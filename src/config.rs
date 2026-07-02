@@ -798,10 +798,10 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     .unwrap_or(false);
     let shell = std::env::var("JTERM1_SHELL").ok().or(fc.shell);
 
-    // Parse terminal mode (default: block)
+    // Parse terminal mode (default: vte)
     let terminal_mode_str = env_string("JTERM1_MODE")
         .or(fc.terminal_mode)
-        .unwrap_or_else(|| "block".to_string());
+        .unwrap_or_else(|| "vte".to_string());
     let terminal_mode = match terminal_mode_str.to_lowercase().as_str() {
         "vte" => TerminalMode::Vte,
         _ => TerminalMode::Block,

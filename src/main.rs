@@ -1270,12 +1270,13 @@ impl AppModel {
         let pane_id = self.next_pane_id;
         self.next_pane_id += 1;
         let argv = Rc::new(config::build_remote_argv(host));
+        let mode = self.config.borrow().terminal_mode;
         let pane = create_pane(
             &self.config,
             &argv,
             id,
             pane_id,
-            TerminalMode::Block,
+            mode,
             None,
             None,
             sender,
@@ -1419,12 +1420,13 @@ impl AppModel {
             .map(|c| c.host.clone())
             .unwrap_or(conn.host.clone());
         let argv = Rc::new(config::build_remote_argv(&host_now));
+        let mode = self.config.borrow().terminal_mode;
         let pane = create_pane(
             &self.config,
             &argv,
             tab_id,
             pane_id,
-            TerminalMode::Block,
+            mode,
             None,
             None,
             sender,
