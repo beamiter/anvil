@@ -296,14 +296,15 @@ pub(crate) fn normalize_key(key: Key) -> Key {
 
 pub(crate) fn parse_key_combo(s: &str) -> Result<KeyCombo, String> {
     let mut modifiers = ModifierType::empty();
-    let parts: Vec<&str> = s.split('+').collect();
-    if parts.is_empty() {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
         return Err("Empty key combo".to_string());
     }
+    let parts: Vec<&str> = trimmed.split('+').map(|p| p.trim()).collect();
 
     // The last part is the key, but "+" itself is special:
     // "Ctrl+Shift++" means Ctrl+Shift and key is "+"
-    let (mod_parts, key_str) = if s.ends_with("++") && parts.len() >= 3 {
+    let (mod_parts, key_str) = if trimmed.ends_with("++") && parts.len() >= 3 {
         (&parts[..parts.len() - 2], "+")
     } else if parts.last() == Some(&"") && parts.len() >= 2 {
         // "Ctrl++" case
@@ -314,9 +315,9 @@ pub(crate) fn parse_key_combo(s: &str) -> Result<KeyCombo, String> {
 
     for part in mod_parts {
         match *part {
-            "Ctrl" => modifiers |= ModifierType::CONTROL_MASK,
-            "Shift" => modifiers |= ModifierType::SHIFT_MASK,
-            "Alt" => modifiers |= ModifierType::ALT_MASK,
+            _ if part.eq_ignore_ascii_case("Ctrl") => modifiers |= ModifierType::CONTROL_MASK,
+            _ if part.eq_ignore_ascii_case("Shift") => modifiers |= ModifierType::SHIFT_MASK,
+            _ if part.eq_ignore_ascii_case("Alt") => modifiers |= ModifierType::ALT_MASK,
             other => return Err(format!("Unknown modifier: {other}")),
         }
     }
@@ -324,22 +325,22 @@ pub(crate) fn parse_key_combo(s: &str) -> Result<KeyCombo, String> {
     let key = match key_str {
         "+" | "plus" => Key::plus,
         "-" | "minus" => Key::minus,
-        "PageUp" => Key::Page_Up,
-        "PageDown" => Key::Page_Down,
-        "Tab" => Key::Tab,
-        "Escape" | "Esc" => Key::Escape,
-        "Return" | "Enter" => Key::Return,
-        "Up" => Key::Up,
-        "Down" => Key::Down,
-        "Left" => Key::Left,
-        "Right" => Key::Right,
-        "!" | "exclam" => Key::exclam,
-        "Space" => Key::space,
-        "Backspace" => Key::BackSpace,
-        "Delete" => Key::Delete,
-        "Home" => Key::Home,
-        "End" => Key::End,
-        "Insert" => Key::Insert,
+        k if k.eq_ignore_ascii_case("PageUp") => Key::Page_Up,
+        k if k.eq_ignore_ascii_case("PageDown") => Key::Page_Down,
+        k if k.eq_ignore_ascii_case("Tab") => Key::Tab,
+        k if k.eq_ignore_ascii_case("Escape") || k.eq_ignore_ascii_case("Esc") => Key::Escape,
+        k if k.eq_ignore_ascii_case("Return") || k.eq_ignore_ascii_case("Enter") => Key::Return,
+        k if k.eq_ignore_ascii_case("Up") => Key::Up,
+        k if k.eq_ignore_ascii_case("Down") => Key::Down,
+        k if k.eq_ignore_ascii_case("Left") => Key::Left,
+        k if k.eq_ignore_ascii_case("Right") => Key::Right,
+        k if k.eq_ignore_ascii_case("!") || k.eq_ignore_ascii_case("exclam") => Key::exclam,
+        k if k.eq_ignore_ascii_case("Space") => Key::space,
+        k if k.eq_ignore_ascii_case("Backspace") => Key::BackSpace,
+        k if k.eq_ignore_ascii_case("Delete") => Key::Delete,
+        k if k.eq_ignore_ascii_case("Home") => Key::Home,
+        k if k.eq_ignore_ascii_case("End") => Key::End,
+        k if k.eq_ignore_ascii_case("Insert") => Key::Insert,
         s if s.len() == 1 => {
             let c = s.chars().next().unwrap();
             if c.is_ascii_digit() {
@@ -560,5 +561,31 @@ impl KeybindingMap {
             result.push((action, display));
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_key_combo_trims_whitespace() {
+        let combo = parse_key_combo(" Ctrl + Shift + P ").expect("valid");
+        assert!(combo.modifiers.contains(ModifierType::CONTROL_MASK));
+        assert!(combo.modifiers.contains(ModifierType::SHIFT_MASK));
+        assert_eq!(combo.key, Key::P);
+    }
+
+    #[test]
+    fn parse_key_combo_empty_string_is_error() {
+        let err = parse_key_combo("   ").expect_err("empty input should fail");
+        assert_eq!(err, "Empty key combo");
+    }
+
+    #[test]
+    fn parse_key_combo_allows_lowercase_modifiers() {
+        let combo = parse_key_combo("ctrl+p").expect("valid");
+        assert!(combo.modifiers.contains(ModifierType::CONTROL_MASK));
+        assert_eq!(combo.key, Key::P);
     }
 }
