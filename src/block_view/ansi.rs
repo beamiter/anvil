@@ -153,29 +153,9 @@ pub(crate) fn contains_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool 
     if haystack.len() < needle.len() {
         return false;
     }
-    let first = needle[0];
-    let finder = memchr::memchr_iter(first, haystack);
-    for pos in finder {
-        // memchr_iter yields ascending positions, so once a candidate would run
-        // past the end every later one does too: stop scanning this byte, but
-        // still fall through to the uppercase-variant search below.
-        if pos + needle.len() > haystack.len() {
-            break;
-        }
-        let candidate = &haystack[pos..pos + needle.len()];
-        if candidate
-            .iter()
-            .zip(needle.iter())
-            .all(|(&h, &n)| h.to_ascii_lowercase() == n)
-        {
-            return true;
-        }
-    }
-    // Also check uppercase variant of first byte
-    let first_upper = first.to_ascii_uppercase();
-    if first_upper != first {
-        let finder = memchr::memchr_iter(first_upper, haystack);
-        for pos in finder {
+
+    fn scan(haystack: &[u8], needle: &[u8], first: u8) -> bool {
+        for pos in memchr::memchr_iter(first, haystack) {
             if pos + needle.len() > haystack.len() {
                 break;
             }
@@ -183,11 +163,22 @@ pub(crate) fn contains_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool 
             if candidate
                 .iter()
                 .zip(needle.iter())
-                .all(|(&h, &n)| h.to_ascii_lowercase() == n)
+                .all(|(&h, &n)| h.to_ascii_lowercase() == n.to_ascii_lowercase())
             {
                 return true;
             }
         }
+        false
+    }
+
+    let first_lower = needle[0].to_ascii_lowercase();
+    if scan(haystack, needle, first_lower) {
+        return true;
+    }
+
+    let first_upper = needle[0].to_ascii_uppercase();
+    if first_upper != first_lower && scan(haystack, needle, first_upper) {
+        return true;
     }
     false
 }
@@ -223,6 +214,7 @@ mod tests {
     #[test]
     fn matches_regardless_of_case() {
         assert!(cci(b"Hello World", b"hello"));
+        assert!(cci(b"Hello World", b"HELLO"));
         assert!(cci(b"hello world", b"world"));
         assert!(cci(b"MiXeD", b"mixed"));
     }

@@ -12,7 +12,7 @@ use gtk4::glib::translate::IntoGlib;
 use gtk4::TextBuffer;
 use relm4::gtk;
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum UnderlineStyle {
     #[default]
     None,
@@ -140,28 +140,80 @@ fn bytes_to_u8(bytes: &[u8]) -> Option<u8> {
     }
 }
 
-fn parse_colon_color_bytes(sub_parts: &[&[u8]], palette: &[RGBA; 16]) -> Option<RGBA> {
-    let mode = bytes_to_u32(sub_parts.get(1)?);
+fn parse_colon_color_bytes<'a>(
+    mut sub_parts: impl Iterator<Item = &'a [u8]>,
+    palette: &[RGBA; 16],
+) -> Option<RGBA> {
+    let mode = bytes_to_u32(sub_parts.next()?);
     match mode {
         5 => {
-            let idx = bytes_to_u8(sub_parts.get(2)?)?;
+            let idx = sub_parts.find_map(bytes_to_u8)?;
             let (r, g, b) = ansi256_to_rgb(idx, palette);
             Some(rgb(r, g, b))
         }
         2 => {
-            let nums: Vec<u8> = sub_parts[2..]
-                .iter()
-                .filter_map(|s| bytes_to_u8(s))
-                .collect();
-            if nums.len() >= 3 {
+            let mut last = [0u8; 3];
+            let mut count = 0usize;
+            for n in sub_parts.filter_map(bytes_to_u8) {
+                last[count % 3] = n;
+                count += 1;
+            }
+            if count >= 3 {
+                let start = count % 3;
                 Some(rgb(
-                    nums[nums.len() - 3],
-                    nums[nums.len() - 2],
-                    nums[nums.len() - 1],
+                    last[start],
+                    last[(start + 1) % 3],
+                    last[(start + 2) % 3],
                 ))
             } else {
                 None
             }
+        }
+        _ => None,
+    }
+}
+
+fn parse_colon_sgr(style: &mut AnsiStyleState, part: &[u8], palette: &[RGBA; 16]) {
+    let mut sub_parts = part.split(|&b| b == b':');
+    let base = bytes_to_u32(sub_parts.next().unwrap_or_default());
+    match base {
+        4 => {
+            let sub = sub_parts.next().map(bytes_to_u32).unwrap_or(1);
+            style.underline_style = match sub {
+                0 => UnderlineStyle::None,
+                1 => UnderlineStyle::Single,
+                2 => UnderlineStyle::Double,
+                3 => UnderlineStyle::Curly,
+                4 => UnderlineStyle::Dotted,
+                5 => UnderlineStyle::Dashed,
+                _ => UnderlineStyle::Single,
+            };
+        }
+        38 | 48 | 58 => {
+            if let Some(color) = parse_colon_color_bytes(sub_parts, palette) {
+                match base {
+                    38 => style.foreground = Some(color),
+                    48 => style.background = Some(color),
+                    _ => style.underline_color = Some(color),
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_extended_color<'a>(chunks: &mut SgrChunks<'a>, palette: &[RGBA; 16]) -> Option<RGBA> {
+    match chunks.next()? {
+        b"5" => {
+            let ci = bytes_to_u8(chunks.next()?)?;
+            let (r, g, b) = ansi256_to_rgb(ci, palette);
+            Some(rgb(r, g, b))
+        }
+        b"2" => {
+            let r = bytes_to_u8(chunks.next()?)?;
+            let g = bytes_to_u8(chunks.next()?)?;
+            let b = bytes_to_u8(chunks.next()?)?;
+            Some(rgb(r, g, b))
         }
         _ => None,
     }
@@ -172,39 +224,10 @@ fn parse_colon_color_bytes(sub_parts: &[&[u8]], palette: &[RGBA; 16]) -> Option<
 /// `String::parse::<u32>` round-trip the old `&[String]` signature forced.
 pub fn parse_sgr_params(style: &mut AnsiStyleState, params: &[u8], palette: &[RGBA; 16]) {
     // Empty params == bare `\e[m` == reset.
-    let chunks: SgrChunks = SgrChunks::new(params);
-    let parts: Vec<&[u8]> = chunks.collect();
-    let mut index = 0;
-    while index < parts.len() {
-        let part = parts[index];
+    let mut chunks = SgrChunks::new(params);
+    while let Some(part) = chunks.next() {
         if part.contains(&b':') {
-            let sub_parts: Vec<&[u8]> = part.split(|&b| b == b':').collect();
-            let base = bytes_to_u32(sub_parts[0]);
-            match base {
-                4 => {
-                    let sub = sub_parts.get(1).map(|s| bytes_to_u32(s)).unwrap_or(1);
-                    style.underline_style = match sub {
-                        0 => UnderlineStyle::None,
-                        1 => UnderlineStyle::Single,
-                        2 => UnderlineStyle::Double,
-                        3 => UnderlineStyle::Curly,
-                        4 => UnderlineStyle::Dotted,
-                        5 => UnderlineStyle::Dashed,
-                        _ => UnderlineStyle::Single,
-                    };
-                }
-                38 | 48 | 58 => {
-                    if let Some(color) = parse_colon_color_bytes(&sub_parts, palette) {
-                        match base {
-                            38 => style.foreground = Some(color),
-                            48 => style.background = Some(color),
-                            _ => style.underline_color = Some(color),
-                        }
-                    }
-                }
-                _ => {}
-            }
-            index += 1;
+            parse_colon_sgr(style, part, palette);
             continue;
         }
 
@@ -256,44 +279,17 @@ pub fn parse_sgr_params(style: &mut AnsiStyleState, params: &[u8], palette: &[RG
                 style.background = Some(rgb(r, g, b));
             }
             38 | 48 => {
-                let target = if param == 38 {
-                    &mut style.foreground
-                } else {
-                    &mut style.background
-                };
-                if index + 2 < parts.len() && parts[index + 1] == b"5" {
-                    if let Some(ci) = bytes_to_u8(parts[index + 2]) {
-                        let (r, g, b) = ansi256_to_rgb(ci, palette);
-                        *target = Some(rgb(r, g, b));
+                if let Some(color) = parse_extended_color(&mut chunks, palette) {
+                    if param == 38 {
+                        style.foreground = Some(color);
+                    } else {
+                        style.background = Some(color);
                     }
-                    index += 2;
-                } else if index + 4 < parts.len() && parts[index + 1] == b"2" {
-                    if let (Some(r), Some(g), Some(b)) = (
-                        bytes_to_u8(parts[index + 2]),
-                        bytes_to_u8(parts[index + 3]),
-                        bytes_to_u8(parts[index + 4]),
-                    ) {
-                        *target = Some(rgb(r, g, b));
-                    }
-                    index += 4;
                 }
             }
             58 => {
-                if index + 2 < parts.len() && parts[index + 1] == b"5" {
-                    if let Some(ci) = bytes_to_u8(parts[index + 2]) {
-                        let (r, g, b) = ansi256_to_rgb(ci, palette);
-                        style.underline_color = Some(rgb(r, g, b));
-                    }
-                    index += 2;
-                } else if index + 4 < parts.len() && parts[index + 1] == b"2" {
-                    if let (Some(r), Some(g), Some(b)) = (
-                        bytes_to_u8(parts[index + 2]),
-                        bytes_to_u8(parts[index + 3]),
-                        bytes_to_u8(parts[index + 4]),
-                    ) {
-                        style.underline_color = Some(rgb(r, g, b));
-                    }
-                    index += 4;
+                if let Some(color) = parse_extended_color(&mut chunks, palette) {
+                    style.underline_color = Some(color);
                 }
             }
             59 => style.underline_color = None,
@@ -305,7 +301,6 @@ pub fn parse_sgr_params(style: &mut AnsiStyleState, params: &[u8], palette: &[RG
             55 => style.overline = false,
             _ => {}
         }
-        index += 1;
     }
 }
 
@@ -473,43 +468,48 @@ fn flush_line(runs: &mut Vec<AnsiTextRun>, line: &mut Vec<(char, AnsiStyleState)
 /// Parse ANSI text into styled runs. The concatenation of `run.text` is the
 /// plain text; offsets line up with `apply_ansi_runs_to_buffer`.
 pub fn ansi_text_runs(input: &str, palette: &[RGBA; 16]) -> Vec<AnsiTextRun> {
-    let chars: Vec<char> = input.chars().collect();
     let mut runs: Vec<AnsiTextRun> = Vec::new();
     let mut style = AnsiStyleState::default();
     let mut line: Vec<(char, AnsiStyleState)> = Vec::new();
     let mut col = 0usize;
-    let mut i = 0;
+    let mut i = 0usize;
+    let bytes = input.as_bytes();
 
-    while i < chars.len() {
-        let c = chars[i];
+    while i < input.len() {
+        let c = input[i..].chars().next().unwrap();
+        let next_i = i + c.len_utf8();
         match c {
             '\x1b' => {
-                i += 1;
-                if i >= chars.len() {
+                i = next_i;
+                if i >= input.len() {
                     break;
                 }
-                match chars[i] {
+                let esc = input[i..].chars().next().unwrap();
+                i += esc.len_utf8();
+                match esc {
                     '[' => {
-                        i += 1;
                         let start = i;
-                        while i < chars.len() && !('@'..='~').contains(&chars[i]) {
-                            i += 1;
+                        while i < input.len() {
+                            let ch = input[i..].chars().next().unwrap();
+                            if ('@'..='~').contains(&ch) {
+                                break;
+                            }
+                            i += ch.len_utf8();
                         }
-                        if i < chars.len() {
-                            let final_c = chars[i];
-                            let params: String = chars[start..i].iter().collect();
-                            i += 1;
+                        if i < input.len() {
+                            let final_c = input[i..].chars().next().unwrap();
+                            let params = &bytes[start..i];
+                            i += final_c.len_utf8();
                             match final_c {
                                 'm' => {
-                                    let bytes = params.as_bytes();
-                                    if bytes.is_empty() {
+                                    if params.is_empty() {
                                         parse_sgr_params(&mut style, b"0", palette);
                                     } else {
-                                        parse_sgr_params(&mut style, bytes, palette);
+                                        parse_sgr_params(&mut style, params, palette);
                                     }
                                 }
                                 'K' => {
-                                    let n = params.parse::<u32>().unwrap_or(0);
+                                    let n = bytes_to_u32(params);
                                     match n {
                                         0 => line.truncate(col),
                                         2 => line.clear(),
@@ -521,38 +521,50 @@ pub fn ansi_text_runs(input: &str, palette: &[RGBA; 16]) -> Vec<AnsiTextRun> {
                         }
                     }
                     ']' => {
-                        i += 1;
-                        let mut payload = String::new();
-                        while i < chars.len() {
-                            if chars[i] == '\x07' {
-                                i += 1;
+                        let payload_start = i;
+                        let mut payload_end = i;
+                        while i < input.len() {
+                            let ch = input[i..].chars().next().unwrap();
+                            if ch == '\x07' {
+                                payload_end = i;
+                                i += ch.len_utf8();
                                 break;
                             }
-                            if chars[i] == '\x1b' && i + 1 < chars.len() && chars[i + 1] == '\\' {
-                                i += 2;
-                                break;
+                            if ch == '\x1b' {
+                                let after_esc = i + ch.len_utf8();
+                                if after_esc < input.len() {
+                                    let next = input[after_esc..].chars().next().unwrap();
+                                    if next == '\\' {
+                                        payload_end = i;
+                                        i = after_esc + next.len_utf8();
+                                        break;
+                                    }
+                                }
                             }
-                            payload.push(chars[i]);
-                            i += 1;
+                            i += ch.len_utf8();
+                            payload_end = i;
                         }
-                        if let Some(rest) = payload.strip_prefix("8;") {
-                            if let Some(semi) = rest.find(';') {
-                                let uri = &rest[semi + 1..];
-                                style.hyperlink = if uri.is_empty() {
-                                    None
-                                } else {
-                                    Some(uri.to_string())
-                                };
+                        if payload_end >= payload_start {
+                            let payload = &input[payload_start..payload_end];
+                            if let Some(rest) = payload.strip_prefix("8;") {
+                                if let Some(semi) = rest.find(';') {
+                                    let uri = &rest[semi + 1..];
+                                    style.hyperlink = if uri.is_empty() {
+                                        None
+                                    } else {
+                                        Some(uri.to_string())
+                                    };
+                                }
                             }
                         }
                     }
                     '(' | ')' => {
-                        i += 1;
-                        if i < chars.len() {
-                            i += 1;
+                        if i < input.len() {
+                            let ch = input[i..].chars().next().unwrap();
+                            i += ch.len_utf8();
                         }
                     }
-                    _ => i += 1,
+                    _ => {}
                 }
             }
             '\n' => {
@@ -562,11 +574,11 @@ pub fn ansi_text_runs(input: &str, palette: &[RGBA; 16]) -> Vec<AnsiTextRun> {
                     style: AnsiStyleState::default(),
                 });
                 col = 0;
-                i += 1;
+                i = next_i;
             }
             '\r' => {
                 col = 0;
-                i += 1;
+                i = next_i;
             }
             '\t' => {
                 let next = ((col / 8) + 1) * 8;
@@ -574,22 +586,111 @@ pub fn ansi_text_runs(input: &str, palette: &[RGBA; 16]) -> Vec<AnsiTextRun> {
                     set_cell(&mut line, col, ' ', &style);
                     col += 1;
                 }
-                i += 1;
+                i = next_i;
             }
             '\x08' => {
                 col = col.saturating_sub(1);
-                i += 1;
+                i = next_i;
             }
-            c if (c as u32) < 0x20 => i += 1,
+            c if (c as u32) < 0x20 => i = next_i,
             c => {
                 set_cell(&mut line, col, c, &style);
                 col += 1;
-                i += 1;
+                i = next_i;
             }
         }
     }
     flush_line(&mut runs, &mut line);
     runs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn palette() -> [RGBA; 16] {
+        [
+            rgb(0, 0, 0),
+            rgb(128, 0, 0),
+            rgb(0, 128, 0),
+            rgb(128, 128, 0),
+            rgb(0, 0, 128),
+            rgb(128, 0, 128),
+            rgb(0, 128, 128),
+            rgb(192, 192, 192),
+            rgb(128, 128, 128),
+            rgb(255, 0, 0),
+            rgb(0, 255, 0),
+            rgb(255, 255, 0),
+            rgb(0, 0, 255),
+            rgb(255, 0, 255),
+            rgb(0, 255, 255),
+            rgb(255, 255, 255),
+        ]
+    }
+
+    fn plain_text(runs: &[AnsiTextRun]) -> String {
+        runs.iter().map(|run| run.text.as_str()).collect()
+    }
+
+    fn rgba_tuple(color: &RGBA) -> (u8, u8, u8) {
+        (
+            (color.red() * 255.0) as u8,
+            (color.green() * 255.0) as u8,
+            (color.blue() * 255.0) as u8,
+        )
+    }
+
+    #[test]
+    fn ansi_text_runs_preserves_basic_sgr_styles() {
+        let runs = ansi_text_runs("plain \x1b[31;1mred\x1b[0m done", &palette());
+        assert_eq!(plain_text(&runs), "plain red done");
+
+        let red = runs.iter().find(|run| run.text == "red").unwrap();
+        assert!(red.style.bold);
+        assert!(red.style.foreground.is_some());
+    }
+
+    #[test]
+    fn ansi_text_runs_preserves_semicolon_truecolor() {
+        let runs = ansi_text_runs("\x1b[38;2;12;34;56mfg", &palette());
+        let fg = runs.iter().find(|run| run.text == "fg").unwrap();
+        assert_eq!(
+            fg.style.foreground.as_ref().map(rgba_tuple),
+            Some((12, 34, 56))
+        );
+    }
+
+    #[test]
+    fn ansi_text_runs_preserves_colon_underline_style_and_color() {
+        let runs = ansi_text_runs("\x1b[4:3;58:2::9:8:7mul", &palette());
+        let ul = runs.iter().find(|run| run.text == "ul").unwrap();
+        assert_eq!(ul.style.underline_style, UnderlineStyle::Curly);
+        assert_eq!(
+            ul.style.underline_color.as_ref().map(rgba_tuple),
+            Some((9, 8, 7))
+        );
+    }
+
+    #[test]
+    fn ansi_text_runs_handles_osc8_links() {
+        let runs = ansi_text_runs(
+            "\x1b]8;;https://example.com\x07link\x1b]8;;\x07 tail",
+            &palette(),
+        );
+        assert_eq!(plain_text(&runs), "link tail");
+
+        let link = runs.iter().find(|run| run.text == "link").unwrap();
+        assert_eq!(link.style.hyperlink.as_deref(), Some("https://example.com"));
+        let tail = runs.iter().find(|run| run.text == " tail").unwrap();
+        assert_eq!(tail.style.hyperlink, None);
+    }
+
+    #[test]
+    fn ansi_text_runs_handles_carriage_return_and_wide_chars() {
+        let runs = ansi_text_runs("hello\r你界", &palette());
+        assert_eq!(plain_text(&runs), "你界llo");
+    }
 }
 
 fn ensure_osc8_tag(buffer: &TextBuffer, uri: &str) -> gtk::TextTag {

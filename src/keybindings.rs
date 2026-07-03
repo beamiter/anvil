@@ -573,7 +573,7 @@ mod tests {
         let combo = parse_key_combo(" Ctrl + Shift + P ").expect("valid");
         assert!(combo.modifiers.contains(ModifierType::CONTROL_MASK));
         assert!(combo.modifiers.contains(ModifierType::SHIFT_MASK));
-        assert_eq!(combo.key, Key::P);
+        assert_eq!(combo.key, Key::p);
     }
 
     #[test]
@@ -586,6 +586,6 @@ mod tests {
     fn parse_key_combo_allows_lowercase_modifiers() {
         let combo = parse_key_combo("ctrl+p").expect("valid");
         assert!(combo.modifiers.contains(ModifierType::CONTROL_MASK));
-        assert_eq!(combo.key, Key::P);
+        assert_eq!(combo.key, Key::p);
     }
 }

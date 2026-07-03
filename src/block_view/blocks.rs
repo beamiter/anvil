@@ -172,73 +172,81 @@ impl Clone for FinishedBlock {
 /// the reconstructed buffer text matches the command exactly.
 pub(crate) fn highlight_command_to_ansi(cmd: &str) -> String {
     const RESET: &str = "\x1b[0m";
-    let chars: Vec<char> = cmd.chars().collect();
     let mut out = String::with_capacity(cmd.len() + 32);
-    let mut i = 0;
+    let mut i = 0usize;
     let mut expect_command = true;
-    while i < chars.len() {
-        let c = chars[i];
+    while i < cmd.len() {
+        let c = cmd[i..].chars().next().unwrap();
         if c.is_whitespace() {
             out.push(c);
-            i += 1;
+            i += c.len_utf8();
             continue;
         }
         if c == '"' || c == '\'' {
             let quote = c;
             let start = i;
-            i += 1;
-            while i < chars.len() {
-                if quote == '"' && chars[i] == '\\' && i + 1 < chars.len() {
-                    i += 2;
+            i += c.len_utf8();
+            while i < cmd.len() {
+                let ch = cmd[i..].chars().next().unwrap();
+                if quote == '"' && ch == '\\' {
+                    i += ch.len_utf8();
+                    if i < cmd.len() {
+                        let escaped = cmd[i..].chars().next().unwrap();
+                        i += escaped.len_utf8();
+                    }
                     continue;
                 }
-                let done = chars[i] == quote;
-                i += 1;
+                let done = ch == quote;
+                i += ch.len_utf8();
                 if done {
                     break;
                 }
             }
             out.push_str("\x1b[32m");
-            out.extend(chars[start..i].iter());
+            out.push_str(&cmd[start..i]);
             out.push_str(RESET);
             expect_command = false;
             continue;
         }
         if matches!(c, '|' | '&' | ';' | '>' | '<') {
             let start = i;
-            while i < chars.len() && matches!(chars[i], '|' | '&' | ';' | '>' | '<') {
-                i += 1;
+            while i < cmd.len() {
+                let ch = cmd[i..].chars().next().unwrap();
+                if !matches!(ch, '|' | '&' | ';' | '>' | '<') {
+                    break;
+                }
+                i += ch.len_utf8();
             }
             out.push_str("\x1b[35m");
-            out.extend(chars[start..i].iter());
+            out.push_str(&cmd[start..i]);
             out.push_str(RESET);
             expect_command = true;
             continue;
         }
         let start = i;
-        while i < chars.len() {
-            let cc = chars[i];
+        while i < cmd.len() {
+            let cc = cmd[i..].chars().next().unwrap();
             if cc.is_whitespace() || matches!(cc, '|' | '&' | ';' | '>' | '<' | '"' | '\'') {
                 break;
             }
-            i += 1;
+            i += cc.len_utf8();
         }
-        let word: String = chars[start..i].iter().collect();
+        let word = &cmd[start..i];
         if word.starts_with('-') {
             out.push_str("\x1b[90m");
-            out.push_str(&word);
+            out.push_str(word);
             out.push_str(RESET);
         } else if word.starts_with('$') {
             out.push_str("\x1b[36m");
-            out.push_str(&word);
+            out.push_str(word);
             out.push_str(RESET);
         } else if expect_command {
             out.push_str("\x1b[1;36m");
-            out.push_str(&word);
+            out.push_str(word);
             out.push_str(RESET);
             expect_command = false;
         } else {
-            out.push_str(&word);
+            out.push_str(word);
         }
     }
     out
@@ -269,11 +277,6 @@ fn filter_output_lines(
     } else {
         None
     };
-    let lc_query = if case_sensitive {
-        String::new()
-    } else {
-        query.to_lowercase()
-    };
     let lines: Vec<&str> = full.lines().collect();
     let matches_line = |line: &str| -> bool {
         let hit = if let Some(ref re) = re {
@@ -281,7 +284,7 @@ fn filter_output_lines(
         } else if case_sensitive {
             line.contains(query)
         } else {
-            line.to_lowercase().contains(&lc_query)
+            contains_case_insensitive(line.as_bytes(), query.as_bytes())
         };
         hit ^ invert
     };
@@ -381,6 +384,20 @@ mod tests {
     #[test]
     fn output_row_count_preserves_intentional_blank_lines_before_final_ending() {
         assert_eq!(output_row_count("a\n\n"), 2);
+    }
+
+    #[test]
+    fn command_highlight_preserves_original_text() {
+        let cmd = "git commit -m \"hello 世界\" && echo $HOME | wc -l";
+        assert_eq!(strip_ansi(&highlight_command_to_ansi(cmd)), cmd);
+    }
+
+    #[test]
+    fn filter_output_lines_matches_case_insensitively_without_regex() {
+        assert_eq!(
+            filter_output_lines("alpha\nBeta\ngamma", "BETA", false, false, false, 0),
+            "Beta"
+        );
     }
 }
 

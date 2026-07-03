@@ -87,8 +87,7 @@ impl TermView {
 
     /// Search blocks with optional filters
     pub fn search_blocks_with_filters(&self, query: &str, filters: &BlockFilters) -> Vec<usize> {
-        let q = query.to_lowercase();
-        let q_bytes = q.as_bytes();
+        let q_bytes = query.as_bytes();
 
         let re = if filters.use_regex && !query.is_empty() {
             regex::RegexBuilder::new(query)
@@ -105,7 +104,7 @@ impl TermView {
             .iter()
             .enumerate()
             .filter(|(_, b)| {
-                let text_match = if q.is_empty() {
+                let text_match = if query.is_empty() {
                     true
                 } else if let Some(ref re) = re {
                     re.is_match(&b.prompt) || re.is_match(&b.cmd) || re.is_match(&b.output)
@@ -337,16 +336,18 @@ impl TermView {
         if pattern.is_empty() {
             return Ok(Vec::new());
         }
-        let compiled_pattern = if is_regex {
-            pattern.to_string()
+        let re = if is_regex {
+            Some(
+                regex::RegexBuilder::new(pattern)
+                    .case_insensitive(true)
+                    .multi_line(true)
+                    .build()
+                    .map_err(|e| format!("{e}"))?,
+            )
         } else {
-            regex::escape(pattern)
+            None
         };
-        let re = regex::RegexBuilder::new(&compiled_pattern)
-            .case_insensitive(true)
-            .multi_line(true)
-            .build()
-            .map_err(|e| format!("{e}"))?;
+        let pattern_bytes = pattern.as_bytes();
 
         let finished = self.finished_blocks.borrow();
         let mut hits: Vec<CrossBlockHit> = Vec::new();
@@ -367,7 +368,11 @@ impl TermView {
                 if hits.len() >= max_hits {
                     break;
                 }
-                if re.is_match(line) {
+                let is_match = match re.as_ref() {
+                    Some(re) => re.is_match(line),
+                    None => contains_case_insensitive(line.as_bytes(), pattern_bytes),
+                };
+                if is_match {
                     hits.push(CrossBlockHit {
                         block_id: block.id,
                         is_output: false,
@@ -384,7 +389,11 @@ impl TermView {
                     if hits.len() >= max_hits {
                         break;
                     }
-                    if re.is_match(line) {
+                    let is_match = match re.as_ref() {
+                        Some(re) => re.is_match(line),
+                        None => contains_case_insensitive(line.as_bytes(), pattern_bytes),
+                    };
+                    if is_match {
                         hits.push(CrossBlockHit {
                             block_id: block.id,
                             is_output: true,
