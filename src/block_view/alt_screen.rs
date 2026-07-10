@@ -133,12 +133,13 @@ pub(crate) fn create_active_terminal(config: &Config) -> Terminal {
     let terminal = Terminal::builder()
         .hexpand(true)
         .vexpand(true)
+        .name("term_name")
         .can_focus(true)
         .allow_hyperlink(true)
         .bold_is_bright(true)
         .input_enabled(true)
         .scrollback_lines(config.terminal_scrollback_lines)
-        .cursor_blink_mode(CursorBlinkMode::On)
+        .cursor_blink_mode(CursorBlinkMode::System)
         .cursor_shape(CursorShape::Block)
         .font_scale(config.default_font_scale)
         .opacity(1.0)
@@ -151,7 +152,20 @@ pub(crate) fn create_active_terminal(config: &Config) -> Terminal {
     // which readline-style line editors (incl. rsh) ignore — making Backspace dead.
     terminal.set_backspace_binding(vte4::EraseBinding::AsciiDelete);
     apply_theme_to_vte(&terminal, config);
+    if let Ok(regex) = vte4::Regex::for_match(
+        r"[a-z]+://[[:graph:]]+",
+        pcre2_sys::PCRE2_CASELESS | pcre2_sys::PCRE2_MULTILINE,
+    ) {
+        terminal.match_add_regex(&regex, 0);
+    }
     terminal
+}
+
+pub(crate) fn apply_snapshot_theme_to_vte(terminal: &Terminal, config: &Config) {
+    apply_theme_to_vte(terminal, config);
+    let mut transparent = config.background;
+    transparent.set_alpha(0.0);
+    terminal.set_color_cursor(Some(&transparent));
 }
 
 /// A read-only PTY-less VTE used as the renderer for a single finished block.
@@ -193,12 +207,7 @@ pub(crate) fn create_finished_terminal(
         .scroll_on_keystroke(false)
         .build();
     terminal.set_mouse_autohide(true);
-    apply_theme_to_vte(&terminal, config);
-    // Hide the read-only block's cursor — the completed output should not show a
-    // blinking caret at the end of the last line.
-    let mut transparent = config.background;
-    transparent.set_alpha(0.0);
-    terminal.set_color_cursor(Some(&transparent));
+    apply_snapshot_theme_to_vte(&terminal, config);
     terminal.set_size(cols.max(1), visible_rows);
     // URL detection — mirror the live-VTE pattern at src/terminal.rs:52-56.
     if let Ok(regex) = vte4::Regex::for_match(

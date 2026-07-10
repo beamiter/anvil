@@ -506,6 +506,10 @@ impl Component for VteTerminal {
             }
             VteInput::GrabFocus => {
                 self.terminal.grab_focus();
+                let terminal = self.terminal.clone();
+                gtk::glib::idle_add_local_once(move || {
+                    terminal.grab_focus();
+                });
             }
             VteInput::Copy | VteInput::CopyOutputOnly => {
                 self.terminal.copy_clipboard_format(vte4::Format::Text)

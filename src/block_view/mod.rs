@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 use vte4::Terminal;
-use vte4::{TerminalExt, TerminalExtManual};
+use vte4::TerminalExt;
 
 use crate::config::Config;
 use crate::parser::{ColorKind, Parser, ParserConfig, ParserEvent};
@@ -84,6 +84,19 @@ fn sample_output_for_event(output: &str) -> String {
         tail_start.saturating_sub(head_end),
         &output[tail_start..]
     )
+}
+
+/// Strip an exact prompt prefix when a shell integration reports PromptEnd
+/// before its prompt has finished rendering into the VTE range.
+fn normalize_captured_command(captured: &str, prompt: &str) -> String {
+    let captured = captured.trim();
+    let prompt = prompt.trim();
+    if !prompt.is_empty() {
+        if let Some(command) = captured.strip_prefix(prompt) {
+            return command.trim_start().to_string();
+        }
+    }
+    captured.to_string()
 }
 
 /// Probe the cwd for git metadata and update the strip label. Hides the
@@ -323,11 +336,9 @@ struct ReaderCtx {
     selected_block_id_rc: Rc<Cell<Option<u64>>>,
     cmd_running_rc: Rc<Cell<bool>>,
     running_cmd_rc: Rc<RefCell<String>>,
-    /// Re-runs the input-cell sizing (`update_input_height`). Called at every
-    /// FTCS state transition so the live VTE switches between compact (idle)
-    /// and viewport (running / alt-screen) deterministically — without waiting
-    /// for the next `contents_changed` to race with the child's first draw.
-    resize_active: Rc<dyn Fn()>,
+    /// Recomputes the compact/full visual live surface. PTY geometry is kept
+    /// separately at the full pane viewport.
+    layout_active_surface: Rc<dyn Fn()>,
     /// Bottom-of-pane repo metadata label. Re-probed every time a block
     /// finishes (the user may have just run `git commit`, `git pull`,
     /// or anything else that changes branch/dirty/ahead-behind).
@@ -429,7 +440,7 @@ impl ReaderCtx {
             selected_block_id_rc,
             cmd_running_rc,
             running_cmd_rc,
-            resize_active,
+            layout_active_surface,
             repo_strip,
             block_finished_cbs,
         } = self;
@@ -685,6 +696,9 @@ impl ReaderCtx {
                                 let finished_blocks_for_menu = finished_blocks_for_cb.clone();
                                 let block_list_for_menu = block_list_rc.clone();
                                 let vte_for_copy = active_vte.clone();
+                                let pty_for_rerun_menu = pty_for_init.clone();
+                                let pty_synced_for_rerun_menu = pty_synced_rc.clone();
+                                let active_for_rerun_menu = active_rc.clone();
                                 let selected_for_menu = selected_block_id_rc.clone();
                                 let block_id = finished_clone.id;
 
@@ -727,6 +741,31 @@ impl ReaderCtx {
                                     };
 
                                     {
+                                        let item = make_item("Copy Command");
+                                        let popover_c = popover.clone();
+                                        let finished_for_copy = finished_menu_clone.clone();
+                                        let vte_for_action = vte_for_copy.clone();
+                                        item.connect_clicked(move |_| {
+                                            popover_c.popdown();
+                                            vte_for_action.clipboard().set_text(&finished_for_copy.cmd_text);
+                                        });
+                                        vbox.append(&item);
+                                    }
+                                    {
+                                        let item = make_item("Copy Output");
+                                        let popover_c = popover.clone();
+                                        let finished_for_copy = finished_menu_clone.clone();
+                                        let vte_for_action = vte_for_copy.clone();
+                                        item.connect_clicked(move |_| {
+                                            popover_c.popdown();
+                                            finished_for_copy.with_stripped_output(|output| {
+                                                vte_for_action.clipboard().set_text(output);
+                                            });
+                                        });
+                                        vbox.append(&item);
+                                    }
+
+                                    {
                                         let item = make_item("Copy Block");
                                         let popover_c = popover.clone();
                                         let finished_for_copy = finished_menu_clone.clone();
@@ -758,6 +797,24 @@ impl ReaderCtx {
                                         });
                                         vbox.append(&item);
                                     }
+
+                                    {
+                                        let item = make_item("Insert Command at Prompt");
+                                        let popover_c = popover.clone();
+                                        let finished_for_rerun = finished_menu_clone.clone();
+                                        let pty_for_action = pty_for_rerun_menu.clone();
+                                        let pty_synced_for_action = pty_synced_for_rerun_menu.clone();
+                                        let active_for_action = active_for_rerun_menu.clone();
+                                        item.connect_clicked(move |_| {
+                                            popover_c.popdown();
+                                            if pty_synced_for_action.get() { pty_for_action.write_bytes(b"\x15"); }
+                                            pty_for_action.write_bytes(finished_for_rerun.cmd_text.as_bytes());
+                                            pty_synced_for_action.set(true);
+                                            active_for_action.borrow().grab_focus();
+                                        });
+                                        vbox.append(&item);
+                                    }
+                                    vbox.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
 
                                     {
                                         let item = make_item("Export as Markdown");
@@ -842,7 +899,12 @@ impl ReaderCtx {
                             // now that no command is running. Sync the PTY size
                             // so the shell sees the new winsize before it reads
                             // anything past the prompt.
-                            sync_active_to_pty(&resize_active, &active_vte, &pty_for_init);
+                            sync_active_to_pty(
+                                &layout_active_surface,
+                                &active_vte,
+                                &block_scroll_rc,
+                                &pty_for_init,
+                            );
                             scroll_debouncer.mark_dirty(&block_scroll_rc);
                         }
 
@@ -875,7 +937,7 @@ impl ReaderCtx {
                             prompt_end_pos_rc.set((col, row));
                             pty_synced_rc.set(false);
                             bstate_rc.set(BlockState::AwaitingCommand);
-                            resize_active();
+                            layout_active_surface();
                             let active_for_focus = active_rc.clone();
                             glib::idle_add_local_once(move || {
                                 active_for_focus.borrow().grab_focus();
@@ -914,7 +976,7 @@ impl ReaderCtx {
                             // shell echoes a newline and starts the command).
                             let (cmd_end_col, cmd_end_row) = active_vte.cursor_position();
                             let (start_col, start_row) = prompt_end_pos_rc.get();
-                            let cmd_from_vte = active_vte
+                            let captured = active_vte
                                 .text_range_format(
                                     vte4::Format::Text,
                                     start_row,
@@ -924,9 +986,8 @@ impl ReaderCtx {
                                 )
                                 .0
                                 .map(|gs| gs.to_string())
-                                .unwrap_or_default()
-                                .trim()
-                                .to_string();
+                                .unwrap_or_default();
+                            let cmd_from_vte = normalize_captured_command(&captured, &prompt_display_rc.borrow());
                             *vte_typed_cmd_rc.borrow_mut() = cmd_from_vte.clone();
                             *running_cmd_rc.borrow_mut() = cmd_from_vte;
                             cmd_running_rc.set(true);
@@ -937,7 +998,12 @@ impl ReaderCtx {
                             // runs, then snapshot it into a finished block on the
                             // next prompt. Interactive CLIs such as Codex rely on
                             // VTE applying cursor positioning/redraws directly.
-                            sync_active_to_pty(&resize_active, &active_vte, &pty_for_init);
+                            sync_active_to_pty(
+                                &layout_active_surface,
+                                &active_vte,
+                                &block_scroll_rc,
+                                &pty_for_init,
+                            );
                             scroll_debouncer.mark_dirty(&block_scroll_rc);
                         }
 
@@ -960,7 +1026,7 @@ impl ReaderCtx {
                                     &visible_indices_rc,
                                     &fullscreen_rc,
                                 );
-                                resize_active();
+                                layout_active_surface();
                             }
                             pending_exit_code_rc.set(*code);
                             cmd_running_rc.set(false);
@@ -986,7 +1052,12 @@ impl ReaderCtx {
                             );
                             // Grow the live VTE to the full viewport before the
                             // app draws (see sync_active_to_pty doc).
-                            sync_active_to_pty(&resize_active, &active_vte, &pty_for_init);
+                            sync_active_to_pty(
+                                &layout_active_surface,
+                                &active_vte,
+                                &block_scroll_rc,
+                                &pty_for_init,
+                            );
                             active_vte.feed(b"\x1b[?1049h");
                         }
 
@@ -1007,7 +1078,12 @@ impl ReaderCtx {
                             bstate_rc.set(prev_state_rc.get());
                             // Collapse the live VTE back to the compact input cell
                             // now that the alt app has released the viewport.
-                            sync_active_to_pty(&resize_active, &active_vte, &pty_for_init);
+                            sync_active_to_pty(
+                                &layout_active_surface,
+                                &active_vte,
+                                &block_scroll_rc,
+                                &pty_for_init,
+                            );
                             let active_for_idle = active_rc.clone();
                             glib::idle_add_local_once(move || {
                                 active_for_idle.borrow().grab_focus();
@@ -1065,17 +1141,29 @@ impl ReaderCtx {
     }
 }
 
-/// Run `resize_active` (recompute target rows from layout + state) and then push
-/// the resulting (cols, rows) to the PTY synchronously. Used at state
+/// Lay out the live surface and then push the full pane grid to the PTY
+/// synchronously. Used at state
 /// transitions where the child needs to see a correct winsize on its very first
 /// read — `top` queries TIOCGWINSZ before painting, less/vim do the same.
 /// Without the synchronous push the per-frame resize tick would catch up only
 /// on the next frame, racing with the child.
-fn sync_active_to_pty(resize_active: &Rc<dyn Fn()>, vte: &Terminal, pty: &OwnedPty) {
-    resize_active();
-    let cols = vte.column_count().max(1) as u16;
-    let rows = vte.row_count().max(1) as u16;
+fn sync_active_to_pty(
+    layout_active_surface: &Rc<dyn Fn()>,
+    vte: &Terminal,
+    scroll: &ScrolledWindow,
+    pty: &OwnedPty,
+) {
+    layout_active_surface();
+    let (cols, rows) = pty_grid_size(vte, scroll);
     pty.resize(cols, rows);
+}
+
+fn pty_grid_size(vte: &Terminal, scroll: &ScrolledWindow) -> (u16, u16) {
+    let cols = vte.column_count().max(1) as u16;
+    let rows = viewport_rows_for(vte, scroll)
+        .unwrap_or_else(|| vte.row_count().max(1))
+        .clamp(1, u16::MAX as i64) as u16;
+    (cols, rows)
 }
 
 fn viewport_rows_for(vte: &Terminal, scroll: &ScrolledWindow) -> Option<i64> {
@@ -1435,10 +1523,9 @@ impl TermView {
 
         block_list.append(active.borrow().widget());
 
-        // The live VTE holder is NOT pinned to the full viewport. Its height is
-        // driven by `update_input_height` (installed after `bstate` exists below):
-        // compact (content-sized, min MIN_INPUT_ROWS) while idle so history shows
-        // above it (warp model), and full-viewport only for alt-screen apps.
+        // The live VTE is visually compact at a prompt and expands to the full
+        // viewport while a command or terminal app owns the surface. Its PTY
+        // geometry remains viewport-sized in both cases.
 
         // ── Jump-to-bottom floating action button ─────────────────────────
         // Shown when the user scrolls up into history; an optional unread badge
@@ -1575,7 +1662,7 @@ impl TermView {
         // (vim/less/TUIs) which need real terminal rows. During a running command
         // the height is frozen at the idle value (no per-chunk resize / SIGWINCH
         // thrash); the full output is snapshotted into a finished block when done.
-        let update_input_height: Rc<dyn Fn()> = {
+        let layout_active_surface: Rc<dyn Fn()> = {
             let holder = active.borrow().widget().clone();
             let vte = active_vte.clone();
             let scroll = block_scroll.clone();
@@ -1656,7 +1743,7 @@ impl TermView {
             // → … an infinite two-state oscillation. A low-priority idle runs once
             // per content burst, AFTER layout settles (so `upper` is final), and is
             // never re-triggered by the visibility side-effects of its own scroll.
-            let f = update_input_height.clone();
+            let f = layout_active_surface.clone();
             let scroll = block_scroll.clone();
             let user_scrolled = user_scrolled_up.clone();
             let programmatic = programmatic_scroll.clone();
@@ -1881,7 +1968,7 @@ impl TermView {
                 selected_block_id_rc: selected_block_id.clone(),
                 cmd_running_rc: cmd_running.clone(),
                 running_cmd_rc: running_cmd.clone(),
-                resize_active: update_input_height.clone(),
+                layout_active_surface: layout_active_surface.clone(),
                 repo_strip: repo_strip.clone(),
                 block_finished_cbs: block_finished_callbacks.clone(),
             }
@@ -1952,7 +2039,7 @@ impl TermView {
         // (hidden off-screen blocks collapse to 0 height) and oscillates forever.
         // The follow-bottom pin is the deferred idle scheduled on contents_changed.
         {
-            let f = update_input_height.clone();
+            let f = layout_active_surface.clone();
             let last_page = Rc::new(Cell::new(0.0f64));
             block_scroll.vadjustment().connect_changed(move |adj| {
                 let page = adj.page_size();
@@ -2424,19 +2511,14 @@ impl TermView {
         term_view
     }
 
-    /// Keep the PTY grid in sync with the live VTE (jterm1 model). The VTE
-    /// re-derives its own column/row count from its allocation on every
-    /// size_allocate, so we just mirror that onto the PTY whenever it changes —
-    /// no pixel math, no chrome calibration. State-driven sizing (compact
-    /// when idle, viewport when running) is handled in `update_input_height`,
-    /// and FTCS transitions push TIOCSWINSZ synchronously from the reader so
-    /// the child never sees a stale winsize on its first read.
+    /// Keep PTY geometry synchronized with the real pane viewport, independent
+    /// of the compact/full visual state of the live VTE.
     fn install_resize_tick(&self) {
         let pty_for_resize = self.pty.clone();
+        let scroll_for_resize = self.block_scroll.clone();
         let last: Rc<Cell<(u16, u16)>> = Rc::new(Cell::new((0, 0)));
         let tick_id = self.active_vte.add_tick_callback(move |vte, _clock| {
-            let cols = vte.column_count() as u16;
-            let rows = vte.row_count() as u16;
+            let (cols, rows) = pty_grid_size(vte, &scroll_for_resize);
             if cols > 0 && rows > 0 && (cols, rows) != last.get() {
                 last.set((cols, rows));
                 pty_for_resize.resize(cols, rows);
@@ -2484,6 +2566,10 @@ impl TermView {
 
     pub fn grab_focus(&self) {
         self.active_vte.grab_focus();
+        let active_vte = self.active_vte.clone();
+        glib::idle_add_local_once(move || {
+            active_vte.grab_focus();
+        });
     }
 
     /// Copy selected text to clipboard.
@@ -2698,21 +2784,21 @@ impl TermView {
     /// Apply updated theme colors to the block widgets and the live VTE.
     pub fn apply_theme(&self) {
         let config = self.config.borrow();
-        let palette_refs: Vec<&RGBA> = config.palette.iter().collect();
-        self.active_vte.set_colors(
-            Some(&config.foreground),
-            Some(&config.background),
-            &palette_refs,
-        );
-        self.active_vte.set_color_cursor(Some(&config.cursor));
-        self.active_vte
-            .set_color_cursor_foreground(Some(&config.cursor_foreground));
+        apply_theme_to_vte(&self.active_vte, &config);
+        for block in self.finished_blocks.borrow().iter() {
+            apply_snapshot_theme_to_vte(&block.command_vte, &config);
+            apply_snapshot_theme_to_vte(&block.output_vte, &config);
+        }
         install_block_css(&config);
     }
 
     /// Update font for VTE terminal and block view CSS.
     pub fn set_font(&self, font_desc: &FontDescription) {
         self.active_vte.set_font(Some(font_desc));
+        for block in self.finished_blocks.borrow().iter() {
+            block.command_vte.set_font(Some(font_desc));
+            block.output_vte.set_font(Some(font_desc));
+        }
         // Update config and regenerate CSS with new font
         self.config.borrow_mut().font_desc = font_desc.to_string();
         install_block_css(&self.config.borrow());
@@ -2721,6 +2807,10 @@ impl TermView {
     /// Update font scale for VTE terminal and block view CSS.
     pub fn set_font_scale(&self, scale: f64) {
         self.active_vte.set_font_scale(scale);
+        for block in self.finished_blocks.borrow().iter() {
+            block.command_vte.set_font_scale(scale);
+            block.output_vte.set_font_scale(scale);
+        }
         self.config.borrow_mut().default_font_scale = scale;
         // Regenerate CSS with updated font scale
         install_block_css(&self.config.borrow());
