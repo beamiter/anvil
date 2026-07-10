@@ -1278,16 +1278,7 @@ impl AppModel {
         self.next_pane_id += 1;
         let argv = Rc::new(config::build_remote_argv(host));
         let mode = self.config.borrow().terminal_mode;
-        let pane = create_pane(
-            &self.config,
-            &argv,
-            id,
-            pane_id,
-            mode,
-            None,
-            None,
-            sender,
-        );
+        let pane = create_pane(&self.config, &argv, id, pane_id, mode, None, None, sender);
         let holder = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         holder.set_hexpand(true);
         holder.set_vexpand(true);

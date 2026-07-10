@@ -572,6 +572,12 @@ impl FinishedBlock {
         // ── Header row ──────────────────────────────────────────────────────
         let header_row = gtk4::Box::new(Orientation::Horizontal, 8);
         header_row.add_css_class("block-header");
+        // The output surface keeps VTE's native text selection, so selection
+        // lives on this header strip. Make the otherwise subtle interaction
+        // discoverable without adding permanent visual chrome to every block.
+        header_row.set_tooltip_text(Some(
+            "Click to select · Enter recalls command · Ctrl+B toggles bookmark",
+        ));
         header_row.set_margin_start(12);
         header_row.set_margin_end(8);
         header_row.set_margin_top(6);

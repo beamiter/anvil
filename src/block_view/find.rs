@@ -59,9 +59,36 @@ fn snippet(line: &str) -> String {
     }
 }
 
+/// Duration-related filters are meaningful only for blocks whose shell
+/// integration reported a duration. Older restored history can legitimately
+/// lack that field; treating `None` as a match made a "slow blocks" jump land
+/// on an unknown-duration command instead of an actually slow one.
+fn duration_matches(duration: Option<u64>, filters: &BlockFilters) -> bool {
+    let needs_duration =
+        filters.min_duration_ms.is_some() || filters.max_duration_ms.is_some() || filters.slow_only;
+    if !needs_duration {
+        return true;
+    }
+    let Some(duration) = duration else {
+        return false;
+    };
+    if let Some(min_dur) = filters.min_duration_ms {
+        if duration < min_dur {
+            return false;
+        }
+    }
+    if let Some(max_dur) = filters.max_duration_ms {
+        if duration > max_dur {
+            return false;
+        }
+    }
+    !filters.slow_only || duration >= filters.slow_threshold_ms
+}
+
 #[cfg(test)]
 mod tests {
-    use super::snippet;
+    use super::{duration_matches, snippet};
+    use crate::block_view::BlockFilters;
 
     #[test]
     fn snippet_passes_through_short_line() {
@@ -74,6 +101,18 @@ mod tests {
         let out = snippet(&long);
         assert!(out.ends_with('…'));
         assert_eq!(out.chars().filter(|&c| c == 'a').count(), 240);
+    }
+
+    #[test]
+    fn slow_filter_excludes_unknown_duration() {
+        let filters = BlockFilters {
+            slow_only: true,
+            slow_threshold_ms: 1_000,
+            ..BlockFilters::default()
+        };
+        assert!(!duration_matches(None, &filters));
+        assert!(!duration_matches(Some(999), &filters));
+        assert!(duration_matches(Some(1_000), &filters));
     }
 }
 
@@ -130,21 +169,8 @@ impl TermView {
                     return false;
                 }
 
-                // Duration filters
-                if let Some(duration) = b.duration_ms {
-                    if let Some(min_dur) = filters.min_duration_ms {
-                        if duration < min_dur {
-                            return false;
-                        }
-                    }
-                    if let Some(max_dur) = filters.max_duration_ms {
-                        if duration > max_dur {
-                            return false;
-                        }
-                    }
-                    if filters.slow_only && duration < filters.slow_threshold_ms {
-                        return false;
-                    }
+                if !duration_matches(b.duration_ms, filters) {
+                    return false;
                 }
 
                 true

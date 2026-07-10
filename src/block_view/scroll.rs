@@ -128,6 +128,21 @@ impl WidgetPool {
 
     pub(crate) fn release(&mut self, widget: gtk4::Box) {
         if self.available.len() < self.max_pool_size {
+            // A recycled finished-block container has gesture/motion controllers
+            // whose closures capture the old block ID and action handles. Keeping
+            // them makes a newly rendered block react as its predecessor (and
+            // stacks duplicate hover/right-click handlers on each reuse).
+            // Controllers belong only to this short-lived outer Box, so clear
+            // them before pooling; `FinishedBlock::new_with_pool` installs the
+            // fresh handlers for the new block.
+            let controllers = widget.observe_controllers();
+            while let Some(controller) = controllers.item(0) {
+                if let Ok(controller) = controller.downcast::<gtk4::EventController>() {
+                    widget.remove_controller(&controller);
+                } else {
+                    break;
+                }
+            }
             self.available.push(widget);
         }
     }

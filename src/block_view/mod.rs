@@ -334,6 +334,7 @@ struct ReaderCtx {
     unread_count_rc: Rc<Cell<u32>>,
     jump_fab: gtk4::Button,
     selected_block_id_rc: Rc<Cell<Option<u64>>>,
+    bookmarks_rc: Rc<RefCell<std::collections::HashSet<u64>>>,
     cmd_running_rc: Rc<Cell<bool>>,
     running_cmd_rc: Rc<RefCell<String>>,
     /// Recomputes the compact/full visual live surface. PTY geometry is kept
@@ -438,6 +439,7 @@ impl ReaderCtx {
             unread_count_rc,
             jump_fab,
             selected_block_id_rc,
+            bookmarks_rc,
             cmd_running_rc,
             running_cmd_rc,
             layout_active_surface,
@@ -700,6 +702,9 @@ impl ReaderCtx {
                                 let pty_synced_for_rerun_menu = pty_synced_rc.clone();
                                 let active_for_rerun_menu = active_rc.clone();
                                 let selected_for_menu = selected_block_id_rc.clone();
+                                let bookmarks_for_menu = bookmarks_rc.clone();
+                                let visible_for_menu = visible_indices_rc.clone();
+                                let widget_pool_for_menu = widget_pool_for_cb.clone();
                                 let block_id = finished_clone.id;
 
                                 let right_click = gtk4::GestureClick::new();
@@ -840,19 +845,30 @@ impl ReaderCtx {
                                         let block_list_for_delete = block_list_for_menu.clone();
                                         let block_data_for_delete = block_data_for_export.clone();
                                         let selected_for_delete = selected_for_menu.clone();
+                                        let bookmarks_for_delete = bookmarks_for_menu.clone();
+                                        let visible_for_delete = visible_for_menu.clone();
+                                        let widget_pool_for_delete = widget_pool_for_menu.clone();
                                         let block_id_del = block_id;
                                         item.connect_clicked(move |_| {
                                             popover_c.popdown();
                                             let mut blocks = finished_blocks_for_delete.borrow_mut();
                                             if let Some(pos) = blocks.iter().position(|b| b.id == block_id_del) {
                                                 let block = blocks.remove(pos);
-                                                block_list_for_delete.remove(block.widget());
+                                                let widget = block.widget().clone();
+                                                block_list_for_delete.remove(&widget);
+                                                widget_pool_for_delete.borrow_mut().release(widget);
                                             }
                                             if selected_for_delete.get() == Some(block_id_del) {
                                                 selected_for_delete.set(None);
                                             }
                                             // Keep block_data in lockstep with the widget list.
                                             block_data_for_delete.borrow_mut().retain(|b| b.id != block_id_del);
+                                            bookmarks_for_delete.borrow_mut().remove(&block_id_del);
+                                            // Index-based virtualization must be recalculated after
+                                            // any removal; retaining the old set can hide the block
+                                            // that shifted into this slot until the next full scroll.
+                                            visible_for_delete.borrow_mut().clear();
+                                            block_list_for_delete.queue_allocate();
                                         });
                                         vbox.append(&item);
                                     }
@@ -877,9 +893,11 @@ impl ReaderCtx {
                                     if selected_block_id_rc.get() == Some(oldest.id) {
                                         selected_block_id_rc.set(None);
                                     }
+                                    bookmarks_rc.borrow_mut().remove(&oldest.id);
                                     let widget_to_release = oldest.widget().clone();
                                     block_list_rc.remove(&widget_to_release);
                                     widget_pool_for_cb.borrow_mut().release(widget_to_release);
+                                    visible_indices_rc.borrow_mut().clear();
                                 }
 
                                 if block_data_for_cb.borrow().len() > max_blocks {
@@ -1230,6 +1248,7 @@ struct KeyCtx {
     selected_block_id_for_key: Rc<Cell<Option<u64>>>,
     block_scroll_for_key: ScrolledWindow,
     bookmarks_for_key: Rc<RefCell<std::collections::HashSet<u64>>>,
+    visible_indices_for_key: Rc<RefCell<std::collections::HashSet<usize>>>,
     bstate_for_key: Rc<Cell<BlockState>>,
 }
 
@@ -1245,6 +1264,7 @@ impl KeyCtx {
             selected_block_id_for_key,
             block_scroll_for_key,
             bookmarks_for_key,
+            visible_indices_for_key,
             bstate_for_key,
         } = self;
         key_ctrl.connect_key_pressed(move |_controller, keyval, _keycode, modifiers| {
@@ -1264,18 +1284,19 @@ impl KeyCtx {
                 return glib::Propagation::Stop;
             }
 
-            // Ctrl+Shift+Up/Down: move the finished-block selection (Warp uses
-            // Ctrl+Up/Down, but VTE swallows plain Ctrl+arrow before the capture
-            // handler, so Shift is required in practice; the condition stays
-            // permissive so plain Ctrl+arrow also works where it is delivered).
-            if ctrl && !alt && matches!(keyval, Key::Up | Key::Down) {
+            // Ctrl+Shift+[/]: move the finished-block selection. Arrow variants
+            // were unreachable by default because the window reserves Ctrl+Up /
+            // Down for scrolling and Ctrl+Shift+Up / Down for pane focus.
+            // Brackets are unbound at the application level and don't steal a
+            // common readline editing shortcut.
+            if ctrl && shift && !alt && matches!(keyval, Key::bracketleft | Key::bracketright) {
                 let finished = finished_blocks_for_key.borrow();
                 if finished.is_empty() {
                     return glib::Propagation::Stop;
                 }
                 let current = selected_block_id_for_key.get();
                 let current_idx = current.and_then(|id| finished.iter().position(|b| b.id == id));
-                let new_idx = if keyval == Key::Up {
+                let new_idx = if keyval == Key::bracketleft {
                     match current_idx {
                         None => Some(finished.len() - 1),
                         Some(0) => Some(0),
@@ -1430,6 +1451,14 @@ impl KeyCtx {
                 for block in blocks.drain(..) {
                     block_list_for_key.remove(block.widget());
                 }
+                // FinishedBlock and BlockData must always have matching indices:
+                // virtual scrolling uses BlockData heights to decide which widget
+                // to map. Leaving old data behind made the next command invisible
+                // or made filters jump to a removed block after Ctrl+Shift+L.
+                block_data_for_key.borrow_mut().clear();
+                bookmarks_for_key.borrow_mut().clear();
+                visible_indices_for_key.borrow_mut().clear();
+                selected_block_id_for_key.set(None);
                 pty_for_key.write_bytes(b"\x0c");
                 return glib::Propagation::Stop;
             }
@@ -1966,6 +1995,7 @@ impl TermView {
                 unread_count_rc: unread_count.clone(),
                 jump_fab: jump_fab.clone(),
                 selected_block_id_rc: selected_block_id.clone(),
+                bookmarks_rc: block_bookmarks.clone(),
                 cmd_running_rc: cmd_running.clone(),
                 running_cmd_rc: running_cmd.clone(),
                 layout_active_surface: layout_active_surface.clone(),
@@ -2258,6 +2288,7 @@ impl TermView {
                 selected_block_id_for_key,
                 block_scroll_for_key,
                 bookmarks_for_key: block_bookmarks.clone(),
+                visible_indices_for_key: visible_indices.clone(),
                 bstate_for_key: bstate.clone(),
             }
             .connect(&key_ctrl);
@@ -2969,30 +3000,62 @@ impl TermView {
         }
         if let Some(block) = finished.get(block_index) {
             select_finished_block(&finished, &self.selected_block_id, Some(block.id));
-            block.widget().grab_focus();
             let adj = self.block_scroll.vadjustment();
-            if let Some(value) = block
-                .widget()
-                .compute_point(&self.block_scroll, &gtk4::graphene::Point::new(0.0, 0.0))
-            {
-                adj.set_value(value.y() as f64);
-            }
+            // A virtualized widget may be unmapped, in which case GTK reports
+            // no meaningful coordinates (or 0, 0). Use the retained height
+            // estimates to bring it into the realized range first; then correct
+            // to the exact GTK position after layout. This makes failed/slow/
+            // bookmarked-block shortcuts dependable even in long sessions.
+            let estimated_top: i32 = self
+                .block_data
+                .borrow()
+                .iter()
+                .take(block_index)
+                .map(|data| data.estimated_height.max(1))
+                .sum();
+            let max_value = (adj.upper() - adj.page_size()).max(adj.lower());
+            adj.set_value((estimated_top as f64).clamp(adj.lower(), max_value));
+
+            let widget = block.widget().clone();
+            let scroll = self.block_scroll.clone();
+            glib::idle_add_local_once(move || {
+                if let Some(point) =
+                    widget.compute_point(&scroll, &gtk4::graphene::Point::new(0.0, 0.0))
+                {
+                    let adj = scroll.vadjustment();
+                    let max_value = (adj.upper() - adj.page_size()).max(adj.lower());
+                    adj.set_value((point.y() as f64).clamp(adj.lower(), max_value));
+                }
+            });
         }
     }
 
     /// Delete a block by ID (for right-click menu).
     pub fn delete_block_by_id(&self, block_id: u64) {
         let mut finished = self.finished_blocks.borrow_mut();
-        if let Some(pos) = finished.iter().position(|b| b.id == block_id) {
-            let block_to_remove = finished.remove(pos);
-            let widget_to_release = block_to_remove.widget().clone();
-            self.block_list.remove(&widget_to_release);
-            // Return widget to pool for potential reuse
-            self.widget_pool.borrow_mut().release(widget_to_release);
-            // Keep the serializable record list in lockstep with the widget list;
-            // otherwise the two desync and count-based eviction / id lookups drift.
-            self.block_data.borrow_mut().retain(|b| b.id != block_id);
+        let Some(pos) = finished.iter().position(|b| b.id == block_id) else {
+            return;
+        };
+        let block_to_remove = finished.remove(pos);
+        let widget_to_release = block_to_remove.widget().clone();
+        self.block_list.remove(&widget_to_release);
+        // Return widget to pool for potential reuse
+        self.widget_pool.borrow_mut().release(widget_to_release);
+        drop(finished);
+
+        // Keep the serializable record list in lockstep with the widget list;
+        // otherwise the two desync and count-based eviction / id lookups drift.
+        self.block_data.borrow_mut().retain(|b| b.id != block_id);
+        self.bookmarks.borrow_mut().remove(&block_id);
+        if self.selected_block_id.get() == Some(block_id) {
+            self.selected_block_id.set(None);
         }
+        // Stored indices no longer identify the same widgets after removal.
+        // Recompute them on the next viewport update rather than retaining a
+        // stale set that can keep an unrelated block hidden.
+        self.visible_indices.borrow_mut().clear();
+        self.update_viewport();
+        self.update_block_visibility();
     }
 
     /// Most-recent-first deduplicated list of finished-block command lines.

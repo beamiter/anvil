@@ -127,12 +127,15 @@ impl Action {
             Action::ToggleTabMarked => "Toggle tab marked",
             Action::ToggleTabPinned => "Toggle tab pinned",
             Action::ToggleTabPlacement => "Toggle tab placement (sidebar/top)",
-            Action::FilterFailedBlocks => "Filter failed blocks",
-            Action::FilterSlowBlocks => "Filter slow blocks",
-            Action::FilterPinnedBlocks => "Filter pinned blocks",
+            // These actions navigate to the first matching block; they do not
+            // hide unrelated blocks. Name them accurately in the palette so a
+            // shortcut never appears to have silently failed.
+            Action::FilterFailedBlocks => "Jump to first failed block",
+            Action::FilterSlowBlocks => "Jump to first slow block",
+            Action::FilterPinnedBlocks => "Jump to first pinned block",
             Action::JumpToPrevPinned => "Jump to previous pinned block",
             Action::JumpToNextPinned => "Jump to next pinned block",
-            Action::ClearBlockFilter => "Clear block filter",
+            Action::ClearBlockFilter => "Jump to oldest block",
             Action::ToggleDebugDashboard => "Toggle debug dashboard",
             Action::OpenAiPanel => "Open AI panel",
             Action::OpenWorkflows => "Open workflows",
