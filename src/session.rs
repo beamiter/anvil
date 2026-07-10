@@ -11,15 +11,15 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
-use crate::config::TerminalMode;
-
 /// One node of a tab's pane tree: either a terminal leaf or a split of two
 /// subtrees. Mirrors jterm4's `PaneLayout`.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub(crate) enum PaneLayout {
     Leaf {
-        /// "vte" or "block".
+        /// Legacy pane backend recorded by older snapshots.  Restores use the
+        /// current `terminal_mode` configuration instead, so changing the
+        /// configuration takes effect on the next launch.
         mode: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
@@ -34,15 +34,6 @@ pub(crate) enum PaneLayout {
         start: Box<PaneLayout>,
         end: Box<PaneLayout>,
     },
-}
-
-impl PaneLayout {
-    pub(crate) fn terminal_mode(mode: &str) -> TerminalMode {
-        match mode {
-            "vte" => TerminalMode::Vte,
-            _ => TerminalMode::Block,
-        }
-    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

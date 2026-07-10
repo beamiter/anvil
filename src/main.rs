@@ -1051,6 +1051,13 @@ impl AppModel {
 
     /// Recursively build the GTK widget tree for a persisted `PaneLayout`,
     /// pushing each created leaf into `panes` in tree order.
+    ///
+    /// Pane mode used to be persisted with the session.  That made a mode
+    /// change in config appear to have no effect: restoring an old VTE pane
+    /// recreated it as VTE even when `terminal_mode = "block"`.  The current
+    /// configuration is the authority for every newly-created backend,
+    /// including restored panes; the snapshot only restores layout and shell
+    /// state.
     fn build_pane_layout(
         &mut self,
         node: &session::PaneLayout,
@@ -1059,7 +1066,7 @@ impl AppModel {
         sender: &ComponentSender<AppModel>,
     ) -> gtk::Widget {
         match node {
-            session::PaneLayout::Leaf { mode, cwd, cmds } => {
+            session::PaneLayout::Leaf { cwd, cmds, .. } => {
                 let pane_id = self.next_pane_id;
                 self.next_pane_id += 1;
                 let pane = create_pane(
@@ -1067,7 +1074,7 @@ impl AppModel {
                     &self.shell_argv,
                     tab_id,
                     pane_id,
-                    session::PaneLayout::terminal_mode(mode),
+                    self.config.borrow().terminal_mode,
                     cmds.clone(),
                     cwd.clone(),
                     sender,
@@ -2254,6 +2261,9 @@ impl AppModel {
             config.font_desc = new_config.font_desc.clone();
             config.default_font_scale = new_config.default_font_scale;
             config.startup_commands = new_config.startup_commands.clone();
+            // Existing terminal widgets cannot change backend in place, but
+            // every tab/pane created after a reload must use the new mode.
+            config.terminal_mode = new_config.terminal_mode;
             if let Some(theme) = &theme {
                 config.theme_name = theme.name.clone();
                 config.foreground = theme.foreground;
