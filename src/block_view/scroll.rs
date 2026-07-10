@@ -64,7 +64,11 @@ impl ScrollDebouncer {
         let programmatic = self.programmatic_scroll.clone();
         let tries = Rc::new(Cell::new(0u8));
 
-        glib::idle_add_local(move || {
+        // An idle source that returns `Continue` can run all retries before GTK
+        // reaches another layout frame. Virtualized blocks then have not expanded
+        // yet, so every retry observes the same stale adjustment. Space the
+        // bounded retries over frames instead.
+        glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
             if user_scrolled.get() || tries.get() >= 12 {
                 return glib::ControlFlow::Break;
             }
