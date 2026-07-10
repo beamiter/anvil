@@ -1997,22 +1997,38 @@ impl TermView {
             let unread = unread_count.clone();
             let scroll = block_scroll.clone();
             let holder = active.borrow().widget().clone();
+            let programmatic_scroll = programmatic_scroll.clone();
             let check_pending = Rc::new(Cell::new(false));
+            let pending_programmatic_only = Rc::new(Cell::new(true));
             block_scroll
                 .vadjustment()
                 .connect_value_changed(move |_adj| {
+                    // `set_value()` emits this synchronously, while the geometry
+                    // check below deliberately runs on idle. Preserve the source
+                    // now: otherwise the programmatic flag has been cleared by
+                    // the time the idle runs and a follow-bottom pin is mistaken
+                    // for the user scrolling into history.
+                    let caused_by_programmatic_scroll = programmatic_scroll.get();
                     if check_pending.get() {
+                        if !caused_by_programmatic_scroll {
+                            pending_programmatic_only.set(false);
+                        }
                         return;
                     }
                     check_pending.set(true);
+                    pending_programmatic_only.set(caused_by_programmatic_scroll);
                     let user_scrolled = user_scrolled.clone();
                     let fab = fab.clone();
                     let unread = unread.clone();
                     let scroll = scroll.clone();
                     let holder = holder.clone();
                     let check_pending = check_pending.clone();
+                    let pending_programmatic_only = pending_programmatic_only.clone();
                     glib::idle_add_local_once(move || {
                         check_pending.set(false);
+                        if pending_programmatic_only.replace(true) {
+                            return;
+                        }
                         let vp_h = scroll.height() as f64;
                         let at_bottom = holder
                             .compute_bounds(&scroll)
@@ -2185,10 +2201,11 @@ impl TermView {
             });
         }
 
-        // When a normal command is running, the visible command/output lives in
-        // the running block and the active VTE is hidden to avoid an empty input
-        // card at the bottom. Keep basic terminal input working by forwarding
-        // common keys from the focusable root directly to the PTY.
+        // Keep explicit terminal interrupts available while a normal command is
+        // running. Printable keys, editing keys, and Enter must fall through to
+        // VTE: its GTK input-method context turns a composed CJK candidate into
+        // one UTF-8 `commit` signal. Sending raw keyvals here bypasses that
+        // context, so fcitx/ibus can show a candidate window but cannot commit it.
         {
             let pty_for_root_key = pty.clone();
             let bstate_for_root_key = bstate.clone();
@@ -2213,22 +2230,6 @@ impl TermView {
                     pty_for_root_key.write_bytes(b"\x04");
                     return glib::Propagation::Stop;
                 }
-                if !ctrl && !alt && matches!(keyval, Key::Return | Key::KP_Enter) {
-                    pty_for_root_key.write_bytes(b"\r");
-                    return glib::Propagation::Stop;
-                }
-                if !ctrl && !alt && matches!(keyval, Key::BackSpace) {
-                    pty_for_root_key.write_bytes(b"\x7f");
-                    return glib::Propagation::Stop;
-                }
-                if !ctrl && !alt {
-                    if let Some(ch) = keyval.to_unicode() {
-                        let mut buf = [0u8; 4];
-                        pty_for_root_key.write_bytes(ch.encode_utf8(&mut buf).as_bytes());
-                        return glib::Propagation::Stop;
-                    }
-                }
-
                 glib::Propagation::Proceed
             });
             root.add_controller(root_key);

@@ -63,26 +63,21 @@ impl ScrollDebouncer {
         let user_scrolled = self.user_scrolled_up.clone();
         let programmatic = self.programmatic_scroll.clone();
         let tries = Rc::new(Cell::new(0u8));
-        let stable = Rc::new(Cell::new(0u8));
 
         glib::idle_add_local(move || {
-            if user_scrolled.get() || tries.get() >= 12 || stable.get() >= 2 {
+            if user_scrolled.get() || tries.get() >= 12 {
                 return glib::ControlFlow::Break;
             }
             tries.set(tries.get() + 1);
 
             let adj = scroll.vadjustment();
-            let before = adj.value();
             let target = (adj.upper() - adj.page_size()).max(adj.lower());
             programmatic.set(true);
             adj.set_value(target);
             programmatic.set(false);
-
-            if (adj.value() - before).abs() < 1.0 {
-                stable.set(stable.get() + 1);
-            } else {
-                stable.set(0);
-            }
+            // Virtualized blocks can become visible a frame or two after this
+            // target appears stable. Keep pinning for the bounded settling
+            // window so the new live prompt cannot be left below the viewport.
             glib::ControlFlow::Continue
         });
     }
