@@ -398,10 +398,6 @@ pub(crate) fn install_block_css(config: &Config) {
             background-color: {bg_hex};
             caret-color: {fg_hex};
         }}
-        @keyframes blink {{
-            0%, 49% {{ opacity: 1; }}
-            50%, 100% {{ opacity: 0; }}
-        }}
         .block-cmd-active text selection {{
             background-color: transparent;
         }}
