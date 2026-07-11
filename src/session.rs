@@ -6,7 +6,8 @@
 //! develop / docker exec …) are restored. The snapshot is written as JSON and
 //! consumed (deleted) on load, matching jterm4's consume-on-start semantics.
 
-use gtk4::glib;
+use gtk::glib;
+use relm4::gtk;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;

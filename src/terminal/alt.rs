@@ -10,6 +10,7 @@
 //! `htop` (text_range_format racing the VTE's paint). Aligns with warp's
 //! "alt-screen content is ephemeral; the live grid is what you see" model.
 
+use relm4::gtk;
 use vte4::{Terminal, TerminalExt};
 
 /// Scrape the currently-visible VTE grid as plain text.
@@ -19,7 +20,7 @@ pub(crate) fn visible_vte_text(vte: &Terminal) -> String {
     if rows <= 0 || cols <= 0 {
         return String::new();
     }
-    use gtk4::prelude::{AdjustmentExt, ScrollableExt};
+    use gtk::prelude::{AdjustmentExt, ScrollableExt};
     let adj = vte.vadjustment().expect("vte has vadjustment");
     let top = adj.value().floor() as i64;
     let (text0, _) = vte.text_range_format(

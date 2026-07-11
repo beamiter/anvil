@@ -6,8 +6,9 @@
 //! block boundaries. Also hosts the metadata-only filter pass used by the
 //! command palette's failed/slow toggles and by the debug dashboard counts.
 
-use gtk4::glib;
-use gtk4::prelude::*;
+use gtk::glib;
+use gtk::prelude::*;
+use relm4::gtk;
 use vte4::TerminalExt;
 
 use super::{contains_case_insensitive, select_finished_block, BlockFilters, TermView};
@@ -334,8 +335,7 @@ impl TermView {
         let widget = block.widget().clone();
         let scroll = self.block_scroll.clone();
         glib::idle_add_local_once(move || {
-            if let Some(point) =
-                widget.compute_point(&scroll, &gtk4::graphene::Point::new(0.0, 0.0))
+            if let Some(point) = widget.compute_point(&scroll, &gtk::graphene::Point::new(0.0, 0.0))
             {
                 let adj = scroll.vadjustment();
                 let target = (point.y() as f64) - adj.page_size() / 3.0;
@@ -447,7 +447,7 @@ impl TermView {
         let adj = self.block_scroll.vadjustment();
         if let Some(value) = block
             .widget()
-            .compute_point(&self.block_scroll, &gtk4::graphene::Point::new(0.0, 0.0))
+            .compute_point(&self.block_scroll, &gtk::graphene::Point::new(0.0, 0.0))
         {
             adj.set_value(value.y() as f64);
         }

@@ -1,7 +1,8 @@
-use gtk4::gdk::RGBA;
-use gtk4::pango::FontDescription;
-use gtk4::prelude::*;
-use gtk4::{glib, Orientation, ScrolledWindow};
+use gtk::gdk::RGBA;
+use gtk::pango::FontDescription;
+use gtk::prelude::*;
+use gtk::{glib, Orientation, ScrolledWindow};
+use relm4::gtk;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -48,7 +49,7 @@ fn next_block_id() -> u64 {
 
 /// Update the jump-to-bottom FAB's label to show an unread-block badge: just the
 /// chevron when nothing is pending, chevron + count (clamped to "99+") otherwise.
-fn set_jump_fab_label(fab: &gtk4::Button, unread: u32) {
+fn set_jump_fab_label(fab: &gtk::Button, unread: u32) {
     if unread > 0 {
         let n = if unread > 99 {
             "99+".to_string()
@@ -102,7 +103,7 @@ fn normalize_captured_command(captured: &str, prompt: &str) -> String {
 /// Probe the cwd for git metadata and update the strip label. Hides the
 /// label when cwd is empty, missing, or not inside a repo — the user
 /// shouldn't see a stale branch from a previous pane state.
-fn refresh_repo_strip(label: &gtk4::Label, cwd: &str) {
+fn refresh_repo_strip(label: &gtk::Label, cwd: &str) {
     if cwd.is_empty() {
         label.set_visible(false);
         return;
@@ -181,15 +182,15 @@ fn install_finished_block_selection(
     let finished_blocks_for_select = finished_blocks.clone();
     let selected_for_click = selected_block_id.clone();
     let this_id = block.id;
-    let left_click = gtk4::GestureClick::new();
+    let left_click = gtk::GestureClick::new();
     left_click.set_button(1);
-    left_click.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    left_click.set_propagation_phase(gtk::PropagationPhase::Capture);
     left_click.connect_pressed(move |gesture, n_press, _, y| {
         // Only act on the first press of a sequence. Refiring grab_focus() on
         // the 2nd/3rd press would interrupt VTE's native double/triple-click
         // word/line selection in the output VTE child.
         if n_press != 1 {
-            gesture.set_state(gtk4::EventSequenceState::Denied);
+            gesture.set_state(gtk::EventSequenceState::Denied);
             return;
         }
         active_for_click.borrow().grab_focus();
@@ -204,7 +205,7 @@ fn install_finished_block_selection(
             };
             select_finished_block(&finished, &selected_for_click, target);
         }
-        gesture.set_state(gtk4::EventSequenceState::Denied);
+        gesture.set_state(gtk::EventSequenceState::Denied);
     });
     block.widget().add_controller(left_click);
 }
@@ -226,9 +227,9 @@ const MIN_INPUT_ROWS: i32 = 6;
 type BlockFinishedCallbacks = Rc<RefCell<Vec<Box<dyn Fn(String, i32, String)>>>>;
 
 pub struct TermView {
-    root: gtk4::Box,
+    root: gtk::Box,
     block_scroll: ScrolledWindow,
-    block_list: gtk4::Box,
+    block_list: gtk::Box,
     /// The single persistent live VTE (jterm1 model): prompt + typing + output all
     /// render here natively; finished commands snapshot into styled blocks above.
     active_vte: Terminal,
@@ -275,7 +276,7 @@ pub struct TermView {
     /// Per-frame resize tick installed on `root`. Held so it can be removed on
     /// Drop — otherwise the callback runs forever and keeps its Rc captures
     /// (pty/active/vte/vte_box) alive past tab close.
-    resize_tick_id: RefCell<Option<gtk4::TickCallbackId>>,
+    resize_tick_id: RefCell<Option<gtk::TickCallbackId>>,
     /// Tracks per-VTE selections so a drag that crosses block boundaries can be
     /// copied as one contiguous string via Ctrl+Shift+C.
     cross_selection: Rc<CrossSelection>,
@@ -312,7 +313,7 @@ struct ReaderCtx {
     /// Rendered prompt (last non-empty line) captured at PromptEnd, used by the
     /// finalize path since prompt_buf is cleared once the prompt ends.
     prompt_display_rc: Rc<RefCell<String>>,
-    block_list_rc: gtk4::Box,
+    block_list_rc: gtk::Box,
     block_scroll_rc: ScrolledWindow,
     remote_session_cbs: StrCallbacks,
     exited_cbs: IntCallbacks,
@@ -336,7 +337,7 @@ struct ReaderCtx {
     current_cwd_for_cb: Rc<RefCell<String>>,
     event_buf: Rc<RefCell<Vec<ParserEvent>>>,
     unread_count_rc: Rc<Cell<u32>>,
-    jump_fab: gtk4::Button,
+    jump_fab: gtk::Button,
     selected_block_id_rc: Rc<Cell<Option<u64>>>,
     bookmarks_rc: Rc<RefCell<std::collections::HashSet<u64>>>,
     cmd_running_rc: Rc<Cell<bool>>,
@@ -347,7 +348,7 @@ struct ReaderCtx {
     /// Bottom-of-pane repo metadata label. Re-probed every time a block
     /// finishes (the user may have just run `git commit`, `git pull`,
     /// or anything else that changes branch/dirty/ahead-behind).
-    repo_strip: gtk4::Label,
+    repo_strip: gtk::Label,
     block_finished_cbs: BlockFinishedCallbacks,
 }
 
@@ -715,13 +716,13 @@ impl ReaderCtx {
                                 let widget_pool_for_menu = widget_pool_for_cb.clone();
                                 let block_id = finished_clone.id;
 
-                                let right_click = gtk4::GestureClick::new();
+                                let right_click = gtk::GestureClick::new();
                                 right_click.set_button(3);
 
                                 let finished_menu_clone = finished_clone.clone();
                                 let block_data_for_export = block_data_for_cb.clone();
                                 right_click.connect_pressed(move |gesture, _n_press, x, y| {
-                                    gesture.set_state(gtk4::EventSequenceState::Claimed);
+                                    gesture.set_state(gtk::EventSequenceState::Claimed);
                                     {
                                         let finished = finished_blocks_for_menu.borrow();
                                         select_finished_block(
@@ -731,23 +732,23 @@ impl ReaderCtx {
                                         );
                                     }
 
-                                    let popover = gtk4::Popover::new();
-                                    let widget: &gtk4::Widget = &finished_menu_clone.widget().clone().upcast::<gtk4::Widget>();
+                                    let popover = gtk::Popover::new();
+                                    let widget: &gtk::Widget = &finished_menu_clone.widget().clone().upcast::<gtk::Widget>();
                                     popover.set_parent(widget);
-                                    popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(
+                                    popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(
                                         x as i32, y as i32, 1, 1,
                                     )));
                                     popover.set_has_arrow(false);
 
-                                    let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+                                    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
                                     vbox.add_css_class("menu");
 
-                                    let make_item = |label: &str| -> gtk4::Button {
-                                        let btn = gtk4::Button::with_label(label);
+                                    let make_item = |label: &str| -> gtk::Button {
+                                        let btn = gtk::Button::with_label(label);
                                         btn.set_has_frame(false);
-                                        btn.set_halign(gtk4::Align::Fill);
+                                        btn.set_halign(gtk::Align::Fill);
                                         if let Some(child) = btn.child() {
-                                            child.set_halign(gtk4::Align::Start);
+                                            child.set_halign(gtk::Align::Start);
                                         }
                                         btn.add_css_class("flat");
                                         btn
@@ -827,7 +828,7 @@ impl ReaderCtx {
                                         });
                                         vbox.append(&item);
                                     }
-                                    vbox.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+                                    vbox.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
                                     {
                                         let item = make_item("Export as Markdown");
@@ -1118,7 +1119,7 @@ impl ReaderCtx {
 
                         ParserEvent::ClipboardSet(text) => {
                             if config_for_cb.borrow().allow_remote_clipboard_write {
-                                if let Some(display) = gtk4::gdk::Display::default() {
+                                if let Some(display) = gtk::gdk::Display::default() {
                                     let clipboard = display.clipboard();
                                     clipboard.set_text(text);
                                 }
@@ -1252,7 +1253,7 @@ struct KeyCtx {
     typed_cmd_for_key: Rc<RefCell<String>>,
     finished_blocks_for_key: Rc<RefCell<Vec<FinishedBlock>>>,
     block_data_for_key: Rc<RefCell<VecDeque<BlockData>>>,
-    block_list_for_key: gtk4::Box,
+    block_list_for_key: gtk::Box,
     selected_block_id_for_key: Rc<Cell<Option<u64>>>,
     block_scroll_for_key: ScrolledWindow,
     bookmarks_for_key: Rc<RefCell<std::collections::HashSet<u64>>>,
@@ -1261,7 +1262,7 @@ struct KeyCtx {
 }
 
 impl KeyCtx {
-    fn connect(self, key_ctrl: &gtk4::EventControllerKey) {
+    fn connect(self, key_ctrl: &gtk::EventControllerKey) {
         let KeyCtx {
             pty_for_key,
             active_vte_for_key,
@@ -1276,10 +1277,10 @@ impl KeyCtx {
             bstate_for_key,
         } = self;
         key_ctrl.connect_key_pressed(move |_controller, keyval, _keycode, modifiers| {
-            use gtk4::gdk::Key;
-            let ctrl = modifiers.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
-            let shift = modifiers.contains(gtk4::gdk::ModifierType::SHIFT_MASK);
-            let alt = modifiers.contains(gtk4::gdk::ModifierType::ALT_MASK);
+            use gtk::gdk::Key;
+            let ctrl = modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK);
+            let shift = modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK);
+            let alt = modifiers.contains(gtk::gdk::ModifierType::ALT_MASK);
 
             // Shift+PageUp/PageDown: page the block history locally. The
             // vadjustment value_changed handler keeps scroll-lock in sync.
@@ -1325,7 +1326,7 @@ impl KeyCtx {
                         let scroll = block_scroll_for_key.clone();
                         glib::idle_add_local_once(move || {
                             if let Some(point) =
-                                widget.compute_point(&scroll, &gtk4::graphene::Point::new(0.0, 0.0))
+                                widget.compute_point(&scroll, &gtk::graphene::Point::new(0.0, 0.0))
                             {
                                 let adj = scroll.vadjustment();
                                 let target = (point.y() as f64) - adj.page_size() / 3.0;
@@ -1439,7 +1440,7 @@ impl KeyCtx {
                         let scroll = block_scroll_for_key.clone();
                         glib::idle_add_local_once(move || {
                             if let Some(point) =
-                                widget.compute_point(&scroll, &gtk4::graphene::Point::new(0.0, 0.0))
+                                widget.compute_point(&scroll, &gtk::graphene::Point::new(0.0, 0.0))
                             {
                                 let adj = scroll.vadjustment();
                                 let target = (point.y() as f64) - adj.page_size() / 3.0;
@@ -1527,14 +1528,14 @@ impl TermView {
         initial_commands: Option<&str>,
     ) -> Self {
         // ── Build widget tree ──────────────────────────────────────────────
-        let root = gtk4::Box::new(Orientation::Vertical, 0);
+        let root = gtk::Box::new(Orientation::Vertical, 0);
         root.set_hexpand(true);
         root.set_vexpand(true);
         root.set_focusable(true);
         root.add_css_class("term-view-root");
 
         // Block list inside a scrolled window
-        let block_list = gtk4::Box::new(Orientation::Vertical, 0);
+        let block_list = gtk::Box::new(Orientation::Vertical, 0);
         block_list.set_vexpand(true); // jterm1: expand so the active card fills
                                       // the space left below finished blocks.
         block_list.add_css_class("block-list");
@@ -1542,7 +1543,7 @@ impl TermView {
         let block_scroll = ScrolledWindow::new();
         block_scroll.set_hexpand(true);
         block_scroll.set_vexpand(true);
-        block_scroll.set_policy(gtk4::PolicyType::Automatic, gtk4::PolicyType::Automatic);
+        block_scroll.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Automatic);
         block_scroll.set_child(Some(&block_list));
         block_scroll.add_css_class("block-scroll");
         // A focusable ScrolledWindow steals keyboard focus from the live VTE
@@ -1569,13 +1570,13 @@ impl TermView {
         // counts finished blocks that completed while scrolled away. Clicking it
         // returns the view to the live prompt. Overlaid on the scroll area so it
         // floats over the block list without taking layout space.
-        let jump_fab = gtk4::Button::new();
+        let jump_fab = gtk::Button::new();
         jump_fab.add_css_class("jump-bottom-fab");
         jump_fab.add_css_class("flat");
         jump_fab.set_label("\u{f078}"); // nf-fa-chevron_down
         jump_fab.set_tooltip_text(Some("Jump to latest"));
-        jump_fab.set_halign(gtk4::Align::End);
-        jump_fab.set_valign(gtk4::Align::End);
+        jump_fab.set_halign(gtk::Align::End);
+        jump_fab.set_valign(gtk::Align::End);
         jump_fab.set_margin_end(18);
         jump_fab.set_margin_bottom(18);
         jump_fab.set_visible(false);
@@ -1585,20 +1586,20 @@ impl TermView {
         // When a command is running and the user has scrolled up into history,
         // a thin bar pins to the top of the scroll area showing the live command
         // and its elapsed time, so they don't lose track of what's executing.
-        let sticky_label = gtk4::Label::new(None);
-        sticky_label.set_halign(gtk4::Align::Start);
-        sticky_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        let sticky_label = gtk::Label::new(None);
+        sticky_label.set_halign(gtk::Align::Start);
+        sticky_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
         sticky_label.set_hexpand(true);
         sticky_label.add_css_class("sticky-running-label");
-        let sticky_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        let sticky_bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         sticky_bar.add_css_class("sticky-running-header");
         sticky_bar.append(&sticky_label);
-        sticky_bar.set_halign(gtk4::Align::Fill);
-        sticky_bar.set_valign(gtk4::Align::Start);
+        sticky_bar.set_halign(gtk::Align::Fill);
+        sticky_bar.set_valign(gtk::Align::Start);
         sticky_bar.set_visible(false);
         sticky_bar.set_can_focus(false);
 
-        let scroll_overlay = gtk4::Overlay::new();
+        let scroll_overlay = gtk::Overlay::new();
         scroll_overlay.set_child(Some(&block_scroll));
         scroll_overlay.add_overlay(&sticky_bar);
         scroll_overlay.add_overlay(&jump_fab);
@@ -1609,10 +1610,10 @@ impl TermView {
         // pane's git branch + dirty marker + ahead/behind. Refreshed on
         // cwd change and on every finished block (the user may have just
         // run `git commit` or `git pull`). Hidden when cwd isn't a repo.
-        let repo_strip = gtk4::Label::new(None);
-        repo_strip.set_halign(gtk4::Align::Start);
+        let repo_strip = gtk::Label::new(None);
+        repo_strip.set_halign(gtk::Align::Start);
         repo_strip.set_xalign(0.0);
-        repo_strip.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        repo_strip.set_ellipsize(gtk::pango::EllipsizeMode::End);
         repo_strip.add_css_class("repo-strip");
         repo_strip.set_visible(false);
         if config.show_repo_strip {
@@ -1879,7 +1880,7 @@ impl TermView {
             let repo_strip_for_cwd = repo_strip.clone();
             active_vte.connect_current_directory_uri_notify(move |_| {
                 if let Some(uri) = vte_for_cwd.current_directory_uri() {
-                    let file = gtk4::gio::File::for_uri(uri.as_str());
+                    let file = gtk::gio::File::for_uri(uri.as_str());
                     if let Some(path) = file
                         .path()
                         .map(|p| p.to_string_lossy().to_string())
@@ -2253,10 +2254,10 @@ impl TermView {
         {
             let pty_for_root_key = pty.clone();
             let bstate_for_root_key = bstate.clone();
-            let root_key = gtk4::EventControllerKey::new();
-            root_key.set_propagation_phase(gtk4::PropagationPhase::Capture);
+            let root_key = gtk::EventControllerKey::new();
+            root_key.set_propagation_phase(gtk::PropagationPhase::Capture);
             root_key.connect_key_pressed(move |_controller, keyval, _keycode, modifiers| {
-                use gtk4::gdk::Key;
+                use gtk::gdk::Key;
                 if !matches!(
                     bstate_for_root_key.get(),
                     BlockState::CollectingOutput | BlockState::PostCommand
@@ -2264,8 +2265,8 @@ impl TermView {
                     return glib::Propagation::Proceed;
                 }
 
-                let ctrl = modifiers.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
-                let alt = modifiers.contains(gtk4::gdk::ModifierType::ALT_MASK);
+                let ctrl = modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK);
+                let alt = modifiers.contains(gtk::gdk::ModifierType::ALT_MASK);
                 if ctrl && !alt && matches!(keyval, Key::c | Key::C) {
                     pty_for_root_key.write_bytes(b"\x03");
                     return glib::Propagation::Stop;
@@ -2289,8 +2290,8 @@ impl TermView {
             let block_list_for_key = block_list.clone();
             let selected_block_id_for_key = selected_block_id.clone();
             let block_scroll_for_key = block_scroll.clone();
-            let key_ctrl = gtk4::EventControllerKey::new();
-            key_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
+            let key_ctrl = gtk::EventControllerKey::new();
+            key_ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
 
             KeyCtx {
                 pty_for_key,
@@ -2328,8 +2329,8 @@ impl TermView {
             {
                 let pointer_for_motion = pointer_cell.clone();
                 let vte_for_motion = active_vte.clone();
-                let motion = gtk4::EventControllerMotion::new();
-                motion.set_propagation_phase(gtk4::PropagationPhase::Capture);
+                let motion = gtk::EventControllerMotion::new();
+                motion.set_propagation_phase(gtk::PropagationPhase::Capture);
                 motion.connect_motion(move |_, x, y| {
                     let cw = (vte_for_motion.char_width() as f64).max(1.0);
                     let ch = (vte_for_motion.char_height() as f64).max(1.0);
@@ -2345,11 +2346,11 @@ impl TermView {
             let scroll_enabled = config.scroll_reporting_enabled;
             let pty_for_scroll = pty.clone();
             let pointer_for_scroll = pointer_cell.clone();
-            let scroll_ctrl = gtk4::EventControllerScroll::new(
-                gtk4::EventControllerScrollFlags::VERTICAL
-                    | gtk4::EventControllerScrollFlags::HORIZONTAL,
+            let scroll_ctrl = gtk::EventControllerScroll::new(
+                gtk::EventControllerScrollFlags::VERTICAL
+                    | gtk::EventControllerScrollFlags::HORIZONTAL,
             );
-            scroll_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
+            scroll_ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
             scroll_ctrl.connect_scroll(move |_, _dx, dy| {
                 let in_mouse_app = fullscreen_for_scroll.get()
                     && mouse_mode_for_scroll.get() != MouseReportingMode::None;
@@ -2576,7 +2577,7 @@ impl TermView {
     }
 
     /// Root GTK widget to embed in the notebook page.
-    pub fn widget(&self) -> gtk4::Widget {
+    pub fn widget(&self) -> gtk::Widget {
         self.root.clone().upcast()
     }
 
@@ -2715,7 +2716,7 @@ impl TermView {
         let clipboard = self.active_vte.clipboard();
         let pty = self.pty.clone();
         let bracketed_paste = self.bracketed_paste.clone();
-        clipboard.read_text_async(None::<&gtk4::gio::Cancellable>, move |result| {
+        clipboard.read_text_async(None::<&gtk::gio::Cancellable>, move |result| {
             let Ok(Some(text)) = result else {
                 return;
             };
@@ -3050,7 +3051,7 @@ impl TermView {
             let scroll = self.block_scroll.clone();
             glib::idle_add_local_once(move || {
                 if let Some(point) =
-                    widget.compute_point(&scroll, &gtk4::graphene::Point::new(0.0, 0.0))
+                    widget.compute_point(&scroll, &gtk::graphene::Point::new(0.0, 0.0))
                 {
                     let adj = scroll.vadjustment();
                     let max_value = (adj.upper() - adj.page_size()).max(adj.lower());

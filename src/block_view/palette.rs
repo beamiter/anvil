@@ -5,8 +5,9 @@
 //! with a subsequence fuzzy match, and on selection clear the live shell line and
 //! type the chosen command (without executing) so the user can edit before Enter.
 
-use gtk4::prelude::*;
-use gtk4::{glib, Orientation, ScrolledWindow};
+use gtk::prelude::*;
+use gtk::{glib, Orientation, ScrolledWindow};
+use relm4::gtk;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use vte4::Terminal;
@@ -60,29 +61,29 @@ pub(crate) fn show_command_palette(
     typed_cmd: Rc<RefCell<String>>,
     live_vte: Terminal,
 ) {
-    let popover = gtk4::Popover::new();
+    let popover = gtk::Popover::new();
     popover.set_parent(parent);
     popover.set_has_arrow(false);
     popover.set_autohide(true);
     popover.add_css_class("command-palette");
-    popover.set_position(gtk4::PositionType::Bottom);
+    popover.set_position(gtk::PositionType::Bottom);
     let pw = parent.width().max(1);
-    popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(pw / 2, 0, 1, 1)));
+    popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(pw / 2, 0, 1, 1)));
 
-    let vbox = gtk4::Box::new(Orientation::Vertical, 6);
+    let vbox = gtk::Box::new(Orientation::Vertical, 6);
     vbox.set_size_request(540, -1);
 
-    let entry = gtk4::SearchEntry::new();
+    let entry = gtk::SearchEntry::new();
     entry.set_placeholder_text(Some("Search command history…"));
     vbox.append(&entry);
 
     // Outcome filters: restrict the list to failed-only / slow-only runs. The
     // backend metadata (exit code, duration) rides along on each PaletteEntry.
-    let filter_row = gtk4::Box::new(Orientation::Horizontal, 6);
-    let failed_toggle = gtk4::ToggleButton::with_label("Failed");
+    let filter_row = gtk::Box::new(Orientation::Horizontal, 6);
+    let failed_toggle = gtk::ToggleButton::with_label("Failed");
     failed_toggle.set_tooltip_text(Some("Show only commands that exited non-zero"));
     failed_toggle.add_css_class("flat");
-    let slow_toggle = gtk4::ToggleButton::with_label("Slow");
+    let slow_toggle = gtk::ToggleButton::with_label("Slow");
     slow_toggle.set_tooltip_text(Some("Show only commands slower than 2s"));
     slow_toggle.add_css_class("flat");
     filter_row.append(&failed_toggle);
@@ -92,12 +93,12 @@ pub(crate) fn show_command_palette(
     let failed_only = Rc::new(Cell::new(false));
     let slow_only = Rc::new(Cell::new(false));
 
-    let list = gtk4::ListBox::new();
-    list.set_selection_mode(gtk4::SelectionMode::Single);
+    let list = gtk::ListBox::new();
+    list.set_selection_mode(gtk::SelectionMode::Single);
     list.add_css_class("command-palette-list");
 
     let scroller = ScrolledWindow::new();
-    scroller.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+    scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
     scroller.set_min_content_height(300);
     scroller.set_max_content_height(300);
     scroller.set_child(Some(&list));
@@ -128,11 +129,11 @@ pub(crate) fn show_command_palette(
             scored.sort_by_key(|(s, _)| *s);
             let mut keep = Vec::with_capacity(scored.len());
             for (_, c) in scored {
-                let row_label = gtk4::Label::new(Some(c));
-                row_label.set_halign(gtk4::Align::Start);
-                row_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                let row_label = gtk::Label::new(Some(c));
+                row_label.set_halign(gtk::Align::Start);
+                row_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
                 row_label.add_css_class("command-palette-row");
-                let row = gtk4::ListBoxRow::new();
+                let row = gtk::ListBoxRow::new();
                 row.set_child(Some(&row_label));
                 list.append(&row);
                 keep.push(c.to_string());
@@ -211,10 +212,10 @@ pub(crate) fn show_command_palette(
         let list = list.clone();
         let popover = popover.clone();
         let choose = choose.clone();
-        let key = gtk4::EventControllerKey::new();
-        key.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let key = gtk::EventControllerKey::new();
+        key.set_propagation_phase(gtk::PropagationPhase::Capture);
         key.connect_key_pressed(move |_, keyval, _, _| {
-            use gtk4::gdk::Key;
+            use gtk::gdk::Key;
             let n_rows = {
                 let mut n = 0;
                 while list.row_at_index(n).is_some() {

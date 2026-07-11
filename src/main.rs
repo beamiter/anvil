@@ -14,8 +14,13 @@ mod palette;
 mod parser;
 mod process;
 mod pty;
+mod search;
 mod session;
+mod sidebar;
+mod sidebar_toggle;
+mod tab_strip;
 mod terminal;
+mod top_bar;
 mod vte_pty;
 mod workflows;
 
@@ -24,6 +29,7 @@ use gtk::gdk::ModifierType;
 use gtk::gio::{self, Cancellable};
 use gtk::glib;
 use relm4::adw;
+use relm4::factory::FactoryVecDeque;
 use relm4::gtk;
 use relm4::prelude::*;
 use std::cell::RefCell;
@@ -84,6 +90,7 @@ enum AppMsg {
     RenameTab(u64, String),
     /// Drag-and-drop reorder: move the tab with this id to the target index.
     ReorderTab(u64, usize),
+    TabRowAction(u64, tab_strip::TabAction),
     SetTabFilter(String),
     /// File tree: insert a file's shell-quoted path into the active terminal.
     FileTreeActivateFile(String),
@@ -99,6 +106,7 @@ enum AppMsg {
     AgentReject(usize),
     /// User accepted an edited variant of the command at the given index.
     AgentEditAndApprove(usize, String),
+    AgentEditRequested(usize, String),
     /// LLM reply arrived for the most recent turn.
     AgentLlmReply(Result<String, String>),
     /// A finished block arrived from one of the panes — feed it to the
@@ -240,29 +248,32 @@ struct AppModel {
     window_opacity: f64,
     stack: gtk::Stack,
     tab_strip: gtk::Box,
+    tab_rows: FactoryVecDeque<tab_strip::TabRow>,
     window: adw::ApplicationWindow,
     dyn_css: gtk::CssProvider,
-    search_bar: gtk::SearchBar,
-    search_entry: gtk::SearchEntry,
-    tab_filter_entry: gtk::SearchEntry,
+    search: Controller<search::SearchModel>,
+    tab_filter_control: Controller<sidebar::TabFilterModel>,
     tab_filter: String,
     file_tree_store: gtk::TreeStore,
-    file_tree_root_label: gtk::Label,
+    file_header: Controller<sidebar::FileHeaderModel>,
     file_tree_root: Rc<RefCell<std::path::PathBuf>>,
     tab_strip_scroll: gtk::ScrolledWindow,
     top_tab_scroll: gtk::ScrolledWindow,
+    top_bar: Controller<top_bar::TopBarModel>,
     sidebar_box: gtk::Box,
     sidebar_stack: gtk::Stack,
-    sidebar_tabs_btn: gtk::ToggleButton,
-    sidebar_files_btn: gtk::ToggleButton,
+    sidebar_toggle: Controller<sidebar_toggle::SidebarToggleModel>,
     tab_placement: std::cell::Cell<config::TabPlacement>,
     sidebar_view: std::cell::Cell<config::SidebarView>,
-    command_palette_dialog: Rc<RefCell<Option<adw::Dialog>>>,
-    settings_dialog: Rc<RefCell<Option<adw::PreferencesDialog>>>,
-    debug_dashboard_dialog: Rc<RefCell<Option<adw::Dialog>>>,
-    /// Inline Ctrl+R history popover anchored to the active terminal widget.
-    /// One per app — opening it on a different terminal moves it.
-    history_popover: Rc<RefCell<Option<gtk::Popover>>>,
+    command_palette: Controller<dialogs::command_palette::PaletteModel>,
+    settings: Controller<dialogs::settings::SettingsModel>,
+    settings_font_names: Rc<Vec<String>>,
+    remote_picker: Controller<dialogs::remote_picker::RemotePickerModel>,
+    debug_dashboard: Controller<dialogs::debug_dashboard::DebugDashboardModel>,
+    history: Controller<dialogs::history::HistoryModel>,
+    workflow_dialog: Controller<dialogs::workflow::WorkflowModel>,
+    ai_panel: Controller<dialogs::ai_panel::AiPanelModel>,
+    notebook: Controller<notebook::NotebookModel>,
     /// Workflows loaded from disk. Refreshed on demand each time the palette
     /// is opened (cheap — handful of small YAML files) so users see edits
     /// without a restart.
@@ -270,6 +281,8 @@ struct AppModel {
     /// At most one agent session is active per app. Opening the panel
     /// while another session is alive cancels the previous one.
     active_agent: Rc<RefCell<Option<agent::AgentSession>>>,
+    agent_panel: Controller<agent::AgentPanelModel>,
+    agent_edit: Controller<agent::AgentEditModel>,
 }
 
 /// Strip one layer of markdown code fence (```bash … ``` or ``` … ```) if it
@@ -412,10 +425,8 @@ impl AppModel {
             }
             return;
         }
-        let sender_clone = sender.clone();
-        dialogs::show_workflow_param_dialog(&self.window, workflow, move |rendered| {
-            sender_clone.input(AppMsg::PaletteTypeCommand(rendered));
-        });
+        self.workflow_dialog
+            .emit(dialogs::workflow::WorkflowMsg::Open(workflow));
     }
 
     /// `?` palette accept handler: run the natural-language query through the
@@ -453,7 +464,7 @@ impl AppModel {
 
     // ── Agent mode ───────────────────────────────────────────────────────
 
-    fn open_agent_panel(&self, sender: &ComponentSender<AppModel>) {
+    fn open_agent_panel(&self, _sender: &ComponentSender<AppModel>) {
         let cfg = self.config.borrow();
         if !cfg.ai_enabled || !cfg.agent_enabled {
             log::info!(
@@ -463,7 +474,6 @@ impl AppModel {
             );
             return;
         }
-        let max_turns = cfg.agent_max_turns;
         drop(cfg);
         let Some(client) = ai::AiClient::from_env() else {
             log::warn!("agent: no AI provider configured");
@@ -484,14 +494,31 @@ impl AppModel {
             .unwrap_or(0);
         *self.active_agent.borrow_mut() = Some(agent::AgentSession::new(tab_id, pane_id));
 
-        let provider_name = client.display_name();
-        agent::show_agent_panel(
-            &self.window,
-            &self.active_agent,
-            sender.clone(),
-            &provider_name,
-            max_turns,
-        );
+        if let Some(view) = self.agent_panel_view() {
+            self.agent_panel.emit(agent::AgentPanelMsg::Open {
+                provider_name: client.display_name(),
+                view,
+            });
+        }
+    }
+
+    fn agent_panel_view(&self) -> Option<agent::AgentPanelView> {
+        let session = self.active_agent.borrow();
+        let session = session.as_ref()?;
+        Some(agent::AgentPanelView {
+            transcript: session.transcript.clone(),
+            turns_used: session.turns_used,
+            max_turns: self.config.borrow().agent_max_turns,
+            awaiting_command: session.awaiting_command.is_some(),
+            sealed: session.sealed,
+            loading: session.in_flight.is_some(),
+        })
+    }
+
+    fn refresh_agent_panel(&self) {
+        if let Some(view) = self.agent_panel_view() {
+            self.agent_panel.emit(agent::AgentPanelMsg::Render(view));
+        }
     }
 
     /// Push a user turn and kick off the next LLM turn.
@@ -507,7 +534,7 @@ impl AppModel {
             }
             sess.transcript.push(agent::Turn::User(text));
         }
-        agent::rerender(&self.active_agent, sender.clone());
+        self.refresh_agent_panel();
         self.agent_kick_llm(sender);
     }
 
@@ -515,7 +542,7 @@ impl AppModel {
         &self,
         idx: usize,
         edited: Option<String>,
-        sender: &ComponentSender<AppModel>,
+        _sender: &ComponentSender<AppModel>,
     ) {
         let (cmd, tab_id, pane_id) = {
             let mut guard = self.active_agent.borrow_mut();
@@ -544,7 +571,7 @@ impl AppModel {
             term.emit(VteInput::WriteInput(bytes));
             term.emit(VteInput::GrabFocus);
         }
-        agent::rerender(&self.active_agent, sender.clone());
+        self.refresh_agent_panel();
     }
 
     fn agent_reject(&self, idx: usize, sender: &ComponentSender<AppModel>) {
@@ -557,7 +584,7 @@ impl AppModel {
                 *approved = Some(false);
             }
         }
-        agent::rerender(&self.active_agent, sender.clone());
+        self.refresh_agent_panel();
         // Kick the LLM again so it can suggest something else.
         self.agent_kick_llm(sender);
     }
@@ -596,24 +623,20 @@ impl AppModel {
                 output_sample: agent::sample_observation(&output_sample),
             });
         }
-        agent::rerender(&self.active_agent, sender.clone());
+        self.refresh_agent_panel();
         self.agent_kick_llm(sender);
     }
 
     fn agent_handle_reply(
         &self,
         reply: Result<String, String>,
-        sender: &ComponentSender<AppModel>,
+        _sender: &ComponentSender<AppModel>,
     ) {
         {
             let mut guard = self.active_agent.borrow_mut();
             let Some(sess) = guard.as_mut() else { return };
             if sess.is_cancelled() {
                 return;
-            }
-            if let Some(spinner) = sess.spinner.as_ref() {
-                spinner.set_visible(false);
-                spinner.stop();
             }
             sess.in_flight = None;
             sess.turns_used = sess.turns_used.saturating_add(1);
@@ -658,7 +681,7 @@ impl AppModel {
                 sess.sealed = true;
             }
         }
-        agent::rerender(&self.active_agent, sender.clone());
+        self.refresh_agent_panel();
     }
 
     fn agent_kick_llm(&self, sender: &ComponentSender<AppModel>) {
@@ -708,18 +731,19 @@ impl AppModel {
             }
             sender_for_reply.input(AppMsg::AgentLlmReply(result));
         });
-        // Stash the handle on the session + show spinner.
-        let mut guard = self.active_agent.borrow_mut();
-        if let Some(sess) = guard.as_mut() {
-            if let Some(spinner) = sess.spinner.as_ref() {
-                spinner.set_visible(true);
-                spinner.start();
+        // Stash the handle on the business session; the panel derives its
+        // spinner state from `in_flight` through a fresh view snapshot.
+        {
+            let mut guard = self.active_agent.borrow_mut();
+            if let Some(sess) = guard.as_mut() {
+                sess.in_flight = Some(handle);
             }
-            sess.in_flight = Some(handle);
         }
+        self.refresh_agent_panel();
     }
 
     fn agent_close(&self) {
+        self.agent_edit.emit(agent::AgentEditMsg::Close);
         if let Some(prev) = self.active_agent.borrow_mut().take() {
             prev.cancel();
         }
@@ -733,206 +757,24 @@ impl AppModel {
             .map(|p| &p.terminal)
     }
 
-    /// Pop up the session-level AI panel. The panel has a freeform question
-    /// field plus an optional "attach recent shell context" toggle that
-    /// includes the last few finished blocks' command + exit + first line of
-    /// output (no raw stdout dumps — keeps the prompt small + the privacy
-    /// boundary obvious to the user).
-    fn show_ai_session_panel(&self, _sender: &ComponentSender<AppModel>) {
-        use adw::prelude::*;
+    /// Open the session-level AI panel with the configured history source.
+    fn show_ai_session_panel(&self) {
         if !self.config.borrow().ai_enabled {
             return;
         }
-
-        let dialog = adw::Dialog::builder()
-            .title("Ask AI")
-            .content_width(640)
-            .content_height(520)
-            .build();
-        let header = adw::HeaderBar::new();
-        let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        content.set_margin_top(12);
-        content.set_margin_bottom(12);
-        content.set_margin_start(12);
-        content.set_margin_end(12);
-
-        let prompt_label = gtk::Label::new(Some("Your question:"));
-        prompt_label.set_halign(gtk::Align::Start);
-        prompt_label.add_css_class("dim-label");
-        content.append(&prompt_label);
-
-        let entry = gtk::TextView::builder()
-            .wrap_mode(gtk::WrapMode::WordChar)
-            .height_request(80)
-            .build();
-        entry.add_css_class("ai-panel-entry");
-        let entry_scroll = gtk::ScrolledWindow::builder()
-            .hexpand(true)
-            .child(&entry)
-            .build();
-        entry_scroll.set_min_content_height(80);
-        content.append(&entry_scroll);
-
-        let attach_check = gtk::CheckButton::with_label("Include recent shell context");
-        attach_check.set_active(true);
-        content.append(&attach_check);
-
-        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        buttons.set_halign(gtk::Align::End);
-        let send_btn = gtk::Button::with_label("Ask");
-        send_btn.add_css_class("suggested-action");
-        let status = gtk::Label::new(Some(""));
-        status.add_css_class("dim-label");
-        status.set_halign(gtk::Align::Start);
-        status.set_hexpand(true);
-        buttons.append(&status);
-        buttons.append(&send_btn);
-        content.append(&buttons);
-
-        let spinner = gtk::Spinner::new();
-        spinner.set_visible(false);
-        content.append(&spinner);
-
-        let answer = gtk::TextView::builder()
-            .editable(false)
-            .cursor_visible(false)
-            .wrap_mode(gtk::WrapMode::WordChar)
-            .build();
-        answer.add_css_class("ai-explain-body");
-        let answer_scroll = gtk::ScrolledWindow::builder()
-            .hexpand(true)
-            .vexpand(true)
-            .child(&answer)
-            .build();
-        content.append(&answer_scroll);
-
-        let toolbar = adw::ToolbarView::new();
-        toolbar.add_top_bar(&header);
-        toolbar.set_content(Some(&content));
-        dialog.set_child(Some(&toolbar));
-
-        // Collect a small context snapshot: history-file tail (latest 5
-        // commands). Falls back to empty if history is unconfigured.
-        let history_path = self.config.borrow().block_history_path.clone();
-        let context_factory: Rc<dyn Fn() -> Option<String>> = {
-            let history_path = history_path.clone();
-            Rc::new(move || {
-                let path = history_path.as_ref()?;
-                let p = std::path::Path::new(path);
-                let items = palette::read_history(p, 5);
-                if items.is_empty() {
-                    return None;
-                }
-                let mut s = String::new();
-                for it in items.iter().rev() {
-                    let exit = it.exit_code;
-                    s.push_str(&format!("$ {} (exit {exit})\n", it.command));
-                }
-                Some(s)
-            })
-        };
-
-        let in_flight: Rc<RefCell<Option<ai::AiHandle>>> = Rc::new(RefCell::new(None));
-        let dialog_for_close = dialog.clone();
-        let in_flight_for_close = in_flight.clone();
-        dialog.connect_closed(move |_| {
-            if let Some(h) = in_flight_for_close.borrow().as_ref() {
-                h.cancel();
-            }
-        });
-        let _ = dialog_for_close;
-
-        // Hooked here so capturing isn't needlessly duplicated below.
-        let send_handler = {
-            let entry = entry.clone();
-            let answer = answer.clone();
-            let spinner = spinner.clone();
-            let status = status.clone();
-            let send_btn = send_btn.clone();
-            let attach_check = attach_check.clone();
-            let in_flight = in_flight.clone();
-            let context_factory = context_factory.clone();
-            move || {
-                let buffer = entry.buffer();
-                let (start, end) = buffer.bounds();
-                let question = buffer.text(&start, &end, true).to_string();
-                let trimmed = question.trim();
-                if trimmed.is_empty() {
-                    status.set_text("(question is empty)");
-                    return;
-                }
-                let Some(client) = ai::AiClient::from_env() else {
-                    status.set_text(
-                        "No AI provider configured. Set ANTHROPIC_API_KEY / OPENAI_API_KEY, \
-                         or run `ollama serve`.",
-                    );
-                    return;
-                };
-                let context = if attach_check.is_active() {
-                    context_factory()
-                } else {
-                    None
-                };
-                let (system, user) = ai::build_session_prompt(trimmed, context.as_deref());
-                answer.buffer().set_text("");
-                status.set_text(&format!("Asking {} …", client.display_name()));
-                spinner.set_visible(true);
-                spinner.start();
-                send_btn.set_sensitive(false);
-
-                let answer_cb = answer.clone();
-                let spinner_cb = spinner.clone();
-                let status_cb = status.clone();
-                let send_btn_cb = send_btn.clone();
-                let h = ai::ask(client, system, user, move |result| {
-                    spinner_cb.stop();
-                    spinner_cb.set_visible(false);
-                    send_btn_cb.set_sensitive(true);
-                    match result {
-                        Ok(text) => {
-                            status_cb.set_text("");
-                            answer_cb.buffer().set_text(text.trim());
-                        }
-                        Err(msg) => status_cb.set_text(&format!("AI error: {msg}")),
-                    }
-                });
-                *in_flight.borrow_mut() = Some(h);
-            }
-        };
-        {
-            let send_handler = send_handler.clone();
-            send_btn.connect_clicked(move |_| send_handler());
-        }
-
-        // Ctrl+Enter inside the question entry triggers send.
-        let key = gtk::EventControllerKey::new();
-        key.connect_key_pressed({
-            let send_handler = send_handler.clone();
-            move |_, keyval, _, state| {
-                use gtk::gdk::Key;
-                if matches!(keyval, Key::Return | Key::KP_Enter)
-                    && state.contains(ModifierType::CONTROL_MASK)
-                {
-                    send_handler();
-                    return gtk::glib::Propagation::Stop;
-                }
-                gtk::glib::Propagation::Proceed
-            }
-        });
-        entry.add_controller(key);
-
-        dialog.present(Some(&self.window));
-        entry.grab_focus();
+        self.ai_panel.emit(dialogs::ai_panel::AiPanelMsg::Open(
+            self.config.borrow().block_history_path.clone(),
+        ));
     }
 
     /// Rebuild the file tree with `root` at the top.
     #[allow(deprecated)]
     fn set_file_tree_root(&self, root: std::path::PathBuf) {
         self.file_tree_store.clear();
-        self.file_tree_root_label
-            .set_text(&file_tree::display_path(&root));
-        self.file_tree_root_label
-            .set_tooltip_text(Some(&root.to_string_lossy()));
+        self.file_header.emit(sidebar::FileHeaderMsg::SetRoot {
+            display: file_tree::display_path(&root),
+            tooltip: root.to_string_lossy().into_owned(),
+        });
         file_tree::populate_dir(&self.file_tree_store, None, &root);
         *self.file_tree_root.borrow_mut() = root;
     }
@@ -1998,16 +1840,7 @@ impl AppModel {
     }
 
     fn toggle_search(&mut self) {
-        let opening = !self.search_bar.is_search_mode();
-        self.search_bar.set_search_mode(opening);
-        if opening {
-            self.search_entry.grab_focus();
-        } else {
-            if let Some(t) = self.active_terminal() {
-                t.emit(VteInput::SearchClear);
-                t.emit(VteInput::GrabFocus);
-            }
-        }
+        self.search.emit(search::SearchMsg::Toggle);
     }
 
     /// Parse the find-bar text: `/pattern/` means regex, anything else literal.
@@ -2088,65 +1921,68 @@ impl AppModel {
             }
             Action::ToggleCommandPalette => {
                 self.reload_workflows();
-                dialogs::toggle_command_palette(
-                    &self.window,
-                    &self.kbmap,
-                    &self.workflows,
-                    &self.command_palette_dialog,
-                    sender,
-                );
+                self.command_palette
+                    .emit(dialogs::command_palette::PaletteMsg::Toggle {
+                        mode: palette::PaletteMode::Commands,
+                        history_path: None,
+                    });
             }
             Action::OpenPalette => {
                 self.reload_workflows();
                 let history = self.config.borrow().block_history_path.clone();
-                dialogs::toggle_palette(
-                    &self.window,
-                    &self.kbmap,
-                    history.as_deref().map(std::path::Path::new),
-                    &self.workflows,
-                    &self.command_palette_dialog,
-                    sender,
-                    palette::PaletteMode::All,
-                );
+                self.command_palette
+                    .emit(dialogs::command_palette::PaletteMsg::Toggle {
+                        mode: palette::PaletteMode::All,
+                        history_path: history.map(std::path::PathBuf::from),
+                    });
             }
             Action::OpenHistoryPalette => {
                 self.reload_workflows();
                 let history = self.config.borrow().block_history_path.clone();
                 if let Some(term) = self.active_terminal() {
-                    let anchor = term.widget();
-                    dialogs::toggle_history_popover(
-                        &anchor,
-                        &self.kbmap,
-                        history.as_deref().map(std::path::Path::new),
-                        &self.workflows,
-                        &self.history_popover,
-                        sender,
-                    );
+                    self.history.emit(dialogs::history::HistoryMsg::Toggle {
+                        anchor: term.widget(),
+                        history_path: history.map(std::path::PathBuf::from),
+                    });
                 }
             }
             Action::OpenWorkflows => {
                 self.reload_workflows();
                 let history = self.config.borrow().block_history_path.clone();
-                dialogs::toggle_palette(
-                    &self.window,
-                    &self.kbmap,
-                    history.as_deref().map(std::path::Path::new),
-                    &self.workflows,
-                    &self.command_palette_dialog,
-                    sender,
-                    palette::PaletteMode::Workflows,
-                );
+                self.command_palette
+                    .emit(dialogs::command_palette::PaletteMsg::Toggle {
+                        mode: palette::PaletteMode::Workflows,
+                        history_path: history.map(std::path::PathBuf::from),
+                    });
             }
             Action::ToggleSettings => {
-                dialogs::toggle_settings(
-                    &self.window,
-                    &self.config,
-                    &self.themes,
-                    self.font_scale,
-                    self.window_opacity,
-                    &self.settings_dialog,
-                    sender,
-                );
+                let config = self.config.borrow();
+                let font_desc = gtk::pango::FontDescription::from_string(&config.font_desc);
+                let family = font_desc
+                    .family()
+                    .map(|family| family.to_string())
+                    .unwrap_or_default();
+                let font = self
+                    .settings_font_names
+                    .iter()
+                    .position(|candidate| candidate == &family)
+                    .unwrap_or(0) as u32;
+                let theme = self
+                    .themes
+                    .iter()
+                    .position(|candidate| candidate.name == config.theme_name)
+                    .unwrap_or(0) as u32;
+                self.settings.emit(dialogs::settings::SettingsMsg::Toggle(
+                    dialogs::settings::SettingsValues {
+                        theme,
+                        font,
+                        font_size: (font_desc.size() as f64 / gtk::pango::SCALE as f64).max(6.0),
+                        font_scale: self.font_scale,
+                        opacity: self.window_opacity,
+                        scrollback: config.terminal_scrollback_lines as f64,
+                    },
+                    self.window.clone(),
+                ));
             }
             Action::ToggleSearch => self.toggle_search(),
             Action::MoveTabLeft => self.move_tab(-1, sender),
@@ -2173,7 +2009,7 @@ impl AppModel {
                 if self.tab_placement.get() == config::TabPlacement::Sidebar {
                     self.apply_sidebar_view(config::SidebarView::Tabs, true);
                 }
-                self.tab_filter_entry.grab_focus();
+                self.tab_filter_control.emit(sidebar::TabFilterMsg::Focus);
             }
             Action::PrevTab => self.switch_tab(-1, sender),
             Action::NextTab => self.switch_tab(1, sender),
@@ -2228,11 +2064,15 @@ impl AppModel {
                 }
             }
             Action::ShowRemotePicker => {
-                dialogs::show_remote_picker(&self.window, &self.config, sender);
+                self.remote_picker
+                    .emit(dialogs::remote_picker::RemotePickerMsg::Toggle(
+                        self.config.borrow().remote_hosts.clone(),
+                    ));
             }
             Action::ToggleDebugDashboard => {
                 let info = self.debug_info_snapshot();
-                dialogs::toggle_debug_dashboard(&self.window, info, &self.debug_dashboard_dialog);
+                self.debug_dashboard
+                    .emit(dialogs::debug_dashboard::DebugDashboardMsg::Toggle(info));
             }
             Action::ConnectRemote(n) => {
                 let host = self.config.borrow().remote_hosts.get(n as usize).cloned();
@@ -2241,7 +2081,7 @@ impl AppModel {
                 }
             }
             Action::OpenAiPanel => {
-                self.show_ai_session_panel(sender);
+                self.show_ai_session_panel();
             }
             Action::OpenAgent => {
                 self.open_agent_panel(sender);
@@ -2367,11 +2207,13 @@ impl AppModel {
         // The Tabs sidebar view only makes sense when tabs live in the sidebar.
         match placement {
             TabPlacement::Sidebar => {
-                self.sidebar_tabs_btn.set_sensitive(true);
+                self.sidebar_toggle
+                    .emit(sidebar_toggle::SidebarToggleMsg::SetTabsEnabled(true));
                 self.apply_sidebar_view(self.sidebar_view.get(), false);
             }
             TabPlacement::TopBar => {
-                self.sidebar_tabs_btn.set_sensitive(false);
+                self.sidebar_toggle
+                    .emit(sidebar_toggle::SidebarToggleMsg::SetTabsEnabled(false));
                 self.apply_sidebar_view(SidebarView::Files, false);
             }
         }
@@ -2387,10 +2229,8 @@ impl AppModel {
             SidebarView::Tabs => self.sidebar_stack.set_visible_child_name("tabs"),
             SidebarView::Files => self.sidebar_stack.set_visible_child_name("files"),
         }
-        // set_active does not refire `clicked`, so this won't recurse.
-        self.sidebar_tabs_btn.set_active(view == SidebarView::Tabs);
-        self.sidebar_files_btn
-            .set_active(view == SidebarView::Files);
+        self.sidebar_toggle
+            .emit(sidebar_toggle::SidebarToggleMsg::SetView(view));
 
         if persist {
             self.sidebar_view.set(view);
@@ -2460,28 +2300,12 @@ impl AppModel {
     /// never emits `clicked`. Keeping the existing widget alive also avoids a
     /// surprising amount of layout and session-persistence work.
     fn update_tab_title_widget(&self, id: u64, title: &str) -> bool {
-        let widget_name = format!("tab-{id}");
-        let mut row = self.tab_strip.first_child();
-        while let Some(row_widget) = row {
-            let mut child = row_widget.first_child();
-            while let Some(widget) = child {
-                if let Ok(button) = widget.clone().downcast::<gtk::ToggleButton>() {
-                    if button.widget_name() == widget_name {
-                        button.set_tooltip_text(Some(title));
-                        if let Some(label) = button
-                            .child()
-                            .and_then(|child| child.downcast::<gtk::Label>().ok())
-                        {
-                            label.set_label(title);
-                        }
-                        return true;
-                    }
-                }
-                child = widget.next_sibling();
-            }
-            row = row_widget.next_sibling();
-        }
-        false
+        let Some(index) = self.tab_rows.iter().position(|row| row.id == id) else {
+            return false;
+        };
+        self.tab_rows
+            .send(index, tab_strip::TabRowMsg::SetTitle(title.to_string()));
+        true
     }
 
     /// Flip the tab strip between the sidebar and the top bar, then persist.
@@ -2497,315 +2321,51 @@ impl AppModel {
         config::save_config(&self.config.borrow());
     }
 
-    fn rebuild_tab_strip(&self, sender: &ComponentSender<AppModel>) {
-        while let Some(child) = self.tab_strip.first_child() {
-            self.tab_strip.remove(&child);
-        }
-        // Saved remote hosts, surfaced as "Remote: <name>" items in the tab
-        // context menu (parity with jterm4).
-        let remote_list: Vec<(u8, String)> = self
-            .config
-            .borrow()
+    fn rebuild_tab_strip(&mut self, _sender: &ComponentSender<AppModel>) {
+        let config = self.config.borrow();
+        let remote_hosts: Vec<(u8, String)> = config
             .remote_hosts
             .iter()
             .take(u8::MAX as usize)
             .enumerate()
-            .map(|(i, h)| (i as u8, h.name.clone()))
+            .map(|(index, host)| (index as u8, host.name.clone()))
             .collect();
+        let tab_width = config.tab_width;
+        drop(config);
+
         let filter = self.tab_filter.to_lowercase();
-        for (idx, tab) in self.tabs.iter().enumerate() {
-            if !filter.is_empty() && !tab.title.to_lowercase().contains(&filter) {
-                continue;
-            }
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-            row.add_css_class("tab-row");
-            if idx == self.active {
-                row.add_css_class("active-tab");
-            }
+        let sidebar = self.tab_placement.get() == config::TabPlacement::Sidebar;
+        let rows: Vec<_> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| filter.is_empty() || tab.title.to_lowercase().contains(&filter))
+            .map(|(index, tab)| tab_strip::TabRowInit {
+                id: tab.id,
+                target_index: index,
+                title: tab.title.clone(),
+                active: index == self.active,
+                bell: tab.bell,
+                activity: tab.activity,
+                marked: tab.marked,
+                pinned: tab.pinned,
+                connection: tab.remote.as_ref().map(|remote| match remote.status {
+                    ConnStatus::Connecting => tab_strip::ConnectionState::Connecting,
+                    ConnStatus::Connected => tab_strip::ConnectionState::Connected,
+                    ConnStatus::Disconnected => tab_strip::ConnectionState::Disconnected,
+                }),
+                remote_hosts: remote_hosts.clone(),
+                tab_width,
+                sidebar,
+            })
+            .collect();
 
-            // Remote connection status dot (Connecting / Connected / Disconnected).
-            if let Some(conn) = tab.remote.as_ref() {
-                let dot = gtk::Label::new(Some("\u{25CF}"));
-                dot.add_css_class("conn-dot");
-                dot.add_css_class(match conn.status {
-                    ConnStatus::Connecting => "conn-connecting",
-                    ConnStatus::Connected => "conn-connected",
-                    ConnStatus::Disconnected => "conn-disconnected",
-                });
-                row.append(&dot);
-            }
-
-            let select_btn = gtk::ToggleButton::new();
-            // Stable identity lets title-only updates preserve this button and
-            // all of its click/drag gesture state.
-            select_btn.set_widget_name(&format!("tab-{}", tab.id));
-            let title_label = gtk::Label::new(Some(&tab.title));
-            title_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            title_label.set_single_line_mode(true);
-            title_label.set_xalign(0.0);
-            title_label.set_hexpand(true);
-            let close_icon = gtk::Image::from_icon_name("window-close-symbolic");
-            close_icon.add_css_class("tab-strip-close");
-            close_icon.set_opacity(0.0);
-            let tab_content = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-            tab_content.append(&title_label);
-            tab_content.append(&close_icon);
-            select_btn.set_child(Some(&tab_content));
-            select_btn.set_tooltip_text(Some(&tab.title));
-            select_btn.set_active(idx == self.active);
-            select_btn.add_css_class("tab-strip-btn");
-            if tab.bell {
-                select_btn.add_css_class("tab-bell");
-            }
-            if tab.activity {
-                select_btn.add_css_class("tab-activity");
-            }
-            if tab.marked {
-                select_btn.add_css_class("tab-marked");
-            }
-            if tab.pinned {
-                select_btn.add_css_class("tab-pinned");
-            }
-            let id = tab.id;
-            let s = sender.clone();
-            select_btn.connect_clicked(move |_| s.input(AppMsg::SelectTab(id)));
-
-            // Keep the close affordance within the tab control, matching
-            // jterm4, while showing it only when the tab is hovered.
-            let hover = gtk::EventControllerMotion::new();
-            let close_on_enter = close_icon.clone();
-            hover.connect_enter(move |_, _, _| close_on_enter.set_opacity(1.0));
-            let close_on_leave = close_icon.clone();
-            hover.connect_leave(move |_| close_on_leave.set_opacity(0.0));
-            select_btn.add_controller(hover);
-
-            // Intercept a press on the embedded icon before ToggleButton
-            // selects the tab. A separate nested Button is not valid GTK
-            // hierarchy, so use the icon's bounds as jterm4 does.
-            let close_click = gtk::GestureClick::new();
-            close_click.set_propagation_phase(gtk::PropagationPhase::Capture);
-            let close_icon_for_hit = close_icon.clone();
-            let select_btn_for_hit = select_btn.clone();
-            let close_sender = sender.clone();
-            let close_id = tab.id;
-            close_click.connect_pressed(move |gesture, _, x, y| {
-                let button_widget = select_btn_for_hit.upcast_ref::<gtk::Widget>();
-                let icon_widget = close_icon_for_hit.upcast_ref::<gtk::Widget>();
-                let point = gtk::graphene::Point::new(x as f32, y as f32);
-                if let Some(mapped) = button_widget.compute_point(icon_widget, &point) {
-                    let ix = mapped.x() as f64;
-                    let iy = mapped.y() as f64;
-                    if ix >= 0.0
-                        && iy >= 0.0
-                        && ix <= icon_widget.width() as f64
-                        && iy <= icon_widget.height() as f64
-                    {
-                        gesture.set_state(gtk::EventSequenceState::Claimed);
-                        close_sender.input(AppMsg::CloseTab(close_id));
-                    }
-                }
-            });
-            select_btn.add_controller(close_click);
-
-            // Double-click to rename: a popover with a prefilled entry.
-            let rename = gtk::GestureClick::new();
-            rename.set_button(gtk::gdk::ffi::GDK_BUTTON_PRIMARY as u32);
-            let id_r = tab.id;
-            let title_r = tab.title.clone();
-            let s_r = sender.clone();
-            let btn_r = select_btn.clone();
-            rename.connect_pressed(move |_, n_press, _, _| {
-                if n_press != 2 {
-                    return;
-                }
-                let popover = gtk::Popover::new();
-                popover.set_parent(&btn_r);
-                let entry = gtk::Entry::new();
-                entry.set_text(&title_r);
-                entry.select_region(0, -1);
-                popover.set_child(Some(&entry));
-                let s_e = s_r.clone();
-                let pop = popover.clone();
-                entry.connect_activate(move |e| {
-                    s_e.input(AppMsg::RenameTab(id_r, e.text().to_string()));
-                    pop.popdown();
-                });
-                popover.connect_closed(|p| p.unparent());
-                popover.popup();
-                entry.grab_focus();
-            });
-            select_btn.add_controller(rename);
-
-            // Right-click context menu (parity with jterm4's tab menu). Items
-            // dispatch existing AppMsgs; actions that operate on the active tab
-            // are preceded by a SelectTab so they target the clicked tab.
-            let ctx = gtk::GestureClick::new();
-            ctx.set_button(gtk::gdk::ffi::GDK_BUTTON_SECONDARY as u32);
-            let id_c = tab.id;
-            let marked_c = tab.marked;
-            let pinned_c = tab.pinned;
-            let title_c = tab.title.clone();
-            let remote_list_c = remote_list.clone();
-            let s_c = sender.clone();
-            let btn_c = select_btn.clone();
-            ctx.connect_pressed(move |g, _, x, y| {
-                g.set_state(gtk::EventSequenceState::Claimed);
-                let popover = gtk::Popover::new();
-                popover.set_parent(&btn_c);
-                popover.set_has_arrow(false);
-                popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-                let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
-                vbox.add_css_class("menu");
-
-                let item = |label: &str| {
-                    let b = gtk::Button::with_label(label);
-                    b.set_has_frame(false);
-                    b.add_css_class("flat");
-                    if let Some(child) = b.child() {
-                        child.set_halign(gtk::Align::Start);
-                    }
-                    b
-                };
-
-                let entries: [(&str, AppMsg); 6] = [
-                    ("New Tab", AppMsg::NewTab),
-                    ("Duplicate", AppMsg::Action(Action::DuplicateTab)),
-                    (
-                        if marked_c { "Unmark" } else { "Mark Important" },
-                        AppMsg::Action(Action::ToggleTabMarked),
-                    ),
-                    (
-                        if pinned_c { "Unpin Tab" } else { "Pin Tab" },
-                        AppMsg::Action(Action::ToggleTabPinned),
-                    ),
-                    ("Rename", AppMsg::Ignore),
-                    ("Close", AppMsg::CloseTab(id_c)),
-                ];
-                for (label, msg) in entries {
-                    let b = item(label);
-                    let pop = popover.clone();
-                    let s = s_c.clone();
-                    let btn_for_rename = btn_c.clone();
-                    let title_for_rename = title_c.clone();
-                    b.connect_clicked(move |_| {
-                        pop.popdown();
-                        match &msg {
-                            AppMsg::Ignore => {
-                                // Rename: open a prefilled entry popover.
-                                let rp = gtk::Popover::new();
-                                rp.set_parent(&btn_for_rename);
-                                let entry = gtk::Entry::new();
-                                entry.set_text(&title_for_rename);
-                                entry.select_region(0, -1);
-                                rp.set_child(Some(&entry));
-                                let s_e = s.clone();
-                                let rp_c = rp.clone();
-                                entry.connect_activate(move |e| {
-                                    s_e.input(AppMsg::RenameTab(id_c, e.text().to_string()));
-                                    rp_c.popdown();
-                                });
-                                rp.connect_closed(|p| p.unparent());
-                                rp.popup();
-                                entry.grab_focus();
-                            }
-                            AppMsg::Action(_) => {
-                                // Target the clicked tab, then run the action.
-                                s.input(AppMsg::SelectTab(id_c));
-                                s.input(msg.clone());
-                            }
-                            _ => s.input(msg.clone()),
-                        }
-                    });
-                    vbox.append(&b);
-                }
-
-                // One "Remote: <name>" item per saved host; opens a new remote
-                // tab. Separated from the tab-management items above.
-                if !remote_list_c.is_empty() {
-                    let sep = gtk::Separator::new(gtk::Orientation::Horizontal);
-                    vbox.append(&sep);
-                    for (n, name) in remote_list_c.iter() {
-                        let b = item(&format!("Remote: {name}"));
-                        let pop = popover.clone();
-                        let s = s_c.clone();
-                        let n = *n;
-                        b.connect_clicked(move |_| {
-                            pop.popdown();
-                            s.input(AppMsg::Action(Action::ConnectRemote(n)));
-                        });
-                        vbox.append(&b);
-                    }
-                }
-
-                popover.set_child(Some(&vbox));
-                popover.connect_closed(|p| p.unparent());
-                popover.popup();
-            });
-            select_btn.add_controller(ctx);
-
-            // Retained only for the existing row layout; jterm4's top tabs use
-            // their natural width, so this remains hidden in both placements.
-            let resize_handle = gtk::Box::new(gtk::Orientation::Vertical, 0);
-            resize_handle.add_css_class("tab-resize-handle");
-            resize_handle.set_tooltip_text(Some("Drag to resize tabs"));
-            let resize = gtk::GestureDrag::new();
-            resize.set_button(gtk::gdk::ffi::GDK_BUTTON_PRIMARY as u32);
-            let start_width = Rc::new(std::cell::Cell::new(0_i32));
-            {
-                let config = self.config.clone();
-                let start_width = start_width.clone();
-                resize.connect_drag_begin(move |_, _, _| {
-                    start_width.set(config.borrow().tab_width as i32);
-                });
-            }
-            {
-                let button = select_btn.clone();
-                let start_width = start_width.clone();
-                resize.connect_drag_update(move |_, dx, _| {
-                    let width = (start_width.get() + dx as i32)
-                        .clamp(MIN_TAB_WIDTH as i32, MAX_TAB_WIDTH as i32);
-                    button.set_width_request(width);
-                });
-            }
-            {
-                let sender = sender.clone();
-                let start_width = start_width.clone();
-                resize.connect_drag_end(move |_, dx, _| {
-                    let width = (start_width.get() + dx as i32)
-                        .clamp(MIN_TAB_WIDTH as i32, MAX_TAB_WIDTH as i32)
-                        as u32;
-                    sender.input(AppMsg::SetTabWidth(width));
-                });
-            }
-            resize_handle.add_controller(resize);
-
-            // Drag-and-drop reorder: drag a tab button, drop onto another row.
-            let drag = gtk::DragSource::new();
-            drag.set_actions(gtk::gdk::DragAction::MOVE);
-            let drag_id = tab.id;
-            drag.connect_prepare(move |_, _, _| {
-                Some(gtk::gdk::ContentProvider::for_value(&drag_id.to_value()))
-            });
-            select_btn.add_controller(drag);
-
-            let drop = gtk::DropTarget::new(glib::Type::U64, gtk::gdk::DragAction::MOVE);
-            let target_idx = idx;
-            let s_d = sender.clone();
-            drop.connect_drop(move |_, value, _, _| {
-                if let Ok(src_id) = value.get::<u64>() {
-                    s_d.input(AppMsg::ReorderTab(src_id, target_idx));
-                    true
-                } else {
-                    false
-                }
-            });
-            row.add_controller(drop);
-
-            row.append(&select_btn);
-            row.append(&resize_handle);
-            self.apply_strip_row_placement(row.upcast_ref::<gtk::Widget>());
-            self.tab_strip.append(&row);
+        let mut factory = self.tab_rows.guard();
+        factory.clear();
+        for row in rows {
+            factory.push_back(row);
         }
+        drop(factory);
         self.sync_tab_bar_visibility();
         self.persist_session();
     }
@@ -2818,7 +2378,7 @@ fn install_static_css() {
         ".tab-strip-btn { padding: 4px 8px; border-radius: 4px; margin-bottom: 2px; color: #ffffff; }
          .tab-strip-btn:checked { font-weight: bold; border: 1px solid currentColor; border-radius: 4px; }
          .tab-strip-close { min-width: 16px; min-height: 16px; color: #ffffff; }
-         .tab-resize-handle { min-width: 6px; margin: 0 1px; border-left: 1px solid rgba(255,255,255,0.38); cursor: col-resize; }
+         .tab-resize-handle { min-width: 6px; margin: 0 1px; border-left: 1px solid rgba(255,255,255,0.38); }
          .tab-resize-handle:hover { border-left-color: rgba(255,255,255,0.9); }
          .tab-strip { min-width: 140px; padding: 2px 4px; }
          .file-tree { padding: 2px; }
@@ -2889,6 +2449,8 @@ impl SimpleComponent for AppModel {
         let window_opacity = config.window_opacity;
         let font_scale = config.default_font_scale;
         let config = Rc::new(RefCell::new(config));
+        let kbmap = Rc::new(RefCell::new(kbmap));
+        let workflows = Rc::new(RefCell::new(Vec::new()));
 
         root.set_opacity(window_opacity);
 
@@ -2905,63 +2467,27 @@ impl SimpleComponent for AppModel {
         let stack = gtk::Stack::new();
         let tab_strip = gtk::Box::new(gtk::Orientation::Vertical, 0);
 
-        // Inline find bar (hidden until ToggleSearch). The entry feeds queries
-        // back to the model, which routes them to the active terminal backend.
-        let search_entry = gtk::SearchEntry::new();
-        search_entry.set_placeholder_text(Some("Find… (/regex/ for regex)"));
-        search_entry.set_hexpand(true);
-        let search_bar = gtk::SearchBar::builder().search_mode_enabled(false).build();
-        search_bar.set_child(Some(&search_entry));
-        search_bar.connect_entry(&search_entry);
-        {
-            let sender = sender.clone();
-            search_entry.connect_search_changed(move |e| {
-                sender.input(AppMsg::SearchChanged(e.text().to_string()));
-            });
-        }
-        {
-            let sender = sender.clone();
-            search_entry.connect_activate(move |_| sender.input(AppMsg::SearchNext));
-        }
-        {
-            let sender = sender.clone();
-            let key = gtk::EventControllerKey::new();
-            key.set_propagation_phase(gtk::PropagationPhase::Capture);
-            key.connect_key_pressed(move |_, keyval, _, state| {
-                use gtk::gdk::Key;
-                if keyval == Key::Escape {
-                    sender.input(AppMsg::SearchClose);
-                    return glib::Propagation::Stop;
-                }
-                if matches!(keyval, Key::Return | Key::KP_Enter)
-                    && state.contains(ModifierType::SHIFT_MASK)
-                {
-                    sender.input(AppMsg::SearchPrev);
-                    return glib::Propagation::Stop;
-                }
-                glib::Propagation::Proceed
-            });
-            search_entry.add_controller(key);
-        }
+        let search =
+            search::SearchModel::builder()
+                .launch(())
+                .forward(sender.input_sender(), |output| match output {
+                    search::SearchOutput::Changed(query) => AppMsg::SearchChanged(query),
+                    search::SearchOutput::Next => AppMsg::SearchNext,
+                    search::SearchOutput::Previous => AppMsg::SearchPrev,
+                    search::SearchOutput::Closed => AppMsg::SearchClose,
+                });
 
-        // Tab-strip filter entry (lives at the top of the sidebar). FilterTabs
-        // focuses it; typing hides strip rows whose title doesn't match.
-        let tab_filter_entry = gtk::SearchEntry::new();
-        tab_filter_entry.set_placeholder_text(Some("Filter tabs..."));
-        {
-            let sender = sender.clone();
-            tab_filter_entry.connect_search_changed(move |e| {
-                sender.input(AppMsg::SetTabFilter(e.text().to_string()));
-            });
-        }
+        let tab_filter_control = sidebar::TabFilterModel::builder().launch(()).forward(
+            sender.input_sender(),
+            |output| match output {
+                sidebar::TabFilterOutput::Changed(filter) => AppMsg::SetTabFilter(filter),
+            },
+        );
 
         // File tree browser (lower half of the sidebar).
         let file_tree_store = file_tree::new_store();
         let file_tree_view = file_tree::new_view(&file_tree_store);
         file_tree_view.add_css_class("file-tree");
-        let file_tree_root_label = gtk::Label::new(Some("~"));
-        file_tree_root_label.set_xalign(0.0);
-        file_tree_root_label.set_ellipsize(gtk::pango::EllipsizeMode::Start);
         {
             // Lazy directory expansion: fill children on first expand.
             let store = file_tree_store.clone();
@@ -3003,10 +2529,22 @@ impl SimpleComponent for AppModel {
         let file_tree_scroll = gtk::ScrolledWindow::new();
         file_tree_scroll.set_vexpand(true);
         file_tree_scroll.set_child(Some(&file_tree_view));
+        let file_header = sidebar::FileHeaderModel::builder().launch(()).forward(
+            sender.input_sender(),
+            |output| match output {
+                sidebar::FileHeaderOutput::Up => AppMsg::FileTreeGoUp,
+                sidebar::FileHeaderOutput::CurrentDirectory => AppMsg::FileTreeGotoCwd,
+            },
+        );
 
         let sidebar_width = config.borrow().sidebar_width as i32;
         let tab_placement = config.borrow().tab_placement;
         let sidebar_view = config.borrow().sidebar_view;
+        let sidebar_toggle = sidebar_toggle::SidebarToggleModel::builder()
+            .launch((sidebar_view, tab_placement == config::TabPlacement::Sidebar))
+            .forward(sender.input_sender(), |output| match output {
+                sidebar_toggle::SidebarToggleOutput::View(view) => AppMsg::SetSidebarView(view),
+            });
 
         // Scroll holders the tab strip can be reparented between (sidebar vs
         // top bar). apply_tab_placement() owns which one holds tab_strip.
@@ -3029,131 +2567,30 @@ impl SimpleComponent for AppModel {
         top_tab_scroll.add_css_class("top-tab-scroll");
         top_tab_scroll.set_visible(false);
 
-        // Keep the toolbar controls above the tab viewport. Overlay children
-        // do not contribute to the window's minimum width, so hundreds of
-        // tabs cannot push the trailing controls (or the whole window) out.
-        let top_bar = gtk::Overlay::new();
-        top_bar.add_css_class("top-bar");
-        top_bar.set_hexpand(true);
-        // Overlay children do not participate in size measurement. Reserve
-        // the normal jterm4 toolbar height explicitly so the tabs and controls
-        // are not vertically clipped.
-        top_bar.set_height_request(40);
-        top_bar.set_child(Some(&gtk::Box::new(gtk::Orientation::Horizontal, 0)));
-
-        let top_left = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        top_left.set_halign(gtk::Align::Start);
-        top_left.set_valign(gtk::Align::Center);
-        let toggle_sidebar_btn = gtk::Button::from_icon_name("open-menu-symbolic");
-        toggle_sidebar_btn.set_focus_on_click(false);
-        toggle_sidebar_btn.set_can_focus(false);
-        toggle_sidebar_btn.set_tooltip_text(Some("Toggle sidebar (Ctrl+\\)"));
-        toggle_sidebar_btn.add_css_class("flat");
-        {
-            let sender = sender.clone();
-            toggle_sidebar_btn.connect_clicked(move |_| sender.input(AppMsg::ToggleSidebar));
-        }
-        let toggle_placement_btn = gtk::Button::from_icon_name("view-list-symbolic");
-        toggle_placement_btn.set_focus_on_click(false);
-        toggle_placement_btn.set_can_focus(false);
-        toggle_placement_btn.set_tooltip_text(Some("Toggle tabs: sidebar / top bar"));
-        toggle_placement_btn.add_css_class("flat");
-        {
-            let sender = sender.clone();
-            toggle_placement_btn.connect_clicked(move |_| {
-                sender.input(AppMsg::Action(Action::ToggleTabPlacement));
-            });
-        }
-        top_left.append(&toggle_sidebar_btn);
-        top_left.append(&toggle_placement_btn);
-
-        let top_right = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        top_right.add_css_class("top-bar-actions");
-        top_right.set_halign(gtk::Align::End);
-        top_right.set_valign(gtk::Align::Center);
-        let add_tab_button = gtk::Button::from_icon_name("list-add-symbolic");
-        add_tab_button.set_focus_on_click(false);
-        add_tab_button.set_can_focus(false);
-        add_tab_button.set_tooltip_text(Some("New tab (Ctrl+Shift+T)"));
-        add_tab_button.add_css_class("flat");
-        {
-            let sender = sender.clone();
-            add_tab_button.connect_clicked(move |_| sender.input(AppMsg::NewTab));
-        }
-        let close_window_button = gtk::Button::from_icon_name("window-close-symbolic");
-        close_window_button.set_focus_on_click(false);
-        close_window_button.set_can_focus(false);
-        close_window_button.set_tooltip_text(Some("Close window"));
-        close_window_button.add_css_class("flat");
-        {
-            let sender = sender.clone();
-            close_window_button.connect_clicked(move |_| sender.input(AppMsg::Quit));
-        }
-        top_right.append(&add_tab_button);
-        top_right.append(&close_window_button);
-
         top_tab_scroll.set_margin_start(88);
-        // Leave enough room for both trailing buttons plus their spacing and
-        // the toolbar's horizontal padding; tab content is clipped before it.
+        // Reserve room for the leading controls and trailing window actions.
         top_tab_scroll.set_margin_end(104);
-        top_bar.add_overlay(&top_tab_scroll);
-        top_bar.add_overlay(&top_left);
-        top_bar.add_overlay(&top_right);
+        let top_bar = top_bar::TopBarModel::builder()
+            .launch(top_tab_scroll.clone())
+            .forward(sender.input_sender(), |output| match output {
+                top_bar::TopBarOutput::ToggleSidebar => AppMsg::ToggleSidebar,
+                top_bar::TopBarOutput::ToggleTabPlacement => {
+                    AppMsg::Action(Action::ToggleTabPlacement)
+                }
+                top_bar::TopBarOutput::NewTab => AppMsg::NewTab,
+                top_bar::TopBarOutput::Quit => AppMsg::Quit,
+            });
 
-        // Segmented view toggle: Tabs | Files, driving sidebar_stack.
-        let sidebar_tabs_btn = gtk::ToggleButton::with_label("Tabs");
-        sidebar_tabs_btn.add_css_class("sidebar-toggle");
-        let sidebar_files_btn = gtk::ToggleButton::with_label("Files");
-        sidebar_files_btn.add_css_class("sidebar-toggle");
-        sidebar_files_btn.set_group(Some(&sidebar_tabs_btn));
-        {
-            let sender = sender.clone();
-            sidebar_tabs_btn.connect_clicked(move |b| {
-                if b.is_active() {
-                    sender.input(AppMsg::SetSidebarView(config::SidebarView::Tabs));
-                }
-            });
-        }
-        {
-            let sender = sender.clone();
-            sidebar_files_btn.connect_clicked(move |b| {
-                if b.is_active() {
-                    sender.input(AppMsg::SetSidebarView(config::SidebarView::Files));
-                }
-            });
-        }
-        let toggle_row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        toggle_row.add_css_class("sidebar-toggle-row");
-        sidebar_tabs_btn.set_hexpand(true);
-        sidebar_files_btn.set_hexpand(true);
-        toggle_row.append(&sidebar_tabs_btn);
-        toggle_row.append(&sidebar_files_btn);
+        let toggle_row = sidebar_toggle.widget();
 
         // "tabs" page: filter entry + the tab strip's sidebar holder.
         let tabs_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        tabs_page.append(&tab_filter_entry);
+        tabs_page.append(tab_filter_control.widget());
         tabs_page.append(&tab_strip_scroll);
 
         // "files" page: root header (up / goto-cwd / path) + file tree.
         let files_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        let file_header = gtk::Box::new(gtk::Orientation::Horizontal, 2);
-        let up_btn = gtk::Button::from_icon_name("go-up-symbolic");
-        up_btn.set_tooltip_text(Some("Parent directory"));
-        {
-            let sender = sender.clone();
-            up_btn.connect_clicked(move |_| sender.input(AppMsg::FileTreeGoUp));
-        }
-        let home_btn = gtk::Button::from_icon_name("go-home-symbolic");
-        home_btn.set_tooltip_text(Some("Go to current directory"));
-        {
-            let sender = sender.clone();
-            home_btn.connect_clicked(move |_| sender.input(AppMsg::FileTreeGotoCwd));
-        }
-        file_tree_root_label.set_hexpand(true);
-        file_header.append(&up_btn);
-        file_header.append(&home_btn);
-        file_header.append(&file_tree_root_label);
-        files_page.append(&file_header);
+        files_page.append(file_header.widget());
         files_page.append(&file_tree_scroll);
 
         let sidebar_stack = gtk::Stack::new();
@@ -3165,7 +2602,7 @@ impl SimpleComponent for AppModel {
         sidebar_box.set_width_request(sidebar_width);
         sidebar_box.set_hexpand(false);
         sidebar_box.add_css_class("tab-strip");
-        sidebar_box.append(&toggle_row);
+        sidebar_box.append(toggle_row);
         sidebar_box.append(&sidebar_stack);
 
         // A Paned gives the sidebar the visible, draggable divider used by
@@ -3181,10 +2618,151 @@ impl SimpleComponent for AppModel {
         content_paned.set_shrink_end_child(true);
         content_paned.set_position(sidebar_width);
 
+        let mut settings_font_names: Vec<String> = root
+            .pango_context()
+            .list_families()
+            .iter()
+            .filter(|family| family.is_monospace())
+            .map(|family| family.name().to_string())
+            .collect();
+        settings_font_names.sort_by_key(|name| name.to_lowercase());
+
+        let current_font_desc =
+            gtk::pango::FontDescription::from_string(&config.borrow().font_desc);
+        let current_family = current_font_desc
+            .family()
+            .map(|family| family.to_string())
+            .unwrap_or_default();
+        let current_font = settings_font_names
+            .iter()
+            .position(|family| family == &current_family)
+            .unwrap_or(0) as u32;
+        let current_theme = themes
+            .iter()
+            .position(|theme| theme.name == config.borrow().theme_name)
+            .unwrap_or(0) as u32;
+        let settings = dialogs::settings::SettingsModel::builder()
+            .launch(dialogs::settings::SettingsInit {
+                theme_names: themes.iter().map(|theme| theme.name.clone()).collect(),
+                font_names: settings_font_names.clone(),
+                values: dialogs::settings::SettingsValues {
+                    theme: current_theme,
+                    font: current_font,
+                    font_size: (current_font_desc.size() as f64 / gtk::pango::SCALE as f64)
+                        .max(6.0),
+                    font_scale,
+                    opacity: window_opacity,
+                    scrollback: config.borrow().terminal_scrollback_lines as f64,
+                },
+            })
+            .forward(sender.input_sender(), |output| match output {
+                dialogs::settings::SettingsOutput::Theme(index) => AppMsg::SettingsTheme(index),
+                dialogs::settings::SettingsOutput::FontDesc(desc) => AppMsg::SettingsFontDesc(desc),
+                dialogs::settings::SettingsOutput::FontScale(scale) => {
+                    AppMsg::SettingsFontScale(scale)
+                }
+                dialogs::settings::SettingsOutput::Opacity(opacity) => {
+                    AppMsg::SettingsOpacity(opacity)
+                }
+                dialogs::settings::SettingsOutput::Scrollback(lines) => {
+                    AppMsg::SettingsScrollback(lines)
+                }
+            });
+        let remote_picker = dialogs::remote_picker::RemotePickerModel::builder()
+            .launch(root.clone())
+            .forward(sender.input_sender(), |output| match output {
+                dialogs::remote_picker::RemotePickerOutput::Connect(index) => {
+                    AppMsg::Action(Action::ConnectRemote(index as u8))
+                }
+            });
+        let command_palette = dialogs::command_palette::PaletteModel::builder()
+            .launch(dialogs::command_palette::PaletteInit {
+                parent: root.clone(),
+                keybindings: kbmap.clone(),
+                workflows: workflows.clone(),
+            })
+            .forward(sender.input_sender(), |output| match output {
+                dialogs::command_palette::PaletteOutput::Action(action) => AppMsg::Action(action),
+                dialogs::command_palette::PaletteOutput::TypeCommand(command) => {
+                    AppMsg::PaletteTypeCommand(command)
+                }
+                dialogs::command_palette::PaletteOutput::AskAi(query) => {
+                    AppMsg::PaletteAskAi(query)
+                }
+                dialogs::command_palette::PaletteOutput::RunWorkflow(path) => {
+                    AppMsg::PaletteRunWorkflow(path)
+                }
+            });
+        let history = dialogs::history::HistoryModel::builder()
+            .launch(dialogs::history::HistoryInit {
+                keybindings: kbmap.clone(),
+                workflows: workflows.clone(),
+            })
+            .forward(sender.input_sender(), |output| match output {
+                dialogs::history::HistoryOutput::Action(action) => AppMsg::Action(action),
+                dialogs::history::HistoryOutput::TypeCommand(command) => {
+                    AppMsg::PaletteTypeCommand(command)
+                }
+                dialogs::history::HistoryOutput::AskAi(query) => AppMsg::PaletteAskAi(query),
+                dialogs::history::HistoryOutput::RunWorkflow(path) => {
+                    AppMsg::PaletteRunWorkflow(path)
+                }
+            });
+        let debug_dashboard = dialogs::debug_dashboard::DebugDashboardModel::builder()
+            .launch(root.clone())
+            .detach();
+        let workflow_dialog = dialogs::workflow::WorkflowModel::builder()
+            .launch(root.clone())
+            .forward(sender.input_sender(), |output| match output {
+                dialogs::workflow::WorkflowOutput::Command(command) => {
+                    AppMsg::PaletteTypeCommand(command)
+                }
+            });
+        let ai_panel = dialogs::ai_panel::AiPanelModel::builder()
+            .launch(root.clone())
+            .detach();
+        let notebook = notebook::NotebookModel::builder()
+            .launch(root.clone())
+            .detach();
+        let agent_panel = agent::AgentPanelModel::builder()
+            .launch(root.clone())
+            .forward(sender.input_sender(), |output| match output {
+                agent::AgentPanelOutput::Send(text) => AppMsg::AgentSend(text),
+                agent::AgentPanelOutput::Approve(index) => AppMsg::AgentApprove(index),
+                agent::AgentPanelOutput::Edit(index, command) => {
+                    AppMsg::AgentEditRequested(index, command)
+                }
+                agent::AgentPanelOutput::Reject(index) => AppMsg::AgentReject(index),
+                agent::AgentPanelOutput::Closed => AppMsg::AgentClose,
+            });
+        let agent_edit = agent::AgentEditModel::builder()
+            .launch(root.clone())
+            .forward(sender.input_sender(), |output| match output {
+                agent::AgentEditOutput::Approved(index, command) => {
+                    AppMsg::AgentEditAndApprove(index, command)
+                }
+            });
+        let tab_rows = FactoryVecDeque::builder()
+            .launch(tab_strip.clone())
+            .forward(sender.input_sender(), |output| match output {
+                tab_strip::TabRowOutput::Select(id) => AppMsg::SelectTab(id),
+                tab_strip::TabRowOutput::Close(id) => AppMsg::CloseTab(id),
+                tab_strip::TabRowOutput::Rename(id, title) => AppMsg::RenameTab(id, title),
+                tab_strip::TabRowOutput::NewTab => AppMsg::NewTab,
+                tab_strip::TabRowOutput::Action(id, action) => AppMsg::TabRowAction(id, action),
+                tab_strip::TabRowOutput::ConnectRemote(index) => {
+                    AppMsg::Action(Action::ConnectRemote(index))
+                }
+                tab_strip::TabRowOutput::Resize(width) => AppMsg::SetTabWidth(width),
+                tab_strip::TabRowOutput::Reorder { source_id, target } => {
+                    AppMsg::ReorderTab(source_id, target)
+                }
+            });
+
         let mut model = AppModel {
             config,
             themes: Rc::new(themes),
-            kbmap: Rc::new(RefCell::new(kbmap)),
+            kbmap,
             shell_argv,
             tabs: Vec::new(),
             active: 0,
@@ -3195,31 +2773,40 @@ impl SimpleComponent for AppModel {
             window_opacity,
             stack: stack.clone(),
             tab_strip: tab_strip.clone(),
+            tab_rows,
             window: root.clone(),
             dyn_css,
-            search_bar: search_bar.clone(),
-            search_entry: search_entry.clone(),
-            tab_filter_entry: tab_filter_entry.clone(),
+            search,
+            tab_filter_control,
             tab_filter: String::new(),
             file_tree_store: file_tree_store.clone(),
-            file_tree_root_label: file_tree_root_label.clone(),
+            file_header,
             file_tree_root: Rc::new(RefCell::new(std::path::PathBuf::new())),
             tab_strip_scroll: tab_strip_scroll.clone(),
             top_tab_scroll: top_tab_scroll.clone(),
+            top_bar,
             sidebar_box: sidebar_box.clone(),
             sidebar_stack: sidebar_stack.clone(),
-            sidebar_tabs_btn: sidebar_tabs_btn.clone(),
-            sidebar_files_btn: sidebar_files_btn.clone(),
+            sidebar_toggle,
             tab_placement: std::cell::Cell::new(tab_placement),
             sidebar_view: std::cell::Cell::new(sidebar_view),
-            command_palette_dialog: Rc::new(RefCell::new(None)),
-            settings_dialog: Rc::new(RefCell::new(None)),
-            debug_dashboard_dialog: Rc::new(RefCell::new(None)),
-            history_popover: Rc::new(RefCell::new(None)),
-            workflows: Rc::new(RefCell::new(Vec::new())),
+            command_palette,
+            settings,
+            settings_font_names: Rc::new(settings_font_names),
+            remote_picker,
+            debug_dashboard,
+            history,
+            workflow_dialog,
+            ai_panel,
+            notebook,
+            workflows,
             active_agent: Rc::new(RefCell::new(None)),
+            agent_panel,
+            agent_edit,
         };
 
+        let search_bar = model.search.widget();
+        let top_bar = model.top_bar.widget();
         let widgets = view_output!();
 
         // Place the tab strip (sidebar vs top bar) and select the sidebar view.
@@ -3502,7 +3089,12 @@ impl SimpleComponent for AppModel {
                     t.emit(VteInput::SearchPrev);
                 }
             }
-            AppMsg::SearchClose => self.toggle_search(),
+            AppMsg::SearchClose => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.emit(VteInput::SearchClear);
+                    terminal.emit(VteInput::GrabFocus);
+                }
+            }
             AppMsg::RenameTab(id, title) => {
                 if let Some(idx) = self.index_of(id) {
                     let trimmed = title.trim();
@@ -3522,6 +3114,15 @@ impl SimpleComponent for AppModel {
                 }
             }
             AppMsg::ReorderTab(src_id, to_idx) => self.reorder_tab(src_id, to_idx, &sender),
+            AppMsg::TabRowAction(id, action) => {
+                self.select_tab(id, &sender);
+                let action = match action {
+                    tab_strip::TabAction::Duplicate => Action::DuplicateTab,
+                    tab_strip::TabAction::ToggleMarked => Action::ToggleTabMarked,
+                    tab_strip::TabAction::TogglePinned => Action::ToggleTabPinned,
+                };
+                self.execute_action(action, &sender);
+            }
             AppMsg::SetTabFilter(text) => {
                 self.tab_filter = text;
                 self.rebuild_tab_strip(&sender);
@@ -3534,13 +3135,17 @@ impl SimpleComponent for AppModel {
                 }
             }
             AppMsg::OpenNotebook(path) => {
-                notebook::open_notebook_dialog(&self.window, &path);
+                self.notebook.emit(notebook::NotebookMsg::Open(path));
             }
             AppMsg::OpenAgent => self.open_agent_panel(&sender),
             AppMsg::AgentSend(text) => self.agent_send(text, &sender),
             AppMsg::AgentApprove(idx) => self.agent_approve(idx, None, &sender),
             AppMsg::AgentEditAndApprove(idx, new_cmd) => {
                 self.agent_approve(idx, Some(new_cmd), &sender);
+            }
+            AppMsg::AgentEditRequested(idx, command) => {
+                self.agent_edit
+                    .emit(agent::AgentEditMsg::Open(idx, command));
             }
             AppMsg::AgentReject(idx) => self.agent_reject(idx, &sender),
             AppMsg::AgentLlmReply(reply) => self.agent_handle_reply(reply, &sender),
@@ -3571,7 +3176,7 @@ impl SimpleComponent for AppModel {
                 self.handle_palette_ask_ai(query, &sender);
             }
             AppMsg::OpenAiPanel => {
-                self.show_ai_session_panel(&sender);
+                self.show_ai_session_panel();
             }
             AppMsg::PaletteRunWorkflow(path) => {
                 self.run_workflow_from_path(path, &sender);

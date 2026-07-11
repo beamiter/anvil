@@ -16,6 +16,8 @@
 //! Once loaded, workflows surface in the command palette as a third tier
 //! (after actions and history) and via `:` prefix or `Action::OpenWorkflows`.
 
+use relm4::gtk;
+
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -98,7 +100,7 @@ fn load_one(path: &Path) -> Result<Workflow, String> {
 
 /// Standard config dir: `<XDG_CONFIG_HOME>/jterm1/workflows/`.
 pub(crate) fn user_workflow_dir() -> PathBuf {
-    let base: PathBuf = gtk4::glib::user_config_dir();
+    let base: PathBuf = gtk::glib::user_config_dir();
     base.join("jterm1").join("workflows")
 }
 

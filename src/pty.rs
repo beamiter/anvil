@@ -4,10 +4,11 @@
 //! intercept the raw stream for OSC 133 block detection.
 
 use crate::process::terminate_terminal_process;
-use gtk4::glib;
+use gtk::glib;
 use nix::libc;
 use nix::pty::{openpty, OpenptyResult};
 use nix::unistd::{self, ForkResult, Pid};
+use relm4::gtk;
 use std::ffi::CString;
 use std::io::{self, Read as _};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};

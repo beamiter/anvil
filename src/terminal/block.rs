@@ -5,8 +5,9 @@
 //! implementation itself is now the jterm4 `block_view::TermView`; this file
 //! only adapts that GTK view to the existing jterm1 component surface.
 
-use gtk4::pango::FontDescription;
-use gtk4::prelude::*;
+use gtk::pango::FontDescription;
+use gtk::prelude::*;
+use relm4::gtk;
 use relm4::prelude::*;
 use std::cell::Cell;
 use std::rc::Rc;
@@ -26,11 +27,11 @@ impl Component for BlockTerminal {
     type Input = VteInput;
     type Output = VteOutput;
     type CommandOutput = ();
-    type Root = gtk4::Widget;
+    type Root = gtk::Widget;
     type Widgets = ();
 
     fn init_root() -> Self::Root {
-        gtk4::Box::new(gtk4::Orientation::Vertical, 0).upcast()
+        gtk::Box::new(gtk::Orientation::Vertical, 0).upcast()
     }
 
     fn init(
@@ -94,7 +95,7 @@ impl Component for BlockTerminal {
                 }
                 let _ = sender.output(VteOutput::Activity);
                 let activity_pending = activity_pending.clone();
-                gtk4::glib::timeout_add_local_once(Duration::from_millis(100), move || {
+                gtk::glib::timeout_add_local_once(Duration::from_millis(100), move || {
                     activity_pending.set(false);
                 });
             }
@@ -110,7 +111,7 @@ impl Component for BlockTerminal {
             }
         });
 
-        if let Some(container) = root.downcast_ref::<gtk4::Box>() {
+        if let Some(container) = root.downcast_ref::<gtk::Box>() {
             container.append(&view.widget());
         }
 

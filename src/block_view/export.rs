@@ -5,7 +5,8 @@
 //! Reads only the in-memory `block_data` and `finished_blocks` snapshots; no
 //! VTE state mutation.
 
-use gtk4::prelude::*;
+use gtk::prelude::*;
+use relm4::gtk;
 
 use super::{strip_ansi, BlockData, TermView};
 

@@ -29,9 +29,10 @@
 //!   shell → parser → vte_pty.write_bytes()       (jterm1 → VTE)
 //!   vte_pty reader → shell_pty.write_bytes()     (VTE → shell)
 
-use gtk4::glib;
+use gtk::glib;
 use nix::libc;
 use nix::pty::{openpty, OpenptyResult};
+use relm4::gtk;
 use std::io::{self, Read as _};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::sync::{mpsc, Arc, Mutex};
@@ -138,7 +139,7 @@ impl VtePty {
         // two crates without taking a hard dep on io-lifetimes here.
         let master_raw = master.into_raw_fd();
         let master_fd = unsafe { io_lifetimes::OwnedFd::from_raw_fd(master_raw) };
-        let vte_pty = vte4::Pty::foreign_sync(master_fd, None::<&gtk4::gio::Cancellable>)
+        let vte_pty = vte4::Pty::foreign_sync(master_fd, None::<&gtk::gio::Cancellable>)
             .map_err(|e| io::Error::other(e.to_string()))?;
         Ok(VtePty {
             local: Arc::new(Mutex::new(Some(slave))),

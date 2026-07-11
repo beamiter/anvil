@@ -18,7 +18,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,6 +27,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use adw::prelude::*;
 use relm4::adw;
 use relm4::gtk;
+use relm4::prelude::*;
 
 /// Max bytes of captured output retained per cell run before truncation.
 /// Matches the spirit of `block.rs`'s raw-output cap — bounded memory even
@@ -198,101 +199,142 @@ struct CellHandle {
     cancelled: Arc<AtomicBool>,
 }
 
-/// Open a notebook viewer modal for the given file. Returns immediately;
-/// the dialog drives itself.
-pub(crate) fn open_notebook_dialog(window: &adw::ApplicationWindow, path: &Path) {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(err) => {
-            log::warn!("notebook: cannot read {}: {err}", path.display());
-            return;
-        }
-    };
-    let segments = parse_segments(&text);
+#[derive(Debug)]
+pub(crate) enum NotebookMsg {
+    Open(PathBuf),
+    Closed,
+}
 
-    let dialog = adw::Dialog::builder()
-        .title(&format!(
-            "Notebook: {}",
-            path.file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.display().to_string())
-        ))
-        .content_width(880)
-        .content_height(680)
-        .build();
-    let header = adw::HeaderBar::new();
+pub(crate) struct NotebookModel {
+    parent: adw::ApplicationWindow,
+    handles: Rc<RefCell<Vec<Rc<CellHandle>>>>,
+}
 
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    content.set_margin_top(12);
-    content.set_margin_bottom(12);
-    content.set_margin_start(16);
-    content.set_margin_end(16);
+#[relm4::component(pub(crate))]
+impl Component for NotebookModel {
+    type Init = adw::ApplicationWindow;
+    type Input = NotebookMsg;
+    type Output = ();
+    type CommandOutput = ();
 
-    let cwd = path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    view! {
+        root = adw::Dialog {
+            set_content_width: 880,
+            set_content_height: 680,
+            connect_closed => NotebookMsg::Closed,
 
-    // Track open cell handles so close → kill.
-    let handles: Rc<RefCell<Vec<Rc<CellHandle>>>> = Rc::new(RefCell::new(Vec::new()));
+            #[wrap(Some)]
+            set_child = &adw::ToolbarView {
+                add_top_bar = &adw::HeaderBar {},
 
-    for seg in segments {
-        match seg {
-            Segment::Text(t) => {
-                let label = gtk::Label::new(None);
-                label.set_use_markup(true);
-                label.set_markup(&render_text_to_pango(&t));
-                label.set_wrap(true);
-                label.set_xalign(0.0);
-                label.set_halign(gtk::Align::Fill);
-                label.set_selectable(true);
-                content.append(&label);
-            }
-            Segment::Code { lang, src } => {
-                let card = build_code_cell(&lang, &src, &cwd, &handles);
-                content.append(&card);
-            }
+                #[wrap(Some)]
+                set_content = &gtk::ScrolledWindow {
+                    set_hexpand: true,
+                    set_vexpand: true,
+
+                    #[name(content)]
+                    gtk::Box {
+                        set_orientation: gtk::Orientation::Vertical,
+                        set_spacing: 12,
+                        set_margin_top: 12,
+                        set_margin_bottom: 12,
+                        set_margin_start: 16,
+                        set_margin_end: 16,
+                    },
+                },
+            },
         }
     }
 
-    // Footer: explain the isolation model so users know why their aliases
-    // aren't honoured.
-    let footer = gtk::Label::new(Some(
-        "Cells run in an isolated `bash -c` rooted at the notebook's directory. \
-         Shell init scripts (.bashrc, aliases, rsh) are not loaded.",
-    ));
-    footer.set_wrap(true);
-    footer.set_xalign(0.0);
-    footer.add_css_class("dim-label");
-    content.append(&footer);
+    fn init(
+        parent: Self::Init,
+        root: Self::Root,
+        sender: ComponentSender<Self>,
+    ) -> ComponentParts<Self> {
+        let model = Self {
+            parent,
+            handles: Rc::new(RefCell::new(Vec::new())),
+        };
+        let widgets = view_output!();
+        ComponentParts { model, widgets }
+    }
 
-    let scrolled = gtk::ScrolledWindow::builder()
-        .hexpand(true)
-        .vexpand(true)
-        .child(&content)
-        .build();
-
-    let toolbar = adw::ToolbarView::new();
-    toolbar.add_top_bar(&header);
-    toolbar.set_content(Some(&scrolled));
-    dialog.set_child(Some(&toolbar));
-
-    // Kill any running cell when the user closes the notebook.
-    {
-        let handles = handles.clone();
-        dialog.connect_closed(move |_| {
-            for h in handles.borrow().iter() {
-                h.cancelled.store(true, Ordering::SeqCst);
-                if let Ok(mut guard) = h.child.lock() {
-                    if let Some(mut child) = guard.take() {
-                        let _ = child.kill();
+    fn update_with_view(
+        &mut self,
+        widgets: &mut Self::Widgets,
+        msg: Self::Input,
+        _sender: ComponentSender<Self>,
+        root: &Self::Root,
+    ) {
+        match msg {
+            NotebookMsg::Open(path) => {
+                let text = match std::fs::read_to_string(&path) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        log::warn!("notebook: cannot read {}: {error}", path.display());
+                        return;
+                    }
+                };
+                self.cancel_cells();
+                while let Some(child) = widgets.content.first_child() {
+                    widgets.content.remove(&child);
+                }
+                root.set_title(&format!(
+                    "Notebook: {}",
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string())
+                ));
+                let cwd = path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                for segment in parse_segments(&text) {
+                    match segment {
+                        Segment::Text(text) => {
+                            let label = gtk::Label::new(None);
+                            label.set_use_markup(true);
+                            label.set_markup(&render_text_to_pango(&text));
+                            label.set_wrap(true);
+                            label.set_xalign(0.0);
+                            label.set_halign(gtk::Align::Fill);
+                            label.set_selectable(true);
+                            widgets.content.append(&label);
+                        }
+                        Segment::Code { lang, src } => widgets.content.append(&build_code_cell(
+                            &lang,
+                            &src,
+                            &cwd,
+                            &self.handles,
+                        )),
                     }
                 }
+                let footer = gtk::Label::new(Some(
+                    "Cells run in an isolated `bash -c` rooted at the notebook's directory. \
+                     Shell init scripts (.bashrc, aliases, rsh) are not loaded.",
+                ));
+                footer.set_wrap(true);
+                footer.set_xalign(0.0);
+                footer.add_css_class("dim-label");
+                widgets.content.append(&footer);
+                root.present(Some(&self.parent));
             }
-        });
+            NotebookMsg::Closed => self.cancel_cells(),
+        }
     }
+}
 
-    dialog.present(Some(window));
+impl NotebookModel {
+    fn cancel_cells(&self) {
+        for handle in self.handles.borrow_mut().drain(..) {
+            handle.cancelled.store(true, Ordering::SeqCst);
+            if let Ok(mut guard) = handle.child.lock() {
+                if let Some(mut child) = guard.take() {
+                    let _ = child.kill();
+                }
+            }
+        }
+    }
 }
 
 fn build_code_cell(

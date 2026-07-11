@@ -6,10 +6,10 @@
 //! final frame) without a full terminal grid. Ported/condensed from jterm4's
 //! `block_view/ansi.rs`.
 
+use gtk::gdk::RGBA;
+use gtk::glib::translate::IntoGlib;
 use gtk::prelude::*;
-use gtk4::gdk::RGBA;
-use gtk4::glib::translate::IntoGlib;
-use gtk4::TextBuffer;
+use gtk::TextBuffer;
 use relm4::gtk;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

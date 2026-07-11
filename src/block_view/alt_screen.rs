@@ -6,8 +6,9 @@
 //! is **discarded** — the active block keeps only the command name + exit code.
 //! No frame-merge / pager-snapshot path runs, matching Warp.
 use crate::config::Config;
-use gtk4::gdk::RGBA;
-use gtk4::pango::FontDescription;
+use gtk::gdk::RGBA;
+use gtk::pango::FontDescription;
+use relm4::gtk;
 use vte4::{CursorBlinkMode, CursorShape, Terminal};
 use vte4::{TerminalExt, TerminalExtManual};
 

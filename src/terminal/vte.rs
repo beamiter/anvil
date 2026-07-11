@@ -1,19 +1,19 @@
 //! VTE terminal backend as a relm4 Component.
 //!
-//! Wraps a `vte4::Terminal` + `gtk4::Scrollbar` in a horizontal box. The shell
+//! Wraps a `vte4::Terminal` + `gtk::Scrollbar` in a horizontal box. The shell
 //! is spawned on init. VTE signals (cwd/exit/bell/title/activity) are forwarded
 //! as component Output messages instead of jterm4's callback-Vec observer model.
 
+use gtk::gdk::ffi::GDK_BUTTON_PRIMARY;
+use gtk::gdk::ModifierType;
+use gtk::gdk::RGBA;
+use gtk::gio::{self, Cancellable};
+use gtk::glib::translate::IntoGlib;
+use gtk::glib::SpawnFlags;
+use gtk::pango::FontDescription;
 use gtk::prelude::*;
-use gtk4::gdk::ffi::GDK_BUTTON_PRIMARY;
-use gtk4::gdk::ModifierType;
-use gtk4::gdk::RGBA;
-use gtk4::gio::{self, Cancellable};
-use gtk4::glib::translate::IntoGlib;
-use gtk4::glib::SpawnFlags;
-use gtk4::pango::FontDescription;
-use gtk4::GestureClick;
-use gtk4::Orientation;
+use gtk::GestureClick;
+use gtk::Orientation;
 use relm4::gtk;
 use relm4::prelude::*;
 use std::cell::{Cell, RefCell};
@@ -562,7 +562,7 @@ impl Component for VteTerminal {
                 let pattern = if use_regex {
                     query
                 } else {
-                    gtk4::glib::Regex::escape_string(&query).to_string()
+                    gtk::glib::Regex::escape_string(&query).to_string()
                 };
                 if let Ok(regex) = vte4::Regex::for_search(&pattern, pcre2_sys::PCRE2_CASELESS) {
                     self.terminal.search_set_regex(Some(&regex), 0);

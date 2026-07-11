@@ -15,6 +15,7 @@
 //! Scope: enough to handle pagers and dashboards. Color/SGR is dropped (we
 //! only return text). Unsupported sequences are skipped without aborting.
 
+use relm4::gtk;
 use std::collections::HashMap;
 
 const MIN_COLS: usize = 1;
@@ -114,8 +115,8 @@ pub fn render_to_text(bytes: &[u8], cols: usize, rows: usize) -> String {
     render_to_ansi(bytes, cols, rows, &default_palette())
 }
 
-fn default_palette() -> [gtk4::gdk::RGBA; 16] {
-    [gtk4::gdk::RGBA::BLACK; 16]
+fn default_palette() -> [gtk::gdk::RGBA; 16] {
+    [gtk::gdk::RGBA::BLACK; 16]
 }
 
 /// Replay `bytes` onto a `cols × rows` grid and return the resulting text WITH
@@ -126,7 +127,7 @@ pub fn render_to_ansi(
     bytes: &[u8],
     cols: usize,
     rows: usize,
-    palette: &[gtk4::gdk::RGBA; 16],
+    palette: &[gtk::gdk::RGBA; 16],
 ) -> String {
     let cols = cols.max(MIN_COLS);
     let rows = rows.max(MIN_ROWS);
@@ -490,7 +491,7 @@ struct StyleKey {
 }
 
 #[inline]
-fn pack_rgba(c: &gtk4::gdk::RGBA) -> u32 {
+fn pack_rgba(c: &gtk::gdk::RGBA) -> u32 {
     ((c.red() * 255.0).round() as u32) << 24
         | ((c.green() * 255.0).round() as u32) << 16
         | ((c.blue() * 255.0).round() as u32) << 8
@@ -576,7 +577,7 @@ struct Grid {
     cur_style: u16,
     /// Palette used to resolve indexed SGR colors (30-37/40-47/90-97/100-107
     /// and 38;5/48;5) to RGB. Threaded in from the active terminal's theme.
-    palette: [gtk4::gdk::RGBA; 16],
+    palette: [gtk::gdk::RGBA; 16],
     /// Last printable char written — REP (CSI Pn b) repeats this.
     last_char: Option<char>,
     /// DEC special line-drawing charset selected for G0/G1 (`ESC ( 0` etc.).
@@ -589,7 +590,7 @@ struct Grid {
 }
 
 impl Grid {
-    fn new(cols: usize, rows: usize, palette: [gtk4::gdk::RGBA; 16]) -> Self {
+    fn new(cols: usize, rows: usize, palette: [gtk::gdk::RGBA; 16]) -> Self {
         Self {
             cells: vec![vec![blank_cell(); cols]; rows],
             cols,
@@ -1197,7 +1198,7 @@ mod tests {
         // A clear-screen + home + colorized line. The recorded output must
         // contain an SGR sequence so the rendered block keeps its color
         // (previously stripped entirely by the no-SGR grid).
-        let palette = [gtk4::gdk::RGBA::BLACK; 16];
+        let palette = [gtk::gdk::RGBA::BLACK; 16];
         let bytes = b"\x1b[2J\x1b[H\x1b[31mred-text\x1b[0m plain";
         let out = render_to_ansi(bytes, 80, 24, &palette);
         assert!(out.contains("red-text"));
@@ -1283,7 +1284,7 @@ mod tests {
     fn osc8_hyperlinks_survive_replay() {
         // `\e]8;;https://x.example\e\\` link \e]8;;\e\\ plain
         // Replay must preserve both the link and the URI on the rendered text.
-        let palette = [gtk4::gdk::RGBA::BLACK; 16];
+        let palette = [gtk::gdk::RGBA::BLACK; 16];
         let bytes = b"\x1b[2J\x1b[H\x1b]8;;https://x.example\x1b\\link\x1b]8;;\x1b\\ plain";
         let out = render_to_ansi(bytes, 80, 24, &palette);
         assert!(out.contains("link"));

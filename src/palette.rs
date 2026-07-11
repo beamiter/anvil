@@ -1,9 +1,9 @@
 //! Command palette: fuzzy-ranked search over multiple sources (actions, shell
 //! history), with prefix-driven filters (`>` commands, `@` history).
 //!
-//! The UI lives in `dialogs::toggle_command_palette` — this module is the pure
-//! data + ranking layer so it can be tested independently and reused by other
-//! surfaces (e.g. the inline Ctrl-R popover in `dialogs::show_history_popover`).
+//! The UI lives in the `dialogs::command_palette` Relm4 component — this
+//! module is the pure data + ranking layer so it can be tested independently
+//! and reused by other surfaces such as the inline Ctrl-R popover.
 
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;

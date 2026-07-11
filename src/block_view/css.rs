@@ -1,6 +1,7 @@
 //! css — extracted from block_view (mechanical split, no logic changes)
 use crate::config::Config;
-use gtk4::gdk::RGBA;
+use gtk::gdk::RGBA;
+use relm4::gtk;
 use std::cell::RefCell;
 
 /// Vertical chrome the `.block-active` holder adds around the live VTE:
@@ -532,12 +533,12 @@ pub(crate) fn install_block_css(config: &Config) {
     );
 
     thread_local! {
-        static BLOCK_CSS_PROVIDER: RefCell<Option<gtk4::CssProvider>> = const { RefCell::new(None) };
+        static BLOCK_CSS_PROVIDER: RefCell<Option<gtk::CssProvider>> = const { RefCell::new(None) };
     }
 
-    let provider = gtk4::CssProvider::new();
+    let provider = gtk::CssProvider::new();
     provider.load_from_string(&css);
-    let Some(display) = gtk4::gdk::Display::default() else {
+    let Some(display) = gtk::gdk::Display::default() else {
         // No display (headless / CI). Nothing to style.
         return;
     };
@@ -545,12 +546,12 @@ pub(crate) fn install_block_css(config: &Config) {
     BLOCK_CSS_PROVIDER.with(|cell| {
         let mut prev = cell.borrow_mut();
         if let Some(old) = prev.take() {
-            gtk4::style_context_remove_provider_for_display(&display, &old);
+            gtk::style_context_remove_provider_for_display(&display, &old);
         }
-        gtk4::style_context_add_provider_for_display(
+        gtk::style_context_add_provider_for_display(
             &display,
             &provider,
-            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
         *prev = Some(provider);
     });

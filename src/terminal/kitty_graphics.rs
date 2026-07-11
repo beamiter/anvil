@@ -15,11 +15,12 @@
 //! Per-image and per-block memory caps prevent a runaway shell from ballooning
 //! RSS; oversize payloads are dropped silently.
 
+use relm4::gtk;
 use std::collections::HashMap;
 
-use gtk4::gdk;
-use gtk4::glib;
-use gtk4::prelude::Cast;
+use gtk::gdk;
+use gtk::glib;
+use gtk::prelude::Cast;
 
 /// Per-image base64 payload cap (before decoding) — ~16 MB encoded.
 const MAX_ENCODED_BYTES: usize = 16 * 1024 * 1024;

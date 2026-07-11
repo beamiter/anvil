@@ -2,7 +2,8 @@
 use super::*;
 use crate::config::Config;
 use crate::terminal::open_uri;
-use gtk4::Orientation;
+use gtk::Orientation;
+use relm4::gtk;
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -91,7 +92,7 @@ pub struct BlockFilters {
 
 pub(crate) struct FinishedBlock {
     pub(crate) id: u64,
-    pub(crate) widget: gtk4::Box,
+    pub(crate) widget: gtk::Box,
     pub(crate) prompt_text: String,
     /// Read-only VTE displaying the executed command line (single-row typically).
     pub(crate) command_vte: vte4::Terminal,
@@ -113,13 +114,13 @@ pub(crate) struct FinishedBlock {
     /// the lifetime of the block (finished blocks are append-once in practice).
     pub(crate) stripped_output: Rc<RefCell<Option<String>>>,
     pub(crate) cmd_text: String,
-    pub(crate) copy_cmd_btn: gtk4::Button,
-    pub(crate) copy_output_btn: gtk4::Button,
-    pub(crate) rerun_btn: gtk4::Button,
-    pub(crate) header_row: gtk4::Box,
-    pub(crate) action_box: gtk4::Box,
-    pub(crate) bookmark_star: gtk4::Label,
-    pub(crate) status_icon: gtk4::Label,
+    pub(crate) copy_cmd_btn: gtk::Button,
+    pub(crate) copy_output_btn: gtk::Button,
+    pub(crate) rerun_btn: gtk::Button,
+    pub(crate) header_row: gtk::Box,
+    pub(crate) action_box: gtk::Box,
+    pub(crate) bookmark_star: gtk::Label,
+    pub(crate) status_icon: gtk::Label,
     /// Column count the output VTE is sized to — needed for re-feed (filter).
     pub(crate) cols: i64,
     /// Visible-row cap (config.finished_block_viewport_rows).
@@ -356,7 +357,7 @@ fn pin_vte_to_top(vte: &vte4::Terminal) {
     }
 }
 
-fn forward_outer_scroll(outer: &gtk4::ScrolledWindow, dy: f64) {
+fn forward_outer_scroll(outer: &gtk::ScrolledWindow, dy: f64) {
     let outer_adj = outer.vadjustment();
     let step = outer_adj.step_increment().max(outer_adj.page_size() * 0.1);
     let max_value = (outer_adj.upper() - outer_adj.page_size()).max(outer_adj.lower());
@@ -443,7 +444,7 @@ pub(crate) fn estimated_finished_block_height(config: &Config, output_rows: usiz
     (rows + 2) * cell + 34
 }
 
-fn flash_button_label(btn: &gtk4::Button, label: &'static str, tooltip: &'static str) {
+fn flash_button_label(btn: &gtk::Button, label: &'static str, tooltip: &'static str) {
     let old_label = btn.label().map(|s| s.to_string()).unwrap_or_default();
     let old_tooltip = btn.tooltip_text().map(|s| s.to_string());
     btn.set_label(label);
@@ -573,7 +574,7 @@ impl FinishedBlock {
         end_time_ms: Option<u64>,
         cwd: Option<&str>,
         cols: i64,
-        recycled: Option<gtk4::Box>,
+        recycled: Option<gtk::Box>,
     ) -> Self {
         let viewport_cap = config.finished_block_viewport_rows.max(3) as i64;
         let max_expanded_cap = (config.finished_block_max_expanded_rows as i64).max(viewport_cap);
@@ -588,7 +589,7 @@ impl FinishedBlock {
             reused.remove_css_class("block-failed");
             reused
         } else {
-            let b = gtk4::Box::new(Orientation::Vertical, 0);
+            let b = gtk::Box::new(Orientation::Vertical, 0);
             b.add_css_class("block-finished");
             b.set_margin_top(4);
             b.set_margin_bottom(4);
@@ -607,10 +608,10 @@ impl FinishedBlock {
         // Add hover highlighting to show block is interactive (and reveal the
         // quick-action buttons). The action box is created below; it's wired into
         // these handlers after construction.
-        let hover_ctrl = gtk4::EventControllerMotion::new();
+        let hover_ctrl = gtk::EventControllerMotion::new();
 
         // ── Header row ──────────────────────────────────────────────────────
-        let header_row = gtk4::Box::new(Orientation::Horizontal, 8);
+        let header_row = gtk::Box::new(Orientation::Horizontal, 8);
         header_row.add_css_class("block-header");
         // The output surface keeps VTE's native text selection, so selection
         // lives on this header strip. Make the otherwise subtle interaction
@@ -624,15 +625,15 @@ impl FinishedBlock {
         header_row.set_margin_bottom(2);
 
         // Bookmark star (gutter marker), hidden until the block is bookmarked.
-        let bookmark_star = gtk4::Label::new(Some("\u{f02e}")); // nf-fa-bookmark
+        let bookmark_star = gtk::Label::new(Some("\u{f02e}")); // nf-fa-bookmark
         bookmark_star.add_css_class("block-bookmark-star");
-        bookmark_star.set_halign(gtk4::Align::Start);
+        bookmark_star.set_halign(gtk::Align::Start);
         bookmark_star.set_visible(false);
         header_row.append(&bookmark_star);
 
         // Status icon: ✓ for success, ✗ for failure.
         // Nerd Font glyphs: nf-fa-check () on success, nf-fa-times () on failure.
-        let status_icon = gtk4::Label::new(Some(if exit_code == 0 {
+        let status_icon = gtk::Label::new(Some(if exit_code == 0 {
             "\u{f00c}"
         } else {
             "\u{f00d}"
@@ -642,33 +643,33 @@ impl FinishedBlock {
         } else {
             "block-status-bad"
         });
-        status_icon.set_halign(gtk4::Align::Start);
+        status_icon.set_halign(gtk::Align::Start);
         header_row.append(&status_icon);
 
         // Context chips (Warp-style): cwd pill + git-branch pill.
         if let Some(cwd_path) = cwd {
             let shortened = shorten_path(cwd_path);
             // nf-fa-folder () prefix
-            let cwd_chip = gtk4::Label::new(Some(&format!("\u{f07b} {}", shortened)));
+            let cwd_chip = gtk::Label::new(Some(&format!("\u{f07b} {}", shortened)));
             cwd_chip.add_css_class("block-chip");
-            cwd_chip.set_halign(gtk4::Align::Start);
-            cwd_chip.set_ellipsize(gtk4::pango::EllipsizeMode::Start);
+            cwd_chip.set_halign(gtk::Align::Start);
+            cwd_chip.set_ellipsize(gtk::pango::EllipsizeMode::Start);
             cwd_chip.set_max_width_chars(40);
             header_row.append(&cwd_chip);
 
             // git-branch chip (nf-dev-git-branch )
             if let Some(branch) = git_branch_for(cwd_path) {
-                let git_chip = gtk4::Label::new(Some(&format!("\u{e725} {}", branch)));
+                let git_chip = gtk::Label::new(Some(&format!("\u{e725} {}", branch)));
                 git_chip.add_css_class("block-chip-git");
-                git_chip.set_halign(gtk4::Align::Start);
-                git_chip.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                git_chip.set_halign(gtk::Align::Start);
+                git_chip.set_ellipsize(gtk::pango::EllipsizeMode::End);
                 git_chip.set_max_width_chars(28);
                 header_row.append(&git_chip);
             }
         }
 
         // Spacer
-        let spacer = gtk4::Box::new(Orientation::Horizontal, 0);
+        let spacer = gtk::Box::new(Orientation::Horizontal, 0);
         spacer.set_hexpand(true);
         header_row.append(&spacer);
 
@@ -680,7 +681,7 @@ impl FinishedBlock {
             let h = local_secs / 3600;
             let m = (local_secs % 3600) / 60;
             let sec = local_secs % 60;
-            let ts_label = gtk4::Label::new(Some(&format!("{:02}:{:02}:{:02}", h, m, sec)));
+            let ts_label = gtk::Label::new(Some(&format!("{:02}:{:02}:{:02}", h, m, sec)));
             ts_label.add_css_class("block-header-label");
             header_row.append(&ts_label);
         }
@@ -696,39 +697,39 @@ impl FinishedBlock {
                 let min = dur_sec / 60.0;
                 format!("{:.0}m", min)
             };
-            let dur_label = gtk4::Label::new(Some(&duration_text));
+            let dur_label = gtk::Label::new(Some(&duration_text));
             dur_label.add_css_class("block-meta-badge");
             header_row.append(&dur_label);
         }
 
         // Exit code badge
         if exit_code != 0 {
-            let badge = gtk4::Label::new(Some(&format!("exit:{}", exit_code)));
+            let badge = gtk::Label::new(Some(&format!("exit:{}", exit_code)));
             badge.add_css_class("block-exit-bad");
             header_row.append(&badge);
         }
 
         // Quick-action buttons (hidden until the block is hovered). Handlers are
         // wired by the caller, which has access to the clipboard + active block.
-        let action_box = gtk4::Box::new(Orientation::Horizontal, 2);
+        let action_box = gtk::Box::new(Orientation::Horizontal, 2);
         action_box.set_visible(false);
         // Small gap between the meta badges (timestamp/duration/exit) on the
         // right and the action button group, so they read as separate units
         // rather than one undifferentiated cluster.
         action_box.set_margin_start(6);
-        let copy_cmd_btn = gtk4::Button::with_label("\u{f0c5}"); // nf-fa-copy  copy command
+        let copy_cmd_btn = gtk::Button::with_label("\u{f0c5}"); // nf-fa-copy  copy command
         copy_cmd_btn.set_tooltip_text(Some("Copy command"));
-        let copy_output_btn = gtk4::Button::with_label("\u{f0ea}"); // nf-fa-clipboard  copy output
+        let copy_output_btn = gtk::Button::with_label("\u{f0ea}"); // nf-fa-clipboard  copy output
         copy_output_btn.set_tooltip_text(Some("Copy output"));
-        let rerun_btn = gtk4::Button::with_label("\u{f021}"); // nf-fa-refresh  re-run
+        let rerun_btn = gtk::Button::with_label("\u{f021}"); // nf-fa-refresh  re-run
         rerun_btn.set_tooltip_text(Some("Re-run command"));
-        let filter_btn = gtk4::Button::with_label("\u{f0b0}"); // nf-fa-filter  filter output
+        let filter_btn = gtk::Button::with_label("\u{f0b0}"); // nf-fa-filter  filter output
         filter_btn.set_tooltip_text(Some("Filter output"));
         // Expand button: appears only when output_rows > viewport_cap; toggles
         // the output VTE between the capped height and a roomier expanded height
         // (`finished_block_max_expanded_rows`). Wired below once output_rows and
         // the output VTE exist.
-        let expand_btn = gtk4::Button::with_label("\u{f065}"); // nf-fa-expand
+        let expand_btn = gtk::Button::with_label("\u{f065}"); // nf-fa-expand
         expand_btn.set_tooltip_text(Some("Expand block"));
         for btn in [
             &copy_cmd_btn,
@@ -762,7 +763,7 @@ impl FinishedBlock {
         outer.add_controller(hover_ctrl);
 
         // Collapse toggle button
-        let collapse_btn = gtk4::Button::with_label("\u{f078}"); // nf-fa-chevron_down
+        let collapse_btn = gtk::Button::with_label("\u{f078}"); // nf-fa-chevron_down
         collapse_btn.add_css_class("block-collapse-btn");
         collapse_btn.add_css_class("flat");
         header_row.append(&collapse_btn);
@@ -908,20 +909,20 @@ impl FinishedBlock {
         }
 
         // Command row: Warp-style accent prompt chevron + the command VTE.
-        let cmd_row = gtk4::Box::new(Orientation::Horizontal, 0);
-        let chevron = gtk4::Label::new(Some("\u{276f}")); // ❯
+        let cmd_row = gtk::Box::new(Orientation::Horizontal, 0);
+        let chevron = gtk::Label::new(Some("\u{276f}")); // ❯
         chevron.add_css_class("block-prompt-chevron");
-        chevron.set_valign(gtk4::Align::Start);
+        chevron.set_valign(gtk::Align::Start);
         cmd_row.append(&chevron);
         cmd_row.append(&command_vte);
 
         outer.append(&cmd_row);
-        let output_widget: gtk4::Widget = output_vte.clone().upcast::<gtk4::Widget>();
+        let output_widget: gtk::Widget = output_vte.clone().upcast::<gtk::Widget>();
         outer.append(&output_vte);
-        let collapsed_summary = gtk4::Button::with_label(&collapsed_output_summary(output_rows));
+        let collapsed_summary = gtk::Button::with_label(&collapsed_output_summary(output_rows));
         collapsed_summary.add_css_class("block-output-summary");
         collapsed_summary.add_css_class("flat");
-        collapsed_summary.set_halign(gtk4::Align::Start);
+        collapsed_summary.set_halign(gtk::Align::Start);
         collapsed_summary.set_margin_start(18);
         collapsed_summary.set_margin_end(8);
         collapsed_summary.set_margin_bottom(4);
@@ -934,7 +935,7 @@ impl FinishedBlock {
         // `check_match_at` return the matching URL at the pointer position;
         // VTE handles word/line double/triple-click selection natively.
         {
-            let click = gtk4::GestureClick::new();
+            let click = gtk::GestureClick::new();
             click.set_button(1);
             let vte_for_click = output_vte.clone();
             click.connect_pressed(move |controller, n_press, x, y| {
@@ -942,7 +943,7 @@ impl FinishedBlock {
                     return;
                 }
                 let state = controller.current_event_state();
-                if !state.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
+                if !state.contains(gtk::gdk::ModifierType::CONTROL_MASK) {
                     return;
                 }
                 let (uri, _tag) = vte_for_click.check_match_at(x, y);
@@ -950,7 +951,7 @@ impl FinishedBlock {
                     let s = uri.to_string();
                     if !s.is_empty() {
                         open_uri(&s);
-                        controller.set_state(gtk4::EventSequenceState::Claimed);
+                        controller.set_state(gtk::EventSequenceState::Claimed);
                     }
                 }
             });
@@ -1001,7 +1002,7 @@ impl FinishedBlock {
         // the action box toggles a compact row that narrows the output to lines
         // matching the query, honoring regex / case / invert / context-lines.
         {
-            let filter_row = gtk4::Box::new(Orientation::Horizontal, 4);
+            let filter_row = gtk::Box::new(Orientation::Horizontal, 4);
             filter_row.add_css_class("block-filter-row");
             filter_row.set_visible(false);
             filter_row.set_margin_start(12);
@@ -1009,21 +1010,21 @@ impl FinishedBlock {
             filter_row.set_margin_top(2);
             filter_row.set_margin_bottom(2);
 
-            let filter_entry = gtk4::SearchEntry::new();
+            let filter_entry = gtk::SearchEntry::new();
             filter_entry.set_placeholder_text(Some("Filter output…"));
             filter_entry.set_hexpand(true);
-            let regex_tg = gtk4::ToggleButton::with_label(".*");
+            let regex_tg = gtk::ToggleButton::with_label(".*");
             regex_tg.set_tooltip_text(Some("Regular expression"));
-            let case_tg = gtk4::ToggleButton::with_label("Aa");
+            let case_tg = gtk::ToggleButton::with_label("Aa");
             case_tg.set_tooltip_text(Some("Case sensitive"));
-            let invert_tg = gtk4::ToggleButton::with_label("!");
+            let invert_tg = gtk::ToggleButton::with_label("!");
             invert_tg.set_tooltip_text(Some("Invert match (hide matching lines)"));
-            let ctx_spin = gtk4::SpinButton::with_range(0.0, 9.0, 1.0);
+            let ctx_spin = gtk::SpinButton::with_range(0.0, 9.0, 1.0);
             ctx_spin.set_tooltip_text(Some("Lines of context around each match"));
             ctx_spin.set_value(0.0);
-            let filter_status = gtk4::Label::new(None);
+            let filter_status = gtk::Label::new(None);
             filter_status.add_css_class("block-filter-status");
-            filter_status.set_halign(gtk4::Align::Start);
+            filter_status.set_halign(gtk::Align::Start);
             for w in [&regex_tg, &case_tg, &invert_tg] {
                 w.add_css_class("flat");
                 w.add_css_class("block-filter-toggle");
@@ -1170,7 +1171,7 @@ impl FinishedBlock {
         }
     }
 
-    pub(crate) fn widget(&self) -> &gtk4::Box {
+    pub(crate) fn widget(&self) -> &gtk::Box {
         &self.widget
     }
 
@@ -1180,11 +1181,11 @@ impl FinishedBlock {
     /// silently swallows wheels that no longer scroll its own buffer, and the
     /// page never resumes. Closes the perceptual gap with a single-scrollback
     /// VTE pane (terminator/xterm).
-    pub(crate) fn connect_scroll_forwarding(&self, outer: &gtk4::ScrolledWindow) {
+    pub(crate) fn connect_scroll_forwarding(&self, outer: &gtk::ScrolledWindow) {
         let scroll_ctrl =
-            gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
+            gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
         if !self.output_scrollable {
-            scroll_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
+            scroll_ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
         }
         let vte = self.output_vte.clone();
         let outer_for_vte = outer.clone();
@@ -1269,7 +1270,7 @@ impl FinishedBlock {
 /// accumulated output (`raw_output`) is snapshotted into a styled FinishedBlock
 /// stacked above this card.
 pub(crate) struct ActiveBlock {
-    pub(crate) widget: gtk4::Box,
+    pub(crate) widget: gtk::Box,
     pub(crate) active_vte: Terminal,
     /// Raw output bytes accumulated during CollectingOutput, consumed by the
     /// finalize path to build the styled finished block (jterm1's `out_buf`).
@@ -1278,7 +1279,7 @@ pub(crate) struct ActiveBlock {
 
 impl ActiveBlock {
     pub(crate) fn new(config: &Config) -> Self {
-        let widget = gtk4::Box::new(Orientation::Vertical, 0);
+        let widget = gtk::Box::new(Orientation::Vertical, 0);
         widget.add_css_class("block-active");
         // focusable(false) keeps the holder Box from being a focus target, but we
         // must NOT set can_focus(false): in GTK4 that blocks all descendants
@@ -1372,7 +1373,7 @@ impl ActiveBlock {
         self.raw_output.borrow_mut().clear();
     }
 
-    pub(crate) fn widget(&self) -> &gtk4::Box {
+    pub(crate) fn widget(&self) -> &gtk::Box {
         &self.widget
     }
 

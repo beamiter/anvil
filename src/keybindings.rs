@@ -1,6 +1,7 @@
-use gtk4::gdk::Key;
-use gtk4::gdk::ModifierType;
-use gtk4::glib::translate::IntoGlib;
+use gtk::gdk::Key;
+use gtk::gdk::ModifierType;
+use gtk::glib::translate::IntoGlib;
+use relm4::gtk;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 

@@ -17,10 +17,12 @@
 //! the drag started, so VTE's native per-cell selection still owns the common
 //! case.
 
+use relm4::gtk;
+
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use gtk4::prelude::*;
+use gtk::prelude::*;
 use vte4::TerminalExt;
 
 use crate::block_view::blocks::FinishedBlock;
@@ -38,7 +40,7 @@ pub(crate) struct CrossSelection {
 
 impl CrossSelection {
     pub(crate) fn install(
-        block_scroll: &gtk4::ScrolledWindow,
+        block_scroll: &gtk::ScrolledWindow,
         finished_blocks: Rc<RefCell<Vec<FinishedBlock>>>,
         active_vte: vte4::Terminal,
     ) -> Rc<Self> {
@@ -49,9 +51,9 @@ impl CrossSelection {
             claimed: Cell::new(false),
         });
 
-        let drag = gtk4::GestureDrag::new();
-        drag.set_button(gtk4::gdk::BUTTON_PRIMARY);
-        drag.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let drag = gtk::GestureDrag::new();
+        drag.set_button(gtk::gdk::BUTTON_PRIMARY);
+        drag.set_propagation_phase(gtk::PropagationPhase::Capture);
 
         let scroll_for_begin = block_scroll.clone();
         let this_for_begin = this.clone();
@@ -80,7 +82,7 @@ impl CrossSelection {
             }
             // Crossed a boundary: claim and paint per-widget select_all on the
             // covered range.
-            gesture.set_state(gtk4::EventSequenceState::Claimed);
+            gesture.set_state(gtk::EventSequenceState::Claimed);
             this_for_update.claimed.set(true);
             this_for_update.paint_range(start, cur_idx);
         });
@@ -113,8 +115,8 @@ impl CrossSelection {
     /// Find which VTE in `ordered_vtes()` the pointer `(x, y)` (in
     /// `block_scroll` coords) lies over. Returns None when the pointer is over
     /// chrome/empty space.
-    fn vte_index_at(&self, block_scroll: &gtk4::ScrolledWindow, x: f64, y: f64) -> Option<usize> {
-        let picked = block_scroll.pick(x, y, gtk4::PickFlags::DEFAULT)?;
+    fn vte_index_at(&self, block_scroll: &gtk::ScrolledWindow, x: f64, y: f64) -> Option<usize> {
+        let picked = block_scroll.pick(x, y, gtk::PickFlags::DEFAULT)?;
         let vtes = self.ordered_vtes();
         for (i, vte) in vtes.iter().enumerate() {
             if widget_contains(vte, &picked) {
@@ -179,9 +181,9 @@ impl CrossSelection {
 /// True if `needle` is `haystack` or one of its descendants. GTK's `pick()`
 /// returns the deepest widget at a coordinate (often a text view inside the
 /// VTE), so direct identity comparison won't match the VTE itself.
-fn widget_contains(haystack: &impl IsA<gtk4::Widget>, needle: &gtk4::Widget) -> bool {
-    let haystack = haystack.upcast_ref::<gtk4::Widget>();
-    let mut cur: Option<gtk4::Widget> = Some(needle.clone());
+fn widget_contains(haystack: &impl IsA<gtk::Widget>, needle: &gtk::Widget) -> bool {
+    let haystack = haystack.upcast_ref::<gtk::Widget>();
+    let mut cur: Option<gtk::Widget> = Some(needle.clone());
     while let Some(w) = cur {
         if &w == haystack {
             return true;

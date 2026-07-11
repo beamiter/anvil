@@ -1,7 +1,8 @@
 //! scroll — extracted from block_view (mechanical split, no logic changes)
-use gtk4::glib;
-use gtk4::prelude::*;
-use gtk4::ScrolledWindow;
+use gtk::glib;
+use gtk::prelude::*;
+use gtk::ScrolledWindow;
+use relm4::gtk;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -110,7 +111,7 @@ impl Clone for ViewportState {
 }
 
 pub(crate) struct WidgetPool {
-    pub(crate) available: Vec<gtk4::Box>,
+    pub(crate) available: Vec<gtk::Box>,
     pub(crate) max_pool_size: usize,
 }
 
@@ -122,11 +123,11 @@ impl WidgetPool {
         }
     }
 
-    pub(crate) fn acquire(&mut self) -> Option<gtk4::Box> {
+    pub(crate) fn acquire(&mut self) -> Option<gtk::Box> {
         self.available.pop()
     }
 
-    pub(crate) fn release(&mut self, widget: gtk4::Box) {
+    pub(crate) fn release(&mut self, widget: gtk::Box) {
         if self.available.len() < self.max_pool_size {
             // A recycled finished-block container has gesture/motion controllers
             // whose closures capture the old block ID and action handles. Keeping
@@ -137,7 +138,7 @@ impl WidgetPool {
             // fresh handlers for the new block.
             let controllers = widget.observe_controllers();
             while let Some(controller) = controllers.item(0) {
-                if let Ok(controller) = controller.downcast::<gtk4::EventController>() {
+                if let Ok(controller) = controller.downcast::<gtk::EventController>() {
                     widget.remove_controller(&controller);
                 } else {
                     break;

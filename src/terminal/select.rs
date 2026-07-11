@@ -6,7 +6,7 @@
 //! Ported from jterm4's `block_view/select.rs`.
 
 use gtk::prelude::*;
-use gtk4::TextBuffer;
+use gtk::TextBuffer;
 use regex::Regex;
 use relm4::gtk;
 use std::sync::LazyLock;

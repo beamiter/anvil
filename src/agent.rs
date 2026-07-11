@@ -26,15 +26,13 @@
 //!    callbacks) and clears `awaiting_output` so a late block-finished
 //!    event won't attach to a dead session.
 
-use std::cell::RefCell;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use adw::prelude::*;
 use relm4::adw;
 use relm4::gtk;
-use relm4::ComponentSender;
+use relm4::prelude::*;
 
 /// Hard cap on transcript bytes sent to the LLM. Past this, the middle is
 /// elided. Chosen well below typical 100k context windows so the system
@@ -350,14 +348,6 @@ pub(crate) struct AgentSession {
     /// How many model turns we've spent this session (incremented at
     /// each `next_turn` call). Compared against `agent_max_turns`.
     pub turns_used: u32,
-    /// UI handles. None when the panel is being built; populated by
-    /// `show_agent_panel` after the dialog is constructed so re-render
-    /// can find them.
-    pub transcript_box: Option<gtk::Box>,
-    pub spinner: Option<gtk::Spinner>,
-    pub status_label: Option<gtk::Label>,
-    pub send_btn: Option<gtk::Button>,
-    pub input_entry: Option<gtk::Entry>,
     /// Held so dropping the session cancels an in-flight LLM request.
     pub in_flight: Option<crate::ai::AiHandle>,
     /// Tab + pane the session is bound to. Commands are typed into this
@@ -377,11 +367,6 @@ impl AgentSession {
             awaiting_command: None,
             cancelled: Arc::new(AtomicBool::new(false)),
             turns_used: 0,
-            transcript_box: None,
-            spinner: None,
-            status_label: None,
-            send_btn: None,
-            input_entry: None,
             in_flight: None,
             bound_tab,
             bound_pane,
@@ -418,189 +403,329 @@ pub(crate) fn sample_observation(output: &str) -> String {
     elide_middle(output, MAX_OBS_BYTES)
 }
 
-/// Build and present the agent panel. The dialog is modal-ish (adw::Dialog).
-/// All user actions dispatch back through `sender` as variants of
-/// `crate::AppMsg` — we don't manipulate AppModel state directly here.
-///
-/// `session` is the freshly-constructed session whose UI handles we
-/// populate on the way out. The caller is expected to store the same
-/// `Rc` in `AppModel.active_agent` so update handlers can find it.
-pub(crate) fn show_agent_panel(
-    window: &adw::ApplicationWindow,
-    session: &Rc<RefCell<Option<AgentSession>>>,
-    sender: ComponentSender<crate::AppModel>,
-    provider_name: &str,
-    max_turns: u32,
-) {
-    let dialog = adw::Dialog::builder()
-        .title("AI agent")
-        .content_width(820)
-        .content_height(640)
-        .build();
-    let header = adw::HeaderBar::new();
-
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    content.set_margin_top(12);
-    content.set_margin_bottom(12);
-    content.set_margin_start(12);
-    content.set_margin_end(12);
-
-    let intro = gtk::Label::new(Some(&format!(
-        "Talk to {provider_name}. The model proposes one command per turn; you approve each before it runs. Output is fed back automatically. Max {max_turns} turns."
-    )));
-    intro.set_wrap(true);
-    intro.set_halign(gtk::Align::Start);
-    intro.add_css_class("dim-label");
-    content.append(&intro);
-
-    let transcript_box = gtk::Box::new(gtk::Orientation::Vertical, 10);
-    transcript_box.set_margin_top(4);
-    let transcript_scroll = gtk::ScrolledWindow::builder()
-        .hexpand(true)
-        .vexpand(true)
-        .child(&transcript_box)
-        .build();
-    content.append(&transcript_scroll);
-
-    let status_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let status_label = gtk::Label::new(Some(""));
-    status_label.set_halign(gtk::Align::Start);
-    status_label.set_hexpand(true);
-    status_label.add_css_class("dim-label");
-    let spinner = gtk::Spinner::new();
-    spinner.set_visible(false);
-    status_row.append(&status_label);
-    status_row.append(&spinner);
-    content.append(&status_row);
-
-    let input_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    let input = gtk::Entry::builder()
-        .placeholder_text("What do you want to do? (Enter to send)")
-        .hexpand(true)
-        .build();
-    let send_btn = gtk::Button::with_label("Send");
-    send_btn.add_css_class("suggested-action");
-    input_row.append(&input);
-    input_row.append(&send_btn);
-    content.append(&input_row);
-
-    let toolbar = adw::ToolbarView::new();
-    toolbar.add_top_bar(&header);
-    toolbar.set_content(Some(&content));
-    dialog.set_child(Some(&toolbar));
-
-    {
-        let mut sess = session.borrow_mut();
-        if let Some(sess) = sess.as_mut() {
-            sess.transcript_box = Some(transcript_box.clone());
-            sess.spinner = Some(spinner.clone());
-            sess.status_label = Some(status_label.clone());
-            sess.send_btn = Some(send_btn.clone());
-            sess.input_entry = Some(input.clone());
-        }
-    }
-
-    {
-        let sender = sender.clone();
-        let input = input.clone();
-        send_btn.connect_clicked(move |_| {
-            let text = input.text().to_string();
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
-                return;
-            }
-            input.set_text("");
-            sender.input(crate::AppMsg::AgentSend(trimmed.to_string()));
-        });
-    }
-    {
-        let sender = sender.clone();
-        let input_for_activate = input.clone();
-        input.connect_activate(move |entry| {
-            let text = entry.text().to_string();
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
-                return;
-            }
-            input_for_activate.set_text("");
-            sender.input(crate::AppMsg::AgentSend(trimmed.to_string()));
-        });
-    }
-
-    {
-        let sender = sender.clone();
-        dialog.connect_closed(move |_| {
-            sender.input(crate::AppMsg::AgentClose);
-        });
-    }
-
-    dialog.present(Some(window));
-    input.grab_focus();
-    rerender(session, sender);
+#[derive(Debug, Clone)]
+pub(crate) struct AgentPanelView {
+    pub(crate) transcript: Vec<Turn>,
+    pub(crate) turns_used: u32,
+    pub(crate) max_turns: u32,
+    pub(crate) awaiting_command: bool,
+    pub(crate) sealed: bool,
+    pub(crate) loading: bool,
 }
 
-/// Rebuild the transcript view from the current session state. Cheap to
-/// call after every transcript mutation — the panel typically holds a
-/// dozen widgets at most.
-pub(crate) fn rerender(
-    session: &Rc<RefCell<Option<AgentSession>>>,
-    sender: ComponentSender<crate::AppModel>,
-) {
-    let sess_borrow = session.borrow();
-    let Some(sess) = sess_borrow.as_ref() else {
-        return;
-    };
-    let Some(tb) = sess.transcript_box.as_ref() else {
-        return;
-    };
+#[derive(Debug)]
+pub(crate) enum AgentPanelMsg {
+    Open {
+        provider_name: String,
+        view: AgentPanelView,
+    },
+    Render(AgentPanelView),
+    Submit,
+    Closed,
+}
 
-    // Clear existing children.
-    while let Some(child) = tb.first_child() {
-        tb.remove(&child);
-    }
+#[derive(Debug)]
+pub(crate) enum AgentPanelOutput {
+    Send(String),
+    Approve(usize),
+    Edit(usize, String),
+    Reject(usize),
+    Closed,
+}
 
-    for (idx, turn) in sess.transcript.iter().enumerate() {
-        match turn {
-            Turn::User(msg) => tb.append(&render_user(msg)),
-            Turn::AssistantThought(msg) => tb.append(&render_thought(msg)),
-            Turn::AssistantSay(msg) => tb.append(&render_say(msg)),
-            Turn::AssistantProposed { cmd, approved } => {
-                tb.append(&render_proposed(
-                    idx,
-                    cmd,
-                    *approved,
-                    sender.clone(),
-                    sess.sealed,
-                ));
-            }
-            Turn::Observation {
-                exit,
-                output_sample,
-            } => {
-                tb.append(&render_observation(*exit, output_sample));
-            }
+pub(crate) struct AgentPanelModel {
+    parent: adw::ApplicationWindow,
+    view: AgentPanelView,
+}
+
+#[relm4::component(pub(crate))]
+impl Component for AgentPanelModel {
+    type Init = adw::ApplicationWindow;
+    type Input = AgentPanelMsg;
+    type Output = AgentPanelOutput;
+    type CommandOutput = ();
+
+    view! {
+        root = adw::Dialog {
+            set_title: "AI agent",
+            set_content_width: 820,
+            set_content_height: 640,
+            connect_closed => AgentPanelMsg::Closed,
+
+            #[wrap(Some)]
+            set_child = &adw::ToolbarView {
+                add_top_bar = &adw::HeaderBar {},
+
+                #[wrap(Some)]
+                set_content = &gtk::Box {
+                    set_orientation: gtk::Orientation::Vertical,
+                    set_spacing: 8,
+                    set_margin_all: 12,
+
+                    #[name(intro)]
+                    gtk::Label {
+                        set_wrap: true,
+                        set_halign: gtk::Align::Start,
+                        add_css_class: "dim-label",
+                    },
+
+                    gtk::ScrolledWindow {
+                        set_hexpand: true,
+                        set_vexpand: true,
+
+                        #[name(transcript_box)]
+                        gtk::Box {
+                            set_orientation: gtk::Orientation::Vertical,
+                            set_spacing: 10,
+                            set_margin_top: 4,
+                        },
+                    },
+
+                    gtk::Box {
+                        set_orientation: gtk::Orientation::Horizontal,
+                        set_spacing: 8,
+
+                        #[name(status)]
+                        gtk::Label {
+                            set_halign: gtk::Align::Start,
+                            set_hexpand: true,
+                            add_css_class: "dim-label",
+                        },
+
+                        #[name(spinner)]
+                        gtk::Spinner {
+                            set_visible: false,
+                        },
+                    },
+
+                    gtk::Box {
+                        set_orientation: gtk::Orientation::Horizontal,
+                        set_spacing: 6,
+
+                        #[name(input)]
+                        gtk::Entry {
+                            set_placeholder_text: Some("What do you want to do? (Enter to send)"),
+                            set_hexpand: true,
+                            connect_activate => AgentPanelMsg::Submit,
+                        },
+
+                        #[name(send_button)]
+                        gtk::Button {
+                            set_label: "Send",
+                            add_css_class: "suggested-action",
+                            connect_clicked => AgentPanelMsg::Submit,
+                        },
+                    },
+                },
+            },
         }
     }
 
-    if let Some(status) = sess.status_label.as_ref() {
-        let txt = if sess.sealed {
+    fn init(
+        parent: Self::Init,
+        root: Self::Root,
+        sender: ComponentSender<Self>,
+    ) -> ComponentParts<Self> {
+        let model = Self {
+            parent,
+            view: AgentPanelView {
+                transcript: Vec::new(),
+                turns_used: 0,
+                max_turns: 1,
+                awaiting_command: false,
+                sealed: false,
+                loading: false,
+            },
+        };
+        let widgets = view_output!();
+        ComponentParts { model, widgets }
+    }
+
+    fn update_with_view(
+        &mut self,
+        widgets: &mut Self::Widgets,
+        msg: Self::Input,
+        sender: ComponentSender<Self>,
+        root: &Self::Root,
+    ) {
+        match msg {
+            AgentPanelMsg::Open {
+                provider_name,
+                view,
+            } => {
+                widgets.intro.set_label(&format!(
+                    "Talk to {provider_name}. The model proposes one command per turn; you approve each before it runs. Output is fed back automatically. Max {} turns.",
+                    view.max_turns
+                ));
+                self.view = view;
+                self.render(widgets, sender);
+                root.present(Some(&self.parent));
+                widgets.input.grab_focus();
+            }
+            AgentPanelMsg::Render(view) => {
+                self.view = view;
+                self.render(widgets, sender);
+            }
+            AgentPanelMsg::Submit => {
+                let text = widgets.input.text();
+                let text = text.trim();
+                if !text.is_empty() && !self.view.sealed {
+                    let _ = sender.output(AgentPanelOutput::Send(text.to_string()));
+                    widgets.input.set_text("");
+                }
+            }
+            AgentPanelMsg::Closed => {
+                let _ = sender.output(AgentPanelOutput::Closed);
+            }
+        }
+    }
+}
+
+impl AgentPanelModel {
+    fn render(&self, widgets: &AgentPanelModelWidgets, sender: ComponentSender<Self>) {
+        while let Some(child) = widgets.transcript_box.first_child() {
+            widgets.transcript_box.remove(&child);
+        }
+        for (index, turn) in self.view.transcript.iter().enumerate() {
+            let widget = match turn {
+                Turn::User(message) => render_user(message),
+                Turn::AssistantThought(message) => render_thought(message),
+                Turn::AssistantSay(message) => render_say(message),
+                Turn::AssistantProposed { cmd, approved } => {
+                    render_proposed(index, cmd, *approved, sender.clone(), self.view.sealed)
+                }
+                Turn::Observation {
+                    exit,
+                    output_sample,
+                } => render_observation(*exit, output_sample),
+            };
+            widgets.transcript_box.append(&widget);
+        }
+        let status = if self.view.sealed {
             format!(
-                "Session sealed — open a new agent for more turns.  ({}/{})",
-                sess.turns_used,
-                sess.turns_used.max(1)
+                "Session sealed — open a new agent for more turns. ({}/{})",
+                self.view.turns_used, self.view.max_turns
             )
-        } else if sess.awaiting_command.is_some() {
+        } else if self.view.awaiting_command {
             "Waiting for command output…".to_string()
         } else {
-            format!("turn {}/{}", sess.turns_used, sess.turns_used.max(1))
+            format!("turn {}/{}", self.view.turns_used, self.view.max_turns)
         };
-        status.set_text(&txt);
+        widgets.status.set_label(&status);
+        widgets.send_button.set_sensitive(!self.view.sealed);
+        widgets.input.set_sensitive(!self.view.sealed);
+        widgets.spinner.set_visible(self.view.loading);
+        if self.view.loading {
+            widgets.spinner.start();
+        } else {
+            widgets.spinner.stop();
+        }
     }
-    if let Some(send) = sess.send_btn.as_ref() {
-        send.set_sensitive(!sess.sealed);
+}
+
+#[derive(Debug)]
+pub(crate) enum AgentEditMsg {
+    Open(usize, String),
+    Submit,
+    Close,
+}
+
+#[derive(Debug)]
+pub(crate) enum AgentEditOutput {
+    Approved(usize, String),
+}
+
+pub(crate) struct AgentEditModel {
+    parent: adw::ApplicationWindow,
+    index: usize,
+}
+
+#[relm4::component(pub(crate))]
+impl Component for AgentEditModel {
+    type Init = adw::ApplicationWindow;
+    type Input = AgentEditMsg;
+    type Output = AgentEditOutput;
+    type CommandOutput = ();
+
+    view! {
+        root = adw::Dialog {
+            set_title: "Edit command",
+            set_content_width: 560,
+            set_content_height: 180,
+
+            #[wrap(Some)]
+            set_child = &adw::ToolbarView {
+                add_top_bar = &adw::HeaderBar {},
+
+                #[wrap(Some)]
+                set_content = &gtk::Box {
+                    set_orientation: gtk::Orientation::Vertical,
+                    set_spacing: 8,
+                    set_margin_all: 12,
+
+                    #[name(entry)]
+                    gtk::Entry {
+                        set_hexpand: true,
+                        connect_activate => AgentEditMsg::Submit,
+                    },
+
+                    gtk::Box {
+                        set_orientation: gtk::Orientation::Horizontal,
+                        set_spacing: 6,
+                        set_halign: gtk::Align::End,
+
+                        gtk::Button {
+                            set_label: "Cancel",
+                            connect_clicked => AgentEditMsg::Close,
+                        },
+
+                        gtk::Button {
+                            set_label: "Run",
+                            add_css_class: "suggested-action",
+                            connect_clicked => AgentEditMsg::Submit,
+                        },
+                    },
+                },
+            },
+        }
     }
-    if let Some(input) = sess.input_entry.as_ref() {
-        input.set_sensitive(!sess.sealed);
+
+    fn init(
+        parent: Self::Init,
+        root: Self::Root,
+        sender: ComponentSender<Self>,
+    ) -> ComponentParts<Self> {
+        let model = Self { parent, index: 0 };
+        let widgets = view_output!();
+        ComponentParts { model, widgets }
+    }
+
+    fn update_with_view(
+        &mut self,
+        widgets: &mut Self::Widgets,
+        msg: Self::Input,
+        sender: ComponentSender<Self>,
+        root: &Self::Root,
+    ) {
+        match msg {
+            AgentEditMsg::Open(index, command) => {
+                self.index = index;
+                widgets.entry.set_text(&command);
+                widgets.entry.select_region(0, -1);
+                root.present(Some(&self.parent));
+                widgets.entry.grab_focus();
+            }
+            AgentEditMsg::Submit => {
+                let command = widgets.entry.text();
+                let command = command.trim();
+                if !command.is_empty() {
+                    root.force_close();
+                    let _ =
+                        sender.output(AgentEditOutput::Approved(self.index, command.to_string()));
+                }
+            }
+            AgentEditMsg::Close => root.force_close(),
+        }
     }
 }
 
@@ -643,7 +768,7 @@ fn render_proposed(
     idx: usize,
     cmd: &str,
     approved: Option<bool>,
-    sender: ComponentSender<crate::AppModel>,
+    sender: ComponentSender<AgentPanelModel>,
     sealed: bool,
 ) -> gtk::Widget {
     let frame = gtk::Frame::new(None);
@@ -693,19 +818,22 @@ fn render_proposed(
             let reject = gtk::Button::with_label("Reject");
             {
                 let sender = sender.clone();
-                approve.connect_clicked(move |_| sender.input(crate::AppMsg::AgentApprove(idx)));
-            }
-            {
-                let sender = sender.clone();
-                let cmd_str = cmd.to_string();
-                edit.connect_clicked(move |btn| {
-                    let parent = btn.root().and_then(|r| r.downcast::<gtk::Window>().ok());
-                    show_edit_dialog(parent.as_ref(), &cmd_str, sender.clone(), idx);
+                approve.connect_clicked(move |_| {
+                    let _ = sender.output(AgentPanelOutput::Approve(idx));
                 });
             }
             {
                 let sender = sender.clone();
-                reject.connect_clicked(move |_| sender.input(crate::AppMsg::AgentReject(idx)));
+                let cmd_str = cmd.to_string();
+                edit.connect_clicked(move |_| {
+                    let _ = sender.output(AgentPanelOutput::Edit(idx, cmd_str.clone()));
+                });
+            }
+            {
+                let sender = sender.clone();
+                reject.connect_clicked(move |_| {
+                    let _ = sender.output(AgentPanelOutput::Reject(idx));
+                });
             }
             btn_row.append(&reject);
             btn_row.append(&edit);
@@ -749,67 +877,6 @@ fn render_observation(exit: i32, output_sample: &str) -> gtk::Widget {
         .build();
     exp.set_child(Some(&scroll));
     exp.upcast()
-}
-
-fn show_edit_dialog(
-    parent: Option<&gtk::Window>,
-    initial: &str,
-    sender: ComponentSender<crate::AppModel>,
-    idx: usize,
-) {
-    let dialog = adw::Dialog::builder()
-        .title("Edit command")
-        .content_width(560)
-        .content_height(180)
-        .build();
-    let header = adw::HeaderBar::new();
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    content.set_margin_top(12);
-    content.set_margin_bottom(12);
-    content.set_margin_start(12);
-    content.set_margin_end(12);
-    let entry = gtk::Entry::builder().text(initial).hexpand(true).build();
-    content.append(&entry);
-    let btn_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    btn_row.set_halign(gtk::Align::End);
-    let cancel = gtk::Button::with_label("Cancel");
-    let run = gtk::Button::with_label("Run");
-    run.add_css_class("suggested-action");
-    btn_row.append(&cancel);
-    btn_row.append(&run);
-    content.append(&btn_row);
-    let toolbar = adw::ToolbarView::new();
-    toolbar.add_top_bar(&header);
-    toolbar.set_content(Some(&content));
-    dialog.set_child(Some(&toolbar));
-
-    let dialog_for_cancel = dialog.clone();
-    cancel.connect_clicked(move |_| {
-        let _ = dialog_for_cancel.close();
-    });
-
-    {
-        let dialog = dialog.clone();
-        let entry = entry.clone();
-        let sender = sender.clone();
-        run.connect_clicked(move |_| {
-            let new_cmd = entry.text().to_string();
-            let trimmed = new_cmd.trim();
-            if trimmed.is_empty() {
-                return;
-            }
-            sender.input(crate::AppMsg::AgentEditAndApprove(idx, trimmed.to_string()));
-            dialog.close();
-        });
-    }
-    {
-        let run = run.clone();
-        entry.connect_activate(move |_| {
-            run.emit_clicked();
-        });
-    }
-
-    dialog.present(parent);
 }
 
 fn elide_middle(s: &str, max_bytes: usize) -> String {

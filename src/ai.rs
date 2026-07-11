@@ -12,11 +12,12 @@
 //! palette). Block output passed to the cloud LLM is bounded (head/tail)
 //! by the caller before reaching us.
 
+use relm4::gtk;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use gtk4::glib;
+use gtk::glib;
 
 /// Default cap on response tokens for any AI call. Keeps explanations
 /// terse and bounds cost.
