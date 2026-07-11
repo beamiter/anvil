@@ -1016,8 +1016,16 @@ impl AppModel {
             zoom: None,
             remote: None,
         };
-        self.tabs.push(tab);
+        self.insert_tab_after_active(tab);
         self.select_tab(id, sender);
+    }
+
+    /// Insert a newly-created tab immediately after the active tab. Session
+    /// restoration intentionally bypasses this so its saved tab order remains
+    /// unchanged.
+    fn insert_tab_after_active(&mut self, tab: Tab) {
+        let insert_at = self.active.saturating_add(1).min(self.tabs.len());
+        self.tabs.insert(insert_at, tab);
     }
 
     /// Recreate a tab from a persisted snapshot, rebuilding the full nested
@@ -1303,7 +1311,7 @@ impl AppModel {
                 spawn_at: std::time::Instant::now(),
             }),
         };
-        self.tabs.push(tab);
+        self.insert_tab_after_active(tab);
         self.select_tab(id, sender);
     }
 
@@ -1609,7 +1617,7 @@ impl AppModel {
             zoom: None,
             remote: None,
         };
-        self.tabs.push(tab);
+        self.insert_tab_after_active(tab);
         self.select_tab(id, sender);
     }
 
@@ -1968,7 +1976,7 @@ impl AppModel {
             zoom: None,
             remote: None,
         };
-        self.tabs.push(new_tab);
+        self.insert_tab_after_active(new_tab);
         self.select_tab(new_id, sender);
     }
 
