@@ -403,6 +403,20 @@ mod tests {
     }
 
     #[test]
+    fn terminalize_command_line_breaks_return_to_the_command_column() {
+        assert_eq!(
+            terminalize_line_breaks(b"cd /tmp\npython3 demo.py"),
+            b"cd /tmp\r\npython3 demo.py"
+        );
+        // Preserve already-terminalized streams; ANSI formatting must not
+        // disturb the newline conversion either.
+        assert_eq!(
+            terminalize_line_breaks(b"\x1b[36mrun\x1b[0m\r\nnext"),
+            b"\x1b[36mrun\x1b[0m\r\nnext"
+        );
+    }
+
+    #[test]
     fn filter_output_lines_matches_case_insensitively_without_regex() {
         assert_eq!(
             filter_output_lines("alpha\nBeta\ngamma", "BETA", false, false, false, 0),
@@ -474,6 +488,32 @@ pub(crate) fn render_bytes_into_finished_vte(
     if let Some(adj) = vte.vadjustment() {
         adj.set_value(adj.lower());
     }
+}
+
+/// Convert logical line breaks to terminal line breaks before feeding a VTE.
+///
+/// `Terminal::feed` follows terminal semantics: a bare LF moves down but keeps
+/// the current column. Captured command text, however, uses ordinary Rust
+/// newlines between pasted/continued input lines. Feeding those bytes directly
+/// made every continuation start underneath the end of the preceding line.
+fn terminalize_line_breaks(bytes: &[u8]) -> Vec<u8> {
+    let extra_crs = bytes
+        .iter()
+        .enumerate()
+        .filter(|&(i, &b)| b == b'\n' && (i == 0 || bytes[i - 1] != b'\r'))
+        .count();
+    if extra_crs == 0 {
+        return bytes.to_vec();
+    }
+
+    let mut terminal_bytes = Vec::with_capacity(bytes.len() + extra_crs);
+    for (i, &byte) in bytes.iter().enumerate() {
+        if byte == b'\n' && (i == 0 || bytes[i - 1] != b'\r') {
+            terminal_bytes.push(b'\r');
+        }
+        terminal_bytes.push(byte);
+    }
+    terminal_bytes
 }
 
 impl FinishedBlock {
@@ -736,6 +776,9 @@ impl FinishedBlock {
             _ if cmd.is_empty() => b"(empty)".to_vec(),
             _ => highlight_command_to_ansi(cmd).into_bytes(),
         };
+        // Captured command strings use logical newlines. Convert them to CRLF
+        // for VTE so every pasted/continued line begins at the command column.
+        let cmd_bytes = terminalize_line_breaks(&cmd_bytes);
         // Command typically fits one line; allow a few in case of multiline pastes.
         let cmd_rows = cmd_bytes.iter().filter(|&&b| b == b'\n').count().max(0) as i64 + 1;
         let command_vte = create_finished_terminal(config, cols, cmd_rows.max(1), 5);
@@ -757,6 +800,12 @@ impl FinishedBlock {
                 fed.set(true);
                 w.set_size(cols_for_map, cmd_rows_for_map);
                 w.feed(&cmd_bytes_for_map);
+                // Gtk may otherwise allocate this VTE at one row, leaving the
+                // continuation lines in its internal scrollback.
+                let ch = w.char_height() as i32;
+                if ch > 0 {
+                    w.set_height_request(cmd_rows_for_map as i32 * ch);
+                }
             });
         }
 
