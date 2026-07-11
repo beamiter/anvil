@@ -23,67 +23,21 @@ pub struct OwnedPty {
     pid: Pid,
 }
 
-// Raw GLib FFI for g_unix_fd_add_full (not exposed by glib-rs).
-extern "C" {
-    fn g_unix_fd_add_full(
-        priority: i32,
-        fd: i32,
-        condition: u32,
-        function: extern "C" fn(fd: i32, condition: u32, user_data: *mut std::ffi::c_void) -> i32,
-        user_data: *mut std::ffi::c_void,
-        notify: extern "C" fn(data: *mut std::ffi::c_void),
-    ) -> u32;
-}
-
-const G_IO_IN: u32 = 1;
-// PTY data is allowed to be plentiful (for example a spinner repainting while
-// a command runs).  Run its source at idle priority so GTK first dispatches
-// pointer/button events.  At default priority a perpetually readable eventfd
-// can keep winning the main loop even though each dispatch is bounded below.
-const G_PRIORITY_DEFAULT_IDLE: i32 = 200;
-/// Bound the amount of shell output processed in one GLib source dispatch.
-/// A continuously chatty command (for example `RUST_LOG=debug` compositor
-/// output) otherwise keeps the PTY source ready forever and starves pointer
-/// and keyboard events, making tab switching appear broken.
-const MAX_MESSAGES_PER_DISPATCH: usize = 8;
-
-struct FdWatchData<F: FnMut() -> bool> {
-    callback: F,
-}
-
-extern "C" fn fd_watch_callback<F: FnMut() -> bool>(
-    _fd: i32,
-    _condition: u32,
-    user_data: *mut std::ffi::c_void,
-) -> i32 {
-    let data = unsafe { &mut *(user_data as *mut FdWatchData<F>) };
-    if (data.callback)() {
-        1
-    } else {
-        0
-    }
-}
-
-extern "C" fn fd_watch_destroy<F: FnMut() -> bool>(user_data: *mut std::ffi::c_void) {
-    unsafe {
-        drop(Box::from_raw(user_data as *mut FdWatchData<F>));
-    }
-}
-
-fn unix_fd_add_local<F: FnMut() -> bool + 'static>(fd: RawFd, func: F) {
-    let data = Box::new(FdWatchData { callback: func });
-    let ptr = Box::into_raw(data) as *mut std::ffi::c_void;
-    unsafe {
-        g_unix_fd_add_full(
-            G_PRIORITY_DEFAULT_IDLE,
-            fd,
-            G_IO_IN,
-            fd_watch_callback::<F>,
-            ptr,
-            fd_watch_destroy::<F>,
-        );
-    }
-}
+/// Process exactly one bounded chunk per GLib dispatch. Even at idle priority,
+/// one callback must return quickly enough for GTK to run input/layout sources.
+/// Eight 256 KiB chunks used to keep the main thread inside VTE feeding for
+/// long stretches, so mouse clicks appeared to do nothing while keyboard tab
+/// shortcuts occasionally slipped through.
+const MAX_MESSAGES_PER_DISPATCH: usize = 1;
+/// Bound queued PTY data and let the kernel PTY apply normal backpressure to a
+/// runaway producer. An unbounded channel can otherwise grow indefinitely while
+/// GTK consumes output more slowly than the child writes it.
+const PTY_QUEUE_CAPACITY: usize = 8;
+/// Pace main-thread terminal feeding. A readiness source immediately becomes
+/// ready again while a producer is chatty, so priority alone does not provide a
+/// frame boundary. At 8 ms and 32 KiB chunks the cap is about 4 MiB/s per PTY,
+/// while pointer and keyboard handling get a scheduling opportunity each tick.
+const PTY_DISPATCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(8);
 
 impl OwnedPty {
     fn close_master_fd(&self) {
@@ -187,9 +141,9 @@ impl OwnedPty {
         terminate_terminal_process(self.pid.as_raw());
     }
 
-    /// Spawn a background reader thread (64KB buffer); deliver data via an
-    /// eventfd-signaled mpsc channel processed on the GLib main thread.
-    pub fn start_reader<F, E>(&self, mut callback: F, on_exit: E)
+    /// Spawn a background reader thread; deliver bounded data through a
+    /// backpressured channel paced on the GLib main thread.
+    pub fn start_reader<F, E>(&self, callback: F, on_exit: E)
     where
         F: FnMut(Vec<u8>) + 'static,
         E: FnOnce(i32) + 'static,
@@ -205,95 +159,16 @@ impl OwnedPty {
         };
 
         let child_pid = self.pid;
-        let (tx, rx) = mpsc::channel::<PtyMsg>();
+        let (tx, rx) = mpsc::sync_channel::<PtyMsg>(PTY_QUEUE_CAPACITY);
 
-        let efd: RawFd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-        if efd < 0 {
-            self.start_reader_polling(fd, child_pid, tx, rx, callback, on_exit);
-            return;
-        }
-
-        let efd_for_thread = efd;
-
-        std::thread::spawn(move || {
-            let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-            let mut buf = [0u8; 65536];
-            loop {
-                match file.read(&mut buf) {
-                    Ok(0) | Err(_) => {
-                        std::mem::forget(file);
-                        break;
-                    }
-                    Ok(n) => {
-                        let mut combined = Vec::with_capacity(n + 4096);
-                        combined.extend_from_slice(&buf[..n]);
-                        // Coalesce bytes that arrive within ~1ms so a single PTY frame
-                        // (e.g. clear + repaint from `top`/`htop`) lands in VTE atomically
-                        // instead of as a clear-only chunk followed by a content chunk —
-                        // the latter renders an empty screen for one paint cycle and
-                        // shows up as flicker.
-                        coalesce_pending(fd, &mut file, &mut buf, &mut combined);
-                        if tx.send(PtyMsg::Data(combined)).is_err() {
-                            std::mem::forget(file);
-                            break;
-                        }
-                        signal_eventfd(efd_for_thread);
-                    }
-                }
-            }
-            reap_child(child_pid, &tx);
-            signal_eventfd(efd_for_thread);
-        });
-
-        let on_exit = std::cell::Cell::new(Some(on_exit));
-
-        unix_fd_add_local(efd, move || {
-            let mut val: u64 = 0;
-            unsafe {
-                libc::read(efd, &mut val as *mut u64 as *mut libc::c_void, 8);
-            }
-            let mut processed = 0usize;
-            loop {
-                match rx.try_recv() {
-                    Ok(PtyMsg::Data(data)) => {
-                        callback(data);
-                        processed += 1;
-                        if processed >= MAX_MESSAGES_PER_DISPATCH {
-                            // eventfd's read above consumed the aggregate wakeup
-                            // count. Re-signal it for queued data so GLib returns
-                            // to its main loop before this source runs again.
-                            signal_eventfd(efd);
-                            return true;
-                        }
-                    }
-                    Ok(PtyMsg::Exit(code)) => {
-                        if let Some(f) = on_exit.take() {
-                            f(code);
-                        }
-                        unsafe {
-                            libc::close(efd);
-                        }
-                        return false;
-                    }
-                    Err(mpsc::TryRecvError::Empty) => {
-                        return true;
-                    }
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        unsafe {
-                            libc::close(efd);
-                        }
-                        return false;
-                    }
-                }
-            }
-        });
+        self.start_reader_timed(fd, child_pid, tx, rx, callback, on_exit);
     }
 
-    fn start_reader_polling<F, E>(
+    fn start_reader_timed<F, E>(
         &self,
         fd: RawFd,
         child_pid: Pid,
-        tx: mpsc::Sender<PtyMsg>,
+        tx: mpsc::SyncSender<PtyMsg>,
         rx: mpsc::Receiver<PtyMsg>,
         mut callback: F,
         on_exit: E,
@@ -303,7 +178,7 @@ impl OwnedPty {
     {
         std::thread::spawn(move || {
             let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-            let mut buf = [0u8; 65536];
+            let mut buf = [0u8; 32 * 1024];
             loop {
                 match file.read(&mut buf) {
                     Ok(0) | Err(_) => {
@@ -327,36 +202,40 @@ impl OwnedPty {
         let on_exit = std::cell::Cell::new(Some(on_exit));
         let rx = std::cell::RefCell::new(rx);
 
-        glib::timeout_add_local(std::time::Duration::from_millis(1), move || {
-            let mut processed = 0usize;
-            loop {
-                match rx.borrow().try_recv() {
-                    Ok(PtyMsg::Data(data)) => {
-                        callback(data);
-                        processed += 1;
-                        if processed >= MAX_MESSAGES_PER_DISPATCH {
+        glib::timeout_add_local_full(
+            PTY_DISPATCH_INTERVAL,
+            glib::Priority::DEFAULT_IDLE,
+            move || {
+                let mut processed = 0usize;
+                loop {
+                    match rx.borrow().try_recv() {
+                        Ok(PtyMsg::Data(data)) => {
+                            callback(data);
+                            processed += 1;
+                            if processed >= MAX_MESSAGES_PER_DISPATCH {
+                                return glib::ControlFlow::Continue;
+                            }
+                        }
+                        Ok(PtyMsg::Exit(code)) => {
+                            if let Some(f) = on_exit.take() {
+                                f(code);
+                            }
+                            return glib::ControlFlow::Break;
+                        }
+                        Err(mpsc::TryRecvError::Empty) => {
                             return glib::ControlFlow::Continue;
                         }
-                    }
-                    Ok(PtyMsg::Exit(code)) => {
-                        if let Some(f) = on_exit.take() {
-                            f(code);
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            return glib::ControlFlow::Break;
                         }
-                        return glib::ControlFlow::Break;
-                    }
-                    Err(mpsc::TryRecvError::Empty) => {
-                        return glib::ControlFlow::Continue;
-                    }
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        return glib::ControlFlow::Break;
                     }
                 }
-            }
-        });
+            },
+        );
     }
 }
 
-fn reap_child(child_pid: Pid, tx: &mpsc::Sender<PtyMsg>) {
+fn reap_child(child_pid: Pid, tx: &mpsc::SyncSender<PtyMsg>) {
     use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
     let max_wait_secs = 5;
     for _ in 0..(max_wait_secs * 10) {
@@ -388,12 +267,12 @@ fn reap_child(child_pid: Pid, tx: &mpsc::Sender<PtyMsg>) {
 }
 
 /// Briefly poll the PTY master for more bytes already on the wire and append
-/// them onto `combined`. Caps work at 256KB / 8 follow-up reads so a steady
-/// firehose can't starve the main thread; the 1ms poll timeout is a tiny
+/// them onto `combined`. Caps each delivered chunk at 32 KiB so even a steady
+/// firehose cannot create a single long-running GTK callback; the 1ms timeout is a tiny
 /// fraction of a 60Hz frame budget but enough to merge clear+repaint pairs
 /// that one program emitted in a single render.
 fn coalesce_pending(fd: RawFd, file: &mut std::fs::File, buf: &mut [u8], combined: &mut Vec<u8>) {
-    const MAX_BYTES: usize = 256 * 1024;
+    const MAX_BYTES: usize = 32 * 1024;
     const MAX_FOLLOWUP_READS: u32 = 8;
     let mut follow_ups = 0u32;
     while combined.len() < MAX_BYTES && follow_ups < MAX_FOLLOWUP_READS {
@@ -406,18 +285,13 @@ fn coalesce_pending(fd: RawFd, file: &mut std::fs::File, buf: &mut [u8], combine
         if r <= 0 || (pfd.revents & libc::POLLIN) == 0 {
             break;
         }
-        match file.read(buf) {
+        let remaining = MAX_BYTES - combined.len();
+        let read_len = remaining.min(buf.len());
+        match file.read(&mut buf[..read_len]) {
             Ok(0) | Err(_) => break,
             Ok(m) => combined.extend_from_slice(&buf[..m]),
         }
         follow_ups += 1;
-    }
-}
-
-fn signal_eventfd(efd: RawFd) {
-    let val: u64 = 1;
-    unsafe {
-        libc::write(efd, &val as *const u64 as *const libc::c_void, 8);
     }
 }
 
