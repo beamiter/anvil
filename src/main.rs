@@ -2441,6 +2441,38 @@ impl AppModel {
         }
     }
 
+    /// Update a tab's displayed title without replacing its button.
+    ///
+    /// Some terminal applications (notably Codex CLI) animate an OSC title by
+    /// cycling a leading spinner glyph. Rebuilding the whole strip for every
+    /// frame destroys the button between pointer press and release, so GTK
+    /// never emits `clicked`. Keeping the existing widget alive also avoids a
+    /// surprising amount of layout and session-persistence work.
+    fn update_tab_title_widget(&self, id: u64, title: &str) -> bool {
+        let widget_name = format!("tab-{id}");
+        let mut row = self.tab_strip.first_child();
+        while let Some(row_widget) = row {
+            let mut child = row_widget.first_child();
+            while let Some(widget) = child {
+                if let Ok(button) = widget.clone().downcast::<gtk::ToggleButton>() {
+                    if button.widget_name() == widget_name {
+                        button.set_tooltip_text(Some(title));
+                        if let Some(label) = button
+                            .child()
+                            .and_then(|child| child.downcast::<gtk::Label>().ok())
+                        {
+                            label.set_label(title);
+                        }
+                        return true;
+                    }
+                }
+                child = widget.next_sibling();
+            }
+            row = row_widget.next_sibling();
+        }
+        false
+    }
+
     /// Flip the tab strip between the sidebar and the top bar, then persist.
     fn toggle_tab_placement(&self) {
         use config::TabPlacement;
@@ -2493,6 +2525,9 @@ impl AppModel {
             }
 
             let select_btn = gtk::ToggleButton::new();
+            // Stable identity lets title-only updates preserve this button and
+            // all of its click/drag gesture state.
+            select_btn.set_widget_name(&format!("tab-{}", tab.id));
             let title_label = gtk::Label::new(Some(&tab.title));
             title_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
             title_label.set_single_line_mode(true);
@@ -3262,8 +3297,21 @@ impl SimpleComponent for AppModel {
             AppMsg::TitleChanged(id, title) => {
                 if let Some(idx) = self.index_of(id) {
                     if !self.tabs[idx].custom_title && !title.is_empty() {
+                        let filter = self.tab_filter.to_lowercase();
+                        let was_visible = filter.is_empty()
+                            || self.tabs[idx].title.to_lowercase().contains(&filter);
+                        let is_visible =
+                            filter.is_empty() || title.to_lowercase().contains(&filter);
                         self.tabs[idx].title = title;
-                        self.rebuild_tab_strip(&sender);
+                        // A filter membership change really does alter the row
+                        // set. Otherwise update only the label: OSC-title
+                        // spinners can arrive many times per second.
+                        if was_visible != is_visible
+                            || (is_visible
+                                && !self.update_tab_title_widget(id, &self.tabs[idx].title))
+                        {
+                            self.rebuild_tab_strip(&sender);
+                        }
                     }
                 }
             }
