@@ -251,7 +251,7 @@ struct AppModel {
     file_tree_root: Rc<RefCell<std::path::PathBuf>>,
     tab_strip_scroll: gtk::ScrolledWindow,
     top_tab_scroll: gtk::ScrolledWindow,
-    top_tab_bar: gtk::Box,
+    sidebar_box: gtk::Box,
     sidebar_stack: gtk::Stack,
     sidebar_tabs_btn: gtk::ToggleButton,
     sidebar_files_btn: gtk::ToggleButton,
@@ -2084,7 +2084,7 @@ impl AppModel {
             }
             Action::ToggleSidebar => {
                 self.sidebar_visible = !self.sidebar_visible;
-                self.tab_strip.set_visible(self.sidebar_visible);
+                self.sidebar_box.set_visible(self.sidebar_visible);
             }
             Action::ToggleCommandPalette => {
                 self.reload_workflows();
@@ -2169,6 +2169,7 @@ impl AppModel {
             Action::CloseSelectedTabs => self.close_marked_tabs(sender),
             Action::FilterTabs => {
                 self.sidebar_visible = true;
+                self.sidebar_box.set_visible(true);
                 if self.tab_placement.get() == config::TabPlacement::Sidebar {
                     self.apply_sidebar_view(config::SidebarView::Tabs, true);
                 }
@@ -2315,6 +2316,7 @@ impl AppModel {
              .terminal-box scrollbar slider {{ background-color: rgba({fr},{fgg},{fb},0.4); }}
              .terminal-box scrollbar slider:hover {{ background-color: rgba({fr},{fgg},{fb},0.7); }}
              .top-bar {{ background-color: rgb({br},{bgg},{bb}); color: rgb({fr},{fgg},{fb}); }}
+             .top-bar-actions {{ background-color: rgb({br},{bgg},{bb}); }}
              .top-bar button {{ color: rgb({fr},{fgg},{fb}); }}
              .tab-strip {{ background-color: rgb({br},{bgg},{bb}); }}
              .tab-strip-btn {{ color: rgba({fr},{fgg},{fb},0.6); }}
@@ -2338,6 +2340,7 @@ impl AppModel {
                 self.tab_strip.set_valign(gtk::Align::Start);
                 self.tab_strip.set_hexpand(false);
                 self.tab_strip.set_vexpand(true);
+                self.tab_strip.set_width_request(-1);
                 self.tab_strip.remove_css_class("top-tabs");
                 self.tab_strip_scroll.set_child(Some(&self.tab_strip));
             }
@@ -2346,6 +2349,9 @@ impl AppModel {
                 self.tab_strip.set_valign(gtk::Align::Center);
                 self.tab_strip.set_hexpand(true);
                 self.tab_strip.set_vexpand(false);
+                // Do not let the sum of every tab's minimum width become the
+                // application's minimum width. The viewport owns overflow.
+                self.tab_strip.set_width_request(1);
                 self.tab_strip.add_css_class("top-tabs");
                 self.top_tab_scroll.set_child(Some(&self.tab_strip));
             }
@@ -2393,8 +2399,8 @@ impl AppModel {
         }
     }
 
-    /// Size a strip row and its tab button for the active placement. Top-bar
-    /// tabs use one persisted width; sidebar tabs continue to fill the sidebar.
+    /// Size tab rows for the active placement. Like jterm4, top-bar tabs use
+    /// their natural label width rather than a shared fixed width.
     fn apply_strip_row_placement(&self, row: &gtk::Widget) {
         match self.tab_placement.get() {
             config::TabPlacement::Sidebar => {
@@ -2415,17 +2421,16 @@ impl AppModel {
             }
             config::TabPlacement::TopBar => {
                 row.set_hexpand(false);
-                let width = self.config.borrow().tab_width as i32;
                 let mut child = row.first_child();
                 while let Some(widget) = child {
                     if let Ok(button) = widget.clone().downcast::<gtk::ToggleButton>() {
                         if button.has_css_class("tab-strip-btn") {
                             button.set_hexpand(false);
-                            button.set_width_request(width);
+                            button.set_width_request(-1);
                         }
                     }
                     if widget.has_css_class("tab-resize-handle") {
-                        widget.set_visible(true);
+                        widget.set_visible(false);
                     }
                     child = widget.next_sibling();
                 }
@@ -2433,11 +2438,17 @@ impl AppModel {
         }
     }
 
-    /// Show the top tab bar only when tabs live there.
+    /// Match jterm4: a lone tab needs no top-bar tab control.
     fn sync_tab_bar_visibility(&self) {
         match self.tab_placement.get() {
-            config::TabPlacement::Sidebar => self.top_tab_bar.set_visible(false),
-            config::TabPlacement::TopBar => self.top_tab_bar.set_visible(true),
+            config::TabPlacement::Sidebar => {
+                self.tab_strip_scroll.set_visible(true);
+                self.top_tab_scroll.set_visible(false);
+            }
+            config::TabPlacement::TopBar => {
+                self.tab_strip_scroll.set_visible(true);
+                self.top_tab_scroll.set_visible(self.tabs.len() > 1);
+            }
         }
     }
 
@@ -2532,7 +2543,14 @@ impl AppModel {
             title_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
             title_label.set_single_line_mode(true);
             title_label.set_xalign(0.0);
-            select_btn.set_child(Some(&title_label));
+            title_label.set_hexpand(true);
+            let close_icon = gtk::Image::from_icon_name("window-close-symbolic");
+            close_icon.add_css_class("tab-strip-close");
+            close_icon.set_opacity(0.0);
+            let tab_content = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+            tab_content.append(&title_label);
+            tab_content.append(&close_icon);
+            select_btn.set_child(Some(&tab_content));
             select_btn.set_tooltip_text(Some(&tab.title));
             select_btn.set_active(idx == self.active);
             select_btn.add_css_class("tab-strip-btn");
@@ -2551,6 +2569,43 @@ impl AppModel {
             let id = tab.id;
             let s = sender.clone();
             select_btn.connect_clicked(move |_| s.input(AppMsg::SelectTab(id)));
+
+            // Keep the close affordance within the tab control, matching
+            // jterm4, while showing it only when the tab is hovered.
+            let hover = gtk::EventControllerMotion::new();
+            let close_on_enter = close_icon.clone();
+            hover.connect_enter(move |_, _, _| close_on_enter.set_opacity(1.0));
+            let close_on_leave = close_icon.clone();
+            hover.connect_leave(move |_| close_on_leave.set_opacity(0.0));
+            select_btn.add_controller(hover);
+
+            // Intercept a press on the embedded icon before ToggleButton
+            // selects the tab. A separate nested Button is not valid GTK
+            // hierarchy, so use the icon's bounds as jterm4 does.
+            let close_click = gtk::GestureClick::new();
+            close_click.set_propagation_phase(gtk::PropagationPhase::Capture);
+            let close_icon_for_hit = close_icon.clone();
+            let select_btn_for_hit = select_btn.clone();
+            let close_sender = sender.clone();
+            let close_id = tab.id;
+            close_click.connect_pressed(move |gesture, _, x, y| {
+                let button_widget = select_btn_for_hit.upcast_ref::<gtk::Widget>();
+                let icon_widget = close_icon_for_hit.upcast_ref::<gtk::Widget>();
+                let point = gtk::graphene::Point::new(x as f32, y as f32);
+                if let Some(mapped) = button_widget.compute_point(icon_widget, &point) {
+                    let ix = mapped.x() as f64;
+                    let iy = mapped.y() as f64;
+                    if ix >= 0.0
+                        && iy >= 0.0
+                        && ix <= icon_widget.width() as f64
+                        && iy <= icon_widget.height() as f64
+                    {
+                        gesture.set_state(gtk::EventSequenceState::Claimed);
+                        close_sender.input(AppMsg::CloseTab(close_id));
+                    }
+                }
+            });
+            select_btn.add_controller(close_click);
 
             // Double-click to rename: a popover with a prefilled entry.
             let rename = gtk::GestureClick::new();
@@ -2688,14 +2743,8 @@ impl AppModel {
             });
             select_btn.add_controller(ctx);
 
-            let close_btn = gtk::Button::with_label("✕");
-            close_btn.add_css_class("tab-close");
-            let id2 = tab.id;
-            let s2 = sender.clone();
-            close_btn.connect_clicked(move |_| s2.input(AppMsg::CloseTab(id2)));
-
-            // The handle changes the shared top-tab width. Keeping it outside
-            // the button avoids conflicting with tab selection and reordering.
+            // Retained only for the existing row layout; jterm4's top tabs use
+            // their natural width, so this remains hidden in both placements.
             let resize_handle = gtk::Box::new(gtk::Orientation::Vertical, 0);
             resize_handle.add_css_class("tab-resize-handle");
             resize_handle.set_tooltip_text(Some("Drag to resize tabs"));
@@ -2754,7 +2803,6 @@ impl AppModel {
 
             row.append(&select_btn);
             row.append(&resize_handle);
-            row.append(&close_btn);
             self.apply_strip_row_placement(row.upcast_ref::<gtk::Widget>());
             self.tab_strip.append(&row);
         }
@@ -2769,12 +2817,11 @@ fn install_static_css() {
     provider.load_from_data(
         ".tab-strip-btn { padding: 4px 8px; border-radius: 4px; margin-bottom: 2px; color: #ffffff; }
          .tab-strip-btn:checked { font-weight: bold; border: 1px solid currentColor; border-radius: 4px; }
-         .tab-close { min-width: 16px; min-height: 16px; padding: 0; margin: 0; color: #ffffff; opacity: 0; }
-         .tab-resize-handle { min-width: 6px; margin: 0 1px; cursor: col-resize; }
-         .tab-row:hover .tab-close { opacity: 1; }
-         .tab-row.active-tab .tab-close { opacity: 1; }
-         .tab-strip { min-width: 140px; padding: 2px 4px; color: #ffffff; }
-         .tab-strip treeview { color: #ffffff; }
+         .tab-strip-close { min-width: 16px; min-height: 16px; color: #ffffff; }
+         .tab-resize-handle { min-width: 6px; margin: 0 1px; border-left: 1px solid rgba(255,255,255,0.38); cursor: col-resize; }
+         .tab-resize-handle:hover { border-left-color: rgba(255,255,255,0.9); }
+         .tab-strip { min-width: 140px; padding: 2px 4px; }
+         .file-tree { padding: 2px; }
          .sidebar-toggle { color: #ffffff; }
          .top-bar { padding: 2px 4px; }
          .terminal-box scrollbar slider { min-width: 6px; border-radius: 3px; }
@@ -2787,8 +2834,8 @@ fn install_static_css() {
          .conn-connecting { color: #f1fa8c; }
          .conn-connected { color: #50fa7b; }
          .conn-disconnected { color: #ff5555; }
-         .top-tab-bar { padding: 2px 4px; }
          .top-tabs { } .top-tabs .tab-row { margin-right: 2px; }
+         .top-tab-scroll, .top-tab-scroll > viewport { min-width: 0; }
          .sidebar-toggle-row { margin-bottom: 2px; }
          .sidebar-toggle { padding: 2px 6px; }",
     );
@@ -2816,56 +2863,15 @@ impl SimpleComponent for AppModel {
             gtk::Box {
                 set_orientation: gtk::Orientation::Vertical,
 
-                gtk::Box {
-                    set_orientation: gtk::Orientation::Horizontal,
-                    add_css_class: "top-bar",
-
-                    gtk::Button {
-                        set_label: "☰",
-                        connect_clicked[sender] => move |_| sender.input(AppMsg::ToggleSidebar),
-                    },
-                    gtk::Box { set_hexpand: true },
-                    gtk::Button {
-                        set_label: "+",
-                        connect_clicked[sender] => move |_| sender.input(AppMsg::NewTab),
-                    },
-                    gtk::Button {
-                        set_label: "✕",
-                        set_tooltip_text: Some("Close window"),
-                        add_css_class: "top-bar-close",
-                        connect_clicked[sender] => move |_| sender.input(AppMsg::Quit),
-                    },
-                },
-
-                // Top tab bar: holds the horizontal tab strip when tab
-                // placement is TopBar. Hidden in Sidebar mode.
                 #[local_ref]
-                top_tab_bar -> gtk::Box {
-                    set_orientation: gtk::Orientation::Horizontal,
-                    add_css_class: "top-tab-bar",
-                },
+                top_bar -> gtk::Overlay {},
 
                 #[local_ref]
                 search_bar -> gtk::SearchBar {},
 
-                gtk::Box {
-                    set_orientation: gtk::Orientation::Horizontal,
+                #[local_ref]
+                content_paned -> gtk::Paned {
                     set_vexpand: true,
-
-                    // Sidebar holds the view toggle (tabs / files) plus the
-                    // stack switching between them. Pinned non-expanding so it
-                    // does not compete with the terminal stack.
-                    #[local_ref]
-                    sidebar_box -> gtk::Box {
-                        #[watch]
-                        set_visible: model.sidebar_visible,
-                    },
-
-                    #[local_ref]
-                    stack -> gtk::Stack {
-                        set_hexpand: true,
-                        set_vexpand: true,
-                    },
                 },
             }
         }
@@ -2952,6 +2958,7 @@ impl SimpleComponent for AppModel {
         // File tree browser (lower half of the sidebar).
         let file_tree_store = file_tree::new_store();
         let file_tree_view = file_tree::new_view(&file_tree_store);
+        file_tree_view.add_css_class("file-tree");
         let file_tree_root_label = gtk::Label::new(Some("~"));
         file_tree_root_label.set_xalign(0.0);
         file_tree_root_label.set_ellipsize(gtk::pango::EllipsizeMode::Start);
@@ -3007,10 +3014,91 @@ impl SimpleComponent for AppModel {
         tab_strip_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
         tab_strip_scroll.set_vexpand(true);
         let top_tab_scroll = gtk::ScrolledWindow::new();
-        top_tab_scroll.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Never);
+        // The strip remains horizontally scrollable by touchpad/Shift+wheel,
+        // but its scrollbar must not consume a second row in the title bar.
+        top_tab_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Never);
         top_tab_scroll.set_hexpand(true);
-        let top_tab_bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        top_tab_bar.append(&top_tab_scroll);
+        top_tab_scroll.set_vexpand(false);
+        top_tab_scroll.set_overflow(gtk::Overflow::Hidden);
+        // It is the only expanding item in the toolbar and must yield space
+        // to the trailing New-tab / Close-window buttons as tabs accumulate.
+        top_tab_scroll.set_width_request(0);
+        top_tab_scroll.set_min_content_width(0);
+        top_tab_scroll.set_max_content_width(1);
+        top_tab_scroll.set_propagate_natural_width(false);
+        top_tab_scroll.add_css_class("top-tab-scroll");
+        top_tab_scroll.set_visible(false);
+
+        // Keep the toolbar controls above the tab viewport. Overlay children
+        // do not contribute to the window's minimum width, so hundreds of
+        // tabs cannot push the trailing controls (or the whole window) out.
+        let top_bar = gtk::Overlay::new();
+        top_bar.add_css_class("top-bar");
+        top_bar.set_hexpand(true);
+        // Overlay children do not participate in size measurement. Reserve
+        // the normal jterm4 toolbar height explicitly so the tabs and controls
+        // are not vertically clipped.
+        top_bar.set_height_request(40);
+        top_bar.set_child(Some(&gtk::Box::new(gtk::Orientation::Horizontal, 0)));
+
+        let top_left = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        top_left.set_halign(gtk::Align::Start);
+        top_left.set_valign(gtk::Align::Center);
+        let toggle_sidebar_btn = gtk::Button::from_icon_name("open-menu-symbolic");
+        toggle_sidebar_btn.set_focus_on_click(false);
+        toggle_sidebar_btn.set_can_focus(false);
+        toggle_sidebar_btn.set_tooltip_text(Some("Toggle sidebar (Ctrl+\\)"));
+        toggle_sidebar_btn.add_css_class("flat");
+        {
+            let sender = sender.clone();
+            toggle_sidebar_btn.connect_clicked(move |_| sender.input(AppMsg::ToggleSidebar));
+        }
+        let toggle_placement_btn = gtk::Button::from_icon_name("view-list-symbolic");
+        toggle_placement_btn.set_focus_on_click(false);
+        toggle_placement_btn.set_can_focus(false);
+        toggle_placement_btn.set_tooltip_text(Some("Toggle tabs: sidebar / top bar"));
+        toggle_placement_btn.add_css_class("flat");
+        {
+            let sender = sender.clone();
+            toggle_placement_btn.connect_clicked(move |_| {
+                sender.input(AppMsg::Action(Action::ToggleTabPlacement));
+            });
+        }
+        top_left.append(&toggle_sidebar_btn);
+        top_left.append(&toggle_placement_btn);
+
+        let top_right = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        top_right.add_css_class("top-bar-actions");
+        top_right.set_halign(gtk::Align::End);
+        top_right.set_valign(gtk::Align::Center);
+        let add_tab_button = gtk::Button::from_icon_name("list-add-symbolic");
+        add_tab_button.set_focus_on_click(false);
+        add_tab_button.set_can_focus(false);
+        add_tab_button.set_tooltip_text(Some("New tab (Ctrl+Shift+T)"));
+        add_tab_button.add_css_class("flat");
+        {
+            let sender = sender.clone();
+            add_tab_button.connect_clicked(move |_| sender.input(AppMsg::NewTab));
+        }
+        let close_window_button = gtk::Button::from_icon_name("window-close-symbolic");
+        close_window_button.set_focus_on_click(false);
+        close_window_button.set_can_focus(false);
+        close_window_button.set_tooltip_text(Some("Close window"));
+        close_window_button.add_css_class("flat");
+        {
+            let sender = sender.clone();
+            close_window_button.connect_clicked(move |_| sender.input(AppMsg::Quit));
+        }
+        top_right.append(&add_tab_button);
+        top_right.append(&close_window_button);
+
+        top_tab_scroll.set_margin_start(88);
+        // Leave enough room for both trailing buttons plus their spacing and
+        // the toolbar's horizontal padding; tab content is clipped before it.
+        top_tab_scroll.set_margin_end(104);
+        top_bar.add_overlay(&top_tab_scroll);
+        top_bar.add_overlay(&top_left);
+        top_bar.add_overlay(&top_right);
 
         // Segmented view toggle: Tabs | Files, driving sidebar_stack.
         let sidebar_tabs_btn = gtk::ToggleButton::with_label("Tabs");
@@ -3080,6 +3168,19 @@ impl SimpleComponent for AppModel {
         sidebar_box.append(&toggle_row);
         sidebar_box.append(&sidebar_stack);
 
+        // A Paned gives the sidebar the visible, draggable divider used by
+        // jterm4. Keep the sidebar at its persisted width on startup.
+        let content_paned = gtk::Paned::new(gtk::Orientation::Horizontal);
+        content_paned.set_vexpand(true);
+        content_paned.set_wide_handle(true);
+        content_paned.set_start_child(Some(&sidebar_box));
+        content_paned.set_end_child(Some(&stack));
+        content_paned.set_resize_start_child(false);
+        content_paned.set_resize_end_child(true);
+        content_paned.set_shrink_start_child(false);
+        content_paned.set_shrink_end_child(true);
+        content_paned.set_position(sidebar_width);
+
         let mut model = AppModel {
             config,
             themes: Rc::new(themes),
@@ -3105,7 +3206,7 @@ impl SimpleComponent for AppModel {
             file_tree_root: Rc::new(RefCell::new(std::path::PathBuf::new())),
             tab_strip_scroll: tab_strip_scroll.clone(),
             top_tab_scroll: top_tab_scroll.clone(),
-            top_tab_bar: top_tab_bar.clone(),
+            sidebar_box: sidebar_box.clone(),
             sidebar_stack: sidebar_stack.clone(),
             sidebar_tabs_btn: sidebar_tabs_btn.clone(),
             sidebar_files_btn: sidebar_files_btn.clone(),
@@ -3233,6 +3334,7 @@ impl SimpleComponent for AppModel {
             AppMsg::PrevTab => self.switch_tab(-1, &sender),
             AppMsg::ToggleSidebar => {
                 self.sidebar_visible = !self.sidebar_visible;
+                self.sidebar_box.set_visible(self.sidebar_visible);
             }
             AppMsg::Quit => {
                 self.window.close();
