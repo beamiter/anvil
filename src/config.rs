@@ -195,6 +195,8 @@ pub struct Config {
     pub(crate) sidebar_view: SidebarView,
     /// Sidebar width in pixels.
     pub(crate) sidebar_width: u32,
+    /// Width of each tab in the top tab bar, in pixels.
+    pub(crate) tab_width: u32,
     // Block view optimizations
     pub(crate) ansi_cache_capacity: u32,
     pub(crate) max_visible_blocks: u32,
@@ -417,6 +419,7 @@ struct FileConfig {
     tab_placement: Option<String>,
     sidebar_view: Option<String>,
     sidebar_width: Option<u32>,
+    tab_width: Option<u32>,
     // Block view optimizations
     ansi_cache_capacity: Option<u32>,
     max_visible_blocks: Option<u32>,
@@ -526,6 +529,10 @@ fn load_file_config() -> FileConfig {
             .map(|s| s.to_string()),
         sidebar_width: table
             .get("sidebar_width")
+            .and_then(|v| v.as_integer())
+            .map(|v| v as u32),
+        tab_width: table
+            .get("tab_width")
             .and_then(|v| v.as_integer())
             .map(|v| v as u32),
         ansi_cache_capacity: table
@@ -838,6 +845,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     );
     let sidebar_view = SidebarView::parse(&fc.sidebar_view.unwrap_or_else(|| "tabs".to_string()));
     let sidebar_width = fc.sidebar_width.unwrap_or(220).clamp(120, 800);
+    let tab_width = fc.tab_width.unwrap_or(180).clamp(80, 480);
 
     let config = Config {
         window_opacity,
@@ -856,6 +864,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         tab_placement,
         sidebar_view,
         sidebar_width,
+        tab_width,
         ansi_cache_capacity,
         max_visible_blocks,
         output_batch_min_ms,
@@ -955,6 +964,10 @@ pub(crate) fn save_config(config: &Config) {
     table.insert(
         "sidebar_width".into(),
         toml::Value::Integer(config.sidebar_width as i64),
+    );
+    table.insert(
+        "tab_width".into(),
+        toml::Value::Integer(config.tab_width as i64),
     );
 
     let mut colors = toml::Table::new();

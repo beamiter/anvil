@@ -35,6 +35,8 @@ use terminal::{default_tab_title, BlockTerminal, VteInit, VteInput, VteOutput, V
 
 const FONT_STEP: f64 = 0.025;
 const OPACITY_STEP: f64 = 0.025;
+const MIN_TAB_WIDTH: u32 = 80;
+const MAX_TAB_WIDTH: u32 = 480;
 
 #[derive(Debug, Clone)]
 enum AppMsg {
@@ -78,6 +80,7 @@ enum AppMsg {
     SearchPrev,
     SearchClose,
     // Tab management.
+    SetTabWidth(u32),
     RenameTab(u64, String),
     /// Drag-and-drop reorder: move the tab with this id to the target index.
     ReorderTab(u64, usize),
@@ -2245,7 +2248,7 @@ impl AppModel {
         }
     }
 
-    fn reload_config(&mut self) {
+    fn reload_config(&mut self, sender: &ComponentSender<AppModel>) {
         let (new_config, themes, new_kb) = load_config();
         let theme = themes
             .iter()
@@ -2260,6 +2263,7 @@ impl AppModel {
             config.font_desc = new_config.font_desc.clone();
             config.default_font_scale = new_config.default_font_scale;
             config.startup_commands = new_config.startup_commands.clone();
+            config.tab_width = new_config.tab_width;
             // Existing terminal widgets cannot change backend in place, but
             // every tab/pane created after a reload must use the new mode.
             config.terminal_mode = new_config.terminal_mode;
@@ -2290,6 +2294,7 @@ impl AppModel {
         *self.kbmap.borrow_mut() = new_kb;
         self.themes = Rc::new(themes);
         self.apply_dynamic_css();
+        self.rebuild_tab_strip(sender);
         log::info!("Configuration reloaded from disk");
     }
 
@@ -2388,12 +2393,43 @@ impl AppModel {
         }
     }
 
-    /// Size a single strip row for the active placement: fill width in the
-    /// sidebar, hug content in the top bar.
+    /// Size a strip row and its tab button for the active placement. Top-bar
+    /// tabs use one persisted width; sidebar tabs continue to fill the sidebar.
     fn apply_strip_row_placement(&self, row: &gtk::Widget) {
         match self.tab_placement.get() {
-            config::TabPlacement::Sidebar => row.set_hexpand(true),
-            config::TabPlacement::TopBar => row.set_hexpand(false),
+            config::TabPlacement::Sidebar => {
+                row.set_hexpand(true);
+                let mut child = row.first_child();
+                while let Some(widget) = child {
+                    if let Ok(button) = widget.clone().downcast::<gtk::ToggleButton>() {
+                        if button.has_css_class("tab-strip-btn") {
+                            button.set_hexpand(true);
+                            button.set_width_request(-1);
+                        }
+                    }
+                    if widget.has_css_class("tab-resize-handle") {
+                        widget.set_visible(false);
+                    }
+                    child = widget.next_sibling();
+                }
+            }
+            config::TabPlacement::TopBar => {
+                row.set_hexpand(false);
+                let width = self.config.borrow().tab_width as i32;
+                let mut child = row.first_child();
+                while let Some(widget) = child {
+                    if let Ok(button) = widget.clone().downcast::<gtk::ToggleButton>() {
+                        if button.has_css_class("tab-strip-btn") {
+                            button.set_hexpand(false);
+                            button.set_width_request(width);
+                        }
+                    }
+                    if widget.has_css_class("tab-resize-handle") {
+                        widget.set_visible(true);
+                    }
+                    child = widget.next_sibling();
+                }
+            }
         }
     }
 
@@ -2456,8 +2492,13 @@ impl AppModel {
                 row.append(&dot);
             }
 
-            let select_btn = gtk::ToggleButton::with_label(&tab.title);
-            select_btn.set_hexpand(true);
+            let select_btn = gtk::ToggleButton::new();
+            let title_label = gtk::Label::new(Some(&tab.title));
+            title_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            title_label.set_single_line_mode(true);
+            title_label.set_xalign(0.0);
+            select_btn.set_child(Some(&title_label));
+            select_btn.set_tooltip_text(Some(&tab.title));
             select_btn.set_active(idx == self.active);
             select_btn.add_css_class("tab-strip-btn");
             if tab.bell {
@@ -2618,6 +2659,42 @@ impl AppModel {
             let s2 = sender.clone();
             close_btn.connect_clicked(move |_| s2.input(AppMsg::CloseTab(id2)));
 
+            // The handle changes the shared top-tab width. Keeping it outside
+            // the button avoids conflicting with tab selection and reordering.
+            let resize_handle = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            resize_handle.add_css_class("tab-resize-handle");
+            resize_handle.set_tooltip_text(Some("Drag to resize tabs"));
+            let resize = gtk::GestureDrag::new();
+            resize.set_button(gtk::gdk::ffi::GDK_BUTTON_PRIMARY as u32);
+            let start_width = Rc::new(std::cell::Cell::new(0_i32));
+            {
+                let config = self.config.clone();
+                let start_width = start_width.clone();
+                resize.connect_drag_begin(move |_, _, _| {
+                    start_width.set(config.borrow().tab_width as i32);
+                });
+            }
+            {
+                let button = select_btn.clone();
+                let start_width = start_width.clone();
+                resize.connect_drag_update(move |_, dx, _| {
+                    let width = (start_width.get() + dx as i32)
+                        .clamp(MIN_TAB_WIDTH as i32, MAX_TAB_WIDTH as i32);
+                    button.set_width_request(width);
+                });
+            }
+            {
+                let sender = sender.clone();
+                let start_width = start_width.clone();
+                resize.connect_drag_end(move |_, dx, _| {
+                    let width = (start_width.get() + dx as i32)
+                        .clamp(MIN_TAB_WIDTH as i32, MAX_TAB_WIDTH as i32)
+                        as u32;
+                    sender.input(AppMsg::SetTabWidth(width));
+                });
+            }
+            resize_handle.add_controller(resize);
+
             // Drag-and-drop reorder: drag a tab button, drop onto another row.
             let drag = gtk::DragSource::new();
             drag.set_actions(gtk::gdk::DragAction::MOVE);
@@ -2641,6 +2718,7 @@ impl AppModel {
             row.add_controller(drop);
 
             row.append(&select_btn);
+            row.append(&resize_handle);
             row.append(&close_btn);
             self.apply_strip_row_placement(row.upcast_ref::<gtk::Widget>());
             self.tab_strip.append(&row);
@@ -2657,6 +2735,7 @@ fn install_static_css() {
         ".tab-strip-btn { padding: 4px 8px; border-radius: 4px; margin-bottom: 2px; color: #ffffff; }
          .tab-strip-btn:checked { font-weight: bold; border: 1px solid currentColor; border-radius: 4px; }
          .tab-close { min-width: 16px; min-height: 16px; padding: 0; margin: 0; color: #ffffff; opacity: 0; }
+         .tab-resize-handle { min-width: 6px; margin: 0 1px; cursor: col-resize; }
          .tab-row:hover .tab-close { opacity: 1; }
          .tab-row.active-tab .tab-close { opacity: 1; }
          .tab-strip { min-width: 140px; padding: 2px 4px; color: #ffffff; }
@@ -3129,7 +3208,12 @@ impl SimpleComponent for AppModel {
                 }
             }
             AppMsg::Action(action) => self.execute_action(action, &sender),
-            AppMsg::ReloadConfig => self.reload_config(),
+            AppMsg::ReloadConfig => self.reload_config(&sender),
+            AppMsg::SetTabWidth(width) => {
+                self.config.borrow_mut().tab_width = width.clamp(MIN_TAB_WIDTH, MAX_TAB_WIDTH);
+                self.rebuild_tab_strip(&sender);
+                config::save_config(&self.config.borrow());
+            }
             AppMsg::PaneExited(tab_id, pane_id, code) => {
                 // A remote single-pane tab that died abnormally is reconnected in
                 // place instead of closed; everything else closes normally.
