@@ -8,6 +8,9 @@
 use gtk4::pango::FontDescription;
 use gtk4::prelude::*;
 use relm4::prelude::*;
+use std::cell::Cell;
+use std::rc::Rc;
+use std::time::Duration;
 use vte4::prelude::TerminalExt;
 
 use crate::block_view::TermView;
@@ -76,10 +79,24 @@ impl Component for BlockTerminal {
                 let _ = sender.output(VteOutput::TitleChanged(title.to_string()));
             }
         });
+        // A live block can repaint many times a second (spinners/progress
+        // bars).  The tab model only needs a recent-activity notification, so
+        // coalesce those repaints before they enter Relm4's application queue.
+        // Without this, queued Activity messages can delay pointer clicks in
+        // the tab strip while the command is still producing output.
+        let activity_pending = Rc::new(Cell::new(false));
         view.connect_activity({
             let sender = sender.clone();
+            let activity_pending = activity_pending.clone();
             move || {
+                if activity_pending.replace(true) {
+                    return;
+                }
                 let _ = sender.output(VteOutput::Activity);
+                let activity_pending = activity_pending.clone();
+                gtk4::glib::timeout_add_local_once(Duration::from_millis(100), move || {
+                    activity_pending.set(false);
+                });
             }
         });
         view.connect_block_finished({

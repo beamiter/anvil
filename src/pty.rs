@@ -36,7 +36,11 @@ extern "C" {
 }
 
 const G_IO_IN: u32 = 1;
-const G_PRIORITY_DEFAULT: i32 = 0;
+// PTY data is allowed to be plentiful (for example a spinner repainting while
+// a command runs).  Run its source at idle priority so GTK first dispatches
+// pointer/button events.  At default priority a perpetually readable eventfd
+// can keep winning the main loop even though each dispatch is bounded below.
+const G_PRIORITY_DEFAULT_IDLE: i32 = 200;
 /// Bound the amount of shell output processed in one GLib source dispatch.
 /// A continuously chatty command (for example `RUST_LOG=debug` compositor
 /// output) otherwise keeps the PTY source ready forever and starves pointer
@@ -71,7 +75,7 @@ fn unix_fd_add_local<F: FnMut() -> bool + 'static>(fd: RawFd, func: F) {
     let ptr = Box::into_raw(data) as *mut std::ffi::c_void;
     unsafe {
         g_unix_fd_add_full(
-            G_PRIORITY_DEFAULT,
+            G_PRIORITY_DEFAULT_IDLE,
             fd,
             G_IO_IN,
             fd_watch_callback::<F>,
