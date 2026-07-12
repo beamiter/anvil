@@ -6,6 +6,27 @@ use relm4::gtk;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+/// Ignore sub-pixel adjustment churn. GTK can report tiny floating-point
+/// differences after layout even though the viewport is visually stationary;
+/// writing those values back wakes every value-changed observer for no benefit.
+const SCROLL_EPSILON_PX: f64 = 0.5;
+/// Once the computed bottom target is unchanged for this many layout frames,
+/// virtualized blocks have had enough time to realize and the pin can release.
+const BOTTOM_STABLE_FRAMES: u8 = 4;
+/// Safety bound for unusually slow virtual-layout settling.
+const MAX_BOTTOM_PIN_TRIES: u8 = 12;
+
+fn scroll_value_changed(current: f64, target: f64) -> bool {
+    (current - target).abs() > SCROLL_EPSILON_PX
+}
+
+fn next_stable_frame_count(last_target: Option<f64>, target: f64, current: u8) -> u8 {
+    match last_target {
+        Some(last) if !scroll_value_changed(last, target) => current.saturating_add(1),
+        _ => 0,
+    }
+}
+
 /// Scrolls the block list to follow the live prompt — jterm1's `autoscroll`
 /// model, ported faithfully.
 ///
@@ -40,6 +61,9 @@ impl ScrollDebouncer {
         }
         let adj = scroll.vadjustment();
         let target = (adj.upper() - adj.page_size()).max(adj.lower());
+        if !scroll_value_changed(adj.value(), target) {
+            return;
+        }
         // Guard the scroll with the programmatic flag so the scroll-lock detector
         // doesn't mistake it for the user dragging the scrollbar.
         self.programmatic_scroll.set(true);
@@ -64,26 +88,43 @@ impl ScrollDebouncer {
         let user_scrolled = self.user_scrolled_up.clone();
         let programmatic = self.programmatic_scroll.clone();
         let tries = Rc::new(Cell::new(0u8));
+        let last_target = Rc::new(Cell::new(None::<f64>));
+        let stable_frames = Rc::new(Cell::new(0u8));
 
         // An idle source that returns `Continue` can run all retries before GTK
         // reaches another layout frame. Virtualized blocks then have not expanded
         // yet, so every retry observes the same stale adjustment. Space the
         // bounded retries over frames instead.
         glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
-            if user_scrolled.get() || tries.get() >= 12 {
+            if user_scrolled.get() || tries.get() >= MAX_BOTTOM_PIN_TRIES {
                 return glib::ControlFlow::Break;
             }
             tries.set(tries.get() + 1);
 
             let adj = scroll.vadjustment();
             let target = (adj.upper() - adj.page_size()).max(adj.lower());
-            programmatic.set(true);
-            adj.set_value(target);
-            programmatic.set(false);
-            // Virtualized blocks can become visible a frame or two after this
-            // target appears stable. Keep pinning for the bounded settling
-            // window so the new live prompt cannot be left below the viewport.
-            glib::ControlFlow::Continue
+            let next_stable =
+                next_stable_frame_count(last_target.get(), target, stable_frames.get());
+            last_target.set(Some(target));
+            stable_frames.set(next_stable);
+
+            // Avoid re-emitting value-changed when layout has not moved the bottom.
+            // Besides reducing work, this releases the viewport sooner so a user
+            // wheel/drag immediately after command completion does not feel fought.
+            if scroll_value_changed(adj.value(), target) {
+                programmatic.set(true);
+                adj.set_value(target);
+                programmatic.set(false);
+            }
+
+            if next_stable >= BOTTOM_STABLE_FRAMES {
+                glib::ControlFlow::Break
+            } else {
+                // Virtualized blocks can become visible a frame or two after this
+                // target appears stable. Require several stable frames before
+                // stopping, while retaining the bounded retry fallback above.
+                glib::ControlFlow::Continue
+            }
         });
     }
 
@@ -155,3 +196,21 @@ impl WidgetPool {
 pub(crate) type StrCallbacks = Rc<RefCell<Vec<Box<dyn Fn(&str)>>>>;
 pub(crate) type IntCallbacks = Rc<RefCell<Vec<Box<dyn Fn(i32)>>>>;
 pub(crate) type VoidCallbacks = Rc<RefCell<Vec<Box<dyn Fn()>>>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ignores_subpixel_scroll_churn() {
+        assert!(!scroll_value_changed(100.0, 100.4));
+        assert!(scroll_value_changed(100.0, 100.6));
+    }
+
+    #[test]
+    fn stable_frame_count_resets_when_layout_moves() {
+        assert_eq!(next_stable_frame_count(None, 100.0, 3), 0);
+        assert_eq!(next_stable_frame_count(Some(100.0), 100.2, 2), 3);
+        assert_eq!(next_stable_frame_count(Some(100.0), 101.0, 3), 0);
+    }
+}
