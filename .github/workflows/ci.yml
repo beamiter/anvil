@@ -35,7 +35,8 @@ jobs:
             pkg-config \
             libgtk-4-dev \
             libadwaita-1-dev \
-            libvte-2.91-gtk4-dev
+            libvte-2.91-gtk4-dev \
+            xvfb
 
       - name: Install Rust toolchain
         run: |
@@ -62,16 +63,21 @@ jobs:
         run: cargo check --all-targets
 
       - name: Run tests
-        run: cargo test --all-targets --no-fail-fast
+        id: tests
+        run: xvfb-run --auto-servernum cargo test --all-targets --no-fail-fast 2>&1 | tee test.log
 
       - name: Run Clippy
         id: clippy
+        if: ${{ !cancelled() }}
         run: cargo clippy --all-targets -- -D warnings 2>&1 | tee clippy.log
 
-      - name: Upload Clippy diagnostics
-        if: ${{ failure() && steps.clippy.outcome == 'failure' }}
+      - name: Upload CI diagnostics
+        if: ${{ failure() }}
         uses: actions/upload-artifact@v4
         with:
-          name: clippy-diagnostics
-          path: clippy.log
+          name: ci-diagnostics
+          path: |
+            test.log
+            clippy.log
+          if-no-files-found: ignore
           retention-days: 7
