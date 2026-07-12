@@ -3215,7 +3215,7 @@ fn main() {
 /// falls back to raw keysyms. Each var is only filled in when the environment
 /// hasn't already set it, so an existing (e.g. ibus) setup is left untouched.
 fn init_input_method_env() {
-    let is_unset = |k: &str| std::env::var_os(k).map_or(true, |v| v.is_empty());
+    let is_unset = |k: &str| std::env::var_os(k).is_none_or(|v| v.is_empty());
 
     if let Some(fcitx_gtk_path) = option_env!("FCITX5_GTK_PATH") {
         if !fcitx_gtk_path.is_empty() {

@@ -781,7 +781,7 @@ impl FinishedBlock {
         // for VTE so every pasted/continued line begins at the command column.
         let cmd_bytes = terminalize_line_breaks(&cmd_bytes);
         // Command typically fits one line; allow a few in case of multiline pastes.
-        let cmd_rows = cmd_bytes.iter().filter(|&&b| b == b'\n').count().max(0) as i64 + 1;
+        let cmd_rows = cmd_bytes.iter().filter(|&&b| b == b'\n').count() as i64 + 1;
         let command_vte = create_finished_terminal(config, cols, cmd_rows.max(1), 5);
         // Defer feeds until the widget is actually mapped — VTE's internal
         // grid resize from set_size() doesn't take effect until the widget is

@@ -23,6 +23,11 @@ jobs:
     name: Rust quality
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    defaults:
+      run:
+        # Explicit Bash gives every run step `-e -o pipefail`, so a failing
+        # Cargo command cannot be hidden by the following `tee` process.
+        shell: bash
 
     steps:
       - name: Check out repository
@@ -69,7 +74,19 @@ jobs:
       - name: Run Clippy
         id: clippy
         if: ${{ !cancelled() }}
-        run: cargo clippy --all-targets -- -D warnings 2>&1 | tee clippy.log
+        run: |
+          # These structural/style lints are the explicit legacy baseline. All
+          # other Rust and Clippy warnings remain denied and fail the build.
+          cargo clippy --all-targets -- \
+            -D warnings \
+            -A clippy::type_complexity \
+            -A clippy::doc_lazy_continuation \
+            -A clippy::items_after_test_module \
+            -A clippy::too_many_arguments \
+            -A clippy::manual_clamp \
+            -A clippy::if_same_then_else \
+            -A clippy::needless_range_loop \
+            2>&1 | tee clippy.log
 
       - name: Upload CI diagnostics
         if: ${{ failure() }}

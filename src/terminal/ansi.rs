@@ -558,11 +558,9 @@ pub fn ansi_text_runs(input: &str, palette: &[RGBA; 16]) -> Vec<AnsiTextRun> {
                             }
                         }
                     }
-                    '(' | ')' => {
-                        if i < input.len() {
-                            let ch = input[i..].chars().next().unwrap();
-                            i += ch.len_utf8();
-                        }
+                    '(' | ')' if i < input.len() => {
+                        let ch = input[i..].chars().next().unwrap();
+                        i += ch.len_utf8();
                     }
                     _ => {}
                 }

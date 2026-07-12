@@ -1257,7 +1257,7 @@ mod tests {
         // leak into the rendered output; the placeholder takes its place.
         let mut bytes: Vec<u8> = Vec::new();
         bytes.extend_from_slice(b"before \x1bPq");
-        bytes.extend(std::iter::repeat(b'#').take(200));
+        bytes.extend(std::iter::repeat_n(b'#', 200));
         bytes.extend_from_slice(b"\x1b\\ after");
         let out = render_to_text(&bytes, 80, 24);
         assert!(!out.contains("##########"), "raw payload leaked: {out:?}");
@@ -1271,7 +1271,7 @@ mod tests {
         // \e_G ...payload... \e\
         let mut bytes: Vec<u8> = Vec::new();
         bytes.extend_from_slice(b"x\x1b_G");
-        bytes.extend(std::iter::repeat(b'a').take(50));
+        bytes.extend(std::iter::repeat_n(b'a', 50));
         bytes.extend_from_slice(b"\x1b\\y");
         let out = render_to_text(&bytes, 80, 24);
         assert!(!out.contains("aaaaaaaaaa"), "raw payload leaked: {out:?}");

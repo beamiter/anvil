@@ -163,7 +163,7 @@ pub(crate) fn contains_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool 
             if candidate
                 .iter()
                 .zip(needle.iter())
-                .all(|(&h, &n)| h.to_ascii_lowercase() == n.to_ascii_lowercase())
+                .all(|(&h, &n)| h.eq_ignore_ascii_case(&n))
             {
                 return true;
             }
