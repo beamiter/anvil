@@ -23,6 +23,11 @@ jobs:
     name: Rust quality
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    defaults:
+      run:
+        # Explicit Bash gives every run step `-e -o pipefail`, so a failing
+        # Cargo command cannot be hidden by the following `tee` process.
+        shell: bash
 
     steps:
       - name: Check out repository
