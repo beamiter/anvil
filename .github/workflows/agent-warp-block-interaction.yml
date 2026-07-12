@@ -6,6 +6,11 @@ on:
       - agent/warp-block-detail-parity
     paths:
       - .agent-warp-block-interaction-trigger
+  pull_request:
+    branches:
+      - master
+    paths:
+      - .agent-warp-block-interaction-trigger
 
 permissions:
   contents: write
