@@ -1,4 +1,4 @@
-//! scroll — extracted from block_view (mechanical split, no logic changes)
+//! Block-view scrolling, follow-bottom settling, and widget virtualization.
 use gtk::glib;
 use gtk::prelude::*;
 use gtk::ScrolledWindow;
@@ -27,6 +27,20 @@ fn next_stable_frame_count(last_target: Option<f64>, target: f64, current: u8) -
     }
 }
 
+/// Claim the single follow-bottom settling source.
+///
+/// PTY output can request a deferred pin several times before the next GTK frame.
+/// Starting one timer per request makes those timers outlive each other and keeps
+/// pulling the viewport after the layout is already stable. Coalesce all requests
+/// into the active source: it observes the latest adjustment geometry on every
+/// frame, so another source would add work without improving correctness.
+fn try_begin_bottom_pin(user_scrolled: bool, active: &Cell<bool>) -> bool {
+    if user_scrolled || active.replace(true) {
+        return false;
+    }
+    true
+}
+
 /// Scrolls the block list to follow the live prompt — jterm1's `autoscroll`
 /// model, ported faithfully.
 ///
@@ -42,6 +56,10 @@ fn next_stable_frame_count(last_target: Option<f64>, target: f64, current: u8) -
 pub(crate) struct ScrollDebouncer {
     pub(crate) user_scrolled_up: Rc<Cell<bool>>,
     pub(crate) programmatic_scroll: Rc<Cell<bool>>,
+    /// At most one frame-spaced follow-bottom source may run at a time. Repeated
+    /// output/layout notifications are naturally absorbed by that source because
+    /// it recomputes the current target on each frame.
+    bottom_pin_active: Rc<Cell<bool>>,
 }
 
 impl ScrollDebouncer {
@@ -52,6 +70,7 @@ impl ScrollDebouncer {
         Self {
             user_scrolled_up,
             programmatic_scroll,
+            bottom_pin_active: Rc::new(Cell::new(false)),
         }
     }
 
@@ -80,13 +99,14 @@ impl ScrollDebouncer {
     /// keeps the latest finished block and prompt visible instead of leaving
     /// their lower rows clipped behind the active cell.
     pub(crate) fn pin_to_bottom_deferred(&self, scroll: &ScrolledWindow) {
-        if self.user_scrolled_up.get() {
+        if !try_begin_bottom_pin(self.user_scrolled_up.get(), &self.bottom_pin_active) {
             return;
         }
 
         let scroll = scroll.clone();
         let user_scrolled = self.user_scrolled_up.clone();
         let programmatic = self.programmatic_scroll.clone();
+        let bottom_pin_active = self.bottom_pin_active.clone();
         let tries = Rc::new(Cell::new(0u8));
         let last_target = Rc::new(Cell::new(None::<f64>));
         let stable_frames = Rc::new(Cell::new(0u8));
@@ -97,6 +117,7 @@ impl ScrollDebouncer {
         // bounded retries over frames instead.
         glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
             if user_scrolled.get() || tries.get() >= MAX_BOTTOM_PIN_TRIES {
+                bottom_pin_active.set(false);
                 return glib::ControlFlow::Break;
             }
             tries.set(tries.get() + 1);
@@ -118,6 +139,7 @@ impl ScrollDebouncer {
             }
 
             if next_stable >= BOTTOM_STABLE_FRAMES {
+                bottom_pin_active.set(false);
                 glib::ControlFlow::Break
             } else {
                 // Virtualized blocks can become visible a frame or two after this
@@ -212,5 +234,18 @@ mod tests {
         assert_eq!(next_stable_frame_count(None, 100.0, 3), 0);
         assert_eq!(next_stable_frame_count(Some(100.0), 100.2, 2), 3);
         assert_eq!(next_stable_frame_count(Some(100.0), 101.0, 3), 0);
+    }
+
+    #[test]
+    fn bottom_pin_coalesces_overlapping_requests() {
+        let active = Cell::new(false);
+
+        assert!(try_begin_bottom_pin(false, &active));
+        assert!(active.get());
+        assert!(!try_begin_bottom_pin(false, &active));
+
+        active.set(false);
+        assert!(!try_begin_bottom_pin(true, &active));
+        assert!(!active.get());
     }
 }
