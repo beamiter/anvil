@@ -23,15 +23,15 @@ jobs:
       - name: Capture patch diagnostics
         run: |
           set +e
-          python3 .github/scripts/agent_warp_block_interaction.py > .agent-warp-block-interaction-result 2>&1
+          python3 .github/scripts/agent_warp_block_interaction.py > warp-block-interaction-result.txt 2>&1
           status=$?
-          echo "status=$status" >> .agent-warp-block-interaction-result
-          cat .agent-warp-block-interaction-result
+          echo "status=$status" >> warp-block-interaction-result.txt
+          cat warp-block-interaction-result.txt
           exit 0
 
       - name: Upload diagnostics
         uses: actions/upload-artifact@v4
         with:
           name: warp-block-interaction-diagnostics
-          path: .agent-warp-block-interaction-result
+          path: warp-block-interaction-result.txt
           retention-days: 1
