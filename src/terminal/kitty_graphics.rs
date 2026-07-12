@@ -256,7 +256,7 @@ fn decode_base64(input: &[u8]) -> Option<Vec<u8>> {
         bits += 6;
         if bits >= 8 {
             bits -= 8;
-            out.push((buf >> bits) as u8 & 0xFF);
+            out.push((buf >> bits) as u8);
             buf &= (1u32 << bits) - 1;
         }
     }

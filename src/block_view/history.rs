@@ -120,7 +120,7 @@ impl TermView {
         for (idx, block) in temp_blocks.into_iter().enumerate() {
             if idx >= start_idx {
                 log::debug!("Loaded historical block #{}: prompt={:?}, cmd={:?}, output_len={}, exit_code={}",
-                    idx, &block.prompt, &block.cmd, block.output.len(), block.exit_code);
+                    idx, block.prompt, block.cmd, block.output.len(), block.exit_code);
                 blocks.push_back(block);
             }
         }

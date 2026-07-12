@@ -235,7 +235,7 @@ mod tests {
         std::fs::write(dir.join("a.yaml"), "name: A\ncommand: echo a\n").unwrap();
         std::fs::write(dir.join("b.yaml"), "this: is not a workflow\n").unwrap();
         std::fs::write(dir.join("c.yaml"), "name: C\ncommand: echo c\n").unwrap();
-        let loaded = load_all(&[dir.clone()]);
+        let loaded = load_all(std::slice::from_ref(&dir));
         let names: Vec<&str> = loaded.iter().map(|w| w.name.as_str()).collect();
         assert_eq!(names, vec!["A", "C"], "names actually {:?}", names);
         let _ = std::fs::remove_dir_all(dir);

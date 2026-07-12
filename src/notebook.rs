@@ -63,7 +63,7 @@ pub(crate) fn parse_segments(input: &str) -> Vec<Segment> {
             let lang = line.trim_start_matches(fence).trim().to_string();
             let mut src = String::new();
             let mut closed = false;
-            while let Some(inner) = lines.next() {
+            for inner in lines.by_ref() {
                 if fence_marker(inner).map(|m| m == fence).unwrap_or(false) {
                     closed = true;
                     break;

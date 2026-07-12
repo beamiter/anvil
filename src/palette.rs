@@ -279,7 +279,7 @@ fn push_if_match(matcher: &SkimMatcherV2, needle: &str, mut e: Entry, out: &mut 
     if let Some(s) = score {
         // Preserve the recency baseline as a tiny tie-breaker beneath the
         // fuzzy score so equally-good matches keep their recency order.
-        e.score = s.saturating_mul(1000) + e.score;
+        e.score += s.saturating_mul(1000);
         out.push(e);
     }
 }

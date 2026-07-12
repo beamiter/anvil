@@ -144,10 +144,7 @@ fn sanitize_input_chunk(
         return (Cow::Owned(wrapped), next_paste_active);
     }
 
-    (
-        Cow::Owned(data[..first_break].to_vec()),
-        next_paste_active,
-    )
+    (Cow::Owned(data[..first_break].to_vec()), next_paste_active)
 }
 
 impl OwnedPty {
@@ -225,11 +222,8 @@ impl OwnedPty {
     pub fn write_bytes(&self, data: &[u8]) {
         let paste_active = self.outgoing_bracketed_paste.load(Ordering::Relaxed);
         let shell_supports_bracketed_paste = self.shell_bracketed_paste.load(Ordering::Relaxed);
-        let (safe_data, next_paste_active) = sanitize_input_chunk(
-            data,
-            paste_active,
-            shell_supports_bracketed_paste,
-        );
+        let (safe_data, next_paste_active) =
+            sanitize_input_chunk(data, paste_active, shell_supports_bracketed_paste);
         self.outgoing_bracketed_paste
             .store(next_paste_active, Ordering::Relaxed);
 
