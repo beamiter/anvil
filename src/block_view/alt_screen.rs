@@ -93,7 +93,7 @@ fn finished_buffer_rows_from_adjustment(lower: f64, upper: f64, visible_rows: i6
 /// `feed()`, not a string-width estimate: ANSI controls, wide/combining glyphs,
 /// tabs, carriage-return redraws and automatic wrapping are all already resolved
 /// by VTE at this point.
-fn expand_finished_terminal_to_buffer(terminal: &Terminal, finalize: bool) {
+pub(crate) fn expand_finished_terminal_to_buffer(terminal: &Terminal, finalize: bool) {
     let visible_rows = terminal.row_count().max(1);
     let rows = terminal
         .vadjustment()
@@ -118,6 +118,27 @@ fn expand_finished_terminal_to_buffer(terminal: &Terminal, finalize: bool) {
     if let Some(adj) = terminal.vadjustment() {
         adj.set_value(adj.lower());
     }
+}
+
+/// Settle a finished snapshot after bytes have been fed. VTE updates its grid
+/// and adjustment asynchronously, so use two idle passes: the first folds any
+/// overflow/soft-wrapped rows into the widget, and the second removes the
+/// temporary private scrollback once those rows are part of the card itself.
+pub(crate) fn settle_finished_terminal_after_feed(terminal: &Terminal) {
+    let terminal = terminal.clone();
+    glib::idle_add_local_once(move || {
+        expand_finished_terminal_to_buffer(&terminal, false);
+        let terminal = terminal.clone();
+        glib::idle_add_local_once(move || {
+            expand_finished_terminal_to_buffer(&terminal, true);
+            let terminal = terminal.clone();
+            glib::idle_add_local_once(move || {
+                if let Some(adj) = terminal.vadjustment() {
+                    adj.set_value(adj.lower());
+                }
+            });
+        });
+    });
 }
 
 /// The command snapshot is the only finished VTE placed directly inside the
@@ -310,34 +331,16 @@ pub(crate) fn create_finished_terminal(
     apply_snapshot_theme_to_vte(&terminal, config);
     terminal.set_size(cols.max(1), visible_rows);
 
-    // `blocks.rs` feeds snapshots from its own map handler. This handler is
-    // registered first and schedules an idle, so every map handler (including
-    // the feed) has completed before we inspect VTE's real adjustment extent.
-    // The guard keeps ordinary unmap/remap churn from repeatedly resizing cards.
+    // `blocks.rs` performs the actual feed from its map/filter paths. Keep
+    // one constructor-level hook for command snapshots and other one-shot users;
+    // every explicit re-feed also calls the same settling helper.
     {
         let expanded = std::cell::Cell::new(false);
         terminal.connect_map(move |terminal| {
             if expanded.replace(true) {
                 return;
             }
-            let terminal = terminal.clone();
-            glib::idle_add_local_once(move || {
-                // Keep temporary scrollback for one settling pass: VTE may finish
-                // applying a just-fed byte stream after the map signal returns.
-                expand_finished_terminal_to_buffer(&terminal, false);
-                let terminal = terminal.clone();
-                glib::idle_add_local_once(move || {
-                    expand_finished_terminal_to_buffer(&terminal, true);
-                    // Adjustment bounds can settle one layout pass after
-                    // set_size(). Re-pin the now non-scrollable snapshot.
-                    let terminal = terminal.clone();
-                    glib::idle_add_local_once(move || {
-                        if let Some(adj) = terminal.vadjustment() {
-                            adj.set_value(adj.lower());
-                        }
-                    });
-                });
-            });
+            settle_finished_terminal_after_feed(terminal);
         });
     }
 

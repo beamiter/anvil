@@ -118,6 +118,9 @@ pub(crate) struct FinishedBlock {
     pub(crate) rerun_btn: gtk::Button,
     pub(crate) header_row: gtk::Box,
     pub(crate) action_box: gtk::Box,
+    /// Toggle the per-block output filter without discarding its query. Exposed
+    /// so the Warp-compatible keyboard action can target the selected/latest block.
+    pub(crate) toggle_filter: Rc<dyn Fn()>,
     pub(crate) bookmark_star: gtk::Label,
     pub(crate) status_icon: gtk::Label,
     /// Column count the output VTE is sized to — needed for re-feed (filter).
@@ -146,6 +149,7 @@ impl Clone for FinishedBlock {
             rerun_btn: self.rerun_btn.clone(),
             header_row: self.header_row.clone(),
             action_box: self.action_box.clone(),
+            toggle_filter: self.toggle_filter.clone(),
             bookmark_star: self.bookmark_star.clone(),
             status_icon: self.status_icon.clone(),
             cols: self.cols,
@@ -489,36 +493,33 @@ fn flash_button_label(btn: &gtk::Button, label: &'static str, tooltip: &'static 
     });
 }
 
-/// Render `bytes` into a read-only finished VTE: reset the grid, resize to the
-/// new visible-row count (so the chrome shrinks/grows on filter), then feed
-/// the bytes in one shot. Used for filter changes — the initial feed happens
-/// once at construction.
+/// Render `bytes` into a read-only finished VTE. Keep a generous temporary
+/// scrollback while feeding: the logical/visual row estimate can still be smaller
+/// than VTE's real result for cursor movement, CR redraws, combining glyphs and
+/// other terminal semantics. The post-feed settling pass then expands the card to
+/// the real buffer and removes that private scrollback.
 pub(crate) fn render_bytes_into_finished_vte(
     vte: &vte4::Terminal,
     text: &str,
     cols: i64,
     output_rows: i64,
     viewport_cap: i64,
+    capture_rows: i64,
 ) {
     let display_text = output_display_text(text);
     let visible_rows = output_rows.min(viewport_cap).max(1);
-    let scrollback = if output_rows > visible_rows {
-        output_rows.saturating_sub(visible_rows).saturating_add(64)
-    } else {
-        0
-    };
+    let overflow_rows = output_rows.saturating_sub(visible_rows).saturating_add(64);
+    let scrollback = capture_rows.max(overflow_rows).max(64);
     vte.set_scroll_on_output(false);
-    // Set size BEFORE reset/feed so VTE's internal grid is sized correctly when
-    // bytes are processed. If we feed first and resize later, VTE wraps lines
-    // at the pre-resize default width (root cause of the ls-output misalignment
-    // bug: `ls` formats for N cols but VTE wrapped at a narrower width,
-    // producing mid-word splits like "ta\nuri-sandbox").
+    // Size and arm scrollback BEFORE reset/feed. Reset may clamp the grid on some
+    // VTE builds, so both are reasserted before processing the snapshot bytes.
     vte.set_size(cols.max(1), visible_rows);
     vte.set_scrollback_lines(scrollback);
     vte.reset(true, true);
-    // reset() can clamp dimensions on some VTE builds — re-assert.
     vte.set_size(cols.max(1), visible_rows);
+    vte.set_scrollback_lines(scrollback);
     vte.feed(display_text.as_bytes());
+    settle_finished_terminal_after_feed(vte);
     if let Some(adj) = vte.vadjustment() {
         adj.set_value(adj.lower());
     }
@@ -616,6 +617,9 @@ impl FinishedBlock {
         let output_rows = output_visual_row_count(output, cols);
         let viewport_cap = output_rows.max(1);
         let max_expanded_cap = viewport_cap;
+        // Mirrors create_finished_terminal's temporary capture budget. It is a
+        // limit, not an eagerly allocated grid, and is removed after each feed.
+        let capture_rows = (config.truncation_threshold_lines as i64).max(4096);
 
         let outer = if let Some(reused) = recycled {
             while let Some(child) = reused.first_child() {
@@ -818,9 +822,10 @@ impl FinishedBlock {
         // Captured command strings use logical newlines. Convert them to CRLF
         // for VTE so every pasted/continued line begins at the command column.
         let cmd_bytes = terminalize_line_breaks(&cmd_bytes);
-        // Command typically fits one line; allow a few in case of multiline pastes.
+        // Allocate every logical command row up front; VTE's post-feed pass
+        // adds any further rows caused by soft wrapping or control sequences.
         let cmd_rows = cmd_bytes.iter().filter(|&&b| b == b'\n').count() as i64 + 1;
-        let command_vte = create_finished_terminal(config, cols, cmd_rows.max(1), 5);
+        let command_vte = create_finished_terminal(config, cols, cmd_rows.max(1), cmd_rows.max(1));
         // Defer feeds until the widget is actually mapped — VTE's internal
         // grid resize from set_size() doesn't take effect until the widget is
         // realized, so feeding immediately wraps content at a smaller default
@@ -830,7 +835,7 @@ impl FinishedBlock {
         {
             let cmd_bytes_for_map = cmd_bytes.clone();
             let cols_for_map = cols.max(1);
-            let cmd_rows_for_map = cmd_rows.max(1).min(5);
+            let cmd_rows_for_map = cmd_rows.max(1);
             let fed = Cell::new(false);
             command_vte.connect_map(move |w| {
                 if fed.get() {
@@ -886,7 +891,7 @@ impl FinishedBlock {
                     cap_for_map
                 };
                 let visible_rows = rows.min(cap).max(1);
-                render_bytes_into_finished_vte(w, &text, cols_for_map, rows, cap);
+                render_bytes_into_finished_vte(w, &text, cols_for_map, rows, cap, capture_rows);
                 // Pin a minimum pixel height so GTK's vertical Box layout cannot
                 // shrink this VTE below what set_size requested. Without this,
                 // finished VTEs can be allocated at ~1 row and VTE scrolls their
@@ -1031,10 +1036,11 @@ impl FinishedBlock {
             collapsed_summary.set_visible(false);
         }
 
-        // Per-block output filter (Warp's BlockFilterQuery): the funnel button in
-        // the action box toggles a compact row that narrows the output to lines
-        // matching the query, honoring regex / case / invert / context-lines.
-        {
+        // Per-block output filter (Warp's BlockFilterQuery). Closing the
+        // editor disables filtering but deliberately preserves the query/options;
+        // reopening it reapplies the same filter, matching Warp's toggle behavior.
+        let filter_enabled = Rc::new(Cell::new(false));
+        let toggle_filter: Rc<dyn Fn()> = {
             let filter_row = gtk::Box::new(Orientation::Horizontal, 4);
             filter_row.add_css_class("block-filter-row");
             filter_row.set_visible(false);
@@ -1084,13 +1090,13 @@ impl FinishedBlock {
                 let filter_status = filter_status.clone();
                 let expand_btn = expand_btn.clone();
                 let expanded = expanded.clone();
-                let filter_btn = filter_btn.clone();
                 let collapsed_summary = collapsed_summary.clone();
+                let filter_enabled = filter_enabled.clone();
                 move || {
                     let q = filter_entry.text().to_string();
                     let full = full_output.borrow();
                     let full_rows = output_row_count(&full);
-                    let shown = if q.is_empty() {
+                    let shown = if !filter_enabled.get() || q.is_empty() {
                         full.to_string()
                     } else {
                         filter_output_lines(
@@ -1115,6 +1121,7 @@ impl FinishedBlock {
                         cols,
                         shown_visual_rows,
                         active_cap,
+                        capture_rows,
                     );
                     let ch = output_vte.char_height() as i32;
                     if ch > 0 {
@@ -1122,9 +1129,8 @@ impl FinishedBlock {
                             (shown_visual_rows.min(active_cap).max(1) as i32) * ch,
                         );
                     }
-                    let has_query = !q.trim().is_empty();
+                    let has_query = filter_enabled.get() && !q.trim().is_empty();
                     if has_query {
-                        filter_btn.add_css_class("block-action-active");
                         filter_status.set_visible(true);
                         let hidden = full_rows.saturating_sub(shown_rows);
                         if shown.trim().is_empty() {
@@ -1139,15 +1145,11 @@ impl FinishedBlock {
                             ));
                         }
                     } else {
-                        filter_btn.remove_css_class("block-action-active");
                         filter_status.remove_css_class("block-filter-empty");
                         filter_status.set_visible(false);
                     }
-                    expand_btn.set_visible(shown_rows > viewport_cap);
+                    expand_btn.set_visible(shown_visual_rows > viewport_cap);
                     collapsed_summary.set_label(&collapsed_output_summary(shown_rows));
-                    // Keep `displayed_output` in sync so a later unmap → remap
-                    // (block scrolls out of view, then back) re-feeds the
-                    // filtered text, not the full output.
                     *displayed_output.borrow_mut() = shown;
                 }
             };
@@ -1165,23 +1167,27 @@ impl FinishedBlock {
                 ctx_spin.connect_value_changed(move |_| a());
             }
 
-            let filter_row_for_btn = filter_row.clone();
-            let entry_for_btn = filter_entry.clone();
-            let apply_for_btn = apply.clone();
+            let filter_row_for_toggle = filter_row.clone();
+            let entry_for_toggle = filter_entry.clone();
+            let apply_for_toggle = apply.clone();
             let filter_btn_for_toggle = filter_btn.clone();
-            filter_btn.connect_clicked(move |_| {
-                let show = !filter_row_for_btn.is_visible();
-                filter_row_for_btn.set_visible(show);
+            let filter_enabled_for_toggle = filter_enabled.clone();
+            let toggle: Rc<dyn Fn()> = Rc::new(move || {
+                let show = !filter_row_for_toggle.is_visible();
+                filter_row_for_toggle.set_visible(show);
+                filter_enabled_for_toggle.set(show);
                 if show {
                     filter_btn_for_toggle.add_css_class("block-action-active");
-                    entry_for_btn.grab_focus();
+                    entry_for_toggle.grab_focus();
                 } else {
                     filter_btn_for_toggle.remove_css_class("block-action-active");
-                    entry_for_btn.set_text("");
-                    apply_for_btn();
                 }
+                apply_for_toggle();
             });
-        }
+            let toggle_for_button = toggle.clone();
+            filter_btn.connect_clicked(move |_| toggle_for_button());
+            toggle
+        };
 
         FinishedBlock {
             id,
@@ -1198,6 +1204,7 @@ impl FinishedBlock {
             rerun_btn,
             header_row,
             action_box,
+            toggle_filter,
             bookmark_star,
             status_icon,
             cols,
