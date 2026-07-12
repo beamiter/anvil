@@ -7,7 +7,9 @@
 //! No frame-merge / pager-snapshot path runs, matching Warp.
 use crate::config::Config;
 use gtk::gdk::RGBA;
+use gtk::glib;
 use gtk::pango::FontDescription;
+use gtk::prelude::*;
 use relm4::gtk;
 use vte4::{CursorBlinkMode, CursorShape, Terminal};
 use vte4::{TerminalExt, TerminalExtManual};
@@ -70,6 +72,92 @@ pub(crate) fn encode_mouse_wheel(
     }
 }
 
+/// Convert VTE's adjustment extent into the number of rows currently retained
+/// by the snapshot. `lower` is negative when wrapped/overflow rows live in
+/// scrollback, while `upper - lower` covers both scrollback and the visible grid.
+fn finished_buffer_rows_from_adjustment(lower: f64, upper: f64, visible_rows: i64) -> i64 {
+    let visible_rows = visible_rows.max(1);
+    if !lower.is_finite() || !upper.is_finite() || upper <= lower {
+        return visible_rows;
+    }
+    let span = (upper - lower).ceil();
+    if span >= i64::MAX as f64 {
+        i64::MAX
+    } else {
+        (span as i64).max(visible_rows)
+    }
+}
+
+/// Grow a read-only finished VTE from its provisional grid to every row VTE
+/// actually rendered. This is intentionally based on the terminal buffer after
+/// `feed()`, not a string-width estimate: ANSI controls, wide/combining glyphs,
+/// tabs, carriage-return redraws and automatic wrapping are all already resolved
+/// by VTE at this point.
+fn expand_finished_terminal_to_buffer(terminal: &Terminal, finalize: bool) {
+    let visible_rows = terminal.row_count().max(1);
+    let rows = terminal
+        .vadjustment()
+        .map(|adj| finished_buffer_rows_from_adjustment(adj.lower(), adj.upper(), visible_rows))
+        .unwrap_or(visible_rows);
+    let cols = terminal.column_count().max(1);
+
+    if rows > visible_rows {
+        terminal.set_size(cols, rows);
+    }
+    if finalize {
+        // Once all rows are part of the widget, no finished block should own a
+        // private vertical scroll range. The outer block ScrolledWindow is the
+        // one continuous history canvas, matching Warp's block interaction model.
+        terminal.set_scrollback_lines(0);
+    }
+
+    let cell_height = (terminal.char_height() as i32).max(1);
+    let rows_i32 = rows.clamp(1, i32::MAX as i64) as i32;
+    terminal.set_height_request(rows_i32.saturating_mul(cell_height));
+
+    if let Some(adj) = terminal.vadjustment() {
+        adj.set_value(adj.lower());
+    }
+}
+
+/// The command snapshot is the only finished VTE placed directly inside the
+/// horizontal prompt row. Output snapshots are direct children of the block's
+/// vertical card and already use `FinishedBlock::connect_scroll_forwarding`.
+fn is_finished_command_surface(terminal: &Terminal) -> bool {
+    terminal
+        .parent()
+        .and_then(|parent| parent.downcast::<gtk::Box>().ok())
+        .is_some_and(|parent| parent.orientation() == gtk::Orientation::Horizontal)
+}
+
+fn outer_block_scroller(terminal: &Terminal) -> Option<gtk::ScrolledWindow> {
+    let mut parent = terminal.parent();
+    while let Some(widget) = parent {
+        if let Ok(scroll) = widget.clone().downcast::<gtk::ScrolledWindow>() {
+            return Some(scroll);
+        }
+        parent = widget.parent();
+    }
+    None
+}
+
+fn forward_command_surface_scroll(terminal: &Terminal, dy: f64) -> bool {
+    if dy == 0.0 || !is_finished_command_surface(terminal) {
+        return false;
+    }
+    let Some(outer) = outer_block_scroller(terminal) else {
+        return false;
+    };
+    let adjustment = outer.vadjustment();
+    let step = adjustment
+        .step_increment()
+        .max(adjustment.page_size() * 0.1);
+    let max_value = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
+    let target = (adjustment.value() + dy * step).clamp(adjustment.lower(), max_value);
+    adjustment.set_value(target);
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,6 +191,17 @@ mod tests {
     fn zero_delta_returns_no_bytes() {
         // Spurious 0 delta from GTK shouldn't paginate the app.
         assert!(encode_mouse_wheel(MouseReportingMode::Sgr, 0.0, 1, 1).is_none());
+    }
+
+    #[test]
+    fn finished_buffer_rows_include_wrapped_scrollback() {
+        assert_eq!(finished_buffer_rows_from_adjustment(-7.0, 5.0, 5), 12);
+    }
+
+    #[test]
+    fn finished_buffer_rows_never_shrink_the_provisional_grid() {
+        assert_eq!(finished_buffer_rows_from_adjustment(0.0, 1.0, 5), 5);
+        assert_eq!(finished_buffer_rows_from_adjustment(f64::NAN, 1.0, 3), 3);
     }
 }
 
@@ -169,11 +268,11 @@ pub(crate) fn apply_snapshot_theme_to_vte(terminal: &Terminal, config: &Config) 
     terminal.set_color_cursor(Some(&transparent));
 }
 
-/// A read-only PTY-less VTE used as the renderer for a single finished block.
-/// Input is disabled; cursor is hidden (block widget shows completed output, not
-/// a live prompt). `output_rows` sizes the widget to exactly the captured row
-/// count up to `viewport_cap`; anything beyond goes into the widget's own
-/// scrollback so the user can scroll within a long block (e.g. `git log`).
+/// A read-only PTY-less VTE used as the renderer for one finished command or
+/// output surface. The caller supplies a provisional row count; after the first
+/// map/feed pass, the widget expands to VTE's complete rendered buffer so no
+/// wrapping, multiline input or terminal control sequence is clipped into a
+/// private inner scroll area.
 pub(crate) fn create_finished_terminal(
     config: &Config,
     cols: i64,
@@ -181,11 +280,15 @@ pub(crate) fn create_finished_terminal(
     viewport_cap: i64,
 ) -> Terminal {
     let visible_rows = output_rows.min(viewport_cap).max(1);
-    let scrollback = if output_rows > visible_rows {
-        output_rows.saturating_sub(visible_rows).saturating_add(64) as u32
-    } else {
-        0
-    };
+    // The caller's estimate can be too small (most notably a long single-line
+    // command that wraps). Keep enough temporary scrollback to retain those rows
+    // until the post-feed expansion below makes them part of the widget itself.
+    // VTE treats this as a limit and allocates used rows, not a 50k-row grid.
+    let capture_rows = output_rows
+        .max(viewport_cap)
+        .max(config.truncation_threshold_lines as i64)
+        .max(4096)
+        .clamp(1, u32::MAX as i64) as u32;
     let terminal = Terminal::builder()
         .hexpand(true)
         .vexpand(false)
@@ -193,23 +296,69 @@ pub(crate) fn create_finished_terminal(
         .allow_hyperlink(true)
         .bold_is_bright(true)
         .input_enabled(false)
-        .scrollback_lines(scrollback)
+        .scrollback_lines(capture_rows)
         .cursor_blink_mode(CursorBlinkMode::Off)
         .cursor_shape(CursorShape::Block)
         .font_scale(config.default_font_scale)
         .opacity(1.0)
         .pointer_autohide(true)
         .enable_sixel(true)
-        // Finished blocks are snapshots. Short output gets no scrollback at
-        // all, so it cannot drift to a remembered internal scroll offset; long
-        // output anchors at the top so `git log`-style output starts from the
-        // first line instead of snapping to the tail.
         .scroll_on_output(false)
         .scroll_on_keystroke(false)
         .build();
     terminal.set_mouse_autohide(true);
     apply_snapshot_theme_to_vte(&terminal, config);
     terminal.set_size(cols.max(1), visible_rows);
+
+    // `blocks.rs` feeds snapshots from its own map handler. This handler is
+    // registered first and schedules an idle, so every map handler (including
+    // the feed) has completed before we inspect VTE's real adjustment extent.
+    // The guard keeps ordinary unmap/remap churn from repeatedly resizing cards.
+    {
+        let expanded = std::cell::Cell::new(false);
+        terminal.connect_map(move |terminal| {
+            if expanded.replace(true) {
+                return;
+            }
+            let terminal = terminal.clone();
+            glib::idle_add_local_once(move || {
+                // Keep temporary scrollback for one settling pass: VTE may finish
+                // applying a just-fed byte stream after the map signal returns.
+                expand_finished_terminal_to_buffer(&terminal, false);
+                let terminal = terminal.clone();
+                glib::idle_add_local_once(move || {
+                    expand_finished_terminal_to_buffer(&terminal, true);
+                    // Adjustment bounds can settle one layout pass after
+                    // set_size(). Re-pin the now non-scrollable snapshot.
+                    let terminal = terminal.clone();
+                    glib::idle_add_local_once(move || {
+                        if let Some(adj) = terminal.vadjustment() {
+                            adj.set_value(adj.lower());
+                        }
+                    });
+                });
+            });
+        });
+    }
+
+    // VTE consumes wheel events even when its private scrollback is empty. The
+    // output surface already has explicit outer-scroll forwarding in blocks.rs;
+    // add the same behavior to the command surface, identified by its horizontal
+    // prompt-row parent, so scrolling never sticks while the pointer is over it.
+    {
+        let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+        scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let terminal_for_scroll = terminal.clone();
+        scroll.connect_scroll(move |_, _dx, dy| {
+            if forward_command_surface_scroll(&terminal_for_scroll, dy) {
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        terminal.add_controller(scroll);
+    }
+
     // URL detection — mirror the live-VTE pattern at src/terminal.rs:52-56.
     if let Ok(regex) = vte4::Regex::for_match(
         r"[a-z]+://[[:graph:]]+",
