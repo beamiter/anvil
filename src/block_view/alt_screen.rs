@@ -93,7 +93,7 @@ fn finished_buffer_rows_from_adjustment(lower: f64, upper: f64, visible_rows: i6
 /// `feed()`, not a string-width estimate: ANSI controls, wide/combining glyphs,
 /// tabs, carriage-return redraws and automatic wrapping are all already resolved
 /// by VTE at this point.
-pub(crate) fn expand_finished_terminal_to_buffer(terminal: &Terminal, finalize: bool) {
+pub(crate) fn expand_finished_terminal_to_buffer(terminal: &Terminal) {
     let visible_rows = terminal.row_count().max(1);
     let rows = terminal
         .vadjustment()
@@ -104,12 +104,10 @@ pub(crate) fn expand_finished_terminal_to_buffer(terminal: &Terminal, finalize: 
     if rows > visible_rows {
         terminal.set_size(cols, rows);
     }
-    if finalize {
-        // Once all rows are part of the widget, no finished block should own a
-        // private vertical scroll range. The outer block ScrolledWindow is the
-        // one continuous history canvas, matching Warp's block interaction model.
-        terminal.set_scrollback_lines(0);
-    }
+    // Keep the capture capacity armed after expansion. The configured value is
+    // only a limit, so unused rows do not create an inner scroll range. More
+    // importantly, an older idle-settling callback can no longer clear the
+    // scrollback needed by a newer filter render before VTE has processed it.
 
     let cell_height = (terminal.char_height() as i32).max(1);
     let rows_i32 = rows.clamp(1, i32::MAX as i64) as i32;
@@ -122,15 +120,16 @@ pub(crate) fn expand_finished_terminal_to_buffer(terminal: &Terminal, finalize: 
 
 /// Settle a finished snapshot after bytes have been fed. VTE updates its grid
 /// and adjustment asynchronously, so use two idle passes: the first folds any
-/// overflow/soft-wrapped rows into the widget, and the second removes the
-/// temporary private scrollback once those rows are part of the card itself.
+/// overflow/soft-wrapped rows into the widget, and the second observes any
+/// adjustment changes caused by that resize. Capture capacity remains armed so
+/// overlapping filter renders cannot invalidate one another.
 pub(crate) fn settle_finished_terminal_after_feed(terminal: &Terminal) {
     let terminal = terminal.clone();
     glib::idle_add_local_once(move || {
-        expand_finished_terminal_to_buffer(&terminal, false);
+        expand_finished_terminal_to_buffer(&terminal);
         let terminal = terminal.clone();
         glib::idle_add_local_once(move || {
-            expand_finished_terminal_to_buffer(&terminal, true);
+            expand_finished_terminal_to_buffer(&terminal);
             let terminal = terminal.clone();
             glib::idle_add_local_once(move || {
                 if let Some(adj) = terminal.vadjustment() {
