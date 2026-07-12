@@ -2768,7 +2768,9 @@ impl SimpleComponent for AppModel {
             active: 0,
             next_id: 0,
             next_pane_id: 0,
-            sidebar_visible: true,
+            // With tabs in the top bar, keep the optional file sidebar closed
+            // until the user explicitly opens it.
+            sidebar_visible: tab_placement == config::TabPlacement::Sidebar,
             font_scale,
             window_opacity,
             stack: stack.clone(),
@@ -2811,6 +2813,7 @@ impl SimpleComponent for AppModel {
 
         // Place the tab strip (sidebar vs top bar) and select the sidebar view.
         model.apply_tab_placement();
+        model.sidebar_box.set_visible(model.sidebar_visible);
 
         // Window-level key controller: intercept shortcuts before VTE.
         let key_controller = gtk::EventControllerKey::new();
