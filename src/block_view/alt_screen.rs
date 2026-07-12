@@ -75,11 +75,7 @@ pub(crate) fn encode_mouse_wheel(
 /// Convert VTE's adjustment extent into the number of rows currently retained
 /// by the snapshot. `lower` is negative when wrapped/overflow rows live in
 /// scrollback, while `upper - lower` covers both scrollback and the visible grid.
-fn finished_buffer_rows_from_adjustment(
-    lower: f64,
-    upper: f64,
-    visible_rows: i64,
-) -> i64 {
+fn finished_buffer_rows_from_adjustment(lower: f64, upper: f64, visible_rows: i64) -> i64 {
     let visible_rows = visible_rows.max(1);
     if !lower.is_finite() || !upper.is_finite() || upper <= lower {
         return visible_rows;
@@ -101,9 +97,7 @@ fn expand_finished_terminal_to_buffer(terminal: &Terminal, finalize: bool) {
     let visible_rows = terminal.row_count().max(1);
     let rows = terminal
         .vadjustment()
-        .map(|adj| {
-            finished_buffer_rows_from_adjustment(adj.lower(), adj.upper(), visible_rows)
-        })
+        .map(|adj| finished_buffer_rows_from_adjustment(adj.lower(), adj.upper(), visible_rows))
         .unwrap_or(visible_rows);
     let cols = terminal.column_count().max(1);
 
@@ -124,6 +118,44 @@ fn expand_finished_terminal_to_buffer(terminal: &Terminal, finalize: bool) {
     if let Some(adj) = terminal.vadjustment() {
         adj.set_value(adj.lower());
     }
+}
+
+/// The command snapshot is the only finished VTE placed directly inside the
+/// horizontal prompt row. Output snapshots are direct children of the block's
+/// vertical card and already use `FinishedBlock::connect_scroll_forwarding`.
+fn is_finished_command_surface(terminal: &Terminal) -> bool {
+    terminal
+        .parent()
+        .and_then(|parent| parent.downcast::<gtk::Box>().ok())
+        .is_some_and(|parent| parent.orientation() == gtk::Orientation::Horizontal)
+}
+
+fn outer_block_scroller(terminal: &Terminal) -> Option<gtk::ScrolledWindow> {
+    let mut parent = terminal.parent();
+    while let Some(widget) = parent {
+        if let Ok(scroll) = widget.clone().downcast::<gtk::ScrolledWindow>() {
+            return Some(scroll);
+        }
+        parent = widget.parent();
+    }
+    None
+}
+
+fn forward_command_surface_scroll(terminal: &Terminal, dy: f64) -> bool {
+    if dy == 0.0 || !is_finished_command_surface(terminal) {
+        return false;
+    }
+    let Some(outer) = outer_block_scroller(terminal) else {
+        return false;
+    };
+    let adjustment = outer.vadjustment();
+    let step = adjustment
+        .step_increment()
+        .max(adjustment.page_size() * 0.1);
+    let max_value = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
+    let target = (adjustment.value() + dy * step).clamp(adjustment.lower(), max_value);
+    adjustment.set_value(target);
+    true
 }
 
 #[cfg(test)]
@@ -169,10 +201,7 @@ mod tests {
     #[test]
     fn finished_buffer_rows_never_shrink_the_provisional_grid() {
         assert_eq!(finished_buffer_rows_from_adjustment(0.0, 1.0, 5), 5);
-        assert_eq!(
-            finished_buffer_rows_from_adjustment(f64::NAN, 1.0, 3),
-            3
-        );
+        assert_eq!(finished_buffer_rows_from_adjustment(f64::NAN, 1.0, 3), 3);
     }
 }
 
@@ -310,6 +339,24 @@ pub(crate) fn create_finished_terminal(
                 });
             });
         });
+    }
+
+    // VTE consumes wheel events even when its private scrollback is empty. The
+    // output surface already has explicit outer-scroll forwarding in blocks.rs;
+    // add the same behavior to the command surface, identified by its horizontal
+    // prompt-row parent, so scrolling never sticks while the pointer is over it.
+    {
+        let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+        scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let terminal_for_scroll = terminal.clone();
+        scroll.connect_scroll(move |_, _dx, dy| {
+            if forward_command_surface_scroll(&terminal_for_scroll, dy) {
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        terminal.add_controller(scroll);
     }
 
     // URL detection — mirror the live-VTE pattern at src/terminal.rs:52-56.
