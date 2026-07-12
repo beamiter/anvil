@@ -61,8 +61,17 @@ jobs:
       - name: Check all targets
         run: cargo check --all-targets
 
-      - name: Run Clippy
-        run: cargo clippy --all-targets -- -D warnings
-
       - name: Run tests
         run: cargo test --all-targets --no-fail-fast
+
+      - name: Run Clippy
+        id: clippy
+        run: cargo clippy --all-targets -- -D warnings 2>&1 | tee clippy.log
+
+      - name: Upload Clippy diagnostics
+        if: ${{ failure() && steps.clippy.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: clippy-diagnostics
+          path: clippy.log
+          retention-days: 7
