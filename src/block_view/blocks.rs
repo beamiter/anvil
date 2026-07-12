@@ -96,9 +96,8 @@ pub(crate) struct FinishedBlock {
     pub(crate) prompt_text: String,
     /// Read-only VTE displaying the executed command line (single-row typically).
     pub(crate) command_vte: vte4::Terminal,
-    /// Read-only VTE displaying the captured output. Full output is fed once;
-    /// rows beyond viewport_cap live in this VTE's own scrollback so the user
-    /// can scroll inside long blocks (e.g. `git log`).
+    /// Read-only VTE displaying the captured output. Finished output takes its
+    /// full natural height; scrolling belongs to the outer block canvas.
     pub(crate) output_vte: vte4::Terminal,
     /// Raw ANSI-bearing output bytes — the source for filter re-feed and the
     /// copy-output action. Mutable so filter can swap the displayed slice
@@ -123,7 +122,8 @@ pub(crate) struct FinishedBlock {
     pub(crate) status_icon: gtk::Label,
     /// Column count the output VTE is sized to — needed for re-feed (filter).
     pub(crate) cols: i64,
-    /// Visible-row cap (config.finished_block_viewport_rows).
+    /// Number of rows allocated to this finished output. Kept with the widget
+    /// so filter re-renders use the same full-height canvas allocation.
     pub(crate) viewport_cap: i64,
     /// True only when this block has more output rows than can be shown at once.
     pub(crate) output_scrollable: bool,
@@ -317,6 +317,33 @@ fn output_row_count(text: &str) -> i64 {
     }
 }
 
+/// Rows occupied after VTE wraps the snapshot at `cols`. Finished cards need
+/// this rather than the logical line count, otherwise a stack trace containing
+/// very long type names is still pushed into the VTE's private scrollback.
+fn output_visual_row_count(text: &str, cols: i64) -> i64 {
+    use unicode_width::UnicodeWidthChar;
+
+    let cols = cols.max(1) as usize;
+    let text = output_display_text(text);
+    if text.is_empty() {
+        return 1;
+    }
+
+    text.split('\n')
+        .map(|line| {
+            let mut width = 0usize;
+            for ch in line.trim_end_matches('\r').chars() {
+                width += match ch {
+                    '\t' => 8 - (width % 8),
+                    _ => UnicodeWidthChar::width(ch).unwrap_or(0),
+                };
+            }
+            width.max(1).div_ceil(cols) as i64
+        })
+        .sum::<i64>()
+        .max(1)
+}
+
 fn output_display_text(text: &str) -> &str {
     let text = if let Some(stripped) = text.strip_prefix("\r\n") {
         stripped
@@ -395,6 +422,12 @@ mod tests {
     #[test]
     fn output_row_count_preserves_intentional_blank_lines_before_final_ending() {
         assert_eq!(output_row_count("a\n\n"), 2);
+    }
+
+    #[test]
+    fn visual_row_count_includes_terminal_wrapping() {
+        assert_eq!(output_visual_row_count("123456789\nabc", 4), 4);
+        assert_eq!(output_visual_row_count("界界界", 4), 2);
     }
 
     #[test]
@@ -576,8 +609,13 @@ impl FinishedBlock {
         cols: i64,
         recycled: Option<gtk::Box>,
     ) -> Self {
-        let viewport_cap = config.finished_block_viewport_rows.max(3) as i64;
-        let max_expanded_cap = (config.finished_block_max_expanded_rows as i64).max(viewport_cap);
+        // A finished block is a card on one vertically scrolling canvas, like
+        // Warp: its output must keep its complete height instead of becoming a
+        // small, independently scrolling terminal. The global truncation limit
+        // still bounds pathological output before construction.
+        let output_rows = output_visual_row_count(output, cols);
+        let viewport_cap = output_rows.max(1);
+        let max_expanded_cap = viewport_cap;
 
         let outer = if let Some(reused) = recycled {
             while let Some(child) = reused.first_child() {
@@ -810,16 +848,11 @@ impl FinishedBlock {
             });
         }
 
-        // Output VTE: full output fed once on first map; rows beyond the
-        // viewport cap live in this widget's scrollback so the user can
-        // scroll inside the block. When the block scrolls out of view it's
-        // unmapped — at that point we reset the VTE's grid + scrollback so
-        // its per-widget buffer memory is reclaimed. A subsequent map (block
-        // scrolls back in) re-feeds from `displayed_output`, which the filter
-        // path keeps in sync with whatever the user wants to see.
+        // Output VTE: full output fed once on first map and allocated at its
+        // complete wrapped height. The outer ScrolledWindow is the sole
+        // vertical canvas; `displayed_output` keeps filter re-renders in sync.
         let full_output: Rc<RefCell<String>> = Rc::new(RefCell::new(output.to_string()));
         let displayed_output: Rc<RefCell<String>> = Rc::new(RefCell::new(output.to_string()));
-        let output_rows = output_row_count(output);
         let output_scrollable = output_rows > viewport_cap;
         let output_vte = create_finished_terminal(config, cols, output_rows, viewport_cap);
         let initial_visible_rows = output_rows.min(viewport_cap).max(1);
@@ -846,7 +879,7 @@ impl FinishedBlock {
                 }
                 fed.set(true);
                 let text = displayed_for_map.borrow();
-                let rows = output_row_count(&text);
+                let rows = output_visual_row_count(&text, cols_for_map);
                 let cap = if expanded_for_map.get() {
                     max_for_map
                 } else {
@@ -890,7 +923,7 @@ impl FinishedBlock {
                 } else {
                     viewport_cap
                 };
-                let rows = output_row_count(&displayed_for_btn.borrow());
+                let rows = output_visual_row_count(&displayed_for_btn.borrow(), cols_for_btn);
                 let visible_rows = rows.min(cap).max(1);
                 output_vte_for_btn.set_size(cols_for_btn, visible_rows);
                 let ch = output_vte_for_btn.char_height() as i32;
@@ -1070,6 +1103,7 @@ impl FinishedBlock {
                         )
                     };
                     let shown_rows = output_row_count(&shown);
+                    let shown_visual_rows = output_visual_row_count(&shown, cols);
                     let active_cap = if expanded.get() {
                         max_expanded_cap
                     } else {
@@ -1079,13 +1113,14 @@ impl FinishedBlock {
                         &output_vte,
                         &shown,
                         cols,
-                        shown_rows,
+                        shown_visual_rows,
                         active_cap,
                     );
                     let ch = output_vte.char_height() as i32;
                     if ch > 0 {
-                        output_vte
-                            .set_height_request((shown_rows.min(active_cap).max(1) as i32) * ch);
+                        output_vte.set_height_request(
+                            (shown_visual_rows.min(active_cap).max(1) as i32) * ch,
+                        );
                     }
                     let has_query = !q.trim().is_empty();
                     if has_query {
@@ -1175,12 +1210,8 @@ impl FinishedBlock {
         &self.widget
     }
 
-    /// Forward wheel events on the output VTE to the outer ScrolledWindow once
-    /// the VTE's internal scrollback can't move further in the wheel direction.
-    /// Without this the user's scroll "sticks" at a long block's edge: VTE
-    /// silently swallows wheels that no longer scroll its own buffer, and the
-    /// page never resumes. Closes the perceptual gap with a single-scrollback
-    /// VTE pane (terminator/xterm).
+    /// Forward wheel events from full-height output VTEs to the one outer
+    /// ScrolledWindow so all finished blocks behave as a continuous canvas.
     pub(crate) fn connect_scroll_forwarding(&self, outer: &gtk::ScrolledWindow) {
         let scroll_ctrl =
             gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
