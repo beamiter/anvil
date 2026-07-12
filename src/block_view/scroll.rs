@@ -27,18 +27,18 @@ fn next_stable_frame_count(last_target: Option<f64>, target: f64, current: u8) -
     }
 }
 
-/// Claim the single follow-bottom settling source.
+/// Claim or refresh the single follow-bottom settling source.
 ///
-/// PTY output can request a deferred pin several times before the next GTK frame.
-/// Starting one timer per request makes those timers outlive each other and keeps
-/// pulling the viewport after the layout is already stable. Coalesce all requests
-/// into the active source: it observes the latest adjustment geometry on every
-/// frame, so another source would add work without improving correctness.
-fn try_begin_bottom_pin(user_scrolled: bool, active: &Cell<bool>) -> bool {
-    if user_scrolled || active.replace(true) {
+/// A coalesced request still increments `generation`. The active timer observes
+/// that change on its next frame and resets its retry/stability counters, giving
+/// newly-added virtualized content a full settling window without starting a
+/// second timer.
+fn request_bottom_pin(user_scrolled: bool, active: &Cell<bool>, generation: &Cell<u64>) -> bool {
+    if user_scrolled {
         return false;
     }
-    true
+    generation.set(generation.get().wrapping_add(1));
+    !active.replace(true)
 }
 
 /// Scrolls the block list to follow the live prompt — jterm1's `autoscroll`
@@ -57,9 +57,10 @@ pub(crate) struct ScrollDebouncer {
     pub(crate) user_scrolled_up: Rc<Cell<bool>>,
     pub(crate) programmatic_scroll: Rc<Cell<bool>>,
     /// At most one frame-spaced follow-bottom source may run at a time. Repeated
-    /// output/layout notifications are naturally absorbed by that source because
-    /// it recomputes the current target on each frame.
+    /// output/layout notifications refresh its generation instead of creating
+    /// overlapping timers.
     bottom_pin_active: Rc<Cell<bool>>,
+    bottom_pin_generation: Rc<Cell<u64>>,
 }
 
 impl ScrollDebouncer {
@@ -71,6 +72,7 @@ impl ScrollDebouncer {
             user_scrolled_up,
             programmatic_scroll,
             bottom_pin_active: Rc::new(Cell::new(false)),
+            bottom_pin_generation: Rc::new(Cell::new(0)),
         }
     }
 
@@ -99,7 +101,11 @@ impl ScrollDebouncer {
     /// keeps the latest finished block and prompt visible instead of leaving
     /// their lower rows clipped behind the active cell.
     pub(crate) fn pin_to_bottom_deferred(&self, scroll: &ScrolledWindow) {
-        if !try_begin_bottom_pin(self.user_scrolled_up.get(), &self.bottom_pin_active) {
+        if !request_bottom_pin(
+            self.user_scrolled_up.get(),
+            &self.bottom_pin_active,
+            &self.bottom_pin_generation,
+        ) {
             return;
         }
 
@@ -107,6 +113,8 @@ impl ScrollDebouncer {
         let user_scrolled = self.user_scrolled_up.clone();
         let programmatic = self.programmatic_scroll.clone();
         let bottom_pin_active = self.bottom_pin_active.clone();
+        let bottom_pin_generation = self.bottom_pin_generation.clone();
+        let observed_generation = Rc::new(Cell::new(bottom_pin_generation.get()));
         let tries = Rc::new(Cell::new(0u8));
         let last_target = Rc::new(Cell::new(None::<f64>));
         let stable_frames = Rc::new(Cell::new(0u8));
@@ -116,7 +124,23 @@ impl ScrollDebouncer {
         // yet, so every retry observes the same stale adjustment. Space the
         // bounded retries over frames instead.
         glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
-            if user_scrolled.get() || tries.get() >= MAX_BOTTOM_PIN_TRIES {
+            if user_scrolled.get() {
+                bottom_pin_active.set(false);
+                return glib::ControlFlow::Break;
+            }
+
+            // Another output/layout notification arrived while this timer was
+            // active. Refresh the settling budget before checking the retry cap;
+            // otherwise a request arriving on the last frame would be discarded.
+            let generation = bottom_pin_generation.get();
+            if observed_generation.get() != generation {
+                observed_generation.set(generation);
+                tries.set(0);
+                last_target.set(None);
+                stable_frames.set(0);
+            }
+
+            if tries.get() >= MAX_BOTTOM_PIN_TRIES {
                 bottom_pin_active.set(false);
                 return glib::ControlFlow::Break;
             }
@@ -237,15 +261,21 @@ mod tests {
     }
 
     #[test]
-    fn bottom_pin_coalesces_overlapping_requests() {
+    fn bottom_pin_coalesces_and_refreshes_overlapping_requests() {
         let active = Cell::new(false);
+        let generation = Cell::new(0u64);
 
-        assert!(try_begin_bottom_pin(false, &active));
+        assert!(request_bottom_pin(false, &active, &generation));
         assert!(active.get());
-        assert!(!try_begin_bottom_pin(false, &active));
+        assert_eq!(generation.get(), 1);
+
+        assert!(!request_bottom_pin(false, &active, &generation));
+        assert!(active.get());
+        assert_eq!(generation.get(), 2);
 
         active.set(false);
-        assert!(!try_begin_bottom_pin(true, &active));
+        assert!(!request_bottom_pin(true, &active, &generation));
         assert!(!active.get());
+        assert_eq!(generation.get(), 2);
     }
 }

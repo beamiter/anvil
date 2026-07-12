@@ -721,8 +721,8 @@ impl FinishedBlock {
         copy_cmd_btn.set_tooltip_text(Some("Copy command"));
         let copy_output_btn = gtk::Button::with_label("\u{f0ea}"); // nf-fa-clipboard  copy output
         copy_output_btn.set_tooltip_text(Some("Copy output"));
-        let rerun_btn = gtk::Button::with_label("\u{f021}"); // nf-fa-refresh  re-run
-        rerun_btn.set_tooltip_text(Some("Re-run command"));
+        let rerun_btn = gtk::Button::with_label("\u{f021}"); // nf-fa-refresh  recall command
+        rerun_btn.set_tooltip_text(Some("Insert command at prompt"));
         let filter_btn = gtk::Button::with_label("\u{f0b0}"); // nf-fa-filter  filter output
         filter_btn.set_tooltip_text(Some("Filter output"));
         // Expand button: appears only when output_rows > viewport_cap; toggles
@@ -1216,14 +1216,17 @@ impl FinishedBlock {
         self.output_vte.add_controller(scroll_ctrl);
     }
 
-    /// Wire the hover quick-action buttons (copy command, copy output, re-run).
+    /// Wire the hover quick-action buttons (copy command, copy output, recall).
     /// Kept separate from construction because handlers need the clipboard, PTY,
-    /// and active block, which only the owning `TermView` has.
+    /// shell input state, and active block, which only the owning `TermView` has.
     pub(crate) fn connect_actions(
         &self,
         vte: &Terminal,
         pty: &Rc<crate::pty::OwnedPty>,
         pty_synced: &Rc<Cell<bool>>,
+        bracketed_paste: &Rc<Cell<bool>>,
+        typed_cmd: &Rc<RefCell<String>>,
+        bstate: &Rc<Cell<BlockState>>,
         active: &Rc<RefCell<ActiveBlock>>,
     ) {
         let vte_for_cmd = vte.clone();
@@ -1245,19 +1248,25 @@ impl FinishedBlock {
 
         let pty_for_rerun = Rc::clone(pty);
         let pty_synced_for_rerun = pty_synced.clone();
+        let bracketed_paste_for_rerun = bracketed_paste.clone();
+        let typed_cmd_for_rerun = typed_cmd.clone();
+        let bstate_for_rerun = bstate.clone();
         let active_for_rerun = active.clone();
         let cmd_for_rerun = self.cmd_text.clone();
         self.rerun_btn.connect_clicked(move |btn| {
-            // Clear any partial line at the live prompt (Ctrl+U) then type the
-            // command bytes into the shell, leaving the user to press Enter
-            // (jterm1 rerun model).
-            if pty_synced_for_rerun.get() {
-                pty_for_rerun.write_bytes(b"\x15");
+            if recall_command_at_prompt(
+                &pty_for_rerun,
+                &pty_synced_for_rerun,
+                &typed_cmd_for_rerun,
+                bstate_for_rerun.get(),
+                &cmd_for_rerun,
+                bracketed_paste_for_rerun.get(),
+            ) {
+                active_for_rerun.borrow().grab_focus();
+                flash_button_label(btn, "\u{f00c}", "Command inserted");
+            } else {
+                flash_button_label(btn, "\u{f071}", "Wait for an editable prompt");
             }
-            pty_for_rerun.write_bytes(cmd_for_rerun.as_bytes());
-            pty_synced_for_rerun.set(true);
-            active_for_rerun.borrow().grab_focus();
-            flash_button_label(btn, "\u{f00c}", "Command inserted");
         });
     }
 }

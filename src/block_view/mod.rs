@@ -100,6 +100,64 @@ fn normalize_captured_command(captured: &str, prompt: &str) -> String {
     captured.to_string()
 }
 
+/// Build the text and PTY byte stream used when recalling a finished command.
+///
+/// Multiline commands are safe only when the shell has enabled bracketed paste:
+/// the wrapper inserts embedded newlines into the edit buffer without submitting
+/// them. Without DECSET 2004, fall back to the first logical line rather than
+/// accidentally executing the remainder.
+pub(crate) fn build_command_recall(command: &str, bracketed_paste: bool) -> (String, Vec<u8>) {
+    let normalized = command.replace("\r\n", "\n").replace('\r', "\n");
+    let multiline = normalized.contains('\n');
+    let recalled = if multiline && !bracketed_paste {
+        normalized.split('\n').next().unwrap_or("").to_string()
+    } else {
+        normalized
+    };
+
+    if multiline && bracketed_paste {
+        let mut payload = Vec::with_capacity(recalled.len() + 12);
+        payload.extend_from_slice(b"\x1b[200~");
+        payload.extend_from_slice(recalled.as_bytes());
+        payload.extend_from_slice(b"\x1b[201~");
+        (recalled, payload)
+    } else {
+        let payload = recalled.as_bytes().to_vec();
+        (recalled, payload)
+    }
+}
+
+/// Replace the current editable shell line with a finished command.
+///
+/// Refuse to write while a command or full-screen program owns the PTY. Besides
+/// preventing accidental input injection, keeping `typed_cmd` synchronized makes
+/// the compact live cell expand correctly for recalled multiline commands.
+pub(crate) fn recall_command_at_prompt(
+    pty: &OwnedPty,
+    pty_synced: &Cell<bool>,
+    typed_cmd: &RefCell<String>,
+    state: BlockState,
+    command: &str,
+    bracketed_paste: bool,
+) -> bool {
+    if state != BlockState::AwaitingCommand {
+        return false;
+    }
+
+    let (recalled, payload) = build_command_recall(command, bracketed_paste);
+    if recalled.is_empty() {
+        return false;
+    }
+
+    if pty_synced.get() || !typed_cmd.borrow().is_empty() {
+        pty.write_bytes(b"\x15");
+    }
+    pty.write_bytes(&payload);
+    *typed_cmd.borrow_mut() = recalled;
+    pty_synced.set(true);
+    true
+}
+
 /// Probe the cwd for git metadata and update the strip label. Hides the
 /// label when cwd is empty, missing, or not inside a repo — the user
 /// shouldn't see a stale branch from a previous pane state.
@@ -676,7 +734,15 @@ impl ReaderCtx {
                                 let finished_clone = finished.clone();
                                 let finished_widget = finished_clone.widget().clone();
 
-                                finished_clone.connect_actions(&active_vte, &pty_for_init, &pty_synced_rc, &active_rc);
+                                finished_clone.connect_actions(
+                                    &active_vte,
+                                    &pty_for_init,
+                                    &pty_synced_rc,
+                                    &bracketed_paste_rc,
+                                    &typed_cmd_rc,
+                                    &bstate_rc,
+                                    &active_rc,
+                                );
                                 finished_clone.connect_scroll_forwarding(&block_scroll_rc);
 
                                 finished_blocks_for_cb.borrow_mut().push(finished);
@@ -709,6 +775,9 @@ impl ReaderCtx {
                                 let vte_for_copy = active_vte.clone();
                                 let pty_for_rerun_menu = pty_for_init.clone();
                                 let pty_synced_for_rerun_menu = pty_synced_rc.clone();
+                                let bracketed_paste_for_rerun_menu = bracketed_paste_rc.clone();
+                                let typed_cmd_for_rerun_menu = typed_cmd_rc.clone();
+                                let bstate_for_rerun_menu = bstate_rc.clone();
                                 let active_for_rerun_menu = active_rc.clone();
                                 let selected_for_menu = selected_block_id_rc.clone();
                                 let bookmarks_for_menu = bookmarks_rc.clone();
@@ -818,13 +887,26 @@ impl ReaderCtx {
                                         let finished_for_rerun = finished_menu_clone.clone();
                                         let pty_for_action = pty_for_rerun_menu.clone();
                                         let pty_synced_for_action = pty_synced_for_rerun_menu.clone();
+                                        let bracketed_paste_for_action =
+                                            bracketed_paste_for_rerun_menu.clone();
+                                        let typed_cmd_for_action = typed_cmd_for_rerun_menu.clone();
+                                        let bstate_for_action = bstate_for_rerun_menu.clone();
                                         let active_for_action = active_for_rerun_menu.clone();
+                                        item.set_sensitive(
+                                            bstate_for_action.get() == BlockState::AwaitingCommand,
+                                        );
                                         item.connect_clicked(move |_| {
                                             popover_c.popdown();
-                                            if pty_synced_for_action.get() { pty_for_action.write_bytes(b"\x15"); }
-                                            pty_for_action.write_bytes(finished_for_rerun.cmd_text.as_bytes());
-                                            pty_synced_for_action.set(true);
-                                            active_for_action.borrow().grab_focus();
+                                            if recall_command_at_prompt(
+                                                &pty_for_action,
+                                                &pty_synced_for_action,
+                                                &typed_cmd_for_action,
+                                                bstate_for_action.get(),
+                                                &finished_for_rerun.cmd_text,
+                                                bracketed_paste_for_action.get(),
+                                            ) {
+                                                active_for_action.borrow().grab_focus();
+                                            }
                                         });
                                         vbox.append(&item);
                                     }
@@ -1249,6 +1331,8 @@ fn exit_fullscreen(
 /// fall through to the VTE.
 struct KeyCtx {
     pty_for_key: Rc<OwnedPty>,
+    pty_synced_for_key: Rc<Cell<bool>>,
+    bracketed_paste_for_key: Rc<Cell<bool>>,
     active_vte_for_key: Terminal,
     typed_cmd_for_key: Rc<RefCell<String>>,
     finished_blocks_for_key: Rc<RefCell<Vec<FinishedBlock>>>,
@@ -1265,6 +1349,8 @@ impl KeyCtx {
     fn connect(self, key_ctrl: &gtk::EventControllerKey) {
         let KeyCtx {
             pty_for_key,
+            pty_synced_for_key,
+            bracketed_paste_for_key,
             active_vte_for_key,
             typed_cmd_for_key,
             finished_blocks_for_key,
@@ -1339,15 +1425,19 @@ impl KeyCtx {
             }
 
             // Enter while a block is selected: recall its command into the live
-            // input line (clear the shell line with Ctrl+U, then type it).
+            // input line without executing embedded newlines.
             if matches!(keyval, Key::Return | Key::KP_Enter) {
                 if let Some(sel_id) = selected_block_id_for_key.get() {
                     let finished = finished_blocks_for_key.borrow();
                     if let Some(block) = finished.iter().find(|b| b.id == sel_id) {
-                        let cmd: String = block.cmd_text.lines().next().unwrap_or("").to_string();
-                        pty_for_key.write_bytes(b"\x15");
-                        pty_for_key.write_bytes(cmd.as_bytes());
-                        typed_cmd_for_key.borrow_mut().clear();
+                        recall_command_at_prompt(
+                            &pty_for_key,
+                            &pty_synced_for_key,
+                            &typed_cmd_for_key,
+                            bstate_for_key.get(),
+                            &block.cmd_text,
+                            bracketed_paste_for_key.get(),
+                        );
                     }
                     select_finished_block(&finished, &selected_block_id_for_key, None);
                     return glib::Propagation::Stop;
@@ -2295,6 +2385,8 @@ impl TermView {
 
             KeyCtx {
                 pty_for_key,
+                pty_synced_for_key: pty_synced.clone(),
+                bracketed_paste_for_key: bracketed_paste.clone(),
                 active_vte_for_key,
                 typed_cmd_for_key,
                 finished_blocks_for_key,
@@ -2454,6 +2546,9 @@ impl TermView {
                     &term_view.active_vte,
                     &term_view.pty,
                     &pty_synced,
+                    &term_view.bracketed_paste,
+                    &term_view.typed_cmd,
+                    &term_view.bstate,
                     &term_view.active,
                 );
                 finished.connect_scroll_forwarding(&term_view.block_scroll);
@@ -3133,7 +3228,8 @@ impl TermView {
 #[cfg(test)]
 mod tests {
     use super::{
-        coalesce_bytes_events, is_post_command_metadata, strip_ansi, strip_ansi_with_clear_detect,
+        build_command_recall, coalesce_bytes_events, is_post_command_metadata, strip_ansi,
+        strip_ansi_with_clear_detect,
     };
     use crate::parser::ParserEvent;
 
@@ -3172,6 +3268,27 @@ mod tests {
         assert!(is_post_command_metadata(b"\x1b]0;title\x1b\\"));
         assert!(!is_post_command_metadata(b"/home/yj\r\n"));
         assert!(!is_post_command_metadata(b"daily.txt  Documents\r\n"));
+    }
+
+    #[test]
+    fn multiline_recall_uses_bracketed_paste_when_available() {
+        let (text, payload) = build_command_recall("printf a\r\nprintf b", true);
+        assert_eq!(text, "printf a\nprintf b");
+        assert_eq!(payload, b"\x1b[200~printf a\nprintf b\x1b[201~");
+    }
+
+    #[test]
+    fn multiline_recall_falls_back_to_first_line_without_bracketed_paste() {
+        let (text, payload) = build_command_recall("printf a\nprintf b", false);
+        assert_eq!(text, "printf a");
+        assert_eq!(payload, b"printf a");
+    }
+
+    #[test]
+    fn single_line_recall_does_not_add_paste_markers() {
+        let (text, payload) = build_command_recall("git status", true);
+        assert_eq!(text, "git status");
+        assert_eq!(payload, b"git status");
     }
 
     #[test]
