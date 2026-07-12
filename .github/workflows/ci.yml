@@ -77,7 +77,8 @@ jobs:
             || true
           cargo fmt --all
 
-          git add src Cargo.lock
+          git add src
+          git add -f Cargo.lock
           if git diff --cached --quiet; then
             exit 0
           fi
