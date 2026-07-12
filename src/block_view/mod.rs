@@ -464,6 +464,19 @@ fn is_post_command_metadata(bytes: &[u8]) -> bool {
         || bytes.starts_with(b"\x1b]2;")
 }
 
+/// Pick the command text recorded for a finished block.  The live VTE is the
+/// most faithful source (history recall, cursor editing, suggestions), but its
+/// `feed()` updates can still be queued when OSC 133;C is handled.  Keep the
+/// input shadow as a fallback for that race instead of dropping the block.
+fn finished_command(vte_capture: &str, input_shadow: &str) -> String {
+    let captured = vte_capture.trim();
+    if captured.is_empty() {
+        input_shadow.trim().to_string()
+    } else {
+        captured.to_string()
+    }
+}
+
 impl ReaderCtx {
     fn install(self, pty: &Rc<OwnedPty>) {
         let ReaderCtx {
@@ -609,12 +622,10 @@ impl ReaderCtx {
                                 // keystroke shadow only if the VTE read came back
                                 // empty (which would indicate the prompt-end
                                 // anchor never captured a valid cursor position).
-                                let vte_cmd = vte_typed_cmd_rc.borrow().trim().to_string();
-                                let cmd = if !vte_cmd.is_empty() {
-                                    vte_cmd
-                                } else {
-                                    typed_cmd_rc.borrow().trim().to_string()
-                                };
+                                let cmd = finished_command(
+                                    &vte_typed_cmd_rc.borrow(),
+                                    &typed_cmd_rc.borrow(),
+                                );
 
                                 if cmd.is_empty() {
                                     // Nothing meaningful to record; just reset.
@@ -1101,7 +1112,11 @@ impl ReaderCtx {
                             *running_cmd_rc.borrow_mut() = cmd_from_vte;
                             cmd_running_rc.set(true);
                             bstate_rc.set(BlockState::CollectingOutput);
-                            typed_cmd_rc.borrow_mut().clear();
+                            // Do not clear the input shadow here. VTE `feed()` is
+                            // asynchronous, so the text-range capture above can
+                            // occasionally be empty even for a real command. It
+                            // remains the finalize fallback until PromptEnd
+                            // clears both command buffers for the next prompt.
                             // Match jterm1's block-mode runtime model: keep the
                             // active VTE as the live surface while the command
                             // runs, then snapshot it into a finished block on the
@@ -3228,8 +3243,8 @@ impl TermView {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_command_recall, coalesce_bytes_events, is_post_command_metadata, strip_ansi,
-        strip_ansi_with_clear_detect,
+        build_command_recall, coalesce_bytes_events, finished_command, is_post_command_metadata,
+        strip_ansi, strip_ansi_with_clear_detect,
     };
     use crate::parser::ParserEvent;
 
@@ -3268,6 +3283,20 @@ mod tests {
         assert!(is_post_command_metadata(b"\x1b]0;title\x1b\\"));
         assert!(!is_post_command_metadata(b"/home/yj\r\n"));
         assert!(!is_post_command_metadata(b"daily.txt  Documents\r\n"));
+    }
+
+    #[test]
+    fn command_finalize_falls_back_when_vte_feed_has_not_rendered_yet() {
+        assert_eq!(finished_command("", "git status"), "git status");
+        assert_eq!(finished_command("  ", "git status"), "git status");
+    }
+
+    #[test]
+    fn command_finalize_prefers_vte_capture_for_edited_or_recalled_input() {
+        assert_eq!(
+            finished_command("git status --short", "git status"),
+            "git status --short"
+        );
     }
 
     #[test]
