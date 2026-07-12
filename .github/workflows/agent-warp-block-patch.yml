@@ -1,0 +1,429 @@
+name: Apply Warp block layout patch
+
+on:
+  push:
+    branches:
+      - agent/warp-block-complete-content
+
+permissions:
+  contents: write
+
+concurrency:
+  group: agent-warp-block-complete-content
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/warp-block-complete-content
+          fetch-depth: 0
+
+      - name: Apply complete-content block layout
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          blocks_path = Path("src/block_view/blocks.rs")
+          mod_path = Path("src/block_view/mod.rs")
+          scroll_path = Path("src/block_view/scroll.rs")
+
+          blocks = blocks_path.read_text()
+          if "Finished command snapshots use their complete natural height" in blocks:
+              print("Warp block patch already applied")
+              raise SystemExit(0)
+
+          def replace_once(text: str, old: str, new: str, label: str) -> str:
+              if old not in text:
+                  raise SystemExit(f"missing patch target: {label}")
+              return text.replace(old, new, 1)
+
+          blocks = replace_once(
+              blocks,
+              r'''    /// Read-only VTE displaying the executed command line (single-row typically).
+    pub(crate) command_vte: vte4::Terminal,
+''',
+              r'''    /// Read-only VTE displaying the complete executed command. It takes its
+    /// natural wrapped/multiline height instead of hiding rows in private VTE
+    /// scrollback.
+    pub(crate) command_vte: vte4::Terminal,
+''',
+              "command VTE field documentation",
+          )
+
+          blocks = replace_once(
+              blocks,
+              r'''/// Rows occupied after VTE wraps the snapshot at `cols`. Finished cards need
+/// this rather than the logical line count, otherwise a stack trace containing
+/// very long type names is still pushed into the VTE's private scrollback.
+fn output_visual_row_count(text: &str, cols: i64) -> i64 {
+    use unicode_width::UnicodeWidthChar;
+
+    let cols = cols.max(1) as usize;
+    let text = output_display_text(text);
+    if text.is_empty() {
+        return 1;
+    }
+
+    text.split('\n')
+        .map(|line| {
+            let mut width = 0usize;
+            for ch in line.trim_end_matches('\r').chars() {
+                width += match ch {
+                    '\t' => 8 - (width % 8),
+                    _ => UnicodeWidthChar::width(ch).unwrap_or(0),
+                };
+            }
+            width.max(1).div_ceil(cols) as i64
+        })
+        .sum::<i64>()
+        .max(1)
+}
+''',
+              r'''/// Rows occupied after VTE wraps text at `cols`. Finished command and output
+/// snapshots both use this calculation so their widget height contains every
+/// rendered row. Styling/control bytes must not count as printable cells.
+fn terminal_visual_row_count(text: &str, cols: i64) -> i64 {
+    use unicode_width::UnicodeWidthChar;
+
+    let cols = cols.max(1) as usize;
+    let display_text = strip_ansi(output_display_text(text));
+    if display_text.is_empty() {
+        return 1;
+    }
+
+    display_text
+        .split('\n')
+        .map(|line| {
+            let mut width = 0usize;
+            for ch in line.trim_end_matches('\r').chars() {
+                width += match ch {
+                    '\t' => 8 - (width % 8),
+                    _ => UnicodeWidthChar::width(ch).unwrap_or(0),
+                };
+            }
+            width.max(1).div_ceil(cols) as i64
+        })
+        .sum::<i64>()
+        .max(1)
+}
+''',
+              "terminal visual row calculation",
+          )
+          blocks = blocks.replace(
+              "output_visual_row_count(", "terminal_visual_row_count("
+          )
+
+          blocks = replace_once(
+              blocks,
+              r'''    #[test]
+    fn visual_row_count_includes_terminal_wrapping() {
+        assert_eq!(terminal_visual_row_count("123456789\nabc", 4), 4);
+        assert_eq!(terminal_visual_row_count("界界界", 4), 2);
+    }
+''',
+              r'''    #[test]
+    fn visual_row_count_includes_terminal_wrapping() {
+        assert_eq!(terminal_visual_row_count("123456789\nabc", 4), 4);
+        assert_eq!(terminal_visual_row_count("界界界", 4), 2);
+    }
+
+    #[test]
+    fn visual_row_count_ignores_ansi_formatting_bytes() {
+        assert_eq!(
+            terminal_visual_row_count("\x1b[1;36m1234\x1b[0m", 4),
+            1
+        );
+    }
+
+    #[test]
+    fn visual_row_count_covers_wrapped_and_multiline_commands() {
+        assert_eq!(terminal_visual_row_count("123456789", 4), 3);
+        assert_eq!(terminal_visual_row_count("1\n2\n3\n4\n5\n6", 80), 6);
+    }
+''',
+              "visual row regression tests",
+          )
+
+          blocks = replace_once(
+              blocks,
+              r'''        // Captured command strings use logical newlines. Convert them to CRLF
+        // for VTE so every pasted/continued line begins at the command column.
+        let cmd_bytes = terminalize_line_breaks(&cmd_bytes);
+        // Command typically fits one line; allow a few in case of multiline pastes.
+        let cmd_rows = cmd_bytes.iter().filter(|&&b| b == b'\n').count() as i64 + 1;
+        let command_vte = create_finished_terminal(config, cols, cmd_rows.max(1), 5);
+''',
+              r'''        // Finished command snapshots use their complete natural height. Size
+        // from the bytes actually rendered (ANSI styling excluded), including
+        // both logical newlines and terminal wrapping. Reserve two columns for
+        // the prompt chevron/gutter so a command never clips at the card edge.
+        let command_cols = cols.saturating_sub(2).max(1);
+        let cmd_rows =
+            terminal_visual_row_count(&String::from_utf8_lossy(&cmd_bytes), command_cols).max(1);
+        // Captured command strings use logical newlines. Convert them to CRLF
+        // for VTE so every pasted/continued line begins at the command column.
+        let cmd_bytes = terminalize_line_breaks(&cmd_bytes);
+        let command_vte = create_finished_terminal(
+            config,
+            command_cols,
+            cmd_rows,
+            cmd_rows,
+        );
+        command_vte
+            .set_height_request(cmd_rows as i32 * estimated_cell_height_px(config));
+''',
+              "full-height command VTE construction",
+          )
+
+          blocks = replace_once(
+              blocks,
+              "            let cols_for_map = cols.max(1);\n            let cmd_rows_for_map = cmd_rows.max(1).min(5);\n",
+              "            let cols_for_map = command_cols;\n            let cmd_rows_for_map = cmd_rows;\n",
+              "command map dimensions",
+          )
+          blocks = replace_once(
+              blocks,
+              "                w.set_size(cols_for_map, cmd_rows_for_map);\n                w.feed(&cmd_bytes_for_map);\n",
+              "                w.set_size(cols_for_map, cmd_rows_for_map);\n                w.set_scrollback_lines(0);\n                w.feed(&cmd_bytes_for_map);\n                pin_vte_to_top(w);\n",
+              "command feed top pin",
+          )
+
+          blocks = replace_once(
+              blocks,
+              r'''    /// Forward wheel events from full-height output VTEs to the one outer
+    /// ScrolledWindow so all finished blocks behave as a continuous canvas.
+    pub(crate) fn connect_scroll_forwarding(&self, outer: &gtk::ScrolledWindow) {
+        let scroll_ctrl =
+''',
+              r'''    /// Forward wheel events from both read-only VTE surfaces to the one outer
+    /// ScrolledWindow so command and output feel like one continuous Warp-style
+    /// block canvas instead of independent terminal viewports.
+    pub(crate) fn connect_scroll_forwarding(&self, outer: &gtk::ScrolledWindow) {
+        let command_scroll =
+            gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+        command_scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let outer_for_command = outer.clone();
+        command_scroll.connect_scroll(move |_, _dx, dy| {
+            forward_outer_scroll(&outer_for_command, dy);
+            glib::Propagation::Stop
+        });
+        self.command_vte.add_controller(command_scroll);
+
+        let scroll_ctrl =
+''',
+              "command surface scroll forwarding",
+          )
+
+          blocks_path.write_text(blocks)
+
+          mod_rs = mod_path.read_text()
+          mod_rs = replace_once(
+              mod_rs,
+              r'''                                let truncation_limit = config_for_cb.borrow().truncation_threshold_lines as usize;
+                                let output_trimmed = {
+                                    let trimmed = output_plain.trim();
+                                    let lines: Vec<&str> = trimmed.lines().collect();
+                                    if lines.len() > truncation_limit {
+                                        let kept: String = lines[..truncation_limit].join("\n");
+                                        format!("{}\n\n[... truncated: {} lines total, showing first {}]", kept, lines.len(), truncation_limit)
+                                    } else {
+                                        trimmed.to_string()
+                                    }
+                                };
+
+                                let line_count = output_trimmed.lines().count();
+''',
+              r'''                                // BlockData and viewport bookkeeping describe the same full
+                                // output that the card renders. Do not derive metadata from a
+                                // synthetic first-N-lines truncation: it makes long blocks appear
+                                // shorter than their real content and destabilizes scrolling.
+                                let line_count = output_plain.trim().lines().count();
+''',
+              "full output metadata",
+          )
+
+          mod_rs = replace_once(
+              mod_rs,
+              r'''                // Schedule visibility update on next idle
+                let vp = viewport.clone();
+                let finished = finished_blocks.clone();
+                let visible = visible_indices.clone();
+                let fullscreen = fullscreen.clone();
+                glib::idle_add_local_once(move || {
+                    if fullscreen.get() {
+                        return;
+                    }
+                    let vp_ref = vp.borrow();
+                    let mut new_visible = std::collections::HashSet::new();
+
+                    for i in
+                        vp_ref.first_visible..=vp_ref.last_visible.min(vp_ref.first_visible + 1000)
+                    {
+                        new_visible.insert(i);
+                    }
+
+                    let finished_ref = finished.borrow();
+                    let mut visible_ref = visible.borrow_mut();
+
+                    for (i, block) in finished_ref.iter().enumerate() {
+                        if new_visible.contains(&i) && !visible_ref.contains(&i) {
+                            block.widget().set_visible(true);
+                        } else if !new_visible.contains(&i) && visible_ref.contains(&i) {
+                            block.widget().set_visible(false);
+                        }
+                    }
+
+                    *visible_ref = new_visible;
+                });
+''',
+              r'''                // Keep every retained block in GTK's real layout. Hiding an
+                // off-screen block collapses it to zero height, which changes the
+                // scroll range and can make neighboring content jump or disappear.
+                let finished = finished_blocks.clone();
+                let visible = visible_indices.clone();
+                let fullscreen = fullscreen.clone();
+                glib::idle_add_local_once(move || {
+                    if fullscreen.get() {
+                        return;
+                    }
+                    let finished_ref = finished.borrow();
+                    for block in finished_ref.iter() {
+                        block.widget().set_visible(true);
+                    }
+                    let mut visible_ref = visible.borrow_mut();
+                    visible_ref.clear();
+                    visible_ref.extend(0..finished_ref.len());
+                });
+''',
+              "continuous block canvas scroll handler",
+          )
+
+          mod_rs = replace_once(
+              mod_rs,
+              r'''    /// Update block visibility based on viewport: show visible blocks, hide off-screen ones.
+    pub fn update_block_visibility(&self) {
+        let vp = self.viewport.borrow().clone();
+        let mut new_visible = std::collections::HashSet::new();
+
+        // Only show blocks in the visible range
+        for i in vp.first_visible..=vp.last_visible.min(vp.first_visible + 1000) {
+            new_visible.insert(i);
+        }
+
+        let finished = self.finished_blocks.borrow();
+        let mut visible = self.visible_indices.borrow_mut();
+
+        // Update visibility: hide blocks not in new_visible, show blocks in new_visible
+        for (i, block) in finished.iter().enumerate() {
+            if new_visible.contains(&i) && !visible.contains(&i) {
+                block.widget().set_visible(true);
+            } else if !new_visible.contains(&i) && visible.contains(&i) {
+                block.widget().set_visible(false);
+            }
+        }
+
+        *visible = new_visible;
+    }
+''',
+              r'''    /// Keep every retained finished block in the continuous scroll layout.
+    /// Off-screen widgets must retain their natural height; otherwise GTK collapses
+    /// the scroll range and a large block can appear clipped or disappear entirely.
+    pub fn update_block_visibility(&self) {
+        if self.fullscreen.get() {
+            return;
+        }
+        let finished = self.finished_blocks.borrow();
+        for block in finished.iter() {
+            block.widget().set_visible(true);
+        }
+        let mut visible = self.visible_indices.borrow_mut();
+        visible.clear();
+        visible.extend(0..finished.len());
+    }
+''',
+              "continuous block visibility method",
+          )
+
+          mod_rs = replace_once(
+              mod_rs,
+              r'''/// Restore the block list when the alt-screen app exits, re-applying virtual-scroll
+/// visibility so only the previously-visible blocks reappear.
+fn exit_fullscreen(
+    finished: &Rc<RefCell<Vec<FinishedBlock>>>,
+    visible_indices: &Rc<RefCell<std::collections::HashSet<usize>>>,
+    fullscreen: &Rc<Cell<bool>>,
+) {
+    if !fullscreen.replace(false) {
+        return;
+    }
+    let visible = visible_indices.borrow();
+    for (i, block) in finished.borrow().iter().enumerate() {
+        block.widget().set_visible(visible.contains(&i));
+    }
+}
+''',
+              r'''/// Restore the complete continuous block canvas when an alt-screen app exits.
+fn exit_fullscreen(
+    finished: &Rc<RefCell<Vec<FinishedBlock>>>,
+    visible_indices: &Rc<RefCell<std::collections::HashSet<usize>>>,
+    fullscreen: &Rc<Cell<bool>>,
+) {
+    if !fullscreen.replace(false) {
+        return;
+    }
+    let finished = finished.borrow();
+    let mut visible = visible_indices.borrow_mut();
+    visible.clear();
+    for (i, block) in finished.iter().enumerate() {
+        block.widget().set_visible(true);
+        visible.insert(i);
+    }
+}
+''',
+              "fullscreen block restoration",
+          )
+          mod_path.write_text(mod_rs)
+
+          scroll_rs = scroll_path.read_text()
+          scroll_rs = replace_once(
+              scroll_rs,
+              r'''    /// With virtual scrolling, hidden blocks have 0 GTK height until the scroll
+    /// position brings them near the viewport. A single `upper - page` jump can
+    /// therefore land short: the jump reveals more blocks, those blocks expand,
+    /// and `upper` grows on the next frame. Re-applying the bottom pin briefly
+    /// keeps the latest finished block and prompt visible instead of leaving
+    /// their lower rows clipped behind the active cell.
+''',
+              r'''    /// Finished VTEs replace their pre-map height request with the exact cell
+    /// height after GTK realizes them. A single `upper - page` jump can therefore
+    /// land short while that layout settles. Re-applying the bottom pin briefly
+    /// keeps the latest finished block and prompt visible instead of leaving
+    /// their lower rows clipped behind the active cell.
+''',
+              "bottom pin documentation",
+          )
+          scroll_path.write_text(scroll_rs)
+          PY
+
+      - name: Format Rust sources
+        run: |
+          rustup component add rustfmt
+          cargo fmt --all
+
+      - name: Commit patch
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            echo "No patch changes to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/block_view/blocks.rs src/block_view/mod.rs src/block_view/scroll.rs
+          git commit -m "Align finished block layout with Warp"
+          git push origin HEAD:agent/warp-block-complete-content
