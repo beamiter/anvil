@@ -9,10 +9,12 @@ use nix::libc;
 use nix::pty::{openpty, OpenptyResult};
 use nix::unistd::{self, ForkResult, Pid};
 use relm4::gtk;
+use std::borrow::Cow;
 use std::ffi::CString;
 use std::io::{self, Read as _};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 
 enum PtyMsg {
     Data(Vec<u8>),
@@ -20,8 +22,16 @@ enum PtyMsg {
 }
 
 pub struct OwnedPty {
-    master: std::sync::Arc<std::sync::Mutex<Option<OwnedFd>>>,
+    master: Arc<std::sync::Mutex<Option<OwnedFd>>>,
     pid: Pid,
+    /// Tracks bracketed-paste writes whose start/body/end arrive as separate
+    /// `write_bytes` calls. While active, embedded line endings are intentional
+    /// paste content and must be forwarded unchanged.
+    outgoing_bracketed_paste: AtomicBool,
+    /// Mirrors the shell's DECSET 2004 state observed on the PTY output stream.
+    /// At an interactive prompt this lets insertion-only multiline input be
+    /// wrapped safely instead of executing one command per line.
+    shell_bracketed_paste: Arc<AtomicBool>,
 }
 
 /// Process exactly one bounded chunk per GLib dispatch. Even at idle priority,
@@ -39,6 +49,106 @@ const PTY_QUEUE_CAPACITY: usize = 8;
 /// frame boundary. At 8 ms and 32 KiB chunks the cap is about 4 MiB/s per PTY,
 /// while pointer and keyboard handling get a scheduling opportunity each tick.
 const PTY_DISPATCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(8);
+
+const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
+const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
+const BRACKETED_PASTE_ENABLE: &[u8] = b"\x1b[?2004h";
+const BRACKETED_PASTE_DISABLE: &[u8] = b"\x1b[?2004l";
+
+/// Observe DECSET/DECRST 2004 in a stream that may split an escape sequence
+/// across read chunks. `tail` retains only the bytes needed to bridge the next
+/// boundary; the returned bool is the mode after processing `data`.
+fn observe_bracketed_paste_mode(current: bool, tail: &mut Vec<u8>, data: &[u8]) -> bool {
+    let mut combined = Vec::with_capacity(tail.len() + data.len());
+    combined.extend_from_slice(tail);
+    combined.extend_from_slice(data);
+
+    let mut enabled = current;
+    let mut index = 0usize;
+    while index < combined.len() {
+        let rest = &combined[index..];
+        if rest.starts_with(BRACKETED_PASTE_ENABLE) {
+            enabled = true;
+            index += BRACKETED_PASTE_ENABLE.len();
+        } else if rest.starts_with(BRACKETED_PASTE_DISABLE) {
+            enabled = false;
+            index += BRACKETED_PASTE_DISABLE.len();
+        } else {
+            index += 1;
+        }
+    }
+
+    let bridge_len = BRACKETED_PASTE_ENABLE
+        .len()
+        .max(BRACKETED_PASTE_DISABLE.len())
+        .saturating_sub(1);
+    let keep_from = combined.len().saturating_sub(bridge_len);
+    tail.clear();
+    tail.extend_from_slice(&combined[keep_from..]);
+    enabled
+}
+
+/// Protect insertion-only input from silently becoming multiple submissions.
+///
+/// Block recall has several UI entry points. Some already pass only the first
+/// logical line, while the hover action and context menu pass the complete
+/// captured command. Writing an unframed newline stream directly to a shell PTY
+/// executes every completed line immediately. The same hazard exists when a
+/// shell has bracketed paste disabled and the user pastes multiple lines.
+///
+/// The PTY boundary is the one place all of those writes share, so enforce one
+/// consistent contract here:
+///
+/// - explicit or already-active bracketed-paste payloads pass through;
+/// - data ending in CR is an explicit submission and passes through;
+/// - multiline insertion is automatically bracket-wrapped when the shell
+///   advertises DECSET 2004;
+/// - otherwise multiline insertion safely falls back to its first line;
+/// - ordinary single-line input is unchanged.
+///
+/// Returns the bytes to write plus the outgoing bracketed-paste state for the
+/// next call.
+fn sanitize_input_chunk(
+    data: &[u8],
+    paste_active: bool,
+    shell_supports_bracketed_paste: bool,
+) -> (Cow<'_, [u8]>, bool) {
+    let starts_paste = data.starts_with(BRACKETED_PASTE_START);
+    let ends_paste = data.ends_with(BRACKETED_PASTE_END);
+    let protected_by_paste = paste_active || starts_paste;
+    let next_paste_active = if ends_paste {
+        false
+    } else if starts_paste {
+        true
+    } else {
+        paste_active
+    };
+
+    // A final CR is how terminal callers explicitly press Enter. Do not rewrite
+    // those command-execution paths, even when the submitted command is multiline.
+    if protected_by_paste || data.ends_with(b"\r") {
+        return (Cow::Borrowed(data), next_paste_active);
+    }
+
+    let Some(first_break) = data.iter().position(|&byte| byte == b'\r' || byte == b'\n') else {
+        return (Cow::Borrowed(data), next_paste_active);
+    };
+
+    if shell_supports_bracketed_paste {
+        let mut wrapped = Vec::with_capacity(
+            BRACKETED_PASTE_START.len() + data.len() + BRACKETED_PASTE_END.len(),
+        );
+        wrapped.extend_from_slice(BRACKETED_PASTE_START);
+        wrapped.extend_from_slice(data);
+        wrapped.extend_from_slice(BRACKETED_PASTE_END);
+        return (Cow::Owned(wrapped), next_paste_active);
+    }
+
+    (
+        Cow::Owned(data[..first_break].to_vec()),
+        next_paste_active,
+    )
+}
 
 impl OwnedPty {
     fn close_master_fd(&self) {
@@ -88,8 +198,10 @@ impl OwnedPty {
             Ok(ForkResult::Parent { child }) => {
                 drop(slave);
                 Ok(OwnedPty {
-                    master: std::sync::Arc::new(std::sync::Mutex::new(Some(master))),
+                    master: Arc::new(std::sync::Mutex::new(Some(master))),
                     pid: child,
+                    outgoing_bracketed_paste: AtomicBool::new(false),
+                    shell_bracketed_paste: Arc::new(AtomicBool::new(false)),
                 })
             }
             Err(e) => Err(io::Error::other(e)),
@@ -111,11 +223,28 @@ impl OwnedPty {
     }
 
     pub fn write_bytes(&self, data: &[u8]) {
+        let paste_active = self.outgoing_bracketed_paste.load(Ordering::Relaxed);
+        let shell_supports_bracketed_paste = self.shell_bracketed_paste.load(Ordering::Relaxed);
+        let (safe_data, next_paste_active) = sanitize_input_chunk(
+            data,
+            paste_active,
+            shell_supports_bracketed_paste,
+        );
+        self.outgoing_bracketed_paste
+            .store(next_paste_active, Ordering::Relaxed);
+
+        if safe_data.is_empty() {
+            return;
+        }
         if let Ok(guard) = self.master.lock() {
             if let Some(fd) = guard.as_ref() {
                 let raw = fd.as_raw_fd();
                 unsafe {
-                    libc::write(raw, data.as_ptr() as *const libc::c_void, data.len());
+                    libc::write(
+                        raw,
+                        safe_data.as_ptr() as *const libc::c_void,
+                        safe_data.len(),
+                    );
                 }
             }
         }
@@ -161,8 +290,17 @@ impl OwnedPty {
 
         let child_pid = self.pid;
         let (tx, rx) = mpsc::sync_channel::<PtyMsg>(PTY_QUEUE_CAPACITY);
+        let shell_bracketed_paste = Arc::clone(&self.shell_bracketed_paste);
 
-        self.start_reader_timed(fd, child_pid, tx, rx, callback, on_exit);
+        self.start_reader_timed(
+            fd,
+            child_pid,
+            tx,
+            rx,
+            callback,
+            on_exit,
+            shell_bracketed_paste,
+        );
     }
 
     fn start_reader_timed<F, E>(
@@ -173,6 +311,7 @@ impl OwnedPty {
         rx: mpsc::Receiver<PtyMsg>,
         mut callback: F,
         on_exit: E,
+        shell_bracketed_paste: Arc<AtomicBool>,
     ) where
         F: FnMut(Vec<u8>) + 'static,
         E: FnOnce(i32) + 'static,
@@ -180,6 +319,7 @@ impl OwnedPty {
         std::thread::spawn(move || {
             let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
             let mut buf = [0u8; 32 * 1024];
+            let mut mode_tail = Vec::with_capacity(BRACKETED_PASTE_ENABLE.len().saturating_sub(1));
             loop {
                 match file.read(&mut buf) {
                     Ok(0) | Err(_) => {
@@ -190,6 +330,12 @@ impl OwnedPty {
                         let mut combined = Vec::with_capacity(n + 4096);
                         combined.extend_from_slice(&buf[..n]);
                         coalesce_pending(fd, &mut file, &mut buf, &mut combined);
+                        let mode = observe_bracketed_paste_mode(
+                            shell_bracketed_paste.load(Ordering::Relaxed),
+                            &mut mode_tail,
+                            &combined,
+                        );
+                        shell_bracketed_paste.store(mode, Ordering::Relaxed);
                         if tx.send(PtyMsg::Data(combined)).is_err() {
                             std::mem::forget(file);
                             break;
@@ -300,5 +446,76 @@ impl Drop for OwnedPty {
     fn drop(&mut self) {
         self.close_master_fd();
         terminate_terminal_process(self.pid.as_raw());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unframed_multiline_insert_falls_back_to_first_line_without_shell_support() {
+        let (safe, active) = sanitize_input_chunk(b"echo first\necho second", false, false);
+        assert_eq!(safe.as_ref(), b"echo first");
+        assert!(!active);
+
+        let (safe, _) = sanitize_input_chunk(b"echo first\r\necho second", false, false);
+        assert_eq!(safe.as_ref(), b"echo first");
+    }
+
+    #[test]
+    fn shell_supported_multiline_insert_is_automatically_bracketed() {
+        let input = b"echo first\necho second";
+        let (safe, active) = sanitize_input_chunk(input, false, true);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(BRACKETED_PASTE_START);
+        expected.extend_from_slice(input);
+        expected.extend_from_slice(BRACKETED_PASTE_END);
+        assert_eq!(safe.as_ref(), expected.as_slice());
+        assert!(!active);
+    }
+
+    #[test]
+    fn explicit_submission_preserves_multiline_bytes() {
+        let submitted = b"if true; then\necho ok\nfi\r";
+        let (safe, active) = sanitize_input_chunk(submitted, false, false);
+        assert_eq!(safe.as_ref(), submitted);
+        assert!(!active);
+    }
+
+    #[test]
+    fn bracketed_paste_preserves_multiline_body_across_writes() {
+        let (start, active) = sanitize_input_chunk(BRACKETED_PASTE_START, false, false);
+        assert_eq!(start.as_ref(), BRACKETED_PASTE_START);
+        assert!(active);
+
+        let body = b"echo first\necho second";
+        let (safe_body, active) = sanitize_input_chunk(body, active, false);
+        assert_eq!(safe_body.as_ref(), body);
+        assert!(active);
+
+        let (end, active) = sanitize_input_chunk(BRACKETED_PASTE_END, active, false);
+        assert_eq!(end.as_ref(), BRACKETED_PASTE_END);
+        assert!(!active);
+    }
+
+    #[test]
+    fn ordinary_single_line_input_is_unchanged() {
+        let input = b"git status";
+        let (safe, active) = sanitize_input_chunk(input, false, false);
+        assert_eq!(safe.as_ref(), input);
+        assert!(!active);
+    }
+
+    #[test]
+    fn observes_split_bracketed_paste_mode_sequences() {
+        let mut tail = Vec::new();
+        let enabled = observe_bracketed_paste_mode(false, &mut tail, b"prompt\x1b[?20");
+        assert!(!enabled);
+        let enabled = observe_bracketed_paste_mode(enabled, &mut tail, b"04h");
+        assert!(enabled);
+
+        let enabled = observe_bracketed_paste_mode(enabled, &mut tail, b"\x1b[?2004l");
+        assert!(!enabled);
     }
 }
