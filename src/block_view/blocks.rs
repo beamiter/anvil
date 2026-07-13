@@ -429,6 +429,41 @@ fn forward_outer_scroll(outer: &gtk::ScrolledWindow, dy: f64) {
     outer_adj.set_value(target);
 }
 
+/// Move one adjustment for a wheel/trackpad delta. Returns true when that
+/// adjustment consumed movement, allowing nested scroll surfaces to hand off
+/// only at their actual top/bottom boundary.
+fn scroll_adjustment(adj: &gtk::Adjustment, dy: f64) -> bool {
+    let Some(target) = scroll_target(
+        adj.value(),
+        adj.lower(),
+        adj.upper(),
+        adj.page_size(),
+        adj.step_increment(),
+        dy,
+    ) else {
+        return false;
+    };
+    adj.set_value(target);
+    true
+}
+
+fn scroll_target(
+    value: f64,
+    lower: f64,
+    upper: f64,
+    page_size: f64,
+    step_increment: f64,
+    dy: f64,
+) -> Option<f64> {
+    if dy == 0.0 {
+        return None;
+    }
+    let step = step_increment.max(page_size * 0.1).max(1.0);
+    let max_value = (upper - page_size).max(lower);
+    let target = (value + dy * step).clamp(lower, max_value);
+    ((target - value).abs() > f64::EPSILON).then_some(target)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,6 +508,13 @@ mod tests {
         assert_eq!(fitted_output_rows(600, 20, 500), 30);
         assert_eq!(fitted_output_rows(25, 20, 500), 3);
         assert_eq!(fitted_output_rows(600, 20, 12), 12);
+    }
+
+    #[test]
+    fn inner_scroll_consumes_until_its_boundary() {
+        assert_eq!(scroll_target(50.0, 0.0, 100.0, 20.0, 1.0, 1.0), Some(52.0));
+        assert_eq!(scroll_target(80.0, 0.0, 100.0, 20.0, 1.0, 1.0), None);
+        assert_eq!(scroll_target(80.0, 0.0, 100.0, 20.0, 1.0, -1.0), Some(78.0));
     }
 
     #[test]
@@ -1410,44 +1452,43 @@ impl FinishedBlock {
         Some(rows)
     }
 
-    /// Forward wheel events from full-height output VTEs to the one outer
-    /// ScrolledWindow so all finished blocks behave as a continuous canvas.
+    /// Give a long block first refusal on wheel events while the pointer is over
+    /// either its output or its scrollbar. Only hand off to the outer history
+    /// canvas after the inner adjustment reaches the requested boundary.
     pub(crate) fn connect_scroll_forwarding(&self, outer: &gtk::ScrolledWindow) {
-        let scroll_ctrl =
-            gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
-        if !self.output_scrollable {
+        let targets: [gtk::Widget; 2] = [
+            self.output_vte.clone().upcast(),
+            self.output_scrollbar.clone().upcast(),
+        ];
+        for target in targets {
+            let scroll_ctrl =
+                gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+            // Capture before VTE and the ancestor ScrolledWindow can both react
+            // to the same event. Slider dragging is a pointer gesture and stays
+            // native to gtk::Scrollbar.
             scroll_ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
-        }
-        let vte = self.output_vte.downgrade();
-        let outer_for_vte = outer.downgrade();
-        let output_scrollable = self.output_scrollable;
-        scroll_ctrl.connect_scroll(move |_, _dx, dy| {
-            let (Some(vte), Some(outer_for_vte)) = (vte.upgrade(), outer_for_vte.upgrade()) else {
-                return glib::Propagation::Proceed;
-            };
-            if !output_scrollable {
-                pin_vte_to_top(&vte);
+            let vte = self.output_vte.downgrade();
+            let outer_for_vte = outer.downgrade();
+            let output_scrollable = self.output_scrollable;
+            scroll_ctrl.connect_scroll(move |_, _dx, dy| {
+                let (Some(vte), Some(outer_for_vte)) = (vte.upgrade(), outer_for_vte.upgrade())
+                else {
+                    return glib::Propagation::Proceed;
+                };
+                if output_scrollable {
+                    if let Some(inner_adj) = vte.vadjustment() {
+                        if scroll_adjustment(&inner_adj, dy) {
+                            return glib::Propagation::Stop;
+                        }
+                    }
+                } else {
+                    pin_vte_to_top(&vte);
+                }
                 forward_outer_scroll(&outer_for_vte, dy);
-                return glib::Propagation::Stop;
-            }
-
-            let Some(inner_adj) = vte.vadjustment() else {
-                return glib::Propagation::Proceed;
-            };
-            let at_top = inner_adj.value() <= inner_adj.lower() + f64::EPSILON;
-            let at_bottom =
-                inner_adj.value() + inner_adj.page_size() >= inner_adj.upper() - f64::EPSILON;
-            let going_up = dy < 0.0;
-            let going_down = dy > 0.0;
-            if (going_up && !at_top) || (going_down && !at_bottom) {
-                // VTE still has room to scroll itself; let it.
-                return glib::Propagation::Proceed;
-            }
-            // Drive the outer ScrolledWindow by one step in the wheel direction.
-            forward_outer_scroll(&outer_for_vte, dy);
-            glib::Propagation::Stop
-        });
-        self.output_vte.add_controller(scroll_ctrl);
+                glib::Propagation::Stop
+            });
+            target.add_controller(scroll_ctrl);
+        }
     }
 
     /// Wire the hover quick-action buttons (copy command, copy output, recall).
