@@ -135,6 +135,13 @@ pub(crate) fn install_block_css(config: &Config) {
         (err.green() * 255.0) as u8,
         (err.blue() * 255.0) as u8,
     );
+    // Cyan distinguishes asynchronous/background output from command success.
+    let async_color = &config.palette[6];
+    let async_hex = rgba_to_hex(async_color);
+    let async_r = (async_color.red() * 255.0) as u8;
+    let async_g = (async_color.green() * 255.0) as u8;
+    let async_b = (async_color.blue() * 255.0) as u8;
+    let async_stripe = format!("rgba({async_r},{async_g},{async_b},0.65)");
 
     // Per-channel components for the success/error/accent colors, used to build
     // tinted backgrounds and focus glows directly in the CSS template.
@@ -219,6 +226,11 @@ pub(crate) fn install_block_css(config: &Config) {
             border-left-color: {err_stripe};
             background-color: rgba({err_r},{err_g},{err_b},0.11);
             box-shadow: inset 2px 0 0 0 {err_stripe};
+        }}
+        .block-background {{
+            border-left-color: {async_stripe};
+            background-color: rgba({async_r},{async_g},{async_b},0.07);
+            box-shadow: inset 2px 0 0 0 {async_stripe};
         }}
         .block-hovered {{
             background-color: rgba({fg_r},{fg_g},{fg_b},0.05);
@@ -327,6 +339,26 @@ pub(crate) fn install_block_css(config: &Config) {
             font-family: "{font_family}";
             font-size: 0.82em;
             font-weight: bold;
+        }}
+        .block-status-background {{
+            color: {async_hex};
+            background-color: rgba({async_r},{async_g},{async_b},0.16);
+            border-radius: 999px;
+            min-width: 16px;
+            min-height: 16px;
+            padding: 1px 5px;
+            font-family: "{font_family}";
+            font-size: 0.82em;
+            font-weight: bold;
+        }}
+        .block-background-chip {{
+            color: {async_hex};
+            background-color: rgba({async_r},{async_g},{async_b},0.12);
+            border: 1px solid rgba({async_r},{async_g},{async_b},0.28);
+            border-radius: 999px;
+            font-family: "{font_family}";
+            font-size: 0.78em;
+            padding: 1px 9px;
         }}
         .block-action-btn {{
             color: {dim_fg};
