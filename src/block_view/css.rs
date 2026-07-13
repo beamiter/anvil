@@ -235,6 +235,25 @@ pub(crate) fn install_block_css(config: &Config) {
             background-color: {bg_hex};
             box-shadow: 0 2px 8px rgba(0,0,0,0.18);
         }}
+        .block-output-scrollbar {{
+            min-width: 10px;
+            margin: 1px 3px 1px 1px;
+            padding: 0;
+            background-color: transparent;
+        }}
+        .block-output-scrollbar trough {{
+            min-width: 8px;
+            border-radius: 4px;
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.06);
+        }}
+        .block-output-scrollbar slider {{
+            min-width: 6px;
+            border-radius: 4px;
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.38);
+        }}
+        .block-output-scrollbar slider:hover {{
+            background-color: rgba({acc_r},{acc_g},{acc_b},0.78);
+        }}
         .block-prompt-chevron {{
             color: {accent};
             font-family: "{font_family}";

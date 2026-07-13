@@ -99,6 +99,9 @@ pub(crate) struct FinishedBlock {
     /// Read-only VTE displaying the captured output. Finished output takes its
     /// full natural height; scrolling belongs to the outer block canvas.
     pub(crate) output_vte: vte4::Terminal,
+    /// Visible per-block scrollbar for long output, bound to `output_vte`'s
+    /// private adjustment.
+    output_scrollbar: gtk::Scrollbar,
     /// Raw ANSI-bearing output bytes — the source for filter re-feed and the
     /// copy-output action. Mutable so filter can swap the displayed slice
     /// without losing the original.
@@ -146,6 +149,7 @@ impl Clone for FinishedBlock {
             prompt_text: self.prompt_text.clone(),
             command_vte: self.command_vte.clone(),
             output_vte: self.output_vte.clone(),
+            output_scrollbar: self.output_scrollbar.clone(),
             cmd_text: self.cmd_text.clone(),
             full_output: self.full_output.clone(),
             displayed_output: self.displayed_output.clone(),
@@ -1048,8 +1052,17 @@ impl FinishedBlock {
         cmd_row.append(&command_vte);
 
         outer.append(&cmd_row);
-        let output_widget: gtk::Widget = output_vte.clone().upcast::<gtk::Widget>();
-        outer.append(&output_vte);
+        let output_box = gtk::Box::new(Orientation::Horizontal, 0);
+        output_box.set_hexpand(true);
+        output_box.append(&output_vte);
+        let output_scrollbar =
+            gtk::Scrollbar::new(Orientation::Vertical, output_vte.vadjustment().as_ref());
+        output_scrollbar.add_css_class("block-output-scrollbar");
+        output_scrollbar.set_visible(output_scrollable);
+        output_scrollbar.set_tooltip_text(Some("Scroll within this block"));
+        output_box.append(&output_scrollbar);
+        let output_widget: gtk::Widget = output_box.clone().upcast::<gtk::Widget>();
+        outer.append(&output_box);
         let collapsed_summary = gtk::Button::with_label(&collapsed_output_summary(output_rows));
         collapsed_summary.add_css_class("block-output-summary");
         collapsed_summary.add_css_class("flat");
@@ -1192,6 +1205,7 @@ impl FinishedBlock {
                 let ctx_spin = ctx_spin.downgrade();
                 let filter_status = filter_status.downgrade();
                 let expand_btn = expand_btn.downgrade();
+                let output_scrollbar = output_scrollbar.downgrade();
                 let expanded = expanded.clone();
                 let dynamic_viewport_rows = dynamic_viewport_rows.clone();
                 let collapsed_summary = collapsed_summary.downgrade();
@@ -1206,6 +1220,7 @@ impl FinishedBlock {
                         Some(ctx_spin),
                         Some(filter_status),
                         Some(expand_btn),
+                        Some(output_scrollbar),
                         Some(collapsed_summary),
                     ) = (
                         output_vte.upgrade(),
@@ -1216,6 +1231,7 @@ impl FinishedBlock {
                         ctx_spin.upgrade(),
                         filter_status.upgrade(),
                         expand_btn.upgrade(),
+                        output_scrollbar.upgrade(),
                         collapsed_summary.upgrade(),
                     )
                     else {
@@ -1277,6 +1293,7 @@ impl FinishedBlock {
                         filter_status.set_visible(false);
                     }
                     expand_btn.set_visible(shown_visual_rows > dynamic_viewport_rows.get());
+                    output_scrollbar.set_visible(shown_visual_rows > active_cap);
                     collapsed_summary.set_label(&collapsed_output_summary(shown_rows));
                     let display_override = if shown == full.as_str() {
                         None
@@ -1340,6 +1357,7 @@ impl FinishedBlock {
             prompt_text: prompt.to_string(),
             command_vte,
             output_vte,
+            output_scrollbar,
             full_output,
             displayed_output,
             stripped_output: Rc::new(RefCell::new(None)),
@@ -1387,6 +1405,7 @@ impl FinishedBlock {
         self.output_vte.set_size(self.cols.max(1), rows);
         self.output_vte
             .set_height_request((rows as i32).saturating_mul(cell_height));
+        self.output_scrollbar.set_visible(self.output_rows > rows);
         self.output_vte.queue_allocate();
         Some(rows)
     }
