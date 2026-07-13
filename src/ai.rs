@@ -206,11 +206,12 @@ pub(crate) fn ask(
 /// extra global state for our low request rate, and a per-call agent makes
 /// the cancel/timeout story trivial.
 fn http_agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout_read(Duration::from_secs(60))
-        .timeout_write(Duration::from_secs(15))
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(10)))
+        .timeout_recv_body(Some(Duration::from_secs(60)))
+        .timeout_send_body(Some(Duration::from_secs(15)))
         .build()
+        .into()
 }
 
 fn run_request(client: &AiClient, system: &str, user: &str) -> Result<String, String> {
@@ -231,15 +232,18 @@ fn call_anthropic(client: &AiClient, system: &str, user: &str) -> Result<String,
     });
     let mut req = http_agent()
         .post(&url)
-        .set("Content-Type", "application/json")
-        .set("anthropic-version", "2023-06-01");
+        .header("Content-Type", "application/json")
+        .header("anthropic-version", "2023-06-01");
     if let Some(key) = &client.api_key {
-        req = req.set("x-api-key", key);
+        req = req.header("x-api-key", key.as_str());
     }
-    let resp = req
-        .send_string(&body.to_string())
+    let mut resp = req
+        .send(body.to_string())
         .map_err(|e| format!("anthropic request failed: {e}"))?;
-    let text = resp.into_string().map_err(|e| format!("read body: {e}"))?;
+    let text = resp
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("read body: {e}"))?;
     let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))?;
     if let Some(s) = v["content"][0]["text"].as_str() {
         Ok(s.to_string())
@@ -265,14 +269,17 @@ fn call_openai(client: &AiClient, system: &str, user: &str) -> Result<String, St
     });
     let mut req = http_agent()
         .post(&url)
-        .set("Content-Type", "application/json");
+        .header("Content-Type", "application/json");
     if let Some(key) = &client.api_key {
-        req = req.set("Authorization", &format!("Bearer {key}"));
+        req = req.header("Authorization", format!("Bearer {key}"));
     }
-    let resp = req
-        .send_string(&body.to_string())
+    let mut resp = req
+        .send(body.to_string())
         .map_err(|e| format!("openai request failed: {e}"))?;
-    let text = resp.into_string().map_err(|e| format!("read body: {e}"))?;
+    let text = resp
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("read body: {e}"))?;
     let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))?;
     if let Some(s) = v["choices"][0]["message"]["content"].as_str() {
         Ok(s.to_string())
@@ -295,12 +302,15 @@ fn call_ollama(client: &AiClient, system: &str, user: &str) -> Result<String, St
         "stream": false,
         "options": { "num_predict": MAX_TOKENS },
     });
-    let resp = http_agent()
+    let mut resp = http_agent()
         .post(&url)
-        .set("Content-Type", "application/json")
-        .send_string(&body.to_string())
+        .header("Content-Type", "application/json")
+        .send(body.to_string())
         .map_err(|e| format!("ollama request failed (is `ollama serve` running?): {e}"))?;
-    let text = resp.into_string().map_err(|e| format!("read body: {e}"))?;
+    let text = resp
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("read body: {e}"))?;
     let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))?;
     if let Some(s) = v["response"].as_str() {
         Ok(s.to_string())

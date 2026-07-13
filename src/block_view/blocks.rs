@@ -14,7 +14,6 @@ use vte4::TerminalExt;
 
 /// Data for a finished command block (decoupled from widget representation)
 #[derive(Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-#[archive(check_bytes)]
 pub(crate) struct BlockData {
     pub(crate) id: u64,
     pub(crate) prompt: String,

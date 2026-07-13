@@ -33,7 +33,7 @@ impl TermView {
         let compress = self.config.borrow().block_history_compress;
 
         for block in blocks.iter() {
-            let serialized = rkyv::to_bytes::<_, 256>(block)
+            let serialized = rkyv::to_bytes::<rkyv::rancor::Error>(block)
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
 
             let record: &[u8] = if compress {
@@ -101,7 +101,7 @@ impl TermView {
                 data
             };
 
-            if let Ok(block) = rkyv::from_bytes::<BlockData>(&decoded) {
+            if let Ok(block) = rkyv::from_bytes::<BlockData, rkyv::rancor::Error>(&decoded) {
                 temp_blocks.push(block);
             }
         }
