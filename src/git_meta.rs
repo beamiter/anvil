@@ -377,12 +377,7 @@ mod tests {
 
         assert_eq!(request_rx.try_iter().count(), 1);
         assert_eq!(
-            service
-                .pending
-                .lock()
-                .unwrap()
-                .get(path)
-                .map(Vec::len),
+            service.pending.lock().unwrap().get(path).map(Vec::len),
             Some(2)
         );
     }
