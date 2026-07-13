@@ -1,16 +1,16 @@
 name: Apply workspace operations migration
 
 on:
-  push:
+  pull_request:
     branches:
-      - agent/jterm1-workspace-ops-module
+      - master
 
 permissions:
   contents: write
 
 jobs:
   migrate:
-    if: github.actor != 'github-actions[bot]'
+    if: github.head_ref == 'agent/jterm1-workspace-ops-module' && github.actor != 'github-actions[bot]'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -26,9 +26,7 @@ jobs:
 
           main_path = Path('src/main.rs')
           text = main_path.read_text()
-
-          module_line = 'mod workspace_ops;\n'
-          if module_line not in text:
+          if 'mod workspace_ops;\n' not in text:
               text = text.replace('mod workspace;\n', 'mod workspace;\nmod workspace_ops;\n', 1)
 
           start_marker = '    fn add_tab(\n'
@@ -40,7 +38,6 @@ jobs:
 
           block = text[start:end]
           block = re.sub(r'^    fn ', '    pub(crate) fn ', block, flags=re.MULTILINE)
-
           module = '''//! Workspace, tab, pane, session-restore, and remote-connection operations.\n//!\n//! This remains an inherent `AppModel` implementation inside the same Relm4\n//! component. The extraction only separates responsibilities from `main.rs`; it\n//! does not introduce another model, message loop, or UI framework.\n\nuse super::*;\n\nimpl AppModel {\n''' + block + '}\n'
           Path('src/workspace_ops.rs').write_text(module)
           main_path.write_text(text[:start] + text[end:])
@@ -48,6 +45,7 @@ jobs:
 
           cargo fmt --all
           git rm .github/workflows/apply-workspace-ops-migration.yml
+          git rm -f .github/workflows/.workspace-ops-trigger
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add src/main.rs src/workspace_ops.rs
