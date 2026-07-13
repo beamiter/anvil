@@ -1,0 +1,44 @@
+name: Diagnose Warp multi-block selection patch
+
+on:
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out patch branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/warp-multi-block-selection
+
+      - name: Extract and run patch
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import base64, gzip, pathlib, subprocess
+          workflow = pathlib.Path('.github/workflows/agent-warp-multi-selection.yml').read_text().splitlines()
+          start = next(i for i, line in enumerate(workflow) if "cat <<'PATCH_PAYLOAD'" in line) + 1
+          end = next(i for i in range(start, len(workflow)) if workflow[i].strip() == 'PATCH_PAYLOAD')
+          payload = ''.join(line.strip() for line in workflow[start:end])
+          script = gzip.decompress(base64.b64decode(payload))
+          pathlib.Path('/tmp/agent_warp_multi_selection.py').write_bytes(script)
+          result = subprocess.run(['python3', '/tmp/agent_warp_multi_selection.py'], text=True, capture_output=True)
+          pathlib.Path('patch.log').write_text(result.stdout + result.stderr)
+          pathlib.Path('patch-status.txt').write_text(str(result.returncode))
+          print(pathlib.Path('patch.log').read_text())
+          PY
+
+      - name: Upload patch diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: warp-multi-selection-diagnostics
+          path: |
+            patch.log
+            patch-status.txt
+          retention-days: 1
