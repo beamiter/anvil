@@ -1,0 +1,55 @@
+name: Apply workspace operations migration
+
+on:
+  push:
+    branches:
+      - agent/jterm1-workspace-ops-module
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/jterm1-workspace-ops-module
+
+      - name: Extract workspace operations
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          main_path = Path('src/main.rs')
+          text = main_path.read_text()
+
+          module_line = 'mod workspace_ops;\n'
+          if module_line not in text:
+              text = text.replace('mod workspace;\n', 'mod workspace;\nmod workspace_ops;\n', 1)
+
+          start_marker = '    fn add_tab(\n'
+          end_marker = '    fn set_font_scale_all(\n'
+          start = text.find(start_marker)
+          end = text.find(end_marker, start)
+          if start < 0 or end < 0:
+              raise SystemExit('workspace operation markers not found')
+
+          block = text[start:end]
+          block = re.sub(r'^    fn ', '    pub(crate) fn ', block, flags=re.MULTILINE)
+
+          module = '''//! Workspace, tab, pane, session-restore, and remote-connection operations.\n//!\n//! This remains an inherent `AppModel` implementation inside the same Relm4\n//! component. The extraction only separates responsibilities from `main.rs`; it\n//! does not introduce another model, message loop, or UI framework.\n\nuse super::*;\n\nimpl AppModel {\n''' + block + '}\n'
+          Path('src/workspace_ops.rs').write_text(module)
+          main_path.write_text(text[:start] + text[end:])
+          PY
+
+          cargo fmt --all
+          git rm .github/workflows/apply-workspace-ops-migration.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/main.rs src/workspace_ops.rs
+          git commit -m "Extract workspace operations from AppModel"
+          git push origin HEAD:agent/jterm1-workspace-ops-module
