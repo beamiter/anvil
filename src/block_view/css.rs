@@ -206,6 +206,11 @@ pub(crate) fn install_block_css(config: &Config) {
             min-height: 40px;
             transition: background-color 140ms ease, border-color 140ms ease, box-shadow 140ms ease;
         }}
+        .block-finished.block-compact {{
+            border-radius: 6px;
+            min-height: 32px;
+            box-shadow: none;
+        }}
         .block-success {{
             border-left-color: {ok_stripe};
         }}
@@ -234,6 +239,12 @@ pub(crate) fn install_block_css(config: &Config) {
             padding: 2px 0;
             background-color: {bg_hex};
             box-shadow: 0 2px 8px rgba(0,0,0,0.18);
+        }}
+        .block-active.block-compact {{
+            border-radius: 6px;
+            margin: 1px 4px;
+            padding: 0;
+            box-shadow: none;
         }}
         .block-prompt-chevron {{
             color: {accent};
@@ -497,6 +508,24 @@ pub(crate) fn install_block_css(config: &Config) {
             font-family: "{font_family}";
             font-size: 0.92em;
             font-weight: bold;
+        }}
+        .sticky-header-control {{
+            color: {dim_fg};
+            min-width: 22px;
+            min-height: 22px;
+            padding: 0 4px;
+            border-radius: 999px;
+            font-family: "{font_family}";
+            font-size: 0.82em;
+        }}
+        .sticky-header-control:hover {{
+            color: {fg_hex};
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.12);
+        }}
+        .sticky-running-header.sticky-minimized {{
+            padding: 2px 8px;
+            background-color: rgba({bg_r},{bg_g},{bg_b},0.92);
+            box-shadow: 0 1px 4px rgba(0,0,0,0.24);
         }}
         .repo-strip {{
             color: rgba({acc_r},{acc_g},{acc_b},0.85);

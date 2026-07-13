@@ -121,6 +121,8 @@ pub(crate) struct FinishedBlock {
     /// Toggle the per-block output filter without discarding its query. Exposed
     /// so the Warp-compatible keyboard action can target the selected/latest block.
     pub(crate) toggle_filter: Rc<dyn Fn()>,
+    /// Explicit Warp-style navigation affordance for oversized output.
+    pub(crate) jump_bottom_btn: gtk::Button,
     pub(crate) bookmark_star: gtk::Label,
     pub(crate) status_icon: gtk::Label,
     /// Column count the output VTE is sized to — needed for re-feed (filter).
@@ -130,6 +132,8 @@ pub(crate) struct FinishedBlock {
     pub(crate) viewport_cap: i64,
     /// True only when this block has more output rows than can be shown at once.
     pub(crate) output_scrollable: bool,
+    /// Whether this block is tall enough to expose long-block navigation.
+    pub(crate) long_output: bool,
 }
 
 impl Clone for FinishedBlock {
@@ -150,11 +154,13 @@ impl Clone for FinishedBlock {
             header_row: self.header_row.clone(),
             action_box: self.action_box.clone(),
             toggle_filter: self.toggle_filter.clone(),
+            jump_bottom_btn: self.jump_bottom_btn.clone(),
             bookmark_star: self.bookmark_star.clone(),
             status_icon: self.status_icon.clone(),
             cols: self.cols,
             viewport_cap: self.viewport_cap,
             output_scrollable: self.output_scrollable,
+            long_output: self.long_output,
         }
     }
 }
@@ -396,6 +402,28 @@ fn forward_outer_scroll(outer: &gtk::ScrolledWindow, dy: f64) {
     outer_adj.set_value(target);
 }
 
+/// Convert a block's viewport-relative geometry into an absolute outer-scroll
+/// target. All entry points (button, shortcut, context menu, sticky header) use
+/// this one calculation so long-block navigation lands identically.
+fn block_edge_scroll_target(
+    current: f64,
+    relative_top: f64,
+    block_height: f64,
+    page_size: f64,
+    lower: f64,
+    upper: f64,
+    bottom: bool,
+) -> f64 {
+    let max_value = (upper - page_size).max(lower);
+    let absolute_top = current + relative_top;
+    let target = if bottom {
+        absolute_top + block_height - page_size
+    } else {
+        absolute_top
+    };
+    target.clamp(lower, max_value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,6 +487,22 @@ mod tests {
         assert_eq!(
             filter_output_lines("alpha\nBeta\ngamma", "BETA", false, false, false, 0),
             "Beta"
+        );
+    }
+
+    #[test]
+    fn block_edge_target_uses_absolute_canvas_coordinates() {
+        assert_eq!(
+            block_edge_scroll_target(300.0, 50.0, 800.0, 200.0, 0.0, 2000.0, false),
+            350.0
+        );
+        assert_eq!(
+            block_edge_scroll_target(300.0, 50.0, 800.0, 200.0, 0.0, 2000.0, true),
+            950.0
+        );
+        assert_eq!(
+            block_edge_scroll_target(1500.0, 100.0, 800.0, 200.0, 0.0, 1800.0, true),
+            1600.0
         );
     }
 }
@@ -617,6 +661,7 @@ impl FinishedBlock {
         let output_rows = output_visual_row_count(output, cols);
         let viewport_cap = output_rows.max(1);
         let max_expanded_cap = viewport_cap;
+        let long_output = output_rows > config.finished_block_viewport_rows.max(3) as i64;
         // Mirrors create_finished_terminal's temporary capture budget. It is a
         // limit, not an eagerly allocated grid, and is removed after each feed.
         let capture_rows = (config.truncation_threshold_lines as i64).max(4096);
@@ -633,12 +678,21 @@ impl FinishedBlock {
         } else {
             let b = gtk::Box::new(Orientation::Vertical, 0);
             b.add_css_class("block-finished");
-            b.set_margin_top(4);
-            b.set_margin_bottom(4);
-            b.set_margin_start(8);
-            b.set_margin_end(8);
             b
         };
+        if config.block_compact {
+            outer.add_css_class("block-compact");
+            outer.set_margin_top(1);
+            outer.set_margin_bottom(1);
+            outer.set_margin_start(4);
+            outer.set_margin_end(4);
+        } else {
+            outer.remove_css_class("block-compact");
+            outer.set_margin_top(4);
+            outer.set_margin_bottom(4);
+            outer.set_margin_start(8);
+            outer.set_margin_end(8);
+        }
 
         // Status stripe: green left border on success, red on failure.
         outer.add_css_class(if exit_code == 0 {
@@ -659,12 +713,19 @@ impl FinishedBlock {
         // lives on this header strip. Make the otherwise subtle interaction
         // discoverable without adding permanent visual chrome to every block.
         header_row.set_tooltip_text(Some(
-            "Click to select · Enter recalls command · Ctrl+B toggles bookmark",
+            "Click to select · Enter recalls command · Ctrl+Shift+B toggles bookmark",
         ));
-        header_row.set_margin_start(12);
-        header_row.set_margin_end(8);
-        header_row.set_margin_top(6);
-        header_row.set_margin_bottom(2);
+        if config.block_compact {
+            header_row.set_margin_start(8);
+            header_row.set_margin_end(6);
+            header_row.set_margin_top(3);
+            header_row.set_margin_bottom(1);
+        } else {
+            header_row.set_margin_start(12);
+            header_row.set_margin_end(8);
+            header_row.set_margin_top(6);
+            header_row.set_margin_bottom(2);
+        }
 
         // Bookmark star (gutter marker), hidden until the block is bookmarked.
         let bookmark_star = gtk::Label::new(Some("\u{f02e}")); // nf-fa-bookmark
@@ -767,6 +828,9 @@ impl FinishedBlock {
         rerun_btn.set_tooltip_text(Some("Insert command at prompt"));
         let filter_btn = gtk::Button::with_label("\u{f0b0}"); // nf-fa-filter  filter output
         filter_btn.set_tooltip_text(Some("Filter output"));
+        let jump_bottom_btn = gtk::Button::with_label("\u{f103}"); // nf-fa-angle-double-down
+        jump_bottom_btn.set_tooltip_text(Some("Jump to bottom of this block"));
+        jump_bottom_btn.set_visible(long_output);
         // Expand button: appears only when output_rows > viewport_cap; toggles
         // the output VTE between the capped height and a roomier expanded height
         // (`finished_block_max_expanded_rows`). Wired below once output_rows and
@@ -778,6 +842,7 @@ impl FinishedBlock {
             &copy_output_btn,
             &rerun_btn,
             &filter_btn,
+            &jump_bottom_btn,
             &expand_btn,
         ] {
             btn.add_css_class("block-action-btn");
@@ -1205,11 +1270,13 @@ impl FinishedBlock {
             header_row,
             action_box,
             toggle_filter,
+            jump_bottom_btn,
             bookmark_star,
             status_icon,
             cols,
             viewport_cap,
             output_scrollable,
+            long_output,
         }
     }
 
@@ -1217,9 +1284,38 @@ impl FinishedBlock {
         &self.widget
     }
 
+    /// Scroll this block's command edge or output edge into the outer history
+    /// canvas. The child VTEs never own this navigation.
+    pub(crate) fn scroll_to_edge(&self, outer: &gtk::ScrolledWindow, bottom: bool) {
+        let widget = self.widget.clone();
+        let outer = outer.clone();
+        glib::idle_add_local_once(move || {
+            let Some(bounds) = widget.compute_bounds(&outer) else {
+                return;
+            };
+            let adj = outer.vadjustment();
+            let target = block_edge_scroll_target(
+                adj.value(),
+                bounds.y() as f64,
+                bounds.height() as f64,
+                adj.page_size(),
+                adj.lower(),
+                adj.upper(),
+                bottom,
+            );
+            adj.set_value(target);
+        });
+    }
+
     /// Forward wheel events from full-height output VTEs to the one outer
     /// ScrolledWindow so all finished blocks behave as a continuous canvas.
     pub(crate) fn connect_scroll_forwarding(&self, outer: &gtk::ScrolledWindow) {
+        let block_for_jump = self.clone();
+        let outer_for_jump = outer.clone();
+        self.jump_bottom_btn.connect_clicked(move |_| {
+            block_for_jump.scroll_to_edge(&outer_for_jump, true);
+        });
+
         let scroll_ctrl =
             gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
         if !self.output_scrollable {
@@ -1328,6 +1424,9 @@ impl ActiveBlock {
     pub(crate) fn new(config: &Config) -> Self {
         let widget = gtk::Box::new(Orientation::Vertical, 0);
         widget.add_css_class("block-active");
+        if config.block_compact {
+            widget.add_css_class("block-compact");
+        }
         // focusable(false) keeps the holder Box from being a focus target, but we
         // must NOT set can_focus(false): in GTK4 that blocks all descendants
         // (including active_vte) from ever receiving focus.
