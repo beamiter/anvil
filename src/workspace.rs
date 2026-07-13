@@ -6,6 +6,7 @@
 use relm4::gtk;
 use relm4::gtk::prelude::*;
 use relm4::prelude::Controller;
+use relm4::ComponentController;
 
 use crate::config::{self, TerminalMode};
 use crate::process;
