@@ -201,29 +201,207 @@ fn build_color_query_reply(config: &Config, kind: ColorKind) -> String {
     }
 }
 
-/// Move the finished-block selection to `new_id` (or clear it with `None`),
-/// updating the selected CSS class and persistent quick-action visibility on both
-/// the previously-selected and newly-selected blocks. Shared by click selection
-/// and keyboard navigation so they stay in sync.
-fn select_finished_block(
+type SelectedBlockIds = Rc<RefCell<std::collections::HashSet<u64>>>;
+
+/// Apply the Warp-style multi-selection model to every finished block. All
+/// selected blocks get a light outline; the active edge gets the stronger outline
+/// and owns the persistent quick-action row.
+fn sync_finished_block_selection(
     finished: &[FinishedBlock],
+    selected_block_ids: &SelectedBlockIds,
     selected_block_id: &Rc<Cell<Option<u64>>>,
-    new_id: Option<u64>,
 ) {
-    let prev = selected_block_id.get();
-    if let Some(pid) = prev {
-        if let Some(b) = finished.iter().find(|b| b.id == pid) {
-            b.widget().remove_css_class("block-selected");
-            b.action_box.set_visible(false);
+    let selected = selected_block_ids.borrow();
+    let active = selected_block_id.get();
+    for block in finished {
+        let is_selected = selected.contains(&block.id);
+        if is_selected {
+            block.widget().add_css_class("block-selected");
+        } else {
+            block.widget().remove_css_class("block-selected");
+        }
+
+        let is_active = active == Some(block.id);
+        if is_active {
+            block.widget().add_css_class("block-selection-active");
+            block.action_box.set_visible(true);
+        } else {
+            block.widget().remove_css_class("block-selection-active");
+            if !block.widget().has_css_class("block-hovered") {
+                block.action_box.set_visible(false);
+            }
         }
     }
-    if let Some(nid) = new_id {
-        if let Some(b) = finished.iter().find(|b| b.id == nid) {
-            b.widget().add_css_class("block-selected");
-            b.action_box.set_visible(true);
+}
+
+fn clear_finished_block_selection(
+    finished: &[FinishedBlock],
+    selected_block_ids: &SelectedBlockIds,
+    selected_block_id: &Rc<Cell<Option<u64>>>,
+    selection_anchor_id: &Rc<Cell<Option<u64>>>,
+) {
+    selected_block_ids.borrow_mut().clear();
+    selected_block_id.set(None);
+    selection_anchor_id.set(None);
+    sync_finished_block_selection(finished, selected_block_ids, selected_block_id);
+}
+
+fn replace_finished_block_selection(
+    finished: &[FinishedBlock],
+    selected_block_ids: &SelectedBlockIds,
+    selected_block_id: &Rc<Cell<Option<u64>>>,
+    selection_anchor_id: &Rc<Cell<Option<u64>>>,
+    new_id: Option<u64>,
+) {
+    {
+        let mut selected = selected_block_ids.borrow_mut();
+        selected.clear();
+        if let Some(id) = new_id {
+            selected.insert(id);
         }
     }
     selected_block_id.set(new_id);
+    selection_anchor_id.set(new_id);
+    sync_finished_block_selection(finished, selected_block_ids, selected_block_id);
+}
+
+/// Make `id` the active edge without discarding an existing multi-selection.
+/// Right-click uses this so opening actions on one selected block does not collapse
+/// a range the user just built.
+fn activate_finished_block_selection(
+    finished: &[FinishedBlock],
+    selected_block_ids: &SelectedBlockIds,
+    selected_block_id: &Rc<Cell<Option<u64>>>,
+    selection_anchor_id: &Rc<Cell<Option<u64>>>,
+    id: u64,
+) {
+    if !selected_block_ids.borrow().contains(&id) {
+        replace_finished_block_selection(
+            finished,
+            selected_block_ids,
+            selected_block_id,
+            selection_anchor_id,
+            Some(id),
+        );
+        return;
+    }
+    selected_block_id.set(Some(id));
+    selection_anchor_id.set(Some(id));
+    sync_finished_block_selection(finished, selected_block_ids, selected_block_id);
+}
+
+fn toggle_finished_block_selection(
+    finished: &[FinishedBlock],
+    selected_block_ids: &SelectedBlockIds,
+    selected_block_id: &Rc<Cell<Option<u64>>>,
+    selection_anchor_id: &Rc<Cell<Option<u64>>>,
+    id: u64,
+) {
+    let removed = {
+        let mut selected = selected_block_ids.borrow_mut();
+        if selected.remove(&id) {
+            true
+        } else {
+            selected.insert(id);
+            false
+        }
+    };
+
+    if removed {
+        let active_missing = selected_block_id
+            .get()
+            .is_some_and(|active| !selected_block_ids.borrow().contains(&active));
+        if selected_block_id.get() == Some(id) || active_missing {
+            let fallback = {
+                let selected = selected_block_ids.borrow();
+                finished
+                    .iter()
+                    .rev()
+                    .find(|block| selected.contains(&block.id))
+                    .map(|block| block.id)
+            };
+            selected_block_id.set(fallback);
+        }
+        let anchor_missing = selection_anchor_id
+            .get()
+            .is_some_and(|anchor| !selected_block_ids.borrow().contains(&anchor));
+        if selection_anchor_id.get() == Some(id) || anchor_missing {
+            selection_anchor_id.set(selected_block_id.get());
+        }
+    } else {
+        selected_block_id.set(Some(id));
+        selection_anchor_id.set(Some(id));
+    }
+    sync_finished_block_selection(finished, selected_block_ids, selected_block_id);
+}
+
+fn selected_id_range(ids: &[u64], anchor: u64, target: u64) -> Vec<u64> {
+    let Some(anchor_index) = ids.iter().position(|id| *id == anchor) else {
+        return vec![target];
+    };
+    let Some(target_index) = ids.iter().position(|id| *id == target) else {
+        return vec![target];
+    };
+    let (start, end) = if anchor_index <= target_index {
+        (anchor_index, target_index)
+    } else {
+        (target_index, anchor_index)
+    };
+    ids[start..=end].to_vec()
+}
+
+fn select_finished_block_range(
+    finished: &[FinishedBlock],
+    selected_block_ids: &SelectedBlockIds,
+    selected_block_id: &Rc<Cell<Option<u64>>>,
+    selection_anchor_id: &Rc<Cell<Option<u64>>>,
+    target: u64,
+) {
+    let anchor = selection_anchor_id
+        .get()
+        .or_else(|| selected_block_id.get())
+        .unwrap_or(target);
+    let ordered_ids: Vec<u64> = finished.iter().map(|block| block.id).collect();
+    let range = selected_id_range(&ordered_ids, anchor, target);
+    {
+        let mut selected = selected_block_ids.borrow_mut();
+        selected.clear();
+        selected.extend(range);
+    }
+    selected_block_id.set(Some(target));
+    selection_anchor_id.set(Some(anchor));
+    sync_finished_block_selection(finished, selected_block_ids, selected_block_id);
+}
+
+fn remove_finished_block_from_selection(
+    finished: &[FinishedBlock],
+    selected_block_ids: &SelectedBlockIds,
+    selected_block_id: &Rc<Cell<Option<u64>>>,
+    selection_anchor_id: &Rc<Cell<Option<u64>>>,
+    removed_id: u64,
+) {
+    selected_block_ids.borrow_mut().remove(&removed_id);
+    let active_missing = selected_block_id
+        .get()
+        .is_some_and(|active| !selected_block_ids.borrow().contains(&active));
+    if selected_block_id.get() == Some(removed_id) || active_missing {
+        let fallback = {
+            let selected = selected_block_ids.borrow();
+            finished
+                .iter()
+                .rev()
+                .find(|block| selected.contains(&block.id))
+                .map(|block| block.id)
+        };
+        selected_block_id.set(fallback);
+    }
+    let anchor_missing = selection_anchor_id
+        .get()
+        .is_some_and(|anchor| !selected_block_ids.borrow().contains(&anchor));
+    if selection_anchor_id.get() == Some(removed_id) || anchor_missing {
+        selection_anchor_id.set(selected_block_id.get());
+    }
+    sync_finished_block_selection(finished, selected_block_ids, selected_block_id);
 }
 
 /// Bring a selected block into the upper third of the viewport. `compute_point`
@@ -242,12 +420,42 @@ fn scroll_finished_block_into_view(block: &FinishedBlock, scroll: &ScrolledWindo
     });
 }
 
-/// Move the Warp-style block selection by one item. Moving up with no current
-/// selection starts at the newest finished block; moving down past the newest
-/// block returns focus to the live prompt.
+/// HOME/END move through the outer history canvas. END repeats for a few layout
+/// passes because virtualized blocks regain height as they enter the viewport.
+fn scroll_history_to_edge(scroll: &ScrolledWindow, bottom: bool) {
+    let adj = scroll.vadjustment();
+    if !bottom {
+        adj.set_value(adj.lower());
+        return;
+    }
+    adj.set_value((adj.upper() - adj.page_size()).max(adj.lower()));
+    let scroll = scroll.clone();
+    let tries = Rc::new(Cell::new(0u8));
+    glib::idle_add_local(move || {
+        if tries.get() >= 12 {
+            return glib::ControlFlow::Break;
+        }
+        tries.set(tries.get() + 1);
+        let adj = scroll.vadjustment();
+        let before = adj.value();
+        let target = (adj.upper() - adj.page_size()).max(adj.lower());
+        adj.set_value(target);
+        if (adj.value() - before).abs() < 1.0 {
+            glib::ControlFlow::Break
+        } else {
+            glib::ControlFlow::Continue
+        }
+    });
+}
+
+/// Move the Warp-style active selection by one item. Plain arrows collapse a
+/// multi-selection back to the newly active block; Shift+arrows use the range
+/// helper below to expand or contract instead.
 fn move_finished_block_selection(
     finished: &[FinishedBlock],
+    selected_block_ids: &SelectedBlockIds,
     selected_block_id: &Rc<Cell<Option<u64>>>,
+    selection_anchor_id: &Rc<Cell<Option<u64>>>,
     scroll: &ScrolledWindow,
     direction: i32,
 ) -> bool {
@@ -271,12 +479,54 @@ fn move_finished_block_selection(
         }
     };
     let target_id = target.and_then(|index| finished.get(index).map(|block| block.id));
-    select_finished_block(finished, selected_block_id, target_id);
+    replace_finished_block_selection(
+        finished,
+        selected_block_ids,
+        selected_block_id,
+        selection_anchor_id,
+        target_id,
+    );
     if let Some(index) = target {
         if let Some(block) = finished.get(index) {
             scroll_finished_block_into_view(block, scroll);
         }
     }
+    true
+}
+
+fn extend_finished_block_selection(
+    finished: &[FinishedBlock],
+    selected_block_ids: &SelectedBlockIds,
+    selected_block_id: &Rc<Cell<Option<u64>>>,
+    selection_anchor_id: &Rc<Cell<Option<u64>>>,
+    scroll: &ScrolledWindow,
+    direction: i32,
+) -> bool {
+    if finished.is_empty() || direction == 0 {
+        return false;
+    }
+    let Some(current) = selected_block_id
+        .get()
+        .and_then(|id| finished.iter().position(|block| block.id == id))
+    else {
+        return false;
+    };
+    let target = if direction < 0 {
+        current.saturating_sub(1)
+    } else {
+        (current + 1).min(finished.len() - 1)
+    };
+    let Some(block) = finished.get(target) else {
+        return false;
+    };
+    select_finished_block_range(
+        finished,
+        selected_block_ids,
+        selected_block_id,
+        selection_anchor_id,
+        block.id,
+    );
+    scroll_finished_block_into_view(block, scroll);
     true
 }
 
@@ -296,44 +546,74 @@ fn scroll_selected_finished_block_edge(
     true
 }
 
-/// Install the shared click-to-select behavior for a finished block. New blocks
-/// and restored history blocks must use the same handler; otherwise keyboard
-/// block actions only work on commands produced after app startup.
+/// Install Warp's Linux selection gestures. Plain click makes one active block,
+/// Shift-click selects a contiguous range, and Ctrl+Shift-click toggles a block.
+/// Modifier clicks work across the card; plain clicks remain header-only so VTE
+/// output keeps native text selection.
 fn install_finished_block_selection(
     block: &FinishedBlock,
     active: &Rc<RefCell<ActiveBlock>>,
     finished_blocks: &Rc<RefCell<Vec<FinishedBlock>>>,
+    selected_block_ids: &SelectedBlockIds,
     selected_block_id: &Rc<Cell<Option<u64>>>,
+    selection_anchor_id: &Rc<Cell<Option<u64>>>,
 ) {
     let active_for_click = active.clone();
     let header_for_click = block.header_row.clone();
     let finished_blocks_for_select = finished_blocks.clone();
+    let selected_ids_for_click = selected_block_ids.clone();
     let selected_for_click = selected_block_id.clone();
+    let anchor_for_click = selection_anchor_id.clone();
     let this_id = block.id;
     let left_click = gtk::GestureClick::new();
     left_click.set_button(1);
     left_click.set_propagation_phase(gtk::PropagationPhase::Capture);
     left_click.connect_pressed(move |gesture, n_press, _, y| {
-        // Only act on the first press of a sequence. Refiring grab_focus() on
-        // the 2nd/3rd press would interrupt VTE's native double/triple-click
-        // word/line selection in the output VTE child.
         if n_press != 1 {
             gesture.set_state(gtk::EventSequenceState::Denied);
             return;
         }
-        active_for_click.borrow().grab_focus();
-        // Header strip occupies the top of the block; a press there toggles
-        // this block's selection. Output clicks stay native VTE selection.
-        if y <= header_for_click.height() as f64 {
+        let state = gesture.current_event_state();
+        let ctrl = state.contains(gtk::gdk::ModifierType::CONTROL_MASK);
+        let shift = state.contains(gtk::gdk::ModifierType::SHIFT_MASK);
+        let over_terminal_surface = y > header_for_click.height() as f64;
+        if !over_terminal_surface || shift {
+            active_for_click.borrow().grab_focus();
             let finished = finished_blocks_for_select.borrow();
-            let target = if selected_for_click.get() == Some(this_id) {
-                None
+            if ctrl && shift {
+                toggle_finished_block_selection(
+                    &finished,
+                    &selected_ids_for_click,
+                    &selected_for_click,
+                    &anchor_for_click,
+                    this_id,
+                );
+            } else if shift {
+                select_finished_block_range(
+                    &finished,
+                    &selected_ids_for_click,
+                    &selected_for_click,
+                    &anchor_for_click,
+                    this_id,
+                );
             } else {
-                Some(this_id)
-            };
-            select_finished_block(&finished, &selected_for_click, target);
+                replace_finished_block_selection(
+                    &finished,
+                    &selected_ids_for_click,
+                    &selected_for_click,
+                    &anchor_for_click,
+                    Some(this_id),
+                );
+            }
         }
-        gesture.set_state(gtk::EventSequenceState::Denied);
+        // A modifier click on command/output is a block-selection gesture,
+        // not the start of a native VTE text selection. Header clicks still
+        // proceed so collapse/action buttons receive their own sequence.
+        gesture.set_state(if shift && over_terminal_surface {
+            gtk::EventSequenceState::Claimed
+        } else {
+            gtk::EventSequenceState::Denied
+        });
     });
     block.widget().add_controller(left_click);
 }
@@ -394,7 +674,9 @@ pub struct TermView {
     viewport: Rc<RefCell<ViewportState>>,
     widget_pool: Rc<RefCell<WidgetPool>>,
     visible_indices: Rc<RefCell<std::collections::HashSet<usize>>>,
+    selected_block_ids: SelectedBlockIds,
     selected_block_id: Rc<Cell<Option<u64>>>,
+    selection_anchor_id: Rc<Cell<Option<u64>>>,
     bookmarks: Rc<RefCell<std::collections::HashSet<u64>>>,
     /// Find-within-blocks state: every match across the finished blocks plus a
     /// cursor into it, so Ctrl+F highlights all hits and Next/Prev step through
@@ -472,7 +754,9 @@ struct ReaderCtx {
     event_buf: Rc<RefCell<Vec<ParserEvent>>>,
     unread_count_rc: Rc<Cell<u32>>,
     jump_fab: gtk::Button,
+    selected_block_ids_rc: SelectedBlockIds,
     selected_block_id_rc: Rc<Cell<Option<u64>>>,
+    selection_anchor_id_rc: Rc<Cell<Option<u64>>>,
     bookmarks_rc: Rc<RefCell<std::collections::HashSet<u64>>>,
     cmd_running_rc: Rc<Cell<bool>>,
     running_cmd_rc: Rc<RefCell<String>>,
@@ -591,7 +875,9 @@ impl ReaderCtx {
             event_buf,
             unread_count_rc,
             jump_fab,
+            selected_block_ids_rc,
             selected_block_id_rc,
+            selection_anchor_id_rc,
             bookmarks_rc,
             cmd_running_rc,
             running_cmd_rc,
@@ -867,7 +1153,9 @@ impl ReaderCtx {
                                 let typed_cmd_for_rerun_menu = typed_cmd_rc.clone();
                                 let bstate_for_rerun_menu = bstate_rc.clone();
                                 let active_for_rerun_menu = active_rc.clone();
+                                let selected_ids_for_menu = selected_block_ids_rc.clone();
                                 let selected_for_menu = selected_block_id_rc.clone();
+                                let anchor_for_menu = selection_anchor_id_rc.clone();
                                 let bookmarks_for_menu = bookmarks_rc.clone();
                                 let block_scroll_for_menu = block_scroll_rc.clone();
                                 let visible_for_menu = visible_indices_rc.clone();
@@ -883,10 +1171,12 @@ impl ReaderCtx {
                                     gesture.set_state(gtk::EventSequenceState::Claimed);
                                     {
                                         let finished = finished_blocks_for_menu.borrow();
-                                        select_finished_block(
+                                        activate_finished_block_selection(
                                             &finished,
+                                            &selected_ids_for_menu,
                                             &selected_for_menu,
-                                            Some(block_id),
+                                            &anchor_for_menu,
+                                            block_id,
                                         );
                                     }
 
@@ -1097,7 +1387,9 @@ impl ReaderCtx {
                                         let finished_blocks_for_delete = finished_blocks_for_menu.clone();
                                         let block_list_for_delete = block_list_for_menu.clone();
                                         let block_data_for_delete = block_data_for_export.clone();
+                                        let selected_ids_for_delete = selected_ids_for_menu.clone();
                                         let selected_for_delete = selected_for_menu.clone();
+                                        let anchor_for_delete = anchor_for_menu.clone();
                                         let bookmarks_for_delete = bookmarks_for_menu.clone();
                                         let visible_for_delete = visible_for_menu.clone();
                                         let widget_pool_for_delete = widget_pool_for_menu.clone();
@@ -1111,9 +1403,13 @@ impl ReaderCtx {
                                                 block_list_for_delete.remove(&widget);
                                                 widget_pool_for_delete.borrow_mut().release(widget);
                                             }
-                                            if selected_for_delete.get() == Some(block_id_del) {
-                                                selected_for_delete.set(None);
-                                            }
+                                            remove_finished_block_from_selection(
+                                                &blocks,
+                                                &selected_ids_for_delete,
+                                                &selected_for_delete,
+                                                &anchor_for_delete,
+                                                block_id_del,
+                                            );
                                             // Keep block_data in lockstep with the widget list.
                                             block_data_for_delete.borrow_mut().retain(|b| b.id != block_id_del);
                                             bookmarks_for_delete.borrow_mut().remove(&block_id_del);
@@ -1138,14 +1434,20 @@ impl ReaderCtx {
                                     &finished_clone,
                                     &active_rc,
                                     &finished_blocks_for_cb,
+                                    &selected_block_ids_rc,
                                     &selected_block_id_rc,
+                                    &selection_anchor_id_rc,
                                 );
 
                                 if finished_blocks_for_cb.borrow().len() > max_blocks {
                                     let oldest = finished_blocks_for_cb.borrow_mut().remove(0);
-                                    if selected_block_id_rc.get() == Some(oldest.id) {
-                                        selected_block_id_rc.set(None);
-                                    }
+                                    remove_finished_block_from_selection(
+                                        &finished_blocks_for_cb.borrow(),
+                                        &selected_block_ids_rc,
+                                        &selected_block_id_rc,
+                                        &selection_anchor_id_rc,
+                                        oldest.id,
+                                    );
                                     bookmarks_rc.borrow_mut().remove(&oldest.id);
                                     let widget_to_release = oldest.widget().clone();
                                     block_list_rc.remove(&widget_to_release);
@@ -1512,7 +1814,9 @@ struct KeyCtx {
     finished_blocks_for_key: Rc<RefCell<Vec<FinishedBlock>>>,
     block_data_for_key: Rc<RefCell<VecDeque<BlockData>>>,
     block_list_for_key: gtk::Box,
+    selected_block_ids_for_key: SelectedBlockIds,
     selected_block_id_for_key: Rc<Cell<Option<u64>>>,
+    selection_anchor_id_for_key: Rc<Cell<Option<u64>>>,
     block_scroll_for_key: ScrolledWindow,
     bookmarks_for_key: Rc<RefCell<std::collections::HashSet<u64>>>,
     visible_indices_for_key: Rc<RefCell<std::collections::HashSet<usize>>>,
@@ -1530,7 +1834,9 @@ impl KeyCtx {
             finished_blocks_for_key,
             block_data_for_key,
             block_list_for_key,
+            selected_block_ids_for_key,
             selected_block_id_for_key,
+            selection_anchor_id_for_key,
             block_scroll_for_key,
             bookmarks_for_key,
             visible_indices_for_key,
@@ -1542,13 +1848,23 @@ impl KeyCtx {
             let shift = modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK);
             let alt = modifiers.contains(gtk::gdk::ModifierType::ALT_MASK);
 
-            // Warp pages block history with PageUp/PageDown. While a command or
-            // fullscreen/raw terminal owns the viewport, leave these keys to VTE.
+            // Warp pages and jumps through block history locally. While a command
+            // or fullscreen/raw terminal owns the viewport, forward these keys to it.
             let history_navigation = !matches!(
                 bstate_for_key.get(),
                 BlockState::CollectingOutput | BlockState::AltScreen | BlockState::RawFallback
             );
             if !ctrl
+                && !shift
+                && !alt
+                && history_navigation
+                && matches!(keyval, Key::Home | Key::End)
+            {
+                scroll_history_to_edge(&block_scroll_for_key, keyval == Key::End);
+                return glib::Propagation::Stop;
+            }
+            if !ctrl
+                && !shift
                 && !alt
                 && history_navigation
                 && matches!(keyval, Key::Page_Up | Key::Page_Down)
@@ -1559,6 +1875,28 @@ impl KeyCtx {
                 let max_val = (adj.upper() - adj.page_size()).max(adj.lower());
                 adj.set_value((adj.value() + delta).clamp(adj.lower(), max_val));
                 return glib::Propagation::Stop;
+            }
+
+            // Shift+Up/Down expands or contracts the active range. The fixed anchor
+            // stays where selection began, while the stronger active edge moves.
+            if !ctrl
+                && shift
+                && !alt
+                && selected_block_id_for_key.get().is_some()
+                && matches!(keyval, Key::Up | Key::Down)
+            {
+                let finished = finished_blocks_for_key.borrow();
+                let direction = if keyval == Key::Up { -1 } else { 1 };
+                if extend_finished_block_selection(
+                    &finished,
+                    &selected_block_ids_for_key,
+                    &selected_block_id_for_key,
+                    &selection_anchor_id_for_key,
+                    &block_scroll_for_key,
+                    direction,
+                ) {
+                    return glib::Propagation::Stop;
+                }
             }
 
             // Once a block is selected, plain Up/Down walks blocks instead of
@@ -1573,7 +1911,9 @@ impl KeyCtx {
                 let direction = if keyval == Key::Up { -1 } else { 1 };
                 move_finished_block_selection(
                     &finished,
+                    &selected_block_ids_for_key,
                     &selected_block_id_for_key,
+                    &selection_anchor_id_for_key,
                     &block_scroll_for_key,
                     direction,
                 );
@@ -1601,7 +1941,9 @@ impl KeyCtx {
                 let direction = if keyval == Key::bracketleft { -1 } else { 1 };
                 move_finished_block_selection(
                     &finished,
+                    &selected_block_ids_for_key,
                     &selected_block_id_for_key,
+                    &selection_anchor_id_for_key,
                     &block_scroll_for_key,
                     direction,
                 );
@@ -1623,7 +1965,12 @@ impl KeyCtx {
                             bracketed_paste_for_key.get(),
                         );
                     }
-                    select_finished_block(&finished, &selected_block_id_for_key, None);
+                    clear_finished_block_selection(
+                        &finished,
+                        &selected_block_ids_for_key,
+                        &selected_block_id_for_key,
+                        &selection_anchor_id_for_key,
+                    );
                     return glib::Propagation::Stop;
                 }
                 return glib::Propagation::Proceed;
@@ -1633,7 +1980,12 @@ impl KeyCtx {
             if keyval == Key::Escape {
                 if selected_block_id_for_key.get().is_some() {
                     let finished = finished_blocks_for_key.borrow();
-                    select_finished_block(&finished, &selected_block_id_for_key, None);
+                    clear_finished_block_selection(
+                        &finished,
+                        &selected_block_ids_for_key,
+                        &selected_block_id_for_key,
+                        &selection_anchor_id_for_key,
+                    );
                     return glib::Propagation::Stop;
                 }
                 return glib::Propagation::Proceed;
@@ -1725,19 +2077,15 @@ impl KeyCtx {
                 };
                 if let Some(idx) = target {
                     let new_id = finished.get(idx).map(|b| b.id);
-                    select_finished_block(&finished, &selected_block_id_for_key, new_id);
+                    replace_finished_block_selection(
+                        &finished,
+                        &selected_block_ids_for_key,
+                        &selected_block_id_for_key,
+                        &selection_anchor_id_for_key,
+                        new_id,
+                    );
                     if let Some(block) = finished.get(idx) {
-                        let widget = block.widget().clone();
-                        let scroll = block_scroll_for_key.clone();
-                        glib::idle_add_local_once(move || {
-                            if let Some(point) =
-                                widget.compute_point(&scroll, &gtk::graphene::Point::new(0.0, 0.0))
-                            {
-                                let adj = scroll.vadjustment();
-                                let target = (point.y() as f64) - adj.page_size() / 3.0;
-                                adj.set_value(target.max(0.0));
-                            }
-                        });
+                        scroll_finished_block_into_view(block, &block_scroll_for_key);
                     }
                 }
                 return glib::Propagation::Stop;
@@ -1758,7 +2106,9 @@ impl KeyCtx {
                 block_data_for_key.borrow_mut().clear();
                 bookmarks_for_key.borrow_mut().clear();
                 visible_indices_for_key.borrow_mut().clear();
+                selected_block_ids_for_key.borrow_mut().clear();
                 selected_block_id_for_key.set(None);
+                selection_anchor_id_for_key.set(None);
                 pty_for_key.write_bytes(b"\x0c");
                 return glib::Propagation::Stop;
             }
@@ -2254,7 +2604,10 @@ impl TermView {
 
         let widget_pool: Rc<RefCell<WidgetPool>> = Rc::new(RefCell::new(WidgetPool::new()));
         let pty_synced: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let selected_block_ids: SelectedBlockIds =
+            Rc::new(RefCell::new(std::collections::HashSet::new()));
         let selected_block_id: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
+        let selection_anchor_id: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
         // Bookmarked block ids (in-memory for the session). Toggled with Ctrl+B;
         // navigated with Alt+Up/Down. Not persisted (avoids an rkyv schema bump).
         let block_bookmarks: Rc<RefCell<std::collections::HashSet<u64>>> =
@@ -2410,7 +2763,9 @@ impl TermView {
                 event_buf,
                 unread_count_rc: unread_count.clone(),
                 jump_fab: jump_fab.clone(),
+                selected_block_ids_rc: selected_block_ids.clone(),
                 selected_block_id_rc: selected_block_id.clone(),
+                selection_anchor_id_rc: selection_anchor_id.clone(),
                 bookmarks_rc: block_bookmarks.clone(),
                 cmd_running_rc: cmd_running.clone(),
                 running_cmd_rc: running_cmd.clone(),
@@ -2738,7 +3093,9 @@ impl TermView {
             let finished_blocks_for_key = finished_blocks_rc.clone();
             let block_data_for_key = block_data_rc.clone();
             let block_list_for_key = block_list.clone();
+            let selected_block_ids_for_key = selected_block_ids.clone();
             let selected_block_id_for_key = selected_block_id.clone();
+            let selection_anchor_id_for_key = selection_anchor_id.clone();
             let block_scroll_for_key = block_scroll.clone();
             let key_ctrl = gtk::EventControllerKey::new();
             key_ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -2752,7 +3109,9 @@ impl TermView {
                 finished_blocks_for_key,
                 block_data_for_key,
                 block_list_for_key,
+                selected_block_ids_for_key,
                 selected_block_id_for_key,
+                selection_anchor_id_for_key,
                 block_scroll_for_key,
                 bookmarks_for_key: block_bookmarks.clone(),
                 visible_indices_for_key: visible_indices.clone(),
@@ -2859,7 +3218,9 @@ impl TermView {
             })),
             widget_pool,
             visible_indices,
+            selected_block_ids,
             selected_block_id,
+            selection_anchor_id,
             bookmarks: block_bookmarks,
             find_state: Rc::new(RefCell::new(FindState::default())),
             current_cwd: current_cwd.clone(),
@@ -2922,7 +3283,9 @@ impl TermView {
                     &finished,
                     &term_view.active,
                     &term_view.finished_blocks,
+                    &term_view.selected_block_ids,
                     &term_view.selected_block_id,
+                    &term_view.selection_anchor_id,
                 );
                 term_view.finished_blocks.borrow_mut().push(finished);
             }
@@ -3097,23 +3460,35 @@ impl TermView {
         log::debug!(">>> TermView::copy_to_clipboard called (alt={})", alt_held);
 
         // (0) Whole-block selection (Warp's CopyBlock; +Alt → output only).
-        if let Some(sel_id) = self.selected_block_id.get() {
-            let bd = self.block_data.borrow();
-            if let Some(b) = bd.iter().find(|b| b.id == sel_id) {
-                let text = if alt_held {
-                    b.output.clone()
-                } else if b.output.trim().is_empty() {
-                    b.cmd.clone()
-                } else {
-                    format!("{}\n{}", b.cmd, b.output)
-                };
-                log::debug!(
-                    ">>> TermView copy: copied whole block {} ({} chars)",
-                    sel_id,
-                    text.len()
-                );
-                self.active_vte.clipboard().set_text(&text);
-                return;
+        // Multi-selection copies blocks in terminal order with one blank line between
+        // them, so the clipboard preserves the same visual grouping as the canvas.
+        {
+            let selected = self.selected_block_ids.borrow();
+            if !selected.is_empty() {
+                let data = self.block_data.borrow();
+                let parts: Vec<String> = data
+                    .iter()
+                    .filter(|block| selected.contains(&block.id))
+                    .map(|block| {
+                        if alt_held {
+                            block.output.clone()
+                        } else if block.output.trim().is_empty() {
+                            block.cmd.clone()
+                        } else {
+                            format!("{}\n{}", block.cmd, block.output)
+                        }
+                    })
+                    .collect();
+                if !parts.is_empty() {
+                    let text = parts.join("\n\n");
+                    log::debug!(
+                        ">>> TermView copy: copied {} selected blocks ({} chars)",
+                        parts.len(),
+                        text.len()
+                    );
+                    self.active_vte.clipboard().set_text(&text);
+                    return;
+                }
             }
         }
 
@@ -3231,7 +3606,9 @@ impl TermView {
             if (lines < 0 || self.selected_block_id.get().is_some())
                 && move_finished_block_selection(
                     &finished,
+                    &self.selected_block_ids,
                     &self.selected_block_id,
+                    &self.selection_anchor_id,
                     &self.block_scroll,
                     lines.signum(),
                 )
@@ -3436,6 +3813,7 @@ impl TermView {
             .get()
             .map(|id| id.to_string())
             .unwrap_or_else(|| "none".to_string());
+        let selected_count = self.selected_block_ids.borrow().len();
 
         vec![
             (
@@ -3478,6 +3856,10 @@ impl TermView {
                         total_output_bytes.to_string(),
                     ),
                     ("Selected block id".to_string(), selected),
+                    (
+                        "Selected block count".to_string(),
+                        selected_count.to_string(),
+                    ),
                 ],
             ),
             (
@@ -3508,7 +3890,13 @@ impl TermView {
             return;
         }
         if let Some(block) = finished.get(block_index) {
-            select_finished_block(&finished, &self.selected_block_id, Some(block.id));
+            replace_finished_block_selection(
+                &finished,
+                &self.selected_block_ids,
+                &self.selected_block_id,
+                &self.selection_anchor_id,
+                Some(block.id),
+            );
             let adj = self.block_scroll.vadjustment();
             // A virtualized widget may be unmapped, in which case GTK reports
             // no meaningful coordinates (or 0, 0). Use the retained height
@@ -3550,15 +3938,19 @@ impl TermView {
         self.block_list.remove(&widget_to_release);
         // Return widget to pool for potential reuse
         self.widget_pool.borrow_mut().release(widget_to_release);
+        remove_finished_block_from_selection(
+            &finished,
+            &self.selected_block_ids,
+            &self.selected_block_id,
+            &self.selection_anchor_id,
+            block_id,
+        );
         drop(finished);
 
         // Keep the serializable record list in lockstep with the widget list;
         // otherwise the two desync and count-based eviction / id lookups drift.
         self.block_data.borrow_mut().retain(|b| b.id != block_id);
         self.bookmarks.borrow_mut().remove(&block_id);
-        if self.selected_block_id.get() == Some(block_id) {
-            self.selected_block_id.set(None);
-        }
         // Stored indices no longer identify the same widgets after removal.
         // Recompute them on the next viewport update rather than retaining a
         // stale set that can keep an unrelated block hidden.
@@ -3612,7 +4004,7 @@ impl TermView {
 mod tests {
     use super::{
         build_command_recall, coalesce_bytes_events, finished_command, is_post_command_metadata,
-        strip_ansi, strip_ansi_with_clear_detect,
+        selected_id_range, strip_ansi, strip_ansi_with_clear_detect,
     };
     use crate::parser::ParserEvent;
 
@@ -3641,6 +4033,14 @@ mod tests {
         ];
         coalesce_bytes_events(&mut events);
         assert_eq!(ev_summary(&events), vec!["B(hello world!)"]);
+    }
+
+    #[test]
+    fn selected_block_range_is_inclusive_in_both_directions() {
+        let ids = [10, 20, 30, 40];
+        assert_eq!(selected_id_range(&ids, 20, 40), vec![20, 30, 40]);
+        assert_eq!(selected_id_range(&ids, 40, 20), vec![20, 30, 40]);
+        assert_eq!(selected_id_range(&ids, 99, 30), vec![30]);
     }
 
     #[test]

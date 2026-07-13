@@ -788,6 +788,7 @@ impl FinishedBlock {
             }
             reused.remove_css_class("block-hovered");
             reused.remove_css_class("block-selected");
+            reused.remove_css_class("block-selection-active");
             reused.remove_css_class("block-success");
             reused.remove_css_class("block-failed");
             reused
@@ -829,7 +830,7 @@ impl FinishedBlock {
         // lives on this header strip. Make the otherwise subtle interaction
         // discoverable without adding permanent visual chrome to every block.
         header_row.set_tooltip_text(Some(
-            "Click to select · Enter recalls command · Ctrl+Shift+B toggles bookmark",
+            "Click to select · Shift-click range · Ctrl+Shift-click toggle · Enter recalls",
         ));
         if config.block_compact {
             header_row.set_margin_start(8);
@@ -977,9 +978,8 @@ impl FinishedBlock {
         let action_box_for_leave = action_box.clone();
         hover_ctrl.connect_leave(move |_| {
             outer_for_leave.remove_css_class("block-hovered");
-            // Keep the quick actions visible while the block is selected so they
-            // stay reachable without re-hovering.
-            if !outer_for_leave.has_css_class("block-selected") {
+            // Only the active edge of a multi-selection owns persistent actions.
+            if !outer_for_leave.has_css_class("block-selection-active") {
                 action_box_for_leave.set_visible(false);
             }
         });
