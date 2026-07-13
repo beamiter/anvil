@@ -280,6 +280,22 @@ fn move_finished_block_selection(
     true
 }
 
+fn scroll_selected_finished_block_edge(
+    finished: &[FinishedBlock],
+    selected_block_id: &Rc<Cell<Option<u64>>>,
+    scroll: &ScrolledWindow,
+    bottom: bool,
+) -> bool {
+    let Some(id) = selected_block_id.get() else {
+        return false;
+    };
+    let Some(block) = finished.iter().find(|block| block.id == id) else {
+        return false;
+    };
+    block.scroll_to_edge(scroll, bottom);
+    true
+}
+
 /// Install the shared click-to-select behavior for a finished block. New blocks
 /// and restored history blocks must use the same handler; otherwise keyboard
 /// block actions only work on commands produced after app startup.
@@ -853,6 +869,7 @@ impl ReaderCtx {
                                 let active_for_rerun_menu = active_rc.clone();
                                 let selected_for_menu = selected_block_id_rc.clone();
                                 let bookmarks_for_menu = bookmarks_rc.clone();
+                                let block_scroll_for_menu = block_scroll_rc.clone();
                                 let visible_for_menu = visible_indices_rc.clone();
                                 let widget_pool_for_menu = widget_pool_for_cb.clone();
                                 let block_id = finished_clone.id;
@@ -935,6 +952,79 @@ impl ReaderCtx {
                                         });
                                         vbox.append(&item);
                                     }
+
+                                    {
+                                        let item = make_item("Scroll to Top of Block");
+                                        let popover_c = popover.clone();
+                                        let finished_for_scroll = finished_menu_clone.clone();
+                                        let scroll_for_action = block_scroll_for_menu.clone();
+                                        item.connect_clicked(move |_| {
+                                            popover_c.popdown();
+                                            finished_for_scroll
+                                                .scroll_to_edge(&scroll_for_action, false);
+                                        });
+                                        vbox.append(&item);
+                                    }
+                                    if finished_menu_clone.long_output {
+                                        let item = make_item("Jump to Bottom of Block");
+                                        let popover_c = popover.clone();
+                                        let finished_for_scroll = finished_menu_clone.clone();
+                                        let scroll_for_action = block_scroll_for_menu.clone();
+                                        item.connect_clicked(move |_| {
+                                            popover_c.popdown();
+                                            finished_for_scroll
+                                                .scroll_to_edge(&scroll_for_action, true);
+                                        });
+                                        vbox.append(&item);
+                                    }
+                                    {
+                                        let item = make_item("Toggle Output Filter");
+                                        let popover_c = popover.clone();
+                                        let finished_for_filter = finished_menu_clone.clone();
+                                        item.connect_clicked(move |_| {
+                                            popover_c.popdown();
+                                            (finished_for_filter.toggle_filter)();
+                                        });
+                                        vbox.append(&item);
+                                    }
+                                    {
+                                        let bookmarked =
+                                            bookmarks_for_menu.borrow().contains(&block_id);
+                                        let item = make_item(if bookmarked {
+                                            "Remove Bookmark"
+                                        } else {
+                                            "Bookmark Block"
+                                        });
+                                        let popover_c = popover.clone();
+                                        let finished_for_bookmark = finished_menu_clone.clone();
+                                        let bookmarks_for_action = bookmarks_for_menu.clone();
+                                        item.connect_clicked(move |_| {
+                                            popover_c.popdown();
+                                            let mut marks = bookmarks_for_action.borrow_mut();
+                                            let now_bookmarked = if marks.remove(&block_id) {
+                                                false
+                                            } else {
+                                                marks.insert(block_id);
+                                                true
+                                            };
+                                            finished_for_bookmark
+                                                .bookmark_star
+                                                .set_visible(now_bookmarked);
+                                            if now_bookmarked {
+                                                finished_for_bookmark
+                                                    .widget()
+                                                    .add_css_class("block-bookmarked");
+                                            } else {
+                                                finished_for_bookmark
+                                                    .widget()
+                                                    .remove_css_class("block-bookmarked");
+                                            }
+                                        });
+                                        vbox.append(&item);
+                                    }
+                                    vbox.append(&gtk::Separator::new(
+                                        gtk::Orientation::Horizontal,
+                                    ));
 
                                     {
                                         let item = make_item("Export as JSON");
@@ -1357,10 +1447,18 @@ fn viewport_rows_for(vte: &Terminal, scroll: &ScrolledWindow) -> Option<i64> {
     if page <= 1 {
         return None;
     }
-    // .block-active wraps the VTE with margin+border+padding; subtract it from
-    // page_size so the holder total fits. Running commands use this same row
-    // count for their live active VTE, matching jterm1's block-mode behavior.
-    let usable = (page - css::BLOCK_ACTIVE_VCHROME_PX).max(cell_h);
+    // .block-active wraps the VTE with margin+border+padding; subtract the
+    // chrome for the active density so the holder total fits exactly.
+    let compact = vte
+        .parent()
+        .and_then(|parent| parent.downcast::<gtk::Box>().ok())
+        .is_some_and(|holder| holder.has_css_class("block-compact"));
+    let chrome = if compact {
+        css::BLOCK_ACTIVE_COMPACT_VCHROME_PX
+    } else {
+        css::BLOCK_ACTIVE_VCHROME_PX
+    };
+    let usable = (page - chrome).max(cell_h);
     Some(((usable / cell_h).max(1)) as i64)
 }
 
@@ -1482,6 +1580,20 @@ impl KeyCtx {
                 return glib::Propagation::Stop;
             }
 
+            // Warp Linux: Ctrl+Shift+Up/Down jumps to the top/bottom edge
+            // of the currently selected block.
+            if ctrl && shift && !alt && matches!(keyval, Key::Up | Key::Down) {
+                let finished = finished_blocks_for_key.borrow();
+                if scroll_selected_finished_block_edge(
+                    &finished,
+                    &selected_block_id_for_key,
+                    &block_scroll_for_key,
+                    keyval == Key::Down,
+                ) {
+                    return glib::Propagation::Stop;
+                }
+            }
+
             // Keep the existing bracket aliases for window-manager/keybinding
             // conflicts, but route them through the same selection semantics.
             if ctrl && shift && !alt && matches!(keyval, Key::bracketleft | Key::bracketright) {
@@ -1546,13 +1658,11 @@ impl KeyCtx {
                 }
             }
 
-            // Ctrl+B: toggle a bookmark on the selected block (Warp's
-            // ToggleBookmarkBlock). Shows the gutter star + accent stripe.
-            // Only consume the key when bookmark logic actually fires — in
-            // alt-screen (vim/less) or with no selection, let VTE deliver
-            // Ctrl+B to the running app (e.g. vim's page-up).
+            // Ctrl+Shift+B: toggle a bookmark on the selected block (Warp's
+            // Linux binding). Shows the gutter star + accent stripe.
+            // Only consume the key when bookmark logic actually fires.
             if ctrl
-                && !shift
+                && shift
                 && !alt
                 && matches!(keyval, Key::b | Key::B)
                 && bstate_for_key.get() != BlockState::AltScreen
@@ -1772,16 +1882,55 @@ impl TermView {
         sticky_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
         sticky_label.set_hexpand(true);
         sticky_label.add_css_class("sticky-running-label");
-        let sticky_bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+
+        let sticky_jump_bottom_btn = gtk::Button::with_label("\u{f103}");
+        sticky_jump_bottom_btn.set_tooltip_text(Some("Jump to bottom of this block"));
+        sticky_jump_bottom_btn.add_css_class("sticky-header-control");
+        sticky_jump_bottom_btn.add_css_class("flat");
+        sticky_jump_bottom_btn.set_focusable(false);
+        sticky_jump_bottom_btn.set_visible(false);
+
+        let sticky_minimize_btn = gtk::Button::with_label("\u{f077}");
+        sticky_minimize_btn.set_tooltip_text(Some("Minimize sticky command header"));
+        sticky_minimize_btn.add_css_class("sticky-header-control");
+        sticky_minimize_btn.add_css_class("flat");
+        sticky_minimize_btn.set_focusable(false);
+
+        let sticky_bar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         sticky_bar.add_css_class("sticky-running-header");
         sticky_bar.append(&sticky_label);
+        sticky_bar.append(&sticky_jump_bottom_btn);
+        sticky_bar.append(&sticky_minimize_btn);
         sticky_bar.set_halign(gtk::Align::Fill);
         sticky_bar.set_valign(gtk::Align::Start);
         sticky_bar.set_visible(false);
-        sticky_bar.set_can_focus(false);
+        sticky_bar.set_focusable(false);
+
         // Some sticky headers represent a finished, oversized block. Store that
-        // block id so clicking the header can jump back to its command start.
+        // block id so clicking the label can jump back to its command start.
         let sticky_target_id: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
+        let sticky_minimized: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        {
+            let minimized = sticky_minimized.clone();
+            let label = sticky_label.clone();
+            let jump = sticky_jump_bottom_btn.clone();
+            let bar = sticky_bar.clone();
+            sticky_minimize_btn.connect_clicked(move |button| {
+                let now_minimized = !minimized.get();
+                minimized.set(now_minimized);
+                label.set_visible(!now_minimized);
+                jump.set_visible(false);
+                if now_minimized {
+                    bar.add_css_class("sticky-minimized");
+                    button.set_label("\u{f078}");
+                    button.set_tooltip_text(Some("Expand sticky command header"));
+                } else {
+                    bar.remove_css_class("sticky-minimized");
+                    button.set_label("\u{f077}");
+                    button.set_tooltip_text(Some("Minimize sticky command header"));
+                }
+            });
+        }
 
         let scroll_overlay = gtk::Overlay::new();
         scroll_overlay.set_child(Some(&block_scroll));
@@ -2081,20 +2230,24 @@ impl TermView {
                 let Some(block) = finished.iter().find(|block| block.id == id) else {
                     return;
                 };
-                let widget = block.widget().clone();
-                let scroll = scroll.clone();
-                glib::idle_add_local_once(move || {
-                    if let Some(point) =
-                        widget.compute_point(&scroll, &gtk::graphene::Point::new(0.0, 0.0))
-                    {
-                        let adj = scroll.vadjustment();
-                        let max_value = (adj.upper() - adj.page_size()).max(adj.lower());
-                        let target = adj.value() + point.y() as f64;
-                        adj.set_value(target.clamp(adj.lower(), max_value));
-                    }
-                });
+                block.scroll_to_edge(&scroll, false);
             });
-            sticky_bar.add_controller(click);
+            sticky_label.add_controller(click);
+        }
+        {
+            let target = sticky_target_id.clone();
+            let finished = finished_blocks_rc.clone();
+            let scroll = block_scroll.clone();
+            sticky_jump_bottom_btn.connect_clicked(move |_| {
+                let Some(id) = target.get() else {
+                    return;
+                };
+                let finished = finished.borrow();
+                let Some(block) = finished.iter().find(|block| block.id == id) else {
+                    return;
+                };
+                block.scroll_to_edge(&scroll, true);
+            });
         }
 
         let pending_exit_code: Rc<Cell<i32>> = Rc::new(Cell::new(0));
@@ -2414,7 +2567,9 @@ impl TermView {
         let sticky_timer_id = {
             let sticky = sticky_bar.clone();
             let sticky_label = sticky_label.clone();
+            let sticky_jump_bottom = sticky_jump_bottom_btn.clone();
             let sticky_target = sticky_target_id.clone();
+            let sticky_minimized = sticky_minimized.clone();
             let cmd_running = cmd_running.clone();
             let running_cmd = running_cmd.clone();
             let block_start_time = block_start_time.clone();
@@ -2426,17 +2581,20 @@ impl TermView {
                     return glib::ControlFlow::Break;
                 }
 
+                let minimized = sticky_minimized.get();
                 // At the live prompt there is no sticky header to compute. Avoid
                 // walking every finished block and querying GTK geometry on a
                 // permanent timer while the terminal is idle.
                 if !user_scrolled.get() {
                     sticky_target.set(None);
+                    sticky_jump_bottom.set_visible(false);
                     sticky.set_visible(false);
                     return glib::ControlFlow::Continue;
                 }
 
                 if cmd_running.get() {
                     sticky_target.set(None);
+                    sticky_jump_bottom.set_visible(false);
                     let cmd = running_cmd.borrow();
                     let cmd_disp = cmd.trim();
                     let elapsed = block_start_time
@@ -2455,6 +2613,7 @@ impl TermView {
                         format!("\u{25b6}  {}    {}", cmd_disp, elapsed_str)
                     };
                     sticky_label.set_text(&label);
+                    sticky_label.set_visible(!minimized);
                     sticky.set_visible(true);
                     return glib::ControlFlow::Continue;
                 }
@@ -2473,13 +2632,13 @@ impl TermView {
                             .unwrap_or("")
                             .trim()
                             .to_string();
-                        Some((block.id, command))
+                        Some((block.id, command, block.long_output))
                     } else {
                         None
                     }
                 });
 
-                if let Some((id, command)) = candidate {
+                if let Some((id, command, long_output)) = candidate {
                     sticky_target.set(Some(id));
                     let command = if command.is_empty() {
                         "(empty command)".to_string()
@@ -2487,9 +2646,12 @@ impl TermView {
                         command
                     };
                     sticky_label.set_text(&format!("\u{276f}  {}", command));
+                    sticky_label.set_visible(!minimized);
+                    sticky_jump_bottom.set_visible(!minimized && long_output);
                     sticky.set_visible(true);
                 } else {
                     sticky_target.set(None);
+                    sticky_jump_bottom.set_visible(false);
                     sticky.set_visible(false);
                 }
                 glib::ControlFlow::Continue

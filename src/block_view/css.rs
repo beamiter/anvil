@@ -8,11 +8,12 @@ use std::cell::RefCell;
 /// 4px top margin + 4px bottom margin + 1px top border + 1px bottom border +
 /// 2px top padding + 2px bottom padding = 14px.
 ///
-/// Used by `update_input_height` to subtract this from the visible page size
-/// before computing how many VTE rows fit. Must stay in sync with the
-/// `.block-active` rule below; if the margin/border/padding here changes,
-/// update this constant too.
+/// Used by the live-surface layout to subtract chrome from the visible page
+/// before computing how many VTE rows fit. Keep both values in sync with the
+/// normal and `.block-active.block-compact` rules below.
 pub(crate) const BLOCK_ACTIVE_VCHROME_PX: i32 = 14;
+/// Compact mode: 1px top/bottom margin + 1px top/bottom border, no padding.
+pub(crate) const BLOCK_ACTIVE_COMPACT_VCHROME_PX: i32 = 4;
 
 pub(crate) fn rgba_to_hex(c: &RGBA) -> String {
     format!(
@@ -206,6 +207,11 @@ pub(crate) fn install_block_css(config: &Config) {
             min-height: 40px;
             transition: background-color 140ms ease, border-color 140ms ease, box-shadow 140ms ease;
         }}
+        .block-finished.block-compact {{
+            border-radius: 6px;
+            min-height: 32px;
+            box-shadow: none;
+        }}
         .block-success {{
             border-left-color: {ok_stripe};
         }}
@@ -234,6 +240,12 @@ pub(crate) fn install_block_css(config: &Config) {
             padding: 2px 0;
             background-color: {bg_hex};
             box-shadow: 0 2px 8px rgba(0,0,0,0.18);
+        }}
+        .block-active.block-compact {{
+            border-radius: 6px;
+            margin: 1px 4px;
+            padding: 0;
+            box-shadow: none;
         }}
         .block-output-scrollbar {{
             min-width: 10px;
@@ -516,6 +528,24 @@ pub(crate) fn install_block_css(config: &Config) {
             font-family: "{font_family}";
             font-size: 0.92em;
             font-weight: bold;
+        }}
+        .sticky-header-control {{
+            color: {dim_fg};
+            min-width: 22px;
+            min-height: 22px;
+            padding: 0 4px;
+            border-radius: 999px;
+            font-family: "{font_family}";
+            font-size: 0.82em;
+        }}
+        .sticky-header-control:hover {{
+            color: {fg_hex};
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.12);
+        }}
+        .sticky-running-header.sticky-minimized {{
+            padding: 2px 8px;
+            background-color: rgba({bg_r},{bg_g},{bg_b},0.92);
+            box-shadow: 0 1px 4px rgba(0,0,0,0.24);
         }}
         .repo-strip {{
             color: rgba({acc_r},{acc_g},{acc_b},0.85);

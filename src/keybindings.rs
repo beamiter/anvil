@@ -495,14 +495,16 @@ impl KeybindingMap {
         bind("Ctrl+Alt+Right", Action::ResizePaneRight);
         bind("Ctrl+Alt+Up", Action::ResizePaneUp);
         bind("Ctrl+Alt+Down", Action::ResizePaneDown);
-        bind("Ctrl+Shift+B", Action::ToggleTabPlacement);
+        // Keep Warp's Ctrl+Shift+B available for block bookmarks.
+        bind("Ctrl+Alt+B", Action::ToggleTabPlacement);
         bind("Ctrl+Shift+Z", Action::TogglePaneZoom);
         bind("Ctrl+Shift+!", Action::MovePaneToNewTab);
         bind("F12", Action::ToggleDebugDashboard);
         bind("Ctrl+Shift+Left", Action::FocusPaneLeft);
         bind("Ctrl+Shift+Right", Action::FocusPaneRight);
-        bind("Ctrl+Shift+Up", Action::FocusPaneUp);
-        bind("Ctrl+Shift+Down", Action::FocusPaneDown);
+        // Warp reserves Ctrl+Shift+Up/Down for selected-block top/bottom.
+        bind("Ctrl+Alt+Shift+Up", Action::FocusPaneUp);
+        bind("Ctrl+Alt+Shift+Down", Action::FocusPaneDown);
         bind("Ctrl+Shift+A", Action::OpenAiPanel);
         bind("Ctrl+Shift+Y", Action::OpenWorkflows);
         bind("Ctrl+Shift+G", Action::OpenAgent);
