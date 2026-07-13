@@ -1,6 +1,9 @@
 name: Apply Warp multi-block selection patch
 
 on:
+  pull_request:
+    branches:
+      - master
   push:
     branches:
       - agent/warp-multi-block-selection
