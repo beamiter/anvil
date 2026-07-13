@@ -540,8 +540,8 @@ fn flash_button_label(btn: &gtk::Button, label: &'static str, tooltip: &'static 
 /// Render `bytes` into a read-only finished VTE. Keep a generous temporary
 /// scrollback while feeding: the logical/visual row estimate can still be smaller
 /// than VTE's real result for cursor movement, CR redraws, combining glyphs and
-/// other terminal semantics. The post-feed settling pass then expands the card to
-/// the real buffer and removes that private scrollback.
+/// other terminal semantics. The post-feed settling pass expands the card to
+/// the real buffer while unused capture capacity remains only a safety limit.
 pub(crate) fn render_bytes_into_finished_vte(
     vte: &vte4::Terminal,
     text: &str,
@@ -662,8 +662,9 @@ impl FinishedBlock {
         let viewport_cap = output_rows.max(1);
         let max_expanded_cap = viewport_cap;
         let long_output = output_rows > config.finished_block_viewport_rows.max(3) as i64;
-        // Mirrors create_finished_terminal's temporary capture budget. It is a
-        // limit, not an eagerly allocated grid, and is removed after each feed.
+        // Mirrors create_finished_terminal's capture budget. It is a limit,
+        // not an eagerly allocated grid, and remains armed across re-feeds so an
+        // older settling callback cannot invalidate a newer filtered render.
         let capture_rows = (config.truncation_threshold_lines as i64).max(4096);
 
         let outer = if let Some(reused) = recycled {

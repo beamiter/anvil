@@ -1440,10 +1440,18 @@ fn viewport_rows_for(vte: &Terminal, scroll: &ScrolledWindow) -> Option<i64> {
     if page <= 1 {
         return None;
     }
-    // .block-active wraps the VTE with margin+border+padding; subtract it from
-    // page_size so the holder total fits. Running commands use this same row
-    // count for their live active VTE, matching jterm1's block-mode behavior.
-    let usable = (page - css::BLOCK_ACTIVE_VCHROME_PX).max(cell_h);
+    // .block-active wraps the VTE with margin+border+padding; subtract the
+    // chrome for the active density so the holder total fits exactly.
+    let compact = vte
+        .parent()
+        .and_then(|parent| parent.downcast::<gtk::Box>().ok())
+        .is_some_and(|holder| holder.has_css_class("block-compact"));
+    let chrome = if compact {
+        css::BLOCK_ACTIVE_COMPACT_VCHROME_PX
+    } else {
+        css::BLOCK_ACTIVE_VCHROME_PX
+    };
+    let usable = (page - chrome).max(cell_h);
     Some(((usable / cell_h).max(1)) as i64)
 }
 

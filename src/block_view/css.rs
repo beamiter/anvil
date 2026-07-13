@@ -8,11 +8,12 @@ use std::cell::RefCell;
 /// 4px top margin + 4px bottom margin + 1px top border + 1px bottom border +
 /// 2px top padding + 2px bottom padding = 14px.
 ///
-/// Used by `update_input_height` to subtract this from the visible page size
-/// before computing how many VTE rows fit. Must stay in sync with the
-/// `.block-active` rule below; if the margin/border/padding here changes,
-/// update this constant too.
+/// Used by the live-surface layout to subtract chrome from the visible page
+/// before computing how many VTE rows fit. Keep both values in sync with the
+/// normal and `.block-active.block-compact` rules below.
 pub(crate) const BLOCK_ACTIVE_VCHROME_PX: i32 = 14;
+/// Compact mode: 1px top/bottom margin + 1px top/bottom border, no padding.
+pub(crate) const BLOCK_ACTIVE_COMPACT_VCHROME_PX: i32 = 4;
 
 pub(crate) fn rgba_to_hex(c: &RGBA) -> String {
     format!(
