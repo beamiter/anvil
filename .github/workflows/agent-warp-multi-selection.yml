@@ -1,0 +1,89 @@
+name: Apply Warp multi-block selection patch
+
+on:
+  push:
+    branches:
+      - agent/warp-multi-block-selection
+    paths:
+      - .agent-warp-multi-selection-trigger
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out patch branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/warp-multi-block-selection
+          fetch-depth: 0
+
+      - name: Decode and apply source patch
+        shell: bash
+        run: |
+          cat <<'PATCH_PAYLOAD' | base64 -d | gzip -d > /tmp/agent_warp_multi_selection.py
+          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
+          PATCH_PAYLOAD
+          python3 /tmp/agent_warp_multi_selection.py
+          cargo fmt --all
+
+      - name: Install GTK and VTE development packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            pkg-config \
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            libvte-2.91-gtk4-dev \
+            xvfb
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check all targets
+        run: cargo check --all-targets
+
+      - name: Run tests
+        run: xvfb-run --auto-servernum cargo test --all-targets --no-fail-fast
+
+      - name: Run Clippy
+        run: |
+          cargo clippy --all-targets -- \
+            -D warnings \
+            -A clippy::type_complexity \
+            -A clippy::doc_lazy_continuation \
+            -A clippy::items_after_test_module \
+            -A clippy::too_many_arguments \
+            -A clippy::manual_clamp \
+            -A clippy::if_same_then_else \
+            -A clippy::needless_range_loop
+
+      - name: Remove temporary patch machinery
+        run: |
+          rm -f .agent-warp-multi-selection-trigger
+          rm -f .github/workflows/agent-warp-multi-selection.yml
+
+      - name: Commit source changes
+        run: |
+          git config user.name "openai-codex[bot]"
+          git config user.email "openai-codex[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --stat
+          if git diff --cached --quiet; then
+            echo "No source changes to commit"
+            exit 1
+          fi
+          git commit -m "Align Warp multi-block selection and history navigation"
+          git push origin HEAD:agent/warp-multi-block-selection
