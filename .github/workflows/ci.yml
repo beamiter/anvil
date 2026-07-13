@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -25,55 +25,13 @@ jobs:
     timeout-minutes: 30
     defaults:
       run:
+        # Explicit Bash gives every run step `-e -o pipefail`, so a failing
+        # Cargo command cannot be hidden by the following `tee` process.
         shell: bash
 
     steps:
-      - name: Check out source branch
+      - name: Check out repository
         uses: actions/checkout@v4
-        with:
-          ref: agent/warp-multi-block-selection
-          fetch-depth: 0
-
-      - name: Finalize modifier-click propagation
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path("src/block_view/mod.rs")
-          text = path.read_text()
-          start = text.index("fn install_finished_block_selection(")
-          end = text.index("    block.widget().add_controller(left_click);", start)
-          segment = text[start:end]
-
-          old = """        let shift = state.contains(gtk::gdk::ModifierType::SHIFT_MASK);
-                  if y <= header_for_click.height() as f64 || shift {"""
-          new = """        let shift = state.contains(gtk::gdk::ModifierType::SHIFT_MASK);
-                  let over_terminal_surface = y > header_for_click.height() as f64;
-                  if !over_terminal_surface || shift {"""
-          if segment.count(old) != 1:
-              raise SystemExit(f"gesture condition: expected one match, found {segment.count(old)}")
-          segment = segment.replace(old, new, 1)
-
-          old = """        }
-                  gesture.set_state(gtk::EventSequenceState::Denied);
-              });"""
-          new = """        }
-                  // A modifier click on command/output is a block-selection gesture,
-                  // not the start of a native VTE text selection. Header clicks still
-                  // proceed so collapse/action buttons receive their own sequence.
-                  gesture.set_state(if shift && over_terminal_surface {
-                      gtk::EventSequenceState::Claimed
-                  } else {
-                      gtk::EventSequenceState::Denied
-                  });
-              });"""
-          if segment.count(old) != 1:
-              raise SystemExit(f"gesture final state: expected one match, found {segment.count(old)}")
-          segment = segment.replace(old, new, 1)
-
-          path.write_text(text[:start] + segment + text[end:])
-          PY
-          cargo fmt --all
 
       - name: Install GTK and VTE development packages
         run: |
@@ -110,10 +68,15 @@ jobs:
         run: cargo check --all-targets
 
       - name: Run tests
-        run: xvfb-run --auto-servernum cargo test --all-targets --no-fail-fast
+        id: tests
+        run: xvfb-run --auto-servernum cargo test --all-targets --no-fail-fast 2>&1 | tee test.log
 
       - name: Run Clippy
+        id: clippy
+        if: ${{ !cancelled() }}
         run: |
+          # These structural/style lints are the explicit legacy baseline. All
+          # other Rust and Clippy warnings remain denied and fail the build.
           cargo clippy --all-targets -- \
             -D warnings \
             -A clippy::type_complexity \
@@ -122,25 +85,16 @@ jobs:
             -A clippy::too_many_arguments \
             -A clippy::manual_clamp \
             -A clippy::if_same_then_else \
-            -A clippy::needless_range_loop
+            -A clippy::needless_range_loop \
+            2>&1 | tee clippy.log
 
-      - name: Restore repository workflow and remove temporary machinery
-        run: |
-          git checkout origin/master -- .github/workflows/ci.yml
-          rm -f .agent-warp-selection-gesture-fix-trigger
-          rm -f .github/workflows/agent-warp-selection-gesture-fix.yml
-          rm -f .github/workflows/agent-warp-selection-gesture-fix-v2.yml
-          rm -f test.log clippy.log
-
-      - name: Commit finalized source
-        run: |
-          git config user.name "openai-codex[bot]"
-          git config user.email "openai-codex[bot]@users.noreply.github.com"
-          git add -A
-          git diff --cached --stat
-          if git diff --cached --quiet; then
-            echo "No finalized source changes to commit"
-            exit 1
-          fi
-          git commit -m "Prevent modifier block selection from leaking into VTE text selection"
-          git push origin HEAD:agent/warp-multi-block-selection
+      - name: Upload CI diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-diagnostics
+          path: |
+            test.log
+            clippy.log
+          if-no-files-found: ignore
+          retention-days: 7

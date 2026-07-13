@@ -576,7 +576,8 @@ fn install_finished_block_selection(
         let state = gesture.current_event_state();
         let ctrl = state.contains(gtk::gdk::ModifierType::CONTROL_MASK);
         let shift = state.contains(gtk::gdk::ModifierType::SHIFT_MASK);
-        if y <= header_for_click.height() as f64 || shift {
+        let over_terminal_surface = y > header_for_click.height() as f64;
+        if !over_terminal_surface || shift {
             active_for_click.borrow().grab_focus();
             let finished = finished_blocks_for_select.borrow();
             if ctrl && shift {
@@ -605,7 +606,14 @@ fn install_finished_block_selection(
                 );
             }
         }
-        gesture.set_state(gtk::EventSequenceState::Denied);
+        // A modifier click on command/output is a block-selection gesture,
+        // not the start of a native VTE text selection. Header clicks still
+        // proceed so collapse/action buttons receive their own sequence.
+        gesture.set_state(if shift && over_terminal_surface {
+            gtk::EventSequenceState::Claimed
+        } else {
+            gtk::EventSequenceState::Denied
+        });
     });
     block.widget().add_controller(left_click);
 }
