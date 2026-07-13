@@ -41,6 +41,10 @@ pub(crate) struct BlockData {
 }
 
 impl BlockData {
+    pub(crate) fn is_background(&self) -> bool {
+        self.cmd.trim().is_empty()
+    }
+
     /// Export block to JSON format
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_string())
@@ -50,15 +54,19 @@ impl BlockData {
     pub fn to_markdown(&self) -> String {
         let mut md = String::new();
 
-        md.push_str("## Command Block\n\n");
+        if self.is_background() {
+            md.push_str("## Background Output\n\n");
+        } else {
+            md.push_str("## Command Block\n\n");
 
-        if !self.prompt.is_empty() {
-            md.push_str(&format!("**Prompt:** `{}`\n\n", self.prompt));
+            if !self.prompt.is_empty() {
+                md.push_str(&format!("**Prompt:** `{}`\n\n", self.prompt));
+            }
+
+            md.push_str("**Command:**\n```bash\n");
+            md.push_str(&self.cmd);
+            md.push_str("\n```\n\n");
         }
-
-        md.push_str("**Command:**\n```bash\n");
-        md.push_str(&self.cmd);
-        md.push_str("\n```\n\n");
 
         if !self.output.is_empty() {
             md.push_str("**Output:**\n```\n");
@@ -66,7 +74,9 @@ impl BlockData {
             md.push_str("\n```\n\n");
         }
 
-        md.push_str(&format!("**Exit Code:** {}\n\n", self.exit_code));
+        if !self.is_background() {
+            md.push_str(&format!("**Exit Code:** {}\n\n", self.exit_code));
+        }
 
         if let Some(dur) = self.duration_ms {
             let dur_sec = dur as f64 / 1000.0;
@@ -74,6 +84,19 @@ impl BlockData {
         }
 
         md
+    }
+}
+
+/// Text copied for a whole block. Background blocks have no command, so copying
+/// them must not introduce the blank first line that a naive `cmd + "\\n" + output`
+/// join would create.
+pub(crate) fn block_clipboard_text(cmd: &str, output: &str, output_only: bool) -> String {
+    if output_only || cmd.trim().is_empty() {
+        output.to_string()
+    } else if output.trim().is_empty() {
+        cmd.to_string()
+    } else {
+        format!("{}\n{}", cmd, output)
     }
 }
 
@@ -91,6 +114,8 @@ pub struct BlockFilters {
 
 pub(crate) struct FinishedBlock {
     pub(crate) id: u64,
+    /// Commandless output emitted while the shell prompt was idle.
+    pub(crate) is_background: bool,
     pub(crate) widget: gtk::Box,
     pub(crate) prompt_text: String,
     /// Read-only VTE displaying the executed command line (single-row typically).
@@ -148,6 +173,7 @@ impl Clone for FinishedBlock {
     fn clone(&self) -> Self {
         Self {
             id: self.id,
+            is_background: self.is_background,
             widget: self.widget.clone(),
             prompt_text: self.prompt_text.clone(),
             command_vte: self.command_vte.clone(),
@@ -788,6 +814,8 @@ impl FinishedBlock {
         cols: i64,
         recycled: Option<gtk::Box>,
     ) -> Self {
+        let is_background = cmd.trim().is_empty();
+
         // Keep ordinary output on the outer continuous canvas, but cap very long
         // snapshots. GTK cannot allocate an arbitrarily tall single widget, so
         // long blocks retain VTE's private scrollback inside this viewport.
@@ -811,6 +839,7 @@ impl FinishedBlock {
             reused.remove_css_class("block-selection-active");
             reused.remove_css_class("block-success");
             reused.remove_css_class("block-failed");
+            reused.remove_css_class("block-background");
             reused
         } else {
             let b = gtk::Box::new(Orientation::Vertical, 0);
@@ -831,8 +860,11 @@ impl FinishedBlock {
             outer.set_margin_end(8);
         }
 
-        // Status stripe: green left border on success, red on failure.
-        outer.add_css_class(if exit_code == 0 {
+        // Status stripe: green on success, red on failure, cyan for output
+        // emitted while the shell prompt was idle (Warp background blocks).
+        outer.add_css_class(if is_background {
+            "block-background"
+        } else if exit_code == 0 {
             "block-success"
         } else {
             "block-failed"
@@ -849,9 +881,11 @@ impl FinishedBlock {
         // The output surface keeps VTE's native text selection, so selection
         // lives on this header strip. Make the otherwise subtle interaction
         // discoverable without adding permanent visual chrome to every block.
-        header_row.set_tooltip_text(Some(
-            "Click to select · Shift-click range · Ctrl+Shift-click toggle · Enter recalls",
-        ));
+        header_row.set_tooltip_text(Some(if is_background {
+            "Click to select · Shift-click range · Ctrl+Shift-click toggle"
+        } else {
+            "Click to select · Shift-click range · Ctrl+Shift-click toggle · Enter recalls"
+        }));
         if config.block_compact {
             header_row.set_margin_start(8);
             header_row.set_margin_end(6);
@@ -871,20 +905,31 @@ impl FinishedBlock {
         bookmark_star.set_visible(false);
         header_row.append(&bookmark_star);
 
-        // Status icon: ✓ for success, ✗ for failure.
-        // Nerd Font glyphs: nf-fa-check () on success, nf-fa-times () on failure.
-        let status_icon = gtk::Label::new(Some(if exit_code == 0 {
+        // Status icon: ✓ for success, ✗ for failure, spinner for an
+        // asynchronous/background block.
+        let status_icon = gtk::Label::new(Some(if is_background {
+            "\u{f110}"
+        } else if exit_code == 0 {
             "\u{f00c}"
         } else {
             "\u{f00d}"
         }));
-        status_icon.add_css_class(if exit_code == 0 {
+        status_icon.add_css_class(if is_background {
+            "block-status-background"
+        } else if exit_code == 0 {
             "block-status-ok"
         } else {
             "block-status-bad"
         });
         status_icon.set_halign(gtk::Align::Start);
         header_row.append(&status_icon);
+
+        if is_background {
+            let background_chip = gtk::Label::new(Some("Background output"));
+            background_chip.add_css_class("block-background-chip");
+            background_chip.set_halign(gtk::Align::Start);
+            header_row.append(&background_chip);
+        }
 
         // Context chips (Warp-style): cwd pill + git-branch pill.
         if let Some(cwd_path) = cwd {
@@ -963,6 +1008,10 @@ impl FinishedBlock {
         copy_output_btn.set_tooltip_text(Some("Copy output"));
         let rerun_btn = gtk::Button::with_label("\u{f021}"); // nf-fa-refresh  recall command
         rerun_btn.set_tooltip_text(Some("Insert command at prompt"));
+        // Commandless background blocks retain output actions, find/filter,
+        // bookmarks and selection, but cannot copy or recall a command.
+        copy_cmd_btn.set_visible(!is_background);
+        rerun_btn.set_visible(!is_background);
         let filter_btn = gtk::Button::with_label("\u{f0b0}"); // nf-fa-filter  filter output
         filter_btn.set_tooltip_text(Some("Filter output"));
         let jump_bottom_btn = gtk::Button::with_label("\u{f103}"); // nf-fa-angle-double-down
@@ -1179,6 +1228,7 @@ impl FinishedBlock {
         cmd_row.append(&command_vte);
 
         outer.append(&cmd_row);
+        cmd_row.set_visible(!is_background);
         let output_box = gtk::Box::new(Orientation::Horizontal, 0);
         output_box.set_hexpand(true);
         output_box.append(&output_vte);
@@ -1480,6 +1530,7 @@ impl FinishedBlock {
 
         FinishedBlock {
             id,
+            is_background,
             widget: outer,
             prompt_text: prompt.to_string(),
             command_vte,
