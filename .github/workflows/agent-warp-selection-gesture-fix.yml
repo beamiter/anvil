@@ -4,6 +4,11 @@ on:
   pull_request:
     branches:
       - master
+  push:
+    branches:
+      - agent/warp-multi-block-selection
+    paths:
+      - .agent-warp-selection-gesture-fix-trigger
 
 permissions:
   contents: write
@@ -56,8 +61,10 @@ jobs:
           PY
           cargo fmt --all
 
-      - name: Remove temporary workflow
-        run: rm -f .github/workflows/agent-warp-selection-gesture-fix.yml
+      - name: Remove temporary machinery
+        run: |
+          rm -f .agent-warp-selection-gesture-fix-trigger
+          rm -f .github/workflows/agent-warp-selection-gesture-fix.yml
 
       - name: Commit source change
         run: |
