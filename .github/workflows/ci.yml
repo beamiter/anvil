@@ -16,13 +16,14 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: "1"
 
 jobs:
   rust:
-    name: Rust quality
+    name: Rust quality and release
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 40
     defaults:
       run:
         # Explicit Bash gives every run step `-e -o pipefail`, so a failing
@@ -65,11 +66,11 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Check all targets
-        run: cargo check --all-targets
+        run: cargo check --all-targets --locked
 
       - name: Run tests
         id: tests
-        run: xvfb-run --auto-servernum cargo test --all-targets --no-fail-fast 2>&1 | tee test.log
+        run: xvfb-run --auto-servernum cargo test --all-targets --locked --no-fail-fast 2>&1 | tee test.log
 
       - name: Run Clippy
         id: clippy
@@ -77,7 +78,7 @@ jobs:
         run: |
           # These structural/style lints are the explicit legacy baseline. All
           # other Rust and Clippy warnings remain denied and fail the build.
-          cargo clippy --all-targets -- \
+          cargo clippy --all-targets --locked -- \
             -D warnings \
             -A clippy::type_complexity \
             -A clippy::doc_lazy_continuation \
@@ -87,6 +88,14 @@ jobs:
             -A clippy::if_same_then_else \
             -A clippy::needless_range_loop \
             2>&1 | tee clippy.log
+
+      - name: Check documentation build
+        if: ${{ !cancelled() }}
+        run: cargo doc --no-deps --locked
+
+      - name: Build optimized release binary
+        if: ${{ !cancelled() }}
+        run: cargo build --release --locked
 
       - name: Upload CI diagnostics
         if: ${{ failure() }}
