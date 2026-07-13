@@ -1,0 +1,115 @@
+name: Finalize Warp multi-selection gesture handling
+
+on:
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out patch branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/warp-multi-block-selection
+          fetch-depth: 0
+
+      - name: Claim modifier clicks over terminal surfaces
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/block_view/mod.rs')
+          text = path.read_text()
+          old = '''        if y <= header_for_click.height() as f64 || shift {
+              active_for_click.borrow().grab_focus();
+              let finished = finished_blocks_for_select.borrow();
+              if ctrl && shift {
+                  toggle_finished_block_selection(
+                      &finished,
+                      &selected_ids_for_click,
+                      &selected_for_click,
+                      &anchor_for_click,
+                      this_id,
+                  );
+              } else if shift {
+                  select_finished_block_range(
+                      &finished,
+                      &selected_ids_for_click,
+                      &selected_for_click,
+                      &anchor_for_click,
+                      this_id,
+                  );
+              } else {
+                  replace_finished_block_selection(
+                      &finished,
+                      &selected_ids_for_click,
+                      &selected_for_click,
+                      &anchor_for_click,
+                      Some(this_id),
+                  );
+              }
+          }
+          gesture.set_state(gtk::EventSequenceState::Denied);'''
+          new = '''        let over_terminal_surface = y > header_for_click.height() as f64;
+          if !over_terminal_surface || shift {
+              active_for_click.borrow().grab_focus();
+              let finished = finished_blocks_for_select.borrow();
+              if ctrl && shift {
+                  toggle_finished_block_selection(
+                      &finished,
+                      &selected_ids_for_click,
+                      &selected_for_click,
+                      &anchor_for_click,
+                      this_id,
+                  );
+              } else if shift {
+                  select_finished_block_range(
+                      &finished,
+                      &selected_ids_for_click,
+                      &selected_for_click,
+                      &anchor_for_click,
+                      this_id,
+                  );
+              } else {
+                  replace_finished_block_selection(
+                      &finished,
+                      &selected_ids_for_click,
+                      &selected_for_click,
+                      &anchor_for_click,
+                      Some(this_id),
+                  );
+              }
+          }
+          // A modifier click on command/output is a block-selection gesture, not
+          // the start of a native VTE text selection. Header clicks still proceed
+          // so collapse/action buttons can receive their own click sequence.
+          gesture.set_state(if shift && over_terminal_surface {
+              gtk::EventSequenceState::Claimed
+          } else {
+              gtk::EventSequenceState::Denied
+          });'''
+          count = text.count(old)
+          if count != 1:
+              raise SystemExit(f'gesture block: expected one match, found {count}')
+          path.write_text(text.replace(old, new, 1))
+          PY
+          cargo fmt --all
+
+      - name: Remove temporary workflow
+        run: rm -f .github/workflows/agent-warp-selection-gesture-fix.yml
+
+      - name: Commit source change
+        run: |
+          git config user.name "openai-codex[bot]"
+          git config user.email "openai-codex[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --stat
+          git commit -m "Prevent modifier block selection from leaking into VTE text selection"
+          git push origin HEAD:agent/warp-multi-block-selection
