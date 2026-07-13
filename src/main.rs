@@ -2,6 +2,7 @@
 
 mod agent;
 mod ai;
+mod app_msg;
 mod block_view;
 mod cli;
 mod command_history;
@@ -25,6 +26,7 @@ mod terminal;
 mod top_bar;
 mod vte_pty;
 mod workflows;
+mod workspace;
 
 use adw::prelude::*;
 use gtk::gdk::ModifierType;
@@ -37,212 +39,16 @@ use relm4::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use app_msg::AppMsg;
 use config::{choose_shell_argv, config_file_path, load_config, Config, TerminalMode, Theme};
 use keybindings::{normalize_key, Action, Direction, KeyCombo, KeybindingMap};
 use terminal::{default_tab_title, BlockTerminal, VteInit, VteInput, VteOutput, VteTerminal};
+use workspace::{ConnStatus, Pane, RemoteConn, Tab, TermCtl, ZoomState};
 
 const FONT_STEP: f64 = 0.025;
 const OPACITY_STEP: f64 = 0.025;
 const MIN_TAB_WIDTH: u32 = 80;
 const MAX_TAB_WIDTH: u32 = 480;
-
-#[derive(Debug, Clone)]
-enum AppMsg {
-    NewTab,
-    CloseTab(u64),
-    /// Close without the running-process confirmation (dialog already approved).
-    ForceCloseTab(u64),
-    ForceClosePane(u64),
-    SelectTab(u64),
-    NextTab,
-    PrevTab,
-    ToggleSidebar,
-    /// Close the application window (top-bar X button).
-    Quit,
-    /// Close after the running-process confirmation has been accepted.
-    ForceQuit,
-    /// Transient, user-visible status/error feedback.
-    Toast(String),
-    /// Block-view: Alt+Ctrl+Shift+C — copy the selected block's output only.
-    CopyOutputOnly,
-    Action(Action),
-    ReloadConfig,
-    PaneExited(u64, u64, i32),
-    PaneCwdChanged(u64, u64, String),
-    /// Remote rsh announced its session id (OSC 7770). Stored on the tab's
-    /// RemoteConn so reconnects pass `--session <id>` and rsh restores state.
-    PaneRemoteSessionId(u64, String),
-    /// Reconnect-countdown tick for a remote tab (id, seconds remaining).
-    RemoteReconnectTick(u64, u64),
-    /// Backoff elapsed: respawn the remote connection (id, attempt to seed).
-    RemoteReconnectNow(u64, u32),
-    PaneFocused(u64, u64),
-    TitleChanged(u64, String),
-    Bell(u64),
-    Activity(u64),
-    // Settings dialog edits (applied to live config + persisted).
-    SettingsTheme(usize),
-    SettingsFontDesc(String),
-    SettingsFontScale(f64),
-    SettingsOpacity(f64),
-    SettingsScrollback(u32),
-    SettingsTerminalMode(usize),
-    SettingsBlockCompact(bool),
-    SettingsCommandHistory(bool),
-    SettingsAiEnabled(bool),
-    SettingsAgentEnabled(bool),
-    SettingsNotifications(bool),
-    SettingsRemoteClipboard(bool),
-    // Search bar.
-    SearchChanged(String),
-    SearchNext,
-    SearchPrev,
-    SearchClose,
-    // Tab management.
-    SetTabWidth(u32),
-    RenameTab(u64, String),
-    /// Drag-and-drop reorder: move the tab with this id to the target index.
-    ReorderTab(u64, usize),
-    TabRowAction(u64, tab_strip::TabAction),
-    SetTabFilter(String),
-    /// File tree: insert a file's shell-quoted path into the active terminal.
-    FileTreeActivateFile(String),
-    /// File tree: open a `.jtnb.md` notebook viewer.
-    OpenNotebook(std::path::PathBuf),
-    /// Open the multi-turn AI agent panel.
-    OpenAgent,
-    /// User typed a message in the agent panel input.
-    AgentSend(String),
-    /// User approved the proposed command at the given transcript index.
-    AgentApprove(usize),
-    /// User rejected the proposed command at the given transcript index.
-    AgentReject(usize),
-    /// User accepted an edited variant of the command at the given index.
-    AgentEditAndApprove(usize, String),
-    AgentEditRequested(usize, String),
-    /// LLM reply arrived for the most recent turn.
-    AgentLlmReply(Result<String, String>),
-    /// A finished block arrived from one of the panes — feed it to the
-    /// active agent if there's a match.
-    AgentBlockFinished {
-        tab_id: u64,
-        pane_id: u64,
-        command: String,
-        exit_code: i32,
-        output_sample: String,
-    },
-    /// Agent dialog closed — drop the session.
-    AgentClose,
-    /// File tree: reroot to the active tab's working directory.
-    FileTreeGotoCwd,
-    /// File tree: move the root up to its parent directory.
-    FileTreeGoUp,
-    /// Sidebar: switch between the tab list and the file tree view.
-    SetSidebarView(config::SidebarView),
-    /// Palette accepted a command — type it into the active pane (no newline)
-    /// so the user can edit before submitting.
-    PaletteTypeCommand(String),
-    /// Palette `?` prefix: send the natural-language query to the AI bridge.
-    /// On success the returned command is typed into the active pane (still
-    /// no autosubmit — matches PaletteTypeCommand's safety stance).
-    PaletteAskAi(String),
-    /// Open the session AI panel (Ctrl+Shift+A by default).
-    OpenAiPanel,
-    /// Palette `:` prefix or Ctrl+Shift+Y: the user picked a workflow whose
-    /// definition lives at this path. The handler reloads + locates it (so
-    /// edits between palette-open and Accept are still honoured), opens the
-    /// param-fill dialog, and on submit types the rendered command into the
-    /// active pane.
-    PaletteRunWorkflow(std::path::PathBuf),
-    Ignore,
-}
-
-/// Holds either backend; both share `VteInput`/`VteOutput` so callers stay
-/// backend-agnostic.
-enum TermCtl {
-    Vte(Controller<VteTerminal>),
-    Block(Controller<BlockTerminal>),
-}
-
-impl TermCtl {
-    fn emit(&self, msg: VteInput) {
-        match self {
-            TermCtl::Vte(c) => c.emit(msg),
-            TermCtl::Block(c) => c.emit(msg),
-        }
-    }
-
-    fn widget(&self) -> gtk::Widget {
-        match self {
-            TermCtl::Vte(c) => c.widget().clone().upcast(),
-            TermCtl::Block(c) => c.widget().clone().upcast(),
-        }
-    }
-}
-
-struct Pane {
-    terminal: TermCtl,
-    id: u64,
-    cwd: Option<String>,
-    mode: TerminalMode,
-    probe: terminal::PaneProbe,
-}
-
-impl Pane {
-    /// A restorable command running in this pane (ssh/nix develop/docker exec/…),
-    /// or None if just the shell is foreground.
-    fn restorable_command(&self) -> Option<String> {
-        process::restorable_command(self.probe.pty_fd.get(), self.probe.shell_pid.get())
-    }
-
-    /// Name of the foreground process for the close-confirmation prompt.
-    fn foreground_process(&self) -> Option<String> {
-        process::foreground_process_name(self.probe.pty_fd.get(), self.probe.shell_pid.get())
-    }
-}
-
-/// Connection state of a remote (ssh) tab, shown as a status dot in the strip.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ConnStatus {
-    Connecting,
-    Connected,
-    Disconnected,
-}
-
-/// Per-tab ssh connection record: drives the status badge and auto-reconnect.
-#[derive(Clone)]
-struct RemoteConn {
-    host: config::RemoteHost,
-    status: ConnStatus,
-    /// Reconnect-backoff attempt counter.
-    attempt: u32,
-    /// When the current connection attempt was spawned (for backoff reset).
-    spawn_at: std::time::Instant,
-}
-
-/// Saved tree position of the active pane while a tab is pane-zoomed.
-struct ZoomState {
-    tree_root: gtk::Widget,
-    pane_widget: gtk::Widget,
-    parent: gtk::Paned,
-    was_start: bool,
-}
-
-struct Tab {
-    holder: gtk::Box,
-    panes: Vec<Pane>,
-    active_pane: usize,
-    title: String,
-    custom_title: bool,
-    bell: bool,
-    activity: bool,
-    marked: bool,
-    pinned: bool,
-    id: u64,
-    zoom: Option<ZoomState>,
-    /// Set when this tab is an ssh connection (status badge + auto-reconnect).
-    remote: Option<RemoteConn>,
-}
 
 // `file_tree_store: gtk::TreeStore` uses the GTK4 TreeStore family deprecated in
 // 4.10; it stays functional and a ColumnView rewrite is out of scope.
