@@ -389,6 +389,9 @@ pub struct TermView {
     /// Drop — otherwise the callback runs forever and keeps its Rc captures
     /// (pty/active/vte/vte_box) alive past tab close.
     resize_tick_id: RefCell<Option<gtk::TickCallbackId>>,
+    /// Periodic sticky-header refresh. Explicitly removed on tab close so its
+    /// GTK captures cannot keep the detached block tree alive.
+    sticky_timer_id: RefCell<Option<glib::SourceId>>,
     /// Tracks per-VTE selections so a drag that crosses block boundaries can be
     /// copied as one contiguous string via Ctrl+Shift+C.
     cross_selection: Rc<CrossSelection>,
@@ -397,6 +400,9 @@ pub struct TermView {
 impl Drop for TermView {
     fn drop(&mut self) {
         if let Some(id) = self.resize_tick_id.borrow_mut().take() {
+            id.remove();
+        }
+        if let Some(id) = self.sticky_timer_id.borrow_mut().take() {
             id.remove();
         }
     }
@@ -717,10 +723,6 @@ impl ReaderCtx {
                                 };
 
                                 let line_count = output_trimmed.lines().count();
-                                let estimated_height = estimated_finished_block_height(
-                                    &config_for_cb.borrow(),
-                                    line_count,
-                                );
 
                                 let start_time = block_start_time_for_cb.get();
                                 let now = SystemTime::now();
@@ -747,6 +749,11 @@ impl ReaderCtx {
                                 // the same width — preserving column-formatted output
                                 // (ls, git log, etc.) instead of reflowing it.
                                 let cols = active_rc.borrow().grid_cols() as i64;
+                                let estimated_height = estimated_finished_block_height_for_text(
+                                    &config_for_cb.borrow(),
+                                    &output_plain,
+                                    cols,
+                                );
                                 let block_data = BlockData {
                                     id: block_id,
                                     prompt: prompt.clone(),
@@ -1869,6 +1876,9 @@ impl TermView {
         // mistake them for a user drag.
         let user_scrolled_up: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let programmatic_scroll: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let block_data_rc: Rc<RefCell<VecDeque<BlockData>>> =
+            Rc::new(RefCell::new(VecDeque::new()));
+        let finished_blocks_rc: Rc<RefCell<Vec<FinishedBlock>>> = Rc::new(RefCell::new(Vec::new()));
 
         // ── Warp-style input-cell sizing ──────────────────────────────────
         // The live VTE holder hugs its content (prompt + typed command) with a
@@ -1883,11 +1893,39 @@ impl TermView {
             let scroll = block_scroll.clone();
             let bstate = bstate.clone();
             let typed_cmd = typed_cmd.clone();
+            let finished_for_layout = finished_blocks_rc.clone();
+            let block_data_for_layout = block_data_rc.clone();
+            let config_for_layout = config.clone();
             let last_size_target: Rc<Cell<(i64, i64)>> = Rc::new(Cell::new((0, 0)));
+            let last_output_layout: Rc<Cell<(i32, usize)>> = Rc::new(Cell::new((-1, 0)));
             Rc::new(move || {
                 let cell_h = (vte.char_height() as i32).max(1);
                 let Some(viewport_rows) = viewport_rows_for(&vte, &scroll) else {
                     return;
+                };
+                let fit_finished_outputs = |input_rows: i64| {
+                    let page_height = scroll.vadjustment().page_size() as i32;
+                    let input_height = (input_rows as i32)
+                        .saturating_mul(cell_h)
+                        .saturating_add(css::BLOCK_ACTIVE_VCHROME_PX);
+                    let available = page_height.saturating_sub(input_height).max(cell_h * 3);
+                    let block_count = finished_for_layout.borrow().len();
+                    let layout_key = (available, block_count);
+                    if last_output_layout.replace(layout_key) == layout_key {
+                        return;
+                    }
+
+                    let finished = finished_for_layout.borrow();
+                    let mut block_data = block_data_for_layout.borrow_mut();
+                    for block in finished.iter() {
+                        let Some(rows) = block.fit_output_to_height(available) else {
+                            continue;
+                        };
+                        if let Some(data) = block_data.iter_mut().find(|data| data.id == block.id) {
+                            data.estimated_height =
+                                estimated_finished_block_height(&config_for_layout, rows);
+                        }
+                    }
                 };
                 let cols = vte.column_count().max(1);
                 let state = bstate.get();
@@ -1902,6 +1940,7 @@ impl TermView {
                     }
                     holder.set_visible(true);
                     holder.set_height_request((viewport_rows as i32) * cell_h);
+                    fit_finished_outputs(viewport_rows);
                     return;
                 }
                 holder.set_visible(true);
@@ -1941,6 +1980,7 @@ impl TermView {
                     last_size_target.set(target);
                 }
                 holder.set_height_request((target_rows as i32) * cell_h);
+                fit_finished_outputs(target_rows);
             })
         };
         // Coalesces follow-bottom pins so a burst of contents-changed signals
@@ -2022,10 +2062,6 @@ impl TermView {
         // DECSET 2004 state here so clipboard pastes can be forwarded as one
         // ordered byte stream instead of relying on VTE's unrelated PTY.
         let bracketed_paste: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        let block_data_rc: Rc<RefCell<VecDeque<BlockData>>> =
-            Rc::new(RefCell::new(VecDeque::new()));
-        let finished_blocks_rc: Rc<RefCell<Vec<FinishedBlock>>> = Rc::new(RefCell::new(Vec::new()));
-
         // A finished-block sticky header behaves like Warp's: click it to return
         // to the command at the top of the oversized block.
         {
@@ -2375,7 +2411,7 @@ impl TermView {
         // Running commands keep their existing status header while the user reads
         // history. Finished oversized blocks pin their command when the original
         // header has scrolled above the viewport but the block still spans it.
-        {
+        let sticky_timer_id = {
             let sticky = sticky_bar.clone();
             let sticky_label = sticky_label.clone();
             let sticky_target = sticky_target_id.clone();
@@ -2385,12 +2421,21 @@ impl TermView {
             let user_scrolled = user_scrolled_up.clone();
             let finished = finished_blocks_rc.clone();
             let scroll = block_scroll.clone();
-            glib::timeout_add_local(std::time::Duration::from_millis(120), move || {
+            glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
                 if sticky.parent().is_none() {
                     return glib::ControlFlow::Break;
                 }
 
-                if cmd_running.get() && user_scrolled.get() {
+                // At the live prompt there is no sticky header to compute. Avoid
+                // walking every finished block and querying GTK geometry on a
+                // permanent timer while the terminal is idle.
+                if !user_scrolled.get() {
+                    sticky_target.set(None);
+                    sticky.set_visible(false);
+                    return glib::ControlFlow::Continue;
+                }
+
+                if cmd_running.get() {
                     sticky_target.set(None);
                     let cmd = running_cmd.borrow();
                     let cmd_disp = cmd.trim();
@@ -2448,8 +2493,8 @@ impl TermView {
                     sticky.set_visible(false);
                 }
                 glib::ControlFlow::Continue
-            });
-        }
+            })
+        };
 
         // ── VTE is used as a display-only widget (fed via feed() in alt-screen mode)
         //    so we do NOT attach it to the PTY. Our reader thread handles all I/O.
@@ -2657,6 +2702,7 @@ impl TermView {
             find_state: Rc::new(RefCell::new(FindState::default())),
             current_cwd: current_cwd.clone(),
             resize_tick_id: RefCell::new(None),
+            sticky_timer_id: RefCell::new(Some(sticky_timer_id)),
             cross_selection,
         };
 
@@ -2669,15 +2715,20 @@ impl TermView {
         // mid-word). For old saves without a cols field (cols == 0), fall back
         // to the live VTE's current column count.
         {
-            let block_data_ref = term_view.block_data.borrow();
+            let mut block_data_ref = term_view.block_data.borrow_mut();
             let config = term_view.config.borrow();
             let fallback_cols = term_view.active.borrow().grid_cols() as i64;
-            for block in block_data_ref.iter() {
+            for block in block_data_ref.iter_mut() {
                 let cols = if block.cols > 0 {
                     block.cols as i64
                 } else {
                     fallback_cols
                 };
+                // Older history entries stored an estimate based only on `\n`
+                // count. Recompute it so a restored long wrapped line is not
+                // virtualized away while it is still visible.
+                block.estimated_height =
+                    estimated_finished_block_height_for_text(&config, &block.output, cols);
                 let finished = FinishedBlock::new(
                     block.id,
                     &block.prompt,

@@ -14,6 +14,11 @@ use relm4::gtk;
 use vte4::{CursorBlinkMode, CursorShape, Terminal};
 use vte4::{TerminalExt, TerminalExtManual};
 
+/// Give dense block output a little breathing room.  In particular, long
+/// compiler/type traces are otherwise difficult to follow because many patched
+/// monospace fonts paint almost up to VTE's default cell boundary.
+pub(crate) const BLOCK_CELL_HEIGHT_SCALE: f64 = 1.12;
+
 // ─── Mouse Reporting Mode ─────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -262,6 +267,7 @@ pub(crate) fn create_active_terminal(config: &Config) -> Terminal {
         .cursor_blink_mode(CursorBlinkMode::System)
         .cursor_shape(CursorShape::Block)
         .font_scale(config.default_font_scale)
+        .cell_height_scale(BLOCK_CELL_HEIGHT_SCALE)
         .opacity(1.0)
         .pointer_autohide(true)
         .enable_sixel(true)
@@ -298,6 +304,7 @@ pub(crate) fn create_finished_terminal(
     cols: i64,
     output_rows: i64,
     viewport_cap: i64,
+    expand_to_buffer: bool,
 ) -> Terminal {
     let visible_rows = output_rows.min(viewport_cap).max(1);
     // The caller's estimate can be too small (most notably a long single-line
@@ -320,6 +327,7 @@ pub(crate) fn create_finished_terminal(
         .cursor_blink_mode(CursorBlinkMode::Off)
         .cursor_shape(CursorShape::Block)
         .font_scale(config.default_font_scale)
+        .cell_height_scale(BLOCK_CELL_HEIGHT_SCALE)
         .opacity(1.0)
         .pointer_autohide(true)
         .enable_sixel(true)
@@ -333,7 +341,7 @@ pub(crate) fn create_finished_terminal(
     // `blocks.rs` performs the actual feed from its map/filter paths. Keep
     // one constructor-level hook for command snapshots and other one-shot users;
     // every explicit re-feed also calls the same settling helper.
-    {
+    if expand_to_buffer {
         let expanded = std::cell::Cell::new(false);
         terminal.connect_map(move |terminal| {
             if expanded.replace(true) {
