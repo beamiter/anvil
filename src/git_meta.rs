@@ -1,22 +1,28 @@
-//! git_meta — bounded shell-out for the active-pane git status strip.
+//! git_meta — coalesced background Git metadata for the active-pane strip.
 //!
-//! A refresh uses one `git status --porcelain=v2 --branch` process to read the
-//! branch, dirty flag, and ahead/behind counts. Older code launched several git
-//! processes per refresh and documented a timeout without actually enforcing it.
-//! The single-process parser keeps the GTK/Relm4 main-thread pause small, while a
-//! real deadline kills a wedged git process instead of allowing it to hang the UI.
+//! Callers may run on the GTK/Relm4 main thread, so they never execute Git
+//! directly. A single worker owns all `git status --porcelain=v2 --branch`
+//! processes, coalesces concurrent requests for the same directory, and stores
+//! the latest result in a small process-wide cache. A caller waits only for a
+//! short hand-off budget; when a repository is slow it receives the previous
+//! cached value while the worker continues refreshing it in the background.
 //!
 //! Failures are silent — non-repo directories just return `None` and the strip
 //! hides itself. Git-status flakiness should never surface as a terminal error.
 
+use std::collections::HashMap;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const GIT_STATUS_TIMEOUT: Duration = Duration::from_millis(500);
 const GIT_WAIT_POLL: Duration = Duration::from_millis(5);
+/// The UI may briefly wait for a healthy local repository, but a slow disk,
+/// remote mount, or wedged worktree must never consume the full Git timeout.
+const UI_WAIT_BUDGET: Duration = Duration::from_millis(12);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepoMeta {
@@ -30,14 +36,122 @@ pub struct RepoMeta {
     pub behind: Option<u32>,
 }
 
-/// Resolve repo metadata for `cwd`. Returns `None` if `cwd` is not inside a git
-/// repository, the directory does not exist, git is unavailable, or the probe
-/// exceeds the hard timeout.
+type ProbeResult = Option<RepoMeta>;
+type ReplySender = mpsc::SyncSender<ProbeResult>;
+
+/// One process-wide worker is enough: status probes are tiny, and serializing
+/// them avoids spawning a thread/process storm when several panes finish output
+/// at once. Requests for the same cwd share one in-flight subprocess.
+struct GitMetaService {
+    request_tx: mpsc::Sender<PathBuf>,
+    cache: Arc<Mutex<HashMap<PathBuf, ProbeResult>>>,
+    pending: Arc<Mutex<HashMap<PathBuf, Vec<ReplySender>>>>,
+}
+
+impl GitMetaService {
+    fn new() -> Option<Self> {
+        let (request_tx, request_rx) = mpsc::channel::<PathBuf>();
+        let cache = Arc::new(Mutex::new(HashMap::new()));
+        let pending = Arc::new(Mutex::new(HashMap::<PathBuf, Vec<ReplySender>>::new()));
+
+        let cache_worker = cache.clone();
+        let pending_worker = pending.clone();
+        thread::Builder::new()
+            .name("jterm1-git-meta-worker".to_string())
+            .spawn(move || worker_loop(request_rx, &cache_worker, &pending_worker))
+            .ok()?;
+
+        Some(Self {
+            request_tx,
+            cache,
+            pending,
+        })
+    }
+
+    fn cached(&self, path: &Path) -> Option<ProbeResult> {
+        self.cache.lock().ok()?.get(path).cloned()
+    }
+
+    /// Queue a refresh and return a one-shot receiver for the result. When this
+    /// cwd is already running, append the receiver to that probe's waiter list
+    /// instead of launching another Git process.
+    fn request(&self, path: &Path) -> Option<mpsc::Receiver<ProbeResult>> {
+        let path = path.to_path_buf();
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+
+        {
+            let mut pending = self.pending.lock().ok()?;
+            if let Some(waiters) = pending.get_mut(&path) {
+                waiters.push(reply_tx);
+                return Some(reply_rx);
+            }
+            pending.insert(path.clone(), vec![reply_tx]);
+        }
+
+        if self.request_tx.send(path.clone()).is_err() {
+            if let Ok(mut pending) = self.pending.lock() {
+                pending.remove(&path);
+            }
+            return None;
+        }
+        Some(reply_rx)
+    }
+}
+
+fn service() -> Option<&'static GitMetaService> {
+    static SERVICE: OnceLock<Option<GitMetaService>> = OnceLock::new();
+    SERVICE.get_or_init(GitMetaService::new).as_ref()
+}
+
+fn worker_loop(
+    request_rx: mpsc::Receiver<PathBuf>,
+    cache: &Mutex<HashMap<PathBuf, ProbeResult>>,
+    pending: &Mutex<HashMap<PathBuf, Vec<ReplySender>>>,
+) {
+    for path in request_rx {
+        let result = read_uncached(&path);
+
+        if let Ok(mut cache) = cache.lock() {
+            cache.insert(path.clone(), result.clone());
+        }
+
+        let waiters = pending
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.remove(&path))
+            .unwrap_or_default();
+        for waiter in waiters {
+            let _ = waiter.send(result.clone());
+        }
+    }
+}
+
+/// Resolve repo metadata for `cwd` without running Git on the caller's thread.
+///
+/// A healthy local repository usually completes inside `UI_WAIT_BUDGET`, keeping
+/// first paint responsive while still showing fresh data. If it takes longer,
+/// return the last cached value (or `None` on the first probe); the shared worker
+/// continues and makes the result available to the next normal refresh.
 pub fn read(cwd: &Path) -> Option<RepoMeta> {
     if !cwd.is_dir() {
         return None;
     }
 
+    let service = service()?;
+    let stale = service.cached(cwd).flatten();
+    let Some(reply) = service.request(cwd) else {
+        return stale;
+    };
+
+    match reply.recv_timeout(UI_WAIT_BUDGET) {
+        Ok(fresh) => fresh,
+        Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => stale,
+    }
+}
+
+/// Execute and parse one status probe. This function is called only by the
+/// background service worker.
+fn read_uncached(cwd: &Path) -> ProbeResult {
     let output = run_git_status(cwd)?;
     parse_porcelain_v2(&output)
 }
@@ -105,10 +219,9 @@ fn parse_ahead_behind(value: &str) -> Option<(u32, u32)> {
     Some((ahead, behind))
 }
 
-/// Run one bounded git-status process. Stdout is drained on a worker thread so a
+/// Run one bounded git-status process. Stdout is drained on a helper thread so a
 /// repository with many changed files cannot fill the pipe and deadlock before
-/// the child exits. The GTK/Relm4 caller still waits synchronously, but never for
-/// longer than the configured deadline.
+/// the child exits. This entire function runs behind `GitMetaService`.
 fn run_git_status(cwd: &Path) -> Option<String> {
     let mut child = Command::new("git")
         .args([
@@ -246,6 +359,31 @@ mod tests {
         assert_eq!(
             parse_porcelain_v2("# branch.oid (initial)\n# branch.head (detached)\n"),
             None
+        );
+    }
+
+    #[test]
+    fn coalesces_waiters_for_the_same_path() {
+        let (request_tx, request_rx) = mpsc::channel();
+        let service = GitMetaService {
+            request_tx,
+            cache: Arc::new(Mutex::new(HashMap::new())),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let path = Path::new("/tmp/repo");
+
+        let _first = service.request(path).expect("first request");
+        let _second = service.request(path).expect("coalesced request");
+
+        assert_eq!(request_rx.try_iter().count(), 1);
+        assert_eq!(
+            service
+                .pending
+                .lock()
+                .unwrap()
+                .get(path)
+                .map(Vec::len),
+            Some(2)
         );
     }
 
