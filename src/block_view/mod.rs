@@ -697,6 +697,9 @@ pub struct TermView {
 
 impl Drop for TermView {
     fn drop(&mut self) {
+        if let Err(err) = self.save_history() {
+            log::warn!("save block history on close: {err}");
+        }
         if let Some(id) = self.resize_tick_id.borrow_mut().take() {
             id.remove();
         }
@@ -1457,6 +1460,32 @@ impl ReaderCtx {
 
                                 if block_data_for_cb.borrow().len() > max_blocks {
                                     block_data_for_cb.borrow_mut().pop_front();
+                                }
+
+                                // Keep a small JSONL command index separate from
+                                // optional full-output block history. This powers
+                                // History, palette search, and opt-in AI context
+                                // without persisting terminal output by default.
+                                let (history_path, history_limit) = {
+                                    let cfg = config_for_cb.borrow();
+                                    (
+                                        cfg.command_history_enabled
+                                            .then(|| cfg.command_history_path.clone())
+                                            .flatten(),
+                                        cfg.command_history_max_entries as usize,
+                                    )
+                                };
+                                if let Some(path) = history_path {
+                                    if let Err(err) = crate::command_history::append(
+                                        std::path::Path::new(&path),
+                                        history_limit,
+                                        &cmd,
+                                        block_cwd.as_deref(),
+                                        exit_code,
+                                        end_time_ms,
+                                    ) {
+                                        log::warn!("command history: {err}");
+                                    }
                                 }
 
                                 let preserve = config_for_cb.borrow().preserve_live_scrollback;
@@ -4046,10 +4075,10 @@ mod tests {
     #[test]
     fn post_command_metadata_detection_matches_shell_osc_updates() {
         assert!(is_post_command_metadata(
-            b"\x1b]7;file://host/home/yj\x1b\\"
+            b"\x1b]7;file://host/home/tester\x1b\\"
         ));
         assert!(is_post_command_metadata(b"\x1b]0;title\x1b\\"));
-        assert!(!is_post_command_metadata(b"/home/yj\r\n"));
+        assert!(!is_post_command_metadata(b"/home/tester\r\n"));
         assert!(!is_post_command_metadata(b"daily.txt  Documents\r\n"));
     }
 

@@ -209,6 +209,12 @@ pub struct Config {
     pub(crate) finished_block_max_expanded_rows: u32,
     pub(crate) max_collapsed_output_lines: u32,
     pub(crate) virtual_scroll_margin: u32,
+    /// Lightweight JSONL command index used by History, the command palette,
+    /// and optional AI context. Unlike `block_history_path`, this never stores
+    /// command output.
+    pub(crate) command_history_enabled: bool,
+    pub(crate) command_history_path: Option<String>,
+    pub(crate) command_history_max_entries: u32,
     pub(crate) block_history_path: Option<String>,
     pub(crate) block_history_compress: bool,
     /// Compact (denser) block-mode spacing, matching Warp's compact density.
@@ -400,6 +406,29 @@ pub(crate) fn config_file_path() -> PathBuf {
     glib::user_config_dir().join("jterm1").join("config.toml")
 }
 
+pub(crate) fn default_command_history_path() -> String {
+    glib::user_state_dir()
+        .join("jterm1")
+        .join("history.jsonl")
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Return a user-facing diagnostic when the config exists but cannot be read
+/// or parsed. Callers use this before hot reload and before any write so a
+/// malformed hand-edited file is never silently replaced with defaults.
+pub(crate) fn config_file_error() -> Option<String> {
+    let path = config_file_path();
+    match fs::read_to_string(&path) {
+        Ok(contents) => contents
+            .parse::<toml::Table>()
+            .err()
+            .map(|err| format!("{}: {err}", path.display())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => Some(format!("{}: {err}", path.display())),
+    }
+}
+
 /// Parsed TOML config file structure.
 #[derive(Default)]
 struct FileConfig {
@@ -432,6 +461,9 @@ struct FileConfig {
     finished_block_max_expanded_rows: Option<u32>,
     max_collapsed_output_lines: Option<u32>,
     virtual_scroll_margin: Option<u32>,
+    command_history_enabled: Option<bool>,
+    command_history_path: Option<String>,
+    command_history_max_entries: Option<u32>,
     block_history_path: Option<String>,
     block_history_compress: Option<bool>,
     block_compact: Option<bool>,
@@ -481,7 +513,7 @@ fn load_file_config() -> FileConfig {
         scrollback: table
             .get("scrollback")
             .and_then(|v| v.as_integer())
-            .map(|v| v as u32),
+            .and_then(|v| u32::try_from(v).ok()),
         font: table
             .get("font")
             .and_then(|v| v.as_str())
@@ -531,51 +563,62 @@ fn load_file_config() -> FileConfig {
         sidebar_width: table
             .get("sidebar_width")
             .and_then(|v| v.as_integer())
-            .map(|v| v as u32),
+            .and_then(|v| u32::try_from(v).ok()),
         tab_width: table
             .get("tab_width")
             .and_then(|v| v.as_integer())
-            .map(|v| v as u32),
+            .and_then(|v| u32::try_from(v).ok()),
         ansi_cache_capacity: table
             .get("ansi_cache_capacity")
             .and_then(|v| v.as_integer())
-            .map(|v| v as u32),
+            .and_then(|v| u32::try_from(v).ok()),
         max_visible_blocks: table
             .get("max_visible_blocks")
             .and_then(|v| v.as_integer())
-            .map(|v| v as u32),
+            .and_then(|v| u32::try_from(v).ok()),
         output_batch_min_ms: table
             .get("output_batch_min_ms")
             .and_then(|v| v.as_integer())
-            .map(|v| v as u32),
+            .and_then(|v| u32::try_from(v).ok()),
         output_batch_max_ms: table
             .get("output_batch_max_ms")
             .and_then(|v| v.as_integer())
-            .map(|v| v as u32),
+            .and_then(|v| u32::try_from(v).ok()),
         lazy_load_threshold: table
             .get("lazy_load_threshold")
             .and_then(|v| v.as_integer())
-            .map(|v| v as u32),
+            .and_then(|v| u32::try_from(v).ok()),
         truncation_threshold_lines: table
             .get("truncation_threshold_lines")
             .and_then(|v| v.as_integer())
-            .map(|v| v as u32),
+            .and_then(|v| u32::try_from(v).ok()),
         finished_block_viewport_rows: table
             .get("finished_block_viewport_rows")
             .and_then(|v| v.as_integer())
-            .map(|v| v as u32),
+            .and_then(|v| u32::try_from(v).ok()),
         finished_block_max_expanded_rows: table
             .get("finished_block_max_expanded_rows")
             .and_then(|v| v.as_integer())
-            .map(|v| v as u32),
+            .and_then(|v| u32::try_from(v).ok()),
         max_collapsed_output_lines: table
             .get("max_collapsed_output_lines")
             .and_then(|v| v.as_integer())
-            .map(|v| v as u32),
+            .and_then(|v| u32::try_from(v).ok()),
         virtual_scroll_margin: table
             .get("virtual_scroll_margin")
             .and_then(|v| v.as_integer())
-            .map(|v| v as u32),
+            .and_then(|v| u32::try_from(v).ok()),
+        command_history_enabled: table
+            .get("command_history_enabled")
+            .and_then(|v| v.as_bool()),
+        command_history_path: table
+            .get("command_history_path")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        command_history_max_entries: table
+            .get("command_history_max_entries")
+            .and_then(|v| v.as_integer())
+            .and_then(|v| u32::try_from(v).ok()),
         block_history_path: table
             .get("block_history_path")
             .and_then(|v| v.as_str())
@@ -605,12 +648,12 @@ fn load_file_config() -> FileConfig {
         agent_max_turns: table
             .get("agent_max_turns")
             .and_then(|v| v.as_integer())
-            .map(|v| v as u32),
+            .and_then(|v| u32::try_from(v).ok()),
         notify_long_blocks: table.get("notify_long_blocks").and_then(|v| v.as_bool()),
         notify_long_block_threshold_ms: table
             .get("notify_long_block_threshold_ms")
             .and_then(|v| v.as_integer())
-            .map(|v| v as u64),
+            .and_then(|v| u64::try_from(v).ok()),
         show_repo_strip: table.get("show_repo_strip").and_then(|v| v.as_bool()),
         remote_hosts,
     }
@@ -700,33 +743,11 @@ fn remote_host_to_toml(h: &RemoteHost) -> toml::Value {
     toml::Value::Table(t)
 }
 
-/// Built-in remote hosts used when no config file exists yet, so a fresh
-/// install can connect without hand-writing `[[remote_hosts]]` first.
+/// A fresh install has no implicit network destinations. Remote targets are
+/// user-owned configuration and must never ship with developer addresses,
+/// usernames, session ids, or absolute paths baked in.
 fn default_remote_hosts() -> Vec<RemoteHost> {
-    vec![
-        RemoteHost {
-            name: "home-dev".into(),
-            host: "100.99.153.18".into(),
-            user: Some("yj".into()),
-            // Full path: a non-interactive ssh PATH resolves bare `rsh` to the
-            // system ssh-alternative, not the block-mode rsh in ~/.cargo/bin.
-            remote_shell: "/home/yj/.cargo/bin/rsh".into(),
-            session: Some("cloud-test".into()),
-            ssh_args: Vec::new(),
-            login_shell: true,
-            multiplex: true,
-        },
-        RemoteHost {
-            name: "localhost-test".into(),
-            host: "localhost".into(),
-            user: Some("mm".into()),
-            remote_shell: "rsh".into(),
-            session: Some("local-test".into()),
-            ssh_args: Vec::new(),
-            login_shell: true,
-            multiplex: true,
-        },
-    ]
+    Vec::new()
 }
 
 // ---------------------------------------------------------------------------
@@ -753,7 +774,8 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         .clamp(0.01, 1.0);
     let terminal_scrollback_lines = env_u32("JTERM1_SCROLLBACK")
         .or(fc.scrollback)
-        .unwrap_or(5000);
+        .unwrap_or(5000)
+        .min(1_000_000);
     let default_font_scale = env_f64("JTERM1_FONT_SCALE")
         .or(fc.font_scale)
         .unwrap_or(1.0)
@@ -787,36 +809,55 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     let ansi_cache_capacity = env_u32("JTERM1_ANSI_CACHE_CAP")
         .or(fc.ansi_cache_capacity)
         .unwrap_or(256)
-        .max(1);
+        .clamp(1, 65_536);
     let max_visible_blocks = env_u32("JTERM1_MAX_BLOCKS")
         .or(fc.max_visible_blocks)
-        .unwrap_or(200);
+        .unwrap_or(200)
+        .clamp(1, 10_000);
     let output_batch_min_ms = env_u32("JTERM1_BATCH_MIN")
         .or(fc.output_batch_min_ms)
-        .unwrap_or(10);
+        .unwrap_or(10)
+        .clamp(1, 1_000);
     let output_batch_max_ms = env_u32("JTERM1_BATCH_MAX")
         .or(fc.output_batch_max_ms)
-        .unwrap_or(100);
+        .unwrap_or(100)
+        .clamp(output_batch_min_ms, 5_000);
     let lazy_load_threshold = env_u32("JTERM1_LAZY_LINES")
         .or(fc.lazy_load_threshold)
-        .unwrap_or(1000);
+        .unwrap_or(1000)
+        .clamp(1, 100_000);
     let truncation_threshold_lines = env_u32("JTERM1_TRUNCATION_LINES")
         .or(fc.truncation_threshold_lines)
-        .unwrap_or(50000);
+        .unwrap_or(50000)
+        .clamp(100, 1_000_000);
     let finished_block_viewport_rows = env_u32("JTERM1_FINISHED_VIEWPORT_ROWS")
         .or(fc.finished_block_viewport_rows)
         .unwrap_or(24)
-        .max(3);
+        .clamp(3, 5_000);
     let finished_block_max_expanded_rows = env_u32("JTERM1_FINISHED_MAX_EXPANDED_ROWS")
         .or(fc.finished_block_max_expanded_rows)
         .unwrap_or(5000)
         .clamp(finished_block_viewport_rows, 5000);
     let max_collapsed_output_lines = env_u32("JTERM1_MAX_COLLAPSED_LINES")
         .or(fc.max_collapsed_output_lines)
-        .unwrap_or(25);
+        .unwrap_or(25)
+        .min(10_000);
     let virtual_scroll_margin = env_u32("JTERM1_VSCROLL_MARGIN")
         .or(fc.virtual_scroll_margin)
-        .unwrap_or(1);
+        .unwrap_or(1)
+        .min(100);
+    let command_history_enabled = fc.command_history_enabled.unwrap_or(true);
+    let command_history_path = command_history_enabled.then(|| {
+        std::env::var("JTERM1_COMMAND_HISTORY_PATH")
+            .ok()
+            .or(fc.command_history_path)
+            .filter(|path| !path.trim().is_empty())
+            .unwrap_or_else(default_command_history_path)
+    });
+    let command_history_max_entries = fc
+        .command_history_max_entries
+        .unwrap_or(10_000)
+        .clamp(100, 100_000);
     let block_history_path = std::env::var("JTERM1_HISTORY_PATH")
         .ok()
         .or(fc.block_history_path);
@@ -830,10 +871,12 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     .unwrap_or(false);
     let shell = std::env::var("JTERM1_SHELL").ok().or(fc.shell);
 
-    // Parse terminal mode (default: vte)
+    // Block mode is jterm1's defining experience and is required for the
+    // command-completion events consumed by Agent and command history. Users
+    // can still opt into the compatibility VTE backend explicitly.
     let terminal_mode_str = env_string("JTERM1_MODE")
         .or(fc.terminal_mode)
-        .unwrap_or_else(|| "vte".to_string());
+        .unwrap_or_else(|| "block".to_string());
     let terminal_mode = match terminal_mode_str.to_lowercase().as_str() {
         "vte" => TerminalMode::Vte,
         _ => TerminalMode::Block,
@@ -876,6 +919,9 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         finished_block_max_expanded_rows,
         max_collapsed_output_lines,
         virtual_scroll_margin,
+        command_history_enabled,
+        command_history_path,
+        command_history_max_entries,
         block_history_path,
         block_history_compress,
         block_compact,
@@ -915,20 +961,50 @@ pub(crate) fn rgba_to_hex(c: &RGBA) -> String {
     )
 }
 
-pub(crate) fn save_config(config: &Config) {
+fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut options = fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(contents)?;
+    file.sync_all()
+}
+
+pub(crate) fn save_config(config: &Config) -> Result<(), String> {
     let path = config_file_path();
     if let Some(parent) = path.parent() {
-        if let Err(err) = fs::create_dir_all(parent) {
-            log::warn!("Failed to create config dir {}: {err}", parent.display());
-            return;
-        }
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("create config dir {}: {err}", parent.display()))?;
     }
 
-    // Read existing config to preserve user-authored sections (e.g. [keybindings])
-    let mut table = fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| s.parse::<toml::Table>().ok())
-        .unwrap_or_default();
+    // Read existing config to preserve user-authored sections (e.g.
+    // [keybindings]). A parse failure is a hard stop: falling back to an empty
+    // table here would destroy the user's file on the next settings change.
+    let existing = match fs::read_to_string(&path) {
+        Ok(contents) => Some(contents),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(format!("read config {}: {err}", path.display())),
+    };
+    let mut table = match existing.as_deref() {
+        Some(contents) => contents.parse::<toml::Table>().map_err(|err| {
+            format!(
+                "refusing to overwrite invalid config {}: {err}",
+                path.display()
+            )
+        })?,
+        None => toml::Table::new(),
+    };
 
     table.insert("opacity".into(), toml::Value::Float(config.window_opacity));
     table.insert(
@@ -970,6 +1046,27 @@ pub(crate) fn save_config(config: &Config) {
         "tab_width".into(),
         toml::Value::Integer(config.tab_width as i64),
     );
+    table.insert(
+        "block_compact".into(),
+        toml::Value::Boolean(config.block_compact),
+    );
+    table.insert(
+        "command_history_enabled".into(),
+        toml::Value::Boolean(config.command_history_enabled),
+    );
+    table.insert("ai_enabled".into(), toml::Value::Boolean(config.ai_enabled));
+    table.insert(
+        "agent_enabled".into(),
+        toml::Value::Boolean(config.agent_enabled),
+    );
+    table.insert(
+        "notify_long_blocks".into(),
+        toml::Value::Boolean(config.notify_long_blocks),
+    );
+    table.insert(
+        "allow_remote_clipboard_write".into(),
+        toml::Value::Boolean(config.allow_remote_clipboard_write),
+    );
 
     let mut colors = toml::Table::new();
     colors.insert(
@@ -990,33 +1087,26 @@ pub(crate) fn save_config(config: &Config) {
     );
     table.insert("colors".into(), toml::Value::Table(colors));
 
-    // Seed the built-in default hosts on the FIRST save (when the file has no
-    // [[remote_hosts]] yet), so writing any other setting doesn't create a config
-    // that silently drops the context-menu remote-connect items. remote_hosts has
-    // no in-app editor, so once the section exists it is user-authored: never
-    // overwrite it here, or hand-edited hosts get clobbered on the next save.
-    if !table.contains_key("remote_hosts") && !config.remote_hosts.is_empty() {
-        let hosts: Vec<toml::Value> = config
-            .remote_hosts
-            .iter()
-            .map(remote_host_to_toml)
-            .collect();
-        table.insert("remote_hosts".into(), toml::Value::Array(hosts));
-    }
-
     let content = table.to_string();
     let tmp_path = path.with_extension("toml.tmp");
-    if let Err(err) = fs::write(&tmp_path, &content) {
-        log::warn!("Failed to write config {}: {err}", tmp_path.display());
-        return;
-    }
-    if let Err(err) = fs::rename(&tmp_path, &path) {
-        let _ = fs::remove_file(&path);
-        if let Err(err2) = fs::rename(&tmp_path, &path) {
-            log::warn!("Failed to move config into place: {err} / {err2}");
+    write_private_file(&tmp_path, content.as_bytes())
+        .map_err(|err| format!("write config {}: {err}", tmp_path.display()))?;
+
+    // Keep one known-good snapshot. If creating the backup fails, leave the
+    // live file untouched instead of weakening the safety guarantee.
+    if let Some(existing) = existing {
+        let backup = path.with_extension("toml.bak");
+        if let Err(err) = write_private_file(&backup, existing.as_bytes()) {
             let _ = fs::remove_file(&tmp_path);
+            return Err(format!("write config backup {}: {err}", backup.display()));
         }
     }
+
+    if let Err(err) = fs::rename(&tmp_path, &path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!("replace config {}: {err}", path.display()));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1036,7 +1126,7 @@ fn is_executable(path: &Path) -> bool {
     path.is_file()
 }
 
-fn find_executable_in_path(exe_name: &str) -> Option<PathBuf> {
+pub(crate) fn find_executable_in_path(exe_name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     std::env::split_paths(&path_var)
         .map(|dir| dir.join(exe_name))
@@ -1088,10 +1178,10 @@ mod tests {
     fn host() -> RemoteHost {
         RemoteHost {
             name: "h".into(),
-            host: "1.2.3.4".into(),
-            user: Some("yj".into()),
-            remote_shell: "/home/yj/.cargo/bin/rsh".into(),
-            session: Some("cloud-test".into()),
+            host: "203.0.113.10".into(),
+            user: Some("tester".into()),
+            remote_shell: "/home/tester/.local/bin/rsh".into(),
+            session: Some("staging-test".into()),
             ssh_args: Vec::new(),
             login_shell: true,
             // Off by default in tests so exact-argv assertions stay deterministic
@@ -1108,8 +1198,8 @@ mod tests {
             vec![
                 "ssh",
                 "-t",
-                "yj@1.2.3.4",
-                "bash -lc 'exec /home/yj/.cargo/bin/rsh --session cloud-test'",
+                "tester@203.0.113.10",
+                "bash -lc 'exec /home/tester/.local/bin/rsh --session staging-test'",
             ]
         );
     }
@@ -1121,7 +1211,7 @@ mod tests {
         let argv = build_remote_argv(&h);
         assert_eq!(
             argv.last().unwrap(),
-            "/home/yj/.cargo/bin/rsh --session cloud-test"
+            "/home/tester/.local/bin/rsh --session staging-test"
         );
     }
 
@@ -1132,16 +1222,16 @@ mod tests {
         let argv = build_remote_argv(&h);
         assert_eq!(
             argv.last().unwrap(),
-            r#"bash -lc 'exec /home/yj/.cargo/bin/rsh --session it'\''s'"#
+            r#"bash -lc 'exec /home/tester/.local/bin/rsh --session it'\''s'"#
         );
     }
 
     #[test]
     fn rsh_wrapper_uses_interactive_bash() {
-        let argv = wrap_rsh_argv_in_interactive_bash("/home/yj/.cargo/bin/rsh")
+        let argv = wrap_rsh_argv_in_interactive_bash("/home/tester/.local/bin/rsh")
             .expect("bash should be available in the test environment");
         assert_eq!(argv[1], "-ic");
-        assert_eq!(argv[2], "exec '/home/yj/.cargo/bin/rsh'");
+        assert_eq!(argv[2], "exec '/home/tester/.local/bin/rsh'");
     }
 
     #[test]
@@ -1163,7 +1253,10 @@ mod tests {
             "argv: {argv:?}"
         );
         // ControlMaster flags must precede the target.
-        let target_idx = argv.iter().position(|a| a == "yj@1.2.3.4").unwrap();
+        let target_idx = argv
+            .iter()
+            .position(|a| a == "tester@203.0.113.10")
+            .unwrap();
         let cm_idx = argv.iter().position(|a| a == "ControlMaster=auto").unwrap();
         assert!(cm_idx < target_idx);
     }
@@ -1178,14 +1271,14 @@ mod tests {
     }
 
     #[test]
-    fn missing_remote_hosts_section_uses_defaults() {
+    fn missing_remote_hosts_section_has_no_implicit_destinations() {
         let table = "font = 'monospace 12'".parse::<toml::Table>().unwrap();
         let remote_hosts = if table.contains_key("remote_hosts") {
             parse_remote_hosts(&table)
         } else {
             default_remote_hosts()
         };
-        assert!(!remote_hosts.is_empty());
+        assert!(remote_hosts.is_empty());
     }
 
     #[test]

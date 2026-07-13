@@ -186,6 +186,7 @@ impl Clone for FinishedBlock {
 ///   - quoted strings: green
 ///   - operators (`| & ; > <`): magenta
 ///   - `$VAR` references: cyan
+///
 /// Whitespace and all other text are emitted verbatim in the default color, so
 /// the reconstructed buffer text matches the command exactly.
 pub(crate) fn highlight_command_to_ansi(cmd: &str) -> String {
@@ -507,7 +508,7 @@ mod tests {
 
     #[test]
     fn output_row_count_ignores_one_final_line_ending() {
-        assert_eq!(output_row_count("/home/yj\r\n"), 1);
+        assert_eq!(output_row_count("/home/tester\r\n"), 1);
         assert_eq!(output_row_count("a\nb\nc\nd\n"), 4);
     }
 
@@ -682,7 +683,7 @@ pub(crate) fn render_bytes_into_finished_vte(
     // preserves those unused rows as a large blank tail. Overflow is retained
     // in scrollback and `settle_finished_terminal_after_feed` expands the widget
     // to the exact buffer span after VTE has processed the bytes.
-    let visible_rows = output_rows.min(viewport_cap).min(32).max(1);
+    let visible_rows = output_rows.min(viewport_cap).clamp(1, 32);
     let overflow_rows = output_rows.saturating_sub(visible_rows).saturating_add(64);
     let scrollback = capture_rows.max(overflow_rows).max(64);
     vte.set_scroll_on_output(false);
@@ -1061,7 +1062,7 @@ impl FinishedBlock {
         let full_output: Rc<RefCell<String>> = Rc::new(RefCell::new(output.to_string()));
         let displayed_output: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let output_scrollable = output_rows > viewport_cap;
-        let initial_visible_rows = output_rows.min(viewport_cap).min(32).max(1);
+        let initial_visible_rows = output_rows.min(viewport_cap).clamp(1, 32);
         let output_vte = create_finished_terminal(
             config,
             cols,
@@ -1101,7 +1102,7 @@ impl FinishedBlock {
                 } else {
                     cap_for_map.get()
                 };
-                let visible_rows = rows.min(cap).min(32).max(1);
+                let visible_rows = rows.min(cap).clamp(1, 32);
                 render_bytes_into_finished_vte(
                     w,
                     text,
@@ -1397,7 +1398,7 @@ impl FinishedBlock {
                     );
                     let ch = output_vte.char_height() as i32;
                     if ch > 0 {
-                        let probe_rows = shown_visual_rows.min(active_cap).min(32).max(1);
+                        let probe_rows = shown_visual_rows.min(active_cap).clamp(1, 32);
                         output_vte.set_height_request((probe_rows as i32) * ch);
                     }
                     let has_query = filter_enabled.get() && !q.trim().is_empty();
@@ -1610,6 +1611,9 @@ impl FinishedBlock {
     /// Wire the hover quick-action buttons (copy command, copy output, recall).
     /// Kept separate from construction because handlers need the clipboard, PTY,
     /// shell input state, and active block, which only the owning `TermView` has.
+    // These arguments are the distinct shared state cells captured by GTK
+    // callbacks; grouping them would only hide the ownership contract.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn connect_actions(
         &self,
         vte: &Terminal,

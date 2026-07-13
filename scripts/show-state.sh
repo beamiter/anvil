@@ -1,77 +1,82 @@
 #!/usr/bin/env bash
-# Visualize jterm4 session state
+# Pretty-print jterm1's JSON session state.
 
-STATE_FILE="${HOME}/.config/jterm4/tabs.state"
+set -euo pipefail
 
-if [ ! -f "$STATE_FILE" ]; then
-    echo "❌ No state file found at $STATE_FILE"
+CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}"
+STATE_DIR="${CONFIG_HOME}/jterm1"
+
+if (($# > 1)); then
+    echo "Usage: $0 [STATE_FILE]" >&2
+    exit 2
+fi
+
+if (($# == 1)); then
+    STATE_FILE="$1"
+else
+    shopt -s nullglob
+    candidates=("${STATE_DIR}"/tabs.*.state)
+    [[ -f "${STATE_DIR}/tabs.state" ]] && candidates+=("${STATE_DIR}/tabs.state")
+    shopt -u nullglob
+    if ((${#candidates[@]} == 0)); then
+        echo "No session snapshots found under ${STATE_DIR}" >&2
+        exit 1
+    fi
+    STATE_FILE="${candidates[0]}"
+    for candidate in "${candidates[@]:1}"; do
+        if [[ "${candidate}" -nt "${STATE_FILE}" ]]; then
+            STATE_FILE="${candidate}"
+        fi
+    done
+fi
+
+if [[ ! -f "${STATE_FILE}" ]]; then
+    echo "No state file found at ${STATE_FILE}" >&2
     exit 1
 fi
 
-echo "📊 jterm4 Session State Visualization"
-echo "======================================"
-echo ""
+if ! command -v jq >/dev/null 2>&1; then
+    echo "Error: jq is required to inspect ${STATE_FILE}" >&2
+    exit 1
+fi
 
-# Parse current page
-current_page=$(grep '^current_page=' "$STATE_FILE" | cut -d= -f2)
-echo "📌 Current Page: ${current_page:-0}"
-echo ""
+if ! jq empty "${STATE_FILE}" 2>/dev/null; then
+    echo "Error: ${STATE_FILE} is not valid JSON." >&2
+    exit 1
+fi
 
-# Parse tabs
-tab_num=0
-while IFS=$'\t' read -r line; do
-    if [[ "$line" =~ ^tab= ]]; then
-        tab_num=$((tab_num + 1))
+tab_count="$(jq '.tabs | length' "${STATE_FILE}")"
+active_index="$(jq '.active // 0' "${STATE_FILE}")"
 
-        # Remove "tab=" prefix
-        data="${line#tab=}"
+echo "jterm1 session state"
+echo "===================="
+echo "File: ${STATE_FILE}"
+echo "Tabs: ${tab_count}"
+if ((tab_count > 0)); then
+    echo "Active tab: $((active_index + 1)) (stored index ${active_index})"
+fi
+echo
+echo "Warning: state may contain working directories and commands."
+echo
 
-        # Split by tab
-        IFS=$'\t' read -r name layout_json <<< "$data"
+jq_color=()
+if [[ -t 1 ]]; then
+    jq_color=(-C)
+fi
 
-        echo "📑 Tab $tab_num: $name"
+for ((index = 0; index < tab_count; index++)); do
+    title="$(jq -r --argjson index "${index}" '.tabs[$index].title // "Untitled"' "${STATE_FILE}")"
+    custom_title="$(jq -r --argjson index "${index}" '.tabs[$index].custom_title // false' "${STATE_FILE}")"
+    pane_count="$(jq --argjson index "${index}" '[.tabs[$index].layout | .. | objects | select(.type == "leaf")] | length' "${STATE_FILE}")"
+    layout_type="$(jq -r --argjson index "${index}" '.tabs[$index].layout.type // "unknown"' "${STATE_FILE}")"
 
-        # Try to parse as JSON
-        if echo "$layout_json" | jq . &> /dev/null 2>&1; then
-            layout_type=$(echo "$layout_json" | jq -r '.type')
-
-            case "$layout_type" in
-                leaf)
-                    dir=$(echo "$layout_json" | jq -r '.dir')
-                    sid=$(echo "$layout_json" | jq -r '.sid')
-                    cmds=$(echo "$layout_json" | jq -r '.cmds // "none"')
-
-                    echo "   Type: Single pane"
-                    echo "   Directory: $dir"
-                    echo "   Session ID: $sid"
-                    echo "   Commands: $cmds"
-                    ;;
-
-                split)
-                    orientation=$(echo "$layout_json" | jq -r '.orientation')
-                    position=$(echo "$layout_json" | jq -r '.position')
-
-                    orientation_name=$([[ "$orientation" == "h" ]] && echo "Horizontal" || echo "Vertical")
-
-                    echo "   Type: Split pane ($orientation_name)"
-                    echo "   Position: $position"
-                    echo "   Structure:"
-
-                    # Show simplified tree
-                    echo "$layout_json" | jq -C '.' | sed 's/^/      /'
-                    ;;
-            esac
-        else
-            # Legacy format or simple directory
-            echo "   Format: Legacy"
-            echo "   Data: $layout_json"
-        fi
-
-        echo ""
+    marker=" "
+    if ((index == active_index)); then
+        marker="*"
     fi
-done < "$STATE_FILE"
-
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "Total tabs: $tab_num"
-echo ""
-echo "💡 Tip: Edit state file at: $STATE_FILE"
+    echo "${marker} Tab $((index + 1)): ${title}"
+    echo "    Custom title: ${custom_title}"
+    echo "    Layout: ${layout_type}; panes: ${pane_count}"
+    jq "${jq_color[@]}" --argjson index "${index}" '.tabs[$index].layout' "${STATE_FILE}" | sed 's/^/      /'
+    echo
+done

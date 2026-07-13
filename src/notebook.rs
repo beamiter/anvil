@@ -190,13 +190,28 @@ fn escape_pango(s: &str) -> String {
 /// Per-cell execution handle so the close-dialog hook can kill in-flight
 /// children when the user dismisses the notebook.
 struct CellHandle {
-    /// Shared with the worker thread so Stop can `kill()` from the UI side
-    /// while the worker still holds the join handle.
+    /// Shared with the worker thread so Stop can `kill()` from the UI side.
+    /// The child stays in this slot until the worker observes and reaps its
+    /// exit; taking it in either caller would make the other side powerless.
     child: Arc<Mutex<Option<Child>>>,
     /// Cross-thread flag — set true when the user clicks Stop / closes the
     /// dialog, read by the worker when deciding whether to report
     /// `cancelled` vs the real exit code.
     cancelled: Arc<AtomicBool>,
+}
+
+impl CellHandle {
+    /// Request cancellation without taking ownership away from the worker.
+    /// `Child::kill` only needs `&mut Child`, so the worker can keep polling the
+    /// same shared handle and reap it once the signal has taken effect.
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        if let Ok(mut guard) = self.child.lock() {
+            if let Some(child) = guard.as_mut() {
+                let _ = child.kill();
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -327,12 +342,7 @@ impl Component for NotebookModel {
 impl NotebookModel {
     fn cancel_cells(&self) {
         for handle in self.handles.borrow_mut().drain(..) {
-            handle.cancelled.store(true, Ordering::SeqCst);
-            if let Ok(mut guard) = handle.child.lock() {
-                if let Some(mut child) = guard.take() {
-                    let _ = child.kill();
-                }
-            }
+            handle.cancel();
         }
     }
 }
@@ -430,6 +440,12 @@ fn build_code_cell(
 
     frame.set_child(Some(&vbox));
 
+    // Each Stop button must target its own cell. Looking through the dialog's
+    // global handle list can stop a different cell when several run at once.
+    // Installing this before the worker starts also closes the tiny race where
+    // Stop is clicked before `Command::spawn` has parked the Child handle.
+    let active_handle: Rc<RefCell<Option<Rc<CellHandle>>>> = Rc::new(RefCell::new(None));
+
     if runnable {
         let src = src.to_string();
         let cwd = cwd.to_path_buf();
@@ -439,6 +455,7 @@ fn build_code_cell(
         let output_buffer_c = output_buffer.clone();
         let output_scroll_c = output_scroll.clone();
         let status_label_c = status_label.clone();
+        let active_handle_c = active_handle.clone();
         run_btn.connect_clicked(move |_| {
             // Reset previous output.
             output_buffer_c.set_text("");
@@ -453,6 +470,7 @@ fn build_code_cell(
                 child: Arc::new(Mutex::new(None)),
                 cancelled: Arc::new(AtomicBool::new(false)),
             });
+            *active_handle_c.borrow_mut() = Some(handle.clone());
             handles.borrow_mut().push(handle.clone());
 
             spawn_cell(
@@ -469,23 +487,10 @@ fn build_code_cell(
     }
 
     {
-        let handles_for_stop = handles.clone();
+        let active_handle_for_stop = active_handle;
         stop_btn.connect_clicked(move |btn| {
-            // Stop the most-recent still-running cell. There's at most one
-            // active per stop button, but stale entries linger so iterate
-            // newest-first.
-            for h in handles_for_stop.borrow().iter().rev() {
-                let mut guard = match h.child.lock() {
-                    Ok(g) => g,
-                    Err(_) => continue,
-                };
-                if guard.is_some() {
-                    h.cancelled.store(true, Ordering::SeqCst);
-                    if let Some(mut child) = guard.take() {
-                        let _ = child.kill();
-                    }
-                    break;
-                }
+            if let Some(handle) = active_handle_for_stop.borrow().as_ref() {
+                handle.cancel();
             }
             btn.set_sensitive(false);
         });
@@ -530,11 +535,26 @@ fn spawn_cell(
             }
         };
 
-        // Park the Child so the UI thread can kill() it.
+        // Park the Child so the UI thread can kill() it. Cancellation can win
+        // the race before spawn completes; honour the flag while holding the
+        // first lock so such a child cannot escape into the background.
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
-        if let Ok(mut guard) = child_slot.lock() {
-            *guard = Some(child);
+        match child_slot.lock() {
+            Ok(mut guard) => {
+                *guard = Some(child);
+                if cancelled_flag.load(Ordering::SeqCst) {
+                    if let Some(child) = guard.as_mut() {
+                        let _ = child.kill();
+                    }
+                }
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = done_tx.send(Err("child handle mutex poisoned".to_string()));
+                return;
+            }
         }
 
         // stdout reader.
@@ -576,19 +596,10 @@ fn spawn_cell(
             })
         });
 
-        // Wait for the process; we may not own the Child anymore if Stop
-        // already killed it, but in either case the readers will end.
-        let exit = {
-            let taken = child_slot.lock().ok().and_then(|mut g| g.take());
-            if let Some(mut child) = taken {
-                child.wait().map(|s| s.code().unwrap_or(-1))
-            } else {
-                // Child already taken by Stop. Best-effort: wait for the
-                // reader threads to exit (they will, since the pipes
-                // closed), then report cancelled.
-                Ok(-1)
-            }
-        };
+        // Poll under short locks rather than taking the Child and blocking in
+        // `wait()`. This leaves Stop/close able to call `kill()` throughout the
+        // run, while this worker remains the sole reaper.
+        let exit = wait_for_shared_child(&child_slot);
 
         // Drain readers before we report done so chunks don't arrive after
         // the exit notification (UI order-sensitive).
@@ -678,6 +689,34 @@ fn spawn_cell(
     });
 }
 
+/// Wait for a shared child without holding the mutex between polls. The UI can
+/// therefore acquire the same handle and call `kill()` at any point. Once an
+/// exit is observed, `try_wait` has reaped it and we clear the slot.
+fn wait_for_shared_child(child_slot: &Arc<Mutex<Option<Child>>>) -> std::io::Result<i32> {
+    loop {
+        let result = {
+            let mut guard = child_slot
+                .lock()
+                .map_err(|_| std::io::Error::other("child handle mutex poisoned"))?;
+            let child = guard
+                .as_mut()
+                .ok_or_else(|| std::io::Error::other("child handle missing before exit"))?;
+            match child.try_wait()? {
+                Some(status) => {
+                    let code = status.code().unwrap_or(-1);
+                    guard.take();
+                    Some(code)
+                }
+                None => None,
+            }
+        };
+        if let Some(code) = result {
+            return Ok(code);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -761,6 +800,38 @@ mod tests {
         assert!(
             matches!(segs.first(), Some(Segment::Code { .. })),
             "got {segs:?}"
+        );
+    }
+
+    #[test]
+    fn cancel_leaves_child_for_worker_to_reap() {
+        let child = Command::new("bash")
+            .args(["-c", "exec sleep 30"])
+            .spawn()
+            .expect("spawn cancellable child");
+        let handle = CellHandle {
+            child: Arc::new(Mutex::new(Some(child))),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+
+        handle.cancel();
+
+        assert!(handle.cancelled.load(Ordering::SeqCst));
+        assert!(
+            handle.child.lock().expect("child slot").is_some(),
+            "cancel must not take the Child away from the waiting worker"
+        );
+
+        let started = std::time::Instant::now();
+        let code = wait_for_shared_child(&handle.child).expect("reap killed child");
+        assert_eq!(code, -1, "a signal-terminated child has no exit code");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "cancelled child was not reaped promptly"
+        );
+        assert!(
+            handle.child.lock().expect("child slot").is_none(),
+            "worker must clear the slot after reaping"
         );
     }
 }

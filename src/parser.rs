@@ -4,6 +4,13 @@
 //! sequences that drive the block view. OSC 7/title sequences pass through to
 //! VTE so its native cwd/title signals stay authoritative.
 
+/// OSC can carry clipboard data and titles, but an unterminated sequence must
+/// not be allowed to retain arbitrary process output forever.
+const MAX_OSC_PAYLOAD_BYTES: usize = 1024 * 1024;
+/// Kitty graphics uses APC and permits images up to 16 MiB encoded. Keep that
+/// supported ceiling while bounding malformed, unterminated transmissions.
+const MAX_APC_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+
 /// Which color slot an OSC 10/11/12/4 query asked about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorKind {
@@ -94,10 +101,18 @@ enum State {
     Osc { buf: Vec<u8> },
     /// Just saw ESC while in OSC — next byte should be '\' for ST
     OscEsc { payload: Vec<u8> },
+    /// OSC exceeded its hard payload limit. Ignore bytes until BEL or ST.
+    OscDiscard,
+    /// Saw ESC while discarding an oversized OSC; '\' completes ST.
+    OscDiscardEsc,
     /// Inside APC (ESC _): collecting bytes for Kitty graphics etc.
     Apc { buf: Vec<u8> },
     /// Saw ESC while in APC — next byte should be '\' for ST
     ApcEsc { payload: Vec<u8> },
+    /// APC exceeded its hard payload limit. Ignore bytes until BEL or ST.
+    ApcDiscard,
+    /// Saw ESC while discarding an oversized APC; '\' completes ST.
+    ApcDiscardEsc,
     /// Inside DCS (ESC P): collect until ST. Unlike `Ignore`, the bytes are
     /// rewrapped as `ESC P ... ESC \` and passed through to the active VTE so
     /// sixel graphics, DECRQSS replies, and tmux passthrough survive block mode.
@@ -504,7 +519,13 @@ impl Parser {
                         self.state = State::OscEsc { payload };
                     }
                     _ => {
-                        buf.push(b);
+                        if buf.len() >= MAX_OSC_PAYLOAD_BYTES {
+                            // Release the accumulated payload immediately, then
+                            // resynchronise only at this string's terminator.
+                            self.state = State::OscDiscard;
+                        } else {
+                            buf.push(b);
+                        }
                     }
                 },
 
@@ -516,6 +537,20 @@ impl Parser {
                     if b != b'\\' {
                         self.passthrough.push(b);
                     }
+                }
+
+                State::OscDiscard => match b {
+                    0x07 => self.state = State::Ground,
+                    0x1b => self.state = State::OscDiscardEsc,
+                    _ => {}
+                },
+
+                State::OscDiscardEsc => {
+                    self.state = match b {
+                        b'\\' | 0x07 => State::Ground,
+                        0x1b => State::OscDiscardEsc,
+                        _ => State::OscDiscard,
+                    };
                 }
 
                 State::Apc { buf } => match b {
@@ -530,7 +565,14 @@ impl Parser {
                         self.state = State::ApcEsc { payload };
                     }
                     _ => {
-                        buf.push(b);
+                        if buf.len() >= MAX_APC_PAYLOAD_BYTES {
+                            // Kitty's normal size ceiling has been crossed.
+                            // Drop the partial image and wait for BEL/ST before
+                            // interpreting subsequent terminal output again.
+                            self.state = State::ApcDiscard;
+                        } else {
+                            buf.push(b);
+                        }
                     }
                 },
 
@@ -545,6 +587,20 @@ impl Parser {
                         events.push(ParserEvent::ApcSequence(payload));
                         self.passthrough.push(b);
                     }
+                }
+
+                State::ApcDiscard => match b {
+                    0x07 => self.state = State::Ground,
+                    0x1b => self.state = State::ApcDiscardEsc,
+                    _ => {}
+                },
+
+                State::ApcDiscardEsc => {
+                    self.state = match b {
+                        b'\\' | 0x07 => State::Ground,
+                        0x1b => State::ApcDiscardEsc,
+                        _ => State::ApcDiscard,
+                    };
                 }
 
                 State::Dcs { buf } => match b {
@@ -970,5 +1026,52 @@ mod tests {
         assert!(events
             .iter()
             .all(|e| !matches!(e, ParserEvent::RemoteSessionId(_))));
+    }
+
+    #[test]
+    fn oversized_osc_is_discarded_and_recovers_from_split_st() {
+        let mut p = Parser::new();
+        let mut events = Vec::new();
+        p.feed(b"\x1b]0;", &mut events);
+
+        // Feed in ordinary PTY-sized fragments so the limit is exercised
+        // across calls, including the byte that crosses it.
+        let chunk = vec![b'x'; 64 * 1024];
+        for _ in 0..=(MAX_OSC_PAYLOAD_BYTES / chunk.len()) {
+            p.feed(&chunk, &mut events);
+        }
+
+        assert!(events.is_empty());
+        assert!(matches!(p.state, State::OscDiscard));
+
+        // ST itself may be split at a read boundary. Once it arrives, normal
+        // output must be parsed again and none of the oversized OSC may leak.
+        p.feed(b"\x1b", &mut events);
+        assert!(matches!(p.state, State::OscDiscardEsc));
+        p.feed(b"\\visible", &mut events);
+        assert!(matches!(p.state, State::Ground));
+        assert_eq!(collect_bytes(&events), b"visible");
+    }
+
+    #[test]
+    fn oversized_apc_is_discarded_and_recovers_at_bel() {
+        let mut p = Parser::new();
+        let mut events = Vec::new();
+        p.feed(b"\x1b_Ga=T;", &mut events);
+
+        let chunk = vec![b'A'; 64 * 1024];
+        for _ in 0..=(MAX_APC_PAYLOAD_BYTES / chunk.len()) {
+            p.feed(&chunk, &mut events);
+        }
+
+        assert!(events.is_empty());
+        assert!(matches!(p.state, State::ApcDiscard));
+
+        p.feed(b"\x07visible", &mut events);
+        assert!(matches!(p.state, State::Ground));
+        assert_eq!(collect_bytes(&events), b"visible");
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event, ParserEvent::ApcSequence(_))));
     }
 }

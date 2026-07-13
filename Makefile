@@ -1,10 +1,10 @@
-# jterm4 Makefile
+# jterm1 Makefile
 # Convenience wrapper for common development tasks
 
 .PHONY: help build run test check fmt clippy clean install dev watch benchmark debug
 
 help:
-	@echo "jterm4 Development Commands"
+	@echo "jterm1 Development Commands"
 	@echo "==========================="
 	@echo ""
 	@echo "Build Commands:"

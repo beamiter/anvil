@@ -77,7 +77,16 @@ pub(crate) fn load_all(dirs: &[PathBuf]) -> Vec<Workflow> {
         paths.sort();
         for path in paths {
             match load_one(&path) {
-                Ok(wf) => out.push(wf),
+                Ok(wf) => {
+                    // Earlier directories have higher precedence, allowing a
+                    // user workflow to replace an installed example by name.
+                    if !out
+                        .iter()
+                        .any(|existing: &Workflow| existing.name == wf.name)
+                    {
+                        out.push(wf);
+                    }
+                }
                 Err(err) => log::warn!("workflows: skipping {}: {err}", path.display()),
             }
         }
@@ -102,6 +111,52 @@ fn load_one(path: &Path) -> Result<Workflow, String> {
 pub(crate) fn user_workflow_dir() -> PathBuf {
     let base: PathBuf = gtk::glib::user_config_dir();
     base.join("jterm1").join("workflows")
+}
+
+/// Workflow search path in precedence order. User-authored config wins,
+/// followed by installed examples, then the source-tree examples used during
+/// development. `JTERM1_WORKFLOW_DIR` may add one or more platform-separated
+/// directories without replacing the standard locations.
+pub(crate) fn workflow_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![user_workflow_dir()];
+    if let Some(extra) = std::env::var_os("JTERM1_WORKFLOW_DIR") {
+        dirs.extend(std::env::split_paths(&extra));
+    }
+    dirs.push(gtk::glib::user_data_dir().join("jterm1").join("workflows"));
+    dirs.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts")
+            .join("workflows"),
+    );
+    let mut unique = Vec::new();
+    for dir in dirs {
+        if !unique.contains(&dir) {
+            unique.push(dir);
+        }
+    }
+    unique
+}
+
+/// Locate the installed/development welcome notebook used by the command
+/// center's first-run entry.
+pub(crate) fn welcome_notebook_path() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(asset_dir) = std::env::var_os("JTERM1_ASSET_DIR") {
+        candidates.push(PathBuf::from(asset_dir).join("notebooks/welcome.jtnb.md"));
+    }
+    candidates.push(
+        gtk::glib::user_data_dir()
+            .join("jterm1")
+            .join("notebooks")
+            .join("welcome.jtnb.md"),
+    );
+    candidates.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts")
+            .join("notebooks")
+            .join("welcome.jtnb.md"),
+    );
+    candidates.into_iter().find(|path| path.is_file())
 }
 
 /// Substitute `{{name}}` occurrences with values from `values`. Returns an

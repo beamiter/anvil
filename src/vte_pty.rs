@@ -96,6 +96,9 @@ pub struct VtePty {
     /// close/drop and writes serialise. Named "local" to avoid confusion: the
     /// master is owned by libvte (and closed when `vte_pty` drops).
     local: Arc<Mutex<Option<OwnedFd>>>,
+    /// Ordered bridge writes are completed on a worker so a full VTE-side PTY
+    /// can never stall GTK's main loop.
+    write_tx: mpsc::Sender<Vec<u8>>,
     /// The `vte4::Pty` holding the master end. The caller passes this to
     /// `Terminal::set_pty`. Stored so it lives as long as VtePty does.
     vte_pty: vte4::Pty,
@@ -141,8 +144,11 @@ impl VtePty {
         let master_fd = unsafe { io_lifetimes::OwnedFd::from_raw_fd(master_raw) };
         let vte_pty = vte4::Pty::foreign_sync(master_fd, None::<&gtk::gio::Cancellable>)
             .map_err(|e| io::Error::other(e.to_string()))?;
+        let writer_fd = slave.try_clone()?;
+        let write_tx = crate::pty::spawn_fd_writer(writer_fd, "jterm1-vte-writer")?;
         Ok(VtePty {
             local: Arc::new(Mutex::new(Some(slave))),
+            write_tx,
             vte_pty,
         })
     }
@@ -151,18 +157,15 @@ impl VtePty {
         &self.vte_pty
     }
 
-    /// Feed bytes from the shell PTY → the VTE side. Best-effort: a partial
-    /// write or EAGAIN is dropped (the master PTY's kernel buffer is large
-    /// enough for normal terminal traffic and a few-byte loss after disconnect
-    /// is preferable to blocking the UI thread).
+    /// Feed bytes from the shell PTY → the VTE side without doing kernel I/O
+    /// on GTK's main thread. The worker preserves message ordering and
+    /// completes short writes.
     pub fn write_bytes(&self, data: &[u8]) {
-        if let Ok(guard) = self.local.lock() {
-            if let Some(fd) = guard.as_ref() {
-                let raw = fd.as_raw_fd();
-                unsafe {
-                    libc::write(raw, data.as_ptr() as *const libc::c_void, data.len());
-                }
-            }
+        if let Err(err) = self.write_tx.send(data.to_vec()) {
+            log::warn!(
+                "VTE bridge queue is closed; discarded {} byte(s)",
+                err.0.len()
+            );
         }
     }
 
@@ -194,15 +197,6 @@ impl VtePty {
     where
         F: FnMut(Vec<u8>) + 'static,
     {
-        let fd = match self
-            .local
-            .lock()
-            .ok()
-            .and_then(|g| g.as_ref().map(|f| f.as_raw_fd()))
-        {
-            Some(fd) => fd,
-            None => return,
-        };
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         let efd: RawFd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
         if efd < 0 {
@@ -230,19 +224,30 @@ impl VtePty {
             });
             return;
         }
+        let reader_fd = match self
+            .local
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().and_then(|fd| fd.try_clone().ok()))
+        {
+            Some(fd) => fd,
+            None => {
+                unsafe { libc::close(efd) };
+                return;
+            }
+        };
         let efd_for_thread = efd;
         std::thread::spawn(move || {
-            let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+            // Own a duplicate instead of borrowing `local`'s raw descriptor;
+            // closing the model can no longer make this thread read a reused
+            // descriptor belonging to an unrelated resource.
+            let mut file = std::fs::File::from(reader_fd);
             let mut buf = [0u8; 65536];
             loop {
                 match file.read(&mut buf) {
-                    Ok(0) | Err(_) => {
-                        std::mem::forget(file);
-                        break;
-                    }
+                    Ok(0) | Err(_) => break,
                     Ok(n) => {
                         if tx.send(buf[..n].to_vec()).is_err() {
-                            std::mem::forget(file);
                             break;
                         }
                         let one: u64 = 1;

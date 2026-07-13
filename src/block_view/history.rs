@@ -24,11 +24,19 @@ impl TermView {
         // seeded from this file at startup, so appending it re-wrote every loaded
         // block on each session — O(N²) file growth and duplicate blocks on the
         // next load. Persisting the current capped deque keeps the file bounded.
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
 
         let compress = self.config.borrow().block_history_compress;
 
@@ -75,7 +83,8 @@ impl TermView {
         use std::io::Read;
         let mut file = std::fs::File::open(path)?;
         let lazy_load_threshold = self.config.borrow().lazy_load_threshold as usize;
-        let mut temp_blocks = Vec::new();
+        let mut temp_blocks = std::collections::VecDeque::with_capacity(lazy_load_threshold);
+        let mut total_loaded = 0usize;
 
         // First pass: load all blocks into temporary storage
         loop {
@@ -95,34 +104,52 @@ impl TermView {
             file.read_exact(&mut data)?;
 
             let decoded = if self.config.borrow().block_history_compress {
-                zstd::decode_all(data.as_slice())
-                    .map_err(|e| std::io::Error::other(e.to_string()))?
+                const MAX_DECODED_BYTES: u64 = 256 * 1024 * 1024;
+                let decoder = zstd::Decoder::new(data.as_slice())
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                let mut decoded = Vec::new();
+                decoder
+                    .take(MAX_DECODED_BYTES + 1)
+                    .read_to_end(&mut decoded)?;
+                if decoded.len() as u64 > MAX_DECODED_BYTES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "block history record expands beyond 256 MiB",
+                    ));
+                }
+                decoded
             } else {
                 data
             };
 
             if let Ok(block) = rkyv::from_bytes::<BlockData, rkyv::rancor::Error>(&decoded) {
-                temp_blocks.push(block);
+                total_loaded = total_loaded.saturating_add(1);
+                if temp_blocks.len() == lazy_load_threshold {
+                    temp_blocks.pop_front();
+                }
+                temp_blocks.push_back(block);
             }
         }
 
-        // Second pass: only load the most recent N blocks (lazy loading optimization)
-        let total_loaded = temp_blocks.len();
-        let start_idx = if total_loaded > lazy_load_threshold {
-            log::info!("Lazy loading history: keeping {} recent blocks out of {} total (skipping {} old blocks)",
-                lazy_load_threshold, total_loaded, total_loaded - lazy_load_threshold);
-            total_loaded - lazy_load_threshold
-        } else {
-            0
-        };
+        if total_loaded > temp_blocks.len() {
+            log::info!(
+                "Lazy loading history: keeping {} recent blocks out of {} total",
+                temp_blocks.len(),
+                total_loaded
+            );
+        }
 
         let mut blocks = self.block_data.borrow_mut();
         for (idx, block) in temp_blocks.into_iter().enumerate() {
-            if idx >= start_idx {
-                log::debug!("Loaded historical block #{}: prompt={:?}, cmd={:?}, output_len={}, exit_code={}",
-                    idx, block.prompt, block.cmd, block.output.len(), block.exit_code);
-                blocks.push_back(block);
-            }
+            log::debug!(
+                "Loaded historical block #{}: prompt={:?}, cmd={:?}, output_len={}, exit_code={}",
+                idx,
+                block.prompt,
+                block.cmd,
+                block.output.len(),
+                block.exit_code
+            );
+            blocks.push_back(block);
         }
 
         Ok(())

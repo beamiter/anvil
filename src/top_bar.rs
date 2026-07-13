@@ -6,6 +6,7 @@ use relm4::prelude::*;
 
 #[derive(Debug)]
 pub(crate) enum TopBarOutput {
+    OpenPalette,
     ToggleSidebar,
     ToggleTabPlacement,
     NewTab,
@@ -40,9 +41,18 @@ impl SimpleComponent for TopBarModel {
                 set_valign: gtk::Align::Center,
 
                 gtk::Button {
-                    set_icon_name: "open-menu-symbolic",
+                    set_icon_name: "system-search-symbolic",
                     set_focus_on_click: false,
-                    set_can_focus: false,
+                    set_tooltip_text: Some("Open command center (Ctrl+Shift+P)"),
+                    add_css_class: "flat",
+                    connect_clicked[sender] => move |_| {
+                        let _ = sender.output(TopBarOutput::OpenPalette);
+                    },
+                },
+
+                gtk::Button {
+                    set_icon_name: "sidebar-show-symbolic",
+                    set_focus_on_click: false,
                     set_tooltip_text: Some("Toggle sidebar (Ctrl+\\)"),
                     add_css_class: "flat",
                     connect_clicked[sender] => move |_| {
@@ -53,7 +63,6 @@ impl SimpleComponent for TopBarModel {
                 gtk::Button {
                     set_icon_name: "view-list-symbolic",
                     set_focus_on_click: false,
-                    set_can_focus: false,
                     set_tooltip_text: Some("Toggle tabs: sidebar / top bar"),
                     add_css_class: "flat",
                     connect_clicked[sender] => move |_| {
@@ -75,7 +84,6 @@ impl SimpleComponent for TopBarModel {
                 gtk::Button {
                     set_icon_name: "list-add-symbolic",
                     set_focus_on_click: false,
-                    set_can_focus: false,
                     set_tooltip_text: Some("New tab (Ctrl+Shift+T)"),
                     add_css_class: "flat",
                     connect_clicked[sender] => move |_| {
@@ -86,7 +94,6 @@ impl SimpleComponent for TopBarModel {
                 gtk::Button {
                     set_icon_name: "window-close-symbolic",
                     set_focus_on_click: false,
-                    set_can_focus: false,
                     set_tooltip_text: Some("Close window"),
                     add_css_class: "flat",
                     connect_clicked[sender] => move |_| {

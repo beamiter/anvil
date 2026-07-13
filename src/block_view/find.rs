@@ -87,6 +87,9 @@ fn duration_matches(duration: Option<u64>, filters: &BlockFilters) -> bool {
 }
 
 #[cfg(test)]
+// Keeping focused helper tests beside the helpers makes this mechanically
+// extracted module easier to navigate; production methods continue below.
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{duration_matches, snippet};
     use crate::block_view::BlockFilters;
@@ -346,8 +349,9 @@ impl TermView {
     }
 
     /// Cross-block ripgrep-style flat-result scan over cached stripped output
-    /// + command text. Caller passes a literal substring (case-insensitive)
+    /// and command text. Caller passes a literal substring (case-insensitive)
     /// when `is_regex == false`, else a regex. Returns at most `max_hits`
+    ///
     /// hits in block-list order; each hit carries enough context (line
     /// number + the raw line + cmd preview) to drive a palette UI that lets
     /// the user pick one and jump to it.

@@ -335,9 +335,7 @@ pub fn render_to_ansi(
 }
 
 fn utf8_char_len(b: u8) -> usize {
-    if b < 0x80 {
-        1
-    } else if b < 0xc0 {
+    if b < 0xc0 {
         1
     } else if b < 0xe0 {
         2
@@ -833,8 +831,8 @@ impl Grid {
         for c in (self.col + n..self.cols).rev() {
             row[c] = row[c - n];
         }
-        for c in self.col..self.col + n {
-            row[c] = bg;
+        for cell in row.iter_mut().skip(self.col).take(n) {
+            *cell = bg;
         }
     }
 
@@ -853,8 +851,12 @@ impl Grid {
         for c in self.col..self.cols.saturating_sub(n) {
             row[c] = row[c + n];
         }
-        for c in self.cols.saturating_sub(n)..self.cols {
-            row[c] = bg;
+        for cell in row
+            .iter_mut()
+            .take(self.cols)
+            .skip(self.cols.saturating_sub(n))
+        {
+            *cell = bg;
         }
     }
 

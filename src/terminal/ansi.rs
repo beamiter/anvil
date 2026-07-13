@@ -603,6 +603,9 @@ pub fn ansi_text_runs(input: &str, palette: &[RGBA; 16]) -> Vec<AnsiTextRun> {
 }
 
 #[cfg(test)]
+// Parser tests intentionally sit at the parser boundary; the GTK application
+// helpers below form a separate section of this module.
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 

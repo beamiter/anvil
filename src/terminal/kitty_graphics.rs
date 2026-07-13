@@ -26,6 +26,12 @@ use gtk::prelude::Cast;
 const MAX_ENCODED_BYTES: usize = 16 * 1024 * 1024;
 /// Per-block decoded image bytes cap (sum of all images attached to a block).
 pub(crate) const MAX_PENDING_BYTES_PER_BLOCK: usize = 16 * 1024 * 1024;
+/// Reject dimensions beyond a conservative texture/GPU-friendly ceiling even
+/// when a very thin image would otherwise fit the byte budget.
+const MAX_IMAGE_DIMENSION: u32 = 16_384;
+/// A decoded image may occupy at most the same budget as all pending images in
+/// a block. RGB input is expanded to RGBA, so the output size is authoritative.
+const MAX_DECODED_IMAGE_BYTES: usize = MAX_PENDING_BYTES_PER_BLOCK;
 
 /// Image-data format identifier from the `f=` key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,6 +42,20 @@ enum Format {
     Rgba,
     /// `f=24` — 24-bit RGB. Expanded to RGBA with alpha=255 before upload.
     Rgb,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImageError {
+    Invalid,
+    TooLarge,
+}
+
+struct ImageLayout {
+    width: i32,
+    height: i32,
+    source_bytes: usize,
+    output_bytes: usize,
+    stride: usize,
 }
 
 /// In-progress assembly keyed by client image id (`i=`). Multi-chunk uploads
@@ -149,23 +169,28 @@ impl Assembler {
         };
 
         // Accumulate this chunk's base64 bytes (skipping any embedded
-        // whitespace some emitters add).
-        let before = entry.encoded.len();
-        entry.encoded.reserve(body.len());
+        // whitespace some emitters add). Check the final size before reserve:
+        // reserving an attacker-controlled chunk first would briefly bypass the
+        // cap and can panic on capacity/allocation failure.
+        let chunk_len = body.iter().filter(|b| !b.is_ascii_whitespace()).count();
+        let Some(encoded_len) = entry.encoded.len().checked_add(chunk_len) else {
+            return Outcome::Skipped;
+        };
+        if encoded_len > MAX_ENCODED_BYTES {
+            log::warn!(
+                "kitty graphics: dropping oversize image ({} > {} encoded bytes)",
+                encoded_len,
+                MAX_ENCODED_BYTES
+            );
+            return Outcome::Skipped;
+        }
+        if entry.encoded.try_reserve(chunk_len).is_err() {
+            return Outcome::Skipped;
+        }
         for &b in body {
             if !b.is_ascii_whitespace() {
                 entry.encoded.push(b);
             }
-        }
-        if entry.encoded.len() > MAX_ENCODED_BYTES {
-            // Oversize — drop the assembly entirely so the next image starts clean.
-            log::warn!(
-                "kitty graphics: dropping oversize image ({} > {} encoded bytes)",
-                entry.encoded.len(),
-                MAX_ENCODED_BYTES
-            );
-            let _ = before; // (kept for future telemetry hook)
-            return Outcome::Skipped;
         }
 
         if more {
@@ -180,24 +205,35 @@ impl Assembler {
             return Outcome::Pending;
         }
 
+        // Reject terminal-supplied raw dimensions before decoding the base64
+        // body, so an impossible layout cannot force even the bounded decoded
+        // allocation. PNG dimensions live inside the encoded IHDR and are
+        // checked immediately after decoding, before GDK sees the bytes.
+        let raw_layout = match entry.format {
+            Format::Png => Ok(()),
+            Format::Rgba => checked_image_layout(entry.width, entry.height, 4).map(|_| ()),
+            Format::Rgb => checked_image_layout(entry.width, entry.height, 3).map(|_| ()),
+        };
+        match raw_layout {
+            Ok(()) => {}
+            Err(ImageError::TooLarge) => return Outcome::Skipped,
+            Err(ImageError::Invalid) => return Outcome::Invalid,
+        }
+
         // Final chunk — decode and build a texture.
         let decoded = match decode_base64(&entry.encoded) {
             Some(v) => v,
             None => return Outcome::Invalid,
         };
-        let texture = match entry.format {
-            Format::Png => match png_to_texture(&decoded) {
-                Some(t) => t,
-                None => return Outcome::Invalid,
-            },
-            Format::Rgba => match rgba_to_texture(entry.width, entry.height, &decoded, true) {
-                Some(t) => t,
-                None => return Outcome::Invalid,
-            },
-            Format::Rgb => match rgba_to_texture(entry.width, entry.height, &decoded, false) {
-                Some(t) => t,
-                None => return Outcome::Invalid,
-            },
+        let texture_result = match entry.format {
+            Format::Png => png_to_texture(decoded),
+            Format::Rgba => rgba_to_texture(entry.width, entry.height, &decoded, true),
+            Format::Rgb => rgba_to_texture(entry.width, entry.height, &decoded, false),
+        };
+        let texture = match texture_result {
+            Ok(texture) => texture,
+            Err(ImageError::TooLarge) => return Outcome::Skipped,
+            Err(ImageError::Invalid) => return Outcome::Invalid,
         };
         if entry.display {
             Outcome::Complete(texture)
@@ -247,7 +283,9 @@ fn decode_base64(input: &[u8]) -> Option<Vec<u8>> {
         end -= 1;
     }
     let data = &input[..end];
-    let mut out = Vec::with_capacity(data.len() * 3 / 4);
+    let capacity = data.len().checked_mul(3)?.checked_div(4)?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(capacity).ok()?;
     let mut buf: u32 = 0;
     let mut bits = 0u32;
     for &b in data {
@@ -263,56 +301,149 @@ fn decode_base64(input: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+fn checked_image_layout(
+    width: u32,
+    height: u32,
+    source_channels: usize,
+) -> Result<ImageLayout, ImageError> {
+    if width == 0 || height == 0 || !matches!(source_channels, 3 | 4) {
+        return Err(ImageError::Invalid);
+    }
+    if width > MAX_IMAGE_DIMENSION || height > MAX_IMAGE_DIMENSION {
+        return Err(ImageError::TooLarge);
+    }
+
+    let width_usize = usize::try_from(width).map_err(|_| ImageError::TooLarge)?;
+    let height_usize = usize::try_from(height).map_err(|_| ImageError::TooLarge)?;
+    let width_i32 = i32::try_from(width).map_err(|_| ImageError::TooLarge)?;
+    let height_i32 = i32::try_from(height).map_err(|_| ImageError::TooLarge)?;
+    let pixels = width_usize
+        .checked_mul(height_usize)
+        .ok_or(ImageError::TooLarge)?;
+    let source_bytes = pixels
+        .checked_mul(source_channels)
+        .ok_or(ImageError::TooLarge)?;
+    let output_bytes = pixels.checked_mul(4).ok_or(ImageError::TooLarge)?;
+    let stride = width_usize.checked_mul(4).ok_or(ImageError::TooLarge)?;
+    if source_bytes > MAX_DECODED_IMAGE_BYTES || output_bytes > MAX_DECODED_IMAGE_BYTES {
+        return Err(ImageError::TooLarge);
+    }
+
+    Ok(ImageLayout {
+        width: width_i32,
+        height: height_i32,
+        source_bytes,
+        output_bytes,
+        stride,
+    })
+}
+
+/// Read PNG dimensions before invoking GDK. A tiny compressed payload can
+/// otherwise advertise a huge canvas and make the image loader allocate it.
+fn png_layout(bytes: &[u8]) -> Result<ImageLayout, ImageError> {
+    const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    const IHDR_LEN: u32 = 13;
+
+    if bytes.len() < 24
+        || &bytes[..8] != PNG_SIGNATURE
+        || u32::from_be_bytes(bytes[8..12].try_into().map_err(|_| ImageError::Invalid)?) != IHDR_LEN
+        || &bytes[12..16] != b"IHDR"
+    {
+        return Err(ImageError::Invalid);
+    }
+    let width = u32::from_be_bytes(bytes[16..20].try_into().map_err(|_| ImageError::Invalid)?);
+    let height = u32::from_be_bytes(bytes[20..24].try_into().map_err(|_| ImageError::Invalid)?);
+    // GDK exposes a four-byte-per-pixel texture regardless of the PNG's source
+    // color type, so use RGBA for the decoded allocation budget.
+    checked_image_layout(width, height, 4)
+}
+
 /// Decode a PNG payload into a gdk::Texture via the bundled GdkPixbuf loader.
-/// Returns None if GTK cannot recognise the image.
-fn png_to_texture(bytes: &[u8]) -> Option<gdk::Texture> {
-    let gbytes = glib::Bytes::from(bytes);
-    gdk::Texture::from_bytes(&gbytes).ok()
+fn png_to_texture(bytes: Vec<u8>) -> Result<gdk::Texture, ImageError> {
+    if bytes.len() > MAX_ENCODED_BYTES {
+        return Err(ImageError::TooLarge);
+    }
+    let _layout = png_layout(&bytes)?;
+    let gbytes = glib::Bytes::from_owned(bytes);
+    gdk::Texture::from_bytes(&gbytes).map_err(|_| ImageError::Invalid)
 }
 
 /// Build a texture from raw RGB(A) pixels. `has_alpha=false` expands each
 /// 3-byte pixel to 4 bytes with full opacity, matching the kitty protocol's
 /// `f=24` semantics.
-fn rgba_to_texture(width: u32, height: u32, data: &[u8], has_alpha: bool) -> Option<gdk::Texture> {
-    if width == 0 || height == 0 {
-        return None;
+fn rgba_to_texture(
+    width: u32,
+    height: u32,
+    data: &[u8],
+    has_alpha: bool,
+) -> Result<gdk::Texture, ImageError> {
+    let source_channels = if has_alpha { 4 } else { 3 };
+    let layout = checked_image_layout(width, height, source_channels)?;
+    if data.len() < layout.source_bytes {
+        return Err(ImageError::Invalid);
     }
-    let (stride, bytes) = if has_alpha {
-        let expected = (width as usize) * (height as usize) * 4;
-        if data.len() < expected {
-            return None;
-        }
-        (width as usize * 4, data[..expected].to_vec())
+
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(layout.output_bytes)
+        .map_err(|_| ImageError::TooLarge)?;
+    if has_alpha {
+        bytes.extend_from_slice(&data[..layout.source_bytes]);
     } else {
-        let expected = (width as usize) * (height as usize) * 3;
-        if data.len() < expected {
-            return None;
+        for px in data[..layout.source_bytes].chunks_exact(3) {
+            bytes.extend_from_slice(&[px[0], px[1], px[2], 0xFF]);
         }
-        let mut out = Vec::with_capacity((width as usize) * (height as usize) * 4);
-        for px in data[..expected].chunks_exact(3) {
-            out.push(px[0]);
-            out.push(px[1]);
-            out.push(px[2]);
-            out.push(0xFF);
-        }
-        (width as usize * 4, out)
-    };
-    let gbytes = glib::Bytes::from(&bytes);
-    Some(
-        gdk::MemoryTexture::new(
-            width as i32,
-            height as i32,
-            gdk::MemoryFormat::R8g8b8a8,
-            &gbytes,
-            stride,
-        )
-        .upcast(),
+    }
+    debug_assert_eq!(bytes.len(), layout.output_bytes);
+
+    let gbytes = glib::Bytes::from_owned(bytes);
+    Ok(gdk::MemoryTexture::new(
+        layout.width,
+        layout.height,
+        gdk::MemoryFormat::R8g8b8a8,
+        &gbytes,
+        layout.stride,
     )
+    .upcast())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn encode_base64(input: &[u8]) -> Vec<u8> {
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = Vec::with_capacity(input.len().div_ceil(3) * 4);
+        for chunk in input.chunks(3) {
+            let a = chunk[0];
+            let b = chunk.get(1).copied().unwrap_or(0);
+            let c = chunk.get(2).copied().unwrap_or(0);
+            out.push(TABLE[(a >> 2) as usize]);
+            out.push(TABLE[(((a & 0x03) << 4) | (b >> 4)) as usize]);
+            out.push(if chunk.len() > 1 {
+                TABLE[(((b & 0x0f) << 2) | (c >> 6)) as usize]
+            } else {
+                b'='
+            });
+            out.push(if chunk.len() > 2 {
+                TABLE[(c & 0x3f) as usize]
+            } else {
+                b'='
+            });
+        }
+        out
+    }
+
+    fn png_header(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+        bytes.extend_from_slice(&13u32.to_be_bytes());
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes
+    }
 
     #[test]
     fn base64_round_trip() {
@@ -383,5 +514,42 @@ mod tests {
         // Assembler state cleared after completion.
         assert!(a.in_flight.is_empty());
         assert!(a.anon.is_none());
+    }
+
+    #[test]
+    fn oversized_raw_dimensions_are_skipped_without_overflow() {
+        let cases: &[&[u8]] = &[
+            b"Ga=T,f=32,s=4294967295,v=4294967295;AAAA",
+            b"Ga=T,f=24,s=16384,v=16384;AAAA",
+            b"Ga=T,f=32,s=16385,v=1;AAAA",
+        ];
+        for payload in cases {
+            let mut assembler = Assembler::new();
+            assert!(matches!(assembler.feed(payload), Outcome::Skipped));
+        }
+    }
+
+    #[test]
+    fn checked_layout_enforces_decoded_byte_budget() {
+        let at_limit = checked_image_layout(2048, 2048, 4).expect("16 MiB RGBA fits");
+        assert_eq!(at_limit.output_bytes, MAX_DECODED_IMAGE_BYTES);
+        assert!(matches!(
+            checked_image_layout(2049, 2048, 4),
+            Err(ImageError::TooLarge)
+        ));
+        assert!(matches!(
+            checked_image_layout(u32::MAX, 1, 4),
+            Err(ImageError::TooLarge)
+        ));
+    }
+
+    #[test]
+    fn oversized_png_ihdr_is_skipped_before_gdk_decode() {
+        let encoded = encode_base64(&png_header(MAX_IMAGE_DIMENSION + 1, 1));
+        let mut payload = b"Ga=T,f=100;".to_vec();
+        payload.extend_from_slice(&encoded);
+
+        let mut assembler = Assembler::new();
+        assert!(matches!(assembler.feed(&payload), Outcome::Skipped));
     }
 }

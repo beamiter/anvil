@@ -184,6 +184,9 @@ fn forward_command_surface_scroll(terminal: &Terminal, dy: f64) -> bool {
 }
 
 #[cfg(test)]
+// Protocol tests stay beside the encoder helpers they specify; moving this
+// block below GTK builders would separate the small pure-logic unit.
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 

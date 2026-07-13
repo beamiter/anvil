@@ -1,0 +1,230 @@
+//! Small dependency-free command-line contract for launching and diagnosing
+//! jterm1. Parsing stays independent of GTK so `--help`, `--version`, and
+//! `--doctor` remain fast and usable on headless machines.
+
+use std::ffi::OsString;
+use std::path::PathBuf;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Mode {
+    Block,
+    Vte,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LaunchOptions {
+    pub(crate) working_directory: Option<PathBuf>,
+    pub(crate) execute: Option<Vec<String>>,
+    pub(crate) no_restore: bool,
+    pub(crate) mode: Option<Mode>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ShellIntegration {
+    Bash,
+    Zsh,
+    Fish,
+    PowerShell,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Command {
+    Run(LaunchOptions),
+    Help,
+    Version,
+    Doctor,
+    InitConfig,
+    PrintShellIntegration(ShellIntegration),
+}
+
+pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
+    let args: Vec<OsString> = args.into_iter().collect();
+    if args.first().is_some_and(|arg| arg == "--doctor") {
+        require_exact_args(&args, 1, "--doctor")?;
+        return Ok(Command::Doctor);
+    }
+    if args.first().is_some_and(|arg| arg == "--init-config") {
+        require_exact_args(&args, 1, "--init-config")?;
+        return Ok(Command::InitConfig);
+    }
+    if args.first().is_some_and(|arg| arg == "--shell-integration") {
+        require_exact_args(&args, 2, "--shell-integration <shell>")?;
+        let shell = args[1]
+            .to_str()
+            .ok_or_else(|| "shell name must be valid UTF-8".to_string())?;
+        let shell = match shell.to_ascii_lowercase().as_str() {
+            "bash" => ShellIntegration::Bash,
+            "zsh" => ShellIntegration::Zsh,
+            "fish" => ShellIntegration::Fish,
+            "powershell" | "pwsh" | "ps1" => ShellIntegration::PowerShell,
+            _ => {
+                return Err(format!(
+                    "unsupported shell '{shell}' (use bash, zsh, fish, or pwsh)"
+                ))
+            }
+        };
+        return Ok(Command::PrintShellIntegration(shell));
+    }
+
+    let mut launch = LaunchOptions::default();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        match arg.to_str() {
+            Some("-h" | "--help") => return Ok(Command::Help),
+            Some("-V" | "--version") => return Ok(Command::Version),
+            Some("--no-restore") => launch.no_restore = true,
+            Some("-d" | "--working-directory") => {
+                index += 1;
+                let path = args
+                    .get(index)
+                    .ok_or_else(|| "--working-directory requires a path".to_string())?;
+                launch.working_directory = Some(PathBuf::from(path));
+            }
+            Some("--mode") => {
+                index += 1;
+                let mode = args
+                    .get(index)
+                    .and_then(|value| value.to_str())
+                    .ok_or_else(|| "--mode requires 'block' or 'vte'".to_string())?;
+                launch.mode = Some(match mode.to_ascii_lowercase().as_str() {
+                    "block" => Mode::Block,
+                    "vte" => Mode::Vte,
+                    _ => return Err(format!("invalid terminal mode '{mode}' (use block or vte)")),
+                });
+            }
+            Some("-e" | "--execute" | "--") => {
+                let command = args[index + 1..]
+                    .iter()
+                    .map(|arg| {
+                        arg.clone().into_string().map_err(|_| {
+                            "command arguments must be valid UTF-8 in this release".to_string()
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if command.is_empty() {
+                    return Err(format!("{} requires a command", arg.to_string_lossy()));
+                }
+                launch.execute = Some(command);
+                break;
+            }
+            Some(value) if value.starts_with('-') => {
+                return Err(format!("unknown option '{value}'"));
+            }
+            _ => {
+                if launch.working_directory.is_some() {
+                    return Err("only one working directory may be specified".to_string());
+                }
+                launch.working_directory = Some(PathBuf::from(arg));
+            }
+        }
+        index += 1;
+    }
+    Ok(Command::Run(launch))
+}
+
+fn require_exact_args(args: &[OsString], expected: usize, usage: &str) -> Result<(), String> {
+    if args.len() == expected {
+        Ok(())
+    } else {
+        Err(format!("usage: jterm1 {usage}"))
+    }
+}
+
+pub(crate) const HELP: &str = r#"jterm1 — a Block-first terminal workspace
+
+Usage:
+  jterm1 [OPTIONS] [DIRECTORY]
+  jterm1 [OPTIONS] --execute COMMAND [ARG...]
+
+Launch options:
+  -d, --working-directory DIR  Start in DIR
+  -e, --execute COMMAND ...    Run a command instead of the configured shell
+      --mode block|vte         Override the terminal backend for this window
+      --no-restore             Start a fresh workspace
+
+Utilities:
+      --doctor                 Check configuration and runtime dependencies
+      --init-config            Create a documented config without overwriting one
+      --shell-integration SH   Print integration for bash, zsh, fish, or pwsh
+  -h, --help                   Show this help
+  -V, --version                Show the version
+
+Examples:
+  jterm1 ~/project
+  jterm1 --mode block --no-restore
+  jterm1 -d /tmp -e bash -lc 'printf "hello\\n"'
+  source <(jterm1 --shell-integration bash)
+"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_strs(args: &[&str]) -> Result<Command, String> {
+        parse(args.iter().map(OsString::from))
+    }
+
+    #[test]
+    fn parses_launch_options_and_execute_remainder() {
+        let command = parse_strs(&[
+            "--mode", "block", "-d", "/tmp", "-e", "bash", "-lc", "echo hi",
+        ])
+        .unwrap();
+        assert_eq!(
+            command,
+            Command::Run(LaunchOptions {
+                working_directory: Some(PathBuf::from("/tmp")),
+                execute: Some(vec!["bash".into(), "-lc".into(), "echo hi".into()]),
+                no_restore: false,
+                mode: Some(Mode::Block),
+            })
+        );
+    }
+
+    #[test]
+    fn positional_argument_is_working_directory() {
+        let Command::Run(options) = parse_strs(&["~/project"]).unwrap() else {
+            panic!("expected run")
+        };
+        assert_eq!(options.working_directory, Some(PathBuf::from("~/project")));
+    }
+
+    #[test]
+    fn parses_shell_integration_alias() {
+        assert_eq!(
+            parse_strs(&["--shell-integration", "pwsh"]).unwrap(),
+            Command::PrintShellIntegration(ShellIntegration::PowerShell)
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_option() {
+        assert!(parse_strs(&["--wat"])
+            .unwrap_err()
+            .contains("unknown option"));
+    }
+
+    #[test]
+    fn execute_requires_command() {
+        assert!(parse_strs(&["-e"])
+            .unwrap_err()
+            .contains("requires a command"));
+    }
+
+    #[test]
+    fn execute_remainder_may_contain_help_or_version_flags() {
+        let Command::Run(help) = parse_strs(&["-e", "cargo", "--help"]).unwrap() else {
+            panic!("expected run")
+        };
+        assert_eq!(help.execute, Some(vec!["cargo".into(), "--help".into()]));
+
+        let Command::Run(version) = parse_strs(&["--execute", "bash", "--version"]).unwrap() else {
+            panic!("expected run")
+        };
+        assert_eq!(
+            version.execute,
+            Some(vec!["bash".into(), "--version".into()])
+        );
+    }
+}

@@ -3,6 +3,8 @@
 mod agent;
 mod ai;
 mod block_view;
+mod cli;
+mod command_history;
 mod config;
 mod dialogs;
 mod file_tree;
@@ -57,6 +59,10 @@ enum AppMsg {
     ToggleSidebar,
     /// Close the application window (top-bar X button).
     Quit,
+    /// Close after the running-process confirmation has been accepted.
+    ForceQuit,
+    /// Transient, user-visible status/error feedback.
+    Toast(String),
     /// Block-view: Alt+Ctrl+Shift+C — copy the selected block's output only.
     CopyOutputOnly,
     Action(Action),
@@ -80,6 +86,13 @@ enum AppMsg {
     SettingsFontScale(f64),
     SettingsOpacity(f64),
     SettingsScrollback(u32),
+    SettingsTerminalMode(usize),
+    SettingsBlockCompact(bool),
+    SettingsCommandHistory(bool),
+    SettingsAiEnabled(bool),
+    SettingsAgentEnabled(bool),
+    SettingsNotifications(bool),
+    SettingsRemoteClipboard(bool),
     // Search bar.
     SearchChanged(String),
     SearchNext,
@@ -250,6 +263,9 @@ struct AppModel {
     tab_strip: gtk::Box,
     tab_rows: FactoryVecDeque<tab_strip::TabRow>,
     window: adw::ApplicationWindow,
+    toast_overlay: adw::ToastOverlay,
+    quit_allowed: Rc<std::cell::Cell<bool>>,
+    session_persistence: bool,
     dyn_css: gtk::CssProvider,
     search: Controller<search::SearchModel>,
     tab_filter_control: Controller<sidebar::TabFilterModel>,
@@ -398,7 +414,7 @@ impl AppModel {
     /// open so users see new/edited YAMLs without a restart. Cheap: a few
     /// short files, parsed once.
     fn reload_workflows(&self) {
-        let dirs = vec![workflows::user_workflow_dir()];
+        let dirs = workflows::workflow_dirs();
         let loaded = workflows::load_all(&dirs);
         *self.workflows.borrow_mut() = loaded;
     }
@@ -416,12 +432,16 @@ impl AppModel {
             .cloned();
         let Some(workflow) = workflow else {
             log::warn!("workflow not found: {}", path.display());
+            self.show_toast(format!("Workflow not found: {}", path.display()));
             return;
         };
         if workflow.args.is_empty() {
             match workflows::render(&workflow, &std::collections::HashMap::new()) {
                 Ok(rendered) => sender.input(AppMsg::PaletteTypeCommand(rendered)),
-                Err(e) => log::warn!("workflow render failed: {e}"),
+                Err(e) => {
+                    log::warn!("workflow render failed: {e}");
+                    self.show_toast(format!("Workflow could not be rendered: {e}"));
+                }
             }
             return;
         }
@@ -439,6 +459,7 @@ impl AppModel {
         }
         let Some(client) = ai::AiClient::from_env() else {
             log::warn!("AI palette: no provider configured");
+            self.show_toast("No AI provider is configured.");
             return;
         };
         let cwd = self
@@ -457,7 +478,10 @@ impl AppModel {
                     sender_clone.input(AppMsg::PaletteTypeCommand(cleaned));
                 }
             }
-            Err(e) => log::warn!("AI palette request failed: {e}"),
+            Err(e) => {
+                log::warn!("AI palette request failed: {e}");
+                sender_clone.input(AppMsg::Toast(format!("AI request failed: {e}")));
+            }
         });
         std::mem::forget(_h);
     }
@@ -472,11 +496,24 @@ impl AppModel {
                 cfg.ai_enabled,
                 cfg.agent_enabled
             );
+            self.show_toast("AI Agent is disabled in configuration.");
             return;
         }
         drop(cfg);
+        let active_is_block = self
+            .tabs
+            .get(self.active)
+            .and_then(|tab| tab.panes.get(tab.active_pane))
+            .is_some_and(|pane| matches!(pane.mode, TerminalMode::Block));
+        if !active_is_block {
+            self.show_toast(
+                "AI Agent requires a Block-mode pane so command results can be observed.",
+            );
+            return;
+        }
         let Some(client) = ai::AiClient::from_env() else {
             log::warn!("agent: no AI provider configured");
+            self.show_toast("No AI provider is configured.");
             return;
         };
 
@@ -763,7 +800,7 @@ impl AppModel {
             return;
         }
         self.ai_panel.emit(dialogs::ai_panel::AiPanelMsg::Open(
-            self.config.borrow().block_history_path.clone(),
+            self.config.borrow().command_history_path.clone(),
         ));
     }
 
@@ -819,27 +856,38 @@ impl AppModel {
     }
 
     fn add_tab(&mut self, initial_commands: Option<String>, sender: &ComponentSender<AppModel>) {
+        // New tabs inherit the active pane's working directory (matches
+        // DuplicateTab), so Ctrl+Shift+T opens where the user already is.
+        let cwd = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.panes.get(t.active_pane))
+            .and_then(|p| p.cwd.clone());
+        self.add_tab_with(initial_commands, cwd, self.shell_argv.clone(), sender);
+    }
+
+    fn add_tab_with(
+        &mut self,
+        initial_commands: Option<String>,
+        working_directory: Option<String>,
+        shell_argv: Rc<Vec<String>>,
+        sender: &ComponentSender<AppModel>,
+    ) {
         let id = self.next_id;
         self.next_id += 1;
         let pane_id = self.next_pane_id;
         self.next_pane_id += 1;
         let number = self.tabs.len() as u32 + 1;
         let mode = self.config.borrow().terminal_mode;
-        // New tabs inherit the active pane's working directory (matches
-        // DuplicateTab / jterm4), so Ctrl+Shift+T opens where you already are.
-        let cwd = self
-            .tabs
-            .get(self.active)
-            .and_then(|t| t.panes.get(t.active_pane))
-            .and_then(|p| p.cwd.clone());
+        let title_cwd = working_directory.clone();
         let pane = create_pane(
             &self.config,
-            &self.shell_argv,
+            &shell_argv,
             id,
             pane_id,
             mode,
             initial_commands,
-            cwd,
+            working_directory,
             sender,
         );
         let holder = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -851,7 +899,7 @@ impl AppModel {
             holder,
             panes: vec![pane],
             active_pane: 0,
-            title: default_tab_title(number, None),
+            title: default_tab_title(number, title_cwd.as_deref()),
             custom_title: false,
             bell: false,
             activity: false,
@@ -1053,7 +1101,60 @@ impl AppModel {
     }
 
     fn persist_session(&self) {
-        session::save_session(&self.snapshot_session());
+        if self.session_persistence {
+            session::save_session(&self.snapshot_session());
+        }
+    }
+
+    fn show_toast(&self, message: impl AsRef<str>) {
+        self.toast_overlay
+            .add_toast(adw::Toast::new(message.as_ref()));
+    }
+
+    fn persist_config(&self) {
+        if let Err(err) = config::save_config(&self.config.borrow()) {
+            log::error!("{err}");
+            self.show_toast(format!("Settings were not saved: {err}"));
+        }
+    }
+
+    fn running_process_summary(&self) -> Option<String> {
+        let mut running = Vec::new();
+        for tab in &self.tabs {
+            for pane in &tab.panes {
+                if let Some(process) = pane.foreground_process() {
+                    let label = format!("{} — {process}", tab.title);
+                    if !running.contains(&label) {
+                        running.push(label);
+                    }
+                }
+            }
+        }
+        if running.is_empty() {
+            return None;
+        }
+        const MAX_SHOWN: usize = 8;
+        let hidden = running.len().saturating_sub(MAX_SHOWN);
+        running.truncate(MAX_SHOWN);
+        let mut summary = running.join("\n");
+        if hidden > 0 {
+            summary.push_str(&format!("\n…and {hidden} more"));
+        }
+        Some(summary)
+    }
+
+    fn request_quit(&self, sender: &ComponentSender<AppModel>) {
+        if let Some(running) = self.running_process_summary() {
+            dialogs::confirm_close(&self.window, &running, AppMsg::ForceQuit, sender);
+        } else {
+            sender.input(AppMsg::ForceQuit);
+        }
+    }
+
+    fn force_quit(&self) {
+        self.persist_session();
+        self.quit_allowed.set(true);
+        self.window.close();
     }
 
     /// App-level diagnostics for the debug dashboard. (jterm4 surfaces per-block
@@ -1130,7 +1231,10 @@ impl AppModel {
         let pane_id = self.next_pane_id;
         self.next_pane_id += 1;
         let argv = Rc::new(config::build_remote_argv(host));
-        let mode = self.config.borrow().terminal_mode;
+        // Remote sessions need OSC 133/7/7770 parsing for blocks, cwd updates,
+        // resumable session ids, and Agent observations. Keep them on the Block
+        // backend even when the local compatibility backend is configured.
+        let mode = TerminalMode::Block;
         let pane = create_pane(&self.config, &argv, id, pane_id, mode, None, None, sender);
         let holder = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         holder.set_hexpand(true);
@@ -1271,7 +1375,7 @@ impl AppModel {
             .map(|c| c.host.clone())
             .unwrap_or(conn.host.clone());
         let argv = Rc::new(config::build_remote_argv(&host_now));
-        let mode = self.config.borrow().terminal_mode;
+        let mode = TerminalMode::Block;
         let pane = create_pane(
             &self.config,
             &argv,
@@ -1929,7 +2033,7 @@ impl AppModel {
             }
             Action::OpenPalette => {
                 self.reload_workflows();
-                let history = self.config.borrow().block_history_path.clone();
+                let history = self.config.borrow().command_history_path.clone();
                 self.command_palette
                     .emit(dialogs::command_palette::PaletteMsg::Toggle {
                         mode: palette::PaletteMode::All,
@@ -1938,7 +2042,7 @@ impl AppModel {
             }
             Action::OpenHistoryPalette => {
                 self.reload_workflows();
-                let history = self.config.borrow().block_history_path.clone();
+                let history = self.config.borrow().command_history_path.clone();
                 if let Some(term) = self.active_terminal() {
                     self.history.emit(dialogs::history::HistoryMsg::Toggle {
                         anchor: term.widget(),
@@ -1948,7 +2052,7 @@ impl AppModel {
             }
             Action::OpenWorkflows => {
                 self.reload_workflows();
-                let history = self.config.borrow().block_history_path.clone();
+                let history = self.config.borrow().command_history_path.clone();
                 self.command_palette
                     .emit(dialogs::command_palette::PaletteMsg::Toggle {
                         mode: palette::PaletteMode::Workflows,
@@ -1980,10 +2084,26 @@ impl AppModel {
                         font_scale: self.font_scale,
                         opacity: self.window_opacity,
                         scrollback: config.terminal_scrollback_lines as f64,
+                        terminal_mode: match config.terminal_mode {
+                            TerminalMode::Block => 0,
+                            TerminalMode::Vte => 1,
+                        },
+                        block_compact: config.block_compact,
+                        command_history: config.command_history_enabled,
+                        ai_enabled: config.ai_enabled,
+                        agent_enabled: config.agent_enabled,
+                        notifications: config.notify_long_blocks,
+                        remote_clipboard: config.allow_remote_clipboard_write,
                     },
                     self.window.clone(),
                 ));
             }
+            Action::OpenWelcome => match workflows::welcome_notebook_path() {
+                Some(path) => self.notebook.emit(notebook::NotebookMsg::Open(path)),
+                None => self.show_toast(
+                    "Welcome notebook was not found. Reinstall jterm1's shared assets.",
+                ),
+            },
             Action::ToggleSearch => self.toggle_search(),
             Action::MoveTabLeft => self.move_tab(-1, sender),
             Action::MoveTabRight => self.move_tab(1, sender),
@@ -2090,33 +2210,19 @@ impl AppModel {
     }
 
     fn reload_config(&mut self, sender: &ComponentSender<AppModel>) {
-        let (new_config, themes, new_kb) = load_config();
-        let theme = themes
-            .iter()
-            .find(|t| t.name == new_config.theme_name)
-            .or_else(|| themes.first())
-            .cloned();
-
-        {
-            let mut config = self.config.borrow_mut();
-            config.window_opacity = new_config.window_opacity;
-            config.terminal_scrollback_lines = new_config.terminal_scrollback_lines;
-            config.font_desc = new_config.font_desc.clone();
-            config.default_font_scale = new_config.default_font_scale;
-            config.startup_commands = new_config.startup_commands.clone();
-            config.tab_width = new_config.tab_width;
-            // Existing terminal widgets cannot change backend in place, but
-            // every tab/pane created after a reload must use the new mode.
-            config.terminal_mode = new_config.terminal_mode;
-            if let Some(theme) = &theme {
-                config.theme_name = theme.name.clone();
-                config.foreground = theme.foreground;
-                config.background = theme.background;
-                config.cursor = theme.cursor;
-                config.cursor_foreground = theme.cursor_foreground;
-                config.palette = theme.palette;
-            }
+        if let Some(error) = config::config_file_error() {
+            log::warn!("configuration reload rejected: {error}");
+            self.show_toast(format!(
+                "Config reload rejected; the current settings remain active. {error}"
+            ));
+            return;
         }
+        let (new_config, themes, new_kb) = load_config();
+        let new_shell_argv = Rc::new(choose_shell_argv(new_config.shell.as_deref()));
+        let backend_changed = std::mem::discriminant(&self.config.borrow().terminal_mode)
+            != std::mem::discriminant(&new_config.terminal_mode);
+        *self.config.borrow_mut() = new_config.clone();
+        self.shell_argv = new_shell_argv;
 
         self.set_window_opacity(new_config.window_opacity);
         let font_desc = self.config.borrow().font_desc.clone();
@@ -2137,6 +2243,11 @@ impl AppModel {
         self.apply_dynamic_css();
         self.rebuild_tab_strip(sender);
         log::info!("Configuration reloaded from disk");
+        if backend_changed {
+            self.show_toast("Terminal mode changed; it will apply to new panes and tabs.");
+        } else {
+            self.show_toast("Configuration reloaded.");
+        }
     }
 
     #[allow(deprecated)]
@@ -2235,7 +2346,7 @@ impl AppModel {
         if persist {
             self.sidebar_view.set(view);
             self.config.borrow_mut().sidebar_view = view;
-            config::save_config(&self.config.borrow());
+            self.persist_config();
         }
     }
 
@@ -2318,7 +2429,7 @@ impl AppModel {
         self.tab_placement.set(next);
         self.config.borrow_mut().tab_placement = next;
         self.apply_tab_placement();
-        config::save_config(&self.config.borrow());
+        self.persist_config();
     }
 
     fn rebuild_tab_strip(&mut self, _sender: &ComponentSender<AppModel>) {
@@ -2410,7 +2521,7 @@ fn install_static_css() {
 
 #[relm4::component]
 impl SimpleComponent for AppModel {
-    type Init = ();
+    type Init = cli::LaunchOptions;
     type Input = AppMsg;
     type Output = ();
 
@@ -2420,18 +2531,22 @@ impl SimpleComponent for AppModel {
             set_default_width: 800,
             set_default_height: 600,
 
-            gtk::Box {
-                set_orientation: gtk::Orientation::Vertical,
+            #[local_ref]
+            toast_overlay -> adw::ToastOverlay {
+                #[wrap(Some)]
+                set_child = &gtk::Box {
+                    set_orientation: gtk::Orientation::Vertical,
 
-                #[local_ref]
-                top_bar -> gtk::Overlay {},
+                    #[local_ref]
+                    top_bar -> gtk::Overlay {},
 
-                #[local_ref]
-                search_bar -> gtk::SearchBar {},
+                    #[local_ref]
+                    search_bar -> gtk::SearchBar {},
 
-                #[local_ref]
-                content_paned -> gtk::Paned {
-                    set_vexpand: true,
+                    #[local_ref]
+                    content_paned -> gtk::Paned {
+                        set_vexpand: true,
+                    },
                 },
             }
         }
@@ -2439,13 +2554,28 @@ impl SimpleComponent for AppModel {
 
     #[allow(deprecated)]
     fn init(
-        _init: Self::Init,
+        init: Self::Init,
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
-        let (config, themes, kbmap) = load_config();
+        let config_warning = config::config_file_error();
+        let (mut config, themes, kbmap) = load_config();
+        if let Some(mode) = init.mode {
+            config.terminal_mode = match mode {
+                cli::Mode::Block => TerminalMode::Block,
+                cli::Mode::Vte => TerminalMode::Vte,
+            };
+        }
         let shell_argv = Rc::new(choose_shell_argv(config.shell.as_deref()));
         let startup = config.startup_commands.clone();
+        let requested_cwd = init
+            .working_directory
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned());
+        let execute_argv = init.execute.clone().map(Rc::new);
+        let restore_session =
+            !init.no_restore && init.working_directory.is_none() && init.execute.is_none();
+        let session_persistence = init.execute.is_none();
         let window_opacity = config.window_opacity;
         let font_scale = config.default_font_scale;
         let config = Rc::new(RefCell::new(config));
@@ -2567,12 +2697,13 @@ impl SimpleComponent for AppModel {
         top_tab_scroll.add_css_class("top-tab-scroll");
         top_tab_scroll.set_visible(false);
 
-        top_tab_scroll.set_margin_start(88);
+        top_tab_scroll.set_margin_start(128);
         // Reserve room for the leading controls and trailing window actions.
         top_tab_scroll.set_margin_end(104);
         let top_bar = top_bar::TopBarModel::builder()
             .launch(top_tab_scroll.clone())
             .forward(sender.input_sender(), |output| match output {
+                top_bar::TopBarOutput::OpenPalette => AppMsg::Action(Action::ToggleCommandPalette),
                 top_bar::TopBarOutput::ToggleSidebar => AppMsg::ToggleSidebar,
                 top_bar::TopBarOutput::ToggleTabPlacement => {
                     AppMsg::Action(Action::ToggleTabPlacement)
@@ -2653,6 +2784,16 @@ impl SimpleComponent for AppModel {
                     font_scale,
                     opacity: window_opacity,
                     scrollback: config.borrow().terminal_scrollback_lines as f64,
+                    terminal_mode: match config.borrow().terminal_mode {
+                        TerminalMode::Block => 0,
+                        TerminalMode::Vte => 1,
+                    },
+                    block_compact: config.borrow().block_compact,
+                    command_history: config.borrow().command_history_enabled,
+                    ai_enabled: config.borrow().ai_enabled,
+                    agent_enabled: config.borrow().agent_enabled,
+                    notifications: config.borrow().notify_long_blocks,
+                    remote_clipboard: config.borrow().allow_remote_clipboard_write,
                 },
             })
             .forward(sender.input_sender(), |output| match output {
@@ -2666,6 +2807,27 @@ impl SimpleComponent for AppModel {
                 }
                 dialogs::settings::SettingsOutput::Scrollback(lines) => {
                     AppMsg::SettingsScrollback(lines)
+                }
+                dialogs::settings::SettingsOutput::TerminalMode(mode) => {
+                    AppMsg::SettingsTerminalMode(mode)
+                }
+                dialogs::settings::SettingsOutput::BlockCompact(enabled) => {
+                    AppMsg::SettingsBlockCompact(enabled)
+                }
+                dialogs::settings::SettingsOutput::CommandHistory(enabled) => {
+                    AppMsg::SettingsCommandHistory(enabled)
+                }
+                dialogs::settings::SettingsOutput::AiEnabled(enabled) => {
+                    AppMsg::SettingsAiEnabled(enabled)
+                }
+                dialogs::settings::SettingsOutput::AgentEnabled(enabled) => {
+                    AppMsg::SettingsAgentEnabled(enabled)
+                }
+                dialogs::settings::SettingsOutput::Notifications(enabled) => {
+                    AppMsg::SettingsNotifications(enabled)
+                }
+                dialogs::settings::SettingsOutput::RemoteClipboard(enabled) => {
+                    AppMsg::SettingsRemoteClipboard(enabled)
                 }
             });
         let remote_picker = dialogs::remote_picker::RemotePickerModel::builder()
@@ -2759,6 +2921,8 @@ impl SimpleComponent for AppModel {
                 }
             });
 
+        let toast_overlay = adw::ToastOverlay::new();
+        let quit_allowed = Rc::new(std::cell::Cell::new(false));
         let mut model = AppModel {
             config,
             themes: Rc::new(themes),
@@ -2777,6 +2941,9 @@ impl SimpleComponent for AppModel {
             tab_strip: tab_strip.clone(),
             tab_rows,
             window: root.clone(),
+            toast_overlay: toast_overlay.clone(),
+            quit_allowed: quit_allowed.clone(),
+            session_persistence,
             dyn_css,
             search,
             tab_filter_control,
@@ -2809,7 +2976,31 @@ impl SimpleComponent for AppModel {
 
         let search_bar = model.search.widget();
         let top_bar = model.top_bar.widget();
+        let toast_overlay = &model.toast_overlay;
         let widgets = view_output!();
+
+        // Route both the title-bar button and the window manager's close action
+        // through the same running-process confirmation. ForceQuit flips the
+        // shared flag before calling close(), allowing that second signal
+        // through without presenting the dialog again.
+        {
+            let close_sender = sender.clone();
+            let quit_allowed = model.quit_allowed.clone();
+            root.connect_close_request(move |_| {
+                if quit_allowed.get() {
+                    glib::Propagation::Proceed
+                } else {
+                    close_sender.input(AppMsg::Quit);
+                    glib::Propagation::Stop
+                }
+            });
+        }
+
+        if let Some(error) = config_warning {
+            model.show_toast(format!(
+                "Config could not be loaded; defaults are active. Your file was left untouched. {error}"
+            ));
+        }
 
         // Place the tab strip (sidebar vs top bar) and select the sidebar view.
         model.apply_tab_placement();
@@ -2889,7 +3080,7 @@ impl SimpleComponent for AppModel {
 
         // Restore a previously-saved session if present (consume-on-start);
         // otherwise open a single fresh tab running startup_commands.
-        match session::load_session() {
+        match restore_session.then(session::load_session).flatten() {
             Some(saved) => {
                 for tab in &saved.tabs {
                     model.restore_tab(tab, &sender);
@@ -2902,7 +3093,15 @@ impl SimpleComponent for AppModel {
                     model.select_tab(id, &sender);
                 }
             }
-            None => model.add_tab(startup, &sender),
+            None => {
+                let initial_argv = execute_argv.unwrap_or_else(|| model.shell_argv.clone());
+                let initial_commands = if init.execute.is_some() {
+                    None
+                } else {
+                    startup
+                };
+                model.add_tab_with(initial_commands, requested_cwd, initial_argv, &sender);
+            }
         }
 
         model.init_file_tree();
@@ -2927,8 +3126,10 @@ impl SimpleComponent for AppModel {
                 self.sidebar_box.set_visible(self.sidebar_visible);
             }
             AppMsg::Quit => {
-                self.window.close();
+                self.request_quit(&sender);
             }
+            AppMsg::ForceQuit => self.force_quit(),
+            AppMsg::Toast(message) => self.show_toast(message),
             AppMsg::CopyOutputOnly => {
                 if let Some(t) = self.active_terminal() {
                     t.emit(VteInput::CopyOutputOnly);
@@ -2939,7 +3140,7 @@ impl SimpleComponent for AppModel {
             AppMsg::SetTabWidth(width) => {
                 self.config.borrow_mut().tab_width = width.clamp(MIN_TAB_WIDTH, MAX_TAB_WIDTH);
                 self.rebuild_tab_strip(&sender);
-                config::save_config(&self.config.borrow());
+                self.persist_config();
             }
             AppMsg::PaneExited(tab_id, pane_id, code) => {
                 // A remote single-pane tab that died abnormally is reconnected in
@@ -3041,7 +3242,7 @@ impl SimpleComponent for AppModel {
                         }
                     }
                     self.apply_dynamic_css();
-                    config::save_config(&self.config.borrow());
+                    self.persist_config();
                 }
             }
             AppMsg::SettingsFontDesc(desc) => {
@@ -3051,17 +3252,17 @@ impl SimpleComponent for AppModel {
                         pane.terminal.emit(VteInput::SetFont(desc.clone()));
                     }
                 }
-                config::save_config(&self.config.borrow());
+                self.persist_config();
             }
             AppMsg::SettingsFontScale(scale) => {
                 self.set_font_scale_all(scale);
                 self.config.borrow_mut().default_font_scale = scale;
-                config::save_config(&self.config.borrow());
+                self.persist_config();
             }
             AppMsg::SettingsOpacity(opacity) => {
                 self.set_window_opacity(opacity);
                 self.config.borrow_mut().window_opacity = opacity;
-                config::save_config(&self.config.borrow());
+                self.persist_config();
             }
             AppMsg::SettingsScrollback(lines) => {
                 self.config.borrow_mut().terminal_scrollback_lines = lines;
@@ -3070,7 +3271,55 @@ impl SimpleComponent for AppModel {
                         pane.terminal.emit(VteInput::SetScrollback(lines as i64));
                     }
                 }
-                config::save_config(&self.config.borrow());
+                self.persist_config();
+            }
+            AppMsg::SettingsTerminalMode(mode) => {
+                self.config.borrow_mut().terminal_mode = if mode == 0 {
+                    TerminalMode::Block
+                } else {
+                    TerminalMode::Vte
+                };
+                self.persist_config();
+                self.show_toast("Terminal backend will apply to new local panes.");
+            }
+            AppMsg::SettingsBlockCompact(enabled) => {
+                self.config.borrow_mut().block_compact = enabled;
+                self.persist_config();
+                self.show_toast("Block density will apply to new Block panes.");
+            }
+            AppMsg::SettingsCommandHistory(enabled) => {
+                let mut config = self.config.borrow_mut();
+                config.command_history_enabled = enabled;
+                if enabled && config.command_history_path.is_none() {
+                    config.command_history_path = Some(config::default_command_history_path());
+                }
+                drop(config);
+                self.persist_config();
+                self.show_toast("Command history preference will apply to new Block panes.");
+            }
+            AppMsg::SettingsAiEnabled(enabled) => {
+                self.config.borrow_mut().ai_enabled = enabled;
+                if !enabled {
+                    self.agent_close();
+                }
+                self.persist_config();
+            }
+            AppMsg::SettingsAgentEnabled(enabled) => {
+                self.config.borrow_mut().agent_enabled = enabled;
+                if !enabled {
+                    self.agent_close();
+                }
+                self.persist_config();
+            }
+            AppMsg::SettingsNotifications(enabled) => {
+                self.config.borrow_mut().notify_long_blocks = enabled;
+                self.persist_config();
+                self.show_toast("Notification preference will apply to new Block panes.");
+            }
+            AppMsg::SettingsRemoteClipboard(enabled) => {
+                self.config.borrow_mut().allow_remote_clipboard_write = enabled;
+                self.persist_config();
+                self.show_toast("Clipboard policy will apply to new panes.");
             }
             AppMsg::SearchChanged(text) => {
                 if let Some(t) = self.active_terminal() {
@@ -3193,16 +3442,211 @@ impl SimpleComponent for AppModel {
 }
 
 fn main() {
-    init_input_method_env();
-    // NON_UNIQUE: each launch is its own process with its own window, instead of
-    // the second invocation activating the first instance and then exiting.
-    let app = RelmApp::from_app(
-        adw::Application::builder()
-            .application_id("app.jterm1")
-            .flags(gio::ApplicationFlags::NON_UNIQUE)
-            .build(),
+    let command = match cli::parse(std::env::args_os().skip(1)) {
+        Ok(command) => command,
+        Err(error) => {
+            eprintln!("jterm1: {error}\nTry 'jterm1 --help' for usage.");
+            std::process::exit(2);
+        }
+    };
+
+    match command {
+        cli::Command::Help => print!("{}", cli::HELP),
+        cli::Command::Version => println!("jterm1 {}", env!("CARGO_PKG_VERSION")),
+        cli::Command::Doctor => {
+            init_logging();
+            if !run_doctor() {
+                std::process::exit(1);
+            }
+        }
+        cli::Command::InitConfig => {
+            if let Err(error) = init_config_file() {
+                eprintln!("jterm1: {error}");
+                std::process::exit(1);
+            }
+        }
+        cli::Command::PrintShellIntegration(shell) => print_shell_integration(shell),
+        cli::Command::Run(mut options) => {
+            if let Err(error) = validate_launch_options(&mut options) {
+                eprintln!("jterm1: {error}");
+                std::process::exit(2);
+            }
+            init_logging();
+            init_input_method_env();
+            // NON_UNIQUE: each launch is its own process with its own window.
+            // Session persistence uses per-process snapshots so instances do
+            // not overwrite one another.
+            let app = RelmApp::from_app(
+                adw::Application::builder()
+                    .application_id("app.jterm1")
+                    .flags(gio::ApplicationFlags::NON_UNIQUE)
+                    .build(),
+            )
+            // jterm1 has already parsed its command line. Passing only argv[0]
+            // prevents GApplication from rejecting our launch options as
+            // unknown GTK options during its second-stage initialization.
+            .with_args(vec!["jterm1".to_string()]);
+            app.run::<AppModel>(options);
+        }
+    }
+}
+
+fn init_logging() {
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        .format_timestamp_millis()
+        .try_init();
+}
+
+fn validate_launch_options(options: &mut cli::LaunchOptions) -> Result<(), String> {
+    if let Some(directory) = options.working_directory.as_mut() {
+        let canonical = std::fs::canonicalize(&*directory)
+            .map_err(|err| format!("cannot open directory {}: {err}", directory.display()))?;
+        if !canonical.is_dir() {
+            return Err(format!("{} is not a directory", canonical.display()));
+        }
+        *directory = canonical;
+    }
+    if let Some(argv) = &options.execute {
+        let executable = argv.first().expect("CLI parser rejects empty commands");
+        let path = std::path::Path::new(executable);
+        let found = if path.components().count() > 1 {
+            path.is_file()
+        } else {
+            config::find_executable_in_path(executable).is_some()
+        };
+        if !found {
+            return Err(format!("command not found: {executable}"));
+        }
+    }
+    Ok(())
+}
+
+fn init_config_file() -> Result<(), String> {
+    use std::io::Write;
+
+    let path = config_file_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("cannot create {}: {err}", parent.display()))?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::AlreadyExists {
+            format!("{} already exists; it was not overwritten", path.display())
+        } else {
+            format!("cannot create {}: {err}", path.display())
+        }
+    })?;
+    file.write_all(include_str!("../config.toml.example").as_bytes())
+        .map_err(|err| format!("cannot write {}: {err}", path.display()))?;
+    println!("Created {}", path.display());
+    Ok(())
+}
+
+fn print_shell_integration(shell: cli::ShellIntegration) {
+    let script = match shell {
+        cli::ShellIntegration::Bash => include_str!("../scripts/shell-integration/jterm1.bash"),
+        cli::ShellIntegration::Zsh => include_str!("../scripts/shell-integration/jterm1.zsh"),
+        cli::ShellIntegration::Fish => include_str!("../scripts/shell-integration/jterm1.fish"),
+        cli::ShellIntegration::PowerShell => {
+            include_str!("../scripts/shell-integration/jterm1.ps1")
+        }
+    };
+    print!("{script}");
+}
+
+fn run_doctor() -> bool {
+    let mut errors = 0usize;
+    let mut warnings = 0usize;
+    let ok = |label: &str, value: String| println!("[ok]    {label}: {value}");
+    let mut warn = |label: &str, value: String| {
+        warnings += 1;
+        println!("[warn]  {label}: {value}");
+    };
+    let mut error = |label: &str, value: String| {
+        errors += 1;
+        println!("[error] {label}: {value}");
+    };
+
+    println!("jterm1 {} diagnostics\n", env!("CARGO_PKG_VERSION"));
+    let config_path = config_file_path();
+    match config::config_file_error() {
+        Some(message) => error("config", message),
+        None if config_path.is_file() => ok("config", config_path.display().to_string()),
+        None => warn(
+            "config",
+            format!(
+                "{} does not exist (built-in defaults)",
+                config_path.display()
+            ),
+        ),
+    }
+
+    let (config, _, _) = load_config();
+    let shell_argv = choose_shell_argv(config.shell.as_deref());
+    let shell = shell_argv.first().cloned().unwrap_or_default();
+    let shell_found = if std::path::Path::new(&shell).components().count() > 1 {
+        std::path::Path::new(&shell).is_file()
+    } else {
+        config::find_executable_in_path(&shell).is_some()
+    };
+    if shell_found {
+        ok("shell", shell_argv.join(" "));
+    } else {
+        error("shell", format!("not executable: {shell}"));
+    }
+
+    let display = std::env::var("WAYLAND_DISPLAY")
+        .ok()
+        .map(|value| format!("Wayland {value}"))
+        .or_else(|| {
+            std::env::var("DISPLAY")
+                .ok()
+                .map(|value| format!("X11 {value}"))
+        });
+    match display {
+        Some(display) => ok("display", display),
+        None => warn(
+            "display",
+            "DISPLAY and WAYLAND_DISPLAY are unset".to_string(),
+        ),
+    }
+
+    match &config.command_history_path {
+        Some(path) => ok("command history", path.clone()),
+        None => warn("command history", "disabled".to_string()),
+    }
+    let workflow_count = workflows::load_all(&workflows::workflow_dirs()).len();
+    ok("workflows", format!("{workflow_count} available"));
+    if let Some(client) = ai::AiClient::from_env() {
+        ok("AI", client.display_name());
+    } else {
+        warn("AI", "provider configuration is incomplete".to_string());
+    }
+    if config::find_executable_in_path("notify-send").is_some() {
+        ok("notifications", "notify-send available".to_string());
+    } else {
+        warn(
+            "notifications",
+            "notify-send missing (long-command alerts disabled)".to_string(),
+        );
+    }
+    ok(
+        "terminal mode",
+        match config.terminal_mode {
+            TerminalMode::Block => "block".to_string(),
+            TerminalMode::Vte => "vte".to_string(),
+        },
     );
-    app.run::<AppModel>(());
+
+    println!("\nSummary: {errors} error(s), {warnings} warning(s)");
+    errors == 0
 }
 
 /// Make the fcitx5 GTK4 input-method module discoverable before GTK initializes,

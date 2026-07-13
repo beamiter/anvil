@@ -1,59 +1,75 @@
 #!/usr/bin/env bash
-# jterm4 installation script
+# Build and install jterm1 for the current user.
 
-set -e
+set -euo pipefail
 
-echo "🚀 Installing jterm4..."
-
-# Check if nix is available
-if ! command -v nix &> /dev/null; then
-    echo "❌ Error: nix is required but not found"
-    echo "   Please install nix first: https://nixos.org/download.html"
-    exit 1
-fi
-
-# Build release version
-echo "📦 Building release version..."
-nix develop --command bash -c "cargo build --release"
-
-# Check if build succeeded
-if [ ! -f "target/release/jterm4" ]; then
-    echo "❌ Build failed"
-    exit 1
-fi
-
-# Install binary
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 INSTALL_DIR="${HOME}/.local/bin"
-mkdir -p "${INSTALL_DIR}"
+CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}"
+DATA_HOME="${XDG_DATA_HOME:-${HOME}/.local/share}"
+CONFIG_DIR="${CONFIG_HOME}/jterm1"
+DATA_DIR="${DATA_HOME}/jterm1"
+APPLICATIONS_DIR="${DATA_HOME}/applications"
+BINARY="${PROJECT_ROOT}/target/release/jterm1"
 
-echo "📥 Installing to ${INSTALL_DIR}/jterm4..."
-cp target/release/jterm4 "${INSTALL_DIR}/jterm4"
-chmod +x "${INSTALL_DIR}/jterm4"
+echo "Installing jterm1..."
 
-# Create config directory
-CONFIG_DIR="${HOME}/.config/jterm4"
-mkdir -p "${CONFIG_DIR}"
-
-# Copy example config if no config exists
-if [ ! -f "${CONFIG_DIR}/config.toml" ]; then
-    if [ -f "config.toml.example" ]; then
-        echo "📝 Creating default config at ${CONFIG_DIR}/config.toml..."
-        cp config.toml.example "${CONFIG_DIR}/config.toml"
-    fi
+if ! command -v nix >/dev/null 2>&1; then
+    echo "Error: Nix with flakes support is required." >&2
+    echo "Install Nix from https://nixos.org/download/ and try again." >&2
+    exit 1
 fi
 
-echo ""
-echo "✅ Installation complete!"
-echo ""
-echo "🎉 jterm4 is now installed at ${INSTALL_DIR}/jterm4"
-echo ""
-echo "📖 Next steps:"
-echo "   1. Make sure ${INSTALL_DIR} is in your PATH"
-echo "   2. Run: jterm4"
-echo "   3. Edit config: ${CONFIG_DIR}/config.toml"
-echo ""
-echo "💡 Tips:"
-echo "   - Press Ctrl+Shift+K to see all keyboard shortcuts"
-echo "   - Use Ctrl+Shift+\\ for split panes"
-echo "   - Session state is automatically saved and restored"
-echo ""
+echo "Building the release binary..."
+(
+    cd "${PROJECT_ROOT}"
+    nix develop --command cargo build --release
+)
+
+if [[ ! -x "${BINARY}" ]]; then
+    echo "Error: build completed without creating ${BINARY}" >&2
+    exit 1
+fi
+
+echo "Installing ${INSTALL_DIR}/jterm1..."
+install -Dm755 "${BINARY}" "${INSTALL_DIR}/jterm1"
+
+mkdir -p "${CONFIG_DIR}"
+if [[ ! -e "${CONFIG_DIR}/config.toml" ]]; then
+    echo "Creating ${CONFIG_DIR}/config.toml..."
+    install -m600 "${PROJECT_ROOT}/config.toml.example" "${CONFIG_DIR}/config.toml"
+else
+    echo "Keeping existing config: ${CONFIG_DIR}/config.toml"
+fi
+
+echo "Installing desktop entry and user-facing examples..."
+install -Dm644 \
+    "${PROJECT_ROOT}/packaging/app.jterm1.desktop" \
+    "${APPLICATIONS_DIR}/app.jterm1.desktop"
+
+SHELL_INTEGRATION_DIR="${DATA_DIR}/shell-integration"
+mkdir -p "${SHELL_INTEGRATION_DIR}"
+for source_file in "${PROJECT_ROOT}"/scripts/shell-integration/jterm1.*; do
+    install -m644 "${source_file}" "${SHELL_INTEGRATION_DIR}/$(basename -- "${source_file}")"
+done
+
+WORKFLOW_DIR="${DATA_DIR}/workflows"
+mkdir -p "${WORKFLOW_DIR}"
+for workflow in "${PROJECT_ROOT}"/scripts/workflows/*.yaml; do
+    install -m644 "${workflow}" "${WORKFLOW_DIR}/$(basename -- "${workflow}")"
+done
+
+install -Dm644 \
+    "${PROJECT_ROOT}/scripts/notebooks/welcome.jtnb.md" \
+    "${DATA_DIR}/notebooks/welcome.jtnb.md"
+
+echo
+echo "jterm1 installation complete."
+echo "  Binary:            ${INSTALL_DIR}/jterm1"
+echo "  Configuration:     ${CONFIG_DIR}/config.toml"
+echo "  Shell integration: ${SHELL_INTEGRATION_DIR}"
+echo "  Welcome notebook:  ${DATA_DIR}/notebooks/welcome.jtnb.md"
+echo
+echo "Make sure ${INSTALL_DIR} is in PATH, then run: jterm1"
+echo "Use Ctrl+Shift+P for the command palette and Ctrl+Shift+O for settings."

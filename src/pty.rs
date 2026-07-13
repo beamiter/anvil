@@ -12,7 +12,7 @@ use relm4::gtk;
 use std::borrow::Cow;
 use std::ffi::CString;
 use std::io::{self, Read as _};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
@@ -23,6 +23,10 @@ enum PtyMsg {
 
 pub struct OwnedPty {
     master: Arc<std::sync::Mutex<Option<OwnedFd>>>,
+    /// `send` on this unbounded channel never waits for the kernel PTY buffer.
+    /// A dedicated worker preserves ordering and completes short writes away
+    /// from GTK's main thread.
+    input_tx: mpsc::Sender<Vec<u8>>,
     pid: Pid,
     /// Tracks bracketed-paste writes whose start/body/end arrive as separate
     /// `write_bytes` calls. While active, embedded line endings are intentional
@@ -54,6 +58,55 @@ const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 const BRACKETED_PASTE_ENABLE: &[u8] = b"\x1b[?2004h";
 const BRACKETED_PASTE_DISABLE: &[u8] = b"\x1b[?2004l";
+
+/// Write a complete byte slice to a blocking fd, retrying interrupted and
+/// partial writes. This must run only on a background writer thread: a full
+/// PTY buffer is allowed to backpressure that worker, never GTK's main loop.
+pub(crate) fn write_all_fd(fd: RawFd, mut data: &[u8]) -> io::Result<()> {
+    while !data.is_empty() {
+        let written = unsafe { libc::write(fd, data.as_ptr().cast::<libc::c_void>(), data.len()) };
+        if written > 0 {
+            data = &data[written as usize..];
+            continue;
+        }
+        if written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "PTY write returned zero",
+            ));
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Start an ordered, non-UI-blocking writer for a duplicated PTY descriptor.
+///
+/// The queue is deliberately unbounded: terminal input must not be truncated,
+/// and both producers are already paced (human/VTE input or the bounded PTY
+/// reader). Kernel backpressure is isolated to this worker instead of freezing
+/// window input, rendering, and close handling.
+pub(crate) fn spawn_fd_writer(
+    fd: OwnedFd,
+    thread_name: &'static str,
+) -> io::Result<mpsc::Sender<Vec<u8>>> {
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    std::thread::Builder::new()
+        .name(thread_name.to_string())
+        .spawn(move || {
+            for data in rx {
+                if let Err(err) = write_all_fd(fd.as_raw_fd(), &data) {
+                    log::warn!("{thread_name} stopped: {err}");
+                    break;
+                }
+            }
+        })?;
+    Ok(tx)
+}
 
 /// Observe DECSET/DECRST 2004 in a stream that may split an escape sequence
 /// across read chunks. `tail` retains only the bytes needed to bridge the next
@@ -194,8 +247,23 @@ impl OwnedPty {
             }
             Ok(ForkResult::Parent { child }) => {
                 drop(slave);
+                let writer_fd = match master.try_clone() {
+                    Ok(fd) => fd,
+                    Err(error) => {
+                        terminate_terminal_process(child.as_raw());
+                        return Err(error);
+                    }
+                };
+                let input_tx = match spawn_fd_writer(writer_fd, "jterm1-pty-writer") {
+                    Ok(tx) => tx,
+                    Err(error) => {
+                        terminate_terminal_process(child.as_raw());
+                        return Err(error);
+                    }
+                };
                 Ok(OwnedPty {
                     master: Arc::new(std::sync::Mutex::new(Some(master))),
+                    input_tx,
                     pid: child,
                     outgoing_bracketed_paste: AtomicBool::new(false),
                     shell_bracketed_paste: Arc::new(AtomicBool::new(false)),
@@ -230,17 +298,11 @@ impl OwnedPty {
         if safe_data.is_empty() {
             return;
         }
-        if let Ok(guard) = self.master.lock() {
-            if let Some(fd) = guard.as_ref() {
-                let raw = fd.as_raw_fd();
-                unsafe {
-                    libc::write(
-                        raw,
-                        safe_data.as_ptr() as *const libc::c_void,
-                        safe_data.len(),
-                    );
-                }
-            }
+        if let Err(err) = self.input_tx.send(safe_data.into_owned()) {
+            log::warn!(
+                "PTY input queue is closed; discarded {} byte(s)",
+                err.0.len()
+            );
         }
     }
 
@@ -272,11 +334,11 @@ impl OwnedPty {
         F: FnMut(Vec<u8>) + 'static,
         E: FnOnce(i32) + 'static,
     {
-        let fd = match self
+        let reader_fd = match self
             .master
             .lock()
             .ok()
-            .and_then(|guard| guard.as_ref().map(|fd| fd.as_raw_fd()))
+            .and_then(|guard| guard.as_ref().and_then(|fd| fd.try_clone().ok()))
         {
             Some(fd) => fd,
             None => return,
@@ -287,7 +349,7 @@ impl OwnedPty {
         let shell_bracketed_paste = Arc::clone(&self.shell_bracketed_paste);
 
         self.start_reader_timed(
-            fd,
+            reader_fd,
             child_pid,
             tx,
             rx,
@@ -297,9 +359,13 @@ impl OwnedPty {
         );
     }
 
+    // The transport endpoints and the two one-shot callbacks have independent
+    // ownership/lifetimes; a wrapper struct would add indirection without
+    // reducing the unsafe FD boundary this helper centralizes.
+    #[allow(clippy::too_many_arguments)]
     fn start_reader_timed<F, E>(
         &self,
-        fd: RawFd,
+        reader_fd: OwnedFd,
         child_pid: Pid,
         tx: mpsc::SyncSender<PtyMsg>,
         rx: mpsc::Receiver<PtyMsg>,
@@ -311,13 +377,16 @@ impl OwnedPty {
         E: FnOnce(i32) + 'static,
     {
         std::thread::spawn(move || {
-            let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+            // The reader owns a duplicated descriptor. It can never observe a
+            // different file after the model closes and the kernel reuses the
+            // original descriptor number.
+            let mut file = std::fs::File::from(reader_fd);
+            let fd = file.as_raw_fd();
             let mut buf = [0u8; 32 * 1024];
             let mut mode_tail = Vec::with_capacity(BRACKETED_PASTE_ENABLE.len().saturating_sub(1));
             loop {
                 match file.read(&mut buf) {
                     Ok(0) | Err(_) => {
-                        std::mem::forget(file);
                         break;
                     }
                     Ok(n) => {
@@ -331,7 +400,6 @@ impl OwnedPty {
                         );
                         shell_bracketed_paste.store(mode, Ordering::Relaxed);
                         if tx.send(PtyMsg::Data(combined)).is_err() {
-                            std::mem::forget(file);
                             break;
                         }
                     }
@@ -446,6 +514,25 @@ impl Drop for OwnedPty {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_writer_preserves_large_payload_and_order() {
+        let (mut reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let tx = spawn_fd_writer(writer.into(), "jterm1-test-writer").unwrap();
+
+        // Larger than a typical Unix socket buffer: the worker will encounter
+        // kernel backpressure, while both queue sends must return immediately.
+        let payload = vec![0x5a; 2 * 1024 * 1024];
+        tx.send(payload.clone()).unwrap();
+        tx.send(b"tail".to_vec()).unwrap();
+        drop(tx);
+
+        let mut received = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut received).unwrap();
+        assert_eq!(received.len(), payload.len() + 4);
+        assert_eq!(&received[..payload.len()], payload.as_slice());
+        assert_eq!(&received[payload.len()..], b"tail");
+    }
 
     #[test]
     fn unframed_multiline_insert_falls_back_to_first_line_without_shell_support() {

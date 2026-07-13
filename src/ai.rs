@@ -146,6 +146,10 @@ pub(crate) struct AiHandle {
     cancelled: Arc<AtomicBool>,
 }
 
+type AiResult = Result<String, String>;
+type AiResultSlot = Arc<std::sync::Mutex<Option<AiResult>>>;
+type AiCompletion = Box<dyn FnOnce(AiResult)>;
+
 impl AiHandle {
     pub(crate) fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
@@ -159,7 +163,7 @@ pub(crate) fn ask(
     client: AiClient,
     system: String,
     user: String,
-    on_done: impl FnOnce(Result<String, String>) + 'static,
+    on_done: impl FnOnce(AiResult) + 'static,
 ) -> AiHandle {
     let cancelled = Arc::new(AtomicBool::new(false));
     let cancelled_thread = cancelled.clone();
@@ -167,12 +171,11 @@ pub(crate) fn ask(
     // glib::Sender can't carry FnOnce closures portably; use a one-shot
     // channel pattern: thread parks the result behind a Mutex<Option<T>>
     // and a glib idle pulls it on the main thread.
-    let slot: Arc<std::sync::Mutex<Option<Result<String, String>>>> =
-        Arc::new(std::sync::Mutex::new(None));
+    let slot: AiResultSlot = Arc::new(std::sync::Mutex::new(None));
     let slot_thread = slot.clone();
     let slot_main = slot.clone();
     // `on_done` is FnOnce; wrap in Option so the idle closure can take it.
-    let mut on_done_cell: Option<Box<dyn FnOnce(Result<String, String>)>> = Some(Box::new(on_done));
+    let mut on_done_cell: Option<AiCompletion> = Some(Box::new(on_done));
 
     std::thread::spawn(move || {
         let result = run_request(&client, &system, &user);

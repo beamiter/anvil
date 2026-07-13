@@ -21,6 +21,7 @@ pub(crate) enum Action {
     OpenPalette,
     OpenHistoryPalette,
     ToggleSettings,
+    OpenWelcome,
     ToggleSidebar,
     SplitHorizontal,
     SplitVertical,
@@ -87,6 +88,7 @@ impl Action {
             Action::OpenPalette => "Palette: search everything",
             Action::OpenHistoryPalette => "Palette: search history",
             Action::ToggleSettings => "Toggle settings panel",
+            Action::OpenWelcome => "Open welcome & quick start",
             Action::ToggleSidebar => "Toggle sidebar",
             Action::SplitHorizontal => "Split horizontal",
             Action::SplitVertical => "Split vertical",
@@ -160,6 +162,7 @@ impl Action {
             Action::OpenPalette => Some("open_palette"),
             Action::OpenHistoryPalette => Some("open_history_palette"),
             Action::ToggleSettings => Some("toggle_settings"),
+            Action::OpenWelcome => None,
             Action::ToggleSidebar => Some("toggle_sidebar"),
             Action::SplitHorizontal => Some("split_horizontal"),
             Action::SplitVertical => Some("split_vertical"),
@@ -219,6 +222,7 @@ impl Action {
             Action::OpenPalette,
             Action::OpenHistoryPalette,
             Action::ToggleSettings,
+            Action::OpenWelcome,
             Action::ToggleSidebar,
             Action::SplitHorizontal,
             Action::SplitVertical,
@@ -530,19 +534,30 @@ impl KeybindingMap {
                 log::warn!("Keybinding value for {config_key} must be a string");
                 continue;
             };
-
-            // Remove old bindings for this action
-            self.bindings.retain(|_, a| *a != action);
-
-            // Parse and add new binding
-            match parse_key_combo(key_str) {
-                Ok(combo) => {
-                    self.bindings.insert(combo, action);
-                }
+            let combo = match parse_key_combo(key_str) {
+                Ok(combo) => combo,
                 Err(e) => {
+                    // Keep the previous/default binding. A typo in config must
+                    // not make an action unreachable.
                     log::warn!("Invalid keybinding '{key_str}' for {config_key}: {e}");
+                    continue;
+                }
+            };
+            if let Some(existing) = self.bindings.get(&combo).copied() {
+                if existing != action {
+                    // Reject ambiguous overrides instead of silently stealing
+                    // another action's key and leaving it unbound.
+                    log::warn!(
+                        "Keybinding '{key_str}' for {config_key} conflicts with '{}'",
+                        existing.name()
+                    );
+                    continue;
                 }
             }
+
+            // Only mutate after parsing and conflict checks have succeeded.
+            self.bindings.retain(|_, a| *a != action);
+            self.bindings.insert(combo, action);
         }
     }
 
@@ -593,5 +608,27 @@ mod tests {
         let combo = parse_key_combo("ctrl+p").expect("valid");
         assert!(combo.modifiers.contains(ModifierType::CONTROL_MASK));
         assert_eq!(combo.key, Key::p);
+    }
+
+    #[test]
+    fn invalid_override_keeps_default_binding() {
+        let mut map = KeybindingMap::from_defaults();
+        let original = parse_key_combo("Ctrl+Shift+T").unwrap();
+        let table = "new_tab = 'Ctrl+NoSuchModifier+T'"
+            .parse::<toml::Table>()
+            .unwrap();
+        map.apply_user_overrides(&table);
+        assert_eq!(map.lookup(&original), Some(Action::NewTab));
+    }
+
+    #[test]
+    fn conflicting_override_keeps_both_defaults() {
+        let mut map = KeybindingMap::from_defaults();
+        let new_tab = parse_key_combo("Ctrl+Shift+T").unwrap();
+        let paste = parse_key_combo("Ctrl+Shift+V").unwrap();
+        let table = "new_tab = 'Ctrl+Shift+V'".parse::<toml::Table>().unwrap();
+        map.apply_user_overrides(&table);
+        assert_eq!(map.lookup(&new_tab), Some(Action::NewTab));
+        assert_eq!(map.lookup(&paste), Some(Action::Paste));
     }
 }

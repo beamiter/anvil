@@ -45,7 +45,7 @@ pub fn long_block_finished(cmd: &str, exit_code: i32, duration_ms: u64) {
 
     let _ = Command::new("notify-send")
         .args([
-            "--app-name=jterm4",
+            "--app-name=jterm1",
             "--icon=utilities-terminal",
             "--urgency",
             urgency,
