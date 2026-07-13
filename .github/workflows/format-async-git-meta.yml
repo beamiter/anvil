@@ -1,0 +1,41 @@
+name: Format async Git metadata
+
+on:
+  push:
+    branches:
+      - agent/jterm1-async-git-meta
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  format:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/jterm1-async-git-meta
+
+      - name: Install Rustfmt
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Format and remove one-shot workflow
+        run: |
+          cargo fmt --all
+          rm .github/workflows/format-async-git-meta.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/git_meta.rs .github/workflows/format-async-git-meta.yml
+          git commit -m "Format async Git metadata service"
+          git push origin HEAD:agent/jterm1-async-git-meta
+
+      - name: Validate formatted head
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run ci.yml --ref agent/jterm1-async-git-meta
