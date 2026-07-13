@@ -1,0 +1,244 @@
+name: Apply app state module migration
+
+on:
+  push:
+    branches:
+      - agent/jterm1-app-state-modules
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/jterm1-app-state-modules
+
+      - name: Extract messages and workspace state
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          app_msg = r'''//! Top-level Relm4 application messages.
+          //!
+          //! Keeping the event vocabulary separate from the component implementation
+          //! makes the update loop easier to navigate without changing Relm4 ownership.
+
+          use crate::keybindings::Action;
+
+          #[derive(Debug, Clone)]
+          pub(crate) enum AppMsg {
+              NewTab,
+              CloseTab(u64),
+              ForceCloseTab(u64),
+              ForceClosePane(u64),
+              SelectTab(u64),
+              NextTab,
+              PrevTab,
+              ToggleSidebar,
+              Quit,
+              ForceQuit,
+              Toast(String),
+              CopyOutputOnly,
+              Action(Action),
+              ReloadConfig,
+              PaneExited(u64, u64, i32),
+              PaneCwdChanged(u64, u64, String),
+              PaneRemoteSessionId(u64, String),
+              RemoteReconnectTick(u64, u64),
+              RemoteReconnectNow(u64, u32),
+              PaneFocused(u64, u64),
+              TitleChanged(u64, String),
+              Bell(u64),
+              Activity(u64),
+              SettingsTheme(usize),
+              SettingsFontDesc(String),
+              SettingsFontScale(f64),
+              SettingsOpacity(f64),
+              SettingsScrollback(u32),
+              SettingsTerminalMode(usize),
+              SettingsBlockCompact(bool),
+              SettingsCommandHistory(bool),
+              SettingsAiEnabled(bool),
+              SettingsAgentEnabled(bool),
+              SettingsNotifications(bool),
+              SettingsRemoteClipboard(bool),
+              SearchChanged(String),
+              SearchNext,
+              SearchPrev,
+              SearchClose,
+              SetTabWidth(u32),
+              RenameTab(u64, String),
+              ReorderTab(u64, usize),
+              TabRowAction(u64, crate::tab_strip::TabAction),
+              SetTabFilter(String),
+              FileTreeActivateFile(String),
+              OpenNotebook(std::path::PathBuf),
+              OpenAgent,
+              AgentSend(String),
+              AgentApprove(usize),
+              AgentReject(usize),
+              AgentEditAndApprove(usize, String),
+              AgentEditRequested(usize, String),
+              AgentLlmReply(Result<String, String>),
+              AgentBlockFinished {
+                  tab_id: u64,
+                  pane_id: u64,
+                  command: String,
+                  exit_code: i32,
+                  output_sample: String,
+              },
+              AgentClose,
+              FileTreeGotoCwd,
+              FileTreeGoUp,
+              SetSidebarView(crate::config::SidebarView),
+              PaletteTypeCommand(String),
+              PaletteAskAi(String),
+              OpenAiPanel,
+              PaletteRunWorkflow(std::path::PathBuf),
+              Ignore,
+          }
+          '''
+
+          workspace = r'''//! Pane and tab controller state owned by the Relm4 application model.
+          //!
+          //! These types still hold GTK widgets and Relm4 controllers; the extraction is
+          //! an ownership boundary, not a second UI framework or an alternate state loop.
+
+          use relm4::gtk;
+          use relm4::gtk::prelude::*;
+          use relm4::prelude::Controller;
+
+          use crate::config::{self, TerminalMode};
+          use crate::process;
+          use crate::terminal::{self, BlockTerminal, VteInput, VteTerminal};
+
+          /// Backend-neutral controller used by pane-management code.
+          pub(crate) enum TermCtl {
+              Vte(Controller<VteTerminal>),
+              Block(Controller<BlockTerminal>),
+          }
+
+          impl TermCtl {
+              pub(crate) fn emit(&self, msg: VteInput) {
+                  match self {
+                      Self::Vte(controller) => controller.emit(msg),
+                      Self::Block(controller) => controller.emit(msg),
+                  }
+              }
+
+              pub(crate) fn widget(&self) -> gtk::Widget {
+                  match self {
+                      Self::Vte(controller) => controller.widget().clone().upcast(),
+                      Self::Block(controller) => controller.widget().clone().upcast(),
+                  }
+              }
+          }
+
+          pub(crate) struct Pane {
+              pub(crate) terminal: TermCtl,
+              pub(crate) id: u64,
+              pub(crate) cwd: Option<String>,
+              pub(crate) mode: TerminalMode,
+              pub(crate) probe: terminal::PaneProbe,
+          }
+
+          impl Pane {
+              /// A restorable command running in this pane, or `None` when the
+              /// foreground process is the pane's normal shell.
+              pub(crate) fn restorable_command(&self) -> Option<String> {
+                  process::restorable_command(self.probe.pty_fd.get(), self.probe.shell_pid.get())
+              }
+
+              pub(crate) fn foreground_process(&self) -> Option<String> {
+                  process::foreground_process_name(
+                      self.probe.pty_fd.get(),
+                      self.probe.shell_pid.get(),
+                  )
+              }
+          }
+
+          #[derive(Clone, Copy, PartialEq, Eq)]
+          pub(crate) enum ConnStatus {
+              Connecting,
+              Connected,
+              Disconnected,
+          }
+
+          #[derive(Clone)]
+          pub(crate) struct RemoteConn {
+              pub(crate) host: config::RemoteHost,
+              pub(crate) status: ConnStatus,
+              pub(crate) attempt: u32,
+              pub(crate) spawn_at: std::time::Instant,
+          }
+
+          /// Saved tree position of the active pane while a tab is pane-zoomed.
+          pub(crate) struct ZoomState {
+              pub(crate) tree_root: gtk::Widget,
+              pub(crate) pane_widget: gtk::Widget,
+              pub(crate) parent: gtk::Paned,
+              pub(crate) was_start: bool,
+          }
+
+          pub(crate) struct Tab {
+              pub(crate) holder: gtk::Box,
+              pub(crate) panes: Vec<Pane>,
+              pub(crate) active_pane: usize,
+              pub(crate) title: String,
+              pub(crate) custom_title: bool,
+              pub(crate) bell: bool,
+              pub(crate) activity: bool,
+              pub(crate) marked: bool,
+              pub(crate) pinned: bool,
+              pub(crate) id: u64,
+              pub(crate) zoom: Option<ZoomState>,
+              pub(crate) remote: Option<RemoteConn>,
+          }
+          '''
+
+          Path('src/app_msg.rs').write_text(app_msg, encoding='utf-8')
+          Path('src/workspace.rs').write_text(workspace, encoding='utf-8')
+
+          path = Path('src/main.rs')
+          text = path.read_text(encoding='utf-8')
+
+          text = text.replace('mod agent;\n', 'mod agent;\nmod app_msg;\n', 1)
+          text = text.replace('mod workflows;\n', 'mod workflows;\nmod workspace;\n', 1)
+          text = text.replace(
+              'use config::{choose_shell_argv, config_file_path, load_config, Config, TerminalMode, Theme};\n',
+              'use app_msg::AppMsg;\nuse config::{choose_shell_argv, config_file_path, load_config, Config, TerminalMode, Theme};\n',
+              1,
+          )
+          terminal_use = (
+              'use terminal::{default_tab_title, BlockTerminal, VteInit, VteInput, VteOutput, VteTerminal};\n'
+          )
+          text = text.replace(
+              terminal_use,
+              terminal_use
+              + 'use workspace::{ConnStatus, Pane, RemoteConn, Tab, TermCtl, ZoomState};\n',
+              1,
+          )
+
+          msg_start = text.index('#[derive(Debug, Clone)]\nenum AppMsg {')
+          msg_end = text.index('\n/// Holds either backend;', msg_start)
+          text = text[:msg_start] + text[msg_end:]
+
+          state_start = text.index('/// Holds either backend;')
+          state_end = text.index('// `file_tree_store:', state_start)
+          text = text[:state_start] + text[state_end:]
+
+          path.write_text(text, encoding='utf-8')
+          PY
+
+          cargo fmt --all
+          rm .github/workflows/apply-app-state-modules.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/main.rs src/app_msg.rs src/workspace.rs .github/workflows/apply-app-state-modules.yml
+          git commit -m "Extract Relm4 app messages and workspace state"
+          git push origin HEAD:agent/jterm1-app-state-modules
