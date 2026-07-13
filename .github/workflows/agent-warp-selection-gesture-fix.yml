@@ -27,66 +27,20 @@ jobs:
 
           path = Path('src/block_view/mod.rs')
           text = path.read_text()
-          old = '''        if y <= header_for_click.height() as f64 || shift {
-              active_for_click.borrow().grab_focus();
-              let finished = finished_blocks_for_select.borrow();
-              if ctrl && shift {
-                  toggle_finished_block_selection(
-                      &finished,
-                      &selected_ids_for_click,
-                      &selected_for_click,
-                      &anchor_for_click,
-                      this_id,
-                  );
-              } else if shift {
-                  select_finished_block_range(
-                      &finished,
-                      &selected_ids_for_click,
-                      &selected_for_click,
-                      &anchor_for_click,
-                      this_id,
-                  );
-              } else {
-                  replace_finished_block_selection(
-                      &finished,
-                      &selected_ids_for_click,
-                      &selected_for_click,
-                      &anchor_for_click,
-                      Some(this_id),
-                  );
-              }
-          }
-          gesture.set_state(gtk::EventSequenceState::Denied);'''
-          new = '''        let over_terminal_surface = y > header_for_click.height() as f64;
-          if !over_terminal_surface || shift {
-              active_for_click.borrow().grab_focus();
-              let finished = finished_blocks_for_select.borrow();
-              if ctrl && shift {
-                  toggle_finished_block_selection(
-                      &finished,
-                      &selected_ids_for_click,
-                      &selected_for_click,
-                      &anchor_for_click,
-                      this_id,
-                  );
-              } else if shift {
-                  select_finished_block_range(
-                      &finished,
-                      &selected_ids_for_click,
-                      &selected_for_click,
-                      &anchor_for_click,
-                      this_id,
-                  );
-              } else {
-                  replace_finished_block_selection(
-                      &finished,
-                      &selected_ids_for_click,
-                      &selected_for_click,
-                      &anchor_for_click,
-                      Some(this_id),
-                  );
-              }
-          }
+
+          old = '''        let shift = state.contains(gtk::gdk::ModifierType::SHIFT_MASK);
+          if y <= header_for_click.height() as f64 || shift {'''
+          new = '''        let shift = state.contains(gtk::gdk::ModifierType::SHIFT_MASK);
+          let over_terminal_surface = y > header_for_click.height() as f64;
+          if !over_terminal_surface || shift {'''
+          if text.count(old) != 1:
+              raise SystemExit(f'gesture condition: expected one match, found {text.count(old)}')
+          text = text.replace(old, new, 1)
+
+          old = '''        }
+          gesture.set_state(gtk::EventSequenceState::Denied);
+      });'''
+          new = '''        }
           // A modifier click on command/output is a block-selection gesture, not
           // the start of a native VTE text selection. Header clicks still proceed
           // so collapse/action buttons can receive their own click sequence.
@@ -94,10 +48,10 @@ jobs:
               gtk::EventSequenceState::Claimed
           } else {
               gtk::EventSequenceState::Denied
-          });'''
-          count = text.count(old)
-          if count != 1:
-              raise SystemExit(f'gesture block: expected one match, found {count}')
+          });
+      });'''
+          if text.count(old) != 1:
+              raise SystemExit(f'gesture final state: expected one match, found {text.count(old)}')
           path.write_text(text.replace(old, new, 1))
           PY
           cargo fmt --all
