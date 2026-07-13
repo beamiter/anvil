@@ -9,12 +9,13 @@
 //!
 //! Privacy: nothing leaves the machine without an explicit user action
 //! (clicking an Explain button, typing into the panel, hitting `?` in the
-//! palette). Block output passed to the cloud LLM is bounded (head/tail)
-//! by the caller before reaching us.
+//! palette). AI-bound text is bounded by callers and scrubbed for common
+//! high-confidence secret formats immediately before the request is started.
 
+use regex::Regex;
 use relm4::gtk;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use gtk::glib;
@@ -22,6 +23,53 @@ use gtk::glib;
 /// Default cap on response tokens for any AI call. Keeps explanations
 /// terse and bounds cost.
 const MAX_TOKENS: u32 = 600;
+
+/// Conservative, high-confidence patterns for credentials that commonly appear
+/// in terminal output. Avoid generic hashes so git SHAs and build IDs survive.
+fn secret_patterns() -> &'static [(&'static str, Regex)] {
+    static PATTERNS: OnceLock<Vec<(&'static str, Regex)>> = OnceLock::new();
+    PATTERNS.get_or_init(|| {
+        [
+            (
+                "private-key",
+                r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+            ),
+            ("aws-access-key", r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+            ("github-pat", r"\bgithub_pat_[A-Za-z0-9_]{82}\b"),
+            ("github-token", r"\bgh[opusr]_[A-Za-z0-9]{36,}\b"),
+            ("slack-token", r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b"),
+            (
+                "jwt",
+                r"\beyJ[A-Za-z0-9_=-]{8,}\.eyJ[A-Za-z0-9_=-]{8,}\.[A-Za-z0-9_=.+/-]{8,}\b",
+            ),
+            ("anthropic-key", r"\bsk-ant-[A-Za-z0-9_-]{20,}\b"),
+            ("openai-key", r"\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b"),
+        ]
+        .into_iter()
+        .map(|(kind, pattern)| {
+            (
+                kind,
+                Regex::new(pattern).expect("AI secret-redaction pattern must compile"),
+            )
+        })
+        .collect()
+    })
+}
+
+/// Scrub secrets while preserving the original allocation when no pattern
+/// matches, which is the overwhelmingly common path.
+fn redact_secrets_owned(mut input: String) -> String {
+    for (kind, regex) in secret_patterns() {
+        if !regex.is_match(&input) {
+            continue;
+        }
+        let replacement = format!("[REDACTED:{kind}]");
+        input = regex
+            .replace_all(&input, replacement.as_str())
+            .into_owned();
+    }
+    input
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Provider {
@@ -167,6 +215,11 @@ pub(crate) fn ask(
 ) -> AiHandle {
     let cancelled = Arc::new(AtomicBool::new(false));
     let cancelled_thread = cancelled.clone();
+
+    // Scrub at the common provider boundary so every AI surface — explain,
+    // palette, session Q&A, and agent mode — gets identical protection.
+    let system = redact_secrets_owned(system);
+    let user = redact_secrets_owned(user);
 
     // glib::Sender can't carry FnOnce closures portably; use a one-shot
     // channel pattern: thread parks the result behind a Mutex<Option<T>>
@@ -327,11 +380,28 @@ fn call_ollama(client: &AiClient, system: &str, user: &str) -> Result<String, St
     }
 }
 
+fn floor_char_boundary(s: &str, index: usize) -> usize {
+    let mut index = index.min(s.len());
+    while index > 0 && !s.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn ceil_char_boundary(s: &str, index: usize) -> usize {
+    let mut index = index.min(s.len());
+    while index < s.len() && !s.is_char_boundary(index) {
+        index += 1;
+    }
+    index
+}
+
 fn trim_for_log(s: &str) -> String {
     if s.len() <= 256 {
         s.to_string()
     } else {
-        format!("{}…", &s[..256])
+        let end = floor_char_boundary(s, 256);
+        format!("{}…", &s[..end])
     }
 }
 
@@ -344,11 +414,14 @@ fn sample_output(output: &str, max_bytes: usize) -> String {
         return output.to_string();
     }
     let half = max_bytes / 2;
-    let head = &output[..half];
-    let tail = &output[output.len() - half..];
+    let head_end = floor_char_boundary(output, half);
+    let tail_start = ceil_char_boundary(output, output.len().saturating_sub(half));
+    let head = &output[..head_end];
+    let tail = &output[tail_start..];
+    let retained = head.len().saturating_add(tail.len());
     format!(
         "{head}\n\n… [{} bytes elided] …\n\n{tail}",
-        output.len() - max_bytes
+        output.len().saturating_sub(retained)
     )
 }
 
@@ -456,6 +529,39 @@ mod tests {
         let s = sample_output(&big, 1000);
         assert!(s.len() < 1500);
         assert!(s.contains("elided"));
+    }
+
+    #[test]
+    fn sample_output_is_safe_at_multibyte_boundaries() {
+        let big = "编译失败🙂".repeat(2_000);
+        let sampled = sample_output(&big, 1_001);
+        assert!(sampled.contains("elided"));
+        assert!(sampled.starts_with('编'));
+        assert!(sampled.ends_with('🙂'));
+    }
+
+    #[test]
+    fn log_trimming_is_safe_at_multibyte_boundaries() {
+        let input = "界".repeat(100);
+        let trimmed = trim_for_log(&input);
+        assert!(trimmed.ends_with('…'));
+        assert!(trimmed.len() <= 259);
+    }
+
+    #[test]
+    fn ai_context_redacts_high_confidence_secrets() {
+        let token = format!("ghp_{}", "A".repeat(36));
+        let input = format!("git remote contains {token}");
+        let redacted = redact_secrets_owned(input);
+        assert!(redacted.contains("[REDACTED:github-token]"));
+        assert!(!redacted.contains("ghp_"));
+    }
+
+    #[test]
+    fn ai_context_keeps_git_hashes_and_uuids() {
+        let input =
+            "commit deadbeefcafef00d1234567890abcdef01234567 uuid 550e8400-e29b-41d4-a716-446655440000";
+        assert_eq!(redact_secrets_owned(input.to_string()), input);
     }
 
     #[test]
