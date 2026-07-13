@@ -64,9 +64,7 @@ fn redact_secrets_owned(mut input: String) -> String {
             continue;
         }
         let replacement = format!("[REDACTED:{kind}]");
-        input = regex
-            .replace_all(&input, replacement.as_str())
-            .into_owned();
+        input = regex.replace_all(&input, replacement.as_str()).into_owned();
     }
     input
 }
