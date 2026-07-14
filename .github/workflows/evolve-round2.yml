@@ -4,13 +4,18 @@ on:
   push:
     branches:
       - agent/resilience-observability-evolution
+  pull_request:
+    branches:
+      - master
+    types:
+      - synchronize
   workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
-  group: resilience-evolution-${{ github.ref }}
+  group: resilience-evolution-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -100,12 +105,12 @@ jobs:
           git commit -m "Add resilient startup, diagnostics, and security tooling"
 
           for attempt in 1 2 3; do
+            git fetch origin agent/resilience-observability-evolution
+            git rebase origin/agent/resilience-observability-evolution
             if git push origin HEAD:agent/resilience-observability-evolution; then
               exit 0
             fi
-            echo "Push attempt ${attempt} failed; rebasing onto the current branch tip."
-            git fetch origin agent/resilience-observability-evolution
-            git rebase origin/agent/resilience-observability-evolution
+            echo "Push attempt ${attempt} failed; retrying after refresh."
           done
           echo "Unable to publish the generated commit after three attempts." >&2
           exit 1
