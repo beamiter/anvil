@@ -1,6 +1,6 @@
 Traceback (most recent call last):
-  File "/home/runner/work/jterm1/jterm1/scripts/evolve_round2.py", line 1234, in <module>
+  File "/home/runner/work/jterm1/jterm1/scripts/evolve_round2.py", line 1317, in <module>
     replace_once(
   File "/home/runner/work/jterm1/jterm1/scripts/evolve_round2.py", line 26, in replace_once
     raise RuntimeError(f"{path}: expected one match, found {count}: {old[:80]!r}")
-RuntimeError: README.md: expected one match, found 0: 'make clippy    # repository lint policy\n'
+RuntimeError: CONTRIBUTING.md: expected one match, found 2: 'make verify\n```\n'
