@@ -1,0 +1,39 @@
+name: One-shot rustfmt
+
+on:
+  push:
+    branches:
+      - agent/production-readiness-evolution
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out upgrade branch
+        uses: actions/checkout@v5
+        with:
+          ref: agent/production-readiness-evolution
+          fetch-depth: 0
+
+      - name: Install rustfmt
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+
+      - name: Format and commit
+        run: |
+          cargo fmt --all
+          if git diff --quiet; then
+            echo "No formatting changes were required."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- '*.rs'
+          git commit -m "Apply rustfmt"
+          git push origin HEAD:agent/production-readiness-evolution
