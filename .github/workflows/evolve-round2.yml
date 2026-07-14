@@ -1,0 +1,48 @@
+name: One-shot resilience evolution
+
+on:
+  push:
+    branches:
+      - agent/resilience-observability-evolution
+
+permissions:
+  contents: write
+
+jobs:
+  evolve:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out evolution branch
+        uses: actions/checkout@v5
+        with:
+          ref: agent/resilience-observability-evolution
+          fetch-depth: 0
+
+      - name: Install formatting toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+
+      - name: Apply deterministic migration
+        run: python3 scripts/evolve_round2.py
+
+      - name: Format and validate generated sources
+        run: |
+          cargo fmt --all
+          python3 -m py_compile scripts/evolve_round2.py
+          bash -n scripts/*.sh packaging/*.sh
+          git diff --check
+
+      - name: Commit evolved source
+        run: |
+          if git diff --quiet && [[ -z "$(git ls-files --others --exclude-standard)" ]]; then
+            echo "No migration changes were produced."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Add resilient startup, diagnostics, and security tooling"
+          git push origin HEAD:agent/resilience-observability-evolution
