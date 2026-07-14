@@ -33,7 +33,21 @@ jobs:
           rustup default stable
 
       - name: Apply deterministic migration
-        run: python3 scripts/evolve_round2.py
+        run: |
+          set +e
+          python3 scripts/evolve_round2.py >migration.log 2>&1
+          status=$?
+          cat migration.log
+          if (( status != 0 )); then
+            mkdir -p .github
+            cp migration.log .github/evolve-round2-error.log
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add .github/evolve-round2-error.log
+            git commit -m "Capture resilience migration failure"
+            git push origin HEAD:agent/resilience-observability-evolution
+            exit "${status}"
+          fi
 
       - name: Format and validate generated sources
         run: |
