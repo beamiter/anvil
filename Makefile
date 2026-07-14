@@ -1,25 +1,27 @@
 # jterm1 Makefile
 # Convenience wrapper for common development tasks
 
-.PHONY: help build run test check fmt clippy clean install dev watch benchmark debug
+.PHONY: help build run test check fmt clippy verify package clean install dev watch benchmark debug
 
 help:
 	@echo "jterm1 Development Commands"
 	@echo "==========================="
 	@echo ""
 	@echo "Build Commands:"
-	@echo "  make build      - Build release version"
+	@echo "  make build      - Build the optimized release binary"
 	@echo "  make run        - Run in development mode"
-	@echo "  make install    - Install to ~/.local/bin"
+	@echo "  make install    - Build and install to the current user account"
+	@echo "  make package    - Build a portable release archive and checksum"
 	@echo ""
 	@echo "Quality Commands:"
 	@echo "  make test       - Run all tests"
 	@echo "  make check      - Check code without building"
 	@echo "  make fmt        - Format code"
-	@echo "  make clippy     - Lint code"
+	@echo "  make clippy     - Run the repository lint policy"
+	@echo "  make verify     - Run the complete local quality gate"
 	@echo ""
 	@echo "Development:"
-	@echo "  make dev        - Run dev script"
+	@echo "  make dev        - Run the development helper"
 	@echo "  make watch      - Watch for changes and rebuild"
 	@echo "  make benchmark  - Run performance benchmarks"
 	@echo "  make debug      - Show debug information"
@@ -45,6 +47,12 @@ fmt:
 
 clippy:
 	@./scripts/dev.sh clippy
+
+verify:
+	@./scripts/dev.sh verify
+
+package:
+	@./scripts/dev.sh package
 
 clean:
 	@./scripts/dev.sh clean
