@@ -135,6 +135,16 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
         }
         index += 1;
     }
+
+    if launch.safe_mode {
+        if launch.mode.is_some() {
+            return Err("--safe-mode cannot be combined with --mode".to_string());
+        }
+        if launch.execute.is_some() {
+            return Err("--safe-mode cannot be combined with --execute".to_string());
+        }
+    }
+
     Ok(Command::Run(launch))
 }
 
@@ -157,7 +167,7 @@ Launch options:
   -e, --execute COMMAND ...    Run a command instead of the configured shell
       --mode block|vte         Override the terminal backend for this window
       --no-restore             Start a fresh workspace
-      --safe-mode             Use isolated VTE defaults without restore or persistence
+      --safe-mode              Use isolated VTE defaults without restore or persistence
 
 Utilities:
       --doctor [--json]        Check configuration and runtime dependencies
@@ -268,5 +278,16 @@ mod tests {
         assert!(options.safe_mode);
         assert!(options.no_restore);
         assert!(options.execute.is_none());
+        assert!(options.mode.is_none());
+    }
+
+    #[test]
+    fn safe_mode_rejects_backend_and_execute_overrides() {
+        assert!(parse_strs(&["--safe-mode", "--mode", "block"])
+            .unwrap_err()
+            .contains("--mode"));
+        assert!(parse_strs(&["--safe-mode", "--execute", "bash"])
+            .unwrap_err()
+            .contains("--execute"));
     }
 }
