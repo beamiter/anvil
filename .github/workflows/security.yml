@@ -1,0 +1,56 @@
+name: Security
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dependency-and-shell-audit:
+    name: Dependency and shell audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        run: |
+          rustup show
+          rustc --version
+          cargo --version
+
+      - name: Cache Cargo data
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-security-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-security-
+
+      - name: Install audit tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes shellcheck
+          if ! command -v cargo-audit >/dev/null 2>&1; then
+            cargo install cargo-audit --locked
+          fi
+
+      - name: Audit dependencies and shell scripts
+        run: bash scripts/security-check.sh
