@@ -29,9 +29,7 @@ fn command_for_review(response: &str) -> Result<String, &'static str> {
         return Err("AI returned an empty command; nothing was inserted.");
     }
     if command.chars().any(char::is_control) {
-        return Err(
-            "AI returned a multi-line or control-character command; nothing was inserted.",
-        );
+        return Err("AI returned a multi-line or control-character command; nothing was inserted.");
     }
     Ok(command.to_string())
 }
@@ -104,10 +102,7 @@ mod tests {
 
     #[test]
     fn accepts_one_printable_command() {
-        assert_eq!(
-            command_for_review("  printf 'ok'  ").unwrap(),
-            "printf 'ok'"
-        );
+        assert_eq!(command_for_review("  printf 'ok'  ").unwrap(), "printf 'ok'");
     }
 
     #[test]
