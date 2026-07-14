@@ -1,55 +1,4 @@
-from pathlib import Path
-import re
-
-main_path = Path("src/main.rs")
-text = main_path.read_text()
-
-if "mod action_ops;\n" not in text:
-    text = text.replace("mod agent;\n", "mod action_ops;\nmod agent;\n", 1)
-if "mod settings_ops;\n" not in text:
-    text = text.replace("mod session;\n", "mod session;\nmod settings_ops;\n", 1)
-
-# Extract the contiguous action-dispatch implementation. These remain inherent
-# methods on the same Relm4 AppModel; only their source file changes.
-start = text.find("    fn set_font_scale_all(")
-end = text.find("    fn reload_config(", start)
-if start < 0 or end < 0:
-    raise SystemExit("action operation markers not found")
-action_block = text[start:end]
-action_block = re.sub(r"^    fn ", "    pub(crate) fn ", action_block, flags=re.MULTILINE)
-action_module = '''//! Keyboard action dispatch and live view controls.\n//!\n//! This is an inherent implementation of the existing Relm4 `AppModel`. The\n//! extraction changes file ownership only; `Component::update` remains the single\n//! application message loop.\n\nuse super::*;\n\nimpl AppModel {\n''' + action_block + "}\n"
-Path("src/action_ops.rs").write_text(action_module)
-text = text[:start] + text[end:]
-
-# Replace the large settings arms with focused method calls. Keeping the message
-# variants in AppMsg preserves the current Relm4 input contract.
-settings_start = text.find("            AppMsg::SettingsTheme(idx) => {")
-settings_end = text.find("            AppMsg::SearchChanged(text) => {", settings_start)
-if settings_start < 0 or settings_end < 0:
-    raise SystemExit("settings dispatch markers not found")
-settings_dispatch = '''            AppMsg::SettingsTheme(idx) => self.apply_settings_theme(idx),
-            AppMsg::SettingsFontDesc(desc) => self.apply_settings_font_desc(desc),
-            AppMsg::SettingsFontScale(scale) => self.apply_settings_font_scale(scale),
-            AppMsg::SettingsOpacity(opacity) => self.apply_settings_opacity(opacity),
-            AppMsg::SettingsScrollback(lines) => self.apply_settings_scrollback(lines),
-            AppMsg::SettingsTerminalMode(mode) => self.apply_settings_terminal_mode(mode),
-            AppMsg::SettingsBlockCompact(enabled) => self.apply_settings_block_compact(enabled),
-            AppMsg::SettingsCommandHistory(enabled) => {
-                self.apply_settings_command_history(enabled)
-            }
-            AppMsg::SettingsAiEnabled(enabled) => self.apply_settings_ai_enabled(enabled),
-            AppMsg::SettingsAgentEnabled(enabled) => self.apply_settings_agent_enabled(enabled),
-            AppMsg::SettingsNotifications(enabled) => {
-                self.apply_settings_notifications(enabled)
-            }
-            AppMsg::SettingsRemoteClipboard(enabled) => {
-                self.apply_settings_remote_clipboard(enabled)
-            }
-'''
-text = text[:settings_start] + settings_dispatch + text[settings_end:]
-main_path.write_text(text)
-
-settings_module = r'''//! Settings mutations and live propagation to existing panes.
+//! Settings mutations and live propagation to existing panes.
 //!
 //! Settings continue to arrive as `AppMsg` variants through the same Relm4
 //! component update loop. These methods only isolate the mutation and broadcast
@@ -166,5 +115,3 @@ impl AppModel {
         self.show_toast("Clipboard policy will apply to new panes.");
     }
 }
-'''
-Path("src/settings_ops.rs").write_text(settings_module)
