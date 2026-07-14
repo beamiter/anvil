@@ -190,7 +190,7 @@ impl AppModel {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     tab.marked = !tab.marked;
                 }
-                self.rebuild_tab_strip(sender);
+                self.sync_tab_strip();
             }
             Action::ToggleTabPinned => {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
@@ -251,6 +251,21 @@ impl AppModel {
             Action::ClearBlockFilter => {
                 if let Some(t) = self.active_terminal() {
                     t.emit(VteInput::ClearBlockFilter);
+                }
+            }
+            Action::SelectAllBlocks => {
+                if let Some(t) = self.active_terminal() {
+                    t.emit(VteInput::SelectAllBlocks);
+                }
+            }
+            Action::ClearBlocks => {
+                if let Some(t) = self.active_terminal() {
+                    t.emit(VteInput::ClearBlocks);
+                }
+            }
+            Action::ReinputSelectedCommands => {
+                if let Some(t) = self.active_terminal() {
+                    t.emit(VteInput::ReinputSelectedCommands);
                 }
             }
             Action::QuickSwitchTab(n) => {

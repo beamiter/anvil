@@ -89,6 +89,7 @@ struct AppModel {
     file_tree_store: gtk::TreeStore,
     file_header: Controller<sidebar::FileHeaderModel>,
     file_tree_root: Rc<RefCell<std::path::PathBuf>>,
+    file_tree_scan_generation: Rc<std::cell::Cell<u64>>,
     tab_strip_scroll: gtk::ScrolledWindow,
     top_tab_scroll: gtk::ScrolledWindow,
     top_bar: Controller<top_bar::TopBarModel>,
@@ -305,6 +306,7 @@ impl SimpleComponent for AppModel {
             store: file_tree_store,
             scroll: file_tree_scroll,
             header: file_header,
+            scan_generation: file_tree_scan_generation,
         } = startup_ui::build_file_tree(&sender);
 
         let sidebar_width = config.borrow().sidebar_width as i32;
@@ -568,6 +570,7 @@ impl SimpleComponent for AppModel {
             file_tree_store: file_tree_store.clone(),
             file_header,
             file_tree_root: Rc::new(RefCell::new(std::path::PathBuf::new())),
+            file_tree_scan_generation,
             tab_strip_scroll: tab_strip_scroll.clone(),
             top_tab_scroll: top_tab_scroll.clone(),
             top_bar,
@@ -756,7 +759,7 @@ impl SimpleComponent for AppModel {
             AppMsg::ReloadConfig => self.reload_config(&sender),
             AppMsg::SetTabWidth(width) => {
                 self.config.borrow_mut().tab_width = width.clamp(MIN_TAB_WIDTH, MAX_TAB_WIDTH);
-                self.rebuild_tab_strip(&sender);
+                self.sync_tab_strip();
                 self.persist_config();
             }
             AppMsg::PaneExited(tab_id, pane_id, code) => {
@@ -771,7 +774,7 @@ impl SimpleComponent for AppModel {
                 if let Some(idx) = self.index_of(id) {
                     if let Some(conn) = self.tabs[idx].remote.as_ref() {
                         self.tabs[idx].title = format!("{} — reconnect {secs}s", conn.host.name);
-                        self.rebuild_tab_strip(&sender);
+                        self.sync_tab_strip();
                     }
                 }
             }
@@ -781,11 +784,13 @@ impl SimpleComponent for AppModel {
             AppMsg::PaneCwdChanged(_, pane_id, path) => {
                 if let Some((ti, pi)) = self.find_pane(pane_id) {
                     self.tabs[ti].panes[pi].cwd = Some(path.clone());
-                    self.mark_remote_connected(ti, &sender);
+                    let connection_changed = self.mark_remote_connected(ti);
                     if self.tabs[ti].active_pane == pi && !self.tabs[ti].custom_title {
                         let number = ti as u32 + 1;
                         self.tabs[ti].title = default_tab_title(number, Some(&path));
                         self.rebuild_tab_strip(&sender);
+                    } else if connection_changed {
+                        self.sync_tab_strip();
                     }
                 }
             }
@@ -829,16 +834,19 @@ impl SimpleComponent for AppModel {
                 if let Some(idx) = self.index_of(id) {
                     if idx != self.active {
                         self.tabs[idx].bell = true;
-                        self.rebuild_tab_strip(&sender);
+                        self.sync_tab_strip();
                     }
                 }
             }
             AppMsg::Activity(id) => {
                 if let Some(idx) = self.index_of(id) {
-                    self.mark_remote_connected(idx, &sender);
+                    let mut changed = self.mark_remote_connected(idx);
                     if idx != self.active && !self.tabs[idx].activity {
                         self.tabs[idx].activity = true;
-                        self.rebuild_tab_strip(&sender);
+                        changed = true;
+                    }
+                    if changed {
+                        self.sync_tab_strip();
                     }
                 }
             }
@@ -912,7 +920,7 @@ impl SimpleComponent for AppModel {
             }
             AppMsg::SetTabFilter(text) => {
                 self.tab_filter = text;
-                self.rebuild_tab_strip(&sender);
+                self.sync_tab_strip();
             }
             AppMsg::FileTreeActivateFile(path) => {
                 if let Some(term) = self.active_terminal() {

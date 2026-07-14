@@ -3,19 +3,19 @@
 use relm4::factory::{DynamicIndex, FactoryComponent, FactorySender};
 use relm4::gtk;
 use relm4::gtk::prelude::*;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use crate::{MAX_TAB_WIDTH, MIN_TAB_WIDTH};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConnectionState {
     Connecting,
     Connected,
     Disconnected,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TabRowInit {
     pub(crate) id: u64,
     pub(crate) target_index: usize,
@@ -34,6 +34,7 @@ pub(crate) struct TabRowInit {
 #[derive(Debug)]
 pub(crate) enum TabRowMsg {
     SetTitle(String),
+    Sync(TabRowInit),
 }
 
 #[derive(Debug)]
@@ -68,6 +69,30 @@ pub(crate) struct TabRow {
     remote_hosts: Vec<(u8, String)>,
     tab_width: u32,
     sidebar: bool,
+    action_state: Rc<RefCell<TabRowActionState>>,
+}
+
+#[derive(Debug, Clone)]
+struct TabRowActionState {
+    target_index: usize,
+    title: String,
+    marked: bool,
+    pinned: bool,
+    remote_hosts: Vec<(u8, String)>,
+    tab_width: u32,
+}
+
+impl TabRowActionState {
+    fn from_init(init: &TabRowInit) -> Self {
+        Self {
+            target_index: init.target_index,
+            title: init.title.clone(),
+            marked: init.marked,
+            pinned: init.pinned,
+            remote_hosts: init.remote_hosts.clone(),
+            tab_width: init.tab_width,
+        }
+    }
 }
 
 #[relm4::factory(pub(crate))]
@@ -81,21 +106,28 @@ impl FactoryComponent for TabRow {
     view! {
         root = gtk::Box {
             set_orientation: gtk::Orientation::Horizontal,
+            #[watch]
             set_hexpand: self.sidebar,
+            #[watch]
             set_css_classes: &self.row_classes(),
 
             gtk::Label {
                 set_label: "\u{25CF}",
+                #[watch]
                 set_visible: self.connection.is_some(),
+                #[watch]
                 set_css_classes: &self.connection_classes(),
             },
 
             #[name(select_button)]
             gtk::ToggleButton {
                 set_widget_name: &format!("tab-{}", self.id),
+                #[watch]
                 set_active: self.active,
+                #[watch]
                 set_hexpand: self.sidebar,
                 set_width_request: -1,
+                #[watch]
                 set_css_classes: &self.button_classes(),
                 #[watch]
                 set_tooltip_text: Some(&self.title),
@@ -142,9 +174,15 @@ impl FactoryComponent for TabRow {
 
                 add_controller = gtk::GestureClick {
                     set_button: gtk::gdk::BUTTON_PRIMARY,
-                    connect_pressed[sender, select_button, id = self.id, title = self.title.clone()] =>
+                    connect_pressed[
+                        sender,
+                        select_button,
+                        id = self.id,
+                        action_state = self.action_state.clone()
+                    ] =>
                         move |_, presses, _, _| {
                             if presses == 2 {
+                                let title = action_state.borrow().title.clone();
                                 show_rename(&select_button, id, &title, sender.clone());
                             }
                         },
@@ -156,21 +194,19 @@ impl FactoryComponent for TabRow {
                         sender,
                         select_button,
                         id = self.id,
-                        title = self.title.clone(),
-                        marked = self.marked,
-                        pinned = self.pinned,
-                        remote_hosts = self.remote_hosts.clone()
+                        action_state = self.action_state.clone()
                     ] => move |gesture, _, x, y| {
                         gesture.set_state(gtk::EventSequenceState::Claimed);
+                        let state = action_state.borrow().clone();
                         show_context_menu(
                             &select_button,
                             x,
                             y,
                             id,
-                            &title,
-                            marked,
-                            pinned,
-                            &remote_hosts,
+                            &state.title,
+                            state.marked,
+                            state.pinned,
+                            &state.remote_hosts,
                             sender.clone(),
                         );
                     },
@@ -192,8 +228,11 @@ impl FactoryComponent for TabRow {
 
                 add_controller = gtk::GestureDrag {
                     set_button: gtk::gdk::BUTTON_PRIMARY,
-                    connect_drag_begin[start_width, tab_width = self.tab_width] => move |_, _, _| {
-                        start_width.set(tab_width as i32);
+                    connect_drag_begin[
+                        start_width,
+                        action_state = self.action_state.clone()
+                    ] => move |_, _, _| {
+                        start_width.set(action_state.borrow().tab_width as i32);
                     },
                     connect_drag_update[select_button, start_width] => move |_, dx, _| {
                         let width = (start_width.get() + dx as i32)
@@ -213,8 +252,9 @@ impl FactoryComponent for TabRow {
                 gtk::glib::Type::U64,
                 gtk::gdk::DragAction::MOVE,
             ) {
-                connect_drop[sender, target = self.target_index] => move |_, value, _, _| {
+                connect_drop[sender, action_state = self.action_state.clone()] => move |_, value, _, _| {
                     if let Ok(source_id) = value.get::<u64>() {
+                        let target = action_state.borrow().target_index;
                         let _ = sender.output(TabRowOutput::Reorder { source_id, target });
                         true
                     } else {
@@ -226,20 +266,7 @@ impl FactoryComponent for TabRow {
     }
 
     fn init_model(init: Self::Init, _index: &DynamicIndex, _sender: FactorySender<Self>) -> Self {
-        Self {
-            id: init.id,
-            target_index: init.target_index,
-            title: init.title,
-            active: init.active,
-            bell: init.bell,
-            activity: init.activity,
-            marked: init.marked,
-            pinned: init.pinned,
-            connection: init.connection,
-            remote_hosts: init.remote_hosts,
-            tab_width: init.tab_width,
-            sidebar: init.sidebar,
-        }
+        Self::from_init(init)
     }
 
     fn init_widgets(
@@ -256,12 +283,66 @@ impl FactoryComponent for TabRow {
 
     fn update(&mut self, msg: Self::Input, _sender: FactorySender<Self>) {
         match msg {
-            TabRowMsg::SetTitle(title) => self.title = title,
+            TabRowMsg::SetTitle(title) => {
+                self.action_state.borrow_mut().title = title.clone();
+                self.title = title;
+            }
+            TabRowMsg::Sync(init) => self.sync_from(init),
         }
     }
 }
 
 impl TabRow {
+    fn from_init(init: TabRowInit) -> Self {
+        let action_state = Rc::new(RefCell::new(TabRowActionState::from_init(&init)));
+        Self {
+            id: init.id,
+            target_index: init.target_index,
+            title: init.title,
+            active: init.active,
+            bell: init.bell,
+            activity: init.activity,
+            marked: init.marked,
+            pinned: init.pinned,
+            connection: init.connection,
+            remote_hosts: init.remote_hosts,
+            tab_width: init.tab_width,
+            sidebar: init.sidebar,
+            action_state,
+        }
+    }
+
+    pub(crate) fn matches_init(&self, init: &TabRowInit) -> bool {
+        self.id == init.id
+            && self.target_index == init.target_index
+            && self.title == init.title
+            && self.active == init.active
+            && self.bell == init.bell
+            && self.activity == init.activity
+            && self.marked == init.marked
+            && self.pinned == init.pinned
+            && self.connection == init.connection
+            && self.remote_hosts == init.remote_hosts
+            && self.tab_width == init.tab_width
+            && self.sidebar == init.sidebar
+    }
+
+    fn sync_from(&mut self, init: TabRowInit) {
+        debug_assert_eq!(self.id, init.id);
+        *self.action_state.borrow_mut() = TabRowActionState::from_init(&init);
+        self.target_index = init.target_index;
+        self.title = init.title;
+        self.active = init.active;
+        self.bell = init.bell;
+        self.activity = init.activity;
+        self.marked = init.marked;
+        self.pinned = init.pinned;
+        self.connection = init.connection;
+        self.remote_hosts = init.remote_hosts;
+        self.tab_width = init.tab_width;
+        self.sidebar = init.sidebar;
+    }
+
     fn row_classes(&self) -> Vec<&'static str> {
         let mut classes = vec!["tab-row"];
         if self.active {
@@ -433,4 +514,51 @@ fn add_menu_item<F>(
         let _ = output(&sender);
     });
     menu.append(&button);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn init() -> TabRowInit {
+        TabRowInit {
+            id: 7,
+            target_index: 2,
+            title: "shell".to_string(),
+            active: false,
+            bell: false,
+            activity: false,
+            marked: false,
+            pinned: false,
+            connection: Some(ConnectionState::Connecting),
+            remote_hosts: vec![(0, "host-a".to_string())],
+            tab_width: 180,
+            sidebar: true,
+        }
+    }
+
+    #[test]
+    fn sync_updates_visual_and_action_state_without_replacing_identity() {
+        let mut row = TabRow::from_init(init());
+        let mut updated = init();
+        updated.target_index = 4;
+        updated.title = "remote".to_string();
+        updated.active = true;
+        updated.bell = true;
+        updated.marked = true;
+        updated.connection = Some(ConnectionState::Connected);
+        updated.remote_hosts.push((1, "host-b".to_string()));
+        updated.tab_width = 240;
+        updated.sidebar = false;
+
+        row.sync_from(updated.clone());
+
+        assert!(row.matches_init(&updated));
+        let actions = row.action_state.borrow();
+        assert_eq!(actions.target_index, 4);
+        assert_eq!(actions.title, "remote");
+        assert!(actions.marked);
+        assert_eq!(actions.remote_hosts.len(), 2);
+        assert_eq!(actions.tab_width, 240);
+    }
 }

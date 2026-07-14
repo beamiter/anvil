@@ -59,18 +59,21 @@ pub(crate) struct FileTreeUi {
     pub(crate) store: gtk::TreeStore,
     pub(crate) scroll: gtk::ScrolledWindow,
     pub(crate) header: Controller<sidebar::FileHeaderModel>,
+    pub(crate) scan_generation: Rc<std::cell::Cell<u64>>,
 }
 
 #[allow(deprecated)]
 pub(crate) fn build_file_tree(sender: &ComponentSender<AppModel>) -> FileTreeUi {
     let store = file_tree::new_store();
     let view = file_tree::new_view(&store);
+    let scan_generation = Rc::new(std::cell::Cell::new(0));
     view.add_css_class("file-tree");
 
     {
         let store = store.clone();
+        let scan_generation = scan_generation.clone();
         view.connect_row_expanded(move |_view, iter, _path| {
-            file_tree::on_expand(&store, iter);
+            file_tree::on_expand(&store, iter, &scan_generation);
         });
     }
     {
@@ -121,6 +124,7 @@ pub(crate) fn build_file_tree(sender: &ComponentSender<AppModel>) -> FileTreeUi 
         store,
         scroll,
         header,
+        scan_generation,
     }
 }
 

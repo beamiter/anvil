@@ -56,13 +56,23 @@ pub(crate) enum Action {
     FilterSlowBlocks,
     FilterPinnedBlocks,
     ClearBlockFilter,
+    /// Select every finished block in the active block-mode pane. Warp exposes
+    /// this as a first-class block action rather than ordinary terminal text
+    /// selection.
+    SelectAllBlocks,
+    /// Remove every finished block from the active block-mode pane.
+    ClearBlocks,
+    /// Put the commands from the current block selection back into the live
+    /// input editor, preserving terminal order for multi-selection.
+    ReinputSelectedCommands,
     /// Jump to the previous / next pinned ("bookmarked") block. Warp parity:
     /// gives users persistent navigation targets through long sessions.
     JumpToPrevPinned,
     JumpToNextPinned,
     ToggleDebugDashboard,
     /// Open the session-level AI panel for free-form questions about the
-    /// current shell context (Ctrl+Shift+A by default).
+    /// current shell context (Ctrl+Alt+Shift+A by default; Ctrl+Shift+A is the
+    /// Warp-compatible Select All Blocks action).
     OpenAiPanel,
     /// Open the palette focused on parameterised command templates
     /// ("workflows", `:` prefix). Ctrl+Shift+Y by default.
@@ -139,6 +149,9 @@ impl Action {
             Action::JumpToPrevPinned => "Jump to previous pinned block",
             Action::JumpToNextPinned => "Jump to next pinned block",
             Action::ClearBlockFilter => "Jump to oldest block",
+            Action::SelectAllBlocks => "Select all blocks",
+            Action::ClearBlocks => "Clear blocks",
+            Action::ReinputSelectedCommands => "Reinput selected commands",
             Action::ToggleDebugDashboard => "Toggle debug dashboard",
             Action::OpenAiPanel => "Open AI panel",
             Action::OpenWorkflows => "Open workflows",
@@ -199,6 +212,9 @@ impl Action {
             Action::JumpToPrevPinned => Some("jump_to_prev_pinned"),
             Action::JumpToNextPinned => Some("jump_to_next_pinned"),
             Action::ClearBlockFilter => Some("clear_block_filter"),
+            Action::SelectAllBlocks => Some("select_all_blocks"),
+            Action::ClearBlocks => Some("clear_blocks"),
+            Action::ReinputSelectedCommands => Some("reinput_selected_commands"),
             Action::ToggleDebugDashboard => Some("toggle_debug_dashboard"),
             Action::OpenAiPanel => Some("open_ai_panel"),
             Action::OpenWorkflows => Some("open_workflows"),
@@ -257,6 +273,9 @@ impl Action {
             Action::JumpToPrevPinned,
             Action::JumpToNextPinned,
             Action::ClearBlockFilter,
+            Action::SelectAllBlocks,
+            Action::ClearBlocks,
+            Action::ReinputSelectedCommands,
             Action::ToggleDebugDashboard,
             Action::OpenAiPanel,
             Action::OpenWorkflows,
@@ -453,9 +472,11 @@ impl KeybindingMap {
         bind("Ctrl+Shift+C", Action::Copy);
         bind("Ctrl+Shift+V", Action::Paste);
         bind("Ctrl+Shift++", Action::FontIncrease);
-        bind("Ctrl+Shift+I", Action::FontDecrease);
         bind("Ctrl+Shift+J", Action::OpacityDecrease);
-        bind("Ctrl+Shift+K", Action::OpacityIncrease);
+        // Warp reserves Ctrl+Shift+I/K for reinputting selected commands and
+        // clearing blocks. Keep opacity available without shadowing those block
+        // actions; Ctrl+minus remains the primary font-decrease binding.
+        bind("Ctrl+Alt+Shift+K", Action::OpacityIncrease);
         bind("Ctrl+Shift+F", Action::ToggleSearch);
         bind("Ctrl+Shift+P", Action::ToggleCommandPalette);
         // Ctrl+r hijacks the shell's reverse-i-search to bring up the same
@@ -473,6 +494,9 @@ impl KeybindingMap {
         bind("Alt+Up", Action::JumpToPrevPinned);
         bind("Alt+Down", Action::JumpToNextPinned);
         bind("Ctrl+Shift+N", Action::ClearBlockFilter);
+        bind("Ctrl+Shift+A", Action::SelectAllBlocks);
+        bind("Ctrl+Shift+K", Action::ClearBlocks);
+        bind("Ctrl+Shift+I", Action::ReinputSelectedCommands);
         bind("Ctrl+Shift+E", Action::SplitHorizontal);
         bind("Ctrl+Shift+D", Action::SplitVertical);
         bind("Ctrl+Shift+PageUp", Action::PrevTab);
@@ -509,7 +533,7 @@ impl KeybindingMap {
         // Warp reserves Ctrl+Shift+Up/Down for selected-block top/bottom.
         bind("Ctrl+Alt+Shift+Up", Action::FocusPaneUp);
         bind("Ctrl+Alt+Shift+Down", Action::FocusPaneDown);
-        bind("Ctrl+Shift+A", Action::OpenAiPanel);
+        bind("Ctrl+Alt+Shift+A", Action::OpenAiPanel);
         bind("Ctrl+Shift+Y", Action::OpenWorkflows);
         bind("Ctrl+Shift+G", Action::OpenAgent);
 
@@ -630,5 +654,19 @@ mod tests {
         map.apply_user_overrides(&table);
         assert_eq!(map.lookup(&new_tab), Some(Action::NewTab));
         assert_eq!(map.lookup(&paste), Some(Action::Paste));
+    }
+
+    #[test]
+    fn warp_block_action_defaults_are_not_shadowed() {
+        let map = KeybindingMap::from_defaults();
+        let cases = [
+            ("Ctrl+Shift+A", Action::SelectAllBlocks),
+            ("Ctrl+Shift+I", Action::ReinputSelectedCommands),
+            ("Ctrl+Shift+K", Action::ClearBlocks),
+        ];
+        for (binding, expected) in cases {
+            let combo = parse_key_combo(binding).expect("valid built-in binding");
+            assert_eq!(map.lookup(&combo), Some(expected), "{binding}");
+        }
     }
 }

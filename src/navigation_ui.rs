@@ -150,7 +150,7 @@ impl AppModel {
     }
 
     /// Flip the tab strip between the sidebar and the top bar, then persist.
-    pub(crate) fn toggle_tab_placement(&self) {
+    pub(crate) fn toggle_tab_placement(&mut self) {
         use config::TabPlacement;
         let next = match self.tab_placement.get() {
             TabPlacement::Sidebar => TabPlacement::TopBar,
@@ -159,10 +159,21 @@ impl AppModel {
         self.tab_placement.set(next);
         self.config.borrow_mut().tab_placement = next;
         self.apply_tab_placement();
+        self.sync_tab_strip();
         self.persist_config();
     }
 
     pub(crate) fn rebuild_tab_strip(&mut self, _sender: &ComponentSender<AppModel>) {
+        self.refresh_tab_strip(true);
+    }
+
+    /// Refresh row state without writing a session snapshot. Bell/activity and
+    /// connection-state changes are presentation-only and can arrive often.
+    pub(crate) fn sync_tab_strip(&mut self) {
+        self.refresh_tab_strip(false);
+    }
+
+    fn refresh_tab_strip(&mut self, persist: bool) {
         let config = self.config.borrow();
         let remote_hosts: Vec<(u8, String)> = config
             .remote_hosts
@@ -201,13 +212,36 @@ impl AppModel {
             })
             .collect();
 
-        let mut factory = self.tab_rows.guard();
-        factory.clear();
-        for row in rows {
-            factory.push_back(row);
+        let same_rows = self.tab_rows.len() == rows.len()
+            && self
+                .tab_rows
+                .iter()
+                .zip(rows.iter())
+                .all(|(current, next)| current.id == next.id);
+
+        if same_rows {
+            let updates: Vec<_> = self
+                .tab_rows
+                .iter()
+                .zip(rows.iter())
+                .enumerate()
+                .filter(|(_, (current, next))| !current.matches_init(next))
+                .map(|(index, (_, next))| (index, next.clone()))
+                .collect();
+            for (index, row) in updates {
+                self.tab_rows.send(index, tab_strip::TabRowMsg::Sync(row));
+            }
+        } else {
+            let mut factory = self.tab_rows.guard();
+            factory.clear();
+            for row in rows {
+                factory.push_back(row);
+            }
         }
-        drop(factory);
+
         self.sync_tab_bar_visibility();
-        self.persist_session();
+        if persist {
+            self.persist_session();
+        }
     }
 }

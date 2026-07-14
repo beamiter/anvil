@@ -140,6 +140,9 @@ impl Component for BlockTerminal {
             VteInput::FilterSlowBlocks => self.view.apply_slow_filter(),
             VteInput::FilterPinnedBlocks => self.view.apply_pinned_filter(),
             VteInput::ClearBlockFilter => self.view.clear_block_filter(),
+            VteInput::SelectAllBlocks => self.view.select_all_blocks(),
+            VteInput::ClearBlocks => self.view.clear_blocks(),
+            VteInput::ReinputSelectedCommands => self.view.reinput_selected_commands(),
             VteInput::JumpToPrevPinned => self.view.jump_to_pinned(-1),
             VteInput::JumpToNextPinned => self.view.jump_to_pinned(1),
             VteInput::SearchSet(query, use_regex) => {

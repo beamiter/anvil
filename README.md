@@ -183,22 +183,25 @@ are currently active.
 | `Ctrl+Shift+X/S/M` | Jump to the first failed / slow / pinned block |
 | `Alt+Up/Down` | Previous / next pinned block |
 | `Ctrl+Shift+N` | Jump to the oldest block |
-| `Ctrl+Shift+A` | Session AI panel |
+| `Ctrl+Shift+A` | Select all finished blocks |
+| `Ctrl+Shift+I` | Reinput selected block commands without running them |
+| `Ctrl+Shift+K` | Clear all finished blocks in the pane |
+| `Ctrl+Alt+Shift+A` | Session AI panel |
 | `Ctrl+Shift+Y` | Workflows |
 | `Ctrl+Shift+G` | AI agent |
 | `F12` | Debug dashboard |
 | `Ctrl+Shift++` | Increase font scale |
-| `Ctrl+-` or `Ctrl+Shift+I` | Decrease font scale |
-| `Ctrl+Shift+J/K` | Decrease / increase window opacity |
+| `Ctrl+-` | Decrease font scale |
+| `Ctrl+Shift+J` / `Ctrl+Alt+Shift+K` | Decrease / increase window opacity |
 | `Ctrl+Up/Down` | Scroll terminal output |
 
 Block mode also has context-sensitive navigation:
 
 - `Home` / `End` and `PageUp` / `PageDown` navigate completed output while no
   command or full-screen application owns the viewport.
-- With a block selected, `Up` / `Down` moves the selection, `Shift+Up/Down`
-  extends it, `Enter` recalls its command without running it, and `Escape`
-  clears the selection.
+- With one or more blocks selected, `Up` / `Down` moves the active edge,
+  `Shift+Up/Down` extends the range, `Enter` recalls every selected command in
+  terminal order without running it, and `Escape` clears the selection.
 - `Ctrl+Shift+B` bookmarks the selected block.
 - `Alt+Shift+F` toggles the selected or most recent block's output filter.
 - `Ctrl+P` opens block mode's in-memory command-history picker.
