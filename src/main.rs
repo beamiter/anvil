@@ -87,6 +87,7 @@ struct AppModel {
     file_tree_store: gtk::TreeStore,
     file_header: Controller<sidebar::FileHeaderModel>,
     file_tree_root: Rc<RefCell<std::path::PathBuf>>,
+    file_tree_scan_generation: Rc<std::cell::Cell<u64>>,
     tab_strip_scroll: gtk::ScrolledWindow,
     top_tab_scroll: gtk::ScrolledWindow,
     top_bar: Controller<top_bar::TopBarModel>,
@@ -407,12 +408,14 @@ impl SimpleComponent for AppModel {
         // File tree browser (lower half of the sidebar).
         let file_tree_store = file_tree::new_store();
         let file_tree_view = file_tree::new_view(&file_tree_store);
+        let file_tree_scan_generation = Rc::new(std::cell::Cell::new(0));
         file_tree_view.add_css_class("file-tree");
         {
             // Lazy directory expansion: fill children on first expand.
             let store = file_tree_store.clone();
+            let scan_generation = file_tree_scan_generation.clone();
             file_tree_view.connect_row_expanded(move |_tv, iter, _path| {
-                file_tree::on_expand(&store, iter);
+                file_tree::on_expand(&store, iter, &scan_generation);
             });
         }
         {
@@ -741,6 +744,7 @@ impl SimpleComponent for AppModel {
             file_tree_store: file_tree_store.clone(),
             file_header,
             file_tree_root: Rc::new(RefCell::new(std::path::PathBuf::new())),
+            file_tree_scan_generation,
             tab_strip_scroll: tab_strip_scroll.clone(),
             top_tab_scroll: top_tab_scroll.clone(),
             top_bar,

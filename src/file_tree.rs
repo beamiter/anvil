@@ -12,14 +12,82 @@ use relm4::gtk;
 
 use gtk::glib;
 use gtk::prelude::*;
-use gtk::{CellRendererPixbuf, CellRendererText, TreeIter, TreeStore, TreeView, TreeViewColumn};
+use gtk::{
+    CellRendererPixbuf, CellRendererText, TreeIter, TreeRowReference, TreeStore, TreeView,
+    TreeViewColumn,
+};
+use std::cell::Cell;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::mpsc;
+use std::time::Duration;
 
 // TreeStore column indices.
 pub(crate) const COL_NAME: u32 = 0;
 pub(crate) const COL_PATH: u32 = 1;
 pub(crate) const COL_IS_DIR: u32 = 2;
 pub(crate) const COL_ICON: u32 = 3;
+const SCAN_POLL_INTERVAL: Duration = Duration::from_millis(16);
+
+#[derive(Debug)]
+pub(crate) struct FileEntry {
+    name: String,
+    path: PathBuf,
+    is_dir: bool,
+}
+
+fn sort_entries(entries: &mut [FileEntry]) {
+    entries.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+}
+
+fn scan_dir(dir: &Path) -> io::Result<Vec<FileEntry>> {
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(dir)?.flatten() {
+        let path = entry.path();
+        entries.push(FileEntry {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            is_dir: path.is_dir(),
+            path,
+        });
+    }
+    sort_entries(&mut entries);
+    Ok(entries)
+}
+
+pub(crate) fn request_dir_scan<F>(dir: PathBuf, apply: F) -> io::Result<()>
+where
+    F: FnOnce(io::Result<Vec<FileEntry>>) + 'static,
+{
+    let (tx, rx) = mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("jterm1-file-tree-scan".to_string())
+        .spawn(move || {
+            let _ = tx.send(scan_dir(&dir));
+        })?;
+
+    let mut apply = Some(apply);
+    glib::timeout_add_local(SCAN_POLL_INTERVAL, move || match rx.try_recv() {
+        Ok(result) => {
+            if let Some(apply) = apply.take() {
+                apply(result);
+            }
+            glib::ControlFlow::Break
+        }
+        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+        Err(mpsc::TryRecvError::Disconnected) => {
+            if let Some(apply) = apply.take() {
+                apply(Err(io::Error::other("file-tree scan worker disconnected")));
+            }
+            glib::ControlFlow::Break
+        }
+    });
+    Ok(())
+}
 
 /// A four-column store: display name, absolute path, is-directory, icon name.
 pub(crate) fn new_store() -> TreeStore {
@@ -48,25 +116,13 @@ pub(crate) fn new_view(store: &TreeStore) -> TreeView {
     view
 }
 
-/// Insert one row per directory entry under `parent` (dirs first, then files,
-/// case-insensitive). Directories get a placeholder child so the expander arrow
-/// shows before they are loaded.
-pub(crate) fn populate_dir(store: &TreeStore, parent: Option<&TreeIter>, dir: &Path) {
-    let mut entries: Vec<(String, PathBuf, bool)> = Vec::new();
-    if let Ok(read) = std::fs::read_dir(dir) {
-        for entry in read.flatten() {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().to_string();
-            let is_dir = path.is_dir();
-            entries.push((name, path, is_dir));
-        }
-    }
-    entries.sort_by(|a, b| {
-        b.2.cmp(&a.2) // directories (true) first
-            .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
-    });
-
-    for (name, path, is_dir) in entries {
+/// Insert one row per pre-scanned directory entry under `parent`.
+pub(crate) fn append_entries(
+    store: &TreeStore,
+    parent: Option<&TreeIter>,
+    entries: Vec<FileEntry>,
+) {
+    for FileEntry { name, path, is_dir } in entries {
         let icon = if is_dir {
             "folder-symbolic"
         } else {
@@ -100,7 +156,7 @@ pub(crate) fn populate_dir(store: &TreeStore, parent: Option<&TreeIter>, dir: &P
 }
 
 /// Lazily fill a directory row's real children on first expansion.
-pub(crate) fn on_expand(store: &TreeStore, iter: &TreeIter) {
+pub(crate) fn on_expand(store: &TreeStore, iter: &TreeIter, scan_generation: &Rc<Cell<u64>>) {
     // A not-yet-loaded directory has a single placeholder child (empty path).
     let Some(first_child) = store.iter_children(Some(iter)) else {
         return;
@@ -112,13 +168,64 @@ pub(crate) fn on_expand(store: &TreeStore, iter: &TreeIter) {
     if !child_path.is_empty() {
         return; // already populated
     }
-    store.remove(&first_child);
+    let scan_in_progress: bool = store
+        .get_value(&first_child, COL_IS_DIR as i32)
+        .get()
+        .unwrap_or(false);
+    if scan_in_progress {
+        return;
+    }
     let dir_path: String = store
         .get_value(iter, COL_PATH as i32)
         .get()
         .unwrap_or_default();
-    if !dir_path.is_empty() {
-        populate_dir(store, Some(iter), Path::new(&dir_path));
+    if dir_path.is_empty() {
+        return;
+    }
+    let Some(row_ref) = TreeRowReference::new(store, &store.path(iter)) else {
+        return;
+    };
+
+    store.set(&first_child, &[(COL_IS_DIR, &true)]);
+    let store_for_result = store.clone();
+    let active_generation = scan_generation.clone();
+    let generation = active_generation.get();
+    let expected_path = dir_path.clone();
+    if let Err(error) = request_dir_scan(PathBuf::from(dir_path), move |result| {
+        if active_generation.get() != generation {
+            return;
+        }
+        let Some(row_path) = row_ref.path() else {
+            return;
+        };
+        let Some(parent) = store_for_result.iter(&row_path) else {
+            return;
+        };
+        let current_path: String = store_for_result
+            .get_value(&parent, COL_PATH as i32)
+            .get()
+            .unwrap_or_default();
+        if current_path != expected_path {
+            return;
+        }
+        let Some(placeholder) = store_for_result.iter_children(Some(&parent)) else {
+            return;
+        };
+        let placeholder_path: String = store_for_result
+            .get_value(&placeholder, COL_PATH as i32)
+            .get()
+            .unwrap_or_default();
+        if !placeholder_path.is_empty() {
+            return;
+        }
+        store_for_result.remove(&placeholder);
+        match result {
+            Ok(entries) => append_entries(&store_for_result, Some(&parent), entries),
+            Err(error) => log::warn!("failed to scan directory {expected_path}: {error}"),
+        }
+    }) {
+        store.set(&first_child, &[(COL_IS_DIR, &false)]);
+        log::warn!("failed to start directory scan: {error}");
     }
 }
 
@@ -142,4 +249,40 @@ pub(crate) fn display_path(path: &Path) -> String {
 /// Single-quote a path for safe shell insertion.
 pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entries_sort_directories_first_then_by_name() {
+        let mut entries = vec![
+            FileEntry {
+                name: "Zulu.txt".into(),
+                path: PathBuf::from("Zulu.txt"),
+                is_dir: false,
+            },
+            FileEntry {
+                name: "beta".into(),
+                path: PathBuf::from("beta"),
+                is_dir: true,
+            },
+            FileEntry {
+                name: "Alpha.txt".into(),
+                path: PathBuf::from("Alpha.txt"),
+                is_dir: false,
+            },
+            FileEntry {
+                name: "Able".into(),
+                path: PathBuf::from("Able"),
+                is_dir: true,
+            },
+        ];
+
+        sort_entries(&mut entries);
+
+        let names: Vec<_> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, ["Able", "beta", "Alpha.txt", "Zulu.txt"]);
+    }
 }
