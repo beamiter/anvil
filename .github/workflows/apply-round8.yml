@@ -1,0 +1,31 @@
+name: Apply round 8 extraction
+
+on:
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    if: github.head_ref == 'agent/jterm1-config-navigation-modules' && github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/jterm1-config-navigation-modules
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Extract config and navigation operations
+        run: |
+          python3 .github/scripts/migrate_round8.py
+          cargo fmt --all
+          git rm .github/scripts/migrate_round8.py .github/workflows/apply-round8.yml .round8-trigger
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/main.rs src/config_ops.rs src/navigation_ui.rs
+          git commit -m "Extract config and navigation operations"
+          git push origin HEAD:agent/jterm1-config-navigation-modules
