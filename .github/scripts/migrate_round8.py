@@ -10,7 +10,7 @@ if "mod navigation_ui;\n" not in text:
     text = text.replace("mod notebook;\n", "mod notebook;\nmod navigation_ui;\n", 1)
 
 config_start = text.find("    fn reload_config(")
-nav_start = text.find("    fn apply_tab_placement(", config_start)
+nav_start = text.find("    /// Move the tab strip into the holder", config_start)
 impl_end_marker = "}\n\n#[allow(deprecated)]\nfn install_static_css"
 impl_end = text.find(impl_end_marker, nav_start)
 if min(config_start, nav_start, impl_end) < 0:
