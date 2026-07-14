@@ -20,12 +20,25 @@ jobs:
         with:
           components: rustfmt
       - name: Extract config and navigation operations
+        id: migrate
+        shell: bash
         run: |
-          python3 .github/scripts/migrate_round8.py
-          cargo fmt --all
-          git rm .github/scripts/migrate_round8.py .github/workflows/apply-round8.yml .round8-trigger
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add src/main.rs src/config_ops.rs src/navigation_ui.rs
-          git commit -m "Extract config and navigation operations"
-          git push origin HEAD:agent/jterm1-config-navigation-modules
+          set -o pipefail
+          {
+            python3 .github/scripts/migrate_round8.py
+            cargo fmt --all
+            git rm .github/scripts/migrate_round8.py .github/workflows/apply-round8.yml .round8-trigger
+            git config user.name github-actions[bot]
+            git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+            git add src/main.rs src/config_ops.rs src/navigation_ui.rs
+            git commit -m "Extract config and navigation operations"
+            git push origin HEAD:agent/jterm1-config-navigation-modules
+          } 2>&1 | tee migration.log
+      - name: Upload migration diagnostics
+        if: ${{ failure() && steps.migrate.conclusion == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: round8-migration-log
+          path: migration.log
+          if-no-files-found: error
+          retention-days: 1
