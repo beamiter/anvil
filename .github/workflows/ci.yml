@@ -21,20 +21,18 @@ env:
 
 jobs:
   rust:
-    name: Rust quality and release
+    name: Rust quality, smoke tests, and bundle
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 45
     defaults:
       run:
-        # Explicit Bash gives every run step `-e -o pipefail`, so a failing
-        # Cargo command cannot be hidden by the following `tee` process.
         shell: bash
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Install GTK and VTE development packages
+      - name: Install GTK, VTE, and validation packages
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes \
@@ -42,6 +40,7 @@ jobs:
             libgtk-4-dev \
             libadwaita-1-dev \
             libvte-2.91-gtk4-dev \
+            desktop-file-utils \
             xvfb
 
       - name: Install Rust toolchain
@@ -75,19 +74,7 @@ jobs:
       - name: Run Clippy
         id: clippy
         if: ${{ !cancelled() }}
-        run: |
-          # These structural/style lints are the explicit legacy baseline. All
-          # other Rust and Clippy warnings remain denied and fail the build.
-          cargo clippy --all-targets --locked -- \
-            -D warnings \
-            -A clippy::type_complexity \
-            -A clippy::doc_lazy_continuation \
-            -A clippy::items_after_test_module \
-            -A clippy::too_many_arguments \
-            -A clippy::manual_clamp \
-            -A clippy::if_same_then_else \
-            -A clippy::needless_range_loop \
-            2>&1 | tee clippy.log
+        run: bash scripts/clippy.sh 2>&1 | tee clippy.log
 
       - name: Check documentation build
         if: ${{ !cancelled() }}
@@ -96,6 +83,30 @@ jobs:
       - name: Build optimized release binary
         if: ${{ !cancelled() }}
         run: cargo build --release --locked
+
+      - name: Validate CLI and desktop integration
+        if: ${{ !cancelled() }}
+        run: |
+          target/release/jterm1 --help | grep -F "Block-first terminal workspace"
+          version="$(awk -F ' *= *' '$1 == "version" { gsub(/"/, "", $2); print $2; exit }' Cargo.toml)"
+          target/release/jterm1 --version | grep -Fx "jterm1 ${version}"
+          target/release/jterm1 --doctor
+          desktop-file-validate packaging/app.jterm1.desktop
+
+      - name: Build and verify portable release bundle
+        if: ${{ !cancelled() }}
+        run: |
+          bash scripts/package-release.sh target/release/jterm1
+          (cd target/dist && sha256sum --check *.sha256)
+
+      - name: Upload portable release bundle
+        if: ${{ success() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: jterm1-${{ github.sha }}
+          path: target/dist/*
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Upload CI diagnostics
         if: ${{ failure() }}
@@ -107,3 +118,20 @@ jobs:
             clippy.log
           if-no-files-found: ignore
           retention-days: 7
+
+  nix:
+    name: Nix package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Evaluate and build flake checks
+        run: nix flake check --no-write-lock-file --print-build-logs
