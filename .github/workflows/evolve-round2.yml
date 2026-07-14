@@ -4,16 +4,14 @@ on:
   push:
     branches:
       - agent/resilience-observability-evolution
-  pull_request:
-    branches:
-      - master
-    types:
-      - opened
-      - synchronize
   workflow_dispatch:
 
 permissions:
   contents: write
+
+concurrency:
+  group: resilience-evolution-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   evolve:
@@ -87,14 +85,27 @@ jobs:
           bash -n scripts/*.sh packaging/*.sh
           git diff --check
 
-      - name: Commit evolved source
+      - name: Commit and publish evolved source
         run: |
+          rm -f migration.log
+          rm -rf scripts/__pycache__
           if git diff --quiet && [[ -z "$(git ls-files --others --exclude-standard)" ]]; then
             echo "No migration changes were produced."
             exit 0
           fi
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
           git commit -m "Add resilient startup, diagnostics, and security tooling"
-          git push origin HEAD:agent/resilience-observability-evolution
+
+          for attempt in 1 2 3; do
+            if git push origin HEAD:agent/resilience-observability-evolution; then
+              exit 0
+            fi
+            echo "Push attempt ${attempt} failed; rebasing onto the current branch tip."
+            git fetch origin agent/resilience-observability-evolution
+            git rebase origin/agent/resilience-observability-evolution
+          done
+          echo "Unable to publish the generated commit after three attempts." >&2
+          exit 1
