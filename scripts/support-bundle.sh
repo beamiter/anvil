@@ -34,7 +34,7 @@ json_status=0
 "${JTERM1_BIN}" --doctor --json >"${BUNDLE_DIR}/doctor.json" 2>"${BUNDLE_DIR}/doctor-json.stderr" || json_status=$?
 
 binary_path="$(command -v "${JTERM1_BIN}")"
-version="$(${JTERM1_BIN} --version 2>&1 || true)"
+version="$("${JTERM1_BIN}" --version 2>&1 || true)"
 config_home="${XDG_CONFIG_HOME:-${HOME}/.config}"
 data_home="${XDG_DATA_HOME:-${HOME}/.local/share}"
 state_home="${XDG_STATE_HOME:-${HOME}/.local/state}"
