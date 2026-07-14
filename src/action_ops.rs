@@ -253,6 +253,21 @@ impl AppModel {
                     t.emit(VteInput::ClearBlockFilter);
                 }
             }
+            Action::SelectAllBlocks => {
+                if let Some(t) = self.active_terminal() {
+                    t.emit(VteInput::SelectAllBlocks);
+                }
+            }
+            Action::ClearBlocks => {
+                if let Some(t) = self.active_terminal() {
+                    t.emit(VteInput::ClearBlocks);
+                }
+            }
+            Action::ReinputSelectedCommands => {
+                if let Some(t) = self.active_terminal() {
+                    t.emit(VteInput::ReinputSelectedCommands);
+                }
+            }
             Action::QuickSwitchTab(n) => {
                 if !self.tabs.is_empty() {
                     let last = self.tabs.len() - 1;

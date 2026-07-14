@@ -4,7 +4,7 @@ use gtk::prelude::*;
 use gtk::{glib, Orientation, ScrolledWindow};
 use relm4::gtk;
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
@@ -125,6 +125,40 @@ pub(crate) fn build_command_recall(command: &str, bracketed_paste: bool) -> (Str
         let payload = recalled.as_bytes().to_vec();
         (recalled, payload)
     }
+}
+
+/// Collect commands from a block selection in terminal order. Background
+/// blocks are intentionally skipped: they have output but no command to put
+/// back into the editor. A newline between commands creates one editable
+/// multiline buffer when bracketed paste is available.
+fn selected_command_text<'a, I>(blocks: I, selected: &HashSet<u64>) -> String
+where
+    I: IntoIterator<Item = (u64, &'a str)>,
+{
+    blocks
+        .into_iter()
+        .filter(|(id, command)| selected.contains(id) && !command.trim().is_empty())
+        .map(|(_, command)| command)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn recall_selected_commands_at_prompt(
+    pty: &OwnedPty,
+    pty_synced: &Cell<bool>,
+    typed_cmd: &RefCell<String>,
+    state: BlockState,
+    finished: &[FinishedBlock],
+    selected: &HashSet<u64>,
+    bracketed_paste: bool,
+) -> bool {
+    let command = selected_command_text(
+        finished
+            .iter()
+            .map(|block| (block.id, block.cmd_text.as_str())),
+        selected,
+    );
+    recall_command_at_prompt(pty, pty_synced, typed_cmd, state, &command, bracketed_paste)
 }
 
 /// Replace the current editable shell line with a finished command.
@@ -657,6 +691,9 @@ pub struct TermView {
     /// them for a user drag.
     programmatic_scroll: Rc<Cell<bool>>,
     pty: Rc<OwnedPty>,
+    /// Whether programmatic recall has already synchronized the live shell
+    /// editor. Shared with the key and block-action paths.
+    pty_synced: Rc<Cell<bool>>,
     cwd_callbacks: StrCallbacks,
     remote_session_callbacks: StrCallbacks,
     exited_callbacks: IntCallbacks,
@@ -678,6 +715,11 @@ pub struct TermView {
     selected_block_id: Rc<Cell<Option<u64>>>,
     selection_anchor_id: Rc<Cell<Option<u64>>>,
     bookmarks: Rc<RefCell<std::collections::HashSet<u64>>>,
+    /// Number shown on the jump-to-latest affordance while history is scrolled
+    /// away from the live prompt. Kept on TermView so Clear Blocks can reset
+    /// all of the visible block-history state atomically.
+    unread_count: Rc<Cell<u32>>,
+    jump_fab: gtk::Button,
     /// Find-within-blocks state: every match across the finished blocks plus a
     /// cursor into it, so Ctrl+F highlights all hits and Next/Prev step through
     /// them (Warp's FindWithinBlock). Tags are stripped on close via clear_find.
@@ -1264,49 +1306,91 @@ impl ReaderCtx {
                                         btn
                                     };
 
-                                    if !finished_menu_clone.is_background {
-                                        let item = make_item("Copy Command");
+                                    let selected_count = selected_ids_for_menu.borrow().len();
+                                    let has_selected_commands = {
+                                        let selected = selected_ids_for_menu.borrow();
+                                        block_data_for_export.borrow().iter().any(|block| {
+                                            selected.contains(&block.id)
+                                                && !block.cmd.trim().is_empty()
+                                        })
+                                    };
+
+                                    if has_selected_commands {
+                                        let item = make_item(if selected_count > 1 {
+                                            "Copy Commands"
+                                        } else {
+                                            "Copy Command"
+                                        });
                                         let popover_c = popover.clone();
-                                        let finished_for_copy = finished_menu_clone.clone();
+                                        let block_data_for_copy = block_data_for_export.clone();
+                                        let selected_ids_for_copy = selected_ids_for_menu.clone();
                                         let vte_for_action = vte_for_copy.clone();
                                         item.connect_clicked(move |_| {
                                             popover_c.popdown();
-                                            vte_for_action
-                                                .clipboard()
-                                                .set_text(&finished_for_copy.cmd_text);
+                                            let selected = selected_ids_for_copy.borrow();
+                                            let blocks = block_data_for_copy.borrow();
+                                            let text = selected_command_text(
+                                                blocks
+                                                    .iter()
+                                                    .map(|block| (block.id, block.cmd.as_str())),
+                                                &selected,
+                                            );
+                                            vte_for_action.clipboard().set_text(&text);
                                         });
                                         vbox.append(&item);
                                     }
                                     {
-                                        let item = make_item("Copy Output");
+                                        let item = make_item(if selected_count > 1 {
+                                            "Copy Outputs"
+                                        } else {
+                                            "Copy Output"
+                                        });
                                         let popover_c = popover.clone();
-                                        let finished_for_copy = finished_menu_clone.clone();
+                                        let block_data_for_copy = block_data_for_export.clone();
+                                        let selected_ids_for_copy = selected_ids_for_menu.clone();
                                         let vte_for_action = vte_for_copy.clone();
                                         item.connect_clicked(move |_| {
                                             popover_c.popdown();
-                                            finished_for_copy.with_stripped_output(|output| {
-                                                vte_for_action.clipboard().set_text(output);
-                                            });
+                                            let selected = selected_ids_for_copy.borrow();
+                                            let blocks = block_data_for_copy.borrow();
+                                            let text = blocks
+                                                .iter()
+                                                .filter(|block| selected.contains(&block.id))
+                                                .map(|block| strip_ansi(&block.output))
+                                                .collect::<Vec<_>>()
+                                                .join("\n\n");
+                                            vte_for_action.clipboard().set_text(&text);
                                         });
                                         vbox.append(&item);
                                     }
 
                                     {
-                                        let item = make_item("Copy Block");
+                                        let item = make_item(if selected_count > 1 {
+                                            "Copy Blocks"
+                                        } else {
+                                            "Copy Block"
+                                        });
                                         let popover_c = popover.clone();
-                                        let finished_for_copy = finished_menu_clone.clone();
+                                        let block_data_for_copy = block_data_for_export.clone();
+                                        let selected_ids_for_copy = selected_ids_for_menu.clone();
                                         let vte_for_action = vte_for_copy.clone();
                                         item.connect_clicked(move |_| {
                                             popover_c.popdown();
-                                            let cmd_text = finished_for_copy.cmd_text.clone();
-                                            let output_text =
-                                                strip_ansi(&finished_for_copy.full_output.borrow());
-                                            let full_text = block_clipboard_text(
-                                                &cmd_text,
-                                                &output_text,
-                                                false,
-                                            );
-                                            vte_for_action.clipboard().set_text(&full_text);
+                                            let selected = selected_ids_for_copy.borrow();
+                                            let blocks = block_data_for_copy.borrow();
+                                            let text = blocks
+                                                .iter()
+                                                .filter(|block| selected.contains(&block.id))
+                                                .map(|block| {
+                                                    block_clipboard_text(
+                                                        &block.cmd,
+                                                        &strip_ansi(&block.output),
+                                                        false,
+                                                    )
+                                                })
+                                                .collect::<Vec<_>>()
+                                                .join("\n\n");
+                                            vte_for_action.clipboard().set_text(&text);
                                         });
                                         vbox.append(&item);
                                     }
@@ -1401,10 +1485,17 @@ impl ReaderCtx {
                                         vbox.append(&item);
                                     }
 
-                                    if !finished_menu_clone.is_background {
-                                        let item = make_item("Insert Command at Prompt");
+                                    if has_selected_commands {
+                                        let item = make_item(if selected_count > 1 {
+                                            "Insert Commands at Prompt"
+                                        } else {
+                                            "Insert Command at Prompt"
+                                        });
                                         let popover_c = popover.clone();
-                                        let finished_for_rerun = finished_menu_clone.clone();
+                                        let finished_for_rerun = finished_blocks_for_menu.clone();
+                                        let selected_ids_for_rerun = selected_ids_for_menu.clone();
+                                        let selected_for_rerun = selected_for_menu.clone();
+                                        let anchor_for_rerun = anchor_for_menu.clone();
                                         let pty_for_action = pty_for_rerun_menu.clone();
                                         let pty_synced_for_action = pty_synced_for_rerun_menu.clone();
                                         let bracketed_paste_for_action =
@@ -1417,14 +1508,26 @@ impl ReaderCtx {
                                         );
                                         item.connect_clicked(move |_| {
                                             popover_c.popdown();
-                                            if recall_command_at_prompt(
-                                                &pty_for_action,
-                                                &pty_synced_for_action,
-                                                &typed_cmd_for_action,
-                                                bstate_for_action.get(),
-                                                &finished_for_rerun.cmd_text,
-                                                bracketed_paste_for_action.get(),
-                                            ) {
+                                            let finished = finished_for_rerun.borrow();
+                                            let recalled = {
+                                                let selected = selected_ids_for_rerun.borrow();
+                                                recall_selected_commands_at_prompt(
+                                                    &pty_for_action,
+                                                    &pty_synced_for_action,
+                                                    &typed_cmd_for_action,
+                                                    bstate_for_action.get(),
+                                                    &finished,
+                                                    &selected,
+                                                    bracketed_paste_for_action.get(),
+                                                )
+                                            };
+                                            if recalled {
+                                                clear_finished_block_selection(
+                                                    &finished,
+                                                    &selected_ids_for_rerun,
+                                                    &selected_for_rerun,
+                                                    &anchor_for_rerun,
+                                                );
                                                 active_for_action.borrow().grab_focus();
                                             }
                                         });
@@ -1914,13 +2017,11 @@ struct KeyCtx {
     typed_cmd_for_key: Rc<RefCell<String>>,
     finished_blocks_for_key: Rc<RefCell<Vec<FinishedBlock>>>,
     block_data_for_key: Rc<RefCell<VecDeque<BlockData>>>,
-    block_list_for_key: gtk::Box,
     selected_block_ids_for_key: SelectedBlockIds,
     selected_block_id_for_key: Rc<Cell<Option<u64>>>,
     selection_anchor_id_for_key: Rc<Cell<Option<u64>>>,
     block_scroll_for_key: ScrolledWindow,
     bookmarks_for_key: Rc<RefCell<std::collections::HashSet<u64>>>,
-    visible_indices_for_key: Rc<RefCell<std::collections::HashSet<usize>>>,
     bstate_for_key: Rc<Cell<BlockState>>,
 }
 
@@ -1934,13 +2035,11 @@ impl KeyCtx {
             typed_cmd_for_key,
             finished_blocks_for_key,
             block_data_for_key,
-            block_list_for_key,
             selected_block_ids_for_key,
             selected_block_id_for_key,
             selection_anchor_id_for_key,
             block_scroll_for_key,
             bookmarks_for_key,
-            visible_indices_for_key,
             bstate_for_key,
         } = self;
         key_ctrl.connect_key_pressed(move |_controller, keyval, _keycode, modifiers| {
@@ -2051,28 +2150,34 @@ impl KeyCtx {
                 return glib::Propagation::Stop;
             }
 
-            // Enter while a block is selected: recall its command into the live
-            // input line without executing embedded newlines.
+            // Enter while blocks are selected: recall every selected command in
+            // terminal order as one editable multiline buffer. If the PTY is not
+            // at a prompt (or the selection contains only background output), do
+            // not swallow Enter from the running program/live editor.
             if matches!(keyval, Key::Return | Key::KP_Enter) {
-                if let Some(sel_id) = selected_block_id_for_key.get() {
+                if selected_block_id_for_key.get().is_some() {
                     let finished = finished_blocks_for_key.borrow();
-                    if let Some(block) = finished.iter().find(|b| b.id == sel_id) {
-                        recall_command_at_prompt(
+                    let recalled = {
+                        let selected = selected_block_ids_for_key.borrow();
+                        recall_selected_commands_at_prompt(
                             &pty_for_key,
                             &pty_synced_for_key,
                             &typed_cmd_for_key,
                             bstate_for_key.get(),
-                            &block.cmd_text,
+                            &finished,
+                            &selected,
                             bracketed_paste_for_key.get(),
+                        )
+                    };
+                    if recalled {
+                        clear_finished_block_selection(
+                            &finished,
+                            &selected_block_ids_for_key,
+                            &selected_block_id_for_key,
+                            &selection_anchor_id_for_key,
                         );
+                        return glib::Propagation::Stop;
                     }
-                    clear_finished_block_selection(
-                        &finished,
-                        &selected_block_ids_for_key,
-                        &selected_block_id_for_key,
-                        &selection_anchor_id_for_key,
-                    );
-                    return glib::Propagation::Stop;
                 }
                 return glib::Propagation::Proceed;
             }
@@ -2189,28 +2294,6 @@ impl KeyCtx {
                         scroll_finished_block_into_view(block, &block_scroll_for_key);
                     }
                 }
-                return glib::Propagation::Stop;
-            }
-
-            // Ctrl+Shift+L: clear visible finished blocks + send form feed to
-            // the shell. (Plain Ctrl+L is left to the shell so readline's
-            // clear-screen still works as users expect inside the live cell.)
-            if ctrl && shift && !alt && matches!(keyval, Key::l | Key::L) {
-                let mut blocks = finished_blocks_for_key.borrow_mut();
-                for block in blocks.drain(..) {
-                    block_list_for_key.remove(block.widget());
-                }
-                // FinishedBlock and BlockData must always have matching indices:
-                // virtual scrolling uses BlockData heights to decide which widget
-                // to map. Leaving old data behind made the next command invisible
-                // or made filters jump to a removed block after Ctrl+Shift+L.
-                block_data_for_key.borrow_mut().clear();
-                bookmarks_for_key.borrow_mut().clear();
-                visible_indices_for_key.borrow_mut().clear();
-                selected_block_ids_for_key.borrow_mut().clear();
-                selected_block_id_for_key.set(None);
-                selection_anchor_id_for_key.set(None);
-                pty_for_key.write_bytes(b"\x0c");
                 return glib::Propagation::Stop;
             }
 
@@ -3199,7 +3282,6 @@ impl TermView {
             let typed_cmd_for_key = typed_cmd.clone();
             let finished_blocks_for_key = finished_blocks_rc.clone();
             let block_data_for_key = block_data_rc.clone();
-            let block_list_for_key = block_list.clone();
             let selected_block_ids_for_key = selected_block_ids.clone();
             let selected_block_id_for_key = selected_block_id.clone();
             let selection_anchor_id_for_key = selection_anchor_id.clone();
@@ -3215,13 +3297,11 @@ impl TermView {
                 typed_cmd_for_key,
                 finished_blocks_for_key,
                 block_data_for_key,
-                block_list_for_key,
                 selected_block_ids_for_key,
                 selected_block_id_for_key,
                 selection_anchor_id_for_key,
                 block_scroll_for_key,
                 bookmarks_for_key: block_bookmarks.clone(),
-                visible_indices_for_key: visible_indices.clone(),
                 bstate_for_key: bstate.clone(),
             }
             .connect(&key_ctrl);
@@ -3306,6 +3386,7 @@ impl TermView {
             user_scrolled_up: user_scrolled_up.clone(),
             programmatic_scroll: programmatic_scroll.clone(),
             pty,
+            pty_synced: pty_synced.clone(),
             cwd_callbacks,
             remote_session_callbacks,
             exited_callbacks,
@@ -3329,6 +3410,8 @@ impl TermView {
             selected_block_id,
             selection_anchor_id,
             bookmarks: block_bookmarks,
+            unread_count,
+            jump_fab,
             find_state: Rc::new(RefCell::new(FindState::default())),
             current_cwd: current_cwd.clone(),
             resize_tick_id: RefCell::new(None),
@@ -3728,6 +3811,110 @@ impl TermView {
         adj.set_value(value);
     }
 
+    /// Select all completed blocks as one Warp-style range. The newest block is
+    /// the active edge (strong outline), while the oldest is the fixed anchor
+    /// used if the user subsequently contracts the range with Shift+Up.
+    pub fn select_all_blocks(&self) {
+        if self.fullscreen.get() {
+            return;
+        }
+        let finished = self.finished_blocks.borrow();
+        let (Some(first), Some(last)) = (finished.first(), finished.last()) else {
+            return;
+        };
+        {
+            let mut selected = self.selected_block_ids.borrow_mut();
+            selected.clear();
+            selected.extend(finished.iter().map(|block| block.id));
+        }
+        self.selection_anchor_id.set(Some(first.id));
+        self.selected_block_id.set(Some(last.id));
+        sync_finished_block_selection(&finished, &self.selected_block_ids, &self.selected_block_id);
+        self.active.borrow().grab_focus();
+    }
+
+    /// Recall every selected command, in terminal order, into the editable live
+    /// prompt. Bracketed paste keeps a multi-selection as a multiline buffer; on
+    /// shells without it the existing safe first-line fallback still applies.
+    pub fn reinput_selected_commands(&self) {
+        if self.fullscreen.get() {
+            return;
+        }
+        let finished = self.finished_blocks.borrow();
+        let recalled = {
+            let selected = self.selected_block_ids.borrow();
+            recall_selected_commands_at_prompt(
+                &self.pty,
+                &self.pty_synced,
+                &self.typed_cmd,
+                self.bstate.get(),
+                &finished,
+                &selected,
+                self.bracketed_paste.get(),
+            )
+        };
+        if recalled {
+            clear_finished_block_selection(
+                &finished,
+                &self.selected_block_ids,
+                &self.selected_block_id,
+                &self.selection_anchor_id,
+            );
+            self.active.borrow().grab_focus();
+        }
+    }
+
+    /// Remove all completed blocks and all state indexed by those blocks. This
+    /// is deliberately pane-local: command-only history remains available in
+    /// Ctrl+R, while optional full block-history persistence is overwritten
+    /// immediately so cleared output does not reappear after a crash/restart.
+    pub fn clear_blocks(&self) {
+        self.clear_find();
+        self.active_vte.unselect_all();
+
+        let widgets: Vec<gtk::Box> = self
+            .finished_blocks
+            .borrow_mut()
+            .drain(..)
+            .map(|block| block.widget().clone())
+            .collect();
+        let mut pool = self.widget_pool.borrow_mut();
+        for widget in widgets {
+            self.block_list.remove(&widget);
+            pool.release(widget);
+        }
+        drop(pool);
+
+        // BlockData and FinishedBlock are parallel lists. Virtualization,
+        // bookmarks, selection, and unread state all reference their IDs or
+        // indices, so clearing only the widgets would corrupt the next block.
+        self.block_data.borrow_mut().clear();
+        self.bookmarks.borrow_mut().clear();
+        self.visible_indices.borrow_mut().clear();
+        self.selected_block_ids.borrow_mut().clear();
+        self.selected_block_id.set(None);
+        self.selection_anchor_id.set(None);
+        self.unread_count.set(0);
+        set_jump_fab_label(&self.jump_fab, 0);
+        self.jump_fab.set_visible(false);
+        {
+            let mut viewport = self.viewport.borrow_mut();
+            viewport.first_visible = 0;
+            viewport.last_visible = 0;
+            viewport.total_height = 0;
+        }
+        self.block_list.queue_allocate();
+
+        // At an idle prompt, also ask the shell to repaint a clean live input
+        // surface. Never inject form-feed into a running/full-screen program.
+        if self.bstate.get() == BlockState::AwaitingCommand {
+            self.pty.write_bytes(b"\x0c");
+        }
+        if let Err(err) = self.save_history() {
+            log::warn!("save cleared block history: {err}");
+        }
+    }
+
     pub fn apply_failed_filter(&self) {
         if let Some(idx) = self.get_failed_blocks().first().copied() {
             self.scroll_to_block(idx);
@@ -4103,11 +4290,12 @@ impl TermView {
 mod tests {
     use super::{
         background_output_has_visible_text, block_clipboard_text, build_command_recall,
-        coalesce_bytes_events, finished_command, is_post_command_metadata, selected_id_range,
-        strip_ansi, strip_ansi_with_clear_detect, take_background_output,
+        coalesce_bytes_events, finished_command, is_post_command_metadata, selected_command_text,
+        selected_id_range, strip_ansi, strip_ansi_with_clear_detect, take_background_output,
     };
     use crate::parser::ParserEvent;
     use std::cell::RefCell;
+    use std::collections::HashSet;
 
     #[test]
     fn background_output_requires_visible_text() {
@@ -4216,6 +4404,31 @@ mod tests {
         let (text, payload) = build_command_recall("git status", true);
         assert_eq!(text, "git status");
         assert_eq!(payload, b"git status");
+    }
+
+    #[test]
+    fn selected_commands_keep_terminal_order_and_skip_background_blocks() {
+        let selected = HashSet::from([30, 10, 20]);
+        let blocks = [
+            (10, "git status"),
+            (20, ""),
+            (30, "cargo test"),
+            (40, "git push"),
+        ];
+        assert_eq!(
+            selected_command_text(blocks, &selected),
+            "git status\ncargo test"
+        );
+    }
+
+    #[test]
+    fn selected_commands_preserve_multiline_commands() {
+        let selected = HashSet::from([7, 8]);
+        let blocks = [(7, "printf 'a\\n'\nprintf 'b\\n'"), (8, "echo done")];
+        assert_eq!(
+            selected_command_text(blocks, &selected),
+            "printf 'a\\n'\nprintf 'b\\n'\necho done"
+        );
     }
 
     #[test]

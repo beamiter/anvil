@@ -335,6 +335,12 @@ pub enum VteInput {
     FilterSlowBlocks,
     FilterPinnedBlocks,
     ClearBlockFilter,
+    /// Block-view only: select all completed blocks.
+    SelectAllBlocks,
+    /// Block-view only: remove all completed blocks from the pane.
+    ClearBlocks,
+    /// Block-view only: put all selected commands back into the input editor.
+    ReinputSelectedCommands,
     /// Block-view only: jump to the previous / next pinned block.
     JumpToPrevPinned,
     JumpToNextPinned,
@@ -556,6 +562,9 @@ impl Component for VteTerminal {
             | VteInput::FilterSlowBlocks
             | VteInput::FilterPinnedBlocks
             | VteInput::ClearBlockFilter
+            | VteInput::SelectAllBlocks
+            | VteInput::ClearBlocks
+            | VteInput::ReinputSelectedCommands
             | VteInput::JumpToPrevPinned
             | VteInput::JumpToNextPinned => {}
             VteInput::SearchSet(query, use_regex) => {
