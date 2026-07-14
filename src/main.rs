@@ -2,6 +2,7 @@
 
 mod action_ops;
 mod agent;
+mod agent_ops;
 mod ai;
 mod app_msg;
 mod block_view;
@@ -11,6 +12,7 @@ mod config;
 mod config_ops;
 mod dialogs;
 mod file_tree;
+mod file_tree_ops;
 mod git_meta;
 mod keybindings;
 mod navigation_ui;
@@ -29,6 +31,7 @@ mod tab_strip;
 mod terminal;
 mod top_bar;
 mod vte_pty;
+mod workflow_ops;
 mod workflows;
 mod workspace;
 mod workspace_ops;
@@ -221,45 +224,6 @@ impl AppModel {
             .filter(|p| p.is_dir())
     }
 
-    /// Re-scan the user's workflow directory. Called before each palette
-    /// open so users see new/edited YAMLs without a restart. Cheap: a few
-    /// short files, parsed once.
-    fn reload_workflows(&self) {
-        let dirs = workflows::workflow_dirs();
-        let loaded = workflows::load_all(&dirs);
-        *self.workflows.borrow_mut() = loaded;
-    }
-
-    /// Look up a workflow by source path (the palette gives us a path, not
-    /// an index, because the workflow list can be rebuilt between
-    /// gather() and accept). If the workflow has no args, render and type
-    /// immediately; otherwise open the param-fill dialog.
-    fn run_workflow_from_path(&self, path: std::path::PathBuf, sender: &ComponentSender<AppModel>) {
-        let workflow = self
-            .workflows
-            .borrow()
-            .iter()
-            .find(|w| w.source_path.as_deref() == Some(path.as_path()))
-            .cloned();
-        let Some(workflow) = workflow else {
-            log::warn!("workflow not found: {}", path.display());
-            self.show_toast(format!("Workflow not found: {}", path.display()));
-            return;
-        };
-        if workflow.args.is_empty() {
-            match workflows::render(&workflow, &std::collections::HashMap::new()) {
-                Ok(rendered) => sender.input(AppMsg::PaletteTypeCommand(rendered)),
-                Err(e) => {
-                    log::warn!("workflow render failed: {e}");
-                    self.show_toast(format!("Workflow could not be rendered: {e}"));
-                }
-            }
-            return;
-        }
-        self.workflow_dialog
-            .emit(dialogs::workflow::WorkflowMsg::Open(workflow));
-    }
-
     /// `?` palette accept handler: run the natural-language query through the
     /// configured AI provider and, on success, type the returned command into
     /// the active pane (no autosubmit). Errors raise a transient toast/log
@@ -297,314 +261,6 @@ impl AppModel {
         std::mem::forget(_h);
     }
 
-    // ── Agent mode ───────────────────────────────────────────────────────
-
-    fn open_agent_panel(&self, _sender: &ComponentSender<AppModel>) {
-        let cfg = self.config.borrow();
-        if !cfg.ai_enabled || !cfg.agent_enabled {
-            log::info!(
-                "agent: disabled (ai_enabled={}, agent_enabled={})",
-                cfg.ai_enabled,
-                cfg.agent_enabled
-            );
-            self.show_toast("AI Agent is disabled in configuration.");
-            return;
-        }
-        drop(cfg);
-        let active_is_block = self
-            .tabs
-            .get(self.active)
-            .and_then(|tab| tab.panes.get(tab.active_pane))
-            .is_some_and(|pane| matches!(pane.mode, TerminalMode::Block));
-        if !active_is_block {
-            self.show_toast(
-                "AI Agent requires a Block-mode pane so command results can be observed.",
-            );
-            return;
-        }
-        let Some(client) = ai::AiClient::from_env() else {
-            log::warn!("agent: no AI provider configured");
-            self.show_toast("No AI provider is configured.");
-            return;
-        };
-
-        // Cancel any pre-existing session before replacing.
-        if let Some(prev) = self.active_agent.borrow_mut().take() {
-            prev.cancel();
-        }
-
-        let tab_id = self.tabs.get(self.active).map(|t| t.id).unwrap_or(0);
-        let pane_id = self
-            .tabs
-            .get(self.active)
-            .and_then(|t| t.panes.get(t.active_pane))
-            .map(|p| p.id)
-            .unwrap_or(0);
-        *self.active_agent.borrow_mut() = Some(agent::AgentSession::new(tab_id, pane_id));
-
-        if let Some(view) = self.agent_panel_view() {
-            self.agent_panel.emit(agent::AgentPanelMsg::Open {
-                provider_name: client.display_name(),
-                view,
-            });
-        }
-    }
-
-    fn agent_panel_view(&self) -> Option<agent::AgentPanelView> {
-        let session = self.active_agent.borrow();
-        let session = session.as_ref()?;
-        Some(agent::AgentPanelView {
-            transcript: session.transcript.clone(),
-            turns_used: session.turns_used,
-            max_turns: self.config.borrow().agent_max_turns,
-            awaiting_command: session.awaiting_command.is_some(),
-            sealed: session.sealed,
-            loading: session.in_flight.is_some(),
-        })
-    }
-
-    fn refresh_agent_panel(&self) {
-        if let Some(view) = self.agent_panel_view() {
-            self.agent_panel.emit(agent::AgentPanelMsg::Render(view));
-        }
-    }
-
-    /// Push a user turn and kick off the next LLM turn.
-    fn agent_send(&self, text: String, sender: &ComponentSender<AppModel>) {
-        if self.active_agent.borrow().is_none() {
-            return;
-        }
-        {
-            let mut guard = self.active_agent.borrow_mut();
-            let sess = guard.as_mut().unwrap();
-            if sess.sealed {
-                return;
-            }
-            sess.transcript.push(agent::Turn::User(text));
-        }
-        self.refresh_agent_panel();
-        self.agent_kick_llm(sender);
-    }
-
-    fn agent_approve(
-        &self,
-        idx: usize,
-        edited: Option<String>,
-        _sender: &ComponentSender<AppModel>,
-    ) {
-        let (cmd, tab_id, pane_id) = {
-            let mut guard = self.active_agent.borrow_mut();
-            let Some(sess) = guard.as_mut() else { return };
-            if sess.sealed {
-                return;
-            }
-            let final_cmd = match sess.transcript.get_mut(idx) {
-                Some(agent::Turn::AssistantProposed { cmd, approved }) => {
-                    if let Some(new_cmd) = edited {
-                        *cmd = new_cmd;
-                    }
-                    *approved = Some(true);
-                    cmd.clone()
-                }
-                _ => return,
-            };
-            sess.awaiting_command = Some(final_cmd.clone());
-            (final_cmd, sess.bound_tab, sess.bound_pane)
-        };
-        // Type the command into the bound pane, autosubmit with \r since
-        // the user has explicitly approved.
-        if let Some(term) = self.terminal_for(tab_id, pane_id) {
-            let mut bytes = cmd.into_bytes();
-            bytes.push(b'\r');
-            term.emit(VteInput::WriteInput(bytes));
-            term.emit(VteInput::GrabFocus);
-        }
-        self.refresh_agent_panel();
-    }
-
-    fn agent_reject(&self, idx: usize, sender: &ComponentSender<AppModel>) {
-        {
-            let mut guard = self.active_agent.borrow_mut();
-            let Some(sess) = guard.as_mut() else { return };
-            if let Some(agent::Turn::AssistantProposed { approved, .. }) =
-                sess.transcript.get_mut(idx)
-            {
-                *approved = Some(false);
-            }
-        }
-        self.refresh_agent_panel();
-        // Kick the LLM again so it can suggest something else.
-        self.agent_kick_llm(sender);
-    }
-
-    fn agent_handle_block_finished(
-        &self,
-        tab_id: u64,
-        pane_id: u64,
-        command: String,
-        exit_code: i32,
-        output_sample: String,
-        sender: &ComponentSender<AppModel>,
-    ) {
-        let should_feed = {
-            let guard = self.active_agent.borrow();
-            let Some(sess) = guard.as_ref() else { return };
-            if sess.bound_tab != tab_id || sess.bound_pane != pane_id {
-                return;
-            }
-            match sess.awaiting_command.as_ref() {
-                Some(expected) if expected.trim() == command.trim() => true,
-                // The user typed something themselves while the agent was
-                // waiting — drop this block and keep waiting.
-                _ => false,
-            }
-        };
-        if !should_feed {
-            return;
-        }
-        {
-            let mut guard = self.active_agent.borrow_mut();
-            let Some(sess) = guard.as_mut() else { return };
-            sess.awaiting_command = None;
-            sess.transcript.push(agent::Turn::Observation {
-                exit: exit_code,
-                output_sample: agent::sample_observation(&output_sample),
-            });
-        }
-        self.refresh_agent_panel();
-        self.agent_kick_llm(sender);
-    }
-
-    fn agent_handle_reply(
-        &self,
-        reply: Result<String, String>,
-        _sender: &ComponentSender<AppModel>,
-    ) {
-        {
-            let mut guard = self.active_agent.borrow_mut();
-            let Some(sess) = guard.as_mut() else { return };
-            if sess.is_cancelled() {
-                return;
-            }
-            sess.in_flight = None;
-            sess.turns_used = sess.turns_used.saturating_add(1);
-
-            match reply {
-                Err(e) => {
-                    sess.transcript.push(agent::Turn::AssistantSay(format!(
-                        "[error contacting model: {e}]"
-                    )));
-                }
-                Ok(raw) => {
-                    let parsed = agent::parse_action(&raw);
-                    match parsed {
-                        agent::ParsedAction::Run { thought, command } => {
-                            if let Some(t) = thought {
-                                sess.transcript.push(agent::Turn::AssistantThought(t));
-                            }
-                            sess.transcript.push(agent::Turn::AssistantProposed {
-                                cmd: command,
-                                approved: None,
-                            });
-                        }
-                        agent::ParsedAction::Say { thought, message } => {
-                            if let Some(t) = thought {
-                                sess.transcript.push(agent::Turn::AssistantThought(t));
-                            }
-                            sess.transcript.push(agent::Turn::AssistantSay(message));
-                        }
-                        agent::ParsedAction::Done { thought, message } => {
-                            if let Some(t) = thought {
-                                sess.transcript.push(agent::Turn::AssistantThought(t));
-                            }
-                            sess.transcript.push(agent::Turn::AssistantSay(message));
-                            sess.sealed = true;
-                        }
-                    }
-                }
-            }
-            // Turn-cap seal.
-            let cap = self.config.borrow().agent_max_turns;
-            if sess.turns_used >= cap {
-                sess.sealed = true;
-            }
-        }
-        self.refresh_agent_panel();
-    }
-
-    fn agent_kick_llm(&self, sender: &ComponentSender<AppModel>) {
-        let Some(client) = ai::AiClient::from_env() else {
-            return;
-        };
-        // Build the prompt outside the borrow.
-        let (system, user) = {
-            let guard = self.active_agent.borrow();
-            let Some(sess) = guard.as_ref() else { return };
-            if sess.sealed {
-                return;
-            }
-            // Don't double-fire while still waiting for a command's output.
-            if sess.awaiting_command.is_some() {
-                return;
-            }
-            let cwd = self
-                .active_cwd()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "/".to_string());
-            let shell = self
-                .shell_argv
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "/bin/sh".to_string());
-            let os = std::env::consts::OS.to_string();
-            (
-                ai::build_agent_system_prompt(&cwd, &shell, &os),
-                sess.build_user_prompt(),
-            )
-        };
-
-        let sender_for_reply = sender.clone();
-        let cancelled = {
-            let guard = self.active_agent.borrow();
-            guard.as_ref().map(|s| s.cancelled.clone())
-        };
-        let handle = ai::ask(client, system, user, move |result| {
-            // Cancelled-check is already done by ask() against its own flag,
-            // but the agent session may have moved on between fire and
-            // delivery — re-check here.
-            if let Some(c) = &cancelled {
-                if c.load(std::sync::atomic::Ordering::SeqCst) {
-                    return;
-                }
-            }
-            sender_for_reply.input(AppMsg::AgentLlmReply(result));
-        });
-        // Stash the handle on the business session; the panel derives its
-        // spinner state from `in_flight` through a fresh view snapshot.
-        {
-            let mut guard = self.active_agent.borrow_mut();
-            if let Some(sess) = guard.as_mut() {
-                sess.in_flight = Some(handle);
-            }
-        }
-        self.refresh_agent_panel();
-    }
-
-    fn agent_close(&self) {
-        self.agent_edit.emit(agent::AgentEditMsg::Close);
-        if let Some(prev) = self.active_agent.borrow_mut().take() {
-            prev.cancel();
-        }
-    }
-
-    fn terminal_for(&self, tab_id: u64, pane_id: u64) -> Option<&TermCtl> {
-        self.tabs
-            .iter()
-            .find(|t| t.id == tab_id)
-            .and_then(|t| t.panes.iter().find(|p| p.id == pane_id))
-            .map(|p| &p.terminal)
-    }
-
     /// Open the session-level AI panel with the configured history source.
     fn show_ai_session_panel(&self) {
         if !self.config.borrow().ai_enabled {
@@ -613,57 +269,6 @@ impl AppModel {
         self.ai_panel.emit(dialogs::ai_panel::AiPanelMsg::Open(
             self.config.borrow().command_history_path.clone(),
         ));
-    }
-
-    /// Rebuild the file tree with `root` at the top.
-    #[allow(deprecated)]
-    fn set_file_tree_root(&self, root: std::path::PathBuf) {
-        self.file_tree_store.clear();
-        self.file_header.emit(sidebar::FileHeaderMsg::SetRoot {
-            display: file_tree::display_path(&root),
-            tooltip: root.to_string_lossy().into_owned(),
-        });
-        file_tree::populate_dir(&self.file_tree_store, None, &root);
-        *self.file_tree_root.borrow_mut() = root;
-    }
-
-    /// Initialize the file tree to the active cwd, else `$HOME`, else `/`.
-    fn init_file_tree(&self) {
-        let start = self
-            .active_cwd()
-            .or_else(file_tree::home_dir)
-            .unwrap_or_else(|| std::path::PathBuf::from("/"));
-        self.set_file_tree_root(start);
-    }
-
-    /// Jump the file tree to the active tab's working directory.
-    fn file_tree_goto_current_cwd(&self) {
-        match self.active_cwd() {
-            Some(dir) => {
-                if *self.file_tree_root.borrow() != dir {
-                    self.set_file_tree_root(dir);
-                }
-            }
-            None => {
-                if self.file_tree_root.borrow().as_os_str().is_empty() {
-                    if let Some(home) = file_tree::home_dir() {
-                        self.set_file_tree_root(home);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Move the file tree root up to its parent directory.
-    fn file_tree_go_up(&self) {
-        let parent = self
-            .file_tree_root
-            .borrow()
-            .parent()
-            .map(std::path::Path::to_path_buf);
-        if let Some(parent) = parent {
-            self.set_file_tree_root(parent);
-        }
     }
 }
 
