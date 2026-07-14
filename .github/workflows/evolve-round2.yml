@@ -4,6 +4,13 @@ on:
   push:
     branches:
       - agent/resilience-observability-evolution
+  pull_request:
+    branches:
+      - master
+    types:
+      - opened
+      - synchronize
+  workflow_dispatch:
 
 permissions:
   contents: write
