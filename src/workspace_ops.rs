@@ -6,6 +6,66 @@
 
 use super::*;
 
+/// Detach one terminal leaf, remove its immediate split, and promote the sibling
+/// into the validated grandparent slot. Validation happens before mutation so a
+/// malformed widget tree cannot leave the model and GTK hierarchy out of sync.
+fn detach_leaf_and_promote(holder: &gtk::Box, leaf: &gtk::Widget) -> Option<gtk::Widget> {
+    enum Destination {
+        PanedStart(gtk::Paned),
+        PanedEnd(gtk::Paned),
+        Holder,
+    }
+
+    let parent = leaf.parent()?.downcast::<gtk::Paned>().ok()?;
+    let start = parent.start_child();
+    let end = parent.end_child();
+    let sibling = if start.as_ref() == Some(leaf) {
+        end?
+    } else if end.as_ref() == Some(leaf) {
+        start?
+    } else {
+        return None;
+    };
+
+    let parent_widget = parent.clone().upcast::<gtk::Widget>();
+    let grandparent = parent_widget.parent()?;
+    let holder_widget = holder.clone().upcast::<gtk::Widget>();
+    let destination = if grandparent == holder_widget {
+        Destination::Holder
+    } else if let Ok(grandparent) = grandparent.downcast::<gtk::Paned>() {
+        if grandparent.start_child().as_ref() == Some(&parent_widget) {
+            Destination::PanedStart(grandparent)
+        } else if grandparent.end_child().as_ref() == Some(&parent_widget) {
+            Destination::PanedEnd(grandparent)
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+
+    parent.set_start_child(None::<&gtk::Widget>);
+    parent.set_end_child(None::<&gtk::Widget>);
+    match destination {
+        Destination::PanedStart(grandparent) => grandparent.set_start_child(Some(&sibling)),
+        Destination::PanedEnd(grandparent) => grandparent.set_end_child(Some(&sibling)),
+        Destination::Holder => {
+            holder.remove(&parent_widget);
+            holder.append(&sibling);
+        }
+    }
+    Some(sibling)
+}
+
+fn active_index_after_remove(active: usize, removed: usize, remaining: usize) -> usize {
+    debug_assert!(remaining > 0);
+    if active > removed {
+        active - 1
+    } else {
+        active.min(remaining - 1)
+    }
+}
+
 impl AppModel {
     pub(crate) fn add_tab(
         &mut self,
@@ -844,42 +904,11 @@ impl AppModel {
             self.close_tab(tab_id, sender);
             return;
         }
-        let eff = self.tabs[ti].panes[pi].terminal.widget();
-        if let Some(parent) = eff.parent() {
-            if let Ok(paned) = parent.downcast::<gtk::Paned>() {
-                let start = paned.start_child();
-                let end = paned.end_child();
-                let sibling = if start.as_ref() == Some(&eff) {
-                    end
-                } else {
-                    start
-                };
-                paned.set_start_child(None::<&gtk::Widget>);
-                paned.set_end_child(None::<&gtk::Widget>);
-                if let Some(sibling) = sibling {
-                    let paned_w: gtk::Widget = paned.clone().upcast();
-                    if let Some(gp) = paned_w.parent() {
-                        if let Ok(gpp) = gp.clone().downcast::<gtk::Paned>() {
-                            if gpp.start_child().as_ref() == Some(&paned_w) {
-                                gpp.set_start_child(Some(&sibling));
-                            } else {
-                                gpp.set_end_child(Some(&sibling));
-                            }
-                        } else {
-                            let holder = &self.tabs[ti].holder;
-                            holder.remove(&paned_w);
-                            holder.append(&sibling);
-                        }
-                    }
-                }
-            }
-        }
-
+        let Some(removed) = self.detach_pane_from_tab(ti, pi) else {
+            log::error!("Failed to detach pane {pane_id} from tab widget tree");
+            return;
+        };
         let tab = &mut self.tabs[ti];
-        let removed = tab.panes.remove(pi);
-        if tab.active_pane >= tab.panes.len() {
-            tab.active_pane = tab.panes.len() - 1;
-        }
         let ap = tab.active_pane;
         tab.panes[ap].terminal.emit(VteInput::GrabFocus);
         drop(removed);
@@ -1026,54 +1055,19 @@ impl AppModel {
 
     /// Detach the active pane from a split tab and host it in a brand-new tab.
     pub(crate) fn move_pane_to_new_tab(&mut self, sender: &ComponentSender<AppModel>) {
-        let Some(tab) = self.tabs.get(self.active) else {
+        let (ti, pi, pane_id) = {
+            let Some(tab) = self.tabs.get(self.active) else {
+                return;
+            };
+            if tab.panes.len() <= 1 || tab.zoom.is_some() {
+                return;
+            }
+            (self.active, tab.active_pane, tab.panes[tab.active_pane].id)
+        };
+        let Some(moved) = self.detach_pane_from_tab(ti, pi) else {
+            log::error!("Failed to detach pane {pane_id} into a new tab");
             return;
         };
-        if tab.panes.len() <= 1 || tab.zoom.is_some() {
-            return;
-        }
-        let ti = self.active;
-        let pi = tab.active_pane;
-        let eff = tab.panes[pi].terminal.widget();
-
-        // Collapse the source tree, promoting the sibling (same as close_pane).
-        if let Some(parent) = eff.parent() {
-            if let Ok(paned) = parent.downcast::<gtk::Paned>() {
-                let start = paned.start_child();
-                let end = paned.end_child();
-                let sibling = if start.as_ref() == Some(&eff) {
-                    end
-                } else {
-                    start
-                };
-                paned.set_start_child(None::<&gtk::Widget>);
-                paned.set_end_child(None::<&gtk::Widget>);
-                if let Some(sibling) = sibling {
-                    let paned_w: gtk::Widget = paned.clone().upcast();
-                    if let Some(gp) = paned_w.parent() {
-                        if let Ok(gpp) = gp.clone().downcast::<gtk::Paned>() {
-                            if gpp.start_child().as_ref() == Some(&paned_w) {
-                                gpp.set_start_child(Some(&sibling));
-                            } else {
-                                gpp.set_end_child(Some(&sibling));
-                            }
-                        } else {
-                            let holder = &self.tabs[ti].holder;
-                            holder.remove(&paned_w);
-                            holder.append(&sibling);
-                        }
-                    }
-                }
-            }
-        }
-
-        let moved = self.tabs[ti].panes.remove(pi);
-        {
-            let tab = &mut self.tabs[ti];
-            if tab.active_pane >= tab.panes.len() {
-                tab.active_pane = tab.panes.len() - 1;
-            }
-        }
 
         let new_id = self.next_id;
         self.next_id += 1;
@@ -1101,5 +1095,45 @@ impl AppModel {
         };
         self.insert_tab_after_active(new_tab);
         self.select_tab(new_id, sender);
+    }
+
+    /// Remove a non-final pane from both the GTK split tree and the tab model.
+    /// Keeping these mutations together prevents either representation from
+    /// advancing when structural validation fails.
+    fn detach_pane_from_tab(&mut self, tab_index: usize, pane_index: usize) -> Option<Pane> {
+        let tab = self.tabs.get(tab_index)?;
+        if tab.panes.len() <= 1 || pane_index >= tab.panes.len() {
+            return None;
+        }
+
+        let leaf = tab.panes[pane_index].terminal.widget();
+        detach_leaf_and_promote(&tab.holder, &leaf)?;
+
+        let tab = self.tabs.get_mut(tab_index)?;
+        let removed = tab.panes.remove(pane_index);
+        tab.active_pane = active_index_after_remove(tab.active_pane, pane_index, tab.panes.len());
+        Some(removed)
+    }
+}
+
+#[cfg(test)]
+mod pane_tree_tests {
+    use super::active_index_after_remove;
+
+    #[test]
+    fn active_index_tracks_the_same_pane_when_an_earlier_pane_is_removed() {
+        assert_eq!(active_index_after_remove(2, 0, 2), 1);
+        assert_eq!(active_index_after_remove(1, 0, 2), 0);
+    }
+
+    #[test]
+    fn removing_the_active_pane_prefers_the_next_then_previous_pane() {
+        assert_eq!(active_index_after_remove(1, 1, 2), 1);
+        assert_eq!(active_index_after_remove(2, 2, 2), 1);
+    }
+
+    #[test]
+    fn removing_a_later_pane_keeps_the_active_index() {
+        assert_eq!(active_index_after_remove(0, 2, 2), 0);
     }
 }
