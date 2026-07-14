@@ -11,6 +11,7 @@ mod cli;
 mod command_history;
 mod config;
 mod config_ops;
+mod diagnostics;
 mod dialogs;
 mod file_tree;
 mod file_tree_ops;
@@ -82,6 +83,7 @@ struct AppModel {
     toast_overlay: adw::ToastOverlay,
     quit_allowed: Rc<std::cell::Cell<bool>>,
     session_persistence: bool,
+    safe_mode: bool,
     dyn_css: gtk::CssProvider,
     search: Controller<search::SearchModel>,
     tab_filter_control: Controller<sidebar::TabFilterModel>,
@@ -253,24 +255,37 @@ impl SimpleComponent for AppModel {
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
-        let config_warning = config::config_file_error();
+        let config_warning = if init.safe_mode {
+            None
+        } else {
+            config::config_file_error()
+        };
         let (mut config, themes, kbmap) = load_config();
+        if init.safe_mode {
+            config.apply_safe_mode();
+        }
         if let Some(mode) = init.mode {
             config.terminal_mode = match mode {
                 cli::Mode::Block => TerminalMode::Block,
                 cli::Mode::Vte => TerminalMode::Vte,
             };
         }
-        let shell_argv = Rc::new(choose_shell_argv(config.shell.as_deref()));
+        let shell_argv = if init.safe_mode {
+            Rc::new(vec!["sh".to_string()])
+        } else {
+            Rc::new(choose_shell_argv(config.shell.as_deref()))
+        };
         let startup = config.startup_commands.clone();
         let requested_cwd = init
             .working_directory
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned());
         let execute_argv = init.execute.clone().map(Rc::new);
-        let restore_session =
-            !init.no_restore && init.working_directory.is_none() && init.execute.is_none();
-        let session_persistence = init.execute.is_none();
+        let restore_session = !init.safe_mode
+            && !init.no_restore
+            && init.working_directory.is_none()
+            && init.execute.is_none();
+        let session_persistence = init.execute.is_none() && !init.safe_mode;
         let window_opacity = config.window_opacity;
         let font_scale = config.default_font_scale;
         let config = Rc::new(RefCell::new(config));
@@ -563,6 +578,7 @@ impl SimpleComponent for AppModel {
             toast_overlay: toast_overlay.clone(),
             quit_allowed: quit_allowed.clone(),
             session_persistence,
+            safe_mode: init.safe_mode,
             dyn_css,
             search,
             tab_filter_control,
@@ -621,6 +637,11 @@ impl SimpleComponent for AppModel {
                 "Config could not be loaded; defaults are active. Your file was left untouched. {error}"
             ));
         }
+        if init.safe_mode {
+            model.show_toast(
+                "Safe mode: VTE + sh, with startup commands, restore, persistence, remote hosts, and AI disabled.",
+            );
+        }
 
         // Place the tab strip (sidebar vs top bar) and select the sidebar view.
         model.apply_tab_placement();
@@ -664,36 +685,40 @@ impl SimpleComponent for AppModel {
         }
         root.add_controller(key_controller);
 
-        // Config file hot reload: watch config.toml for external changes.
-        let config_path = config_file_path();
-        if let Some(parent) = config_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let config_file = gio::File::for_path(&config_path);
-        if let Ok(monitor) =
-            config_file.monitor_file(gio::FileMonitorFlags::NONE, None::<&Cancellable>)
-        {
-            let rsender = sender.clone();
-            let reload_pending = Rc::new(std::cell::Cell::new(false));
-            monitor.connect_changed(move |_, _, _, event| {
-                if matches!(
-                    event,
-                    gio::FileMonitorEvent::Changed | gio::FileMonitorEvent::Created
-                ) && !reload_pending.get()
-                {
-                    reload_pending.set(true);
-                    let rsender = rsender.clone();
-                    let pending = reload_pending.clone();
-                    glib::timeout_add_local_once(
-                        std::time::Duration::from_millis(200),
-                        move || {
-                            pending.set(false);
-                            rsender.input(AppMsg::ReloadConfig);
-                        },
-                    );
-                }
-            });
-            unsafe { root.set_data("config-monitor", monitor) };
+        // Config file hot reload is intentionally disabled in safe mode: a
+        // change on disk must not re-enable startup, persistence, remote, or AI
+        // behavior in the isolated recovery session.
+        if !init.safe_mode {
+            let config_path = config_file_path();
+            if let Some(parent) = config_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let config_file = gio::File::for_path(&config_path);
+            if let Ok(monitor) =
+                config_file.monitor_file(gio::FileMonitorFlags::NONE, None::<&Cancellable>)
+            {
+                let rsender = sender.clone();
+                let reload_pending = Rc::new(std::cell::Cell::new(false));
+                monitor.connect_changed(move |_, _, _, event| {
+                    if matches!(
+                        event,
+                        gio::FileMonitorEvent::Changed | gio::FileMonitorEvent::Created
+                    ) && !reload_pending.get()
+                    {
+                        reload_pending.set(true);
+                        let rsender = rsender.clone();
+                        let pending = reload_pending.clone();
+                        glib::timeout_add_local_once(
+                            std::time::Duration::from_millis(200),
+                            move || {
+                                pending.set(false);
+                                rsender.input(AppMsg::ReloadConfig);
+                            },
+                        );
+                    }
+                });
+                unsafe { root.set_data("config-monitor", monitor) };
+            }
         }
 
         model.apply_dynamic_css();
@@ -996,9 +1021,9 @@ fn main() {
     match command {
         cli::Command::Help => print!("{}", cli::HELP),
         cli::Command::Version => println!("jterm1 {}", env!("CARGO_PKG_VERSION")),
-        cli::Command::Doctor => {
+        cli::Command::Doctor(format) => {
             init_logging();
-            if !run_doctor() {
+            if !run_doctor(format) {
                 std::process::exit(1);
             }
         }
@@ -1104,92 +1129,8 @@ fn print_shell_integration(shell: cli::ShellIntegration) {
     print!("{script}");
 }
 
-fn run_doctor() -> bool {
-    let mut errors = 0usize;
-    let mut warnings = 0usize;
-    let ok = |label: &str, value: String| println!("[ok]    {label}: {value}");
-    let mut warn = |label: &str, value: String| {
-        warnings += 1;
-        println!("[warn]  {label}: {value}");
-    };
-    let mut error = |label: &str, value: String| {
-        errors += 1;
-        println!("[error] {label}: {value}");
-    };
-
-    println!("jterm1 {} diagnostics\n", env!("CARGO_PKG_VERSION"));
-    let config_path = config_file_path();
-    match config::config_file_error() {
-        Some(message) => error("config", message),
-        None if config_path.is_file() => ok("config", config_path.display().to_string()),
-        None => warn(
-            "config",
-            format!(
-                "{} does not exist (built-in defaults)",
-                config_path.display()
-            ),
-        ),
-    }
-
-    let (config, _, _) = load_config();
-    let shell_argv = choose_shell_argv(config.shell.as_deref());
-    let shell = shell_argv.first().cloned().unwrap_or_default();
-    let shell_found = if std::path::Path::new(&shell).components().count() > 1 {
-        std::path::Path::new(&shell).is_file()
-    } else {
-        config::find_executable_in_path(&shell).is_some()
-    };
-    if shell_found {
-        ok("shell", shell_argv.join(" "));
-    } else {
-        error("shell", format!("not executable: {shell}"));
-    }
-
-    let display = std::env::var("WAYLAND_DISPLAY")
-        .ok()
-        .map(|value| format!("Wayland {value}"))
-        .or_else(|| {
-            std::env::var("DISPLAY")
-                .ok()
-                .map(|value| format!("X11 {value}"))
-        });
-    match display {
-        Some(display) => ok("display", display),
-        None => warn(
-            "display",
-            "DISPLAY and WAYLAND_DISPLAY are unset".to_string(),
-        ),
-    }
-
-    match &config.command_history_path {
-        Some(path) => ok("command history", path.clone()),
-        None => warn("command history", "disabled".to_string()),
-    }
-    let workflow_count = workflows::load_all(&workflows::workflow_dirs()).len();
-    ok("workflows", format!("{workflow_count} available"));
-    if let Some(client) = ai::AiClient::from_env() {
-        ok("AI", client.display_name());
-    } else {
-        warn("AI", "provider configuration is incomplete".to_string());
-    }
-    if config::find_executable_in_path("notify-send").is_some() {
-        ok("notifications", "notify-send available".to_string());
-    } else {
-        warn(
-            "notifications",
-            "notify-send missing (long-command alerts disabled)".to_string(),
-        );
-    }
-    ok(
-        "terminal mode",
-        match config.terminal_mode {
-            TerminalMode::Block => "block".to_string(),
-            TerminalMode::Vte => "vte".to_string(),
-        },
-    );
-
-    println!("\nSummary: {errors} error(s), {warnings} warning(s)");
-    errors == 0
+fn run_doctor(format: cli::DoctorFormat) -> bool {
+    diagnostics::run(format)
 }
 
 /// Make the fcitx5 GTK4 input-method module discoverable before GTK initializes,

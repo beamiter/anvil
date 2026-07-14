@@ -7,6 +7,14 @@ versioning for tagged releases while it remains experimental.
 
 ### Added
 
+- Isolated `--safe-mode` recovery sessions with VTE + `sh`, no restore or
+  persistence, and network/state-producing integrations disabled.
+- Machine-readable `--doctor --json` diagnostics and a privacy-preserving
+  `jterm1-support-bundle` archive generator.
+- A scheduled dependency vulnerability audit, ShellCheck gate, shared
+  `make security` command, and repository Rust toolchain contract.
+- Build provenance metadata and the exact Cargo lockfile in portable bundles.
+
 - First-class Nix package, `nix run` app, flake check, and enriched development
   shell for the two supported Linux architectures.
 - Deterministic portable Linux release archives with SHA-256 checksums and a

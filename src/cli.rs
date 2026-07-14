@@ -11,11 +11,18 @@ pub(crate) enum Mode {
     Vte,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DoctorFormat {
+    Human,
+    Json,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct LaunchOptions {
     pub(crate) working_directory: Option<PathBuf>,
     pub(crate) execute: Option<Vec<String>>,
     pub(crate) no_restore: bool,
+    pub(crate) safe_mode: bool,
     pub(crate) mode: Option<Mode>,
 }
 
@@ -32,7 +39,7 @@ pub(crate) enum Command {
     Run(LaunchOptions),
     Help,
     Version,
-    Doctor,
+    Doctor(DoctorFormat),
     InitConfig,
     PrintShellIntegration(ShellIntegration),
 }
@@ -40,8 +47,12 @@ pub(crate) enum Command {
 pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
     let args: Vec<OsString> = args.into_iter().collect();
     if args.first().is_some_and(|arg| arg == "--doctor") {
-        require_exact_args(&args, 1, "--doctor")?;
-        return Ok(Command::Doctor);
+        let format = match args.as_slice() {
+            [_] => DoctorFormat::Human,
+            [_, flag] if flag == "--json" => DoctorFormat::Json,
+            _ => return Err("usage: jterm1 --doctor [--json]".to_string()),
+        };
+        return Ok(Command::Doctor(format));
     }
     if args.first().is_some_and(|arg| arg == "--init-config") {
         require_exact_args(&args, 1, "--init-config")?;
@@ -74,6 +85,10 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
             Some("-h" | "--help") => return Ok(Command::Help),
             Some("-V" | "--version") => return Ok(Command::Version),
             Some("--no-restore") => launch.no_restore = true,
+            Some("--safe-mode") => {
+                launch.safe_mode = true;
+                launch.no_restore = true;
+            }
             Some("-d" | "--working-directory") => {
                 index += 1;
                 let path = args
@@ -142,9 +157,10 @@ Launch options:
   -e, --execute COMMAND ...    Run a command instead of the configured shell
       --mode block|vte         Override the terminal backend for this window
       --no-restore             Start a fresh workspace
+      --safe-mode             Use isolated VTE defaults without restore or persistence
 
 Utilities:
-      --doctor                 Check configuration and runtime dependencies
+      --doctor [--json]        Check configuration and runtime dependencies
       --init-config            Create a documented config without overwriting one
       --shell-integration SH   Print integration for bash, zsh, fish, or pwsh
   -h, --help                   Show this help
@@ -153,6 +169,8 @@ Utilities:
 Examples:
   jterm1 ~/project
   jterm1 --mode block --no-restore
+  jterm1 --safe-mode
+  jterm1 --doctor --json
   jterm1 -d /tmp -e bash -lc 'printf "hello\\n"'
   source <(jterm1 --shell-integration bash)
 "#;
@@ -177,6 +195,7 @@ mod tests {
                 working_directory: Some(PathBuf::from("/tmp")),
                 execute: Some(vec!["bash".into(), "-lc".into(), "echo hi".into()]),
                 no_restore: false,
+                safe_mode: false,
                 mode: Some(Mode::Block),
             })
         );
@@ -226,5 +245,28 @@ mod tests {
             version.execute,
             Some(vec!["bash".into(), "--version".into()])
         );
+    }
+
+    #[test]
+    fn doctor_supports_human_and_json_formats() {
+        assert_eq!(
+            parse_strs(&["--doctor"]).unwrap(),
+            Command::Doctor(DoctorFormat::Human)
+        );
+        assert_eq!(
+            parse_strs(&["--doctor", "--json"]).unwrap(),
+            Command::Doctor(DoctorFormat::Json)
+        );
+        assert!(parse_strs(&["--doctor", "--verbose"]).is_err());
+    }
+
+    #[test]
+    fn safe_mode_implies_a_fresh_workspace() {
+        let Command::Run(options) = parse_strs(&["--safe-mode"]).unwrap() else {
+            panic!("expected run")
+        };
+        assert!(options.safe_mode);
+        assert!(options.no_restore);
+        assert!(options.execute.is_none());
     }
 }

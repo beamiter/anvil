@@ -55,6 +55,10 @@
                 "$out/share/doc/jterm1/config.toml.example"
               install -Dm644 README.md \
                 "$out/share/doc/jterm1/README.md"
+              install -Dm644 Cargo.lock \
+                "$out/share/doc/jterm1/Cargo.lock"
+              install -Dm755 scripts/support-bundle.sh \
+                "$out/bin/jterm1-support-bundle"
 
               install -d "$out/share/jterm1/shell-integration"
               install -m644 scripts/shell-integration/jterm1.* \
@@ -96,7 +100,9 @@
               rustc
               rustfmt
               clippy
+              cargo-audit
               cargo-watch
+              shellcheck
 
               gtk4
               glib

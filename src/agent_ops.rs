@@ -9,6 +9,10 @@ impl AppModel {
     // ── Agent mode ───────────────────────────────────────────────────────
 
     pub(crate) fn open_agent_panel(&self, _sender: &ComponentSender<AppModel>) {
+        if self.safe_mode {
+            self.show_toast("AI Agent is unavailable in safe mode.");
+            return;
+        }
         let cfg = self.config.borrow();
         if !cfg.ai_enabled || !cfg.agent_enabled {
             log::info!(

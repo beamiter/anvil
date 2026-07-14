@@ -19,6 +19,8 @@ fi
 
 printf 'Installing jterm1 for %s...\n' "${USER:-the current user}"
 install -Dm755 "${SCRIPT_DIR}/bin/jterm1" "${INSTALL_DIR}/jterm1"
+install -Dm755 "${SCRIPT_DIR}/bin/jterm1-support-bundle" \
+    "${INSTALL_DIR}/jterm1-support-bundle"
 
 mkdir -p "${CONFIG_DIR}"
 if [[ ! -e "${CONFIG_DIR}/config.toml" ]]; then
@@ -47,6 +49,10 @@ install -Dm644 \
     "${DATA_DIR}/notebooks/welcome.jtnb.md"
 install -Dm644 "${SCRIPT_DIR}/share/doc/jterm1/README.md" \
     "${DOC_DIR}/README.md"
+install -Dm644 "${SCRIPT_DIR}/share/doc/jterm1/Cargo.lock" \
+    "${DOC_DIR}/Cargo.lock"
+install -Dm644 "${SCRIPT_DIR}/share/doc/jterm1/BUILDINFO" \
+    "${DOC_DIR}/BUILDINFO"
 
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database "${APPLICATIONS_DIR}" >/dev/null 2>&1 || true
@@ -56,6 +62,7 @@ cat <<EOF_MESSAGE
 
 jterm1 installation complete.
   Binary:            ${INSTALL_DIR}/jterm1
+  Support bundle:    ${INSTALL_DIR}/jterm1-support-bundle
   Configuration:     ${CONFIG_DIR}/config.toml
   Shell integration: ${DATA_DIR}/shell-integration
   Welcome notebook:  ${DATA_DIR}/notebooks/welcome.jtnb.md

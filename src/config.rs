@@ -251,6 +251,27 @@ pub struct Config {
     pub(crate) remote_hosts: Vec<RemoteHost>,
 }
 
+impl Config {
+    /// Reduce startup to a local, non-persistent compatibility session. Safe
+    /// mode intentionally ignores user commands, remote destinations, history,
+    /// notifications, repository probes, clipboard writes, and all AI surfaces.
+    pub(crate) fn apply_safe_mode(&mut self) {
+        self.shell = None;
+        self.startup_commands = None;
+        self.terminal_mode = TerminalMode::Vte;
+        self.command_history_enabled = false;
+        self.command_history_path = None;
+        self.block_history_path = None;
+        self.preserve_live_scrollback = false;
+        self.allow_remote_clipboard_write = false;
+        self.ai_enabled = false;
+        self.agent_enabled = false;
+        self.notify_long_blocks = false;
+        self.show_repo_strip = false;
+        self.remote_hosts.clear();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Theme
 // ---------------------------------------------------------------------------
@@ -1309,5 +1330,34 @@ mod tests {
         assert_eq!(parsed[0].session, original.session);
         assert_eq!(parsed[0].login_shell, original.login_shell);
         assert_eq!(parsed[0].multiplex, original.multiplex);
+    }
+
+    #[test]
+    fn safe_mode_removes_external_and_persistent_state() {
+        let (mut config, _, _) = load_config();
+        config.shell = Some("/custom/shell".into());
+        config.startup_commands = Some("touch /tmp/should-not-run".into());
+        config.command_history_enabled = true;
+        config.command_history_path = Some("/tmp/history".into());
+        config.block_history_path = Some("/tmp/blocks".into());
+        config.ai_enabled = true;
+        config.agent_enabled = true;
+        config.notify_long_blocks = true;
+        config.allow_remote_clipboard_write = true;
+        config.remote_hosts.push(host());
+
+        config.apply_safe_mode();
+
+        assert!(matches!(config.terminal_mode, TerminalMode::Vte));
+        assert!(config.shell.is_none());
+        assert!(config.startup_commands.is_none());
+        assert!(!config.command_history_enabled);
+        assert!(config.command_history_path.is_none());
+        assert!(config.block_history_path.is_none());
+        assert!(!config.ai_enabled);
+        assert!(!config.agent_enabled);
+        assert!(!config.notify_long_blocks);
+        assert!(!config.allow_remote_clipboard_write);
+        assert!(config.remote_hosts.is_empty());
     }
 }

@@ -19,7 +19,10 @@ tab using GitHub's private vulnerability reporting flow. Include:
 
 Do not open a public issue for an unpatched vulnerability or include live
 credentials, private keys, access tokens, or sensitive terminal output in a
-report. Replace secrets with clearly marked test values.
+report. Replace secrets with clearly marked test values. The installed
+`jterm1-support-bundle` command intentionally excludes configuration contents,
+terminal history/output, environment values, and credentials; review its files
+before attaching the archive.
 
 ## Scope notes
 

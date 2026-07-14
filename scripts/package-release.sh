@@ -34,6 +34,7 @@ PACKAGE_ROOT="${STAGE_DIR}/${PACKAGE_NAME}"
 trap 'rm -rf -- "${STAGE_DIR}"' EXIT
 
 install -Dm755 "${BINARY}" "${PACKAGE_ROOT}/bin/jterm1"
+install -Dm755 scripts/support-bundle.sh "${PACKAGE_ROOT}/bin/jterm1-support-bundle"
 install -Dm755 packaging/install-release.sh "${PACKAGE_ROOT}/install.sh"
 install -Dm644 packaging/RELEASE_README.md "${PACKAGE_ROOT}/README.txt"
 printf '%s\n' "${VERSION}" > "${PACKAGE_ROOT}/VERSION"
@@ -43,6 +44,14 @@ install -Dm644 packaging/app.jterm1.desktop \
 install -Dm644 README.md "${PACKAGE_ROOT}/share/doc/jterm1/README.md"
 install -Dm644 config.toml.example \
     "${PACKAGE_ROOT}/share/doc/jterm1/config.toml.example"
+install -Dm644 Cargo.lock "${PACKAGE_ROOT}/share/doc/jterm1/Cargo.lock"
+cat >"${PACKAGE_ROOT}/share/doc/jterm1/BUILDINFO" <<EOF_BUILDINFO
+version=${VERSION}
+target=${TARGET}
+source_date_epoch=${SOURCE_DATE_EPOCH}
+git_commit=$(git rev-parse HEAD 2>/dev/null || echo unknown)
+rustc=$(rustc --version)
+EOF_BUILDINFO
 
 install -d "${PACKAGE_ROOT}/share/jterm1/shell-integration"
 install -m644 scripts/shell-integration/jterm1.* \
