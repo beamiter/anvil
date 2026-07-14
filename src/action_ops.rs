@@ -190,7 +190,7 @@ impl AppModel {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     tab.marked = !tab.marked;
                 }
-                self.rebuild_tab_strip(sender);
+                self.sync_tab_strip();
             }
             Action::ToggleTabPinned => {
                 if let Some(tab) = self.tabs.get_mut(self.active) {

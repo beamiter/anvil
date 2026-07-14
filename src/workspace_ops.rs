@@ -429,13 +429,14 @@ impl AppModel {
     }
 
     /// Flip a Connecting remote tab to Connected (first output/cwd seen).
-    pub(crate) fn mark_remote_connected(&mut self, idx: usize, sender: &ComponentSender<AppModel>) {
+    pub(crate) fn mark_remote_connected(&mut self, idx: usize) -> bool {
         if let Some(conn) = self.tabs[idx].remote.as_mut() {
             if conn.status != ConnStatus::Connected {
                 conn.status = ConnStatus::Connected;
-                self.rebuild_tab_strip(sender);
+                return true;
             }
         }
+        false
     }
 
     /// If `tab_id` is a single-pane remote tab that died abnormally, start a

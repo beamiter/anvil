@@ -7,7 +7,7 @@
 use super::*;
 
 impl AppModel {
-    pub(crate) fn reload_config(&mut self, sender: &ComponentSender<AppModel>) {
+    pub(crate) fn reload_config(&mut self, _sender: &ComponentSender<AppModel>) {
         if let Some(error) = config::config_file_error() {
             log::warn!("configuration reload rejected: {error}");
             self.show_toast(format!(
@@ -39,7 +39,7 @@ impl AppModel {
         *self.kbmap.borrow_mut() = new_kb;
         self.themes = Rc::new(themes);
         self.apply_dynamic_css();
-        self.rebuild_tab_strip(sender);
+        self.sync_tab_strip();
         log::info!("Configuration reloaded from disk");
         if backend_changed {
             self.show_toast("Terminal mode changed; it will apply to new panes and tabs.");
