@@ -97,12 +97,18 @@ mod tests {
 
     #[test]
     fn strips_a_wrapping_language_fence() {
-        assert_eq!(strip_code_fences("```bash\nprintf 'ok'\n```"), "printf 'ok'");
+        assert_eq!(
+            strip_code_fences("```bash\nprintf 'ok'\n```"),
+            "printf 'ok'"
+        );
     }
 
     #[test]
     fn accepts_one_printable_command() {
-        assert_eq!(command_for_review("  printf 'ok'  ").unwrap(), "printf 'ok'");
+        assert_eq!(
+            command_for_review("  printf 'ok'  ").unwrap(),
+            "printf 'ok'"
+        );
     }
 
     #[test]
