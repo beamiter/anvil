@@ -34,6 +34,8 @@ fi
 
 echo "Installing ${INSTALL_DIR}/jterm1..."
 install -Dm755 "${BINARY}" "${INSTALL_DIR}/jterm1"
+install -Dm755 "${PROJECT_ROOT}/scripts/support-bundle.sh" \
+    "${INSTALL_DIR}/jterm1-support-bundle"
 
 mkdir -p "${CONFIG_DIR}"
 if [[ ! -e "${CONFIG_DIR}/config.toml" ]]; then
@@ -67,6 +69,7 @@ install -Dm644 \
 echo
 echo "jterm1 installation complete."
 echo "  Binary:            ${INSTALL_DIR}/jterm1"
+echo "  Support bundle:    ${INSTALL_DIR}/jterm1-support-bundle"
 echo "  Configuration:     ${CONFIG_DIR}/config.toml"
 echo "  Shell integration: ${SHELL_INTEGRATION_DIR}"
 echo "  Welcome notebook:  ${DATA_DIR}/notebooks/welcome.jtnb.md"

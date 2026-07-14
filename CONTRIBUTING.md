@@ -11,6 +11,7 @@ Nix with flakes enabled is the supported development path:
 ```bash
 nix develop
 make verify
+make security
 ```
 
 Useful focused commands include `make run`, `make test`, `make check`, and
@@ -24,6 +25,7 @@ Before opening a pull request, run:
 
 ```bash
 make verify
+make security
 ```
 
 This checks formatting, all Rust targets, tests, the repository Clippy policy,

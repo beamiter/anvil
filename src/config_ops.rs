@@ -8,6 +8,10 @@ use super::*;
 
 impl AppModel {
     pub(crate) fn reload_config(&mut self, _sender: &ComponentSender<AppModel>) {
+        if self.safe_mode {
+            self.show_toast("Configuration reload is disabled in safe mode.");
+            return;
+        }
         if let Some(error) = config::config_file_error() {
             log::warn!("configuration reload rejected: {error}");
             self.show_toast(format!(

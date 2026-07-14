@@ -63,6 +63,8 @@ then run:
 ```bash
 jterm1
 jterm1 --doctor
+jterm1 --doctor --json            # machine-readable support diagnostics
+jterm1 --safe-mode                # isolated VTE + sh recovery session
 ```
 
 Useful headless commands:
@@ -84,8 +86,38 @@ make run       # debug build and launch
 make test      # cargo test --all-targets
 make check     # cargo check --all-targets
 make build     # release build
+make clippy    # repository lint policy
+make security  # dependency audit + ShellCheck
 make help      # all helpers
 ```
+
+## Diagnostics and recovery
+
+`jterm1 --doctor` reports configuration, shell, display, integrations, remote
+readiness, permissions, and session-state metadata. Add `--json` for automation
+or support tooling; neither format includes configuration contents, terminal
+history, command output, environment values, or credentials.
+
+When configuration, startup commands, session restore, or an integration causes
+a bad launch, use:
+
+```bash
+jterm1 --safe-mode
+```
+
+Safe mode starts a local VTE pane with `sh`, skips session restore and persistence,
+ignores configured startup commands and remote hosts, disables AI, notifications,
+repository probes, history, and remote clipboard writes, and refuses to save or
+hot-reload settings for that process.
+
+Create a privacy-preserving support archive with:
+
+```bash
+jterm1-support-bundle ~/Desktop
+```
+
+Review the archive before sharing it. The bundle contains structured diagnostics,
+system identity, linked-library information, and file metadata only.
 
 ## Terminal modes
 

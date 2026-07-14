@@ -8,7 +8,7 @@ PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 CMD="${1:-run}"
 
 usage() {
-    echo "Usage: $0 {run|build|test|check|fmt|clippy|verify|package|clean|watch}"
+    echo "Usage: $0 {run|build|test|check|fmt|clippy|security|verify|package|clean|watch}"
     echo
     echo "Commands:"
     echo "  run      - Run jterm1 in development mode"
@@ -17,6 +17,7 @@ usage() {
     echo "  check    - Check all Rust targets"
     echo "  fmt      - Format the Rust source"
     echo "  clippy   - Run the repository lint policy"
+    echo "  security - Audit dependencies and shell scripts"
     echo "  verify   - Run formatting, checks, tests, lints, and docs"
     echo "  package  - Build a portable release archive and checksum"
     echo "  clean    - Clean build artifacts"
@@ -24,7 +25,7 @@ usage() {
 }
 
 case "${CMD}" in
-    run|build|test|check|fmt|clippy|verify|package|clean|watch) ;;
+    run|build|test|check|fmt|clippy|security|verify|package|clean|watch) ;;
     *)
         usage
         exit 1
@@ -72,6 +73,11 @@ case "${CMD}" in
     clippy)
         echo "Running Clippy..."
         run_in_nix bash scripts/clippy.sh
+        ;;
+
+    security)
+        echo "Running dependency and shell-script security checks..."
+        run_in_nix bash scripts/security-check.sh
         ;;
 
     verify)

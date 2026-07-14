@@ -332,6 +332,10 @@ impl AppModel {
     }
 
     pub(crate) fn persist_config(&self) {
+        if self.safe_mode {
+            self.show_toast("Settings are temporary and are not saved in safe mode.");
+            return;
+        }
         if let Err(err) = config::save_config(&self.config.borrow()) {
             log::error!("{err}");
             self.show_toast(format!("Settings were not saved: {err}"));

@@ -40,6 +40,10 @@ impl AppModel {
     /// the active pane (no autosubmit). Errors raise a transient toast/log
     /// only — the user can always retry.
     pub(crate) fn handle_palette_ask_ai(&self, query: String, sender: &ComponentSender<AppModel>) {
+        if self.safe_mode {
+            self.show_toast("AI is unavailable in safe mode.");
+            return;
+        }
         if !self.config.borrow().ai_enabled {
             return;
         }
@@ -82,6 +86,10 @@ impl AppModel {
 
     /// Open the session-level AI panel with the configured history source.
     pub(crate) fn show_ai_session_panel(&self) {
+        if self.safe_mode {
+            self.show_toast("AI is unavailable in safe mode.");
+            return;
+        }
         if !self.config.borrow().ai_enabled {
             return;
         }

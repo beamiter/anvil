@@ -1,7 +1,7 @@
 # jterm1 Makefile
 # Convenience wrapper for common development tasks
 
-.PHONY: help build run test check fmt clippy verify package clean install dev watch benchmark debug
+.PHONY: help build run test check fmt clippy security verify package support-bundle clean install dev watch benchmark debug
 
 help:
 	@echo "jterm1 Development Commands"
@@ -18,6 +18,7 @@ help:
 	@echo "  make check      - Check code without building"
 	@echo "  make fmt        - Format code"
 	@echo "  make clippy     - Run the repository lint policy"
+	@echo "  make security   - Audit dependencies and shell scripts"
 	@echo "  make verify     - Run the complete local quality gate"
 	@echo ""
 	@echo "Development:"
@@ -25,6 +26,7 @@ help:
 	@echo "  make watch      - Watch for changes and rebuild"
 	@echo "  make benchmark  - Run performance benchmarks"
 	@echo "  make debug      - Show debug information"
+	@echo "  make support-bundle - Create a privacy-preserving support archive"
 	@echo ""
 	@echo "Cleanup:"
 	@echo "  make clean      - Clean build artifacts"
@@ -48,11 +50,17 @@ fmt:
 clippy:
 	@./scripts/dev.sh clippy
 
+security:
+	@./scripts/dev.sh security
+
 verify:
 	@./scripts/dev.sh verify
 
 package:
 	@./scripts/dev.sh package
+
+support-bundle:
+	@./scripts/support-bundle.sh
 
 clean:
 	@./scripts/dev.sh clean
