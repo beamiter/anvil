@@ -34,6 +34,24 @@ jobs:
 
       - name: Apply deterministic migration
         run: |
+          rm -f .github/evolve-round2-error.log migration.log
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("README.md")
+          content = path.read_text(encoding="utf-8")
+          anchor = "make help      # all helpers\n"
+          if "make clippy    # repository lint policy\n" not in content:
+              if content.count(anchor) != 1:
+                  raise SystemExit("README development-command anchor is ambiguous")
+              content = content.replace(
+                  anchor,
+                  "make clippy    # repository lint policy\n" + anchor,
+                  1,
+              )
+              path.write_text(content, encoding="utf-8")
+          PY
+
           set +e
           python3 scripts/evolve_round2.py >migration.log 2>&1
           status=$?
