@@ -1,92 +1,183 @@
-//! history — extracted from block_view (mechanical split, no logic changes)
+//! Persist structured block history as length-prefixed rkyv records.
 //!
-//! Persist the in-memory `block_data` deque to/from disk as length-prefixed
-//! rkyv records (optional zstd). Truncate-on-save (not append) keeps the file
-//! bounded, since the deque was already seeded from this file on startup.
+//! The in-memory deque is already bounded and seeded from this file, so saves
+//! replace the file rather than append duplicate records.
 
 use super::{BlockData, TermView};
+use std::borrow::Cow;
+use std::collections::VecDeque;
+use std::ffi::OsString;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-#[allow(dead_code)]
-impl TermView {
-    /// Save block history to file (if configured).
-    pub fn save_history(&self) -> std::io::Result<()> {
-        use std::io::Write;
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+const MAX_RECORD_BYTES: usize = 256 * 1024 * 1024;
+const MAX_DECODED_BYTES: u64 = 256 * 1024 * 1024;
 
-        let path_opt = self.config.borrow().block_history_path.as_ref().cloned();
-        if path_opt.is_none() {
-            return Ok(());
-        }
+/// Expand only the shell-style `~/` prefix used in configuration.
+fn expand_home_prefix_with(path: &str, home: Option<&Path>) -> PathBuf {
+    match (path.strip_prefix("~/"), home) {
+        (Some(rest), Some(home)) => home.join(rest),
+        _ => PathBuf::from(path),
+    }
+}
 
-        let path = path_opt.unwrap();
-        let blocks = self.block_data.borrow();
+fn history_path(path: &str) -> PathBuf {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    expand_home_prefix_with(path, home.as_deref())
+}
 
-        // Overwrite (truncate), do NOT append. The in-memory deque was itself
-        // seeded from this file at startup, so appending it re-wrote every loaded
-        // block on each session — O(N²) file growth and duplicate blocks on the
-        // next load. Persisting the current capped deque keeps the file bounded.
-        let mut options = std::fs::OpenOptions::new();
-        options.create(true).write(true).truncate(true);
+fn temp_file_name(target: &Path) -> io::Result<OsString> {
+    let file_name = target.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("history path has no file name: {}", target.display()),
+        )
+    })?;
+    let sequence = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut name = OsString::from(".");
+    name.push(file_name);
+    name.push(format!(".tmp-{}-{sequence}", std::process::id()));
+    Ok(name)
+}
+
+/// Write beside `target`, sync, then atomically rename over the previous file.
+fn atomic_write(
+    target: &Path,
+    write_contents: impl FnOnce(&mut File) -> io::Result<()>,
+) -> io::Result<()> {
+    let parent = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+
+    let temp_path = parent.join(temp_file_name(target)?);
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let mut file = options.open(path)?;
+        let mut temp = options.open(&temp_path)?;
+        write_contents(&mut temp)?;
+        temp.flush()?;
+        temp.sync_all()?;
+        drop(temp);
+        fs::rename(&temp_path, target)?;
+
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
-
-        let compress = self.config.borrow().block_history_compress;
-
-        for block in blocks.iter() {
-            let serialized = rkyv::to_bytes::<rkyv::rancor::Error>(block)
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
-
-            let record: &[u8] = if compress {
-                &zstd::encode_all(serialized.as_slice(), 3)
-                    .map_err(|e| std::io::Error::other(e.to_string()))?
-            } else {
-                &serialized
-            };
-
-            // The length prefix is a u32; silently truncating it would corrupt all
-            // following frame boundaries. Skip any (pathologically large) record
-            // that would not fit rather than write a bad prefix.
-            if record.len() > u32::MAX as usize {
-                log::warn!(
-                    "save_history: skipping block of {} bytes (exceeds u32 frame limit)",
-                    record.len()
-                );
-                continue;
-            }
-            file.write_all(&(record.len() as u32).to_le_bytes())?;
-            file.write_all(record)?;
-        }
-
+        File::open(parent)?.sync_all()?;
         Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn push_bounded_back<T>(items: &mut VecDeque<T>, item: T, limit: usize) {
+    if limit == 0 {
+        return;
+    }
+    if items.len() == limit {
+        items.pop_front();
+    }
+    items.push_back(item);
+}
+
+fn decode_record(data: Vec<u8>, compressed: bool, max_decoded_bytes: u64) -> io::Result<Vec<u8>> {
+    if !compressed {
+        return Ok(data);
     }
 
-    /// Load block history from file (if configured).
-    pub fn load_history(&self) -> std::io::Result<()> {
-        let path_opt = self.config.borrow().block_history_path.as_ref().cloned();
-        if path_opt.is_none() {
+    let decoder =
+        zstd::Decoder::new(data.as_slice()).map_err(|error| io::Error::other(error.to_string()))?;
+    let mut decoded = Vec::new();
+    decoder
+        .take(max_decoded_bytes + 1)
+        .read_to_end(&mut decoded)?;
+    if decoded.len() as u64 > max_decoded_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("block history record expands beyond {max_decoded_bytes} bytes"),
+        ));
+    }
+    Ok(decoded)
+}
+
+#[allow(dead_code)]
+impl TermView {
+    /// Save block history without risking truncation of the last good snapshot.
+    pub fn save_history(&self) -> io::Result<()> {
+        let (path_opt, compress) = {
+            let config = self.config.borrow();
+            (
+                config.block_history_path.as_ref().cloned(),
+                config.block_history_compress,
+            )
+        };
+        let Some(path) = path_opt else {
+            return Ok(());
+        };
+
+        let path = history_path(&path);
+        let blocks = self.block_data.borrow();
+        atomic_write(&path, |file| {
+            for block in blocks.iter() {
+                let serialized = rkyv::to_bytes::<rkyv::rancor::Error>(block)
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                let record: Cow<'_, [u8]> = if compress {
+                    Cow::Owned(
+                        zstd::encode_all(serialized.as_slice(), 3)
+                            .map_err(|error| io::Error::other(error.to_string()))?,
+                    )
+                } else {
+                    Cow::Borrowed(serialized.as_slice())
+                };
+
+                if record.len() > u32::MAX as usize {
+                    log::warn!(
+                        "save_history: skipping block of {} bytes (exceeds u32 frame limit)",
+                        record.len()
+                    );
+                    continue;
+                }
+                file.write_all(&(record.len() as u32).to_le_bytes())?;
+                file.write_all(record.as_ref())?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Load only the configured number of most-recent history records.
+    pub fn load_history(&self) -> io::Result<()> {
+        let (path_opt, compress, lazy_load_threshold) = {
+            let config = self.config.borrow();
+            (
+                config.block_history_path.as_ref().cloned(),
+                config.block_history_compress,
+                config.lazy_load_threshold as usize,
+            )
+        };
+        let Some(path) = path_opt else {
+            return Ok(());
+        };
+
+        let path = history_path(&path);
+        if !path.exists() {
             return Ok(());
         }
 
-        let path = path_opt.unwrap();
-        if !std::path::Path::new(&path).exists() {
-            return Ok(());
-        }
-
-        use std::io::Read;
-        let mut file = std::fs::File::open(path)?;
-        let lazy_load_threshold = self.config.borrow().lazy_load_threshold as usize;
-        let mut temp_blocks = std::collections::VecDeque::with_capacity(lazy_load_threshold);
+        let mut file = File::open(path)?;
+        let mut recent_blocks = VecDeque::new();
         let mut total_loaded = 0usize;
 
-        // First pass: load all blocks into temporary storage
         loop {
             let mut len_bytes = [0u8; 4];
             if file.read_exact(&mut len_bytes).is_err() {
@@ -94,56 +185,38 @@ impl TermView {
             }
 
             let len = u32::from_le_bytes(len_bytes) as usize;
-            // Guard against a corrupt/misaligned length causing a giant allocation.
-            const MAX_RECORD_BYTES: usize = 256 * 1024 * 1024;
             if len > MAX_RECORD_BYTES {
-                log::warn!("load_history: record length {} exceeds {} — treating file as corrupt, stopping", len, MAX_RECORD_BYTES);
+                log::warn!(
+                    "load_history: record length {} exceeds {} - treating file as corrupt, stopping",
+                    len,
+                    MAX_RECORD_BYTES
+                );
                 break;
             }
             let mut data = vec![0u8; len];
             file.read_exact(&mut data)?;
-
-            let decoded = if self.config.borrow().block_history_compress {
-                const MAX_DECODED_BYTES: u64 = 256 * 1024 * 1024;
-                let decoder = zstd::Decoder::new(data.as_slice())
-                    .map_err(|e| std::io::Error::other(e.to_string()))?;
-                let mut decoded = Vec::new();
-                decoder
-                    .take(MAX_DECODED_BYTES + 1)
-                    .read_to_end(&mut decoded)?;
-                if decoded.len() as u64 > MAX_DECODED_BYTES {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "block history record expands beyond 256 MiB",
-                    ));
-                }
-                decoded
-            } else {
-                data
-            };
+            let decoded = decode_record(data, compress, MAX_DECODED_BYTES)?;
 
             if let Ok(block) = rkyv::from_bytes::<BlockData, rkyv::rancor::Error>(&decoded) {
                 total_loaded = total_loaded.saturating_add(1);
-                if temp_blocks.len() == lazy_load_threshold {
-                    temp_blocks.pop_front();
-                }
-                temp_blocks.push_back(block);
+                push_bounded_back(&mut recent_blocks, block, lazy_load_threshold);
             }
         }
 
-        if total_loaded > temp_blocks.len() {
+        if total_loaded > recent_blocks.len() {
             log::info!(
                 "Lazy loading history: keeping {} recent blocks out of {} total",
-                temp_blocks.len(),
+                recent_blocks.len(),
                 total_loaded
             );
         }
 
+        let start_index = total_loaded.saturating_sub(recent_blocks.len());
         let mut blocks = self.block_data.borrow_mut();
-        for (idx, block) in temp_blocks.into_iter().enumerate() {
+        for (offset, block) in recent_blocks.into_iter().enumerate() {
             log::debug!(
                 "Loaded historical block #{}: prompt={:?}, cmd={:?}, output_len={}, exit_code={}",
-                idx,
+                start_index + offset,
                 block.prompt,
                 block.cmd,
                 block.output.len(),
@@ -151,7 +224,123 @@ impl TermView {
             );
             blocks.push_back(block);
         }
-
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{atomic_write, decode_record, expand_home_prefix_with, push_bounded_back};
+    use std::collections::VecDeque;
+    use std::fs;
+    use std::io;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(name: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "jterm1-history-{name}-{}-{unique}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn push_bounded_back_keeps_only_recent_items() {
+        let mut items = VecDeque::new();
+        for item in 0..5 {
+            push_bounded_back(&mut items, item, 3);
+        }
+        assert_eq!(items.into_iter().collect::<Vec<_>>(), vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn push_bounded_back_honors_zero_limit() {
+        let mut items = VecDeque::new();
+        push_bounded_back(&mut items, 1, 0);
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn expands_only_home_slash_prefix() {
+        let home = Path::new("/home/tester");
+        assert_eq!(
+            expand_home_prefix_with("~/.local/share/jterm1/history", Some(home)),
+            home.join(".local/share/jterm1/history")
+        );
+        assert_eq!(expand_home_prefix_with("~", Some(home)), PathBuf::from("~"));
+        assert_eq!(
+            expand_home_prefix_with("~other/history", Some(home)),
+            PathBuf::from("~other/history")
+        );
+        assert_eq!(
+            expand_home_prefix_with("cache/~/history", Some(home)),
+            PathBuf::from("cache/~/history")
+        );
+    }
+
+    #[test]
+    fn atomic_write_creates_parent_directories_and_replaces_file() {
+        let dir = TestDir::new("replace");
+        let target = dir.path().join("nested/deeper/history.bin");
+        atomic_write(&target, |file| {
+            use std::io::Write as _;
+            file.write_all(b"first")
+        })
+        .unwrap();
+        atomic_write(&target, |file| {
+            use std::io::Write as _;
+            file.write_all(b"second")
+        })
+        .unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"second");
+    }
+
+    #[test]
+    fn failed_atomic_write_preserves_previous_file_and_cleans_temp() {
+        let dir = TestDir::new("failure");
+        let target = dir.path().join("history.bin");
+        fs::write(&target, b"last-good").unwrap();
+
+        let error = atomic_write(&target, |file| {
+            use std::io::Write as _;
+            file.write_all(b"partial")?;
+            Err(io::Error::other("simulated encoder failure"))
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(fs::read(&target).unwrap(), b"last-good");
+        let entries = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![target.file_name().unwrap()]);
+    }
+
+    #[test]
+    fn compressed_record_decode_enforces_output_limit() {
+        let compressed = zstd::encode_all(&b"0123456789abcdef"[..], 1).unwrap();
+        let error = decode_record(compressed, true, 8).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 }
