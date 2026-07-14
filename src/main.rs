@@ -4,6 +4,7 @@ mod action_ops;
 mod agent;
 mod agent_ops;
 mod ai;
+mod ai_palette_ops;
 mod app_msg;
 mod block_view;
 mod cli;
@@ -27,6 +28,7 @@ mod session;
 mod settings_ops;
 mod sidebar;
 mod sidebar_toggle;
+mod startup_ui;
 mod tab_strip;
 mod terminal;
 mod top_bar;
@@ -113,20 +115,6 @@ struct AppModel {
     active_agent: Rc<RefCell<Option<agent::AgentSession>>>,
     agent_panel: Controller<agent::AgentPanelModel>,
     agent_edit: Controller<agent::AgentEditModel>,
-}
-
-/// Strip one layer of markdown code fence (```bash … ``` or ``` … ```) if it
-/// wraps the entire response. LLMs often format single-command outputs that
-/// way even when asked for raw text.
-fn strip_code_fences(s: &str) -> &str {
-    let s = s.trim();
-    if let Some(rest) = s.strip_prefix("```") {
-        let after_lang = rest.split_once('\n').map(|(_, r)| r).unwrap_or(rest);
-        if let Some(inner) = after_lang.trim_end().strip_suffix("```") {
-            return inner.trim();
-        }
-    }
-    s
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -223,90 +211,6 @@ impl AppModel {
             .map(std::path::PathBuf::from)
             .filter(|p| p.is_dir())
     }
-
-    /// `?` palette accept handler: run the natural-language query through the
-    /// configured AI provider and, on success, type the returned command into
-    /// the active pane (no autosubmit). Errors raise a transient toast/log
-    /// only — the user can always retry.
-    fn handle_palette_ask_ai(&self, query: String, sender: &ComponentSender<AppModel>) {
-        if !self.config.borrow().ai_enabled {
-            return;
-        }
-        let Some(client) = ai::AiClient::from_env() else {
-            log::warn!("AI palette: no provider configured");
-            self.show_toast("No AI provider is configured.");
-            return;
-        };
-        let cwd = self
-            .active_cwd()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "<unknown>".to_string());
-        let (system, user) = ai::build_nl_to_cmd_prompt(&query, &cwd);
-        let sender_clone = sender.clone();
-        // Fire and forget — keeping the handle would just let us cancel, but
-        // the palette has already closed by the time we get here, so there's
-        // nothing user-visible to cancel against.
-        let _h = ai::ask(client, system, user, move |result| match result {
-            Ok(cmd) => {
-                let cleaned = strip_code_fences(cmd.trim()).to_string();
-                if !cleaned.is_empty() {
-                    sender_clone.input(AppMsg::PaletteTypeCommand(cleaned));
-                }
-            }
-            Err(e) => {
-                log::warn!("AI palette request failed: {e}");
-                sender_clone.input(AppMsg::Toast(format!("AI request failed: {e}")));
-            }
-        });
-        std::mem::forget(_h);
-    }
-
-    /// Open the session-level AI panel with the configured history source.
-    fn show_ai_session_panel(&self) {
-        if !self.config.borrow().ai_enabled {
-            return;
-        }
-        self.ai_panel.emit(dialogs::ai_panel::AiPanelMsg::Open(
-            self.config.borrow().command_history_path.clone(),
-        ));
-    }
-}
-
-#[allow(deprecated)]
-fn install_static_css() {
-    let provider = gtk::CssProvider::new();
-    provider.load_from_data(
-        ".tab-strip-btn { padding: 4px 8px; border-radius: 4px; margin-bottom: 2px; color: #ffffff; }
-         .tab-strip-btn:checked { font-weight: bold; border: 1px solid currentColor; border-radius: 4px; }
-         .tab-strip-close { min-width: 16px; min-height: 16px; color: #ffffff; }
-         .tab-resize-handle { min-width: 6px; margin: 0 1px; border-left: 1px solid rgba(255,255,255,0.38); }
-         .tab-resize-handle:hover { border-left-color: rgba(255,255,255,0.9); }
-         .tab-strip { min-width: 140px; padding: 2px 4px; }
-         .file-tree { padding: 2px; }
-         .sidebar-toggle { color: #ffffff; }
-         .top-bar { padding: 2px 4px; }
-         .terminal-box scrollbar slider { min-width: 6px; border-radius: 3px; }
-         .terminal-box scrollbar { padding: 0; }
-         .tab-activity { font-style: italic; }
-         .tab-bell { color: #f1fa8c; }
-         .tab-marked { background-color: rgba(80,160,255,0.22); font-weight: bold; }
-         .tab-pinned { background-color: rgba(255,200,80,0.18); }
-         .conn-dot { margin: 0 4px; font-size: 9px; }
-         .conn-connecting { color: #f1fa8c; }
-         .conn-connected { color: #50fa7b; }
-         .conn-disconnected { color: #ff5555; }
-         .top-tabs { } .top-tabs .tab-row { margin-right: 2px; }
-         .top-tab-scroll, .top-tab-scroll > viewport { min-width: 0; }
-         .sidebar-toggle-row { margin-bottom: 2px; }
-         .sidebar-toggle { padding: 2px 6px; }",
-    );
-    if let Some(display) = gtk::gdk::Display::default() {
-        gtk::style_context_add_provider_for_display(
-            &display,
-            &provider,
-            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-        );
-    }
 }
 
 #[relm4::component]
@@ -374,15 +278,8 @@ impl SimpleComponent for AppModel {
 
         root.set_opacity(window_opacity);
 
-        install_static_css();
-        let dyn_css = gtk::CssProvider::new();
-        if let Some(display) = gtk::gdk::Display::default() {
-            gtk::style_context_add_provider_for_display(
-                &display,
-                &dyn_css,
-                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
-            );
-        }
+        startup_ui::install_static_css();
+        let dyn_css = startup_ui::install_dynamic_css_provider();
 
         let stack = gtk::Stack::new();
         let tab_strip = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -404,58 +301,11 @@ impl SimpleComponent for AppModel {
             },
         );
 
-        // File tree browser (lower half of the sidebar).
-        let file_tree_store = file_tree::new_store();
-        let file_tree_view = file_tree::new_view(&file_tree_store);
-        file_tree_view.add_css_class("file-tree");
-        {
-            // Lazy directory expansion: fill children on first expand.
-            let store = file_tree_store.clone();
-            file_tree_view.connect_row_expanded(move |_tv, iter, _path| {
-                file_tree::on_expand(&store, iter);
-            });
-        }
-        {
-            // Activate: toggle directories, insert file paths into the terminal.
-            let store = file_tree_store.clone();
-            let sender = sender.clone();
-            file_tree_view.connect_row_activated(move |tv, path, _col| {
-                let Some(iter) = store.iter(path) else { return };
-                let is_dir: bool = store
-                    .get_value(&iter, file_tree::COL_IS_DIR as i32)
-                    .get()
-                    .unwrap_or(false);
-                if is_dir {
-                    if tv.row_expanded(path) {
-                        tv.collapse_row(path);
-                    } else {
-                        tv.expand_row(path, false);
-                    }
-                    return;
-                }
-                let file_path: String = store
-                    .get_value(&iter, file_tree::COL_PATH as i32)
-                    .get()
-                    .unwrap_or_default();
-                if !file_path.is_empty() {
-                    if file_path.ends_with(".jtnb.md") {
-                        sender.input(AppMsg::OpenNotebook(std::path::PathBuf::from(file_path)));
-                    } else {
-                        sender.input(AppMsg::FileTreeActivateFile(file_path));
-                    }
-                }
-            });
-        }
-        let file_tree_scroll = gtk::ScrolledWindow::new();
-        file_tree_scroll.set_vexpand(true);
-        file_tree_scroll.set_child(Some(&file_tree_view));
-        let file_header = sidebar::FileHeaderModel::builder().launch(()).forward(
-            sender.input_sender(),
-            |output| match output {
-                sidebar::FileHeaderOutput::Up => AppMsg::FileTreeGoUp,
-                sidebar::FileHeaderOutput::CurrentDirectory => AppMsg::FileTreeGotoCwd,
-            },
-        );
+        let startup_ui::FileTreeUi {
+            store: file_tree_store,
+            scroll: file_tree_scroll,
+            header: file_header,
+        } = startup_ui::build_file_tree(&sender);
 
         let sidebar_width = config.borrow().sidebar_width as i32;
         let tab_placement = config.borrow().tab_placement;
@@ -466,30 +316,7 @@ impl SimpleComponent for AppModel {
                 sidebar_toggle::SidebarToggleOutput::View(view) => AppMsg::SetSidebarView(view),
             });
 
-        // Scroll holders the tab strip can be reparented between (sidebar vs
-        // top bar). apply_tab_placement() owns which one holds tab_strip.
-        let tab_strip_scroll = gtk::ScrolledWindow::new();
-        tab_strip_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
-        tab_strip_scroll.set_vexpand(true);
-        let top_tab_scroll = gtk::ScrolledWindow::new();
-        // The strip remains horizontally scrollable by touchpad/Shift+wheel,
-        // but its scrollbar must not consume a second row in the title bar.
-        top_tab_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Never);
-        top_tab_scroll.set_hexpand(true);
-        top_tab_scroll.set_vexpand(false);
-        top_tab_scroll.set_overflow(gtk::Overflow::Hidden);
-        // It is the only expanding item in the toolbar and must yield space
-        // to the trailing New-tab / Close-window buttons as tabs accumulate.
-        top_tab_scroll.set_width_request(0);
-        top_tab_scroll.set_min_content_width(0);
-        top_tab_scroll.set_max_content_width(1);
-        top_tab_scroll.set_propagate_natural_width(false);
-        top_tab_scroll.add_css_class("top-tab-scroll");
-        top_tab_scroll.set_visible(false);
-
-        top_tab_scroll.set_margin_start(128);
-        // Reserve room for the leading controls and trailing window actions.
-        top_tab_scroll.set_margin_end(104);
+        let (tab_strip_scroll, top_tab_scroll) = startup_ui::build_tab_scrolls();
         let top_bar = top_bar::TopBarModel::builder()
             .launch(top_tab_scroll.clone())
             .forward(sender.input_sender(), |output| match output {
