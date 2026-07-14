@@ -96,6 +96,13 @@ jobs:
           {
             rm -f migration.log
             rm -rf scripts/__pycache__
+            # The Actions token can publish source but cannot update workflow
+            # files. Those two validated files are applied separately through
+            # the repository connector after this source commit lands.
+            git restore .github/workflows/ci.yml
+            rm -f .github/workflows/security.yml
+            printf '/publish.log\n' >>.git/info/exclude
+
             if git diff --quiet && [[ -z "$(git ls-files --others --exclude-standard)" ]]; then
               echo "No migration changes were produced."
               exit 0
