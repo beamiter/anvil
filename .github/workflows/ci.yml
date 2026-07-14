@@ -91,6 +91,7 @@ jobs:
           version="$(awk -F ' *= *' '$1 == "version" { gsub(/"/, "", $2); print $2; exit }' Cargo.toml)"
           target/release/jterm1 --version | grep -Fx "jterm1 ${version}"
           target/release/jterm1 --doctor
+          target/release/jterm1 --doctor --json | python3 -m json.tool >/dev/null
           desktop-file-validate packaging/app.jterm1.desktop
 
       - name: Build and verify portable release bundle
@@ -98,6 +99,8 @@ jobs:
         run: |
           bash scripts/package-release.sh target/release/jterm1
           (cd target/dist && sha256sum --check *.sha256)
+          JTERM1_BIN=target/release/jterm1 bash scripts/support-bundle.sh target/support
+          tar -tzf target/support/jterm1-support-*.tar.gz | grep -F '/doctor.json'
 
       - name: Upload portable release bundle
         if: ${{ success() }}
