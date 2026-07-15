@@ -66,6 +66,11 @@ jobs:
           PY
           git diff --check
 
+          # The Actions token has contents:write but cannot update workflow files.
+          # Publish the permanent CI delta separately through the repository API.
+          cp .github/workflows/ci.yml /tmp/round3-ci.yml
+          git checkout -- .github/workflows/ci.yml
+
       - name: Upload finalizer diagnostics
         if: ${{ failure() }}
         uses: actions/upload-artifact@v4
@@ -75,6 +80,7 @@ jobs:
             /tmp/round3-finalize.log
             /tmp/round3-patch.sha256
             /tmp/round3.patch
+            /tmp/round3-ci.yml
           if-no-files-found: warn
           retention-days: 1
 
@@ -100,6 +106,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: round3-publish-diagnostics
-          path: /tmp/round3-publish.log
+          path: |
+            /tmp/round3-publish.log
+            /tmp/round3-ci.yml
           if-no-files-found: warn
           retention-days: 1
