@@ -9,8 +9,9 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 
-use crate::cli::DoctorFormat;
+use crate::cli::ReportFormat;
 use crate::config::{self, choose_shell_argv, config_file_path, load_config, TerminalMode};
+use crate::config_store::{self, ConfigLockStatus};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -76,19 +77,38 @@ fn collect() -> DiagnosticReport {
     let mut report = DiagnosticReport::new();
     let config_path = config_file_path();
 
-    match config::config_file_error() {
-        Some(message) => report.push("config", CheckStatus::Error, message),
-        None if config_path.is_file() => {
-            report.push("config", CheckStatus::Ok, config_path.display().to_string())
-        }
-        None => report.push(
+    let validation = config_store::validate_current_config();
+    if !validation.exists() {
+        report.push(
             "config",
             CheckStatus::Warning,
             format!(
                 "{} does not exist (built-in defaults)",
                 config_path.display()
             ),
-        ),
+        );
+    } else if validation.errors() > 0 {
+        report.push(
+            "config",
+            CheckStatus::Error,
+            format!(
+                "{} has {} validation error(s); run `jterm1 --check-config`",
+                config_path.display(),
+                validation.errors()
+            ),
+        );
+    } else if validation.warnings() > 0 {
+        report.push(
+            "config",
+            CheckStatus::Warning,
+            format!(
+                "{} is readable with {} warning(s); run `jterm1 --check-config`",
+                config_path.display(),
+                validation.warnings()
+            ),
+        );
+    } else {
+        report.push("config", CheckStatus::Ok, config_path.display().to_string());
     }
 
     #[cfg(unix)]
@@ -104,6 +124,40 @@ fn collect() -> DiagnosticReport {
                 format!("{mode:04o} (recommended: 0600)"),
             );
         }
+    }
+
+    let backup_count = config_store::backup_paths()
+        .into_iter()
+        .filter(|path| path.is_file())
+        .count();
+    report.push(
+        "config backups",
+        if backup_count > 0 {
+            CheckStatus::Ok
+        } else {
+            CheckStatus::Warning
+        },
+        if backup_count > 0 {
+            format!("{backup_count} rotating backup(s) available")
+        } else {
+            "none yet; backups are created after in-app saves".to_string()
+        },
+    );
+
+    match config_store::lock_status() {
+        ConfigLockStatus::Clear => {
+            report.push("config write lock", CheckStatus::Ok, "clear");
+        }
+        ConfigLockStatus::Active => report.push(
+            "config write lock",
+            CheckStatus::Warning,
+            "another process may currently be saving settings",
+        ),
+        ConfigLockStatus::Unavailable => report.push(
+            "config write lock",
+            CheckStatus::Warning,
+            "status could not be inspected",
+        ),
     }
 
     let (config, _, _) = load_config();
@@ -247,11 +301,11 @@ fn print_json(report: &DiagnosticReport) -> io::Result<()> {
     writeln!(stdout)
 }
 
-pub(crate) fn run(format: DoctorFormat) -> bool {
+pub(crate) fn run(format: ReportFormat) -> bool {
     let report = collect();
     let printed = match format {
-        DoctorFormat::Human => print_human(&report),
-        DoctorFormat::Json => print_json(&report),
+        ReportFormat::Human => print_human(&report),
+        ReportFormat::Json => print_json(&report),
     };
     if let Err(error) = printed {
         eprintln!("jterm1: failed to write diagnostics: {error}");
