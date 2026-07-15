@@ -1,0 +1,75 @@
+name: One-shot finalize round 3 configuration integrity
+
+on:
+  push:
+    branches:
+      - agent/config-integrity-finalize
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: round3-config-integrity-finalize
+  cancel-in-progress: true
+
+jobs:
+  finalize:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out corrective branch
+        uses: actions/checkout@v5
+        with:
+          ref: agent/config-integrity-finalize
+          fetch-depth: 0
+
+      - name: Install formatting toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+
+      - name: Reconstruct and apply reviewed patch
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin agent/config-integrity-evolution
+          {
+            git show 81e1483cfe5acb1e23f9f364050e52a2d1a264dd:scripts/.round3-patch.00
+            git show 81e1483cfe5acb1e23f9f364050e52a2d1a264dd:scripts/.round3-patch.01
+            git show 4e13382c76f966e18323ba0e2066572088e63181:scripts/.round3-patch.02
+            git show f9a1f9a84c367b59636af9bc3c7e3782470d4818:scripts/.round3-patch.03
+            git show 37427bbd71ebd2dbd8062af8e2fc02d9c3c6f5cb:scripts/.round3-patch.04
+          } > /tmp/round3.patch
+          echo 'b5491fc8b11a843f89aa9ec28544943c55143c4a82f83f5e136d3065d6d8b20f  /tmp/round3.patch' | sha256sum --check
+          git apply --check /tmp/round3.patch
+          git apply /tmp/round3.patch
+          cargo fmt --all
+
+          bash -n scripts/*.sh packaging/*.sh
+          python3 - <<'PY'
+          from pathlib import Path
+          import tomllib
+
+          tomllib.loads(Path('Cargo.toml').read_text(encoding='utf-8'))
+          tomllib.loads(Path('config.toml.example').read_text(encoding='utf-8'))
+          PY
+          git diff --check
+
+      - name: Remove all temporary migration material
+        run: |
+          rm -f \
+            .github/workflows/round3-source-snapshot.yml \
+            .github/workflows/round3-finalize.yml \
+            scripts/.round3-payload.* \
+            scripts/.round3-patch.*
+
+      - name: Commit and publish final product source
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "Finalize transactional configuration integrity"
+          git push origin HEAD:agent/config-integrity-finalize
