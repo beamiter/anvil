@@ -1,0 +1,39 @@
+name: Round 3 source snapshot
+
+on:
+  push:
+    branches:
+      - agent/config-integrity-evolution
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out evolution branch
+        uses: actions/checkout@v5
+        with:
+          ref: agent/config-integrity-evolution
+          fetch-depth: 0
+
+      - name: Package source snapshot
+        run: |
+          set -euo pipefail
+          mkdir -p snapshot
+          git rev-parse HEAD > snapshot/SOURCE_COMMIT
+          git rev-parse HEAD^{tree} > snapshot/SOURCE_TREE
+          git ls-files -z | tar --null -T - -czf snapshot/jterm1-source.tar.gz
+
+      - name: Upload source snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: jterm1-round3-source
+          path: snapshot/*
+          if-no-files-found: error
+          retention-days: 1
