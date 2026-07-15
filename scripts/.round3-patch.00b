@@ -1,0 +1,250 @@
+-# config. Keep a backup while experimenting: malformed TOML falls back to
+-# built-in defaults for loading, and in-app saves refuse to overwrite it.
++# config. In-app writes are locked, revision-checked, and atomically replaced;
++# stale windows cannot overwrite newer edits. Two known-good backups rotate as
++# config.toml.bak and config.toml.bak.1. Malformed or schema-invalid files fall
++# back to safe defaults for loading and are never overwritten by the settings UI.
++# Validate without starting GTK: jterm1 --check-config
+ 
+ # Appearance. Built-in themes: default, light, solarized-dark,
+ # solarized-light, gruvbox-dark, gruvbox-light, dracula, nord.
+diff --git a/packaging/RELEASE_README.md b/packaging/RELEASE_README.md
+index 4d7a1f1..915c1d9 100644
+--- a/packaging/RELEASE_README.md
++++ b/packaging/RELEASE_README.md
+@@ -27,13 +27,16 @@ After installation:
+ ```bash
+ jterm1 --doctor
+ jterm1 --doctor --json
++jterm1 --check-config
+ jterm1 --safe-mode
+ jterm1
+ ```
+ 
+ For support, `jterm1-support-bundle [OUTPUT_DIRECTORY]` creates a privacy-preserving
+ archive that excludes configuration contents, terminal history/output, and secret
+-values.
++values. In-app settings use revision-checked atomic writes and two rotating backups;
++`jterm1 --restore-config-backup` restores the newest valid one while preserving the
++replaced file.
+ 
+ The installer writes the binary to `~/.local/bin/jterm1` and assets beneath
+ `${XDG_DATA_HOME:-$HOME/.local/share}`. Add `~/.local/bin` to `PATH` when needed.
+diff --git a/scripts/support-bundle.sh b/scripts/support-bundle.sh
+index 9aa93dc..2889863 100755
+--- a/scripts/support-bundle.sh
++++ b/scripts/support-bundle.sh
+@@ -30,8 +30,12 @@ mkdir -p "${BUNDLE_DIR}"
+ 
+ human_status=0
+ json_status=0
++config_status=0
++config_json_status=0
+ "${JTERM1_BIN}" --doctor >"${BUNDLE_DIR}/doctor.txt" 2>&1 || human_status=$?
+ "${JTERM1_BIN}" --doctor --json >"${BUNDLE_DIR}/doctor.json" 2>"${BUNDLE_DIR}/doctor-json.stderr" || json_status=$?
++"${JTERM1_BIN}" --check-config >"${BUNDLE_DIR}/config-check.txt" 2>&1 || config_status=$?
++"${JTERM1_BIN}" --check-config --json >"${BUNDLE_DIR}/config-check.json" 2>"${BUNDLE_DIR}/config-check-json.stderr" || config_json_status=$?
+ 
+ binary_path="$(command -v "${JTERM1_BIN}")"
+ version="$("${JTERM1_BIN}" --version 2>&1 || true)"
+@@ -45,6 +49,8 @@ state_home="${XDG_STATE_HOME:-${HOME}/.local/state}"
+     printf 'binary=%s\n' "${binary_path}"
+     printf 'doctor_exit=%s\n' "${human_status}"
+     printf 'doctor_json_exit=%s\n' "${json_status}"
++    printf 'config_check_exit=%s\n' "${config_status}"
++    printf 'config_check_json_exit=%s\n' "${config_json_status}"
+     printf 'uname=%s\n' "$(uname -a 2>/dev/null || true)"
+     printf 'architecture=%s\n' "$(uname -m 2>/dev/null || true)"
+     printf 'session_type=%s\n' "${XDG_SESSION_TYPE:-unset}"
+@@ -59,6 +65,9 @@ state_home="${XDG_STATE_HOME:-${HOME}/.local/state}"
+     for path in \
+         "${config_home}/jterm1/config.toml" \
+         "${config_home}/jterm1/config.toml.bak" \
++        "${config_home}/jterm1/config.toml.bak.1" \
++        "${config_home}/jterm1/config.toml.before-restore" \
++        "${config_home}/jterm1/config.toml.lock" \
+         "${state_home}/jterm1/history.jsonl"; do
+         if [[ -e "${path}" ]]; then
+             stat --printf='%A %a %s bytes %n\n' "${path}" 2>/dev/null || ls -ld -- "${path}"
+@@ -88,8 +97,9 @@ fi
+ cat >"${BUNDLE_DIR}/README.txt" <<'EOF_README'
+ This support bundle intentionally excludes configuration contents, terminal
+ history, command output, clipboard data, environment values, API keys, SSH host
+-details, and session snapshots. It contains diagnostics, file metadata, system
+-identity, and the presence/absence of selected integration variables only.
++details, and session snapshots. It contains diagnostics, configuration schema
++issues without values, file metadata, system identity, and the presence/absence
++of selected integration variables only.
+ Review every file before sharing the archive.
+ EOF_README
+ 
+diff --git a/src/cli.rs b/src/cli.rs
+index 19a34db..f23ac56 100644
+--- a/src/cli.rs
++++ b/src/cli.rs
+@@ -12,7 +12,7 @@ pub(crate) enum Mode {
+ }
+ 
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+-pub(crate) enum DoctorFormat {
++pub(crate) enum ReportFormat {
+     Human,
+     Json,
+ }
+@@ -39,7 +39,10 @@ pub(crate) enum Command {
+     Run(LaunchOptions),
+     Help,
+     Version,
+-    Doctor(DoctorFormat),
++    Doctor(ReportFormat),
++    CheckConfig(ReportFormat),
++    RestoreConfigBackup,
++    ConfigPath,
+     InitConfig,
+     PrintShellIntegration(ShellIntegration),
+ }
+@@ -47,12 +50,27 @@ pub(crate) enum Command {
+ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
+     let args: Vec<OsString> = args.into_iter().collect();
+     if args.first().is_some_and(|arg| arg == "--doctor") {
+-        let format = match args.as_slice() {
+-            [_] => DoctorFormat::Human,
+-            [_, flag] if flag == "--json" => DoctorFormat::Json,
+-            _ => return Err("usage: jterm1 --doctor [--json]".to_string()),
+-        };
+-        return Ok(Command::Doctor(format));
++        return Ok(Command::Doctor(parse_report_format(
++            &args,
++            "--doctor [--json]",
++        )?));
++    }
++    if args.first().is_some_and(|arg| arg == "--check-config") {
++        return Ok(Command::CheckConfig(parse_report_format(
++            &args,
++            "--check-config [--json]",
++        )?));
++    }
++    if args
++        .first()
++        .is_some_and(|arg| arg == "--restore-config-backup")
++    {
++        require_exact_args(&args, 1, "--restore-config-backup")?;
++        return Ok(Command::RestoreConfigBackup);
++    }
++    if args.first().is_some_and(|arg| arg == "--config-path") {
++        require_exact_args(&args, 1, "--config-path")?;
++        return Ok(Command::ConfigPath);
+     }
+     if args.first().is_some_and(|arg| arg == "--init-config") {
+         require_exact_args(&args, 1, "--init-config")?;
+@@ -148,6 +166,14 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
+     Ok(Command::Run(launch))
+ }
+ 
++fn parse_report_format(args: &[OsString], usage: &str) -> Result<ReportFormat, String> {
++    match args {
++        [_] => Ok(ReportFormat::Human),
++        [_, flag] if flag == "--json" => Ok(ReportFormat::Json),
++        _ => Err(format!("usage: jterm1 {usage}")),
++    }
++}
++
+ fn require_exact_args(args: &[OsString], expected: usize, usage: &str) -> Result<(), String> {
+     if args.len() == expected {
+         Ok(())
+@@ -171,6 +197,9 @@ Launch options:
+ 
+ Utilities:
+       --doctor [--json]        Check configuration and runtime dependencies
++      --check-config [--json]  Validate keys, types, ranges, colors, and shortcuts
++      --restore-config-backup  Restore the newest valid rotating config backup
++      --config-path            Print the active configuration file path
+       --init-config            Create a documented config without overwriting one
+       --shell-integration SH   Print integration for bash, zsh, fish, or pwsh
+   -h, --help                   Show this help
+@@ -181,6 +210,8 @@ Examples:
+   jterm1 --mode block --no-restore
+   jterm1 --safe-mode
+   jterm1 --doctor --json
++  jterm1 --check-config
++  jterm1 --restore-config-backup
+   jterm1 -d /tmp -e bash -lc 'printf "hello\\n"'
+   source <(jterm1 --shell-integration bash)
+ "#;
+@@ -261,11 +292,11 @@ mod tests {
+     fn doctor_supports_human_and_json_formats() {
+         assert_eq!(
+             parse_strs(&["--doctor"]).unwrap(),
+-            Command::Doctor(DoctorFormat::Human)
++            Command::Doctor(ReportFormat::Human)
+         );
+         assert_eq!(
+             parse_strs(&["--doctor", "--json"]).unwrap(),
+-            Command::Doctor(DoctorFormat::Json)
++            Command::Doctor(ReportFormat::Json)
+         );
+         assert!(parse_strs(&["--doctor", "--verbose"]).is_err());
+     }
+@@ -290,4 +321,28 @@ mod tests {
+             .unwrap_err()
+             .contains("--execute"));
+     }
++
++    #[test]
++    fn config_check_supports_human_and_json_formats() {
++        assert_eq!(
++            parse_strs(&["--check-config"]).unwrap(),
++            Command::CheckConfig(ReportFormat::Human)
++        );
++        assert_eq!(
++            parse_strs(&["--check-config", "--json"]).unwrap(),
++            Command::CheckConfig(ReportFormat::Json)
++        );
++        assert!(parse_strs(&["--check-config", "--verbose"]).is_err());
++    }
++
++    #[test]
++    fn config_recovery_utilities_require_exact_arguments() {
++        assert_eq!(
++            parse_strs(&["--restore-config-backup"]).unwrap(),
++            Command::RestoreConfigBackup
++        );
++        assert_eq!(parse_strs(&["--config-path"]).unwrap(), Command::ConfigPath);
++        assert!(parse_strs(&["--restore-config-backup", "extra"]).is_err());
++        assert!(parse_strs(&["--config-path", "extra"]).is_err());
++    }
+ }
+diff --git a/src/config.rs b/src/config.rs
+index 695b34b..552032f 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -970,7 +970,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
+ }
+ 
+ // ---------------------------------------------------------------------------
+-// save_config
++// Config serialization helpers
+ // ---------------------------------------------------------------------------
+ 
+ pub(crate) fn rgba_to_hex(c: &RGBA) -> String {
+@@ -982,154 +982,6 @@ pub(crate) fn rgba_to_hex(c: &RGBA) -> String {
+     )
+ }
+ 
+-fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+-    use std::io::Write;
+-
+-    let mut options = fs::OpenOptions::new();
+-    options.create(true).truncate(true).write(true);
+-    #[cfg(unix)]
+-    {
+-        use std::os::unix::fs::OpenOptionsExt;
+-        options.mode(0o600);
+-    }
+-    let mut file = options.open(path)?;
+-    #[cfg(unix)]
+-    {
+-        use std::os::unix::fs::PermissionsExt;
+-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+-    }
+-    file.write_all(contents)?;
