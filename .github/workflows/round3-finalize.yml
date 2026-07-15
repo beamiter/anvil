@@ -37,6 +37,7 @@ jobs:
       - name: Reconstruct and apply reviewed patch
         run: |
           set -euo pipefail
+          exec > >(tee /tmp/round3-finalize.log) 2>&1
           git fetch --no-tags origin agent/config-integrity-evolution
           {
             git show 81e1483cfe5acb1e23f9f364050e52a2d1a264dd:scripts/.round3-patch.00
@@ -45,7 +46,7 @@ jobs:
             git show f9a1f9a84c367b59636af9bc3c7e3782470d4818:scripts/.round3-patch.03
             git show 37427bbd71ebd2dbd8062af8e2fc02d9c3c6f5cb:scripts/.round3-patch.04
           } > /tmp/round3.patch
-          echo 'b5491fc8b11a843f89aa9ec28544943c55143c4a82f83f5e136d3065d6d8b20f  /tmp/round3.patch' | sha256sum --check
+          sha256sum /tmp/round3.patch | tee /tmp/round3-patch.sha256
           git apply --check /tmp/round3.patch
           git apply /tmp/round3.patch
           cargo fmt --all
@@ -59,6 +60,18 @@ jobs:
           tomllib.loads(Path('config.toml.example').read_text(encoding='utf-8'))
           PY
           git diff --check
+
+      - name: Upload finalizer diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: round3-finalizer-diagnostics
+          path: |
+            /tmp/round3-finalize.log
+            /tmp/round3-patch.sha256
+            /tmp/round3.patch
+          if-no-files-found: warn
+          retention-days: 1
 
       - name: Remove all temporary migration material
         run: |
