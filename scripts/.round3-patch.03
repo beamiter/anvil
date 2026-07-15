@@ -1,0 +1,585 @@
++                format!("is outside the supported range {minimum}..={maximum}; it will be clamped"),
++            );
++        }
++    }
++}
++
++fn check_enum(
++    report: &mut ConfigValidationReport,
++    table: &toml::Table,
++    key: &str,
++    accepted: &[&str],
++) {
++    let Some(value) = table.get(key).and_then(toml::Value::as_str) else {
++        return;
++    };
++    if !accepted
++        .iter()
++        .any(|candidate| value.eq_ignore_ascii_case(candidate))
++    {
++        report.error(key, format!("must be one of: {}", accepted.join(", ")));
++    }
++}
++
++fn check_nonempty_string(
++    report: &mut ConfigValidationReport,
++    table: &toml::Table,
++    key: &str,
++) {
++    if table
++        .get(key)
++        .and_then(toml::Value::as_str)
++        .is_some_and(|value| value.trim().is_empty())
++    {
++        report.error(key, "must not be empty");
++    }
++}
++
++fn check_absolute_path(
++    report: &mut ConfigValidationReport,
++    table: &toml::Table,
++    key: &str,
++) {
++    let Some(value) = table.get(key).and_then(toml::Value::as_str) else {
++        return;
++    };
++    if !value.trim().is_empty() && !Path::new(value).is_absolute() {
++        report.error(key, "must be an absolute path; '~' is not expanded");
++    }
++}
++
++fn validate_colors(report: &mut ConfigValidationReport, table: &toml::Table) {
++    let Some(colors) = table.get("colors").and_then(toml::Value::as_table) else {
++        return;
++    };
++    let known: HashSet<&str> = ["foreground", "background", "cursor", "cursor_foreground"]
++        .into_iter()
++        .collect();
++    for (key, value) in colors {
++        let path = format!("colors.{key}");
++        if !known.contains(key.as_str()) {
++            report.warning(path, "unknown color key; it is preserved but ignored");
++            continue;
++        }
++        let Some(color) = value.as_str() else {
++            report.error(path, "must be a color string");
++            continue;
++        };
++        if RGBA::parse(color).is_err() {
++            report.error(path, "is not a valid GTK color");
++        }
++    }
++}
++
++fn validate_keybindings(report: &mut ConfigValidationReport, table: &toml::Table) {
++    let Some(keybindings) = table.get("keybindings").and_then(toml::Value::as_table) else {
++        return;
++    };
++    let known: HashSet<&str> = Action::all_actions()
++        .into_iter()
++        .filter_map(|action| action.config_key())
++        .collect();
++    let mut seen: HashMap<KeyCombo, String> = HashMap::new();
++    for (key, value) in keybindings {
++        let path = format!("keybindings.{key}");
++        if !known.contains(key.as_str()) {
++            report.warning(path, "unknown action; the binding is ignored");
++            continue;
++        }
++        let Some(binding) = value.as_str() else {
++            report.error(path, "must be a shortcut string");
++            continue;
++        };
++        match parse_key_combo(binding) {
++            Ok(combo) => {
++                if let Some(previous) = seen.insert(combo, key.clone()) {
++                    report.warning(
++                        path,
++                        format!("duplicates keybindings.{previous}; the later binding wins"),
++                    );
++                }
++            }
++            Err(_) => report.error(path, "is not a valid shortcut"),
++        }
++    }
++}
++
++fn validate_remote_hosts(report: &mut ConfigValidationReport, table: &toml::Table) {
++    let Some(hosts) = table.get("remote_hosts").and_then(toml::Value::as_array) else {
++        return;
++    };
++    let known: HashSet<&str> = [
++        "name",
++        "host",
++        "user",
++        "remote_shell",
++        "session",
++        "ssh_args",
++        "login_shell",
++        "multiplex",
++    ]
++    .into_iter()
++    .collect();
++    let mut names = HashSet::new();
++    for (index, value) in hosts.iter().enumerate() {
++        let prefix = format!("remote_hosts[{index}]");
++        let Some(host) = value.as_table() else {
++            report.error(prefix, "must be a table");
++            continue;
++        };
++        for key in host.keys() {
++            if !known.contains(key.as_str()) {
++                report.warning(
++                    format!("{prefix}.{key}"),
++                    "unknown remote-host key; it is ignored",
++                );
++            }
++        }
++        match host.get("host").and_then(toml::Value::as_str) {
++            Some(value) if !value.trim().is_empty() => {}
++            Some(_) => report.error(format!("{prefix}.host"), "must not be empty"),
++            None => report.error(format!("{prefix}.host"), "is required and must be a string"),
++        }
++        for key in ["name", "user", "remote_shell", "session"] {
++            if let Some(value) = host.get(key) {
++                if !value.is_str() {
++                    report.error(format!("{prefix}.{key}"), "must be a string");
++                }
++            }
++        }
++        for key in ["login_shell", "multiplex"] {
++            if let Some(value) = host.get(key) {
++                if !value.is_bool() {
++                    report.error(format!("{prefix}.{key}"), "must be a boolean");
++                }
++            }
++        }
++        if let Some(value) = host.get("ssh_args") {
++            match value.as_array() {
++                Some(arguments) if arguments.iter().all(toml::Value::is_str) => {}
++                Some(_) => report.error(
++                    format!("{prefix}.ssh_args"),
++                    "must contain only strings",
++                ),
++                None => report.error(format!("{prefix}.ssh_args"), "must be an array"),
++            }
++        }
++        if let Some(name) = host.get("name").and_then(toml::Value::as_str) {
++            if name.trim().is_empty() {
++                report.error(format!("{prefix}.name"), "must not be empty");
++            } else if !names.insert(name.to_string()) {
++                report.warning(format!("{prefix}.name"), "duplicates an earlier remote name");
++            }
++        }
++    }
++}
++
++fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
++    let mut report = ConfigValidationReport::new(path, true);
++    let known: HashSet<&str> = [
++        "opacity",
++        "scrollback",
++        "font",
++        "font_scale",
++        "theme",
++        "colors",
++        "keybindings",
++        "shell",
++        "startup_commands",
++        "terminal_mode",
++        "tab_placement",
++        "sidebar_view",
++        "sidebar_width",
++        "tab_width",
++        "ansi_cache_capacity",
++        "max_visible_blocks",
++        "output_batch_min_ms",
++        "output_batch_max_ms",
++        "lazy_load_threshold",
++        "truncation_threshold_lines",
++        "finished_block_viewport_rows",
++        "finished_block_max_expanded_rows",
++        "max_collapsed_output_lines",
++        "virtual_scroll_margin",
++        "command_history_enabled",
++        "command_history_path",
++        "command_history_max_entries",
++        "block_history_path",
++        "block_history_compress",
++        "block_compact",
++        "editor_input",
++        "allow_remote_clipboard_write",
++        "ai_enabled",
++        "agent_enabled",
++        "agent_max_turns",
++        "mouse_reporting_enabled",
++        "focus_reporting_enabled",
++        "scroll_reporting_enabled",
++        "preserve_live_scrollback",
++        "notify_long_blocks",
++        "notify_long_block_threshold_ms",
++        "show_repo_strip",
++        "remote_hosts",
++    ]
++    .into_iter()
++    .collect();
++    for key in table.keys() {
++        if !known.contains(key.as_str()) {
++            report.warning(key, "unknown key; it is preserved but ignored by this version");
++        }
++    }
++
++    for key in ["opacity", "font_scale"] {
++        check_type(&mut report, table, key, ExpectedType::Number);
++    }
++    for key in [
++        "scrollback",
++        "sidebar_width",
++        "tab_width",
++        "ansi_cache_capacity",
++        "max_visible_blocks",
++        "output_batch_min_ms",
++        "output_batch_max_ms",
++        "lazy_load_threshold",
++        "truncation_threshold_lines",
++        "finished_block_viewport_rows",
++        "finished_block_max_expanded_rows",
++        "max_collapsed_output_lines",
++        "virtual_scroll_margin",
++        "command_history_max_entries",
++        "agent_max_turns",
++        "notify_long_block_threshold_ms",
++    ] {
++        check_type(&mut report, table, key, ExpectedType::Integer);
++    }
++    for key in [
++        "font",
++        "theme",
++        "shell",
++        "startup_commands",
++        "terminal_mode",
++        "tab_placement",
++        "sidebar_view",
++        "command_history_path",
++        "block_history_path",
++    ] {
++        check_type(&mut report, table, key, ExpectedType::String);
++    }
++    for key in [
++        "command_history_enabled",
++        "block_history_compress",
++        "block_compact",
++        "editor_input",
++        "allow_remote_clipboard_write",
++        "ai_enabled",
++        "agent_enabled",
++        "mouse_reporting_enabled",
++        "focus_reporting_enabled",
++        "scroll_reporting_enabled",
++        "preserve_live_scrollback",
++        "notify_long_blocks",
++        "show_repo_strip",
++    ] {
++        check_type(&mut report, table, key, ExpectedType::Boolean);
++    }
++    check_type(&mut report, table, "colors", ExpectedType::Table);
++    check_type(&mut report, table, "keybindings", ExpectedType::Table);
++    check_type(&mut report, table, "remote_hosts", ExpectedType::Array);
++
++    check_nonempty_string(&mut report, table, "font");
++    check_nonempty_string(&mut report, table, "theme");
++    check_nonempty_string(&mut report, table, "shell");
++    check_absolute_path(&mut report, table, "shell");
++    check_enum(
++        &mut report,
++        table,
++        "theme",
++        &[
++            "default",
++            "light",
++            "solarized-dark",
++            "solarized-light",
++            "gruvbox-dark",
++            "gruvbox-light",
++            "dracula",
++            "nord",
++        ],
++    );
++    check_enum(&mut report, table, "terminal_mode", &["block", "vte"]);
++    check_enum(
++        &mut report,
++        table,
++        "tab_placement",
++        &["sidebar", "top", "topbar", "top_bar"],
++    );
++    check_enum(
++        &mut report,
++        table,
++        "sidebar_view",
++        &["tabs", "files", "file", "filetree", "file_tree"],
++    );
++    check_absolute_path(&mut report, table, "command_history_path");
++    check_absolute_path(&mut report, table, "block_history_path");
++
++    check_number_range(&mut report, table, "opacity", 0.01, 1.0);
++    check_number_range(&mut report, table, "font_scale", 0.1, 10.0);
++    check_integer_range(&mut report, table, "scrollback", 0, 1_000_000);
++    check_integer_range(&mut report, table, "sidebar_width", 120, 800);
++    check_integer_range(&mut report, table, "tab_width", 80, 480);
++    check_integer_range(&mut report, table, "ansi_cache_capacity", 1, 65_536);
++    check_integer_range(&mut report, table, "max_visible_blocks", 1, 10_000);
++    check_integer_range(&mut report, table, "output_batch_min_ms", 1, 1_000);
++    check_integer_range(&mut report, table, "output_batch_max_ms", 1, 5_000);
++    check_integer_range(&mut report, table, "lazy_load_threshold", 1, 100_000);
++    check_integer_range(
++        &mut report,
++        table,
++        "truncation_threshold_lines",
++        100,
++        1_000_000,
++    );
++    check_integer_range(
++        &mut report,
++        table,
++        "finished_block_viewport_rows",
++        3,
++        5_000,
++    );
++    check_integer_range(
++        &mut report,
++        table,
++        "finished_block_max_expanded_rows",
++        3,
++        5_000,
++    );
++    check_integer_range(
++        &mut report,
++        table,
++        "max_collapsed_output_lines",
++        0,
++        10_000,
++    );
++    check_integer_range(&mut report, table, "virtual_scroll_margin", 0, 100);
++    check_integer_range(
++        &mut report,
++        table,
++        "command_history_max_entries",
++        100,
++        100_000,
++    );
++    check_integer_range(&mut report, table, "agent_max_turns", 1, i64::MAX);
++    check_integer_range(
++        &mut report,
++        table,
++        "notify_long_block_threshold_ms",
++        0,
++        i64::MAX,
++    );
++
++    if let (Some(minimum), Some(maximum)) = (
++        table
++            .get("output_batch_min_ms")
++            .and_then(toml::Value::as_integer),
++        table
++            .get("output_batch_max_ms")
++            .and_then(toml::Value::as_integer),
++    ) {
++        if maximum < minimum {
++            report.error(
++                "output_batch_max_ms",
++                "must be greater than or equal to output_batch_min_ms",
++            );
++        }
++    }
++    if let (Some(viewport), Some(expanded)) = (
++        table
++            .get("finished_block_viewport_rows")
++            .and_then(toml::Value::as_integer),
++        table
++            .get("finished_block_max_expanded_rows")
++            .and_then(toml::Value::as_integer),
++    ) {
++        if expanded < viewport {
++            report.error(
++                "finished_block_max_expanded_rows",
++                "must be greater than or equal to finished_block_viewport_rows",
++            );
++        }
++    }
++
++    validate_colors(&mut report, table);
++    validate_keybindings(&mut report, table);
++    validate_remote_hosts(&mut report, table);
++    report
++}
++
++fn validate_path(path: &Path) -> ConfigValidationReport {
++    let bytes = match fs::read(path) {
++        Ok(bytes) => bytes,
++        Err(error) if error.kind() == io::ErrorKind::NotFound => {
++            let mut report = ConfigValidationReport::new(path, false);
++            report.warning("config", "file does not exist; built-in defaults will be used");
++            return report;
++        }
++        Err(_) => {
++            let mut report = ConfigValidationReport::new(path, true);
++            report.error("config", "file cannot be read");
++            return report;
++        }
++    };
++    let text = match std::str::from_utf8(&bytes) {
++        Ok(text) => text,
++        Err(_) => {
++            let mut report = ConfigValidationReport::new(path, true);
++            report.error("config", "file is not valid UTF-8");
++            return report;
++        }
++    };
++    let table = match text.parse::<toml::Table>() {
++        Ok(table) => table,
++        Err(_) => {
++            let mut report = ConfigValidationReport::new(path, true);
++            report.error("config", "file is not valid TOML");
++            return report;
++        }
++    };
++    validate_table(path, &table)
++}
++
++pub(crate) fn validate_current_config() -> ConfigValidationReport {
++    validate_path(&config::config_file_path())
++}
++
++fn print_validation_human(report: &ConfigValidationReport) -> io::Result<()> {
++    let mut stdout = io::stdout().lock();
++    writeln!(stdout, "jterm1 configuration check")?;
++    writeln!(stdout, "path: {}\n", report.path)?;
++    if report.issues.is_empty() {
++        writeln!(stdout, "[ok   ] configuration is valid")?;
++    } else {
++        for issue in &report.issues {
++            writeln!(
++                stdout,
++                "[{:<5}] {}: {}",
++                issue.severity.label(),
++                issue.key,
++                issue.message
++            )?;
++        }
++    }
++    writeln!(
++        stdout,
++        "\nSummary: {} error(s), {} warning(s)",
++        report.errors, report.warnings
++    )
++}
++
++fn print_validation_json(report: &ConfigValidationReport) -> io::Result<()> {
++    let mut stdout = io::stdout().lock();
++    serde_json::to_writer_pretty(&mut stdout, report).map_err(io::Error::other)?;
++    writeln!(stdout)
++}
++
++pub(crate) fn run_check(format: ReportFormat) -> bool {
++    let report = validate_current_config();
++    let result = match format {
++        ReportFormat::Human => print_validation_human(&report),
++        ReportFormat::Json => print_validation_json(&report),
++    };
++    if let Err(error) = result {
++        eprintln!("jterm1: failed to write configuration report: {error}");
++        return false;
++    }
++    report.healthy()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn temporary_directory(label: &str) -> PathBuf {
++        let nonce = UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed);
++        let path = std::env::temp_dir().join(format!(
++            "jterm1-config-store-{label}-{}-{nonce}",
++            std::process::id()
++        ));
++        fs::create_dir_all(&path).unwrap();
++        path
++    }
++
++    #[test]
++    fn revisions_detect_external_changes() {
++        let directory = temporary_directory("revision");
++        let path = directory.join("config.toml");
++        fs::write(&path, "opacity = 0.5\n").unwrap();
++        let first = revision_at(&path).unwrap();
++        fs::write(&path, "opacity = 0.6\n").unwrap();
++        let second = revision_at(&path).unwrap();
++        assert_ne!(first, second);
++        fs::remove_dir_all(directory).unwrap();
++    }
++
++    #[test]
++    fn stale_writer_is_rejected_without_touching_disk() {
++        let directory = temporary_directory("conflict");
++        let path = directory.join("config.toml");
++        fs::write(&path, "opacity = 0.5\n").unwrap();
++        let expected = revision_at(&path).unwrap();
++        fs::write(&path, "opacity = 0.6\n").unwrap();
++        let config = config::load_config().0;
++        let error = save_config_to_path(&path, &config, Some(&expected)).unwrap_err();
++        assert!(error.is_conflict());
++        assert_eq!(fs::read_to_string(&path).unwrap(), "opacity = 0.6\n");
++        fs::remove_dir_all(directory).unwrap();
++    }
++
++    #[test]
++    fn lock_status_tracks_an_active_writer_and_clears_after_drop() {
++        let directory = temporary_directory("lock");
++        let path = directory.join("config.toml");
++        let guard = ConfigFileLock::acquire(&path).unwrap();
++        let lock_path = lock_path_for(&path);
++        let observer = open_lock_file(&lock_path).unwrap();
++        assert!(!try_lock_exclusive(&observer).unwrap());
++        drop(observer);
++        drop(guard);
++        let observer = open_lock_file(&lock_path).unwrap();
++        assert!(try_lock_exclusive(&observer).unwrap());
++        unlock(&observer);
++        fs::remove_dir_all(directory).unwrap();
++    }
++
++    #[test]
++    fn validation_reports_unknown_and_invalid_keys_without_values() {
++        let directory = temporary_directory("validation");
++        let path = directory.join("config.toml");
++        fs::write(
++            &path,
++            "opacity = 'secret-value'\nunknown_setting = 'also-secret'\n",
++        )
++        .unwrap();
++        let report = validate_path(&path);
++        assert_eq!(report.errors(), 1);
++        assert_eq!(report.warnings(), 1);
++        let json = serde_json::to_string(&report).unwrap();
++        assert!(!json.contains("secret-value"));
++        assert!(!json.contains("also-secret"));
++        fs::remove_dir_all(directory).unwrap();
++    }
++
++    #[test]
++    fn restore_uses_secondary_when_primary_is_invalid() {
++        let directory = temporary_directory("restore");
++        let path = directory.join("config.toml");
++        fs::write(&path, "not valid toml = [\n").unwrap();
++        fs::write(backup_path_for(&path), "also invalid = [\n").unwrap();
++        fs::write(secondary_backup_path_for(&path), "opacity = 0.7\n").unwrap();
++        let (source, _) = restore_backup_to_path(&path).unwrap();
++        assert_eq!(source, secondary_backup_path_for(&path));
++        assert_eq!(fs::read_to_string(&path).unwrap(), "opacity = 0.7\n");
++        assert!(before_restore_path_for(&path).is_file());
++        fs::remove_dir_all(directory).unwrap();
++    }
++
++    #[test]
++    fn revision_debug_output_never_contains_configuration_bytes() {
