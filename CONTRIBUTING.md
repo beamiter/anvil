@@ -48,8 +48,11 @@ add ad-hoc `allow` flags to CI or local scripts.
   never let one malformed record prevent loading the remaining records.
 - Add tests for parsers, shell quoting, persistence, command recall, and other
   behavior that can be checked without a visible desktop.
-- Keep user configuration backward-compatible. New keys need safe defaults and
-  documentation in `config.toml.example`.
+- Keep user configuration backward-compatible. New keys need safe defaults,
+  validation in `config_store`, and documentation in `config.toml.example`.
+- Configuration writes must preserve unknown sections, hold the advisory lock,
+  compare the expected revision, rotate backups before replacement, and sync the
+  file and parent directory. Add conflict and recovery tests for changes here.
 
 ## Pull requests
 

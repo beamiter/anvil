@@ -27,13 +27,16 @@ After installation:
 ```bash
 jterm1 --doctor
 jterm1 --doctor --json
+jterm1 --check-config
 jterm1 --safe-mode
 jterm1
 ```
 
 For support, `jterm1-support-bundle [OUTPUT_DIRECTORY]` creates a privacy-preserving
 archive that excludes configuration contents, terminal history/output, and secret
-values.
+values. In-app settings use revision-checked atomic writes and two rotating backups;
+`jterm1 --restore-config-backup` restores the newest valid one while preserving the
+replaced file.
 
 The installer writes the binary to `~/.local/bin/jterm1` and assets beneath
 `${XDG_DATA_HOME:-$HOME/.local/share}`. Add `~/.local/bin` to `PATH` when needed.

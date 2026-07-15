@@ -11,6 +11,7 @@ mod cli;
 mod command_history;
 mod config;
 mod config_ops;
+mod config_store;
 mod diagnostics;
 mod dialogs;
 mod file_tree;
@@ -66,6 +67,7 @@ const MAX_TAB_WIDTH: u32 = 480;
 #[allow(deprecated)]
 struct AppModel {
     config: Rc<RefCell<Config>>,
+    config_revision: RefCell<Option<config_store::ConfigRevision>>,
     themes: Rc<Vec<Theme>>,
     kbmap: Rc<RefCell<KeybindingMap>>,
     shell_argv: Rc<Vec<String>>,
@@ -259,6 +261,18 @@ impl SimpleComponent for AppModel {
             None
         } else {
             config::config_file_error()
+        };
+        let config_validation = (!init.safe_mode).then(config_store::validate_current_config);
+        let config_revision = if init.safe_mode {
+            None
+        } else {
+            match config_store::current_revision() {
+                Ok(revision) => Some(revision),
+                Err(error) => {
+                    log::warn!("configuration revision unavailable at startup: {error}");
+                    None
+                }
+            }
         };
         let (mut config, themes, kbmap) = load_config();
         if init.safe_mode {
@@ -559,6 +573,7 @@ impl SimpleComponent for AppModel {
         let quit_allowed = Rc::new(std::cell::Cell::new(false));
         let mut model = AppModel {
             config,
+            config_revision: RefCell::new(config_revision),
             themes: Rc::new(themes),
             kbmap,
             shell_argv,
@@ -636,6 +651,18 @@ impl SimpleComponent for AppModel {
             model.show_toast(format!(
                 "Config could not be loaded; defaults are active. Your file was left untouched. {error}"
             ));
+        } else if let Some(validation) = config_validation {
+            if validation.errors() > 0 {
+                model.show_toast(format!(
+                    "Configuration has {} validation error(s). Run `jterm1 --check-config`; invalid values kept safe defaults.",
+                    validation.errors()
+                ));
+            } else if validation.warnings() > 0 {
+                model.show_toast(format!(
+                    "Configuration loaded with {} warning(s). Run `jterm1 --check-config` for details.",
+                    validation.warnings()
+                ));
+            }
         }
         if init.safe_mode {
             model.show_toast(
@@ -1032,6 +1059,27 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        cli::Command::CheckConfig(format) => {
+            init_logging();
+            if !config_store::run_check(format) {
+                std::process::exit(1);
+            }
+        }
+        cli::Command::RestoreConfigBackup => {
+            init_logging();
+            match config_store::restore_backup() {
+                Ok((source, _revision)) => println!(
+                    "Restored {} from {}",
+                    config_file_path().display(),
+                    source.display()
+                ),
+                Err(error) => {
+                    eprintln!("jterm1: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        cli::Command::ConfigPath => println!("{}", config_file_path().display()),
         cli::Command::InitConfig => {
             if let Err(error) = init_config_file() {
                 eprintln!("jterm1: {error}");
@@ -1117,7 +1165,14 @@ fn init_config_file() -> Result<(), String> {
         }
     })?;
     file.write_all(include_str!("../config.toml.example").as_bytes())
+        .and_then(|_| file.sync_all())
         .map_err(|err| format!("cannot write {}: {err}", path.display()))?;
+    drop(file);
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|err| format!("cannot sync {}: {err}", parent.display()))?;
+    }
     println!("Created {}", path.display());
     Ok(())
 }
@@ -1134,7 +1189,7 @@ fn print_shell_integration(shell: cli::ShellIntegration) {
     print!("{script}");
 }
 
-fn run_doctor(format: cli::DoctorFormat) -> bool {
+fn run_doctor(format: cli::ReportFormat) -> bool {
     diagnostics::run(format)
 }
 

@@ -336,9 +336,25 @@ impl AppModel {
             self.show_toast("Settings are temporary and are not saved in safe mode.");
             return;
         }
-        if let Err(err) = config::save_config(&self.config.borrow()) {
-            log::error!("{err}");
-            self.show_toast(format!("Settings were not saved: {err}"));
+        let expected = self.config_revision.borrow().clone();
+        let result = {
+            let config = self.config.borrow();
+            config_store::save_config(&config, expected.as_ref())
+        };
+        match result {
+            Ok(revision) => {
+                *self.config_revision.borrow_mut() = Some(revision);
+            }
+            Err(error) if error.is_conflict() => {
+                log::warn!("settings save conflict: {error}");
+                self.show_toast(
+                    "Settings were not saved because the config changed elsewhere. The newer file will reload automatically; reapply your change.",
+                );
+            }
+            Err(error) => {
+                log::error!("{error}");
+                self.show_toast(format!("Settings were not saved: {error}"));
+            }
         }
     }
 

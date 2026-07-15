@@ -30,4 +30,6 @@ jterm1 executes commands with the permissions of the current user. Notebook
 cells and approved AI-agent commands are not sandboxed. A report is especially
 useful when jterm1 executes input without the documented user action, exposes
 terminal data outside the configured workflow, bypasses an approval boundary,
-or writes persistent state unsafely.
+or writes persistent state unsafely. Configuration backups can contain the same
+sensitive paths and remote profiles as the live file; diagnostic and validation
+commands intentionally report key names and metadata without values.
