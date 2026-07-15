@@ -1,0 +1,33 @@
++        let revision = fingerprint(b"api_key = 'secret-value'");
++        let debug = format!("{revision:?}");
++        assert!(debug.contains("bytes"));
++        assert!(!debug.contains("secret-value"));
++    }
++
++    #[test]
++    fn rotating_backups_keep_the_previous_two_valid_versions() {
++        let directory = temporary_directory("rotation");
++        let path = directory.join("config.toml");
++        fs::write(&path, "opacity = 0.4\n").unwrap();
++        rotate_backups(&path, b"opacity = 0.4\n").unwrap();
++        rotate_backups(&path, b"opacity = 0.5\n").unwrap();
++        assert_eq!(
++            fs::read_to_string(backup_path_for(&path)).unwrap(),
++            "opacity = 0.5\n"
++        );
++        assert_eq!(
++            fs::read_to_string(secondary_backup_path_for(&path)).unwrap(),
++            "opacity = 0.4\n"
++        );
++        fs::remove_dir_all(directory).unwrap();
++    }
++
++    #[test]
++    fn documented_example_passes_schema_validation() {
++        let table = include_str!("../config.toml.example")
++            .parse::<toml::Table>()
++            .unwrap();
++        let report = validate_table(Path::new("config.toml"), &table);
++        assert_eq!(report.errors(), 0);
++    }
++}
