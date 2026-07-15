@@ -737,6 +737,11 @@ impl SimpleComponent for AppModel {
                 if let Some(id) = active_id {
                     model.select_tab(id, &sender);
                 }
+                // Loading claims and consumes the exited process's snapshot.
+                // Checkpoint the restored workspace under this process now so
+                // a crash or forced termination before another structural tab
+                // change does not lose the recovered session.
+                model.persist_session();
             }
             None => {
                 let initial_argv = execute_argv.unwrap_or_else(|| model.shell_argv.clone());

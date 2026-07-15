@@ -119,7 +119,8 @@ impl AppModel {
         }
     }
 
-    /// Match jterm4: a lone tab needs no top-bar tab control.
+    /// Keep the top-bar tab strip visible even for a lone tab so its title and
+    /// tab actions remain available in the configured placement.
     pub(crate) fn sync_tab_bar_visibility(&self) {
         match self.tab_placement.get() {
             config::TabPlacement::Sidebar => {
@@ -128,7 +129,7 @@ impl AppModel {
             }
             config::TabPlacement::TopBar => {
                 self.tab_strip_scroll.set_visible(true);
-                self.top_tab_scroll.set_visible(self.tabs.len() > 1);
+                self.top_tab_scroll.set_visible(!self.tabs.is_empty());
             }
         }
     }

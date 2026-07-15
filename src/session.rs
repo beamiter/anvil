@@ -383,13 +383,30 @@ fn process_is_alive(pid: u32) -> bool {
         return false;
     };
     let rc = unsafe { nix::libc::kill(pid, 0) };
-    if rc == 0 {
-        return true;
+    if rc != 0 {
+        return matches!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(nix::libc::EPERM)
+        );
     }
-    matches!(
-        io::Error::last_os_error().raw_os_error(),
-        Some(nix::libc::EPERM)
-    )
+
+    // kill(pid, 0) also succeeds for a zombie. Such a process has already
+    // exited and can no longer own or update its snapshot; launchers that reap
+    // children late would otherwise make every saved session look permanently
+    // live. Linux exposes the state after the parenthesized command in stat.
+    #[cfg(target_os = "linux")]
+    if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
+        if matches!(process_state_from_stat(&stat), Some('Z' | 'X' | 'x')) {
+            return false;
+        }
+    }
+
+    true
+}
+
+#[cfg(target_os = "linux")]
+fn process_state_from_stat(stat: &str) -> Option<char> {
+    stat.rsplit_once(')')?.1.trim_start().chars().next()
 }
 
 #[cfg(not(unix))]
@@ -444,6 +461,20 @@ mod tests {
                 },
             }],
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_proc_stat_state_with_spaces_and_parentheses_in_command() {
+        assert_eq!(
+            process_state_from_stat("42 (jterm worker) Z 1 2 3"),
+            Some('Z')
+        );
+        assert_eq!(
+            process_state_from_stat("42 (odd ) name) S 1 2 3"),
+            Some('S')
+        );
+        assert_eq!(process_state_from_stat("malformed"), None);
     }
 
     fn write_session(path: &Path, title: &str) {
