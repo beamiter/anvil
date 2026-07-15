@@ -1,0 +1,206 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 7c9f0eb..c465fca 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -92,6 +92,24 @@ jobs:
+           target/release/jterm1 --version | grep -Fx "jterm1 ${version}"
+           target/release/jterm1 --doctor
+           target/release/jterm1 --doctor --json | python3 -m json.tool >/dev/null
++          target/release/jterm1 --check-config --json | python3 -m json.tool >/dev/null
++
++          config_root="$(mktemp -d)"
++          mkdir -p "${config_root}/jterm1"
++          cp config.toml.example "${config_root}/jterm1/config.toml"
++          XDG_CONFIG_HOME="${config_root}" target/release/jterm1 --check-config
++          test "$(XDG_CONFIG_HOME="${config_root}" target/release/jterm1 --config-path)" = \
++            "${config_root}/jterm1/config.toml"
++
++          cp "${config_root}/jterm1/config.toml" "${config_root}/jterm1/config.toml.bak"
++          printf 'opacity = "wrong"\n' >"${config_root}/jterm1/config.toml"
++          if XDG_CONFIG_HOME="${config_root}" target/release/jterm1 --check-config; then
++            echo "invalid configuration unexpectedly passed validation" >&2
++            exit 1
++          fi
++          XDG_CONFIG_HOME="${config_root}" target/release/jterm1 --restore-config-backup
++          XDG_CONFIG_HOME="${config_root}" target/release/jterm1 --check-config
++          test -s "${config_root}/jterm1/config.toml.before-restore"
+           desktop-file-validate packaging/app.jterm1.desktop
+ 
+       - name: Build and verify portable release bundle
+@@ -101,6 +119,7 @@ jobs:
+           (cd target/dist && sha256sum --check *.sha256)
+           JTERM1_BIN=target/release/jterm1 bash scripts/support-bundle.sh target/support
+           tar -tzf target/support/jterm1-support-*.tar.gz | grep -F '/doctor.json'
++          tar -tzf target/support/jterm1-support-*.tar.gz | grep -F '/config-check.json'
+ 
+       - name: Upload portable release bundle
+         if: ${{ success() }}
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 5f86680..4d04f7a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,10 @@ versioning for tagged releases while it remains experimental.
+ 
+ ### Added
+ 
++- `--check-config [--json]`, `--config-path`, and explicit rotating-backup
++  recovery with preservation of the replaced live file.
++- Process-safe configuration locking, exact revision conflict detection, two
++  known-good backups, and durable atomic replacement.
+ - Isolated `--safe-mode` recovery sessions with VTE + `sh`, no restore or
+   persistence, and network/state-producing integrations disabled.
+ - Machine-readable `--doctor --json` diagnostics and a privacy-preserving
+@@ -26,6 +30,8 @@ versioning for tagged releases while it remains experimental.
+ 
+ ### Changed
+ 
++- In-app settings now refuse stale multi-window writes and invalid schemas;
++  diagnostics and support bundles expose validation/lock state without values.
+ - Local and CI linting now share one canonical Clippy policy.
+ - Development commands use the committed Cargo lockfile and expose complete
+   `make verify` and `make package` workflows.
+diff --git a/CONTRIBUTING.md b/CONTRIBUTING.md
+index 4818c03..462465d 100644
+--- a/CONTRIBUTING.md
++++ b/CONTRIBUTING.md
+@@ -48,8 +48,11 @@ add ad-hoc `allow` flags to CI or local scripts.
+   never let one malformed record prevent loading the remaining records.
+ - Add tests for parsers, shell quoting, persistence, command recall, and other
+   behavior that can be checked without a visible desktop.
+-- Keep user configuration backward-compatible. New keys need safe defaults and
+-  documentation in `config.toml.example`.
++- Keep user configuration backward-compatible. New keys need safe defaults,
++  validation in `config_store`, and documentation in `config.toml.example`.
++- Configuration writes must preserve unknown sections, hold the advisory lock,
++  compare the expected revision, rotate backups before replacement, and sync the
++  file and parent directory. Add conflict and recovery tests for changes here.
+ 
+ ## Pull requests
+ 
+diff --git a/Cargo.toml b/Cargo.toml
+index c74efbc..ce510aa 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -13,7 +13,7 @@ relm4 = { version = "0.11", features = ["libadwaita", "gnome_46"] }
+ vte4 = { version = "0.10.0", features = ["v0_76"] }
+ log = { version = "0.4", features = ["std"] }
+ memchr = "2"
+-nix = { version = "0.31.3", features = ["term", "signal", "process", "ioctl"] }
++nix = { version = "0.31.3", features = ["term", "signal", "process", "ioctl", "fs"] }
+ pcre2-sys = "0.2.10"
+ toml = "1.1.2"
+ serde = { version = "1.0", features = ["derive"] }
+diff --git a/README.md b/README.md
+index d9d03c0..7d0ec53 100644
+--- a/README.md
++++ b/README.md
+@@ -64,6 +64,8 @@ then run:
+ jterm1
+ jterm1 --doctor
+ jterm1 --doctor --json            # machine-readable support diagnostics
++jterm1 --check-config             # validate config without exposing its values
++jterm1 --config-path              # print the active config path
+ jterm1 --safe-mode                # isolated VTE + sh recovery session
+ ```
+ 
+@@ -73,6 +75,8 @@ Useful headless commands:
+ jterm1 --help
+ jterm1 --version
+ jterm1 --init-config                 # create config without overwriting one
++jterm1 --check-config --json         # machine-readable schema validation
++jterm1 --restore-config-backup       # restore newest valid rotating backup
+ jterm1 --shell-integration bash      # print an integration script
+ jterm1 --mode vte --no-restore       # launch a fresh compatibility session
+ jterm1 -d /path/to/project           # launch in a directory
+@@ -119,6 +123,24 @@ jterm1-support-bundle ~/Desktop
+ Review the archive before sharing it. The bundle contains structured diagnostics,
+ system identity, linked-library information, and file metadata only.
+ 
++Validate configuration keys, types, ranges, colors, shortcuts, and remote-host
++records without starting GTK:
++
++```bash
++jterm1 --check-config
++jterm1 --check-config --json
++```
++
++The report names keys and problems but never includes configuration values. If a
++bad edit or interrupted recovery leaves the live file unusable, restore the newest
++valid rotating backup with:
++
++```bash
++jterm1 --restore-config-backup
++```
++
++The command preserves the replaced live file as `config.toml.before-restore`.
++
+ ## Terminal modes
+ 
+ Block mode is the default. It keeps a live VTE input cell at the bottom and
+@@ -276,6 +298,20 @@ JTERM1_FG / BG / CURSOR / CURSOR_FG
+ Advanced block-rendering and history tuning keys are documented in
+ `config.toml.example`.
+ 
++### Configuration integrity
++
++Every window records the exact bytes of the configuration it loaded. In-app
++settings saves acquire an advisory process lock and compare that revision with the
++current file before writing. If another jterm1 window or editor changed the file,
++the stale writer is rejected instead of overwriting newer work; the file watcher
++then reloads the newer version and the user can reapply the setting.
++
++Successful saves use a unique sibling temporary file, `fsync`, atomic rename, and
++a directory sync. Two known-good states rotate through `config.toml.bak` and
++`config.toml.bak.1`. Invalid TOML or schema errors are never overwritten by the UI.
++The lock anchor is `config.toml.lock`; it contains no configuration data and may
++remain on disk while unlocked.
++
+ ### Workflows
+ 
+ Workflow files live in:
+@@ -378,6 +414,11 @@ inspection instead of being deleted. Inspect the newest snapshot with:
+ ./scripts/debug.sh info
+ ```
+ 
++Configuration recovery files live beside `config.toml`: two rotating backups
++(`config.toml.bak` and `config.toml.bak.1`) plus `config.toml.before-restore`
++when the recovery command replaces a live file. They are private user files and
++can contain the same paths or remote profiles as the main configuration.
++
+ Command-only history is enabled by default at
+ `${XDG_STATE_HOME:-$HOME/.local/state}/jterm1/history.jsonl`. It stores the
+ command, working directory, exit status, and completion time, but not terminal
+@@ -402,9 +443,10 @@ still recovery state rather than durable project storage.
+ - Long-command notifications can expose the first line of a command on the
+   desktop notification surface; set `notify_long_blocks = false` on shared or
+   locked-down desktops.
+-- Session state, command history, and block history may contain commands,
+-  output, and local paths. Protect or delete those files before sharing
+-  diagnostics.
++- Configuration backups, session state, command history, and block history may
++  contain remote profiles, commands, output, and local paths. Protect or delete
++  those files before sharing diagnostics. `--check-config` and the support bundle
++  report only schema issues and metadata, never configuration values.
+ - Shell integration modifies prompt/pre-exec hooks. Review the script and test
+   it with heavily customized shell frameworks.
+ - AI context leaves the machine when a cloud provider is selected. Use Ollama
+diff --git a/SECURITY.md b/SECURITY.md
+index f3029b8..8fd32bf 100644
+--- a/SECURITY.md
++++ b/SECURITY.md
+@@ -30,4 +30,6 @@ jterm1 executes commands with the permissions of the current user. Notebook
+ cells and approved AI-agent commands are not sandboxed. A report is especially
+ useful when jterm1 executes input without the documented user action, exposes
+ terminal data outside the configured workflow, bypasses an approval boundary,
+-or writes persistent state unsafely.
++or writes persistent state unsafely. Configuration backups can contain the same
++sensitive paths and remote profiles as the live file; diagnostic and validation
++commands intentionally report key names and metadata without values.
+diff --git a/config.toml.example b/config.toml.example
+index a9ad57b..6607b06 100644
+--- a/config.toml.example
++++ b/config.toml.example
+@@ -4,8 +4,11 @@
+ #   ${XDG_CONFIG_HOME:-$HOME/.config}/jterm1/config.toml
+ #
+ # jterm1 preserves unknown and hand-authored sections when it saves a valid
