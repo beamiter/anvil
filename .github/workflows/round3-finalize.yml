@@ -1,9 +1,13 @@
 name: One-shot finalize round 3 configuration integrity
 
 on:
-  push:
+  pull_request:
     branches:
-      - agent/config-integrity-finalize
+      - agent/round3-staging-base
+    types:
+      - opened
+      - synchronize
+      - reopened
   workflow_dispatch:
 
 permissions:
