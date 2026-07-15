@@ -104,7 +104,7 @@ jobs:
 
       - name: Upload portable release bundle
         if: ${{ success() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: jterm1-${{ github.sha }}
           path: target/dist/*
@@ -113,7 +113,7 @@ jobs:
 
       - name: Upload CI diagnostics
         if: ${{ failure() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ci-diagnostics
           path: |
