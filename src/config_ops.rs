@@ -19,11 +19,34 @@ impl AppModel {
             ));
             return;
         }
+        let validation = config_store::validate_current_config();
+        if validation.errors() > 0 {
+            log::warn!(
+                "configuration reload rejected: {} validation error(s)",
+                validation.errors()
+            );
+            self.show_toast(format!(
+                "Config reload rejected: {} validation error(s). Run `jterm1 --check-config`.",
+                validation.errors()
+            ));
+            return;
+        }
+        let revision = match config_store::current_revision() {
+            Ok(revision) => revision,
+            Err(error) => {
+                log::warn!("configuration reload rejected: {error}");
+                self.show_toast(format!(
+                    "Config reload rejected because its revision could not be read: {error}"
+                ));
+                return;
+            }
+        };
         let (new_config, themes, new_kb) = load_config();
         let new_shell_argv = Rc::new(choose_shell_argv(new_config.shell.as_deref()));
         let backend_changed = std::mem::discriminant(&self.config.borrow().terminal_mode)
             != std::mem::discriminant(&new_config.terminal_mode);
         *self.config.borrow_mut() = new_config.clone();
+        *self.config_revision.borrow_mut() = Some(revision);
         self.shell_argv = new_shell_argv;
 
         self.set_window_opacity(new_config.window_opacity);
@@ -47,6 +70,11 @@ impl AppModel {
         log::info!("Configuration reloaded from disk");
         if backend_changed {
             self.show_toast("Terminal mode changed; it will apply to new panes and tabs.");
+        } else if validation.warnings() > 0 {
+            self.show_toast(format!(
+                "Configuration reloaded with {} warning(s).",
+                validation.warnings()
+            ));
         } else {
             self.show_toast("Configuration reloaded.");
         }

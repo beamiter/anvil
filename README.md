@@ -64,6 +64,8 @@ then run:
 jterm1
 jterm1 --doctor
 jterm1 --doctor --json            # machine-readable support diagnostics
+jterm1 --check-config             # validate config without exposing its values
+jterm1 --config-path              # print the active config path
 jterm1 --safe-mode                # isolated VTE + sh recovery session
 ```
 
@@ -73,6 +75,8 @@ Useful headless commands:
 jterm1 --help
 jterm1 --version
 jterm1 --init-config                 # create config without overwriting one
+jterm1 --check-config --json         # machine-readable schema validation
+jterm1 --restore-config-backup       # restore newest valid rotating backup
 jterm1 --shell-integration bash      # print an integration script
 jterm1 --mode vte --no-restore       # launch a fresh compatibility session
 jterm1 -d /path/to/project           # launch in a directory
@@ -118,6 +122,24 @@ jterm1-support-bundle ~/Desktop
 
 Review the archive before sharing it. The bundle contains structured diagnostics,
 system identity, linked-library information, and file metadata only.
+
+Validate configuration keys, types, ranges, colors, shortcuts, and remote-host
+records without starting GTK:
+
+```bash
+jterm1 --check-config
+jterm1 --check-config --json
+```
+
+The report names keys and problems but never includes configuration values. If a
+bad edit or interrupted recovery leaves the live file unusable, restore the newest
+valid rotating backup with:
+
+```bash
+jterm1 --restore-config-backup
+```
+
+The command preserves the replaced live file as `config.toml.before-restore`.
 
 ## Terminal modes
 
@@ -276,6 +298,20 @@ JTERM1_FG / BG / CURSOR / CURSOR_FG
 Advanced block-rendering and history tuning keys are documented in
 `config.toml.example`.
 
+### Configuration integrity
+
+Every window records the exact bytes of the configuration it loaded. In-app
+settings saves acquire an advisory process lock and compare that revision with the
+current file before writing. If another jterm1 window or editor changed the file,
+the stale writer is rejected instead of overwriting newer work; the file watcher
+then reloads the newer version and the user can reapply the setting.
+
+Successful saves use a unique sibling temporary file, `fsync`, atomic rename, and
+a directory sync. Two known-good states rotate through `config.toml.bak` and
+`config.toml.bak.1`. Invalid TOML or schema errors are never overwritten by the UI.
+The lock anchor is `config.toml.lock`; it contains no configuration data and may
+remain on disk while unlocked.
+
 ### Workflows
 
 Workflow files live in:
@@ -378,6 +414,11 @@ inspection instead of being deleted. Inspect the newest snapshot with:
 ./scripts/debug.sh info
 ```
 
+Configuration recovery files live beside `config.toml`: two rotating backups
+(`config.toml.bak` and `config.toml.bak.1`) plus `config.toml.before-restore`
+when the recovery command replaces a live file. They are private user files and
+can contain the same paths or remote profiles as the main configuration.
+
 Command-only history is enabled by default at
 `${XDG_STATE_HOME:-$HOME/.local/state}/jterm1/history.jsonl`. It stores the
 command, working directory, exit status, and completion time, but not terminal
@@ -402,9 +443,10 @@ still recovery state rather than durable project storage.
 - Long-command notifications can expose the first line of a command on the
   desktop notification surface; set `notify_long_blocks = false` on shared or
   locked-down desktops.
-- Session state, command history, and block history may contain commands,
-  output, and local paths. Protect or delete those files before sharing
-  diagnostics.
+- Configuration backups, session state, command history, and block history may
+  contain remote profiles, commands, output, and local paths. Protect or delete
+  those files before sharing diagnostics. `--check-config` and the support bundle
+  report only schema issues and metadata, never configuration values.
 - Shell integration modifies prompt/pre-exec hooks. Review the script and test
   it with heavily customized shell frameworks.
 - AI context leaves the machine when a cloud provider is selected. Use Ollama

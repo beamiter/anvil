@@ -12,7 +12,7 @@ pub(crate) enum Mode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DoctorFormat {
+pub(crate) enum ReportFormat {
     Human,
     Json,
 }
@@ -39,7 +39,10 @@ pub(crate) enum Command {
     Run(LaunchOptions),
     Help,
     Version,
-    Doctor(DoctorFormat),
+    Doctor(ReportFormat),
+    CheckConfig(ReportFormat),
+    RestoreConfigBackup,
+    ConfigPath,
     InitConfig,
     PrintShellIntegration(ShellIntegration),
 }
@@ -47,12 +50,27 @@ pub(crate) enum Command {
 pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
     let args: Vec<OsString> = args.into_iter().collect();
     if args.first().is_some_and(|arg| arg == "--doctor") {
-        let format = match args.as_slice() {
-            [_] => DoctorFormat::Human,
-            [_, flag] if flag == "--json" => DoctorFormat::Json,
-            _ => return Err("usage: jterm1 --doctor [--json]".to_string()),
-        };
-        return Ok(Command::Doctor(format));
+        return Ok(Command::Doctor(parse_report_format(
+            &args,
+            "--doctor [--json]",
+        )?));
+    }
+    if args.first().is_some_and(|arg| arg == "--check-config") {
+        return Ok(Command::CheckConfig(parse_report_format(
+            &args,
+            "--check-config [--json]",
+        )?));
+    }
+    if args
+        .first()
+        .is_some_and(|arg| arg == "--restore-config-backup")
+    {
+        require_exact_args(&args, 1, "--restore-config-backup")?;
+        return Ok(Command::RestoreConfigBackup);
+    }
+    if args.first().is_some_and(|arg| arg == "--config-path") {
+        require_exact_args(&args, 1, "--config-path")?;
+        return Ok(Command::ConfigPath);
     }
     if args.first().is_some_and(|arg| arg == "--init-config") {
         require_exact_args(&args, 1, "--init-config")?;
@@ -148,6 +166,14 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
     Ok(Command::Run(launch))
 }
 
+fn parse_report_format(args: &[OsString], usage: &str) -> Result<ReportFormat, String> {
+    match args {
+        [_] => Ok(ReportFormat::Human),
+        [_, flag] if flag == "--json" => Ok(ReportFormat::Json),
+        _ => Err(format!("usage: jterm1 {usage}")),
+    }
+}
+
 fn require_exact_args(args: &[OsString], expected: usize, usage: &str) -> Result<(), String> {
     if args.len() == expected {
         Ok(())
@@ -171,6 +197,9 @@ Launch options:
 
 Utilities:
       --doctor [--json]        Check configuration and runtime dependencies
+      --check-config [--json]  Validate keys, types, ranges, colors, and shortcuts
+      --restore-config-backup  Restore the newest valid rotating config backup
+      --config-path            Print the active configuration file path
       --init-config            Create a documented config without overwriting one
       --shell-integration SH   Print integration for bash, zsh, fish, or pwsh
   -h, --help                   Show this help
@@ -181,6 +210,8 @@ Examples:
   jterm1 --mode block --no-restore
   jterm1 --safe-mode
   jterm1 --doctor --json
+  jterm1 --check-config
+  jterm1 --restore-config-backup
   jterm1 -d /tmp -e bash -lc 'printf "hello\\n"'
   source <(jterm1 --shell-integration bash)
 "#;
@@ -261,11 +292,11 @@ mod tests {
     fn doctor_supports_human_and_json_formats() {
         assert_eq!(
             parse_strs(&["--doctor"]).unwrap(),
-            Command::Doctor(DoctorFormat::Human)
+            Command::Doctor(ReportFormat::Human)
         );
         assert_eq!(
             parse_strs(&["--doctor", "--json"]).unwrap(),
-            Command::Doctor(DoctorFormat::Json)
+            Command::Doctor(ReportFormat::Json)
         );
         assert!(parse_strs(&["--doctor", "--verbose"]).is_err());
     }
@@ -289,5 +320,29 @@ mod tests {
         assert!(parse_strs(&["--safe-mode", "--execute", "bash"])
             .unwrap_err()
             .contains("--execute"));
+    }
+
+    #[test]
+    fn config_check_supports_human_and_json_formats() {
+        assert_eq!(
+            parse_strs(&["--check-config"]).unwrap(),
+            Command::CheckConfig(ReportFormat::Human)
+        );
+        assert_eq!(
+            parse_strs(&["--check-config", "--json"]).unwrap(),
+            Command::CheckConfig(ReportFormat::Json)
+        );
+        assert!(parse_strs(&["--check-config", "--verbose"]).is_err());
+    }
+
+    #[test]
+    fn config_recovery_utilities_require_exact_arguments() {
+        assert_eq!(
+            parse_strs(&["--restore-config-backup"]).unwrap(),
+            Command::RestoreConfigBackup
+        );
+        assert_eq!(parse_strs(&["--config-path"]).unwrap(), Command::ConfigPath);
+        assert!(parse_strs(&["--restore-config-backup", "extra"]).is_err());
+        assert!(parse_strs(&["--config-path", "extra"]).is_err());
     }
 }

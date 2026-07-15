@@ -30,8 +30,12 @@ mkdir -p "${BUNDLE_DIR}"
 
 human_status=0
 json_status=0
+config_status=0
+config_json_status=0
 "${JTERM1_BIN}" --doctor >"${BUNDLE_DIR}/doctor.txt" 2>&1 || human_status=$?
 "${JTERM1_BIN}" --doctor --json >"${BUNDLE_DIR}/doctor.json" 2>"${BUNDLE_DIR}/doctor-json.stderr" || json_status=$?
+"${JTERM1_BIN}" --check-config >"${BUNDLE_DIR}/config-check.txt" 2>&1 || config_status=$?
+"${JTERM1_BIN}" --check-config --json >"${BUNDLE_DIR}/config-check.json" 2>"${BUNDLE_DIR}/config-check-json.stderr" || config_json_status=$?
 
 binary_path="$(command -v "${JTERM1_BIN}")"
 version="$("${JTERM1_BIN}" --version 2>&1 || true)"
@@ -45,6 +49,8 @@ state_home="${XDG_STATE_HOME:-${HOME}/.local/state}"
     printf 'binary=%s\n' "${binary_path}"
     printf 'doctor_exit=%s\n' "${human_status}"
     printf 'doctor_json_exit=%s\n' "${json_status}"
+    printf 'config_check_exit=%s\n' "${config_status}"
+    printf 'config_check_json_exit=%s\n' "${config_json_status}"
     printf 'uname=%s\n' "$(uname -a 2>/dev/null || true)"
     printf 'architecture=%s\n' "$(uname -m 2>/dev/null || true)"
     printf 'session_type=%s\n' "${XDG_SESSION_TYPE:-unset}"
@@ -59,6 +65,9 @@ state_home="${XDG_STATE_HOME:-${HOME}/.local/state}"
     for path in \
         "${config_home}/jterm1/config.toml" \
         "${config_home}/jterm1/config.toml.bak" \
+        "${config_home}/jterm1/config.toml.bak.1" \
+        "${config_home}/jterm1/config.toml.before-restore" \
+        "${config_home}/jterm1/config.toml.lock" \
         "${state_home}/jterm1/history.jsonl"; do
         if [[ -e "${path}" ]]; then
             stat --printf='%A %a %s bytes %n\n' "${path}" 2>/dev/null || ls -ld -- "${path}"
@@ -88,8 +97,9 @@ fi
 cat >"${BUNDLE_DIR}/README.txt" <<'EOF_README'
 This support bundle intentionally excludes configuration contents, terminal
 history, command output, clipboard data, environment values, API keys, SSH host
-details, and session snapshots. It contains diagnostics, file metadata, system
-identity, and the presence/absence of selected integration variables only.
+details, and session snapshots. It contains diagnostics, configuration schema
+issues without values, file metadata, system identity, and the presence/absence
+of selected integration variables only.
 Review every file before sharing the archive.
 EOF_README
 

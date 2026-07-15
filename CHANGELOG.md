@@ -7,6 +7,10 @@ versioning for tagged releases while it remains experimental.
 
 ### Added
 
+- `--check-config [--json]`, `--config-path`, and explicit rotating-backup
+  recovery with preservation of the replaced live file.
+- Process-safe configuration locking, exact revision conflict detection, two
+  known-good backups, and durable atomic replacement.
 - Isolated `--safe-mode` recovery sessions with VTE + `sh`, no restore or
   persistence, and network/state-producing integrations disabled.
 - Machine-readable `--doctor --json` diagnostics and a privacy-preserving
@@ -26,6 +30,8 @@ versioning for tagged releases while it remains experimental.
 
 ### Changed
 
+- In-app settings now refuse stale multi-window writes and invalid schemas;
+  diagnostics and support bundles expose validation/lock state without values.
 - Local and CI linting now share one canonical Clippy policy.
 - Development commands use the committed Cargo lockfile and expose complete
   `make verify` and `make package` workflows.

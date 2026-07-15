@@ -4,8 +4,11 @@
 #   ${XDG_CONFIG_HOME:-$HOME/.config}/jterm1/config.toml
 #
 # jterm1 preserves unknown and hand-authored sections when it saves a valid
-# config. Keep a backup while experimenting: malformed TOML falls back to
-# built-in defaults for loading, and in-app saves refuse to overwrite it.
+# config. In-app writes are locked, revision-checked, and atomically replaced;
+# stale windows cannot overwrite newer edits. Two known-good backups rotate as
+# config.toml.bak and config.toml.bak.1. Malformed or schema-invalid files fall
+# back to safe defaults for loading and are never overwritten by the settings UI.
+# Validate without starting GTK: jterm1 --check-config
 
 # Appearance. Built-in themes: default, light, solarized-dark,
 # solarized-light, gruvbox-dark, gruvbox-light, dracula, nord.
