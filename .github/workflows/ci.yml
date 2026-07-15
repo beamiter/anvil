@@ -92,6 +92,24 @@ jobs:
           target/release/jterm1 --version | grep -Fx "jterm1 ${version}"
           target/release/jterm1 --doctor
           target/release/jterm1 --doctor --json | python3 -m json.tool >/dev/null
+          target/release/jterm1 --check-config --json | python3 -m json.tool >/dev/null
+
+          config_root="$(mktemp -d)"
+          mkdir -p "${config_root}/jterm1"
+          cp config.toml.example "${config_root}/jterm1/config.toml"
+          XDG_CONFIG_HOME="${config_root}" target/release/jterm1 --check-config
+          test "$(XDG_CONFIG_HOME="${config_root}" target/release/jterm1 --config-path)" = \
+            "${config_root}/jterm1/config.toml"
+
+          cp "${config_root}/jterm1/config.toml" "${config_root}/jterm1/config.toml.bak"
+          printf 'opacity = "wrong"\n' >"${config_root}/jterm1/config.toml"
+          if XDG_CONFIG_HOME="${config_root}" target/release/jterm1 --check-config; then
+            echo "invalid configuration unexpectedly passed validation" >&2
+            exit 1
+          fi
+          XDG_CONFIG_HOME="${config_root}" target/release/jterm1 --restore-config-backup
+          XDG_CONFIG_HOME="${config_root}" target/release/jterm1 --check-config
+          test -s "${config_root}/jterm1/config.toml.before-restore"
           desktop-file-validate packaging/app.jterm1.desktop
 
       - name: Build and verify portable release bundle
@@ -101,6 +119,7 @@ jobs:
           (cd target/dist && sha256sum --check *.sha256)
           JTERM1_BIN=target/release/jterm1 bash scripts/support-bundle.sh target/support
           tar -tzf target/support/jterm1-support-*.tar.gz | grep -F '/doctor.json'
+          tar -tzf target/support/jterm1-support-*.tar.gz | grep -F '/config-check.json'
 
       - name: Upload portable release bundle
         if: ${{ success() }}
