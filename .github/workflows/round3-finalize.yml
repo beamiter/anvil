@@ -39,13 +39,17 @@ jobs:
           set -euo pipefail
           exec > >(tee /tmp/round3-finalize.log) 2>&1
           git fetch --no-tags origin agent/config-integrity-evolution
-          {
-            git show 81e1483cfe5acb1e23f9f364050e52a2d1a264dd^:scripts/.round3-patch.00
-            git show 81e1483cfe5acb1e23f9f364050e52a2d1a264dd:scripts/.round3-patch.01
-            git show 4e13382c76f966e18323ba0e2066572088e63181:scripts/.round3-patch.02
-            git show f9a1f9a84c367b59636af9bc3c7e3782470d4818:scripts/.round3-patch.03
-            git show 37427bbd71ebd2dbd8062af8e2fc02d9c3c6f5cb:scripts/.round3-patch.04
-          } > /tmp/round3.patch
+          : > /tmp/round3.patch
+          for part in 00 01 02 03 04; do
+            path="scripts/.round3-patch.${part}"
+            commit="$(git log --all --diff-filter=A --format=%H -- "${path}" | tail -n 1)"
+            if [[ -z "${commit}" ]]; then
+              echo "Could not locate the addition commit for ${path}." >&2
+              exit 1
+            fi
+            echo "${path}: ${commit}"
+            git show "${commit}:${path}" >> /tmp/round3.patch
+          done
           sha256sum /tmp/round3.patch | tee /tmp/round3-patch.sha256
           echo 'b5491fc8b11a843f89aa9ec28544943c55143c4a82f83f5e136d3065d6d8b20f  /tmp/round3.patch' | sha256sum --check
           git apply --check /tmp/round3.patch
