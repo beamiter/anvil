@@ -1,0 +1,555 @@
+-    file.sync_all()
+-}
+-
+-pub(crate) fn save_config(config: &Config) -> Result<(), String> {
+-    let path = config_file_path();
+-    if let Some(parent) = path.parent() {
+-        fs::create_dir_all(parent)
+-            .map_err(|err| format!("create config dir {}: {err}", parent.display()))?;
+-    }
+-
+-    // Read existing config to preserve user-authored sections (e.g.
+-    // [keybindings]). A parse failure is a hard stop: falling back to an empty
+-    // table here would destroy the user's file on the next settings change.
+-    let existing = match fs::read_to_string(&path) {
+-        Ok(contents) => Some(contents),
+-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+-        Err(err) => return Err(format!("read config {}: {err}", path.display())),
+-    };
+-    let mut table = match existing.as_deref() {
+-        Some(contents) => contents.parse::<toml::Table>().map_err(|err| {
+-            format!(
+-                "refusing to overwrite invalid config {}: {err}",
+-                path.display()
+-            )
+-        })?,
+-        None => toml::Table::new(),
+-    };
+-
+-    table.insert("opacity".into(), toml::Value::Float(config.window_opacity));
+-    table.insert(
+-        "scrollback".into(),
+-        toml::Value::Integer(config.terminal_scrollback_lines as i64),
+-    );
+-    table.insert("font".into(), toml::Value::String(config.font_desc.clone()));
+-    table.insert(
+-        "font_scale".into(),
+-        toml::Value::Float(config.default_font_scale),
+-    );
+-    table.insert(
+-        "theme".into(),
+-        toml::Value::String(config.theme_name.clone()),
+-    );
+-    table.insert(
+-        "terminal_mode".into(),
+-        toml::Value::String(
+-            match config.terminal_mode {
+-                TerminalMode::Block => "block",
+-                TerminalMode::Vte => "vte",
+-            }
+-            .to_string(),
+-        ),
+-    );
+-    table.insert(
+-        "tab_placement".into(),
+-        toml::Value::String(config.tab_placement.as_str().to_string()),
+-    );
+-    table.insert(
+-        "sidebar_view".into(),
+-        toml::Value::String(config.sidebar_view.as_str().to_string()),
+-    );
+-    table.insert(
+-        "sidebar_width".into(),
+-        toml::Value::Integer(config.sidebar_width as i64),
+-    );
+-    table.insert(
+-        "tab_width".into(),
+-        toml::Value::Integer(config.tab_width as i64),
+-    );
+-    table.insert(
+-        "block_compact".into(),
+-        toml::Value::Boolean(config.block_compact),
+-    );
+-    table.insert(
+-        "command_history_enabled".into(),
+-        toml::Value::Boolean(config.command_history_enabled),
+-    );
+-    table.insert("ai_enabled".into(), toml::Value::Boolean(config.ai_enabled));
+-    table.insert(
+-        "agent_enabled".into(),
+-        toml::Value::Boolean(config.agent_enabled),
+-    );
+-    table.insert(
+-        "notify_long_blocks".into(),
+-        toml::Value::Boolean(config.notify_long_blocks),
+-    );
+-    table.insert(
+-        "allow_remote_clipboard_write".into(),
+-        toml::Value::Boolean(config.allow_remote_clipboard_write),
+-    );
+-
+-    let mut colors = toml::Table::new();
+-    colors.insert(
+-        "foreground".into(),
+-        toml::Value::String(rgba_to_hex(&config.foreground)),
+-    );
+-    colors.insert(
+-        "background".into(),
+-        toml::Value::String(rgba_to_hex(&config.background)),
+-    );
+-    colors.insert(
+-        "cursor".into(),
+-        toml::Value::String(rgba_to_hex(&config.cursor)),
+-    );
+-    colors.insert(
+-        "cursor_foreground".into(),
+-        toml::Value::String(rgba_to_hex(&config.cursor_foreground)),
+-    );
+-    table.insert("colors".into(), toml::Value::Table(colors));
+-
+-    let content = table.to_string();
+-    let tmp_path = path.with_extension("toml.tmp");
+-    write_private_file(&tmp_path, content.as_bytes())
+-        .map_err(|err| format!("write config {}: {err}", tmp_path.display()))?;
+-
+-    // Keep one known-good snapshot. If creating the backup fails, leave the
+-    // live file untouched instead of weakening the safety guarantee.
+-    if let Some(existing) = existing {
+-        let backup = path.with_extension("toml.bak");
+-        if let Err(err) = write_private_file(&backup, existing.as_bytes()) {
+-            let _ = fs::remove_file(&tmp_path);
+-            return Err(format!("write config backup {}: {err}", backup.display()));
+-        }
+-    }
+-
+-    if let Err(err) = fs::rename(&tmp_path, &path) {
+-        let _ = fs::remove_file(&tmp_path);
+-        return Err(format!("replace config {}: {err}", path.display()));
+-    }
+-    Ok(())
+-}
+-
+ // ---------------------------------------------------------------------------
+ // Shell selection
+ // ---------------------------------------------------------------------------
+diff --git a/src/config_ops.rs b/src/config_ops.rs
+index 3968c3c..e29b490 100644
+--- a/src/config_ops.rs
++++ b/src/config_ops.rs
+@@ -19,11 +19,34 @@ impl AppModel {
+             ));
+             return;
+         }
++        let validation = config_store::validate_current_config();
++        if validation.errors() > 0 {
++            log::warn!(
++                "configuration reload rejected: {} validation error(s)",
++                validation.errors()
++            );
++            self.show_toast(format!(
++                "Config reload rejected: {} validation error(s). Run `jterm1 --check-config`.",
++                validation.errors()
++            ));
++            return;
++        }
++        let revision = match config_store::current_revision() {
++            Ok(revision) => revision,
++            Err(error) => {
++                log::warn!("configuration reload rejected: {error}");
++                self.show_toast(format!(
++                    "Config reload rejected because its revision could not be read: {error}"
++                ));
++                return;
++            }
++        };
+         let (new_config, themes, new_kb) = load_config();
+         let new_shell_argv = Rc::new(choose_shell_argv(new_config.shell.as_deref()));
+         let backend_changed = std::mem::discriminant(&self.config.borrow().terminal_mode)
+             != std::mem::discriminant(&new_config.terminal_mode);
+         *self.config.borrow_mut() = new_config.clone();
++        *self.config_revision.borrow_mut() = Some(revision);
+         self.shell_argv = new_shell_argv;
+ 
+         self.set_window_opacity(new_config.window_opacity);
+@@ -47,6 +70,11 @@ impl AppModel {
+         log::info!("Configuration reloaded from disk");
+         if backend_changed {
+             self.show_toast("Terminal mode changed; it will apply to new panes and tabs.");
++        } else if validation.warnings() > 0 {
++            self.show_toast(format!(
++                "Configuration reloaded with {} warning(s).",
++                validation.warnings()
++            ));
+         } else {
+             self.show_toast("Configuration reloaded.");
+         }
+diff --git a/src/diagnostics.rs b/src/diagnostics.rs
+index dc95e2b..0af95e8 100644
+--- a/src/diagnostics.rs
++++ b/src/diagnostics.rs
+@@ -9,8 +9,9 @@ use std::fs;
+ use std::io::{self, Write};
+ use std::path::Path;
+ 
+-use crate::cli::DoctorFormat;
++use crate::cli::ReportFormat;
+ use crate::config::{self, choose_shell_argv, config_file_path, load_config, TerminalMode};
++use crate::config_store::{self, ConfigLockStatus};
+ 
+ #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+ #[serde(rename_all = "lowercase")]
+@@ -76,19 +77,38 @@ fn collect() -> DiagnosticReport {
+     let mut report = DiagnosticReport::new();
+     let config_path = config_file_path();
+ 
+-    match config::config_file_error() {
+-        Some(message) => report.push("config", CheckStatus::Error, message),
+-        None if config_path.is_file() => {
+-            report.push("config", CheckStatus::Ok, config_path.display().to_string())
+-        }
+-        None => report.push(
++    let validation = config_store::validate_current_config();
++    if !validation.exists() {
++        report.push(
+             "config",
+             CheckStatus::Warning,
+             format!(
+                 "{} does not exist (built-in defaults)",
+                 config_path.display()
+             ),
+-        ),
++        );
++    } else if validation.errors() > 0 {
++        report.push(
++            "config",
++            CheckStatus::Error,
++            format!(
++                "{} has {} validation error(s); run `jterm1 --check-config`",
++                config_path.display(),
++                validation.errors()
++            ),
++        );
++    } else if validation.warnings() > 0 {
++        report.push(
++            "config",
++            CheckStatus::Warning,
++            format!(
++                "{} is readable with {} warning(s); run `jterm1 --check-config`",
++                config_path.display(),
++                validation.warnings()
++            ),
++        );
++    } else {
++        report.push("config", CheckStatus::Ok, config_path.display().to_string());
+     }
+ 
+     #[cfg(unix)]
+@@ -106,6 +126,40 @@ fn collect() -> DiagnosticReport {
+         }
+     }
+ 
++    let backup_count = config_store::backup_paths()
++        .into_iter()
++        .filter(|path| path.is_file())
++        .count();
++    report.push(
++        "config backups",
++        if backup_count > 0 {
++            CheckStatus::Ok
++        } else {
++            CheckStatus::Warning
++        },
++        if backup_count > 0 {
++            format!("{backup_count} rotating backup(s) available")
++        } else {
++            "none yet; backups are created after in-app saves".to_string()
++        },
++    );
++
++    match config_store::lock_status() {
++        ConfigLockStatus::Clear => {
++            report.push("config write lock", CheckStatus::Ok, "clear");
++        }
++        ConfigLockStatus::Active => report.push(
++            "config write lock",
++            CheckStatus::Warning,
++            "another process may currently be saving settings",
++        ),
++        ConfigLockStatus::Unavailable => report.push(
++            "config write lock",
++            CheckStatus::Warning,
++            "status could not be inspected",
++        ),
++    }
++
+     let (config, _, _) = load_config();
+     let shell_argv = choose_shell_argv(config.shell.as_deref());
+     let shell = shell_argv.first().cloned().unwrap_or_default();
+@@ -247,11 +301,11 @@ fn print_json(report: &DiagnosticReport) -> io::Result<()> {
+     writeln!(stdout)
+ }
+ 
+-pub(crate) fn run(format: DoctorFormat) -> bool {
++pub(crate) fn run(format: ReportFormat) -> bool {
+     let report = collect();
+     let printed = match format {
+-        DoctorFormat::Human => print_human(&report),
+-        DoctorFormat::Json => print_json(&report),
++        ReportFormat::Human => print_human(&report),
++        ReportFormat::Json => print_json(&report),
+     };
+     if let Err(error) = printed {
+         eprintln!("jterm1: failed to write diagnostics: {error}");
+diff --git a/src/main.rs b/src/main.rs
+index 869ec2a..be8bfda 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -11,6 +11,7 @@ mod cli;
+ mod command_history;
+ mod config;
+ mod config_ops;
++mod config_store;
+ mod diagnostics;
+ mod dialogs;
+ mod file_tree;
+@@ -66,6 +67,7 @@ const MAX_TAB_WIDTH: u32 = 480;
+ #[allow(deprecated)]
+ struct AppModel {
+     config: Rc<RefCell<Config>>,
++    config_revision: RefCell<Option<config_store::ConfigRevision>>,
+     themes: Rc<Vec<Theme>>,
+     kbmap: Rc<RefCell<KeybindingMap>>,
+     shell_argv: Rc<Vec<String>>,
+@@ -260,6 +262,18 @@ impl SimpleComponent for AppModel {
+         } else {
+             config::config_file_error()
+         };
++        let config_validation = (!init.safe_mode).then(config_store::validate_current_config);
++        let config_revision = if init.safe_mode {
++            None
++        } else {
++            match config_store::current_revision() {
++                Ok(revision) => Some(revision),
++                Err(error) => {
++                    log::warn!("configuration revision unavailable at startup: {error}");
++                    None
++                }
++            }
++        };
+         let (mut config, themes, kbmap) = load_config();
+         if init.safe_mode {
+             config.apply_safe_mode();
+@@ -559,6 +573,7 @@ impl SimpleComponent for AppModel {
+         let quit_allowed = Rc::new(std::cell::Cell::new(false));
+         let mut model = AppModel {
+             config,
++            config_revision: RefCell::new(config_revision),
+             themes: Rc::new(themes),
+             kbmap,
+             shell_argv,
+@@ -636,6 +651,18 @@ impl SimpleComponent for AppModel {
+             model.show_toast(format!(
+                 "Config could not be loaded; defaults are active. Your file was left untouched. {error}"
+             ));
++        } else if let Some(validation) = config_validation {
++            if validation.errors() > 0 {
++                model.show_toast(format!(
++                    "Configuration has {} validation error(s). Run `jterm1 --check-config`; invalid values kept safe defaults.",
++                    validation.errors()
++                ));
++            } else if validation.warnings() > 0 {
++                model.show_toast(format!(
++                    "Configuration loaded with {} warning(s). Run `jterm1 --check-config` for details.",
++                    validation.warnings()
++                ));
++            }
+         }
+         if init.safe_mode {
+             model.show_toast(
+@@ -1027,6 +1054,27 @@ fn main() {
+                 std::process::exit(1);
+             }
+         }
++        cli::Command::CheckConfig(format) => {
++            init_logging();
++            if !config_store::run_check(format) {
++                std::process::exit(1);
++            }
++        }
++        cli::Command::RestoreConfigBackup => {
++            init_logging();
++            match config_store::restore_backup() {
++                Ok((source, _revision)) => println!(
++                    "Restored {} from {}",
++                    config_file_path().display(),
++                    source.display()
++                ),
++                Err(error) => {
++                    eprintln!("jterm1: {error}");
++                    std::process::exit(1);
++                }
++            }
++        }
++        cli::Command::ConfigPath => println!("{}", config_file_path().display()),
+         cli::Command::InitConfig => {
+             if let Err(error) = init_config_file() {
+                 eprintln!("jterm1: {error}");
+@@ -1112,7 +1160,14 @@ fn init_config_file() -> Result<(), String> {
+         }
+     })?;
+     file.write_all(include_str!("../config.toml.example").as_bytes())
++        .and_then(|_| file.sync_all())
+         .map_err(|err| format!("cannot write {}: {err}", path.display()))?;
++    drop(file);
++    if let Some(parent) = path.parent() {
++        std::fs::File::open(parent)
++            .and_then(|directory| directory.sync_all())
++            .map_err(|err| format!("cannot sync {}: {err}", parent.display()))?;
++    }
+     println!("Created {}", path.display());
+     Ok(())
+ }
+@@ -1129,7 +1184,7 @@ fn print_shell_integration(shell: cli::ShellIntegration) {
+     print!("{script}");
+ }
+ 
+-fn run_doctor(format: cli::DoctorFormat) -> bool {
++fn run_doctor(format: cli::ReportFormat) -> bool {
+     diagnostics::run(format)
+ }
+ 
+diff --git a/src/workspace_ops.rs b/src/workspace_ops.rs
+index 9ec0a9e..c3828bf 100644
+--- a/src/workspace_ops.rs
++++ b/src/workspace_ops.rs
+@@ -336,9 +336,25 @@ impl AppModel {
+             self.show_toast("Settings are temporary and are not saved in safe mode.");
+             return;
+         }
+-        if let Err(err) = config::save_config(&self.config.borrow()) {
+-            log::error!("{err}");
+-            self.show_toast(format!("Settings were not saved: {err}"));
++        let expected = self.config_revision.borrow().clone();
++        let result = {
++            let config = self.config.borrow();
++            config_store::save_config(&config, expected.as_ref())
++        };
++        match result {
++            Ok(revision) => {
++                *self.config_revision.borrow_mut() = Some(revision);
++            }
++            Err(error) if error.is_conflict() => {
++                log::warn!("settings save conflict: {error}");
++                self.show_toast(
++                    "Settings were not saved because the config changed elsewhere. The newer file will reload automatically; reapply your change.",
++                );
++            }
++            Err(error) => {
++                log::error!("{error}");
++                self.show_toast(format!("Settings were not saved: {error}"));
++            }
+         }
+     }
+ 
+diff --git a/src/config_store.rs b/src/config_store.rs
+new file mode 100644
+index 0000000..9296cb2
+--- /dev/null
++++ b/src/config_store.rs
+@@ -0,0 +1,1364 @@
++//! Transactional configuration persistence, validation, and backup recovery.
++//!
++//! jterm1 is a `NON_UNIQUE` application: several windows may hold an in-memory
++//! configuration at once. This module prevents an older window from silently
++//! overwriting a newer on-disk edit by combining a process-safe lock with an
++//! optimistic content revision. Writes use unique sibling temporary files,
++//! durable renames, and two rotating known-good backups.
++
++use relm4::gtk;
++use serde::Serialize;
++use std::collections::{HashMap, HashSet};
++use std::fmt;
++use std::fs;
++use std::io::{self, Write};
++use std::path::{Path, PathBuf};
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::os::fd::AsRawFd;
++use std::thread;
++use std::time::{Duration, Instant};
++
++use nix::errno::Errno;
++use nix::fcntl::{flock, FlockArg};
++
++use gtk::gdk::RGBA;
++
++use crate::cli::ReportFormat;
++use crate::config::{self, Config, TerminalMode};
++use crate::keybindings::{parse_key_combo, Action, KeyCombo};
++
++const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
++const FNV_OFFSET: u64 = 0xcbf29ce484222325;
++const FNV_PRIME: u64 = 0x100000001b3;
++
++static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(1);
++
++#[derive(Clone, PartialEq, Eq)]
++pub(crate) enum ConfigRevision {
++    Missing,
++    Present { content: Box<[u8]>, hash: u64 },
++}
++
++impl fmt::Debug for ConfigRevision {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::Missing => f.write_str("Missing"),
++            Self::Present { content, hash } => f
++                .debug_struct("Present")
++                .field("bytes", &content.len())
++                .field("hash", hash)
++                .finish(),
++        }
++    }
++}
++
++#[derive(Debug)]
++pub(crate) enum ConfigWriteError {
++    Conflict { path: PathBuf },
++    Locked { path: PathBuf },
++    RevisionUnavailable { path: PathBuf },
++    InvalidConfig { path: PathBuf, errors: usize },
++    BackupUnavailable { path: PathBuf },
++    Io(String),
++}
++
++impl ConfigWriteError {
++    pub(crate) fn is_conflict(&self) -> bool {
++        matches!(self, Self::Conflict { .. })
++    }
++}
++
++impl std::error::Error for ConfigWriteError {}
++
++impl fmt::Display for ConfigWriteError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::Conflict { path } => write!(
++                f,
++                "{} changed in another window or editor; reload it before saving",
++                path.display()
++            ),
++            Self::Locked { path } => write!(
++                f,
++                "timed out waiting for the configuration write lock {}",
++                path.display()
++            ),
++            Self::RevisionUnavailable { path } => write!(
++                f,
++                "cannot safely save {} because its starting revision is unavailable",
++                path.display()
++            ),
++            Self::InvalidConfig { path, errors } => write!(
++                f,
++                "refusing to overwrite {} because validation found {errors} error(s)",
++                path.display()
++            ),
++            Self::BackupUnavailable { path } => write!(
