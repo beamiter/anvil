@@ -81,7 +81,7 @@ impl Component for DebugDashboardModel {
     ) {
         match msg {
             DebugDashboardMsg::Toggle(info) => {
-                if root.is_visible() {
+                if root.parent().is_some() {
                     root.force_close();
                     return;
                 }

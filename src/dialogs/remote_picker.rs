@@ -178,7 +178,7 @@ impl Component for RemotePickerModel {
     ) {
         match msg {
             RemotePickerMsg::Toggle(hosts) => {
-                if root.is_visible() {
+                if root.parent().is_some() {
                     root.force_close();
                     return;
                 }

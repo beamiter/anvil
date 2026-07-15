@@ -274,7 +274,7 @@ impl Component for SettingsModel {
     ) {
         match msg {
             SettingsMsg::Toggle(values, parent) => {
-                if root.is_visible() {
+                if root.parent().is_some() {
                     root.force_close();
                     return;
                 }

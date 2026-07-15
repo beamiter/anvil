@@ -205,7 +205,7 @@ impl Component for PaletteModel {
     ) {
         match msg {
             PaletteMsg::Toggle { mode, history_path } => {
-                if root.is_visible() {
+                if root.parent().is_some() {
                     root.force_close();
                     return;
                 }
