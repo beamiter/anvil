@@ -40,7 +40,7 @@ jobs:
           exec > >(tee /tmp/round3-finalize.log) 2>&1
           git fetch --no-tags origin agent/config-integrity-evolution
           : > /tmp/round3.patch
-          for part in 00 01 02 03 04; do
+          for part in 00a 00b 01 02 03 04; do
             path="scripts/.round3-patch.${part}"
             commit="$(git log --all --diff-filter=A --format=%H -- "${path}" | tail -n 1)"
             if [[ -z "${commit}" ]]; then
