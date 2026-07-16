@@ -12,7 +12,7 @@
 //! D-Bus is broken, the user shouldn't see a stack trace from a feature
 //! that's meant to be unobtrusive.
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// Post a desktop notification for a command that just finished. `cmd` is
 /// the displayed command (truncated to keep the toast readable);
@@ -23,14 +23,7 @@ use std::process::{Command, Stdio};
 /// have time to refill their coffee.
 pub fn long_block_finished(cmd: &str, exit_code: i32, duration_ms: u64) {
     // Truncate the cmd so the notification title stays one line.
-    let title_cmd = cmd.lines().next().unwrap_or(cmd);
-    let title_cmd = if title_cmd.len() > 60 {
-        let mut s = title_cmd[..60].to_string();
-        s.push('…');
-        s
-    } else {
-        title_cmd.to_string()
-    };
+    let title_cmd = notification_title(cmd);
 
     let status = if exit_code == 0 { "✓" } else { "✗" };
     let title = format!("{status} {title_cmd}");
@@ -43,10 +36,10 @@ pub fn long_block_finished(cmd: &str, exit_code: i32, duration_ms: u64) {
     // a moment of attention.
     let timeout_ms = if exit_code == 0 { "5000" } else { "10000" };
 
-    let _ = Command::new("notify-send")
+    let _ = crate::host::command("notify-send")
         .args([
             "--app-name=jterm1",
-            "--icon=utilities-terminal",
+            "--icon=io.github.beamiter.jterm1",
             "--urgency",
             urgency,
             "--expire-time",
@@ -59,6 +52,18 @@ pub fn long_block_finished(cmd: &str, exit_code: i32, duration_ms: u64) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
+}
+
+fn notification_title(cmd: &str) -> String {
+    const MAX_CHARS: usize = 60;
+
+    let first_line = cmd.lines().next().unwrap_or(cmd);
+    let mut chars = first_line.chars();
+    let mut title: String = chars.by_ref().take(MAX_CHARS).collect();
+    if chars.next().is_some() {
+        title.push('…');
+    }
+    title
 }
 
 /// Render a millisecond count as a short human string. Used in the
@@ -115,5 +120,21 @@ mod tests {
         assert_eq!(humanize_duration(3_600_000), "1h");
         assert_eq!(humanize_duration(3_660_000), "1h 1m");
         assert_eq!(humanize_duration(7_200_000), "2h");
+    }
+
+    #[test]
+    fn notification_title_truncates_unicode_on_character_boundaries() {
+        for command in [
+            format!("a{}", "界".repeat(60)),
+            format!("a{}", "🙂".repeat(60)),
+        ] {
+            let title = notification_title(&command);
+            assert!(title.ends_with('…'));
+            assert_eq!(title.chars().count(), 61);
+            assert_eq!(
+                title.chars().take(60).collect::<String>(),
+                command.chars().take(60).collect::<String>()
+            );
+        }
     }
 }

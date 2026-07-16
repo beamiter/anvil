@@ -32,12 +32,29 @@ impl TermCtl {
             Self::Block(controller) => controller.widget().clone().upcast(),
         }
     }
+
+    /// Agent execution is intentionally Block-only and requires a clean,
+    /// shell-integrated prompt with no existing user or programmatic input.
+    pub(crate) fn can_accept_agent_command(&self) -> bool {
+        match self {
+            Self::Vte(_) => false,
+            Self::Block(controller) => controller.model().can_accept_agent_command(),
+        }
+    }
+
+    pub(crate) fn block_debug_info(&self) -> Option<crate::block_view::DebugInfo> {
+        match self {
+            Self::Vte(_) => None,
+            Self::Block(controller) => Some(controller.model().debug_info()),
+        }
+    }
 }
 
 pub(crate) struct Pane {
     pub(crate) terminal: TermCtl,
     pub(crate) id: u64,
     pub(crate) cwd: Option<String>,
+    pub(crate) session_id: Option<String>,
     pub(crate) mode: TerminalMode,
     pub(crate) probe: terminal::PaneProbe,
 }
@@ -64,6 +81,9 @@ pub(crate) enum ConnStatus {
 #[derive(Clone)]
 pub(crate) struct RemoteConn {
     pub(crate) host: config::RemoteHost,
+    /// Stable identity of the pane that owns this connection. A tab can also
+    /// contain local split panes, so tab-level metadata alone is ambiguous.
+    pub(crate) pane_id: u64,
     pub(crate) status: ConnStatus,
     pub(crate) attempt: u32,
     pub(crate) spawn_at: std::time::Instant,

@@ -50,7 +50,15 @@
 
             postInstall = ''
               install -Dm644 packaging/app.jterm1.desktop \
-                "$out/share/applications/app.jterm1.desktop"
+                "$out/share/applications/io.github.beamiter.jterm1.desktop"
+              install -Dm644 packaging/app.jterm1.metainfo.xml \
+                "$out/share/metainfo/io.github.beamiter.jterm1.metainfo.xml"
+              install -Dm644 packaging/app.jterm1.svg \
+                "$out/share/icons/hicolor/scalable/apps/io.github.beamiter.jterm1.svg"
+              install -Dm644 packaging/app.jterm1-128.png \
+                "$out/share/icons/hicolor/128x128/apps/io.github.beamiter.jterm1.png"
+              install -Dm644 packaging/app.jterm1-256.png \
+                "$out/share/icons/hicolor/256x256/apps/io.github.beamiter.jterm1.png"
               install -Dm644 config.toml.example \
                 "$out/share/doc/jterm1/config.toml.example"
               install -Dm644 README.md \
@@ -61,6 +69,8 @@
                 "$out/bin/jterm1-support-bundle"
 
               install -d "$out/share/jterm1/shell-integration"
+              install -m644 scripts/shell-integration/README.md \
+                "$out/share/jterm1/shell-integration/"
               install -m644 scripts/shell-integration/jterm1.* \
                 "$out/share/jterm1/shell-integration/"
 

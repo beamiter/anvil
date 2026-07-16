@@ -10,7 +10,7 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use crate::cli::ReportFormat;
-use crate::config::{self, choose_shell_argv, config_file_path, load_config, TerminalMode};
+use crate::config::{choose_shell_argv, config_file_path, load_config, TerminalMode};
 use crate::config_store::{self, ConfigLockStatus};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -67,10 +67,101 @@ impl DiagnosticReport {
 fn executable_exists(executable: &str) -> bool {
     let path = Path::new(executable);
     if path.components().count() > 1 {
-        path.is_file()
+        if crate::host::is_flatpak() {
+            crate::host::command("test")
+                .args(["-x", executable])
+                .status()
+                .is_ok_and(|status| status.success())
+        } else {
+            let Ok(metadata) = fs::metadata(path) else {
+                return false;
+            };
+            if !metadata.is_file() {
+                return false;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                metadata.permissions().mode() & 0o111 != 0
+            }
+            #[cfg(not(unix))]
+            {
+                true
+            }
+        }
     } else {
-        config::find_executable_in_path(executable).is_some()
+        crate::host::command_available(executable)
     }
+}
+
+/// Support-bundle mode retains readiness checks while suppressing local paths
+/// and user-authored values. It is intentionally an internal environment flag,
+/// not a general command-line option.
+fn diagnostics_redacted() -> bool {
+    std::env::var_os("JTERM1_DIAGNOSTICS_REDACT")
+        .is_some_and(|value| !value.is_empty() && value != "0")
+}
+
+fn diagnostic_path(path: &Path) -> String {
+    if diagnostics_redacted() {
+        "<config-file>".to_string()
+    } else {
+        path.display().to_string()
+    }
+}
+
+fn config_backup_health() -> (usize, usize, usize) {
+    let mut present = 0;
+    let mut valid = 0;
+    let mut invalid_or_unreadable = 0;
+    for path in config_store::backup_paths() {
+        if !path.exists() {
+            continue;
+        }
+        present += 1;
+        let validation = config_store::validate_path(&path);
+        if validation.exists() && validation.errors() == 0 {
+            valid += 1;
+        } else {
+            invalid_or_unreadable += 1;
+        }
+    }
+    (present, valid, invalid_or_unreadable)
+}
+
+fn workflow_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "toml" | "yaml" | "yml"
+            )
+        })
+}
+
+fn workflow_discovery() -> (usize, usize, usize, usize) {
+    let dirs = crate::workflows::workflow_dirs();
+    let mut readable_dirs = 0;
+    let mut rejected = 0;
+    for dir in &dirs {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        readable_dirs += 1;
+        for path in entries.filter_map(Result::ok).map(|entry| entry.path()) {
+            if path.is_file() && workflow_file(&path) && crate::workflows::load_one(&path).is_err()
+            {
+                rejected += 1;
+            }
+        }
+    }
+    (
+        crate::workflows::load_all(&dirs).len(),
+        readable_dirs,
+        dirs.len(),
+        rejected,
+    )
 }
 
 fn collect() -> DiagnosticReport {
@@ -84,7 +175,7 @@ fn collect() -> DiagnosticReport {
             CheckStatus::Warning,
             format!(
                 "{} does not exist (built-in defaults)",
-                config_path.display()
+                diagnostic_path(&config_path)
             ),
         );
     } else if validation.errors() > 0 {
@@ -93,7 +184,7 @@ fn collect() -> DiagnosticReport {
             CheckStatus::Error,
             format!(
                 "{} has {} validation error(s); run `jterm1 --check-config`",
-                config_path.display(),
+                diagnostic_path(&config_path),
                 validation.errors()
             ),
         );
@@ -103,12 +194,12 @@ fn collect() -> DiagnosticReport {
             CheckStatus::Warning,
             format!(
                 "{} is readable with {} warning(s); run `jterm1 --check-config`",
-                config_path.display(),
+                diagnostic_path(&config_path),
                 validation.warnings()
             ),
         );
     } else {
-        report.push("config", CheckStatus::Ok, config_path.display().to_string());
+        report.push("config", CheckStatus::Ok, diagnostic_path(&config_path));
     }
 
     #[cfg(unix)]
@@ -126,21 +217,18 @@ fn collect() -> DiagnosticReport {
         }
     }
 
-    let backup_count = config_store::backup_paths()
-        .into_iter()
-        .filter(|path| path.is_file())
-        .count();
+    let (backup_count, valid_backups, bad_backups) = config_backup_health();
     report.push(
         "config backups",
-        if backup_count > 0 {
-            CheckStatus::Ok
-        } else {
+        if bad_backups > 0 || valid_backups == 0 {
             CheckStatus::Warning
-        },
-        if backup_count > 0 {
-            format!("{backup_count} rotating backup(s) available")
         } else {
+            CheckStatus::Ok
+        },
+        if backup_count == 0 {
             "none yet; backups are created after in-app saves".to_string()
+        } else {
+            format!("{valid_backups} valid, {bad_backups} invalid or unreadable")
         },
     );
 
@@ -160,16 +248,52 @@ fn collect() -> DiagnosticReport {
         ),
     }
 
+    let flatpak = crate::host::is_flatpak();
+    let bridge_available = crate::host::bridge_available();
+    report.push(
+        "runtime",
+        if !flatpak || bridge_available {
+            CheckStatus::Ok
+        } else {
+            CheckStatus::Error
+        },
+        if flatpak {
+            format!(
+                "flatpak; host bridge {}",
+                if bridge_available {
+                    "available"
+                } else {
+                    "missing"
+                }
+            )
+        } else {
+            "native".to_string()
+        },
+    );
+
     let (config, _, _) = load_config();
     let shell_argv = choose_shell_argv(config.shell.as_deref());
     let shell = shell_argv.first().cloned().unwrap_or_default();
     if executable_exists(&shell) {
-        report.push("shell", CheckStatus::Ok, shell_argv.join(" "));
+        let detail = if diagnostics_redacted() {
+            Path::new(&shell)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("available")
+                .to_string()
+        } else {
+            shell_argv.join(" ")
+        };
+        report.push("shell", CheckStatus::Ok, detail);
     } else {
         report.push(
             "shell",
             CheckStatus::Error,
-            format!("not executable: {shell}"),
+            if diagnostics_redacted() {
+                "configured shell is not executable".to_string()
+            } else {
+                format!("not executable: {shell}")
+            },
         );
     }
 
@@ -193,42 +317,104 @@ fn collect() -> DiagnosticReport {
     }
 
     match &config.command_history_path {
-        Some(path) => report.push("command history", CheckStatus::Ok, path.clone()),
+        Some(path) => report.push(
+            "command history",
+            CheckStatus::Ok,
+            if diagnostics_redacted() {
+                "enabled; metadata only".to_string()
+            } else {
+                path.clone()
+            },
+        ),
         None => report.push("command history", CheckStatus::Warning, "disabled"),
     }
 
-    let workflow_count = crate::workflows::load_all(&crate::workflows::workflow_dirs()).len();
+    let (workflow_count, readable_workflow_dirs, workflow_dirs, rejected_workflows) =
+        workflow_discovery();
     report.push(
         "workflows",
-        CheckStatus::Ok,
-        format!("{workflow_count} available"),
+        if workflow_count == 0 || rejected_workflows > 0 {
+            CheckStatus::Warning
+        } else {
+            CheckStatus::Ok
+        },
+        format!(
+            "{workflow_count} available; {readable_workflow_dirs}/{workflow_dirs} search locations readable; {rejected_workflows} invalid or unreadable file(s)"
+        ),
+    );
+
+    let welcome_notebook = crate::workflows::welcome_notebook_path();
+    report.push(
+        "welcome notebook",
+        if welcome_notebook.is_some() {
+            CheckStatus::Ok
+        } else {
+            CheckStatus::Warning
+        },
+        if welcome_notebook.is_some() {
+            "available in configured/user/system/source assets"
+        } else {
+            "not found in configured/user/system/source assets"
+        },
     );
 
     if !config.ai_enabled {
         report.push("AI", CheckStatus::Warning, "disabled by configuration");
-    } else if let Some(client) = crate::ai::AiClient::from_env() {
-        report.push("AI", CheckStatus::Ok, client.display_name());
     } else {
-        report.push(
-            "AI",
-            CheckStatus::Warning,
-            "provider configuration is incomplete",
-        );
+        match crate::ai::AiClient::from_config(&config) {
+            Ok(client) => report.push(
+                "AI",
+                CheckStatus::Ok,
+                if diagnostics_redacted() {
+                    format!(
+                        "{} configured; API key {}",
+                        client.provider.display_name(),
+                        if client.api_key.is_some() {
+                            "present"
+                        } else {
+                            "not set (optional for local/compatible endpoints)"
+                        }
+                    )
+                } else {
+                    client.display_name()
+                },
+            ),
+            Err(error) => report.push(
+                "AI",
+                CheckStatus::Warning,
+                if diagnostics_redacted() {
+                    "provider configuration or credentials are incomplete".to_string()
+                } else {
+                    error
+                },
+            ),
+        }
     }
 
-    if config::find_executable_in_path("notify-send").is_some() {
-        report.push("notifications", CheckStatus::Ok, "notify-send available");
-    } else {
+    for (name, purpose) in [
+        ("git", "repository status"),
+        ("ssh", "remote sessions"),
+        ("notify-send", "long-command notifications"),
+    ] {
+        let available = crate::host::command_available(name);
         report.push(
-            "notifications",
-            CheckStatus::Warning,
-            "notify-send missing (long-command alerts disabled)",
+            name,
+            if available {
+                CheckStatus::Ok
+            } else {
+                CheckStatus::Warning
+            },
+            if available {
+                format!("available ({purpose})")
+            } else {
+                format!("not found ({purpose} unavailable)")
+            },
         );
     }
 
     if config.remote_hosts.is_empty() {
         report.push("remote hosts", CheckStatus::Ok, "none configured");
-    } else if config::find_executable_in_path("ssh").is_some() {
+    } else if crate::host::command_available("ssh") {
         report.push(
             "remote hosts",
             CheckStatus::Ok,
@@ -251,28 +437,12 @@ fn collect() -> DiagnosticReport {
         },
     );
 
-    let session_dir = crate::session::state_file_path()
-        .parent()
-        .map(Path::to_path_buf);
-    if let Some(session_dir) = session_dir {
-        let snapshots = fs::read_dir(&session_dir)
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|name| name.starts_with("tabs.") && name.contains(".state"))
-            })
-            .count();
-        report.push(
-            "session state",
-            CheckStatus::Ok,
-            format!("{} ({snapshots} snapshot(s))", session_dir.display()),
-        );
-    }
+    let (ready_snapshots, active_snapshots) = crate::session::session_snapshot_counts();
+    report.push(
+        "session snapshots",
+        CheckStatus::Ok,
+        format!("{ready_snapshots} ready, {active_snapshots} active"),
+    );
 
     report
 }
@@ -317,6 +487,31 @@ pub(crate) fn run(format: ReportFormat) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_shell_path_must_have_an_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "jterm1-doctor-shell-permissions-{}",
+            std::process::id()
+        ));
+        fs::write(&path, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(!executable_exists(path.to_str().unwrap()));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(executable_exists(path.to_str().unwrap()));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn workflow_discovery_recognizes_all_supported_extensions() {
+        assert!(workflow_file(Path::new("one.toml")));
+        assert!(workflow_file(Path::new("two.YAML")));
+        assert!(workflow_file(Path::new("three.yml")));
+        assert!(!workflow_file(Path::new("README.md")));
+    }
 
     #[test]
     fn report_counts_warnings_and_errors() {

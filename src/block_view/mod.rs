@@ -12,7 +12,7 @@ use vte4::Terminal;
 use vte4::TerminalExt;
 
 use crate::config::Config;
-use crate::parser::{ColorKind, Parser, ParserConfig, ParserEvent};
+use crate::parser::{ColorKind, KeyboardProtocolQuery, Parser, ParserConfig, ParserEvent};
 use crate::pty::OwnedPty;
 
 mod alt_screen;
@@ -234,6 +234,29 @@ fn build_color_query_reply(config: &Config, kind: ColorKind) -> String {
         ColorKind::Palette(idx) => {
             format!("\x1b]4;{idx};rgb:{r:04x}/{g:04x}/{b:04x}\x1b\\")
         }
+    }
+}
+
+fn build_keyboard_query_reply(
+    query: KeyboardProtocolQuery,
+    cursor_col: i64,
+    cursor_row: i64,
+) -> String {
+    match query {
+        KeyboardProtocolQuery::KittyQuery => "\x1b[?0u".to_string(),
+        KeyboardProtocolQuery::ModifyOtherKeysQuery => "\x1b[>4;0m".to_string(),
+        KeyboardProtocolQuery::PrimaryDeviceAttributes => "\x1b[?1;2c".to_string(),
+        KeyboardProtocolQuery::SecondaryDeviceAttributes => "\x1b[>0;0;0c".to_string(),
+        KeyboardProtocolQuery::TertiaryDeviceAttributes => "\x1bP!|00000000\x1b\\".to_string(),
+        KeyboardProtocolQuery::XtVersion => {
+            format!("\x1bP>|jterm1 {}\x1b\\", env!("CARGO_PKG_VERSION"))
+        }
+        KeyboardProtocolQuery::DeviceStatus => "\x1b[0n".to_string(),
+        KeyboardProtocolQuery::CursorPosition => format!(
+            "\x1b[{};{}R",
+            cursor_row.saturating_add(1).max(1),
+            cursor_col.saturating_add(1).max(1)
+        ),
     }
 }
 
@@ -669,6 +692,8 @@ const MAX_RAW_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const MIN_INPUT_ROWS: i32 = 6;
 
 type BlockFinishedCallbacks = Rc<RefCell<Vec<Box<dyn Fn(String, i32, String)>>>>;
+type BlockContextCallbacks = Rc<RefCell<Vec<Box<dyn Fn(crate::ai::BlockContext)>>>>;
+pub(crate) type DebugInfo = Vec<(&'static str, Vec<(String, String)>)>;
 
 pub struct TermView {
     root: gtk::Box,
@@ -703,6 +728,7 @@ pub struct TermView {
     title_callbacks: StrCallbacks,
     activity_callbacks: VoidCallbacks,
     block_finished_callbacks: BlockFinishedCallbacks,
+    ask_ai_about_block_callbacks: BlockContextCallbacks,
     mouse_reporting_mode: Rc<Cell<MouseReportingMode>>,
     /// Whether the shell has enabled DECSET 2004. Clipboard input is written
     /// directly to our PTY, so block mode must apply this wrapper itself.
@@ -822,6 +848,7 @@ struct ReaderCtx {
     /// or anything else that changes branch/dirty/ahead-behind).
     repo_strip: gtk::Label,
     block_finished_cbs: BlockFinishedCallbacks,
+    ask_ai_about_block_cbs: BlockContextCallbacks,
 }
 
 /// Fold every run of consecutive `ParserEvent::Bytes(_)` entries in `events`
@@ -955,6 +982,7 @@ impl ReaderCtx {
             layout_active_surface,
             repo_strip,
             block_finished_cbs,
+            ask_ai_about_block_cbs,
         } = self;
         pty.start_reader(
             move |data: Vec<u8>| {
@@ -1266,6 +1294,7 @@ impl ReaderCtx {
                                 let block_scroll_for_menu = block_scroll_rc.clone();
                                 let visible_for_menu = visible_indices_rc.clone();
                                 let widget_pool_for_menu = widget_pool_for_cb.clone();
+                                let ask_ai_cbs_for_menu = ask_ai_about_block_cbs.clone();
                                 let block_id = finished_clone.id;
 
                                 let right_click = gtk::GestureClick::new();
@@ -1338,6 +1367,32 @@ impl ReaderCtx {
                                                 &selected,
                                             );
                                             vte_for_action.clipboard().set_text(&text);
+                                        });
+                                        vbox.append(&item);
+                                    }
+
+                                    {
+                                        let item = make_item("Ask AI About Block");
+                                        let popover_c = popover.clone();
+                                        let finished_for_ai = finished_menu_clone.clone();
+                                        let block_data_for_ai = block_data_for_export.clone();
+                                        let callbacks_for_ai = ask_ai_cbs_for_menu.clone();
+                                        item.connect_clicked(move |_| {
+                                            popover_c.popdown();
+                                            let output = finished_for_ai.with_stripped_output(|text| {
+                                                crate::ai::truncate_for_context(text, 80)
+                                            });
+                                            let data = block_data_for_ai.borrow();
+                                            let record = data.iter().find(|block| block.id == block_id);
+                                            let context = crate::ai::BlockContext {
+                                                cmd: finished_for_ai.cmd_text.clone(),
+                                                output,
+                                                cwd: record.and_then(|block| block.cwd.clone()),
+                                                exit_code: record.map(|block| block.exit_code).unwrap_or(0),
+                                            };
+                                            for callback in callbacks_for_ai.borrow().iter() {
+                                                callback(context.clone());
+                                            }
                                         });
                                         vbox.append(&item);
                                     }
@@ -1891,7 +1946,11 @@ impl ReaderCtx {
                             pty_for_init.write_bytes(reply.as_bytes());
                         }
 
-                        ParserEvent::KeyboardProtocolQuery(_query) => {}
+                        ParserEvent::KeyboardProtocolQuery(query) => {
+                            let (col, row) = active_vte.cursor_position();
+                            let reply = build_keyboard_query_reply(*query, col, row);
+                            pty_for_init.write_bytes(reply.as_bytes());
+                        }
 
                         ParserEvent::ApcSequence(payload) => {
                             // Forward Kitty graphics (APC G ...) to the live VTE
@@ -2311,6 +2370,13 @@ impl KeyCtx {
 
 #[allow(dead_code)]
 impl TermView {
+    /// Replace the runtime configuration shared by parser and rendering
+    /// callbacks. Visual setters are dispatched separately; this updates
+    /// behavioral options without requiring Block panes to be recreated.
+    pub(crate) fn reload_config(&self, config: &Config) {
+        *self.config.borrow_mut() = config.clone();
+    }
+
     pub fn new(
         config: &Config,
         shell_argv: &[String],
@@ -2480,11 +2546,12 @@ impl TermView {
         // keep colored git output, keep the interactive pager even for a short
         // `git log`, and let less use alt-screen so transient pager content
         // stays ephemeral. Respect an explicit user-provided LESS.
-        let mut env_extra: Vec<(&str, &str)> = if std::env::var_os("LESS").is_none() {
-            vec![("LESS", "R")]
-        } else {
-            Vec::new()
-        };
+        // Match the VTE backend: shell rc files use this stable marker to
+        // source jterm1's OSC integration in both terminal modes.
+        let mut env_extra: Vec<(&str, &str)> = vec![("TERM_PROGRAM", "jterm1")];
+        if std::env::var_os("LESS").is_none() {
+            env_extra.push(("LESS", "R"));
+        }
         let session_id_owned = session_id.map(|s| s.to_string());
         if let Some(ref sid) = session_id_owned {
             if is_rsh {
@@ -2707,6 +2774,7 @@ impl TermView {
         let title_callbacks: StrCallbacks = Rc::new(RefCell::new(vec![]));
         let activity_callbacks: VoidCallbacks = Rc::new(RefCell::new(vec![]));
         let block_finished_callbacks: BlockFinishedCallbacks = Rc::new(RefCell::new(vec![]));
+        let ask_ai_about_block_callbacks: BlockContextCallbacks = Rc::new(RefCell::new(vec![]));
         let mouse_reporting_mode: Rc<Cell<MouseReportingMode>> =
             Rc::new(Cell::new(MouseReportingMode::None));
         // Unlike a regular VTE terminal, block mode owns the shell PTY. Keep
@@ -2926,6 +2994,7 @@ impl TermView {
                 layout_active_surface: layout_active_surface.clone(),
                 repo_strip: repo_strip.clone(),
                 block_finished_cbs: block_finished_callbacks.clone(),
+                ask_ai_about_block_cbs: ask_ai_about_block_callbacks.clone(),
             }
             .install(&pty);
         }
@@ -3180,7 +3249,25 @@ impl TermView {
             let bstate_for_commit = bstate.clone();
             let typed_cmd_for_commit = typed_cmd.clone();
             let idle_input_dirty_for_commit = idle_input_dirty.clone();
+            let pty_synced_for_commit = pty_synced.clone();
+            let finished_blocks_for_commit = finished_blocks_rc.clone();
+            let selected_block_ids_for_commit = selected_block_ids.clone();
+            let selected_block_id_for_commit = selected_block_id.clone();
+            let selection_anchor_id_for_commit = selection_anchor_id.clone();
             active_vte.connect_commit(move |_, text, _size| {
+                // Real terminal input exits historical block selection. Without
+                // this, Enter can recall an old selection after the user has
+                // already begun editing a new command at the live prompt.
+                if selected_block_id_for_commit.get().is_some() {
+                    let finished = finished_blocks_for_commit.borrow();
+                    clear_finished_block_selection(
+                        &finished,
+                        &selected_block_ids_for_commit,
+                        &selected_block_id_for_commit,
+                        &selection_anchor_id_for_commit,
+                    );
+                }
+
                 pty_for_commit.write_bytes(text.as_bytes());
                 // The finished-block command text comes from a live-VTE
                 // text_range read at CommandStart (see PromptEnd / CommandStart
@@ -3190,6 +3277,15 @@ impl TermView {
                 // drives `update_input_height`.
                 if bstate_for_commit.get() == BlockState::AwaitingCommand {
                     idle_input_dirty_for_commit.set(true);
+                    if text
+                        .as_bytes()
+                        .iter()
+                        .any(|&byte| byte != b'\r' && byte != b'\n')
+                    {
+                        // A later history recall must replace this readline
+                        // buffer, not append to it.
+                        pty_synced_for_commit.set(true);
+                    }
                     let mut cmd = typed_cmd_for_commit.borrow_mut();
                     for ch in text.chars() {
                         if ch == '\r' || ch == '\n' {
@@ -3269,6 +3365,31 @@ impl TermView {
             .connect(&key_ctrl);
 
             active_vte.add_controller(key_ctrl);
+        }
+
+        // Clicking the live prompt is also an explicit exit from historical
+        // selection. Programmatic focus from a block header does not trigger
+        // this gesture, so keyboard navigation remains intact.
+        {
+            let finished_for_click = finished_blocks_rc.clone();
+            let selected_ids_for_click = selected_block_ids.clone();
+            let selected_for_click = selected_block_id.clone();
+            let anchor_for_click = selection_anchor_id.clone();
+            let active_click = gtk::GestureClick::new();
+            active_click.set_button(1);
+            active_click.set_propagation_phase(gtk::PropagationPhase::Capture);
+            active_click.connect_pressed(move |_, _, _, _| {
+                if selected_for_click.get().is_some() {
+                    let finished = finished_for_click.borrow();
+                    clear_finished_block_selection(
+                        &finished,
+                        &selected_ids_for_click,
+                        &selected_for_click,
+                        &anchor_for_click,
+                    );
+                }
+            });
+            active_vte.add_controller(active_click);
         }
 
         // Wheel handling inside an alt-screen + mouse-reporting app (less / vim /
@@ -3356,6 +3477,7 @@ impl TermView {
             title_callbacks,
             activity_callbacks,
             block_finished_callbacks,
+            ask_ai_about_block_callbacks,
             mouse_reporting_mode,
             bracketed_paste,
             config: Rc::new(RefCell::new(config.clone())),
@@ -3456,6 +3578,7 @@ impl TermView {
             let finished_blocks = term_view.finished_blocks.clone();
             let visible_indices = term_view.visible_indices.clone();
             let fullscreen = term_view.fullscreen.clone();
+            let visibility_update_pending = Rc::new(Cell::new(false));
 
             let vadjust = block_scroll.vadjustment();
             vadjust.connect_changed(move |_| {
@@ -3492,12 +3615,21 @@ impl TermView {
                 vp.total_height = y;
                 drop(vp);
 
+                // Scroll adjustments can fire many times before GTK reaches
+                // idle. The viewport above always holds the newest values, so
+                // one pending realization pass is sufficient.
+                if visibility_update_pending.replace(true) {
+                    return;
+                }
+
                 // Schedule visibility update on next idle
                 let vp = viewport.clone();
                 let finished = finished_blocks.clone();
                 let visible = visible_indices.clone();
                 let fullscreen = fullscreen.clone();
+                let pending = visibility_update_pending.clone();
                 glib::idle_add_local_once(move || {
+                    pending.set(false);
                     if fullscreen.get() {
                         return;
                     }
@@ -3559,7 +3691,21 @@ impl TermView {
 
     /// Send key bytes into the PTY (user input).
     pub fn write_input(&self, data: &[u8]) {
+        if self.bstate.get() == BlockState::AwaitingCommand
+            && data.iter().any(|byte| !matches!(byte, b'\r' | b'\n'))
+        {
+            self.typed_cmd
+                .borrow_mut()
+                .push_str(&String::from_utf8_lossy(data));
+        }
         self.pty.write_bytes(data);
+    }
+
+    /// Agent commands may only be submitted into a clean, idle shell editor.
+    pub fn can_accept_agent_command(&self) -> bool {
+        self.bstate.get() == BlockState::AwaitingCommand
+            && !self.fullscreen.get()
+            && self.typed_cmd.borrow().trim().is_empty()
     }
 
     /// Resize the PTY.
@@ -3739,6 +3885,15 @@ impl TermView {
         F: Fn(String, i32, String) + 'static,
     {
         self.block_finished_callbacks.borrow_mut().push(Box::new(f));
+    }
+
+    pub fn connect_ask_ai_about_block<F>(&self, f: F)
+    where
+        F: Fn(crate::ai::BlockContext) + 'static,
+    {
+        self.ask_ai_about_block_callbacks
+            .borrow_mut()
+            .push(Box::new(f));
     }
 
     pub fn scroll_lines(&self, lines: i32) {
@@ -4040,7 +4195,7 @@ impl TermView {
 
     /// Collect a snapshot of internal runtime state for the debug dashboard.
     /// Returns labelled sections, each a list of (key, value) rows.
-    pub fn debug_info(&self) -> Vec<(&'static str, Vec<(String, String)>)> {
+    pub fn debug_info(&self) -> DebugInfo {
         let out_cols = self.active_vte.column_count();
         let out_rows = self.active_vte.row_count();
 
@@ -4252,12 +4407,45 @@ impl TermView {
 mod tests {
     use super::{
         background_output_has_visible_text, block_clipboard_text, build_command_recall,
-        coalesce_bytes_events, finished_command, is_post_command_metadata, selected_command_text,
-        selected_id_range, strip_ansi, strip_ansi_with_clear_detect, take_background_output,
+        build_keyboard_query_reply, coalesce_bytes_events, finished_command,
+        is_post_command_metadata, selected_command_text, selected_id_range, strip_ansi,
+        strip_ansi_with_clear_detect, take_background_output,
     };
-    use crate::parser::ParserEvent;
+    use crate::parser::{KeyboardProtocolQuery, ParserEvent};
     use std::cell::RefCell;
     use std::collections::HashSet;
+
+    #[test]
+    fn keyboard_protocol_queries_have_safe_fallback_replies() {
+        assert_eq!(
+            build_keyboard_query_reply(KeyboardProtocolQuery::KittyQuery, 0, 0),
+            "\x1b[?0u"
+        );
+        assert_eq!(
+            build_keyboard_query_reply(KeyboardProtocolQuery::ModifyOtherKeysQuery, 0, 0),
+            "\x1b[>4;0m"
+        );
+        assert_eq!(
+            build_keyboard_query_reply(KeyboardProtocolQuery::PrimaryDeviceAttributes, 0, 0),
+            "\x1b[?1;2c"
+        );
+        assert_eq!(
+            build_keyboard_query_reply(KeyboardProtocolQuery::DeviceStatus, 0, 0),
+            "\x1b[0n"
+        );
+        assert_eq!(
+            build_keyboard_query_reply(KeyboardProtocolQuery::CursorPosition, 4, 2),
+            "\x1b[3;5R"
+        );
+        assert_eq!(
+            build_keyboard_query_reply(KeyboardProtocolQuery::CursorPosition, -8, -2),
+            "\x1b[1;1R"
+        );
+        let version = build_keyboard_query_reply(KeyboardProtocolQuery::XtVersion, 0, 0);
+        assert!(version.starts_with("\x1bP>|jterm1 "));
+        assert!(version.contains(env!("CARGO_PKG_VERSION")));
+        assert!(version.ends_with("\x1b\\"));
+    }
 
     #[test]
     fn background_output_requires_visible_text() {

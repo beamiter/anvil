@@ -41,6 +41,10 @@ impl TabPlacement {
     }
 }
 
+fn resolve_sidebar_visibility(explicit: Option<bool>, placement: TabPlacement) -> bool {
+    explicit.unwrap_or(placement == TabPlacement::Sidebar)
+}
+
 /// Which single view the sidebar shows (tab list vs file tree).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SidebarView {
@@ -194,6 +198,9 @@ pub struct Config {
     pub(crate) tab_placement: TabPlacement,
     /// Which single view the sidebar shows (tab list vs file tree).
     pub(crate) sidebar_view: SidebarView,
+    /// Whether the left sidebar is visible. Older configs derive this from
+    /// tab placement so sidebar tabs remain discoverable after an upgrade.
+    pub(crate) sidebar_visible: bool,
     /// Sidebar width in pixels.
     pub(crate) sidebar_width: u32,
     /// Width of each tab in the top tab bar, in pixels.
@@ -244,6 +251,16 @@ pub struct Config {
     /// session is sealed and the user must start a new one — this is a
     /// runaway-loop safety net, not a usability lever.
     pub(crate) agent_max_turns: u32,
+    /// Provider wire protocol: anthropic, openai-compatible, or ollama.
+    pub(crate) ai_provider: String,
+    /// Provider API root. Endpoint suffixes are added by the AI client.
+    pub(crate) ai_base_url: String,
+    /// Provider-specific model id.
+    pub(crate) ai_model: String,
+    /// Per-request maximum output tokens.
+    pub(crate) ai_max_tokens: u32,
+    /// Redact secret-looking values before sending context to an AI provider.
+    pub(crate) ai_redact_secrets: bool,
     pub(crate) notify_long_blocks: bool,
     pub(crate) notify_long_block_threshold_ms: u64,
     pub(crate) show_repo_strip: bool,
@@ -252,23 +269,71 @@ pub struct Config {
 }
 
 impl Config {
-    /// Reduce startup to a local, non-persistent compatibility session. Safe
-    /// mode intentionally ignores user commands, remote destinations, history,
-    /// notifications, repository probes, clipboard writes, and all AI surfaces.
+    /// Replace the complete configuration with an isolated, built-in VTE
+    /// profile. This deliberately ignores both the user's file and JTERM1_*
+    /// appearance/behavior overrides, making safe mode useful for diagnosis.
+    #[cfg(test)]
     pub(crate) fn apply_safe_mode(&mut self) {
-        self.shell = None;
-        self.startup_commands = None;
-        self.terminal_mode = TerminalMode::Vte;
-        self.command_history_enabled = false;
-        self.command_history_path = None;
-        self.block_history_path = None;
-        self.preserve_live_scrollback = false;
-        self.allow_remote_clipboard_write = false;
-        self.ai_enabled = false;
-        self.agent_enabled = false;
-        self.notify_long_blocks = false;
-        self.show_repo_strip = false;
-        self.remote_hosts.clear();
+        *self = Self::safe_defaults();
+    }
+
+    fn safe_defaults() -> Self {
+        let themes = builtin_themes();
+        let theme = &themes[0];
+        Self {
+            window_opacity: 0.95,
+            terminal_scrollback_lines: 5_000,
+            font_desc: "SauceCodePro Nerd Font Mono 14".to_string(),
+            default_font_scale: 1.0,
+            theme_name: theme.name.clone(),
+            foreground: theme.foreground,
+            background: theme.background,
+            cursor: theme.cursor,
+            cursor_foreground: theme.cursor_foreground,
+            palette: theme.palette,
+            shell: None,
+            startup_commands: None,
+            terminal_mode: TerminalMode::Vte,
+            tab_placement: TabPlacement::Sidebar,
+            sidebar_view: SidebarView::Tabs,
+            sidebar_visible: true,
+            sidebar_width: 220,
+            tab_width: 180,
+            ansi_cache_capacity: 256,
+            max_visible_blocks: 200,
+            output_batch_min_ms: 10,
+            output_batch_max_ms: 100,
+            lazy_load_threshold: 1_000,
+            truncation_threshold_lines: 50_000,
+            finished_block_viewport_rows: 24,
+            finished_block_max_expanded_rows: 5_000,
+            max_collapsed_output_lines: 25,
+            virtual_scroll_margin: 1,
+            command_history_enabled: false,
+            command_history_path: None,
+            command_history_max_entries: 10_000,
+            block_history_path: None,
+            block_history_compress: true,
+            block_compact: false,
+            editor_input: true,
+            allow_remote_clipboard_write: false,
+            mouse_reporting_enabled: true,
+            focus_reporting_enabled: true,
+            scroll_reporting_enabled: true,
+            preserve_live_scrollback: false,
+            ai_enabled: false,
+            agent_enabled: false,
+            agent_max_turns: 20,
+            ai_provider: "anthropic".to_string(),
+            ai_base_url: "https://api.anthropic.com".to_string(),
+            ai_model: "claude-sonnet-4-6".to_string(),
+            ai_max_tokens: 1_024,
+            ai_redact_secrets: true,
+            notify_long_blocks: false,
+            notify_long_block_threshold_ms: 10_000,
+            show_repo_strip: false,
+            remote_hosts: Vec::new(),
+        }
     }
 }
 
@@ -411,6 +476,15 @@ fn env_u32(name: &str) -> Option<u32> {
     std::env::var(name).ok().and_then(|v| v.parse::<u32>().ok())
 }
 
+fn env_bool(name: &str) -> Option<bool> {
+    let value = std::env::var(name).ok()?;
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
 fn env_string(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|s| !s.trim().is_empty())
 }
@@ -419,12 +493,48 @@ fn env_rgba(name: &str) -> Option<RGBA> {
     env_string(name).and_then(|v| RGBA::parse(&v).ok())
 }
 
+fn normalize_ai_provider(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "anthropic" | "claude" => Some("anthropic"),
+        "openai" | "openai-compatible" | "openai_compatible" => Some("openai-compatible"),
+        "ollama" => Some("ollama"),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // File config
 // ---------------------------------------------------------------------------
 
 pub(crate) fn config_file_path() -> PathBuf {
-    glib::user_config_dir().join("jterm1").join("config.toml")
+    let override_path = std::env::var_os("JTERM1_CONFIG")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
+    resolve_config_file_path(override_path, glib::user_config_dir())
+}
+
+fn resolve_config_file_path(override_path: Option<PathBuf>, user_config_dir: PathBuf) -> PathBuf {
+    override_path.unwrap_or_else(|| user_config_dir.join("jterm1").join("config.toml"))
+}
+
+#[cfg(test)]
+mod config_path_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_config_path_wins_over_xdg_default() {
+        assert_eq!(
+            resolve_config_file_path(
+                Some(PathBuf::from("/tmp/自定义.toml")),
+                PathBuf::from("/xdg")
+            ),
+            PathBuf::from("/tmp/自定义.toml")
+        );
+        assert_eq!(
+            resolve_config_file_path(None, PathBuf::from("/xdg")),
+            PathBuf::from("/xdg/jterm1/config.toml")
+        );
+    }
 }
 
 pub(crate) fn default_command_history_path() -> String {
@@ -469,6 +579,7 @@ struct FileConfig {
     terminal_mode: Option<String>,
     tab_placement: Option<String>,
     sidebar_view: Option<String>,
+    sidebar_visible: Option<bool>,
     sidebar_width: Option<u32>,
     tab_width: Option<u32>,
     // Block view optimizations
@@ -493,6 +604,11 @@ struct FileConfig {
     ai_enabled: Option<bool>,
     agent_enabled: Option<bool>,
     agent_max_turns: Option<u32>,
+    ai_provider: Option<String>,
+    ai_base_url: Option<String>,
+    ai_model: Option<String>,
+    ai_max_tokens: Option<u32>,
+    ai_redact_secrets: Option<bool>,
     mouse_reporting_enabled: Option<bool>,
     focus_reporting_enabled: Option<bool>,
     scroll_reporting_enabled: Option<bool>,
@@ -581,6 +697,7 @@ fn load_file_config() -> FileConfig {
             .get("sidebar_view")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
+        sidebar_visible: table.get("sidebar_visible").and_then(|v| v.as_bool()),
         sidebar_width: table
             .get("sidebar_width")
             .and_then(|v| v.as_integer())
@@ -670,6 +787,23 @@ fn load_file_config() -> FileConfig {
             .get("agent_max_turns")
             .and_then(|v| v.as_integer())
             .and_then(|v| u32::try_from(v).ok()),
+        ai_provider: table
+            .get("ai_provider")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        ai_base_url: table
+            .get("ai_base_url")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        ai_model: table
+            .get("ai_model")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        ai_max_tokens: table
+            .get("ai_max_tokens")
+            .and_then(|v| v.as_integer())
+            .and_then(|v| u32::try_from(v).ok()),
+        ai_redact_secrets: table.get("ai_redact_secrets").and_then(|v| v.as_bool()),
         notify_long_blocks: table.get("notify_long_blocks").and_then(|v| v.as_bool()),
         notify_long_block_threshold_ms: table
             .get("notify_long_block_threshold_ms")
@@ -909,8 +1043,37 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
             .unwrap_or_else(|| "sidebar".to_string()),
     );
     let sidebar_view = SidebarView::parse(&fc.sidebar_view.unwrap_or_else(|| "tabs".to_string()));
+    let sidebar_visible = resolve_sidebar_visibility(fc.sidebar_visible, tab_placement);
     let sidebar_width = fc.sidebar_width.unwrap_or(220).clamp(120, 800);
     let tab_width = fc.tab_width.unwrap_or(180).clamp(80, 480);
+
+    let requested_ai_provider = env_string("JTERM1_AI_PROVIDER")
+        .or(fc.ai_provider)
+        .unwrap_or_else(|| "anthropic".to_string());
+    let ai_provider = normalize_ai_provider(&requested_ai_provider)
+        .unwrap_or_else(|| {
+            log::warn!(
+                "Unknown ai_provider '{}', using anthropic",
+                requested_ai_provider.trim()
+            );
+            "anthropic"
+        })
+        .to_string();
+    let (default_ai_model, default_ai_base_url) = match ai_provider.as_str() {
+        "openai-compatible" => ("gpt-4o-mini", "https://api.openai.com/v1"),
+        "ollama" => ("codellama:7b", "http://localhost:11434"),
+        _ => ("claude-sonnet-4-6", "https://api.anthropic.com"),
+    };
+    let ai_model = env_string("JTERM1_AI_MODEL")
+        .or(fc.ai_model)
+        .filter(|model| !model.trim().is_empty())
+        .unwrap_or_else(|| default_ai_model.to_string());
+    let ai_base_url = env_string("JTERM1_AI_BASE_URL")
+        .or(fc.ai_base_url)
+        .filter(|url| !url.trim().is_empty())
+        .unwrap_or_else(|| default_ai_base_url.to_string())
+        .trim_end_matches('/')
+        .to_string();
 
     let config = Config {
         window_opacity,
@@ -928,6 +1091,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         terminal_mode,
         tab_placement,
         sidebar_view,
+        sidebar_visible,
         sidebar_width,
         tab_width,
         ansi_cache_capacity,
@@ -952,9 +1116,26 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         focus_reporting_enabled: fc.focus_reporting_enabled.unwrap_or(true),
         scroll_reporting_enabled: fc.scroll_reporting_enabled.unwrap_or(true),
         preserve_live_scrollback: fc.preserve_live_scrollback.unwrap_or(false),
-        ai_enabled: fc.ai_enabled.unwrap_or(true),
-        agent_enabled: fc.agent_enabled.unwrap_or(true),
-        agent_max_turns: fc.agent_max_turns.unwrap_or(20).max(1),
+        ai_enabled: env_bool("JTERM1_AI_ENABLED")
+            .or(fc.ai_enabled)
+            .unwrap_or(true),
+        agent_enabled: env_bool("JTERM1_AGENT_ENABLED")
+            .or(fc.agent_enabled)
+            .unwrap_or(true),
+        agent_max_turns: env_u32("JTERM1_AGENT_MAX_TURNS")
+            .or(fc.agent_max_turns)
+            .unwrap_or(20)
+            .clamp(1, 100),
+        ai_provider,
+        ai_base_url,
+        ai_model,
+        ai_max_tokens: env_u32("JTERM1_AI_MAX_TOKENS")
+            .or(fc.ai_max_tokens)
+            .unwrap_or(1_024)
+            .clamp(1, 32_768),
+        ai_redact_secrets: env_bool("JTERM1_AI_REDACT_SECRETS")
+            .or(fc.ai_redact_secrets)
+            .unwrap_or(true),
         notify_long_blocks: fc.notify_long_blocks.unwrap_or(true),
         notify_long_block_threshold_ms: fc.notify_long_block_threshold_ms.unwrap_or(10_000),
         show_repo_strip: fc.show_repo_strip.unwrap_or(true),
@@ -967,6 +1148,17 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     }
 
     (config, themes, keybinding_map)
+}
+
+/// Load no external configuration at all. Unlike applying a partial override
+/// after `load_config`, this cannot block on or inherit a user-selected config
+/// path, and it also resets custom keybindings.
+pub(crate) fn load_safe_config() -> (Config, Vec<Theme>, KeybindingMap) {
+    (
+        Config::safe_defaults(),
+        builtin_themes(),
+        KeybindingMap::from_defaults(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1166,6 +1358,29 @@ mod tests {
     }
 
     #[test]
+    fn ai_provider_aliases_normalize_to_wire_protocols() {
+        for alias in ["anthropic", "Anthropic", "claude"] {
+            assert_eq!(normalize_ai_provider(alias), Some("anthropic"));
+        }
+        for alias in ["openai", "OpenAI-Compatible", "openai_compatible"] {
+            assert_eq!(normalize_ai_provider(alias), Some("openai-compatible"));
+        }
+        assert_eq!(normalize_ai_provider("ollama"), Some("ollama"));
+        assert_eq!(normalize_ai_provider("unknown"), None);
+    }
+
+    #[test]
+    fn sidebar_visibility_defaults_follow_tab_placement() {
+        assert!(resolve_sidebar_visibility(None, TabPlacement::Sidebar));
+        assert!(!resolve_sidebar_visibility(None, TabPlacement::TopBar));
+        assert!(resolve_sidebar_visibility(Some(true), TabPlacement::TopBar));
+        assert!(!resolve_sidebar_visibility(
+            Some(false),
+            TabPlacement::Sidebar
+        ));
+    }
+
+    #[test]
     fn remote_host_toml_round_trips() {
         let original = host();
         let mut table = toml::Table::new();
@@ -1208,6 +1423,11 @@ mod tests {
         assert!(config.block_history_path.is_none());
         assert!(!config.ai_enabled);
         assert!(!config.agent_enabled);
+        assert_eq!(config.ai_provider, "anthropic");
+        assert_eq!(config.ai_model, "claude-sonnet-4-6");
+        assert_eq!(config.ai_base_url, "https://api.anthropic.com");
+        assert_eq!(config.ai_max_tokens, 1_024);
+        assert!(config.ai_redact_secrets);
         assert!(!config.notify_long_blocks);
         assert!(!config.allow_remote_clipboard_write);
         assert!(config.remote_hosts.is_empty());

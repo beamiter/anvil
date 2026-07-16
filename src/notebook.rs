@@ -1,38 +1,44 @@
 //! Lightweight executable notebook: `.jtnb.md` files = markdown + runnable
-//! shell code fences. The viewer is a modal dialog; each ```bash / ```sh /
-//! ```shell``` fence becomes a card with a Run button, output is captured
-//! inline.
+//! shell code fences. The viewer is a modal dialog; supported shell fences
+//! become cards with Run/Stop controls, bounded inline output, and sequential
+//! Run All / Stop All orchestration.
 //!
 //! Why minimal:
 //! - No external markdown crate (offline-build constraint; pulldown_cmark
 //!   isn't in the cargo cache). We implement just enough to recognise code
 //!   fences and apply trivial styling (headings, bold/italic/inline-code)
 //!   via pango markup.
-//! - Cells run in an isolated `bash -c` subprocess rooted at the notebook's
-//!   own directory — they do NOT touch the user's active terminal. This is
-//!   a deliberate trade-off: users get reproducible execution at the cost
-//!   of missing their shell aliases. Documented in the dialog footer.
+//! - Cells run in isolated process groups rooted at the notebook's own
+//!   directory — they do NOT touch the user's active terminal. Closing or
+//!   stopping the notebook kills the whole group so descendants cannot leak.
 //! - Output captured via two reader threads (stdout/stderr each on their
 //!   own thread) feeding an mpsc channel polled on the GLib main loop.
 //!   Avoids the classic single-pipe-fills-and-blocks deadlock.
 
 use std::cell::{Cell, RefCell};
-use std::io::Read;
+use std::collections::VecDeque;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
 
 use adw::prelude::*;
 use relm4::adw;
 use relm4::gtk;
 use relm4::prelude::*;
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 /// Max bytes of captured output retained per cell run before truncation.
 /// Matches the spirit of `block.rs`'s raw-output cap — bounded memory even
 /// for runaway commands.
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+const OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(40);
+const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Segment {
@@ -44,72 +50,105 @@ pub(crate) enum Segment {
     Code { lang: String, src: String },
 }
 
-/// Split a markdown source into text + code segments. We recognise both
-/// triple-backtick and triple-tilde fences (CommonMark). Unterminated
-/// fences are treated as text — predictable failure mode > erroring out
-/// on a partially-edited notebook.
-pub(crate) fn parse_segments(input: &str) -> Vec<Segment> {
-    let mut out: Vec<Segment> = Vec::new();
-    let mut text_buf = String::new();
-    let mut lines = input.lines().peekable();
-
-    while let Some(line) = lines.next() {
-        if let Some(fence) = fence_marker(line) {
-            // Flush pending text.
-            if !text_buf.is_empty() {
-                out.push(Segment::Text(std::mem::take(&mut text_buf)));
-            }
-            // Lang is everything after the opening fence.
-            let lang = line.trim_start_matches(fence).trim().to_string();
-            let mut src = String::new();
-            let mut closed = false;
-            for inner in lines.by_ref() {
-                if fence_marker(inner).map(|m| m == fence).unwrap_or(false) {
-                    closed = true;
-                    break;
-                }
-                src.push_str(inner);
-                src.push('\n');
-            }
-            if closed {
-                // Strip the trailing \n we added to the last source line
-                // for cosmetic consistency in the displayed snippet.
-                if src.ends_with('\n') {
-                    src.pop();
-                }
-                out.push(Segment::Code { lang, src });
-            } else {
-                // Unterminated: put the fence + the rest back as text so
-                // the user sees something rather than the cell vanishing.
-                text_buf.push_str(line);
-                text_buf.push('\n');
-                text_buf.push_str(&src);
-            }
-        } else {
-            text_buf.push_str(line);
-            text_buf.push('\n');
-        }
-    }
-    if !text_buf.is_empty() {
-        out.push(Segment::Text(text_buf));
-    }
-    out
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Fence {
+    marker: u8,
+    length: usize,
 }
 
-/// Returns the fence marker (``` or ~~~) if the line starts with one
-/// (allowing up to 3 leading spaces, per CommonMark). Otherwise None.
-fn fence_marker(line: &str) -> Option<&'static str> {
+fn leading_indent(line: &str) -> Option<&str> {
     let stripped = line.trim_start_matches(' ');
-    if line.len() - stripped.len() > 3 {
+    (line.len() - stripped.len() <= 3).then_some(stripped)
+}
+
+fn opening_fence(line: &str) -> Option<(Fence, &str)> {
+    let stripped = leading_indent(line)?;
+    let marker = *stripped.as_bytes().first()?;
+    if marker != b'`' && marker != b'~' {
         return None;
     }
-    if stripped.starts_with("```") {
-        return Some("```");
+    let length = stripped
+        .as_bytes()
+        .iter()
+        .take_while(|byte| **byte == marker)
+        .count();
+    if length < 3 {
+        return None;
     }
-    if stripped.starts_with("~~~") {
-        return Some("~~~");
+    let info = stripped[length..].trim();
+    if marker == b'`' && info.as_bytes().contains(&b'`') {
+        return None;
     }
-    None
+    Some((Fence { marker, length }, info))
+}
+
+fn is_closing_fence(line: &str, opening: Fence) -> bool {
+    let Some(stripped) = leading_indent(line) else {
+        return false;
+    };
+    let marker_count = stripped
+        .as_bytes()
+        .iter()
+        .take_while(|byte| **byte == opening.marker)
+        .count();
+    marker_count >= opening.length && stripped[marker_count..].trim().is_empty()
+}
+
+fn push_text(segments: &mut Vec<Segment>, text: String) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(Segment::Text(previous)) = segments.last_mut() {
+        previous.push_str(&text);
+    } else {
+        segments.push(Segment::Text(text));
+    }
+}
+
+/// Split a markdown source into text + code segments. We recognise backtick
+/// and tilde fences of length three or greater, including CommonMark's three
+/// allowed leading spaces. Unterminated fences remain visible as text.
+pub(crate) fn parse_segments(input: &str) -> Vec<Segment> {
+    let mut segments = Vec::new();
+    let mut text = String::new();
+    let mut lines = input.lines();
+
+    while let Some(line) = lines.next() {
+        let Some((fence, info)) = opening_fence(line) else {
+            text.push_str(line);
+            text.push('\n');
+            continue;
+        };
+
+        push_text(&mut segments, std::mem::take(&mut text));
+        let mut source = String::new();
+        let mut closed = false;
+        for inner in lines.by_ref() {
+            if is_closing_fence(inner, fence) {
+                closed = true;
+                break;
+            }
+            source.push_str(inner);
+            source.push('\n');
+        }
+
+        if closed {
+            if source.ends_with('\n') {
+                source.pop();
+            }
+            segments.push(Segment::Code {
+                lang: info.to_owned(),
+                src: source,
+            });
+        } else {
+            text.push_str(line);
+            text.push('\n');
+            text.push_str(&source);
+        }
+    }
+
+    push_text(&mut segments, text);
+    segments
 }
 
 /// Render the markdown body of a `Text` segment to a Pango-markup string.
@@ -187,31 +226,305 @@ fn escape_pango(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-/// Per-cell execution handle so the close-dialog hook can kill in-flight
-/// children when the user dismisses the notebook.
+#[derive(Debug, Clone)]
+struct CommandSpec {
+    argv: Vec<String>,
+    source: String,
+    cwd: PathBuf,
+}
+
+fn language_name(info: &str) -> &str {
+    info.split_whitespace().next().unwrap_or("")
+}
+
+/// Select an interpreter from the fence's first info-string word. Unlabelled
+/// and `shell` cells use the user's login shell; explicit fences are kept
+/// deterministic and do not source interactive profiles.
+fn shell_argv_for_info(info: &str, configured_shell: &[String]) -> Option<Vec<String>> {
+    let language = language_name(info).to_ascii_lowercase();
+    match language.as_str() {
+        "" | "shell" => (!configured_shell.is_empty()).then(|| configured_shell.to_vec()),
+        "bash" | "sh" | "zsh" | "fish" => Some(vec![language]),
+        "pwsh" => Some(vec![
+            "pwsh".to_owned(),
+            "-NoLogo".to_owned(),
+            "-NoProfile".to_owned(),
+            "-NonInteractive".to_owned(),
+            "-Command".to_owned(),
+            "-".to_owned(),
+        ]),
+        "powershell" => Some(vec![
+            "powershell".to_owned(),
+            "-NoLogo".to_owned(),
+            "-NoProfile".to_owned(),
+            "-NonInteractive".to_owned(),
+            "-Command".to_owned(),
+            "-".to_owned(),
+        ]),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CellOutcome {
+    Exited(i32),
+    Cancelled,
+    Failed(String),
+}
+
+impl CellOutcome {
+    fn failed(&self) -> bool {
+        !matches!(self, Self::Exited(0))
+    }
+}
+
+enum WorkerEvent {
+    Output(OutputStream, Vec<u8>),
+    Done(CellOutcome),
+}
+
+/// Per-cell execution handle so Stop, Stop All, and dialog close can terminate
+/// the same process while the worker remains its sole reaper.
 struct CellHandle {
-    /// Shared with the worker thread so Stop can `kill()` from the UI side.
-    /// The child stays in this slot until the worker observes and reaps its
-    /// exit; taking it in either caller would make the other side powerless.
     child: Arc<Mutex<Option<Child>>>,
-    /// Cross-thread flag — set true when the user clicks Stop / closes the
-    /// dialog, read by the worker when deciding whether to report
-    /// `cancelled` vs the real exit code.
     cancelled: Arc<AtomicBool>,
+    /// Kept independently of `Child`: the group can still contain descendants
+    /// after the interpreter itself has exited and been reaped.
+    pgid: Arc<AtomicI32>,
 }
 
 impl CellHandle {
-    /// Request cancellation without taking ownership away from the worker.
-    /// `Child::kill` only needs `&mut Child`, so the worker can keep polling the
-    /// same shared handle and reap it once the signal has taken effect.
+    fn new() -> Self {
+        Self {
+            child: Arc::new(Mutex::new(None)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            pgid: Arc::new(AtomicI32::new(0)),
+        }
+    }
+
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
+        signal_process_group(self.pgid.load(Ordering::SeqCst));
         if let Ok(mut guard) = self.child.lock() {
             if let Some(child) = guard.as_mut() {
-                let _ = child.kill();
+                terminate_child_group(child);
             }
         }
     }
+}
+
+fn signal_process_group(pgid: i32) {
+    #[cfg(unix)]
+    if pgid > 0 {
+        // SAFETY: `kill` receives a valid signal number; a negative PID targets
+        // the process group created for this cell. Failure (already exited) is
+        // intentionally harmless.
+        unsafe {
+            nix::libc::kill(-pgid, nix::libc::SIGKILL);
+        }
+    }
+}
+
+fn terminate_child_group(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        if let Ok(pid) = i32::try_from(child.id()) {
+            // Every cell is its own process-group leader. Addressing -pid kills
+            // descendants as well as the interpreter, even if the latter has
+            // already forked a long-running background command.
+            unsafe {
+                nix::libc::kill(-pid, nix::libc::SIGKILL);
+            }
+        }
+    }
+    let _ = child.kill();
+}
+
+/// Wait without retaining the child mutex between polls, leaving cancellation
+/// able to signal the process group at any time.
+fn wait_for_shared_child(child_slot: &Arc<Mutex<Option<Child>>>) -> std::io::Result<i32> {
+    loop {
+        let result = {
+            let mut guard = child_slot
+                .lock()
+                .map_err(|_| std::io::Error::other("child handle mutex poisoned"))?;
+            let child = guard
+                .as_mut()
+                .ok_or_else(|| std::io::Error::other("child handle missing before exit"))?;
+            match child.try_wait()? {
+                Some(status) => {
+                    let code = status.code().unwrap_or(-1);
+                    guard.take();
+                    Some(code)
+                }
+                None => None,
+            }
+        };
+        if let Some(code) = result {
+            return Ok(code);
+        }
+        std::thread::sleep(CHILD_POLL_INTERVAL);
+    }
+}
+
+fn spawn_cell_worker(spec: CommandSpec, handle: &CellHandle) -> mpsc::Receiver<WorkerEvent> {
+    // Bound queued output as well as the rendered buffers: a command that
+    // writes faster than GTK can paint applies backpressure instead of growing
+    // an unbounded cross-thread queue.
+    let (sender, receiver) = mpsc::sync_channel(64);
+    let child_slot = handle.child.clone();
+    let cancelled = handle.cancelled.clone();
+    let pgid = handle.pgid.clone();
+
+    std::thread::spawn(move || {
+        let cwd_for_bridge = spec.cwd.to_string_lossy().into_owned();
+        let executable_argv =
+            crate::host::wrap_argv(&spec.argv, Some(cwd_for_bridge.as_str()), &[]);
+        let Some((program, arguments)) = executable_argv.split_first() else {
+            let _ = sender.send(WorkerEvent::Done(CellOutcome::Failed(
+                "no shell executable configured".to_owned(),
+            )));
+            return;
+        };
+
+        let mut command = Command::new(program);
+        command
+            .args(arguments)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if !crate::host::is_flatpak() {
+            command.current_dir(&spec.cwd);
+        }
+        #[cfg(unix)]
+        command.process_group(0);
+
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = sender.send(WorkerEvent::Done(CellOutcome::Failed(format!(
+                    "spawn failed: {error}"
+                ))));
+                return;
+            }
+        };
+        if let Ok(id) = i32::try_from(child.id()) {
+            pgid.store(id, Ordering::SeqCst);
+        }
+
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        match child_slot.lock() {
+            Ok(mut guard) => {
+                *guard = Some(child);
+                if cancelled.load(Ordering::SeqCst) {
+                    if let Some(child) = guard.as_mut() {
+                        terminate_child_group(child);
+                    }
+                }
+            }
+            Err(_) => {
+                terminate_child_group(&mut child);
+                let _ = child.wait();
+                let _ = sender.send(WorkerEvent::Done(CellOutcome::Failed(
+                    "child handle mutex poisoned".to_owned(),
+                )));
+                return;
+            }
+        }
+
+        // Use stdin instead of a giant `-c` argument. This avoids ARG_MAX and
+        // gives every supported interpreter the exact same source bytes.
+        let source = spec.source;
+        let stdin_thread = stdin.map(|mut input| {
+            std::thread::spawn(move || {
+                let _ = input.write_all(source.as_bytes());
+                if !source.ends_with('\n') {
+                    let _ = input.write_all(b"\n");
+                }
+            })
+        });
+
+        let stdout_sender = sender.clone();
+        let stdout_thread = stdout.map(|mut output| {
+            std::thread::spawn(move || {
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    match output.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(count) => {
+                            if stdout_sender
+                                .send(WorkerEvent::Output(
+                                    OutputStream::Stdout,
+                                    buffer[..count].to_vec(),
+                                ))
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+        });
+
+        let stderr_sender = sender.clone();
+        let stderr_thread = stderr.map(|mut output| {
+            std::thread::spawn(move || {
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    match output.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(count) => {
+                            if stderr_sender
+                                .send(WorkerEvent::Output(
+                                    OutputStream::Stderr,
+                                    buffer[..count].to_vec(),
+                                ))
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+        });
+
+        let exit = wait_for_shared_child(&child_slot);
+        // A shell can exit while a background child keeps its output pipes and
+        // process group alive. End that group before joining the pipe readers,
+        // both to bound completion time and to prevent orphaned notebook jobs.
+        signal_process_group(pgid.load(Ordering::SeqCst));
+        if let Some(thread) = stdin_thread {
+            let _ = thread.join();
+        }
+        if let Some(thread) = stdout_thread {
+            let _ = thread.join();
+        }
+        if let Some(thread) = stderr_thread {
+            let _ = thread.join();
+        }
+
+        let outcome = match exit {
+            Ok(_) if cancelled.load(Ordering::SeqCst) => CellOutcome::Cancelled,
+            Ok(code) => CellOutcome::Exited(code),
+            Err(error) => CellOutcome::Failed(format!("wait failed: {error}")),
+        };
+        pgid.store(0, Ordering::SeqCst);
+        let _ = sender.send(WorkerEvent::Done(outcome));
+    });
+
+    receiver
 }
 
 #[derive(Debug)]
@@ -220,14 +533,22 @@ pub(crate) enum NotebookMsg {
     Closed,
 }
 
+pub(crate) struct NotebookInit {
+    pub(crate) parent: adw::ApplicationWindow,
+    pub(crate) safe_mode: bool,
+    pub(crate) configured_shell: Vec<String>,
+}
+
 pub(crate) struct NotebookModel {
     parent: adw::ApplicationWindow,
-    handles: Rc<RefCell<Vec<Rc<CellHandle>>>>,
+    safe_mode: bool,
+    configured_shell: Vec<String>,
+    runtime: Option<Rc<NotebookRuntime>>,
 }
 
 #[relm4::component(pub(crate))]
 impl Component for NotebookModel {
-    type Init = adw::ApplicationWindow;
+    type Init = NotebookInit;
     type Input = NotebookMsg;
     type Output = ();
     type CommandOutput = ();
@@ -262,13 +583,15 @@ impl Component for NotebookModel {
     }
 
     fn init(
-        parent: Self::Init,
+        init: Self::Init,
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
         let model = Self {
-            parent,
-            handles: Rc::new(RefCell::new(Vec::new())),
+            parent: init.parent,
+            safe_mode: init.safe_mode,
+            configured_shell: init.configured_shell,
+            runtime: None,
         };
         let widgets = view_output!();
         ComponentParts { model, widgets }
@@ -283,6 +606,12 @@ impl Component for NotebookModel {
     ) {
         match msg {
             NotebookMsg::Open(path) => {
+                // Safe mode is an isolated diagnostic session: do not even
+                // read an external notebook, and never expose its Run buttons.
+                if self.safe_mode {
+                    log::warn!("notebook: ignored open request in safe mode");
+                    return;
+                }
                 let text = match std::fs::read_to_string(&path) {
                     Ok(text) => text,
                     Err(error) => {
@@ -290,7 +619,9 @@ impl Component for NotebookModel {
                         return;
                     }
                 };
-                self.cancel_cells();
+                if let Some(runtime) = self.runtime.take() {
+                    runtime.shutdown();
+                }
                 while let Some(child) = widgets.content.first_child() {
                     widgets.content.remove(&child);
                 }
@@ -302,8 +633,29 @@ impl Component for NotebookModel {
                 ));
                 let cwd = path
                     .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
                     .map(Path::to_path_buf)
-                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                    .unwrap_or_else(|| {
+                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+                    });
+                let configured_shell = self.configured_shell.clone();
+
+                let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+                let run_all_status = gtk::Label::new(None);
+                run_all_status.set_xalign(0.0);
+                run_all_status.set_hexpand(true);
+                run_all_status.add_css_class("dim-label");
+                run_all_status.set_visible(false);
+                let stop_all_button = gtk::Button::with_label("Stop All");
+                stop_all_button.set_sensitive(false);
+                let run_all_button = gtk::Button::with_label("Run All");
+                run_all_button.add_css_class("suggested-action");
+                actions.append(&run_all_status);
+                actions.append(&stop_all_button);
+                actions.append(&run_all_button);
+                widgets.content.append(&actions);
+
+                let mut cells = Vec::new();
                 for segment in parse_segments(&text) {
                     match segment {
                         Segment::Text(text) => {
@@ -316,404 +668,535 @@ impl Component for NotebookModel {
                             label.set_selectable(true);
                             widgets.content.append(&label);
                         }
-                        Segment::Code { lang, src } => widgets.content.append(&build_code_cell(
-                            &lang,
-                            &src,
-                            &cwd,
-                            &self.handles,
-                        )),
+                        Segment::Code { lang, src } => {
+                            let cell = CellController::new(
+                                cells.len(),
+                                &lang,
+                                &src,
+                                &configured_shell,
+                                &cwd,
+                            );
+                            widgets.content.append(&cell.frame);
+                            cells.push(cell);
+                        }
                     }
                 }
-                let footer = gtk::Label::new(Some(
-                    "Cells run in an isolated `bash -c` rooted at the notebook's directory. \
-                     Shell init scripts (.bashrc, aliases, rsh) are not loaded.",
-                ));
+                let footer = gtk::Label::new(Some(&format!(
+                    "Cells run in isolated process groups with cwd {}. `shell` and unlabeled cells use: {}. Source is provided on stdin; active terminals are never modified.",
+                    cwd.display(),
+                    configured_shell.join(" ")
+                )));
                 footer.set_wrap(true);
                 footer.set_xalign(0.0);
+                footer.set_selectable(true);
                 footer.add_css_class("dim-label");
                 widgets.content.append(&footer);
+
+                let runtime = Rc::new(NotebookRuntime {
+                    cells,
+                    queue: RefCell::new(VecDeque::new()),
+                    run_all_active: Cell::new(false),
+                    closed: Cell::new(false),
+                    stats: RefCell::new(RunAllStats::default()),
+                    run_all_button: run_all_button.clone(),
+                    stop_all_button: stop_all_button.clone(),
+                    status: run_all_status,
+                });
+                run_all_button.set_sensitive(runtime.cells.iter().any(|cell| cell.runnable()));
+
+                let weak_runtime = Rc::downgrade(&runtime);
+                run_all_button.connect_clicked(move |_| {
+                    if let Some(runtime) = weak_runtime.upgrade() {
+                        runtime.start_run_all();
+                    }
+                });
+                let weak_runtime = Rc::downgrade(&runtime);
+                stop_all_button.connect_clicked(move |_| {
+                    if let Some(runtime) = weak_runtime.upgrade() {
+                        runtime.stop_all();
+                    }
+                });
+                self.runtime = Some(runtime);
                 root.present(Some(&self.parent));
             }
-            NotebookMsg::Closed => self.cancel_cells(),
+            NotebookMsg::Closed => {
+                if let Some(runtime) = self.runtime.take() {
+                    runtime.shutdown();
+                }
+            }
         }
     }
 }
 
-impl NotebookModel {
-    fn cancel_cells(&self) {
-        for handle in self.handles.borrow_mut().drain(..) {
-            handle.cancel();
+struct OutputPane {
+    root: gtk::Box,
+    buffer: gtk::TextBuffer,
+    scroll: gtk::ScrolledWindow,
+}
+
+impl OutputPane {
+    fn new(title: &str, is_error: bool) -> Self {
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 3);
+        root.set_visible(false);
+
+        let label = gtk::Label::new(Some(title));
+        label.set_xalign(0.0);
+        label.add_css_class("dim-label");
+        if is_error {
+            label.add_css_class("error");
         }
+        root.append(&label);
+
+        let buffer = gtk::TextBuffer::new(None);
+        let view = gtk::TextView::with_buffer(&buffer);
+        view.set_editable(false);
+        view.set_cursor_visible(false);
+        view.set_monospace(true);
+        view.set_wrap_mode(gtk::WrapMode::WordChar);
+        view.add_css_class("notebook-output");
+        let scroll = gtk::ScrolledWindow::builder()
+            .hexpand(true)
+            .max_content_height(260)
+            .child(&view)
+            .build();
+        scroll.set_propagate_natural_height(true);
+        root.append(&scroll);
+
+        Self {
+            root,
+            buffer,
+            scroll,
+        }
+    }
+
+    fn clear(&self) {
+        self.buffer.set_text("");
+        self.root.set_visible(false);
+    }
+
+    fn append(&self, text: &str) {
+        self.root.set_visible(true);
+        let mut end = self.buffer.end_iter();
+        self.buffer.insert(&mut end, text);
+        let adjustment = self.scroll.vadjustment();
+        adjustment.set_value(adjustment.upper());
     }
 }
 
-fn build_code_cell(
-    lang: &str,
-    src: &str,
-    cwd: &Path,
-    handles: &Rc<RefCell<Vec<Rc<CellHandle>>>>,
-) -> gtk::Frame {
-    let runnable = matches!(
-        lang.to_ascii_lowercase().as_str(),
-        "bash" | "sh" | "shell" | ""
-    );
+type Completion = Box<dyn FnOnce(CellOutcome)>;
 
-    let frame = gtk::Frame::new(None);
-    frame.add_css_class("card");
-    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    vbox.set_margin_top(8);
-    vbox.set_margin_bottom(8);
-    vbox.set_margin_start(8);
-    vbox.set_margin_end(8);
+struct CellController {
+    index: usize,
+    frame: gtk::Frame,
+    command: Option<CommandSpec>,
+    run_button: gtk::Button,
+    stop_button: gtk::Button,
+    stdout: OutputPane,
+    stderr: OutputPane,
+    status: gtk::Label,
+    active: RefCell<Option<Rc<CellHandle>>>,
+    externally_locked: Cell<bool>,
+}
 
-    // Top row: language label + toolbar buttons.
-    let top = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    let lang_label = gtk::Label::new(Some(if lang.is_empty() { "shell" } else { lang }));
-    lang_label.add_css_class("dim-label");
-    lang_label.set_xalign(0.0);
-    lang_label.set_hexpand(true);
-    top.append(&lang_label);
+impl CellController {
+    fn new(
+        index: usize,
+        info: &str,
+        source: &str,
+        configured_shell: &[String],
+        cwd: &Path,
+    ) -> Rc<Self> {
+        let argv = shell_argv_for_info(info, configured_shell);
+        let command = argv.map(|argv| CommandSpec {
+            argv,
+            source: source.to_owned(),
+            cwd: cwd.to_path_buf(),
+        });
 
-    let copy_btn = gtk::Button::with_label("Copy");
-    copy_btn.add_css_class("flat");
-    {
-        let src = src.to_string();
-        copy_btn.connect_clicked(move |_| {
+        let frame = gtk::Frame::new(None);
+        frame.add_css_class("card");
+        let body = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        body.set_margin_top(8);
+        body.set_margin_bottom(8);
+        body.set_margin_start(8);
+        body.set_margin_end(8);
+
+        let toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let language = language_name(info);
+        let language_label = gtk::Label::new(Some(if language.is_empty() {
+            "shell"
+        } else {
+            language
+        }));
+        language_label.set_xalign(0.0);
+        language_label.set_hexpand(true);
+        language_label.add_css_class("dim-label");
+        toolbar.append(&language_label);
+
+        let copy_button = gtk::Button::with_label("Copy");
+        copy_button.add_css_class("flat");
+        let source_for_copy = source.to_owned();
+        copy_button.connect_clicked(move |_| {
             if let Some(display) = gtk::gdk::Display::default() {
-                display.clipboard().set_text(&src);
+                display.clipboard().set_text(&source_for_copy);
             }
         });
-    }
-    let run_btn = gtk::Button::with_label("Run");
-    if runnable {
-        run_btn.add_css_class("suggested-action");
-    } else {
-        run_btn.set_sensitive(false);
-        run_btn.set_tooltip_text(Some("Only bash / sh / shell fences are runnable"));
-    }
-    let stop_btn = gtk::Button::with_label("Stop");
-    stop_btn.set_sensitive(false);
-    top.append(&copy_btn);
-    top.append(&run_btn);
-    top.append(&stop_btn);
-    vbox.append(&top);
+        toolbar.append(&copy_button);
 
-    // Source view: monospace, read-only.
-    let src_buffer = gtk::TextBuffer::new(None);
-    src_buffer.set_text(src);
-    let src_view = gtk::TextView::with_buffer(&src_buffer);
-    src_view.set_editable(false);
-    src_view.set_monospace(true);
-    src_view.set_cursor_visible(false);
-    src_view.set_wrap_mode(gtk::WrapMode::None);
-    src_view.add_css_class("notebook-source");
-    let src_scroll = gtk::ScrolledWindow::builder()
-        .hexpand(true)
-        .max_content_height(220)
-        .child(&src_view)
-        .build();
-    src_scroll.set_propagate_natural_height(true);
-    vbox.append(&src_scroll);
+        let run_button = gtk::Button::with_label("Run");
+        let stop_button = gtk::Button::with_label("Stop");
+        stop_button.set_sensitive(false);
+        if command.is_some() {
+            run_button.add_css_class("suggested-action");
+        } else {
+            run_button.set_sensitive(false);
+            run_button.set_tooltip_text(Some(
+                "Only shell fences are executable; use bash, sh, zsh, fish, pwsh, powershell, shell, or no label",
+            ));
+        }
+        toolbar.append(&run_button);
+        toolbar.append(&stop_button);
+        body.append(&toolbar);
 
-    // Output area, initially hidden until first Run.
-    let output_buffer = gtk::TextBuffer::new(None);
-    let output_view = gtk::TextView::with_buffer(&output_buffer);
-    output_view.set_editable(false);
-    output_view.set_monospace(true);
-    output_view.set_cursor_visible(false);
-    output_view.set_wrap_mode(gtk::WrapMode::WordChar);
-    output_view.add_css_class("notebook-output");
-    let output_scroll = gtk::ScrolledWindow::builder()
-        .hexpand(true)
-        .max_content_height(300)
-        .child(&output_view)
-        .build();
-    output_scroll.set_propagate_natural_height(true);
-    output_scroll.set_visible(false);
-    vbox.append(&output_scroll);
+        let source_buffer = gtk::TextBuffer::new(None);
+        source_buffer.set_text(source);
+        let source_view = gtk::TextView::with_buffer(&source_buffer);
+        source_view.set_editable(false);
+        source_view.set_cursor_visible(false);
+        source_view.set_monospace(true);
+        source_view.set_wrap_mode(gtk::WrapMode::None);
+        source_view.add_css_class("notebook-source");
+        let source_scroll = gtk::ScrolledWindow::builder()
+            .hexpand(true)
+            .max_content_height(220)
+            .child(&source_view)
+            .build();
+        source_scroll.set_propagate_natural_height(true);
+        body.append(&source_scroll);
 
-    let status_label = gtk::Label::new(None);
-    status_label.set_xalign(0.0);
-    status_label.add_css_class("dim-label");
-    status_label.set_visible(false);
-    vbox.append(&status_label);
+        let stdout = OutputPane::new("stdout", false);
+        body.append(&stdout.root);
+        let stderr = OutputPane::new("stderr", true);
+        body.append(&stderr.root);
 
-    frame.set_child(Some(&vbox));
+        let status = gtk::Label::new(None);
+        status.set_xalign(0.0);
+        status.add_css_class("dim-label");
+        status.set_visible(false);
+        body.append(&status);
+        frame.set_child(Some(&body));
 
-    // Each Stop button must target its own cell. Looking through the dialog's
-    // global handle list can stop a different cell when several run at once.
-    // Installing this before the worker starts also closes the tiny race where
-    // Stop is clicked before `Command::spawn` has parked the Child handle.
-    let active_handle: Rc<RefCell<Option<Rc<CellHandle>>>> = Rc::new(RefCell::new(None));
-
-    if runnable {
-        let src = src.to_string();
-        let cwd = cwd.to_path_buf();
-        let handles = handles.clone();
-        let run_btn_c = run_btn.clone();
-        let stop_btn_c = stop_btn.clone();
-        let output_buffer_c = output_buffer.clone();
-        let output_scroll_c = output_scroll.clone();
-        let status_label_c = status_label.clone();
-        let active_handle_c = active_handle.clone();
-        run_btn.connect_clicked(move |_| {
-            // Reset previous output.
-            output_buffer_c.set_text("");
-            output_scroll_c.set_visible(true);
-            status_label_c.set_visible(true);
-            status_label_c.set_text("Running…");
-            status_label_c.remove_css_class("error");
-            run_btn_c.set_sensitive(false);
-            stop_btn_c.set_sensitive(true);
-
-            let handle = Rc::new(CellHandle {
-                child: Arc::new(Mutex::new(None)),
-                cancelled: Arc::new(AtomicBool::new(false)),
-            });
-            *active_handle_c.borrow_mut() = Some(handle.clone());
-            handles.borrow_mut().push(handle.clone());
-
-            spawn_cell(
-                src.clone(),
-                cwd.clone(),
-                handle.clone(),
-                output_buffer_c.clone(),
-                output_scroll_c.clone(),
-                status_label_c.clone(),
-                run_btn_c.clone(),
-                stop_btn_c.clone(),
-            );
+        let cell = Rc::new(Self {
+            index,
+            frame,
+            command,
+            run_button,
+            stop_button,
+            stdout,
+            stderr,
+            status,
+            active: RefCell::new(None),
+            externally_locked: Cell::new(false),
         });
+
+        let weak = Rc::downgrade(&cell);
+        cell.run_button.connect_clicked(move |_| {
+            if let Some(cell) = weak.upgrade() {
+                let _ = cell.run(None);
+            }
+        });
+        let weak = Rc::downgrade(&cell);
+        cell.stop_button.connect_clicked(move |_| {
+            if let Some(cell) = weak.upgrade() {
+                cell.cancel();
+            }
+        });
+        cell
     }
 
-    {
-        let active_handle_for_stop = active_handle;
-        stop_btn.connect_clicked(move |btn| {
-            if let Some(handle) = active_handle_for_stop.borrow().as_ref() {
+    fn runnable(&self) -> bool {
+        self.command.is_some()
+    }
+
+    fn is_running(&self) -> bool {
+        self.active.borrow().is_some()
+    }
+
+    fn set_external_lock(&self, locked: bool) {
+        self.externally_locked.set(locked);
+        self.sync_buttons();
+    }
+
+    fn sync_buttons(&self) {
+        let running = self.is_running();
+        self.run_button
+            .set_sensitive(self.runnable() && !running && !self.externally_locked.get());
+        self.stop_button.set_sensitive(running);
+    }
+
+    fn cancel(&self) {
+        if let Some(handle) = self.active.borrow().as_ref() {
+            handle.cancel();
+            self.status.set_text("Cancelling…");
+            self.stop_button.set_sensitive(false);
+        }
+    }
+
+    fn append_output(&self, stream: OutputStream, bytes: &[u8]) {
+        let text = String::from_utf8_lossy(bytes);
+        match stream {
+            OutputStream::Stdout => self.stdout.append(&text),
+            OutputStream::Stderr => self.stderr.append(&text),
+        }
+    }
+
+    fn finish(&self, outcome: &CellOutcome) {
+        self.status.remove_css_class("error");
+        self.status.remove_css_class("warning");
+        match outcome {
+            CellOutcome::Exited(code) => {
+                self.status.set_text(&format!("exit {code}"));
+                if *code != 0 {
+                    self.status.add_css_class("error");
+                }
+            }
+            CellOutcome::Cancelled => {
+                self.status.set_text("cancelled");
+                self.status.add_css_class("warning");
+            }
+            CellOutcome::Failed(error) => {
+                self.status.set_text(&format!("failed: {error}"));
+                self.status.add_css_class("error");
+            }
+        }
+        self.sync_buttons();
+    }
+
+    fn run(self: &Rc<Self>, completion: Option<Completion>) -> bool {
+        let Some(command) = self.command.clone() else {
+            return false;
+        };
+        if self.is_running() {
+            return false;
+        }
+
+        self.stdout.clear();
+        self.stderr.clear();
+        self.status.set_visible(true);
+        self.status.set_text("Running…");
+        self.status.remove_css_class("error");
+        self.status.remove_css_class("warning");
+
+        let handle = Rc::new(CellHandle::new());
+        *self.active.borrow_mut() = Some(handle.clone());
+        self.sync_buttons();
+        let receiver = spawn_cell_worker(command, &handle);
+        let weak_cell = Rc::downgrade(self);
+        let mut completion = completion;
+        let mut bytes_seen = 0usize;
+        let mut truncated = false;
+
+        gtk::glib::timeout_add_local(OUTPUT_POLL_INTERVAL, move || {
+            let Some(cell) = weak_cell.upgrade() else {
                 handle.cancel();
+                return gtk::glib::ControlFlow::Break;
+            };
+
+            loop {
+                match receiver.try_recv() {
+                    Ok(WorkerEvent::Output(stream, bytes)) => {
+                        if bytes_seen >= MAX_OUTPUT_BYTES {
+                            if !truncated {
+                                truncated = true;
+                                cell.stderr.append("\n[output truncated]\n");
+                            }
+                            continue;
+                        }
+                        let remaining = MAX_OUTPUT_BYTES - bytes_seen;
+                        let count = bytes.len().min(remaining);
+                        bytes_seen += count;
+                        cell.append_output(stream, &bytes[..count]);
+                    }
+                    Ok(WorkerEvent::Done(outcome)) => {
+                        let is_current = cell
+                            .active
+                            .borrow()
+                            .as_ref()
+                            .is_some_and(|active| Rc::ptr_eq(active, &handle));
+                        if is_current {
+                            cell.active.borrow_mut().take();
+                        }
+                        cell.finish(&outcome);
+                        if let Some(callback) = completion.take() {
+                            callback(outcome);
+                        }
+                        return gtk::glib::ControlFlow::Break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {
+                        return gtk::glib::ControlFlow::Continue;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        let outcome = CellOutcome::Failed("worker disconnected".to_owned());
+                        cell.active.borrow_mut().take();
+                        cell.finish(&outcome);
+                        if let Some(callback) = completion.take() {
+                            callback(outcome);
+                        }
+                        return gtk::glib::ControlFlow::Break;
+                    }
+                }
             }
-            btn.set_sensitive(false);
         });
+        true
+    }
+}
+
+#[derive(Default)]
+struct RunAllStats {
+    total: usize,
+    finished: usize,
+    failed: usize,
+}
+
+struct NotebookRuntime {
+    cells: Vec<Rc<CellController>>,
+    queue: RefCell<VecDeque<usize>>,
+    run_all_active: Cell<bool>,
+    closed: Cell<bool>,
+    stats: RefCell<RunAllStats>,
+    run_all_button: gtk::Button,
+    stop_all_button: gtk::Button,
+    status: gtk::Label,
+}
+
+impl NotebookRuntime {
+    fn start_run_all(self: &Rc<Self>) {
+        if self.closed.get() || self.run_all_active.get() {
+            return;
+        }
+        if self.cells.iter().any(|cell| cell.is_running()) {
+            self.status
+                .set_text("Wait for individually running cells, or stop them first.");
+            self.status.add_css_class("warning");
+            self.status.set_visible(true);
+            return;
+        }
+
+        let queue: VecDeque<usize> = self
+            .cells
+            .iter()
+            .enumerate()
+            .filter_map(|(index, cell)| cell.runnable().then_some(index))
+            .collect();
+        if queue.is_empty() {
+            self.status.set_text("No runnable shell cells.");
+            self.status.set_visible(true);
+            return;
+        }
+
+        *self.stats.borrow_mut() = RunAllStats {
+            total: queue.len(),
+            ..RunAllStats::default()
+        };
+        *self.queue.borrow_mut() = queue;
+        self.run_all_active.set(true);
+        self.run_all_button.set_sensitive(false);
+        self.stop_all_button.set_sensitive(true);
+        self.status.remove_css_class("error");
+        self.status.remove_css_class("warning");
+        self.status.set_visible(true);
+        for cell in &self.cells {
+            cell.set_external_lock(true);
+        }
+        self.run_next();
     }
 
-    frame
-}
-
-#[allow(clippy::too_many_arguments)]
-fn spawn_cell(
-    src: String,
-    cwd: std::path::PathBuf,
-    handle: Rc<CellHandle>,
-    output_buffer: gtk::TextBuffer,
-    output_scroll: gtk::ScrolledWindow,
-    status_label: gtk::Label,
-    run_btn: gtk::Button,
-    stop_btn: gtk::Button,
-) {
-    // Two channels: chunks of bytes for incremental output, and the final
-    // exit result. We could collapse to one, but the exit signal sits
-    // cleaner as a separate enum case.
-    let (chunk_tx, chunk_rx) = mpsc::channel::<Vec<u8>>();
-    let (done_tx, done_rx) = mpsc::channel::<Result<i32, String>>();
-
-    let child_slot = handle.child.clone();
-    let cancelled_flag = handle.cancelled.clone();
-    std::thread::spawn(move || {
-        let mut command = Command::new("bash");
-        command
-            .arg("-c")
-            .arg(&src)
-            .current_dir(&cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = match command.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = done_tx.send(Err(format!("spawn failed: {e}")));
-                return;
-            }
+    fn run_next(self: &Rc<Self>) {
+        if !self.run_all_active.get() || self.closed.get() {
+            return;
+        }
+        let Some(index) = self.queue.borrow_mut().pop_front() else {
+            self.finish_run_all();
+            return;
         };
 
-        // Park the Child so the UI thread can kill() it. Cancellation can win
-        // the race before spawn completes; honour the flag while holding the
-        // first lock so such a child cannot escape into the background.
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        match child_slot.lock() {
-            Ok(mut guard) => {
-                *guard = Some(child);
-                if cancelled_flag.load(Ordering::SeqCst) {
-                    if let Some(child) = guard.as_mut() {
-                        let _ = child.kill();
-                    }
-                }
+        let stats = self.stats.borrow();
+        self.status.set_text(&format!(
+            "Running cell {} of {}…",
+            stats.finished + 1,
+            stats.total
+        ));
+        drop(stats);
+
+        let cell = self.cells[index].clone();
+        let weak_runtime: Weak<Self> = Rc::downgrade(self);
+        if !cell.run(Some(Box::new(move |outcome| {
+            if let Some(runtime) = weak_runtime.upgrade() {
+                runtime.cell_finished(outcome);
             }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = done_tx.send(Err("child handle mutex poisoned".to_string()));
-                return;
+        }))) {
+            self.cell_finished(CellOutcome::Failed(format!(
+                "cell {} could not start",
+                cell.index + 1
+            )));
+        }
+    }
+
+    fn cell_finished(self: &Rc<Self>, outcome: CellOutcome) {
+        if !self.run_all_active.get() {
+            return;
+        }
+        {
+            let mut stats = self.stats.borrow_mut();
+            stats.finished += 1;
+            if outcome.failed() {
+                stats.failed += 1;
             }
         }
+        self.run_next();
+    }
 
-        // stdout reader.
-        let chunk_tx_o = chunk_tx.clone();
-        let stdout_thread = stdout.map(|mut so| {
-            std::thread::spawn(move || {
-                let mut buf = [0u8; 4096];
-                loop {
-                    match so.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            if chunk_tx_o.send(buf[..n].to_vec()).is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-            })
-        });
-
-        // stderr reader (merged into the same output buffer — UI doesn't
-        // distinguish streams in v1; the exit colour conveys success/fail).
-        let chunk_tx_e = chunk_tx.clone();
-        let stderr_thread = stderr.map(|mut se| {
-            std::thread::spawn(move || {
-                let mut buf = [0u8; 4096];
-                loop {
-                    match se.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            if chunk_tx_e.send(buf[..n].to_vec()).is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-            })
-        });
-
-        // Poll under short locks rather than taking the Child and blocking in
-        // `wait()`. This leaves Stop/close able to call `kill()` throughout the
-        // run, while this worker remains the sole reaper.
-        let exit = wait_for_shared_child(&child_slot);
-
-        // Drain readers before we report done so chunks don't arrive after
-        // the exit notification (UI order-sensitive).
-        if let Some(jh) = stdout_thread {
-            let _ = jh.join();
-        }
-        if let Some(jh) = stderr_thread {
-            let _ = jh.join();
-        }
-        drop(chunk_tx);
-
-        let result = match exit {
-            Ok(code) => {
-                if cancelled_flag.load(Ordering::SeqCst) {
-                    Err("cancelled".to_string())
-                } else {
-                    Ok(code)
-                }
-            }
-            Err(e) => Err(format!("wait failed: {e}")),
-        };
-        let _ = done_tx.send(result);
-    });
-
-    // Poll the channels on the main loop. 50ms is responsive without
-    // hammering the UI.
-    let bytes_seen: Rc<Cell<usize>> = Rc::new(Cell::new(0));
-    let truncated: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-    let output_buffer_t = output_buffer.clone();
-    let output_scroll_t = output_scroll.clone();
-    let status_label_t = status_label.clone();
-    let run_btn_t = run_btn.clone();
-    let stop_btn_t = stop_btn.clone();
-    gtk::glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
-        // Drain available chunks.
-        loop {
-            match chunk_rx.try_recv() {
-                Ok(bytes) => {
-                    let already = bytes_seen.get();
-                    if already >= MAX_OUTPUT_BYTES {
-                        if !truncated.get() {
-                            truncated.set(true);
-                            let mut end = output_buffer_t.end_iter();
-                            output_buffer_t.insert(&mut end, "\n[output truncated]\n");
-                        }
-                        continue;
-                    }
-                    let remaining = MAX_OUTPUT_BYTES.saturating_sub(already);
-                    let take = bytes.len().min(remaining);
-                    bytes_seen.set(already + take);
-                    let slice = &bytes[..take];
-                    let text = String::from_utf8_lossy(slice);
-                    let mut end = output_buffer_t.end_iter();
-                    output_buffer_t.insert(&mut end, &text);
-                    // Autoscroll.
-                    let vadj = output_scroll_t.vadjustment();
-                    vadj.set_value(vadj.upper());
-                }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => break,
-            }
+    fn finish_run_all(&self) {
+        self.run_all_active.set(false);
+        self.run_all_button.set_sensitive(true);
+        self.stop_all_button.set_sensitive(false);
+        for cell in &self.cells {
+            cell.set_external_lock(false);
         }
 
-        match done_rx.try_recv() {
-            Ok(Ok(code)) => {
-                if code == 0 {
-                    status_label_t.set_text(&format!("exit {code}"));
-                    status_label_t.remove_css_class("error");
-                } else {
-                    status_label_t.set_text(&format!("exit {code}"));
-                    status_label_t.add_css_class("error");
-                }
-                run_btn_t.set_sensitive(true);
-                stop_btn_t.set_sensitive(false);
-                gtk::glib::ControlFlow::Break
-            }
-            Ok(Err(reason)) => {
-                status_label_t.set_text(&format!("failed: {reason}"));
-                status_label_t.add_css_class("error");
-                run_btn_t.set_sensitive(true);
-                stop_btn_t.set_sensitive(false);
-                gtk::glib::ControlFlow::Break
-            }
-            Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
-            Err(mpsc::TryRecvError::Disconnected) => gtk::glib::ControlFlow::Break,
+        let stats = self.stats.borrow();
+        self.status.remove_css_class("warning");
+        if stats.failed == 0 {
+            self.status
+                .set_text(&format!("Run All finished: {} cell(s).", stats.finished));
+            self.status.remove_css_class("error");
+        } else {
+            self.status.set_text(&format!(
+                "Run All finished: {} cell(s), {} failed.",
+                stats.finished, stats.failed
+            ));
+            self.status.add_css_class("error");
         }
-    });
-}
+    }
 
-/// Wait for a shared child without holding the mutex between polls. The UI can
-/// therefore acquire the same handle and call `kill()` at any point. Once an
-/// exit is observed, `try_wait` has reaped it and we clear the slot.
-fn wait_for_shared_child(child_slot: &Arc<Mutex<Option<Child>>>) -> std::io::Result<i32> {
-    loop {
-        let result = {
-            let mut guard = child_slot
-                .lock()
-                .map_err(|_| std::io::Error::other("child handle mutex poisoned"))?;
-            let child = guard
-                .as_mut()
-                .ok_or_else(|| std::io::Error::other("child handle missing before exit"))?;
-            match child.try_wait()? {
-                Some(status) => {
-                    let code = status.code().unwrap_or(-1);
-                    guard.take();
-                    Some(code)
-                }
-                None => None,
-            }
-        };
-        if let Some(code) = result {
-            return Ok(code);
+    fn stop_all(&self) {
+        let was_run_all = self.run_all_active.replace(false);
+        self.queue.borrow_mut().clear();
+        for cell in &self.cells {
+            cell.cancel();
+            cell.set_external_lock(false);
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        self.run_all_button.set_sensitive(!self.closed.get());
+        self.stop_all_button.set_sensitive(false);
+        if was_run_all && !self.closed.get() {
+            self.status.set_text("Run All cancelled.");
+            self.status.add_css_class("warning");
+        }
+    }
+
+    fn shutdown(&self) {
+        self.closed.set(true);
+        self.stop_all();
     }
 }
 
@@ -747,6 +1230,18 @@ mod tests {
         let segs = parse_segments(md);
         assert_eq!(segs.len(), 1);
         assert!(matches!(segs[0], Segment::Code { .. }));
+    }
+
+    #[test]
+    fn longer_fence_does_not_close_on_a_shorter_marker() {
+        let md = "````bash\necho ``` literal\n```\n````\n";
+        assert_eq!(
+            parse_segments(md),
+            vec![Segment::Code {
+                lang: "bash".to_owned(),
+                src: "echo ``` literal\n```".to_owned(),
+            }]
+        );
     }
 
     #[test]
@@ -804,34 +1299,128 @@ mod tests {
     }
 
     #[test]
-    fn cancel_leaves_child_for_worker_to_reap() {
-        let child = Command::new("bash")
-            .args(["-c", "exec sleep 30"])
-            .spawn()
-            .expect("spawn cancellable child");
-        let handle = CellHandle {
-            child: Arc::new(Mutex::new(Some(child))),
-            cancelled: Arc::new(AtomicBool::new(false)),
-        };
+    fn shell_fences_select_the_requested_interpreter() {
+        let configured = vec!["/bin/zsh".to_owned(), "-l".to_owned()];
+        assert_eq!(
+            shell_argv_for_info("shell", &configured),
+            Some(configured.clone())
+        );
+        assert_eq!(
+            shell_argv_for_info("", &configured),
+            Some(configured.clone())
+        );
+        for shell in ["bash", "sh", "zsh", "fish"] {
+            assert_eq!(
+                shell_argv_for_info(&format!("{shell} title=demo"), &configured),
+                Some(vec![shell.to_owned()])
+            );
+        }
+        assert_eq!(
+            shell_argv_for_info("pwsh", &configured),
+            Some(vec![
+                "pwsh".to_owned(),
+                "-NoLogo".to_owned(),
+                "-NoProfile".to_owned(),
+                "-NonInteractive".to_owned(),
+                "-Command".to_owned(),
+                "-".to_owned(),
+            ])
+        );
+        assert_eq!(
+            shell_argv_for_info("powershell", &configured).and_then(|argv| argv.first().cloned()),
+            Some("powershell".to_owned())
+        );
+        assert_eq!(shell_argv_for_info("python", &configured), None);
+        assert_eq!(shell_argv_for_info("shell", &[]), None);
+    }
 
+    #[test]
+    fn worker_keeps_stdout_and_stderr_separate() {
+        let handle = CellHandle::new();
+        let receiver = spawn_cell_worker(
+            CommandSpec {
+                argv: vec!["sh".to_owned()],
+                source: "printf out; printf err >&2; exit 7".to_owned(),
+                cwd: std::env::temp_dir(),
+            },
+            &handle,
+        );
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let outcome = loop {
+            match receiver
+                .recv_timeout(Duration::from_secs(3))
+                .expect("worker event")
+            {
+                WorkerEvent::Output(OutputStream::Stdout, bytes) => stdout.extend(bytes),
+                WorkerEvent::Output(OutputStream::Stderr, bytes) => stderr.extend(bytes),
+                WorkerEvent::Done(outcome) => break outcome,
+            }
+        };
+        assert_eq!(stdout, b"out");
+        assert_eq!(stderr, b"err");
+        assert_eq!(outcome, CellOutcome::Exited(7));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cancellation_kills_and_reaps_the_entire_process_group() {
+        let handle = CellHandle::new();
+        let receiver = spawn_cell_worker(
+            CommandSpec {
+                argv: vec!["sh".to_owned()],
+                source: "sleep 30 & echo ready; wait".to_owned(),
+                cwd: std::env::temp_dir(),
+            },
+            &handle,
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut stdout = Vec::new();
+        while !stdout
+            .windows(b"ready".len())
+            .any(|chunk| chunk == b"ready")
+        {
+            assert!(std::time::Instant::now() < deadline, "cell did not start");
+            match receiver
+                .recv_timeout(Duration::from_millis(100))
+                .expect("ready output")
+            {
+                WorkerEvent::Output(OutputStream::Stdout, bytes) => {
+                    stdout.extend(bytes);
+                }
+                WorkerEvent::Output(OutputStream::Stderr, _) => {}
+                WorkerEvent::Done(outcome) => panic!("cell ended before cancellation: {outcome:?}"),
+            }
+        }
+        let group = handle.pgid.load(Ordering::SeqCst);
+        assert!(group > 0, "worker did not publish its process group");
         handle.cancel();
 
-        assert!(handle.cancelled.load(Ordering::SeqCst));
-        assert!(
-            handle.child.lock().expect("child slot").is_some(),
-            "cancel must not take the Child away from the waiting worker"
-        );
+        let outcome = loop {
+            match receiver
+                .recv_timeout(Duration::from_secs(3))
+                .expect("cancellation outcome")
+            {
+                WorkerEvent::Done(outcome) => break outcome,
+                WorkerEvent::Output(_, _) => {}
+            }
+        };
+        assert_eq!(outcome, CellOutcome::Cancelled);
+        assert!(handle.child.lock().expect("child slot").is_none());
 
-        let started = std::time::Instant::now();
-        let code = wait_for_shared_child(&handle.child).expect("reap killed child");
-        assert_eq!(code, -1, "a signal-terminated child has no exit code");
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(2),
-            "cancelled child was not reaped promptly"
-        );
-        assert!(
-            handle.child.lock().expect("child slot").is_none(),
-            "worker must clear the slot after reaping"
-        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            // Signal 0 checks group existence without modifying it.
+            let exists = unsafe { nix::libc::kill(-group, 0) } == 0;
+            if !exists {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a descendant survived notebook cancellation"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }

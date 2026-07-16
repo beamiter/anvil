@@ -7,6 +7,18 @@ versioning for tagged releases while it remains experimental.
 
 ### Added
 
+- Cross-block command/output search and a shared review-only input boundary for
+  workflow, history, file-tree, notebook, remote, and AI insertions.
+- TOML/YAML workflows with ordered directory precedence, metadata retention,
+  Unicode-safe `{name}`/`{{name}}` substitution, and six installed examples.
+- Multi-shell executable notebooks with Run All/Stop All, separate bounded
+  stdout/stderr, and process-group cancellation that reaps descendants.
+- Configurable Anthropic, OpenAI-compatible, and Ollama clients plus a strict
+  proposal-ID Agent state machine with explicit per-command approval.
+- Stable Flatpak host execution for terminal, notebook, Git, notification, and
+  dependency probes; reverse-DNS desktop/AppStream identity and raster icons.
+- Cargo-or-Nix source installation with prefix/data/bin overrides, `DESTDIR`,
+  dry-run, safe legacy-launcher cleanup, and XDG-aware uninstall.
 - `--check-config [--json]`, `--config-path`, and explicit rotating-backup
   recovery with preservation of the replaced live file.
 - Process-safe configuration locking, exact revision conflict detection, two
@@ -17,11 +29,11 @@ versioning for tagged releases while it remains experimental.
   `jterm1-support-bundle` archive generator.
 - A scheduled dependency vulnerability audit, ShellCheck gate, shared
   `make security` command, and repository Rust toolchain contract.
-- Build provenance metadata and the exact Cargo lockfile in portable bundles.
+- Build provenance metadata and the exact Cargo lockfile in relocatable bundles.
 
 - First-class Nix package, `nix run` app, flake check, and enriched development
   shell for the two supported Linux architectures.
-- Deterministic portable Linux release archives with SHA-256 checksums and a
+- Deterministic relocatable Linux release archives with SHA-256 checksums and a
   user-local installer that preserves existing configuration.
 - Tag-driven GitHub release automation and CI artifacts for every successful
   pull request build.
@@ -30,6 +42,12 @@ versioning for tagged releases while it remains experimental.
 
 ### Changed
 
+- Pane moves and remote reconnect callbacks now retain stable pane/session
+  identity; reconnect cancellation affects only the dead leaf it belongs to.
+- Safe mode ignores user config and behavior overrides, disables restore and
+  persistence, and starts an isolated built-in VTE recovery pane.
+- Support bundles now use redacted diagnostics and exclude host names, local
+  paths, environment values, configuration/history/session contents, and keys.
 - Default shortcuts now share the jterm ergonomic layout: directional Pane
   focus/resize layers, browser-style tab digits, symmetric zoom/opacity keys,
   and shell-owned `Ctrl+R` / `Ctrl+P` passthrough.

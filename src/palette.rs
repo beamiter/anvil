@@ -9,6 +9,7 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use std::path::Path;
 
+use crate::command_history;
 use crate::keybindings::{Action, KeybindingMap};
 use crate::workflows::Workflow;
 
@@ -111,35 +112,8 @@ pub(crate) struct Entry {
 
 /// Read up to the last `max` records from a jsonl history file (newest last).
 /// Records are pulled most-recent-first then reversed for display order.
-pub(crate) fn read_history(path: &Path, max: usize) -> Vec<HistoryItem> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let mut out: Vec<HistoryItem> = text
-        .lines()
-        .rev()
-        .filter_map(|line| serde_json::from_str::<HistoryItem>(line).ok())
-        .filter(|h| !h.command.trim().is_empty())
-        .take(max)
-        .collect();
-    // Deduplicate by command, keeping the most recent occurrence (which appears
-    // first after the reverse). Preserves recency-ordering after dedup.
-    let mut seen = std::collections::HashSet::new();
-    out.retain(|h| seen.insert(h.command.clone()));
-    out
-}
-
-/// Subset of `block::HistoryRecord` needed for the palette — kept minimal so we
-/// stay forward-compatible with new fields in the on-disk format.
-#[derive(Debug, Clone, serde::Deserialize)]
-pub(crate) struct HistoryItem {
-    pub command: String,
-    #[serde(default)]
-    pub cwd: String,
-    #[serde(default)]
-    pub exit_code: i32,
-    #[serde(default)]
-    pub end_time_ms: Option<u64>,
+pub(crate) fn read_history(path: &Path, max: usize) -> Vec<command_history::CommandHistoryRecord> {
+    command_history::read_recent(path, max).unwrap_or_default()
 }
 
 /// Run the query against all enabled sources, score, sort, and return up to
@@ -284,8 +258,8 @@ fn push_if_match(matcher: &SkimMatcherV2, needle: &str, mut e: Entry, out: &mut 
     }
 }
 
-fn history_sublabel(item: &HistoryItem) -> String {
-    let cwd = shorten_path(&item.cwd);
+fn history_sublabel(item: &command_history::CommandHistoryRecord) -> String {
+    let cwd = shorten_path(item.cwd.as_deref().unwrap_or_default());
     if item.exit_code != 0 {
         format!("{cwd}  · exit {}", item.exit_code)
     } else {
@@ -349,6 +323,7 @@ mod tests {
             description: "rebase onto target".to_string(),
             command: "git rebase {{t}}".to_string(),
             tags: vec!["git".to_string()],
+            shell: None,
             args: vec![],
             source_path: Some(std::path::PathBuf::from("/tmp/wf.yaml")),
         };

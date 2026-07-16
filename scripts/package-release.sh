@@ -2,6 +2,7 @@
 # Assemble a deterministic, user-local Linux release bundle.
 
 set -euo pipefail
+umask 022
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
@@ -36,11 +37,22 @@ trap 'rm -rf -- "${STAGE_DIR}"' EXIT
 install -Dm755 "${BINARY}" "${PACKAGE_ROOT}/bin/jterm1"
 install -Dm755 scripts/support-bundle.sh "${PACKAGE_ROOT}/bin/jterm1-support-bundle"
 install -Dm755 packaging/install-release.sh "${PACKAGE_ROOT}/install.sh"
+install -Dm755 scripts/uninstall.sh "${PACKAGE_ROOT}/uninstall.sh"
 install -Dm644 packaging/RELEASE_README.md "${PACKAGE_ROOT}/README.txt"
 printf '%s\n' "${VERSION}" > "${PACKAGE_ROOT}/VERSION"
 
 install -Dm644 packaging/app.jterm1.desktop \
-    "${PACKAGE_ROOT}/share/applications/app.jterm1.desktop"
+    "${PACKAGE_ROOT}/share/applications/io.github.beamiter.jterm1.desktop"
+install -Dm644 packaging/app.jterm1.metainfo.xml \
+    "${PACKAGE_ROOT}/share/metainfo/io.github.beamiter.jterm1.metainfo.xml"
+install -Dm644 packaging/app.jterm1.svg \
+    "${PACKAGE_ROOT}/share/icons/hicolor/scalable/apps/io.github.beamiter.jterm1.svg"
+for size in 128 256; do
+    if [[ -f "packaging/app.jterm1-${size}.png" ]]; then
+        install -Dm644 "packaging/app.jterm1-${size}.png" \
+            "${PACKAGE_ROOT}/share/icons/hicolor/${size}x${size}/apps/io.github.beamiter.jterm1.png"
+    fi
+done
 install -Dm644 README.md "${PACKAGE_ROOT}/share/doc/jterm1/README.md"
 install -Dm644 config.toml.example \
     "${PACKAGE_ROOT}/share/doc/jterm1/config.toml.example"
@@ -54,6 +66,8 @@ rustc=$(rustc --version)
 EOF_BUILDINFO
 
 install -d "${PACKAGE_ROOT}/share/jterm1/shell-integration"
+install -m644 scripts/shell-integration/README.md \
+    "${PACKAGE_ROOT}/share/jterm1/shell-integration/"
 install -m644 scripts/shell-integration/jterm1.* \
     "${PACKAGE_ROOT}/share/jterm1/shell-integration/"
 

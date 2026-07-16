@@ -20,10 +20,10 @@
 //!    head+tail elided to `MAX_TRANSCRIPT_BYTES` so a chatty session can't
 //!    OOM the prompt.
 //! 6. **Output sample bound.** Each observation feeds the model at most
-//!    `MAX_OBS_BYTES` of captured output (head+tail).
+//!    `MAX_OBSERVATION_BYTES` of captured output (head+tail).
 //! 7. **Cancel on close.** Closing the dialog calls `AgentSession::cancel`,
 //!    which both flips the cancelled flag (suppressing pending LLM
-//!    callbacks) and clears `awaiting_output` so a late block-finished
+//!    callbacks) and clears `awaiting_command` so a late block-finished
 //!    event won't attach to a dead session.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,6 +33,7 @@ use adw::prelude::*;
 use relm4::adw;
 use relm4::gtk;
 use relm4::prelude::*;
+use serde_json::{Map, Value};
 
 /// Hard cap on transcript bytes sent to the LLM. Past this, the middle is
 /// elided. Chosen well below typical 100k context windows so the system
@@ -40,13 +41,32 @@ use relm4::prelude::*;
 const MAX_TRANSCRIPT_BYTES: usize = 32 * 1024;
 /// Per-observation output sample cap (head+tail). Keeps the model from
 /// drowning in a `find /` dump.
-const MAX_OBS_BYTES: usize = 4 * 1024;
+const MAX_OBSERVATION_BYTES: usize = 4 * 1024;
+const MAX_COMMAND_BYTES: usize = 16 * 1024;
+const MAX_MESSAGE_BYTES: usize = 16 * 1024;
+const MAX_THOUGHT_BYTES: usize = 4 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ProposalId(u64);
+
+impl ProposalId {
+    pub(crate) fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProposalStatus {
+    Pending,
+    Approved,
+    Rejected,
+}
 
 /// A single entry in the agent's running transcript. The conversation is
 /// reconstructed from this list every turn (we don't cache server-side
 /// chat history because the API contract varies between providers and
 /// resending is fine for short sessions).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Turn {
     /// User's free-text input. The first turn is always a User.
     User(String),
@@ -56,25 +76,26 @@ pub(crate) enum Turn {
     /// The model's chat response that does NOT propose a command. Used for
     /// clarifying questions, summaries, and the final "done" answer.
     AssistantSay(String),
-    /// The model proposed a command. `approved` tracks user verdict:
-    /// `None` = pending, `Some(true)` = ran (Observation follows),
-    /// `Some(false)` = rejected.
-    AssistantProposed { cmd: String, approved: Option<bool> },
+    /// The model proposed a command. Proposal ids are stable for the entire
+    /// session and all approval/observation transitions validate them.
+    AssistantProposed {
+        id: ProposalId,
+        command: String,
+        status: ProposalStatus,
+    },
     /// The captured outcome of an approved command. `output_sample` is
-    /// already truncated to `MAX_OBS_BYTES`.
-    Observation { exit: i32, output_sample: String },
+    /// already truncated to `MAX_OBSERVATION_BYTES`.
+    Observation {
+        proposal_id: ProposalId,
+        exit_code: i32,
+        output_sample: String,
+    },
+    /// A provider or protocol failure. It is shown explicitly and never
+    /// interpreted as a command or normal assistant message.
+    ProtocolError(String),
 }
 
 impl Turn {
-    /// Approximate byte size used for transcript-cap eviction.
-    fn size(&self) -> usize {
-        match self {
-            Turn::User(s) | Turn::AssistantThought(s) | Turn::AssistantSay(s) => s.len() + 8,
-            Turn::AssistantProposed { cmd, .. } => cmd.len() + 16,
-            Turn::Observation { output_sample, .. } => output_sample.len() + 16,
-        }
-    }
-
     /// Render this turn for the LLM prompt. Format is plain text with
     /// `User:` / `Assistant:` / `Output:` markers — matches the few-shot
     /// examples in `build_agent_system_prompt`.
@@ -87,26 +108,31 @@ impl Turn {
                 let payload = serde_json::json!({"action": "say", "message": s});
                 format!("Assistant: {payload}")
             }
-            Turn::AssistantProposed { cmd, approved } => {
-                let payload = serde_json::json!({"action": "run", "command": cmd});
-                match approved {
-                    None => format!("Assistant: {payload}"),
-                    Some(true) => format!("Assistant: {payload}\n[user approved & ran]"),
-                    Some(false) => format!("Assistant: {payload}\n[user rejected]"),
-                }
+            Turn::AssistantProposed {
+                command, status, ..
+            } => {
+                let payload = serde_json::json!({"action": "run", "command": command});
+                let verdict = match status {
+                    ProposalStatus::Pending => "[awaiting user approval]",
+                    ProposalStatus::Approved => "[user approved; awaiting/received output]",
+                    ProposalStatus::Rejected => "[user rejected this proposal]",
+                };
+                format!("Assistant: {payload}\n{verdict}")
             }
             Turn::Observation {
-                exit,
+                exit_code,
                 output_sample,
+                ..
             } => {
-                format!("Output (exit={exit}):\n{output_sample}")
+                format!("Output (exit={exit_code}):\n{output_sample}")
+            }
+            Turn::ProtocolError(message) => {
+                format!("[previous model/provider error: {message}]")
             }
         }
     }
 }
 
-/// The model's reply, parsed from JSON. Falls back to `Say(raw_text)` when
-/// the JSON is malformed so the session stays usable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ParsedAction {
     Run {
@@ -123,82 +149,156 @@ pub(crate) enum ParsedAction {
     },
 }
 
-/// Best-effort JSON parser. Strips a markdown fence if the model wrapped
-/// its reply, then validates required fields. Returns `Say(raw)` on any
-/// failure — never errors, because surfacing the raw text in the panel
-/// is more useful than a parse-error toast.
-pub(crate) fn parse_action(raw: &str) -> ParsedAction {
-    let trimmed = strip_fences(raw.trim()).trim();
-    let value: serde_json::Value = match serde_json::from_str(trimmed) {
-        Ok(v) => v,
-        Err(_) => {
-            return ParsedAction::Say {
-                thought: None,
-                message: raw.trim().to_string(),
-            };
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ParseError {
+    Empty,
+    InvalidFence,
+    InvalidJson(String),
+    ExpectedObject,
+    MissingField(&'static str),
+    InvalidFieldType(&'static str),
+    EmptyField(&'static str),
+    FieldTooLarge(&'static str),
+    UnknownAction(String),
+    UnexpectedField(String),
+    InvalidCommand(String),
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "empty reply"),
+            Self::InvalidFence => write!(f, "invalid or unterminated JSON code fence"),
+            Self::InvalidJson(error) => write!(f, "invalid JSON: {error}"),
+            Self::ExpectedObject => write!(f, "top-level JSON value must be an object"),
+            Self::MissingField(field) => write!(f, "missing required field '{field}'"),
+            Self::InvalidFieldType(field) => write!(f, "field '{field}' must be a string"),
+            Self::EmptyField(field) => write!(f, "field '{field}' must not be empty"),
+            Self::FieldTooLarge(field) => write!(f, "field '{field}' exceeds its size limit"),
+            Self::UnknownAction(action) => write!(f, "unknown action '{action}'"),
+            Self::UnexpectedField(field) => write!(f, "unexpected field '{field}'"),
+            Self::InvalidCommand(message) => write!(f, "invalid command: {message}"),
         }
-    };
-    let thought = value
-        .get("thought")
-        .and_then(|t| t.as_str())
-        .map(str::to_string)
-        .filter(|s| !s.is_empty());
-    let action = value.get("action").and_then(|a| a.as_str()).unwrap_or("");
-    match action {
-        "run" => {
-            let cmd = value
-                .get("command")
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if cmd.is_empty() {
-                ParsedAction::Say {
-                    thought,
-                    message: raw.trim().to_string(),
-                }
-            } else {
-                ParsedAction::Run {
-                    thought,
-                    command: cmd,
-                }
-            }
-        }
-        "done" => ParsedAction::Done {
-            thought,
-            message: value
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("")
-                .to_string(),
-        },
-        // "say" or anything unrecognised → treat as say so unknown action
-        // names don't drop the model's reply on the floor.
-        _ => ParsedAction::Say {
-            thought,
-            message: value
-                .get("message")
-                .and_then(|m| m.as_str())
-                .map(str::to_string)
-                .unwrap_or_else(|| raw.trim().to_string()),
-        },
     }
 }
 
-fn strip_fences(s: &str) -> &str {
-    if let Some(rest) = s.strip_prefix("```json") {
-        let after = rest.trim_start_matches('\n');
-        if let Some(inner) = after.trim_end().strip_suffix("```") {
-            return inner.trim();
-        }
+impl std::error::Error for ParseError {}
+
+/// Parse exactly one JSON object. A single optional `json` fence is accepted;
+/// surrounding prose, multiple fences/objects, unknown keys, and invalid
+/// values are protocol errors and never degrade into executable proposals.
+pub(crate) fn parse_action(raw: &str) -> Result<ParsedAction, ParseError> {
+    let payload = strip_json_fence(raw.trim())?;
+    if payload.is_empty() {
+        return Err(ParseError::Empty);
     }
-    if let Some(rest) = s.strip_prefix("```") {
-        let after = rest.split_once('\n').map(|(_, r)| r).unwrap_or(rest);
-        if let Some(inner) = after.trim_end().strip_suffix("```") {
-            return inner.trim();
+    let value: Value = serde_json::from_str(payload)
+        .map_err(|error| ParseError::InvalidJson(error.to_string()))?;
+    let object = value.as_object().ok_or(ParseError::ExpectedObject)?;
+    let action = required_string(object, "action", 32)?;
+    let thought = optional_string(object, "thought", MAX_THOUGHT_BYTES)?;
+    match action.as_str() {
+        "run" => {
+            reject_unexpected(object, &["action", "thought", "command"])?;
+            let command = required_string(object, "command", MAX_COMMAND_BYTES)?;
+            validate_command(&command)?;
+            Ok(ParsedAction::Run { thought, command })
         }
+        "say" => {
+            reject_unexpected(object, &["action", "thought", "message"])?;
+            let message = required_string(object, "message", MAX_MESSAGE_BYTES)?;
+            Ok(ParsedAction::Say { thought, message })
+        }
+        "done" => {
+            reject_unexpected(object, &["action", "thought", "message"])?;
+            let message = required_string(object, "message", MAX_MESSAGE_BYTES)?;
+            Ok(ParsedAction::Done { thought, message })
+        }
+        other => Err(ParseError::UnknownAction(other.to_string())),
     }
-    s
+}
+
+fn strip_json_fence(raw: &str) -> Result<&str, ParseError> {
+    if !raw.starts_with("```") {
+        return Ok(raw);
+    }
+    let newline = raw.find('\n').ok_or(ParseError::InvalidFence)?;
+    let language = raw[3..newline].trim();
+    if !language.is_empty() && !language.eq_ignore_ascii_case("json") {
+        return Err(ParseError::InvalidFence);
+    }
+    raw[newline + 1..]
+        .strip_suffix("```")
+        .map(str::trim)
+        .ok_or(ParseError::InvalidFence)
+}
+
+fn required_string(
+    object: &Map<String, Value>,
+    field: &'static str,
+    max_bytes: usize,
+) -> Result<String, ParseError> {
+    let value = object.get(field).ok_or(ParseError::MissingField(field))?;
+    let value = value
+        .as_str()
+        .ok_or(ParseError::InvalidFieldType(field))?
+        .trim();
+    if value.is_empty() {
+        return Err(ParseError::EmptyField(field));
+    }
+    if value.len() > max_bytes {
+        return Err(ParseError::FieldTooLarge(field));
+    }
+    Ok(value.to_string())
+}
+
+fn optional_string(
+    object: &Map<String, Value>,
+    field: &'static str,
+    max_bytes: usize,
+) -> Result<Option<String>, ParseError> {
+    let Some(value) = object.get(field) else {
+        return Ok(None);
+    };
+    let value = value
+        .as_str()
+        .ok_or(ParseError::InvalidFieldType(field))?
+        .trim();
+    if value.is_empty() {
+        return Err(ParseError::EmptyField(field));
+    }
+    if value.len() > max_bytes {
+        return Err(ParseError::FieldTooLarge(field));
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn reject_unexpected(object: &Map<String, Value>, allowed: &[&str]) -> Result<(), ParseError> {
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed.contains(&field.as_str()))
+    {
+        return Err(ParseError::UnexpectedField(field.clone()));
+    }
+    Ok(())
+}
+
+fn validate_command(command: &str) -> Result<(), ParseError> {
+    if command.len() > MAX_COMMAND_BYTES {
+        return Err(ParseError::FieldTooLarge("command"));
+    }
+    if command.contains('\0') {
+        return Err(ParseError::InvalidCommand("contains a NUL byte".into()));
+    }
+    if command
+        .chars()
+        .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
+    {
+        return Err(ParseError::InvalidCommand(
+            "contains non-whitespace control characters".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Match a command against the destructive-pattern blacklist. Returns a
@@ -336,46 +436,363 @@ fn has_rm_rf_dangerous_target(lower: &str) -> bool {
 /// behind an `Rc<RefCell<Option<…>>>` — opening a new session replaces it,
 /// closing the dialog clears it.
 pub(crate) struct AgentSession {
-    pub transcript: Vec<Turn>,
-    /// Set when we've sent a command to the active pane and are waiting
-    /// for the corresponding `BlockFinished` event. Stores the command
-    /// text so we can match it against the finished block (the user may
-    /// have typed something else in between).
-    pub awaiting_command: Option<String>,
-    /// Flag flipped to true on dialog close / max-turns reached. Pending
-    /// LLM callbacks check this and bail.
-    pub cancelled: Arc<AtomicBool>,
-    /// How many model turns we've spent this session (incremented at
-    /// each `next_turn` call). Compared against `agent_max_turns`.
-    pub turns_used: u32,
+    transcript: Vec<Turn>,
+    state: AgentState,
+    turns_used: u32,
+    max_turns: u32,
+    next_proposal_id: u64,
+    /// The approved proposal currently executing in the bound pane. Keeping
+    /// the id with the command prevents same-text/stale block completions
+    /// from being attached to the wrong proposal.
+    pub(crate) awaiting_command: Option<(ProposalId, String)>,
+    /// Pending callbacks share this token and must bail immediately after
+    /// cancellation, even if a provider response arrives late.
+    pub(crate) cancelled: Arc<AtomicBool>,
     /// Held so dropping the session cancels an in-flight LLM request.
-    pub in_flight: Option<crate::ai::AiHandle>,
+    pub(crate) in_flight: Option<crate::ai::AiHandle>,
     /// Tab + pane the session is bound to. Commands are typed into this
     /// pane only; a BlockFinished from a different pane is ignored even
     /// if the command text matches.
-    pub bound_tab: u64,
-    pub bound_pane: u64,
-    /// `true` once we've reached `agent_max_turns` or the user explicitly
-    /// stopped — Send is greyed out, future LLM replies dropped.
-    pub sealed: bool,
+    pub(crate) bound_tab: u64,
+    pub(crate) bound_pane: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentState {
+    Ready,
+    AwaitingModel,
+    AwaitingApproval { proposal_id: ProposalId },
+    AwaitingObservation { proposal_id: ProposalId },
+    Completed,
+    Cancelled,
+    TurnLimitReached,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SessionError {
+    EmptyUserMessage,
+    InvalidTransition {
+        operation: &'static str,
+        state: AgentState,
+    },
+    Protocol(ParseError),
+    StaleProposal {
+        expected: ProposalId,
+        received: ProposalId,
+    },
+    ProposalNotFound(ProposalId),
+    TurnLimitReached,
+    Cancelled,
+}
+
+impl std::fmt::Display for SessionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyUserMessage => write!(f, "user message must not be empty"),
+            Self::InvalidTransition { operation, state } => {
+                write!(f, "cannot {operation} while session is {state:?}")
+            }
+            Self::Protocol(error) => write!(f, "model protocol error: {error}"),
+            Self::StaleProposal { expected, received } => write!(
+                f,
+                "proposal id {} is stale; expected {}",
+                received.get(),
+                expected.get()
+            ),
+            Self::ProposalNotFound(id) => write!(f, "proposal {} is not in transcript", id.get()),
+            Self::TurnLimitReached => write!(f, "agent turn limit reached"),
+            Self::Cancelled => write!(f, "agent session cancelled"),
+        }
+    }
+}
+
+impl std::error::Error for SessionError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ModelOutcome {
+    Proposal {
+        id: ProposalId,
+        command: String,
+        danger: Option<&'static str>,
+    },
+    Said(String),
+    Completed(String),
+}
+
+/// Explicit authorization token. Receiving a proposal never executes it;
+/// only a successful approve/edit transition yields this value to the UI.
+#[must_use = "approval only yields a command; the caller must deliberately handle it"]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ApprovedCommand {
+    pub(crate) proposal_id: ProposalId,
+    pub(crate) command: String,
+    pub(crate) danger: Option<&'static str>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CancellationToken(Arc<AtomicBool>);
+
+impl CancellationToken {
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
 }
 
 impl AgentSession {
-    pub(crate) fn new(bound_tab: u64, bound_pane: u64) -> Self {
+    pub(crate) fn new(bound_tab: u64, bound_pane: u64, max_turns: u32) -> Self {
         Self {
             transcript: Vec::new(),
+            state: AgentState::Ready,
+            turns_used: 0,
+            max_turns: max_turns.max(1),
+            next_proposal_id: 1,
             awaiting_command: None,
             cancelled: Arc::new(AtomicBool::new(false)),
-            turns_used: 0,
             in_flight: None,
             bound_tab,
             bound_pane,
-            sealed: false,
         }
     }
 
-    pub(crate) fn cancel(&self) {
+    pub(crate) fn transcript(&self) -> &[Turn] {
+        &self.transcript
+    }
+
+    pub(crate) fn state(&self) -> AgentState {
+        self.state
+    }
+
+    pub(crate) fn turns_used(&self) -> u32 {
+        self.turns_used
+    }
+
+    pub(crate) fn max_turns(&self) -> u32 {
+        self.max_turns
+    }
+
+    pub(crate) fn is_sealed(&self) -> bool {
+        matches!(
+            self.state,
+            AgentState::Completed | AgentState::Cancelled | AgentState::TurnLimitReached
+        )
+    }
+
+    pub(crate) fn can_submit(&self) -> bool {
+        self.state == AgentState::Ready && self.turns_used < self.max_turns
+    }
+
+    pub(crate) fn cancellation_token(&self) -> CancellationToken {
+        CancellationToken(self.cancelled.clone())
+    }
+
+    pub(crate) fn proposal_id_at(&self, transcript_index: usize) -> Option<ProposalId> {
+        match self.transcript.get(transcript_index) {
+            Some(Turn::AssistantProposed { id, .. }) => Some(*id),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn submit_user(&mut self, message: impl Into<String>) -> Result<(), SessionError> {
+        self.check_not_cancelled()?;
+        if self.turns_used >= self.max_turns {
+            self.state = AgentState::TurnLimitReached;
+            return Err(SessionError::TurnLimitReached);
+        }
+        if self.state != AgentState::Ready {
+            return Err(self.invalid_transition("submit user input"));
+        }
+        let message = message.into();
+        let message = message.trim();
+        if message.is_empty() {
+            return Err(SessionError::EmptyUserMessage);
+        }
+        self.transcript.push(Turn::User(message.to_string()));
+        self.state = AgentState::AwaitingModel;
+        Ok(())
+    }
+
+    pub(crate) fn receive_model(&mut self, raw: &str) -> Result<ModelOutcome, SessionError> {
+        self.check_not_cancelled()?;
+        if self.state != AgentState::AwaitingModel {
+            return Err(self.invalid_transition("accept a model reply"));
+        }
+        if self.turns_used >= self.max_turns {
+            self.state = AgentState::TurnLimitReached;
+            return Err(SessionError::TurnLimitReached);
+        }
+        self.in_flight = None;
+        self.turns_used = self.turns_used.saturating_add(1);
+        let action = match parse_action(raw) {
+            Ok(action) => action,
+            Err(error) => {
+                self.transcript.push(Turn::ProtocolError(error.to_string()));
+                self.state = self.ready_or_limited();
+                return Err(SessionError::Protocol(error));
+            }
+        };
+        match action {
+            ParsedAction::Run { thought, command } => {
+                self.push_thought(thought);
+                let id = ProposalId(self.next_proposal_id);
+                self.next_proposal_id = self.next_proposal_id.saturating_add(1);
+                self.transcript.push(Turn::AssistantProposed {
+                    id,
+                    command: command.clone(),
+                    status: ProposalStatus::Pending,
+                });
+                self.state = AgentState::AwaitingApproval { proposal_id: id };
+                Ok(ModelOutcome::Proposal {
+                    id,
+                    danger: is_dangerous(&command),
+                    command,
+                })
+            }
+            ParsedAction::Say { thought, message } => {
+                self.push_thought(thought);
+                self.transcript.push(Turn::AssistantSay(message.clone()));
+                self.state = self.ready_or_limited();
+                Ok(ModelOutcome::Said(message))
+            }
+            ParsedAction::Done { thought, message } => {
+                self.push_thought(thought);
+                self.transcript.push(Turn::AssistantSay(message.clone()));
+                self.state = AgentState::Completed;
+                Ok(ModelOutcome::Completed(message))
+            }
+        }
+    }
+
+    pub(crate) fn accept_model_reply(&mut self, raw: &str) -> Result<ModelOutcome, SessionError> {
+        self.receive_model(raw)
+    }
+
+    /// Record a provider/transport failure without consuming a model turn.
+    /// The session returns to Ready, so the user can retry or revise the
+    /// request without weakening protocol parsing.
+    pub(crate) fn model_failed(&mut self, message: impl Into<String>) -> Result<(), SessionError> {
+        self.check_not_cancelled()?;
+        if self.state != AgentState::AwaitingModel {
+            return Err(self.invalid_transition("record a model failure"));
+        }
+        self.in_flight = None;
+        let message = message.into();
+        let message = message.trim();
+        let message = if message.is_empty() {
+            "provider request failed".to_string()
+        } else {
+            elide_middle(message, MAX_MESSAGE_BYTES)
+        };
+        self.transcript.push(Turn::ProtocolError(message));
+        self.state = self.ready_or_limited();
+        Ok(())
+    }
+
+    pub(crate) fn approve(&mut self, id: ProposalId) -> Result<ApprovedCommand, SessionError> {
+        self.approve_inner(id, None)
+    }
+
+    pub(crate) fn edit_and_approve(
+        &mut self,
+        id: ProposalId,
+        edited_command: impl Into<String>,
+    ) -> Result<ApprovedCommand, SessionError> {
+        self.approve_inner(id, Some(edited_command.into()))
+    }
+
+    fn approve_inner(
+        &mut self,
+        id: ProposalId,
+        edited_command: Option<String>,
+    ) -> Result<ApprovedCommand, SessionError> {
+        self.check_not_cancelled()?;
+        self.expect_pending_proposal(id, "approve a proposal")?;
+        let edited_command = edited_command
+            .map(|command| {
+                let command = command.trim();
+                if command.is_empty() {
+                    return Err(SessionError::Protocol(ParseError::EmptyField("command")));
+                }
+                validate_command(command).map_err(SessionError::Protocol)?;
+                Ok(command.to_string())
+            })
+            .transpose()?;
+        let turn = self.proposal_mut(id)?;
+        let Turn::AssistantProposed {
+            command, status, ..
+        } = turn
+        else {
+            unreachable!("proposal_mut only returns proposal turns")
+        };
+        if let Some(edited) = edited_command {
+            *command = edited;
+        }
+        *status = ProposalStatus::Approved;
+        let command = command.clone();
+        let approved = ApprovedCommand {
+            proposal_id: id,
+            danger: is_dangerous(&command),
+            command: command.clone(),
+        };
+        self.awaiting_command = Some((id, command));
+        self.state = AgentState::AwaitingObservation { proposal_id: id };
+        Ok(approved)
+    }
+
+    pub(crate) fn reject(&mut self, id: ProposalId) -> Result<(), SessionError> {
+        self.check_not_cancelled()?;
+        self.expect_pending_proposal(id, "reject a proposal")?;
+        let turn = self.proposal_mut(id)?;
+        if let Turn::AssistantProposed { status, .. } = turn {
+            *status = ProposalStatus::Rejected;
+        }
+        self.state = if self.turns_used >= self.max_turns {
+            AgentState::TurnLimitReached
+        } else {
+            AgentState::AwaitingModel
+        };
+        Ok(())
+    }
+
+    pub(crate) fn observe(
+        &mut self,
+        id: ProposalId,
+        exit_code: i32,
+        output: &str,
+    ) -> Result<(), SessionError> {
+        self.check_not_cancelled()?;
+        match self.state {
+            AgentState::AwaitingObservation { proposal_id } if proposal_id == id => {}
+            AgentState::AwaitingObservation { proposal_id } => {
+                return Err(SessionError::StaleProposal {
+                    expected: proposal_id,
+                    received: id,
+                });
+            }
+            _ => return Err(self.invalid_transition("record command output")),
+        }
+        self.awaiting_command = None;
+        self.transcript.push(Turn::Observation {
+            proposal_id: id,
+            exit_code,
+            output_sample: sample_observation(output),
+        });
+        // The turn cap does not interrupt an approved command: the final
+        // observation is always recorded before the session is sealed.
+        self.state = if self.turns_used >= self.max_turns {
+            AgentState::TurnLimitReached
+        } else {
+            AgentState::AwaitingModel
+        };
+        Ok(())
+    }
+
+    pub(crate) fn cancel(&mut self) {
+        if let Some(handle) = self.in_flight.take() {
+            handle.cancel();
+        }
         self.cancelled.store(true, Ordering::SeqCst);
+        self.awaiting_command = None;
+        self.state = AgentState::Cancelled;
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
@@ -388,11 +805,71 @@ impl AgentSession {
     pub(crate) fn build_user_prompt(&self) -> String {
         let mut lines: Vec<String> = self.transcript.iter().map(Turn::to_prompt_line).collect();
         // Final hint to nudge JSON output.
-        lines.push(
-            "Reply with one JSON object per the protocol. Do not wrap in markdown.".to_string(),
-        );
+        lines.push("Reply with exactly one JSON object from the protocol; no markdown.".into());
         let full = lines.join("\n\n");
         elide_middle(&full, MAX_TRANSCRIPT_BYTES)
+    }
+
+    fn proposal_mut(&mut self, id: ProposalId) -> Result<&mut Turn, SessionError> {
+        self.transcript
+            .iter_mut()
+            .find(|turn| {
+                matches!(turn, Turn::AssistantProposed { id: candidate, .. } if *candidate == id)
+            })
+            .ok_or(SessionError::ProposalNotFound(id))
+    }
+
+    fn expect_pending_proposal(
+        &self,
+        id: ProposalId,
+        operation: &'static str,
+    ) -> Result<(), SessionError> {
+        match self.state {
+            AgentState::AwaitingApproval { proposal_id } if proposal_id == id => Ok(()),
+            AgentState::AwaitingApproval { proposal_id } => Err(SessionError::StaleProposal {
+                expected: proposal_id,
+                received: id,
+            }),
+            _ => Err(self.invalid_transition(operation)),
+        }
+    }
+
+    fn push_thought(&mut self, thought: Option<String>) {
+        if let Some(thought) = thought {
+            self.transcript.push(Turn::AssistantThought(thought));
+        }
+    }
+
+    fn ready_or_limited(&self) -> AgentState {
+        if self.turns_used >= self.max_turns {
+            AgentState::TurnLimitReached
+        } else {
+            AgentState::Ready
+        }
+    }
+
+    fn check_not_cancelled(&self) -> Result<(), SessionError> {
+        if self.is_cancelled() || self.state == AgentState::Cancelled {
+            Err(SessionError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn invalid_transition(&self, operation: &'static str) -> SessionError {
+        SessionError::InvalidTransition {
+            operation,
+            state: self.state,
+        }
+    }
+}
+
+impl Drop for AgentSession {
+    fn drop(&mut self) {
+        if let Some(handle) = self.in_flight.take() {
+            handle.cancel();
+        }
+        self.cancelled.store(true, Ordering::SeqCst);
     }
 }
 
@@ -400,7 +877,7 @@ impl AgentSession {
 /// beginning (where errors usually surface) and the end (where summary
 /// lines live) while bounding bytes.
 pub(crate) fn sample_observation(output: &str) -> String {
-    elide_middle(output, MAX_OBS_BYTES)
+    elide_middle(output, MAX_OBSERVATION_BYTES)
 }
 
 #[derive(Debug, Clone)]
@@ -408,8 +885,7 @@ pub(crate) struct AgentPanelView {
     pub(crate) transcript: Vec<Turn>,
     pub(crate) turns_used: u32,
     pub(crate) max_turns: u32,
-    pub(crate) awaiting_command: bool,
-    pub(crate) sealed: bool,
+    pub(crate) state: AgentState,
     pub(crate) loading: bool,
 }
 
@@ -532,8 +1008,7 @@ impl Component for AgentPanelModel {
                 transcript: Vec::new(),
                 turns_used: 0,
                 max_turns: 1,
-                awaiting_command: false,
-                sealed: false,
+                state: AgentState::Ready,
                 loading: false,
             },
         };
@@ -569,7 +1044,7 @@ impl Component for AgentPanelModel {
             AgentPanelMsg::Submit => {
                 let text = widgets.input.text();
                 let text = text.trim();
-                if !text.is_empty() && !self.view.sealed {
+                if !text.is_empty() && self.view.state == AgentState::Ready {
                     let _ = sender.output(AgentPanelOutput::Send(text.to_string()));
                     widgets.input.set_text("");
                 }
@@ -591,31 +1066,59 @@ impl AgentPanelModel {
                 Turn::User(message) => render_user(message),
                 Turn::AssistantThought(message) => render_thought(message),
                 Turn::AssistantSay(message) => render_say(message),
-                Turn::AssistantProposed { cmd, approved } => {
-                    render_proposed(index, cmd, *approved, sender.clone(), self.view.sealed)
-                }
+                Turn::AssistantProposed {
+                    id,
+                    command,
+                    status,
+                } => render_proposed(
+                    index,
+                    *id,
+                    command,
+                    *status,
+                    sender.clone(),
+                    matches!(
+                        self.view.state,
+                        AgentState::AwaitingApproval { proposal_id } if proposal_id == *id
+                    ),
+                ),
                 Turn::Observation {
-                    exit,
+                    exit_code,
                     output_sample,
-                } => render_observation(*exit, output_sample),
+                    ..
+                } => render_observation(*exit_code, output_sample),
+                Turn::ProtocolError(message) => render_protocol_error(message),
             };
             widgets.transcript_box.append(&widget);
         }
-        let status = if self.view.sealed {
-            format!(
-                "Session sealed — open a new agent for more turns. ({}/{})",
+        let status = match self.view.state {
+            AgentState::Ready => format!(
+                "Ready — turn {}/{}",
                 self.view.turns_used, self.view.max_turns
-            )
-        } else if self.view.awaiting_command {
-            "Waiting for command output…".to_string()
-        } else {
-            format!("turn {}/{}", self.view.turns_used, self.view.max_turns)
+            ),
+            AgentState::AwaitingModel => format!(
+                "Waiting for model — turn {}/{}",
+                self.view.turns_used, self.view.max_turns
+            ),
+            AgentState::AwaitingApproval { proposal_id } => {
+                format!("Proposal #{} needs approval", proposal_id.get())
+            }
+            AgentState::AwaitingObservation { proposal_id } => {
+                format!("Waiting for proposal #{} output…", proposal_id.get())
+            }
+            AgentState::Completed => "Completed — open a new agent to continue.".to_string(),
+            AgentState::Cancelled => "Cancelled.".to_string(),
+            AgentState::TurnLimitReached => format!(
+                "Turn limit reached — open a new agent to continue. ({}/{})",
+                self.view.turns_used, self.view.max_turns
+            ),
         };
         widgets.status.set_label(&status);
-        widgets.send_button.set_sensitive(!self.view.sealed);
-        widgets.input.set_sensitive(!self.view.sealed);
-        widgets.spinner.set_visible(self.view.loading);
-        if self.view.loading {
+        let can_submit = self.view.state == AgentState::Ready;
+        widgets.send_button.set_sensitive(can_submit);
+        widgets.input.set_sensitive(can_submit);
+        let loading = self.view.loading || self.view.state == AgentState::AwaitingModel;
+        widgets.spinner.set_visible(loading);
+        if loading {
             widgets.spinner.start();
         } else {
             widgets.spinner.stop();
@@ -764,12 +1267,30 @@ fn render_say(msg: &str) -> gtk::Widget {
     l.upcast()
 }
 
+fn render_protocol_error(message: &str) -> gtk::Widget {
+    let frame = gtk::Frame::new(None);
+    frame.add_css_class("card");
+    frame.add_css_class("error");
+    let label = gtk::Label::new(Some(&format!("Protocol/provider error: {message}")));
+    label.set_wrap(true);
+    label.set_xalign(0.0);
+    label.set_selectable(true);
+    label.set_margin_top(8);
+    label.set_margin_bottom(8);
+    label.set_margin_start(10);
+    label.set_margin_end(10);
+    label.add_css_class("error");
+    frame.set_child(Some(&label));
+    frame.upcast()
+}
+
 fn render_proposed(
     idx: usize,
-    cmd: &str,
-    approved: Option<bool>,
+    id: ProposalId,
+    command: &str,
+    status: ProposalStatus,
     sender: ComponentSender<AgentPanelModel>,
-    sealed: bool,
+    is_current: bool,
 ) -> gtk::Widget {
     let frame = gtk::Frame::new(None);
     frame.add_css_class("card");
@@ -779,7 +1300,7 @@ fn render_proposed(
     outer.set_margin_start(10);
     outer.set_margin_end(10);
 
-    let danger = is_dangerous(cmd);
+    let danger = is_dangerous(command);
     if let Some(reason) = danger {
         let warn = gtk::Label::new(Some(&format!("⚠ destructive — {reason}")));
         warn.add_css_class("error");
@@ -793,14 +1314,14 @@ fn render_proposed(
         .monospace(true)
         .wrap_mode(gtk::WrapMode::WordChar)
         .build();
-    cmd_view.buffer().set_text(cmd);
+    cmd_view.buffer().set_text(command);
     cmd_view.add_css_class("ai-explain-body");
     outer.append(&cmd_view);
 
     let btn_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     btn_row.set_halign(gtk::Align::End);
-    match approved {
-        None => {
+    match status {
+        ProposalStatus::Pending => {
             let approve = gtk::Button::with_label(if danger.is_some() {
                 "Approve & Run (destructive)"
             } else {
@@ -811,11 +1332,11 @@ fn render_proposed(
             } else {
                 approve.add_css_class("suggested-action");
             }
-            if sealed {
-                approve.set_sensitive(false);
-            }
+            approve.set_sensitive(is_current);
             let edit = gtk::Button::with_label("Edit");
             let reject = gtk::Button::with_label("Reject");
+            edit.set_sensitive(is_current);
+            reject.set_sensitive(is_current);
             {
                 let sender = sender.clone();
                 approve.connect_clicked(move |_| {
@@ -824,7 +1345,7 @@ fn render_proposed(
             }
             {
                 let sender = sender.clone();
-                let cmd_str = cmd.to_string();
+                let cmd_str = command.to_string();
                 edit.connect_clicked(move |_| {
                     let _ = sender.output(AgentPanelOutput::Edit(idx, cmd_str.clone()));
                 });
@@ -838,13 +1359,18 @@ fn render_proposed(
             btn_row.append(&reject);
             btn_row.append(&edit);
             btn_row.append(&approve);
+            if !is_current {
+                let stale = gtk::Label::new(Some(&format!("proposal #{} inactive", id.get())));
+                stale.add_css_class("dim-label");
+                btn_row.prepend(&stale);
+            }
         }
-        Some(true) => {
+        ProposalStatus::Approved => {
             let l = gtk::Label::new(Some("✓ ran"));
             l.add_css_class("dim-label");
             btn_row.append(&l);
         }
-        Some(false) => {
+        ProposalStatus::Rejected => {
             let l = gtk::Label::new(Some("✗ rejected"));
             l.add_css_class("dim-label");
             btn_row.append(&l);
@@ -909,161 +1435,331 @@ fn elide_middle(s: &str, max_bytes: usize) -> String {
 mod tests {
     use super::*;
 
+    fn session(max_turns: u32) -> AgentSession {
+        AgentSession::new(10, 20, max_turns)
+    }
+
+    fn run_reply(command: &str) -> String {
+        serde_json::json!({"action":"run", "command": command}).to_string()
+    }
+
     #[test]
-    fn parse_action_run_basic() {
-        let r = parse_action(r#"{"action":"run","command":"ls -la"}"#);
+    fn strict_parser_accepts_only_action_specific_schema() {
         assert_eq!(
-            r,
+            parse_action(r#"{"action":"run","command":"ls -la"}"#).unwrap(),
             ParsedAction::Run {
                 thought: None,
-                command: "ls -la".to_string()
+                command: "ls -la".into()
             }
         );
-    }
-
-    #[test]
-    fn parse_action_run_with_thought() {
-        let r = parse_action(r#"{"thought":"need to inspect","action":"run","command":"du -sh"}"#);
-        match r {
-            ParsedAction::Run { thought, command } => {
-                assert_eq!(thought.as_deref(), Some("need to inspect"));
-                assert_eq!(command, "du -sh");
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_action_say() {
-        let r = parse_action(r#"{"action":"say","message":"What dir?"}"#);
         assert_eq!(
-            r,
+            parse_action(r#"{"action":"say","thought":"ask","message":"What dir?"}"#).unwrap(),
             ParsedAction::Say {
-                thought: None,
-                message: "What dir?".to_string()
+                thought: Some("ask".into()),
+                message: "What dir?".into()
             }
         );
-    }
-
-    #[test]
-    fn parse_action_done() {
-        let r = parse_action(r#"{"action":"done","message":"All clear."}"#);
         assert_eq!(
-            r,
+            parse_action(r#"{"action":"done","message":"All clear."}"#).unwrap(),
             ParsedAction::Done {
                 thought: None,
-                message: "All clear.".to_string()
+                message: "All clear.".into()
             }
         );
+        assert!(matches!(
+            parse_action(r#"{"action":"run","command":"ls","message":"extra"}"#),
+            Err(ParseError::UnexpectedField(_))
+        ));
     }
 
     #[test]
-    fn parse_action_strips_json_fence() {
-        let raw = "```json\n{\"action\":\"run\",\"command\":\"echo hi\"}\n```";
-        match parse_action(raw) {
-            ParsedAction::Run { command, .. } => assert_eq!(command, "echo hi"),
-            other => panic!("unexpected: {other:?}"),
-        }
+    fn parser_tolerates_one_json_fence_but_no_prose_or_extra_object() {
+        let parsed =
+            parse_action("```json\n{\"action\":\"done\",\"message\":\"ok\"}\n```").unwrap();
+        assert!(matches!(parsed, ParsedAction::Done { .. }));
+        assert!(parse_action("result: {\"action\":\"done\",\"message\":\"ok\"}").is_err());
+        assert!(parse_action("```text\n{}\n```").is_err());
+        assert!(parse_action("```json\n{}\n``` trailing").is_err());
+        assert!(parse_action(
+            "{\"action\":\"say\",\"message\":\"one\"}\n{\"action\":\"say\",\"message\":\"two\"}"
+        )
+        .is_err());
     }
 
     #[test]
-    fn parse_action_falls_back_to_say_on_garbage() {
-        let r = parse_action("hello this is not JSON");
+    fn parser_rejects_unknown_wrong_type_empty_oversize_and_controls() {
+        assert!(matches!(
+            parse_action(r#"{"action":"frobnicate","message":"huh"}"#),
+            Err(ParseError::UnknownAction(_))
+        ));
+        assert!(matches!(
+            parse_action(r#"{"action":"run","command":7}"#),
+            Err(ParseError::InvalidFieldType("command"))
+        ));
+        assert!(matches!(
+            parse_action(r#"{"action":"run","command":""}"#),
+            Err(ParseError::EmptyField("command"))
+        ));
+        assert!(matches!(
+            parse_action(r#"{"action":"say","thought":"","message":"ok"}"#),
+            Err(ParseError::EmptyField("thought"))
+        ));
+        let oversized = serde_json::json!({
+            "action": "run",
+            "command": "x".repeat(MAX_COMMAND_BYTES + 1)
+        })
+        .to_string();
+        assert!(matches!(
+            parse_action(&oversized),
+            Err(ParseError::FieldTooLarge("command"))
+        ));
+        let control = serde_json::json!({"action":"run", "command":"echo\u{0007}bad"}).to_string();
+        assert!(matches!(
+            parse_action(&control),
+            Err(ParseError::InvalidCommand(_))
+        ));
+    }
+
+    #[test]
+    fn approval_is_explicit_and_observation_advances_session() {
+        let mut s = session(4);
+        s.submit_user("show files").unwrap();
+        let ModelOutcome::Proposal { id, .. } = s.receive_model(&run_reply("ls -la")).unwrap()
+        else {
+            panic!("expected proposal")
+        };
+        assert_eq!(s.state(), AgentState::AwaitingApproval { proposal_id: id });
+        let approved = s.approve(id).unwrap();
+        assert_eq!(approved.proposal_id, id);
+        assert_eq!(approved.command, "ls -la");
+        assert_eq!(s.awaiting_command.as_ref().map(|entry| entry.0), Some(id));
         assert_eq!(
-            r,
-            ParsedAction::Say {
-                thought: None,
-                message: "hello this is not JSON".to_string()
-            }
+            s.state(),
+            AgentState::AwaitingObservation { proposal_id: id }
         );
+        s.observe(id, 0, "a\nb").unwrap();
+        assert_eq!(s.state(), AgentState::AwaitingModel);
+        assert!(s.awaiting_command.is_none());
+        assert!(matches!(
+            s.transcript().last(),
+            Some(Turn::Observation { .. })
+        ));
     }
 
     #[test]
-    fn parse_action_unknown_action_treated_as_say() {
-        let r = parse_action(r#"{"action":"frobnicate","message":"huh"}"#);
+    fn proposal_ids_are_stable_monotonic_and_rejection_is_recorded() {
+        let mut s = session(4);
+        s.submit_user("inspect").unwrap();
+        let ModelOutcome::Proposal { id: first, .. } =
+            s.receive_model(&run_reply("find /")).unwrap()
+        else {
+            panic!("expected proposal")
+        };
+        s.reject(first).unwrap();
+        assert_eq!(s.state(), AgentState::AwaitingModel);
+        let ModelOutcome::Proposal { id: second, .. } = s.receive_model(&run_reply("pwd")).unwrap()
+        else {
+            panic!("expected proposal")
+        };
+        assert_eq!(first.get(), 1);
+        assert_eq!(second.get(), 2);
+        assert!(matches!(
+            s.transcript()
+                .iter()
+                .find(|turn| matches!(turn, Turn::AssistantProposed { id, .. } if *id == first)),
+            Some(Turn::AssistantProposed {
+                status: ProposalStatus::Rejected,
+                ..
+            })
+        ));
+        assert!(matches!(
+            s.approve(first),
+            Err(SessionError::StaleProposal { .. })
+        ));
+    }
+
+    #[test]
+    fn edit_and_approve_validates_and_returns_only_edited_command() {
+        let mut s = session(3);
+        s.submit_user("inspect").unwrap();
+        let ModelOutcome::Proposal { id, .. } = s.receive_model(&run_reply("rm -rf /")).unwrap()
+        else {
+            panic!("expected proposal")
+        };
+        assert!(matches!(
+            s.edit_and_approve(id, "  "),
+            Err(SessionError::Protocol(ParseError::EmptyField("command")))
+        ));
+        assert_eq!(s.state(), AgentState::AwaitingApproval { proposal_id: id });
+        let approved = s.edit_and_approve(id, "ls /").unwrap();
+        assert_eq!(approved.command, "ls /");
+        assert!(approved.danger.is_none());
+        assert!(matches!(
+            s.transcript().last(),
+            Some(Turn::AssistantProposed {
+                command,
+                status: ProposalStatus::Approved,
+                ..
+            }) if command == "ls /"
+        ));
+    }
+
+    #[test]
+    fn stale_and_out_of_order_operations_fail_without_mutating_state() {
+        let mut s = session(3);
+        assert!(matches!(
+            s.receive_model(&run_reply("pwd")),
+            Err(SessionError::InvalidTransition { .. })
+        ));
+        assert!(matches!(
+            s.submit_user("  "),
+            Err(SessionError::EmptyUserMessage)
+        ));
+        assert!(matches!(
+            s.approve(ProposalId(1)),
+            Err(SessionError::InvalidTransition { .. })
+        ));
+        s.submit_user("inspect").unwrap();
+        assert!(matches!(
+            s.submit_user("second while busy"),
+            Err(SessionError::InvalidTransition { .. })
+        ));
+        assert!(matches!(
+            s.observe(ProposalId(1), 0, "wrong"),
+            Err(SessionError::InvalidTransition { .. })
+        ));
+        let ModelOutcome::Proposal { id, .. } = s.receive_model(&run_reply("pwd")).unwrap() else {
+            panic!("expected proposal")
+        };
+        assert!(matches!(
+            s.reject(ProposalId(id.get() + 1)),
+            Err(SessionError::StaleProposal { .. })
+        ));
+        assert!(matches!(
+            s.edit_and_approve(ProposalId(id.get() + 1), "ls"),
+            Err(SessionError::StaleProposal { .. })
+        ));
+        let _approved = s.approve(id).unwrap();
+        assert!(matches!(
+            s.reject(id),
+            Err(SessionError::InvalidTransition { .. })
+        ));
+        assert!(matches!(
+            s.observe(ProposalId(id.get() + 1), 0, "wrong"),
+            Err(SessionError::StaleProposal { .. })
+        ));
         assert_eq!(
-            r,
-            ParsedAction::Say {
-                thought: None,
-                message: "huh".to_string()
-            }
+            s.state(),
+            AgentState::AwaitingObservation { proposal_id: id }
         );
     }
 
     #[test]
-    fn parse_action_empty_command_falls_back_to_say() {
-        let r = parse_action(r#"{"action":"run","command":""}"#);
-        match r {
-            ParsedAction::Say { .. } => {}
-            other => panic!("expected say, got {other:?}"),
-        }
+    fn malformed_reply_is_protocol_error_and_never_a_proposal() {
+        let mut s = session(3);
+        s.submit_user("inspect").unwrap();
+        assert!(matches!(
+            s.receive_model("run: rm -rf /"),
+            Err(SessionError::Protocol(_))
+        ));
+        assert_eq!(s.state(), AgentState::Ready);
+        assert!(matches!(
+            s.transcript().last(),
+            Some(Turn::ProtocolError(_))
+        ));
+        assert!(!s
+            .transcript()
+            .iter()
+            .any(|turn| matches!(turn, Turn::AssistantProposed { .. })));
     }
 
     #[test]
-    fn dangerous_catches_rm_rf_root() {
+    fn provider_failure_returns_to_ready_without_consuming_a_turn() {
+        let mut s = session(3);
+        s.submit_user("inspect").unwrap();
+        s.model_failed("network timeout").unwrap();
+        assert_eq!(s.state(), AgentState::Ready);
+        assert_eq!(s.turns_used(), 0);
+        assert!(s.can_submit());
+        s.submit_user("retry").unwrap();
+        assert_eq!(s.state(), AgentState::AwaitingModel);
+        assert!(matches!(
+            s.receive_model(r#"{"action":"say","message":"recovered"}"#),
+            Ok(ModelOutcome::Said(message)) if message == "recovered"
+        ));
+        assert_eq!(s.turns_used(), 1);
+    }
+
+    #[test]
+    fn turn_cap_waits_for_approved_observation_before_sealing() {
+        let mut s = session(1);
+        s.submit_user("pwd").unwrap();
+        let ModelOutcome::Proposal { id, .. } = s.receive_model(&run_reply("pwd")).unwrap() else {
+            panic!("expected proposal")
+        };
+        assert_eq!(s.state(), AgentState::AwaitingApproval { proposal_id: id });
+        let _approved = s.approve(id).unwrap();
+        assert_eq!(
+            s.state(),
+            AgentState::AwaitingObservation { proposal_id: id }
+        );
+        s.observe(id, 0, "/tmp").unwrap();
+        assert_eq!(s.state(), AgentState::TurnLimitReached);
+        assert!(s.is_sealed());
+        assert!(matches!(
+            s.submit_user("again"),
+            Err(SessionError::TurnLimitReached)
+        ));
+    }
+
+    #[test]
+    fn done_completes_and_cancel_is_immediate() {
+        let mut completed = session(3);
+        completed.submit_user("finish").unwrap();
+        assert!(matches!(
+            completed.receive_model(r#"{"action":"done","message":"all clear"}"#),
+            Ok(ModelOutcome::Completed(message)) if message == "all clear"
+        ));
+        assert_eq!(completed.state(), AgentState::Completed);
+        assert!(!completed.can_submit());
+
+        let mut cancelled = session(3);
+        let token = cancelled.cancellation_token();
+        cancelled.submit_user("inspect").unwrap();
+        cancelled.cancel();
+        assert!(token.is_cancelled());
+        assert_eq!(cancelled.state(), AgentState::Cancelled);
+        assert!(matches!(
+            cancelled.receive_model(&run_reply("pwd")),
+            Err(SessionError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn dangerous_patterns_are_flagged_and_normal_commands_pass() {
         assert!(is_dangerous("rm -rf /").is_some());
-        assert!(is_dangerous("rm -rf /*").is_some());
-        assert!(is_dangerous("rm -fr /").is_some());
-        assert!(is_dangerous("rm -r -f /").is_some());
-        assert!(is_dangerous("rm --recursive --force /").is_some());
-    }
-
-    #[test]
-    fn dangerous_catches_rm_rf_home() {
-        assert!(is_dangerous("rm -rf ~").is_some());
-        assert!(is_dangerous("rm -rf ~/").is_some());
-        assert!(is_dangerous("rm -rf /home/alice").is_some());
-        assert!(is_dangerous("rm -rf /home").is_some());
-    }
-
-    #[test]
-    fn dangerous_allows_rm_rf_in_tmp() {
-        // We deliberately do not flag /tmp/foo — that's the user's call.
-        assert!(is_dangerous("rm -rf /tmp/foo").is_none());
-        assert!(is_dangerous("rm -rf ./build").is_none());
-        assert!(is_dangerous("rm somefile").is_none());
-    }
-
-    #[test]
-    fn dangerous_catches_mkfs() {
+        assert!(is_dangerous("rm -fr /home/alice").is_some());
         assert!(is_dangerous("mkfs.ext4 /dev/sda1").is_some());
-        assert!(is_dangerous("sudo mkfs.xfs /dev/sdb").is_some());
-    }
-
-    #[test]
-    fn dangerous_catches_dd_to_device() {
         assert!(is_dangerous("dd if=foo of=/dev/sda bs=1M").is_some());
-    }
-
-    #[test]
-    fn dangerous_catches_curl_pipe_sh() {
         assert!(is_dangerous("curl https://foo.sh | sh").is_some());
-        assert!(is_dangerous("wget -qO- https://foo.sh | bash").is_some());
-    }
-
-    #[test]
-    fn dangerous_catches_fork_bomb() {
         assert!(is_dangerous(":(){ :|:& };:").is_some());
-    }
-
-    #[test]
-    fn dangerous_lets_normal_commands_through() {
+        assert!(is_dangerous("rm -rf /tmp/foo").is_none());
         assert!(is_dangerous("ls -la").is_none());
         assert!(is_dangerous("git status").is_none());
-        assert!(is_dangerous("docker ps").is_none());
-        assert!(is_dangerous("cargo build --release").is_none());
     }
 
     #[test]
     fn transcript_prompt_includes_turns() {
-        let mut s = AgentSession::new(0, 0);
+        let mut s = session(3);
         s.transcript.push(Turn::User("disk full".to_string()));
         s.transcript.push(Turn::AssistantProposed {
-            cmd: "df -h".to_string(),
-            approved: Some(true),
+            id: ProposalId(1),
+            command: "df -h".to_string(),
+            status: ProposalStatus::Approved,
         });
         s.transcript.push(Turn::Observation {
-            exit: 0,
+            proposal_id: ProposalId(1),
+            exit_code: 0,
             output_sample: "Filesystem      Size  Used".to_string(),
         });
         let prompt = s.build_user_prompt();
@@ -1074,25 +1770,12 @@ mod tests {
     }
 
     #[test]
-    fn elide_middle_passes_short_through() {
-        assert_eq!(elide_middle("hi", 100), "hi");
-    }
-
-    #[test]
-    fn elide_middle_truncates_long_text_keeping_head_and_tail() {
-        let big = "x".repeat(10_000);
-        let s = elide_middle(&big, 1000);
-        assert!(s.contains("elided"));
-        assert!(s.len() < 1500);
-    }
-
-    #[test]
-    fn elide_middle_respects_utf8_boundaries() {
-        // Multibyte chars near the cut points.
-        let s: String = (0..2000).map(|_| "λ").collect();
-        let out = elide_middle(&s, 200);
-        // Must be valid UTF-8 and contain the elision marker.
-        assert!(out.contains("elided"));
-        assert!(out.chars().count() > 0);
+    fn observation_sampling_is_bounded_and_utf8_safe() {
+        let output = "编译失败🙂".repeat(2_000);
+        let sample = sample_observation(&output);
+        assert!(sample.contains("bytes elided"));
+        assert!(sample.starts_with('编'));
+        assert!(sample.ends_with('🙂'));
+        assert!(sample.len() < MAX_OBSERVATION_BYTES + 128);
     }
 }

@@ -6,6 +6,16 @@
 use super::*;
 
 impl AppModel {
+    /// Apply sidebar visibility and optionally persist the user's choice.
+    pub(crate) fn set_sidebar_visible(&mut self, visible: bool, persist: bool) {
+        self.sidebar_visible = visible;
+        self.sidebar_box.set_visible(visible);
+        if persist {
+            self.config.borrow_mut().sidebar_visible = visible;
+            self.persist_config();
+        }
+    }
+
     /// Move the tab strip into the holder matching the current placement and
     /// flip its orientation; sidebar = vertical list, top bar = horizontal.
     pub(crate) fn apply_tab_placement(&self) {

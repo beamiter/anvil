@@ -22,6 +22,7 @@ scrollback = 5000
 terminal_mode = "block"     # "block" or "vte"; applies to newly created panes
 tab_placement = "sidebar"   # "sidebar" or "top"
 sidebar_view = "tabs"       # "tabs" or "files"
+sidebar_visible = true
 sidebar_width = 220
 tab_width = 180
 
@@ -67,11 +68,20 @@ allow_remote_clipboard_write = false
 notify_long_blocks = true
 notify_long_block_threshold_ms = 10000
 
-# Optional AI surfaces. Provider credentials and endpoints are environment
-# variables; do not place API keys in this file.
+# Optional AI surfaces. Credentials (JTERM1_AI_API_KEY, ANTHROPIC_API_KEY,
+# OPENAI_API_KEY, or OLLAMA_API_KEY) remain environment-only and are never
+# written by jterm1. The generic key takes precedence. Provider aliases
+# `claude`, `openai`, and `openai_compatible` are accepted and normalized. Environment overrides take
+# precedence over this file: JTERM1_AI_PROVIDER, JTERM1_AI_MODEL,
+# JTERM1_AI_BASE_URL, JTERM1_AI_MAX_TOKENS, and JTERM1_AI_REDACT_SECRETS.
 ai_enabled = true
 agent_enabled = true
 agent_max_turns = 20
+ai_provider = "anthropic"       # anthropic | openai-compatible | ollama
+ai_model = "claude-sonnet-4-6"
+ai_base_url = "https://api.anthropic.com"
+ai_max_tokens = 1024             # 1 .. 32768
+ai_redact_secrets = true
 
 # Explicitly start with no saved SSH targets. To add targets, remove this line
 # and uncomment one or more [[remote_hosts]] examples at the end of this file.
@@ -127,6 +137,7 @@ remote_hosts = []
 # reinput_selected_commands = "Ctrl+Shift+I"
 # toggle_debug_dashboard = "F12"
 # open_ai_panel = "Ctrl+Alt+Shift+A"
+# ask_ai_about_selected_block = "Ctrl+Shift+Q"
 # open_workflows = "Ctrl+Shift+M"
 # open_agent = "Ctrl+Alt+G"
 

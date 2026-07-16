@@ -14,6 +14,7 @@
 # Guard against double-sourcing in the same shell.
 [[ -n ${__JTERM1_BASH_LOADED:-} ]] && return 0
 __JTERM1_BASH_LOADED=1
+__jterm1_integration_source=${BASH_SOURCE[0]}
 
 # Send raw OSC payload terminated with BEL.
 __jterm1_osc() { printf '\033]%s\007' "$1"; }
@@ -58,11 +59,21 @@ __jterm1_report_cwd() {
 # only emits ;C for the first command of a pipeline.
 
 __jterm1_in_command=0
+__jterm1_in_prompt_command=0
 
 __jterm1_preexec() {
-    # Don't fire inside PROMPT_COMMAND itself.
     [[ -n ${COMP_LINE:-} ]] && return
-    [[ ${BASH_COMMAND} == "${PROMPT_COMMAND}" ]] && return
+    [[ ${BASH_SOURCE[1]:-} == "$__jterm1_integration_source" ]] && return
+
+    # DEBUG also fires inside PROMPT_COMMAND functions. Mark the complete
+    # prompt phase so neither our hook nor a user's existing hook creates a
+    # phantom command block.
+    if [[ ${BASH_COMMAND} == "__jterm1_prompt_command" ]]; then
+        __jterm1_in_prompt_command=1
+        return
+    fi
+    (( __jterm1_in_prompt_command == 1 )) && return
+
     if (( __jterm1_in_command == 0 )); then
         __jterm1_in_command=1
         __jterm1_command_start
@@ -70,7 +81,7 @@ __jterm1_preexec() {
 }
 
 __jterm1_precmd() {
-    local ec=$?
+    local ec=$1
     if (( __jterm1_in_command == 1 )); then
         __jterm1_command_end "${ec}"
         __jterm1_in_command=0
@@ -86,7 +97,21 @@ __jterm1_precmd() {
     fi
 }
 
-trap '__jterm1_preexec' DEBUG
-PROMPT_COMMAND="__jterm1_precmd;${PROMPT_COMMAND:-:}"
+# Preserve every existing prompt hook, including Bash 5's array form, while
+# making this dispatcher the sole PROMPT_COMMAND visible to the DEBUG trap.
+__jterm1_saved_prompt_commands=("${PROMPT_COMMAND[@]:-}")
+__jterm1_prompt_command() {
+    local ec=$?
+    local command
+    __jterm1_in_prompt_command=1
+    __jterm1_precmd "$ec"
+    for command in "${__jterm1_saved_prompt_commands[@]}"; do
+        [[ -n $command ]] && builtin eval -- "$command"
+    done
+    __jterm1_in_prompt_command=0
+}
 
+unset PROMPT_COMMAND
+PROMPT_COMMAND=__jterm1_prompt_command
 export TERM_PROGRAM=jterm1
+trap '__jterm1_preexec' DEBUG

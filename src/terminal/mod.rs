@@ -1,6 +1,7 @@
 pub mod alt;
 pub mod ansi;
 pub mod block;
+mod cross_block_search;
 pub mod grid;
 pub mod kitty_graphics;
 pub mod select;

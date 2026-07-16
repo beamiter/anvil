@@ -40,7 +40,9 @@ jobs:
             libgtk-4-dev \
             libadwaita-1-dev \
             libvte-2.91-gtk4-dev \
+            appstream \
             desktop-file-utils \
+            file \
             xvfb
 
       - name: Install Rust toolchain
@@ -84,6 +86,15 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo build --release --locked
 
+      - name: Validate install and support scripts
+        if: ${{ !cancelled() }}
+        run: |
+          bash -n scripts/install.sh scripts/uninstall.sh scripts/package-release.sh \
+            scripts/support-bundle.sh packaging/install-release.sh
+          scripts/install.sh --help >/dev/null
+          scripts/uninstall.sh --help >/dev/null
+          scripts/install.sh --backend cargo --no-config --no-desktop --dry-run >/dev/null
+
       - name: Validate CLI and desktop integration
         if: ${{ !cancelled() }}
         run: |
@@ -111,17 +122,24 @@ jobs:
           XDG_CONFIG_HOME="${config_root}" target/release/jterm1 --check-config
           test -s "${config_root}/jterm1/config.toml.before-restore"
           desktop-file-validate packaging/app.jterm1.desktop
+          appstreamcli validate --no-net packaging/app.jterm1.metainfo.xml
+          file packaging/app.jterm1-128.png | grep -F '128 x 128'
+          file packaging/app.jterm1-256.png | grep -F '256 x 256'
 
-      - name: Build and verify portable release bundle
+      - name: Build and verify relocatable release bundle
         if: ${{ !cancelled() }}
         run: |
           bash scripts/package-release.sh target/release/jterm1
           (cd target/dist && sha256sum --check *.sha256)
           JTERM1_BIN=target/release/jterm1 bash scripts/support-bundle.sh target/support
           tar -tzf target/support/jterm1-support-*.tar.gz | grep -F '/doctor.json'
-          tar -tzf target/support/jterm1-support-*.tar.gz | grep -F '/config-check.json'
+          tar -tzf target/support/jterm1-support-*.tar.gz | grep -F '/doctor.txt'
+          if tar -tzf target/support/jterm1-support-*.tar.gz | grep -F '/config-check.json'; then
+            echo "support bundle unexpectedly contains config-check output" >&2
+            exit 1
+          fi
 
-      - name: Upload portable release bundle
+      - name: Upload relocatable release bundle
         if: ${{ success() }}
         uses: actions/upload-artifact@v7
         with:

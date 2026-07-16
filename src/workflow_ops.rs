@@ -7,7 +7,7 @@ use super::*;
 
 impl AppModel {
     /// Re-scan the user's workflow directory. Called before each palette
-    /// open so users see new/edited YAMLs without a restart. Cheap: a few
+    /// open so users see new/edited TOML/YAML files without a restart. Cheap: a few
     /// short files, parsed once.
     pub(crate) fn reload_workflows(&self) {
         let dirs = workflows::workflow_dirs();

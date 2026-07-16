@@ -1,9 +1,13 @@
-# jterm1 portable Linux bundle
+# jterm1 relocatable Linux bundle
 
 This archive contains a prebuilt `jterm1` binary plus its desktop entry, shell
 integrations, example workflows, documented configuration, and welcome notebook.
 It installs only into the current user's XDG directories; root access is not
 required, and an existing `config.toml` is never overwritten.
+
+The archive is relocatable before installation, but it is not statically linked
+or self-contained; the compatible GTK/libadwaita/VTE runtime libraries below
+must already exist on the target system.
 
 ## Runtime requirements
 
@@ -21,6 +25,10 @@ tar -xzf jterm1-*.tar.gz
 cd jterm1-*/
 ./install.sh
 ```
+
+The extracted `./uninstall.sh` removes the binary and installed assets while
+preserving configuration and state by default. Add `--purge-config` only when
+those user files should also be removed.
 
 After installation:
 

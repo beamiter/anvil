@@ -22,6 +22,7 @@ pub(crate) enum Action {
     OpenPalette,
     OpenHistoryPalette,
     ToggleSettings,
+    ReloadConfig,
     OpenWelcome,
     ToggleSidebar,
     SplitHorizontal,
@@ -75,11 +76,16 @@ pub(crate) enum Action {
     /// current shell context (Ctrl+Alt+Shift+A by default; Ctrl+Shift+A is the
     /// Warp-compatible Select All Blocks action).
     OpenAiPanel,
+    /// Send the selected finished Block command/output to the AI panel. The
+    /// model response is displayed only; it is never inserted or executed.
+    AskAiAboutSelectedBlock,
     /// Open the palette focused on parameterised command templates
     /// ("workflows", `:` prefix). Ctrl+Shift+M by default.
     OpenWorkflows,
     /// Open the multi-turn agent panel (Warp-style). Ctrl+Alt+G by default.
     OpenAgent,
+    /// Search command and output lines across all completed blocks.
+    CrossBlockSearch,
 }
 
 impl Action {
@@ -100,6 +106,7 @@ impl Action {
             Action::OpenPalette => "Palette: search everything",
             Action::OpenHistoryPalette => "Palette: search history",
             Action::ToggleSettings => "Toggle settings panel",
+            Action::ReloadConfig => "Reload configuration",
             Action::OpenWelcome => "Open welcome & quick start",
             Action::ToggleSidebar => "Toggle sidebar",
             Action::SplitHorizontal => "Split left/right",
@@ -156,8 +163,10 @@ impl Action {
             Action::ReinputSelectedCommands => "Reinput selected commands",
             Action::ToggleDebugDashboard => "Toggle debug dashboard",
             Action::OpenAiPanel => "Open AI panel",
+            Action::AskAiAboutSelectedBlock => "Ask AI about selected block",
             Action::OpenWorkflows => "Open workflows",
             Action::OpenAgent => "Open AI agent",
+            Action::CrossBlockSearch => "Search across blocks (ripgrep)",
         }
     }
 
@@ -178,6 +187,7 @@ impl Action {
             Action::OpenPalette => Some("open_palette"),
             Action::OpenHistoryPalette => Some("open_history_palette"),
             Action::ToggleSettings => Some("toggle_settings"),
+            Action::ReloadConfig => Some("reload_config"),
             Action::OpenWelcome => None,
             Action::ToggleSidebar => Some("toggle_sidebar"),
             Action::SplitHorizontal => Some("split_horizontal"),
@@ -220,8 +230,10 @@ impl Action {
             Action::ReinputSelectedCommands => Some("reinput_selected_commands"),
             Action::ToggleDebugDashboard => Some("toggle_debug_dashboard"),
             Action::OpenAiPanel => Some("open_ai_panel"),
+            Action::AskAiAboutSelectedBlock => Some("ask_ai_about_selected_block"),
             Action::OpenWorkflows => Some("open_workflows"),
             Action::OpenAgent => Some("open_agent"),
+            Action::CrossBlockSearch => Some("cross_block_search"),
         }
     }
 
@@ -242,6 +254,7 @@ impl Action {
             Action::OpenPalette,
             Action::OpenHistoryPalette,
             Action::ToggleSettings,
+            Action::ReloadConfig,
             Action::OpenWelcome,
             Action::ToggleSidebar,
             Action::SplitHorizontal,
@@ -282,8 +295,10 @@ impl Action {
             Action::ReinputSelectedCommands,
             Action::ToggleDebugDashboard,
             Action::OpenAiPanel,
+            Action::AskAiAboutSelectedBlock,
             Action::OpenWorkflows,
             Action::OpenAgent,
+            Action::CrossBlockSearch,
         ]
     }
 }
@@ -487,6 +502,7 @@ impl KeybindingMap {
         // Preserve Ctrl+R and Ctrl+P for shell/readline history navigation.
         bind("Ctrl+Shift+H", Action::OpenHistoryPalette);
         bind("Ctrl+Shift+O", Action::ToggleSettings);
+        bind("Ctrl+Shift+R", Action::ReloadConfig);
         bind("Ctrl+backslash", Action::ToggleSidebar);
         bind("Ctrl+Shift+L", Action::FilterTabs);
         bind("Ctrl+Shift+X", Action::FilterFailedBlocks);
@@ -522,8 +538,10 @@ impl KeybindingMap {
         bind("Ctrl+Alt+Up", Action::FocusPaneUp);
         bind("Ctrl+Alt+Down", Action::FocusPaneDown);
         bind("Ctrl+Alt+Shift+A", Action::OpenAiPanel);
+        bind("Ctrl+Shift+Q", Action::AskAiAboutSelectedBlock);
         bind("Ctrl+Shift+M", Action::OpenWorkflows);
         bind("Ctrl+Alt+G", Action::OpenAgent);
+        bind("Ctrl+Shift+G", Action::CrossBlockSearch);
 
         KeybindingMap { bindings }
     }
@@ -542,10 +560,21 @@ impl KeybindingMap {
                 log::warn!("Unknown keybinding action: {config_key}");
                 continue;
             };
+            if value.as_bool() == Some(false) {
+                self.bindings.retain(|_, bound| *bound != action);
+                continue;
+            }
             let Some(key_str) = value.as_str() else {
-                log::warn!("Keybinding value for {config_key} must be a string");
+                log::warn!("Keybinding value for {config_key} must be a chord string or false");
                 continue;
             };
+            if key_str.trim().is_empty()
+                || key_str.eq_ignore_ascii_case("none")
+                || key_str.eq_ignore_ascii_case("disabled")
+            {
+                self.bindings.retain(|_, bound| *bound != action);
+                continue;
+            }
             let combo = match parse_key_combo(key_str) {
                 Ok(combo) => combo,
                 Err(e) => {
@@ -684,6 +713,7 @@ mod tests {
             ("Ctrl+Shift+P", Action::ToggleCommandPalette),
             ("Ctrl+Shift+H", Action::OpenHistoryPalette),
             ("Ctrl+Shift+O", Action::ToggleSettings),
+            ("Ctrl+Shift+R", Action::ReloadConfig),
             ("Ctrl+backslash", Action::ToggleSidebar),
             ("Ctrl+Shift+L", Action::FilterTabs),
             ("Ctrl+Shift+X", Action::FilterFailedBlocks),
@@ -713,8 +743,10 @@ mod tests {
             ("Ctrl+Alt+Up", Action::FocusPaneUp),
             ("Ctrl+Alt+Down", Action::FocusPaneDown),
             ("Ctrl+Alt+Shift+A", Action::OpenAiPanel),
+            ("Ctrl+Shift+Q", Action::AskAiAboutSelectedBlock),
             ("Ctrl+Shift+M", Action::OpenWorkflows),
             ("Ctrl+Alt+G", Action::OpenAgent),
+            ("Ctrl+Shift+G", Action::CrossBlockSearch),
         ];
 
         for (binding, expected) in cases {
@@ -752,9 +784,7 @@ mod tests {
             "Ctrl+Shift+PageDown",
             "Ctrl+Shift+Left",
             "Ctrl+Shift+Right",
-            "Ctrl+Shift+R",
             "Ctrl+Shift+Y",
-            "Ctrl+Shift+G",
             "Ctrl+Shift++",
             "Ctrl+Shift+J",
             "Ctrl+Alt+Shift+K",

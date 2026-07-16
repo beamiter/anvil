@@ -22,6 +22,13 @@ pub(crate) struct SettingsValues {
     pub(crate) command_history: bool,
     pub(crate) ai_enabled: bool,
     pub(crate) agent_enabled: bool,
+    pub(crate) ai_provider: u32,
+    pub(crate) ai_model: String,
+    pub(crate) ai_base_url: String,
+    pub(crate) ai_max_tokens: f64,
+    pub(crate) ai_redact_secrets: bool,
+    pub(crate) agent_max_turns: f64,
+    pub(crate) safe_mode: bool,
     pub(crate) notifications: bool,
     pub(crate) remote_clipboard: bool,
 }
@@ -46,6 +53,12 @@ pub(crate) enum SettingsMsg {
     CommandHistory(bool),
     AiEnabled(bool),
     AgentEnabled(bool),
+    AiProvider(u32),
+    AiModel(String),
+    AiBaseUrl(String),
+    AiMaxTokens(f64),
+    AiRedactSecrets(bool),
+    AgentMaxTurns(f64),
     Notifications(bool),
     RemoteClipboard(bool),
 }
@@ -62,6 +75,12 @@ pub(crate) enum SettingsOutput {
     CommandHistory(bool),
     AiEnabled(bool),
     AgentEnabled(bool),
+    AiProvider(usize),
+    AiModel(String),
+    AiBaseUrl(String),
+    AiMaxTokens(u32),
+    AiRedactSecrets(bool),
+    AgentMaxTurns(u32),
     Notifications(bool),
     RemoteClipboard(bool),
 }
@@ -213,6 +232,7 @@ impl Component for SettingsModel {
                         set_title: "AI Features",
                         set_subtitle: "Requests run only after an explicit action",
                         set_active: model.values.ai_enabled,
+                        set_sensitive: !model.values.safe_mode,
                         connect_active_notify[sender] => move |row| {
                             sender.input(SettingsMsg::AiEnabled(row.is_active()));
                         },
@@ -223,8 +243,86 @@ impl Component for SettingsModel {
                         set_title: "AI Agent",
                         set_subtitle: "Commands always require approval",
                         set_active: model.values.agent_enabled,
+                        set_sensitive: !model.values.safe_mode && model.values.ai_enabled,
                         connect_active_notify[sender] => move |row| {
                             sender.input(SettingsMsg::AgentEnabled(row.is_active()));
+                        },
+                    },
+
+                    #[name(ai_provider_row)]
+                    adw::ComboRow {
+                        set_title: "AI Provider",
+                        set_subtitle: "API keys stay in environment variables",
+                        set_model: Some(&gtk::StringList::new(
+                            &["Anthropic", "OpenAI-compatible", "Ollama"]
+                        )),
+                        set_selected: model.values.ai_provider,
+                        set_sensitive: !model.values.safe_mode && model.values.ai_enabled,
+                        connect_selected_notify[sender] => move |row| {
+                            sender.input(SettingsMsg::AiProvider(row.selected()));
+                        },
+                    },
+
+                    #[name(ai_model_row)]
+                    adw::EntryRow {
+                        set_title: "AI Model",
+                        set_text: &model.values.ai_model,
+                        set_sensitive: !model.values.safe_mode && model.values.ai_enabled,
+                        connect_changed[sender] => move |row| {
+                            sender.input(SettingsMsg::AiModel(row.text().to_string()));
+                        },
+                    },
+
+                    #[name(ai_base_url_row)]
+                    adw::EntryRow {
+                        set_title: "AI Base URL",
+                        set_text: &model.values.ai_base_url,
+                        set_sensitive: !model.values.safe_mode && model.values.ai_enabled,
+                        connect_changed[sender] => move |row| {
+                            sender.input(SettingsMsg::AiBaseUrl(row.text().to_string()));
+                        },
+                    },
+
+                    #[name(ai_max_tokens_row)]
+                    adw::SpinRow::new(
+                        Some(&gtk::Adjustment::new(
+                            model.values.ai_max_tokens, 1.0, 32_768.0, 64.0, 512.0, 0.0
+                        )),
+                        64.0,
+                        0,
+                    ) {
+                        set_title: "Maximum Response Tokens",
+                        set_sensitive: !model.values.safe_mode && model.values.ai_enabled,
+                        connect_value_notify[sender] => move |row| {
+                            sender.input(SettingsMsg::AiMaxTokens(row.value()));
+                        },
+                    },
+
+                    #[name(ai_redact_secrets_row)]
+                    adw::SwitchRow {
+                        set_title: "Redact Common Secrets",
+                        set_subtitle: "Apply before terminal context is sent",
+                        set_active: model.values.ai_redact_secrets,
+                        set_sensitive: !model.values.safe_mode && model.values.ai_enabled,
+                        connect_active_notify[sender] => move |row| {
+                            sender.input(SettingsMsg::AiRedactSecrets(row.is_active()));
+                        },
+                    },
+
+                    #[name(agent_max_turns_row)]
+                    adw::SpinRow::new(
+                        Some(&gtk::Adjustment::new(
+                            model.values.agent_max_turns, 1.0, 100.0, 1.0, 5.0, 0.0
+                        )),
+                        1.0,
+                        0,
+                    ) {
+                        set_title: "Agent Turn Limit",
+                        set_sensitive: !model.values.safe_mode
+                            && model.values.ai_enabled
+                            && model.values.agent_enabled,
+                        connect_value_notify[sender] => move |row| {
+                            sender.input(SettingsMsg::AgentMaxTurns(row.value()));
                         },
                     },
 
@@ -299,6 +397,31 @@ impl Component for SettingsModel {
                     .agent_enabled_row
                     .set_active(self.values.agent_enabled);
                 widgets
+                    .ai_provider_row
+                    .set_selected(self.values.ai_provider);
+                widgets.ai_model_row.set_text(&self.values.ai_model);
+                widgets.ai_base_url_row.set_text(&self.values.ai_base_url);
+                widgets
+                    .ai_max_tokens_row
+                    .set_value(self.values.ai_max_tokens);
+                widgets
+                    .ai_redact_secrets_row
+                    .set_active(self.values.ai_redact_secrets);
+                widgets
+                    .agent_max_turns_row
+                    .set_value(self.values.agent_max_turns);
+                let ai_sensitive = !self.values.safe_mode && self.values.ai_enabled;
+                widgets.ai_enabled_row.set_sensitive(!self.values.safe_mode);
+                widgets.agent_enabled_row.set_sensitive(ai_sensitive);
+                widgets.ai_provider_row.set_sensitive(ai_sensitive);
+                widgets.ai_model_row.set_sensitive(ai_sensitive);
+                widgets.ai_base_url_row.set_sensitive(ai_sensitive);
+                widgets.ai_max_tokens_row.set_sensitive(ai_sensitive);
+                widgets.ai_redact_secrets_row.set_sensitive(ai_sensitive);
+                widgets
+                    .agent_max_turns_row
+                    .set_sensitive(ai_sensitive && self.values.agent_enabled);
+                widgets
                     .notifications_row
                     .set_active(self.values.notifications);
                 widgets
@@ -344,11 +467,48 @@ impl Component for SettingsModel {
             }
             SettingsMsg::AiEnabled(enabled) => {
                 self.values.ai_enabled = enabled;
+                let sensitive = !self.values.safe_mode && enabled;
+                widgets.agent_enabled_row.set_sensitive(sensitive);
+                widgets.ai_provider_row.set_sensitive(sensitive);
+                widgets.ai_model_row.set_sensitive(sensitive);
+                widgets.ai_base_url_row.set_sensitive(sensitive);
+                widgets.ai_max_tokens_row.set_sensitive(sensitive);
+                widgets.ai_redact_secrets_row.set_sensitive(sensitive);
+                widgets
+                    .agent_max_turns_row
+                    .set_sensitive(sensitive && self.values.agent_enabled);
                 let _ = sender.output(SettingsOutput::AiEnabled(enabled));
             }
             SettingsMsg::AgentEnabled(enabled) => {
                 self.values.agent_enabled = enabled;
+                widgets
+                    .agent_max_turns_row
+                    .set_sensitive(!self.values.safe_mode && self.values.ai_enabled && enabled);
                 let _ = sender.output(SettingsOutput::AgentEnabled(enabled));
+            }
+            SettingsMsg::AiProvider(provider) => {
+                self.values.ai_provider = provider;
+                let _ = sender.output(SettingsOutput::AiProvider(provider as usize));
+            }
+            SettingsMsg::AiModel(model) => {
+                self.values.ai_model = model.clone();
+                let _ = sender.output(SettingsOutput::AiModel(model));
+            }
+            SettingsMsg::AiBaseUrl(base_url) => {
+                self.values.ai_base_url = base_url.clone();
+                let _ = sender.output(SettingsOutput::AiBaseUrl(base_url));
+            }
+            SettingsMsg::AiMaxTokens(max_tokens) => {
+                self.values.ai_max_tokens = max_tokens;
+                let _ = sender.output(SettingsOutput::AiMaxTokens(max_tokens as u32));
+            }
+            SettingsMsg::AiRedactSecrets(enabled) => {
+                self.values.ai_redact_secrets = enabled;
+                let _ = sender.output(SettingsOutput::AiRedactSecrets(enabled));
+            }
+            SettingsMsg::AgentMaxTurns(turns) => {
+                self.values.agent_max_turns = turns;
+                let _ = sender.output(SettingsOutput::AgentMaxTurns(turns as u32));
             }
             SettingsMsg::Notifications(enabled) => {
                 self.values.notifications = enabled;

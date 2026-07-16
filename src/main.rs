@@ -17,6 +17,7 @@ mod dialogs;
 mod file_tree;
 mod file_tree_ops;
 mod git_meta;
+mod host;
 mod keybindings;
 mod navigation_ui;
 mod notebook;
@@ -25,6 +26,8 @@ mod palette;
 mod parser;
 mod process;
 mod pty;
+mod review_input;
+mod review_input_ops;
 mod search;
 mod session;
 mod settings_ops;
@@ -98,6 +101,7 @@ struct AppModel {
     top_tab_scroll: gtk::ScrolledWindow,
     top_bar: Controller<top_bar::TopBarModel>,
     sidebar_box: gtk::Box,
+    content_paned: gtk::Paned,
     sidebar_stack: gtk::Stack,
     sidebar_toggle: Controller<sidebar_toggle::SidebarToggleModel>,
     tab_placement: std::cell::Cell<config::TabPlacement>,
@@ -131,6 +135,7 @@ fn create_pane(
     mode: TerminalMode,
     initial_commands: Option<String>,
     working_directory: Option<String>,
+    session_id: Option<String>,
     sender: &ComponentSender<AppModel>,
 ) -> Pane {
     let probe = terminal::PaneProbe::default();
@@ -140,22 +145,23 @@ fn create_pane(
         config: config.clone(),
         shell_argv: shell_argv.clone(),
         working_directory: working_directory.clone(),
-        session_id: None,
+        session_id: session_id.clone(),
         initial_commands,
         probe: probe.clone(),
     };
     let forward = move |out| match out {
         VteOutput::Exited(code) => AppMsg::PaneExited(tab_id, pane_id, code),
         VteOutput::CwdChanged(p) => AppMsg::PaneCwdChanged(tab_id, pane_id, p),
-        VteOutput::TitleChanged(t) => AppMsg::TitleChanged(tab_id, t),
-        VteOutput::Bell => AppMsg::Bell(tab_id),
-        VteOutput::Activity => AppMsg::Activity(tab_id),
+        // Pane identity is stable across detach/move; tab identity is not.
+        VteOutput::TitleChanged(t) => AppMsg::TitleChanged(pane_id, t),
+        VteOutput::Bell => AppMsg::Bell(pane_id),
+        VteOutput::Activity => AppMsg::Activity(pane_id),
         VteOutput::Focused => AppMsg::PaneFocused(tab_id, pane_id),
         // Slow command finished while unattended: failure draws the bell
         // (attention) style, success the lighter activity style.
-        VteOutput::CommandFinished(true) => AppMsg::Activity(tab_id),
-        VteOutput::CommandFinished(false) => AppMsg::Bell(tab_id),
-        VteOutput::RemoteSessionId(id) => AppMsg::PaneRemoteSessionId(tab_id, id),
+        VteOutput::CommandFinished(true) => AppMsg::Activity(pane_id),
+        VteOutput::CommandFinished(false) => AppMsg::Bell(pane_id),
+        VteOutput::RemoteSessionId(id) => AppMsg::PaneRemoteSessionId(pane_id, id),
         VteOutput::BlockFinished {
             command,
             exit_code,
@@ -167,6 +173,7 @@ fn create_pane(
             exit_code,
             output_sample,
         },
+        VteOutput::AskAiAboutBlock(context) => AppMsg::AskAiAboutBlock(context),
     };
     let terminal = match mode {
         TerminalMode::Block => TermCtl::Block(
@@ -184,6 +191,7 @@ fn create_pane(
         terminal,
         id: pane_id,
         cwd: working_directory,
+        session_id,
         mode,
         probe,
     }
@@ -207,7 +215,11 @@ impl AppModel {
     /// it's a different machine).
     fn active_cwd(&self) -> Option<std::path::PathBuf> {
         let tab = self.tabs.get(self.active)?;
-        if tab.remote.is_some() {
+        if tab.remote.as_ref().is_some_and(|remote| {
+            tab.panes
+                .get(tab.active_pane)
+                .is_some_and(|pane| pane.id == remote.pane_id)
+        }) {
             return None;
         }
         tab.panes
@@ -274,15 +286,18 @@ impl SimpleComponent for AppModel {
                 }
             }
         };
-        let (mut config, themes, kbmap) = load_config();
-        if init.safe_mode {
-            config.apply_safe_mode();
-        }
-        if let Some(mode) = init.mode {
-            config.terminal_mode = match mode {
-                cli::Mode::Block => TerminalMode::Block,
-                cli::Mode::Vte => TerminalMode::Vte,
-            };
+        let (mut config, themes, kbmap) = if init.safe_mode {
+            config::load_safe_config()
+        } else {
+            load_config()
+        };
+        if !init.safe_mode {
+            if let Some(mode) = init.mode {
+                config.terminal_mode = match mode {
+                    cli::Mode::Block => TerminalMode::Block,
+                    cli::Mode::Vte => TerminalMode::Vte,
+                };
+            }
         }
         let shell_argv = if init.safe_mode {
             Rc::new(vec!["sh".to_string()])
@@ -341,6 +356,7 @@ impl SimpleComponent for AppModel {
         let sidebar_width = config.borrow().sidebar_width as i32;
         let tab_placement = config.borrow().tab_placement;
         let sidebar_view = config.borrow().sidebar_view;
+        let sidebar_visible = config.borrow().sidebar_visible;
         let sidebar_toggle = sidebar_toggle::SidebarToggleModel::builder()
             .launch((sidebar_view, tab_placement == config::TabPlacement::Sidebar))
             .forward(sender.input_sender(), |output| match output {
@@ -440,6 +456,17 @@ impl SimpleComponent for AppModel {
                     command_history: config.borrow().command_history_enabled,
                     ai_enabled: config.borrow().ai_enabled,
                     agent_enabled: config.borrow().agent_enabled,
+                    ai_provider: match config.borrow().ai_provider.as_str() {
+                        "openai-compatible" => 1,
+                        "ollama" => 2,
+                        _ => 0,
+                    },
+                    ai_model: config.borrow().ai_model.clone(),
+                    ai_base_url: config.borrow().ai_base_url.clone(),
+                    ai_max_tokens: config.borrow().ai_max_tokens as f64,
+                    ai_redact_secrets: config.borrow().ai_redact_secrets,
+                    agent_max_turns: config.borrow().agent_max_turns as f64,
+                    safe_mode: init.safe_mode,
                     notifications: config.borrow().notify_long_blocks,
                     remote_clipboard: config.borrow().allow_remote_clipboard_write,
                 },
@@ -470,6 +497,22 @@ impl SimpleComponent for AppModel {
                 }
                 dialogs::settings::SettingsOutput::AgentEnabled(enabled) => {
                     AppMsg::SettingsAgentEnabled(enabled)
+                }
+                dialogs::settings::SettingsOutput::AiProvider(provider) => {
+                    AppMsg::SettingsAiProvider(provider)
+                }
+                dialogs::settings::SettingsOutput::AiModel(model) => AppMsg::SettingsAiModel(model),
+                dialogs::settings::SettingsOutput::AiBaseUrl(base_url) => {
+                    AppMsg::SettingsAiBaseUrl(base_url)
+                }
+                dialogs::settings::SettingsOutput::AiMaxTokens(max_tokens) => {
+                    AppMsg::SettingsAiMaxTokens(max_tokens)
+                }
+                dialogs::settings::SettingsOutput::AiRedactSecrets(enabled) => {
+                    AppMsg::SettingsAiRedactSecrets(enabled)
+                }
+                dialogs::settings::SettingsOutput::AgentMaxTurns(turns) => {
+                    AppMsg::SettingsAgentMaxTurns(turns)
                 }
                 dialogs::settings::SettingsOutput::Notifications(enabled) => {
                     AppMsg::SettingsNotifications(enabled)
@@ -532,7 +575,11 @@ impl SimpleComponent for AppModel {
             .launch(root.clone())
             .detach();
         let notebook = notebook::NotebookModel::builder()
-            .launch(root.clone())
+            .launch(notebook::NotebookInit {
+                parent: root.clone(),
+                safe_mode: init.safe_mode,
+                configured_shell: shell_argv.as_ref().clone(),
+            })
             .detach();
         let agent_panel = agent::AgentPanelModel::builder()
             .launch(root.clone())
@@ -583,7 +630,7 @@ impl SimpleComponent for AppModel {
             next_pane_id: 0,
             // With tabs in the top bar, keep the optional file sidebar closed
             // until the user explicitly opens it.
-            sidebar_visible: tab_placement == config::TabPlacement::Sidebar,
+            sidebar_visible,
             font_scale,
             window_opacity,
             stack: stack.clone(),
@@ -606,6 +653,7 @@ impl SimpleComponent for AppModel {
             top_tab_scroll: top_tab_scroll.clone(),
             top_bar,
             sidebar_box: sidebar_box.clone(),
+            content_paned: content_paned.clone(),
             sidebar_stack: sidebar_stack.clone(),
             sidebar_toggle,
             tab_placement: std::cell::Cell::new(tab_placement),
@@ -795,12 +843,12 @@ impl SimpleComponent for AppModel {
             AppMsg::CloseTab(id) => self.request_close_tab(id, &sender),
             AppMsg::ForceCloseTab(id) => self.close_tab(id, &sender),
             AppMsg::ForceClosePane(pane_id) => self.close_pane(pane_id, &sender),
+            AppMsg::ForceCloseMarked(ids) => self.close_tabs(ids, &sender),
             AppMsg::SelectTab(id) => self.select_tab(id, &sender),
             AppMsg::NextTab => self.switch_tab(1, &sender),
             AppMsg::PrevTab => self.switch_tab(-1, &sender),
             AppMsg::ToggleSidebar => {
-                self.sidebar_visible = !self.sidebar_visible;
-                self.sidebar_box.set_visible(self.sidebar_visible);
+                self.set_sidebar_visible(!self.sidebar_visible, true);
             }
             AppMsg::Quit => {
                 self.request_quit(&sender);
@@ -819,29 +867,34 @@ impl SimpleComponent for AppModel {
                 self.sync_tab_strip();
                 self.persist_config();
             }
-            AppMsg::PaneExited(tab_id, pane_id, code) => {
+            AppMsg::PaneExited(_, pane_id, code) => {
                 // A remote single-pane tab that died abnormally is reconnected in
                 // place instead of closed; everything else closes normally.
-                if self.schedule_remote_reconnect(tab_id, code, &sender) {
+                if self.schedule_remote_reconnect(pane_id, code, &sender) {
                     return;
                 }
                 self.close_pane(pane_id, &sender);
             }
-            AppMsg::RemoteReconnectTick(id, secs) => {
-                if let Some(idx) = self.index_of(id) {
-                    if let Some(conn) = self.tabs[idx].remote.as_ref() {
-                        self.tabs[idx].title = format!("{} — reconnect {secs}s", conn.host.name);
-                        self.sync_tab_strip();
+            AppMsg::RemoteReconnectTick(pane_id, secs) => {
+                if self.remote_reconnect_target_is_valid(pane_id) {
+                    if let Some((idx, _)) = self.find_pane(pane_id) {
+                        if let Some(conn) = self.tabs[idx].remote.as_ref() {
+                            self.tabs[idx].title =
+                                format!("{} — reconnect {secs}s", conn.host.name);
+                            self.sync_tab_strip();
+                        }
                     }
+                } else {
+                    self.cancel_remote_reconnect(pane_id, &sender);
                 }
             }
-            AppMsg::RemoteReconnectNow(id, attempt) => {
-                self.do_remote_reconnect(id, attempt, &sender)
+            AppMsg::RemoteReconnectNow(pane_id, attempt) => {
+                self.do_remote_reconnect(pane_id, attempt, &sender)
             }
             AppMsg::PaneCwdChanged(_, pane_id, path) => {
                 if let Some((ti, pi)) = self.find_pane(pane_id) {
                     self.tabs[ti].panes[pi].cwd = Some(path.clone());
-                    let connection_changed = self.mark_remote_connected(ti);
+                    let connection_changed = self.mark_remote_connected(ti, pane_id);
                     if self.tabs[ti].active_pane == pi && !self.tabs[ti].custom_title {
                         let number = ti as u32 + 1;
                         self.tabs[ti].title = default_tab_title(number, Some(&path));
@@ -851,9 +904,14 @@ impl SimpleComponent for AppModel {
                     }
                 }
             }
-            AppMsg::PaneRemoteSessionId(tab_id, id) => {
-                if let Some(idx) = self.index_of(tab_id) {
-                    if let Some(conn) = self.tabs[idx].remote.as_mut() {
+            AppMsg::PaneRemoteSessionId(pane_id, id) => {
+                if let Some((idx, pane_index)) = self.find_pane(pane_id) {
+                    self.tabs[idx].panes[pane_index].session_id = Some(id.clone());
+                    if let Some(conn) = self.tabs[idx]
+                        .remote
+                        .as_mut()
+                        .filter(|conn| conn.pane_id == pane_id)
+                    {
                         // Learn rsh's session id so a reconnect passes the same
                         // `--session <id>` and rsh restores cwd/env/aliases.
                         // Overrides any static value the TOML config set.
@@ -866,8 +924,9 @@ impl SimpleComponent for AppModel {
                     self.tabs[ti].active_pane = pi;
                 }
             }
-            AppMsg::TitleChanged(id, title) => {
-                if let Some(idx) = self.index_of(id) {
+            AppMsg::TitleChanged(pane_id, title) => {
+                if let Some((idx, _)) = self.find_pane(pane_id) {
+                    let id = self.tabs[idx].id;
                     if !self.tabs[idx].custom_title && !title.is_empty() {
                         let filter = self.tab_filter.to_lowercase();
                         let was_visible = filter.is_empty()
@@ -887,17 +946,17 @@ impl SimpleComponent for AppModel {
                     }
                 }
             }
-            AppMsg::Bell(id) => {
-                if let Some(idx) = self.index_of(id) {
+            AppMsg::Bell(pane_id) => {
+                if let Some((idx, _)) = self.find_pane(pane_id) {
                     if idx != self.active {
                         self.tabs[idx].bell = true;
                         self.sync_tab_strip();
                     }
                 }
             }
-            AppMsg::Activity(id) => {
-                if let Some(idx) = self.index_of(id) {
-                    let mut changed = self.mark_remote_connected(idx);
+            AppMsg::Activity(pane_id) => {
+                if let Some((idx, _)) = self.find_pane(pane_id) {
+                    let mut changed = self.mark_remote_connected(idx, pane_id);
                     if idx != self.active && !self.tabs[idx].activity {
                         self.tabs[idx].activity = true;
                         changed = true;
@@ -917,6 +976,16 @@ impl SimpleComponent for AppModel {
             AppMsg::SettingsCommandHistory(enabled) => self.apply_settings_command_history(enabled),
             AppMsg::SettingsAiEnabled(enabled) => self.apply_settings_ai_enabled(enabled),
             AppMsg::SettingsAgentEnabled(enabled) => self.apply_settings_agent_enabled(enabled),
+            AppMsg::SettingsAiProvider(provider) => self.apply_settings_ai_provider(provider),
+            AppMsg::SettingsAiModel(model) => self.apply_settings_ai_model(model),
+            AppMsg::SettingsAiBaseUrl(base_url) => self.apply_settings_ai_base_url(base_url),
+            AppMsg::SettingsAiMaxTokens(max_tokens) => {
+                self.apply_settings_ai_max_tokens(max_tokens)
+            }
+            AppMsg::SettingsAiRedactSecrets(enabled) => {
+                self.apply_settings_ai_redact_secrets(enabled)
+            }
+            AppMsg::SettingsAgentMaxTurns(turns) => self.apply_settings_agent_max_turns(turns),
             AppMsg::SettingsNotifications(enabled) => self.apply_settings_notifications(enabled),
             AppMsg::SettingsRemoteClipboard(enabled) => {
                 self.apply_settings_remote_clipboard(enabled)
@@ -980,14 +1049,15 @@ impl SimpleComponent for AppModel {
                 self.sync_tab_strip();
             }
             AppMsg::FileTreeActivateFile(path) => {
-                if let Some(term) = self.active_terminal() {
-                    let snippet = format!("{} ", file_tree::shell_quote(&path));
-                    term.emit(VteInput::WriteInput(snippet.into_bytes()));
-                    term.emit(VteInput::GrabFocus);
-                }
+                let snippet = format!("{} ", file_tree::shell_quote(&path));
+                self.insert_review_text(&snippet);
             }
             AppMsg::OpenNotebook(path) => {
-                self.notebook.emit(notebook::NotebookMsg::Open(path));
+                if self.safe_mode {
+                    self.show_toast("Notebooks are unavailable in safe mode.");
+                } else {
+                    self.notebook.emit(notebook::NotebookMsg::Open(path));
+                }
             }
             AppMsg::OpenAgent => self.open_agent_panel(&sender),
             AppMsg::AgentSend(text) => self.agent_send(text, &sender),
@@ -1002,33 +1072,42 @@ impl SimpleComponent for AppModel {
             AppMsg::AgentReject(idx) => self.agent_reject(idx, &sender),
             AppMsg::AgentLlmReply(reply) => self.agent_handle_reply(reply, &sender),
             AppMsg::AgentBlockFinished {
-                tab_id,
+                tab_id: _,
                 pane_id,
                 command,
                 exit_code,
                 output_sample,
             } => {
-                self.agent_handle_block_finished(
-                    tab_id,
-                    pane_id,
-                    command,
-                    exit_code,
-                    output_sample,
-                    &sender,
-                );
+                if let Some((tab_index, _)) = self.find_pane(pane_id) {
+                    let tab_id = self.tabs[tab_index].id;
+                    self.agent_handle_block_finished(
+                        tab_id,
+                        pane_id,
+                        command,
+                        exit_code,
+                        output_sample,
+                        &sender,
+                    );
+                }
             }
             AppMsg::AgentClose => self.agent_close(),
             AppMsg::PaletteTypeCommand(cmd) => {
-                if let Some(term) = self.active_terminal() {
-                    term.emit(VteInput::WriteInput(cmd.into_bytes()));
-                    term.emit(VteInput::GrabFocus);
-                }
+                self.insert_review_text(&cmd);
             }
             AppMsg::PaletteAskAi(query) => {
                 self.handle_palette_ask_ai(query, &sender);
             }
+            AppMsg::PaletteReviewAiCommand { pane_id, command } => {
+                self.review_palette_ai_command(pane_id, command, &sender);
+            }
+            AppMsg::PaletteInsertAiCommand { pane_id, command } => {
+                self.insert_palette_ai_command(pane_id, command);
+            }
             AppMsg::OpenAiPanel => {
                 self.show_ai_session_panel();
+            }
+            AppMsg::AskAiAboutBlock(context) => {
+                self.show_ai_session_panel_with_context(Some(context));
             }
             AppMsg::PaletteRunWorkflow(path) => {
                 self.run_workflow_from_path(path, &sender);
@@ -1042,15 +1121,21 @@ impl SimpleComponent for AppModel {
 }
 
 fn main() {
-    let command = match cli::parse(std::env::args_os().skip(1)) {
-        Ok(command) => command,
+    let parsed = match cli::parse(std::env::args_os().skip(1)) {
+        Ok(parsed) => parsed,
         Err(error) => {
             eprintln!("jterm1: {error}\nTry 'jterm1 --help' for usage.");
             std::process::exit(2);
         }
     };
 
-    match command {
+    if let Some(path) = parsed.config_path {
+        // SAFETY: CLI parsing is the first operation in main; no GTK runtime,
+        // worker thread, or configuration read exists yet.
+        unsafe { std::env::set_var("JTERM1_CONFIG", path) };
+    }
+
+    match parsed.command {
         cli::Command::Help => print!("{}", cli::HELP),
         cli::Command::Version => println!("jterm1 {}", env!("CARGO_PKG_VERSION")),
         cli::Command::Doctor(format) => {
@@ -1059,9 +1144,10 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        cli::Command::CheckConfig(format) => {
+        cli::Command::CheckConfig(path, format) => {
             init_logging();
-            if !config_store::run_check(format) {
+            let path = path.unwrap_or_else(config_file_path);
+            if !config_store::run_check_path(&path, format) {
                 std::process::exit(1);
             }
         }
@@ -1086,6 +1172,7 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        cli::Command::PrintDefaultConfig => print!("{}", include_str!("../config.toml.example")),
         cli::Command::PrintShellIntegration(shell) => print_shell_integration(shell),
         cli::Command::Run(mut options) => {
             if let Err(error) = validate_launch_options(&mut options) {
@@ -1099,7 +1186,7 @@ fn main() {
             // not overwrite one another.
             let app = RelmApp::from_app(
                 adw::Application::builder()
-                    .application_id("app.jterm1")
+                    .application_id(host::APP_ID)
                     .flags(gio::ApplicationFlags::NON_UNIQUE)
                     .build(),
             )
@@ -1113,9 +1200,12 @@ fn main() {
 }
 
 fn init_logging() {
-    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
-        .format_timestamp_millis()
-        .try_init();
+    let filter = std::env::var("JTERM1_LOG")
+        .or_else(|_| std::env::var("RUST_LOG"))
+        .unwrap_or_else(|_| "warn".to_string());
+    let mut builder = env_logger::Builder::new();
+    builder.parse_filters(&filter).format_timestamp_millis();
+    let _ = builder.try_init();
 }
 
 fn validate_launch_options(options: &mut cli::LaunchOptions) -> Result<(), String> {

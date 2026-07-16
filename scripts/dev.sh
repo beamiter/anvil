@@ -19,7 +19,7 @@ usage() {
     echo "  clippy   - Run the repository lint policy"
     echo "  security - Audit dependencies and shell scripts"
     echo "  verify   - Run formatting, checks, tests, lints, and docs"
-    echo "  package  - Build a portable release archive and checksum"
+    echo "  package  - Build a relocatable release archive and checksum"
     echo "  clean    - Clean build artifacts"
     echo "  watch    - Watch for changes and rebuild"
 }
@@ -93,7 +93,7 @@ case "${CMD}" in
         ;;
 
     package)
-        echo "Building a portable release bundle..."
+        echo "Building a relocatable release bundle..."
         run_in_nix bash -c '
             set -euo pipefail
             cargo build --release --locked

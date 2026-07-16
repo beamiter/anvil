@@ -14,15 +14,12 @@
 
 use regex::Regex;
 use relm4::gtk;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use gtk::glib;
-
-/// Default cap on response tokens for any AI call. Keeps explanations
-/// terse and bounds cost.
-const MAX_TOKENS: u32 = 600;
 
 /// Conservative, high-confidence patterns for credentials that commonly appear
 /// in terminal output. Avoid generic hashes so git SHAs and build IDs survive.
@@ -72,8 +69,78 @@ fn redact_secrets_owned(mut input: String) -> String {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Provider {
     Anthropic,
-    OpenAI,
+    OpenAiCompatible,
     Ollama,
+}
+
+impl Provider {
+    pub(crate) fn as_config_value(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::OpenAiCompatible => "openai-compatible",
+            Self::Ollama => "ollama",
+        }
+    }
+
+    pub(crate) fn display_name(self) -> &'static str {
+        match self {
+            Self::Anthropic => "Anthropic",
+            Self::OpenAiCompatible => "OpenAI-compatible",
+            Self::Ollama => "Ollama",
+        }
+    }
+
+    pub(crate) fn default_model(self) -> &'static str {
+        match self {
+            Self::Anthropic => "claude-sonnet-4-6",
+            Self::OpenAiCompatible => "gpt-4o-mini",
+            Self::Ollama => "codellama:7b",
+        }
+    }
+
+    pub(crate) fn default_base_url(self) -> &'static str {
+        match self {
+            Self::Anthropic => "https://api.anthropic.com",
+            Self::OpenAiCompatible => "https://api.openai.com/v1",
+            Self::Ollama => "http://localhost:11434",
+        }
+    }
+
+    fn endpoint(self, base_url: &str) -> String {
+        let base = base_url.trim_end_matches('/');
+        match self {
+            Self::Anthropic if base.ends_with("/v1/messages") => base.to_string(),
+            Self::Anthropic if base.ends_with("/v1") => format!("{base}/messages"),
+            Self::Anthropic => format!("{base}/v1/messages"),
+            Self::OpenAiCompatible if base.ends_with("/chat/completions") => base.to_string(),
+            Self::OpenAiCompatible => format!("{base}/chat/completions"),
+            Self::Ollama if base.ends_with("/api/chat") => base.to_string(),
+            Self::Ollama if base.ends_with("/api") => format!("{base}/chat"),
+            Self::Ollama => format!("{base}/api/chat"),
+        }
+    }
+
+    fn api_key(self) -> Option<String> {
+        let provider_key = match self {
+            Self::Anthropic => "ANTHROPIC_API_KEY",
+            Self::OpenAiCompatible => "OPENAI_API_KEY",
+            Self::Ollama => "OLLAMA_API_KEY",
+        };
+        nonempty_env("JTERM1_AI_API_KEY").or_else(|| nonempty_env(provider_key))
+    }
+}
+
+impl FromStr for Provider {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "anthropic" | "claude" => Ok(Self::Anthropic),
+            "openai" | "openai-compatible" | "openai_compatible" => Ok(Self::OpenAiCompatible),
+            "ollama" => Ok(Self::Ollama),
+            other => Err(format!("unknown AI provider '{other}'")),
+        }
+    }
 }
 
 /// All the knobs jterm1's AI helpers need to make one HTTP call. Built once
@@ -84,6 +151,8 @@ pub(crate) struct AiClient {
     pub api_key: Option<String>,
     pub model: String,
     pub base_url: String,
+    pub max_tokens: u32,
+    pub redact_secrets: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -92,6 +161,27 @@ pub struct BlockContext {
     pub output: String,
     pub cwd: Option<String>,
     pub exit_code: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Role {
+    User,
+    Assistant,
+}
+
+impl Role {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Turn {
+    pub(crate) role: Role,
+    pub(crate) text: String,
 }
 
 pub(crate) fn truncate_for_context(output: &str, max_lines_per_side: usize) -> String {
@@ -111,6 +201,49 @@ pub(crate) fn truncate_for_context(output: &str, max_lines_per_side: usize) -> S
 }
 
 impl AiClient {
+    pub(crate) fn new(
+        provider: Provider,
+        api_key: Option<String>,
+        model: impl Into<String>,
+        base_url: impl Into<String>,
+        max_tokens: u32,
+        redact_secrets: bool,
+    ) -> Result<Self, String> {
+        let model = model.into();
+        let base_url = base_url.into();
+        validate_client_values(&model, &base_url, max_tokens)?;
+        let api_key = api_key.filter(|key| !key.trim().is_empty());
+        if provider == Provider::Anthropic && api_key.is_none() {
+            return Err(
+                "Anthropic API key is not set (use JTERM1_AI_API_KEY or ANTHROPIC_API_KEY)"
+                    .to_string(),
+            );
+        }
+        Ok(Self {
+            provider,
+            api_key,
+            model,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            max_tokens,
+            redact_secrets,
+        })
+    }
+
+    pub(crate) fn from_config(config: &crate::config::Config) -> Result<Self, String> {
+        if !config.ai_enabled {
+            return Err("AI features are disabled by configuration".to_string());
+        }
+        let provider = Provider::from_str(&config.ai_provider)?;
+        Self::new(
+            provider,
+            provider.api_key(),
+            config.ai_model.clone(),
+            config.ai_base_url.clone(),
+            config.ai_max_tokens,
+            config.ai_redact_secrets,
+        )
+    }
+
     /// Inspect the environment and return a configured client when at least
     /// one provider looks usable. Returns None when there's no API key AND
     /// no Ollama at the default URL — callers gate UI on that None to hide
@@ -121,67 +254,78 @@ impl AiClient {
         //   2. ANTHROPIC_API_KEY → Anthropic
         //   3. OPENAI_API_KEY → OpenAI
         //   4. fall back to Ollama (no key needed)
-        let forced = std::env::var("JTERM1_AI_PROVIDER").ok();
-        let provider = match forced.as_deref().map(str::to_ascii_lowercase).as_deref() {
-            Some("anthropic" | "claude") => Provider::Anthropic,
-            Some("openai") => Provider::OpenAI,
-            Some("ollama") => Provider::Ollama,
-            // Unknown explicit choice → fall through to auto-detect.
-            _ => {
-                if std::env::var("ANTHROPIC_API_KEY")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-                    .is_some()
-                {
-                    Provider::Anthropic
-                } else if std::env::var("OPENAI_API_KEY")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-                    .is_some()
-                {
-                    Provider::OpenAI
-                } else {
-                    Provider::Ollama
-                }
-            }
+        let provider = match nonempty_env("JTERM1_AI_PROVIDER") {
+            Some(value) => Provider::from_str(&value).ok()?,
+            None if nonempty_env("ANTHROPIC_API_KEY").is_some() => Provider::Anthropic,
+            None if nonempty_env("OPENAI_API_KEY").is_some() => Provider::OpenAiCompatible,
+            None => Provider::Ollama,
         };
-        let (api_key, default_model, default_url) = match provider {
-            Provider::Anthropic => (
-                std::env::var("ANTHROPIC_API_KEY").ok(),
-                "claude-sonnet-4-20250514",
-                "https://api.anthropic.com",
-            ),
-            Provider::OpenAI => (
-                std::env::var("OPENAI_API_KEY").ok(),
-                "gpt-4o-mini",
-                "https://api.openai.com/v1",
-            ),
-            Provider::Ollama => (None, "codellama:7b", "http://localhost:11434"),
-        };
-        // For Anthropic / OpenAI an absent or empty key means we can't reach
-        // anyone; hide the UI. Ollama needs no key so we always try it.
-        if matches!(provider, Provider::Anthropic | Provider::OpenAI)
-            && api_key.as_deref().unwrap_or("").is_empty()
-        {
-            return None;
-        }
-        Some(AiClient {
+        let model =
+            nonempty_env("JTERM1_AI_MODEL").unwrap_or_else(|| provider.default_model().to_string());
+        let base_url = nonempty_env("JTERM1_AI_BASE_URL")
+            .unwrap_or_else(|| provider.default_base_url().to_string());
+        let max_tokens = nonempty_env("JTERM1_AI_MAX_TOKENS")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1_024);
+        let redact_secrets = nonempty_env("JTERM1_AI_REDACT_SECRETS")
+            .and_then(|value| parse_bool(&value))
+            .unwrap_or(true);
+        Self::new(
             provider,
-            api_key,
-            model: std::env::var("JTERM1_AI_MODEL").unwrap_or_else(|_| default_model.to_string()),
-            base_url: std::env::var("JTERM1_AI_BASE_URL")
-                .unwrap_or_else(|_| default_url.to_string()),
-        })
+            provider.api_key(),
+            model,
+            base_url,
+            max_tokens,
+            redact_secrets,
+        )
+        .ok()
     }
 
     /// Short human label for status text ("Claude · sonnet-4 …").
     pub(crate) fn display_name(&self) -> String {
-        let prov = match self.provider {
-            Provider::Anthropic => "Claude",
-            Provider::OpenAI => "OpenAI",
-            Provider::Ollama => "Ollama",
-        };
-        format!("{} · {}", prov, self.model)
+        format!("{} · {}", self.provider.display_name(), self.model)
+    }
+
+    fn prepare_text(&self, text: String) -> String {
+        if self.redact_secrets {
+            redact_secrets_owned(text)
+        } else {
+            text
+        }
+    }
+}
+
+fn validate_client_values(model: &str, base_url: &str, max_tokens: u32) -> Result<(), String> {
+    if model.trim().is_empty() {
+        return Err("AI model must not be empty".to_string());
+    }
+    let base_url = base_url.trim();
+    if !(base_url.starts_with("http://") || base_url.starts_with("https://"))
+        || base_url
+            .split_once("://")
+            .is_none_or(|(_, authority)| authority.is_empty())
+        || base_url.chars().any(char::is_whitespace)
+    {
+        return Err("AI base URL must be an absolute http(s) URL without whitespace".to_string());
+    }
+    if !(1..=32_768).contains(&max_tokens) {
+        return Err("AI max tokens must be between 1 and 32768".to_string());
+    }
+    Ok(())
+}
+
+fn nonempty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
     }
 }
 
@@ -211,13 +355,39 @@ pub(crate) fn ask(
     user: String,
     on_done: impl FnOnce(AiResult) + 'static,
 ) -> AiHandle {
+    ask_turns(
+        client,
+        system,
+        vec![Turn {
+            role: Role::User,
+            text: user,
+        }],
+        on_done,
+    )
+}
+
+/// Fire a provider-neutral multi-turn transcript. Roles are retained all the
+/// way to the provider request body; the legacy `ask` helper above remains the
+/// single-user-turn compatibility entry point for explain/palette/agent calls.
+pub(crate) fn ask_turns(
+    client: AiClient,
+    system: String,
+    history: Vec<Turn>,
+    on_done: impl FnOnce(AiResult) + 'static,
+) -> AiHandle {
     let cancelled = Arc::new(AtomicBool::new(false));
     let cancelled_thread = cancelled.clone();
 
     // Scrub at the common provider boundary so every AI surface — explain,
     // palette, session Q&A, and agent mode — gets identical protection.
-    let system = redact_secrets_owned(system);
-    let user = redact_secrets_owned(user);
+    let system = client.prepare_text(system);
+    let history: Vec<Turn> = history
+        .into_iter()
+        .map(|turn| Turn {
+            role: turn.role,
+            text: client.prepare_text(turn.text),
+        })
+        .collect();
 
     // glib::Sender can't carry FnOnce closures portably; use a one-shot
     // channel pattern: thread parks the result behind a Mutex<Option<T>>
@@ -229,7 +399,7 @@ pub(crate) fn ask(
     let mut on_done_cell: Option<AiCompletion> = Some(Box::new(on_done));
 
     std::thread::spawn(move || {
-        let result = run_request(&client, &system, &user);
+        let result = run_request(&client, &system, &history);
         if cancelled_thread.load(Ordering::SeqCst) {
             return;
         }
@@ -268,22 +438,53 @@ fn http_agent() -> ureq::Agent {
         .into()
 }
 
-fn run_request(client: &AiClient, system: &str, user: &str) -> Result<String, String> {
+fn run_request(client: &AiClient, system: &str, history: &[Turn]) -> Result<String, String> {
     match client.provider {
-        Provider::Anthropic => call_anthropic(client, system, user),
-        Provider::OpenAI => call_openai(client, system, user),
-        Provider::Ollama => call_ollama(client, system, user),
+        Provider::Anthropic => call_anthropic(client, system, history),
+        Provider::OpenAiCompatible => call_openai(client, system, history),
+        Provider::Ollama => call_ollama(client, system, history),
     }
 }
 
-fn call_anthropic(client: &AiClient, system: &str, user: &str) -> Result<String, String> {
-    let url = format!("{}/v1/messages", client.base_url);
-    let body = serde_json::json!({
-        "model": client.model,
-        "max_tokens": MAX_TOKENS,
-        "system": system,
-        "messages": [{"role": "user", "content": user}],
-    });
+fn message_values(history: &[Turn]) -> Vec<serde_json::Value> {
+    history
+        .iter()
+        .map(|turn| serde_json::json!({"role": turn.role.as_str(), "content": turn.text}))
+        .collect()
+}
+
+fn request_body(client: &AiClient, system: &str, history: &[Turn]) -> serde_json::Value {
+    let mut messages = message_values(history);
+    match client.provider {
+        Provider::Anthropic => serde_json::json!({
+            "model": client.model,
+            "max_tokens": client.max_tokens,
+            "system": system,
+            "messages": messages,
+        }),
+        Provider::OpenAiCompatible => {
+            messages.insert(0, serde_json::json!({"role": "system", "content": system}));
+            serde_json::json!({
+                "model": client.model,
+                "max_tokens": client.max_tokens,
+                "messages": messages,
+            })
+        }
+        Provider::Ollama => {
+            messages.insert(0, serde_json::json!({"role": "system", "content": system}));
+            serde_json::json!({
+                "model": client.model,
+                "messages": messages,
+                "stream": false,
+                "options": { "num_predict": client.max_tokens },
+            })
+        }
+    }
+}
+
+fn call_anthropic(client: &AiClient, system: &str, history: &[Turn]) -> Result<String, String> {
+    let url = client.provider.endpoint(&client.base_url);
+    let body = request_body(client, system, history);
     let mut req = http_agent()
         .post(&url)
         .header("Content-Type", "application/json")
@@ -299,8 +500,8 @@ fn call_anthropic(client: &AiClient, system: &str, user: &str) -> Result<String,
         .read_to_string()
         .map_err(|e| format!("read body: {e}"))?;
     let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))?;
-    if let Some(s) = v["content"][0]["text"].as_str() {
-        Ok(s.to_string())
+    if let Some(text) = response_text(client.provider, &v) {
+        Ok(text)
     } else if let Some(msg) = v["error"]["message"].as_str() {
         Err(msg.to_string())
     } else {
@@ -311,16 +512,9 @@ fn call_anthropic(client: &AiClient, system: &str, user: &str) -> Result<String,
     }
 }
 
-fn call_openai(client: &AiClient, system: &str, user: &str) -> Result<String, String> {
-    let url = format!("{}/chat/completions", client.base_url);
-    let body = serde_json::json!({
-        "model": client.model,
-        "max_tokens": MAX_TOKENS,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-    });
+fn call_openai(client: &AiClient, system: &str, history: &[Turn]) -> Result<String, String> {
+    let url = client.provider.endpoint(&client.base_url);
+    let body = request_body(client, system, history);
     let mut req = http_agent()
         .post(&url)
         .header("Content-Type", "application/json");
@@ -335,8 +529,8 @@ fn call_openai(client: &AiClient, system: &str, user: &str) -> Result<String, St
         .read_to_string()
         .map_err(|e| format!("read body: {e}"))?;
     let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))?;
-    if let Some(s) = v["choices"][0]["message"]["content"].as_str() {
-        Ok(s.to_string())
+    if let Some(text) = response_text(client.provider, &v) {
+        Ok(text)
     } else if let Some(msg) = v["error"]["message"].as_str() {
         Err(msg.to_string())
     } else {
@@ -347,18 +541,16 @@ fn call_openai(client: &AiClient, system: &str, user: &str) -> Result<String, St
     }
 }
 
-fn call_ollama(client: &AiClient, system: &str, user: &str) -> Result<String, String> {
-    let url = format!("{}/api/generate", client.base_url);
-    let body = serde_json::json!({
-        "model": client.model,
-        "system": system,
-        "prompt": user,
-        "stream": false,
-        "options": { "num_predict": MAX_TOKENS },
-    });
-    let mut resp = http_agent()
+fn call_ollama(client: &AiClient, system: &str, history: &[Turn]) -> Result<String, String> {
+    let url = client.provider.endpoint(&client.base_url);
+    let body = request_body(client, system, history);
+    let mut req = http_agent()
         .post(&url)
-        .header("Content-Type", "application/json")
+        .header("Content-Type", "application/json");
+    if let Some(key) = &client.api_key {
+        req = req.header("Authorization", format!("Bearer {key}"));
+    }
+    let mut resp = req
         .send(body.to_string())
         .map_err(|e| format!("ollama request failed (is `ollama serve` running?): {e}"))?;
     let text = resp
@@ -366,8 +558,8 @@ fn call_ollama(client: &AiClient, system: &str, user: &str) -> Result<String, St
         .read_to_string()
         .map_err(|e| format!("read body: {e}"))?;
     let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))?;
-    if let Some(s) = v["response"].as_str() {
-        Ok(s.to_string())
+    if let Some(text) = response_text(client.provider, &v) {
+        Ok(text)
     } else if let Some(msg) = v["error"].as_str() {
         Err(msg.to_string())
     } else {
@@ -376,6 +568,51 @@ fn call_ollama(client: &AiClient, system: &str, user: &str) -> Result<String, St
             trim_for_log(&text)
         ))
     }
+}
+
+fn response_text(provider: Provider, value: &serde_json::Value) -> Option<String> {
+    let text = match provider {
+        Provider::Anthropic => value.get("content").and_then(|content| {
+            content.as_array().map(|parts| {
+                parts
+                    .iter()
+                    .filter(|part| {
+                        part.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                    })
+                    .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+        }),
+        Provider::OpenAiCompatible => value
+            .pointer("/choices/0/message/content")
+            .and_then(content_text),
+        Provider::Ollama => value
+            .pointer("/message/content")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                value
+                    .get("response")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            }),
+    }
+    .unwrap_or_default();
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn content_text(value: &serde_json::Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        return Some(text.to_string());
+    }
+    value.as_array().map(|parts| {
+        parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
 }
 
 fn floor_char_boundary(s: &str, index: usize) -> usize {
@@ -457,15 +694,17 @@ If the request is ambiguous, output the safest interpretation."
 /// running transcript, assembled by `agent::AgentSession::build_user_prompt`.
 ///
 /// The JSON-action protocol is the load-bearing piece: the UI parses each
-/// reply with `agent::parse_action`, and a malformed reply degrades to a
-/// `say` so the session continues. Few-shot examples cover the three
+/// reply with `agent::parse_action`, and malformed or schema-invalid output
+/// is surfaced as a protocol error. Few-shot examples cover the three
 /// actions the model is allowed to emit (`run` / `say` / `done`).
 pub(crate) fn build_agent_system_prompt(cwd: &str, shell: &str, os: &str) -> String {
     format!(
         "You are an interactive shell agent helping the user in their terminal. \
-Each reply MUST be a single JSON object — no prose, no markdown fences, no commentary. \
-Schema:\n\
-  {{ \"thought\": \"...\", \"action\": \"run\"|\"say\"|\"done\", \"command\": \"...\", \"message\": \"...\" }}\n\
+Each reply MUST be exactly one JSON object — no prose, markdown, or commentary. \
+Use exactly one of these schemas and no other keys (`thought` is optional):\n\
+  {{ \"action\": \"run\", \"command\": \"...\", \"thought\": \"...\" }}\n\
+  {{ \"action\": \"say\", \"message\": \"...\", \"thought\": \"...\" }}\n\
+  {{ \"action\": \"done\", \"message\": \"...\", \"thought\": \"...\" }}\n\
 - `action: run` means the user must approve a shell command. Put the command in `command`. \
   Use this for anything that changes filesystem, network, or state. Do not chain unrelated \
   steps with `;` or `&&` — one command per turn so the user can review each.\n\
@@ -511,9 +750,141 @@ If shell context is attached, use it. No filler, no markdown headers."
     (system, user)
 }
 
+/// Build the first turn for "Ask AI about selected block". Block data is
+/// system context rather than an assistant/user turn, so subsequent questions
+/// retain a strictly alternating provider transcript.
+pub(crate) fn build_block_chat_prompt(question: &str, context: &BlockContext) -> (String, String) {
+    let cwd = context.cwd.as_deref().unwrap_or("unknown");
+    let system = format!(
+        "You are a terminal assistant. Answer concisely using the selected finished command block. \
+Do not claim that a suggested command was executed.\n\n\
+Selected block:\n\
+cwd: {cwd}\n\
+exit_code: {}\n\
+command:\n{}\n\n\
+output:\n{}",
+        context.exit_code, context.cmd, context.output
+    );
+    (system, format!("Question: {question}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn client(provider: Provider, redact_secrets: bool) -> AiClient {
+        AiClient::new(
+            provider,
+            Some("test-key".to_string()),
+            "test-model",
+            provider.default_base_url(),
+            512,
+            redact_secrets,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn provider_aliases_and_endpoints_are_normalized() {
+        assert_eq!(Provider::from_str("claude").unwrap(), Provider::Anthropic);
+        assert_eq!(
+            Provider::from_str("openai_compatible").unwrap(),
+            Provider::OpenAiCompatible
+        );
+        assert_eq!(
+            Provider::Anthropic.endpoint("https://api.anthropic.com/v1"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            Provider::OpenAiCompatible.endpoint("http://localhost:8000/v1/chat/completions"),
+            "http://localhost:8000/v1/chat/completions"
+        );
+        assert_eq!(
+            Provider::Ollama.endpoint("http://localhost:11434/api"),
+            "http://localhost:11434/api/chat"
+        );
+    }
+
+    #[test]
+    fn client_validates_keys_urls_and_token_bounds() {
+        assert!(AiClient::new(
+            Provider::Anthropic,
+            None,
+            "model",
+            "https://example.com",
+            1,
+            true,
+        )
+        .is_err());
+        assert!(AiClient::new(
+            Provider::OpenAiCompatible,
+            None,
+            "local-model",
+            "http://localhost:8000/v1",
+            32_768,
+            true,
+        )
+        .is_ok());
+        assert!(AiClient::new(
+            Provider::Ollama,
+            None,
+            "model",
+            "file:///tmp/model",
+            512,
+            true,
+        )
+        .is_err());
+        assert!(AiClient::new(
+            Provider::Ollama,
+            None,
+            "model",
+            "http://localhost:11434",
+            0,
+            true,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn parses_provider_response_shapes() {
+        assert_eq!(
+            response_text(
+                Provider::Anthropic,
+                &serde_json::json!({"content": [{"type": "text", "text": "one"}, {"type": "text", "text": "two"}]})
+            )
+            .as_deref(),
+            Some("one\ntwo")
+        );
+        assert_eq!(
+            response_text(
+                Provider::OpenAiCompatible,
+                &serde_json::json!({"choices": [{"message": {"content": [{"text": "ok"}]}}]})
+            )
+            .as_deref(),
+            Some("ok")
+        );
+        assert_eq!(
+            response_text(
+                Provider::Ollama,
+                &serde_json::json!({"message": {"content": "local"}})
+            )
+            .as_deref(),
+            Some("local")
+        );
+    }
+
+    #[test]
+    fn secret_redaction_obeys_the_client_setting() {
+        let token = format!("ghp_{}", "A".repeat(36));
+        let input = format!("token={token}");
+        assert!(!client(Provider::Ollama, true)
+            .prepare_text(input.clone())
+            .contains(&token));
+        assert_eq!(
+            client(Provider::Ollama, false).prepare_text(input.clone()),
+            input
+        );
+    }
 
     #[test]
     fn sample_output_passes_through_small() {
@@ -576,6 +947,58 @@ mod tests {
         let (_sys, user) = build_nl_to_cmd_prompt("list large files", "/var");
         assert!(user.contains("list large files"));
         assert!(user.contains("/var"));
+    }
+
+    #[test]
+    fn provider_request_bodies_preserve_multi_turn_role_order() {
+        let turns = vec![
+            Turn {
+                role: Role::User,
+                text: "first".into(),
+            },
+            Turn {
+                role: Role::Assistant,
+                text: "reply".into(),
+            },
+            Turn {
+                role: Role::User,
+                text: "follow-up".into(),
+            },
+        ];
+        let anthropic = request_body(&client(Provider::Anthropic, false), "system", &turns);
+        let roles: Vec<_> = anthropic["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "user"]);
+
+        let openai = request_body(&client(Provider::OpenAiCompatible, false), "system", &turns);
+        let roles: Vec<_> = openai["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["system", "user", "assistant", "user"]);
+    }
+
+    #[test]
+    fn selected_block_prompt_contains_command_output_exit_and_cwd() {
+        let (system, user) = build_block_chat_prompt(
+            "why?",
+            &BlockContext {
+                cmd: "false".into(),
+                output: "failed".into(),
+                cwd: Some("/tmp".into()),
+                exit_code: 1,
+            },
+        );
+        for expected in ["false", "failed", "/tmp", "exit_code: 1"] {
+            assert!(system.contains(expected));
+        }
+        assert_eq!(user, "Question: why?");
     }
 
     #[test]

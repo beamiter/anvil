@@ -66,6 +66,45 @@ fn active_index_after_remove(active: usize, removed: usize, remaining: usize) ->
     }
 }
 
+fn restored_leaf_mode(configured: TerminalMode, first_leaf: &mut bool) -> TerminalMode {
+    if std::mem::replace(first_leaf, false) {
+        configured
+    } else {
+        TerminalMode::Vte
+    }
+}
+
+fn format_running_process_summary(mut running: Vec<String>) -> Option<String> {
+    if running.is_empty() {
+        return None;
+    }
+    const MAX_SHOWN: usize = 8;
+    let hidden = running.len().saturating_sub(MAX_SHOWN);
+    running.truncate(MAX_SHOWN);
+    let mut summary = running.join("\n");
+    if hidden > 0 {
+        summary.push_str(&format!("\n…and {hidden} more"));
+    }
+    Some(summary)
+}
+
+fn running_process_summary_for_tabs<'a>(tabs: impl IntoIterator<Item = &'a Tab>) -> Option<String> {
+    let mut running = Vec::new();
+    for tab in tabs {
+        for (pane_index, pane) in tab.panes.iter().enumerate() {
+            if let Some(process) = pane.foreground_process() {
+                let location = if tab.panes.len() > 1 {
+                    format!("{} (pane {})", tab.title, pane_index + 1)
+                } else {
+                    tab.title.clone()
+                };
+                running.push(format!("{location} — {process}"));
+            }
+        }
+    }
+    format_running_process_summary(running)
+}
+
 impl AppModel {
     pub(crate) fn add_tab(
         &mut self,
@@ -104,6 +143,7 @@ impl AppModel {
             mode,
             initial_commands,
             working_directory,
+            None,
             sender,
         );
         let holder = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -162,7 +202,7 @@ impl AppModel {
             bell: false,
             activity: false,
             marked: false,
-            pinned: false,
+            pinned: saved.pinned,
             id,
             zoom: None,
             remote: None,
@@ -186,18 +226,37 @@ impl AppModel {
         panes: &mut Vec<Pane>,
         sender: &ComponentSender<AppModel>,
     ) -> gtk::Widget {
+        let mut first_leaf = true;
+        self.build_pane_layout_node(node, tab_id, panes, &mut first_leaf, sender)
+    }
+
+    fn build_pane_layout_node(
+        &mut self,
+        node: &session::PaneLayout,
+        tab_id: u64,
+        panes: &mut Vec<Pane>,
+        first_leaf: &mut bool,
+        sender: &ComponentSender<AppModel>,
+    ) -> gtk::Widget {
         match node {
-            session::PaneLayout::Leaf { cwd, cmds, .. } => {
+            session::PaneLayout::Leaf { cwd, sid, cmds, .. } => {
                 let pane_id = self.next_pane_id;
                 self.next_pane_id += 1;
+                // Runtime splits always retain the original pane and add a VTE
+                // sibling. Rebuild the same shape: the first leaf follows the
+                // current configured default, while every restored sibling is
+                // VTE compatibility mode. A VTE-default workspace remains all
+                // VTE, and old snapshots need no per-leaf migration.
+                let mode = restored_leaf_mode(self.config.borrow().terminal_mode, first_leaf);
                 let pane = create_pane(
                     &self.config,
                     &self.shell_argv,
                     tab_id,
                     pane_id,
-                    self.config.borrow().terminal_mode,
+                    mode,
                     cmds.clone(),
                     cwd.clone(),
+                    sid.clone(),
                     sender,
                 );
                 let widget = pane.terminal.widget();
@@ -218,8 +277,8 @@ impl AppModel {
                 let paned = gtk::Paned::new(o);
                 paned.set_hexpand(true);
                 paned.set_vexpand(true);
-                let start_w = self.build_pane_layout(start, tab_id, panes, sender);
-                let end_w = self.build_pane_layout(end, tab_id, panes, sender);
+                let start_w = self.build_pane_layout_node(start, tab_id, panes, first_leaf, sender);
+                let end_w = self.build_pane_layout_node(end, tab_id, panes, first_leaf, sender);
                 paned.set_start_child(Some(&start_w));
                 paned.set_end_child(Some(&end_w));
                 paned.set_position(*position);
@@ -242,6 +301,7 @@ impl AppModel {
             None => session::PaneLayout::Leaf {
                 mode: "block".to_string(),
                 cwd: None,
+                sid: None,
                 cmds: None,
             },
         }
@@ -263,7 +323,7 @@ impl AppModel {
             }
         } else {
             let pane = tab.panes.iter().find(|p| p.terminal.widget() == *widget);
-            let (mode, cwd, cmds) = match pane {
+            let (mode, cwd, sid, cmds) = match pane {
                 Some(p) => (
                     match p.mode {
                         TerminalMode::Vte => "vte",
@@ -271,11 +331,17 @@ impl AppModel {
                     }
                     .to_string(),
                     p.cwd.clone(),
+                    p.session_id.clone(),
                     p.restorable_command(),
                 ),
-                None => ("block".to_string(), None, None),
+                None => ("block".to_string(), None, None, None),
             };
-            session::PaneLayout::Leaf { mode, cwd, cmds }
+            session::PaneLayout::Leaf {
+                mode,
+                cwd,
+                sid,
+                cmds,
+            }
         }
     }
 
@@ -298,6 +364,7 @@ impl AppModel {
         session::PaneLayout::Leaf {
             mode: "block".to_string(),
             cwd: None,
+            sid: None,
             cmds: None,
         }
     }
@@ -311,6 +378,7 @@ impl AppModel {
             .map(|t| session::SavedTab {
                 title: t.title.clone(),
                 custom_title: t.custom_title,
+                pinned: t.pinned,
                 layout: self.serialize_layout(t),
             })
             .collect();
@@ -359,28 +427,7 @@ impl AppModel {
     }
 
     pub(crate) fn running_process_summary(&self) -> Option<String> {
-        let mut running = Vec::new();
-        for tab in &self.tabs {
-            for pane in &tab.panes {
-                if let Some(process) = pane.foreground_process() {
-                    let label = format!("{} — {process}", tab.title);
-                    if !running.contains(&label) {
-                        running.push(label);
-                    }
-                }
-            }
-        }
-        if running.is_empty() {
-            return None;
-        }
-        const MAX_SHOWN: usize = 8;
-        let hidden = running.len().saturating_sub(MAX_SHOWN);
-        running.truncate(MAX_SHOWN);
-        let mut summary = running.join("\n");
-        if hidden > 0 {
-            summary.push_str(&format!("\n…and {hidden} more"));
-        }
-        Some(summary)
+        running_process_summary_for_tabs(&self.tabs)
     }
 
     pub(crate) fn request_quit(&self, sender: &ComponentSender<AppModel>) {
@@ -392,14 +439,26 @@ impl AppModel {
     }
 
     pub(crate) fn force_quit(&self) {
+        if !self.safe_mode {
+            let width = self.content_paned.position().clamp(120, 800) as u32;
+            let changed = {
+                let config = self.config.borrow();
+                config.sidebar_width != width || config.sidebar_visible != self.sidebar_visible
+            };
+            if changed {
+                let mut config = self.config.borrow_mut();
+                config.sidebar_width = width;
+                config.sidebar_visible = self.sidebar_visible;
+                drop(config);
+                self.persist_config();
+            }
+        }
         self.persist_session();
         self.quit_allowed.set(true);
         self.window.close();
     }
 
-    /// App-level diagnostics for the debug dashboard. (jterm4 surfaces per-block
-    /// stats from the block backend; jterm1 exposes window/session state — block
-    /// internals would need a backend round-trip, noted as a parity gap.)
+    /// App-level diagnostics plus the active Block backend's PTY/viewport state.
     pub(crate) fn debug_info_snapshot(&self) -> Vec<(String, Vec<(String, String)>)> {
         let cfg = self.config.borrow();
         let total_panes: usize = self.tabs.iter().map(|t| t.panes.len()).sum();
@@ -454,11 +513,19 @@ impl AppModel {
                 cfg.startup_commands.clone().unwrap_or_default(),
             ),
         ];
-        vec![
+        let mut info = vec![
             ("Session".to_string(), session),
             ("Appearance".to_string(), appearance),
             ("Config".to_string(), config),
-        ]
+        ];
+        if let Some(block_info) = self.active_terminal().and_then(TermCtl::block_debug_info) {
+            info.extend(
+                block_info
+                    .into_iter()
+                    .map(|(section, rows)| (format!("Block · {section}"), rows)),
+            );
+        }
+        info
     }
 
     /// Open a new tab that connects to a remote host via ssh. Uses block mode
@@ -479,7 +546,17 @@ impl AppModel {
         // resumable session ids, and Agent observations. Keep them on the Block
         // backend even when the local compatibility backend is configured.
         let mode = TerminalMode::Block;
-        let pane = create_pane(&self.config, &argv, id, pane_id, mode, None, None, sender);
+        let pane = create_pane(
+            &self.config,
+            &argv,
+            id,
+            pane_id,
+            mode,
+            None,
+            None,
+            None,
+            sender,
+        );
         let holder = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         holder.set_hexpand(true);
         holder.set_vexpand(true);
@@ -499,6 +576,7 @@ impl AppModel {
             zoom: None,
             remote: Some(RemoteConn {
                 host: host.clone(),
+                pane_id,
                 status: ConnStatus::Connecting,
                 attempt: 0,
                 spawn_at: std::time::Instant::now(),
@@ -509,8 +587,12 @@ impl AppModel {
     }
 
     /// Flip a Connecting remote tab to Connected (first output/cwd seen).
-    pub(crate) fn mark_remote_connected(&mut self, idx: usize) -> bool {
-        if let Some(conn) = self.tabs[idx].remote.as_mut() {
+    pub(crate) fn mark_remote_connected(&mut self, idx: usize, pane_id: u64) -> bool {
+        if let Some(conn) = self.tabs[idx]
+            .remote
+            .as_mut()
+            .filter(|conn| conn.pane_id == pane_id)
+        {
             if conn.status != ConnStatus::Connected {
                 conn.status = ConnStatus::Connected;
                 return true;
@@ -525,15 +607,20 @@ impl AppModel {
     /// the tab closes normally.
     pub(crate) fn schedule_remote_reconnect(
         &mut self,
-        tab_id: u64,
+        pane_id: u64,
         code: i32,
         sender: &ComponentSender<AppModel>,
     ) -> bool {
         const MAX_ATTEMPT: u32 = 6;
-        let Some(idx) = self.index_of(tab_id) else {
+        let Some((idx, _)) = self.find_pane(pane_id) else {
             return false;
         };
-        if self.tabs[idx].panes.len() != 1 {
+        if !reconnect_target_is_valid(
+            self.tabs[idx].panes.len(),
+            self.tabs[idx].zoom.is_some(),
+            self.tabs[idx].remote.as_ref().map(|conn| conn.pane_id),
+            pane_id,
+        ) {
             return false;
         }
         let Some(conn) = self.tabs[idx].remote.clone() else {
@@ -583,10 +670,10 @@ impl AppModel {
             let left = remaining.get();
             if left > 1 {
                 remaining.set(left - 1);
-                s.input(AppMsg::RemoteReconnectTick(tab_id, left - 1));
+                s.input(AppMsg::RemoteReconnectTick(pane_id, left - 1));
                 glib::ControlFlow::Continue
             } else {
-                s.input(AppMsg::RemoteReconnectNow(tab_id, next_attempt));
+                s.input(AppMsg::RemoteReconnectNow(pane_id, next_attempt));
                 glib::ControlFlow::Break
             }
         });
@@ -596,11 +683,15 @@ impl AppModel {
     /// Respawn a dead remote tab's connection in place (same tab id / position).
     pub(crate) fn do_remote_reconnect(
         &mut self,
-        tab_id: u64,
+        pane_id: u64,
         attempt: u32,
         sender: &ComponentSender<AppModel>,
     ) {
-        let Some(idx) = self.index_of(tab_id) else {
+        if !self.remote_reconnect_target_is_valid(pane_id) {
+            self.cancel_remote_reconnect(pane_id, sender);
+            return;
+        }
+        let Some((idx, _)) = self.find_pane(pane_id) else {
             return;
         };
         let Some(conn) = self.tabs[idx].remote.clone() else {
@@ -609,7 +700,7 @@ impl AppModel {
         // Swap the dead pane widget for a fresh remote pane.
         let old_widget = self.tabs[idx].panes[0].terminal.widget();
         self.tabs[idx].holder.remove(&old_widget);
-        let pane_id = self.next_pane_id;
+        let new_pane_id = self.next_pane_id;
         self.next_pane_id += 1;
         // Pull the *current* host snapshot — `conn.host.session` may have been
         // learned dynamically via OSC 7770 during the prior connection, so we
@@ -624,9 +715,10 @@ impl AppModel {
         let pane = create_pane(
             &self.config,
             &argv,
-            tab_id,
-            pane_id,
+            self.tabs[idx].id,
+            new_pane_id,
             mode,
+            None,
             None,
             None,
             sender,
@@ -636,6 +728,7 @@ impl AppModel {
         self.tabs[idx].active_pane = 0;
         self.tabs[idx].title = host_now.name.clone();
         if let Some(c) = self.tabs[idx].remote.as_mut() {
+            c.pane_id = new_pane_id;
             c.status = ConnStatus::Connecting;
             c.attempt = attempt;
             c.spawn_at = std::time::Instant::now();
@@ -644,6 +737,41 @@ impl AppModel {
             self.tabs[idx].panes[0].terminal.emit(VteInput::GrabFocus);
         }
         self.rebuild_tab_strip(sender);
+    }
+
+    /// Revalidate the reconnect ownership at every timer tick and immediately
+    /// before respawn. A split or moved/replaced leaf must never be overwritten
+    /// by a stale reconnect timer.
+    pub(crate) fn remote_reconnect_target_is_valid(&self, pane_id: u64) -> bool {
+        let Some((idx, _)) = self.find_pane(pane_id) else {
+            return false;
+        };
+        reconnect_target_is_valid(
+            self.tabs[idx].panes.len(),
+            self.tabs[idx].zoom.is_some(),
+            self.tabs[idx].remote.as_ref().map(|conn| conn.pane_id),
+            pane_id,
+        )
+    }
+
+    /// Cancel a stale reconnect and remove only its dead remote leaf. Live
+    /// siblings created while the countdown was running remain untouched.
+    pub(crate) fn cancel_remote_reconnect(
+        &mut self,
+        pane_id: u64,
+        sender: &ComponentSender<AppModel>,
+    ) {
+        let Some((idx, _)) = self.find_pane(pane_id) else {
+            return;
+        };
+        if self.tabs[idx]
+            .remote
+            .as_ref()
+            .is_some_and(|conn| conn.pane_id == pane_id)
+        {
+            self.tabs[idx].remote = None;
+        }
+        self.close_pane(pane_id, sender);
     }
 
     /// Stable-partition the tab list so pinned tabs sort to the front, keeping
@@ -694,20 +822,17 @@ impl AppModel {
         self.select_tab(new_id, sender);
     }
 
-    /// First restorable command running in any of a tab's panes, if any.
-    pub(crate) fn tab_running_command(&self, idx: usize) -> Option<String> {
-        self.tabs
-            .get(idx)?
-            .panes
-            .iter()
-            .find_map(|p| p.restorable_command())
+    /// Foreground processes running in a tab's panes, formatted for one
+    /// confirmation dialog. Ordinary shells are omitted by the PTY probe.
+    pub(crate) fn tab_running_process_summary(&self, idx: usize) -> Option<String> {
+        running_process_summary_for_tabs(std::iter::once(self.tabs.get(idx)?))
     }
 
     /// Close a tab, first confirming if a process is still running in it.
     pub(crate) fn request_close_tab(&mut self, id: u64, sender: &ComponentSender<AppModel>) {
         if let Some(idx) = self.index_of(id) {
-            if let Some(cmd) = self.tab_running_command(idx) {
-                dialogs::confirm_close(&self.window, &cmd, AppMsg::ForceCloseTab(id), sender);
+            if let Some(running) = self.tab_running_process_summary(idx) {
+                dialogs::confirm_close(&self.window, &running, AppMsg::ForceCloseTab(id), sender);
                 return;
             }
         }
@@ -717,8 +842,13 @@ impl AppModel {
     /// Close a pane, first confirming if a process is still running in it.
     pub(crate) fn request_close_pane(&mut self, pane_id: u64, sender: &ComponentSender<AppModel>) {
         if let Some((ti, pi)) = self.find_pane(pane_id) {
-            if let Some(cmd) = self.tabs[ti].panes[pi].restorable_command() {
-                dialogs::confirm_close(&self.window, &cmd, AppMsg::ForceClosePane(pane_id), sender);
+            if let Some(process) = self.tabs[ti].panes[pi].foreground_process() {
+                dialogs::confirm_close(
+                    &self.window,
+                    &process,
+                    AppMsg::ForceClosePane(pane_id),
+                    sender,
+                );
                 return;
             }
         }
@@ -795,6 +925,7 @@ impl AppModel {
             mode,
             None,
             cwd,
+            None,
             sender,
         );
         let holder = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -828,9 +959,57 @@ impl AppModel {
             .filter(|t| t.marked)
             .map(|t| t.id)
             .collect();
-        for id in ids {
-            self.close_tab(id, sender);
+        if ids.is_empty() {
+            return;
         }
+        let selected: std::collections::HashSet<u64> = ids.iter().copied().collect();
+        if let Some(running) = running_process_summary_for_tabs(
+            self.tabs.iter().filter(|tab| selected.contains(&tab.id)),
+        ) {
+            // Capture the current selection in the confirmation message. A
+            // cancellation closes nothing and leaves every mark intact; one
+            // confirmation closes the whole captured set without modal spam.
+            dialogs::confirm_close(
+                &self.window,
+                &running,
+                AppMsg::ForceCloseMarked(ids),
+                sender,
+            );
+        } else {
+            self.close_tabs(ids, sender);
+        }
+    }
+
+    /// Remove a captured set of tab ids as one workspace mutation. This keeps
+    /// the current tab selected when possible and rebuilds/persists once.
+    pub(crate) fn close_tabs(&mut self, ids: Vec<u64>, sender: &ComponentSender<AppModel>) {
+        if ids.is_empty() {
+            return;
+        }
+        let selected: std::collections::HashSet<u64> = ids.into_iter().collect();
+        let Some(first_removed) = self.tabs.iter().position(|tab| selected.contains(&tab.id))
+        else {
+            return;
+        };
+        let active_id = self.tabs.get(self.active).map(|tab| tab.id);
+        let mut index = 0;
+        while index < self.tabs.len() {
+            if selected.contains(&self.tabs[index].id) {
+                let tab = self.tabs.remove(index);
+                self.stack.remove(&tab.holder);
+                drop(tab);
+            } else {
+                index += 1;
+            }
+        }
+        if self.tabs.is_empty() {
+            relm4::main_application().quit();
+            return;
+        }
+        let new_id = active_id
+            .filter(|id| self.index_of(*id).is_some())
+            .unwrap_or_else(|| self.tabs[first_removed.min(self.tabs.len() - 1)].id);
+        self.select_tab(new_id, sender);
     }
 
     pub(crate) fn find_pane(&self, pane_id: u64) -> Option<(usize, usize)> {
@@ -870,6 +1049,7 @@ impl AppModel {
             TerminalMode::Vte,
             None,
             wd,
+            None,
             sender,
         );
         let new_widget = new_pane.terminal.widget();
@@ -924,11 +1104,18 @@ impl AppModel {
             self.close_tab(tab_id, sender);
             return;
         }
+        let was_remote = self.tabs[ti]
+            .remote
+            .as_ref()
+            .is_some_and(|conn| conn.pane_id == pane_id);
         let Some(removed) = self.detach_pane_from_tab(ti, pi) else {
             log::error!("Failed to detach pane {pane_id} from tab widget tree");
             return;
         };
         let tab = &mut self.tabs[ti];
+        if was_remote {
+            tab.remote = None;
+        }
         let ap = tab.active_pane;
         tab.panes[ap].terminal.emit(VteInput::GrabFocus);
         drop(removed);
@@ -1075,20 +1262,29 @@ impl AppModel {
 
     /// Detach the active pane from a split tab and host it in a brand-new tab.
     pub(crate) fn move_pane_to_new_tab(&mut self, sender: &ComponentSender<AppModel>) {
-        let (ti, pi, pane_id) = {
+        let (ti, pi, pane_id, moves_remote) = {
             let Some(tab) = self.tabs.get(self.active) else {
                 return;
             };
             if tab.panes.len() <= 1 || tab.zoom.is_some() {
                 return;
             }
-            (self.active, tab.active_pane, tab.panes[tab.active_pane].id)
+            let pane_id = tab.panes[tab.active_pane].id;
+            (
+                self.active,
+                tab.active_pane,
+                pane_id,
+                tab.remote
+                    .as_ref()
+                    .is_some_and(|conn| conn.pane_id == pane_id),
+            )
         };
         let Some(moved) = self.detach_pane_from_tab(ti, pi) else {
             log::error!("Failed to detach pane {pane_id} into a new tab");
             return;
         };
 
+        let remote = moves_remote.then(|| self.tabs[ti].remote.take()).flatten();
         let new_id = self.next_id;
         self.next_id += 1;
         let mw = moved.terminal.widget();
@@ -1098,21 +1294,29 @@ impl AppModel {
         holder.append(&mw);
         self.stack.add_named(&holder, Some(&new_id.to_string()));
         let number = self.tabs.len() as u32 + 1;
-        let title = default_tab_title(number, moved.cwd.as_deref());
+        let (title, custom_title) = remote.as_ref().map_or_else(
+            || (default_tab_title(number, moved.cwd.as_deref()), false),
+            |conn| (conn.host.name.clone(), true),
+        );
         let new_tab = Tab {
             holder,
             panes: vec![moved],
             active_pane: 0,
             title,
-            custom_title: false,
+            custom_title,
             bell: false,
             activity: false,
             marked: false,
             pinned: false,
             id: new_id,
             zoom: None,
-            remote: None,
+            remote,
         };
+        if let Some(session) = self.active_agent.borrow_mut().as_mut() {
+            if session.bound_pane == pane_id {
+                session.bound_tab = new_id;
+            }
+        }
         self.insert_tab_after_active(new_tab);
         self.select_tab(new_id, sender);
     }
@@ -1136,9 +1340,58 @@ impl AppModel {
     }
 }
 
+fn reconnect_target_is_valid(
+    panes_len: usize,
+    zoomed: bool,
+    remote_pane_id: Option<u64>,
+    event_pane_id: u64,
+) -> bool {
+    panes_len == 1 && !zoomed && remote_pane_id == Some(event_pane_id)
+}
+
 #[cfg(test)]
 mod pane_tree_tests {
-    use super::active_index_after_remove;
+    use super::{
+        active_index_after_remove, format_running_process_summary, reconnect_target_is_valid,
+        restored_leaf_mode,
+    };
+    use crate::config::TerminalMode;
+
+    #[test]
+    fn split_restore_keeps_only_the_first_leaf_on_the_configured_backend() {
+        let mut first = true;
+        assert!(matches!(
+            restored_leaf_mode(TerminalMode::Block, &mut first),
+            TerminalMode::Block
+        ));
+        assert!(matches!(
+            restored_leaf_mode(TerminalMode::Block, &mut first),
+            TerminalMode::Vte
+        ));
+        assert!(matches!(
+            restored_leaf_mode(TerminalMode::Block, &mut first),
+            TerminalMode::Vte
+        ));
+
+        let mut first = true;
+        assert!(matches!(
+            restored_leaf_mode(TerminalMode::Vte, &mut first),
+            TerminalMode::Vte
+        ));
+        assert!(matches!(
+            restored_leaf_mode(TerminalMode::Vte, &mut first),
+            TerminalMode::Vte
+        ));
+    }
+
+    #[test]
+    fn remote_reconnect_requires_the_same_only_unzoomed_pane() {
+        assert!(reconnect_target_is_valid(1, false, Some(7), 7));
+        assert!(!reconnect_target_is_valid(2, false, Some(7), 7));
+        assert!(!reconnect_target_is_valid(1, true, Some(7), 7));
+        assert!(!reconnect_target_is_valid(1, false, Some(8), 7));
+        assert!(!reconnect_target_is_valid(1, false, None, 7));
+    }
 
     #[test]
     fn active_index_tracks_the_same_pane_when_an_earlier_pane_is_removed() {
@@ -1155,5 +1408,17 @@ mod pane_tree_tests {
     #[test]
     fn removing_a_later_pane_keeps_the_active_index() {
         assert_eq!(active_index_after_remove(0, 2, 2), 0);
+    }
+
+    #[test]
+    fn running_process_summary_is_empty_or_bounded_without_losing_count() {
+        assert_eq!(format_running_process_summary(Vec::new()), None);
+        let summary = format_running_process_summary(
+            (1..=10).map(|index| format!("tab {index} — vim")).collect(),
+        )
+        .unwrap();
+        assert!(summary.contains("tab 1 — vim"));
+        assert!(!summary.contains("tab 9 — vim"));
+        assert!(summary.ends_with("…and 2 more"));
     }
 }

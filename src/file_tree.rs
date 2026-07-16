@@ -104,6 +104,7 @@ pub(crate) fn new_view(store: &TreeStore) -> TreeView {
     let view = TreeView::with_model(store);
     view.set_headers_visible(false);
     view.set_vexpand(true);
+    view.set_tooltip_column(COL_PATH as i32);
 
     let column = TreeViewColumn::new();
     let icon = CellRendererPixbuf::new();

@@ -40,93 +40,128 @@ pub(crate) enum Command {
     Help,
     Version,
     Doctor(ReportFormat),
-    CheckConfig(ReportFormat),
+    CheckConfig(Option<PathBuf>, ReportFormat),
     RestoreConfigBackup,
     ConfigPath,
     InitConfig,
+    PrintDefaultConfig,
     PrintShellIntegration(ShellIntegration),
 }
 
-pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
-    let args: Vec<OsString> = args.into_iter().collect();
-    if args.first().is_some_and(|arg| arg == "--doctor") {
-        return Ok(Command::Doctor(parse_report_format(
-            &args,
-            "--doctor [--json]",
-        )?));
-    }
-    if args.first().is_some_and(|arg| arg == "--check-config") {
-        return Ok(Command::CheckConfig(parse_report_format(
-            &args,
-            "--check-config [--json]",
-        )?));
-    }
-    if args
-        .first()
-        .is_some_and(|arg| arg == "--restore-config-backup")
-    {
-        require_exact_args(&args, 1, "--restore-config-backup")?;
-        return Ok(Command::RestoreConfigBackup);
-    }
-    if args.first().is_some_and(|arg| arg == "--config-path") {
-        require_exact_args(&args, 1, "--config-path")?;
-        return Ok(Command::ConfigPath);
-    }
-    if args.first().is_some_and(|arg| arg == "--init-config") {
-        require_exact_args(&args, 1, "--init-config")?;
-        return Ok(Command::InitConfig);
-    }
-    if args.first().is_some_and(|arg| arg == "--shell-integration") {
-        require_exact_args(&args, 2, "--shell-integration <shell>")?;
-        let shell = args[1]
-            .to_str()
-            .ok_or_else(|| "shell name must be valid UTF-8".to_string())?;
-        let shell = match shell.to_ascii_lowercase().as_str() {
-            "bash" => ShellIntegration::Bash,
-            "zsh" => ShellIntegration::Zsh,
-            "fish" => ShellIntegration::Fish,
-            "powershell" | "pwsh" | "ps1" => ShellIntegration::PowerShell,
-            _ => {
-                return Err(format!(
-                    "unsupported shell '{shell}' (use bash, zsh, fish, or pwsh)"
-                ))
-            }
-        };
-        return Ok(Command::PrintShellIntegration(shell));
-    }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ParsedArgs {
+    pub(crate) config_path: Option<PathBuf>,
+    pub(crate) command: Command,
+}
 
+fn set_utility(utility: &mut Option<Command>, command: Command) -> Result<(), String> {
+    if utility.is_some() {
+        return Err("only one utility command may be used at a time".to_string());
+    }
+    *utility = Some(command);
+    Ok(())
+}
+
+fn parse_mode(value: &str) -> Result<Mode, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "block" => Ok(Mode::Block),
+        "vte" => Ok(Mode::Vte),
+        _ => Err(format!(
+            "invalid terminal mode '{value}' (use block or vte)"
+        )),
+    }
+}
+
+fn parse_shell(value: &str) -> Result<ShellIntegration, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "bash" => Ok(ShellIntegration::Bash),
+        "zsh" => Ok(ShellIntegration::Zsh),
+        "fish" => Ok(ShellIntegration::Fish),
+        "powershell" | "pwsh" | "ps1" => Ok(ShellIntegration::PowerShell),
+        _ => Err(format!(
+            "unsupported shell '{value}' (use bash, zsh, fish, or pwsh)"
+        )),
+    }
+}
+
+pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<ParsedArgs, String> {
+    let args: Vec<OsString> = args.into_iter().collect();
+    let mut config_path = None;
+    let mut utility = None;
     let mut launch = LaunchOptions::default();
+    let mut report_json = false;
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
-        match arg.to_str() {
-            Some("-h" | "--help") => return Ok(Command::Help),
-            Some("-V" | "--version") => return Ok(Command::Version),
-            Some("--no-restore") => launch.no_restore = true,
-            Some("--safe-mode") => {
+        let option = arg
+            .to_str()
+            .ok_or_else(|| "options must be valid UTF-8".to_string())?;
+        match option {
+            "-h" | "--help" => set_utility(&mut utility, Command::Help)?,
+            "-V" | "--version" => set_utility(&mut utility, Command::Version)?,
+            "--doctor" => set_utility(&mut utility, Command::Doctor(ReportFormat::Human))?,
+            "--check-config" => {
+                let path = args.get(index + 1).and_then(|next| {
+                    (!next.to_string_lossy().starts_with('-')).then(|| PathBuf::from(next))
+                });
+                if path.is_some() {
+                    index += 1;
+                }
+                set_utility(
+                    &mut utility,
+                    Command::CheckConfig(path, ReportFormat::Human),
+                )?;
+            }
+            "--restore-config-backup" => set_utility(&mut utility, Command::RestoreConfigBackup)?,
+            "--config-path" | "--print-config-path" => {
+                set_utility(&mut utility, Command::ConfigPath)?
+            }
+            "--init-config" => set_utility(&mut utility, Command::InitConfig)?,
+            "--print-default-config" => set_utility(&mut utility, Command::PrintDefaultConfig)?,
+            "--shell-integration" => {
+                index += 1;
+                let shell = args
+                    .get(index)
+                    .ok_or_else(|| "--shell-integration requires a shell".to_string())?
+                    .to_str()
+                    .ok_or_else(|| "shell name must be valid UTF-8".to_string())?;
+                set_utility(
+                    &mut utility,
+                    Command::PrintShellIntegration(parse_shell(shell)?),
+                )?;
+            }
+            "--json" => report_json = true,
+            "-c" | "--config" => {
+                index += 1;
+                let path = args
+                    .get(index)
+                    .ok_or_else(|| format!("{option} requires a path"))?;
+                if path.to_string_lossy().starts_with('-') {
+                    return Err(format!("{option} requires a path"));
+                }
+                config_path = Some(PathBuf::from(path));
+            }
+            "--no-restore" => launch.no_restore = true,
+            "--safe-mode" => {
                 launch.safe_mode = true;
                 launch.no_restore = true;
             }
-            Some("-d" | "--working-directory") => {
+            "-d" | "--working-directory" => {
                 index += 1;
                 let path = args
                     .get(index)
                     .ok_or_else(|| "--working-directory requires a path".to_string())?;
                 launch.working_directory = Some(PathBuf::from(path));
             }
-            Some("--mode") => {
+            "--mode" => {
                 index += 1;
                 let mode = args
                     .get(index)
                     .and_then(|value| value.to_str())
                     .ok_or_else(|| "--mode requires 'block' or 'vte'".to_string())?;
-                launch.mode = Some(match mode.to_ascii_lowercase().as_str() {
-                    "block" => Mode::Block,
-                    "vte" => Mode::Vte,
-                    _ => return Err(format!("invalid terminal mode '{mode}' (use block or vte)")),
-                });
+                launch.mode = Some(parse_mode(mode)?);
             }
-            Some("-e" | "--execute" | "--") => {
+            "-e" | "--execute" | "--" => {
                 let command = args[index + 1..]
                     .iter()
                     .map(|arg| {
@@ -141,8 +176,43 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
                 launch.execute = Some(command);
                 break;
             }
-            Some(value) if value.starts_with('-') => {
-                return Err(format!("unknown option '{value}'"));
+            _ if option.starts_with("--config=") => {
+                let value = option.trim_start_matches("--config=");
+                if value.is_empty() {
+                    return Err("--config requires a path".to_string());
+                }
+                config_path = Some(PathBuf::from(value));
+            }
+            _ if option.starts_with("--check-config=") => {
+                let value = option.trim_start_matches("--check-config=");
+                if value.is_empty() {
+                    return Err("--check-config requires a non-empty path".to_string());
+                }
+                set_utility(
+                    &mut utility,
+                    Command::CheckConfig(Some(PathBuf::from(value)), ReportFormat::Human),
+                )?;
+            }
+            _ if option.starts_with("--shell-integration=") => {
+                set_utility(
+                    &mut utility,
+                    Command::PrintShellIntegration(parse_shell(
+                        option.trim_start_matches("--shell-integration="),
+                    )?),
+                )?;
+            }
+            _ if option.starts_with("--mode=") => {
+                launch.mode = Some(parse_mode(option.trim_start_matches("--mode="))?);
+            }
+            _ if option.starts_with("--working-directory=") => {
+                let value = option.trim_start_matches("--working-directory=");
+                if value.is_empty() {
+                    return Err("--working-directory requires a path".to_string());
+                }
+                launch.working_directory = Some(PathBuf::from(value));
+            }
+            _ if option.starts_with('-') => {
+                return Err(format!("unknown option '{option}'"));
             }
             _ => {
                 if launch.working_directory.is_some() {
@@ -154,6 +224,35 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
         index += 1;
     }
 
+    // Keep the check utility tolerant of `--json` before its optional path (or
+    // even a path before the utility) without treating that path as a GUI cwd.
+    if let Some(Command::CheckConfig(path @ None, _)) = utility.as_mut() {
+        if launch.execute.is_none()
+            && !launch.no_restore
+            && !launch.safe_mode
+            && launch.mode.is_none()
+        {
+            *path = launch.working_directory.take();
+        }
+    }
+
+    if report_json {
+        utility = match utility.take() {
+            Some(Command::Doctor(_)) => Some(Command::Doctor(ReportFormat::Json)),
+            Some(Command::CheckConfig(path, _)) => {
+                Some(Command::CheckConfig(path, ReportFormat::Json))
+            }
+            Some(_) => {
+                return Err("--json is only valid with --doctor or --check-config".to_string());
+            }
+            None => return Err("--json requires --doctor or --check-config".to_string()),
+        };
+    }
+
+    if utility.is_some() && launch != LaunchOptions::default() {
+        return Err("launch options cannot be combined with a utility command".to_string());
+    }
+
     if launch.safe_mode {
         if launch.mode.is_some() {
             return Err("--safe-mode cannot be combined with --mode".to_string());
@@ -163,23 +262,10 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
         }
     }
 
-    Ok(Command::Run(launch))
-}
-
-fn parse_report_format(args: &[OsString], usage: &str) -> Result<ReportFormat, String> {
-    match args {
-        [_] => Ok(ReportFormat::Human),
-        [_, flag] if flag == "--json" => Ok(ReportFormat::Json),
-        _ => Err(format!("usage: jterm1 {usage}")),
-    }
-}
-
-fn require_exact_args(args: &[OsString], expected: usize, usage: &str) -> Result<(), String> {
-    if args.len() == expected {
-        Ok(())
-    } else {
-        Err(format!("usage: jterm1 {usage}"))
-    }
+    Ok(ParsedArgs {
+        config_path,
+        command: utility.unwrap_or(Command::Run(launch)),
+    })
 }
 
 pub(crate) const HELP: &str = r#"jterm1 — a Block-first terminal workspace
@@ -187,6 +273,9 @@ pub(crate) const HELP: &str = r#"jterm1 — a Block-first terminal workspace
 Usage:
   jterm1 [OPTIONS] [DIRECTORY]
   jterm1 [OPTIONS] --execute COMMAND [ARG...]
+
+Global options:
+  -c, --config PATH           Use an alternate config file for this process
 
 Launch options:
   -d, --working-directory DIR  Start in DIR
@@ -197,10 +286,12 @@ Launch options:
 
 Utilities:
       --doctor [--json]        Check configuration and runtime dependencies
-      --check-config [--json]  Validate keys, types, ranges, colors, and shortcuts
+      --check-config [PATH] [--json]
+                               Validate keys, types, ranges, colors, and shortcuts
       --restore-config-backup  Restore the newest valid rotating config backup
       --config-path            Print the active configuration file path
       --init-config            Create a documented config without overwriting one
+      --print-default-config   Print the bundled example configuration
       --shell-integration SH   Print integration for bash, zsh, fish, or pwsh
   -h, --help                   Show this help
   -V, --version                Show the version
@@ -211,22 +302,30 @@ Examples:
   jterm1 --safe-mode
   jterm1 --doctor --json
   jterm1 --check-config
+  jterm1 --check-config ~/custom-jterm1.toml --json
+  jterm1 --config ~/custom-jterm1.toml --config-path
   jterm1 --restore-config-backup
   jterm1 -d /tmp -e bash -lc 'printf "hello\\n"'
   source <(jterm1 --shell-integration bash)
+
+JTERM1_CONFIG provides the same process-local config-path override as --config.
 "#;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn parse_strs(args: &[&str]) -> Result<Command, String> {
+    fn parse_strs(args: &[&str]) -> Result<ParsedArgs, String> {
         parse(args.iter().map(OsString::from))
+    }
+
+    fn parse_command(args: &[&str]) -> Result<Command, String> {
+        parse_strs(args).map(|parsed| parsed.command)
     }
 
     #[test]
     fn parses_launch_options_and_execute_remainder() {
-        let command = parse_strs(&[
+        let command = parse_command(&[
             "--mode", "block", "-d", "/tmp", "-e", "bash", "-lc", "echo hi",
         ])
         .unwrap();
@@ -244,7 +343,7 @@ mod tests {
 
     #[test]
     fn positional_argument_is_working_directory() {
-        let Command::Run(options) = parse_strs(&["~/project"]).unwrap() else {
+        let Command::Run(options) = parse_command(&["~/project"]).unwrap() else {
             panic!("expected run")
         };
         assert_eq!(options.working_directory, Some(PathBuf::from("~/project")));
@@ -253,7 +352,7 @@ mod tests {
     #[test]
     fn parses_shell_integration_alias() {
         assert_eq!(
-            parse_strs(&["--shell-integration", "pwsh"]).unwrap(),
+            parse_command(&["--shell-integration", "pwsh"]).unwrap(),
             Command::PrintShellIntegration(ShellIntegration::PowerShell)
         );
     }
@@ -274,12 +373,13 @@ mod tests {
 
     #[test]
     fn execute_remainder_may_contain_help_or_version_flags() {
-        let Command::Run(help) = parse_strs(&["-e", "cargo", "--help"]).unwrap() else {
+        let Command::Run(help) = parse_command(&["-e", "cargo", "--help"]).unwrap() else {
             panic!("expected run")
         };
         assert_eq!(help.execute, Some(vec!["cargo".into(), "--help".into()]));
 
-        let Command::Run(version) = parse_strs(&["--execute", "bash", "--version"]).unwrap() else {
+        let Command::Run(version) = parse_command(&["--execute", "bash", "--version"]).unwrap()
+        else {
             panic!("expected run")
         };
         assert_eq!(
@@ -291,11 +391,11 @@ mod tests {
     #[test]
     fn doctor_supports_human_and_json_formats() {
         assert_eq!(
-            parse_strs(&["--doctor"]).unwrap(),
+            parse_command(&["--doctor"]).unwrap(),
             Command::Doctor(ReportFormat::Human)
         );
         assert_eq!(
-            parse_strs(&["--doctor", "--json"]).unwrap(),
+            parse_command(&["--doctor", "--json"]).unwrap(),
             Command::Doctor(ReportFormat::Json)
         );
         assert!(parse_strs(&["--doctor", "--verbose"]).is_err());
@@ -303,7 +403,7 @@ mod tests {
 
     #[test]
     fn safe_mode_implies_a_fresh_workspace() {
-        let Command::Run(options) = parse_strs(&["--safe-mode"]).unwrap() else {
+        let Command::Run(options) = parse_command(&["--safe-mode"]).unwrap() else {
             panic!("expected run")
         };
         assert!(options.safe_mode);
@@ -325,23 +425,82 @@ mod tests {
     #[test]
     fn config_check_supports_human_and_json_formats() {
         assert_eq!(
-            parse_strs(&["--check-config"]).unwrap(),
-            Command::CheckConfig(ReportFormat::Human)
+            parse_command(&["--check-config"]).unwrap(),
+            Command::CheckConfig(None, ReportFormat::Human)
         );
         assert_eq!(
-            parse_strs(&["--check-config", "--json"]).unwrap(),
-            Command::CheckConfig(ReportFormat::Json)
+            parse_command(&["--check-config", "--json"]).unwrap(),
+            Command::CheckConfig(None, ReportFormat::Json)
         );
         assert!(parse_strs(&["--check-config", "--verbose"]).is_err());
     }
 
     #[test]
+    fn check_config_accepts_explicit_path_without_setting_global_override() {
+        for args in [
+            ["--check-config", "/tmp/检查.toml", "--json"],
+            ["--json", "--check-config", "/tmp/检查.toml"],
+            ["--check-config", "--json", "/tmp/检查.toml"],
+        ] {
+            let parsed = parse_strs(&args).unwrap();
+            assert_eq!(parsed.config_path, None);
+            assert_eq!(
+                parsed.command,
+                Command::CheckConfig(Some(PathBuf::from("/tmp/检查.toml")), ReportFormat::Json)
+            );
+        }
+        assert_eq!(
+            parse_command(&["--check-config=/tmp/explicit.toml"]).unwrap(),
+            Command::CheckConfig(
+                Some(PathBuf::from("/tmp/explicit.toml")),
+                ReportFormat::Human
+            )
+        );
+    }
+
+    #[test]
+    fn global_config_combines_with_launch_and_order_independent_utilities() {
+        let launch = parse_strs(&["-c", "/tmp/custom.toml", "--no-restore"]).unwrap();
+        assert_eq!(launch.config_path, Some(PathBuf::from("/tmp/custom.toml")));
+        assert!(matches!(launch.command, Command::Run(_)));
+
+        for args in [
+            vec!["--config", "/tmp/custom.toml", "--doctor", "--json"],
+            vec!["--doctor", "--json", "-c", "/tmp/custom.toml"],
+            vec!["--check-config", "--json", "-c", "/tmp/custom.toml"],
+            vec!["--config-path", "--config=/tmp/custom.toml"],
+            vec!["--init-config", "-c", "/tmp/custom.toml"],
+            vec!["-c", "/tmp/custom.toml", "--restore-config-backup"],
+            vec!["--print-default-config", "--config", "/tmp/custom.toml"],
+        ] {
+            let parsed = parse_strs(&args).unwrap();
+            assert_eq!(
+                parsed.config_path,
+                Some(PathBuf::from("/tmp/custom.toml")),
+                "args: {args:?}"
+            );
+            assert!(!matches!(parsed.command, Command::Run(_)));
+        }
+    }
+
+    #[test]
     fn config_recovery_utilities_require_exact_arguments() {
         assert_eq!(
-            parse_strs(&["--restore-config-backup"]).unwrap(),
+            parse_command(&["--restore-config-backup"]).unwrap(),
             Command::RestoreConfigBackup
         );
-        assert_eq!(parse_strs(&["--config-path"]).unwrap(), Command::ConfigPath);
+        assert_eq!(
+            parse_command(&["--config-path"]).unwrap(),
+            Command::ConfigPath
+        );
+        assert_eq!(
+            parse_command(&["--print-config-path"]).unwrap(),
+            Command::ConfigPath
+        );
+        assert_eq!(
+            parse_command(&["--print-default-config"]).unwrap(),
+            Command::PrintDefaultConfig
+        );
         assert!(parse_strs(&["--restore-config-backup", "extra"]).is_err());
         assert!(parse_strs(&["--config-path", "extra"]).is_err());
     }

@@ -9,17 +9,31 @@ use gtk::pango::FontDescription;
 use gtk::prelude::*;
 use relm4::gtk;
 use relm4::prelude::*;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 use vte4::prelude::TerminalExt;
 
 use crate::block_view::TermView;
 
+use super::cross_block_search;
+
 pub use super::vte::{VteInit, VteInput, VteOutput};
 
 pub struct BlockTerminal {
-    view: TermView,
+    view: Rc<TermView>,
+    config: Rc<RefCell<crate::config::Config>>,
+    cross_block_search_dialog: Rc<RefCell<Option<relm4::adw::Dialog>>>,
+}
+
+impl BlockTerminal {
+    pub(crate) fn can_accept_agent_command(&self) -> bool {
+        self.view.can_accept_agent_command()
+    }
+
+    pub(crate) fn debug_info(&self) -> crate::block_view::DebugInfo {
+        self.view.debug_info()
+    }
 }
 
 impl Component for BlockTerminal {
@@ -39,13 +53,14 @@ impl Component for BlockTerminal {
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
-        let view = TermView::new(
-            &init.config.borrow(),
+        let config = init.config.clone();
+        let view = Rc::new(TermView::new(
+            &config.borrow(),
             init.shell_argv.as_ref().as_slice(),
             init.working_directory.as_deref(),
             init.session_id.as_deref(),
             init.initial_commands.as_deref(),
-        );
+        ));
 
         init.probe.shell_pid.set(view.pid_i32());
         init.probe.pty_fd.set(view.pty_fd_i32());
@@ -110,16 +125,26 @@ impl Component for BlockTerminal {
                 });
             }
         });
+        view.connect_ask_ai_about_block({
+            let sender = sender.clone();
+            move |context| {
+                let _ = sender.output(VteOutput::AskAiAboutBlock(context));
+            }
+        });
 
         if let Some(container) = root.downcast_ref::<gtk::Box>() {
             container.append(&view.widget());
         }
 
-        let model = BlockTerminal { view };
+        let model = BlockTerminal {
+            view,
+            config,
+            cross_block_search_dialog: Rc::new(RefCell::new(None)),
+        };
         ComponentParts { model, widgets: () }
     }
 
-    fn update(&mut self, msg: Self::Input, _sender: ComponentSender<Self>, _root: &Self::Root) {
+    fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>, _root: &Self::Root) {
         match msg {
             VteInput::WriteInput(data) => self.view.write_input(&data),
             VteInput::Resize(cols, rows) => self.view.resize(cols, rows),
@@ -135,6 +160,7 @@ impl Component for BlockTerminal {
             VteInput::SetScrollback(lines) => self.view.vte().set_scrollback_lines(lines),
             VteInput::ScrollLines(lines) => self.view.scroll_lines(lines),
             VteInput::ApplyTheme => self.view.apply_theme(),
+            VteInput::SyncConfig => self.view.reload_config(&self.config.borrow()),
             VteInput::Kill => self.view.kill(),
             VteInput::FilterFailedBlocks => self.view.apply_failed_filter(),
             VteInput::FilterSlowBlocks => self.view.apply_slow_filter(),
@@ -155,6 +181,15 @@ impl Component for BlockTerminal {
                 let _ = self.view.find_prev();
             }
             VteInput::SearchClear => self.view.clear_find(),
+            VteInput::CrossBlockSearch => cross_block_search::toggle(
+                self.view.clone(),
+                self.cross_block_search_dialog.clone(),
+            ),
+            VteInput::AskAiAboutSelectedBlock => {
+                if let Some(context) = self.view.selected_block_context(80) {
+                    let _ = sender.output(VteOutput::AskAiAboutBlock(context));
+                }
+            }
         }
     }
 }

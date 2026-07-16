@@ -11,7 +11,7 @@ help:
 	@echo "  make build      - Build the optimized release binary"
 	@echo "  make run        - Run in development mode"
 	@echo "  make install    - Build and install to the current user account"
-	@echo "  make package    - Build a portable release archive and checksum"
+	@echo "  make package    - Build a relocatable release archive and checksum"
 	@echo ""
 	@echo "Quality Commands:"
 	@echo "  make test       - Run all tests"

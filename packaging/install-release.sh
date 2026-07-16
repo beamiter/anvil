@@ -2,6 +2,7 @@
 # Install a prebuilt jterm1 release bundle for the current user.
 
 set -euo pipefail
+umask 077
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="${HOME}/.local/bin"
@@ -22,7 +23,7 @@ install -Dm755 "${SCRIPT_DIR}/bin/jterm1" "${INSTALL_DIR}/jterm1"
 install -Dm755 "${SCRIPT_DIR}/bin/jterm1-support-bundle" \
     "${INSTALL_DIR}/jterm1-support-bundle"
 
-mkdir -p "${CONFIG_DIR}"
+install -d -m 0700 "${CONFIG_DIR}"
 if [[ ! -e "${CONFIG_DIR}/config.toml" ]]; then
     install -m600 \
         "${SCRIPT_DIR}/share/doc/jterm1/config.toml.example" \
@@ -33,10 +34,26 @@ else
 fi
 
 install -Dm644 \
-    "${SCRIPT_DIR}/share/applications/app.jterm1.desktop" \
-    "${APPLICATIONS_DIR}/app.jterm1.desktop"
+    "${SCRIPT_DIR}/share/applications/io.github.beamiter.jterm1.desktop" \
+    "${APPLICATIONS_DIR}/io.github.beamiter.jterm1.desktop"
+rm -f -- "${APPLICATIONS_DIR}/app.jterm1.desktop"
+install -Dm644 \
+    "${SCRIPT_DIR}/share/metainfo/io.github.beamiter.jterm1.metainfo.xml" \
+    "${DATA_HOME}/metainfo/io.github.beamiter.jterm1.metainfo.xml"
+install -Dm644 \
+    "${SCRIPT_DIR}/share/icons/hicolor/scalable/apps/io.github.beamiter.jterm1.svg" \
+    "${DATA_HOME}/icons/hicolor/scalable/apps/io.github.beamiter.jterm1.svg"
+for size in 128 256; do
+    icon="${SCRIPT_DIR}/share/icons/hicolor/${size}x${size}/apps/io.github.beamiter.jterm1.png"
+    if [[ -f "${icon}" ]]; then
+        install -Dm644 "${icon}" \
+            "${DATA_HOME}/icons/hicolor/${size}x${size}/apps/io.github.beamiter.jterm1.png"
+    fi
+done
 
 install -d "${DATA_DIR}/shell-integration"
+install -m644 "${SCRIPT_DIR}/share/jterm1/shell-integration/README.md" \
+    "${DATA_DIR}/shell-integration/README.md"
 install -m644 "${SCRIPT_DIR}"/share/jterm1/shell-integration/jterm1.* \
     "${DATA_DIR}/shell-integration/"
 
@@ -66,6 +83,7 @@ jterm1 installation complete.
   Configuration:     ${CONFIG_DIR}/config.toml
   Shell integration: ${DATA_DIR}/shell-integration
   Welcome notebook:  ${DATA_DIR}/notebooks/welcome.jtnb.md
+  Desktop metadata:  ${DATA_HOME}/metainfo/io.github.beamiter.jterm1.metainfo.xml
 
 Make sure ${INSTALL_DIR} is in PATH, then run:
   jterm1 --doctor

@@ -18,9 +18,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use nix::errno::Errno;
-use nix::fcntl::{flock, FlockArg};
-
 use gtk::gdk::RGBA;
 
 use crate::cli::ReportFormat;
@@ -253,21 +250,47 @@ pub(crate) fn backup_paths() -> [PathBuf; 2] {
     [backup_path_for(&path), secondary_backup_path_for(&path)]
 }
 
-#[allow(deprecated)]
-fn try_lock_exclusive(file: &fs::File) -> Result<bool, Errno> {
-    match flock(file.as_raw_fd(), FlockArg::LockExclusiveNonblock) {
-        Ok(()) => Ok(true),
-        Err(Errno::EWOULDBLOCK) => Ok(false),
-        Err(error) => Err(error),
+#[cfg(unix)]
+fn try_lock_exclusive(file: &fs::File) -> io::Result<bool> {
+    // SAFETY: `file` owns a live descriptor for the duration of this call;
+    // `flock` neither retains pointers nor accesses Rust-managed memory.
+    let result =
+        unsafe { nix::libc::flock(file.as_raw_fd(), nix::libc::LOCK_EX | nix::libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error
+        .raw_os_error()
+        .is_some_and(|code| code == nix::libc::EAGAIN || code == nix::libc::EWOULDBLOCK)
+    {
+        Ok(false)
+    } else {
+        Err(error)
     }
 }
 
-#[allow(deprecated)]
+#[cfg(not(unix))]
+fn try_lock_exclusive(_file: &fs::File) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "configuration locking is only supported on Unix",
+    ))
+}
+
+#[cfg(unix)]
 fn unlock(file: &fs::File) {
-    if let Err(error) = flock(file.as_raw_fd(), FlockArg::Unlock) {
-        log::warn!("Failed to release configuration write lock: {error}");
+    // SAFETY: see `try_lock_exclusive`; the descriptor remains live here.
+    if unsafe { nix::libc::flock(file.as_raw_fd(), nix::libc::LOCK_UN) } != 0 {
+        log::warn!(
+            "Failed to release configuration write lock: {}",
+            io::Error::last_os_error()
+        );
     }
 }
+
+#[cfg(not(unix))]
+fn unlock(_file: &fs::File) {}
 
 fn open_lock_file(path: &Path) -> Result<fs::File, ConfigWriteError> {
     let mut options = fs::OpenOptions::new();
@@ -454,6 +477,10 @@ fn apply_config_to_table(config: &Config, table: &mut toml::Table) {
         toml::Value::String(config.sidebar_view.as_str().to_string()),
     );
     table.insert(
+        "sidebar_visible".into(),
+        toml::Value::Boolean(config.sidebar_visible),
+    );
+    table.insert(
         "sidebar_width".into(),
         toml::Value::Integer(config.sidebar_width as i64),
     );
@@ -471,8 +498,32 @@ fn apply_config_to_table(config: &Config, table: &mut toml::Table) {
     );
     table.insert("ai_enabled".into(), toml::Value::Boolean(config.ai_enabled));
     table.insert(
+        "ai_provider".into(),
+        toml::Value::String(config.ai_provider.clone()),
+    );
+    table.insert(
+        "ai_base_url".into(),
+        toml::Value::String(config.ai_base_url.clone()),
+    );
+    table.insert(
+        "ai_model".into(),
+        toml::Value::String(config.ai_model.clone()),
+    );
+    table.insert(
+        "ai_max_tokens".into(),
+        toml::Value::Integer(config.ai_max_tokens as i64),
+    );
+    table.insert(
+        "ai_redact_secrets".into(),
+        toml::Value::Boolean(config.ai_redact_secrets),
+    );
+    table.insert(
         "agent_enabled".into(),
         toml::Value::Boolean(config.agent_enabled),
+    );
+    table.insert(
+        "agent_max_turns".into(),
+        toml::Value::Integer(config.agent_max_turns as i64),
     );
     table.insert(
         "notify_long_blocks".into(),
@@ -923,6 +974,7 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
         "terminal_mode",
         "tab_placement",
         "sidebar_view",
+        "sidebar_visible",
         "sidebar_width",
         "tab_width",
         "ansi_cache_capacity",
@@ -944,6 +996,11 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
         "editor_input",
         "allow_remote_clipboard_write",
         "ai_enabled",
+        "ai_provider",
+        "ai_base_url",
+        "ai_model",
+        "ai_max_tokens",
+        "ai_redact_secrets",
         "agent_enabled",
         "agent_max_turns",
         "mouse_reporting_enabled",
@@ -984,6 +1041,7 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
         "max_collapsed_output_lines",
         "virtual_scroll_margin",
         "command_history_max_entries",
+        "ai_max_tokens",
         "agent_max_turns",
         "notify_long_block_threshold_ms",
     ] {
@@ -999,6 +1057,9 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
         "sidebar_view",
         "command_history_path",
         "block_history_path",
+        "ai_provider",
+        "ai_base_url",
+        "ai_model",
     ] {
         check_type(&mut report, table, key, ExpectedType::String);
     }
@@ -1008,7 +1069,9 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
         "block_compact",
         "editor_input",
         "allow_remote_clipboard_write",
+        "sidebar_visible",
         "ai_enabled",
+        "ai_redact_secrets",
         "agent_enabled",
         "mouse_reporting_enabled",
         "focus_reporting_enabled",
@@ -1026,6 +1089,9 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
     check_nonempty_string(&mut report, table, "font");
     check_nonempty_string(&mut report, table, "theme");
     check_nonempty_string(&mut report, table, "shell");
+    check_nonempty_string(&mut report, table, "ai_provider");
+    check_nonempty_string(&mut report, table, "ai_base_url");
+    check_nonempty_string(&mut report, table, "ai_model");
     check_absolute_path(&mut report, table, "shell");
     check_enum(
         &mut report,
@@ -1046,6 +1112,19 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
     check_enum(
         &mut report,
         table,
+        "ai_provider",
+        &[
+            "anthropic",
+            "claude",
+            "openai",
+            "openai-compatible",
+            "openai_compatible",
+            "ollama",
+        ],
+    );
+    check_enum(
+        &mut report,
+        table,
         "tab_placement",
         &["sidebar", "top", "topbar", "top_bar"],
     );
@@ -1057,6 +1136,21 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
     );
     check_absolute_path(&mut report, table, "command_history_path");
     check_absolute_path(&mut report, table, "block_history_path");
+
+    if let Some(url) = table.get("ai_base_url").and_then(toml::Value::as_str) {
+        let url = url.trim();
+        let valid = (url.starts_with("http://") || url.starts_with("https://"))
+            && url
+                .split_once("://")
+                .is_some_and(|(_, authority)| !authority.is_empty())
+            && !url.chars().any(char::is_whitespace);
+        if !valid {
+            report.error(
+                "ai_base_url",
+                "must be an absolute http(s) URL without whitespace",
+            );
+        }
+    }
 
     check_number_range(&mut report, table, "opacity", 0.01, 1.0);
     check_number_range(&mut report, table, "font_scale", 0.1, 10.0);
@@ -1092,7 +1186,8 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
         100,
         100_000,
     );
-    check_integer_range(&mut report, table, "agent_max_turns", 1, i64::MAX);
+    check_integer_range(&mut report, table, "ai_max_tokens", 1, 32_768);
+    check_integer_range(&mut report, table, "agent_max_turns", 1, 100);
     check_integer_range(
         &mut report,
         table,
@@ -1138,15 +1233,22 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
     report
 }
 
-fn validate_path(path: &Path) -> ConfigValidationReport {
+fn validate_path_with_missing_policy(
+    path: &Path,
+    missing_is_error: bool,
+) -> ConfigValidationReport {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let mut report = ConfigValidationReport::new(path, false);
-            report.warning(
-                "config",
-                "file does not exist; built-in defaults will be used",
-            );
+            if missing_is_error {
+                report.error("config", "file does not exist");
+            } else {
+                report.warning(
+                    "config",
+                    "file does not exist; built-in defaults will be used",
+                );
+            }
             return report;
         }
         Err(_) => {
@@ -1172,6 +1274,10 @@ fn validate_path(path: &Path) -> ConfigValidationReport {
         }
     };
     validate_table(path, &table)
+}
+
+pub(crate) fn validate_path(path: &Path) -> ConfigValidationReport {
+    validate_path_with_missing_policy(path, false)
 }
 
 pub(crate) fn validate_current_config() -> ConfigValidationReport {
@@ -1208,8 +1314,8 @@ fn print_validation_json(report: &ConfigValidationReport) -> io::Result<()> {
     writeln!(stdout)
 }
 
-pub(crate) fn run_check(format: ReportFormat) -> bool {
-    let report = validate_current_config();
+pub(crate) fn run_check_path(path: &Path, format: ReportFormat) -> bool {
+    let report = validate_path_with_missing_policy(path, true);
     let result = match format {
         ReportFormat::Human => print_validation_human(&report),
         ReportFormat::Json => print_validation_json(&report),
@@ -1236,6 +1342,21 @@ mod tests {
     }
 
     #[test]
+    fn explicit_missing_config_is_an_error_but_default_discovery_is_a_warning() {
+        let path = temporary_directory("missing-check").join("absent.toml");
+        let explicit = validate_path_with_missing_policy(&path, true);
+        assert!(!explicit.exists());
+        assert_eq!(explicit.errors(), 1);
+        assert!(!explicit.healthy());
+
+        let discovered = validate_path(&path);
+        assert!(!discovered.exists());
+        assert_eq!(discovered.errors(), 0);
+        assert_eq!(discovered.warnings(), 1);
+        assert!(discovered.healthy());
+    }
+
+    #[test]
     fn revisions_detect_external_changes() {
         let directory = temporary_directory("revision");
         let path = directory.join("config.toml");
@@ -1258,6 +1379,46 @@ mod tests {
         let error = save_config_to_path(&path, &config, Some(&expected)).unwrap_err();
         assert!(error.is_conflict());
         assert_eq!(fs::read_to_string(&path).unwrap(), "opacity = 0.6\n");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn ai_provider_settings_are_persisted_without_credentials() {
+        let directory = temporary_directory("ai-provider");
+        let path = directory.join("config.toml");
+        let mut config = config::load_safe_config().0;
+        config.ai_provider = "ollama".into();
+        config.ai_base_url = "http://localhost:11434".into();
+        config.ai_model = "qwen2.5-coder:7b".into();
+        config.ai_max_tokens = 2_048;
+        config.ai_redact_secrets = false;
+
+        save_config_to_path(&path, &config, Some(&ConfigRevision::Missing)).unwrap();
+        let contents = fs::read_to_string(&path).unwrap();
+        let table = contents.parse::<toml::Table>().unwrap();
+        assert_eq!(
+            table.get("ai_provider").and_then(toml::Value::as_str),
+            Some("ollama")
+        );
+        assert_eq!(
+            table.get("ai_base_url").and_then(toml::Value::as_str),
+            Some("http://localhost:11434")
+        );
+        assert_eq!(
+            table.get("ai_model").and_then(toml::Value::as_str),
+            Some("qwen2.5-coder:7b")
+        );
+        assert_eq!(
+            table.get("ai_max_tokens").and_then(toml::Value::as_integer),
+            Some(2_048)
+        );
+        assert_eq!(
+            table
+                .get("ai_redact_secrets")
+                .and_then(toml::Value::as_bool),
+            Some(false)
+        );
+        assert!(!contents.to_ascii_lowercase().contains("api_key"));
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1293,6 +1454,50 @@ mod tests {
         assert!(!json.contains("secret-value"));
         assert!(!json.contains("also-secret"));
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn validation_checks_ai_provider_settings() {
+        let table = "ai_provider = 'mystery'\nai_base_url = 'file:///tmp/model'\nai_model = ''\nai_max_tokens = 999999\nai_redact_secrets = 'yes'\n"
+            .parse::<toml::Table>()
+            .unwrap();
+        let report = validate_table(Path::new("config.toml"), &table);
+        for key in [
+            "ai_provider",
+            "ai_base_url",
+            "ai_model",
+            "ai_max_tokens",
+            "ai_redact_secrets",
+        ] {
+            assert!(
+                report.issues.iter().any(|issue| issue.key == key),
+                "missing validation issue for {key}: {:?}",
+                report.issues
+            );
+        }
+
+        let aliases = "ai_provider = 'openai_compatible'\nai_base_url = 'http://localhost:8000/v1'\nai_model = 'local-model'\nai_max_tokens = 1\nai_redact_secrets = true\n"
+            .parse::<toml::Table>()
+            .unwrap();
+        assert_eq!(
+            validate_table(Path::new("config.toml"), &aliases).errors(),
+            0
+        );
+    }
+
+    #[test]
+    fn validation_checks_sidebar_visibility_and_agent_turn_cap() {
+        let table = "sidebar_visible = 'yes'\nagent_max_turns = 101\n"
+            .parse::<toml::Table>()
+            .unwrap();
+        let report = validate_table(Path::new("config.toml"), &table);
+        for key in ["sidebar_visible", "agent_max_turns"] {
+            assert!(
+                report.issues.iter().any(|issue| issue.key == key),
+                "missing validation issue for {key}: {:?}",
+                report.issues
+            );
+        }
     }
 
     #[test]

@@ -238,15 +238,23 @@ pub(crate) fn spawn_shell(
             argv_vec.push(sid.to_string());
         }
     }
+    let home = std::env::var("HOME").ok();
+    let requested_working_directory = working_directory.or(home.as_deref());
+    // `TERM_PROGRAM` must be encoded in the host wrapper as well as VTE's
+    // environment, otherwise Flatpak shells cannot see the integration marker.
+    let host_environment = [("TERM_PROGRAM", "jterm1")];
+    let argv_vec =
+        crate::host::wrap_argv(&argv_vec, requested_working_directory, &host_environment);
     let argv: Vec<&str> = argv_vec.iter().map(|s| s.as_str()).collect();
 
-    // Advertise ourselves so users can gate `source jterm1.{bash,zsh,fish}` on
-    // `[[ $TERM_PROGRAM == jterm1 ]]` in their rc files.
     let envv: &[&str] = &["TERM_PROGRAM=jterm1"];
     let spawn_flags = SpawnFlags::SEARCH_PATH;
     let cancellable: Option<&Cancellable> = None;
-    let home = std::env::var("HOME").ok();
-    let working_directory = working_directory.or(home.as_deref());
+    let spawn_working_directory = if crate::host::is_flatpak() {
+        None
+    } else {
+        requested_working_directory
+    };
     let terminal_for_pid = terminal.clone();
 
     let init_cmds = initial_commands.map(|s| s.to_string());
@@ -254,7 +262,7 @@ pub(crate) fn spawn_shell(
 
     terminal.spawn_async(
         PtyFlags::DEFAULT,
-        working_directory,
+        spawn_working_directory,
         &argv,
         envv,
         spawn_flags,
@@ -329,6 +337,9 @@ pub enum VteInput {
     SetScrollback(i64),
     ScrollLines(i32),
     ApplyTheme,
+    /// Refresh backend-owned behavioral configuration from the shared app value.
+    /// VTE panes already hold that shared `Rc`; Block panes copy it internally.
+    SyncConfig,
     Kill,
     /// Block-view only: show only failed / only slow / only pinned / all blocks.
     FilterFailedBlocks,
@@ -350,6 +361,11 @@ pub enum VteInput {
     SearchNext,
     SearchPrev,
     SearchClear,
+    /// Block-view only: open the flat ripgrep-style search over completed blocks.
+    CrossBlockSearch,
+    /// Block-view only: snapshot the selected finished block and forward it to
+    /// the application AI panel. Plain VTE panes ignore this action.
+    AskAiAboutSelectedBlock,
 }
 
 #[derive(Debug)]
@@ -378,6 +394,7 @@ pub enum VteOutput {
         /// so we don't ship 256 KB across a relm4 channel.
         output_sample: String,
     },
+    AskAiAboutBlock(crate::ai::BlockContext),
 }
 
 pub struct VteTerminal {
@@ -549,6 +566,7 @@ impl Component for VteTerminal {
                 self.terminal
                     .set_color_cursor_foreground(Some(&config.cursor_foreground));
             }
+            VteInput::SyncConfig => {}
             VteInput::Kill => {
                 if let Some(pid) = unsafe { self.terminal.data::<i32>("child-pid") } {
                     let pid_val = unsafe { *pid.as_ref() };
@@ -588,6 +606,8 @@ impl Component for VteTerminal {
             VteInput::SearchClear => {
                 self.terminal.search_set_regex(None::<&vte4::Regex>, 0);
             }
+            VteInput::CrossBlockSearch => {}
+            VteInput::AskAiAboutSelectedBlock => {}
         }
     }
 }

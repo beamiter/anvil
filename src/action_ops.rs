@@ -99,8 +99,7 @@ impl AppModel {
                 self.set_window_opacity(o);
             }
             Action::ToggleSidebar => {
-                self.sidebar_visible = !self.sidebar_visible;
-                self.sidebar_box.set_visible(self.sidebar_visible);
+                self.set_sidebar_visible(!self.sidebar_visible, true);
             }
             Action::ToggleCommandPalette => {
                 self.reload_workflows();
@@ -171,19 +170,37 @@ impl AppModel {
                         command_history: config.command_history_enabled,
                         ai_enabled: config.ai_enabled,
                         agent_enabled: config.agent_enabled,
+                        ai_provider: match config.ai_provider.as_str() {
+                            "openai-compatible" => 1,
+                            "ollama" => 2,
+                            _ => 0,
+                        },
+                        ai_model: config.ai_model.clone(),
+                        ai_base_url: config.ai_base_url.clone(),
+                        ai_max_tokens: config.ai_max_tokens as f64,
+                        ai_redact_secrets: config.ai_redact_secrets,
+                        agent_max_turns: config.agent_max_turns as f64,
+                        safe_mode: self.safe_mode,
                         notifications: config.notify_long_blocks,
                         remote_clipboard: config.allow_remote_clipboard_write,
                     },
                     self.window.clone(),
                 ));
             }
-            Action::OpenWelcome => match workflows::welcome_notebook_path() {
-                Some(path) => self.notebook.emit(notebook::NotebookMsg::Open(path)),
-                None => self.show_toast(
-                    "Welcome notebook was not found. Reinstall jterm1's shared assets.",
-                ),
-            },
+            Action::OpenWelcome => {
+                if self.safe_mode {
+                    self.show_toast("Notebooks are unavailable in safe mode.");
+                } else {
+                    match workflows::welcome_notebook_path() {
+                        Some(path) => self.notebook.emit(notebook::NotebookMsg::Open(path)),
+                        None => self.show_toast(
+                            "Welcome notebook was not found. Reinstall jterm1's shared assets.",
+                        ),
+                    }
+                }
+            }
             Action::ToggleSearch => self.toggle_search(),
+            Action::ReloadConfig => self.reload_config(sender),
             Action::MoveTabLeft => self.move_tab(-1, sender),
             Action::MoveTabRight => self.move_tab(1, sender),
             Action::DuplicateTab => self.duplicate_active_tab(sender),
@@ -203,8 +220,7 @@ impl AppModel {
             Action::ToggleTabPlacement => self.toggle_tab_placement(),
             Action::CloseSelectedTabs => self.close_marked_tabs(sender),
             Action::FilterTabs => {
-                self.sidebar_visible = true;
-                self.sidebar_box.set_visible(true);
+                self.set_sidebar_visible(true, true);
                 if self.tab_placement.get() == config::TabPlacement::Sidebar {
                     self.apply_sidebar_view(config::SidebarView::Tabs, true);
                 }
@@ -297,8 +313,18 @@ impl AppModel {
             Action::OpenAiPanel => {
                 self.show_ai_session_panel();
             }
+            Action::AskAiAboutSelectedBlock => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.emit(VteInput::AskAiAboutSelectedBlock);
+                }
+            }
             Action::OpenAgent => {
                 self.open_agent_panel(sender);
+            }
+            Action::CrossBlockSearch => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.emit(VteInput::CrossBlockSearch);
+                }
             }
         }
     }

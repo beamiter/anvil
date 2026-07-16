@@ -2,12 +2,18 @@
 Type=Application
 Name=jterm1
 GenericName=Terminal Emulator
-Comment=Block-aware GTK terminal emulator
+Comment=Block-aware terminal workspace with structured command history
 TryExec=jterm1
 Exec=jterm1
-Icon=utilities-terminal
+Icon=io.github.beamiter.jterm1
 Terminal=false
 Categories=System;TerminalEmulator;
-Keywords=terminal;shell;console;command;
+Keywords=terminal;shell;console;command;developer;ssh;blocks;workflow;notebook;AI;
 StartupNotify=true
-StartupWMClass=app.jterm1
+StartupWMClass=io.github.beamiter.jterm1
+X-GNOME-UsesNotifications=true
+Actions=NewWindow;
+
+[Desktop Action NewWindow]
+Name=New Window
+Exec=jterm1

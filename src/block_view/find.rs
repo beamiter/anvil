@@ -51,13 +51,12 @@ pub struct CrossBlockHit {
 /// the match isn't near the start, but for the MVP we just hard-cap.
 fn snippet(line: &str) -> String {
     const CAP: usize = 240;
-    if line.len() <= CAP {
-        line.to_string()
-    } else {
-        let mut s = line[..CAP].to_string();
-        s.push('…');
-        s
+    let mut chars = line.chars();
+    let mut snippet: String = chars.by_ref().take(CAP).collect();
+    if chars.next().is_some() {
+        snippet.push('…');
     }
+    snippet
 }
 
 /// Duration-related filters are meaningful only for blocks whose shell
@@ -105,6 +104,22 @@ mod tests {
         let out = snippet(&long);
         assert!(out.ends_with('…'));
         assert_eq!(out.chars().filter(|&c| c == 'a').count(), 240);
+    }
+
+    #[test]
+    fn snippet_truncates_unicode_on_char_boundaries() {
+        for line in [
+            format!("a{}", "界".repeat(240)),
+            format!("a{}", "🙂".repeat(240)),
+        ] {
+            let out = snippet(&line);
+            assert!(out.ends_with('…'));
+            assert_eq!(out.chars().count(), 241);
+            assert_eq!(
+                out.chars().take(240).collect::<String>(),
+                line.chars().take(240).collect::<String>()
+            );
+        }
     }
 
     #[test]

@@ -23,6 +23,7 @@ const LEGACY_STATE_FILE: &str = "tabs.state";
 const STATE_PREFIX: &str = "tabs.";
 const STATE_SUFFIX: &str = ".state";
 const CLAIM_MARKER: &str = ".claim.";
+const MAX_RECOVERABLE_SNAPSHOTS: usize = 32;
 
 /// One node of a tab's pane tree: either a terminal leaf or a split of two
 /// subtrees. Mirrors jterm4's `PaneLayout`.
@@ -36,6 +37,9 @@ pub(crate) enum PaneLayout {
         mode: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
+        /// Stable local rsh identity learned through OSC 7770.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sid: Option<String>,
         /// Restorable command to replay on restore (e.g. "ssh host").
         #[serde(skip_serializing_if = "Option::is_none")]
         cmds: Option<String>,
@@ -53,6 +57,10 @@ pub(crate) enum PaneLayout {
 pub(crate) struct SavedTab {
     pub title: String,
     pub custom_title: bool,
+    /// Pinned tabs stay pinned across restarts. Older snapshots predate this
+    /// field and therefore restore as unpinned.
+    #[serde(default)]
+    pub pinned: bool,
     pub layout: PaneLayout,
 }
 
@@ -72,6 +80,40 @@ fn state_file_path_in(dir: &Path, pid: u32) -> PathBuf {
 
 pub(crate) fn state_file_path() -> PathBuf {
     state_file_path_in(&state_dir(), std::process::id())
+}
+
+/// Count recoverable and currently active snapshots without exposing paths.
+/// jterm1 encodes both states in owner/claimer PIDs rather than file suffixes.
+pub(crate) fn session_snapshot_counts() -> (usize, usize) {
+    session_snapshot_counts_in(&state_dir(), std::process::id(), &process_is_alive)
+}
+
+fn session_snapshot_counts_in(
+    dir: &Path,
+    current_pid: u32,
+    is_alive: &dyn Fn(u32) -> bool,
+) -> (usize, usize) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return (0, 0);
+    };
+    let mut ready = 0;
+    let mut active = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let Some(file) = file_name.to_str().and_then(parse_state_file_name) else {
+            continue;
+        };
+        if !path.is_file() {
+            continue;
+        }
+        if state_file_is_recoverable(&file, current_pid, is_alive) {
+            ready += 1;
+        } else {
+            active += 1;
+        }
+    }
+    (ready, active)
 }
 
 pub(crate) fn save_session(session: &SavedSession) {
@@ -100,18 +142,50 @@ pub(crate) fn save_session(session: &SavedSession) {
             return;
         }
     };
-    if let Err(err) = atomic_write(&path, payload.as_bytes()) {
-        log::error!(
-            "Failed to atomically save session snapshot {}: {err}",
-            path.display()
-        );
+    match atomic_write(&path, payload.as_bytes()) {
+        Ok(()) => prune_recoverable_snapshots(
+            &state_dir(),
+            std::process::id(),
+            &process_is_alive,
+            MAX_RECOVERABLE_SNAPSHOTS,
+        ),
+        Err(err) => {
+            log::error!(
+                "Failed to atomically save session snapshot {}: {err}",
+                path.display()
+            );
+        }
     }
 }
 
 /// Load and consume the newest valid snapshot whose owning process has exited.
 /// Corrupt/unreadable files are deliberately retained for inspection/recovery.
 pub(crate) fn load_session() -> Option<SavedSession> {
-    load_session_from(&state_dir(), std::process::id(), &process_is_alive)
+    let directory = state_dir();
+    let current_pid = std::process::id();
+    let session = load_session_from(&directory, current_pid, &process_is_alive);
+    prune_recoverable_snapshots(
+        &directory,
+        current_pid,
+        &process_is_alive,
+        MAX_RECOVERABLE_SNAPSHOTS,
+    );
+    session
+}
+
+fn ensure_private_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700).create(path)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path)
+    }
 }
 
 /// Write to a sibling temp file, fsync it, then replace the destination with a
@@ -121,7 +195,7 @@ fn atomic_write(path: &Path, payload: &[u8]) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "state path has no parent"))?;
-    fs::create_dir_all(parent)?;
+    ensure_private_directory(parent)?;
 
     let tmp = path.with_extension("state.tmp");
     let mut options = fs::OpenOptions::new();
@@ -208,6 +282,50 @@ fn state_file_is_recoverable(
         // Compatibility with the old `tabs.state` format. It has no owner PID,
         // so there is no live process identity to exclude.
         None => true,
+    }
+}
+
+/// Bound stale/ready snapshots without touching files owned or claimed by a
+/// live process. jterm1's filename protocol encodes active and recoverable
+/// states in ownership rather than separate extensions; this gives it the same
+/// bounded-retention property as jterm4's ready-snapshot directory.
+fn prune_recoverable_snapshots(
+    dir: &Path,
+    current_pid: u32,
+    is_alive: &dyn Fn(u32) -> bool,
+    keep: usize,
+) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut snapshots: Vec<(SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = entry.file_name();
+            let file = parse_state_file_name(name.to_str()?)?;
+            if !path.is_file() || !state_file_is_recoverable(&file, current_pid, is_alive) {
+                return None;
+            }
+            let modified = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(UNIX_EPOCH);
+            Some((modified, path))
+        })
+        .collect();
+    snapshots.sort_by(|(left_time, left_path), (right_time, right_path)| {
+        right_time
+            .cmp(left_time)
+            .then_with(|| right_path.cmp(left_path))
+    });
+    for (_, path) in snapshots.into_iter().skip(keep) {
+        if let Err(error) = fs::remove_file(&path) {
+            log::warn!(
+                "Failed to prune old session snapshot {}: {error}",
+                path.display()
+            );
+        }
     }
 }
 
@@ -454,13 +572,40 @@ mod tests {
             tabs: vec![SavedTab {
                 title: title.to_string(),
                 custom_title: true,
+                pinned: false,
                 layout: PaneLayout::Leaf {
                     mode: "block".to_string(),
                     cwd: None,
+                    sid: None,
                     cmds: None,
                 },
             }],
         }
+    }
+
+    #[test]
+    fn pane_session_id_round_trips_and_old_snapshots_remain_compatible() {
+        let with_sid = PaneLayout::Leaf {
+            mode: "block".to_string(),
+            cwd: Some("/tmp".to_string()),
+            sid: Some("rsh-session-42".to_string()),
+            cmds: None,
+        };
+        let encoded = serde_json::to_string(&with_sid).unwrap();
+        assert!(encoded.contains("rsh-session-42"));
+        let decoded: PaneLayout = serde_json::from_str(&encoded).unwrap();
+        assert!(matches!(
+            decoded,
+            PaneLayout::Leaf {
+                sid: Some(ref sid),
+                ..
+            } if sid == "rsh-session-42"
+        ));
+
+        let legacy: PaneLayout =
+            serde_json::from_str(r#"{"type":"leaf","mode":"block","cwd":"/tmp","cmds":null}"#)
+                .unwrap();
+        assert!(matches!(legacy, PaneLayout::Leaf { sid: None, .. }));
     }
 
     #[cfg(target_os = "linux")]
@@ -480,6 +625,28 @@ mod tests {
     fn write_session(path: &Path, title: &str) {
         let payload = serde_json::to_vec(&saved_session(title)).expect("serialize test session");
         atomic_write(path, &payload).expect("write test session");
+    }
+
+    #[test]
+    fn pinned_round_trips_and_legacy_snapshots_default_to_unpinned() {
+        let mut current = saved_session("pinned");
+        current.tabs[0].pinned = true;
+        let encoded = serde_json::to_vec(&current).expect("serialize pinned session");
+        let decoded: SavedSession =
+            serde_json::from_slice(&encoded).expect("deserialize pinned session");
+        assert!(decoded.tabs[0].pinned);
+
+        let legacy = br#"{
+            "active": 0,
+            "tabs": [{
+                "title": "legacy",
+                "custom_title": false,
+                "layout": {"type": "leaf", "mode": "block"}
+            }]
+        }"#;
+        let decoded: SavedSession =
+            serde_json::from_slice(legacy).expect("deserialize legacy session");
+        assert!(!decoded.tabs[0].pinned);
     }
 
     #[test]
@@ -511,6 +678,23 @@ mod tests {
         assert!(parse_state_file_name("tabs.42.state.tmp").is_none());
         assert!(parse_state_file_name("tabs.not-a-pid.state").is_none());
         assert!(parse_state_file_name("tabs.42.state.claim.77.claim.88").is_none());
+    }
+
+    #[test]
+    fn snapshot_counts_separate_recoverable_and_live_files() {
+        let dir = TestDir::new("snapshot-counts");
+        for name in [
+            "tabs.10.state",
+            "tabs.20.state",
+            "tabs.30.state.claim.40",
+            "tabs.30.state.claim.50",
+            "tabs.99.state",
+            "not-a-session.txt",
+        ] {
+            fs::write(dir.path().join(name), b"{}").unwrap();
+        }
+        let counts = session_snapshot_counts_in(dir.path(), 99, &|pid| matches!(pid, 10 | 40));
+        assert_eq!(counts, (2, 3));
     }
 
     #[test]
@@ -592,5 +776,40 @@ mod tests {
         let mut candidates = vec![older, newer];
         sort_candidates_newest_first(&mut candidates);
         assert_eq!(candidates[0].session.tabs[0].title, "newer");
+    }
+
+    #[test]
+    fn retention_prunes_only_recoverable_snapshots() {
+        let dir = TestDir::new("retention");
+        for pid in 10..14 {
+            write_session(&state_file_path_in(dir.path(), pid), &format!("tab-{pid}"));
+        }
+        let live = state_file_path_in(dir.path(), 20);
+        write_session(&live, "live");
+
+        prune_recoverable_snapshots(dir.path(), 99, &|pid| pid == 20, 2);
+
+        let recoverable = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.path() != live)
+            .count();
+        assert_eq!(recoverable, 2);
+        assert!(
+            live.exists(),
+            "a live process snapshot must never be pruned"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_tightens_state_directory_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TestDir::new("private-directory");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        write_session(&state_file_path_in(dir.path(), 10), "private");
+        let mode = fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
     }
 }

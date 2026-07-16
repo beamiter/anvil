@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.beamiter.jterm1</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>LicenseRef-proprietary</project_license>
+  <name>jterm1</name>
+  <summary>Block-aware terminal workspace for Linux</summary>
+  <description>
+    <p>
+      jterm1 combines structured command blocks with a VTE compatibility
+      backend, tabs, split panes, session restore, searchable history,
+      workflows, executable notebooks, SSH sessions, and optional AI tools.
+    </p>
+    <ul>
+      <li>Review-first command insertion and foreground-process close checks</li>
+      <li>Cross-block search, command history, workflows, and notebooks</li>
+      <li>Remote sessions, an asynchronous file tree, and multi-provider AI</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">io.github.beamiter.jterm1.desktop</launchable>
+  <developer id="io.github.beamiter">
+    <name>beamiter</name>
+  </developer>
+  <url type="homepage">https://github.com/beamiter/jterm1</url>
+  <url type="bugtracker">https://github.com/beamiter/jterm1/issues</url>
+  <provides>
+    <binary>jterm1</binary>
+  </provides>
+  <recommends>
+    <control>keyboard</control>
+    <control>pointing</control>
+  </recommends>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.2.0" date="2026-07-16">
+      <description>
+        <p>Parity release covering persistence, safety, workflows, notebooks, AI, and desktop integration.</p>
+      </description>
+    </release>
+  </releases>
+</component>

@@ -8,7 +8,7 @@
 # Emits OSC 133 (FTCS) command lifecycle marks and OSC 7 cwd updates.
 
 if set -q __jterm1_fish_loaded
-    exit 0
+    return 0
 end
 set -g __jterm1_fish_loaded 1
 

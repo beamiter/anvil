@@ -150,6 +150,19 @@ pub(crate) fn contains_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool 
     if needle.is_empty() {
         return true;
     }
+
+    // Keep the allocation-free memchr path for the overwhelmingly common
+    // ASCII case.  For terminal text containing non-ASCII UTF-8, use Rust's
+    // Unicode lowercase mapping so literal filters match e.g. "ÉCHEC" with
+    // "échec" instead of comparing only individual ASCII bytes.
+    if !(haystack.is_ascii() && needle.is_ascii()) {
+        if let (Ok(haystack), Ok(needle)) = (
+            std::str::from_utf8(haystack),
+            std::str::from_utf8(needle),
+        ) {
+            return haystack.to_lowercase().contains(&needle.to_lowercase());
+        }
+    }
     if haystack.len() < needle.len() {
         return false;
     }
@@ -236,5 +249,12 @@ mod tests {
         // false there, skipping the uppercase-variant scan that matches "Fo"
         // at position 0.
         assert!(cci(b"Foxf", b"fo"));
+    }
+
+    #[test]
+    fn matches_unicode_case_insensitively() {
+        assert!(cci("ÉCHEC: déjà vu".as_bytes(), "échec".as_bytes()));
+        assert!(cci("ПРИВЕТ мир".as_bytes(), "привет".as_bytes()));
+        assert!(!cci("你好世界".as_bytes(), "再见".as_bytes()));
     }
 }

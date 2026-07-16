@@ -29,16 +29,20 @@ __jterm1_report_cwd() {
     __jterm1_osc "7;file://${host}${out}"
 }
 
+__jterm1_in_command=0
 __jterm1_preexec() {
-    __jterm1_command_start
+    if (( __jterm1_in_command == 0 )); then
+        __jterm1_in_command=1
+        __jterm1_command_start
+    fi
 }
 
 __jterm1_precmd() {
     local ec=$?
-    # If the previous turn was a real command (preexec ran), close it out.
-    # zsh runs precmd on first prompt too; emitting ;D;0 there is harmless and
-    # matches what every other terminal's integration does.
-    __jterm1_command_end "$ec"
+    if (( __jterm1_in_command == 1 )); then
+        __jterm1_command_end "$ec"
+        __jterm1_in_command=0
+    fi
     __jterm1_report_cwd
     __jterm1_prompt_start
 }

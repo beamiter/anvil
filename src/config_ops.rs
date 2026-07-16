@@ -7,6 +7,17 @@
 use super::*;
 
 impl AppModel {
+    /// Block panes keep a callback-safe configuration snapshot inside
+    /// `TermView`; tell each backend to refresh it after the app-level value
+    /// changes. Plain VTE panes already share the app's `Rc` and no-op.
+    pub(crate) fn sync_terminal_configs(&self) {
+        for tab in &self.tabs {
+            for pane in &tab.panes {
+                pane.terminal.emit(VteInput::SyncConfig);
+            }
+        }
+    }
+
     pub(crate) fn reload_config(&mut self, _sender: &ComponentSender<AppModel>) {
         if self.safe_mode {
             self.show_toast("Configuration reload is disabled in safe mode.");
@@ -45,11 +56,22 @@ impl AppModel {
         let new_shell_argv = Rc::new(choose_shell_argv(new_config.shell.as_deref()));
         let backend_changed = std::mem::discriminant(&self.config.borrow().terminal_mode)
             != std::mem::discriminant(&new_config.terminal_mode);
+        let tab_placement = new_config.tab_placement;
+        let sidebar_view = new_config.sidebar_view;
+        let sidebar_visible = new_config.sidebar_visible;
+        let sidebar_width = new_config.sidebar_width.clamp(120, 800) as i32;
         *self.config.borrow_mut() = new_config.clone();
         *self.config_revision.borrow_mut() = Some(revision);
         self.shell_argv = new_shell_argv;
+        self.sync_terminal_configs();
 
         self.set_window_opacity(new_config.window_opacity);
+        self.tab_placement.set(tab_placement);
+        self.sidebar_view.set(sidebar_view);
+        self.sidebar_box.set_width_request(sidebar_width);
+        self.content_paned.set_position(sidebar_width);
+        self.apply_tab_placement();
+        self.set_sidebar_visible(sidebar_visible, false);
         let font_desc = self.config.borrow().font_desc.clone();
         let scrollback = new_config.terminal_scrollback_lines as i64;
         self.font_scale = new_config.default_font_scale;
