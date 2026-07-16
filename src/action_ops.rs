@@ -89,6 +89,7 @@ impl AppModel {
                 let s = (self.font_scale - FONT_STEP).max(0.1);
                 self.set_font_scale_all(s);
             }
+            Action::FontReset => self.set_font_scale_all(1.0),
             Action::OpacityIncrease => {
                 let o = (self.window_opacity + OPACITY_STEP).clamp(0.01, 1.0);
                 self.set_window_opacity(o);

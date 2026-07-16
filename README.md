@@ -214,39 +214,34 @@ are currently active.
 | `Ctrl+Shift+W` | Close the focused pane, or the tab when it has one pane |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy / paste |
 | `Ctrl+Alt+Shift+C` | In block mode, copy the selected block's output only |
-| `Ctrl+Shift+E` / `Ctrl+Shift+D` | Split horizontally / vertically |
-| `Ctrl+.` / `Ctrl+,` | Cycle pane focus forward / backward |
-| `Ctrl+Shift+Left/Right` | Focus pane left / right |
-| `Ctrl+Alt+Shift+Up/Down` | Focus pane up / down |
-| `Ctrl+Alt+Arrow` | Resize the active split |
+| `Ctrl+Shift+E` / `Ctrl+Shift+D` | Split left/right / top/bottom |
+| `Ctrl+Alt+Arrow` | Focus the pane in that direction |
+| `Ctrl+Alt+Shift+Arrow` | Resize the active split |
 | `Ctrl+Shift+Z` | Toggle pane zoom |
 | `Ctrl+Shift+!` | Move the focused pane into a new tab |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab |
 | `Ctrl+PageDown/PageUp` | Next / previous tab |
-| `Ctrl+0` | First tab |
-| `Ctrl+1` ... `Ctrl+8` | Second ... ninth tab |
+| `Ctrl+1` ... `Ctrl+8` | First ... eighth tab |
 | `Ctrl+9` | Last tab |
 | `Ctrl+Shift+P` | Command palette |
-| `Ctrl+R` | History palette; this intentionally replaces shell reverse search |
+| `Ctrl+Shift+H` | History palette; `Ctrl+R` and `Ctrl+P` remain available to the shell |
 | `Ctrl+Shift+F` | Search terminal output (`/pattern/` enables regex) |
 | `Ctrl+Shift+O` | Settings |
 | `Ctrl+\` | Toggle sidebar |
 | `Ctrl+Alt+B` | Move tabs between sidebar and top bar |
 | `Ctrl+Shift+L` | Focus the tab filter |
-| `Ctrl+Shift+R` | Remote host picker |
-| `Ctrl+Shift+X/S/M` | Jump to the first failed / slow / pinned block |
-| `Alt+Up/Down` | Previous / next pinned block |
+| `Ctrl+Shift+S` | Remote host picker |
+| `Ctrl+Shift+X` | Jump to the first failed block |
 | `Ctrl+Shift+N` | Jump to the oldest block |
 | `Ctrl+Shift+A` | Select all finished blocks |
 | `Ctrl+Shift+I` | Reinput selected block commands without running them |
 | `Ctrl+Shift+K` | Clear all finished blocks in the pane |
 | `Ctrl+Alt+Shift+A` | Session AI panel |
-| `Ctrl+Shift+Y` | Workflows |
-| `Ctrl+Shift+G` | AI agent |
+| `Ctrl+Shift+M` | Workflows |
+| `Ctrl+Alt+G` | AI agent |
 | `F12` | Debug dashboard |
-| `Ctrl+Shift++` | Increase font scale |
-| `Ctrl+-` | Decrease font scale |
-| `Ctrl+Shift+J` / `Ctrl+Alt+Shift+K` | Decrease / increase window opacity |
+| `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | Increase / decrease / reset font scale |
+| `Ctrl+Alt+-` / `Ctrl+Alt+=` | Decrease / increase window opacity |
 | `Ctrl+Up/Down` | Scroll terminal output |
 
 Block mode also has context-sensitive navigation:
@@ -257,8 +252,12 @@ Block mode also has context-sensitive navigation:
   `Shift+Up/Down` extends the range, `Enter` recalls every selected command in
   terminal order without running it, and `Escape` clears the selection.
 - `Ctrl+Shift+B` bookmarks the selected block.
+- `Ctrl+,` / `Ctrl+.` jumps to the previous / next bookmarked block.
 - `Alt+Shift+F` toggles the selected or most recent block's output filter.
-- `Ctrl+P` opens block mode's in-memory command-history picker.
+
+Slow-block, pinned-block, and non-contextual pinned-navigation actions remain
+available in the command palette and can be assigned in `[keybindings]`, but
+have no default shortcuts.
 
 ## Configuration
 
@@ -339,7 +338,7 @@ args:
     default: "."
 ```
 
-Press `Ctrl+Shift+Y` or type `:` in the palette. Rendering a workflow inserts
+Press `Ctrl+Shift+M` or type `:` in the palette. Rendering a workflow inserts
 the command at the prompt; it does not press Enter.
 
 ### Remote hosts

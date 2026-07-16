@@ -95,7 +95,7 @@
 - [ ] 所有完成块立即消失，当前输入提示符仍可使用。
 - [ ] 选区、书签、搜索高亮、虚拟滚动索引和未读徽标一并清除。
 - [ ] 按 `Ctrl+Up` 不会重新选中已清除块。
-- [ ] 按 `Alt+Up` / `Alt+Down` 不会跳到已清除书签。
+- [ ] 按 `Ctrl+,` / `Ctrl+.` 不会跳到已清除书签。
 - [ ] 随后执行 `printf 'after-clear\n'`，新块正常显示、选中、复制和回填。
 - [ ] 从命令面板执行 `Clear blocks` 结果相同。
 
@@ -136,11 +136,12 @@ read -r value; printf 'value=%s\n' "$value"
 - [ ] 单选 background block 后按 `Enter`，不会回填空命令，终端输入仍可继续工作。
 - [ ] 在不支持 bracketed paste 的 shell 中，多行回填只保留第一逻辑行，不应意外执行后续行。
 
-### BM-11 被让出的旧快捷键
+### BM-11 统一后的字体与透明度快捷键
 
-- [ ] `Ctrl+-` 仍能减小字体。
-- [ ] `Ctrl+Shift+J` 仍能降低窗口透明度。
-- [ ] `Ctrl+Alt+Shift+K` 能提高窗口透明度。
+- [ ] `Ctrl+=` 能增大字体，`Ctrl+-` 能减小字体。
+- [ ] `Ctrl+0` 能把字体缩放复位到 `1.0`。
+- [ ] `Ctrl+Alt+-` 能降低窗口透明度。
+- [ ] `Ctrl+Alt+=` 能提高窗口透明度。
 - [ ] `Ctrl+Alt+Shift+A` 能打开 Session AI panel。
 - [ ] `Ctrl+Shift+L` 仍聚焦 tab filter，不会清空块。
 

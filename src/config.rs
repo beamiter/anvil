@@ -235,7 +235,7 @@ pub struct Config {
     /// network call still only fires on an explicit user click — this just
     /// removes the entry points.
     pub(crate) ai_enabled: bool,
-    /// Show the agent-mode entry point (`Ctrl+Shift+G` / palette). Default
+    /// Show the agent-mode entry point (`Ctrl+Alt+G` / palette). Default
     /// on, but suppressed when `ai_enabled` is false. Independent toggle so
     /// users who like the per-block AI helpers but find agent mode too
     /// risky can disable the multi-turn loop without losing the rest.

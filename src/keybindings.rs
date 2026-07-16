@@ -14,6 +14,7 @@ pub(crate) enum Action {
     Paste,
     FontIncrease,
     FontDecrease,
+    FontReset,
     OpacityIncrease,
     OpacityDecrease,
     ToggleSearch,
@@ -75,9 +76,9 @@ pub(crate) enum Action {
     /// Warp-compatible Select All Blocks action).
     OpenAiPanel,
     /// Open the palette focused on parameterised command templates
-    /// ("workflows", `:` prefix). Ctrl+Shift+Y by default.
+    /// ("workflows", `:` prefix). Ctrl+Shift+M by default.
     OpenWorkflows,
-    /// Open the multi-turn agent panel (Warp-style). Ctrl+Shift+G by default.
+    /// Open the multi-turn agent panel (Warp-style). Ctrl+Alt+G by default.
     OpenAgent,
 }
 
@@ -91,6 +92,7 @@ impl Action {
             Action::Paste => "Paste",
             Action::FontIncrease => "Font size increase",
             Action::FontDecrease => "Font size decrease",
+            Action::FontReset => "Font size reset",
             Action::OpacityIncrease => "Opacity increase",
             Action::OpacityDecrease => "Opacity decrease",
             Action::ToggleSearch => "Toggle search",
@@ -100,8 +102,8 @@ impl Action {
             Action::ToggleSettings => "Toggle settings panel",
             Action::OpenWelcome => "Open welcome & quick start",
             Action::ToggleSidebar => "Toggle sidebar",
-            Action::SplitHorizontal => "Split horizontal",
-            Action::SplitVertical => "Split vertical",
+            Action::SplitHorizontal => "Split left/right",
+            Action::SplitVertical => "Split top/bottom",
             Action::PrevTab => "Previous tab",
             Action::NextTab => "Next tab",
             Action::ScrollUp => "Scroll up",
@@ -168,6 +170,7 @@ impl Action {
             Action::Paste => Some("paste"),
             Action::FontIncrease => Some("font_increase"),
             Action::FontDecrease => Some("font_decrease"),
+            Action::FontReset => Some("font_reset"),
             Action::OpacityIncrease => Some("opacity_increase"),
             Action::OpacityDecrease => Some("opacity_decrease"),
             Action::ToggleSearch => Some("toggle_search"),
@@ -231,6 +234,7 @@ impl Action {
             Action::Paste,
             Action::FontIncrease,
             Action::FontDecrease,
+            Action::FontReset,
             Action::OpacityIncrease,
             Action::OpacityDecrease,
             Action::ToggleSearch,
@@ -351,6 +355,7 @@ pub(crate) fn parse_key_combo(s: &str) -> Result<KeyCombo, String> {
 
     let key = match key_str {
         "+" | "plus" => Key::plus,
+        "=" | "equal" => Key::equal,
         "-" | "minus" => Key::minus,
         k if k.eq_ignore_ascii_case("PageUp") => Key::Page_Up,
         k if k.eq_ignore_ascii_case("PageDown") => Key::Page_Down,
@@ -414,6 +419,7 @@ pub(crate) fn key_combo_to_string(combo: &KeyCombo) -> String {
 
     let key_name = match combo.key {
         Key::plus => "+".to_string(),
+        Key::equal => "=".to_string(),
         Key::minus => "-".to_string(),
         Key::Page_Up => "PageUp".to_string(),
         Key::Page_Down => "PageDown".to_string(),
@@ -471,71 +477,53 @@ impl KeybindingMap {
         bind("Ctrl+Shift+W", Action::ClosePaneOrTab);
         bind("Ctrl+Shift+C", Action::Copy);
         bind("Ctrl+Shift+V", Action::Paste);
-        bind("Ctrl+Shift++", Action::FontIncrease);
-        bind("Ctrl+Shift+J", Action::OpacityDecrease);
-        // Warp reserves Ctrl+Shift+I/K for reinputting selected commands and
-        // clearing blocks. Keep opacity available without shadowing those block
-        // actions; Ctrl+minus remains the primary font-decrease binding.
-        bind("Ctrl+Alt+Shift+K", Action::OpacityIncrease);
+        bind("Ctrl+=", Action::FontIncrease);
+        bind("Ctrl+minus", Action::FontDecrease);
+        bind("Ctrl+0", Action::FontReset);
+        bind("Ctrl+Alt+=", Action::OpacityIncrease);
+        bind("Ctrl+Alt+minus", Action::OpacityDecrease);
         bind("Ctrl+Shift+F", Action::ToggleSearch);
         bind("Ctrl+Shift+P", Action::ToggleCommandPalette);
-        // Ctrl+r hijacks the shell's reverse-i-search to bring up the same
-        // palette filtered to shell history (jterm1 picks the bookmark-style
-        // UI over readline). OpenPalette (all sources) is unbound by default
-        // because Ctrl+p would steal readline's previous-history binding;
-        // users who want it can set it in config.
-        bind("Ctrl+r", Action::OpenHistoryPalette);
+        // Preserve Ctrl+R and Ctrl+P for shell/readline history navigation.
+        bind("Ctrl+Shift+H", Action::OpenHistoryPalette);
         bind("Ctrl+Shift+O", Action::ToggleSettings);
         bind("Ctrl+backslash", Action::ToggleSidebar);
         bind("Ctrl+Shift+L", Action::FilterTabs);
         bind("Ctrl+Shift+X", Action::FilterFailedBlocks);
-        bind("Ctrl+Shift+S", Action::FilterSlowBlocks);
-        bind("Ctrl+Shift+M", Action::FilterPinnedBlocks);
-        bind("Alt+Up", Action::JumpToPrevPinned);
-        bind("Alt+Down", Action::JumpToNextPinned);
         bind("Ctrl+Shift+N", Action::ClearBlockFilter);
         bind("Ctrl+Shift+A", Action::SelectAllBlocks);
         bind("Ctrl+Shift+K", Action::ClearBlocks);
         bind("Ctrl+Shift+I", Action::ReinputSelectedCommands);
         bind("Ctrl+Shift+E", Action::SplitHorizontal);
         bind("Ctrl+Shift+D", Action::SplitVertical);
-        bind("Ctrl+Shift+PageUp", Action::PrevTab);
-        bind("Ctrl+Shift+PageDown", Action::NextTab);
         bind("Ctrl+Shift+Tab", Action::PrevTab);
         bind("Ctrl+Tab", Action::NextTab);
         bind("Ctrl+Up", Action::ScrollUp);
         bind("Ctrl+Down", Action::ScrollDown);
-        bind("Ctrl+minus", Action::FontDecrease);
         bind("Ctrl+PageUp", Action::PrevTab);
         bind("Ctrl+PageDown", Action::NextTab);
-        for i in 0..=9u8 {
-            bind(&format!("Ctrl+{i}"), Action::QuickSwitchTab(i));
+        for digit in 1..=8u8 {
+            bind(&format!("Ctrl+{digit}"), Action::QuickSwitchTab(digit - 1));
         }
-        bind("Ctrl+Shift+R", Action::ShowRemotePicker);
-        // Pane focus/cycle/resize avoid Alt: the JWM window manager grabs Alt
-        // before it ever reaches the app. Ctrl+grave is also grabbed by JWM
-        // (only Control_L reaches GTK), so cycle uses Ctrl+period / Ctrl+comma
-        // (no Shift, so no keyval remap, and not grabbed by the WM).
-        bind("Ctrl+period", Action::CyclePaneFocusForward);
-        bind("Ctrl+comma", Action::CyclePaneFocusBackward);
+        bind("Ctrl+9", Action::QuickSwitchTab(9));
+        bind("Ctrl+Shift+S", Action::ShowRemotePicker);
 
-        bind("Ctrl+Alt+Left", Action::ResizePaneLeft);
-        bind("Ctrl+Alt+Right", Action::ResizePaneRight);
-        bind("Ctrl+Alt+Up", Action::ResizePaneUp);
-        bind("Ctrl+Alt+Down", Action::ResizePaneDown);
+        bind("Ctrl+Alt+Shift+Left", Action::ResizePaneLeft);
+        bind("Ctrl+Alt+Shift+Right", Action::ResizePaneRight);
+        bind("Ctrl+Alt+Shift+Up", Action::ResizePaneUp);
+        bind("Ctrl+Alt+Shift+Down", Action::ResizePaneDown);
         // Keep Warp's Ctrl+Shift+B available for block bookmarks.
         bind("Ctrl+Alt+B", Action::ToggleTabPlacement);
         bind("Ctrl+Shift+Z", Action::TogglePaneZoom);
         bind("Ctrl+Shift+!", Action::MovePaneToNewTab);
         bind("F12", Action::ToggleDebugDashboard);
-        bind("Ctrl+Shift+Left", Action::FocusPaneLeft);
-        bind("Ctrl+Shift+Right", Action::FocusPaneRight);
-        // Warp reserves Ctrl+Shift+Up/Down for selected-block top/bottom.
-        bind("Ctrl+Alt+Shift+Up", Action::FocusPaneUp);
-        bind("Ctrl+Alt+Shift+Down", Action::FocusPaneDown);
+        bind("Ctrl+Alt+Left", Action::FocusPaneLeft);
+        bind("Ctrl+Alt+Right", Action::FocusPaneRight);
+        bind("Ctrl+Alt+Up", Action::FocusPaneUp);
+        bind("Ctrl+Alt+Down", Action::FocusPaneDown);
         bind("Ctrl+Alt+Shift+A", Action::OpenAiPanel);
-        bind("Ctrl+Shift+Y", Action::OpenWorkflows);
-        bind("Ctrl+Shift+G", Action::OpenAgent);
+        bind("Ctrl+Shift+M", Action::OpenWorkflows);
+        bind("Ctrl+Alt+G", Action::OpenAgent);
 
         KeybindingMap { bindings }
     }
@@ -635,6 +623,15 @@ mod tests {
     }
 
     #[test]
+    fn equal_key_alias_parses_and_displays_canonically() {
+        let symbol = parse_key_combo("Ctrl+=").expect("symbol form is valid");
+        let named = parse_key_combo("Ctrl+equal").expect("named form is valid");
+        assert_eq!(symbol, named);
+        assert_eq!(symbol.key, Key::equal);
+        assert_eq!(key_combo_to_string(&symbol), "Ctrl+=");
+    }
+
+    #[test]
     fn invalid_override_keeps_default_binding() {
         let mut map = KeybindingMap::from_defaults();
         let original = parse_key_combo("Ctrl+Shift+T").unwrap();
@@ -668,5 +665,112 @@ mod tests {
             let combo = parse_key_combo(binding).expect("valid built-in binding");
             assert_eq!(map.lookup(&combo), Some(expected), "{binding}");
         }
+    }
+
+    #[test]
+    fn unified_default_binding_matrix_is_stable() {
+        let map = KeybindingMap::from_defaults();
+        let cases = [
+            ("Ctrl+Shift+T", Action::NewTab),
+            ("Ctrl+Shift+W", Action::ClosePaneOrTab),
+            ("Ctrl+Shift+C", Action::Copy),
+            ("Ctrl+Shift+V", Action::Paste),
+            ("Ctrl+=", Action::FontIncrease),
+            ("Ctrl+minus", Action::FontDecrease),
+            ("Ctrl+0", Action::FontReset),
+            ("Ctrl+Alt+=", Action::OpacityIncrease),
+            ("Ctrl+Alt+minus", Action::OpacityDecrease),
+            ("Ctrl+Shift+F", Action::ToggleSearch),
+            ("Ctrl+Shift+P", Action::ToggleCommandPalette),
+            ("Ctrl+Shift+H", Action::OpenHistoryPalette),
+            ("Ctrl+Shift+O", Action::ToggleSettings),
+            ("Ctrl+backslash", Action::ToggleSidebar),
+            ("Ctrl+Shift+L", Action::FilterTabs),
+            ("Ctrl+Shift+X", Action::FilterFailedBlocks),
+            ("Ctrl+Shift+N", Action::ClearBlockFilter),
+            ("Ctrl+Shift+A", Action::SelectAllBlocks),
+            ("Ctrl+Shift+K", Action::ClearBlocks),
+            ("Ctrl+Shift+I", Action::ReinputSelectedCommands),
+            ("Ctrl+Shift+E", Action::SplitHorizontal),
+            ("Ctrl+Shift+D", Action::SplitVertical),
+            ("Ctrl+Shift+Tab", Action::PrevTab),
+            ("Ctrl+Tab", Action::NextTab),
+            ("Ctrl+Up", Action::ScrollUp),
+            ("Ctrl+Down", Action::ScrollDown),
+            ("Ctrl+PageUp", Action::PrevTab),
+            ("Ctrl+PageDown", Action::NextTab),
+            ("Ctrl+Shift+S", Action::ShowRemotePicker),
+            ("Ctrl+Alt+Shift+Left", Action::ResizePaneLeft),
+            ("Ctrl+Alt+Shift+Right", Action::ResizePaneRight),
+            ("Ctrl+Alt+Shift+Up", Action::ResizePaneUp),
+            ("Ctrl+Alt+Shift+Down", Action::ResizePaneDown),
+            ("Ctrl+Alt+B", Action::ToggleTabPlacement),
+            ("Ctrl+Shift+Z", Action::TogglePaneZoom),
+            ("Ctrl+Shift+!", Action::MovePaneToNewTab),
+            ("F12", Action::ToggleDebugDashboard),
+            ("Ctrl+Alt+Left", Action::FocusPaneLeft),
+            ("Ctrl+Alt+Right", Action::FocusPaneRight),
+            ("Ctrl+Alt+Up", Action::FocusPaneUp),
+            ("Ctrl+Alt+Down", Action::FocusPaneDown),
+            ("Ctrl+Alt+Shift+A", Action::OpenAiPanel),
+            ("Ctrl+Shift+M", Action::OpenWorkflows),
+            ("Ctrl+Alt+G", Action::OpenAgent),
+        ];
+
+        for (binding, expected) in cases {
+            let combo = parse_key_combo(binding).expect("valid default binding");
+            assert_eq!(map.lookup(&combo), Some(expected), "{binding}");
+        }
+        for digit in 1..=8u8 {
+            let binding = format!("Ctrl+{digit}");
+            let combo = parse_key_combo(&binding).expect("valid tab digit binding");
+            assert_eq!(
+                map.lookup(&combo),
+                Some(Action::QuickSwitchTab(digit - 1)),
+                "{binding}"
+            );
+        }
+        let last = parse_key_combo("Ctrl+9").expect("valid last-tab binding");
+        assert_eq!(map.lookup(&last), Some(Action::QuickSwitchTab(9)));
+
+        assert_eq!(
+            map.bindings.len(),
+            cases.len() + 9,
+            "unexpected or duplicate default binding"
+        );
+    }
+
+    #[test]
+    fn shell_and_context_reserved_chords_have_no_global_default() {
+        let map = KeybindingMap::from_defaults();
+        for binding in [
+            "Ctrl+R",
+            "Ctrl+P",
+            "Ctrl+comma",
+            "Ctrl+period",
+            "Ctrl+Shift+PageUp",
+            "Ctrl+Shift+PageDown",
+            "Ctrl+Shift+Left",
+            "Ctrl+Shift+Right",
+            "Ctrl+Shift+R",
+            "Ctrl+Shift+Y",
+            "Ctrl+Shift+G",
+            "Ctrl+Shift++",
+            "Ctrl+Shift+J",
+            "Ctrl+Alt+Shift+K",
+        ] {
+            let combo = parse_key_combo(binding).expect("valid reserved binding");
+            assert_eq!(map.lookup(&combo), None, "{binding} must stay unbound");
+        }
+        assert!(map
+            .binding_display(&Action::CyclePaneFocusForward)
+            .is_empty());
+        assert!(map
+            .binding_display(&Action::CyclePaneFocusBackward)
+            .is_empty());
+        assert!(map.binding_display(&Action::FilterSlowBlocks).is_empty());
+        assert!(map.binding_display(&Action::FilterPinnedBlocks).is_empty());
+        assert!(map.binding_display(&Action::JumpToPrevPinned).is_empty());
+        assert!(map.binding_display(&Action::JumpToNextPinned).is_empty());
     }
 }

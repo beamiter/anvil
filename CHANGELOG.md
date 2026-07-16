@@ -30,6 +30,9 @@ versioning for tagged releases while it remains experimental.
 
 ### Changed
 
+- Default shortcuts now share the jterm ergonomic layout: directional Pane
+  focus/resize layers, browser-style tab digits, symmetric zoom/opacity keys,
+  and shell-owned `Ctrl+R` / `Ctrl+P` passthrough.
 - In-app settings now refuse stale multi-window writes and invalid schemas;
   diagnostics and support bundles expose validation/lock state without values.
 - Local and CI linting now share one canonical Clippy policy.

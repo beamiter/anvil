@@ -23,6 +23,7 @@ mod css;
 mod export;
 mod find;
 mod history;
+#[allow(dead_code)]
 mod palette;
 mod scroll;
 pub(crate) use alt_screen::*;
@@ -31,6 +32,7 @@ pub(crate) use blocks::*;
 pub(crate) use cross_selection::*;
 pub(crate) use css::*;
 pub(crate) use find::*;
+#[allow(unused_imports)]
 pub(crate) use palette::*;
 pub(crate) use scroll::*;
 
@@ -2013,10 +2015,8 @@ struct KeyCtx {
     pty_for_key: Rc<OwnedPty>,
     pty_synced_for_key: Rc<Cell<bool>>,
     bracketed_paste_for_key: Rc<Cell<bool>>,
-    active_vte_for_key: Terminal,
     typed_cmd_for_key: Rc<RefCell<String>>,
     finished_blocks_for_key: Rc<RefCell<Vec<FinishedBlock>>>,
-    block_data_for_key: Rc<RefCell<VecDeque<BlockData>>>,
     selected_block_ids_for_key: SelectedBlockIds,
     selected_block_id_for_key: Rc<Cell<Option<u64>>>,
     selection_anchor_id_for_key: Rc<Cell<Option<u64>>>,
@@ -2031,10 +2031,8 @@ impl KeyCtx {
             pty_for_key,
             pty_synced_for_key,
             bracketed_paste_for_key,
-            active_vte_for_key,
             typed_cmd_for_key,
             finished_blocks_for_key,
-            block_data_for_key,
             selected_block_ids_for_key,
             selected_block_id_for_key,
             selection_anchor_id_for_key,
@@ -2247,8 +2245,8 @@ impl KeyCtx {
             }
 
             // Ctrl+,/Ctrl+. : jump to the previous/next bookmarked block (Warp's
-            // SelectBookmarkUp/Down). VTE swallows Alt+arrow and plain Ctrl+arrow
-            // before the capture handler sees them, so comma/period are used here.
+            // SelectBookmarkUp/Down). The global pane-cycle defaults deliberately
+            // leave these two context-sensitive chords available to block mode.
             if ctrl && !alt && !shift && matches!(keyval, Key::comma | Key::period) {
                 let finished = finished_blocks_for_key.borrow();
                 let marks = bookmarks_for_key.borrow();
@@ -2303,38 +2301,6 @@ impl KeyCtx {
             // widget currently has focus — in particular after the user
             // mouse-selects text inside a finished block's TextView, focus
             // sits there and this per-VTE controller never fires.
-
-            // Ctrl+P: fuzzy command-history palette. Build a deduped, most-recent
-            // -first entry list from block_data (which carries exit code + duration
-            // for the failed/slow filters) and pop it up.
-            if ctrl && !shift && !alt && matches!(keyval, Key::p | Key::P) {
-                let mut seen = std::collections::HashSet::new();
-                let mut entries = Vec::new();
-                {
-                    let block_data = block_data_for_key.borrow();
-                    for b in block_data.iter().rev() {
-                        let c = b.cmd.lines().next().unwrap_or("").trim().to_string();
-                        if c.is_empty() {
-                            continue;
-                        }
-                        if seen.insert(c.clone()) {
-                            entries.push(PaletteEntry {
-                                cmd: c,
-                                failed: b.exit_code != 0,
-                                slow: b.duration_ms.map(|d| d >= PALETTE_SLOW_MS).unwrap_or(false),
-                            });
-                        }
-                    }
-                }
-                show_command_palette(
-                    &block_scroll_for_key,
-                    entries,
-                    pty_for_key.clone(),
-                    typed_cmd_for_key.clone(),
-                    active_vte_for_key.clone(),
-                );
-                return glib::Propagation::Stop;
-            }
 
             // Everything else: let the VTE translate it (printable keys, editing,
             // control sequences, IME) and emit `commit`.
@@ -2795,7 +2761,7 @@ impl TermView {
         let selected_block_id: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
         let selection_anchor_id: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
         // Bookmarked block ids (in-memory for the session). Toggled with Ctrl+B;
-        // navigated with Alt+Up/Down. Not persisted (avoids an rkyv schema bump).
+        // navigated with Ctrl+,/Ctrl+.. Not persisted (avoids an rkyv schema bump).
         let block_bookmarks: Rc<RefCell<std::collections::HashSet<u64>>> =
             Rc::new(RefCell::new(std::collections::HashSet::new()));
         // Sticky running-command header state: true while a command is executing,
@@ -3278,10 +3244,8 @@ impl TermView {
         // ── Keyboard navigation / copy-paste (Capture phase) ──────────────
         {
             let pty_for_key = pty.clone();
-            let active_vte_for_key = active_vte.clone();
             let typed_cmd_for_key = typed_cmd.clone();
             let finished_blocks_for_key = finished_blocks_rc.clone();
-            let block_data_for_key = block_data_rc.clone();
             let selected_block_ids_for_key = selected_block_ids.clone();
             let selected_block_id_for_key = selected_block_id.clone();
             let selection_anchor_id_for_key = selection_anchor_id.clone();
@@ -3293,10 +3257,8 @@ impl TermView {
                 pty_for_key,
                 pty_synced_for_key: pty_synced.clone(),
                 bracketed_paste_for_key: bracketed_paste.clone(),
-                active_vte_for_key,
                 typed_cmd_for_key,
                 finished_blocks_for_key,
-                block_data_for_key,
                 selected_block_ids_for_key,
                 selected_block_id_for_key,
                 selection_anchor_id_for_key,
@@ -3866,7 +3828,7 @@ impl TermView {
 
     /// Remove all completed blocks and all state indexed by those blocks. This
     /// is deliberately pane-local: command-only history remains available in
-    /// Ctrl+R, while optional full block-history persistence is overwritten
+    /// Ctrl+Shift+H, while optional full block-history persistence is overwritten
     /// immediately so cleared output does not reappear after a crash/restart.
     pub fn clear_blocks(&self) {
         self.clear_find();
