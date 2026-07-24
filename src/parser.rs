@@ -59,7 +59,7 @@ pub enum ParserEvent {
     PromptEnd,
     /// OSC 133 ;C — user pressed Enter, command is executing.
     CommandStart,
-    /// OSC 133 ;D;<code> — command finished with exit code.
+    /// `OSC 133 ;D;<code>` — command finished with exit code.
     CommandEnd(i32),
     /// OSC 7770 — rsh-specific: the remote shell announces its session ID at
     /// startup. jterm1 stores it on the tab's RemoteConn so subsequent
@@ -77,7 +77,7 @@ pub enum ParserEvent {
     ClipboardQuery,
     /// APC sequence (ESC _) — Kitty graphics protocol or similar.
     ApcSequence(Vec<u8>),
-    /// CSI ? <mode> h / l — DEC private mode change. Emitted in addition to
+    /// `CSI ? <mode> h / l` — DEC private mode change. Emitted in addition to
     /// pass-through so block_view can track reporting modes.
     DecsetMode { mode: u32, set: bool },
     /// OSC 10/11/12/4 with a `?` — app is asking the terminal what color it uses.
@@ -667,6 +667,10 @@ fn emit_dcs_passthrough(payload: &[u8], passthrough: &mut Vec<u8>) {
     passthrough.push(b'\\');
 }
 
+fn valid_remote_session_id(id: &str) -> bool {
+    !id.is_empty() && id.chars().count() <= 1_024 && !id.chars().any(char::is_control)
+}
+
 fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
     let s = match std::str::from_utf8(payload) {
         Ok(s) => s,
@@ -695,7 +699,7 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
     // OSC 7770 ; <session-id> — rsh-specific session announce (see rsh osc.rs:107).
     if let Some(rest) = s.strip_prefix("7770;") {
         let id = rest.trim();
-        if !id.is_empty() {
+        if valid_remote_session_id(id) {
             events.push(ParserEvent::RemoteSessionId(id.to_string()));
         }
         return;
@@ -1026,6 +1030,31 @@ mod tests {
         assert!(events
             .iter()
             .all(|e| !matches!(e, ParserEvent::RemoteSessionId(_))));
+    }
+
+    #[test]
+    fn osc_7770_rejects_control_characters_and_oversized_ids() {
+        for payload in [
+            b"\x1b]7770;line\nbreak\x07".to_vec(),
+            b"\x1b]7770;nul\0byte\x07".to_vec(),
+        ] {
+            let mut parser = Parser::new();
+            let mut events = Vec::new();
+            parser.feed(&payload, &mut events);
+            assert!(events
+                .iter()
+                .all(|event| !matches!(event, ParserEvent::RemoteSessionId(_))));
+        }
+
+        let mut payload = b"\x1b]7770;".to_vec();
+        payload.extend(std::iter::repeat_n(b'x', 1_025));
+        payload.push(0x07);
+        let mut parser = Parser::new();
+        let mut events = Vec::new();
+        parser.feed(&payload, &mut events);
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event, ParserEvent::RemoteSessionId(_))));
     }
 
     #[test]

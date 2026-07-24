@@ -3,16 +3,19 @@
 //! from jterm4 — the block view drives its own PTY (rather than vte4's) so it can
 //! intercept the raw stream for OSC 133 block detection.
 
-use crate::process::terminate_terminal_process;
+use crate::process::{terminate_terminal_process, ChildLifecycle};
 use gtk::glib;
 use nix::libc;
 use nix::pty::{openpty, OpenptyResult};
 use nix::unistd::{self, ForkResult, Pid};
 use relm4::gtk;
 use std::borrow::Cow;
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
 use std::io::{self, Read as _};
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
@@ -28,6 +31,8 @@ pub struct OwnedPty {
     /// from GTK's main thread.
     input_tx: mpsc::Sender<Vec<u8>>,
     pid: Pid,
+    child_lifecycle: Arc<ChildLifecycle>,
+    reader_cancelled: Arc<AtomicBool>,
     /// Tracks bracketed-paste writes whose start/body/end arrive as separate
     /// `write_bytes` calls. While active, embedded line endings are intentional
     /// paste content and must be forwarded unchanged.
@@ -200,6 +205,90 @@ fn sanitize_input_chunk(
     (Cow::Owned(data[..first_break].to_vec()), next_paste_active)
 }
 
+fn is_executable_file(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// Resolve the executable before `fork` so the child can call only `execve`.
+/// Relative PATH entries follow `execvp` semantics and are interpreted from
+/// the directory the child will enter.
+fn resolve_executable(
+    executable: &str,
+    path: Option<&OsStr>,
+    child_cwd: Option<&str>,
+) -> io::Result<PathBuf> {
+    let executable_path = Path::new(executable);
+    if executable_path.is_absolute() {
+        return is_executable_file(executable_path)
+            .then(|| executable_path.to_path_buf())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "PTY executable does not exist or is not executable",
+                )
+            });
+    }
+
+    // A process can outlive the directory it started in. Absolute PATH
+    // entries remain usable in that situation, so do not fail the whole pane
+    // merely because getcwd can no longer reconstruct the application cwd.
+    let current_directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    let child_directory = child_cwd
+        .map(PathBuf::from)
+        .map(|directory| {
+            if directory.is_absolute() {
+                directory
+            } else {
+                current_directory.join(directory)
+            }
+        })
+        .unwrap_or_else(|| current_directory.clone());
+    if executable.as_bytes().contains(&b'/') {
+        let candidate = child_directory.join(executable_path);
+        return is_executable_file(&candidate)
+            .then_some(candidate)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "PTY executable does not exist or is not executable",
+                )
+            });
+    }
+
+    let search_path = path.unwrap_or_else(|| OsStr::new("/bin:/usr/bin"));
+    for directory in std::env::split_paths(search_path) {
+        let directory = if directory.as_os_str().is_empty() {
+            child_directory.clone()
+        } else if directory.is_absolute() {
+            directory
+        } else {
+            child_directory.join(directory)
+        };
+        let candidate = directory.join(executable_path);
+        if is_executable_file(&candidate) {
+            return Ok(candidate);
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "PTY executable was not found in PATH",
+    ))
+}
+
+fn kill_and_reap_unowned_child(child: Pid) {
+    let pid = child.as_raw();
+    unsafe {
+        if libc::getpgid(pid) == pid {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+        libc::kill(pid, libc::SIGKILL);
+    }
+    while let Err(nix::errno::Errno::EINTR) = nix::sys::wait::waitpid(child, None) {}
+}
+
 impl OwnedPty {
     fn close_master_fd(&self) {
         if let Ok(mut guard) = self.master.lock() {
@@ -210,13 +299,96 @@ impl OwnedPty {
     pub fn spawn(argv: &[&str], cwd: Option<&str>, env_extra: &[(&str, &str)]) -> io::Result<Self> {
         let argv_owned: Vec<String> = argv.iter().map(|value| (*value).to_string()).collect();
         let host_bridge = crate::host::is_flatpak();
-        let executable_argv = crate::host::wrap_argv(&argv_owned, cwd, env_extra);
+        let effective_cwd = cwd.filter(|directory| {
+            let usable = crate::host::working_directory_available(directory);
+            if !usable {
+                log::warn!("PTY working directory is unavailable; using the application directory");
+            }
+            usable
+        });
+        let executable_argv = crate::host::wrap_argv(&argv_owned, effective_cwd, env_extra);
         if executable_argv.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "empty PTY argv",
             ));
         }
+
+        // Prepare every allocation that exec needs before fork. GTK processes
+        // are multi-threaded; panicking or allocating Rust strings in the child
+        // can deadlock on a lock held by a thread that no longer exists there.
+        let c_argv = executable_argv
+            .iter()
+            .map(|argument| {
+                CString::new(argument.as_bytes()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "PTY command contains an embedded NUL byte",
+                    )
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let child_cwd = if host_bridge { None } else { effective_cwd };
+        let c_cwd = child_cwd
+            .map(|directory| {
+                CString::new(directory.as_bytes()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "PTY working directory contains an embedded NUL byte",
+                    )
+                })
+            })
+            .transpose()?;
+
+        let mut environment = std::collections::BTreeMap::new();
+        environment.extend(std::env::vars_os());
+        environment.insert("TERM".into(), "xterm-256color".into());
+        if !host_bridge {
+            for (key, value) in env_extra {
+                environment.insert((*key).into(), (*value).into());
+            }
+        }
+        let executable_path = resolve_executable(
+            &executable_argv[0],
+            environment
+                .get(OsStr::new("PATH"))
+                .map(|value| value.as_os_str()),
+            child_cwd,
+        )?;
+        let c_executable = CString::new(executable_path.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "resolved PTY executable contains an embedded NUL byte",
+            )
+        })?;
+        let c_environment = environment
+            .into_iter()
+            .map(|(key, value)| {
+                let mut entry =
+                    Vec::with_capacity(key.as_bytes().len() + value.as_bytes().len() + 1);
+                entry.extend_from_slice(key.as_bytes());
+                entry.push(b'=');
+                entry.extend_from_slice(value.as_bytes());
+                CString::new(entry).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "PTY environment contains an embedded NUL byte",
+                    )
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        // `nix::unistd::execvpe` constructs these pointer arrays internally.
+        // Build them here instead so the post-fork child does not allocate.
+        let mut c_argv_ptrs = c_argv
+            .iter()
+            .map(|argument| argument.as_ptr())
+            .collect::<Vec<_>>();
+        c_argv_ptrs.push(std::ptr::null());
+        let mut c_environment_ptrs = c_environment
+            .iter()
+            .map(|entry| entry.as_ptr())
+            .collect::<Vec<_>>();
+        c_environment_ptrs.push(std::ptr::null());
 
         let initial_size = nix::pty::Winsize {
             ws_row: 24,
@@ -230,56 +402,77 @@ impl OwnedPty {
         match unsafe { unistd::fork() } {
             Ok(ForkResult::Child) => {
                 drop(master);
-                let slave_fd = slave.as_raw_fd();
+                let slave_fd = slave.into_raw_fd();
                 unsafe {
                     if libc::setsid() < 0 {
-                        eprintln!("setsid() failed: {}", std::io::Error::last_os_error());
-                        std::process::exit(1);
+                        libc::_exit(126);
                     }
-                    libc::ioctl(slave_fd, libc::TIOCSCTTY, 0);
-                    libc::dup2(slave_fd, 0);
-                    libc::dup2(slave_fd, 1);
-                    libc::dup2(slave_fd, 2);
-                }
-                drop(slave);
-
-                if !host_bridge {
-                    if let Some(dir) = cwd {
-                        let _ = std::env::set_current_dir(dir);
+                    if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) < 0
+                        || libc::dup2(slave_fd, 0) < 0
+                        || libc::dup2(slave_fd, 1) < 0
+                        || libc::dup2(slave_fd, 2) < 0
+                    {
+                        libc::_exit(126);
+                    }
+                    // dup2(oldfd, oldfd) is a no-op and therefore does not
+                    // clear FD_CLOEXEC. Explicitly keep all three standard
+                    // streams alive across exec even if openpty returned one
+                    // of those descriptor numbers as the slave.
+                    for fd in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+                        let flags = libc::fcntl(fd, libc::F_GETFD);
+                        if flags < 0
+                            || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
+                        {
+                            libc::_exit(126);
+                        }
+                    }
+                    if slave_fd > libc::STDERR_FILENO {
+                        libc::close(slave_fd);
                     }
                 }
-                for (key, val) in env_extra {
-                    unsafe { std::env::set_var(key, val) };
-                }
-                unsafe { std::env::set_var("TERM", "xterm-256color") };
 
-                let c_argv: Vec<CString> = executable_argv
-                    .iter()
-                    .map(|argument| CString::new(argument.as_str()).unwrap())
-                    .collect();
-                let _ = unistd::execvp(&c_argv[0], &c_argv);
-                std::process::exit(127);
+                if let Some(directory) = c_cwd.as_ref() {
+                    unsafe {
+                        // The directory was checked before fork. If it vanished
+                        // in the small race window, retain the application
+                        // directory instead of killing the restored pane.
+                        libc::chdir(directory.as_ptr());
+                    }
+                }
+                unsafe {
+                    libc::execve(
+                        c_executable.as_ptr(),
+                        c_argv_ptrs.as_ptr(),
+                        c_environment_ptrs.as_ptr(),
+                    );
+                    libc::_exit(127);
+                }
             }
             Ok(ForkResult::Parent { child }) => {
                 drop(slave);
                 let writer_fd = match master.try_clone() {
                     Ok(fd) => fd,
                     Err(error) => {
-                        terminate_terminal_process(child.as_raw());
+                        drop(master);
+                        kill_and_reap_unowned_child(child);
                         return Err(error);
                     }
                 };
                 let input_tx = match spawn_fd_writer(writer_fd, "jterm1-pty-writer") {
                     Ok(tx) => tx,
                     Err(error) => {
-                        terminate_terminal_process(child.as_raw());
+                        drop(master);
+                        kill_and_reap_unowned_child(child);
                         return Err(error);
                     }
                 };
+                let child_lifecycle = ChildLifecycle::new(child);
                 Ok(OwnedPty {
                     master: Arc::new(std::sync::Mutex::new(Some(master))),
                     input_tx,
                     pid: child,
+                    child_lifecycle,
+                    reader_cancelled: Arc::new(AtomicBool::new(false)),
                     outgoing_bracketed_paste: AtomicBool::new(false),
                     shell_bracketed_paste: Arc::new(AtomicBool::new(false)),
                 })
@@ -338,13 +531,14 @@ impl OwnedPty {
     }
 
     pub fn kill(&self) {
+        self.reader_cancelled.store(true, Ordering::Release);
         self.close_master_fd();
-        terminate_terminal_process(self.pid.as_raw());
+        terminate_terminal_process(Arc::clone(&self.child_lifecycle));
     }
 
     /// Spawn a background reader thread; deliver bounded data through a
     /// backpressured channel paced on the GLib main thread.
-    pub fn start_reader<F, E>(&self, callback: F, on_exit: E)
+    pub fn start_reader<F, E>(&self, callback: F, on_exit: E) -> io::Result<()>
     where
         F: FnMut(Vec<u8>) + 'static,
         E: FnOnce(i32) + 'static,
@@ -356,22 +550,31 @@ impl OwnedPty {
             .and_then(|guard| guard.as_ref().and_then(|fd| fd.try_clone().ok()))
         {
             Some(fd) => fd,
-            None => return,
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "PTY reader descriptor is unavailable",
+                ))
+            }
         };
 
         let child_pid = self.pid;
+        let child_lifecycle = Arc::clone(&self.child_lifecycle);
+        let reader_cancelled = Arc::clone(&self.reader_cancelled);
         let (tx, rx) = mpsc::sync_channel::<PtyMsg>(PTY_QUEUE_CAPACITY);
         let shell_bracketed_paste = Arc::clone(&self.shell_bracketed_paste);
 
         self.start_reader_timed(
             reader_fd,
             child_pid,
+            child_lifecycle,
+            reader_cancelled,
             tx,
             rx,
             callback,
             on_exit,
             shell_bracketed_paste,
-        );
+        )
     }
 
     // The transport endpoints and the two one-shot callbacks have independent
@@ -382,46 +585,82 @@ impl OwnedPty {
         &self,
         reader_fd: OwnedFd,
         child_pid: Pid,
+        child_lifecycle: Arc<ChildLifecycle>,
+        reader_cancelled: Arc<AtomicBool>,
         tx: mpsc::SyncSender<PtyMsg>,
         rx: mpsc::Receiver<PtyMsg>,
         mut callback: F,
         on_exit: E,
         shell_bracketed_paste: Arc<AtomicBool>,
-    ) where
+    ) -> io::Result<()>
+    where
         F: FnMut(Vec<u8>) + 'static,
         E: FnOnce(i32) + 'static,
     {
-        std::thread::spawn(move || {
-            // The reader owns a duplicated descriptor. It can never observe a
-            // different file after the model closes and the kernel reuses the
-            // original descriptor number.
-            let mut file = std::fs::File::from(reader_fd);
-            let fd = file.as_raw_fd();
-            let mut buf = [0u8; 32 * 1024];
-            let mut mode_tail = Vec::with_capacity(BRACKETED_PASTE_ENABLE.len().saturating_sub(1));
-            loop {
-                match file.read(&mut buf) {
-                    Ok(0) | Err(_) => {
+        let reader = std::thread::Builder::new()
+            .name("jterm1-pty-reader".to_string())
+            .spawn(move || {
+                // The reader owns a duplicated descriptor. It can never observe a
+                // different file after the model closes and the kernel reuses the
+                // original descriptor number.
+                let mut file = std::fs::File::from(reader_fd);
+                let fd = file.as_raw_fd();
+                let mut buf = [0u8; 32 * 1024];
+                let mut mode_tail =
+                    Vec::with_capacity(BRACKETED_PASTE_ENABLE.len().saturating_sub(1));
+                loop {
+                    if reader_cancelled.load(Ordering::Acquire) {
                         break;
                     }
-                    Ok(n) => {
-                        let mut combined = Vec::with_capacity(n + 4096);
-                        combined.extend_from_slice(&buf[..n]);
-                        coalesce_pending(fd, &mut file, &mut buf, &mut combined);
-                        let mode = observe_bracketed_paste_mode(
-                            shell_bracketed_paste.load(Ordering::Relaxed),
-                            &mut mode_tail,
-                            &combined,
-                        );
-                        shell_bracketed_paste.store(mode, Ordering::Relaxed);
-                        if tx.send(PtyMsg::Data(combined)).is_err() {
+                    let mut ready = libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let polled = unsafe { libc::poll(&mut ready, 1, 50) };
+                    if polled < 0 {
+                        if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        break;
+                    }
+                    if polled == 0 {
+                        continue;
+                    }
+                    match file.read(&mut buf) {
+                        Ok(0) | Err(_) => {
                             break;
+                        }
+                        Ok(n) => {
+                            let mut combined = Vec::with_capacity(n + 4096);
+                            combined.extend_from_slice(&buf[..n]);
+                            coalesce_pending(fd, &mut file, &mut buf, &mut combined);
+                            let mode = observe_bracketed_paste_mode(
+                                shell_bracketed_paste.load(Ordering::Relaxed),
+                                &mut mode_tail,
+                                &combined,
+                            );
+                            shell_bracketed_paste.store(mode, Ordering::Relaxed);
+                            if tx.send(PtyMsg::Data(combined)).is_err() {
+                                break;
+                            }
                         }
                     }
                 }
-            }
-            reap_child(child_pid, &tx);
-        });
+                if reader_cancelled.load(Ordering::Acquire) {
+                    // Dropping the sole producer disconnects the GLib receiver,
+                    // which removes its source and releases all captured
+                    // widgets/OwnedPty handles even if a descendant keeps the
+                    // slave side open.
+                    return;
+                }
+                reap_child(child_pid, &child_lifecycle, &tx);
+            });
+        if let Err(error) = reader {
+            self.close_master_fd();
+            self.child_lifecycle.force_kill_and_reap();
+            return Err(error);
+        }
 
         let on_exit = std::cell::Cell::new(Some(on_exit));
         let rx = std::cell::RefCell::new(rx);
@@ -456,37 +695,34 @@ impl OwnedPty {
                 }
             },
         );
+        Ok(())
     }
 }
 
-fn reap_child(child_pid: Pid, tx: &mpsc::SyncSender<PtyMsg>) {
-    use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-    let max_wait_secs = 5;
-    for _ in 0..(max_wait_secs * 10) {
-        match waitpid(child_pid, Some(WaitPidFlag::WNOHANG)) {
-            Ok(WaitStatus::Exited(_, code)) => {
-                let _ = tx.send(PtyMsg::Exit(code));
-                return;
-            }
-            Ok(WaitStatus::Signaled(_, sig, _)) => {
-                let _ = tx.send(PtyMsg::Exit(128 + sig as i32));
-                return;
-            }
-            Err(_) | Ok(_) => {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-        }
-    }
-    match waitpid(child_pid, None) {
-        Ok(WaitStatus::Exited(_, code)) => {
+fn reap_child(
+    child_pid: Pid,
+    child_lifecycle: &Arc<ChildLifecycle>,
+    tx: &mpsc::SyncSender<PtyMsg>,
+) {
+    let started = std::time::Instant::now();
+    let mut termination_requested = false;
+    loop {
+        if let Some(code) = child_lifecycle.poll_reap() {
             let _ = tx.send(PtyMsg::Exit(code));
+            return;
         }
-        Ok(WaitStatus::Signaled(_, sig, _)) => {
-            let _ = tx.send(PtyMsg::Exit(128 + sig as i32));
+        // EOF normally precedes shell exit by only a few milliseconds. If an
+        // unusual detached child keeps the pid alive, terminate it instead of
+        // leaving the reader source and its captured widget tree resident.
+        if !termination_requested && started.elapsed() >= std::time::Duration::from_secs(5) {
+            log::warn!(
+                "PTY reader reached EOF but child {} is still alive; terminating it",
+                child_pid
+            );
+            terminate_terminal_process(Arc::clone(child_lifecycle));
+            termination_requested = true;
         }
-        _ => {
-            let _ = tx.send(PtyMsg::Exit(1));
-        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
@@ -521,14 +757,39 @@ fn coalesce_pending(fd: RawFd, file: &mut std::fs::File, buf: &mut [u8], combine
 
 impl Drop for OwnedPty {
     fn drop(&mut self) {
+        self.reader_cancelled.store(true, Ordering::Release);
         self.close_master_fd();
-        terminate_terminal_process(self.pid.as_raw());
+        terminate_terminal_process(Arc::clone(&self.child_lifecycle));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spawn_rejects_nul_before_forking() {
+        let error = OwnedPty::spawn(&["sh", "bad\0argument"], None, &[])
+            .err()
+            .expect("embedded NUL must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn executable_resolution_is_absolute_and_rejects_missing_commands() {
+        let path = std::env::var_os("PATH");
+        let resolved = resolve_executable("sh", path.as_deref(), None).unwrap();
+        assert!(resolved.is_absolute());
+        assert!(is_executable_file(&resolved));
+
+        let missing = resolve_executable(
+            "jterm1-command-that-does-not-exist",
+            Some(OsStr::new("/bin:/usr/bin")),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+    }
 
     #[test]
     fn background_writer_preserves_large_payload_and_order() {

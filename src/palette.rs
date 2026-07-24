@@ -110,18 +110,39 @@ pub(crate) struct Entry {
     pub accept: Accept,
 }
 
-/// Read up to the last `max` records from a jsonl history file (newest last).
-/// Records are pulled most-recent-first then reversed for display order.
+const HISTORY_SNAPSHOT_LIMIT: usize = 2_000;
+
+/// Read up to `max` newest-first records from a JSONL history file.
+///
+/// Non-interactive consumers such as the AI context builder can request their
+/// own small bound directly. Interactive palettes should use
+/// [`load_history_snapshot`] once per opening and filter that snapshot in
+/// memory.
 pub(crate) fn read_history(path: &Path, max: usize) -> Vec<command_history::CommandHistoryRecord> {
     command_history::read_recent(path, max).unwrap_or_default()
 }
 
+/// Load one newest-first history snapshot for a palette opening.
+///
+/// UI components call this only from their `Toggle` path. Query changes then
+/// pass the returned slice to [`gather`], keeping per-keystroke filtering free
+/// of filesystem reads and JSON parsing. Closing and reopening creates a fresh
+/// snapshot, so writes from this or another jterm1 process become visible at a
+/// predictable boundary.
+pub(crate) fn load_history_snapshot(
+    path: Option<&Path>,
+) -> Vec<command_history::CommandHistoryRecord> {
+    path.map(|path| read_history(path, HISTORY_SNAPSHOT_LIMIT))
+        .unwrap_or_default()
+}
+
 /// Run the query against all enabled sources, score, sort, and return up to
-/// `limit` entries.
+/// `limit` entries. This function is deliberately pure with respect to history
+/// storage: callers supply the snapshot captured when their UI opened.
 pub(crate) fn gather(
     query: &Query,
     kbmap: &KeybindingMap,
-    history_path: Option<&Path>,
+    history: &[command_history::CommandHistoryRecord],
     workflows: &[Workflow],
     limit: usize,
 ) -> Vec<Entry> {
@@ -205,25 +226,22 @@ pub(crate) fn gather(
     }
 
     if matches!(query.mode, PaletteMode::All | PaletteMode::History) {
-        if let Some(path) = history_path {
-            let items = read_history(path, 2000);
-            // Recency boost: more-recent entries (lower index in `items`) get
-            // a small score nudge so that with an empty query, history sorts
-            // newest-first, and with a query the tie-breaker still favors
-            // recent matches.
-            let len = items.len();
-            for (idx, item) in items.into_iter().enumerate() {
-                let recency = (len - idx) as i64; // 1..=len
-                let entry = Entry {
-                    tier: 2,
-                    score: recency,
-                    label: item.command.clone(),
-                    sublabel: Some(history_sublabel(&item)),
-                    right: None,
-                    accept: Accept::TypeCommand(item.command),
-                };
-                push_if_match(&matcher, &query.text, entry, &mut out);
-            }
+        // Recency boost: more-recent entries (lower index in the snapshot) get
+        // a small score nudge so that with an empty query, history sorts
+        // newest-first, and with a query the tie-breaker still favors recent
+        // matches.
+        let len = history.len();
+        for (idx, item) in history.iter().enumerate() {
+            let recency = (len - idx) as i64; // 1..=len
+            let entry = Entry {
+                tier: 2,
+                score: recency,
+                label: item.command.clone(),
+                sublabel: Some(history_sublabel(item)),
+                right: None,
+                accept: Accept::TypeCommand(item.command.clone()),
+            };
+            push_if_match(&matcher, &query.text, entry, &mut out);
         }
     }
 
@@ -307,7 +325,7 @@ mod tests {
                 text: String::new(),
             },
             &kbmap,
-            None,
+            &[],
             &[],
             100,
         );
@@ -329,8 +347,38 @@ mod tests {
         };
         let q = Query::parse(":rebase", PaletteMode::All);
         assert_eq!(q.mode, PaletteMode::Workflows);
-        let entries = gather(&q, &kbmap, None, std::slice::from_ref(&wf), 50);
+        let entries = gather(&q, &kbmap, &[], std::slice::from_ref(&wf), 50);
         assert_eq!(entries.len(), 1, "got {entries:?}");
         assert!(matches!(entries[0].accept, Accept::RunWorkflow(_)));
+    }
+
+    #[test]
+    fn query_filtering_uses_snapshot_until_the_next_load() {
+        let path = std::env::temp_dir().join(format!(
+            "jterm1-palette-history-snapshot-{}.jsonl",
+            std::process::id()
+        ));
+        std::fs::write(&path, "{\"command\":\"before\",\"exit_code\":0}\n").unwrap();
+        let snapshot = load_history_snapshot(Some(&path));
+
+        // Simulate another process replacing/appending history while the
+        // palette remains open. Filtering the existing snapshot must not touch
+        // disk, while the next opening must observe the new contents.
+        std::fs::write(&path, "{\"command\":\"after\",\"exit_code\":0}\n").unwrap();
+        let kbmap = KeybindingMap::from_defaults();
+        let query = Query {
+            mode: PaletteMode::History,
+            text: String::new(),
+        };
+        let cached = gather(&query, &kbmap, &snapshot, &[], 10);
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].label, "before");
+
+        let refreshed = load_history_snapshot(Some(&path));
+        let reopened = gather(&query, &kbmap, &refreshed, &[], 10);
+        assert_eq!(reopened.len(), 1);
+        assert_eq!(reopened[0].label, "after");
+
+        std::fs::remove_file(path).unwrap();
     }
 }

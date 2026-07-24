@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use crate::command_history::CommandHistoryRecord;
 use crate::keybindings::{Action, KeybindingMap};
 use crate::palette::{self as palette_data, Accept, Entry, PaletteMode, Query};
 use crate::workflows::Workflow;
@@ -78,6 +79,7 @@ pub(crate) enum PaletteMsg {
     Move(i32),
     AcceptSelected,
     Close,
+    Closed,
 }
 
 #[derive(Debug)]
@@ -93,7 +95,7 @@ pub(crate) struct PaletteModel {
     keybindings: Rc<RefCell<KeybindingMap>>,
     workflows: Rc<RefCell<Vec<Workflow>>>,
     mode: PaletteMode,
-    history_path: Option<PathBuf>,
+    history_snapshot: Vec<CommandHistoryRecord>,
     query: String,
     rows: FactoryVecDeque<PaletteRow>,
 }
@@ -110,6 +112,7 @@ impl Component for PaletteModel {
             set_title: "Palette",
             set_content_width: 560,
             set_content_height: 520,
+            connect_closed => PaletteMsg::Closed,
 
             #[wrap(Some)]
             set_child = &adw::ToolbarView {
@@ -187,7 +190,7 @@ impl Component for PaletteModel {
             keybindings: init.keybindings,
             workflows: init.workflows,
             mode: PaletteMode::All,
-            history_path: None,
+            history_snapshot: Vec::new(),
             query: String::new(),
             rows,
         };
@@ -210,7 +213,8 @@ impl Component for PaletteModel {
                     return;
                 }
                 self.mode = mode;
-                self.history_path = history_path;
+                self.history_snapshot =
+                    palette_data::load_history_snapshot(history_path.as_deref());
                 self.query.clear();
                 root.set_title(title(mode));
                 widgets
@@ -251,6 +255,7 @@ impl Component for PaletteModel {
                 self.accept(accept, &sender, root);
             }
             PaletteMsg::Close => root.force_close(),
+            PaletteMsg::Closed => self.history_snapshot.clear(),
         }
     }
 }
@@ -261,7 +266,7 @@ impl PaletteModel {
         let entries = palette_data::gather(
             &query,
             &self.keybindings.borrow(),
-            self.history_path.as_deref(),
+            &self.history_snapshot,
             &self.workflows.borrow(),
             200,
         );

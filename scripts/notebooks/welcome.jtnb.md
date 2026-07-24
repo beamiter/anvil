@@ -1,12 +1,16 @@
 # Welcome to jterm1 notebooks
 
-A `.jtnb.md` file is just **markdown** with `bash` / `sh` / `shell` code fences.
-Each code fence becomes a runnable cell. Click *Run* to execute, *Stop* to
-cancel a long-running cell, *Copy* to grab the source.
+A `.jtnb.md` file is **markdown** with runnable shell code fences. Unlabelled
+and `shell` fences use jterm1's configured shell; explicit `bash`, `sh`, `zsh`,
+`fish`, `pwsh`, and `powershell` fences use the named interpreter. Each
+runnable cell has *Run*, *Stop*, and *Copy* controls.
 
-Cells run in an *isolated* `bash -c` subprocess rooted at the notebook's own
-directory — they do **not** touch your active terminal. That means no shell
-aliases, no PROMPT_COMMAND surprises, just plain bash.
+Use *Run All* to execute runnable cells in order. *Stop All* terminates the
+current run and clears the remaining queue.
+
+Every run starts in the notebook's directory in its own process group. It does
+**not** touch your active terminal, but it is not sandboxed. *Stop*, *Stop All*,
+and closing the viewer terminate the interpreter and its descendants.
 
 ## Try it
 
@@ -33,8 +37,8 @@ ls /this/path/does/not/exist
 
 ## Long-running cells
 
-Use *Stop* to send SIGKILL. The cell will report `cancelled` instead of an
-exit code.
+Use *Stop* to cancel this cell's process group, or *Stop All* to cancel it and
+clear any queued cells.
 
 ```bash
 echo "starting"; sleep 30; echo "done"
@@ -42,8 +46,8 @@ echo "starting"; sleep 30; echo "done"
 
 ## Other languages
 
-Fences in other languages render as read-only snippets — no Run button.
-This keeps execution explicit and predictable.
+Only unlabelled, `shell`, `bash`, `sh`, `zsh`, `fish`, `pwsh`, and
+`powershell` fences are runnable. Other languages render as read-only snippets.
 
 ```python
 print("This is a python snippet — display only.")

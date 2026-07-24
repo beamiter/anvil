@@ -2,6 +2,7 @@ use gtk::gdk::RGBA;
 use gtk::glib;
 use relm4::gtk;
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -135,8 +136,57 @@ fn wrap_rsh_argv_in_interactive_bash(rsh_path: &str) -> Option<Vec<String>> {
     Some(vec![
         bash_path.to_string_lossy().to_string(),
         "-ic".to_string(),
-        format!("exec {}", shell_single_quote(rsh_path)),
+        // Keep the executable and any later session arguments as structured
+        // argv. `bash -c` assigns the first post-command argument to $0 and
+        // the rest to $@; no shell reconstruction of either value is needed.
+        "exec \"$0\" \"$@\"".to_string(),
+        rsh_path.to_string(),
     ])
+}
+
+pub(crate) fn valid_session_id(session_id: &str) -> bool {
+    !session_id.is_empty() && session_id.len() <= 1024 && !session_id.chars().any(char::is_control)
+}
+
+/// Apply a saved rsh session id to either a direct rsh argv or the exact
+/// interactive-bash wrapper generated above. Returns whether the id was
+/// applied, allowing callers to expose the matching environment marker.
+pub(crate) fn shell_argv_with_session(
+    shell_argv: &[String],
+    session_id: Option<&str>,
+) -> (Vec<String>, bool) {
+    let direct_rsh = shell_argv
+        .first()
+        .and_then(|path| Path::new(path).file_name())
+        .and_then(|name| name.to_str())
+        == Some("rsh");
+    let wrapped_rsh = shell_argv.len() >= 4
+        && shell_argv
+            .first()
+            .and_then(|path| Path::new(path).file_name())
+            .and_then(|name| name.to_str())
+            == Some("bash")
+        && shell_argv[1] == "-ic"
+        && shell_argv[2] == "exec \"$0\" \"$@\""
+        && Path::new(&shell_argv[3])
+            .file_name()
+            .and_then(|name| name.to_str())
+            == Some("rsh");
+
+    let mut argv = shell_argv.to_vec();
+    let applied = match session_id {
+        Some(session_id) if (direct_rsh || wrapped_rsh) && valid_session_id(session_id) => {
+            argv.push("--session".to_string());
+            argv.push(session_id.to_string());
+            true
+        }
+        Some(_) if direct_rsh || wrapped_rsh => {
+            log::warn!("Ignoring invalid saved rsh session id");
+            false
+        }
+        _ => false,
+    };
+    (argv, applied)
 }
 
 /// Build the local argv that connects to a remote host via ssh.
@@ -149,7 +199,10 @@ pub(crate) fn build_remote_argv(host: &RemoteHost) -> Vec<String> {
     let mut remote_cmd = host.remote_shell.clone();
     if let Some(sid) = &host.session {
         remote_cmd.push_str(" --session ");
-        remote_cmd.push_str(sid);
+        // `ssh` passes its trailing command through the remote login shell.
+        // Session ids are data, not shell syntax, so preserve them as exactly
+        // one argument even when they contain whitespace or metacharacters.
+        remote_cmd.push_str(&shell_single_quote(sid));
     }
     if host.login_shell {
         remote_cmd = wrap_exec_in_login_bash(&remote_cmd);
@@ -168,6 +221,9 @@ pub(crate) fn build_remote_argv(host: &RemoteHost) -> Vec<String> {
         }
     }
     argv.extend(host.ssh_args.iter().cloned());
+    // End option parsing before the user-owned destination. In particular, a
+    // host alias beginning with '-' must never be reinterpreted as an ssh flag.
+    argv.push("--".to_string());
     argv.push(target);
     argv.push(remote_cmd);
     argv
@@ -545,6 +601,24 @@ pub(crate) fn default_command_history_path() -> String {
         .into_owned()
 }
 
+fn safe_absolute_history_path(value: Option<String>, setting: &str) -> Option<String> {
+    match value {
+        Some(path)
+            if !path.trim().is_empty()
+                && path.chars().count() <= 16 * 1_024
+                && !path.chars().any(char::is_control)
+                && Path::new(&path).is_absolute() =>
+        {
+            Some(path)
+        }
+        Some(_) => {
+            log::warn!("{setting} is not a safe absolute path; using its safe default");
+            None
+        }
+        None => None,
+    }
+}
+
 /// Return a user-facing diagnostic when the config exists but cannot be read
 /// or parsed. Callers use this before hot reload and before any write so a
 /// malformed hand-edited file is never silently replaced with defaults.
@@ -814,42 +888,82 @@ fn load_file_config() -> FileConfig {
     }
 }
 
-/// Parse `[[remote_hosts]]` array-of-tables. Entries missing a `host` are skipped.
+fn remote_text_is_safe(value: &str, allow_whitespace: bool, max_chars: usize) -> bool {
+    !value.trim().is_empty()
+        && value.chars().count() <= max_chars
+        && !value.chars().any(char::is_control)
+        && (allow_whitespace || !value.chars().any(char::is_whitespace))
+}
+
+fn ssh_argument_is_safe(value: &str) -> bool {
+    value.chars().count() <= 16 * 1_024 && !value.chars().any(char::is_control)
+}
+
+/// Parse `[[remote_hosts]]` array-of-tables. Entries missing a host or carrying
+/// unsafe semantic values are skipped, matching the validator's safe-default
+/// contract even when startup continues after reporting configuration errors.
 fn parse_remote_hosts(table: &toml::Table) -> Vec<RemoteHost> {
     let Some(arr) = table.get("remote_hosts").and_then(|v| v.as_array()) else {
         return Vec::new();
     };
+    let mut names = HashSet::new();
     arr.iter()
         .filter_map(|v| v.as_table())
         .filter_map(|t| {
             let host = t.get("host").and_then(|v| v.as_str())?.to_string();
-            let name = t
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| host.clone());
+            if !remote_text_is_safe(&host, false, 1_024) {
+                return None;
+            }
+            let name = match t.get("name").and_then(|v| v.as_str()) {
+                Some(value) if remote_text_is_safe(value, true, 256) => value.to_string(),
+                Some(_) => return None,
+                None => host.clone(),
+            };
+            // Session snapshots use the display name as the stable profile
+            // identifier. Keep the first safe definition and reject later
+            // duplicates so restore can never silently select another host.
+            if !names.insert(name.clone()) {
+                return None;
+            }
             let user = t
                 .get("user")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
+            if user
+                .as_deref()
+                .is_some_and(|value| !remote_text_is_safe(value, false, 256))
+            {
+                return None;
+            }
             let remote_shell = t
                 .get("remote_shell")
                 .and_then(|v| v.as_str())
                 .unwrap_or("rsh")
                 .to_string();
+            if !remote_text_is_safe(&remote_shell, true, 16 * 1_024) {
+                return None;
+            }
             let session = t
                 .get("session")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            let ssh_args = t
-                .get("ssh_args")
-                .and_then(|v| v.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                        .collect()
-                })
-                .unwrap_or_default();
+            if session
+                .as_deref()
+                .is_some_and(|value| !remote_text_is_safe(value, true, 1_024))
+            {
+                return None;
+            }
+            let ssh_args: Vec<String> = match t.get("ssh_args").and_then(|v| v.as_array()) {
+                Some(arguments) if arguments.iter().all(toml::Value::is_str) => arguments
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect(),
+                Some(_) => return None,
+                None => Vec::new(),
+            };
+            if ssh_args.len() > 128 || ssh_args.iter().any(|value| !ssh_argument_is_safe(value)) {
+                return None;
+            }
             let login_shell = t
                 .get("login_shell")
                 .and_then(|v| v.as_bool())
@@ -1003,19 +1117,24 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         .min(100);
     let command_history_enabled = fc.command_history_enabled.unwrap_or(true);
     let command_history_path = command_history_enabled.then(|| {
-        std::env::var("JTERM1_COMMAND_HISTORY_PATH")
-            .ok()
-            .or(fc.command_history_path)
-            .filter(|path| !path.trim().is_empty())
-            .unwrap_or_else(default_command_history_path)
+        safe_absolute_history_path(
+            std::env::var("JTERM1_COMMAND_HISTORY_PATH")
+                .ok()
+                .or(fc.command_history_path),
+            "command_history_path",
+        )
+        .unwrap_or_else(default_command_history_path)
     });
     let command_history_max_entries = fc
         .command_history_max_entries
         .unwrap_or(10_000)
         .clamp(100, 100_000);
-    let block_history_path = std::env::var("JTERM1_HISTORY_PATH")
-        .ok()
-        .or(fc.block_history_path);
+    let block_history_path = safe_absolute_history_path(
+        std::env::var("JTERM1_HISTORY_PATH")
+            .ok()
+            .or(fc.block_history_path),
+        "block_history_path",
+    );
     let block_history_compress = fc.block_history_compress.unwrap_or(true);
     let block_compact = match std::env::var("JTERM1_BLOCK_COMPACT").ok().as_deref() {
         Some("1") | Some("true") => Some(true),
@@ -1186,6 +1305,11 @@ fn is_executable(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn configured_shell_is_usable(path: &str) -> bool {
+    let path = Path::new(path);
+    path.is_absolute() && is_executable(path)
+}
+
 #[cfg(not(unix))]
 fn is_executable(path: &Path) -> bool {
     path.is_file()
@@ -1201,7 +1325,7 @@ pub(crate) fn find_executable_in_path(exe_name: &str) -> Option<PathBuf> {
 pub(crate) fn choose_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
     // Explicit config / env var wins (needed when PATH is stripped by launchers like wofi).
     if let Some(path) = configured_shell {
-        if is_executable(Path::new(path)) {
+        if configured_shell_is_usable(path) {
             let shell_name = Path::new(path)
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -1214,7 +1338,7 @@ pub(crate) fn choose_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
             return vec![path.to_string()];
         }
         log::warn!(
-            "Configured shell '{}' is not executable, falling back to auto-detection",
+            "Configured shell '{}' is not an absolute executable path, falling back to auto-detection",
             path
         );
     }
@@ -1263,10 +1387,18 @@ mod tests {
             vec![
                 "ssh",
                 "-t",
+                "--",
                 "tester@203.0.113.10",
-                "bash -lc 'exec /home/tester/.local/bin/rsh --session staging-test'",
+                "bash -lc 'exec /home/tester/.local/bin/rsh --session '\\''staging-test'\\'''",
             ]
         );
+    }
+
+    #[test]
+    fn configured_shell_must_be_an_absolute_executable() {
+        assert!(configured_shell_is_usable("/bin/sh"));
+        assert!(!configured_shell_is_usable("./sh"));
+        assert!(!configured_shell_is_usable("sh"));
     }
 
     #[test]
@@ -1276,18 +1408,19 @@ mod tests {
         let argv = build_remote_argv(&h);
         assert_eq!(
             argv.last().unwrap(),
-            "/home/tester/.local/bin/rsh --session staging-test"
+            "/home/tester/.local/bin/rsh --session 'staging-test'"
         );
     }
 
     #[test]
-    fn single_quotes_in_payload_are_escaped() {
+    fn session_payload_is_one_shell_argument() {
         let mut h = host();
-        h.session = Some("it's".into());
+        h.login_shell = false;
+        h.session = Some("it's; printf injected".into());
         let argv = build_remote_argv(&h);
         assert_eq!(
             argv.last().unwrap(),
-            r#"bash -lc 'exec /home/tester/.local/bin/rsh --session it'\''s'"#
+            r#"/home/tester/.local/bin/rsh --session 'it'"'"'s; printf injected'"#
         );
     }
 
@@ -1296,7 +1429,31 @@ mod tests {
         let argv = wrap_rsh_argv_in_interactive_bash("/home/tester/.local/bin/rsh")
             .expect("bash should be available in the test environment");
         assert_eq!(argv[1], "-ic");
-        assert_eq!(argv[2], "exec '/home/tester/.local/bin/rsh'");
+        assert_eq!(
+            &argv[2..],
+            ["exec \"$0\" \"$@\"", "/home/tester/.local/bin/rsh"]
+        );
+    }
+
+    #[test]
+    fn saved_session_is_applied_to_direct_and_wrapped_rsh_argv() {
+        let direct = vec!["/usr/bin/rsh".to_string()];
+        let (direct, applied) = shell_argv_with_session(&direct, Some("session one"));
+        assert!(applied);
+        assert_eq!(&direct[1..], ["--session", "session one"]);
+
+        let wrapped = vec![
+            "/usr/bin/bash".to_string(),
+            "-ic".to_string(),
+            "exec \"$0\" \"$@\"".to_string(),
+            "/usr/bin/rsh".to_string(),
+        ];
+        let (wrapped, applied) = shell_argv_with_session(&wrapped, Some("session two"));
+        assert!(applied);
+        assert_eq!(&wrapped[4..], ["--session", "session two"]);
+
+        let (_, applied) = shell_argv_with_session(&wrapped, Some("bad\nsession"));
+        assert!(!applied);
     }
 
     #[test]
@@ -1324,6 +1481,7 @@ mod tests {
             .unwrap();
         let cm_idx = argv.iter().position(|a| a == "ControlMaster=auto").unwrap();
         assert!(cm_idx < target_idx);
+        assert_eq!(argv[target_idx - 1], "--");
     }
 
     #[test]
@@ -1355,6 +1513,82 @@ mod tests {
             default_remote_hosts()
         };
         assert!(remote_hosts.is_empty());
+    }
+
+    #[test]
+    fn history_paths_must_be_safe_and_absolute() {
+        assert_eq!(
+            safe_absolute_history_path(Some("/tmp/history.jsonl".to_string()), "history"),
+            Some("/tmp/history.jsonl".to_string())
+        );
+        for path in ["Cargo.toml", "", "/tmp/bad\nname"] {
+            assert!(safe_absolute_history_path(Some(path.to_string()), "history").is_none());
+        }
+    }
+
+    #[test]
+    fn unsafe_remote_hosts_fall_back_to_being_unavailable() {
+        let table = concat!(
+            "[[remote_hosts]]\n",
+            "name = 'bad-host'\n",
+            "host = 'bad host'\n",
+            "\n",
+            "[[remote_hosts]]\n",
+            "name = 'bad-session'\n",
+            "host = 'session.example'\n",
+            "session = \"line\\tbreak\"\n",
+            "\n",
+            "[[remote_hosts]]\n",
+            "name = 'bad-arguments'\n",
+            "host = 'arguments.example'\n",
+            "ssh_args = ['-p', 2222]\n",
+            "\n",
+            "[[remote_hosts]]\n",
+            "name = 'safe'\n",
+            "host = 'safe.example'\n",
+            "ssh_args = ['-p', '2222']\n",
+        )
+        .parse::<toml::Table>()
+        .unwrap();
+        let hosts = parse_remote_hosts(&table);
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].name, "safe");
+        assert_eq!(hosts[0].host, "safe.example");
+    }
+
+    #[test]
+    fn duplicate_remote_names_keep_only_the_first_destination() {
+        let table = concat!(
+            "[[remote_hosts]]\n",
+            "name = 'shared-name'\n",
+            "host = 'first.example'\n",
+            "\n",
+            "[[remote_hosts]]\n",
+            "name = 'shared-name'\n",
+            "host = 'second.example'\n",
+        )
+        .parse::<toml::Table>()
+        .unwrap();
+
+        let hosts = parse_remote_hosts(&table);
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].host, "first.example");
+    }
+
+    #[test]
+    fn implicit_remote_name_may_use_the_full_valid_host_length() {
+        let host = "h".repeat(300);
+        let mut entry = toml::Table::new();
+        entry.insert("host".to_string(), toml::Value::String(host.clone()));
+        let mut table = toml::Table::new();
+        table.insert(
+            "remote_hosts".to_string(),
+            toml::Value::Array(vec![toml::Value::Table(entry)]),
+        );
+
+        let hosts = parse_remote_hosts(&table);
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].name, host);
     }
 
     #[test]

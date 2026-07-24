@@ -533,6 +533,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bounded_output_retains_exact_tail_under_a_long_stream() {
+        const CHUNK: usize = 32 * 1024;
+        const LIMIT: usize = 8 * 1024 * 1024;
+        const CHUNKS: usize = 3_200; // 100 MiB total
+        let mut output = VecDeque::new();
+        for index in 0..CHUNKS {
+            append_bounded_output(&mut output, &vec![(index % 251) as u8; CHUNK], LIMIT);
+        }
+        assert_eq!(output.len(), LIMIT);
+        let retained_chunks = LIMIT / CHUNK;
+        let contiguous = output.make_contiguous();
+        for offset in 0..retained_chunks {
+            let expected = ((CHUNKS - retained_chunks + offset) % 251) as u8;
+            assert!(contiguous[offset * CHUNK..(offset + 1) * CHUNK]
+                .iter()
+                .all(|byte| *byte == expected));
+        }
+
+        append_bounded_output(&mut output, &vec![0x5a; LIMIT + CHUNK], LIMIT);
+        assert_eq!(output.len(), LIMIT);
+        assert!(output.iter().all(|byte| *byte == 0x5a));
+    }
+
+    #[test]
     fn output_row_count_ignores_one_final_line_ending() {
         assert_eq!(output_row_count("/home/tester\r\n"), 1);
         assert_eq!(output_row_count("a\nb\nc\nd\n"), 4);
@@ -1729,7 +1753,31 @@ pub(crate) struct ActiveBlock {
     pub(crate) active_vte: Terminal,
     /// Raw output bytes accumulated during CollectingOutput, consumed by the
     /// finalize path to build the styled finished block (jterm1's `out_buf`).
-    pub(crate) raw_output: Rc<RefCell<Vec<u8>>>,
+    pub(crate) raw_output: Rc<RefCell<VecDeque<u8>>>,
+}
+
+/// Retain only the newest `limit` bytes without repeatedly shifting the whole
+/// retained buffer. A `VecDeque` makes long-running output proportional to the
+/// new bytes discarded instead of copying the full multi-megabyte tail for
+/// every PTY chunk.
+pub(super) fn append_bounded_output(buffer: &mut VecDeque<u8>, bytes: &[u8], limit: usize) {
+    if limit == 0 {
+        buffer.clear();
+        return;
+    }
+    if bytes.len() >= limit {
+        buffer.clear();
+        buffer.extend(bytes[bytes.len() - limit..].iter().copied());
+        return;
+    }
+    let overflow = buffer
+        .len()
+        .saturating_add(bytes.len())
+        .saturating_sub(limit);
+    if overflow > 0 {
+        buffer.drain(..overflow);
+    }
+    buffer.extend(bytes.iter().copied());
 }
 
 impl ActiveBlock {
@@ -1755,28 +1803,10 @@ impl ActiveBlock {
         active_vte.set_vexpand(false);
         widget.append(&active_vte);
 
-        // Focus the live VTE as soon as it is realized (jterm1 block.rs:324-328).
-        {
-            let av = active_vte.clone();
-            active_vte.connect_realize(move |_| {
-                av.grab_focus();
-            });
-        }
-        // realize fires before the toplevel is presented, so grab_focus there
-        // can be lost. connect_map fires when the VTE actually becomes visible
-        // (window shown / tab switched), which is the reliable point to take
-        // keyboard focus.
-        {
-            let av = active_vte.clone();
-            active_vte.connect_map(move |_| {
-                av.grab_focus();
-            });
-        }
-
         ActiveBlock {
             widget,
             active_vte,
-            raw_output: Rc::new(RefCell::new(Vec::new())),
+            raw_output: Rc::new(RefCell::new(VecDeque::new())),
         }
     }
 
@@ -1785,19 +1815,15 @@ impl ActiveBlock {
     /// the source the finalize path styles into a finished block.
     pub(crate) fn accumulate_output(&self, raw_bytes: &[u8]) {
         let mut buf = self.raw_output.borrow_mut();
-        buf.extend_from_slice(raw_bytes);
-        if buf.len() > super::MAX_RAW_OUTPUT_BYTES {
-            let drop = buf.len() - super::MAX_RAW_OUTPUT_BYTES;
-            buf.drain(..drop);
-        }
+        append_bounded_output(&mut buf, raw_bytes, super::MAX_RAW_OUTPUT_BYTES);
     }
 
     pub(crate) fn output_text(&self) -> String {
-        let raw = self.raw_output.borrow();
+        let mut raw = self.raw_output.borrow_mut();
         if raw.is_empty() {
             return String::new();
         }
-        String::from_utf8_lossy(&raw).into_owned()
+        String::from_utf8_lossy(raw.make_contiguous()).into_owned()
     }
 
     /// Clear the accumulated output buffer (without touching the VTE).

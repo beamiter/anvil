@@ -190,12 +190,12 @@ impl Component for SettingsModel {
                 },
 
                 adw::PreferencesGroup {
-                    set_title: "Terminal & Blocks",
+                    set_title: &gtk::glib::markup_escape_text("Terminal & Blocks"),
 
                     #[name(terminal_mode_row)]
                     adw::ComboRow {
                         set_title: "Terminal Backend",
-                        set_subtitle: "Applies to new local panes",
+                        set_subtitle: "Applies to new and restored local panes",
                         set_model: Some(&gtk::StringList::new(&["Block", "VTE compatibility"])),
                         set_selected: model.values.terminal_mode,
                         connect_selected_notify[sender] => move |row| {
@@ -225,7 +225,7 @@ impl Component for SettingsModel {
                 },
 
                 adw::PreferencesGroup {
-                    set_title: "Features & Privacy",
+                    set_title: &gtk::glib::markup_escape_text("Features & Privacy"),
 
                     #[name(ai_enabled_row)]
                     adw::SwitchRow {

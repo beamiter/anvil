@@ -6,6 +6,15 @@
 #
 # Emits OSC 133 (FTCS) command lifecycle marks and OSC 7 cwd updates.
 
+# Capture the per-pane cwd authenticator as a private shell parameter, then
+# immediately remove its exported spelling so child processes cannot inherit
+# it. Do this before the load guard for safe re-sourcing.
+if (( ${+JTERM1_CWD_TOKEN} )); then
+    typeset -g __jterm1_cwd_token=$JTERM1_CWD_TOKEN
+    unset JTERM1_CWD_TOKEN
+    typeset -g +x __jterm1_cwd_token
+fi
+
 [[ -n ${__JTERM1_ZSH_LOADED:-} ]] && return 0
 __JTERM1_ZSH_LOADED=1
 
@@ -17,8 +26,13 @@ __jterm1_command_start() { __jterm1_osc "133;C"; }
 __jterm1_command_end()   { __jterm1_osc "133;D;$1"; }
 
 __jterm1_report_cwd() {
-    local host=${HOST:-${HOSTNAME:-localhost}}
-    local out= i ch
+    local host
+    if [[ -n ${__jterm1_cwd_token:-} ]]; then
+        host="jterm1-${__jterm1_cwd_token}"
+    else
+        host=${HOST:-${HOSTNAME:-localhost}}
+    fi
+    local out="" i ch
     for (( i=1; i<=${#PWD}; i++ )); do
         ch=${PWD[i]}
         case $ch in

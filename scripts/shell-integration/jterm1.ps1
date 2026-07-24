@@ -11,6 +11,14 @@
 # Safe to source under non-jterm1 terminals: the OSC sequences are silently
 # discarded by anything that doesn't parse them.
 
+# Copy the per-pane cwd authenticator into script scope, then immediately remove
+# its environment spelling so subsequently launched child processes cannot
+# inherit it. Keep this ahead of the load guard for safe re-sourcing.
+if (Test-Path Env:JTERM1_CWD_TOKEN) {
+    $script:__jterm1_cwd_token = $env:JTERM1_CWD_TOKEN
+    Remove-Item Env:JTERM1_CWD_TOKEN -ErrorAction SilentlyContinue
+}
+
 # Guard against double-sourcing in the same shell session.
 if ($script:__jterm1_loaded) { return }
 $script:__jterm1_loaded = $true
@@ -26,7 +34,13 @@ function __jterm1_osc($payload) {
 function __jterm1_report_cwd_seq {
     # OSC 7 — percent-encode the path so non-ASCII / spaces survive.
     $path = (Get-Location).ProviderPath
-    $hostName = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { [System.Net.Dns]::GetHostName() }
+    $hostName = if ($script:__jterm1_cwd_token) {
+        "jterm1-$($script:__jterm1_cwd_token)"
+    } elseif ($env:COMPUTERNAME) {
+        $env:COMPUTERNAME
+    } else {
+        [System.Net.Dns]::GetHostName()
+    }
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($path)
     $sb = [System.Text.StringBuilder]::new()
     foreach ($b in $bytes) {

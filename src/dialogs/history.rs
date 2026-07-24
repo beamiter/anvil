@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use crate::command_history::CommandHistoryRecord;
 use crate::keybindings::{Action, KeybindingMap};
 use crate::palette::{self, Accept, PaletteMode, Query};
 use crate::workflows::Workflow;
@@ -42,7 +43,7 @@ pub(crate) enum HistoryOutput {
 pub(crate) struct HistoryModel {
     keybindings: Rc<RefCell<KeybindingMap>>,
     workflows: Rc<RefCell<Vec<Workflow>>>,
-    history_path: Option<PathBuf>,
+    history_snapshot: Vec<CommandHistoryRecord>,
     query: String,
     accepts: Vec<Accept>,
 }
@@ -122,7 +123,7 @@ impl Component for HistoryModel {
         let model = Self {
             keybindings: init.keybindings,
             workflows: init.workflows,
-            history_path: None,
+            history_snapshot: Vec::new(),
             query: String::new(),
             accepts: Vec::new(),
         };
@@ -146,7 +147,7 @@ impl Component for HistoryModel {
                     root.popdown();
                     return;
                 }
-                self.history_path = history_path;
+                self.history_snapshot = palette::load_history_snapshot(history_path.as_deref());
                 self.query.clear();
                 widgets.filter_entry.set_text("");
                 self.rebuild_rows(widgets);
@@ -180,7 +181,10 @@ impl Component for HistoryModel {
                 }
             }
             HistoryMsg::Close => root.popdown(),
-            HistoryMsg::Closed => root.unparent(),
+            HistoryMsg::Closed => {
+                self.history_snapshot.clear();
+                root.unparent();
+            }
         }
     }
 }
@@ -194,7 +198,7 @@ impl HistoryModel {
         let entries = palette::gather(
             &query,
             &self.keybindings.borrow(),
-            self.history_path.as_deref(),
+            &self.history_snapshot,
             &self.workflows.borrow(),
             100,
         );

@@ -262,8 +262,9 @@ are currently active.
 | `Ctrl+Shift+P` | Command palette |
 | `Ctrl+Shift+H` | History palette; `Ctrl+R` and `Ctrl+P` remain available to the shell |
 | `Ctrl+Shift+F` | Search terminal output (`/pattern/` enables regex) |
-| `Ctrl+Shift+G` | Search command and output lines across all finished blocks |
+| `Ctrl+Shift+G` | In block mode, search command and output lines across all finished blocks |
 | `Ctrl+Shift+O` | Settings |
+| `Ctrl+Shift+R` | Reload configuration |
 | `Ctrl+\` | Toggle sidebar |
 | `Ctrl+Alt+B` | Move tabs between sidebar and top bar |
 | `Ctrl+Shift+L` | Focus the tab filter |
@@ -311,8 +312,9 @@ an existing file. The application watches the file: appearance, scrollback, key
 bindings, and defaults for newly created panes are reloaded while it is running.
 Some advanced options are captured when a pane is constructed, so restart
 jterm1 after changing them for predictable results. Changing `terminal_mode`
-affects new or restored panes; it does not replace an existing terminal backend
-in place.
+affects new or restored local panes; it does not replace an existing terminal
+backend in place. Managed remote sessions stay on Block so their shell
+integration and reconnect metadata remain available.
 
 `-c PATH` / `--config PATH` selects an alternate file for the current process
 and can be combined with a normal launch, `--doctor`, `--check-config`,
@@ -455,19 +457,24 @@ ${XDG_DATA_HOME:-$HOME/.local/share}/jterm1/notebooks/welcome.jtnb.md
 
 ## State and diagnostics
 
-jterm1 writes one session snapshot per process:
+jterm1 writes one session snapshot and companion lifetime owner lock per
+process:
 
 ```text
-${XDG_CONFIG_HOME:-$HOME/.config}/jterm1/tabs.<pid>.state
+${XDG_CONFIG_HOME:-$HOME/.config}/jterm1/tabs.<uuid>.state
+${XDG_CONFIG_HOME:-$HOME/.config}/jterm1/tabs.<uuid>.lock
 ```
 
 It records tab titles, pane layout, working directories, and restorable
 foreground commands. On startup, jterm1 leaves live windows untouched and
-atomically claims the newest valid snapshot owned by an exited process. The
-legacy `tabs.state` name is still accepted. Corrupt snapshots are retained for
-inspection inside the 32-snapshot recovery window instead of being deleted on
-parse failure. The state directory is owner-only (`0700`) and snapshots are
-`0600`. Inspect the newest snapshot with:
+atomically claims the newest valid snapshot whose owner lock is no longer held.
+Snapshot publication and cleanup share a directory protocol lock so a
+partially published owner cannot be mistaken for an exited process. The legacy
+`tabs.state` and `tabs.<pid>.state` names are still accepted; PID snapshots are
+retained conservatively when their owner cannot be proven dead. Corrupt
+snapshots are retained for inspection inside the 32-snapshot recovery window
+instead of being deleted on parse failure. The state directory is owner-only
+(`0700`), and snapshots and locks are `0600`. Inspect the newest snapshot with:
 
 ```bash
 ./scripts/show-state.sh

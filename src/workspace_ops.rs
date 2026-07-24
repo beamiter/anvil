@@ -66,12 +66,30 @@ fn active_index_after_remove(active: usize, removed: usize, remaining: usize) ->
     }
 }
 
-fn restored_leaf_mode(configured: TerminalMode, first_leaf: &mut bool) -> TerminalMode {
-    if std::mem::replace(first_leaf, false) {
-        configured
+fn restored_leaf_mode(configured: TerminalMode, remote_integrated: bool) -> TerminalMode {
+    if remote_integrated {
+        TerminalMode::Block
     } else {
-        TerminalMode::Vte
+        configured
     }
+}
+
+fn snapshot_restorable_command(
+    managed_remote: bool,
+    detected: Option<Vec<String>>,
+) -> Option<Vec<String>> {
+    (!managed_remote).then_some(detected).flatten()
+}
+
+/// This path is reached only after a managed profile lookup failed. A snapshot
+/// from an older build may still contain its expanded SSH argv; do not execute
+/// that stale command after the user removed or renamed the authoritative
+/// profile.
+fn replay_argv_for_unmanaged_leaf<'a>(
+    remote_name: Option<&str>,
+    commands: Option<&'a [String]>,
+) -> Option<&'a [String]> {
+    remote_name.is_none().then_some(commands).flatten()
 }
 
 fn format_running_process_summary(mut running: Vec<String>) -> Option<String> {
@@ -117,13 +135,19 @@ impl AppModel {
             .tabs
             .get(self.active)
             .and_then(|t| t.panes.get(t.active_pane))
-            .and_then(|p| p.cwd.clone());
-        self.add_tab_with(initial_commands, cwd, self.shell_argv.clone(), sender);
+            .and_then(Pane::local_cwd)
+            .map(str::to_string);
+        self.add_tab_with(
+            InitialCommands::from_config(initial_commands.as_deref()),
+            cwd,
+            self.shell_argv.clone(),
+            sender,
+        );
     }
 
     pub(crate) fn add_tab_with(
         &mut self,
-        initial_commands: Option<String>,
+        initial_commands: InitialCommands,
         working_directory: Option<String>,
         shell_argv: Rc<Vec<String>>,
         sender: &ComponentSender<AppModel>,
@@ -144,6 +168,7 @@ impl AppModel {
             initial_commands,
             working_directory,
             None,
+            false,
             sender,
         );
         let holder = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -187,7 +212,9 @@ impl AppModel {
         let id = self.next_id;
         self.next_id += 1;
         let mut panes = Vec::new();
-        let root_widget = self.build_pane_layout(&saved.layout, id, &mut panes, sender);
+        let mut restored_remote = None;
+        let root_widget =
+            self.build_pane_layout(&saved.layout, id, &mut panes, &mut restored_remote, sender);
         let holder = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         holder.set_hexpand(true);
         holder.set_vexpand(true);
@@ -205,7 +232,7 @@ impl AppModel {
             pinned: saved.pinned,
             id,
             zoom: None,
-            remote: None,
+            remote: restored_remote,
         };
         self.tabs.push(tab);
     }
@@ -216,18 +243,19 @@ impl AppModel {
     /// Pane mode used to be persisted with the session.  That made a mode
     /// change in config appear to have no effect: restoring an old VTE pane
     /// recreated it as VTE even when `terminal_mode = "block"`.  The current
-    /// configuration is the authority for every newly-created backend,
-    /// including restored panes; the snapshot only restores layout and shell
-    /// state.
+    /// configuration is the authority for every newly-created local backend,
+    /// including restored panes; remote-integrated restores keep Block mode so
+    /// OSC session metadata remains available. The snapshot otherwise restores
+    /// only layout and shell state.
     pub(crate) fn build_pane_layout(
         &mut self,
         node: &session::PaneLayout,
         tab_id: u64,
         panes: &mut Vec<Pane>,
+        restored_remote: &mut Option<RemoteConn>,
         sender: &ComponentSender<AppModel>,
     ) -> gtk::Widget {
-        let mut first_leaf = true;
-        self.build_pane_layout_node(node, tab_id, panes, &mut first_leaf, sender)
+        self.build_pane_layout_node(node, tab_id, panes, restored_remote, sender)
     }
 
     fn build_pane_layout_node(
@@ -235,28 +263,120 @@ impl AppModel {
         node: &session::PaneLayout,
         tab_id: u64,
         panes: &mut Vec<Pane>,
-        first_leaf: &mut bool,
+        restored_remote: &mut Option<RemoteConn>,
         sender: &ComponentSender<AppModel>,
     ) -> gtk::Widget {
         match node {
-            session::PaneLayout::Leaf { cwd, sid, cmds, .. } => {
+            session::PaneLayout::Leaf {
+                cwd,
+                cwd_external,
+                remote_name,
+                sid,
+                cmds,
+                ..
+            } => {
                 let pane_id = self.next_pane_id;
                 self.next_pane_id += 1;
-                // Runtime splits always retain the original pane and add a VTE
-                // sibling. Rebuild the same shape: the first leaf follows the
-                // current configured default, while every restored sibling is
-                // VTE compatibility mode. A VTE-default workspace remains all
-                // VTE, and old snapshots need no per-leaf migration.
-                let mode = restored_leaf_mode(self.config.borrow().terminal_mode, first_leaf);
+                let managed_host = remote_name.as_deref().and_then(|name| {
+                    self.config
+                        .borrow()
+                        .remote_hosts
+                        .iter()
+                        .find(|host| host.name == name)
+                        .cloned()
+                });
+                if let Some(mut host) = managed_host {
+                    let restored_sid = sid
+                        .as_deref()
+                        .filter(|value| config::valid_session_id(value))
+                        .map(str::to_string);
+                    if let Some(restored_sid) = restored_sid.as_ref() {
+                        host.session = Some(restored_sid.clone());
+                    } else if sid.is_some() {
+                        log::warn!("Ignoring invalid session id in managed remote snapshot");
+                    }
+                    let shell_argv = Rc::new(config::build_remote_argv(&host));
+                    let pane = create_pane(
+                        &self.config,
+                        &shell_argv,
+                        tab_id,
+                        pane_id,
+                        TerminalMode::Block,
+                        InitialCommands::default(),
+                        None,
+                        restored_sid,
+                        true,
+                        sender,
+                    );
+                    if restored_remote.is_none() {
+                        *restored_remote = Some(RemoteConn {
+                            host,
+                            pane_id,
+                            status: ConnStatus::Connecting,
+                            attempt: 0,
+                            spawn_at: std::time::Instant::now(),
+                        });
+                    }
+                    let widget = pane.terminal.widget();
+                    panes.push(pane);
+                    return widget;
+                } else if let Some(name) = remote_name {
+                    log::warn!(
+                        "Managed remote '{name}' is no longer configured; restoring a local shell without replaying stale connection data"
+                    );
+                    self.show_toast(format!(
+                        "Remote profile “{name}” was removed or renamed; its saved connection was not restored."
+                    ));
+                }
+                let missing_managed_remote = remote_name.is_some();
+                let replay_argv =
+                    replay_argv_for_unmanaged_leaf(remote_name.as_deref(), cmds.as_deref());
+                // The current configuration remains authoritative for restored
+                // local backends. Remote-integrated panes stay on Block because
+                // their OSC cwd/session/reconnect signals are part of the
+                // restore contract even in VTE compatibility mode.
+                let external_cwd = missing_managed_remote
+                    || *cwd_external
+                    || replay_argv.is_some_and(process::command_uses_external_cwd);
+                let remote_integrated = !missing_managed_remote
+                    && (sid.is_some()
+                        || replay_argv.is_some_and(process::command_requires_block_integration));
+                let mode =
+                    restored_leaf_mode(self.config.borrow().terminal_mode, remote_integrated);
+                // OSC 7 from ssh/mosh/container shells reports a path in that
+                // remote namespace. It must neither be passed as a local spawn
+                // cwd nor suppress safe argv replay when absent on this host.
+                let cwd_available = external_cwd
+                    || cwd
+                        .as_deref()
+                        .is_none_or(crate::host::working_directory_available);
+                if !cwd_available {
+                    log::warn!(
+                        "Restored working directory is unavailable; skipping its command replay"
+                    );
+                }
                 let pane = create_pane(
                     &self.config,
                     &self.shell_argv,
                     tab_id,
                     pane_id,
                     mode,
-                    cmds.clone(),
-                    cwd.clone(),
-                    sid.clone(),
+                    if cwd_available {
+                        InitialCommands::from_restored_argv(replay_argv, self.shell_argv.as_ref())
+                    } else {
+                        InitialCommands::default()
+                    },
+                    if external_cwd || !cwd_available {
+                        None
+                    } else {
+                        cwd.clone()
+                    },
+                    if missing_managed_remote {
+                        None
+                    } else {
+                        sid.clone()
+                    },
+                    external_cwd,
                     sender,
                 );
                 let widget = pane.terminal.widget();
@@ -277,8 +397,10 @@ impl AppModel {
                 let paned = gtk::Paned::new(o);
                 paned.set_hexpand(true);
                 paned.set_vexpand(true);
-                let start_w = self.build_pane_layout_node(start, tab_id, panes, first_leaf, sender);
-                let end_w = self.build_pane_layout_node(end, tab_id, panes, first_leaf, sender);
+                let start_w =
+                    self.build_pane_layout_node(start, tab_id, panes, restored_remote, sender);
+                let end_w =
+                    self.build_pane_layout_node(end, tab_id, panes, restored_remote, sender);
                 paned.set_start_child(Some(&start_w));
                 paned.set_end_child(Some(&end_w));
                 paned.set_position(*position);
@@ -301,6 +423,8 @@ impl AppModel {
             None => session::PaneLayout::Leaf {
                 mode: "block".to_string(),
                 cwd: None,
+                cwd_external: false,
+                remote_name: None,
                 sid: None,
                 cmds: None,
             },
@@ -323,22 +447,42 @@ impl AppModel {
             }
         } else {
             let pane = tab.panes.iter().find(|p| p.terminal.widget() == *widget);
-            let (mode, cwd, sid, cmds) = match pane {
-                Some(p) => (
-                    match p.mode {
-                        TerminalMode::Vte => "vte",
-                        TerminalMode::Block => "block",
-                    }
-                    .to_string(),
-                    p.cwd.clone(),
-                    p.session_id.clone(),
-                    p.restorable_command(),
-                ),
-                None => ("block".to_string(), None, None, None),
+            let (mode, cwd, cwd_external, remote_name, sid, cmds) = match pane {
+                Some(p) => {
+                    let managed_remote =
+                        tab.remote.as_ref().filter(|remote| remote.pane_id == p.id);
+                    let cmds = snapshot_restorable_command(
+                        managed_remote.is_some(),
+                        if managed_remote.is_some() {
+                            None
+                        } else {
+                            p.restorable_command()
+                        },
+                    );
+                    let cwd_external = p.cwd_external
+                        || cmds
+                            .as_deref()
+                            .is_some_and(process::command_uses_external_cwd);
+                    (
+                        match p.mode {
+                            TerminalMode::Vte => "vte",
+                            TerminalMode::Block => "block",
+                        }
+                        .to_string(),
+                        p.cwd.clone(),
+                        cwd_external,
+                        managed_remote.map(|remote| remote.host.name.clone()),
+                        p.session_id.clone(),
+                        cmds,
+                    )
+                }
+                None => ("block".to_string(), None, false, None, None, None),
             };
             session::PaneLayout::Leaf {
                 mode,
                 cwd,
+                cwd_external,
+                remote_name,
                 sid,
                 cmds,
             }
@@ -364,6 +508,8 @@ impl AppModel {
         session::PaneLayout::Leaf {
             mode: "block".to_string(),
             cwd: None,
+            cwd_external: false,
+            remote_name: None,
             sid: None,
             cmds: None,
         }
@@ -454,6 +600,9 @@ impl AppModel {
             }
         }
         self.persist_session();
+        if let Err(error) = command_history::flush_pending(std::time::Duration::from_secs(3)) {
+            log::warn!("flush command history on exit: {error}");
+        }
         self.quit_allowed.set(true);
         self.window.close();
     }
@@ -552,9 +701,10 @@ impl AppModel {
             id,
             pane_id,
             mode,
+            InitialCommands::default(),
             None,
             None,
-            None,
+            true,
             sender,
         );
         let holder = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -718,9 +868,10 @@ impl AppModel {
             self.tabs[idx].id,
             new_pane_id,
             mode,
+            InitialCommands::default(),
             None,
             None,
-            None,
+            true,
             sender,
         );
         self.tabs[idx].holder.append(&pane.terminal.widget());
@@ -810,7 +961,7 @@ impl AppModel {
         drop(tab);
 
         if self.tabs.is_empty() {
-            relm4::main_application().quit();
+            self.force_quit();
             return;
         }
         let new_idx = if idx >= self.tabs.len() {
@@ -908,7 +1059,11 @@ impl AppModel {
         let Some(src) = self.tabs.get(self.active) else {
             return;
         };
-        let cwd = src.panes.get(src.active_pane).and_then(|p| p.cwd.clone());
+        let cwd = src
+            .panes
+            .get(src.active_pane)
+            .and_then(Pane::local_cwd)
+            .map(str::to_string);
         let title = src.title.clone();
         let custom_title = src.custom_title;
 
@@ -923,9 +1078,10 @@ impl AppModel {
             id,
             pane_id,
             mode,
-            None,
+            InitialCommands::default(),
             cwd,
             None,
+            false,
             sender,
         );
         let holder = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -1003,7 +1159,7 @@ impl AppModel {
             }
         }
         if self.tabs.is_empty() {
-            relm4::main_application().quit();
+            self.force_quit();
             return;
         }
         let new_id = active_id
@@ -1021,7 +1177,7 @@ impl AppModel {
         None
     }
 
-    /// Split the active pane, placing a fresh bare-VTE pane beside it.
+    /// Split the active pane using the configured local terminal backend.
     pub(crate) fn split_active(
         &mut self,
         orientation: gtk::Orientation,
@@ -1037,7 +1193,8 @@ impl AppModel {
         let tab_id = tab.id;
         let api = tab.active_pane;
         let cur_widget = tab.panes[api].terminal.widget();
-        let wd = tab.panes[api].cwd.clone();
+        let wd = tab.panes[api].local_cwd().map(str::to_string);
+        let mode = self.config.borrow().terminal_mode;
 
         let pane_id = self.next_pane_id;
         self.next_pane_id += 1;
@@ -1046,10 +1203,11 @@ impl AppModel {
             &self.shell_argv,
             tab_id,
             pane_id,
-            TerminalMode::Vte,
-            None,
+            mode,
+            InitialCommands::default(),
             wd,
             None,
+            false,
             sender,
         );
         let new_widget = new_pane.terminal.widget();
@@ -1353,35 +1511,57 @@ fn reconnect_target_is_valid(
 mod pane_tree_tests {
     use super::{
         active_index_after_remove, format_running_process_summary, reconnect_target_is_valid,
-        restored_leaf_mode,
+        replay_argv_for_unmanaged_leaf, restored_leaf_mode, snapshot_restorable_command,
     };
     use crate::config::TerminalMode;
 
     #[test]
-    fn split_restore_keeps_only_the_first_leaf_on_the_configured_backend() {
-        let mut first = true;
+    fn restored_splits_use_the_configured_backend_for_every_leaf() {
+        for _ in 0..3 {
+            assert!(matches!(
+                restored_leaf_mode(TerminalMode::Block, false),
+                TerminalMode::Block
+            ));
+            assert!(matches!(
+                restored_leaf_mode(TerminalMode::Vte, false),
+                TerminalMode::Vte
+            ));
+        }
+    }
+
+    #[test]
+    fn remote_restore_keeps_block_mode_and_ignores_remote_cwd_namespace() {
+        let ssh = vec!["/usr/bin/ssh".to_string(), "example.test".to_string()];
+        let nix = vec!["nix".to_string(), "develop".to_string()];
+        assert!(crate::process::command_uses_external_cwd(&ssh));
+        assert!(!crate::process::command_uses_external_cwd(&nix));
         assert!(matches!(
-            restored_leaf_mode(TerminalMode::Block, &mut first),
+            restored_leaf_mode(TerminalMode::Vte, true),
             TerminalMode::Block
         ));
-        assert!(matches!(
-            restored_leaf_mode(TerminalMode::Block, &mut first),
-            TerminalMode::Vte
-        ));
-        assert!(matches!(
-            restored_leaf_mode(TerminalMode::Block, &mut first),
-            TerminalMode::Vte
-        ));
+    }
 
-        let mut first = true;
-        assert!(matches!(
-            restored_leaf_mode(TerminalMode::Vte, &mut first),
-            TerminalMode::Vte
-        ));
-        assert!(matches!(
-            restored_leaf_mode(TerminalMode::Vte, &mut first),
-            TerminalMode::Vte
-        ));
+    #[test]
+    fn managed_remote_snapshots_store_only_the_profile_identifier() {
+        let stale = vec!["ssh".to_string(), "old.example".to_string()];
+        assert_eq!(snapshot_restorable_command(true, Some(stale.clone())), None);
+        assert_eq!(
+            snapshot_restorable_command(false, Some(stale.clone())),
+            Some(stale)
+        );
+    }
+
+    #[test]
+    fn removed_managed_remote_never_replays_legacy_snapshot_argv() {
+        let stale = vec!["ssh".to_string(), "removed.example".to_string()];
+        assert_eq!(
+            replay_argv_for_unmanaged_leaf(Some("removed"), Some(&stale)),
+            None
+        );
+        assert_eq!(
+            replay_argv_for_unmanaged_leaf(None, Some(&stale)),
+            Some(stale.as_slice())
+        );
     }
 
     #[test]

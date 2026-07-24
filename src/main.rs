@@ -57,7 +57,9 @@ use std::rc::Rc;
 use app_msg::AppMsg;
 use config::{choose_shell_argv, config_file_path, load_config, Config, TerminalMode, Theme};
 use keybindings::{normalize_key, Action, Direction, KeyCombo, KeybindingMap};
-use terminal::{default_tab_title, BlockTerminal, VteInit, VteInput, VteOutput, VteTerminal};
+use terminal::{
+    default_tab_title, BlockTerminal, InitialCommands, VteInit, VteInput, VteOutput, VteTerminal,
+};
 use workspace::{ConnStatus, Pane, RemoteConn, Tab, TermCtl, ZoomState};
 
 const FONT_STEP: f64 = 0.025;
@@ -133,32 +135,39 @@ fn create_pane(
     tab_id: u64,
     pane_id: u64,
     mode: TerminalMode,
-    initial_commands: Option<String>,
+    initial_commands: InitialCommands,
     working_directory: Option<String>,
     session_id: Option<String>,
+    cwd_external: bool,
     sender: &ComponentSender<AppModel>,
 ) -> Pane {
     let probe = terminal::PaneProbe::default();
     // -1 means "no PTY yet"; foreground probing skips it (0 would alias stdin).
     probe.pty_fd.set(-1);
+    let cwd_token = terminal::new_cwd_token();
     let init = VteInit {
         config: config.clone(),
         shell_argv: shell_argv.clone(),
         working_directory: working_directory.clone(),
+        working_directory_external: cwd_external,
         session_id: session_id.clone(),
+        cwd_token,
         initial_commands,
         probe: probe.clone(),
     };
     let forward = move |out| match out {
+        VteOutput::LaunchFailed(message) => AppMsg::PaneLaunchFailed(pane_id, message),
         VteOutput::Exited(code) => AppMsg::PaneExited(tab_id, pane_id, code),
-        VteOutput::CwdChanged(p) => AppMsg::PaneCwdChanged(tab_id, pane_id, p),
+        VteOutput::CwdChanged { path, external } => {
+            AppMsg::PaneCwdChanged(tab_id, pane_id, path, external)
+        }
         // Pane identity is stable across detach/move; tab identity is not.
         VteOutput::TitleChanged(t) => AppMsg::TitleChanged(pane_id, t),
         VteOutput::Bell => AppMsg::Bell(pane_id),
         VteOutput::Activity => AppMsg::Activity(pane_id),
         VteOutput::Focused => AppMsg::PaneFocused(tab_id, pane_id),
-        // Slow command finished while unattended: failure draws the bell
-        // (attention) style, success the lighter activity style.
+        // A command completed in this pane. Inactive tabs show failures with
+        // the bell style and successes with the lighter activity style.
         VteOutput::CommandFinished(true) => AppMsg::Activity(pane_id),
         VteOutput::CommandFinished(false) => AppMsg::Bell(pane_id),
         VteOutput::RemoteSessionId(id) => AppMsg::PaneRemoteSessionId(pane_id, id),
@@ -191,6 +200,7 @@ fn create_pane(
         terminal,
         id: pane_id,
         cwd: working_directory,
+        cwd_external,
         session_id,
         mode,
         probe,
@@ -209,22 +219,14 @@ impl AppModel {
             .map(|p| &p.terminal)
     }
 
-    /// Working directory of the active pane, if it reports one. Remote (ssh)
-    /// tabs return None: their cwd is a path on the remote filesystem and the
-    /// file tree must not follow it (even if a same-named dir exists locally,
-    /// it's a different machine).
+    /// Local working directory of the active pane, if it reports one. External
+    /// ssh/mosh/container paths are deliberately excluded even when the same
+    /// pathname happens to exist on this host.
     fn active_cwd(&self) -> Option<std::path::PathBuf> {
         let tab = self.tabs.get(self.active)?;
-        if tab.remote.as_ref().is_some_and(|remote| {
-            tab.panes
-                .get(tab.active_pane)
-                .is_some_and(|pane| pane.id == remote.pane_id)
-        }) {
-            return None;
-        }
         tab.panes
             .get(tab.active_pane)
-            .and_then(|p| p.cwd.clone())
+            .and_then(Pane::local_cwd)
             .map(std::path::PathBuf::from)
             .filter(|p| p.is_dir())
     }
@@ -821,9 +823,9 @@ impl SimpleComponent for AppModel {
             None => {
                 let initial_argv = execute_argv.unwrap_or_else(|| model.shell_argv.clone());
                 let initial_commands = if init.execute.is_some() {
-                    None
+                    InitialCommands::default()
                 } else {
-                    startup
+                    InitialCommands::from_config(startup.as_deref())
                 };
                 model.add_tab_with(initial_commands, requested_cwd, initial_argv, &sender);
             }
@@ -862,6 +864,19 @@ impl SimpleComponent for AppModel {
             }
             AppMsg::Action(action) => self.execute_action(action, &sender),
             AppMsg::ReloadConfig => self.reload_config(&sender),
+            AppMsg::PaneLaunchFailed(pane_id, message) => {
+                if let Some((idx, _)) = self.find_pane(pane_id) {
+                    if let Some(connection) = self.tabs[idx]
+                        .remote
+                        .as_mut()
+                        .filter(|connection| connection.pane_id == pane_id)
+                    {
+                        connection.status = ConnStatus::Disconnected;
+                    }
+                    self.sync_tab_strip();
+                }
+                self.show_toast(message);
+            }
             AppMsg::SetTabWidth(width) => {
                 self.config.borrow_mut().tab_width = width.clamp(MIN_TAB_WIDTH, MAX_TAB_WIDTH);
                 self.sync_tab_strip();
@@ -891,8 +906,18 @@ impl SimpleComponent for AppModel {
             AppMsg::RemoteReconnectNow(pane_id, attempt) => {
                 self.do_remote_reconnect(pane_id, attempt, &sender)
             }
-            AppMsg::PaneCwdChanged(_, pane_id, path) => {
+            AppMsg::PaneCwdChanged(_, pane_id, path, external) => {
                 if let Some((ti, pi)) = self.find_pane(pane_id) {
+                    let managed_remote = self.tabs[ti]
+                        .remote
+                        .as_ref()
+                        .is_some_and(|remote| remote.pane_id == pane_id);
+                    // Each backend has already combined its authenticated OSC
+                    // authority with the live foreground process. Preserve
+                    // that result; a second app-level pass would discard the
+                    // per-pane token and make opaque Flatpak host shells look
+                    // external again.
+                    self.tabs[ti].panes[pi].cwd_external = managed_remote || external;
                     self.tabs[ti].panes[pi].cwd = Some(path.clone());
                     let connection_changed = self.mark_remote_connected(ti, pane_id);
                     if self.tabs[ti].active_pane == pi && !self.tabs[ti].custom_title {
@@ -922,6 +947,11 @@ impl SimpleComponent for AppModel {
             AppMsg::PaneFocused(_, pane_id) => {
                 if let Some((ti, pi)) = self.find_pane(pane_id) {
                     self.tabs[ti].active_pane = pi;
+                    if self.tabs[ti].bell || self.tabs[ti].activity {
+                        self.tabs[ti].bell = false;
+                        self.tabs[ti].activity = false;
+                        self.sync_tab_strip();
+                    }
                 }
             }
             AppMsg::TitleChanged(pane_id, title) => {
@@ -947,17 +977,19 @@ impl SimpleComponent for AppModel {
                 }
             }
             AppMsg::Bell(pane_id) => {
-                if let Some((idx, _)) = self.find_pane(pane_id) {
-                    if idx != self.active {
+                if let Some((idx, pane_index)) = self.find_pane(pane_id) {
+                    if idx != self.active || pane_index != self.tabs[idx].active_pane {
                         self.tabs[idx].bell = true;
                         self.sync_tab_strip();
                     }
                 }
             }
             AppMsg::Activity(pane_id) => {
-                if let Some((idx, _)) = self.find_pane(pane_id) {
+                if let Some((idx, pane_index)) = self.find_pane(pane_id) {
                     let mut changed = self.mark_remote_connected(idx, pane_id);
-                    if idx != self.active && !self.tabs[idx].activity {
+                    if (idx != self.active || pane_index != self.tabs[idx].active_pane)
+                        && !self.tabs[idx].activity
+                    {
                         self.tabs[idx].activity = true;
                         changed = true;
                     }

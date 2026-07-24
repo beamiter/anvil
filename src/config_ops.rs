@@ -91,7 +91,9 @@ impl AppModel {
         self.sync_tab_strip();
         log::info!("Configuration reloaded from disk");
         if backend_changed {
-            self.show_toast("Terminal mode changed; it will apply to new panes and tabs.");
+            self.show_toast(
+                "Terminal mode changed; it will apply to new and restored local panes.",
+            );
         } else if validation.warnings() > 0 {
             self.show_toast(format!(
                 "Configuration reloaded with {} warning(s).",

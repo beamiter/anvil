@@ -11,6 +11,16 @@
 # Safe to source under non-jterm1 terminals: the OSC sequences are silently
 # discarded by anything that doesn't parse them.
 
+# Keep jterm1's per-pane cwd authenticator in a private, non-exported shell
+# variable. Remove the public environment variable before any prompt command
+# (or child process) can inherit it. This intentionally precedes the load guard
+# so re-sourcing cannot leave a newly supplied token exported.
+if [[ ${JTERM1_CWD_TOKEN+x} ]]; then
+    __jterm1_cwd_token=$JTERM1_CWD_TOKEN
+    unset JTERM1_CWD_TOKEN
+    export -n __jterm1_cwd_token
+fi
+
 # Guard against double-sourcing in the same shell.
 [[ -n ${__JTERM1_BASH_LOADED:-} ]] && return 0
 __JTERM1_BASH_LOADED=1
@@ -35,8 +45,13 @@ __jterm1_command_end() {
 
 # OSC 7 — report current working directory as file:// URI.
 __jterm1_report_cwd() {
-    local host=${HOSTNAME:-localhost}
-    local out= i ch
+    local host
+    if [[ -n ${__jterm1_cwd_token:-} ]]; then
+        host="jterm1-${__jterm1_cwd_token}"
+    else
+        host=${HOSTNAME:-localhost}
+    fi
+    local out="" i ch
     LC_ALL=C
     for (( i=0; i<${#PWD}; i++ )); do
         ch=${PWD:i:1}

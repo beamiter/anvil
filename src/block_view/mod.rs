@@ -693,6 +693,7 @@ const MIN_INPUT_ROWS: i32 = 6;
 
 type BlockFinishedCallbacks = Rc<RefCell<Vec<Box<dyn Fn(String, i32, String)>>>>;
 type BlockContextCallbacks = Rc<RefCell<Vec<Box<dyn Fn(crate::ai::BlockContext)>>>>;
+type CwdCallbacks = Rc<RefCell<Vec<Box<dyn Fn(&str, bool)>>>>;
 pub(crate) type DebugInfo = Vec<(&'static str, Vec<(String, String)>)>;
 
 pub struct TermView {
@@ -717,11 +718,14 @@ pub struct TermView {
     /// Guards programmatic scrolls so the scroll-lock detector doesn't mistake
     /// them for a user drag.
     programmatic_scroll: Rc<Cell<bool>>,
+    /// Set only by an app-level pane/tab selection. A later map may fulfill the
+    /// request, but background Block panes never focus themselves.
+    focus_requested: Rc<Cell<bool>>,
     pty: Rc<OwnedPty>,
     /// Whether programmatic recall has already synchronized the live shell
     /// editor. Shared with the key and block-action paths.
     pty_synced: Rc<Cell<bool>>,
-    cwd_callbacks: StrCallbacks,
+    cwd_callbacks: CwdCallbacks,
     remote_session_callbacks: StrCallbacks,
     exited_callbacks: IntCallbacks,
     bell_callbacks: VoidCallbacks,
@@ -796,7 +800,7 @@ struct ReaderCtx {
     /// Bytes emitted asynchronously after PromptEnd and before the next PromptStart.
     /// Empty-command blocks are inferred from this separate buffer, so no history
     /// schema change is needed.
-    background_output_rc: Rc<RefCell<Vec<u8>>>,
+    background_output_rc: Rc<RefCell<VecDeque<u8>>>,
     /// Once the user starts editing at an idle prompt, output is intentionally left
     /// inline: shell echo/completion and true background output are ambiguous then.
     idle_input_dirty_rc: Rc<Cell<bool>>,
@@ -831,6 +835,7 @@ struct ReaderCtx {
     block_start_time_for_cb: Rc<Cell<Option<SystemTime>>>,
     pending_exit_code_rc: Rc<Cell<i32>>,
     current_cwd_for_cb: Rc<RefCell<String>>,
+    current_cwd_external_for_cb: Rc<Cell<bool>>,
     event_buf: Rc<RefCell<Vec<ParserEvent>>>,
     unread_count_rc: Rc<Cell<u32>>,
     jump_fab: gtk::Button,
@@ -915,9 +920,18 @@ fn background_output_has_visible_text(bytes: &[u8]) -> bool {
         .any(|ch| !ch.is_whitespace() && !ch.is_control())
 }
 
-fn take_background_output(pending: &RefCell<Vec<u8>>) -> Option<String> {
-    let bytes = std::mem::take(&mut *pending.borrow_mut());
-    background_output_has_visible_text(&bytes).then(|| String::from_utf8_lossy(&bytes).into_owned())
+fn take_background_output(pending: &RefCell<VecDeque<u8>>) -> Option<String> {
+    let mut pending = pending.borrow_mut();
+    if pending.is_empty() {
+        return None;
+    }
+    let output = {
+        let bytes = pending.make_contiguous();
+        background_output_has_visible_text(bytes)
+            .then(|| String::from_utf8_lossy(bytes).into_owned())
+    };
+    pending.clear();
+    output
 }
 
 /// Pick the command text recorded for a finished block.  The live VTE is the
@@ -934,7 +948,7 @@ fn finished_command(vte_capture: &str, input_shadow: &str) -> String {
 }
 
 impl ReaderCtx {
-    fn install(self, pty: &Rc<OwnedPty>) {
+    fn install(self, pty: &Rc<OwnedPty>) -> std::io::Result<()> {
         let ReaderCtx {
             active_rc,
             active_vte,
@@ -970,6 +984,7 @@ impl ReaderCtx {
             block_start_time_for_cb,
             pending_exit_code_rc,
             current_cwd_for_cb,
+            current_cwd_external_for_cb,
             event_buf,
             unread_count_rc,
             jump_fab,
@@ -1045,11 +1060,11 @@ impl ReaderCtx {
                                     // from a background process and remains inline.
                                     if !idle_input_dirty_rc.get() {
                                         let mut pending = background_output_rc.borrow_mut();
-                                        pending.extend_from_slice(bytes);
-                                        if pending.len() > MAX_RAW_OUTPUT_BYTES {
-                                            let drop = pending.len() - MAX_RAW_OUTPUT_BYTES;
-                                            pending.drain(..drop);
-                                        }
+                                        append_bounded_output(
+                                            &mut pending,
+                                            bytes,
+                                            MAX_RAW_OUTPUT_BYTES,
+                                        );
                                     }
                                     scroll_debouncer.mark_dirty(&block_scroll_rc);
                                     true
@@ -1271,9 +1286,13 @@ impl ReaderCtx {
                                     }
                                     // Re-probe git state — the command that just
                                     // finished may have changed branch/dirty/upstream.
-                                    if cfg.show_repo_strip {
+                                    if cfg.show_repo_strip
+                                        && !current_cwd_external_for_cb.get()
+                                    {
                                         let cwd = current_cwd_for_cb.borrow().clone();
                                         refresh_repo_strip(&repo_strip, &cwd);
+                                    } else {
+                                        repo_strip.set_visible(false);
                                     }
                                 }
 
@@ -1701,7 +1720,7 @@ impl ReaderCtx {
                                     )
                                 };
                                 if let Some(path) = history_path {
-                                    if let Err(err) = crate::command_history::append(
+                                    if let Err(err) = crate::command_history::enqueue(
                                         std::path::Path::new(&path),
                                         history_limit,
                                         &cmd,
@@ -1767,10 +1786,12 @@ impl ReaderCtx {
                             pty_synced_rc.set(false);
                             bstate_rc.set(BlockState::AwaitingCommand);
                             layout_active_surface();
-                            let active_for_focus = active_rc.clone();
-                            glib::idle_add_local_once(move || {
-                                active_for_focus.borrow().grab_focus();
-                            });
+                            if active_vte.has_focus() {
+                                let active_for_focus = active_rc.clone();
+                                glib::idle_add_local_once(move || {
+                                    active_for_focus.borrow().grab_focus();
+                                });
+                            }
 
                             // Feed next initial command if any.
                             if let Some(cmd) = init_cmds_queue_for_cb.borrow_mut().pop_front() {
@@ -1922,10 +1943,12 @@ impl ReaderCtx {
                                 &block_scroll_rc,
                                 &pty_for_init,
                             );
-                            let active_for_idle = active_rc.clone();
-                            glib::idle_add_local_once(move || {
-                                active_for_idle.borrow().grab_focus();
-                            });
+                            if active_vte.has_focus() {
+                                let active_for_idle = active_rc.clone();
+                                glib::idle_add_local_once(move || {
+                                    active_for_idle.borrow().grab_focus();
+                                });
+                            }
                         }
 
                         ParserEvent::ClipboardSet(text) => {
@@ -1979,7 +2002,7 @@ impl ReaderCtx {
                     cb(exit_code);
                 }
             },
-        );
+        )
     }
 }
 
@@ -2381,9 +2404,11 @@ impl TermView {
         config: &Config,
         shell_argv: &[String],
         cwd: Option<&str>,
+        cwd_external: bool,
         session_id: Option<&str>,
-        initial_commands: Option<&str>,
-    ) -> Self {
+        cwd_token: &str,
+        initial_commands: &[String],
+    ) -> std::io::Result<Self> {
         // ── Build widget tree ──────────────────────────────────────────────
         let root = gtk::Box::new(Orientation::Vertical, 0);
         root.set_hexpand(true);
@@ -2415,6 +2440,15 @@ impl TermView {
         // model); finished commands snapshot into styled blocks above it.
         let active = Rc::new(RefCell::new(ActiveBlock::new(config)));
         let active_vte = active.borrow().active_vte.clone();
+        let focus_requested = Rc::new(Cell::new(false));
+        {
+            let focus_requested = focus_requested.clone();
+            active_vte.connect_map(move |vte| {
+                if focus_requested.replace(false) {
+                    vte.grab_focus();
+                }
+            });
+        }
 
         block_list.append(active.borrow().widget());
 
@@ -2522,22 +2556,8 @@ impl TermView {
         let unread_count: Rc<Cell<u32>> = Rc::new(Cell::new(0));
 
         // ── PTY ───────────────────────────────────────────────────────────
-        // Detect rsh shell for session_id passing
-        let is_rsh = shell_argv
-            .first()
-            .and_then(|s| std::path::Path::new(s).file_name())
-            .and_then(|f| f.to_str())
-            .map(|name| name == "rsh")
-            .unwrap_or(false);
-
-        // Build argv with optional --session for rsh
-        let mut argv_vec: Vec<String> = shell_argv.to_vec();
-        if let Some(sid) = session_id {
-            if is_rsh {
-                argv_vec.push("--session".to_string());
-                argv_vec.push(sid.to_string());
-            }
-        }
+        let (argv_vec, session_applied) =
+            crate::config::shell_argv_with_session(shell_argv, session_id);
         let argv: Vec<&str> = argv_vec.iter().map(|s| s.as_str()).collect();
 
         // Git defaults LESS to "FRX" when the user has not set it. "F" quits
@@ -2548,18 +2568,18 @@ impl TermView {
         // stays ephemeral. Respect an explicit user-provided LESS.
         // Match the VTE backend: shell rc files use this stable marker to
         // source jterm1's OSC integration in both terminal modes.
-        let mut env_extra: Vec<(&str, &str)> = vec![("TERM_PROGRAM", "jterm1")];
+        let mut env_extra = Vec::from(crate::terminal::cwd_token_environment(cwd_token));
         if std::env::var_os("LESS").is_none() {
             env_extra.push(("LESS", "R"));
         }
         let session_id_owned = session_id.map(|s| s.to_string());
         if let Some(ref sid) = session_id_owned {
-            if is_rsh {
+            if session_applied {
                 env_extra.push(("RSH_SESSION_ID", sid.as_str()));
             }
         }
 
-        let pty = Rc::new(OwnedPty::spawn(&argv, cwd, &env_extra).expect("PTY spawn failed"));
+        let pty = Rc::new(OwnedPty::spawn(&argv, cwd, &env_extra)?);
 
         // Store child PID on the live VTE so kill_all_terminal_children can find it
         unsafe {
@@ -2577,7 +2597,7 @@ impl TermView {
         // VTE at CommandStart, so this shadow is no longer load-bearing — it
         // does not need to match the rendered line in edge cases.
         let typed_cmd: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
-        let background_output: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
+        let background_output: Rc<RefCell<VecDeque<u8>>> = Rc::new(RefCell::new(VecDeque::new()));
         let idle_input_dirty: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         // Command text snapshot taken at CommandStart from the VTE itself,
         // between `prompt_end_pos` and the current cursor. This is what
@@ -2756,7 +2776,7 @@ impl TermView {
         let prompt_display: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         // True while an alt-screen app owns the viewport (finished blocks hidden).
         let fullscreen: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        let cwd_callbacks: StrCallbacks = Rc::new(RefCell::new(vec![]));
+        let cwd_callbacks: CwdCallbacks = Rc::new(RefCell::new(vec![]));
         let remote_session_callbacks: StrCallbacks = Rc::new(RefCell::new(vec![]));
         let exited_callbacks: IntCallbacks = Rc::new(RefCell::new(vec![]));
         let bell_callbacks: VoidCallbacks = Rc::new(RefCell::new(vec![]));
@@ -2843,6 +2863,7 @@ impl TermView {
         // integration is live.
         let ftcs_seen: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let current_cwd: Rc<RefCell<String>> = Rc::new(RefCell::new(cwd.unwrap_or("").to_string()));
+        let current_cwd_external = Rc::new(Cell::new(cwd_external));
 
         // CWD updates come from VTE's native OSC 7 signal (the parser passes
         // OSC 7 through unchanged, see parser.rs). Title updates likewise come
@@ -2850,20 +2871,38 @@ impl TermView {
         {
             let cwd_cbs = cwd_callbacks.clone();
             let current_cwd_for_signal = current_cwd.clone();
+            let current_cwd_external_for_signal = current_cwd_external.clone();
             let vte_for_cwd = active_vte.clone();
             let repo_strip_for_cwd = repo_strip.clone();
+            let pty_for_cwd = pty.clone();
+            let cwd_token_for_signal = cwd_token.to_string();
+            let repo_strip_enabled = config.show_repo_strip;
             active_vte.connect_current_directory_uri_notify(move |_| {
                 if let Some(uri) = vte_for_cwd.current_directory_uri() {
-                    let file = gtk::gio::File::for_uri(uri.as_str());
-                    if let Some(path) = file
-                        .path()
-                        .map(|p| p.to_string_lossy().to_string())
-                        .filter(|s| !s.is_empty())
-                    {
+                    if let Ok((path, host)) = glib::filename_from_uri(uri.as_str()) {
+                        let path = path.to_string_lossy().to_string();
+                        if path.is_empty() {
+                            return;
+                        }
+                        let authority = crate::terminal::classify_cwd_authority(
+                            host.as_deref(),
+                            &cwd_token_for_signal,
+                        );
+                        let foreground_external = crate::process::foreground_uses_external_cwd(
+                            pty_for_cwd.master_fd_raw(),
+                            pty_for_cwd.pid_i32(),
+                        );
+                        let external =
+                            crate::terminal::resolve_cwd_external(authority, foreground_external);
+                        current_cwd_external_for_signal.set(external);
                         *current_cwd_for_signal.borrow_mut() = path.clone();
-                        refresh_repo_strip(&repo_strip_for_cwd, &path);
+                        if repo_strip_enabled && !external {
+                            refresh_repo_strip(&repo_strip_for_cwd, &path);
+                        } else {
+                            repo_strip_for_cwd.set_visible(false);
+                        }
                         for cb in cwd_cbs.borrow().iter() {
-                            cb(&path);
+                            cb(&path, external);
                         }
                     }
                 }
@@ -2875,7 +2914,9 @@ impl TermView {
         // on a change).
         {
             let initial_cwd = current_cwd.borrow().clone();
-            refresh_repo_strip(&repo_strip, &initial_cwd);
+            if config.show_repo_strip && !current_cwd_external.get() {
+                refresh_repo_strip(&repo_strip, &initial_cwd);
+            }
         }
         {
             let title_cbs = title_callbacks.clone();
@@ -2929,21 +2970,13 @@ impl TermView {
 
             // Command queue for replaying initial_commands on PromptEnd events
             let init_cmds_queue: Rc<RefCell<std::collections::VecDeque<String>>> =
-                Rc::new(RefCell::new(
-                    initial_commands
-                        .map(|s| {
-                            s.split(", ")
-                                .map(|c| c.trim().to_string())
-                                .filter(|c| !c.is_empty())
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                ));
+                Rc::new(RefCell::new(initial_commands.iter().cloned().collect()));
             let init_cmds_queue_for_cb = Rc::clone(&init_cmds_queue);
             let pty_for_init = Rc::clone(&pty);
             let block_start_time_for_cb = block_start_time.clone();
             let pending_exit_code_rc = pending_exit_code.clone();
             let current_cwd_for_cb = current_cwd.clone();
+            let current_cwd_external_for_cb = current_cwd_external.clone();
 
             let event_buf: Rc<RefCell<Vec<ParserEvent>>> =
                 Rc::new(RefCell::new(Vec::with_capacity(32)));
@@ -2982,6 +3015,7 @@ impl TermView {
                 block_start_time_for_cb,
                 pending_exit_code_rc,
                 current_cwd_for_cb,
+                current_cwd_external_for_cb,
                 event_buf,
                 unread_count_rc: unread_count.clone(),
                 jump_fab: jump_fab.clone(),
@@ -2996,7 +3030,30 @@ impl TermView {
                 block_finished_cbs: block_finished_callbacks.clone(),
                 ask_ai_about_block_cbs: ask_ai_about_block_callbacks.clone(),
             }
-            .install(&pty);
+            .install(&pty)?;
+
+            // Shells without OSC 133 never emit PromptEnd, so the normal
+            // integration-driven replay path above would leave startup/session
+            // commands queued forever. After the same grace period used by the
+            // VTE backend, drain the shared queue only if no integration marker
+            // has appeared. PromptEnd and this fallback therefore cannot send
+            // the same command twice.
+            if !init_cmds_queue.borrow().is_empty() {
+                let init_cmds_fallback = Rc::clone(&init_cmds_queue);
+                let ftcs_seen_fallback = ftcs_seen.clone();
+                let pty_fallback = Rc::downgrade(&pty);
+                glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || {
+                    if ftcs_seen_fallback.get() {
+                        return;
+                    }
+                    let Some(pty) = pty_fallback.upgrade() else {
+                        return;
+                    };
+                    for command in init_cmds_fallback.borrow_mut().drain(..) {
+                        pty.write_bytes(format!("{command}\r").as_bytes());
+                    }
+                });
+            }
         }
 
         // ── Scroll lock + jump-to-bottom FAB ──────────────────────────────
@@ -3468,6 +3525,7 @@ impl TermView {
             fullscreen,
             user_scrolled_up: user_scrolled_up.clone(),
             programmatic_scroll: programmatic_scroll.clone(),
+            focus_requested,
             pty,
             pty_synced: pty_synced.clone(),
             cwd_callbacks,
@@ -3661,10 +3719,7 @@ impl TermView {
         // ── Resize handler: sync PTY cols/rows when widget allocation changes ──
         term_view.install_resize_tick();
 
-        // Give initial focus to the live VTE.
-        term_view.active_vte.grab_focus();
-
-        term_view
+        Ok(term_view)
     }
 
     /// Keep PTY geometry synchronized with the real pane viewport, independent
@@ -3735,10 +3790,20 @@ impl TermView {
     }
 
     pub fn grab_focus(&self) {
+        self.focus_requested.set(true);
         self.active_vte.grab_focus();
+        if self.active_vte.has_focus() {
+            self.focus_requested.set(false);
+        }
         let active_vte = self.active_vte.clone();
+        let focus_requested = self.focus_requested.clone();
         glib::idle_add_local_once(move || {
-            active_vte.grab_focus();
+            if focus_requested.get() {
+                active_vte.grab_focus();
+                if active_vte.has_focus() {
+                    focus_requested.set(false);
+                }
+            }
         });
     }
 
@@ -3856,7 +3921,7 @@ impl TermView {
         });
     }
 
-    pub fn connect_cwd_changed<F: Fn(&str) + 'static>(&self, f: F) {
+    pub fn connect_cwd_changed<F: Fn(&str, bool) + 'static>(&self, f: F) {
         self.cwd_callbacks.borrow_mut().push(Box::new(f));
     }
 
@@ -4413,7 +4478,7 @@ mod tests {
     };
     use crate::parser::{KeyboardProtocolQuery, ParserEvent};
     use std::cell::RefCell;
-    use std::collections::HashSet;
+    use std::collections::{HashSet, VecDeque};
 
     #[test]
     fn keyboard_protocol_queries_have_safe_fallback_replies() {
@@ -4457,7 +4522,7 @@ mod tests {
 
     #[test]
     fn taking_background_output_drains_the_pending_buffer() {
-        let pending = RefCell::new(b"async line\r\n".to_vec());
+        let pending = RefCell::new(VecDeque::from(b"async line\r\n".to_vec()));
         assert_eq!(
             take_background_output(&pending).as_deref(),
             Some("async line\r\n")

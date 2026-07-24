@@ -75,7 +75,7 @@ impl AppModel {
             TerminalMode::Vte
         };
         self.persist_config();
-        self.show_toast("Terminal backend will apply to new local panes.");
+        self.show_toast("Terminal backend will apply to new and restored local panes.");
     }
 
     pub(crate) fn apply_settings_block_compact(&mut self, enabled: bool) {

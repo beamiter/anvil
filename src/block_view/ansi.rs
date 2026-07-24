@@ -156,10 +156,9 @@ pub(crate) fn contains_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool 
     // Unicode lowercase mapping so literal filters match e.g. "ÉCHEC" with
     // "échec" instead of comparing only individual ASCII bytes.
     if !(haystack.is_ascii() && needle.is_ascii()) {
-        if let (Ok(haystack), Ok(needle)) = (
-            std::str::from_utf8(haystack),
-            std::str::from_utf8(needle),
-        ) {
+        if let (Ok(haystack), Ok(needle)) =
+            (std::str::from_utf8(haystack), std::str::from_utf8(needle))
+        {
             return haystack.to_lowercase().contains(&needle.to_lowercase());
         }
     }

@@ -54,15 +54,24 @@ pub(crate) struct Pane {
     pub(crate) terminal: TermCtl,
     pub(crate) id: u64,
     pub(crate) cwd: Option<String>,
+    /// The reported cwd belongs to an ssh/mosh/container namespace. It remains
+    /// useful as terminal/AI context but must not drive local filesystem work.
+    pub(crate) cwd_external: bool,
     pub(crate) session_id: Option<String>,
     pub(crate) mode: TerminalMode,
     pub(crate) probe: terminal::PaneProbe,
 }
 
 impl Pane {
+    pub(crate) fn local_cwd(&self) -> Option<&str> {
+        (!self.cwd_external)
+            .then_some(self.cwd.as_deref())
+            .flatten()
+    }
+
     /// A restorable command running in this pane, or `None` when the
     /// foreground process is the pane's normal shell.
-    pub(crate) fn restorable_command(&self) -> Option<String> {
+    pub(crate) fn restorable_command(&self) -> Option<Vec<String>> {
         process::restorable_command(self.probe.pty_fd.get(), self.probe.shell_pid.get())
     }
 

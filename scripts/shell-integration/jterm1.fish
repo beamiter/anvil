@@ -7,6 +7,14 @@
 #
 # Emits OSC 133 (FTCS) command lifecycle marks and OSC 7 cwd updates.
 
+# Retain the per-pane cwd authenticator only as an unexported fish global, and
+# erase its public environment spelling before any child process can inherit it.
+# This precedes the load guard so re-sourcing cannot leak a newly supplied token.
+if set -q JTERM1_CWD_TOKEN
+    set --global --unexport __jterm1_cwd_token "$JTERM1_CWD_TOKEN"
+    set --erase JTERM1_CWD_TOKEN
+end
+
 if set -q __jterm1_fish_loaded
     return 0
 end
@@ -17,7 +25,12 @@ function __jterm1_osc
 end
 
 function __jterm1_report_cwd --on-variable PWD
-    set -l host (hostname 2>/dev/null; or echo localhost)
+    set -l host
+    if set -q __jterm1_cwd_token; and test -n "$__jterm1_cwd_token"
+        set host "jterm1-$__jterm1_cwd_token"
+    else
+        set host (hostname 2>/dev/null; or echo localhost)
+    end
     set -l enc (string escape --style=url -- $PWD)
     __jterm1_osc "7;file://$host$enc"
 end

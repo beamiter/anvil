@@ -20,20 +20,170 @@ use super::cross_block_search;
 
 pub use super::vte::{VteInit, VteInput, VteOutput};
 
+fn command_finished_output(exit_code: i32) -> VteOutput {
+    VteOutput::CommandFinished(exit_code == 0)
+}
+
 pub struct BlockTerminal {
-    view: Rc<TermView>,
+    view: Option<Rc<TermView>>,
+    terminal_done: Rc<Cell<bool>>,
     config: Rc<RefCell<crate::config::Config>>,
     cross_block_search_dialog: Rc<RefCell<Option<relm4::adw::Dialog>>>,
 }
 
 impl BlockTerminal {
+    fn terminate_once(&self) {
+        if !self.terminal_done.replace(true) {
+            if let Some(view) = self.view.as_ref() {
+                view.kill();
+            }
+        }
+    }
+
     pub(crate) fn can_accept_agent_command(&self) -> bool {
-        self.view.can_accept_agent_command()
+        self.view
+            .as_ref()
+            .is_some_and(|view| view.can_accept_agent_command())
     }
 
     pub(crate) fn debug_info(&self) -> crate::block_view::DebugInfo {
-        self.view.debug_info()
+        self.view.as_ref().map_or_else(
+            || {
+                vec![(
+                    "PTY",
+                    vec![("Status".to_string(), "failed to start".to_string())],
+                )]
+            },
+            |view| view.debug_info(),
+        )
     }
+}
+
+fn launch_error_widget(error: &std::io::Error) -> gtk::Widget {
+    let status = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    status.set_hexpand(true);
+    status.set_vexpand(true);
+    status.set_halign(gtk::Align::Center);
+    status.set_valign(gtk::Align::Center);
+    status.set_margin_start(24);
+    status.set_margin_end(24);
+    status.set_margin_top(24);
+    status.set_margin_bottom(24);
+
+    let title = gtk::Label::new(Some("Terminal failed to start"));
+    title.add_css_class("title-2");
+    let detail = gtk::Label::new(Some(&error.to_string()));
+    detail.set_wrap(true);
+    detail.set_selectable(true);
+    detail.add_css_class("dim-label");
+    let hint = gtk::Label::new(Some(
+        "Check the configured shell, remote command, or host bridge; then close this pane and try again.",
+    ));
+    hint.set_wrap(true);
+
+    status.append(&title);
+    status.append(&detail);
+    status.append(&hint);
+    status.upcast()
+}
+
+fn connect_root_focus(root: &gtk::Widget, sender: &ComponentSender<BlockTerminal>) {
+    // Track focus at the component root so both the live terminal and a launch
+    // error page update the owning split before pane-scoped actions.
+    let focus = gtk::EventControllerFocus::new();
+    focus.connect_enter({
+        let sender = sender.clone();
+        move |_| {
+            let _ = sender.output(VteOutput::Focused);
+        }
+    });
+    root.add_controller(focus);
+    let click = gtk::GestureClick::new();
+    click.set_button(0);
+    click.set_propagation_phase(gtk::PropagationPhase::Capture);
+    click.connect_pressed({
+        let sender = sender.clone();
+        move |_, _, _, _| {
+            let _ = sender.output(VteOutput::Focused);
+        }
+    });
+    root.add_controller(click);
+}
+
+fn connect_view_outputs(
+    view: &Rc<TermView>,
+    sender: &ComponentSender<BlockTerminal>,
+    terminal_done: &Rc<Cell<bool>>,
+) {
+    view.connect_cwd_changed({
+        let sender = sender.clone();
+        move |cwd, external| {
+            let _ = sender.output(VteOutput::CwdChanged {
+                path: cwd.to_string(),
+                external,
+            });
+        }
+    });
+    view.connect_remote_session_id({
+        let sender = sender.clone();
+        move |id| {
+            let _ = sender.output(VteOutput::RemoteSessionId(id.to_string()));
+        }
+    });
+    view.connect_exited({
+        let sender = sender.clone();
+        let terminal_done = terminal_done.clone();
+        move |code| {
+            terminal_done.set(true);
+            let _ = sender.output(VteOutput::Exited(code));
+        }
+    });
+    view.connect_bell({
+        let sender = sender.clone();
+        move || {
+            let _ = sender.output(VteOutput::Bell);
+        }
+    });
+    view.connect_title_changed({
+        let sender = sender.clone();
+        move |title| {
+            let _ = sender.output(VteOutput::TitleChanged(title.to_string()));
+        }
+    });
+    // A live block can repaint many times a second (spinners/progress bars).
+    // Coalesce those repaints before they enter Relm4's application queue.
+    let activity_pending = Rc::new(Cell::new(false));
+    view.connect_activity({
+        let sender = sender.clone();
+        let activity_pending = activity_pending.clone();
+        move || {
+            if activity_pending.replace(true) {
+                return;
+            }
+            let _ = sender.output(VteOutput::Activity);
+            let activity_pending = activity_pending.clone();
+            gtk::glib::timeout_add_local_once(Duration::from_millis(100), move || {
+                activity_pending.set(false);
+            });
+        }
+    });
+    view.connect_block_finished({
+        let sender = sender.clone();
+        move |command, exit_code, output_sample| {
+            let _ = sender.output(command_finished_output(exit_code));
+            let _ = sender.output(VteOutput::BlockFinished {
+                command,
+                exit_code,
+                output_sample,
+            });
+        }
+    });
+    view.connect_ask_ai_about_block({
+        let sender = sender.clone();
+        move |context| {
+            let _ = sender.output(VteOutput::AskAiAboutBlock(context));
+        }
+    });
 }
 
 impl Component for BlockTerminal {
@@ -54,142 +204,139 @@ impl Component for BlockTerminal {
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
         let config = init.config.clone();
-        let view = Rc::new(TermView::new(
-            &config.borrow(),
-            init.shell_argv.as_ref().as_slice(),
-            init.working_directory.as_deref(),
-            init.session_id.as_deref(),
-            init.initial_commands.as_deref(),
-        ));
-
-        init.probe.shell_pid.set(view.pid_i32());
-        init.probe.pty_fd.set(view.pty_fd_i32());
-
-        view.connect_cwd_changed({
-            let sender = sender.clone();
-            move |cwd| {
-                let _ = sender.output(VteOutput::CwdChanged(cwd.to_string()));
-            }
-        });
-        view.connect_remote_session_id({
-            let sender = sender.clone();
-            move |id| {
-                let _ = sender.output(VteOutput::RemoteSessionId(id.to_string()));
-            }
-        });
-        view.connect_exited({
-            let sender = sender.clone();
-            move |code| {
-                let _ = sender.output(VteOutput::Exited(code));
-            }
-        });
-        view.connect_bell({
-            let sender = sender.clone();
-            move || {
-                let _ = sender.output(VteOutput::Bell);
-            }
-        });
-        view.connect_title_changed({
-            let sender = sender.clone();
-            move |title| {
-                let _ = sender.output(VteOutput::TitleChanged(title.to_string()));
-            }
-        });
-        // A live block can repaint many times a second (spinners/progress
-        // bars).  The tab model only needs a recent-activity notification, so
-        // coalesce those repaints before they enter Relm4's application queue.
-        // Without this, queued Activity messages can delay pointer clicks in
-        // the tab strip while the command is still producing output.
-        let activity_pending = Rc::new(Cell::new(false));
-        view.connect_activity({
-            let sender = sender.clone();
-            let activity_pending = activity_pending.clone();
-            move || {
-                if activity_pending.replace(true) {
-                    return;
-                }
-                let _ = sender.output(VteOutput::Activity);
-                let activity_pending = activity_pending.clone();
-                gtk::glib::timeout_add_local_once(Duration::from_millis(100), move || {
-                    activity_pending.set(false);
-                });
-            }
-        });
-        view.connect_block_finished({
-            let sender = sender.clone();
-            move |command, exit_code, output_sample| {
-                let _ = sender.output(VteOutput::BlockFinished {
-                    command,
-                    exit_code,
-                    output_sample,
-                });
-            }
-        });
-        view.connect_ask_ai_about_block({
-            let sender = sender.clone();
-            move |context| {
-                let _ = sender.output(VteOutput::AskAiAboutBlock(context));
-            }
-        });
-
-        if let Some(container) = root.downcast_ref::<gtk::Box>() {
-            container.append(&view.widget());
+        let terminal_done = Rc::new(Cell::new(false));
+        connect_root_focus(&root, &sender);
+        let view = {
+            let config = config.borrow();
+            TermView::new(
+                &config,
+                init.shell_argv.as_ref().as_slice(),
+                init.working_directory.as_deref(),
+                init.working_directory_external,
+                init.session_id.as_deref(),
+                &init.cwd_token,
+                init.initial_commands.as_slice(),
+            )
         }
+        .map(Rc::new);
+
+        let view = match view {
+            Ok(view) => {
+                init.probe.shell_pid.set(view.pid_i32());
+                init.probe.pty_fd.set(view.pty_fd_i32());
+                connect_view_outputs(&view, &sender, &terminal_done);
+                if let Some(container) = root.downcast_ref::<gtk::Box>() {
+                    container.append(&view.widget());
+                }
+                Some(view)
+            }
+            Err(error) => {
+                terminal_done.set(true);
+                log::error!("Block terminal failed to start: {error}");
+                root.set_focusable(true);
+                root.set_focus_on_click(true);
+                if let Some(container) = root.downcast_ref::<gtk::Box>() {
+                    container.append(&launch_error_widget(&error));
+                }
+                let sender = sender.clone();
+                gtk::glib::idle_add_local_once(move || {
+                    let _ = sender.output(VteOutput::LaunchFailed(
+                        "Terminal failed to start; check the shell, remote command, or host bridge."
+                            .to_string(),
+                    ));
+                });
+                None
+            }
+        };
 
         let model = BlockTerminal {
             view,
+            terminal_done,
             config,
             cross_block_search_dialog: Rc::new(RefCell::new(None)),
         };
         ComponentParts { model, widgets: () }
     }
 
-    fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>, _root: &Self::Root) {
+    fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>, root: &Self::Root) {
+        if self.view.is_none() {
+            if matches!(&msg, VteInput::GrabFocus) {
+                root.grab_focus();
+            }
+            return;
+        }
+        let Some(view) = self.view.as_ref() else {
+            return;
+        };
         match msg {
-            VteInput::WriteInput(data) => self.view.write_input(&data),
-            VteInput::Resize(cols, rows) => self.view.resize(cols, rows),
-            VteInput::GrabFocus => self.view.grab_focus(),
-            VteInput::Copy => self.view.copy_to_clipboard(),
-            VteInput::CopyOutputOnly => self.view.copy_to_clipboard_with_modifier(true),
-            VteInput::Paste => self.view.paste_from_clipboard(),
-            VteInput::SetFontScale(scale) => self.view.set_font_scale(scale),
+            VteInput::WriteInput(data) => view.write_input(&data),
+            VteInput::Resize(cols, rows) => view.resize(cols, rows),
+            VteInput::GrabFocus => view.grab_focus(),
+            VteInput::Copy => view.copy_to_clipboard(),
+            VteInput::CopyOutputOnly => view.copy_to_clipboard_with_modifier(true),
+            VteInput::Paste => view.paste_from_clipboard(),
+            VteInput::SetFontScale(scale) => view.set_font_scale(scale),
             VteInput::SetFont(desc) => {
                 let font = FontDescription::from_string(&desc);
-                self.view.set_font(&font);
+                view.set_font(&font);
             }
-            VteInput::SetScrollback(lines) => self.view.vte().set_scrollback_lines(lines),
-            VteInput::ScrollLines(lines) => self.view.scroll_lines(lines),
-            VteInput::ApplyTheme => self.view.apply_theme(),
-            VteInput::SyncConfig => self.view.reload_config(&self.config.borrow()),
-            VteInput::Kill => self.view.kill(),
-            VteInput::FilterFailedBlocks => self.view.apply_failed_filter(),
-            VteInput::FilterSlowBlocks => self.view.apply_slow_filter(),
-            VteInput::FilterPinnedBlocks => self.view.apply_pinned_filter(),
-            VteInput::ClearBlockFilter => self.view.clear_block_filter(),
-            VteInput::SelectAllBlocks => self.view.select_all_blocks(),
-            VteInput::ClearBlocks => self.view.clear_blocks(),
-            VteInput::ReinputSelectedCommands => self.view.reinput_selected_commands(),
-            VteInput::JumpToPrevPinned => self.view.jump_to_pinned(-1),
-            VteInput::JumpToNextPinned => self.view.jump_to_pinned(1),
+            VteInput::SetScrollback(lines) => view.vte().set_scrollback_lines(lines),
+            VteInput::ScrollLines(lines) => view.scroll_lines(lines),
+            VteInput::ApplyTheme => view.apply_theme(),
+            VteInput::SyncConfig => view.reload_config(&self.config.borrow()),
+            VteInput::Kill => self.terminate_once(),
+            VteInput::FilterFailedBlocks => view.apply_failed_filter(),
+            VteInput::FilterSlowBlocks => view.apply_slow_filter(),
+            VteInput::FilterPinnedBlocks => view.apply_pinned_filter(),
+            VteInput::ClearBlockFilter => view.clear_block_filter(),
+            VteInput::SelectAllBlocks => view.select_all_blocks(),
+            VteInput::ClearBlocks => view.clear_blocks(),
+            VteInput::ReinputSelectedCommands => view.reinput_selected_commands(),
+            VteInput::JumpToPrevPinned => view.jump_to_pinned(-1),
+            VteInput::JumpToNextPinned => view.jump_to_pinned(1),
             VteInput::SearchSet(query, use_regex) => {
-                let _ = self.view.find_in_blocks(&query, use_regex);
+                let _ = view.find_in_blocks(&query, use_regex);
             }
             VteInput::SearchNext => {
-                let _ = self.view.find_next();
+                let _ = view.find_next();
             }
             VteInput::SearchPrev => {
-                let _ = self.view.find_prev();
+                let _ = view.find_prev();
             }
-            VteInput::SearchClear => self.view.clear_find(),
-            VteInput::CrossBlockSearch => cross_block_search::toggle(
-                self.view.clone(),
-                self.cross_block_search_dialog.clone(),
-            ),
+            VteInput::SearchClear => view.clear_find(),
+            VteInput::CrossBlockSearch => {
+                cross_block_search::toggle(view.clone(), self.cross_block_search_dialog.clone())
+            }
             VteInput::AskAiAboutSelectedBlock => {
-                if let Some(context) = self.view.selected_block_context(80) {
+                if let Some(context) = view.selected_block_context(80) {
                     let _ = sender.output(VteOutput::AskAiAboutBlock(context));
                 }
             }
         }
+    }
+
+    fn shutdown(&mut self, _widgets: &mut Self::Widgets, _output: relm4::Sender<Self::Output>) {
+        self.terminate_once();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{command_finished_output, VteOutput};
+
+    #[test]
+    fn block_exit_status_maps_to_command_finished_success() {
+        assert!(matches!(
+            command_finished_output(0),
+            VteOutput::CommandFinished(true)
+        ));
+        assert!(matches!(
+            command_finished_output(1),
+            VteOutput::CommandFinished(false)
+        ));
+        assert!(matches!(
+            command_finished_output(-1),
+            VteOutput::CommandFinished(false)
+        ));
     }
 }

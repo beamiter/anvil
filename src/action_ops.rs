@@ -25,6 +25,22 @@ impl AppModel {
         self.search.emit(search::SearchMsg::Toggle);
     }
 
+    fn emit_block_action(&self, input: VteInput, feature: &str) {
+        let pane = self
+            .tabs
+            .get(self.active)
+            .and_then(|tab| tab.panes.get(tab.active_pane));
+        match pane {
+            Some(pane) if matches!(pane.mode, TerminalMode::Block) => {
+                pane.terminal.emit(input);
+            }
+            Some(_) => {
+                self.show_toast(format!("{feature} is available only in a Block-mode pane."))
+            }
+            None => self.show_toast("No active terminal pane."),
+        }
+    }
+
     /// Parse the find-bar text: `/pattern/` means regex, anything else literal.
     pub(crate) fn search_query(text: &str) -> (String, bool) {
         if text.starts_with('/') && text.ends_with('/') && text.len() > 2 {
@@ -103,10 +119,11 @@ impl AppModel {
             }
             Action::ToggleCommandPalette => {
                 self.reload_workflows();
+                let history = self.config.borrow().command_history_path.clone();
                 self.command_palette
                     .emit(dialogs::command_palette::PaletteMsg::Toggle {
                         mode: palette::PaletteMode::Commands,
-                        history_path: None,
+                        history_path: history.map(std::path::PathBuf::from),
                     });
             }
             Action::OpenPalette => {
@@ -239,51 +256,34 @@ impl AppModel {
                 }
             }
             Action::FilterFailedBlocks => {
-                if let Some(t) = self.active_terminal() {
-                    t.emit(VteInput::FilterFailedBlocks);
-                }
+                self.emit_block_action(VteInput::FilterFailedBlocks, "Failed-block navigation");
             }
             Action::FilterSlowBlocks => {
-                if let Some(t) = self.active_terminal() {
-                    t.emit(VteInput::FilterSlowBlocks);
-                }
+                self.emit_block_action(VteInput::FilterSlowBlocks, "Slow-block navigation");
             }
             Action::FilterPinnedBlocks => {
-                if let Some(t) = self.active_terminal() {
-                    t.emit(VteInput::FilterPinnedBlocks);
-                }
+                self.emit_block_action(VteInput::FilterPinnedBlocks, "Bookmarked-block navigation");
             }
             Action::JumpToPrevPinned => {
-                eprintln!("[jterm1] Action::JumpToPrevPinned");
-                if let Some(t) = self.active_terminal() {
-                    t.emit(VteInput::JumpToPrevPinned);
-                }
+                self.emit_block_action(VteInput::JumpToPrevPinned, "Bookmarked-block navigation");
             }
             Action::JumpToNextPinned => {
-                eprintln!("[jterm1] Action::JumpToNextPinned");
-                if let Some(t) = self.active_terminal() {
-                    t.emit(VteInput::JumpToNextPinned);
-                }
+                self.emit_block_action(VteInput::JumpToNextPinned, "Bookmarked-block navigation");
             }
             Action::ClearBlockFilter => {
-                if let Some(t) = self.active_terminal() {
-                    t.emit(VteInput::ClearBlockFilter);
-                }
+                self.emit_block_action(VteInput::ClearBlockFilter, "Block navigation");
             }
             Action::SelectAllBlocks => {
-                if let Some(t) = self.active_terminal() {
-                    t.emit(VteInput::SelectAllBlocks);
-                }
+                self.emit_block_action(VteInput::SelectAllBlocks, "Block selection");
             }
             Action::ClearBlocks => {
-                if let Some(t) = self.active_terminal() {
-                    t.emit(VteInput::ClearBlocks);
-                }
+                self.emit_block_action(VteInput::ClearBlocks, "Clearing finished blocks");
             }
             Action::ReinputSelectedCommands => {
-                if let Some(t) = self.active_terminal() {
-                    t.emit(VteInput::ReinputSelectedCommands);
-                }
+                self.emit_block_action(
+                    VteInput::ReinputSelectedCommands,
+                    "Selected-command recall",
+                );
             }
             Action::QuickSwitchTab(n) => {
                 if !self.tabs.is_empty() {
@@ -294,10 +294,20 @@ impl AppModel {
                 }
             }
             Action::ShowRemotePicker => {
-                self.remote_picker
-                    .emit(dialogs::remote_picker::RemotePickerMsg::Toggle(
-                        self.config.borrow().remote_hosts.clone(),
+                if self.safe_mode {
+                    self.show_toast("Remote connections are disabled in safe mode.");
+                    return;
+                }
+                let hosts = self.config.borrow().remote_hosts.clone();
+                if hosts.is_empty() {
+                    self.show_toast(format!(
+                        "No remote hosts are configured. Add [[remote_hosts]] in {}.",
+                        config_file_path().display()
                     ));
+                } else {
+                    self.remote_picker
+                        .emit(dialogs::remote_picker::RemotePickerMsg::Toggle(hosts));
+                }
             }
             Action::ToggleDebugDashboard => {
                 let info = self.debug_info_snapshot();
@@ -305,26 +315,31 @@ impl AppModel {
                     .emit(dialogs::debug_dashboard::DebugDashboardMsg::Toggle(info));
             }
             Action::ConnectRemote(n) => {
+                if self.safe_mode {
+                    self.show_toast("Remote connections are disabled in safe mode.");
+                    return;
+                }
                 let host = self.config.borrow().remote_hosts.get(n as usize).cloned();
                 if let Some(host) = host {
                     self.add_remote_tab(&host, sender);
+                } else {
+                    self.show_toast("That remote host is no longer configured.");
                 }
             }
             Action::OpenAiPanel => {
                 self.show_ai_session_panel();
             }
             Action::AskAiAboutSelectedBlock => {
-                if let Some(terminal) = self.active_terminal() {
-                    terminal.emit(VteInput::AskAiAboutSelectedBlock);
-                }
+                self.emit_block_action(
+                    VteInput::AskAiAboutSelectedBlock,
+                    "AI context for a finished block",
+                );
             }
             Action::OpenAgent => {
                 self.open_agent_panel(sender);
             }
             Action::CrossBlockSearch => {
-                if let Some(terminal) = self.active_terminal() {
-                    terminal.emit(VteInput::CrossBlockSearch);
-                }
+                self.emit_block_action(VteInput::CrossBlockSearch, "Cross-block search");
             }
         }
     }

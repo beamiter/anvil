@@ -19,7 +19,7 @@ opacity = 0.95
 scrollback = 5000
 
 # Backend and layout.
-terminal_mode = "block"     # "block" or "vte"; applies to newly created panes
+terminal_mode = "block"     # "block" or "vte"; applies to new/restored local panes
 tab_placement = "sidebar"   # "sidebar" or "top"
 sidebar_view = "tabs"       # "tabs" or "files"
 sidebar_visible = true
@@ -107,9 +107,11 @@ remote_hosts = []
 # opacity_increase = "Ctrl+Alt+equal"
 # opacity_decrease = "Ctrl+Alt+minus"
 # toggle_search = "Ctrl+Shift+F"
+# cross_block_search = "Ctrl+Shift+G"
 # toggle_command_palette = "Ctrl+Shift+P"
 # open_history_palette = "Ctrl+Shift+H"
 # toggle_settings = "Ctrl+Shift+O"
+# reload_config = "Ctrl+Shift+R"
 # toggle_sidebar = "Ctrl+backslash"
 # split_horizontal = "Ctrl+Shift+E"
 # split_vertical = "Ctrl+Shift+D"
@@ -158,7 +160,9 @@ remote_hosts = []
 # jump_to_prev_pinned = "Ctrl+Alt+comma"
 # jump_to_next_pinned = "Ctrl+Alt+period"
 
-# Example remote profile. Remove `remote_hosts = []` above before uncommenting.
+# Example remote profile. Each `name` must be unique because session restore
+# uses it as the stable profile identifier. Remove `remote_hosts = []` above
+# before uncommenting.
 # A regular shell gives a conventional SSH tab. A compatible rsh installation
 # can additionally use `session` for block-aware reconnect/resume.
 # [[remote_hosts]]

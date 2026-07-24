@@ -30,6 +30,8 @@ versioning for tagged releases while it remains experimental.
 - A scheduled dependency vulnerability audit, ShellCheck gate, shared
   `make security` command, and repository Rust toolchain contract.
 - Build provenance metadata and the exact Cargo lockfile in relocatable bundles.
+- Commands completed in inactive Block panes now surface activity on success
+  and attention on failure.
 
 - First-class Nix package, `nix run` app, flake check, and enriched development
   shell for the two supported Linux architectures.
@@ -51,6 +53,8 @@ versioning for tagged releases while it remains experimental.
 - Default shortcuts now share the jterm ergonomic layout: directional Pane
   focus/resize layers, browser-style tab digits, symmetric zoom/opacity keys,
   and shell-owned `Ctrl+R` / `Ctrl+P` passthrough.
+- Shortcut references and the welcome notebook now match the reload and
+  cross-block-search bindings plus multi-shell, process-group notebook controls.
 - In-app settings now refuse stale multi-window writes and invalid schemas;
   diagnostics and support bundles expose validation/lock state without values.
 - Local and CI linting now share one canonical Clippy policy.
@@ -59,6 +63,27 @@ versioning for tagged releases while it remains experimental.
 - CI now validates the headless CLI, desktop entry, release bundle, checksum,
   and Nix package in addition to Rust formatting, tests, lints, docs, and the
   optimized build.
+- New splits and every restored local split leaf consistently use the configured
+  terminal backend; integrated remote restores stay on Block, and Block-only
+  actions now explain when invoked from an incompatible VTE pane.
+- Long-running Block output and asynchronous prompt output now use bounded ring
+  buffers, avoiding repeated multi-megabyte front shifts.
+- Command-history writes and compaction now run through a bounded worker and
+  flush on normal shutdown; palette searches use one bounded in-memory snapshot
+  per opening instead of rescanning JSONL on every keystroke.
+- Missing restored working directories fall back safely, while PTY launch
+  failures render an actionable, focus-aware pane error instead of crashing the
+  application. Flatpak host-directory probes are cached and time-bounded.
+- Managed remote panes restore by resolving their saved profile name against
+  the current validated configuration. Profile names are now unique; removing
+  or renaming one suppresses stale connection replay and surfaces a safe local
+  fallback instead.
+- Remote/container working directories remain externally namespaced and can no
+  longer seed local tabs, splits, file trees, duplicate-pane launches, or local
+  Git-status probes.
+- Initial Block commands retain structured argument boundaries through the
+  shell wrapper and use a bounded fallback when shell integration markers are
+  unavailable, including direct SSH and Mosh sessions.
 
 ### Security
 
@@ -67,3 +92,23 @@ versioning for tagged releases while it remains experimental.
 - Potentially destructive AI-generated commands are highlighted for review.
 - Detached palette requests no longer permanently leak their cancellation
   token.
+- Session recovery preserves command argument boundaries and does not execute
+  legacy joined command strings; replay uses shell-specific POSIX or PowerShell
+  quoting and skips unknown grammars. SSH session identifiers are bounded,
+  control-free, and shell-quoted, and option parsing ends before the destination.
+- PTY launch data and `exec` pointer arrays are validated and prepared before
+  `fork`; the child path avoids Rust allocation and environment mutation.
+- PTY reaping and shutdown signals share one lifecycle lock so a released PID
+  can never be targeted by a delayed cleanup worker. Linux descendant signaling
+  uses pidfds plus a bounded repeated session drain, while closing a Block pane
+  also releases its reader source.
+- Session snapshots use per-process unique identities, lifetime-held owner
+  locks, and a serialized publication protocol instead of bare PIDs, preventing
+  PID reuse, namespace changes, or lock-creation races from hiding, consuming,
+  or overwriting another window's recovery state.
+- OSC 7 cwd classification combines a per-pane authenticated authority with
+  sticky namespace state and live foreground ancestry (including Flatpak host
+  wrappers), preventing remote output from relabeling a remote path as local.
+- Shared command history writes are serialized across processes and compacted
+  through unique, atomically replaced temporary files; corrupt unterminated
+  records are skipped with bounded memory.

@@ -217,85 +217,98 @@ pub(crate) fn setup_terminal_click_handler(terminal: &Terminal) {
     terminal.add_controller(click_controller);
 }
 
+fn launch_failure_message(error: &impl std::fmt::Display) -> String {
+    format!("Terminal failed to start: {error}. Check the shell, remote command, or host bridge.")
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_shell(
     terminal: &Terminal,
     argv_owned: &[String],
     working_directory: Option<&str>,
     session_id: Option<&str>,
-    initial_commands: Option<&str>,
+    cwd_token: &str,
+    initial_commands: &[String],
     probe: PaneProbe,
+    sender: ComponentSender<VteTerminal>,
 ) {
-    let mut argv_vec: Vec<String> = argv_owned.to_vec();
-    if let Some(sid) = session_id {
-        let is_rsh = argv_vec
-            .first()
-            .and_then(|s| std::path::Path::new(s).file_name())
-            .and_then(|f| f.to_str())
-            .map(|name| name == "rsh")
-            .unwrap_or(false);
-        if is_rsh {
-            argv_vec.push("--session".to_string());
-            argv_vec.push(sid.to_string());
-        }
-    }
+    let (argv_vec, _) = crate::config::shell_argv_with_session(argv_owned, session_id);
     let home = std::env::var("HOME").ok();
     let requested_working_directory = working_directory.or(home.as_deref());
-    // `TERM_PROGRAM` must be encoded in the host wrapper as well as VTE's
-    // environment, otherwise Flatpak shells cannot see the integration marker.
-    let host_environment = [("TERM_PROGRAM", "jterm1")];
+    let effective_working_directory = requested_working_directory.filter(|directory| {
+        let available = crate::host::working_directory_available(directory);
+        if !available {
+            log::warn!("VTE working directory is unavailable; using the application directory");
+        }
+        available
+    });
+    // The integration marker and cwd-authentication token must be encoded in
+    // the host wrapper as well as VTE's environment. The shell integration
+    // immediately removes the token from its exported environment.
+    let host_environment = crate::terminal::cwd_token_environment(cwd_token);
     let argv_vec =
-        crate::host::wrap_argv(&argv_vec, requested_working_directory, &host_environment);
+        crate::host::wrap_argv(&argv_vec, effective_working_directory, &host_environment);
     let argv: Vec<&str> = argv_vec.iter().map(|s| s.as_str()).collect();
 
-    let envv: &[&str] = &["TERM_PROGRAM=jterm1"];
+    let envv_owned: Vec<String> = host_environment
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
+    let envv: Vec<&str> = envv_owned.iter().map(String::as_str).collect();
     let spawn_flags = SpawnFlags::SEARCH_PATH;
     let cancellable: Option<&Cancellable> = None;
     let spawn_working_directory = if crate::host::is_flatpak() {
         None
     } else {
-        requested_working_directory
+        effective_working_directory
     };
     let terminal_for_pid = terminal.clone();
 
-    let init_cmds = initial_commands.map(|s| s.to_string());
+    let init_cmds = initial_commands.to_vec();
     let terminal_for_init = terminal.clone();
 
     terminal.spawn_async(
         PtyFlags::DEFAULT,
         spawn_working_directory,
         &argv,
-        envv,
+        &envv,
         spawn_flags,
         || {},
         -1,
         cancellable,
         move |res| {
             log::debug!("spawn_async: {res:?}");
-            if let Ok(pid) = res {
-                let pid_i32: i32 = pid.into_glib();
-                unsafe {
-                    terminal_for_pid.set_data::<i32>("child-pid", pid_i32);
+            match res {
+                Ok(pid) => {
+                    let pid_i32: i32 = pid.into_glib();
+                    unsafe {
+                        terminal_for_pid.set_data::<i32>("child-pid", pid_i32);
+                    }
+                    probe.shell_pid.set(pid_i32);
+                    if let Some(pty) = terminal_for_pid.pty() {
+                        use std::os::fd::AsRawFd;
+                        probe.pty_fd.set(pty.fd().as_raw_fd());
+                    }
                 }
-                probe.shell_pid.set(pid_i32);
-                if let Some(pty) = terminal_for_pid.pty() {
-                    use std::os::fd::AsRawFd;
-                    probe.pty_fd.set(pty.fd().as_raw_fd());
+                Err(error) => {
+                    let message = launch_failure_message(&error);
+                    log::error!("{message}");
+                    let terminal_message = format!("\r\njterm1: {message}\r\n");
+                    terminal_for_pid.feed(terminal_message.as_bytes());
+                    let _ = sender.output(VteOutput::LaunchFailed(message));
+                    return;
                 }
             }
-            if let Some(ref cmds) = init_cmds {
-                if !cmds.is_empty() {
-                    let cmds = cmds.clone();
-                    gtk::glib::timeout_add_local_once(
-                        std::time::Duration::from_millis(500),
-                        move || {
-                            let lines: Vec<&str> = cmds.split(", ").collect();
-                            for line in lines {
-                                let text = format!("{}\r", line.trim());
-                                terminal_for_init.feed_child(text.as_bytes());
-                            }
-                        },
-                    );
-                }
+            if !init_cmds.is_empty() {
+                gtk::glib::timeout_add_local_once(
+                    std::time::Duration::from_millis(500),
+                    move || {
+                        for command in init_cmds {
+                            let text = format!("{command}\r");
+                            terminal_for_init.feed_child(text.as_bytes());
+                        }
+                    },
+                );
             }
         },
     );
@@ -303,12 +316,52 @@ pub(crate) fn spawn_shell(
 
 // ─── VteTerminal relm4 Component ────────────────────────────────────────────
 
+/// Commands to submit after a terminal reaches its first prompt.
+///
+/// Configuration retains its historical comma-separated syntax, but it is
+/// parsed once at the application boundary. Session restore instead constructs
+/// exactly one safely quoted command from a persisted argv. Downstream terminal
+/// backends therefore never reinterpret a restored command's commas.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InitialCommands(Vec<String>);
+
+impl InitialCommands {
+    pub(crate) fn from_config(configured: Option<&str>) -> Self {
+        let commands = configured
+            .into_iter()
+            .flat_map(|value| value.split(", "))
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+            .map(str::to_string)
+            .collect();
+        Self(commands)
+    }
+
+    pub(crate) fn from_restored_argv(argv: Option<&[String]>, shell_argv: &[String]) -> Self {
+        let command = argv.and_then(|argv| crate::process::shell_quote_argv_for(argv, shell_argv));
+        if argv.is_some() && command.is_none() {
+            log::warn!(
+                "Skipping session command replay because its argv is unsafe or the configured shell grammar is unsupported"
+            );
+        }
+        Self(command.into_iter().collect())
+    }
+
+    pub(crate) fn as_slice(&self) -> &[String] {
+        &self.0
+    }
+}
+
 pub struct VteInit {
     pub config: Rc<RefCell<Config>>,
     pub shell_argv: Rc<Vec<String>>,
     pub working_directory: Option<String>,
+    pub working_directory_external: bool,
     pub session_id: Option<String>,
-    pub initial_commands: Option<String>,
+    /// Per-pane secret consumed by the shell integration to authenticate OSC 7
+    /// cwd updates even when a Flatpak host shell hides foreground processes.
+    pub cwd_token: String,
+    pub initial_commands: InitialCommands,
     pub probe: PaneProbe,
 }
 
@@ -370,15 +423,19 @@ pub enum VteInput {
 
 #[derive(Debug)]
 pub enum VteOutput {
-    CwdChanged(String),
+    CwdChanged {
+        path: String,
+        external: bool,
+    },
+    LaunchFailed(String),
     Exited(i32),
     Bell,
     TitleChanged(String),
     Activity,
     Focused,
-    /// A command finished while the user wasn't looking (tab inactive or
-    /// scrolled away from the bottom). `true` = success, `false` = failure.
-    /// Only emitted by BlockTerminal.
+    /// A command finished. `true` = success, `false` = failure. Emitted by
+    /// BlockTerminal; the application decides whether an inactive tab needs an
+    /// activity or attention marker.
     CommandFinished(bool),
     /// Remote shell announced its session id via OSC 7770. Carries the id so
     /// the parent app can store it on the tab's RemoteConn for resume-on-reconnect.
@@ -441,15 +498,23 @@ impl Component for VteTerminal {
         {
             let sender = sender.clone();
             let term_for_cwd = terminal.clone();
+            let probe_for_cwd = init.probe.clone();
+            let cwd_token = init.cwd_token.clone();
             terminal.connect_current_directory_uri_notify(move |_| {
                 if let Some(uri) = term_for_cwd.current_directory_uri() {
-                    let file = gio::File::for_uri(uri.as_str());
-                    if let Some(path) = file
-                        .path()
-                        .map(|p| p.to_string_lossy().to_string())
-                        .filter(|s| !s.is_empty())
-                    {
-                        let _ = sender.output(VteOutput::CwdChanged(path));
+                    if let Ok((path, host)) = gtk::glib::filename_from_uri(uri.as_str()) {
+                        let path = path.to_string_lossy().to_string();
+                        if path.is_empty() {
+                            return;
+                        }
+                        let authority =
+                            crate::terminal::classify_cwd_authority(host.as_deref(), &cwd_token);
+                        let foreground = crate::process::foreground_uses_external_cwd(
+                            probe_for_cwd.pty_fd.get(),
+                            probe_for_cwd.shell_pid.get(),
+                        );
+                        let external = crate::terminal::resolve_cwd_external(authority, foreground);
+                        let _ = sender.output(VteOutput::CwdChanged { path, external });
                     }
                 }
             });
@@ -490,8 +555,10 @@ impl Component for VteTerminal {
             &init.shell_argv,
             init.working_directory.as_deref(),
             init.session_id.as_deref(),
-            init.initial_commands.as_deref(),
+            &init.cwd_token,
+            init.initial_commands.as_slice(),
             init.probe.clone(),
+            sender.clone(),
         );
 
         // Grab focus once the widget is realized.
@@ -609,5 +676,67 @@ impl Component for VteTerminal {
             VteInput::CrossBlockSearch => {}
             VteInput::AskAiAboutSelectedBlock => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{launch_failure_message, InitialCommands};
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn configured_commands_are_split_only_at_the_boundary() {
+        let commands = InitialCommands::from_config(Some("cd /tmp, printf ready"));
+        assert_eq!(
+            commands.as_slice(),
+            strings(&["cd /tmp", "printf ready"]).as_slice()
+        );
+    }
+
+    #[test]
+    fn restored_argv_is_always_one_command_even_when_arguments_contain_commas() {
+        let argv = strings(&["ssh", "host", "printf '%s, %s' one two"]);
+        let commands = InitialCommands::from_restored_argv(Some(&argv), &strings(&["bash"]));
+        assert_eq!(commands.as_slice().len(), 1);
+        assert_eq!(
+            commands.as_slice()[0],
+            "'ssh' 'host' 'printf '\"'\"'%s, %s'\"'\"' one two'"
+        );
+    }
+
+    #[test]
+    fn unsafe_restored_argv_is_not_replayed() {
+        let argv = strings(&["ssh", "host", "echo first\necho second"]);
+        assert!(
+            InitialCommands::from_restored_argv(Some(&argv), &strings(&["bash"]))
+                .as_slice()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn restored_argv_uses_powershell_call_syntax() {
+        let argv = strings(&["ssh", "host", "printf 'safe'; one argument"]);
+        let commands =
+            InitialCommands::from_restored_argv(Some(&argv), &strings(&["/usr/bin/pwsh"]));
+        assert_eq!(
+            commands.as_slice(),
+            strings(&["& 'ssh' 'host' 'printf ''safe''; one argument'"]).as_slice()
+        );
+    }
+
+    #[test]
+    fn launch_failure_message_includes_the_underlying_io_error_and_recovery_hint() {
+        let error = std::io::Error::new(std::io::ErrorKind::NotFound, "flatpak-spawn missing");
+        let message = launch_failure_message(&error);
+
+        assert_eq!(
+            message,
+            "Terminal failed to start: flatpak-spawn missing. \
+             Check the shell, remote command, or host bridge."
+        );
     }
 }

@@ -828,6 +828,12 @@ fn check_absolute_path(report: &mut ConfigValidationReport, table: &toml::Table,
     let Some(value) = table.get(key).and_then(toml::Value::as_str) else {
         return;
     };
+    if value.chars().any(char::is_control) {
+        report.error(key, "must not contain control characters");
+    }
+    if value.chars().count() > 16 * 1_024 {
+        report.error(key, "must not exceed 16384 characters");
+    }
     if !value.trim().is_empty() && !Path::new(value).is_absolute() {
         report.error(key, "must be an absolute path; '~' is not expanded");
     }
@@ -889,6 +895,24 @@ fn validate_keybindings(report: &mut ConfigValidationReport, table: &toml::Table
     }
 }
 
+fn validate_remote_text(
+    report: &mut ConfigValidationReport,
+    path: String,
+    value: &str,
+    allow_whitespace: bool,
+    max_chars: usize,
+) {
+    if value.chars().any(char::is_control) {
+        report.error(path.clone(), "must not contain control characters");
+    }
+    if !allow_whitespace && value.chars().any(char::is_whitespace) {
+        report.error(path.clone(), "must not contain whitespace");
+    }
+    if value.chars().count() > max_chars {
+        report.error(path, format!("must not exceed {max_chars} characters"));
+    }
+}
+
 fn validate_remote_hosts(report: &mut ConfigValidationReport, table: &toml::Table) {
     let Some(hosts) = table.get("remote_hosts").and_then(toml::Value::as_array) else {
         return;
@@ -921,13 +945,33 @@ fn validate_remote_hosts(report: &mut ConfigValidationReport, table: &toml::Tabl
             }
         }
         match host.get("host").and_then(toml::Value::as_str) {
-            Some(value) if !value.trim().is_empty() => {}
+            Some(value) if !value.trim().is_empty() => {
+                validate_remote_text(report, format!("{prefix}.host"), value, false, 1_024);
+            }
             Some(_) => report.error(format!("{prefix}.host"), "must not be empty"),
             None => report.error(format!("{prefix}.host"), "is required and must be a string"),
         }
         for key in ["name", "user", "remote_shell", "session"] {
             if let Some(value) = host.get(key) {
-                if !value.is_str() {
+                if let Some(value) = value.as_str() {
+                    if value.trim().is_empty() {
+                        report.error(format!("{prefix}.{key}"), "must not be empty");
+                    } else {
+                        let (allow_whitespace, max_chars) = match key {
+                            "name" => (true, 256),
+                            "remote_shell" => (true, 16 * 1_024),
+                            "session" => (true, 1_024),
+                            _ => (false, 256),
+                        };
+                        validate_remote_text(
+                            report,
+                            format!("{prefix}.{key}"),
+                            value,
+                            allow_whitespace,
+                            max_chars,
+                        );
+                    }
+                } else {
                     report.error(format!("{prefix}.{key}"), "must be a string");
                 }
             }
@@ -941,18 +985,41 @@ fn validate_remote_hosts(report: &mut ConfigValidationReport, table: &toml::Tabl
         }
         if let Some(value) = host.get("ssh_args") {
             match value.as_array() {
-                Some(arguments) if arguments.iter().all(toml::Value::is_str) => {}
+                Some(arguments) if arguments.iter().all(toml::Value::is_str) => {
+                    if arguments.len() > 128 {
+                        report.error(
+                            format!("{prefix}.ssh_args"),
+                            "must not contain more than 128 arguments",
+                        );
+                    }
+                    for (argument_index, argument) in arguments.iter().enumerate() {
+                        validate_remote_text(
+                            report,
+                            format!("{prefix}.ssh_args[{argument_index}]"),
+                            argument.as_str().unwrap_or_default(),
+                            true,
+                            16 * 1_024,
+                        );
+                    }
+                }
                 Some(_) => report.error(format!("{prefix}.ssh_args"), "must contain only strings"),
                 None => report.error(format!("{prefix}.ssh_args"), "must be an array"),
             }
         }
-        if let Some(name) = host.get("name").and_then(toml::Value::as_str) {
-            if name.trim().is_empty() {
-                report.error(format!("{prefix}.name"), "must not be empty");
-            } else if !names.insert(name.to_string()) {
-                report.warning(
-                    format!("{prefix}.name"),
-                    "duplicates an earlier remote name",
+        let effective_name = host
+            .get("name")
+            .and_then(toml::Value::as_str)
+            .map(|name| ("name", name))
+            .or_else(|| {
+                host.get("host")
+                    .and_then(toml::Value::as_str)
+                    .map(|name| ("host", name))
+            });
+        if let Some((key, name)) = effective_name {
+            if !name.trim().is_empty() && !names.insert(name.to_string()) {
+                report.error(
+                    format!("{prefix}.{key}"),
+                    "must be unique because session restore uses it as the profile identifier",
                 );
             }
         }
@@ -1454,6 +1521,75 @@ mod tests {
         assert!(!json.contains("secret-value"));
         assert!(!json.contains("also-secret"));
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn validation_rejects_unsafe_remote_fields_without_echoing_them() {
+        let directory = temporary_directory("remote-validation");
+        let path = directory.join("config.toml");
+        fs::write(
+            &path,
+            concat!(
+                "[[remote_hosts]]\n",
+                "name = 'staging'\n",
+                "host = 'bad host'\n",
+                "user = 'bad user'\n",
+                "remote_shell = ''\n",
+                "session = \"prod\\tsecret\"\n",
+                "ssh_args = [\"-p\", \"22\\tProxyCommand=secret\"]\n",
+            ),
+        )
+        .unwrap();
+        let report = validate_path(&path);
+        let json = serde_json::to_string(&report).unwrap();
+        for key in [
+            "remote_hosts[0].host",
+            "remote_hosts[0].user",
+            "remote_hosts[0].remote_shell",
+            "remote_hosts[0].session",
+            "remote_hosts[0].ssh_args[1]",
+        ] {
+            assert!(json.contains(key), "missing validation issue for {key}");
+        }
+        assert!(!json.contains("ProxyCommand"));
+        assert!(!json.contains("secret"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn validation_rejects_duplicate_remote_profile_names() {
+        let table = concat!(
+            "[[remote_hosts]]\n",
+            "name = 'shared-name'\n",
+            "host = 'first.example'\n",
+            "\n",
+            "[[remote_hosts]]\n",
+            "name = 'shared-name'\n",
+            "host = 'second.example'\n",
+        )
+        .parse::<toml::Table>()
+        .unwrap();
+
+        let report = validate_table(Path::new("config.toml"), &table);
+        assert_eq!(report.errors(), 1);
+        assert!(report.issues.iter().any(|issue| {
+            issue.key == "remote_hosts[1].name" && issue.message.contains("profile identifier")
+        }));
+
+        let implicit = concat!(
+            "[[remote_hosts]]\n",
+            "host = 'same.example'\n",
+            "\n",
+            "[[remote_hosts]]\n",
+            "host = 'same.example'\n",
+        )
+        .parse::<toml::Table>()
+        .unwrap();
+        let report = validate_table(Path::new("config.toml"), &implicit);
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| issue.key == "remote_hosts[1].host"));
     }
 
     #[test]
