@@ -32,6 +32,22 @@ installer prefers [Nix with flakes enabled](https://nixos.org/download/) and
 falls back to Cargo when the GTK 4, libadwaita, VTE, and native build
 dependencies are already available through the system toolchain.
 
+The GTK 4 stack must be recent (glib >= 2.80, pango >= 1.52, gtk4 >= 4.14,
+libadwaita >= 1.5, and the GTK 4 build of VTE, `vte-2.91-gtk4` >= 0.76). Stable
+distributions such as Ubuntu 22.04 ship these too old or omit `vte-2.91-gtk4`
+entirely, so `cargo install --path .` fails in the `*-sys` build scripts. Run
+`./scripts/bootstrap_deps.sh` to provision them:
+
+```bash
+./scripts/bootstrap_deps.sh            # set up the recommended toolchain (Nix)
+./scripts/bootstrap_deps.sh --check    # report what is missing, install nothing
+./scripts/bootstrap_deps.sh --backend system --install   # use distro packages
+```
+
+It defaults to a Nix-based toolchain (which pins matching library versions
+without touching system packages) and can install the distro `-dev` packages
+instead with `--backend system`.
+
 Runtime integrations are optional:
 
 - `notify-send` for long-command desktop notifications
