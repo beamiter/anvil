@@ -783,6 +783,7 @@ dependencies = [
  "env_logger",
  "fuzzy-matcher",
  "io-lifetimes 3.0.1",
+ "jterm_core",
  "log",
  "memchr",
  "nix",
@@ -800,6 +801,14 @@ dependencies = [
  "ureq",
  "vte4",
  "zstd",
+]
+
+[[package]]
+name = "jterm_core"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "memchr",
 ]
 
 [[package]]

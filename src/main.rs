@@ -16,17 +16,20 @@ mod diagnostics;
 mod dialogs;
 mod file_tree;
 mod file_tree_ops;
-mod git_meta;
-mod host;
+use jterm_core::{git_meta, notify, parser, review_input};
+
+mod host {
+    pub use jterm_core::host::*;
+
+    pub const APP_ID: &str = "io.github.beamiter.jterm1";
+}
+
 mod keybindings;
 mod navigation_ui;
 mod notebook;
-mod notify;
 mod palette;
-mod parser;
 mod process;
 mod pty;
-mod review_input;
 mod review_input_ops;
 mod search;
 mod session;
@@ -1154,6 +1157,10 @@ impl SimpleComponent for AppModel {
 }
 
 fn main() {
+    jterm_core::identity::init(jterm_core::identity::AppIdentity {
+        app_name: "jterm1",
+        app_id: host::APP_ID,
+    });
     let parsed = match cli::parse(std::env::args_os().skip(1)) {
         Ok(parsed) => parsed,
         Err(error) => {

@@ -1047,6 +1047,7 @@ impl ReaderCtx {
             block_finished_cbs,
             ask_ai_about_block_cbs,
         } = self;
+        let active_alt_screen_mode_rc: Rc<Cell<Option<u32>>> = Rc::new(Cell::new(None));
         pty.start_reader(
             move |data: Vec<u8>| {
                 let mut events = event_buf.borrow_mut();
@@ -1952,7 +1953,9 @@ impl ReaderCtx {
                             // crashed or exited without rmcup, force the UI back
                             // to the block list so the next prompt is usable.
                             if state == BlockState::AltScreen {
-                                active_vte.feed(b"\x1b[?1049l");
+                                let mode = active_alt_screen_mode_rc.replace(None).unwrap_or(1049);
+                                let leave = format!("\x1b[?{mode}l");
+                                active_vte.feed(leave.as_bytes());
                                 exit_fullscreen(
                                     &finished_blocks_for_cb,
                                     &visible_indices_rc,
@@ -1966,7 +1969,7 @@ impl ReaderCtx {
                             scroll_debouncer.mark_dirty(&block_scroll_rc);
                         }
 
-                        ParserEvent::AltScreenEnter => {
+                        ParserEvent::AltScreenEnter(mode) => {
                             let from_state = bstate_rc.get();
                             if from_state != BlockState::CollectingOutput
                                 && from_state != BlockState::AwaitingCommand
@@ -1975,6 +1978,7 @@ impl ReaderCtx {
                             }
                             prev_state_rc.set(from_state);
                             bstate_rc.set(BlockState::AltScreen);
+                            active_alt_screen_mode_rc.set(Some(*mode));
                             // Hand the viewport to the alt-screen app: hide finished
                             // blocks so the live VTE fills the scroll area.
                             enter_fullscreen(
@@ -1990,17 +1994,20 @@ impl ReaderCtx {
                                 &block_scroll_rc,
                                 &pty_for_init,
                             );
-                            active_vte.feed(b"\x1b[?1049h");
+                            let enter = format!("\x1b[?{mode}h");
+                            active_vte.feed(enter.as_bytes());
                         }
 
-                        ParserEvent::AltScreenLeave => {
+                        ParserEvent::AltScreenLeave(mode) => {
                             if bstate_rc.get() != BlockState::AltScreen {
                                 continue;
                             }
                             // Warp parity: alt-screen content is ephemeral and is
                             // NOT merged into the block. The active block keeps
                             // just the command name + exit code.
-                            active_vte.feed(b"\x1b[?1049l");
+                            active_alt_screen_mode_rc.set(None);
+                            let leave = format!("\x1b[?{mode}l");
+                            active_vte.feed(leave.as_bytes());
                             exit_fullscreen(
                                 &finished_blocks_for_cb,
                                 &visible_indices_rc,
@@ -4736,8 +4743,8 @@ mod tests {
                 ParserEvent::PromptEnd => "PE".to_string(),
                 ParserEvent::CommandStart => "CS".to_string(),
                 ParserEvent::CommandEnd(c) => format!("CE({})", c),
-                ParserEvent::AltScreenEnter => "ALT+".to_string(),
-                ParserEvent::AltScreenLeave => "ALT-".to_string(),
+                ParserEvent::AltScreenEnter(mode) => format!("ALT+({mode})"),
+                ParserEvent::AltScreenLeave(mode) => format!("ALT-({mode})"),
                 _ => "?".to_string(),
             })
             .collect()
