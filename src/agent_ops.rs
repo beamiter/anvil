@@ -25,7 +25,7 @@ impl AppModel {
             return;
         }
         let max_turns = cfg.agent_max_turns;
-        let client = match ai::AiClient::from_config(&cfg) {
+        let client = match ai::client_from_config(&cfg) {
             Ok(client) => client,
             Err(error) => {
                 log::warn!("agent: {error}");
@@ -54,14 +54,31 @@ impl AppModel {
         if let Some(mut previous) = self.active_agent.borrow_mut().take() {
             previous.cancel();
         }
-        *self.active_agent.borrow_mut() =
-            Some(agent::AgentSession::new(tab_id, pane_id, max_turns));
+        // A snapshot persisted by the previous run is restored one-shot and
+        // rebound to the pane the user reopened the Agent on.
+        let snapshot_file = Self::agent_snapshot_path();
+        let restored = jterm_core::agent::read_snapshot_file(&snapshot_file).and_then(|snapshot| {
+            jterm_core::agent::remove_snapshot_file(&snapshot_file);
+            jterm_core::agent::AgentSession::restore(snapshot).ok()
+        });
+        let session = match restored {
+            Some(inner) => {
+                self.show_toast("Restored the previous agent session.");
+                agent::AgentSession::from_restored(inner, tab_id, pane_id)
+            }
+            None => agent::AgentSession::new(tab_id, pane_id, max_turns),
+        };
+        *self.active_agent.borrow_mut() = Some(session);
 
         if let Some(view) = self.agent_panel_view() {
             self.agent_panel.emit(agent::AgentPanelMsg::Open {
                 provider_name: client.display_name(),
                 view,
             });
+        }
+        // A restored session may have died mid-request; resume it.
+        if self.agent_is_awaiting_model() {
+            self.agent_kick_llm(_sender);
         }
     }
 
@@ -74,12 +91,84 @@ impl AppModel {
             max_turns: session.max_turns(),
             state: session.state(),
             loading: session.in_flight.is_some(),
+            attached_context: session
+                .last_manual_completed
+                .as_ref()
+                .map(|context| context.cmd.clone()),
         })
     }
 
     pub(crate) fn refresh_agent_panel(&self) {
         if let Some(view) = self.agent_panel_view() {
             self.agent_panel.emit(agent::AgentPanelMsg::Render(view));
+        }
+    }
+
+    /// Reopen a completed task for a follow-up question in the same
+    /// transcript. The session returns to Ready; the user types the next turn.
+    pub(crate) fn agent_continue(&self) {
+        let result = {
+            let mut guard = self.active_agent.borrow_mut();
+            let Some(session) = guard.as_mut() else {
+                return;
+            };
+            session.continue_after_completion()
+        };
+        if let Err(error) = result {
+            self.report_agent_error("continue", &error);
+        }
+        self.refresh_agent_panel();
+    }
+
+    /// Start a fresh task in the same pane binding, dropping the finished
+    /// transcript and restoring the configured turn budget.
+    pub(crate) fn agent_new_task(&self) {
+        let result = {
+            let mut guard = self.active_agent.borrow_mut();
+            let Some(session) = guard.as_mut() else {
+                return;
+            };
+            session.start_new_task()
+        };
+        if let Err(error) = result {
+            self.report_agent_error("start a new task", &error);
+        }
+        self.refresh_agent_panel();
+    }
+
+    /// Detach the remembered manual command from future model requests.
+    pub(crate) fn agent_clear_context(&self) {
+        {
+            let mut guard = self.active_agent.borrow_mut();
+            let Some(session) = guard.as_mut() else {
+                return;
+            };
+            session.last_manual_completed = None;
+        }
+        self.refresh_agent_panel();
+    }
+
+    fn agent_snapshot_path() -> std::path::PathBuf {
+        let mut path = crate::config::config_file_path();
+        path.set_file_name("agent_session.json");
+        path
+    }
+
+    /// Persist the live Agent session (if any) for the next run. Called on
+    /// quit, before the session is dropped.
+    pub(crate) fn persist_agent_session(&self) {
+        let path = Self::agent_snapshot_path();
+        let snapshot = {
+            let guard = self.active_agent.borrow();
+            guard.as_ref().and_then(|session| session.snapshot())
+        };
+        match snapshot {
+            Some(snapshot) => {
+                if let Err(error) = jterm_core::agent::write_snapshot_file(&path, &snapshot) {
+                    log::warn!("agent: could not persist session: {error}");
+                }
+            }
+            None => jterm_core::agent::remove_snapshot_file(&path),
         }
     }
 
@@ -204,8 +293,8 @@ impl AppModel {
         sender: &ComponentSender<AppModel>,
     ) {
         let proposal_id = {
-            let guard = self.active_agent.borrow();
-            let Some(session) = guard.as_ref() else {
+            let mut guard = self.active_agent.borrow_mut();
+            let Some(session) = guard.as_mut() else {
                 return;
             };
             if session.bound_tab != tab_id || session.bound_pane != pane_id {
@@ -213,9 +302,22 @@ impl AppModel {
             }
             match session.awaiting_command.as_ref() {
                 Some((proposal_id, expected)) if expected.trim() == command.trim() => *proposal_id,
-                // A manual command completed while the Agent was waiting.
-                // Never attach its output to the approved proposal.
-                _ => return,
+                // A manual command completed in the bound pane. Never attach
+                // its output to the approved proposal — remember it instead
+                // as untrusted block context for the next model request.
+                _ => {
+                    let command = command.trim();
+                    if !command.is_empty() {
+                        session.last_manual_completed = Some(ai::BlockContext {
+                            cmd: command.to_string(),
+                            output: output.clone(),
+                            cwd: None,
+                            exit_code,
+                            truncated: output.contains("elided"),
+                        });
+                    }
+                    return;
+                }
             }
         };
 
@@ -264,7 +366,7 @@ impl AppModel {
     }
 
     pub(crate) fn agent_kick_llm(&self, sender: &ComponentSender<AppModel>) {
-        let client = match ai::AiClient::from_config(&self.config.borrow()) {
+        let client = match ai::client_from_config(&self.config.borrow()) {
             Ok(client) => client,
             Err(error) => {
                 let result = {
@@ -311,11 +413,20 @@ impl AppModel {
                 .first()
                 .map(String::as_str)
                 .unwrap_or("/bin/sh");
+            // Cached repo probe with a bounded UI wait; None outside a repo.
+            let git = jterm_core::git_meta::read(std::path::Path::new(cwd));
             (
                 session.bound_tab,
                 session.bound_pane,
-                ai::build_agent_system_prompt(cwd, shell, std::env::consts::OS),
-                session.build_user_prompt(),
+                ai::build_agent_system_prompt(),
+                ai::agent_user_prompt(
+                    &session.build_user_prompt(),
+                    cwd,
+                    shell,
+                    std::env::consts::OS,
+                    git.as_ref(),
+                    session.last_manual_completed.as_ref(),
+                ),
                 session.cancellation_token(),
             )
         };

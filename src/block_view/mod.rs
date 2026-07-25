@@ -1452,11 +1452,14 @@ impl ReaderCtx {
                                             });
                                             let data = block_data_for_ai.borrow();
                                             let record = data.iter().find(|block| block.id == block_id);
+                                            let truncated = output.contains("lines elided")
+                                                || output.contains("bytes elided");
                                             let context = crate::ai::BlockContext {
                                                 cmd: finished_for_ai.cmd_text.clone(),
                                                 output,
                                                 cwd: record.and_then(|block| block.cwd.clone()),
                                                 exit_code: record.map(|block| block.exit_code).unwrap_or(0),
+                                                truncated,
                                             };
                                             for callback in callbacks_for_ai.borrow().iter() {
                                                 callback(context.clone());
@@ -4651,11 +4654,13 @@ impl TermView {
 
         let output =
             block.with_stripped_output(|s| crate::ai::truncate_for_context(s, lines_per_side));
+        let truncated = output.contains("lines elided") || output.contains("bytes elided");
         Some(crate::ai::BlockContext {
             cmd: block.cmd_text.clone(),
             output,
             cwd: bd.and_then(|b| b.cwd.clone()),
             exit_code: bd.map(|b| b.exit_code).unwrap_or(0),
+            truncated,
         })
     }
 }

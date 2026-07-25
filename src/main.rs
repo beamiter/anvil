@@ -595,6 +595,9 @@ impl SimpleComponent for AppModel {
                     AppMsg::AgentEditRequested(index, command)
                 }
                 agent::AgentPanelOutput::Reject(index) => AppMsg::AgentReject(index),
+                agent::AgentPanelOutput::Continue => AppMsg::AgentContinue,
+                agent::AgentPanelOutput::NewTask => AppMsg::AgentNewTask,
+                agent::AgentPanelOutput::ClearContext => AppMsg::AgentClearContext,
                 agent::AgentPanelOutput::Closed => AppMsg::AgentClose,
             });
         let agent_edit = agent::AgentEditModel::builder()
@@ -1096,6 +1099,9 @@ impl SimpleComponent for AppModel {
             }
             AppMsg::OpenAgent => self.open_agent_panel(&sender),
             AppMsg::AgentSend(text) => self.agent_send(text, &sender),
+            AppMsg::AgentContinue => self.agent_continue(),
+            AppMsg::AgentNewTask => self.agent_new_task(),
+            AppMsg::AgentClearContext => self.agent_clear_context(),
             AppMsg::AgentApprove(idx) => self.agent_approve(idx, None, &sender),
             AppMsg::AgentEditAndApprove(idx, new_cmd) => {
                 self.agent_approve(idx, Some(new_cmd), &sender);

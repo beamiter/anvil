@@ -317,6 +317,9 @@ pub struct Config {
     pub(crate) ai_max_tokens: u32,
     /// Redact secret-looking values before sending context to an AI provider.
     pub(crate) ai_redact_secrets: bool,
+    /// Optional path to a 0600 file holding the provider API key, so the key
+    /// never has to live in the process environment or this config file.
+    pub(crate) ai_api_key_file: Option<String>,
     pub(crate) notify_long_blocks: bool,
     pub(crate) notify_long_block_threshold_ms: u64,
     pub(crate) show_repo_strip: bool,
@@ -333,7 +336,7 @@ impl Config {
         *self = Self::safe_defaults();
     }
 
-    fn safe_defaults() -> Self {
+    pub(crate) fn safe_defaults() -> Self {
         let themes = builtin_themes();
         let theme = &themes[0];
         Self {
@@ -385,6 +388,7 @@ impl Config {
             ai_model: "claude-sonnet-4-6".to_string(),
             ai_max_tokens: 1_024,
             ai_redact_secrets: true,
+            ai_api_key_file: None,
             notify_long_blocks: false,
             notify_long_block_threshold_ms: 10_000,
             show_repo_strip: false,
@@ -683,6 +687,7 @@ struct FileConfig {
     ai_model: Option<String>,
     ai_max_tokens: Option<u32>,
     ai_redact_secrets: Option<bool>,
+    ai_api_key_file: Option<String>,
     mouse_reporting_enabled: Option<bool>,
     focus_reporting_enabled: Option<bool>,
     scroll_reporting_enabled: Option<bool>,
@@ -878,6 +883,10 @@ fn load_file_config() -> FileConfig {
             .and_then(|v| v.as_integer())
             .and_then(|v| u32::try_from(v).ok()),
         ai_redact_secrets: table.get("ai_redact_secrets").and_then(|v| v.as_bool()),
+        ai_api_key_file: table
+            .get("ai_api_key_file")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
         notify_long_blocks: table.get("notify_long_blocks").and_then(|v| v.as_bool()),
         notify_long_block_threshold_ms: table
             .get("notify_long_block_threshold_ms")
@@ -1255,6 +1264,9 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         ai_redact_secrets: env_bool("JTERM1_AI_REDACT_SECRETS")
             .or(fc.ai_redact_secrets)
             .unwrap_or(true),
+        ai_api_key_file: env_string("JTERM1_AI_API_KEY_FILE")
+            .or(fc.ai_api_key_file)
+            .filter(|value| !value.trim().is_empty()),
         notify_long_blocks: fc.notify_long_blocks.unwrap_or(true),
         notify_long_block_threshold_ms: fc.notify_long_block_threshold_ms.unwrap_or(10_000),
         show_repo_strip: fc.show_repo_strip.unwrap_or(true),

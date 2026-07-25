@@ -361,7 +361,7 @@ fn collect() -> DiagnosticReport {
     if !config.ai_enabled {
         report.push("AI", CheckStatus::Warning, "disabled by configuration");
     } else {
-        match crate::ai::AiClient::from_config(&config) {
+        match crate::ai::client_from_config(&config) {
             Ok(client) => report.push(
                 "AI",
                 CheckStatus::Ok,

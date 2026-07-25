@@ -600,6 +600,7 @@ impl AppModel {
             }
         }
         self.persist_session();
+        self.persist_agent_session();
         if let Err(error) = command_history::flush_pending(std::time::Duration::from_secs(3)) {
             log::warn!("flush command history on exit: {error}");
         }

@@ -46,7 +46,7 @@ impl AppModel {
             self.show_toast("AI is unavailable in safe mode.");
             return;
         }
-        let client = match ai::AiClient::from_config(&self.config.borrow()) {
+        let client = match ai::client_from_config(&self.config.borrow()) {
             Ok(client) => client,
             Err(error) => {
                 log::warn!("AI palette: {error}");
@@ -170,7 +170,7 @@ impl AppModel {
             self.show_toast("AI is unavailable in safe mode.");
             return;
         }
-        let client = match ai::AiClient::from_config(&self.config.borrow()) {
+        let client = match ai::client_from_config(&self.config.borrow()) {
             Ok(client) => client,
             Err(error) => {
                 self.show_toast(format!("AI provider is unavailable: {error}"));

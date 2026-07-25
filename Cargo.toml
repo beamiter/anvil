@@ -28,7 +28,6 @@ unicode-width = "0.2"
 unicode-bidi = "0.3"
 unicode-bidi-mirroring = "0.4"
 io-lifetimes = "3"
-ureq = { version = "3", default-features = false, features = ["rustls"] }
 serde_yaml = "0.9"
 env_logger = "0.11"
 
