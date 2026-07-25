@@ -270,6 +270,18 @@ impl AppModel {
             Action::JumpToNextPinned => {
                 self.emit_block_action(VteInput::JumpToNextPinned, "Bookmarked-block navigation");
             }
+            Action::JumpToPrevFailed => {
+                self.emit_block_action(VteInput::JumpToPrevFailed, "Failed-block navigation");
+            }
+            Action::JumpToNextFailed => {
+                self.emit_block_action(VteInput::JumpToNextFailed, "Failed-block navigation");
+            }
+            Action::ExportSessionMarkdown => {
+                self.emit_block_action(VteInput::ExportSessionMarkdown, "Session export");
+            }
+            Action::ExportSessionJson => {
+                self.emit_block_action(VteInput::ExportSessionJson, "Session export");
+            }
             Action::ClearBlockFilter => {
                 self.emit_block_action(VteInput::ClearBlockFilter, "Block navigation");
             }
@@ -278,6 +290,9 @@ impl AppModel {
             }
             Action::ClearBlocks => {
                 self.emit_block_action(VteInput::ClearBlocks, "Clearing finished blocks");
+            }
+            Action::UndoClearBlocks => {
+                self.emit_block_action(VteInput::UndoClearBlocks, "Restoring cleared blocks");
             }
             Action::ReinputSelectedCommands => {
                 self.emit_block_action(

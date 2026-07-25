@@ -24,6 +24,14 @@ fn command_finished_output(exit_code: i32) -> VteOutput {
     VteOutput::CommandFinished(exit_code == 0)
 }
 
+/// Toast text for a session-export attempt.
+fn export_notice(result: std::io::Result<std::path::PathBuf>) -> String {
+    match result {
+        Ok(path) => format!("Session exported to {}", path.display()),
+        Err(err) => format!("Session export failed: {err}"),
+    }
+}
+
 pub struct BlockTerminal {
     view: Option<Rc<TermView>>,
     terminal_done: Rc<Cell<bool>>,
@@ -290,10 +298,42 @@ impl Component for BlockTerminal {
             VteInput::FilterPinnedBlocks => view.apply_pinned_filter(),
             VteInput::ClearBlockFilter => view.clear_block_filter(),
             VteInput::SelectAllBlocks => view.select_all_blocks(),
-            VteInput::ClearBlocks => view.clear_blocks(),
+            VteInput::ClearBlocks => {
+                let cleared = view.clear_blocks();
+                if cleared > 0 {
+                    let plural = if cleared == 1 { "" } else { "s" };
+                    let _ = sender.output(VteOutput::Notice(format!(
+                        "Cleared {cleared} block{plural} — \"Undo clear blocks\" restores them."
+                    )));
+                }
+            }
+            VteInput::UndoClearBlocks => {
+                let restored = view.undo_clear_blocks();
+                let message = if restored > 0 {
+                    let plural = if restored == 1 { "" } else { "s" };
+                    format!("Restored {restored} cleared block{plural}.")
+                } else {
+                    "No cleared blocks to restore.".to_string()
+                };
+                let _ = sender.output(VteOutput::Notice(message));
+            }
             VteInput::ReinputSelectedCommands => view.reinput_selected_commands(),
             VteInput::JumpToPrevPinned => view.jump_to_pinned(-1),
             VteInput::JumpToNextPinned => view.jump_to_pinned(1),
+            VteInput::JumpToPrevFailed => view.jump_to_failed(-1),
+            VteInput::JumpToNextFailed => view.jump_to_failed(1),
+            VteInput::ExportSessionMarkdown => {
+                let message = export_notice(
+                    view.export_session_to_file(crate::block_view::SessionExportFormat::Markdown),
+                );
+                let _ = sender.output(VteOutput::Notice(message));
+            }
+            VteInput::ExportSessionJson => {
+                let message = export_notice(
+                    view.export_session_to_file(crate::block_view::SessionExportFormat::Json),
+                );
+                let _ = sender.output(VteOutput::Notice(message));
+            }
             VteInput::SearchSet(query, use_regex) => {
                 let _ = view.find_in_blocks(&query, use_regex);
             }

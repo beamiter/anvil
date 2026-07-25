@@ -101,6 +101,39 @@
 
 若配置了 `block_history_path`，关闭并重新打开 jterm1 后，被清除的块不应恢复。
 
+### BM-07b 清空撤销（Undo clear blocks）
+
+1. 创建至少三个完成块（含一个失败块），按 `Ctrl+Shift+K` 清空。
+2. 观察 toast 提示 `Cleared N blocks — "Undo clear blocks" restores them.`
+3. 执行 `printf 'post-clear\n'` 生成一个新块。
+4. 从命令面板执行 `Undo clear blocks`。
+
+- [ ] 被清除的块全部恢复，且位于 `post-clear` 新块之上，顺序与清除前一致。
+- [ ] toast 显示 `Restored N cleared blocks.`
+- [ ] 恢复后的块可以选中、复制、回填、书签，失败块仍显示失败状态。
+- [ ] 再次执行 `Undo clear blocks`，toast 显示 `No cleared blocks to restore.`,块列表不变。
+- [ ] 在空面板上按 `Ctrl+Shift+K` 不会破坏已有的撤销快照（清空→立即再清空→撤销仍恢复原有块）。
+- [ ] 配置了 `block_history_path` 时，撤销后重启,恢复的块仍然存在。
+- [ ] 在 alt-screen 程序（如 `less`）内执行 `Undo clear blocks` 不产生效果也不崩溃,退出后再执行可正常恢复。
+
+### BM-07c 失败块跳转
+
+1. 依次制造:成功块、失败块 A、成功块、失败块 B、成功块。
+2. 从命令面板执行 `Jump to next failed block` / `Jump to previous failed block`（或绑定 `jump_to_prev_failed` / `jump_to_next_failed` 后用快捷键）。
+
+- [ ] 无选中时,next 跳到最旧失败块,prev 跳到最新失败块。
+- [ ] 已选中失败块 A 时,next 跳到失败块 B,prev 在越过最旧失败块后回绕到最新失败块。
+- [ ] 目标块被选中并滚动进入视口,长会话（250+ 块）中依然可靠。
+- [ ] 无失败块时执行动作无副作用。
+
+### BM-07d 会话导出与 Markdown 复制
+
+- [ ] 从命令面板执行 `Export session as Markdown file`,toast 显示 `Session exported to …/jterm1/exports/session-<时间戳>.md`。
+- [ ] 文件包含所有块的命令、输出、退出码,权限为 `0600`。
+- [ ] `Export session as JSON file` 同理生成 `.json`,内容为块数组。
+- [ ] 同一秒内连续导出两次,第二个文件带 `-1` 后缀,互不覆盖。
+- [ ] 多选块后右键选择 `Copy Blocks as Markdown`,剪贴板为按终端顺序拼接的 Markdown,含 `**Exit Code:**` 元数据;单块时菜单项为 `Copy Block as Markdown`。
+
 ### BM-08 运行中清空与 Enter 透传
 
 先执行：

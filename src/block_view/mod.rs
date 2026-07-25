@@ -31,6 +31,7 @@ pub(crate) use ansi::*;
 pub(crate) use blocks::*;
 pub(crate) use cross_selection::*;
 pub(crate) use css::*;
+pub(crate) use export::SessionExportFormat;
 pub(crate) use find::*;
 #[allow(unused_imports)]
 pub(crate) use palette::*;
@@ -143,6 +144,28 @@ where
         .map(|(_, command)| command)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Markdown for the block-selection right-click copy: every selected block in
+/// terminal order, falling back to the right-clicked block when the selection
+/// set does not cover it (e.g. no selection registered yet).
+fn selected_blocks_markdown<'a, I>(blocks: I, selected: &HashSet<u64>, clicked_id: u64) -> String
+where
+    I: IntoIterator<Item = &'a BlockData>,
+{
+    let mut parts: Vec<String> = Vec::new();
+    let mut clicked_part: Option<String> = None;
+    for block in blocks {
+        if selected.contains(&block.id) {
+            parts.push(block.to_markdown());
+        } else if block.id == clicked_id {
+            clicked_part = Some(block.to_markdown());
+        }
+    }
+    if parts.is_empty() {
+        parts.extend(clicked_part);
+    }
+    parts.join("---\n\n")
 }
 
 fn recall_selected_commands_at_prompt(
@@ -407,6 +430,27 @@ fn selected_id_range(ids: &[u64], anchor: u64, target: u64) -> Vec<u64> {
         (target_index, anchor_index)
     };
     ids[start..=end].to_vec()
+}
+
+/// Pick the next index from an ascending `marked` list relative to the current
+/// position: strictly before/after `cur` in the travel direction, wrapping to
+/// the far end when nothing remains in that direction. `None` only when
+/// `marked` is empty.
+fn step_marked_indices(marked: &[usize], cur: Option<usize>, direction: i32) -> Option<usize> {
+    if direction < 0 {
+        marked
+            .iter()
+            .rev()
+            .find(|&&idx| cur.map(|c| idx < c).unwrap_or(true))
+            .copied()
+            .or_else(|| marked.last().copied())
+    } else {
+        marked
+            .iter()
+            .find(|&&idx| cur.map(|c| idx > c).unwrap_or(true))
+            .copied()
+            .or_else(|| marked.first().copied())
+    }
 }
 
 fn select_finished_block_range(
@@ -747,6 +791,10 @@ pub struct TermView {
     selected_block_id: Rc<Cell<Option<u64>>>,
     selection_anchor_id: Rc<Cell<Option<u64>>>,
     bookmarks: Rc<RefCell<std::collections::HashSet<u64>>>,
+    /// Blocks removed by the most recent Clear Blocks, kept as data so an
+    /// explicit undo can rebuild their widgets. Single-level: a later clear
+    /// with content replaces it; cleared again only when consumed by undo.
+    cleared_stash: RefCell<Vec<BlockData>>,
     /// Number shown on the jump-to-latest affordance while history is scrolled
     /// away from the live prompt. Kept on TermView so Clear Blocks can reset
     /// all of the visible block-history state atomically.
@@ -1543,6 +1591,31 @@ impl ReaderCtx {
                                     vbox.append(&gtk::Separator::new(
                                         gtk::Orientation::Horizontal,
                                     ));
+
+                                    {
+                                        let item = make_item(if selected_count > 1 {
+                                            "Copy Blocks as Markdown"
+                                        } else {
+                                            "Copy Block as Markdown"
+                                        });
+                                        let popover_c = popover.clone();
+                                        let block_data_for_md = block_data_for_export.clone();
+                                        let selected_ids_for_md = selected_ids_for_menu.clone();
+                                        let vte_for_action = vte_for_copy.clone();
+                                        let block_id_md = block_id;
+                                        item.connect_clicked(move |_| {
+                                            popover_c.popdown();
+                                            let selected = selected_ids_for_md.borrow();
+                                            let blocks = block_data_for_md.borrow();
+                                            let text = selected_blocks_markdown(
+                                                blocks.iter(),
+                                                &selected,
+                                                block_id_md,
+                                            );
+                                            vte_for_action.clipboard().set_text(&text);
+                                        });
+                                        vbox.append(&item);
+                                    }
 
                                     {
                                         let item = make_item("Export as JSON");
@@ -3552,6 +3625,7 @@ impl TermView {
             selected_block_id,
             selection_anchor_id,
             bookmarks: block_bookmarks,
+            cleared_stash: RefCell::new(Vec::new()),
             unread_count,
             jump_fab,
             find_state: Rc::new(RefCell::new(FindState::default())),
@@ -3563,6 +3637,14 @@ impl TermView {
 
         // Load history if configured
         let _ = term_view.load_history();
+
+        // Restored blocks keep their persisted ids while the global counter
+        // restarts at 0 every launch. Seed it past every restored id so a new
+        // block can never alias one — selection, bookmarks, undo-clear, and
+        // the block context menu all key on id uniqueness.
+        if let Some(max_id) = term_view.block_data.borrow().iter().map(|b| b.id).max() {
+            BLOCK_ID_COUNTER.fetch_max(max_id + 1, Ordering::Relaxed);
+        }
 
         // Create widgets for loaded blocks. Each block's `cols` is what the live
         // VTE was wrapping at when the command ran; restoring at the same cols
@@ -4050,9 +4132,19 @@ impl TermView {
     /// is deliberately pane-local: command-only history remains available in
     /// Ctrl+Shift+H, while optional full block-history persistence is overwritten
     /// immediately so cleared output does not reappear after a crash/restart.
-    pub fn clear_blocks(&self) {
+    /// Remove every finished block. Returns how many blocks were cleared; the
+    /// removed data is stashed so `undo_clear_blocks` can rebuild it.
+    pub fn clear_blocks(&self) -> usize {
         self.clear_find();
         self.active_vte.unselect_all();
+
+        let cleared: Vec<BlockData> = self.block_data.borrow_mut().drain(..).collect();
+        let cleared_count = cleared.len();
+        // Keep the previous stash when clearing an already-empty pane, so a
+        // reflexive second Ctrl+Shift+K cannot destroy the undo snapshot.
+        if !cleared.is_empty() {
+            *self.cleared_stash.borrow_mut() = cleared;
+        }
 
         let widgets: Vec<gtk::Box> = self
             .finished_blocks
@@ -4070,7 +4162,6 @@ impl TermView {
         // BlockData and FinishedBlock are parallel lists. Virtualization,
         // bookmarks, selection, and unread state all reference their IDs or
         // indices, so clearing only the widgets would corrupt the next block.
-        self.block_data.borrow_mut().clear();
         self.bookmarks.borrow_mut().clear();
         self.visible_indices.borrow_mut().clear();
         self.selected_block_ids.borrow_mut().clear();
@@ -4095,6 +4186,105 @@ impl TermView {
         if let Err(err) = self.save_history() {
             log::warn!("save cleared block history: {err}");
         }
+        cleared_count
+    }
+
+    /// Rebuild the blocks removed by the most recent `clear_blocks`. They are
+    /// older than anything created since, so they are reinserted above the
+    /// current finished blocks. Returns how many blocks were restored.
+    pub fn undo_clear_blocks(&self) -> usize {
+        if self.fullscreen.get() {
+            // An alt-screen app owns the viewport and history widgets are
+            // hidden; keep the stash so undo still works after it exits.
+            return 0;
+        }
+        let stash: Vec<BlockData> = std::mem::take(&mut *self.cleared_stash.borrow_mut());
+        if stash.is_empty() {
+            return 0;
+        }
+        let restored_count = stash.len();
+
+        let mut restored: Vec<FinishedBlock> = Vec::with_capacity(restored_count);
+        {
+            let config = self.config.borrow();
+            let fallback_cols = self.active.borrow().grid_cols() as i64;
+            // Everything restored predates the current finished blocks, so the
+            // insertion anchor is the pane's first finished widget — or the
+            // live input block when the pane has none.
+            let anchor: gtk::Widget = self
+                .finished_blocks
+                .borrow()
+                .first()
+                .map(|block| block.widget().clone().upcast())
+                .unwrap_or_else(|| self.active.borrow().widget().clone().upcast());
+            let mut stash = stash;
+            for block in stash.iter_mut() {
+                let cols = if block.cols > 0 {
+                    block.cols as i64
+                } else {
+                    fallback_cols
+                };
+                block.estimated_height =
+                    estimated_finished_block_height_for_text(&config, &block.output, cols);
+                let finished = FinishedBlock::new(
+                    block.id,
+                    &block.prompt,
+                    &block.cmd,
+                    block.cmd_markup.as_deref(),
+                    &block.output,
+                    block.exit_code,
+                    &config,
+                    block.duration_ms,
+                    block.end_time_ms,
+                    block.cwd.as_deref(),
+                    cols,
+                );
+                finished
+                    .widget()
+                    .insert_before(&self.block_list, Some(&anchor));
+                finished.connect_actions(
+                    &self.active_vte,
+                    &self.pty,
+                    &self.pty_synced,
+                    &self.bracketed_paste,
+                    &self.typed_cmd,
+                    &self.bstate,
+                    &self.active,
+                );
+                finished.connect_scroll_forwarding(&self.block_scroll);
+                install_finished_block_selection(
+                    &finished,
+                    &self.active,
+                    &self.finished_blocks,
+                    &self.selected_block_ids,
+                    &self.selected_block_id,
+                    &self.selection_anchor_id,
+                );
+                restored.push(finished);
+            }
+
+            let mut data = self.block_data.borrow_mut();
+            for block in stash.into_iter().rev() {
+                data.push_front(block);
+            }
+        }
+        self.finished_blocks.borrow_mut().splice(0..0, restored);
+
+        // Virtualization bookkeeping tracks indices; everything previously
+        // visible shifted down by the restored count.
+        {
+            let mut visible = self.visible_indices.borrow_mut();
+            let shifted: std::collections::HashSet<usize> =
+                visible.iter().map(|index| index + restored_count).collect();
+            *visible = shifted;
+        }
+        self.update_viewport();
+        self.update_block_visibility();
+        self.block_list.queue_allocate();
+        if let Err(err) = self.save_history() {
+            log::warn!("save restored block history: {err}");
+        }
+        restored_count
     }
 
     pub fn apply_failed_filter(&self) {
@@ -4128,41 +4318,36 @@ impl TermView {
     }
 
     pub fn jump_to_pinned(&self, direction: i32) {
-        let finished = self.finished_blocks.borrow();
-        let bookmarks = self.bookmarks.borrow();
-        if bookmarks.is_empty() {
-            return;
-        }
-        let marked: Vec<usize> = finished
-            .iter()
-            .enumerate()
-            .filter(|(_, block)| bookmarks.contains(&block.id))
-            .map(|(idx, _)| idx)
-            .collect();
-        if marked.is_empty() {
-            return;
-        }
-        let cur = self
-            .selected_block_id
-            .get()
-            .and_then(|id| finished.iter().position(|block| block.id == id));
-        let target = if direction < 0 {
-            marked
+        let marked: Vec<usize> = {
+            let finished = self.finished_blocks.borrow();
+            let bookmarks = self.bookmarks.borrow();
+            finished
                 .iter()
-                .rev()
-                .find(|&&idx| cur.map(|c| idx < c).unwrap_or(true))
-                .copied()
-                .or_else(|| marked.last().copied())
-        } else {
-            marked
-                .iter()
-                .find(|&&idx| cur.map(|c| idx > c).unwrap_or(true))
-                .copied()
-                .or_else(|| marked.first().copied())
+                .enumerate()
+                .filter(|(_, block)| bookmarks.contains(&block.id))
+                .map(|(idx, _)| idx)
+                .collect()
         };
-        drop(bookmarks);
-        drop(finished);
-        if let Some(idx) = target {
+        self.jump_to_marked_index(&marked, direction);
+    }
+
+    /// Jump to the previous / next failed (non-zero exit) block, wrapping to
+    /// the far end when there is no match in the requested direction.
+    pub fn jump_to_failed(&self, direction: i32) {
+        let failed = self.get_failed_blocks();
+        self.jump_to_marked_index(&failed, direction);
+    }
+
+    /// Shared stepping for pinned/failed navigation: `marked` is an ascending
+    /// index list into the finished blocks.
+    fn jump_to_marked_index(&self, marked: &[usize], direction: i32) {
+        let cur = self.selected_block_id.get().and_then(|id| {
+            self.finished_blocks
+                .borrow()
+                .iter()
+                .position(|block| block.id == id)
+        });
+        if let Some(idx) = step_marked_indices(marked, cur, direction) {
             self.scroll_to_block(idx);
         }
     }
@@ -4473,8 +4658,9 @@ mod tests {
     use super::{
         background_output_has_visible_text, block_clipboard_text, build_command_recall,
         build_keyboard_query_reply, coalesce_bytes_events, finished_command,
-        is_post_command_metadata, selected_command_text, selected_id_range, strip_ansi,
-        strip_ansi_with_clear_detect, take_background_output,
+        is_post_command_metadata, selected_blocks_markdown, selected_command_text,
+        selected_id_range, step_marked_indices, strip_ansi, strip_ansi_with_clear_detect,
+        take_background_output, BlockData,
     };
     use crate::parser::{KeyboardProtocolQuery, ParserEvent};
     use std::cell::RefCell;
@@ -4619,6 +4805,62 @@ mod tests {
         let (text, payload) = build_command_recall("git status", true);
         assert_eq!(text, "git status");
         assert_eq!(payload, b"git status");
+    }
+
+    fn test_block(id: u64, cmd: &str, exit_code: i32) -> BlockData {
+        BlockData {
+            id,
+            prompt: String::new(),
+            cmd: cmd.to_string(),
+            cmd_markup: None,
+            output: format!("output-{id}"),
+            exit_code,
+            estimated_height: 1,
+            line_count: 1,
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: None,
+            cwd: None,
+            cols: 80,
+        }
+    }
+
+    #[test]
+    fn marked_index_stepping_wraps_in_both_directions() {
+        let marked = [2usize, 5, 9];
+        // No current selection: latest-first semantics per direction.
+        assert_eq!(step_marked_indices(&marked, None, 1), Some(2));
+        assert_eq!(step_marked_indices(&marked, None, -1), Some(9));
+        // Strictly next/previous relative to the current block.
+        assert_eq!(step_marked_indices(&marked, Some(5), 1), Some(9));
+        assert_eq!(step_marked_indices(&marked, Some(5), -1), Some(2));
+        // Wrap at the ends.
+        assert_eq!(step_marked_indices(&marked, Some(9), 1), Some(2));
+        assert_eq!(step_marked_indices(&marked, Some(2), -1), Some(9));
+        // Nothing marked -> nowhere to go.
+        assert_eq!(step_marked_indices(&[], Some(3), 1), None);
+    }
+
+    #[test]
+    fn selection_markdown_keeps_terminal_order_and_falls_back_to_clicked_block() {
+        let blocks = [
+            test_block(1, "git status", 0),
+            test_block(2, "cargo test", 101),
+            test_block(3, "git push", 0),
+        ];
+        let selected = HashSet::from([3, 1]);
+        let markdown = selected_blocks_markdown(blocks.iter(), &selected, 1);
+        let first = markdown.find("git status").expect("older block present");
+        let second = markdown.find("git push").expect("newer block present");
+        assert!(first < second, "blocks must keep terminal order");
+        assert!(!markdown.contains("cargo test"));
+        assert!(markdown.contains("---"));
+
+        // Right-click without a registered selection still copies that block.
+        let fallback = selected_blocks_markdown(blocks.iter(), &HashSet::new(), 2);
+        assert!(fallback.contains("cargo test"));
+        assert!(fallback.contains("**Exit Code:** 101"));
+        assert!(!fallback.contains("---"));
     }
 
     #[test]

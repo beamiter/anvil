@@ -403,11 +403,20 @@ pub enum VteInput {
     SelectAllBlocks,
     /// Block-view only: remove all completed blocks from the pane.
     ClearBlocks,
+    /// Block-view only: restore the blocks removed by the last ClearBlocks.
+    UndoClearBlocks,
     /// Block-view only: put all selected commands back into the input editor.
     ReinputSelectedCommands,
     /// Block-view only: jump to the previous / next pinned block.
     JumpToPrevPinned,
     JumpToNextPinned,
+    /// Block-view only: jump to the previous / next failed block.
+    JumpToPrevFailed,
+    JumpToNextFailed,
+    /// Block-view only: write the whole session's blocks to a Markdown / JSON
+    /// file under the jterm1 data directory.
+    ExportSessionMarkdown,
+    ExportSessionJson,
     /// Search: set the query and jump to the first match. `use_regex` treats the
     /// query as a regex; otherwise it is matched literally (case-insensitive).
     SearchSet(String, bool),
@@ -440,6 +449,9 @@ pub enum VteOutput {
     /// Remote shell announced its session id via OSC 7770. Carries the id so
     /// the parent app can store it on the tab's RemoteConn for resume-on-reconnect.
     RemoteSessionId(String),
+    /// User-facing feedback for a backend action (e.g. undo-clear, export)
+    /// that the application surfaces as a toast.
+    Notice(String),
     /// A finished block, with the full reconstructed command + exit + a
     /// captured-output sample. Drives agent-mode's run-observe loop. Emitted
     /// by BlockTerminal only (the plain VTE wrapper has no block concept).
@@ -649,9 +661,14 @@ impl Component for VteTerminal {
             | VteInput::ClearBlockFilter
             | VteInput::SelectAllBlocks
             | VteInput::ClearBlocks
+            | VteInput::UndoClearBlocks
             | VteInput::ReinputSelectedCommands
             | VteInput::JumpToPrevPinned
-            | VteInput::JumpToNextPinned => {}
+            | VteInput::JumpToNextPinned
+            | VteInput::JumpToPrevFailed
+            | VteInput::JumpToNextFailed
+            | VteInput::ExportSessionMarkdown
+            | VteInput::ExportSessionJson => {}
             VteInput::SearchSet(query, use_regex) => {
                 let pattern = if use_regex {
                     query

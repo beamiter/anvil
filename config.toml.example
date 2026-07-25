@@ -159,6 +159,11 @@ remote_hosts = []
 # filter_pinned_blocks = "Ctrl+Alt+Shift+M"
 # jump_to_prev_pinned = "Ctrl+Alt+comma"
 # jump_to_next_pinned = "Ctrl+Alt+period"
+# jump_to_prev_failed = "Ctrl+Alt+Shift+comma"
+# jump_to_next_failed = "Ctrl+Alt+Shift+period"
+# undo_clear_blocks = "Ctrl+Alt+Shift+U"
+# export_session_markdown = "Ctrl+Alt+Shift+E"
+# export_session_json = "Ctrl+Alt+Shift+J"
 
 # Example remote profile. Each `name` must be unique because session restore
 # uses it as the stable profile identifier. Remove `remote_hosts = []` above

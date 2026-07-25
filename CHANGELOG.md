@@ -7,6 +7,18 @@ versioning for tagged releases while it remains experimental.
 
 ### Added
 
+- Clear Blocks is now undoable: the cleared blocks are stashed and an explicit
+  "Undo clear blocks" action rebuilds them above any blocks created since,
+  with toast feedback on both clear and restore.
+- Failed-block navigation: "Jump to previous/next failed block" actions step
+  through non-zero-exit blocks with wrap-around, mirroring pinned-block
+  navigation (`jump_to_prev_failed` / `jump_to_next_failed`).
+- Whole-session export: "Export session as Markdown/JSON file" writes every
+  completed block to a timestamped, owner-only file under the jterm1 data
+  directory and reports the path in a toast.
+- The block right-click menu gained multi-selection-aware "Copy Blocks as
+  Markdown", including prompt, command, output, exit code, and duration.
+
 - Cross-block command/output search and a shared review-only input boundary for
   workflow, history, file-tree, notebook, remote, and AI insertions.
 - TOML/YAML workflows with ordered directory precedence, metadata retention,
@@ -84,6 +96,12 @@ versioning for tagged releases while it remains experimental.
 - Initial Block commands retain structured argument boundaries through the
   shell wrapper and use a bounded fallback when shell integration markers are
   unavailable, including direct SSH and Mosh sessions.
+
+### Fixed
+
+- The block id counter is now seeded past every restored history id, so a new
+  block can no longer alias a restored one and corrupt id-keyed state
+  (selection, bookmarks, undo-clear, context-menu copy).
 
 ### Security
 

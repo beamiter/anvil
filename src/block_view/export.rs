@@ -7,8 +7,36 @@
 
 use gtk::prelude::*;
 use relm4::gtk;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::path::PathBuf;
 
 use super::{strip_ansi, BlockData, TermView};
+
+/// On-disk formats for whole-session export.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionExportFormat {
+    Markdown,
+    Json,
+}
+
+impl SessionExportFormat {
+    fn extension(self) -> &'static str {
+        match self {
+            SessionExportFormat::Markdown => "md",
+            SessionExportFormat::Json => "json",
+        }
+    }
+}
+
+/// `session-<stamp>.<ext>` with a numeric suffix for same-second collisions.
+fn export_file_name(stamp: &str, extension: &str, attempt: u32) -> String {
+    if attempt == 0 {
+        format!("session-{stamp}.{extension}")
+    } else {
+        format!("session-{stamp}-{attempt}.{extension}")
+    }
+}
 
 #[allow(dead_code)]
 impl TermView {
@@ -55,6 +83,46 @@ impl TermView {
         md
     }
 
+    /// Write the whole session's blocks to a timestamped file under the jterm1
+    /// data directory. Exports contain command output, so the file is created
+    /// exclusively with owner-only permissions like the block history.
+    pub fn export_session_to_file(&self, format: SessionExportFormat) -> io::Result<PathBuf> {
+        let contents = match format {
+            SessionExportFormat::Markdown => self.export_session_markdown(),
+            SessionExportFormat::Json => self.export_session_json(),
+        };
+        let dir = gtk::glib::user_data_dir().join("jterm1").join("exports");
+        fs::create_dir_all(&dir)?;
+        let stamp = gtk::glib::DateTime::now_local()
+            .ok()
+            .and_then(|now| now.format("%Y%m%d-%H%M%S").ok())
+            .map(|formatted| formatted.to_string())
+            .unwrap_or_else(|| format!("pid{}", std::process::id()));
+        for attempt in 0..100u32 {
+            let path = dir.join(export_file_name(&stamp, format.extension(), attempt));
+            let mut options = OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&path) {
+                Ok(mut file) => {
+                    file.write_all(contents.as_bytes())?;
+                    file.flush()?;
+                    return Ok(path);
+                }
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "too many session exports share this timestamp",
+        ))
+    }
+
     /// Copy a block's content to clipboard (prompt + cmd + output).
     pub fn copy_block_by_id(&self, block_id: u64) {
         let finished = self.finished_blocks.borrow();
@@ -67,5 +135,26 @@ impl TermView {
             let clipboard = self.active_vte.clipboard();
             clipboard.set_text(&full_text);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{export_file_name, SessionExportFormat};
+
+    #[test]
+    fn export_file_names_disambiguate_same_second_collisions() {
+        assert_eq!(
+            export_file_name(
+                "20260725-101112",
+                SessionExportFormat::Markdown.extension(),
+                0
+            ),
+            "session-20260725-101112.md"
+        );
+        assert_eq!(
+            export_file_name("20260725-101112", SessionExportFormat::Json.extension(), 2),
+            "session-20260725-101112-2.json"
+        );
     }
 }

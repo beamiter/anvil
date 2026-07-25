@@ -64,6 +64,8 @@ pub(crate) enum Action {
     SelectAllBlocks,
     /// Remove every finished block from the active block-mode pane.
     ClearBlocks,
+    /// Restore the blocks removed by the most recent Clear Blocks.
+    UndoClearBlocks,
     /// Put the commands from the current block selection back into the live
     /// input editor, preserving terminal order for multi-selection.
     ReinputSelectedCommands,
@@ -71,6 +73,14 @@ pub(crate) enum Action {
     /// gives users persistent navigation targets through long sessions.
     JumpToPrevPinned,
     JumpToNextPinned,
+    /// Jump to the previous / next failed (non-zero exit) block, mirroring the
+    /// pinned-block navigation for error triage in long sessions.
+    JumpToPrevFailed,
+    JumpToNextFailed,
+    /// Write every completed block to a timestamped Markdown / JSON file under
+    /// the jterm1 data directory.
+    ExportSessionMarkdown,
+    ExportSessionJson,
     ToggleDebugDashboard,
     /// Open the session-level AI panel for free-form questions about the
     /// current shell context (Ctrl+Alt+Shift+A by default; Ctrl+Shift+A is the
@@ -157,9 +167,14 @@ impl Action {
             Action::FilterPinnedBlocks => "Jump to first pinned block",
             Action::JumpToPrevPinned => "Jump to previous pinned block",
             Action::JumpToNextPinned => "Jump to next pinned block",
+            Action::JumpToPrevFailed => "Jump to previous failed block",
+            Action::JumpToNextFailed => "Jump to next failed block",
+            Action::ExportSessionMarkdown => "Export session as Markdown file",
+            Action::ExportSessionJson => "Export session as JSON file",
             Action::ClearBlockFilter => "Jump to oldest block",
             Action::SelectAllBlocks => "Select all blocks",
             Action::ClearBlocks => "Clear blocks",
+            Action::UndoClearBlocks => "Undo clear blocks",
             Action::ReinputSelectedCommands => "Reinput selected commands",
             Action::ToggleDebugDashboard => "Toggle debug dashboard",
             Action::OpenAiPanel => "Open AI panel",
@@ -224,9 +239,14 @@ impl Action {
             Action::FilterPinnedBlocks => Some("filter_pinned_blocks"),
             Action::JumpToPrevPinned => Some("jump_to_prev_pinned"),
             Action::JumpToNextPinned => Some("jump_to_next_pinned"),
+            Action::JumpToPrevFailed => Some("jump_to_prev_failed"),
+            Action::JumpToNextFailed => Some("jump_to_next_failed"),
+            Action::ExportSessionMarkdown => Some("export_session_markdown"),
+            Action::ExportSessionJson => Some("export_session_json"),
             Action::ClearBlockFilter => Some("clear_block_filter"),
             Action::SelectAllBlocks => Some("select_all_blocks"),
             Action::ClearBlocks => Some("clear_blocks"),
+            Action::UndoClearBlocks => Some("undo_clear_blocks"),
             Action::ReinputSelectedCommands => Some("reinput_selected_commands"),
             Action::ToggleDebugDashboard => Some("toggle_debug_dashboard"),
             Action::OpenAiPanel => Some("open_ai_panel"),
@@ -289,9 +309,14 @@ impl Action {
             Action::FilterPinnedBlocks,
             Action::JumpToPrevPinned,
             Action::JumpToNextPinned,
+            Action::JumpToPrevFailed,
+            Action::JumpToNextFailed,
+            Action::ExportSessionMarkdown,
+            Action::ExportSessionJson,
             Action::ClearBlockFilter,
             Action::SelectAllBlocks,
             Action::ClearBlocks,
+            Action::UndoClearBlocks,
             Action::ReinputSelectedCommands,
             Action::ToggleDebugDashboard,
             Action::OpenAiPanel,
@@ -802,5 +827,12 @@ mod tests {
         assert!(map.binding_display(&Action::FilterPinnedBlocks).is_empty());
         assert!(map.binding_display(&Action::JumpToPrevPinned).is_empty());
         assert!(map.binding_display(&Action::JumpToNextPinned).is_empty());
+        assert!(map.binding_display(&Action::JumpToPrevFailed).is_empty());
+        assert!(map.binding_display(&Action::JumpToNextFailed).is_empty());
+        assert!(map.binding_display(&Action::UndoClearBlocks).is_empty());
+        assert!(map
+            .binding_display(&Action::ExportSessionMarkdown)
+            .is_empty());
+        assert!(map.binding_display(&Action::ExportSessionJson).is_empty());
     }
 }

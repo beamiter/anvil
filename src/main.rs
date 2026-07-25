@@ -171,6 +171,7 @@ fn create_pane(
         VteOutput::CommandFinished(true) => AppMsg::Activity(pane_id),
         VteOutput::CommandFinished(false) => AppMsg::Bell(pane_id),
         VteOutput::RemoteSessionId(id) => AppMsg::PaneRemoteSessionId(pane_id, id),
+        VteOutput::Notice(message) => AppMsg::Toast(message),
         VteOutput::BlockFinished {
             command,
             exit_code,
