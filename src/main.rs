@@ -8,7 +8,6 @@ mod ai_palette_ops;
 mod app_msg;
 mod block_view;
 mod cli;
-mod command_history;
 mod config;
 mod config_ops;
 mod config_store;
@@ -16,7 +15,7 @@ mod diagnostics;
 mod dialogs;
 mod file_tree;
 mod file_tree_ops;
-use jterm_core::{git_meta, notify, parser, review_input};
+use jterm_core::{command_history, git_meta, notify, parser, review_input};
 
 mod host {
     pub use jterm_core::host::*;
