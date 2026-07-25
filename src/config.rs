@@ -315,6 +315,8 @@ pub struct Config {
     pub(crate) ai_model: String,
     /// Per-request maximum output tokens.
     pub(crate) ai_max_tokens: u32,
+    /// Optional sampling temperature (0.0..=2.0); None keeps the provider default.
+    pub(crate) ai_temperature: Option<f32>,
     /// Redact secret-looking values before sending context to an AI provider.
     pub(crate) ai_redact_secrets: bool,
     /// Optional path to a 0600 file holding the provider API key, so the key
@@ -387,6 +389,7 @@ impl Config {
             ai_base_url: "https://api.anthropic.com".to_string(),
             ai_model: "claude-sonnet-4-6".to_string(),
             ai_max_tokens: 1_024,
+            ai_temperature: None,
             ai_redact_secrets: true,
             ai_api_key_file: None,
             notify_long_blocks: false,
@@ -534,6 +537,10 @@ fn env_f64(name: &str) -> Option<f64> {
 
 fn env_u32(name: &str) -> Option<u32> {
     std::env::var(name).ok().and_then(|v| v.parse::<u32>().ok())
+}
+
+fn env_f32(name: &str) -> Option<f32> {
+    std::env::var(name).ok().and_then(|v| v.trim().parse::<f32>().ok())
 }
 
 fn env_bool(name: &str) -> Option<bool> {
@@ -686,6 +693,7 @@ struct FileConfig {
     ai_base_url: Option<String>,
     ai_model: Option<String>,
     ai_max_tokens: Option<u32>,
+    ai_temperature: Option<f32>,
     ai_redact_secrets: Option<bool>,
     ai_api_key_file: Option<String>,
     mouse_reporting_enabled: Option<bool>,
@@ -882,6 +890,10 @@ fn load_file_config() -> FileConfig {
             .get("ai_max_tokens")
             .and_then(|v| v.as_integer())
             .and_then(|v| u32::try_from(v).ok()),
+        ai_temperature: table
+            .get("ai_temperature")
+            .and_then(|v| v.as_float())
+            .map(|v| v as f32),
         ai_redact_secrets: table.get("ai_redact_secrets").and_then(|v| v.as_bool()),
         ai_api_key_file: table
             .get("ai_api_key_file")
@@ -1261,6 +1273,9 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
             .or(fc.ai_max_tokens)
             .unwrap_or(1_024)
             .clamp(1, 32_768),
+        ai_temperature: env_f32("JTERM1_AI_TEMPERATURE")
+            .or(fc.ai_temperature)
+            .filter(|t| t.is_finite() && (0.0..=2.0).contains(t)),
         ai_redact_secrets: env_bool("JTERM1_AI_REDACT_SECRETS")
             .or(fc.ai_redact_secrets)
             .unwrap_or(true),
