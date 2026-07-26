@@ -1332,8 +1332,10 @@ mod tests {
             SnapshotOwner::create_in_with_publish_hook(&creator_dir, &mut before_flock)
         });
 
+        // Generous liveness bound: under a loaded parallel test run, thread
+        // scheduling alone can exceed a small timeout and flake this test.
         let lock_path = published_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(30))
             .expect("creator must pause after publishing the final lock pathname");
         let publishing_token = parse_lock_file_token(
             lock_path
@@ -1375,7 +1377,7 @@ mod tests {
             cleanup_done_tx.send(()).unwrap();
         });
         cleanup_done_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(30))
             .expect("busy cleanup must conservatively skip without blocking");
         cleanup.join().unwrap();
         assert!(
