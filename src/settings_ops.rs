@@ -159,6 +159,21 @@ impl AppModel {
         self.persist_config();
     }
 
+    /// The settings dialog already wrote the key file (0600, atomic); the app
+    /// only records where it lives so future sessions read the same file.
+    pub(crate) fn apply_settings_ai_key_file(&mut self, path: String) {
+        if self.safe_mode {
+            self.show_toast("AI is disabled in safe mode.");
+            return;
+        }
+        if path.trim().is_empty() {
+            return;
+        }
+        self.config.borrow_mut().ai_api_key_file = Some(path);
+        self.persist_config();
+        self.show_toast("API key stored.");
+    }
+
     pub(crate) fn apply_settings_ai_base_url(&mut self, base_url: String) {
         if self.safe_mode {
             self.show_toast("AI is disabled in safe mode.");

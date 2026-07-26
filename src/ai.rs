@@ -28,7 +28,7 @@ fn settings(config: &crate::config::Config) -> AiSettings {
     AiSettings {
         enabled: config.ai_enabled,
         provider: config.ai_provider.clone(),
-        api_key_file: config.ai_api_key_file.clone(),
+        api_key_file: jterm_core::ai::resolve_api_key_file(config.ai_api_key_file.as_deref()),
         model: config.ai_model.clone(),
         base_url: config.ai_base_url.clone(),
         max_tokens: config.ai_max_tokens,

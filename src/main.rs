@@ -468,6 +468,7 @@ impl SimpleComponent for AppModel {
                     },
                     ai_model: config.borrow().ai_model.clone(),
                     ai_base_url: config.borrow().ai_base_url.clone(),
+                    ai_api_key_file: config.borrow().ai_api_key_file.clone(),
                     ai_max_tokens: config.borrow().ai_max_tokens as f64,
                     ai_redact_secrets: config.borrow().ai_redact_secrets,
                     agent_max_turns: config.borrow().agent_max_turns as f64,
@@ -507,6 +508,9 @@ impl SimpleComponent for AppModel {
                     AppMsg::SettingsAiProvider(provider)
                 }
                 dialogs::settings::SettingsOutput::AiModel(model) => AppMsg::SettingsAiModel(model),
+                dialogs::settings::SettingsOutput::AiApiKeyFile(path) => {
+                    AppMsg::SettingsAiKeyFile(path)
+                }
                 dialogs::settings::SettingsOutput::AiBaseUrl(base_url) => {
                     AppMsg::SettingsAiBaseUrl(base_url)
                 }
@@ -1016,6 +1020,7 @@ impl SimpleComponent for AppModel {
             AppMsg::SettingsAgentEnabled(enabled) => self.apply_settings_agent_enabled(enabled),
             AppMsg::SettingsAiProvider(provider) => self.apply_settings_ai_provider(provider),
             AppMsg::SettingsAiModel(model) => self.apply_settings_ai_model(model),
+            AppMsg::SettingsAiKeyFile(path) => self.apply_settings_ai_key_file(path),
             AppMsg::SettingsAiBaseUrl(base_url) => self.apply_settings_ai_base_url(base_url),
             AppMsg::SettingsAiMaxTokens(max_tokens) => {
                 self.apply_settings_ai_max_tokens(max_tokens)

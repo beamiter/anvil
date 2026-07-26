@@ -517,6 +517,16 @@ fn apply_config_to_table(config: &Config, table: &mut toml::Table) {
         "ai_redact_secrets".into(),
         toml::Value::Boolean(config.ai_redact_secrets),
     );
+    // Only the file-configured key path is persisted; the JTERM1_AI_API_KEY_FILE
+    // override is applied at client construction and never reaches Config.
+    match &config.ai_api_key_file {
+        Some(path) => {
+            table.insert("ai_api_key_file".into(), toml::Value::String(path.clone()));
+        }
+        None => {
+            table.remove("ai_api_key_file");
+        }
+    }
     table.insert(
         "agent_enabled".into(),
         toml::Value::Boolean(config.agent_enabled),
@@ -1067,7 +1077,9 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
         "ai_base_url",
         "ai_model",
         "ai_max_tokens",
+        "ai_temperature",
         "ai_redact_secrets",
+        "ai_api_key_file",
         "agent_enabled",
         "agent_max_turns",
         "mouse_reporting_enabled",

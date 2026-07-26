@@ -425,7 +425,11 @@ Anthropic default. Accepted values are `anthropic`, `openai-compatible` (or
 `openai`), and `ollama`. `JTERM1_AI_MODEL` and `JTERM1_AI_BASE_URL` override the
 matching TOML settings and provider defaults. `JTERM1_AI_API_KEY` overrides the
 provider-specific `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `OLLAMA_API_KEY`.
-Keep API keys in the environment rather than the TOML file.
+Keep API keys out of the TOML file: either in the environment or in a private
+key file. The Settings dialog's **API Key** row stores a pasted key as a
+0600 single-line file — `ai_api_key_file` if configured, otherwise
+`~/.config/jterm1/ai.key` — and `JTERM1_AI_API_KEY_FILE` overrides the
+configured path without ever being written back to config.toml.
 
 AI network calls happen only after an explicit AI action. The session panel
 keeps a multi-turn role history until Clear is pressed and can optionally attach

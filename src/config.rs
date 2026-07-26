@@ -540,7 +540,9 @@ fn env_u32(name: &str) -> Option<u32> {
 }
 
 fn env_f32(name: &str) -> Option<f32> {
-    std::env::var(name).ok().and_then(|v| v.trim().parse::<f32>().ok())
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
 }
 
 fn env_bool(name: &str) -> Option<bool> {
@@ -1279,9 +1281,10 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         ai_redact_secrets: env_bool("JTERM1_AI_REDACT_SECRETS")
             .or(fc.ai_redact_secrets)
             .unwrap_or(true),
-        ai_api_key_file: env_string("JTERM1_AI_API_KEY_FILE")
-            .or(fc.ai_api_key_file)
-            .filter(|value| !value.trim().is_empty()),
+        // Unlike the other JTERM1_* overrides, the key-path override is applied
+        // at client construction (`jterm_core::ai::resolve_api_key_file`), so
+        // the environment-managed path can never be persisted back to TOML.
+        ai_api_key_file: fc.ai_api_key_file.filter(|value| !value.trim().is_empty()),
         notify_long_blocks: fc.notify_long_blocks.unwrap_or(true),
         notify_long_block_threshold_ms: fc.notify_long_block_threshold_ms.unwrap_or(10_000),
         show_repo_strip: fc.show_repo_strip.unwrap_or(true),

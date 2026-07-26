@@ -42,7 +42,6 @@ const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 pub(crate) use jterm_core::notebook_text::{parse_segments, render_text_to_pango, Segment};
 
-
 #[derive(Debug, Clone)]
 struct CommandSpec {
     argv: Vec<String>,

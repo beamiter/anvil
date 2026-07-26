@@ -25,6 +25,9 @@ pub(crate) struct SettingsValues {
     pub(crate) ai_provider: u32,
     pub(crate) ai_model: String,
     pub(crate) ai_base_url: String,
+    /// TOML-configured key path (never the environment override); the write
+    /// target when the API Key row stores a pasted key.
+    pub(crate) ai_api_key_file: Option<String>,
     pub(crate) ai_max_tokens: f64,
     pub(crate) ai_redact_secrets: bool,
     pub(crate) agent_max_turns: f64,
@@ -56,6 +59,7 @@ pub(crate) enum SettingsMsg {
     AiProvider(u32),
     AiModel(String),
     AiBaseUrl(String),
+    AiApiKeyStore(String),
     AiMaxTokens(f64),
     AiRedactSecrets(bool),
     AgentMaxTurns(f64),
@@ -78,6 +82,8 @@ pub(crate) enum SettingsOutput {
     AiProvider(usize),
     AiModel(String),
     AiBaseUrl(String),
+    /// A key was stored into this path; the app records and persists it.
+    AiApiKeyFile(String),
     AiMaxTokens(u32),
     AiRedactSecrets(bool),
     AgentMaxTurns(u32),
@@ -252,7 +258,7 @@ impl Component for SettingsModel {
                     #[name(ai_provider_row)]
                     adw::ComboRow {
                         set_title: "AI Provider",
-                        set_subtitle: "API keys stay in environment variables",
+                        set_subtitle: "Key from a private key file or environment variables",
                         set_model: Some(&gtk::StringList::new(
                             &["Anthropic", "OpenAI-compatible", "Ollama"]
                         )),
@@ -280,6 +286,16 @@ impl Component for SettingsModel {
                         set_sensitive: !model.values.safe_mode && model.values.ai_enabled,
                         connect_changed[sender] => move |row| {
                             sender.input(SettingsMsg::AiBaseUrl(row.text().to_string()));
+                        },
+                    },
+
+                    #[name(ai_api_key_row)]
+                    adw::PasswordEntryRow {
+                        set_title: "API Key",
+                        set_show_apply_button: true,
+                        set_sensitive: !model.values.safe_mode && model.values.ai_enabled,
+                        connect_apply[sender] => move |row| {
+                            sender.input(SettingsMsg::AiApiKeyStore(row.text().to_string()));
                         },
                     },
 
@@ -401,6 +417,8 @@ impl Component for SettingsModel {
                     .set_selected(self.values.ai_provider);
                 widgets.ai_model_row.set_text(&self.values.ai_model);
                 widgets.ai_base_url_row.set_text(&self.values.ai_base_url);
+                widgets.ai_api_key_row.set_text("");
+                widgets.ai_api_key_row.set_title("API Key");
                 widgets
                     .ai_max_tokens_row
                     .set_value(self.values.ai_max_tokens);
@@ -416,6 +434,7 @@ impl Component for SettingsModel {
                 widgets.ai_provider_row.set_sensitive(ai_sensitive);
                 widgets.ai_model_row.set_sensitive(ai_sensitive);
                 widgets.ai_base_url_row.set_sensitive(ai_sensitive);
+                widgets.ai_api_key_row.set_sensitive(ai_sensitive);
                 widgets.ai_max_tokens_row.set_sensitive(ai_sensitive);
                 widgets.ai_redact_secrets_row.set_sensitive(ai_sensitive);
                 widgets
@@ -472,6 +491,7 @@ impl Component for SettingsModel {
                 widgets.ai_provider_row.set_sensitive(sensitive);
                 widgets.ai_model_row.set_sensitive(sensitive);
                 widgets.ai_base_url_row.set_sensitive(sensitive);
+                widgets.ai_api_key_row.set_sensitive(sensitive);
                 widgets.ai_max_tokens_row.set_sensitive(sensitive);
                 widgets.ai_redact_secrets_row.set_sensitive(sensitive);
                 widgets
@@ -497,6 +517,31 @@ impl Component for SettingsModel {
             SettingsMsg::AiBaseUrl(base_url) => {
                 self.values.ai_base_url = base_url.clone();
                 let _ = sender.output(SettingsOutput::AiBaseUrl(base_url));
+            }
+            SettingsMsg::AiApiKeyStore(key) => {
+                // Same write-target rule as the rest of the family: the
+                // configured path, else the per-app default. The environment
+                // override stays read-only and is never written to.
+                let path = self
+                    .values
+                    .ai_api_key_file
+                    .clone()
+                    .unwrap_or_else(jterm_core::ai::default_api_key_path);
+                match jterm_core::ai::write_api_key_file(&path, &key) {
+                    Ok(()) => {
+                        widgets.ai_api_key_row.set_text("");
+                        widgets
+                            .ai_api_key_row
+                            .set_title("API Key stored — enter a new value to replace it");
+                        self.values.ai_api_key_file = Some(path.clone());
+                        let _ = sender.output(SettingsOutput::AiApiKeyFile(path));
+                    }
+                    Err(error) => {
+                        widgets
+                            .ai_api_key_row
+                            .set_title(&format!("API Key not saved: {error}"));
+                    }
+                }
             }
             SettingsMsg::AiMaxTokens(max_tokens) => {
                 self.values.ai_max_tokens = max_tokens;

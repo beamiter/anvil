@@ -504,8 +504,7 @@ impl AgentPanelModel {
         };
         widgets.status.set_label(&status);
         widgets.continue_button.set_visible(
-            self.view.state == AgentState::Completed
-                && self.view.turns_used < self.view.max_turns,
+            self.view.state == AgentState::Completed && self.view.turns_used < self.view.max_turns,
         );
         widgets.new_task_button.set_visible(matches!(
             self.view.state,
@@ -811,7 +810,6 @@ fn render_observation(exit: i32, output_sample: &str) -> gtk::Widget {
     exp.upcast()
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -833,7 +831,12 @@ mod tests {
         assert_eq!(s.state(), AgentState::AwaitingModel);
 
         let outcome = s.accept_model_reply(&run_reply("ls -la")).unwrap();
-        let ModelOutcome::Proposal { id, command, danger } = outcome else {
+        let ModelOutcome::Proposal {
+            id,
+            command,
+            danger,
+        } = outcome
+        else {
             panic!("expected proposal");
         };
         assert_eq!(command, "ls -la");
@@ -848,16 +851,17 @@ mod tests {
             Some((id, "ls -la".to_string())),
             "approval must arm the block-completion correlation slot"
         );
-        assert_eq!(s.state(), AgentState::AwaitingObservation { proposal_id: id });
+        assert_eq!(
+            s.state(),
+            AgentState::AwaitingObservation { proposal_id: id }
+        );
 
         s.observe(id, 0, "total 0").unwrap();
         assert!(s.awaiting_command.is_none());
         assert_eq!(s.state(), AgentState::AwaitingModel);
 
-        s.accept_model_reply(
-            &serde_json::json!({"action":"done","message":"Listed."}).to_string(),
-        )
-        .unwrap();
+        s.accept_model_reply(&serde_json::json!({"action":"done","message":"Listed."}).to_string())
+            .unwrap();
         assert_eq!(s.state(), AgentState::Completed);
         assert!(s.is_sealed());
     }
@@ -866,8 +870,7 @@ mod tests {
     fn proposal_id_at_maps_transcript_rows_to_proposals() {
         let mut s = session(10);
         s.submit_user("run something").unwrap();
-        let ModelOutcome::Proposal { id, .. } =
-            s.accept_model_reply(&run_reply("true")).unwrap()
+        let ModelOutcome::Proposal { id, .. } = s.accept_model_reply(&run_reply("true")).unwrap()
         else {
             panic!("expected proposal");
         };
@@ -886,15 +889,17 @@ mod tests {
         };
         let approved = s.edit_and_approve(id, "rm -r ./build/tmp").unwrap();
         assert_eq!(approved.command, "rm -r ./build/tmp");
-        assert_eq!(s.awaiting_command, Some((id, "rm -r ./build/tmp".to_string())));
+        assert_eq!(
+            s.awaiting_command,
+            Some((id, "rm -r ./build/tmp".to_string()))
+        );
     }
 
     #[test]
     fn reject_returns_to_model_without_arming_execution() {
         let mut s = session(10);
         s.submit_user("try something").unwrap();
-        let ModelOutcome::Proposal { id, .. } =
-            s.accept_model_reply(&run_reply("true")).unwrap()
+        let ModelOutcome::Proposal { id, .. } = s.accept_model_reply(&run_reply("true")).unwrap()
         else {
             panic!("expected proposal");
         };
@@ -935,7 +940,7 @@ mod tests {
         else {
             panic!("expected proposal");
         };
-        s.approve(id).unwrap();
+        let _ = s.approve(id).unwrap();
         let token = s.cancellation_token();
         s.cancel();
         assert!(s.awaiting_command.is_none());
@@ -952,12 +957,11 @@ mod tests {
     fn turn_cap_still_records_the_final_observation() {
         let mut s = session(1);
         s.submit_user("one shot").unwrap();
-        let ModelOutcome::Proposal { id, .. } =
-            s.accept_model_reply(&run_reply("true")).unwrap()
+        let ModelOutcome::Proposal { id, .. } = s.accept_model_reply(&run_reply("true")).unwrap()
         else {
             panic!("expected proposal");
         };
-        s.approve(id).unwrap();
+        let _ = s.approve(id).unwrap();
         s.observe(id, 0, "done").unwrap();
         assert_eq!(s.state(), AgentState::TurnLimitReached);
         assert!(!s.can_submit());

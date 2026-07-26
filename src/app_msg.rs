@@ -45,6 +45,7 @@ pub(crate) enum AppMsg {
     SettingsAiProvider(usize),
     SettingsAiModel(String),
     SettingsAiBaseUrl(String),
+    SettingsAiKeyFile(String),
     SettingsAiMaxTokens(u32),
     SettingsAiRedactSecrets(bool),
     SettingsAgentMaxTurns(u32),

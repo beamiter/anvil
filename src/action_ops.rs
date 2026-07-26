@@ -194,6 +194,7 @@ impl AppModel {
                         },
                         ai_model: config.ai_model.clone(),
                         ai_base_url: config.ai_base_url.clone(),
+                        ai_api_key_file: config.ai_api_key_file.clone(),
                         ai_max_tokens: config.ai_max_tokens as f64,
                         ai_redact_secrets: config.ai_redact_secrets,
                         agent_max_turns: config.agent_max_turns as f64,
