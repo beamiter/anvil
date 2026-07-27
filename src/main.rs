@@ -26,6 +26,7 @@ mod host {
 mod keybindings;
 mod navigation_ui;
 mod notebook;
+mod pane_header;
 mod palette;
 mod process;
 mod pty;
@@ -199,9 +200,28 @@ fn create_pane(
                 .forward(sender.input_sender(), forward),
         ),
     };
+    let frame = pane_header::PaneFrame::new(&terminal.widget());
+    // The header is this pane's drag handle and its own drop zone. Ids, not
+    // indices, cross the drag boundary: a pane's index shifts when a sibling
+    // closes, but its id never moves.
+    {
+        let sender = sender.clone();
+        frame.install_drag_and_drop(pane_id, move |dragged| {
+            if dragged == pane_id {
+                return false;
+            }
+            sender.input(AppMsg::SwapPanes {
+                dragged,
+                target: pane_id,
+            });
+            true
+        });
+    }
     Pane {
         terminal,
+        frame,
         id: pane_id,
+        title: None,
         cwd: working_directory,
         cwd_external,
         session_id,
@@ -843,6 +863,17 @@ impl SimpleComponent for AppModel {
 
         model.init_file_tree();
 
+        // Directories and foreground commands are polled, not pushed, so the
+        // split panes' headers need a slow tick to stay honest. It touches
+        // only the visible tab, and only while that tab is actually split.
+        {
+            let sender = sender.clone();
+            glib::timeout_add_seconds_local(1, move || {
+                sender.input(AppMsg::RefreshPaneHeaders);
+                glib::ControlFlow::Continue
+            });
+        }
+
         ComponentParts { model, widgets }
     }
 
@@ -929,6 +960,9 @@ impl SimpleComponent for AppModel {
                     // external again.
                     self.tabs[ti].panes[pi].cwd_external = managed_remote || external;
                     self.tabs[ti].panes[pi].cwd = Some(path.clone());
+                    if self.tabs[ti].panes.len() > 1 {
+                        self.refresh_pane_headers(ti);
+                    }
                     let connection_changed = self.mark_remote_connected(ti, pane_id);
                     if self.tabs[ti].active_pane == pi && !self.tabs[ti].custom_title {
                         let number = ti as u32 + 1;
@@ -957,6 +991,7 @@ impl SimpleComponent for AppModel {
             AppMsg::PaneFocused(_, pane_id) => {
                 if let Some((ti, pi)) = self.find_pane(pane_id) {
                     self.tabs[ti].active_pane = pi;
+                    self.refresh_pane_headers(ti);
                     if self.tabs[ti].bell || self.tabs[ti].activity {
                         self.tabs[ti].bell = false;
                         self.tabs[ti].activity = false;
@@ -964,8 +999,14 @@ impl SimpleComponent for AppModel {
                     }
                 }
             }
+            AppMsg::SwapPanes { dragged, target } => self.swap_panes(dragged, target),
+            AppMsg::RefreshPaneHeaders => self.refresh_active_pane_headers(),
             AppMsg::TitleChanged(pane_id, title) => {
-                if let Some((idx, _)) = self.find_pane(pane_id) {
+                if let Some((idx, pane_index)) = self.find_pane(pane_id) {
+                    self.tabs[idx].panes[pane_index].title = (!title.is_empty()).then(|| title.clone());
+                    if self.tabs[idx].panes.len() > 1 {
+                        self.refresh_pane_headers(idx);
+                    }
                     let id = self.tabs[idx].id;
                     if !self.tabs[idx].custom_title && !title.is_empty() {
                         let filter = self.tab_filter.to_lowercase();

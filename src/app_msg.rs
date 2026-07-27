@@ -29,6 +29,15 @@ pub(crate) enum AppMsg {
     RemoteReconnectTick(u64, u64),
     RemoteReconnectNow(u64, u32),
     PaneFocused(u64, u64),
+    /// A pane header was dropped onto another pane: exchange their positions
+    /// in the split tree.
+    SwapPanes {
+        dragged: u64,
+        target: u64,
+    },
+    /// Periodic refresh of the split panes' status headers (cwd and the
+    /// running command are polled, not pushed).
+    RefreshPaneHeaders,
     TitleChanged(u64, String),
     Bell(u64),
     Activity(u64),

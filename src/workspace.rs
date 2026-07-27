@@ -52,7 +52,13 @@ impl TermCtl {
 
 pub(crate) struct Pane {
     pub(crate) terminal: TermCtl,
+    /// Status header plus the terminal. This — not `terminal.widget()` — is
+    /// what the `gtk::Paned` split tree holds for this pane.
+    pub(crate) frame: crate::pane_header::PaneFrame,
     pub(crate) id: u64,
+    /// Latest OSC title this pane reported. Tabs already fold this into their
+    /// own label, but a split tab needs it per pane.
+    pub(crate) title: Option<String>,
     pub(crate) cwd: Option<String>,
     /// The reported cwd belongs to an ssh/mosh/container namespace. It remains
     /// useful as terminal/AI context but must not drive local filesystem work.
@@ -63,6 +69,11 @@ pub(crate) struct Pane {
 }
 
 impl Pane {
+    /// The widget this pane occupies in the split tree.
+    pub(crate) fn widget(&self) -> gtk::Widget {
+        self.frame.widget()
+    }
+
     pub(crate) fn local_cwd(&self) -> Option<&str> {
         (!self.cwd_external)
             .then_some(self.cwd.as_deref())

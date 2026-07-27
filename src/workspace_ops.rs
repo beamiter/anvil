@@ -57,6 +57,92 @@ fn detach_leaf_and_promote(holder: &gtk::Box, leaf: &gtk::Widget) -> Option<gtk:
     Some(sibling)
 }
 
+/// Pane indices in visual order: depth-first through the `Paned` tree, start
+/// child before end child.
+///
+/// The `panes` Vec keeps creation order, which stops describing the layout as
+/// soon as two panes are swapped. Headers number themselves from the widget
+/// tree so "pane 2" is always the second one the user sees.
+fn visual_pane_order(tab: &Tab) -> Vec<usize> {
+    fn walk(widget: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
+        match widget.clone().downcast::<gtk::Paned>() {
+            Ok(paned) => {
+                if let Some(start) = paned.start_child() {
+                    walk(&start, out);
+                }
+                if let Some(end) = paned.end_child() {
+                    walk(&end, out);
+                }
+            }
+            Err(leaf) => out.push(leaf),
+        }
+    }
+
+    let mut leaves = Vec::new();
+    if let Some(root) = tab.holder.first_child() {
+        walk(&root, &mut leaves);
+    }
+    let mut order: Vec<usize> = leaves
+        .iter()
+        .filter_map(|leaf| tab.panes.iter().position(|pane| pane.widget() == *leaf))
+        .collect();
+    // A zoomed tab has only the focused leaf in the tree, and a pane detached
+    // mid-operation has none. Append whatever the walk missed so every pane
+    // still gets a stable number rather than none at all.
+    for index in 0..tab.panes.len() {
+        if !order.contains(&index) {
+            order.push(index);
+        }
+    }
+    order
+}
+
+/// Working directory with `$HOME` collapsed to `~`, for the pane header.
+fn abbreviate_home(path: &str) -> String {
+    match std::env::var_os("HOME") {
+        Some(home) => abbreviate_prefix(path, &home.to_string_lossy()),
+        None => path.to_string(),
+    }
+}
+
+/// The substitution itself, with `home` supplied rather than read from the
+/// environment so it is testable without mutating process-wide state.
+fn abbreviate_prefix(path: &str, home: &str) -> String {
+    if home.is_empty() {
+        return path.to_string();
+    }
+    if path == home {
+        return "~".to_string();
+    }
+    // Only at a component boundary: `/home/user2` merely shares a prefix with
+    // `/home/user` and is a different directory.
+    match path.strip_prefix(home) {
+        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        _ => path.to_string(),
+    }
+}
+
+/// Header title for one pane: its OSC title, else its directory's last
+/// component, else a positional fallback.
+fn pane_header_title(osc_title: Option<&str>, cwd: Option<&str>, position: usize) -> String {
+    if let Some(title) = osc_title.map(str::trim) {
+        if !title.is_empty() {
+            return title.to_string();
+        }
+    }
+    cwd.map(abbreviate_home)
+        .filter(|cwd| !cwd.is_empty())
+        .map(|cwd| {
+            // `~` and `/` have no last component worth showing on their own.
+            std::path::Path::new(&cwd)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+                .unwrap_or(cwd)
+        })
+        .unwrap_or_else(|| format!("Pane {}", position + 1))
+}
+
 fn active_index_after_remove(active: usize, removed: usize, remaining: usize) -> usize {
     debug_assert!(remaining > 0);
     if active > removed {
@@ -174,7 +260,7 @@ impl AppModel {
         let holder = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         holder.set_hexpand(true);
         holder.set_vexpand(true);
-        holder.append(&pane.terminal.widget());
+        holder.append(&pane.widget());
         self.stack.add_named(&holder, Some(&id.to_string()));
         let tab = Tab {
             holder,
@@ -317,7 +403,7 @@ impl AppModel {
                             spawn_at: std::time::Instant::now(),
                         });
                     }
-                    let widget = pane.terminal.widget();
+                    let widget = pane.widget();
                     panes.push(pane);
                     return widget;
                 } else if let Some(name) = remote_name {
@@ -379,7 +465,7 @@ impl AppModel {
                     external_cwd,
                     sender,
                 );
-                let widget = pane.terminal.widget();
+                let widget = pane.widget();
                 panes.push(pane);
                 widget
             }
@@ -446,7 +532,7 @@ impl AppModel {
                 end: Box::new(end),
             }
         } else {
-            let pane = tab.panes.iter().find(|p| p.terminal.widget() == *widget);
+            let pane = tab.panes.iter().find(|p| p.widget() == *widget);
             let (mode, cwd, cwd_external, remote_name, sid, cmds) = match pane {
                 Some(p) => {
                     let managed_remote =
@@ -711,7 +797,7 @@ impl AppModel {
         let holder = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         holder.set_hexpand(true);
         holder.set_vexpand(true);
-        holder.append(&pane.terminal.widget());
+        holder.append(&pane.widget());
         self.stack.add_named(&holder, Some(&id.to_string()));
         let tab = Tab {
             holder,
@@ -849,7 +935,7 @@ impl AppModel {
             return;
         };
         // Swap the dead pane widget for a fresh remote pane.
-        let old_widget = self.tabs[idx].panes[0].terminal.widget();
+        let old_widget = self.tabs[idx].panes[0].widget();
         self.tabs[idx].holder.remove(&old_widget);
         let new_pane_id = self.next_pane_id;
         self.next_pane_id += 1;
@@ -875,7 +961,7 @@ impl AppModel {
             true,
             sender,
         );
-        self.tabs[idx].holder.append(&pane.terminal.widget());
+        self.tabs[idx].holder.append(&pane.widget());
         self.tabs[idx].panes = vec![pane];
         self.tabs[idx].active_pane = 0;
         self.tabs[idx].title = host_now.name.clone();
@@ -952,6 +1038,7 @@ impl AppModel {
             pane.terminal.emit(VteInput::GrabFocus);
         }
         self.file_tree_goto_current_cwd();
+        self.refresh_pane_headers(idx);
         self.rebuild_tab_strip(sender);
     }
 
@@ -972,6 +1059,68 @@ impl AppModel {
         };
         let new_id = self.tabs[new_idx].id;
         self.select_tab(new_id, sender);
+    }
+
+    /// Bring one tab's pane headers up to date: visibility, numbering, focus
+    /// highlight, and the title / directory / running-command line.
+    ///
+    /// A tab with a single pane hides its header entirely — the tab strip and
+    /// window title already name it, and the strip would only cost a row.
+    pub(crate) fn refresh_pane_headers(&self, ti: usize) {
+        let Some(tab) = self.tabs.get(ti) else {
+            return;
+        };
+        let split = tab.panes.len() > 1;
+        for (position, &pane_index) in visual_pane_order(tab).iter().enumerate() {
+            let Some(pane) = tab.panes.get(pane_index) else {
+                continue;
+            };
+            pane.frame.set_header_visible(split);
+            pane.frame.set_focused(pane_index == tab.active_pane);
+            if !split {
+                continue;
+            }
+            let title = pane_header_title(pane.title.as_deref(), pane.cwd.as_deref(), position);
+            let cwd = pane.cwd.as_deref().map(abbreviate_home);
+            pane.frame.set_status(
+                position,
+                &title,
+                cwd.as_deref(),
+                pane.foreground_process().as_deref(),
+            );
+        }
+    }
+
+    /// Refresh the headers of the tab the user is looking at. Background tabs
+    /// are not rendered, so polling their PTYs would be pure waste.
+    pub(crate) fn refresh_active_pane_headers(&self) {
+        self.refresh_pane_headers(self.active);
+    }
+
+    /// Exchange two panes' positions in the split tree after a header drag.
+    ///
+    /// Only the panes move: the tree shape and every divider position the user
+    /// arranged stay exactly as they were, and focus follows the dragged pane
+    /// into its new slot.
+    pub(crate) fn swap_panes(&mut self, dragged: u64, target: u64) {
+        let (Some((ti, di)), Some((tj, tj_index))) =
+            (self.find_pane(dragged), self.find_pane(target))
+        else {
+            return;
+        };
+        // A cross-tab drop would have to move a pane between two widget trees
+        // and two tab identities; refuse rather than half-apply it.
+        if ti != tj || di == tj_index || self.tabs[ti].zoom.is_some() {
+            return;
+        }
+        let dragged_widget = self.tabs[ti].panes[di].widget();
+        let target_widget = self.tabs[ti].panes[tj_index].widget();
+        if !crate::pane_header::swap_pane_widgets(&dragged_widget, &target_widget) {
+            return;
+        }
+        self.tabs[ti].active_pane = di;
+        self.tabs[ti].panes[di].terminal.emit(VteInput::GrabFocus);
+        self.refresh_pane_headers(ti);
     }
 
     /// Foreground processes running in a tab's panes, formatted for one
@@ -1088,7 +1237,7 @@ impl AppModel {
         let holder = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         holder.set_hexpand(true);
         holder.set_vexpand(true);
-        holder.append(&pane.terminal.widget());
+        holder.append(&pane.widget());
         self.stack.add_named(&holder, Some(&id.to_string()));
         let tab = Tab {
             holder,
@@ -1193,7 +1342,7 @@ impl AppModel {
         let ti = self.active;
         let tab_id = tab.id;
         let api = tab.active_pane;
-        let cur_widget = tab.panes[api].terminal.widget();
+        let cur_widget = tab.panes[api].widget();
         let wd = tab.panes[api].local_cwd().map(str::to_string);
         let mode = self.config.borrow().terminal_mode;
 
@@ -1211,7 +1360,7 @@ impl AppModel {
             false,
             sender,
         );
-        let new_widget = new_pane.terminal.widget();
+        let new_widget = new_pane.widget();
 
         let paned = gtk::Paned::new(orientation);
         paned.set_hexpand(true);
@@ -1247,6 +1396,8 @@ impl AppModel {
         tab.panes[tab.active_pane]
             .terminal
             .emit(VteInput::GrabFocus);
+        // The tab just became split, so every pane's header appears now.
+        self.refresh_pane_headers(ti);
     }
 
     /// Remove a pane from its tab, collapsing the Paned tree and promoting the
@@ -1278,6 +1429,8 @@ impl AppModel {
         let ap = tab.active_pane;
         tab.panes[ap].terminal.emit(VteInput::GrabFocus);
         drop(removed);
+        // Numbering shifted, and dropping back to one pane hides the headers.
+        self.refresh_pane_headers(ti);
     }
 
     pub(crate) fn cycle_pane_focus(&mut self, delta: i32) {
@@ -1294,6 +1447,7 @@ impl AppModel {
         tab.panes[tab.active_pane]
             .terminal
             .emit(VteInput::GrabFocus);
+        self.refresh_active_pane_headers();
     }
 
     pub(crate) fn focus_pane_directional(&mut self, direction: Direction) {
@@ -1305,7 +1459,7 @@ impl AppModel {
         }
         let holder: gtk::Widget = tab.holder.clone().upcast();
         let api = tab.active_pane;
-        let focused_widget = tab.panes[api].terminal.widget();
+        let focused_widget = tab.panes[api].widget();
         let Some(fb) = focused_widget.compute_bounds(&holder) else {
             return;
         };
@@ -1317,7 +1471,7 @@ impl AppModel {
             if i == api {
                 continue;
             }
-            let w = pane.terminal.widget();
+            let w = pane.widget();
             let Some(b) = w.compute_bounds(&holder) else {
                 continue;
             };
@@ -1355,7 +1509,7 @@ impl AppModel {
             return;
         };
         let api = tab.active_pane;
-        let mut widget = tab.panes[api].terminal.widget().parent();
+        let mut widget = tab.panes[api].widget().parent();
         while let Some(cur) = widget {
             if let Ok(paned) = cur.clone().downcast::<gtk::Paned>() {
                 if paned.orientation() == target {
@@ -1391,7 +1545,7 @@ impl AppModel {
                 return;
             }
             let api = tab.active_pane;
-            let pane_widget = tab.panes[api].terminal.widget();
+            let pane_widget = tab.panes[api].widget();
             let Some(parent) = pane_widget.parent() else {
                 return;
             };
@@ -1417,6 +1571,9 @@ impl AppModel {
             });
             tab.panes[api].terminal.emit(VteInput::GrabFocus);
         }
+        // Zooming leaves only one leaf in the tree, so pane numbering has to
+        // be recomputed in both directions.
+        self.refresh_pane_headers(ti);
     }
 
     /// Detach the active pane from a split tab and host it in a brand-new tab.
@@ -1446,7 +1603,7 @@ impl AppModel {
         let remote = moves_remote.then(|| self.tabs[ti].remote.take()).flatten();
         let new_id = self.next_id;
         self.next_id += 1;
-        let mw = moved.terminal.widget();
+        let mw = moved.widget();
         let holder = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         holder.set_hexpand(true);
         holder.set_vexpand(true);
@@ -1477,6 +1634,9 @@ impl AppModel {
             }
         }
         self.insert_tab_after_active(new_tab);
+        // The source tab lost a pane and may be back to one; `select_tab`
+        // below only refreshes the destination.
+        self.refresh_pane_headers(ti);
         self.select_tab(new_id, sender);
     }
 
@@ -1489,7 +1649,7 @@ impl AppModel {
             return None;
         }
 
-        let leaf = tab.panes[pane_index].terminal.widget();
+        let leaf = tab.panes[pane_index].widget();
         detach_leaf_and_promote(&tab.holder, &leaf)?;
 
         let tab = self.tabs.get_mut(tab_index)?;
@@ -1511,10 +1671,36 @@ fn reconnect_target_is_valid(
 #[cfg(test)]
 mod pane_tree_tests {
     use super::{
-        active_index_after_remove, format_running_process_summary, reconnect_target_is_valid,
-        replay_argv_for_unmanaged_leaf, restored_leaf_mode, snapshot_restorable_command,
+        abbreviate_prefix, active_index_after_remove, format_running_process_summary,
+        pane_header_title, reconnect_target_is_valid, replay_argv_for_unmanaged_leaf,
+        restored_leaf_mode, snapshot_restorable_command,
     };
     use crate::config::TerminalMode;
+
+    #[test]
+    fn home_is_abbreviated_only_at_a_component_boundary() {
+        assert_eq!(abbreviate_prefix("/home/user", "/home/user"), "~");
+        assert_eq!(abbreviate_prefix("/home/user/src", "/home/user"), "~/src");
+        // A sibling directory that merely shares the prefix must stay intact.
+        assert_eq!(
+            abbreviate_prefix("/home/user2/src", "/home/user"),
+            "/home/user2/src"
+        );
+        assert_eq!(abbreviate_prefix("/etc", "/home/user"), "/etc");
+        assert_eq!(abbreviate_prefix("/etc", ""), "/etc");
+    }
+
+    #[test]
+    fn pane_header_title_prefers_osc_then_directory_then_position() {
+        assert_eq!(pane_header_title(Some("vim README"), Some("/tmp"), 0), "vim README");
+        // Whitespace-only OSC titles must not blank the header.
+        assert_eq!(pane_header_title(Some("   "), Some("/tmp/work"), 0), "work");
+        assert_eq!(pane_header_title(None, Some("/tmp/work"), 0), "work");
+        // A path with no last component keeps whatever it does have.
+        assert_eq!(pane_header_title(None, Some("/"), 0), "/");
+        assert_eq!(pane_header_title(None, None, 2), "Pane 3");
+        assert_eq!(pane_header_title(Some(""), None, 0), "Pane 1");
+    }
 
     #[test]
     fn restored_splits_use_the_configured_backend_for_every_leaf() {

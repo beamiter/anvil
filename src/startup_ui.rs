@@ -8,7 +8,9 @@ use super::*;
 #[allow(deprecated)]
 pub(crate) fn install_static_css() {
     let provider = gtk::CssProvider::new();
-    provider.load_from_data(
+    provider.load_from_data(&format!(
+        "{}{}",
+        crate::pane_header::PANE_HEADER_CSS,
         ".tab-strip-btn { padding: 4px 8px; border-radius: 4px; margin-bottom: 2px; color: #ffffff; }
          .tab-strip-btn:checked { font-weight: bold; border: 1px solid currentColor; border-radius: 4px; }
          .tab-strip-close { min-width: 16px; min-height: 16px; color: #ffffff; }
@@ -32,7 +34,7 @@ pub(crate) fn install_static_css() {
          .top-tab-scroll, .top-tab-scroll > viewport { min-width: 0; }
          .sidebar-toggle-row { margin-bottom: 2px; }
          .sidebar-toggle { padding: 2px 6px; }",
-    );
+    ));
     if let Some(display) = gtk::gdk::Display::default() {
         gtk::style_context_add_provider_for_display(
             &display,
