@@ -19,6 +19,12 @@ Useful focused commands include `make run`, `make test`, `make check`, and
 the release workflow. All Cargo operations that resolve dependencies use the
 committed lockfile.
 
+`jagent` and `jterm_core` are Git dependencies, and the lockfile carries no
+checksum for those. When you repin either revision, update the matching entry
+in `cargoLock.outputHashes` in `flake.nix` as well, otherwise `nix develop`
+and `nix build` fail to evaluate. Set the entry to `pkgs.lib.fakeHash`, run
+`nix build .#default`, and copy the `got:` hash from the mismatch error.
+
 ## Quality gate
 
 Before opening a pull request, run:
