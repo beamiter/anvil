@@ -7,6 +7,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::keybindings::KeybindingMap;
+use jterm_core::host::find_executable_in_path;
+use jterm_core::process::shell_single_quote;
 
 // ---------------------------------------------------------------------------
 // Terminal Mode
@@ -117,22 +119,11 @@ fn control_socket_dir() -> Option<PathBuf> {
     Some(base)
 }
 
-fn shell_single_quote(s: &str) -> String {
-    let mut quoted = String::with_capacity(s.len() + 2);
-    quoted.push('\'');
-    for ch in s.chars() {
-        if ch == '\'' {
-            quoted.push_str("'\"'\"'");
-        } else {
-            quoted.push(ch);
-        }
-    }
-    quoted.push('\'');
-    quoted
-}
-
 fn wrap_exec_in_login_bash(command: &str) -> String {
-    format!("bash -lc 'exec {}'", command.replace('\'', "'\\''"))
+    format!(
+        "bash -lc {}",
+        shell_single_quote(&format!("exec {command}"))
+    )
 }
 
 fn wrap_rsh_argv_in_interactive_bash(rsh_path: &str) -> Option<Vec<String>> {
@@ -1361,13 +1352,6 @@ fn is_executable(path: &Path) -> bool {
     path.is_file()
 }
 
-pub(crate) fn find_executable_in_path(exe_name: &str) -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    std::env::split_paths(&path_var)
-        .map(|dir| dir.join(exe_name))
-        .find(|candidate| is_executable(candidate))
-}
-
 pub(crate) fn choose_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
     // Explicit config / env var wins (needed when PATH is stripped by launchers like wofi).
     if let Some(path) = configured_shell {
@@ -1435,7 +1419,7 @@ mod tests {
                 "-t",
                 "--",
                 "tester@203.0.113.10",
-                "bash -lc 'exec /home/tester/.local/bin/rsh --session '\\''staging-test'\\'''",
+                r#"bash -lc 'exec /home/tester/.local/bin/rsh --session '"'"'staging-test'"'"''"#,
             ]
         );
     }

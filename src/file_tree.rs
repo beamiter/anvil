@@ -247,11 +247,6 @@ pub(crate) fn display_path(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
 
-/// Single-quote a path for safe shell insertion.
-pub(crate) fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

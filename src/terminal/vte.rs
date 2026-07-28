@@ -97,9 +97,7 @@ pub(crate) fn terminal_working_directory(terminal: &Terminal) -> Option<String> 
         }
     }
     let pid: i32 = unsafe { *terminal.data::<i32>("child-pid")?.as_ref() };
-    std::fs::read_link(format!("/proc/{pid}/cwd"))
-        .ok()
-        .map(|p| p.to_string_lossy().to_string())
+    jterm_core::process::process_cwd(pid)
 }
 
 pub(crate) fn default_tab_title(tab_index_1based: u32, working_directory: Option<&str>) -> String {

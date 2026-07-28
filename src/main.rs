@@ -1141,7 +1141,7 @@ impl SimpleComponent for AppModel {
                 self.sync_tab_strip();
             }
             AppMsg::FileTreeActivateFile(path) => {
-                let snippet = format!("{} ", file_tree::shell_quote(&path));
+                let snippet = format!("{} ", process::shell_quote_path(&path));
                 self.insert_review_text(&snippet);
             }
             AppMsg::OpenNotebook(path) => {
@@ -1322,7 +1322,7 @@ fn validate_launch_options(options: &mut cli::LaunchOptions) -> Result<(), Strin
         let found = if path.components().count() > 1 {
             path.is_file()
         } else {
-            config::find_executable_in_path(executable).is_some()
+            host::find_executable_in_path(executable).is_some()
         };
         if !found {
             return Err(format!("command not found: {executable}"));

@@ -73,6 +73,13 @@ versioning for tagged releases while it remains experimental.
 
 ### Changed
 
+- Shell quoting, restorable-command classification, and the `/proc` foreground
+  probes now come from `jterm_core::process` (which was seeded from this
+  repository's copy), and executable lookup uses `jterm_core::host`; the local
+  duplicates were removed. Login-shell wrapping and file-tree path insertion
+  converge on the shared quoting style: embedded single quotes use the
+  `'"'"'` form instead of `'\''` (both POSIX-valid), and obviously safe file
+  paths are inserted unquoted for readability.
 - Pane moves and remote reconnect callbacks now retain stable pane/session
   identity; reconnect cancellation affects only the dead leaf it belongs to.
 - Safe mode ignores user config and behavior overrides, disables restore and
