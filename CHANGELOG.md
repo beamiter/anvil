@@ -141,6 +141,19 @@ versioning for tagged releases while it remains experimental.
   sidebar chord now displays as `Ctrl+\` instead of `Ctrl+backslash`, and
   docs follow the displayed modifier order. A new contract test pins
   jterm1's defaults to the family-wide `DEFAULT_CHORDS` table.
+- Block-mode child-process termination now uses the shared
+  `jterm_core::process` lifecycle (also seeded from this repository's copy):
+  `ChildLifecycle`, `ReapOwner`, and the `EscalationPolicy` ladder replace the
+  local `ChildLifecycle`/`terminate_terminal_process` pair, so `src/process.rs`
+  is re-exports only. The SIGHUP → SIGTERM → SIGKILL timings and the
+  quiet-scan PTY session drain are unchanged. Three things get stricter:
+  constructing a lifecycle is now fallible and opens a pidfd, so every signal
+  during shutdown is bound to the process the PTY forked instead of a bare pid
+  number; the PTY child itself is signaled through that pidfd rather than
+  `kill(pid, …)`; and a lifecycle that is dropped without ever being
+  terminated now reaps its child instead of leaking a zombie. A pane whose
+  PTY cannot be referenced at all (an exhausted descriptor table) fails to
+  open with that error rather than starting unmanaged.
 
 ### Fixed
 

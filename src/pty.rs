@@ -3,7 +3,7 @@
 //! from jterm4 — the block view drives its own PTY (rather than vte4's) so it can
 //! intercept the raw stream for OSC 133 block detection.
 
-use crate::process::{terminate_terminal_process, ChildLifecycle};
+use crate::process::{ChildLifecycle, EscalationPolicy, ReapOwner};
 use gtk::glib;
 use nix::libc;
 use nix::pty::{openpty, OpenptyResult};
@@ -30,7 +30,6 @@ pub struct OwnedPty {
     /// A dedicated worker preserves ordering and completes short writes away
     /// from GTK's main thread.
     input_tx: mpsc::Sender<Vec<u8>>,
-    pid: Pid,
     child_lifecycle: Arc<ChildLifecycle>,
     reader_cancelled: Arc<AtomicBool>,
     /// Tracks bracketed-paste writes whose start/body/end arrive as separate
@@ -278,7 +277,15 @@ fn resolve_executable(
     ))
 }
 
-fn kill_and_reap_unowned_child(child: Pid) {
+/// Kill and reap a freshly forked child that no [`ChildLifecycle`] could be
+/// built for.
+///
+/// This is the one window where a raw `kill` is still the right tool: the
+/// child has just been forked and nobody has reaped it, so its pid cannot have
+/// been reused, and the very failure being handled is that
+/// `ChildLifecycle::new` could not open a reference to it (a full descriptor
+/// table, in practice). Every other teardown path goes through the lifecycle.
+fn kill_and_reap_unreferenced_child(child: Pid) {
     let pid = child.as_raw();
     unsafe {
         if libc::getpgid(pid) == pid {
@@ -450,11 +457,22 @@ impl OwnedPty {
             }
             Ok(ForkResult::Parent { child }) => {
                 drop(slave);
+                // Take ownership of the child's termination path first: from
+                // here on every failure below can tear it down through the
+                // lifecycle instead of an unverified pid.
+                let child_lifecycle = match ChildLifecycle::new(child.as_raw(), ReapOwner::Ours) {
+                    Ok(lifecycle) => lifecycle,
+                    Err(error) => {
+                        drop(master);
+                        kill_and_reap_unreferenced_child(child);
+                        return Err(error);
+                    }
+                };
                 let writer_fd = match master.try_clone() {
                     Ok(fd) => fd,
                     Err(error) => {
                         drop(master);
-                        kill_and_reap_unowned_child(child);
+                        child_lifecycle.force_kill_and_reap();
                         return Err(error);
                     }
                 };
@@ -462,15 +480,13 @@ impl OwnedPty {
                     Ok(tx) => tx,
                     Err(error) => {
                         drop(master);
-                        kill_and_reap_unowned_child(child);
+                        child_lifecycle.force_kill_and_reap();
                         return Err(error);
                     }
                 };
-                let child_lifecycle = ChildLifecycle::new(child);
                 Ok(OwnedPty {
                     master: Arc::new(std::sync::Mutex::new(Some(master))),
                     input_tx,
-                    pid: child,
                     child_lifecycle,
                     reader_cancelled: Arc::new(AtomicBool::new(false)),
                     outgoing_bracketed_paste: AtomicBool::new(false),
@@ -482,7 +498,7 @@ impl OwnedPty {
     }
 
     pub fn pid_i32(&self) -> i32 {
-        self.pid.as_raw()
+        self.child_lifecycle.pid()
     }
 
     /// Raw master-side fd, or -1 if already closed. Borrowed for the lifetime of
@@ -533,7 +549,8 @@ impl OwnedPty {
     pub fn kill(&self) {
         self.reader_cancelled.store(true, Ordering::Release);
         self.close_master_fd();
-        terminate_terminal_process(Arc::clone(&self.child_lifecycle));
+        self.child_lifecycle
+            .terminate(EscalationPolicy::SESSION_DRAIN);
     }
 
     /// Spawn a background reader thread; deliver bounded data through a
@@ -558,7 +575,6 @@ impl OwnedPty {
             }
         };
 
-        let child_pid = self.pid;
         let child_lifecycle = Arc::clone(&self.child_lifecycle);
         let reader_cancelled = Arc::clone(&self.reader_cancelled);
         let (tx, rx) = mpsc::sync_channel::<PtyMsg>(PTY_QUEUE_CAPACITY);
@@ -566,7 +582,6 @@ impl OwnedPty {
 
         self.start_reader_timed(
             reader_fd,
-            child_pid,
             child_lifecycle,
             reader_cancelled,
             tx,
@@ -584,7 +599,6 @@ impl OwnedPty {
     fn start_reader_timed<F, E>(
         &self,
         reader_fd: OwnedFd,
-        child_pid: Pid,
         child_lifecycle: Arc<ChildLifecycle>,
         reader_cancelled: Arc<AtomicBool>,
         tx: mpsc::SyncSender<PtyMsg>,
@@ -654,7 +668,7 @@ impl OwnedPty {
                     // slave side open.
                     return;
                 }
-                reap_child(child_pid, &child_lifecycle, &tx);
+                reap_child(&child_lifecycle, &tx);
             });
         if let Err(error) = reader {
             self.close_master_fd();
@@ -699,11 +713,7 @@ impl OwnedPty {
     }
 }
 
-fn reap_child(
-    child_pid: Pid,
-    child_lifecycle: &Arc<ChildLifecycle>,
-    tx: &mpsc::SyncSender<PtyMsg>,
-) {
+fn reap_child(child_lifecycle: &Arc<ChildLifecycle>, tx: &mpsc::SyncSender<PtyMsg>) {
     let started = std::time::Instant::now();
     let mut termination_requested = false;
     loop {
@@ -717,9 +727,9 @@ fn reap_child(
         if !termination_requested && started.elapsed() >= std::time::Duration::from_secs(5) {
             log::warn!(
                 "PTY reader reached EOF but child {} is still alive; terminating it",
-                child_pid
+                child_lifecycle.pid()
             );
-            terminate_terminal_process(Arc::clone(child_lifecycle));
+            child_lifecycle.terminate(EscalationPolicy::SESSION_DRAIN);
             termination_requested = true;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -759,7 +769,8 @@ impl Drop for OwnedPty {
     fn drop(&mut self) {
         self.reader_cancelled.store(true, Ordering::Release);
         self.close_master_fd();
-        terminate_terminal_process(Arc::clone(&self.child_lifecycle));
+        self.child_lifecycle
+            .terminate(EscalationPolicy::SESSION_DRAIN);
     }
 }
 
