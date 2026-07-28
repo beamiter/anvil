@@ -5,3 +5,6 @@
 .vscode/
 *.swp
 *.swo
+
+# Nix build output
+/result
