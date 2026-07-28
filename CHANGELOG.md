@@ -144,6 +144,24 @@ versioning for tagged releases while it remains experimental.
 
 ### Fixed
 
+- Inline images render again in block mode. The Kitty graphics assembler
+  (`terminal/kitty_graphics.rs`) had no caller: block mode re-wrapped every
+  APC G payload as `ESC _ … ESC \` and fed it to the live VTE, and since
+  libvte implements no APC graphics handler, every `kitten icat` (or other
+  Kitty-protocol) image was silently dropped — no image, no error, no
+  diagnostic. The reader now feeds those payloads to the assembler instead;
+  decoded textures accumulate against the running command and are mounted as
+  GTK Pictures under the finished block's output, folding with the collapse
+  chevron (image-only blocks keep a working chevron). Support probes are
+  answered too: `a=q` validates the sample image, and commands carrying an
+  `i=`/`I=` identifier receive an `OK`/`EINVAL`/`ENOTSUP` reply on the PTY
+  (with `p=` echoed and `q=1`/`q=2` honored), so clients that block waiting
+  for the terminal to answer no longer hang or fall back to text. The
+  per-image (16 MiB encoded), per-block (16 MiB decoded), and dimension
+  (16384 px) caps plus the pre-decode overflow guards are unchanged, and a
+  half-uploaded image is discarded whenever the active block resets. Images
+  are display-only: block history stays text-only, so restored sessions show
+  the text without them. Ports jterm4's implementation.
 - OSC color queries now answer with dynamic colors. When a program sets the
   foreground, background, or cursor color (OSC 10/11/12 with a value), the
   pane records the override — the raw bytes still pass through, so the live

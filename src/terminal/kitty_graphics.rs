@@ -2,18 +2,24 @@
 //!
 //! Supported:
 //! - `a=T` (transmit + display, default) and `a=t` (transmit only — buffered
-//!   but not auto-displayed). `a=q`/`a=d`/`a=p` are silently dropped.
+//!   but not auto-displayed). `a=q` (support probe) is validated and answered
+//!   but never displayed; `a=d`/`a=p` are dropped.
 //! - `f=100` (PNG, default) and `f=32` (RGBA, requires `s=<w>` + `v=<h>`).
 //! - `t=d` (inline base64 payload, default). File / shared-memory transports
 //!   are ignored.
 //! - Chunked transmission via `m=1` (more) + final `m=0` (or absent).
 //!
-//! libvte does not implement this protocol, so block-mode strips APC G
-//! payloads from the byte stream before VTE sees them and renders the decoded
-//! image as a GTK Picture appended to the active block.
+//! libvte does not implement this protocol, so block mode consumes APC G
+//! payloads before VTE sees them and renders the decoded image as a GTK
+//! Picture appended to the finished block. Forwarding the bytes to the live
+//! VTE instead (what block mode used to do) silently dropped every image.
 //!
 //! Per-image and per-block memory caps prevent a runaway shell from ballooning
-//! RSS; oversize payloads are dropped silently.
+//! RSS; oversize payloads are dropped.
+//!
+//! Commands that carry an `i=`/`I=` identifier receive an `OK`/error reply on
+//! the PTY via `response_for`, following jterm2 — the family's reference
+//! responder. See that function for the deliberate divergences.
 
 use relm4::gtk;
 use std::collections::HashMap;
@@ -72,7 +78,7 @@ struct Pending {
 
 /// Parsed result of a single APC G chunk. `Complete` carries a finished image
 /// ready to render; `Pending` means more chunks are expected; `Skipped` means
-/// the chunk was valid but unsupported (e.g. `a=q`) — caller should drop it.
+/// the chunk was valid but unsupported (e.g. `a=d`) — caller should drop it.
 pub(crate) enum Outcome {
     Complete(gdk::Texture),
     /// Buffered but not for display (`a=t`). Future `a=p` is unsupported, so
@@ -82,6 +88,9 @@ pub(crate) enum Outcome {
     Pending,
     Skipped,
     Invalid,
+    /// `a=q` support probe passed validation. Never displayed or stored; the
+    /// caller only owes the client an `OK` reply (see `response_for`).
+    QueryOk,
 }
 
 /// Stateful assembler — owns one entry per in-flight image id.
@@ -121,10 +130,11 @@ impl Assembler {
         let keys = parse_keys(header);
 
         let action = keys.get("a").copied().unwrap_or("t");
-        // Silently ignore unsupported actions; the caller still strips the
-        // APC bytes so libvte doesn't see them as garbage.
+        // Silently ignore unsupported actions; the caller consumed the APC
+        // bytes already so libvte never sees them as garbage.
         match action {
             "T" | "t" => {}
+            "q" => return query_outcome(&keys, body),
             _ => return Outcome::Skipped,
         }
 
@@ -243,6 +253,130 @@ impl Assembler {
             Outcome::CompleteTransmitOnly
         }
     }
+}
+
+/// Validate an `a=q` support probe. `kitten icat` (and other well-behaved
+/// clients) transmit a tiny sample image with `a=q` and block until the
+/// terminal answers, so probes must be validated rather than silently skipped.
+/// Chunking (`m=`) is ignored: known clients probe in one APC.
+fn query_outcome(keys: &HashMap<&str, &str>, body: &[u8]) -> Outcome {
+    if keys.get("t").copied().unwrap_or("d") != "d" {
+        return Outcome::Skipped;
+    }
+    let format = match keys.get("f").copied().unwrap_or("100") {
+        "100" => Format::Png,
+        "32" => Format::Rgba,
+        "24" => Format::Rgb,
+        _ => return Outcome::Skipped,
+    };
+    let encoded: Vec<u8> = body
+        .iter()
+        .copied()
+        .filter(|b| !b.is_ascii_whitespace())
+        .collect();
+    if encoded.len() > MAX_ENCODED_BYTES {
+        return Outcome::Skipped;
+    }
+    if encoded.is_empty() {
+        return Outcome::Invalid;
+    }
+    let Some(decoded) = decode_base64(&encoded) else {
+        return Outcome::Invalid;
+    };
+    let checked = match format {
+        Format::Png => png_layout(&decoded).map(|_| ()),
+        Format::Rgba | Format::Rgb => {
+            let channels = if format == Format::Rgba { 4 } else { 3 };
+            let width = keys.get("s").and_then(|s| s.parse().ok()).unwrap_or(0);
+            let height = keys.get("v").and_then(|s| s.parse().ok()).unwrap_or(0);
+            checked_image_layout(width, height, channels).and_then(|layout| {
+                if decoded.len() < layout.source_bytes {
+                    Err(ImageError::Invalid)
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    };
+    match checked {
+        Ok(()) => Outcome::QueryOk,
+        Err(ImageError::TooLarge) => Outcome::Skipped,
+        Err(ImageError::Invalid) => Outcome::Invalid,
+    }
+}
+
+/// Build the PTY reply owed for a processed APC G payload, or `None` when the
+/// protocol expects silence. Reply semantics follow jterm2, the family's most
+/// complete responder:
+/// - only commands carrying an `i=`/`I=` identifier are answered (the id is
+///   the client's correlation key; kitty itself stays silent without one);
+/// - `q=1` suppresses `OK`, `q=2` also suppresses errors;
+/// - a non-zero `p=` placement id is echoed back.
+///
+/// Deliberate divergences from jterm2, kept small because this responder sits
+/// on top of a minimal assembler rather than a full placement table:
+/// - every unsupported-but-well-formed command answers `ENOTSUP` instead of
+///   per-cause `ENOENT`/`ENOSPC` codes;
+/// - a chunked upload rejected at its first chunk answers every remaining
+///   chunk too (the assembler keeps no tombstone for the aborted id);
+/// - `q=` is read per-chunk, not remembered across an upload.
+pub(crate) fn response_for(payload: &[u8], outcome: &Outcome) -> Option<Vec<u8>> {
+    if payload.first() != Some(&b'G') {
+        return None;
+    }
+    let rest = &payload[1..];
+    let header = match rest.iter().position(|&b| b == b';') {
+        Some(i) => &rest[..i],
+        None => rest,
+    };
+    let keys = parse_keys(header);
+    let id: Option<u32> = keys.get("i").and_then(|s| s.parse().ok());
+    let number: Option<u32> = keys.get("I").and_then(|s| s.parse().ok());
+    if id.is_none() && number.is_none() {
+        return None;
+    }
+    let quiet: u8 = keys
+        .get("q")
+        .and_then(|s| s.parse().ok())
+        .filter(|q| *q <= 2)
+        .unwrap_or(0);
+    let body = match outcome {
+        // Chunked uploads are answered once, after the final chunk.
+        Outcome::Pending => return None,
+        Outcome::Complete(_) | Outcome::CompleteTransmitOnly | Outcome::QueryOk => {
+            if quiet >= 1 {
+                return None;
+            }
+            "OK"
+        }
+        Outcome::Invalid => {
+            if quiet >= 2 {
+                return None;
+            }
+            "EINVAL:invalid graphics payload"
+        }
+        Outcome::Skipped => {
+            if quiet >= 2 {
+                return None;
+            }
+            "ENOTSUP:action, format, transport, or size not supported"
+        }
+    };
+    let mut fields = Vec::with_capacity(3);
+    if let Some(id) = id {
+        fields.push(format!("i={id}"));
+    }
+    if let Some(number) = number {
+        fields.push(format!("I={number}"));
+    }
+    if let Some(placement) = keys
+        .get("p")
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|p| *p != 0)
+    {
+        fields.push(format!("p={placement}"));
+    }
+    Some(format!("\x1b_G{};{body}\x1b\\", fields.join(",")).into_bytes())
 }
 
 /// Parse `key=value,key=value` into a borrow-only map. Empty / malformed
@@ -486,8 +620,8 @@ mod tests {
     #[test]
     fn unsupported_action_is_skipped() {
         let mut a = Assembler::new();
-        assert!(matches!(a.feed(b"Ga=q,i=1;Zm9v"), Outcome::Skipped));
         assert!(matches!(a.feed(b"Ga=d,i=1;"), Outcome::Skipped));
+        assert!(matches!(a.feed(b"Ga=p,i=1;"), Outcome::Skipped));
     }
 
     #[test]
@@ -551,5 +685,94 @@ mod tests {
 
         let mut assembler = Assembler::new();
         assert!(matches!(assembler.feed(&payload), Outcome::Skipped));
+    }
+
+    #[test]
+    fn query_probe_validates_raw_pixels() {
+        // kitten icat's support probe: 1×1 RGB sample under a=q.
+        let mut a = Assembler::new();
+        let payload = b"Ga=q,i=31,s=1,v=1,f=24,t=d;AAAA";
+        let outcome = a.feed(payload);
+        assert!(matches!(outcome, Outcome::QueryOk));
+        assert_eq!(
+            response_for(payload, &outcome).as_deref(),
+            Some(b"\x1b_Gi=31;OK\x1b\\".as_slice())
+        );
+        // Probes never buffer anything.
+        assert!(a.in_flight.is_empty());
+        assert!(a.anon.is_none());
+    }
+
+    #[test]
+    fn query_probe_rejects_bad_or_oversize_payloads() {
+        let mut a = Assembler::new();
+        // Undecodable body.
+        assert!(matches!(
+            a.feed(b"Ga=q,i=1,s=1,v=1,f=24;!!!!"),
+            Outcome::Invalid
+        ));
+        // Payload shorter than the advertised dimensions.
+        assert!(matches!(
+            a.feed(b"Ga=q,i=1,s=2,v=2,f=24;AAAA"),
+            Outcome::Invalid
+        ));
+        // Dimensions beyond the family cap.
+        assert!(matches!(
+            a.feed(b"Ga=q,i=1,s=16385,v=1,f=32;AAAA"),
+            Outcome::Skipped
+        ));
+    }
+
+    #[test]
+    fn responses_require_an_identifier() {
+        assert_eq!(
+            response_for(b"Ga=t,f=24,s=1,v=1;AAAA", &Outcome::Invalid),
+            None
+        );
+        assert_eq!(
+            response_for(b"Ga=T;AAAA", &Outcome::CompleteTransmitOnly),
+            None
+        );
+    }
+
+    #[test]
+    fn responses_echo_ids_and_map_outcomes() {
+        assert_eq!(
+            response_for(
+                b"Ga=t,i=41,s=1,v=1,f=24;AAAA",
+                &Outcome::CompleteTransmitOnly
+            )
+            .as_deref(),
+            Some(b"\x1b_Gi=41;OK\x1b\\".as_slice())
+        );
+        assert_eq!(
+            response_for(b"GI=13,a=T;AAAA", &Outcome::Invalid).as_deref(),
+            Some(b"\x1b_GI=13;EINVAL:invalid graphics payload\x1b\\".as_slice())
+        );
+        assert_eq!(
+            response_for(b"Ga=d,i=5,p=17;", &Outcome::Skipped).as_deref(),
+            Some(
+                b"\x1b_Gi=5,p=17;ENOTSUP:action, format, transport, or size not supported\x1b\\"
+                    .as_slice()
+            )
+        );
+    }
+
+    #[test]
+    fn responses_wait_for_the_final_chunk() {
+        assert_eq!(response_for(b"Ga=T,i=7,m=1;/w", &Outcome::Pending), None);
+    }
+
+    #[test]
+    fn quiet_levels_suppress_responses() {
+        assert_eq!(
+            response_for(b"Ga=q,i=31,q=1,s=1,v=1,f=24;AAAA", &Outcome::QueryOk),
+            None
+        );
+        // q=1 still reports errors …
+        assert!(response_for(b"Ga=T,i=2,q=1;!!!!", &Outcome::Invalid).is_some());
+        // … q=2 silences those too.
+        assert_eq!(response_for(b"Ga=T,i=2,q=2;!!!!", &Outcome::Invalid), None);
+        assert_eq!(response_for(b"Ga=d,i=3,q=2;", &Outcome::Skipped), None);
     }
 }
