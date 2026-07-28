@@ -130,9 +130,30 @@ versioning for tagged releases while it remains experimental.
 - Initial Block commands retain structured argument boundaries through the
   shell wrapper and use a bounded fallback when shell integration markers are
   unavailable, including direct SSH and Mosh sessions.
+- Keyboard chords now use the shared `jterm_core::keybindings` core (parsing,
+  display, and map keys); only the GTK keysym/modifier translation remains
+  app-side. The config grammar widens deliberately: `control`/`option`/
+  `cmd`-style modifier aliases, case-insensitive named keys, `esc`/`del`/
+  `ins`/arrow aliases, and F13–F24 now parse, and `"unbind"` joins the
+  existing unbind tokens (empty, `none`, `disabled`, `false`). The validator
+  now accepts unbind tokens and `false` instead of flagging them. Displayed
+  shortcuts keep the `Ctrl+Shift+Alt` order and "Enter" spelling; the
+  sidebar chord now displays as `Ctrl+\` instead of `Ctrl+backslash`, and
+  docs follow the displayed modifier order. A new contract test pins
+  jterm1's defaults to the family-wide `DEFAULT_CHORDS` table.
 
 ### Fixed
 
+- OSC color queries now answer with dynamic colors. When a program sets the
+  foreground, background, or cursor color (OSC 10/11/12 with a value), the
+  pane records the override — the raw bytes still pass through, so the live
+  VTE recolors natively — and a later OSC 10/11/12 query reports the recorded
+  color instead of the stale static theme; OSC 110/111/112 drops the override
+  so queries fall back to the theme again. Finished-block widgets created
+  after a dynamic change render with the overridden colors too, matching the
+  recolored live view. Specs are parsed as `rgb:R/G/B` (XParseColor, 1–4 hex
+  digits per channel), hex, or color names; unparseable specs leave the
+  tracked state unchanged.
 - The block id counter is now seeded past every restored history id, so a new
   block can no longer alias a restored one and corrupt id-keyed state
   (selection, bookmarks, undo-clear, context-menu copy).

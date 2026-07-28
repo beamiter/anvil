@@ -249,10 +249,10 @@ are currently active.
 | `Ctrl+Shift+T` | New tab |
 | `Ctrl+Shift+W` | Close the focused pane, or the tab when it has one pane |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy / paste |
-| `Ctrl+Alt+Shift+C` | In block mode, copy the selected block's output only |
+| `Ctrl+Shift+Alt+C` | In block mode, copy the selected block's output only |
 | `Ctrl+Shift+E` / `Ctrl+Shift+D` | Split left/right / top/bottom |
 | `Ctrl+Alt+Arrow` | Focus the pane in that direction |
-| `Ctrl+Alt+Shift+Arrow` | Resize the active split |
+| `Ctrl+Shift+Alt+Arrow` | Resize the active split |
 | `Ctrl+Shift+Z` | Toggle pane zoom |
 | `Ctrl+Shift+!` | Move the focused pane into a new tab |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab |
@@ -274,7 +274,7 @@ are currently active.
 | `Ctrl+Shift+A` | Select all finished blocks |
 | `Ctrl+Shift+I` | Reinput selected block commands without running them |
 | `Ctrl+Shift+K` | Clear all finished blocks in the pane |
-| `Ctrl+Alt+Shift+A` | Session AI panel |
+| `Ctrl+Shift+Alt+A` | Session AI panel |
 | `Ctrl+Shift+Q` | Ask AI about the selected finished block |
 | `Ctrl+Shift+M` | Workflows |
 | `Ctrl+Alt+G` | AI agent |

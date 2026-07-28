@@ -1,9 +1,7 @@
-use gtk::gdk::Key;
-use gtk::gdk::ModifierType;
-use gtk::glib::translate::IntoGlib;
+use gtk::gdk::{Key, ModifierType};
+use jterm_core::keybindings::{is_unbind_token, parse, Chord, KeySym, Mods, NamedKey};
 use relm4::gtk;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Action {
@@ -85,7 +83,7 @@ pub(crate) enum Action {
     ExportSessionJson,
     ToggleDebugDashboard,
     /// Open the session-level AI panel for free-form questions about the
-    /// current shell context (Ctrl+Alt+Shift+A by default; Ctrl+Shift+A is the
+    /// current shell context (Ctrl+Shift+Alt+A by default; Ctrl+Shift+A is the
     /// Warp-compatible Select All Blocks action).
     OpenAiPanel,
     /// Send the selected finished Block command/output to the AI panel. The
@@ -342,170 +340,86 @@ pub(crate) enum Direction {
     Down,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct KeyCombo {
-    pub(crate) modifiers: ModifierType,
-    pub(crate) key: Key,
-}
-
-impl PartialEq for KeyCombo {
-    fn eq(&self, other: &Self) -> bool {
-        self.modifiers == other.modifiers && self.key == other.key
-    }
-}
-
-impl Eq for KeyCombo {}
-
-impl Hash for KeyCombo {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.modifiers.bits().hash(state);
-        self.key.into_glib().hash(state);
-    }
-}
-
-pub(crate) fn normalize_key(key: Key) -> Key {
-    // ISO_Left_Tab is what GTK sends for Shift+Tab - normalize to Tab
-    if key == Key::ISO_Left_Tab {
-        return Key::Tab;
-    }
-    key.to_lower()
-}
-
-pub(crate) fn parse_key_combo(s: &str) -> Result<KeyCombo, String> {
-    let mut modifiers = ModifierType::empty();
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
-        return Err("Empty key combo".to_string());
-    }
-    let parts: Vec<&str> = trimmed.split('+').map(|p| p.trim()).collect();
-
-    // The last part is the key, but "+" itself is special:
-    // "Ctrl+Shift++" means Ctrl+Shift and key is "+"
-    let (mod_parts, key_str) = if trimmed.ends_with("++") && parts.len() >= 3 {
-        (&parts[..parts.len() - 2], "+")
-    } else if parts.last() == Some(&"") && parts.len() >= 2 {
-        // "Ctrl++" case
-        (&parts[..parts.len() - 2], "+")
-    } else {
-        (&parts[..parts.len() - 1], *parts.last().unwrap())
+/// Translate a GTK key event into a toolkit-neutral [`Chord`], or `None`
+/// for keysyms no chord string can name (numpad keysyms, bare modifiers,
+/// dead keys).
+///
+/// Chord parsing, display, and hashing live in `jterm_core::keybindings`;
+/// this function is the only place GTK key facts remain:
+///
+/// - Only Ctrl/Shift/Alt are extracted from the modifier state, exactly
+///   as before the migration: a chord still fires with Super or a lock
+///   modifier held, and `super+...` config chords parse but never match.
+/// - `ISO_Left_Tab` (what GTK reports for Shift+Tab) folds to `Tab`.
+/// - `KP_*` keysyms (numpad digits, `KP_Enter`, `KP_Add`, ...) are
+///   excluded rather than folded onto the main row — numpad folding is
+///   not done at this edge today, and no chord string could name these
+///   keysyms before the migration either.
+/// - Letters, digits, and symbols map via `Key::to_unicode()`, lowercased
+///   to match the core invariant that `KeySym::Char` holds lowercase.
+/// - `F1`..`F24` map via the keysym name.
+pub(crate) fn chord_from_gdk(keyval: Key, state: ModifierType) -> Option<Chord> {
+    let mods = Mods {
+        ctrl: state.contains(ModifierType::CONTROL_MASK),
+        shift: state.contains(ModifierType::SHIFT_MASK),
+        alt: state.contains(ModifierType::ALT_MASK),
+        sup: false,
     };
+    let key = keysym_from_gdk(keyval)?;
+    Some(Chord { mods, key })
+}
 
-    for part in mod_parts {
-        match *part {
-            _ if part.eq_ignore_ascii_case("Ctrl") => modifiers |= ModifierType::CONTROL_MASK,
-            _ if part.eq_ignore_ascii_case("Shift") => modifiers |= ModifierType::SHIFT_MASK,
-            _ if part.eq_ignore_ascii_case("Alt") => modifiers |= ModifierType::ALT_MASK,
-            other => return Err(format!("Unknown modifier: {other}")),
+fn keysym_from_gdk(keyval: Key) -> Option<KeySym> {
+    let named = match keyval {
+        Key::Tab | Key::ISO_Left_Tab => Some(NamedKey::Tab),
+        Key::Escape => Some(NamedKey::Escape),
+        Key::Return => Some(NamedKey::Return),
+        Key::space => Some(NamedKey::Space),
+        Key::BackSpace => Some(NamedKey::Backspace),
+        Key::Delete => Some(NamedKey::Delete),
+        Key::Home => Some(NamedKey::Home),
+        Key::End => Some(NamedKey::End),
+        Key::Insert => Some(NamedKey::Insert),
+        Key::Page_Up => Some(NamedKey::PageUp),
+        Key::Page_Down => Some(NamedKey::PageDown),
+        Key::Up => Some(NamedKey::Up),
+        Key::Down => Some(NamedKey::Down),
+        Key::Left => Some(NamedKey::Left),
+        Key::Right => Some(NamedKey::Right),
+        _ => None,
+    };
+    if let Some(named) = named {
+        return Some(KeySym::Named(named));
+    }
+    if let Some(name) = keyval.name() {
+        // KP_Enter and the other numpad keysyms stay unmatchable, as they
+        // were before the migration (KP_1 must not alias Ctrl+1).
+        if name.starts_with("KP_") {
+            return None;
+        }
+        // F25+ exists in GDK, but no chord string can name it.
+        if let Some(n) = name
+            .strip_prefix('F')
+            .and_then(|digits| digits.parse::<u8>().ok())
+            .filter(|n| (1..=24).contains(n))
+        {
+            return Some(KeySym::Function(n));
         }
     }
-
-    let key = match key_str {
-        "+" | "plus" => Key::plus,
-        "=" | "equal" => Key::equal,
-        "-" | "minus" => Key::minus,
-        k if k.eq_ignore_ascii_case("PageUp") => Key::Page_Up,
-        k if k.eq_ignore_ascii_case("PageDown") => Key::Page_Down,
-        k if k.eq_ignore_ascii_case("Tab") => Key::Tab,
-        k if k.eq_ignore_ascii_case("Escape") || k.eq_ignore_ascii_case("Esc") => Key::Escape,
-        k if k.eq_ignore_ascii_case("Return") || k.eq_ignore_ascii_case("Enter") => Key::Return,
-        k if k.eq_ignore_ascii_case("Up") => Key::Up,
-        k if k.eq_ignore_ascii_case("Down") => Key::Down,
-        k if k.eq_ignore_ascii_case("Left") => Key::Left,
-        k if k.eq_ignore_ascii_case("Right") => Key::Right,
-        k if k.eq_ignore_ascii_case("!") || k.eq_ignore_ascii_case("exclam") => Key::exclam,
-        k if k.eq_ignore_ascii_case("Space") => Key::space,
-        k if k.eq_ignore_ascii_case("Backspace") => Key::BackSpace,
-        k if k.eq_ignore_ascii_case("Delete") => Key::Delete,
-        k if k.eq_ignore_ascii_case("Home") => Key::Home,
-        k if k.eq_ignore_ascii_case("End") => Key::End,
-        k if k.eq_ignore_ascii_case("Insert") => Key::Insert,
-        s if s.len() == 1 => {
-            let c = s.chars().next().unwrap();
-            if c.is_ascii_digit() {
-                match c {
-                    '0' => Key::_0,
-                    '1' => Key::_1,
-                    '2' => Key::_2,
-                    '3' => Key::_3,
-                    '4' => Key::_4,
-                    '5' => Key::_5,
-                    '6' => Key::_6,
-                    '7' => Key::_7,
-                    '8' => Key::_8,
-                    '9' => Key::_9,
-                    _ => unreachable!(),
-                }
-            } else if c.is_ascii_alphabetic() {
-                Key::from_name(c.to_lowercase().to_string())
-                    .ok_or_else(|| format!("Unknown key: {s}"))?
-            } else {
-                return Err(format!("Unknown key: {s}"));
-            }
-        }
-        s => Key::from_name(s).ok_or_else(|| format!("Unknown key: {s}"))?,
-    };
-
-    Ok(KeyCombo {
-        modifiers,
-        key: normalize_key(key),
-    })
-}
-
-pub(crate) fn key_combo_to_string(combo: &KeyCombo) -> String {
-    let mut parts = Vec::new();
-    if combo.modifiers.contains(ModifierType::CONTROL_MASK) {
-        parts.push("Ctrl");
+    // Printable keys, lowercased to the core `Char` invariant. A
+    // character whose lowercase expands to multiple chars is unmatchable
+    // by `parse` and is dropped, mirroring the parser's rejection.
+    let c = keyval.to_unicode().filter(|c| !c.is_control())?;
+    let mut lower = c.to_lowercase();
+    match (lower.next(), lower.next()) {
+        (Some(lc), None) => Some(KeySym::Char(lc)),
+        _ => None,
     }
-    if combo.modifiers.contains(ModifierType::SHIFT_MASK) {
-        parts.push("Shift");
-    }
-    if combo.modifiers.contains(ModifierType::ALT_MASK) {
-        parts.push("Alt");
-    }
-
-    let key_name = match combo.key {
-        Key::plus => "+".to_string(),
-        Key::equal => "=".to_string(),
-        Key::minus => "-".to_string(),
-        Key::Page_Up => "PageUp".to_string(),
-        Key::Page_Down => "PageDown".to_string(),
-        Key::Tab | Key::ISO_Left_Tab => "Tab".to_string(),
-        Key::Escape => "Escape".to_string(),
-        Key::Return => "Enter".to_string(),
-        Key::Up => "Up".to_string(),
-        Key::Down => "Down".to_string(),
-        Key::Left => "Left".to_string(),
-        Key::Right => "Right".to_string(),
-        Key::exclam => "!".to_string(),
-        Key::space => "Space".to_string(),
-        Key::BackSpace => "Backspace".to_string(),
-        Key::Delete => "Delete".to_string(),
-        Key::Home => "Home".to_string(),
-        Key::End => "End".to_string(),
-        k => k
-            .name()
-            .map(|n| {
-                let s = n.to_string();
-                if s.len() == 1 {
-                    s.to_uppercase()
-                } else {
-                    s
-                }
-            })
-            .unwrap_or_else(|| "?".to_string()),
-    };
-
-    let mut result = parts.join("+");
-    if !result.is_empty() {
-        result.push('+');
-    }
-    result.push_str(&key_name);
-    result
 }
 
 #[derive(Clone)]
 pub(crate) struct KeybindingMap {
-    pub(crate) bindings: HashMap<KeyCombo, Action>,
+    pub(crate) bindings: HashMap<Chord, Action>,
 }
 
 impl KeybindingMap {
@@ -513,8 +427,8 @@ impl KeybindingMap {
         let mut bindings = HashMap::new();
 
         let mut bind = |s: &str, action: Action| {
-            if let Ok(combo) = parse_key_combo(s) {
-                bindings.insert(combo, action);
+            if let Ok(chord) = parse(s) {
+                bindings.insert(chord, action);
             }
         };
 
@@ -599,15 +513,12 @@ impl KeybindingMap {
                 log::warn!("Keybinding value for {config_key} must be a chord string or false");
                 continue;
             };
-            if key_str.trim().is_empty()
-                || key_str.eq_ignore_ascii_case("none")
-                || key_str.eq_ignore_ascii_case("disabled")
-            {
+            if is_unbind_token(key_str) {
                 self.bindings.retain(|_, bound| *bound != action);
                 continue;
             }
-            let combo = match parse_key_combo(key_str) {
-                Ok(combo) => combo,
+            let combo = match parse(key_str) {
+                Ok(chord) => chord,
                 Err(e) => {
                     // Keep the previous/default binding. A typo in config must
                     // not make an action unreachable.
@@ -633,18 +544,18 @@ impl KeybindingMap {
         }
     }
 
-    pub(crate) fn lookup(&self, combo: &KeyCombo) -> Option<Action> {
-        self.bindings.get(combo).copied()
+    pub(crate) fn lookup(&self, chord: &Chord) -> Option<Action> {
+        self.bindings.get(chord).copied()
     }
 
     pub(crate) fn binding_display(&self, action: &Action) -> String {
-        let combos: Vec<_> = self
+        let chords: Vec<_> = self
             .bindings
             .iter()
             .filter(|(_, a)| *a == action)
-            .map(|(k, _)| key_combo_to_string(k))
+            .map(|(k, _)| k.display())
             .collect();
-        combos.join(", ")
+        chords.join(", ")
     }
 
     pub(crate) fn all_bound_actions(&self) -> Vec<(Action, String)> {
@@ -660,41 +571,209 @@ impl KeybindingMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jterm_core::keybindings::{CommonAction, ParseError, DEFAULT_CHORDS};
 
     #[test]
-    fn parse_key_combo_trims_whitespace() {
-        let combo = parse_key_combo(" Ctrl + Shift + P ").expect("valid");
-        assert!(combo.modifiers.contains(ModifierType::CONTROL_MASK));
-        assert!(combo.modifiers.contains(ModifierType::SHIFT_MASK));
-        assert_eq!(combo.key, Key::p);
+    fn parse_trims_whitespace() {
+        let chord = parse(" Ctrl + Shift + P ").expect("valid");
+        assert!(chord.mods.ctrl);
+        assert!(chord.mods.shift);
+        assert_eq!(chord.key, KeySym::Char('p'));
     }
 
     #[test]
-    fn parse_key_combo_empty_string_is_error() {
-        let err = parse_key_combo("   ").expect_err("empty input should fail");
-        assert_eq!(err, "Empty key combo");
+    fn parse_empty_string_is_error() {
+        assert_eq!(parse("   "), Err(ParseError::Empty));
     }
 
     #[test]
-    fn parse_key_combo_allows_lowercase_modifiers() {
-        let combo = parse_key_combo("ctrl+p").expect("valid");
-        assert!(combo.modifiers.contains(ModifierType::CONTROL_MASK));
-        assert_eq!(combo.key, Key::p);
+    fn parse_allows_lowercase_and_aliased_modifiers() {
+        let chord = parse("ctrl+p").expect("valid");
+        assert!(chord.mods.ctrl);
+        assert_eq!(chord.key, KeySym::Char('p'));
+        // The shared grammar deliberately widens what jterm1 alone used
+        // to accept: control/option style aliases parse too now.
+        assert_eq!(parse("control+p"), Ok(chord));
+        assert_eq!(parse("option+left"), parse("alt+left"));
     }
 
     #[test]
     fn equal_key_alias_parses_and_displays_canonically() {
-        let symbol = parse_key_combo("Ctrl+=").expect("symbol form is valid");
-        let named = parse_key_combo("Ctrl+equal").expect("named form is valid");
+        let symbol = parse("Ctrl+=").expect("symbol form is valid");
+        let named = parse("Ctrl+equal").expect("named form is valid");
         assert_eq!(symbol, named);
-        assert_eq!(symbol.key, Key::equal);
-        assert_eq!(key_combo_to_string(&symbol), "Ctrl+=");
+        assert_eq!(symbol.key, KeySym::Char('='));
+        assert_eq!(symbol.display(), "Ctrl+=");
+    }
+
+    /// The display strings the palette and dialogs show must not change
+    /// shape across the core migration (modifier order Ctrl+Shift+Alt,
+    /// Return spelled "Enter"). One deliberate exception: backslash now
+    /// displays as the literal `\` (the family decision) where the old
+    /// code showed the word "backslash".
+    #[test]
+    fn display_matches_the_legacy_jterm1_format() {
+        for (input, want) in [
+            ("Ctrl+Shift+T", "Ctrl+Shift+T"),
+            ("Ctrl+equal", "Ctrl+="),
+            ("Ctrl+minus", "Ctrl+-"),
+            ("Ctrl+Alt+Shift+Left", "Ctrl+Shift+Alt+Left"),
+            ("Ctrl+Enter", "Ctrl+Enter"),
+            ("Ctrl+Shift+!", "Ctrl+Shift+!"),
+            ("Ctrl+PageUp", "Ctrl+PageUp"),
+            ("Ctrl+backslash", "Ctrl+\\"),
+            ("F12", "F12"),
+        ] {
+            assert_eq!(parse(input).unwrap().display(), want, "{input}");
+        }
+    }
+
+    #[test]
+    fn gdk_edge_folds_iso_left_tab_and_lowercases_letters() {
+        let ctrl_shift = ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK;
+        assert_eq!(
+            chord_from_gdk(Key::ISO_Left_Tab, ctrl_shift),
+            Some(parse("ctrl+shift+tab").unwrap())
+        );
+        assert_eq!(
+            chord_from_gdk(Key::T, ctrl_shift),
+            Some(parse("ctrl+shift+t").unwrap())
+        );
+    }
+
+    #[test]
+    fn gdk_edge_maps_named_function_symbol_and_digit_keys() {
+        let ctrl = ModifierType::CONTROL_MASK;
+        let cases = [
+            (Key::Return, ModifierType::empty(), "enter"),
+            (Key::space, ctrl, "ctrl+space"),
+            (Key::Page_Up, ctrl, "ctrl+pageup"),
+            (Key::F12, ModifierType::empty(), "f12"),
+            (Key::backslash, ctrl, "ctrl+backslash"),
+            (Key::equal, ctrl, "ctrl+="),
+            (Key::exclam, ctrl_shift(), "ctrl+shift+!"),
+            (Key::_1, ctrl, "ctrl+1"),
+        ];
+        for (keyval, state, chord_str) in cases {
+            assert_eq!(
+                chord_from_gdk(keyval, state),
+                Some(parse(chord_str).unwrap()),
+                "{chord_str}"
+            );
+        }
+    }
+
+    fn ctrl_shift() -> ModifierType {
+        ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK
+    }
+
+    #[test]
+    fn gdk_edge_excludes_numpad_keysyms_and_bare_modifiers() {
+        // Numpad folding is NOT done at this edge: KP_1, KP_Enter, and
+        // friends were unmatchable before the migration and must stay so.
+        for keyval in [
+            Key::KP_1,
+            Key::KP_0,
+            Key::KP_Enter,
+            Key::KP_Add,
+            Key::Control_L,
+        ] {
+            assert_eq!(
+                chord_from_gdk(keyval, ModifierType::CONTROL_MASK),
+                None,
+                "{keyval:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gdk_edge_ignores_super_and_lock_modifier_state() {
+        // Only Ctrl/Shift/Alt are extracted, as before the migration: a
+        // chord still fires with Super or a lock modifier held.
+        let plain = chord_from_gdk(Key::c, ctrl_shift());
+        let noisy = chord_from_gdk(
+            Key::c,
+            ctrl_shift() | ModifierType::SUPER_MASK | ModifierType::LOCK_MASK,
+        );
+        assert_eq!(plain, noisy);
+        assert_eq!(plain, Some(parse("ctrl+shift+c").unwrap()));
+    }
+
+    /// The cross-app ergonomic contract: every family default chord maps
+    /// onto a jterm1 action, and `from_defaults` must bind exactly that
+    /// chord to it. `ctrl+shift+a` (SelectAllBlocks here) is deliberately
+    /// absent from the shared table — see DEFAULT_CHORDS' exclusion list.
+    #[test]
+    fn common_default_chord_table_is_honored() {
+        fn local_action(common: CommonAction) -> Action {
+            match common {
+                CommonAction::NewTab => Action::NewTab,
+                CommonAction::ClosePaneOrTab => Action::ClosePaneOrTab,
+                CommonAction::Copy => Action::Copy,
+                CommonAction::Paste => Action::Paste,
+                CommonAction::NextTab => Action::NextTab,
+                CommonAction::PrevTab => Action::PrevTab,
+                // jterm1 binds the ctrl+page pair to the same tab cycling
+                // actions as ctrl+tab / ctrl+shift+tab.
+                CommonAction::NextTabPage => Action::NextTab,
+                CommonAction::PrevTabPage => Action::PrevTab,
+                CommonAction::QuickSwitch(n) => Action::QuickSwitchTab(n - 1),
+                CommonAction::LastTab => Action::QuickSwitchTab(9),
+                CommonAction::FontIncrease => Action::FontIncrease,
+                CommonAction::FontDecrease => Action::FontDecrease,
+                CommonAction::FontReset => Action::FontReset,
+                CommonAction::Search => Action::ToggleSearch,
+                CommonAction::CommandPalette => Action::ToggleCommandPalette,
+                CommonAction::Settings => Action::ToggleSettings,
+                CommonAction::Sidebar => Action::ToggleSidebar,
+                CommonAction::DebugPanel => Action::ToggleDebugDashboard,
+                CommonAction::ScrollUp => Action::ScrollUp,
+                CommonAction::ScrollDown => Action::ScrollDown,
+                CommonAction::PaneFocusLeft => Action::FocusPaneLeft,
+                CommonAction::PaneFocusRight => Action::FocusPaneRight,
+                CommonAction::PaneFocusUp => Action::FocusPaneUp,
+                CommonAction::PaneFocusDown => Action::FocusPaneDown,
+                CommonAction::PaneResizeLeft => Action::ResizePaneLeft,
+                CommonAction::PaneResizeRight => Action::ResizePaneRight,
+                CommonAction::PaneResizeUp => Action::ResizePaneUp,
+                CommonAction::PaneResizeDown => Action::ResizePaneDown,
+                CommonAction::SplitSideBySide => Action::SplitHorizontal,
+                CommonAction::SplitStacked => Action::SplitVertical,
+                CommonAction::PaneZoom => Action::TogglePaneZoom,
+            }
+        }
+
+        let map = KeybindingMap::from_defaults();
+        for (common, chord_str) in DEFAULT_CHORDS {
+            let chord = parse(chord_str).expect("contract chords parse");
+            assert_eq!(
+                map.lookup(&chord),
+                Some(local_action(*common)),
+                "family contract: {chord_str} must be bound to {common:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn string_unbind_tokens_remove_a_binding() {
+        // "unbind" is new with the shared core; empty/none/disabled were
+        // already honored before the migration.
+        for token in ["unbind", "none", "disabled", ""] {
+            let mut map = KeybindingMap::from_defaults();
+            let sidebar = parse("ctrl+backslash").unwrap();
+            assert_eq!(map.lookup(&sidebar), Some(Action::ToggleSidebar));
+            let table = format!("toggle_sidebar = '{token}'")
+                .parse::<toml::Table>()
+                .unwrap();
+            map.apply_user_overrides(&table);
+            assert_eq!(map.lookup(&sidebar), None, "token {token:?}");
+        }
     }
 
     #[test]
     fn invalid_override_keeps_default_binding() {
         let mut map = KeybindingMap::from_defaults();
-        let original = parse_key_combo("Ctrl+Shift+T").unwrap();
+        let original = parse("Ctrl+Shift+T").unwrap();
         let table = "new_tab = 'Ctrl+NoSuchModifier+T'"
             .parse::<toml::Table>()
             .unwrap();
@@ -705,8 +784,8 @@ mod tests {
     #[test]
     fn conflicting_override_keeps_both_defaults() {
         let mut map = KeybindingMap::from_defaults();
-        let new_tab = parse_key_combo("Ctrl+Shift+T").unwrap();
-        let paste = parse_key_combo("Ctrl+Shift+V").unwrap();
+        let new_tab = parse("Ctrl+Shift+T").unwrap();
+        let paste = parse("Ctrl+Shift+V").unwrap();
         let table = "new_tab = 'Ctrl+Shift+V'".parse::<toml::Table>().unwrap();
         map.apply_user_overrides(&table);
         assert_eq!(map.lookup(&new_tab), Some(Action::NewTab));
@@ -722,7 +801,7 @@ mod tests {
             ("Ctrl+Shift+K", Action::ClearBlocks),
         ];
         for (binding, expected) in cases {
-            let combo = parse_key_combo(binding).expect("valid built-in binding");
+            let combo = parse(binding).expect("valid built-in binding");
             assert_eq!(map.lookup(&combo), Some(expected), "{binding}");
         }
     }
@@ -781,19 +860,19 @@ mod tests {
         ];
 
         for (binding, expected) in cases {
-            let combo = parse_key_combo(binding).expect("valid default binding");
+            let combo = parse(binding).expect("valid default binding");
             assert_eq!(map.lookup(&combo), Some(expected), "{binding}");
         }
         for digit in 1..=8u8 {
             let binding = format!("Ctrl+{digit}");
-            let combo = parse_key_combo(&binding).expect("valid tab digit binding");
+            let combo = parse(&binding).expect("valid tab digit binding");
             assert_eq!(
                 map.lookup(&combo),
                 Some(Action::QuickSwitchTab(digit - 1)),
                 "{binding}"
             );
         }
-        let last = parse_key_combo("Ctrl+9").expect("valid last-tab binding");
+        let last = parse("Ctrl+9").expect("valid last-tab binding");
         assert_eq!(map.lookup(&last), Some(Action::QuickSwitchTab(9)));
 
         assert_eq!(
@@ -820,7 +899,7 @@ mod tests {
             "Ctrl+Shift+J",
             "Ctrl+Alt+Shift+K",
         ] {
-            let combo = parse_key_combo(binding).expect("valid reserved binding");
+            let combo = parse(binding).expect("valid reserved binding");
             assert_eq!(map.lookup(&combo), None, "{binding} must stay unbound");
         }
         assert!(map

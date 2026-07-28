@@ -237,8 +237,113 @@ fn refresh_repo_strip(label: &gtk::Label, cwd: &str) {
     }
 }
 
-fn build_color_query_reply(config: &Config, kind: ColorKind) -> String {
-    let rgba = match kind {
+/// Dynamic OSC 10/11/12 color overrides for one pane.
+///
+/// The parser passes the original set/reset bytes through, so the live VTE
+/// recolors itself natively; this struct only remembers the values so that a
+/// later OSC color QUERY reports what the app set instead of the static theme
+/// (vim `background=` probes, theme-switching tools), and so finished-block
+/// VTEs created after the change match the recolored live view. OSC
+/// 110/111/112 resets a slot back to the theme.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct DynamicColors {
+    foreground: Option<RGBA>,
+    background: Option<RGBA>,
+    cursor: Option<RGBA>,
+}
+
+impl DynamicColors {
+    /// Record a dynamic color SET. Unparseable specs are ignored: the raw
+    /// bytes still passed through to the VTE, which applies its own parse, so
+    /// dropping the tracked value merely keeps the theme answer for queries.
+    fn set(&mut self, kind: ColorKind, spec: &str) {
+        let Some(rgba) = parse_color_spec(spec) else {
+            return;
+        };
+        if let Some(slot) = self.slot_mut(kind) {
+            *slot = Some(rgba);
+        }
+    }
+
+    /// Drop a dynamic override (OSC 110/111/112) so queries fall back to the
+    /// theme color again.
+    fn reset(&mut self, kind: ColorKind) {
+        if let Some(slot) = self.slot_mut(kind) {
+            *slot = None;
+        }
+    }
+
+    fn get(&self, kind: ColorKind) -> Option<RGBA> {
+        match kind {
+            ColorKind::Foreground => self.foreground,
+            ColorKind::Background => self.background,
+            ColorKind::Cursor => self.cursor,
+            // OSC 4 palette sets are not tracked (VTE owns them natively).
+            ColorKind::Palette(_) => None,
+        }
+    }
+
+    fn slot_mut(&mut self, kind: ColorKind) -> Option<&mut Option<RGBA>> {
+        match kind {
+            ColorKind::Foreground => Some(&mut self.foreground),
+            ColorKind::Background => Some(&mut self.background),
+            ColorKind::Cursor => Some(&mut self.cursor),
+            ColorKind::Palette(_) => None,
+        }
+    }
+
+    /// Clone the theme `config` with any dynamic overrides substituted, so a
+    /// finished-block VTE created after an OSC 10/11/12 change matches the
+    /// natively recolored live VTE instead of flashing back to theme colors.
+    fn overlay(&self, config: &Config) -> Config {
+        let mut config = config.clone();
+        if let Some(fg) = self.foreground {
+            config.foreground = fg;
+        }
+        if let Some(bg) = self.background {
+            config.background = bg;
+        }
+        if let Some(cursor) = self.cursor {
+            config.cursor = cursor;
+        }
+        config
+    }
+}
+
+/// Parse an OSC 10/11/12 color spec. `RGBA::parse` covers the hex forms,
+/// CSS/X11 names, and `rgb()`/`rgba()`, but not XParseColor's
+/// `rgb:<r>/<g>/<b>` (1–4 hex digits per channel) — the canonical form apps
+/// send — so normalize that one by hand first.
+fn parse_color_spec(spec: &str) -> Option<RGBA> {
+    if let Some(body) = spec.strip_prefix("rgb:") {
+        let mut channels = body.split('/');
+        let (r, g, b) = (channels.next()?, channels.next()?, channels.next()?);
+        if channels.next().is_some() {
+            return None;
+        }
+        return Some(RGBA::new(
+            x11_channel(r)?,
+            x11_channel(g)?,
+            x11_channel(b)?,
+            1.0,
+        ));
+    }
+    RGBA::parse(spec).ok()
+}
+
+/// One XParseColor hex channel scaled to 0.0..=1.0: `"f"` and `"ffff"` both
+/// mean full intensity (value / (16^len - 1)).
+fn x11_channel(text: &str) -> Option<f32> {
+    if text.is_empty() || text.len() > 4 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let value = u32::from_str_radix(text, 16).ok()?;
+    let max = (1u32 << (4 * text.len() as u32)) - 1;
+    Some(value as f32 / max as f32)
+}
+
+fn build_color_query_reply(config: &Config, dynamic: DynamicColors, kind: ColorKind) -> String {
+    let rgba = dynamic.get(kind).unwrap_or_else(|| match kind {
         ColorKind::Foreground => config.foreground,
         ColorKind::Background => config.background,
         ColorKind::Cursor => config.cursor,
@@ -246,7 +351,7 @@ fn build_color_query_reply(config: &Config, kind: ColorKind) -> String {
             let (r, g, b) = crate::terminal::ansi::ansi256_to_rgb(idx, &config.palette);
             RGBA::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0)
         }
-    };
+    });
     let r = (rgba.red() * 65535.0) as u16;
     let g = (rgba.green() * 65535.0) as u16;
     let b = (rgba.blue() * 65535.0) as u16;
@@ -868,6 +973,9 @@ struct ReaderCtx {
     activity_cbs: VoidCallbacks,
     mouse_reporting_rc: Rc<Cell<MouseReportingMode>>,
     bracketed_paste_rc: Rc<Cell<bool>>,
+    /// Dynamic OSC 10/11/12 overrides for this pane: consulted for OSC color
+    /// query replies and overlaid onto the theme for new finished blocks.
+    dynamic_colors_rc: Rc<Cell<DynamicColors>>,
     config_for_cb: Rc<RefCell<Config>>,
     parser: Rc<RefCell<Parser>>,
     block_data_for_cb: Rc<RefCell<VecDeque<BlockData>>>,
@@ -1037,6 +1145,7 @@ impl ReaderCtx {
             activity_cbs,
             mouse_reporting_rc,
             bracketed_paste_rc,
+            dynamic_colors_rc,
             config_for_cb,
             parser,
             block_data_for_cb,
@@ -1291,6 +1400,12 @@ impl ReaderCtx {
                                 block_data_for_cb.borrow_mut().push_back(block_data);
 
                                 let recycled = widget_pool_for_cb.borrow_mut().acquire();
+                                // Snapshot VTEs must match what the live view
+                                // showed: overlay any dynamic OSC 10/11/12
+                                // colors onto the theme for this block.
+                                let block_config = dynamic_colors_rc
+                                    .get()
+                                    .overlay(&config_for_cb.borrow());
                                 let finished = FinishedBlock::new_with_pool(
                                     block_id,
                                     &prompt,
@@ -1298,7 +1413,7 @@ impl ReaderCtx {
                                     None,
                                     &output_with_ansi,
                                     exit_code,
-                                    &config_for_cb.borrow(),
+                                    &block_config,
                                     duration_ms,
                                     end_time_ms,
                                     block_cwd.as_deref(),
@@ -2068,8 +2183,28 @@ impl ReaderCtx {
                         }
 
                         ParserEvent::ColorQuery(kind) => {
-                            let reply = build_color_query_reply(&config_for_cb.borrow(), *kind);
+                            let reply = build_color_query_reply(
+                                &config_for_cb.borrow(),
+                                dynamic_colors_rc.get(),
+                                *kind,
+                            );
                             pty_for_init.write_bytes(reply.as_bytes());
+                        }
+
+                        // The original OSC bytes already passed through to the
+                        // live VTE (which recolors natively); only the tracked
+                        // values change here so queries and new finished blocks
+                        // see the dynamic color.
+                        ParserEvent::ColorSet { kind, spec } => {
+                            let mut colors = dynamic_colors_rc.get();
+                            colors.set(*kind, spec);
+                            dynamic_colors_rc.set(colors);
+                        }
+
+                        ParserEvent::ColorReset(kind) => {
+                            let mut colors = dynamic_colors_rc.get();
+                            colors.reset(*kind);
+                            dynamic_colors_rc.set(colors);
                         }
 
                         ParserEvent::KeyboardProtocolQuery(query) => {
@@ -3068,6 +3203,8 @@ impl TermView {
             let activity_cbs = activity_callbacks.clone();
             let mouse_reporting_rc = mouse_reporting_mode.clone();
             let bracketed_paste_rc = bracketed_paste.clone();
+            let dynamic_colors_rc: Rc<Cell<DynamicColors>> =
+                Rc::new(Cell::new(DynamicColors::default()));
             let config_for_cb = Rc::new(RefCell::new(config.clone()));
             let parser = Rc::new(RefCell::new(Parser::with_config(ParserConfig {
                 mouse_reporting: config.mouse_reporting_enabled,
@@ -3117,6 +3254,7 @@ impl TermView {
                 activity_cbs,
                 mouse_reporting_rc,
                 bracketed_paste_rc,
+                dynamic_colors_rc,
                 config_for_cb,
                 parser,
                 block_data_for_cb,
@@ -4702,13 +4840,15 @@ impl TermView {
 #[cfg(test)]
 mod tests {
     use super::{
-        background_output_has_visible_text, block_clipboard_text, build_command_recall,
-        build_keyboard_query_reply, coalesce_bytes_events, finished_command,
-        is_post_command_metadata, notification_permitted, selected_blocks_markdown,
-        selected_command_text, selected_id_range, step_marked_indices, strip_ansi,
-        strip_ansi_with_clear_detect, take_background_output, BlockData, NOTIFICATION_MIN_INTERVAL,
+        background_output_has_visible_text, block_clipboard_text, build_color_query_reply,
+        build_command_recall, build_keyboard_query_reply, coalesce_bytes_events, finished_command,
+        is_post_command_metadata, notification_permitted, parse_color_spec,
+        selected_blocks_markdown, selected_command_text, selected_id_range, step_marked_indices,
+        strip_ansi, strip_ansi_with_clear_detect, take_background_output, BlockData, DynamicColors,
+        NOTIFICATION_MIN_INTERVAL,
     };
-    use crate::parser::{KeyboardProtocolQuery, ParserEvent};
+    use crate::config::Config;
+    use crate::parser::{ColorKind, KeyboardProtocolQuery, ParserEvent};
     use std::cell::RefCell;
     use std::collections::{HashSet, VecDeque};
     use std::time::Instant;
@@ -4743,6 +4883,75 @@ mod tests {
         assert!(version.starts_with("\x1bP>|jterm1 "));
         assert!(version.contains(env!("CARGO_PKG_VERSION")));
         assert!(version.ends_with("\x1b\\"));
+    }
+
+    #[test]
+    fn dynamic_color_set_changes_query_reply_and_reset_restores_theme() {
+        let config = Config::safe_defaults();
+        let mut dynamic = DynamicColors::default();
+        let theme_reply = build_color_query_reply(&config, dynamic, ColorKind::Background);
+
+        dynamic.set(ColorKind::Background, "#ff8000");
+        assert_eq!(
+            build_color_query_reply(&config, dynamic, ColorKind::Background),
+            "\x1b]11;rgb:ffff/8080/0000\x1b\\"
+        );
+        // Only the set slot is overridden; foreground still answers from theme.
+        assert_eq!(
+            build_color_query_reply(&config, dynamic, ColorKind::Foreground),
+            build_color_query_reply(&config, DynamicColors::default(), ColorKind::Foreground)
+        );
+
+        dynamic.reset(ColorKind::Background);
+        assert_eq!(
+            build_color_query_reply(&config, dynamic, ColorKind::Background),
+            theme_reply
+        );
+    }
+
+    #[test]
+    fn dynamic_color_specs_accept_xparsecolor_and_hex_forms() {
+        // XParseColor `rgb:` channels scale by digit count: "8" and "80" both
+        // mean mid intensity relative to their own maximum.
+        let mut dynamic = DynamicColors::default();
+        dynamic.set(ColorKind::Foreground, "rgb:ff/80/00");
+        let config = Config::safe_defaults();
+        assert_eq!(
+            build_color_query_reply(&config, dynamic, ColorKind::Foreground),
+            "\x1b]10;rgb:ffff/8080/0000\x1b\\"
+        );
+        dynamic.set(ColorKind::Cursor, "rgb:ffff/8080/0000");
+        assert_eq!(
+            build_color_query_reply(&config, dynamic, ColorKind::Cursor),
+            "\x1b]12;rgb:ffff/8080/0000\x1b\\"
+        );
+        assert!(parse_color_spec("#fff").is_some());
+        assert!(parse_color_spec("red").is_some());
+    }
+
+    #[test]
+    fn junk_or_palette_color_specs_leave_tracking_unchanged() {
+        let mut dynamic = DynamicColors::default();
+        dynamic.set(ColorKind::Background, "definitely-not-a-color");
+        assert!(dynamic.get(ColorKind::Background).is_none());
+        dynamic.set(ColorKind::Background, "rgb:zz/00/00");
+        assert!(dynamic.get(ColorKind::Background).is_none());
+        dynamic.set(ColorKind::Background, "rgb:11/22");
+        assert!(dynamic.get(ColorKind::Background).is_none());
+        // OSC 4 palette entries are VTE-native and intentionally not tracked.
+        dynamic.set(ColorKind::Palette(3), "#102030");
+        assert!(dynamic.get(ColorKind::Palette(3)).is_none());
+    }
+
+    #[test]
+    fn dynamic_overlay_substitutes_only_overridden_slots() {
+        let config = Config::safe_defaults();
+        let mut dynamic = DynamicColors::default();
+        dynamic.set(ColorKind::Background, "#102030");
+        let effective = dynamic.overlay(&config);
+        assert_eq!(effective.background, parse_color_spec("#102030").unwrap());
+        assert_eq!(effective.foreground, config.foreground);
+        assert_eq!(effective.cursor, config.cursor);
     }
 
     #[test]

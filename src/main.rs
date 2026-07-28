@@ -48,7 +48,6 @@ mod workspace;
 mod workspace_ops;
 
 use adw::prelude::*;
-use gtk::gdk::ModifierType;
 use gtk::gio::{self, Cancellable};
 use gtk::glib;
 use relm4::adw;
@@ -60,7 +59,7 @@ use std::rc::Rc;
 
 use app_msg::AppMsg;
 use config::{choose_shell_argv, config_file_path, load_config, Config, TerminalMode, Theme};
-use keybindings::{normalize_key, Action, Direction, KeyCombo, KeybindingMap};
+use keybindings::{chord_from_gdk, Action, Direction, KeybindingMap};
 use terminal::{
     default_tab_title, BlockTerminal, InitialCommands, VteInit, VteInput, VteOutput, VteTerminal,
 };
@@ -766,28 +765,21 @@ impl SimpleComponent for AppModel {
             let kb = model.kbmap.clone();
             let ksender = sender.clone();
             key_controller.connect_key_pressed(move |_c, keyval, _kc, state| {
-                let mods = state
-                    & (ModifierType::CONTROL_MASK
-                        | ModifierType::SHIFT_MASK
-                        | ModifierType::ALT_MASK);
-                let combo = KeyCombo {
-                    modifiers: mods,
-                    key: normalize_key(keyval),
+                // The GTK edge: keysym + modifier state -> toolkit-neutral
+                // chord. `None` means no chord string could name this key.
+                let Some(chord) = chord_from_gdk(keyval, state) else {
+                    return glib::Propagation::Proceed;
                 };
-                let lookup = kb.borrow().lookup(&combo);
-                // eprintln!("[jterm1] key combo={:?} -> {:?}", combo, lookup);
-                if let Some(action) = lookup {
+                if let Some(action) = kb.borrow().lookup(&chord) {
                     ksender.input(AppMsg::Action(action));
                     return glib::Propagation::Stop;
                 }
                 // Alt+<Copy-binding> in block mode → copy block output only.
                 // Re-lookup with ALT stripped so users only need to bind Copy once.
-                if mods.contains(ModifierType::ALT_MASK) {
-                    let alt_combo = KeyCombo {
-                        modifiers: mods - ModifierType::ALT_MASK,
-                        key: combo.key,
-                    };
-                    if kb.borrow().lookup(&alt_combo) == Some(Action::Copy) {
+                if chord.mods.alt {
+                    let mut stripped = chord;
+                    stripped.mods.alt = false;
+                    if kb.borrow().lookup(&stripped) == Some(Action::Copy) {
                         ksender.input(AppMsg::CopyOutputOnly);
                         return glib::Propagation::Stop;
                     }

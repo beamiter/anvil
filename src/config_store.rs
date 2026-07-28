@@ -22,7 +22,8 @@ use gtk::gdk::RGBA;
 
 use crate::cli::ReportFormat;
 use crate::config::{self, Config, TerminalMode};
-use crate::keybindings::{parse_key_combo, Action, KeyCombo};
+use crate::keybindings::Action;
+use jterm_core::keybindings::{is_unbind_token, parse, Chord};
 
 const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 const FNV_OFFSET: u64 = 0xcbf29ce484222325;
@@ -885,20 +886,29 @@ fn validate_keybindings(report: &mut ConfigValidationReport, table: &toml::Table
         .into_iter()
         .filter_map(|action| action.config_key())
         .collect();
-    let mut seen: HashMap<KeyCombo, String> = HashMap::new();
+    let mut seen: HashMap<Chord, String> = HashMap::new();
     for (key, value) in keybindings {
         let path = format!("keybindings.{key}");
         if !known.contains(key.as_str()) {
             report.warning(path, "unknown action; the binding is ignored");
             continue;
         }
+        // `false` removes a binding; the loader honors it, so it is valid.
+        if value.as_bool() == Some(false) {
+            continue;
+        }
         let Some(binding) = value.as_str() else {
-            report.error(path, "must be a shortcut string");
+            report.error(path, "must be a shortcut string or false");
             continue;
         };
-        match parse_key_combo(binding) {
-            Ok(combo) => {
-                if let Some(previous) = seen.insert(combo, key.clone()) {
+        // Unbind tokens ("", none, disabled, unbind) are valid values that
+        // remove a binding rather than naming a shortcut.
+        if is_unbind_token(binding) {
+            continue;
+        }
+        match parse(binding) {
+            Ok(chord) => {
+                if let Some(previous) = seen.insert(chord, key.clone()) {
                     report.warning(
                         path,
                         format!("duplicates keybindings.{previous}; the later binding wins"),
