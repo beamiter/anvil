@@ -154,6 +154,16 @@ versioning for tagged releases while it remains experimental.
   recolored live view. Specs are parsed as `rgb:R/G/B` (XParseColor, 1–4 hex
   digits per channel), hex, or color names; unparseable specs leave the
   tracked state unchanged.
+- "Undo clear blocks" now rebuilds blocks with the pane's active dynamic
+  colors. The restore path used the plain theme, so undoing a clear while a
+  program held an OSC 10/11/12 override produced theme-colored blocks sitting
+  next to correctly recolored ones; the tracked overrides are now shared with
+  the view and overlaid exactly as the reader does for new blocks.
+- An explicit theme change now clears the pane's dynamic color overrides.
+  Applying a theme repaints the live VTE and every finished-block snapshot from
+  the theme, so keeping the app's OSC 10/11/12 values left color queries
+  reporting a superseded color that nothing on screen used. A program that
+  cares can set its colors again after the switch.
 - The block id counter is now seeded past every restored history id, so a new
   block can no longer alias a restored one and corrupt id-keyed state
   (selection, bookmarks, undo-clear, context-menu copy).

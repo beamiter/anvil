@@ -310,6 +310,28 @@ impl DynamicColors {
     }
 }
 
+/// Per-pane handle to the tracked dynamic colors. The reader loop, the
+/// undo-clear rebuild, and the theme-apply path all mutate/read the same cell,
+/// so a color set by the app is reflected everywhere a block is built.
+type DynamicColorsRc = Rc<Cell<DynamicColors>>;
+
+/// The config a finished-block VTE must be built with: the pane theme with any
+/// live OSC 10/11/12 overrides substituted. Shared by the reader's
+/// block-finished path and `undo_clear_blocks`, so restored blocks cannot end
+/// up theme-colored next to correctly recolored neighbors.
+fn finished_block_config(dynamic: &DynamicColorsRc, config: &Config) -> Config {
+    dynamic.get().overlay(config)
+}
+
+/// Drop every tracked dynamic override. An explicit user theme change repaints
+/// the live VTE and all snapshot VTEs from the theme, so keeping the app's OSC
+/// 10/11/12 values would leave color queries reporting a color nothing on
+/// screen still uses. Most terminals reset dynamic colors on a theme change for
+/// exactly this reason; an app that cares can set its colors again.
+fn clear_dynamic_colors(dynamic: &DynamicColorsRc) {
+    dynamic.set(DynamicColors::default());
+}
+
 /// Parse an OSC 10/11/12 color spec. `RGBA::parse` covers the hex forms,
 /// CSS/X11 names, and `rgb()`/`rgba()`, but not XParseColor's
 /// `rgb:<r>/<g>/<b>` (1–4 hex digits per channel) — the canonical form apps
@@ -886,6 +908,10 @@ pub struct TermView {
     /// Whether the shell has enabled DECSET 2004. Clipboard input is written
     /// directly to our PTY, so block mode must apply this wrapper itself.
     bracketed_paste: Rc<Cell<bool>>,
+    /// The pane's dynamic OSC 10/11/12 overrides, shared with the reader loop
+    /// that records them. Read when rebuilding blocks (undo-clear must match
+    /// the recolored live view) and cleared by an explicit theme change.
+    dynamic_colors: DynamicColorsRc,
     config: Rc<RefCell<Config>>,
     block_data: Rc<RefCell<VecDeque<BlockData>>>,
     finished_blocks: Rc<RefCell<Vec<FinishedBlock>>>,
@@ -975,7 +1001,9 @@ struct ReaderCtx {
     bracketed_paste_rc: Rc<Cell<bool>>,
     /// Dynamic OSC 10/11/12 overrides for this pane: consulted for OSC color
     /// query replies and overlaid onto the theme for new finished blocks.
-    dynamic_colors_rc: Rc<Cell<DynamicColors>>,
+    /// Shared with `TermView` so undo-clear rebuilds and theme switches see the
+    /// same state.
+    dynamic_colors_rc: DynamicColorsRc,
     config_for_cb: Rc<RefCell<Config>>,
     parser: Rc<RefCell<Parser>>,
     block_data_for_cb: Rc<RefCell<VecDeque<BlockData>>>,
@@ -1403,9 +1431,10 @@ impl ReaderCtx {
                                 // Snapshot VTEs must match what the live view
                                 // showed: overlay any dynamic OSC 10/11/12
                                 // colors onto the theme for this block.
-                                let block_config = dynamic_colors_rc
-                                    .get()
-                                    .overlay(&config_for_cb.borrow());
+                                let block_config = finished_block_config(
+                                    &dynamic_colors_rc,
+                                    &config_for_cb.borrow(),
+                                );
                                 let finished = FinishedBlock::new_with_pool(
                                     block_id,
                                     &prompt,
@@ -3053,6 +3082,10 @@ impl TermView {
         // DECSET 2004 state here so clipboard pastes can be forwarded as one
         // ordered byte stream instead of relying on VTE's unrelated PTY.
         let bracketed_paste: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        // Dynamic OSC 10/11/12 overrides are recorded by the reader loop but
+        // also read by TermView (block rebuilds) and cleared by it (theme
+        // switch), so the cell is created here and shared with ReaderCtx.
+        let dynamic_colors: DynamicColorsRc = Rc::new(Cell::new(DynamicColors::default()));
         // A finished-block sticky header behaves like Warp's: click it to return
         // to the command at the top of the oversized block.
         {
@@ -3203,8 +3236,7 @@ impl TermView {
             let activity_cbs = activity_callbacks.clone();
             let mouse_reporting_rc = mouse_reporting_mode.clone();
             let bracketed_paste_rc = bracketed_paste.clone();
-            let dynamic_colors_rc: Rc<Cell<DynamicColors>> =
-                Rc::new(Cell::new(DynamicColors::default()));
+            let dynamic_colors_rc = dynamic_colors.clone();
             let config_for_cb = Rc::new(RefCell::new(config.clone()));
             let parser = Rc::new(RefCell::new(Parser::with_config(ParserConfig {
                 mouse_reporting: config.mouse_reporting_enabled,
@@ -3793,6 +3825,7 @@ impl TermView {
             ask_ai_about_block_callbacks,
             mouse_reporting_mode,
             bracketed_paste,
+            dynamic_colors,
             config: Rc::new(RefCell::new(config.clone())),
             block_data: block_data_rc,
             finished_blocks: finished_blocks_rc,
@@ -4388,7 +4421,10 @@ impl TermView {
 
         let mut restored: Vec<FinishedBlock> = Vec::with_capacity(restored_count);
         {
-            let config = self.config.borrow();
+            // Rebuild with the same overlay the reader uses for new blocks: if a
+            // dynamic OSC 10/11/12 color is active, restored blocks must match
+            // the recolored live view instead of reverting to theme colors.
+            let config = finished_block_config(&self.dynamic_colors, &self.config.borrow());
             let fallback_cols = self.active.borrow().grid_cols() as i64;
             // Everything restored predates the current finished blocks, so the
             // insertion anchor is the pane's first finished widget — or the
@@ -4535,7 +4571,13 @@ impl TermView {
     }
 
     /// Apply updated theme colors to the block widgets and the live VTE.
+    ///
+    /// An explicit theme change wins over anything an app set with OSC
+    /// 10/11/12: every surface below is repainted from the theme, so the tracked
+    /// overrides are dropped too and the next color query answers with the new
+    /// theme instead of the superseded app color.
     pub fn apply_theme(&self) {
+        clear_dynamic_colors(&self.dynamic_colors);
         let config = self.config.borrow();
         apply_theme_to_vte(&self.active_vte, &config);
         for block in self.finished_blocks.borrow().iter() {
@@ -4841,16 +4883,18 @@ impl TermView {
 mod tests {
     use super::{
         background_output_has_visible_text, block_clipboard_text, build_color_query_reply,
-        build_command_recall, build_keyboard_query_reply, coalesce_bytes_events, finished_command,
-        is_post_command_metadata, notification_permitted, parse_color_spec,
-        selected_blocks_markdown, selected_command_text, selected_id_range, step_marked_indices,
-        strip_ansi, strip_ansi_with_clear_detect, take_background_output, BlockData, DynamicColors,
+        build_command_recall, build_keyboard_query_reply, clear_dynamic_colors,
+        coalesce_bytes_events, finished_block_config, finished_command, is_post_command_metadata,
+        notification_permitted, parse_color_spec, selected_blocks_markdown, selected_command_text,
+        selected_id_range, step_marked_indices, strip_ansi, strip_ansi_with_clear_detect,
+        take_background_output, BlockData, DynamicColors, DynamicColorsRc,
         NOTIFICATION_MIN_INTERVAL,
     };
     use crate::config::Config;
     use crate::parser::{ColorKind, KeyboardProtocolQuery, ParserEvent};
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::{HashSet, VecDeque};
+    use std::rc::Rc;
     use std::time::Instant;
 
     #[test]
@@ -4952,6 +4996,72 @@ mod tests {
         assert_eq!(effective.background, parse_color_spec("#102030").unwrap());
         assert_eq!(effective.foreground, config.foreground);
         assert_eq!(effective.cursor, config.cursor);
+    }
+
+    /// The pane-shared cell, seeded like a program that changed background and
+    /// cursor color at runtime.
+    fn tracked_colors(sets: &[(ColorKind, &str)]) -> DynamicColorsRc {
+        let mut colors = DynamicColors::default();
+        for (kind, spec) in sets {
+            colors.set(*kind, spec);
+        }
+        Rc::new(Cell::new(colors))
+    }
+
+    #[test]
+    fn rebuilt_blocks_use_the_dynamic_overlay_not_the_plain_theme() {
+        // Undo-clear rebuilds stashed blocks through the same helper the reader
+        // uses, so a restored block cannot render theme-colored next to blocks
+        // that were recolored by an OSC 11 change.
+        let config = Config::safe_defaults();
+        let dynamic = tracked_colors(&[
+            (ColorKind::Background, "#102030"),
+            (ColorKind::Cursor, "rgb:ff/80/00"),
+        ]);
+        let rebuilt = finished_block_config(&dynamic, &config);
+        assert_eq!(rebuilt.background, parse_color_spec("#102030").unwrap());
+        assert_eq!(rebuilt.cursor, parse_color_spec("rgb:ff/80/00").unwrap());
+        // Untouched slots stay on the theme.
+        assert_eq!(rebuilt.foreground, config.foreground);
+
+        // With nothing tracked the rebuild is the plain theme again.
+        let plain = finished_block_config(&Rc::new(Cell::new(DynamicColors::default())), &config);
+        assert_eq!(plain.background, config.background);
+        assert_eq!(plain.cursor, config.cursor);
+    }
+
+    #[test]
+    fn applying_a_theme_clears_dynamic_tracking() {
+        let config = Config::safe_defaults();
+        let dynamic = tracked_colors(&[
+            (ColorKind::Foreground, "#ff8000"),
+            (ColorKind::Background, "#102030"),
+            (ColorKind::Cursor, "#00ff00"),
+        ]);
+        assert_ne!(
+            build_color_query_reply(&config, dynamic.get(), ColorKind::Background),
+            build_color_query_reply(&config, DynamicColors::default(), ColorKind::Background)
+        );
+
+        clear_dynamic_colors(&dynamic);
+
+        // Every slot answers from the theme again, and blocks built afterwards
+        // are theme-colored like the repainted live view.
+        for kind in [
+            ColorKind::Foreground,
+            ColorKind::Background,
+            ColorKind::Cursor,
+        ] {
+            assert!(dynamic.get().get(kind).is_none());
+            assert_eq!(
+                build_color_query_reply(&config, dynamic.get(), kind),
+                build_color_query_reply(&config, DynamicColors::default(), kind)
+            );
+        }
+        let rebuilt = finished_block_config(&dynamic, &config);
+        assert_eq!(rebuilt.background, config.background);
+        assert_eq!(rebuilt.foreground, config.foreground);
+        assert_eq!(rebuilt.cursor, config.cursor);
     }
 
     #[test]
