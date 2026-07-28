@@ -31,6 +31,7 @@ mod palette;
 mod process;
 mod pty;
 mod review_input_ops;
+mod rsh_ops;
 mod search;
 mod session;
 mod settings_ops;
@@ -863,6 +864,11 @@ impl SimpleComponent for AppModel {
 
         model.init_file_tree();
 
+        // jterm1 prefers rsh as its shell, so it is worth noticing when the
+        // machine has none or an old one. The check runs on a worker thread and
+        // stays silent unless it has something actionable to offer.
+        model.start_rsh_update_check(&sender);
+
         // Directories and foreground commands are polled, not pushed, so the
         // split panes' headers need a slow tick to stay honest. It touches
         // only the visible tab, and only while that tab is actually split.
@@ -898,6 +904,7 @@ impl SimpleComponent for AppModel {
             }
             AppMsg::ForceQuit => self.force_quit(),
             AppMsg::Toast(message) => self.show_toast(message),
+            AppMsg::RshUpdateChecked(status) => self.offer_rsh_update(&status, &sender),
             AppMsg::CopyOutputOnly => {
                 if let Some(t) = self.active_terminal() {
                     t.emit(VteInput::CopyOutputOnly);

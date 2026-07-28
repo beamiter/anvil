@@ -31,7 +31,7 @@
               # the jagent / jterm_core pins in Cargo.lock change.
               outputHashes = {
                 "jagent-0.2.0" = "sha256-75lH5fOFoj3serTCC+ZZWv85pqQk0Jw94hMWCJLXImI=";
-                "jterm_core-0.1.0" = "sha256-97DL1u9A3lE3UBtdBAOM2xBs2A/QwwaAIFp5QdcFZ/w=";
+                "jterm_core-0.1.0" = "sha256-XSnqHgDRcK7HZig9xePKSKKrURmGpmfZJGTqE7qWKAM=";
               };
             };
             strictDeps = true;

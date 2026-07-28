@@ -7,6 +7,17 @@ versioning for tagged releases while it remains experimental.
 
 ### Added
 
+- One-command install and update for the companion shell rsh. The palette
+  action "Install or update rsh" runs the installer in its own VTE tab, so the
+  tab is the progress UI: it can be interrupted with Ctrl+C and waits for Enter
+  before closing. When rsh is missing or outdated, a toast offers the same
+  action. The installer itself comes from the rsh repository and is embedded in
+  `jterm_core::rsh_install`, which keeps checksum verification, atomic
+  replacement, the rollback copy, and the `/usr/bin/rsh` (BSD remote shell)
+  shadowing warning in one place for the whole family. The check runs on a
+  worker thread and never installs anything on its own; `rsh_update_check`
+  (`startup` / `daily` (default) / `never`) governs how often it looks, and its
+  cache is shared with every other jterm on the machine.
 - Clear Blocks is now undoable: the cleared blocks are stashed and an explicit
   "Undo clear blocks" action rebuilds them above any blocks created since,
   with toast feedback on both clear and restore.

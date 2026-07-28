@@ -46,6 +46,10 @@ fn resolve_sidebar_visibility(explicit: Option<bool>, placement: TabPlacement) -
     explicit.unwrap_or(placement == TabPlacement::Sidebar)
 }
 
+/// When to check whether a newer rsh has been published. Shared with the other
+/// terminals so one config vocabulary covers the family.
+pub use jterm_core::rsh_install::UpdateCheck as RshUpdateCheck;
+
 /// Which single view the sidebar shows (tab list vs file tree).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SidebarView {
@@ -254,6 +258,9 @@ pub struct Config {
     pub(crate) tab_placement: TabPlacement,
     /// Which single view the sidebar shows (tab list vs file tree).
     pub(crate) sidebar_view: SidebarView,
+    /// When to look for a newer rsh. Installing always stays an explicit
+    /// choice: this only governs whether the offer appears.
+    pub(crate) rsh_update_check: RshUpdateCheck,
     /// Whether the left sidebar is visible. Older configs derive this from
     /// tab placement so sidebar tabs remain discoverable after an upgrade.
     pub(crate) sidebar_visible: bool,
@@ -357,6 +364,7 @@ impl Config {
             terminal_mode: TerminalMode::Vte,
             tab_placement: TabPlacement::Sidebar,
             sidebar_view: SidebarView::Tabs,
+            rsh_update_check: RshUpdateCheck::default(),
             sidebar_visible: true,
             sidebar_width: 220,
             tab_width: 180,
@@ -666,6 +674,7 @@ struct FileConfig {
     terminal_mode: Option<String>,
     tab_placement: Option<String>,
     sidebar_view: Option<String>,
+    rsh_update_check: Option<String>,
     sidebar_visible: Option<bool>,
     sidebar_width: Option<u32>,
     tab_width: Option<u32>,
@@ -784,6 +793,10 @@ fn load_file_config() -> FileConfig {
             .map(|s| s.to_string()),
         sidebar_view: table
             .get("sidebar_view")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        rsh_update_check: table
+            .get("rsh_update_check")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
         sidebar_visible: table.get("sidebar_visible").and_then(|v| v.as_bool()),
@@ -1185,6 +1198,8 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
             .unwrap_or_else(|| "sidebar".to_string()),
     );
     let sidebar_view = SidebarView::parse(&fc.sidebar_view.unwrap_or_else(|| "tabs".to_string()));
+    let rsh_update_check =
+        RshUpdateCheck::parse(&fc.rsh_update_check.unwrap_or_else(|| "daily".to_string()));
     let sidebar_visible = resolve_sidebar_visibility(fc.sidebar_visible, tab_placement);
     let sidebar_width = fc.sidebar_width.unwrap_or(220).clamp(120, 800);
     let tab_width = fc.tab_width.unwrap_or(180).clamp(80, 480);
@@ -1233,6 +1248,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         terminal_mode,
         tab_placement,
         sidebar_view,
+        rsh_update_check,
         sidebar_visible,
         sidebar_width,
         tab_width,

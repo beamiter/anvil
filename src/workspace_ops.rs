@@ -238,12 +238,54 @@ impl AppModel {
         shell_argv: Rc<Vec<String>>,
         sender: &ComponentSender<AppModel>,
     ) {
+        self.add_tab_full(
+            initial_commands,
+            working_directory,
+            shell_argv,
+            None,
+            sender,
+        );
+    }
+
+    /// Launch an explicit argv in its own named tab, in conventional VTE mode.
+    ///
+    /// Used for one-shot helpers such as the rsh installer: they emit no
+    /// shell-integration sequences, so Block mode would have nothing to build
+    /// blocks from, and their prompts expect a plain terminal to type into.
+    pub(crate) fn add_command_tab(
+        &mut self,
+        title: &str,
+        argv: Vec<String>,
+        sender: &ComponentSender<AppModel>,
+    ) {
+        self.add_tab_full(
+            InitialCommands::default(),
+            None,
+            Rc::new(argv),
+            Some((TerminalMode::Vte, title.to_string())),
+            sender,
+        );
+    }
+
+    /// Shared body: `command` forces a terminal mode and a fixed tab title,
+    /// which is what one-shot helper tabs need and ordinary tabs must not have.
+    fn add_tab_full(
+        &mut self,
+        initial_commands: InitialCommands,
+        working_directory: Option<String>,
+        shell_argv: Rc<Vec<String>>,
+        command: Option<(TerminalMode, String)>,
+        sender: &ComponentSender<AppModel>,
+    ) {
         let id = self.next_id;
         self.next_id += 1;
         let pane_id = self.next_pane_id;
         self.next_pane_id += 1;
         let number = self.tabs.len() as u32 + 1;
-        let mode = self.config.borrow().terminal_mode;
+        let mode = command
+            .as_ref()
+            .map(|(mode, _)| *mode)
+            .unwrap_or_else(|| self.config.borrow().terminal_mode);
         let title_cwd = working_directory.clone();
         let pane = create_pane(
             &self.config,
@@ -266,8 +308,11 @@ impl AppModel {
             holder,
             panes: vec![pane],
             active_pane: 0,
-            title: default_tab_title(number, title_cwd.as_deref()),
-            custom_title: false,
+            title: command
+                .as_ref()
+                .map(|(_, title)| title.clone())
+                .unwrap_or_else(|| default_tab_title(number, title_cwd.as_deref())),
+            custom_title: command.is_some(),
             bell: false,
             activity: false,
             marked: false,

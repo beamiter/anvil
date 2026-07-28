@@ -24,6 +24,8 @@ pub(crate) enum Action {
     ToggleSettings,
     ReloadConfig,
     OpenWelcome,
+    /// Install rsh, or update the installed one, in a dedicated tab.
+    InstallRsh,
     ToggleSidebar,
     SplitHorizontal,
     SplitVertical,
@@ -118,6 +120,7 @@ impl Action {
             Action::ToggleSettings => "Toggle settings panel",
             Action::ReloadConfig => "Reload configuration",
             Action::OpenWelcome => "Open welcome & quick start",
+            Action::InstallRsh => "Install or update rsh (jterm's shell)",
             Action::ToggleSidebar => "Toggle sidebar",
             Action::SplitHorizontal => "Split left/right",
             Action::SplitVertical => "Split top/bottom",
@@ -204,6 +207,8 @@ impl Action {
             Action::ToggleSettings => Some("toggle_settings"),
             Action::ReloadConfig => Some("reload_config"),
             Action::OpenWelcome => None,
+            // Palette-only: too rare to spend a chord on.
+            Action::InstallRsh => None,
             Action::ToggleSidebar => Some("toggle_sidebar"),
             Action::SplitHorizontal => Some("split_horizontal"),
             Action::SplitVertical => Some("split_vertical"),
@@ -276,6 +281,7 @@ impl Action {
             Action::ToggleSettings,
             Action::ReloadConfig,
             Action::OpenWelcome,
+            Action::InstallRsh,
             Action::ToggleSidebar,
             Action::SplitHorizontal,
             Action::SplitVertical,

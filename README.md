@@ -298,6 +298,32 @@ Slow-block, pinned-block, and non-contextual pinned-navigation actions remain
 available in the command palette and can be assigned in `[keybindings]`, but
 have no default shortcuts.
 
+## Installing and updating rsh
+
+jterm1 prefers its companion shell [`rsh`](https://github.com/beamiter/rsh) and
+falls back to bash only when it cannot find one. The palette action
+**Install or update rsh** runs the installer in a dedicated VTE tab: the tab is
+the progress UI, so it can be interrupted with Ctrl+C and it waits for Enter
+before closing, instead of a failure flashing past.
+
+The installer is embedded in the binary, so a machine that has never had rsh can
+still bootstrap one. It verifies the download's checksum, swaps the binary in
+with `rename(2)` — **shells that are already running keep the version they
+started with; new tabs pick up the new one** — keeps the previous binary for
+rollback, and reports when `PATH` resolves `rsh` to `/usr/bin/rsh`, the BSD
+remote shell on Debian-family systems.
+
+When rsh is missing or a newer one is published, a toast offers the same action.
+The check runs on a worker thread, never installs anything by itself, and stays
+silent when it cannot reach the network:
+
+```toml
+rsh_update_check = "daily"    # "startup" every launch, "daily" cached, "never" off
+```
+
+`daily` reuses the installer's own cache (`~/.cache/rsh/update-check.json`), so
+several jterms open at once still cost one request a day.
+
 ## Configuration
 
 The configuration file is:

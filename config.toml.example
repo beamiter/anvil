@@ -32,6 +32,13 @@ tab_width = 180
 # Separate startup commands with a comma followed by a space.
 # startup_commands = "cd /path/to/project, printf 'ready\\n'"
 
+# When to look for a newer rsh: "startup" checks the network on every launch,
+# "daily" (default) reuses the installer cache shared by every jterm on this
+# machine, "never" disables the check. The check only decides whether the offer
+# appears; installing always stays an explicit choice (palette: "Install or
+# update rsh").
+rsh_update_check = "daily"
+
 # Lightweight command-only JSONL history used by Ctrl+Shift+H, the palette, and
 # optional AI context. The default path is under $XDG_STATE_HOME/jterm1/.
 command_history_enabled = true
