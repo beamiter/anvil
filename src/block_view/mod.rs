@@ -7,7 +7,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 use vte4::Terminal;
 use vte4::TerminalExt;
 
@@ -949,6 +949,26 @@ fn coalesce_bytes_events(events: &mut Vec<ParserEvent>) {
         }
     }
     events.truncate(write);
+}
+
+/// Minimum spacing between OSC 9/777 desktop notifications. The request
+/// originates inside the PTY (and may be remote over SSH), so spawning
+/// `notify-send` is rate-limited app-wide rather than per pane.
+const NOTIFICATION_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+thread_local! {
+    /// Last desktop notification launch, shared by every block view: all PTY
+    /// reader callbacks dispatch on the GTK main thread, so one thread-local
+    /// cell is the app-level state.
+    static LAST_NOTIFICATION_AT: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// True when enough time has passed since the previous desktop notification.
+/// The first permitted notification stamps `LAST_NOTIFICATION_AT`, so later
+/// requests in the same event batch fail this check and drop silently — at
+/// most one notification per batch, matching jterm3.
+fn notification_permitted(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|prev| now.duration_since(prev) >= NOTIFICATION_MIN_INTERVAL)
 }
 
 fn is_post_command_metadata(bytes: &[u8]) -> bool {
@@ -2075,6 +2095,20 @@ impl ReaderCtx {
                                 seq.push(b'\\');
                                 active_vte.feed(&seq);
                             }
+                        }
+
+                        ParserEvent::Notification { title, body } => {
+                            // Desktop notification requested via OSC 9 / OSC
+                            // 777. The parser already control-stripped and
+                            // capped the text; here only launch pacing is
+                            // enforced, then extras drop silently.
+                            let now = Instant::now();
+                            LAST_NOTIFICATION_AT.with(|last| {
+                                if notification_permitted(last.get(), now) {
+                                    last.set(Some(now));
+                                    crate::notify::app_notification(title.as_deref(), body);
+                                }
+                            });
                         }
                     }
                 }
@@ -4670,13 +4704,14 @@ mod tests {
     use super::{
         background_output_has_visible_text, block_clipboard_text, build_command_recall,
         build_keyboard_query_reply, coalesce_bytes_events, finished_command,
-        is_post_command_metadata, selected_blocks_markdown, selected_command_text,
-        selected_id_range, step_marked_indices, strip_ansi, strip_ansi_with_clear_detect,
-        take_background_output, BlockData,
+        is_post_command_metadata, notification_permitted, selected_blocks_markdown,
+        selected_command_text, selected_id_range, step_marked_indices, strip_ansi,
+        strip_ansi_with_clear_detect, take_background_output, BlockData, NOTIFICATION_MIN_INTERVAL,
     };
     use crate::parser::{KeyboardProtocolQuery, ParserEvent};
     use std::cell::RefCell;
     use std::collections::{HashSet, VecDeque};
+    use std::time::Instant;
 
     #[test]
     fn keyboard_protocol_queries_have_safe_fallback_replies() {
@@ -4782,6 +4817,27 @@ mod tests {
         assert!(is_post_command_metadata(b"\x1b]0;title\x1b\\"));
         assert!(!is_post_command_metadata(b"/home/tester\r\n"));
         assert!(!is_post_command_metadata(b"daily.txt  Documents\r\n"));
+    }
+
+    #[test]
+    fn notification_permitted_when_first_or_interval_elapsed() {
+        let now = Instant::now();
+        assert!(notification_permitted(None, now));
+        assert!(notification_permitted(
+            Some(now - NOTIFICATION_MIN_INTERVAL),
+            now
+        ));
+    }
+
+    #[test]
+    fn notification_dropped_inside_min_interval() {
+        let now = Instant::now();
+        // A notification just shown (same batch) blocks the next one.
+        assert!(!notification_permitted(Some(now), now));
+        assert!(!notification_permitted(
+            Some(now - NOTIFICATION_MIN_INTERVAL + std::time::Duration::from_millis(1)),
+            now
+        ));
     }
 
     #[test]

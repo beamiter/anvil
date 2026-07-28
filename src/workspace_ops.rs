@@ -1737,7 +1737,10 @@ mod pane_tree_tests {
 
     #[test]
     fn pane_header_title_prefers_osc_then_directory_then_position() {
-        assert_eq!(pane_header_title(Some("vim README"), Some("/tmp"), 0), "vim README");
+        assert_eq!(
+            pane_header_title(Some("vim README"), Some("/tmp"), 0),
+            "vim README"
+        );
         // Whitespace-only OSC titles must not blank the header.
         assert_eq!(pane_header_title(Some("   "), Some("/tmp/work"), 0), "work");
         assert_eq!(pane_header_title(None, Some("/tmp/work"), 0), "work");

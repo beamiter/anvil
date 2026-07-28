@@ -7,6 +7,12 @@ versioning for tagged releases while it remains experimental.
 
 ### Added
 
+- Block mode now honors OSC 9 and OSC 777 desktop notifications: programs
+  inside the PTY (including remote ones over SSH) can raise a `notify-send`
+  notification through `jterm_core::notify::app_notification`. The parser
+  control-strips and caps the text; jterm1 paces launches app-wide — at most
+  one notification per output batch and one every two seconds, extras dropped
+  silently — matching jterm3.
 - One-command install and update for the companion shell rsh. The palette
   action "Install or update rsh" runs the installer in its own VTE tab, so the
   tab is the progress UI: it can be interrupted with Ctrl+C and waits for Enter

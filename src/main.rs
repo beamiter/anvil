@@ -26,8 +26,8 @@ mod host {
 mod keybindings;
 mod navigation_ui;
 mod notebook;
-mod pane_header;
 mod palette;
+mod pane_header;
 mod process;
 mod pty;
 mod review_input_ops;
@@ -1010,7 +1010,8 @@ impl SimpleComponent for AppModel {
             AppMsg::RefreshPaneHeaders => self.refresh_active_pane_headers(),
             AppMsg::TitleChanged(pane_id, title) => {
                 if let Some((idx, pane_index)) = self.find_pane(pane_id) {
-                    self.tabs[idx].panes[pane_index].title = (!title.is_empty()).then(|| title.clone());
+                    self.tabs[idx].panes[pane_index].title =
+                        (!title.is_empty()).then(|| title.clone());
                     if self.tabs[idx].panes.len() > 1 {
                         self.refresh_pane_headers(idx);
                     }
