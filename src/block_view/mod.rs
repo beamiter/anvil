@@ -2289,7 +2289,7 @@ impl ReaderCtx {
                             // command and are mounted on its finished block.
                             // Non-G APC payloads keep today's behaviour: consumed
                             // silently, since libvte would ignore them anyway.
-                            if payload.first() == Some(&b'G') {
+                            if jterm_core::kitty_graphics::is_graphics_payload(payload) {
                                 let outcome = kitty_assembler_rc.borrow_mut().feed(payload);
                                 // Answer before consuming the outcome: clients
                                 // like `kitten icat` block on the `i=`-keyed

@@ -83,6 +83,23 @@ versioning for tagged releases while it remains experimental.
 
 ### Changed
 
+- The Kitty graphics protocol now parses through
+  `jterm_core::kitty_graphics`: control data, chunk assembly, base64, raw
+  `f=24`/`f=32` validation with RGB→RGBA expansion, the PNG IHDR sniff, and
+  the caps (`Caps::BLOCK`, this repository's historical 16 MiB / 16384 px
+  budgets) are shared with the rest of the family, while the GDK texture
+  build, the `a=q` probe answer, the `i=`/`I=`/`p=` PTY responder, and the
+  per-block image budget stay here. Where the four terminals disagreed the
+  protocol wins, so five behaviors change: a command without `f=` now means
+  raw RGBA instead of PNG (PNG payloads need an explicit `f=100`); a raw
+  payload must match `s=`×`v=`×channels exactly instead of merely reaching it;
+  `t=f`/`t=t`/`t=s` are reported unsupported instead of being decoded as image
+  data; `f=` accepts only `100`/`32`/`24`; and a continuation chunk may carry
+  only `m=` and an optional `q=`, so a repeated first chunk aborts the upload
+  rather than splicing into it. `i=` together with `I=`, `o=z` compression,
+  and Unicode-placeholder controls are now rejected while parsing; because
+  their identifier cannot be trusted, such commands get no reply at all
+  instead of a guessed one.
 - Shell quoting, restorable-command classification, and the `/proc` foreground
   probes now come from `jterm_core::process` (which was seeded from this
   repository's copy), and executable lookup uses `jterm_core::host`; the local
