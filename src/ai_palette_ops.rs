@@ -180,6 +180,7 @@ impl AppModel {
         self.ai_panel.emit(dialogs::ai_panel::AiPanelMsg::Open {
             history_path: self.config.borrow().command_history_path.clone(),
             client,
+            stream: self.config.borrow().ai_stream,
             initial_context,
         });
     }

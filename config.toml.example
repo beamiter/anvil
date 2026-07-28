@@ -80,7 +80,8 @@ notify_long_block_threshold_ms = 10000
 # written by jterm1. The generic key takes precedence. Provider aliases
 # `claude`, `openai`, and `openai_compatible` are accepted and normalized. Environment overrides take
 # precedence over this file: JTERM1_AI_PROVIDER, JTERM1_AI_MODEL,
-# JTERM1_AI_BASE_URL, JTERM1_AI_MAX_TOKENS, and JTERM1_AI_REDACT_SECRETS.
+# JTERM1_AI_BASE_URL, JTERM1_AI_MAX_TOKENS, JTERM1_AI_REDACT_SECRETS, and
+# JTERM1_AI_STREAM.
 ai_enabled = true
 agent_enabled = true
 agent_max_turns = 20
@@ -89,6 +90,7 @@ ai_model = "claude-sonnet-4-6"
 ai_base_url = "https://api.anthropic.com"
 ai_max_tokens = 1024             # 1 .. 32768
 ai_redact_secrets = true
+ai_stream = true                 # stream session AI panel replies as they generate
 
 # Explicitly start with no saved SSH targets. To add targets, remove this line
 # and uncomment one or more [[remote_hosts]] examples at the end of this file.

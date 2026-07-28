@@ -7,6 +7,16 @@ versioning for tagged releases while it remains experimental.
 
 ### Added
 
+- The session AI panel now streams replies: assistant text appears in the
+  transcript as it generates instead of after the full response. On success
+  the streamed text is replaced by the provider's complete reply, so the
+  recorded conversation stays byte-identical to the non-streaming path (and
+  picks up any trailing token-limit advisory); a mid-stream failure keeps the
+  partial text visible and reports the error like any other request error,
+  and cancellation still kills the transfer immediately. Controlled by
+  `ai_stream` (`JTERM1_AI_STREAM`, settings toggle, default on); command
+  generation, explain helpers, and agent mode always wait for the complete
+  reply.
 - Block mode now honors OSC 9 and OSC 777 desktop notifications: programs
   inside the PTY (including remote ones over SSH) can raise a `notify-send`
   notification through `jterm_core::notify::app_notification`. The parser

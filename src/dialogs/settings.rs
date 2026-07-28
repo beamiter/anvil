@@ -30,6 +30,7 @@ pub(crate) struct SettingsValues {
     pub(crate) ai_api_key_file: Option<String>,
     pub(crate) ai_max_tokens: f64,
     pub(crate) ai_redact_secrets: bool,
+    pub(crate) ai_stream: bool,
     pub(crate) agent_max_turns: f64,
     pub(crate) safe_mode: bool,
     pub(crate) notifications: bool,
@@ -62,6 +63,7 @@ pub(crate) enum SettingsMsg {
     AiApiKeyStore(String),
     AiMaxTokens(f64),
     AiRedactSecrets(bool),
+    AiStream(bool),
     AgentMaxTurns(f64),
     Notifications(bool),
     RemoteClipboard(bool),
@@ -86,6 +88,7 @@ pub(crate) enum SettingsOutput {
     AiApiKeyFile(String),
     AiMaxTokens(u32),
     AiRedactSecrets(bool),
+    AiStream(bool),
     AgentMaxTurns(u32),
     Notifications(bool),
     RemoteClipboard(bool),
@@ -325,6 +328,17 @@ impl Component for SettingsModel {
                         },
                     },
 
+                    #[name(ai_stream_row)]
+                    adw::SwitchRow {
+                        set_title: "Stream AI Panel Replies",
+                        set_subtitle: "Show the answer while it is being generated",
+                        set_active: model.values.ai_stream,
+                        set_sensitive: !model.values.safe_mode && model.values.ai_enabled,
+                        connect_active_notify[sender] => move |row| {
+                            sender.input(SettingsMsg::AiStream(row.is_active()));
+                        },
+                    },
+
                     #[name(agent_max_turns_row)]
                     adw::SpinRow::new(
                         Some(&gtk::Adjustment::new(
@@ -425,6 +439,7 @@ impl Component for SettingsModel {
                 widgets
                     .ai_redact_secrets_row
                     .set_active(self.values.ai_redact_secrets);
+                widgets.ai_stream_row.set_active(self.values.ai_stream);
                 widgets
                     .agent_max_turns_row
                     .set_value(self.values.agent_max_turns);
@@ -437,6 +452,7 @@ impl Component for SettingsModel {
                 widgets.ai_api_key_row.set_sensitive(ai_sensitive);
                 widgets.ai_max_tokens_row.set_sensitive(ai_sensitive);
                 widgets.ai_redact_secrets_row.set_sensitive(ai_sensitive);
+                widgets.ai_stream_row.set_sensitive(ai_sensitive);
                 widgets
                     .agent_max_turns_row
                     .set_sensitive(ai_sensitive && self.values.agent_enabled);
@@ -494,6 +510,7 @@ impl Component for SettingsModel {
                 widgets.ai_api_key_row.set_sensitive(sensitive);
                 widgets.ai_max_tokens_row.set_sensitive(sensitive);
                 widgets.ai_redact_secrets_row.set_sensitive(sensitive);
+                widgets.ai_stream_row.set_sensitive(sensitive);
                 widgets
                     .agent_max_turns_row
                     .set_sensitive(sensitive && self.values.agent_enabled);
@@ -550,6 +567,10 @@ impl Component for SettingsModel {
             SettingsMsg::AiRedactSecrets(enabled) => {
                 self.values.ai_redact_secrets = enabled;
                 let _ = sender.output(SettingsOutput::AiRedactSecrets(enabled));
+            }
+            SettingsMsg::AiStream(enabled) => {
+                self.values.ai_stream = enabled;
+                let _ = sender.output(SettingsOutput::AiStream(enabled));
             }
             SettingsMsg::AgentMaxTurns(turns) => {
                 self.values.agent_max_turns = turns;

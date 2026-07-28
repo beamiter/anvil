@@ -135,6 +135,79 @@ pub(crate) fn ask_turns(
     AiHandle { token, suppressed }
 }
 
+/// Fire a multi-turn transcript with incremental delivery. `on_delta` runs on
+/// the GLib main thread with each assistant text fragment as it arrives, and
+/// `on_done` then fires exactly once with the same result `ask_turns` would
+/// deliver. The completed text is the single source of truth: it can end with
+/// a token-limit advisory that never arrived as a fragment, so callers replace
+/// the accumulated fragments with it, which also heals any dropped delta.
+pub(crate) fn ask_turns_streaming(
+    client: AiClient,
+    system: String,
+    history: Vec<Turn>,
+    mut on_delta: impl FnMut(String) + 'static,
+    on_done: impl FnOnce(AiResult) + 'static,
+) -> AiHandle {
+    let token = AiCancellationToken::new();
+    let suppressed = Arc::new(AtomicBool::new(false));
+
+    let slot: AiResultSlot = Arc::new(std::sync::Mutex::new(None));
+    let slot_thread = slot.clone();
+    let slot_main = slot.clone();
+    let mut on_done_cell: Option<AiCompletion> = Some(Box::new(on_done));
+
+    // Fragments cross threads over a plain channel drained by the GLib poll
+    // below. The worker fills the result slot only after the transport
+    // returns, so once the slot is observed no further fragment can arrive.
+    let (delta_tx, delta_rx) = std::sync::mpsc::channel::<String>();
+
+    let worker_token = token.clone();
+    std::thread::spawn(move || {
+        let result = client
+            .send_turns_streaming_cancellable(
+                Some(&system),
+                &history,
+                &worker_token,
+                &mut |fragment| {
+                    let _ = delta_tx.send(fragment.to_string());
+                },
+            )
+            .map_err(|error| error.to_string());
+        if worker_token.is_cancelled() {
+            return;
+        }
+        *slot_thread.lock().expect("ai slot mutex poisoned") = Some(result);
+    });
+
+    // 50ms instead of the blocking poll's 100ms: the tick paces how alive the
+    // streamed text feels, not just completion latency.
+    let suppressed_main = suppressed.clone();
+    glib::timeout_add_local(Duration::from_millis(50), move || {
+        if suppressed_main.load(Ordering::SeqCst) {
+            return glib::ControlFlow::Break;
+        }
+        while let Ok(fragment) = delta_rx.try_recv() {
+            on_delta(fragment);
+        }
+        let taken = slot_main.lock().expect("ai slot mutex poisoned").take();
+        if let Some(result) = taken {
+            // Fragments sent between the drain above and the slot read are
+            // still queued; flush them so a mid-stream failure shows all
+            // text that was received before the error is reported.
+            while let Ok(fragment) = delta_rx.try_recv() {
+                on_delta(fragment);
+            }
+            if let Some(cb) = on_done_cell.take() {
+                cb(result);
+            }
+            return glib::ControlFlow::Break;
+        }
+        glib::ControlFlow::Continue
+    });
+
+    AiHandle { token, suppressed }
+}
+
 /// Build the first turn for "Ask AI about selected block". Block data is
 /// system context rather than an assistant/user turn, so subsequent questions
 /// retain a strictly alternating provider transcript.

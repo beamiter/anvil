@@ -210,6 +210,17 @@ impl AppModel {
         self.persist_config();
     }
 
+    /// Applies to the next request; an in-flight panel reply keeps the
+    /// transport it started with.
+    pub(crate) fn apply_settings_ai_stream(&mut self, enabled: bool) {
+        if self.safe_mode {
+            self.show_toast("AI is disabled in safe mode.");
+            return;
+        }
+        self.config.borrow_mut().ai_stream = enabled;
+        self.persist_config();
+    }
+
     pub(crate) fn apply_settings_agent_max_turns(&mut self, turns: u32) {
         if self.safe_mode {
             self.show_toast("AI Agent is disabled in safe mode.");

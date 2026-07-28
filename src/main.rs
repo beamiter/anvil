@@ -492,6 +492,7 @@ impl SimpleComponent for AppModel {
                     ai_api_key_file: config.borrow().ai_api_key_file.clone(),
                     ai_max_tokens: config.borrow().ai_max_tokens as f64,
                     ai_redact_secrets: config.borrow().ai_redact_secrets,
+                    ai_stream: config.borrow().ai_stream,
                     agent_max_turns: config.borrow().agent_max_turns as f64,
                     safe_mode: init.safe_mode,
                     notifications: config.borrow().notify_long_blocks,
@@ -540,6 +541,9 @@ impl SimpleComponent for AppModel {
                 }
                 dialogs::settings::SettingsOutput::AiRedactSecrets(enabled) => {
                     AppMsg::SettingsAiRedactSecrets(enabled)
+                }
+                dialogs::settings::SettingsOutput::AiStream(enabled) => {
+                    AppMsg::SettingsAiStream(enabled)
                 }
                 dialogs::settings::SettingsOutput::AgentMaxTurns(turns) => {
                     AppMsg::SettingsAgentMaxTurns(turns)
@@ -1077,6 +1081,7 @@ impl SimpleComponent for AppModel {
             AppMsg::SettingsAiRedactSecrets(enabled) => {
                 self.apply_settings_ai_redact_secrets(enabled)
             }
+            AppMsg::SettingsAiStream(enabled) => self.apply_settings_ai_stream(enabled),
             AppMsg::SettingsAgentMaxTurns(turns) => self.apply_settings_agent_max_turns(turns),
             AppMsg::SettingsNotifications(enabled) => self.apply_settings_notifications(enabled),
             AppMsg::SettingsRemoteClipboard(enabled) => {

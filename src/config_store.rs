@@ -521,6 +521,7 @@ fn apply_config_to_table(config: &Config, table: &mut toml::Table) {
         "ai_redact_secrets".into(),
         toml::Value::Boolean(config.ai_redact_secrets),
     );
+    table.insert("ai_stream".into(), toml::Value::Boolean(config.ai_stream));
     // Only the file-configured key path is persisted; the JTERM1_AI_API_KEY_FILE
     // override is applied at client construction and never reaches Config.
     match &config.ai_api_key_file {
@@ -1084,6 +1085,7 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
         "ai_max_tokens",
         "ai_temperature",
         "ai_redact_secrets",
+        "ai_stream",
         "ai_api_key_file",
         "agent_enabled",
         "agent_max_turns",
@@ -1156,6 +1158,7 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
         "sidebar_visible",
         "ai_enabled",
         "ai_redact_secrets",
+        "ai_stream",
         "agent_enabled",
         "mouse_reporting_enabled",
         "focus_reporting_enabled",
@@ -1476,6 +1479,7 @@ mod tests {
         config.ai_model = "qwen2.5-coder:7b".into();
         config.ai_max_tokens = 2_048;
         config.ai_redact_secrets = false;
+        config.ai_stream = false;
 
         save_config_to_path(&path, &config, Some(&ConfigRevision::Missing)).unwrap();
         let contents = fs::read_to_string(&path).unwrap();
@@ -1500,6 +1504,10 @@ mod tests {
             table
                 .get("ai_redact_secrets")
                 .and_then(toml::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            table.get("ai_stream").and_then(toml::Value::as_bool),
             Some(false)
         );
         assert!(!contents.to_ascii_lowercase().contains("api_key"));

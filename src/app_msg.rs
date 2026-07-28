@@ -60,6 +60,7 @@ pub(crate) enum AppMsg {
     SettingsAiKeyFile(String),
     SettingsAiMaxTokens(u32),
     SettingsAiRedactSecrets(bool),
+    SettingsAiStream(bool),
     SettingsAgentMaxTurns(u32),
     SettingsNotifications(bool),
     SettingsRemoteClipboard(bool),

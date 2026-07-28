@@ -197,6 +197,7 @@ impl AppModel {
                         ai_api_key_file: config.ai_api_key_file.clone(),
                         ai_max_tokens: config.ai_max_tokens as f64,
                         ai_redact_secrets: config.ai_redact_secrets,
+                        ai_stream: config.ai_stream,
                         agent_max_turns: config.agent_max_turns as f64,
                         safe_mode: self.safe_mode,
                         notifications: config.notify_long_blocks,

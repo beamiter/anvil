@@ -12,10 +12,18 @@ pub(crate) enum AiPanelMsg {
     Open {
         history_path: Option<String>,
         client: ai::AiClient,
+        /// Stream replies incrementally (`ai_stream`); off falls back to the
+        /// single-callback blocking transport.
+        stream: bool,
         initial_context: Option<ai::BlockContext>,
     },
     Ask,
     Clear,
+    /// One streamed assistant text fragment for the request begun at `epoch`.
+    Delta {
+        epoch: u64,
+        text: String,
+    },
     Result {
         epoch: u64,
         result: Result<String, String>,
@@ -28,6 +36,12 @@ struct ConversationState {
     history: Vec<ai::Turn>,
     epoch: u64,
     active_epoch: Option<u64>,
+    /// Streamed fragments shown so far for the active request. The complete
+    /// text returned on success — never this accumulation — is what enters
+    /// `history`: it can carry a trailing token-limit advisory that never
+    /// arrived as a delta, and replacing the shown partial with it heals any
+    /// dropped fragment.
+    partial: String,
 }
 
 impl ConversationState {
@@ -38,6 +52,7 @@ impl ConversationState {
     fn begin(&mut self, user: String) -> (u64, Vec<ai::Turn>) {
         self.epoch = self.epoch.wrapping_add(1);
         self.active_epoch = Some(self.epoch);
+        self.partial.clear();
         self.history.push(ai::Turn {
             role: ai::Role::User,
             text: user,
@@ -45,11 +60,27 @@ impl ConversationState {
         (self.epoch, self.history.clone())
     }
 
+    /// Accumulate one streamed fragment; stale-epoch fragments are dropped.
+    fn push_delta(&mut self, epoch: u64, fragment: &str) -> bool {
+        if self.active_epoch != Some(epoch) {
+            return false;
+        }
+        self.partial.push_str(fragment);
+        true
+    }
+
+    /// The streamed text shown for the active request; empty for blocking
+    /// requests and once a request settles.
+    fn shown_partial(&self) -> &str {
+        &self.partial
+    }
+
     fn complete_success(&mut self, epoch: u64, answer: String) -> bool {
         if self.active_epoch != Some(epoch) {
             return false;
         }
         self.active_epoch = None;
+        self.partial.clear();
         self.history.push(ai::Turn {
             role: ai::Role::Assistant,
             text: answer,
@@ -62,6 +93,7 @@ impl ConversationState {
             return false;
         }
         self.active_epoch = None;
+        self.partial.clear();
         if self
             .history
             .last()
@@ -82,6 +114,7 @@ impl ConversationState {
     fn clear(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);
         self.active_epoch = None;
+        self.partial.clear();
         self.history.clear();
     }
 }
@@ -90,10 +123,15 @@ pub(crate) struct AiPanelModel {
     parent: adw::ApplicationWindow,
     history_path: Option<String>,
     client: Option<ai::AiClient>,
+    stream: bool,
     in_flight: Option<ai::AiHandle>,
     pending_block_context: Option<ai::BlockContext>,
     conversation_system: Option<String>,
     conversation: ConversationState,
+    /// Marks where the streamed assistant body begins in the transcript so
+    /// the final complete text can replace it in place. Present only while a
+    /// streamed request has shown at least one fragment.
+    stream_anchor: Option<gtk::TextMark>,
 }
 
 #[relm4::component(pub(crate))]
@@ -215,10 +253,12 @@ impl Component for AiPanelModel {
             parent,
             history_path: None,
             client: None,
+            stream: true,
             in_flight: None,
             pending_block_context: None,
             conversation_system: None,
             conversation: ConversationState::default(),
+            stream_anchor: None,
         };
         let widgets = view_output!();
         ComponentParts { model, widgets }
@@ -235,12 +275,15 @@ impl Component for AiPanelModel {
             AiPanelMsg::Open {
                 history_path,
                 client,
+                stream,
                 initial_context,
             } => {
                 self.cancel();
                 self.conversation.clear();
+                self.drop_stream_anchor(&widgets.answer);
                 self.history_path = history_path;
                 self.client = Some(client);
+                self.stream = stream;
                 self.pending_block_context = initial_context;
                 self.conversation_system = None;
                 widgets.status.set_label("");
@@ -295,13 +338,25 @@ impl Component for AiPanelModel {
                 widgets.spinner.set_visible(true);
                 widgets.spinner.start();
                 widgets.ask_button.set_sensitive(false);
-                self.in_flight = Some(ai::ask_turns(client, system, history, move |result| {
-                    sender.input(AiPanelMsg::Result { epoch, result });
-                }));
+                self.in_flight = Some(if self.stream {
+                    let delta_sender = sender.clone();
+                    ai::ask_turns_streaming(
+                        client,
+                        system,
+                        history,
+                        move |text| delta_sender.input(AiPanelMsg::Delta { epoch, text }),
+                        move |result| sender.input(AiPanelMsg::Result { epoch, result }),
+                    )
+                } else {
+                    ai::ask_turns(client, system, history, move |result| {
+                        sender.input(AiPanelMsg::Result { epoch, result });
+                    })
+                });
             }
             AiPanelMsg::Clear => {
                 self.cancel();
                 self.conversation.clear();
+                self.drop_stream_anchor(&widgets.answer);
                 self.pending_block_context = None;
                 self.conversation_system = None;
                 widgets.entry.buffer().set_text("");
@@ -312,12 +367,33 @@ impl Component for AiPanelModel {
                 widgets.ask_button.set_sensitive(true);
                 widgets.entry.grab_focus();
             }
+            AiPanelMsg::Delta { epoch, text } => {
+                if !self.conversation.push_delta(epoch, &text) {
+                    return;
+                }
+                let buffer = widgets.answer.buffer();
+                if self.stream_anchor.is_none() {
+                    // Lazily open the assistant section on the first fragment
+                    // so an early failure never leaves an empty heading, and
+                    // anchor the body start (left gravity) so the complete
+                    // text can replace the partial in place.
+                    let mut end = buffer.end_iter();
+                    if buffer.char_count() > 0 {
+                        buffer.insert(&mut end, "\n\n");
+                    }
+                    buffer.insert(&mut end, "Assistant\n");
+                    let end = buffer.end_iter();
+                    self.stream_anchor = Some(buffer.create_mark(None, &end, true));
+                }
+                let mut end = buffer.end_iter();
+                buffer.insert(&mut end, &text);
+                scroll_to_end(&widgets.answer);
+            }
             AiPanelMsg::Result { epoch, result } => match result {
                 Ok(answer) => {
-                    if !self
-                        .conversation
-                        .complete_success(epoch, answer.trim().to_string())
-                    {
+                    let answer = answer.trim().to_string();
+                    let partial_matches = self.conversation.shown_partial() == answer;
+                    if !self.conversation.complete_success(epoch, answer.clone()) {
                         return;
                     }
                     self.in_flight = None;
@@ -325,13 +401,36 @@ impl Component for AiPanelModel {
                     widgets.spinner.set_visible(false);
                     widgets.ask_button.set_sensitive(true);
                     widgets.status.set_label("");
-                    append_transcript(&widgets.answer, "Assistant", answer.trim());
+                    match self.stream_anchor.take() {
+                        Some(anchor) => {
+                            // The returned complete text is the single source
+                            // of truth; swap it in unless the streamed
+                            // fragments already add up to exactly the same
+                            // bytes.
+                            if !partial_matches {
+                                let buffer = widgets.answer.buffer();
+                                let mut start = buffer.iter_at_mark(&anchor);
+                                let mut end = buffer.end_iter();
+                                buffer.delete(&mut start, &mut end);
+                                let mut end = buffer.end_iter();
+                                buffer.insert(&mut end, &answer);
+                                scroll_to_end(&widgets.answer);
+                            }
+                            widgets.answer.buffer().delete_mark(&anchor);
+                        }
+                        None => append_transcript(&widgets.answer, "Assistant", &answer),
+                    }
                 }
                 Err(error) => {
                     if !self.conversation.complete_error(epoch) {
                         return;
                     }
                     self.in_flight = None;
+                    // A mid-stream failure keeps the fragments already shown;
+                    // only the replace anchor is released.
+                    if let Some(anchor) = self.stream_anchor.take() {
+                        widgets.answer.buffer().delete_mark(&anchor);
+                    }
                     widgets.spinner.stop();
                     widgets.spinner.set_visible(false);
                     widgets.ask_button.set_sensitive(true);
@@ -349,6 +448,13 @@ impl AiPanelModel {
             handle.cancel();
         }
         self.conversation.cancel_active();
+    }
+
+    /// Release the in-place replace anchor without touching the shown text.
+    fn drop_stream_anchor(&mut self, answer: &gtk::TextView) {
+        if let Some(anchor) = self.stream_anchor.take() {
+            answer.buffer().delete_mark(&anchor);
+        }
     }
 
     fn recent_context(&self) -> Option<String> {
@@ -374,6 +480,10 @@ fn append_transcript(view: &gtk::TextView, label: &str, body: &str) {
     buffer.insert(&mut end, label);
     buffer.insert(&mut end, "\n");
     buffer.insert(&mut end, body);
+    scroll_to_end(view);
+}
+
+fn scroll_to_end(view: &gtk::TextView) {
     let view = view.clone();
     gtk::glib::idle_add_local_once(move || {
         let mut end = view.buffer().end_iter();
@@ -397,6 +507,46 @@ mod tests {
         assert_eq!(sent[2].role, ai::Role::User);
         assert!(state.complete_error(two));
         assert_eq!(state.history.len(), 2);
+    }
+
+    #[test]
+    fn streamed_fragments_accumulate_only_for_the_active_request() {
+        let mut state = ConversationState::default();
+        let (epoch, _) = state.begin("question".into());
+        assert!(state.push_delta(epoch, "Hel"));
+        assert!(state.push_delta(epoch, "lo"));
+        assert!(!state.push_delta(epoch.wrapping_add(1), "stale"));
+        assert_eq!(state.shown_partial(), "Hello");
+    }
+
+    #[test]
+    fn final_text_replaces_the_streamed_partial_in_history() {
+        let mut state = ConversationState::default();
+        let (epoch, _) = state.begin("question".into());
+        assert!(state.push_delta(epoch, "Hello"));
+        // The complete text carries a trailing advisory that never streamed;
+        // it — not the accumulated fragments — must be recorded.
+        assert!(state.complete_success(epoch, "Hello\n\n[reply truncated]".into()));
+        assert_eq!(state.shown_partial(), "");
+        let recorded = state.history.last().unwrap();
+        assert_eq!(recorded.role, ai::Role::Assistant);
+        assert_eq!(recorded.text, "Hello\n\n[reply truncated]");
+    }
+
+    #[test]
+    fn a_failed_stream_resets_partial_and_history_like_the_blocking_path() {
+        let mut state = ConversationState::default();
+        let (epoch, _) = state.begin("question".into());
+        assert!(state.push_delta(epoch, "partial answer"));
+        assert!(state.complete_error(epoch));
+        assert_eq!(state.shown_partial(), "");
+        assert!(state.history.is_empty());
+        // A retry starts from the same clean state the blocking path leaves
+        // behind and streams under its own epoch.
+        let (retry, sent) = state.begin("question".into());
+        assert_eq!(sent.len(), 1);
+        assert!(state.push_delta(retry, "again"));
+        assert_eq!(state.shown_partial(), "again");
     }
 
     #[test]

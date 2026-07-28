@@ -317,6 +317,10 @@ pub struct Config {
     pub(crate) ai_temperature: Option<f32>,
     /// Redact secret-looking values before sending context to an AI provider.
     pub(crate) ai_redact_secrets: bool,
+    /// Stream session AI panel replies as they generate instead of waiting
+    /// for the complete response. Affects only the conversational panel;
+    /// one-shot helpers and the agent loop always wait for the full reply.
+    pub(crate) ai_stream: bool,
     /// Optional path to a 0600 file holding the provider API key, so the key
     /// never has to live in the process environment or this config file.
     pub(crate) ai_api_key_file: Option<String>,
@@ -390,6 +394,7 @@ impl Config {
             ai_max_tokens: 1_024,
             ai_temperature: None,
             ai_redact_secrets: true,
+            ai_stream: true,
             ai_api_key_file: None,
             notify_long_blocks: false,
             notify_long_block_threshold_ms: 10_000,
@@ -697,6 +702,7 @@ struct FileConfig {
     ai_max_tokens: Option<u32>,
     ai_temperature: Option<f32>,
     ai_redact_secrets: Option<bool>,
+    ai_stream: Option<bool>,
     ai_api_key_file: Option<String>,
     mouse_reporting_enabled: Option<bool>,
     focus_reporting_enabled: Option<bool>,
@@ -901,6 +907,7 @@ fn load_file_config() -> FileConfig {
             .and_then(|v| v.as_float())
             .map(|v| v as f32),
         ai_redact_secrets: table.get("ai_redact_secrets").and_then(|v| v.as_bool()),
+        ai_stream: table.get("ai_stream").and_then(|v| v.as_bool()),
         ai_api_key_file: table
             .get("ai_api_key_file")
             .and_then(|v| v.as_str())
@@ -1287,6 +1294,9 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
             .filter(|t| t.is_finite() && (0.0..=2.0).contains(t)),
         ai_redact_secrets: env_bool("JTERM1_AI_REDACT_SECRETS")
             .or(fc.ai_redact_secrets)
+            .unwrap_or(true),
+        ai_stream: env_bool("JTERM1_AI_STREAM")
+            .or(fc.ai_stream)
             .unwrap_or(true),
         // Unlike the other JTERM1_* overrides, the key-path override is applied
         // at client construction (`jterm_core::ai::resolve_api_key_file`), so
