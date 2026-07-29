@@ -240,10 +240,10 @@ impl AppModel {
             Action::ToggleTabPlacement => self.toggle_tab_placement(),
             Action::CloseSelectedTabs => self.close_marked_tabs(sender),
             Action::FilterTabs => {
+                // The tab list is reachable from the sidebar in both
+                // placements, so filtering can always take the user there.
                 self.set_sidebar_visible(true, true);
-                if self.tab_placement.get() == config::TabPlacement::Sidebar {
-                    self.apply_sidebar_view(config::SidebarView::Tabs, true);
-                }
+                self.apply_sidebar_view(config::SidebarView::Tabs, true);
                 self.tab_filter_control.emit(sidebar::TabFilterMsg::Focus);
             }
             Action::PrevTab => self.switch_tab(-1, sender),

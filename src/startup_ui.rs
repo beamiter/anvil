@@ -5,6 +5,25 @@
 
 use super::*;
 
+/// Translate a tab row's output into an app message. Shared by the strip and
+/// by the sidebar's mirror list so both behave identically.
+pub(crate) fn tab_row_output_to_msg(output: tab_strip::TabRowOutput) -> AppMsg {
+    match output {
+        tab_strip::TabRowOutput::Select(id) => AppMsg::SelectTab(id),
+        tab_strip::TabRowOutput::Close(id) => AppMsg::CloseTab(id),
+        tab_strip::TabRowOutput::Rename(id, title) => AppMsg::RenameTab(id, title),
+        tab_strip::TabRowOutput::NewTab => AppMsg::NewTab,
+        tab_strip::TabRowOutput::Action(id, action) => AppMsg::TabRowAction(id, action),
+        tab_strip::TabRowOutput::ConnectRemote(index) => {
+            AppMsg::Action(Action::ConnectRemote(index))
+        }
+        tab_strip::TabRowOutput::Resize(width) => AppMsg::SetTabWidth(width),
+        tab_strip::TabRowOutput::Reorder { source_id, target } => {
+            AppMsg::ReorderTab(source_id, target)
+        }
+    }
+}
+
 #[allow(deprecated)]
 pub(crate) fn install_static_css() {
     let provider = gtk::CssProvider::new();

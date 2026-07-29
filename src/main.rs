@@ -89,6 +89,13 @@ struct AppModel {
     stack: gtk::Stack,
     tab_strip: gtk::Box,
     tab_rows: FactoryVecDeque<tab_strip::TabRow>,
+    /// Second, always-vertical tab list living in the sidebar's "tabs" page.
+    /// `tab_strip` is a single widget that gets reparented into whichever
+    /// holder the placement names, so it cannot be in the top bar and the
+    /// sidebar at once; this mirror is what keeps the sidebar tab list
+    /// reachable while the strip is docked to the top bar.
+    sidebar_tab_strip: gtk::Box,
+    sidebar_tab_rows: FactoryVecDeque<tab_strip::TabRow>,
     window: adw::ApplicationWindow,
     toast_overlay: adw::ToastOverlay,
     quit_allowed: Rc<std::cell::Cell<bool>>,
@@ -103,6 +110,7 @@ struct AppModel {
     file_tree_root: Rc<RefCell<std::path::PathBuf>>,
     file_tree_scan_generation: Rc<std::cell::Cell<u64>>,
     tab_strip_scroll: gtk::ScrolledWindow,
+    sidebar_tab_scroll: gtk::ScrolledWindow,
     top_tab_scroll: gtk::ScrolledWindow,
     top_bar: Controller<top_bar::TopBarModel>,
     sidebar_box: gtk::Box,
@@ -353,6 +361,9 @@ impl SimpleComponent for AppModel {
 
         let stack = gtk::Stack::new();
         let tab_strip = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let sidebar_tab_strip = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        sidebar_tab_strip.set_valign(gtk::Align::Start);
+        sidebar_tab_strip.set_vexpand(true);
 
         let search =
             search::SearchModel::builder()
@@ -383,7 +394,7 @@ impl SimpleComponent for AppModel {
         let sidebar_view = config.borrow().sidebar_view;
         let sidebar_visible = config.borrow().sidebar_visible;
         let sidebar_toggle = sidebar_toggle::SidebarToggleModel::builder()
-            .launch((sidebar_view, tab_placement == config::TabPlacement::Sidebar))
+            .launch((sidebar_view, true))
             .forward(sender.input_sender(), |output| match output {
                 sidebar_toggle::SidebarToggleOutput::View(view) => AppMsg::SetSidebarView(view),
             });
@@ -403,10 +414,20 @@ impl SimpleComponent for AppModel {
 
         let toggle_row = sidebar_toggle.widget();
 
-        // "tabs" page: filter entry + the tab strip's sidebar holder.
+        // "tabs" page: filter entry, the tab strip's sidebar holder, and the
+        // mirror list. Exactly one of the two holders is visible at a time —
+        // the real strip when tabs are docked here, the mirror when they live
+        // in the top bar. See `sync_tab_bar_visibility`.
+        let sidebar_tab_scroll = gtk::ScrolledWindow::new();
+        sidebar_tab_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        sidebar_tab_scroll.set_vexpand(true);
+        sidebar_tab_scroll.set_child(Some(&sidebar_tab_strip));
+        sidebar_tab_scroll.set_visible(false);
+
         let tabs_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
         tabs_page.append(tab_filter_control.widget());
         tabs_page.append(&tab_strip_scroll);
+        tabs_page.append(&sidebar_tab_scroll);
 
         // "files" page: root header (up / goto-cwd / path) + file tree.
         let files_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -635,22 +656,14 @@ impl SimpleComponent for AppModel {
                     AppMsg::AgentEditAndApprove(index, command)
                 }
             });
+        // Both tab lists speak the same output vocabulary, so they route
+        // through one translation.
         let tab_rows = FactoryVecDeque::builder()
             .launch(tab_strip.clone())
-            .forward(sender.input_sender(), |output| match output {
-                tab_strip::TabRowOutput::Select(id) => AppMsg::SelectTab(id),
-                tab_strip::TabRowOutput::Close(id) => AppMsg::CloseTab(id),
-                tab_strip::TabRowOutput::Rename(id, title) => AppMsg::RenameTab(id, title),
-                tab_strip::TabRowOutput::NewTab => AppMsg::NewTab,
-                tab_strip::TabRowOutput::Action(id, action) => AppMsg::TabRowAction(id, action),
-                tab_strip::TabRowOutput::ConnectRemote(index) => {
-                    AppMsg::Action(Action::ConnectRemote(index))
-                }
-                tab_strip::TabRowOutput::Resize(width) => AppMsg::SetTabWidth(width),
-                tab_strip::TabRowOutput::Reorder { source_id, target } => {
-                    AppMsg::ReorderTab(source_id, target)
-                }
-            });
+            .forward(sender.input_sender(), startup_ui::tab_row_output_to_msg);
+        let sidebar_tab_rows = FactoryVecDeque::builder()
+            .launch(sidebar_tab_strip.clone())
+            .forward(sender.input_sender(), startup_ui::tab_row_output_to_msg);
 
         let toast_overlay = adw::ToastOverlay::new();
         let quit_allowed = Rc::new(std::cell::Cell::new(false));
@@ -672,6 +685,8 @@ impl SimpleComponent for AppModel {
             stack: stack.clone(),
             tab_strip: tab_strip.clone(),
             tab_rows,
+            sidebar_tab_strip: sidebar_tab_strip.clone(),
+            sidebar_tab_rows,
             window: root.clone(),
             toast_overlay: toast_overlay.clone(),
             quit_allowed: quit_allowed.clone(),
@@ -686,6 +701,7 @@ impl SimpleComponent for AppModel {
             file_tree_root: Rc::new(RefCell::new(std::path::PathBuf::new())),
             file_tree_scan_generation,
             tab_strip_scroll: tab_strip_scroll.clone(),
+            sidebar_tab_scroll: sidebar_tab_scroll.clone(),
             top_tab_scroll: top_tab_scroll.clone(),
             top_bar,
             sidebar_box: sidebar_box.clone(),

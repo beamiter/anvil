@@ -19,7 +19,7 @@ impl AppModel {
     /// Move the tab strip into the holder matching the current placement and
     /// flip its orientation; sidebar = vertical list, top bar = horizontal.
     pub(crate) fn apply_tab_placement(&self) {
-        use config::{SidebarView, TabPlacement};
+        use config::TabPlacement;
         let placement = self.tab_placement.get();
 
         self.tab_strip_scroll.set_child(None::<&gtk::Widget>);
@@ -55,19 +55,12 @@ impl AppModel {
             child = c.next_sibling();
         }
 
-        // The Tabs sidebar view only makes sense when tabs live in the sidebar.
-        match placement {
-            TabPlacement::Sidebar => {
-                self.sidebar_toggle
-                    .emit(sidebar_toggle::SidebarToggleMsg::SetTabsEnabled(true));
-                self.apply_sidebar_view(self.sidebar_view.get(), false);
-            }
-            TabPlacement::TopBar => {
-                self.sidebar_toggle
-                    .emit(sidebar_toggle::SidebarToggleMsg::SetTabsEnabled(false));
-                self.apply_sidebar_view(SidebarView::Files, false);
-            }
-        }
+        // The Tabs sidebar view stays available in both placements: with the
+        // strip in the top bar the sidebar shows the mirror list instead, so
+        // tabs remain visible in two places at once rather than moving.
+        self.sidebar_toggle
+            .emit(sidebar_toggle::SidebarToggleMsg::SetTabsEnabled(true));
+        self.apply_sidebar_view(self.sidebar_view.get(), false);
 
         self.sync_tab_bar_visibility();
     }
@@ -131,14 +124,20 @@ impl AppModel {
 
     /// Keep the top-bar tab strip visible even for a lone tab so its title and
     /// tab actions remain available in the configured placement.
+    ///
+    /// The sidebar's "tabs" page holds two lists: the real strip's holder and
+    /// the mirror. Exactly one is shown, decided by where the strip currently
+    /// lives, so the page never renders an empty holder or a duplicate list.
     pub(crate) fn sync_tab_bar_visibility(&self) {
         match self.tab_placement.get() {
             config::TabPlacement::Sidebar => {
                 self.tab_strip_scroll.set_visible(true);
+                self.sidebar_tab_scroll.set_visible(false);
                 self.top_tab_scroll.set_visible(false);
             }
             config::TabPlacement::TopBar => {
-                self.tab_strip_scroll.set_visible(true);
+                self.tab_strip_scroll.set_visible(false);
+                self.sidebar_tab_scroll.set_visible(true);
                 self.top_tab_scroll.set_visible(!self.tabs.is_empty());
             }
         }
@@ -157,6 +156,12 @@ impl AppModel {
         };
         self.tab_rows
             .send(index, tab_strip::TabRowMsg::SetTitle(title.to_string()));
+        // The mirror filters identically, so the index matches; look it up
+        // anyway rather than assume the two lists never drift.
+        if let Some(index) = self.sidebar_tab_rows.iter().position(|row| row.id == id) {
+            self.sidebar_tab_rows
+                .send(index, tab_strip::TabRowMsg::SetTitle(title.to_string()));
+        }
         true
     }
 
@@ -223,36 +228,54 @@ impl AppModel {
             })
             .collect();
 
-        let same_rows = self.tab_rows.len() == rows.len()
-            && self
-                .tab_rows
-                .iter()
-                .zip(rows.iter())
-                .all(|(current, next)| current.id == next.id);
-
-        if same_rows {
-            let updates: Vec<_> = self
-                .tab_rows
-                .iter()
-                .zip(rows.iter())
-                .enumerate()
-                .filter(|(_, (current, next))| !current.matches_init(next))
-                .map(|(index, (_, next))| (index, next.clone()))
-                .collect();
-            for (index, row) in updates {
-                self.tab_rows.send(index, tab_strip::TabRowMsg::Sync(row));
-            }
-        } else {
-            let mut factory = self.tab_rows.guard();
-            factory.clear();
-            for row in rows {
-                factory.push_back(row);
-            }
-        }
+        // The mirror is always a vertical list, whatever the strip's placement.
+        let mirror_rows: Vec<_> = rows
+            .iter()
+            .cloned()
+            .map(|row| tab_strip::TabRowInit {
+                sidebar: true,
+                ..row
+            })
+            .collect();
+        apply_tab_rows(&mut self.tab_rows, rows);
+        apply_tab_rows(&mut self.sidebar_tab_rows, mirror_rows);
 
         self.sync_tab_bar_visibility();
         if persist {
             self.persist_session();
+        }
+    }
+}
+
+/// Reconcile one tab list against the desired rows. Rows are patched in place
+/// while the ids line up, because rebuilding a row destroys its button between
+/// pointer press and release (see `update_tab_title_widget`).
+fn apply_tab_rows(
+    factory: &mut FactoryVecDeque<tab_strip::TabRow>,
+    rows: Vec<tab_strip::TabRowInit>,
+) {
+    let same_rows = factory.len() == rows.len()
+        && factory
+            .iter()
+            .zip(rows.iter())
+            .all(|(current, next)| current.id == next.id);
+
+    if same_rows {
+        let updates: Vec<_> = factory
+            .iter()
+            .zip(rows.iter())
+            .enumerate()
+            .filter(|(_, (current, next))| !current.matches_init(next))
+            .map(|(index, (_, next))| (index, next.clone()))
+            .collect();
+        for (index, row) in updates {
+            factory.send(index, tab_strip::TabRowMsg::Sync(row));
+        }
+    } else {
+        let mut guard = factory.guard();
+        guard.clear();
+        for row in rows {
+            guard.push_back(row);
         }
     }
 }
