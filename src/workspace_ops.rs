@@ -1106,6 +1106,45 @@ impl AppModel {
         self.select_tab(new_id, sender);
     }
 
+    /// Re-label a tab from the pane it currently has selected.
+    ///
+    /// A tab shows its selected pane, so moving focus between the panes of a
+    /// split has to move the label with it. Without this the strip kept naming
+    /// whichever pane last reported an OSC title. A tab the user renamed keeps
+    /// that name.
+    pub(crate) fn retitle_tab_from_active_pane(
+        &mut self,
+        ti: usize,
+        sender: &ComponentSender<AppModel>,
+    ) {
+        let Some(tab) = self.tabs.get(ti) else {
+            return;
+        };
+        if tab.custom_title {
+            return;
+        }
+        let Some(pane) = tab.panes.get(tab.active_pane) else {
+            return;
+        };
+        let title = pane
+            .title
+            .clone()
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| default_tab_title(ti as u32 + 1, pane.cwd.as_deref()));
+        if tab.title == title {
+            return;
+        }
+        let id = tab.id;
+        self.tabs[ti].title = title;
+        // A filter is matched against the label, so a changed label can move
+        // the row in or out of the filtered set; that needs a full rebuild.
+        let filter = self.tab_filter.to_lowercase();
+        let visible = filter.is_empty() || self.tabs[ti].title.to_lowercase().contains(&filter);
+        if !visible || !self.update_tab_title_widget(id, &self.tabs[ti].title) {
+            self.rebuild_tab_strip(sender);
+        }
+    }
+
     /// Bring one tab's pane headers up to date: visibility, numbering, focus
     /// highlight, and the title / directory / running-command line.
     ///

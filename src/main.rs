@@ -995,6 +995,9 @@ impl SimpleComponent for AppModel {
                 if let Some((ti, pi)) = self.find_pane(pane_id) {
                     self.tabs[ti].active_pane = pi;
                     self.refresh_pane_headers(ti);
+                    // The tab shows its selected pane, so the label follows
+                    // focus across a split.
+                    self.retitle_tab_from_active_pane(ti, &sender);
                     if self.tabs[ti].bell || self.tabs[ti].activity {
                         self.tabs[ti].bell = false;
                         self.tabs[ti].activity = false;
@@ -1012,7 +1015,11 @@ impl SimpleComponent for AppModel {
                         self.refresh_pane_headers(idx);
                     }
                     let id = self.tabs[idx].id;
-                    if !self.tabs[idx].custom_title && !title.is_empty() {
+                    // A tab shows its selected pane. A background pane in a
+                    // split reports OSC titles too, and letting those through
+                    // made the label name a pane the user is not looking at.
+                    let is_selected_pane = pane_index == self.tabs[idx].active_pane;
+                    if is_selected_pane && !self.tabs[idx].custom_title && !title.is_empty() {
                         let filter = self.tab_filter.to_lowercase();
                         let was_visible = filter.is_empty()
                             || self.tabs[idx].title.to_lowercase().contains(&filter);
