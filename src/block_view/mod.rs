@@ -14,6 +14,7 @@ use vte4::TerminalExt;
 use crate::config::Config;
 use crate::parser::{ColorKind, KeyboardProtocolQuery, Parser, ParserConfig, ParserEvent};
 use crate::pty::OwnedPty;
+use crate::pty_input;
 use crate::terminal::kitty_graphics;
 
 mod alt_screen;
@@ -104,31 +105,125 @@ fn normalize_captured_command(captured: &str, prompt: &str) -> String {
     captured.to_string()
 }
 
-/// Build the text and PTY byte stream used when recalling a finished command.
-///
-/// Multiline commands are safe only when the shell has enabled bracketed paste:
-/// the wrapper inserts embedded newlines into the edit buffer without submitting
-/// them. Without DECSET 2004, fall back to the first logical line rather than
-/// accidentally executing the remainder.
-pub(crate) fn build_command_recall(command: &str, bracketed_paste: bool) -> (String, Vec<u8>) {
-    let normalized = command.replace("\r\n", "\n").replace('\r', "\n");
-    let multiline = normalized.contains('\n');
-    let recalled = if multiline && !bracketed_paste {
-        normalized.split('\n').next().unwrap_or("").to_string()
-    } else {
-        normalized
-    };
+/// Stand-in command text for a block whose shell reported that it *had* a
+/// command line and dropped it for size, when the screen scrape came back empty
+/// too. Recorded as the block's command so its output is still filed as a
+/// command block instead of as commandless background output.
+pub(crate) const TRUNCATED_COMMAND_PLACEHOLDER: &str = "[command too long to report]";
 
-    if multiline && bracketed_paste {
-        let mut payload = Vec::with_capacity(recalled.len() + 12);
-        payload.extend_from_slice(b"\x1b[200~");
-        payload.extend_from_slice(recalled.as_bytes());
-        payload.extend_from_slice(b"\x1b[201~");
-        (recalled, payload)
-    } else {
-        let payload = recalled.as_bytes().to_vec();
-        (recalled, payload)
+/// Where a finished block's command text came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommandTextSource {
+    /// The shell attached the command line to its OSC 133 `C` packet (jsh does).
+    ShellReported,
+    /// The shell had a command line but exceeded the packet budget, so only the
+    /// screen scrape is left. Distinct from [`Self::Screen`]: a command really
+    /// did run, so an empty capture must not be read as "no command".
+    ScreenAfterTruncation,
+    /// The shell emits bare marks, so the screen is the only source there is.
+    Screen,
+}
+
+/// Resolve the command line a finished block records.
+///
+/// The shell's own copy wins over the screen scrape, which can only ever show
+/// what the renderer painted: a wrapped line, jsh's autosuggestion ghost text,
+/// or a right-hand prompt all land inside the captured range, and a `feed()`
+/// that has not been flushed yet leaves it empty.
+fn resolve_command_text(
+    reported: Option<&str>,
+    command_truncated: bool,
+    scraped: &str,
+) -> (String, CommandTextSource) {
+    if let Some(command) = reported {
+        return (command.to_string(), CommandTextSource::ShellReported);
     }
+    if command_truncated {
+        let text = if scraped.trim().is_empty() {
+            TRUNCATED_COMMAND_PLACEHOLDER.to_string()
+        } else {
+            scraped.to_string()
+        };
+        return (text, CommandTextSource::ScreenAfterTruncation);
+    }
+    (scraped.to_string(), CommandTextSource::Screen)
+}
+
+/// Lower a possibly-unreported status to the single `i32` that shared APIs still
+/// require: `jterm_core::command_history`, `jterm_core::notify`, and jagent's
+/// block context and observation turns.
+///
+/// `0` is the least-bad stand-in for all four, because every one of them treats
+/// non-zero as "this command failed" — a desktop notification marked critical, a
+/// palette entry in the failure filter, an agent told to fix something. Claiming
+/// a failure nobody observed is worse than claiming an outcome. The distinction
+/// survives wherever this app owns the presentation (the block header, the
+/// markdown export, the inactive-tab styling); widening those APIs to
+/// `Option<i32>` is the follow-up this function exists to make greppable.
+pub(crate) fn exit_code_for_i32_api(exit_code: Option<i32>) -> i32 {
+    exit_code.unwrap_or(0)
+}
+
+/// Duration recorded for a finished block.
+///
+/// The shell's own measurement wins. The local fallback timer starts when this
+/// process *noticed* the CommandStart mark and stops at the next PromptStart, so
+/// it also contains the shell's post-command work plus whatever latency the GTK
+/// dispatch that delivered those marks added.
+fn block_duration_ms(
+    shell_reported: Option<u64>,
+    started: Option<SystemTime>,
+    ended: SystemTime,
+) -> Option<u64> {
+    shell_reported.or_else(|| {
+        started
+            .and_then(|start| ended.duration_since(start).ok())
+            .map(|elapsed| elapsed.as_millis() as u64)
+    })
+}
+
+/// jterm1's paste policy for text this app puts on the shell's prompt (block
+/// recall, the history palette): keep control bytes, because the command came
+/// from this app's own capture of a command the user already ran, and truncate a
+/// multiline payload to its first line when the shell has not advertised DECSET
+/// 2004 — an unframed newline would submit each line as its own command.
+fn prompt_insert_policy() -> pty_input::PastePolicy {
+    pty_input::PastePolicy::prompt_insert(pty_input::UnbracketedMultiline::FirstLineOnly)
+}
+
+/// Encode clipboard text for the shell PTY.
+///
+/// jterm1's clipboard policy: de-fang controls (a clipboard is untrusted text,
+/// and an escape sequence in it would drive the terminal rather than the shell)
+/// and truncate a multiline payload to its first line when the shell has not
+/// advertised DECSET 2004. Paste-marker removal is not part of the policy — the
+/// encoder always does it, which is the fix for a clipboard that closes the
+/// bracketed-paste frame early and has its remainder executed.
+fn build_clipboard_paste(text: &str, bracketed_paste: bool) -> pty_input::Paste {
+    pty_input::encode_paste(
+        text,
+        pty_input::PasteModes {
+            bracketed: bracketed_paste,
+        },
+        pty_input::PastePolicy::clipboard(pty_input::UnbracketedMultiline::FirstLineOnly),
+    )
+}
+
+/// Encode a finished command for insertion at the live prompt.
+///
+/// The framing, the marker removal and the first-line fallback all live in
+/// [`pty_input::encode_prompt_insert`] now; `clear_line_first` is unconditional
+/// there because whatever the user has already typed is not represented by any
+/// flag this app owns, so a conditional `Ctrl+U` appends instead of replacing.
+pub(crate) fn build_command_recall(command: &str, bracketed_paste: bool) -> pty_input::Paste {
+    pty_input::encode_prompt_insert(
+        command,
+        pty_input::PasteModes {
+            bracketed: bracketed_paste,
+        },
+        prompt_insert_policy(),
+        true,
+    )
 }
 
 /// Collect commands from a block selection in terminal order. Background
@@ -187,6 +282,34 @@ fn recall_selected_commands_at_prompt(
     recall_command_at_prompt(pty, pty_synced, typed_cmd, state, &command, bracketed_paste)
 }
 
+/// Mirror text this app wrote to the shell into the live editor shadow.
+///
+/// jterm1 reconstructs the typed line from the live VTE's `commit` signal, which
+/// a clipboard paste never travels through: block mode writes to its own PTY
+/// directly. Without this the shadow misses everything the user pasted, so the
+/// idle input cell keeps the height of a line the shell no longer has and the
+/// background-output heuristic keeps treating the shell's echo of the paste as
+/// asynchronous output.
+///
+/// Only text written at an idle prompt belongs in the shadow: while a command
+/// runs, the same bytes are that program's stdin, not an edited command line.
+fn record_external_input(
+    state: BlockState,
+    text: &str,
+    typed_cmd: &RefCell<String>,
+    pty_synced: &Cell<bool>,
+    idle_input_dirty: &Cell<bool>,
+) {
+    if state != BlockState::AwaitingCommand || text.is_empty() {
+        return;
+    }
+    idle_input_dirty.set(true);
+    // The shell's line buffer now holds text this app put there, so a later
+    // recall must replace the line rather than append to it.
+    pty_synced.set(true);
+    typed_cmd.borrow_mut().push_str(text);
+}
+
 /// Replace the current editable shell line with a finished command.
 ///
 /// Refuse to write while a command or full-screen program owns the PTY. Besides
@@ -204,16 +327,16 @@ pub(crate) fn recall_command_at_prompt(
         return false;
     }
 
-    let (recalled, payload) = build_command_recall(command, bracketed_paste);
-    if recalled.is_empty() {
+    let recall = build_command_recall(command, bracketed_paste);
+    if recall.is_empty() {
         return false;
     }
 
-    if pty_synced.get() || !typed_cmd.borrow().is_empty() {
-        pty.write_bytes(b"\x15");
-    }
-    pty.write_bytes(&payload);
-    *typed_cmd.borrow_mut() = recalled;
+    // One write: the Ctrl+U, the framing and the body are a single payload, so
+    // the PTY boundary sees a whole frame and no other writer can interleave
+    // between the line kill and the text that replaces it.
+    pty.write_bytes(&recall.bytes);
+    *typed_cmd.borrow_mut() = recall.echo_text;
     pty_synced.set(true);
     true
 }
@@ -863,7 +986,10 @@ const MAX_RAW_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 /// viewport, and is forced to the full viewport only for alt-screen apps.
 const MIN_INPUT_ROWS: i32 = 6;
 
-type BlockFinishedCallbacks = Rc<RefCell<Vec<Box<dyn Fn(String, i32, String)>>>>;
+/// `(command, exit status, output sample)`. The status is `None` when the shell
+/// reported none, so a consumer that styles failures can tell "failed" apart from
+/// "outcome unknown".
+type BlockFinishedCallbacks = Rc<RefCell<Vec<Box<dyn Fn(String, Option<i32>, String)>>>>;
 type BlockContextCallbacks = Rc<RefCell<Vec<Box<dyn Fn(crate::ai::BlockContext)>>>>;
 type CwdCallbacks = Rc<RefCell<Vec<Box<dyn Fn(&str, bool)>>>>;
 pub(crate) type DebugInfo = Vec<(&'static str, Vec<(String, String)>)>;
@@ -882,6 +1008,11 @@ pub struct TermView {
     /// authoritative finished-command text is read off the live VTE at
     /// CommandStart, so this never has to round-trip to display.
     typed_cmd: Rc<RefCell<String>>,
+    /// Set once the user has started editing at an idle prompt, so shell echo is
+    /// no longer mistaken for asynchronous background output. Shared with the
+    /// reader loop; the clipboard paste path has to set it too, since a paste
+    /// never travels through the VTE `commit` signal that normally does.
+    idle_input_dirty: Rc<Cell<bool>>,
     /// True while an alt-screen app owns the viewport (finished blocks hidden).
     fullscreen: Rc<Cell<bool>>,
     /// True once the user has scrolled up off the live prompt; while false the
@@ -1018,7 +1149,19 @@ struct ReaderCtx {
     init_cmds_queue_for_cb: Rc<RefCell<std::collections::VecDeque<String>>>,
     pty_for_init: Rc<OwnedPty>,
     block_start_time_for_cb: Rc<Cell<Option<SystemTime>>>,
-    pending_exit_code_rc: Rc<Cell<i32>>,
+    /// Status from the shell's OSC 133 `D` packet. `None` means the shell did
+    /// not report one — not that the command succeeded.
+    pending_exit_code_rc: Rc<Cell<Option<i32>>>,
+    /// Duration the shell measured for the running command, when it sends one.
+    /// Beats `block_start_time_for_cb`, which starts when this process noticed
+    /// the mark.
+    shell_duration_ms_rc: Rc<Cell<Option<u64>>>,
+    /// The shell's execution id for the running command (jsh only): the key its
+    /// execution journal keeps the record under.
+    execution_id_rc: Rc<RefCell<Option<String>>>,
+    /// cwd the running command was started in, as the shell reported it at
+    /// CommandStart. The pane's tracked cwd has already moved on after a `cd`.
+    command_cwd_rc: Rc<RefCell<Option<String>>>,
     current_cwd_for_cb: Rc<RefCell<String>>,
     current_cwd_external_for_cb: Rc<Cell<bool>>,
     event_buf: Rc<RefCell<Vec<ParserEvent>>>,
@@ -1189,6 +1332,9 @@ impl ReaderCtx {
             pty_for_init,
             block_start_time_for_cb,
             pending_exit_code_rc,
+            shell_duration_ms_rc,
+            execution_id_rc,
+            command_cwd_rc,
             current_cwd_for_cb,
             current_cwd_external_for_cb,
             event_buf,
@@ -1397,17 +1543,37 @@ impl ReaderCtx {
                                 let now = SystemTime::now();
                                 let end_time_ms = now.duration_since(SystemTime::UNIX_EPOCH).ok().map(|d| d.as_millis() as u64);
                                 let start_time_ms = start_time.and_then(|st| st.duration_since(SystemTime::UNIX_EPOCH).ok().map(|d| d.as_millis() as u64));
-                                let duration_ms = start_time.and_then(|st| {
-                                    now.duration_since(st).ok().map(|d| d.as_millis() as u64)
-                                });
+                                // Commandless background output has no shell-reported
+                                // figure of its own, so it keeps the local timer only.
+                                let shell_duration_ms = if is_background {
+                                    None
+                                } else {
+                                    shell_duration_ms_rc.take()
+                                };
+                                let duration_ms = block_duration_ms(shell_duration_ms, start_time, now);
 
                                 let block_cwd = {
-                                    let cwd_str = current_cwd_for_cb.borrow().clone();
-                                    if cwd_str.is_empty() { None } else { Some(cwd_str) }
+                                    // The cwd the shell said the command ran in wins
+                                    // over the pane's tracked cwd: after `cd`, the
+                                    // OSC 7 that updated the pane already names the
+                                    // directory the *next* command will run in.
+                                    let reported = if is_background {
+                                        None
+                                    } else {
+                                        command_cwd_rc.borrow_mut().take()
+                                    };
+                                    reported.or_else(|| {
+                                        let cwd_str = current_cwd_for_cb.borrow().clone();
+                                        if cwd_str.is_empty() { None } else { Some(cwd_str) }
+                                    })
                                 };
 
+                                // `None` means the shell never reported a status.
+                                // Background output was never a command, so it has no
+                                // status to report either — both render neutrally
+                                // rather than as a success.
                                 let exit_code = if is_background {
-                                    0
+                                    None
                                 } else {
                                     pending_exit_code_rc.get()
                                 };
@@ -1514,6 +1680,33 @@ impl ReaderCtx {
                                     for cb in block_finished_cbs.borrow().iter() {
                                         cb(cmd.clone(), exit_code, output_sample.clone());
                                     }
+                                    // Attach this block's output to the shell's own
+                                    // journal record. Only jsh sends an execution id,
+                                    // and only it writes the record this completes —
+                                    // without the id there is nothing to correlate,
+                                    // which is why the capture used to stay stranded
+                                    // in this window.
+                                    if let Some(id) = execution_id_rc.borrow_mut().take() {
+                                        // The journal gets the line-capped text this
+                                        // pane kept, with `truncated` set from the same
+                                        // cap. `total_bytes` is measured against the
+                                        // trimmed full capture, so a record that merely
+                                        // lost surrounding blank lines is not reported
+                                        // as truncated. (What this layer cannot see is
+                                        // the live buffer's byte cap dropping the *head*
+                                        // of a very long stream — a gap, not a claim.)
+                                        let total_bytes = output_plain.trim().len();
+                                        let submitted = jterm_core::execution_journal::CompletedExecution {
+                                            id,
+                                            output: output_trimmed.clone(),
+                                            output_available: true,
+                                            truncated: output_trimmed.len() != total_bytes,
+                                            total_bytes,
+                                        };
+                                        if let Err(error) = jterm_core::execution_journal::submit(submitted) {
+                                            log::warn!("jsh execution journal rejected a block's output: {error:?}");
+                                        }
+                                    }
                                 }
 
                                 {
@@ -1521,7 +1714,11 @@ impl ReaderCtx {
                                     if !is_background && cfg.notify_long_blocks {
                                         if let Some(ms) = duration_ms {
                                             if ms >= cfg.notify_long_block_threshold_ms {
-                                                crate::notify::long_block_finished(&cmd, exit_code, ms);
+                                                crate::notify::long_block_finished(
+                                                    &cmd,
+                                                    exit_code_for_i32_api(exit_code),
+                                                    ms,
+                                                );
                                             }
                                         }
                                     }
@@ -1650,7 +1847,7 @@ impl ReaderCtx {
                                                 cmd: finished_for_ai.cmd_text.clone(),
                                                 output,
                                                 cwd: record.and_then(|block| block.cwd.clone()),
-                                                exit_code: record.map(|block| block.exit_code).unwrap_or(0),
+                                                exit_code: exit_code_for_i32_api(record.and_then(|block| block.exit_code)),
                                                 truncated,
                                             };
                                             for callback in callbacks_for_ai.borrow().iter() {
@@ -1994,7 +2191,7 @@ impl ReaderCtx {
                                         history_limit,
                                         &cmd,
                                         block_cwd.as_deref(),
-                                        exit_code,
+                                        exit_code_for_i32_api(exit_code),
                                         end_time_ms,
                                     ) {
                                         log::warn!("command history: {err}");
@@ -2079,7 +2276,7 @@ impl ReaderCtx {
                             scroll_debouncer.mark_dirty(&block_scroll_rc);
                         }
 
-                        ParserEvent::CommandStart => {
+                        ParserEvent::CommandStart(meta) => {
                             ftcs_seen_rc.set(true);
                             let state = bstate_rc.get();
                             if state == BlockState::CollectingOutput || state == BlockState::AltScreen {
@@ -2097,14 +2294,25 @@ impl ReaderCtx {
                             background_output_rc.borrow_mut().clear();
                             active_rc.borrow().reset_output_buffer();
                             block_start_time_for_cb.set(Some(SystemTime::now()));
-                            // Read the typed command directly off the live VTE,
-                            // not from a shadow keystroke buffer. The VTE shows
-                            // what the user actually saw — including history
-                            // recalls and jsh autosuggestion accepts — so what we
-                            // capture here is faithful to the run. Range goes
-                            // from the cursor position captured at PromptEnd to
-                            // the current cursor position (right before the
-                            // shell echoes a newline and starts the command).
+                            // The shell may attach its own measurement to either
+                            // mark; jsh puts it on D. Reset it here so the previous
+                            // command's figure cannot be reused for this one.
+                            shell_duration_ms_rc.set(meta.duration_ms);
+                            // jsh's execution id: the key its journal is written
+                            // under, so the output captured below can be attached
+                            // to the record instead of living only in this window.
+                            *execution_id_rc.borrow_mut() = meta.id.clone();
+                            // The cwd the command runs *in*. The pane's tracked cwd
+                            // comes from an OSC 7 the shell emits with its next
+                            // prompt, which for `cd`/`pushd` is already the new
+                            // directory by the time this block is finalized.
+                            *command_cwd_rc.borrow_mut() = meta.cwd.clone();
+                            // Scrape the command off the live VTE as the fallback
+                            // for shells that send bare marks: the range from the
+                            // cursor captured at PromptEnd to the cursor now (right
+                            // before the shell echoes a newline) is what the user
+                            // saw, including history recalls and jsh autosuggestion
+                            // accepts.
                             let (cmd_end_col, cmd_end_row) = active_vte.cursor_position();
                             let (start_col, start_row) = prompt_end_pos_rc.get();
                             let captured = active_vte
@@ -2118,9 +2326,20 @@ impl ReaderCtx {
                                 .0
                                 .map(|gs| gs.to_string())
                                 .unwrap_or_default();
-                            let cmd_from_vte = normalize_captured_command(&captured, &prompt_display_rc.borrow());
-                            *vte_typed_cmd_rc.borrow_mut() = cmd_from_vte.clone();
-                            *running_cmd_rc.borrow_mut() = cmd_from_vte;
+                            let scraped = normalize_captured_command(&captured, &prompt_display_rc.borrow());
+                            let (command, source) = resolve_command_text(
+                                meta.command.as_deref(),
+                                meta.command_truncated,
+                                &scraped,
+                            );
+                            if source == CommandTextSource::ScreenAfterTruncation {
+                                log::debug!(
+                                    "Shell dropped an oversized command line; falling back to the screen capture ({} bytes)",
+                                    command.len()
+                                );
+                            }
+                            *vte_typed_cmd_rc.borrow_mut() = command.clone();
+                            *running_cmd_rc.borrow_mut() = command;
                             cmd_running_rc.set(true);
                             bstate_rc.set(BlockState::CollectingOutput);
                             // Do not clear the input shadow here. VTE `feed()` is
@@ -2142,7 +2361,7 @@ impl ReaderCtx {
                             scroll_debouncer.mark_dirty(&block_scroll_rc);
                         }
 
-                        ParserEvent::CommandEnd(code) => {
+                        ParserEvent::CommandEnd { exit, meta } => {
                             let state = bstate_rc.get();
                             if state != BlockState::CollectingOutput && state != BlockState::AltScreen {
                                 continue;
@@ -2165,7 +2384,20 @@ impl ReaderCtx {
                                 );
                                 layout_active_surface();
                             }
-                            pending_exit_code_rc.set(*code);
+                            // `None` stays `None`: a shell that reported no status
+                            // is not a shell that reported success, and this used
+                            // to collapse to a green `exit 0`.
+                            pending_exit_code_rc.set(*exit);
+                            // jsh measures the command itself; only fall back to
+                            // this process's timer when the shell said nothing.
+                            if meta.duration_ms.is_some() {
+                                shell_duration_ms_rc.set(meta.duration_ms);
+                            }
+                            // The D packet repeats the execution id, so a shell
+                            // that only tags the finish still correlates.
+                            if meta.id.is_some() {
+                                *execution_id_rc.borrow_mut() = meta.id.clone();
+                            }
                             cmd_running_rc.set(false);
                             bstate_rc.set(BlockState::PostCommand);
                             scroll_debouncer.mark_dirty(&block_scroll_rc);
@@ -2906,16 +3138,16 @@ impl TermView {
 
         // Git defaults LESS to "FRX" when the user has not set it. "F" quits
         // the pager when output fits on one screen, and "X" disables less'
-        // alternate-screen setup. Default to raw-control-char rendering only:
-        // keep colored git output, keep the interactive pager even for a short
-        // `git log`, and let less use alt-screen so transient pager content
-        // stays ephemeral. Respect an explicit user-provided LESS.
-        // Match the VTE backend: shell rc files use this stable marker to
-        // source jterm1's OSC integration in both terminal modes.
+        // alternate-screen setup. jterm1 defaults it to raw-control-char
+        // rendering only: keep colored git output, keep the interactive pager
+        // even for a short `git log`, and let less use alt-screen so transient
+        // pager content stays ephemeral. An explicit user LESS still wins.
+        //
+        // That choice now lives with the spawn itself, as
+        // `child_env::ChildEnv::less_default` in `crate::pty` — one place that
+        // also gets it right for the Flatpak bridge, where "the parent has no
+        // LESS" is the wrong question to ask about the host session.
         let mut env_extra = Vec::from(crate::terminal::cwd_token_environment(cwd_token));
-        if std::env::var_os("LESS").is_none() {
-            env_extra.push(("LESS", "R"));
-        }
         let session_id_owned = session_id.map(|s| s.to_string());
         if let Some(ref sid) = session_id_owned {
             if session_applied {
@@ -3188,7 +3420,14 @@ impl TermView {
             });
         }
 
-        let pending_exit_code: Rc<Cell<i32>> = Rc::new(Cell::new(0));
+        // Set from the shell's OSC 133 `D` packet. `None` — the initial value and
+        // the value for a shell that omits the status — means "not reported",
+        // which the block header renders as neutral rather than as `exit 0`.
+        let pending_exit_code: Rc<Cell<Option<i32>>> = Rc::new(Cell::new(None));
+        // Metadata jsh attaches to the same marks (see ParserEvent::CommandStart).
+        let shell_duration_ms: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
+        let execution_id: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let command_cwd: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
 
         let widget_pool: Rc<RefCell<WidgetPool>> = Rc::new(RefCell::new(WidgetPool::new()));
         let pty_synced: Rc<Cell<bool>> = Rc::new(Cell::new(false));
@@ -3364,6 +3603,9 @@ impl TermView {
                 pty_for_init,
                 block_start_time_for_cb,
                 pending_exit_code_rc,
+                shell_duration_ms_rc: shell_duration_ms.clone(),
+                execution_id_rc: execution_id.clone(),
+                command_cwd_rc: command_cwd.clone(),
                 current_cwd_for_cb,
                 current_cwd_external_for_cb,
                 event_buf,
@@ -3872,6 +4114,7 @@ impl TermView {
             bstate,
             prompt_buf,
             typed_cmd,
+            idle_input_dirty: idle_input_dirty.clone(),
             fullscreen,
             user_scrolled_up: user_scrolled_up.clone(),
             programmatic_scroll: programmatic_scroll.clone(),
@@ -4263,21 +4506,47 @@ impl TermView {
     /// The active VTE is display-only in this mode and has no child PTY, so
     /// `Terminal::paste_clipboard()` can lose or reorder multiline input. Read
     /// the clipboard ourselves and preserve the shell's bracketed-paste mode.
+    ///
+    /// This used to be three raw writes — `ESC[200~`, the clipboard verbatim,
+    /// `ESC[201~` — and the middle one arrived while the PTY boundary already
+    /// considered a frame open, so it was waved through untouched. A clipboard
+    /// containing `ESC[201~` closed the frame early and the bytes after it
+    /// reached the shell as keystrokes, i.e. ran. [`pty_input::encode_paste`]
+    /// removes paste markers from the body unconditionally and returns the whole
+    /// payload as one buffer, so there is no longer a body write to attack.
     pub fn paste_from_clipboard(&self) {
         let clipboard = self.active_vte.clipboard();
         let pty = self.pty.clone();
         let bracketed_paste = self.bracketed_paste.clone();
+        let bstate = self.bstate.clone();
+        let typed_cmd = self.typed_cmd.clone();
+        let pty_synced = self.pty_synced.clone();
+        let idle_input_dirty = self.idle_input_dirty.clone();
         clipboard.read_text_async(None::<&gtk::gio::Cancellable>, move |result| {
             let Ok(Some(text)) = result else {
                 return;
             };
-            if bracketed_paste.get() {
-                pty.write_bytes(b"\x1b[200~");
-                pty.write_bytes(text.as_bytes());
-                pty.write_bytes(b"\x1b[201~");
-            } else {
-                pty.write_bytes(text.as_bytes());
+            let paste = build_clipboard_paste(text.as_str(), bracketed_paste.get());
+            if paste.is_empty() {
+                return;
             }
+            if paste.risk.had_embedded_paste_marker {
+                log::warn!(
+                    "Removed a bracketed-paste marker from pasted text before writing it to the shell"
+                );
+            }
+            pty.write_bytes(&paste.bytes);
+            // Mirror what the child actually received into the editor shadow, or
+            // the live input cell keeps the height of a command the shell no
+            // longer has and the next history recall appends to a line it thinks
+            // is empty.
+            record_external_input(
+                bstate.get(),
+                &paste.echo_text,
+                &typed_cmd,
+                &pty_synced,
+                &idle_input_dirty,
+            );
         });
     }
 
@@ -4307,7 +4576,7 @@ impl TermView {
 
     pub fn connect_block_finished<F>(&self, f: F)
     where
-        F: Fn(String, i32, String) + 'static,
+        F: Fn(String, Option<i32>, String) + 'static,
     {
         self.block_finished_callbacks.borrow_mut().push(Box::new(f));
     }
@@ -4936,7 +5205,7 @@ impl TermView {
             cmd: block.cmd_text.clone(),
             output,
             cwd: bd.and_then(|b| b.cwd.clone()),
-            exit_code: bd.map(|b| b.exit_code).unwrap_or(0),
+            exit_code: exit_code_for_i32_api(bd.and_then(|b| b.exit_code)),
             truncated,
         })
     }
@@ -4945,20 +5214,22 @@ impl TermView {
 #[cfg(test)]
 mod tests {
     use super::{
-        background_output_has_visible_text, block_clipboard_text, build_color_query_reply,
-        build_command_recall, build_keyboard_query_reply, clear_dynamic_colors,
-        coalesce_bytes_events, finished_block_config, finished_command, is_post_command_metadata,
-        notification_permitted, parse_color_spec, selected_blocks_markdown, selected_command_text,
-        selected_id_range, step_marked_indices, strip_ansi, strip_ansi_with_clear_detect,
-        take_background_output, BlockData, DynamicColors, DynamicColorsRc,
-        NOTIFICATION_MIN_INTERVAL,
+        background_output_has_visible_text, block_clipboard_text, block_duration_ms,
+        build_clipboard_paste, build_color_query_reply, build_command_recall,
+        build_keyboard_query_reply, clear_dynamic_colors, coalesce_bytes_events,
+        finished_block_config, finished_command, is_post_command_metadata, notification_permitted,
+        parse_color_spec, record_external_input, resolve_command_text, selected_blocks_markdown,
+        selected_command_text, selected_id_range, step_marked_indices, strip_ansi,
+        strip_ansi_with_clear_detect, take_background_output, BlockData, BlockState,
+        CommandTextSource, DynamicColors, DynamicColorsRc, NOTIFICATION_MIN_INTERVAL,
+        TRUNCATED_COMMAND_PLACEHOLDER,
     };
     use crate::config::Config;
-    use crate::parser::{ColorKind, KeyboardProtocolQuery, ParserEvent};
+    use crate::parser::{ColorKind, CommandMeta, KeyboardProtocolQuery, ParserEvent};
     use std::cell::{Cell, RefCell};
     use std::collections::{HashSet, VecDeque};
     use std::rc::Rc;
-    use std::time::Instant;
+    use std::time::{Instant, SystemTime};
 
     #[test]
     fn keyboard_protocol_queries_have_safe_fallback_replies() {
@@ -5163,8 +5434,8 @@ mod tests {
                 ParserEvent::Bytes(b) => format!("B({})", String::from_utf8_lossy(b)),
                 ParserEvent::PromptStart => "PS".to_string(),
                 ParserEvent::PromptEnd => "PE".to_string(),
-                ParserEvent::CommandStart => "CS".to_string(),
-                ParserEvent::CommandEnd(c) => format!("CE({})", c),
+                ParserEvent::CommandStart(_) => "CS".to_string(),
+                ParserEvent::CommandEnd { exit, .. } => format!("CE({exit:?})"),
                 ParserEvent::AltScreenEnter(mode) => format!("ALT+({mode})"),
                 ParserEvent::AltScreenLeave(mode) => format!("ALT-({mode})"),
                 _ => "?".to_string(),
@@ -5238,26 +5509,168 @@ mod tests {
 
     #[test]
     fn multiline_recall_uses_bracketed_paste_when_available() {
-        let (text, payload) = build_command_recall("printf a\r\nprintf b", true);
-        assert_eq!(text, "printf a\nprintf b");
-        assert_eq!(payload, b"\x1b[200~printf a\nprintf b\x1b[201~");
+        let recall = build_command_recall("printf a\r\nprintf b", true);
+        assert_eq!(recall.echo_text, "printf a\nprintf b");
+        // The leading 0x15 is new: the line kill now rides in the same payload
+        // and is unconditional, because typed text the user has not submitted is
+        // not represented by any flag this app owns.
+        assert_eq!(recall.bytes, b"\x15\x1b[200~printf a\nprintf b\x1b[201~");
     }
 
     #[test]
     fn multiline_recall_falls_back_to_first_line_without_bracketed_paste() {
-        let (text, payload) = build_command_recall("printf a\nprintf b", false);
-        assert_eq!(text, "printf a");
-        assert_eq!(payload, b"printf a");
+        let recall = build_command_recall("printf a\nprintf b", false);
+        assert_eq!(recall.echo_text, "printf a");
+        assert_eq!(recall.bytes, b"\x15printf a");
+        assert!(recall.risk.truncated_to_first_line);
+    }
+
+    /// Was `single_line_recall_does_not_add_paste_markers`. The shared encoder
+    /// frames every payload the shell can unframe itself, single line included,
+    /// which is what keeps one code path for "put this text on the prompt" — and
+    /// a framed insertion is also inert to history expansion. Without DECSET 2004
+    /// the bytes are still bare.
+    #[test]
+    fn single_line_recall_is_framed_only_when_the_shell_advertises_it() {
+        let bracketed = build_command_recall("git status", true);
+        assert_eq!(bracketed.echo_text, "git status");
+        assert_eq!(bracketed.bytes, b"\x15\x1b[200~git status\x1b[201~");
+
+        let bare = build_command_recall("git status", false);
+        assert_eq!(bare.bytes, b"\x15git status");
+    }
+
+    /// A recalled command is text this app captured; a block whose output (or
+    /// whose scraped command line) carried a paste terminator must not be able to
+    /// close the frame early and have the rest of itself executed.
+    #[test]
+    fn recall_strips_a_paste_terminator_out_of_the_command() {
+        let recall = build_command_recall("echo ok\x1b[201~\rrm -rf ~", true);
+        assert!(recall.risk.had_embedded_paste_marker);
+        assert!(!recall
+            .bytes
+            .windows(6)
+            .any(|window| window == b"\x1b[201" as &[u8] || window == b"[201~\r"));
+        assert_eq!(recall.echo_text, "echo ok\nrm -rf ~");
     }
 
     #[test]
-    fn single_line_recall_does_not_add_paste_markers() {
-        let (text, payload) = build_command_recall("git status", true);
-        assert_eq!(text, "git status");
-        assert_eq!(payload, b"git status");
+    fn recall_of_an_empty_command_writes_nothing_at_all() {
+        // Not even the kill-line: the recall paths bail on this instead of
+        // wiping a line the user was editing.
+        assert!(build_command_recall("", true).bytes.is_empty());
     }
 
-    fn test_block(id: u64, cmd: &str, exit_code: i32) -> BlockData {
+    /// The clipboard injection this repo was vulnerable to: the frame used to be
+    /// three separate PTY writes, so the body arrived with a frame already open
+    /// and reached the shell verbatim.
+    #[test]
+    fn clipboard_paste_neutralizes_an_embedded_paste_terminator() {
+        let paste = build_clipboard_paste("docs\x1b[201~\rrm -rf ~\r", true);
+        assert!(paste.risk.had_embedded_paste_marker);
+        assert_eq!(
+            paste.bytes,
+            b"\x1b[200~docs\nrm -rf ~\n\x1b[201~",
+            "{:?}",
+            String::from_utf8_lossy(&paste.bytes)
+        );
+        // No trailing CR outside the frame either: a paste never submits.
+        assert!(!paste.bytes.ends_with(b"\r"));
+    }
+
+    #[test]
+    fn clipboard_paste_keeps_jterm1s_first_line_fallback_and_strips_controls() {
+        let paste = build_clipboard_paste("echo one\necho two", false);
+        assert_eq!(paste.echo_text, "echo one");
+        assert!(paste.risk.truncated_to_first_line);
+
+        // A clipboard is untrusted text; an escape sequence in it would drive the
+        // terminal rather than land in the shell's line buffer.
+        let colored = build_clipboard_paste("echo \x1b[31mred", true);
+        assert_eq!(colored.echo_text, "echo [31mred");
+        assert!(colored.risk.had_controls);
+    }
+
+    #[test]
+    fn pasted_text_is_mirrored_into_the_editor_shadow_only_at_the_prompt() {
+        let typed = RefCell::new(String::from("git "));
+        let synced = Cell::new(false);
+        let dirty = Cell::new(false);
+
+        record_external_input(
+            BlockState::AwaitingCommand,
+            "status",
+            &typed,
+            &synced,
+            &dirty,
+        );
+        assert_eq!(typed.borrow().as_str(), "git status");
+        assert!(synced.get(), "the shell's line buffer now holds our text");
+        assert!(dirty.get());
+
+        // While a command runs the same bytes are that program's stdin, not an
+        // edited command line.
+        let running = Cell::new(false);
+        let running_dirty = Cell::new(false);
+        let running_typed = RefCell::new(String::new());
+        record_external_input(
+            BlockState::CollectingOutput,
+            "y",
+            &running_typed,
+            &running,
+            &running_dirty,
+        );
+        assert!(running_typed.borrow().is_empty());
+        assert!(!running.get());
+    }
+
+    #[test]
+    fn shell_reported_command_beats_the_screen_scrape() {
+        let (command, source) = resolve_command_text(Some("git commit -m 'x'"), false, "git c…");
+        assert_eq!(command, "git commit -m 'x'");
+        assert_eq!(source, CommandTextSource::ShellReported);
+    }
+
+    #[test]
+    fn a_bare_mark_falls_back_to_the_screen_scrape() {
+        let (command, source) = resolve_command_text(None, false, "ls -la");
+        assert_eq!(command, "ls -la");
+        assert_eq!(source, CommandTextSource::Screen);
+    }
+
+    /// A shell that dropped an oversized command line is not a shell without
+    /// integration: a command really ran, so the block must survive even when the
+    /// screen capture came back empty, instead of being filed as commandless
+    /// background output.
+    #[test]
+    fn a_truncated_command_line_is_its_own_case() {
+        let (command, source) = resolve_command_text(None, true, "for f in *; do");
+        assert_eq!(command, "for f in *; do");
+        assert_eq!(source, CommandTextSource::ScreenAfterTruncation);
+
+        let (placeholder, source) = resolve_command_text(None, true, "   ");
+        assert_eq!(placeholder, TRUNCATED_COMMAND_PLACEHOLDER);
+        assert_eq!(source, CommandTextSource::ScreenAfterTruncation);
+        // Contrast: no metadata at all and nothing on screen stays empty, which
+        // the finalize path reads as "nothing meaningful to record".
+        assert_eq!(resolve_command_text(None, false, "").0, "");
+    }
+
+    #[test]
+    fn the_shells_own_duration_beats_the_local_timer() {
+        let started = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(10);
+        let ended = started + std::time::Duration::from_millis(4_000);
+
+        assert_eq!(block_duration_ms(Some(37), Some(started), ended), Some(37));
+        // No shell figure: the local timer, which also contains the shell's
+        // post-command work and this process's dispatch latency.
+        assert_eq!(block_duration_ms(None, Some(started), ended), Some(4_000));
+        assert_eq!(block_duration_ms(None, None, ended), None);
+        // A clock that went backwards is not a duration.
+        assert_eq!(block_duration_ms(None, Some(ended), started), None);
+    }
+
+    fn test_block(id: u64, cmd: &str, exit_code: Option<i32>) -> BlockData {
         BlockData {
             id,
             prompt: String::new(),
@@ -5294,9 +5707,9 @@ mod tests {
     #[test]
     fn selection_markdown_keeps_terminal_order_and_falls_back_to_clicked_block() {
         let blocks = [
-            test_block(1, "git status", 0),
-            test_block(2, "cargo test", 101),
-            test_block(3, "git push", 0),
+            test_block(1, "git status", Some(0)),
+            test_block(2, "cargo test", Some(101)),
+            test_block(3, "git push", Some(0)),
         ];
         let selected = HashSet::from([3, 1]);
         let markdown = selected_blocks_markdown(blocks.iter(), &selected, 1);
@@ -5345,10 +5758,13 @@ mod tests {
             ParserEvent::PromptEnd,
             ParserEvent::Bytes(b"ls".to_vec()),
             ParserEvent::Bytes(b" -la".to_vec()),
-            ParserEvent::CommandStart,
+            ParserEvent::CommandStart(CommandMeta::default()),
             ParserEvent::Bytes(b"file1\n".to_vec()),
             ParserEvent::Bytes(b"file2\n".to_vec()),
-            ParserEvent::CommandEnd(0),
+            ParserEvent::CommandEnd {
+                exit: Some(0),
+                meta: CommandMeta::default(),
+            },
             ParserEvent::PromptStart,
         ];
         coalesce_bytes_events(&mut events);
@@ -5360,7 +5776,7 @@ mod tests {
                 "B(ls -la)",
                 "CS",
                 "B(file1\nfile2\n)",
-                "CE(0)",
+                "CE(Some(0))",
                 "PS",
             ]
         );
@@ -5386,11 +5802,15 @@ mod tests {
         let mut events = vec![
             ParserEvent::PromptStart,
             ParserEvent::PromptEnd,
-            ParserEvent::CommandStart,
-            ParserEvent::CommandEnd(1),
+            ParserEvent::CommandStart(CommandMeta::default()),
+            ParserEvent::CommandEnd {
+                exit: None,
+                meta: CommandMeta::default(),
+            },
         ];
         coalesce_bytes_events(&mut events);
-        assert_eq!(ev_summary(&events), vec!["PS", "PE", "CS", "CE(1)"]);
+        // A shell that sent no status renders as `None`, not as a zero.
+        assert_eq!(ev_summary(&events), vec!["PS", "PE", "CS", "CE(None)"]);
     }
 
     #[test]

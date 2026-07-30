@@ -20,7 +20,11 @@ pub(crate) struct BlockData {
     pub(crate) cmd: String,
     pub(crate) cmd_markup: Option<String>,
     pub(crate) output: String,
-    pub(crate) exit_code: i32,
+    /// Status the shell reported for the command. `None` means it reported none
+    /// — a distinct outcome from `Some(0)`, which older snapshots also used for
+    /// "unknown". Legacy JSON exports that stored a bare number still load,
+    /// since serde reads any present value as `Some`.
+    pub(crate) exit_code: Option<i32>,
     pub(crate) estimated_height: i32,
     pub(crate) line_count: usize,
     #[serde(default)]
@@ -75,7 +79,12 @@ impl BlockData {
         }
 
         if !self.is_background() {
-            md.push_str(&format!("**Exit Code:** {}\n\n", self.exit_code));
+            match self.exit_code {
+                Some(code) => md.push_str(&format!("**Exit Code:** {code}\n\n")),
+                // Do not print `0` here: an export is the copy someone reads
+                // later, and "the shell never said" is the fact we have.
+                None => md.push_str("**Exit Code:** not reported\n\n"),
+            }
         }
 
         if let Some(dur) = self.duration_ms {
@@ -84,6 +93,71 @@ impl BlockData {
         }
 
         md
+    }
+}
+
+/// How a finished block's outcome is presented in its header.
+///
+/// [`Self::Unreported`] is its own state on purpose: a shell that emits a bare
+/// `OSC 133;D` tells us a command ended and nothing about how. That used to be
+/// stored as `0` and drawn as a green check with no badge, i.e. as a success
+/// this terminal never observed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BlockStatus {
+    /// Output emitted while the prompt was idle: there was no command at all.
+    Background,
+    Succeeded,
+    Failed(i32),
+    Unreported,
+}
+
+pub(crate) fn block_status(is_background: bool, exit_code: Option<i32>) -> BlockStatus {
+    match (is_background, exit_code) {
+        (true, _) => BlockStatus::Background,
+        (false, Some(0)) => BlockStatus::Succeeded,
+        (false, Some(code)) => BlockStatus::Failed(code),
+        (false, None) => BlockStatus::Unreported,
+    }
+}
+
+impl BlockStatus {
+    /// Left-edge stripe on the block frame.
+    fn stripe_class(self) -> &'static str {
+        match self {
+            Self::Background => "block-background",
+            Self::Succeeded => "block-success",
+            Self::Failed(_) => "block-failed",
+            Self::Unreported => "block-unknown",
+        }
+    }
+
+    /// Header status glyph (Nerd Font) and the CSS class that colours it.
+    fn icon(self) -> (&'static str, &'static str) {
+        match self {
+            // nf-fa-spinner, nf-fa-check, nf-fa-close, nf-fa-question
+            Self::Background => ("\u{f110}", "block-status-background"),
+            Self::Succeeded => ("\u{f00c}", "block-status-ok"),
+            Self::Failed(_) => ("\u{f00d}", "block-status-bad"),
+            Self::Unreported => ("\u{f128}", "block-status-unknown"),
+        }
+    }
+
+    /// Why the glyph looks the way it does. Only the state a user cannot read
+    /// off a check or a cross needs explaining.
+    fn icon_tooltip(self) -> Option<&'static str> {
+        match self {
+            Self::Unreported => Some("The shell reported no exit status for this command"),
+            _ => None,
+        }
+    }
+
+    /// Right-hand badge text. A status nobody reported has no number to show,
+    /// so the badge is absent rather than showing a made-up one.
+    fn exit_badge(self) -> Option<String> {
+        match self {
+            Self::Failed(code) => Some(format!("exit:{code}")),
+            _ => None,
+        }
     }
 }
 
@@ -532,6 +606,67 @@ fn scroll_target(
 mod tests {
     use super::*;
 
+    fn finished_block(exit_code: Option<i32>) -> BlockData {
+        BlockData {
+            id: 1,
+            prompt: "$ ".to_string(),
+            cmd: "make".to_string(),
+            cmd_markup: None,
+            output: "built".to_string(),
+            exit_code,
+            estimated_height: 1,
+            line_count: 1,
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: None,
+            cwd: None,
+            cols: 80,
+        }
+    }
+
+    #[test]
+    fn an_unreported_status_never_becomes_a_zero() {
+        assert_eq!(block_status(false, None), BlockStatus::Unreported);
+        assert_eq!(block_status(false, Some(0)), BlockStatus::Succeeded);
+        assert_eq!(block_status(false, Some(130)), BlockStatus::Failed(130));
+        assert_eq!(block_status(true, None), BlockStatus::Background);
+        // Background output never was a command, so its absent status is not a
+        // "the shell said nothing" case.
+        assert_eq!(block_status(true, Some(0)), BlockStatus::Background);
+
+        // A number nobody reported cannot be shown, so no badge is rendered.
+        assert_eq!(block_status(false, None).exit_badge(), None);
+        assert_eq!(
+            block_status(false, Some(130)).exit_badge().as_deref(),
+            Some("exit:130")
+        );
+        assert_eq!(block_status(false, Some(0)).exit_badge(), None);
+        // The one state a check or a cross cannot explain gets a tooltip.
+        assert!(block_status(false, None).icon_tooltip().is_some());
+        assert!(block_status(false, Some(0)).icon_tooltip().is_none());
+        // And it is not drawn as either a success or a failure.
+        for reported in [Some(0), Some(1)] {
+            assert_ne!(
+                block_status(false, None).stripe_class(),
+                block_status(false, reported).stripe_class()
+            );
+            assert_ne!(
+                block_status(false, None).icon(),
+                block_status(false, reported).icon()
+            );
+        }
+    }
+
+    #[test]
+    fn markdown_export_says_a_status_was_not_reported() {
+        assert!(finished_block(None)
+            .to_markdown()
+            .contains("**Exit Code:** not reported"));
+        assert!(finished_block(Some(2))
+            .to_markdown()
+            .contains("**Exit Code:** 2"));
+    }
+
     #[test]
     fn bounded_output_retains_exact_tail_under_a_long_stream() {
         const CHUNK: usize = 32 * 1024;
@@ -801,7 +936,7 @@ impl FinishedBlock {
         cmd: &str,
         cmd_ansi: Option<&str>,
         output: &str,
-        exit_code: i32,
+        exit_code: Option<i32>,
         config: &Config,
         duration_ms: Option<u64>,
         end_time_ms: Option<u64>,
@@ -832,7 +967,7 @@ impl FinishedBlock {
         cmd: &str,
         cmd_ansi: Option<&str>,
         output: &str,
-        exit_code: i32,
+        exit_code: Option<i32>,
         config: &Config,
         duration_ms: Option<u64>,
         end_time_ms: Option<u64>,
@@ -870,6 +1005,9 @@ impl FinishedBlock {
             reused.remove_css_class("block-success");
             reused.remove_css_class("block-failed");
             reused.remove_css_class("block-background");
+            // A pooled widget keeps every class it was last given, so the new
+            // block's status stripe would sit under the recycled one.
+            reused.remove_css_class("block-unknown");
             reused
         } else {
             let b = gtk::Box::new(Orientation::Vertical, 0);
@@ -891,14 +1029,10 @@ impl FinishedBlock {
         }
 
         // Status stripe: green on success, red on failure, cyan for output
-        // emitted while the shell prompt was idle (Warp background blocks).
-        outer.add_css_class(if is_background {
-            "block-background"
-        } else if exit_code == 0 {
-            "block-success"
-        } else {
-            "block-failed"
-        });
+        // emitted while the shell prompt was idle (Warp background blocks),
+        // neutral when the shell never reported a status.
+        let status = block_status(is_background, exit_code);
+        outer.add_css_class(status.stripe_class());
 
         // Add hover highlighting to show block is interactive (and reveal the
         // quick-action buttons). The action box is created below; it's wired into
@@ -936,21 +1070,11 @@ impl FinishedBlock {
         header_row.append(&bookmark_star);
 
         // Status icon: ✓ for success, ✗ for failure, spinner for an
-        // asynchronous/background block.
-        let status_icon = gtk::Label::new(Some(if is_background {
-            "\u{f110}"
-        } else if exit_code == 0 {
-            "\u{f00c}"
-        } else {
-            "\u{f00d}"
-        }));
-        status_icon.add_css_class(if is_background {
-            "block-status-background"
-        } else if exit_code == 0 {
-            "block-status-ok"
-        } else {
-            "block-status-bad"
-        });
+        // asynchronous/background block, ? when the shell reported nothing.
+        let (status_glyph, status_class) = status.icon();
+        let status_icon = gtk::Label::new(Some(status_glyph));
+        status_icon.add_css_class(status_class);
+        status_icon.set_tooltip_text(status.icon_tooltip());
         status_icon.set_halign(gtk::Align::Start);
         header_row.append(&status_icon);
 
@@ -1018,8 +1142,8 @@ impl FinishedBlock {
         }
 
         // Exit code badge
-        if exit_code != 0 {
-            let badge = gtk::Label::new(Some(&format!("exit:{}", exit_code)));
+        if let Some(text) = status.exit_badge() {
+            let badge = gtk::Label::new(Some(&text));
             badge.add_css_class("block-exit-bad");
             header_row.append(&badge);
         }

@@ -1344,43 +1344,39 @@ pub(crate) fn rgba_to_hex(c: &RGBA) -> String {
 // Shell selection
 // ---------------------------------------------------------------------------
 
-#[cfg(unix)]
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|m| m.is_file() && (m.permissions().mode() & 0o111 != 0))
-        .unwrap_or(false)
-}
-
-fn configured_shell_is_usable(path: &str) -> bool {
-    let path = Path::new(path);
-    path.is_absolute() && is_executable(path)
-}
-
-#[cfg(not(unix))]
-fn is_executable(path: &Path) -> bool {
-    path.is_file()
+/// Resolve a configured `shell = ` token to an executable file.
+///
+/// The exec-bit check and the "a bare name is a `PATH` lookup, never `./name`"
+/// rule both live in [`jterm_core::host`] now; the local copy predated
+/// `find_executable_in_path` being exec-bit-checked. A bare name resolving
+/// through `PATH` is new here — it used to warn and auto-detect — and it is what
+/// makes `shell = "bash"` work under a launcher that strips nothing but leaves
+/// the shell unqualified.
+fn resolve_configured_shell(token: &str) -> Option<PathBuf> {
+    crate::host::resolve_configured_program(token, std::env::var_os("PATH").as_deref())
 }
 
 pub(crate) fn choose_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
     // Explicit config / env var wins (needed when PATH is stripped by launchers like wofi).
-    if let Some(path) = configured_shell {
-        if configured_shell_is_usable(path) {
-            let shell_name = Path::new(path)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("");
-            if shell_name == "jsh" {
-                if let Some(argv) = wrap_jsh_argv_in_interactive_bash(path) {
-                    return argv;
+    if let Some(token) = configured_shell {
+        match resolve_configured_shell(token) {
+            Some(resolved) => {
+                let path = resolved.to_string_lossy().to_string();
+                let shell_name = resolved
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("");
+                if shell_name == "jsh" {
+                    if let Some(argv) = wrap_jsh_argv_in_interactive_bash(&path) {
+                        return argv;
+                    }
                 }
+                return vec![path];
             }
-            return vec![path.to_string()];
+            None => log::warn!(
+                "Configured shell '{token}' is not an executable file, falling back to auto-detection"
+            ),
         }
-        log::warn!(
-            "Configured shell '{}' is not an absolute executable path, falling back to auto-detection",
-            path
-        );
     }
 
     // Prefer jsh when it's on PATH.
@@ -1434,11 +1430,29 @@ mod tests {
         );
     }
 
+    /// Replaces `configured_shell_must_be_an_absolute_executable`. An absolute
+    /// path still has to be an executable file, but a bare name is now a `PATH`
+    /// lookup instead of a rejection — the family rule from
+    /// `jterm_core::host::resolve_configured_program`.
     #[test]
-    fn configured_shell_must_be_an_absolute_executable() {
-        assert!(configured_shell_is_usable("/bin/sh"));
-        assert!(!configured_shell_is_usable("./sh"));
-        assert!(!configured_shell_is_usable("sh"));
+    fn configured_shell_resolves_absolute_paths_and_path_lookups() {
+        assert_eq!(
+            resolve_configured_shell("/bin/sh"),
+            Some(PathBuf::from("/bin/sh"))
+        );
+        // The lookup, not the caller's cwd: whatever `sh` is on PATH.
+        assert_eq!(
+            resolve_configured_shell("sh"),
+            find_executable_in_path("sh")
+        );
+        // Not a file at all, and not something to keep looking for.
+        assert_eq!(resolve_configured_shell("/bin"), None);
+        assert_eq!(resolve_configured_shell(""), None);
+        assert_eq!(
+            resolve_configured_shell("/definitely/not/here/jsh"),
+            None,
+            "a missing absolute path must not fall through to a PATH lookup"
+        );
     }
 
     #[test]

@@ -232,6 +232,11 @@ pub(crate) fn install_block_css(config: &Config) {
             background-color: rgba({async_r},{async_g},{async_b},0.07);
             box-shadow: inset 2px 0 0 0 {async_stripe};
         }}
+        /* The shell reported no status. Deliberately not tinted like a failure
+           and not striped like a success: nothing is known about the outcome. */
+        .block-unknown {{
+            border-left-color: rgba({fg_r},{fg_g},{fg_b},0.35);
+        }}
         .block-hovered {{
             background-color: rgba({fg_r},{fg_g},{fg_b},0.05);
             border-top-color: rgba({fg_r},{fg_g},{fg_b},0.16);
@@ -343,6 +348,17 @@ pub(crate) fn install_block_css(config: &Config) {
         .block-status-background {{
             color: {async_hex};
             background-color: rgba({async_r},{async_g},{async_b},0.16);
+            border-radius: 999px;
+            min-width: 16px;
+            min-height: 16px;
+            padding: 1px 5px;
+            font-family: "{font_family}";
+            font-size: 0.82em;
+            font-weight: bold;
+        }}
+        .block-status-unknown {{
+            color: {dim_fg};
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.12);
             border-radius: 999px;
             min-width: 16px;
             min-height: 16px;

@@ -15,12 +15,19 @@ mod diagnostics;
 mod dialogs;
 mod file_tree;
 mod file_tree_ops;
-use jterm_core::{command_history, git_meta, notify, parser, review_input};
+use jterm_core::{
+    child_env, command_history, git_meta, notify, parser, pty_input, review_input, snapshot_file,
+};
 
 mod host {
     pub use jterm_core::host::*;
 
     pub const APP_ID: &str = "io.github.beamiter.jterm1";
+    /// Also the `TERM_PROGRAM` every spawn path reports, via
+    /// `jterm_core::child_env`. The shell-integration snippets gate on this exact
+    /// string (`[[ $TERM_PROGRAM == jterm1 ]] && source …`), so changing it
+    /// silently disables OSC 133 block detection.
+    pub const APP_NAME: &str = "jterm1";
 }
 
 mod jsh_ops;
@@ -1264,8 +1271,13 @@ impl SimpleComponent for AppModel {
 
 fn main() {
     jterm_core::identity::init(jterm_core::identity::AppIdentity {
-        app_name: "jterm1",
+        app_name: host::APP_NAME,
         app_id: host::APP_ID,
+        // This crate's version, not jterm_core's: shared code reports it to
+        // child shells as TERM_PROGRAM_VERSION, and a tool that feature-gates
+        // on the TERM_PROGRAM/version pair would otherwise read the core
+        // library's version paired with our name.
+        app_version: env!("CARGO_PKG_VERSION"),
     });
     let parsed = match cli::parse(std::env::args_os().skip(1)) {
         Ok(parsed) => parsed,

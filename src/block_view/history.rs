@@ -177,6 +177,7 @@ impl TermView {
         let mut file = File::open(path)?;
         let mut recent_blocks = VecDeque::new();
         let mut total_loaded = 0usize;
+        let mut undecodable = 0usize;
 
         loop {
             let mut len_bytes = [0u8; 4];
@@ -197,10 +198,26 @@ impl TermView {
             file.read_exact(&mut data)?;
             let decoded = decode_record(data, compress, MAX_DECODED_BYTES)?;
 
-            if let Ok(block) = rkyv::from_bytes::<BlockData, rkyv::rancor::Error>(&decoded) {
-                total_loaded = total_loaded.saturating_add(1);
-                push_bounded_back(&mut recent_blocks, block, lazy_load_threshold);
+            match rkyv::from_bytes::<BlockData, rkyv::rancor::Error>(&decoded) {
+                Ok(block) => {
+                    total_loaded = total_loaded.saturating_add(1);
+                    push_bounded_back(&mut recent_blocks, block, lazy_load_threshold);
+                }
+                // These records are skipped, not repaired: rkyv archives carry no
+                // schema version, so a `BlockData` field that changed shape (most
+                // recently `exit_code`, which became `Option<i32>` so an
+                // unreported status stops looking like a successful zero) makes
+                // every older record undecodable. Say so once instead of silently
+                // starting with an empty history.
+                Err(_) => undecodable = undecodable.saturating_add(1),
             }
+        }
+
+        if undecodable > 0 {
+            log::warn!(
+                "Skipped {undecodable} block-history record(s) this build cannot decode; \
+                 they were written by a different BlockData layout and are left on disk"
+            );
         }
 
         if total_loaded > recent_blocks.len() {
@@ -215,7 +232,7 @@ impl TermView {
         let mut blocks = self.block_data.borrow_mut();
         for (offset, block) in recent_blocks.into_iter().enumerate() {
             log::debug!(
-                "Loaded historical block #{}: prompt={:?}, cmd={:?}, output_len={}, exit_code={}",
+                "Loaded historical block #{}: prompt={:?}, cmd={:?}, output_len={}, exit_code={:?}",
                 start_index + offset,
                 block.prompt,
                 block.cmd,

@@ -20,8 +20,14 @@ use super::cross_block_search;
 
 pub use super::vte::{VteInit, VteInput, VteOutput};
 
-fn command_finished_output(exit_code: i32) -> VteOutput {
-    VteOutput::CommandFinished(exit_code == 0)
+/// Inactive-tab styling for a finished command: failures get the bell style,
+/// everything else the lighter activity style.
+///
+/// Only a status the shell actually reported can be a failure. `None` — a shell
+/// that emits bare OSC 133 marks — used to arrive here as `0` and be styled as a
+/// success; it is now styled as plain activity, which claims neither outcome.
+fn command_finished_output(exit_code: Option<i32>) -> VteOutput {
+    VteOutput::CommandFinished(exit_code.is_none_or(|code| code == 0))
 }
 
 /// Toast text for a session-export attempt.
@@ -181,7 +187,8 @@ fn connect_view_outputs(
             let _ = sender.output(command_finished_output(exit_code));
             let _ = sender.output(VteOutput::BlockFinished {
                 command,
-                exit_code,
+                // The agent transcript this feeds still speaks one i32.
+                exit_code: crate::block_view::exit_code_for_i32_api(exit_code),
                 output_sample,
             });
         }
@@ -367,16 +374,22 @@ mod tests {
     #[test]
     fn block_exit_status_maps_to_command_finished_success() {
         assert!(matches!(
-            command_finished_output(0),
+            command_finished_output(Some(0)),
             VteOutput::CommandFinished(true)
         ));
         assert!(matches!(
-            command_finished_output(1),
+            command_finished_output(Some(1)),
             VteOutput::CommandFinished(false)
         ));
         assert!(matches!(
-            command_finished_output(-1),
+            command_finished_output(Some(-1)),
             VteOutput::CommandFinished(false)
+        ));
+        // New case: the shell reported no status. Styling the tab as a failure
+        // would claim an outcome nothing observed, so it reads as activity.
+        assert!(matches!(
+            command_finished_output(None),
+            VteOutput::CommandFinished(true)
         ));
     }
 }

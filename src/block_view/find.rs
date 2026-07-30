@@ -63,6 +63,23 @@ fn snippet(line: &str) -> String {
 /// integration reported a duration. Older restored history can legitimately
 /// lack that field; treating `None` as a match made a "slow blocks" jump land
 /// on an unknown-duration command instead of an actually slow one.
+/// Whether a block's status passes the exit-code and failed-only filters.
+///
+/// `None` is a status the shell never reported, so it satisfies neither: it is
+/// not equal to any code the user filtered for, and it is not a failure this
+/// terminal watched happen.
+fn exit_status_matches(exit_code: Option<i32>, filters: &BlockFilters) -> bool {
+    if let Some(wanted) = filters.exit_code {
+        if exit_code != Some(wanted) {
+            return false;
+        }
+    }
+    if filters.failed_only && exit_code.is_none_or(|code| code == 0) {
+        return false;
+    }
+    true
+}
+
 fn duration_matches(duration: Option<u64>, filters: &BlockFilters) -> bool {
     let needs_duration =
         filters.min_duration_ms.is_some() || filters.max_duration_ms.is_some() || filters.slow_only;
@@ -90,8 +107,34 @@ fn duration_matches(duration: Option<u64>, filters: &BlockFilters) -> bool {
 // extracted module easier to navigate; production methods continue below.
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::{duration_matches, snippet};
+    use super::{duration_matches, exit_status_matches, snippet};
     use crate::block_view::BlockFilters;
+
+    #[test]
+    fn an_unreported_status_matches_neither_exit_filter() {
+        let unreported = BlockFilters {
+            ..Default::default()
+        };
+        assert!(exit_status_matches(None, &unreported));
+
+        // "Failed" is a claim about what the shell said, so a block whose status
+        // was never reported is not in the failure list.
+        let failed_only = BlockFilters {
+            failed_only: true,
+            ..Default::default()
+        };
+        assert!(!exit_status_matches(None, &failed_only));
+        assert!(!exit_status_matches(Some(0), &failed_only));
+        assert!(exit_status_matches(Some(1), &failed_only));
+
+        // Nor does it answer to a filter for one specific code, including zero.
+        let zero_only = BlockFilters {
+            exit_code: Some(0),
+            ..Default::default()
+        };
+        assert!(!exit_status_matches(None, &zero_only));
+        assert!(exit_status_matches(Some(0), &zero_only));
+    }
 
     #[test]
     fn snippet_passes_through_short_line() {
@@ -176,15 +219,7 @@ impl TermView {
                     return false;
                 }
 
-                // Exit code filter
-                if let Some(exit_code) = filters.exit_code {
-                    if b.exit_code != exit_code {
-                        return false;
-                    }
-                }
-
-                // Failed only filter
-                if filters.failed_only && b.exit_code == 0 {
+                if !exit_status_matches(b.exit_code, filters) {
                     return false;
                 }
 

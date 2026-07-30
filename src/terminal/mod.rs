@@ -35,8 +35,13 @@ pub(crate) fn new_cwd_token() -> String {
     relm4::gtk::glib::uuid_string_random().to_string()
 }
 
-pub(crate) fn cwd_token_environment(token: &str) -> [(&str, &str); 2] {
-    [("TERM_PROGRAM", "jterm1"), (CWD_TOKEN_ENV, token)]
+/// The per-pane extras every spawn path adds on top of the shared child
+/// environment: only the cwd-authentication token now. `TERM_PROGRAM` used to be
+/// spelled out here as well, and `jterm_core::child_env` sets it — with a
+/// matching `TERM_PROGRAM_VERSION` — at all three spawn sites, so a second copy
+/// would only be a place for the two names to drift apart.
+pub(crate) fn cwd_token_environment(token: &str) -> [(&str, &str); 1] {
+    [(CWD_TOKEN_ENV, token)]
 }
 
 fn authenticated_cwd_authority(token: &str) -> Option<String> {
@@ -195,10 +200,44 @@ mod tests {
                 byte.is_ascii_hexdigit()
             }
         }));
+        // TERM_PROGRAM/TERM_PROGRAM_VERSION now come from the shared child
+        // environment policy, so this carries the token and nothing else.
         assert_eq!(
             cwd_token_environment(&first),
-            [("TERM_PROGRAM", "jterm1"), (CWD_TOKEN_ENV, first.as_str())]
+            [(CWD_TOKEN_ENV, first.as_str())]
         );
+    }
+
+    /// The shell-integration snippets are sourced from an rc file behind
+    /// `[[ $TERM_PROGRAM == jterm1 ]]`, and `TERM_PROGRAM` now comes from the
+    /// shared child-environment policy instead of being spelled out per spawn
+    /// site. If the identity this app registers ever stops matching that gate,
+    /// every shell silently loses OSC 133 and block mode stops finding commands.
+    #[test]
+    fn the_child_environment_reports_the_term_program_the_rc_snippets_gate_on() {
+        jterm_core::identity::init(jterm_core::identity::AppIdentity {
+            app_name: crate::host::APP_NAME,
+            app_id: crate::host::APP_ID,
+            app_version: env!("CARGO_PKG_VERSION"),
+        });
+        let overlay = jterm_core::child_env::pairs(
+            &jterm_core::child_env::ChildEnv::from_identity(),
+            &cwd_token_environment("token"),
+        );
+        let term_program = overlay
+            .iter()
+            .find(|(name, _)| name == "TERM_PROGRAM")
+            .map(|(_, value)| value.to_string_lossy().to_string());
+        assert_eq!(term_program.as_deref(), Some("jterm1"));
+
+        for script in ["jterm1.bash", "jterm1.zsh", "jterm1.fish", "jterm1.ps1"] {
+            let source = std::fs::read_to_string(integration_path(script))
+                .unwrap_or_else(|error| panic!("read {script}: {error}"));
+            assert!(
+                source.contains("jterm1"),
+                "{script} must still name the TERM_PROGRAM it is gated on"
+            );
+        }
     }
 
     #[test]

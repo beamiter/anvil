@@ -60,6 +60,8 @@ pub(crate) fn show_command_palette(
     entries: Vec<PaletteEntry>,
     pty: Rc<OwnedPty>,
     typed_cmd: Rc<RefCell<String>>,
+    pty_synced: Rc<Cell<bool>>,
+    bracketed_paste: Rc<Cell<bool>>,
     live_vte: Terminal,
 ) {
     let popover = gtk::Popover::new();
@@ -176,9 +178,21 @@ pub(crate) fn show_command_palette(
             let idx = list.selected_row().map(|r| r.index()).unwrap_or(-1);
             if idx >= 0 {
                 if let Some(cmd) = filtered.borrow().get(idx as usize) {
-                    pty.write_bytes(b"\x15");
-                    pty.write_bytes(cmd.as_bytes());
-                    typed_cmd.borrow_mut().clear();
+                    // One encoded payload, not a raw Ctrl+U followed by raw
+                    // command bytes: the kill-line, the framing and the body
+                    // travel together, paste markers are removed from the body,
+                    // and a multiline entry cannot execute its later lines.
+                    let recall = super::build_command_recall(cmd, bracketed_paste.get());
+                    if !recall.is_empty() {
+                        pty.write_bytes(&recall.bytes);
+                        // Mirror the shell's line buffer. This used to clear the
+                        // shadow and leave `pty_synced` false, so the next block
+                        // recall skipped its own Ctrl+U and appended to the
+                        // palette's command: `git status` + `ls -la` arrived at
+                        // the shell as `git statusls -la`.
+                        *typed_cmd.borrow_mut() = recall.echo_text;
+                        pty_synced.set(true);
+                    }
                 }
             }
             popover.popdown();

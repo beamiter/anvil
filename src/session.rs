@@ -14,11 +14,12 @@
 //! remain readable; PID-owned files are retained conservatively because their
 //! owner identity cannot be proven from another namespace.
 
+use crate::snapshot_file;
 use gtk::glib;
 use relm4::gtk;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -32,6 +33,11 @@ const LOCK_SUFFIX: &str = ".lock";
 const LOCK_PROTOCOL_FILE: &str = ".session-lock-protocol";
 const CLAIM_MARKER: &str = ".claim.";
 const MAX_RECOVERABLE_SNAPSHOTS: usize = 32;
+/// Largest session snapshot this window will read back. A snapshot is a tab list
+/// with one cwd and one argv per pane — kilobytes — so anything past this is a
+/// runaway writer or another program's file at a colliding name, and rejecting
+/// it by size gives a better message than a JSON parse error would.
+const MAX_SNAPSHOT_BYTES: u64 = 4 * 1024 * 1024;
 const OWNER_TOKEN_ATTEMPTS: usize = 128;
 static SNAPSHOT_OWNER: OnceLock<Result<SnapshotOwner, String>> = OnceLock::new();
 
@@ -65,7 +71,7 @@ pub(crate) enum PaneLayout {
         #[serde(
             default,
             skip_serializing_if = "Option::is_none",
-            deserialize_with = "deserialize_restorable_argv"
+            deserialize_with = "jterm_core::process::deserialize_restorable_argv"
         )]
         cmds: Option<Vec<String>>,
     },
@@ -76,31 +82,6 @@ pub(crate) enum PaneLayout {
         start: Box<PaneLayout>,
         end: Box<PaneLayout>,
     },
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum StoredRestorableCommand {
-    Argv(Vec<String>),
-    LegacyString(String),
-}
-
-/// Older snapshots stored a shell command string assembled with `argv.join`.
-/// Its original argument boundaries cannot be recovered safely, so accept the
-/// old shape for session compatibility but deliberately do not auto-execute it.
-fn deserialize_restorable_argv<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let stored = Option::<StoredRestorableCommand>::deserialize(deserializer)?;
-    Ok(match stored {
-        Some(StoredRestorableCommand::Argv(argv)) if !argv.is_empty() => Some(argv),
-        Some(StoredRestorableCommand::LegacyString(_)) => {
-            log::warn!("Ignoring legacy session restore command without argv boundaries");
-            None
-        }
-        _ => None,
-    })
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -503,6 +484,13 @@ pub(crate) fn load_session() -> Option<SavedSession> {
     session
 }
 
+/// Create the state directory and make it private.
+///
+/// Kept local because the shared module only exposes this as a side effect of
+/// [`snapshot_file::write_atomic_private`], and the owner-lock protocol below
+/// needs the directory to exist and be `0700` *before* it creates any file in
+/// it: a lock published under a world-readable directory is the window this
+/// guards against.
 fn ensure_private_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -518,44 +506,14 @@ fn ensure_private_directory(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Write to a sibling temp file, fsync it, then replace the destination with a
-/// single rename. The previous valid snapshot is never removed first, so a
-/// write/rename failure leaves it intact.
+/// Durably replace a snapshot, creating its `0700` directory if needed.
+///
+/// The temp-write/fsync/rename dance and the `0600` mode are
+/// [`snapshot_file::write_atomic_private`] now. jterm1 owns `~/.config/jterm1`
+/// outright, so letting it tighten the parent directory is the documented case
+/// for that function rather than a surprise chmod of somebody's `$HOME`.
 fn atomic_write(path: &Path, payload: &[u8]) -> io::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "state path has no parent"))?;
-    ensure_private_directory(parent)?;
-
-    let tmp = path.with_extension("state.tmp");
-    let mut options = fs::OpenOptions::new();
-    options.create(true).truncate(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&tmp)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    }
-    file.write_all(payload)?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(&tmp, path)?;
-
-    // Persist the renamed directory entry where supported. The snapshot is
-    // already valid if this best-effort durability step fails.
-    if let Err(err) = fs::File::open(parent).and_then(|dir| dir.sync_all()) {
-        log::warn!(
-            "Session snapshot {} was saved, but syncing directory {} failed: {err}",
-            path.display(),
-            parent.display()
-        );
-    }
-    Ok(())
+    snapshot_file::write_atomic_private(path, payload)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -875,7 +833,10 @@ fn scan_candidates(
         }
 
         let path = entry.path();
-        let contents = match fs::read_to_string(&path) {
+        // Bounded: this file was found by scanning a directory, so its size is
+        // not this process's to trust, and an unbounded read happens before
+        // anything can reject the contents.
+        let contents = match snapshot_file::read_bounded(&path, MAX_SNAPSHOT_BYTES) {
             Ok(contents) => contents,
             Err(err) => {
                 log::error!(
@@ -1590,6 +1551,35 @@ mod tests {
         assert!(
             live.state_path.exists(),
             "a held owner lock must prevent pruning"
+        );
+    }
+
+    /// The snapshot path came from a directory scan, so its size is not this
+    /// process's to trust. An oversized file is rejected by size rather than read
+    /// into memory and handed to serde, and — like every other unusable candidate
+    /// here — it is retained for inspection instead of being silently consumed.
+    #[test]
+    fn an_oversized_snapshot_is_skipped_and_retained() {
+        let dir = TestDir::new("oversize");
+        let good_path = state_file_path_for_token(dir.path(), &token(10));
+        write_session(&good_path, "reasonable");
+
+        // Written second, so it is the newest snapshot and therefore the one the
+        // loader prefers: the only reason it is not restored is the size bound.
+        let fat_path = dir.path().join(LEGACY_STATE_FILE);
+        let mut fat = serde_json::to_string(&saved_session("too-big")).unwrap();
+        fat.push_str(&" ".repeat(MAX_SNAPSHOT_BYTES as usize));
+        fs::write(&fat_path, fat.as_bytes()).unwrap();
+
+        let restored = load_session_from(dir.path(), &token(99), &|_| TokenLockState::Available)
+            .expect("the snapshot that fits still restores");
+        assert_eq!(
+            restored.tabs[0].title, "reasonable",
+            "the oversized snapshot must not have been read at all"
+        );
+        assert!(
+            fat_path.exists(),
+            "an oversized snapshot must be left on disk for inspection"
         );
     }
 

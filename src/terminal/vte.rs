@@ -21,6 +21,7 @@ use std::rc::Rc;
 use vte4::{CursorBlinkMode, CursorShape, PtyFlags, Terminal};
 use vte4::{TerminalExt, TerminalExtManual};
 
+use crate::child_env;
 use crate::config::Config;
 
 // ─── Terminal widget construction (ported from jterm4 terminal.rs) ──────────
@@ -248,10 +249,12 @@ pub(crate) fn spawn_shell(
         crate::host::wrap_argv(&argv_vec, effective_working_directory, &host_environment);
     let argv: Vec<&str> = argv_vec.iter().map(|s| s.as_str()).collect();
 
-    let envv_owned: Vec<String> = host_environment
-        .iter()
-        .map(|(key, value)| format!("{key}={value}"))
-        .collect();
+    // libvte injects its own TERM/VTE_VERSION and adds `envv` on top, so this is
+    // identity only: a LESS or a LANG asserted here would override whatever the
+    // user configured, which `child_env::vte_envv` documents and refuses to do.
+    // The cwd-authentication token rides along as the per-call extra.
+    let envv_owned: Vec<String> =
+        child_env::vte_envv(&child_env::ChildEnv::from_identity(), &host_environment);
     let envv: Vec<&str> = envv_owned.iter().map(String::as_str).collect();
     let spawn_flags = SpawnFlags::SEARCH_PATH;
     let cancellable: Option<&Cancellable> = None;
