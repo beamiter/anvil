@@ -274,6 +274,8 @@ impl SimpleComponent for AppModel {
             set_title: Some("jterm1"),
             set_default_width: 800,
             set_default_height: 600,
+            set_modal: false,
+            set_resizable: true,
 
             #[local_ref]
             toast_overlay -> adw::ToastOverlay {
@@ -282,7 +284,7 @@ impl SimpleComponent for AppModel {
                     set_orientation: gtk::Orientation::Vertical,
 
                     #[local_ref]
-                    top_bar -> gtk::Overlay {},
+                    top_bar_handle -> gtk::WindowHandle {},
 
                     #[local_ref]
                     search_bar -> gtk::SearchBar {},
@@ -409,6 +411,8 @@ impl SimpleComponent for AppModel {
                     AppMsg::Action(Action::ToggleTabPlacement)
                 }
                 top_bar::TopBarOutput::NewTab => AppMsg::NewTab,
+                top_bar::TopBarOutput::MinimizeWindow => AppMsg::MinimizeWindow,
+                top_bar::TopBarOutput::ToggleMaximizedWindow => AppMsg::ToggleMaximizedWindow,
                 top_bar::TopBarOutput::Quit => AppMsg::Quit,
             });
 
@@ -726,7 +730,12 @@ impl SimpleComponent for AppModel {
         };
 
         let search_bar = model.search.widget();
+        // WindowHandle gives the custom Relm4 toolbar native titlebar move,
+        // double-click, and context-menu behavior without stealing gestures
+        // from its buttons or the draggable tab strip.
         let top_bar = model.top_bar.widget();
+        let top_bar_handle = gtk::WindowHandle::new();
+        top_bar_handle.set_child(Some(top_bar));
         let toast_overlay = &model.toast_overlay;
         let widgets = view_output!();
 
@@ -744,6 +753,12 @@ impl SimpleComponent for AppModel {
                     close_sender.input(AppMsg::Quit);
                     glib::Propagation::Stop
                 }
+            });
+        }
+        {
+            let window_sender = sender.clone();
+            root.connect_maximized_notify(move |window| {
+                window_sender.input(AppMsg::WindowMaximized(window.is_maximized()));
             });
         }
 
@@ -910,6 +925,18 @@ impl SimpleComponent for AppModel {
             AppMsg::PrevTab => self.switch_tab(-1, &sender),
             AppMsg::ToggleSidebar => {
                 self.set_sidebar_visible(!self.sidebar_visible, true);
+            }
+            AppMsg::MinimizeWindow => self.window.minimize(),
+            AppMsg::ToggleMaximizedWindow => {
+                if self.window.is_maximized() {
+                    self.window.unmaximize();
+                } else {
+                    self.window.maximize();
+                }
+            }
+            AppMsg::WindowMaximized(maximized) => {
+                self.top_bar
+                    .emit(top_bar::TopBarMsg::SetMaximized(maximized));
             }
             AppMsg::Quit => {
                 self.request_quit(&sender);

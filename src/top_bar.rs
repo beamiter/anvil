@@ -10,7 +10,14 @@ pub(crate) enum TopBarOutput {
     ToggleSidebar,
     ToggleTabPlacement,
     NewTab,
+    MinimizeWindow,
+    ToggleMaximizedWindow,
     Quit,
+}
+
+#[derive(Debug)]
+pub(crate) enum TopBarMsg {
+    SetMaximized(bool),
 }
 
 pub(crate) struct TopBarModel {
@@ -18,10 +25,11 @@ pub(crate) struct TopBarModel {
 }
 
 #[relm4::component(pub(crate))]
-impl SimpleComponent for TopBarModel {
+impl Component for TopBarModel {
     type Init = gtk::ScrolledWindow;
-    type Input = ();
+    type Input = TopBarMsg;
     type Output = TopBarOutput;
+    type CommandOutput = ();
 
     view! {
         root = gtk::Overlay {
@@ -80,6 +88,7 @@ impl SimpleComponent for TopBarModel {
                 set_halign: gtk::Align::End,
                 set_valign: gtk::Align::Center,
                 add_css_class: "top-bar-actions",
+                add_css_class: "window-controls",
 
                 gtk::Button {
                     set_icon_name: "list-add-symbolic",
@@ -92,10 +101,34 @@ impl SimpleComponent for TopBarModel {
                 },
 
                 gtk::Button {
+                    set_icon_name: "window-minimize-symbolic",
+                    set_focus_on_click: false,
+                    set_tooltip_text: Some("Minimize window"),
+                    add_css_class: "flat",
+                    add_css_class: "window-control",
+                    connect_clicked[sender] => move |_| {
+                        let _ = sender.output(TopBarOutput::MinimizeWindow);
+                    },
+                },
+
+                #[name(maximize_button)]
+                gtk::Button {
+                    set_icon_name: "window-maximize-symbolic",
+                    set_focus_on_click: false,
+                    set_tooltip_text: Some("Maximize window"),
+                    add_css_class: "flat",
+                    add_css_class: "window-control",
+                    connect_clicked[sender] => move |_| {
+                        let _ = sender.output(TopBarOutput::ToggleMaximizedWindow);
+                    },
+                },
+
+                gtk::Button {
                     set_icon_name: "window-close-symbolic",
                     set_focus_on_click: false,
                     set_tooltip_text: Some("Close window"),
                     add_css_class: "flat",
+                    add_css_class: "window-control",
                     connect_clicked[sender] => move |_| {
                         let _ = sender.output(TopBarOutput::Quit);
                     },
@@ -113,5 +146,25 @@ impl SimpleComponent for TopBarModel {
         let tab_scroll = &model.tab_scroll;
         let widgets = view_output!();
         ComponentParts { model, widgets }
+    }
+
+    fn update_with_view(
+        &mut self,
+        widgets: &mut Self::Widgets,
+        msg: Self::Input,
+        _sender: ComponentSender<Self>,
+        _root: &Self::Root,
+    ) {
+        match msg {
+            TopBarMsg::SetMaximized(maximized) => {
+                let (icon_name, tooltip) = if maximized {
+                    ("window-restore-symbolic", "Restore window")
+                } else {
+                    ("window-maximize-symbolic", "Maximize window")
+                };
+                widgets.maximize_button.set_icon_name(icon_name);
+                widgets.maximize_button.set_tooltip_text(Some(tooltip));
+            }
+        }
     }
 }

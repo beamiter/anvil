@@ -39,6 +39,8 @@ pub(crate) fn install_static_css() {
          .file-tree { padding: 2px; }
          .sidebar-toggle { color: #ffffff; }
          .top-bar { padding: 2px 4px; }
+         .window-controls { margin-left: 2px; }
+         .window-control { min-width: 24px; min-height: 24px; padding: 0; border-radius: 999px; }
          .terminal-box scrollbar slider { min-width: 6px; border-radius: 3px; }
          .terminal-box scrollbar { padding: 0; }
          .tab-activity { font-style: italic; }
