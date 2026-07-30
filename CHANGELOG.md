@@ -23,15 +23,15 @@ versioning for tagged releases while it remains experimental.
   control-strips and caps the text; jterm1 paces launches app-wide — at most
   one notification per output batch and one every two seconds, extras dropped
   silently — matching jterm3.
-- One-command install and update for the companion shell rsh. The palette
-  action "Install or update rsh" runs the installer in its own VTE tab, so the
+- One-command install and update for the companion shell jsh. The palette
+  action "Install or update jsh" runs the installer in its own VTE tab, so the
   tab is the progress UI: it can be interrupted with Ctrl+C and waits for Enter
-  before closing. When rsh is missing or outdated, a toast offers the same
-  action. The installer itself comes from the rsh repository and is embedded in
-  `jterm_core::rsh_install`, which keeps checksum verification, atomic
-  replacement, the rollback copy, and the `/usr/bin/rsh` (BSD remote shell)
-  shadowing warning in one place for the whole family. The check runs on a
-  worker thread and never installs anything on its own; `rsh_update_check`
+  before closing. When jsh is missing or outdated, a toast offers the same
+  action. The installer itself comes from the jsh repository and is embedded in
+  `jterm_core::jsh_install`, which keeps checksum verification, atomic
+  replacement, the rollback copy, and the "`PATH` resolves `jsh` to something
+  else" warning in one place for the whole family. The check runs on a
+  worker thread and never installs anything on its own; `jsh_update_check`
   (`startup` / `daily` (default) / `never`) governs how often it looks, and its
   cache is shared with every other jterm on the machine.
 - Clear Blocks is now undoable: the cleared blocks are stashed and an explicit

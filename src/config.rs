@@ -48,9 +48,9 @@ fn resolve_sidebar_visibility(explicit: Option<bool>, placement: TabPlacement) -
     explicit.unwrap_or(placement == TabPlacement::Sidebar)
 }
 
-/// When to check whether a newer rsh has been published. Shared with the other
+/// When to check whether a newer jsh has been published. Shared with the other
 /// terminals so one config vocabulary covers the family.
-pub use jterm_core::rsh_install::UpdateCheck as RshUpdateCheck;
+pub use jterm_core::jsh_install::UpdateCheck as JshUpdateCheck;
 
 /// Which single view the sidebar shows (tab list vs file tree).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,9 +87,9 @@ pub struct RemoteHost {
     pub name: String,
     pub host: String,
     pub user: Option<String>,
-    /// Shell to launch on the remote side (default "rsh").
+    /// Shell to launch on the remote side (default "jsh").
     pub remote_shell: String,
-    /// Stable session id passed to the remote rsh for resume-on-reconnect.
+    /// Stable session id passed to the remote jsh for resume-on-reconnect.
     pub session: Option<String>,
     /// Extra flags inserted before the target (e.g. ["-p", "2222"]).
     pub ssh_args: Vec<String>,
@@ -126,7 +126,7 @@ fn wrap_exec_in_login_bash(command: &str) -> String {
     )
 }
 
-fn wrap_rsh_argv_in_interactive_bash(rsh_path: &str) -> Option<Vec<String>> {
+fn wrap_jsh_argv_in_interactive_bash(jsh_path: &str) -> Option<Vec<String>> {
     let bash_path = find_executable_in_path("bash")?;
     Some(vec![
         bash_path.to_string_lossy().to_string(),
@@ -135,7 +135,7 @@ fn wrap_rsh_argv_in_interactive_bash(rsh_path: &str) -> Option<Vec<String>> {
         // argv. `bash -c` assigns the first post-command argument to $0 and
         // the rest to $@; no shell reconstruction of either value is needed.
         "exec \"$0\" \"$@\"".to_string(),
-        rsh_path.to_string(),
+        jsh_path.to_string(),
     ])
 }
 
@@ -143,19 +143,19 @@ pub(crate) fn valid_session_id(session_id: &str) -> bool {
     !session_id.is_empty() && session_id.len() <= 1024 && !session_id.chars().any(char::is_control)
 }
 
-/// Apply a saved rsh session id to either a direct rsh argv or the exact
+/// Apply a saved jsh session id to either a direct jsh argv or the exact
 /// interactive-bash wrapper generated above. Returns whether the id was
 /// applied, allowing callers to expose the matching environment marker.
 pub(crate) fn shell_argv_with_session(
     shell_argv: &[String],
     session_id: Option<&str>,
 ) -> (Vec<String>, bool) {
-    let direct_rsh = shell_argv
+    let direct_jsh = shell_argv
         .first()
         .and_then(|path| Path::new(path).file_name())
         .and_then(|name| name.to_str())
-        == Some("rsh");
-    let wrapped_rsh = shell_argv.len() >= 4
+        == Some("jsh");
+    let wrapped_jsh = shell_argv.len() >= 4
         && shell_argv
             .first()
             .and_then(|path| Path::new(path).file_name())
@@ -166,17 +166,17 @@ pub(crate) fn shell_argv_with_session(
         && Path::new(&shell_argv[3])
             .file_name()
             .and_then(|name| name.to_str())
-            == Some("rsh");
+            == Some("jsh");
 
     let mut argv = shell_argv.to_vec();
     let applied = match session_id {
-        Some(session_id) if (direct_rsh || wrapped_rsh) && valid_session_id(session_id) => {
+        Some(session_id) if (direct_jsh || wrapped_jsh) && valid_session_id(session_id) => {
             argv.push("--session".to_string());
             argv.push(session_id.to_string());
             true
         }
-        Some(_) if direct_rsh || wrapped_rsh => {
-            log::warn!("Ignoring invalid saved rsh session id");
+        Some(_) if direct_jsh || wrapped_jsh => {
+            log::warn!("Ignoring invalid saved jsh session id");
             false
         }
         _ => false,
@@ -185,7 +185,7 @@ pub(crate) fn shell_argv_with_session(
 }
 
 /// Build the local argv that connects to a remote host via ssh.
-/// Produces e.g. `["ssh", "-t", "-p", "2222", "mm@100.x.x.x", "rsh --session home-main"]`.
+/// Produces e.g. `["ssh", "-t", "-p", "2222", "mm@100.x.x.x", "jsh --session home-main"]`.
 pub(crate) fn build_remote_argv(host: &RemoteHost) -> Vec<String> {
     let target = match &host.user {
         Some(u) => format!("{u}@{}", host.host),
@@ -249,9 +249,9 @@ pub struct Config {
     pub(crate) tab_placement: TabPlacement,
     /// Which single view the sidebar shows (tab list vs file tree).
     pub(crate) sidebar_view: SidebarView,
-    /// When to look for a newer rsh. Installing always stays an explicit
+    /// When to look for a newer jsh. Installing always stays an explicit
     /// choice: this only governs whether the offer appears.
-    pub(crate) rsh_update_check: RshUpdateCheck,
+    pub(crate) jsh_update_check: JshUpdateCheck,
     /// Whether the left sidebar is visible. Older configs derive this from
     /// tab placement so sidebar tabs remain discoverable after an upgrade.
     pub(crate) sidebar_visible: bool,
@@ -359,7 +359,7 @@ impl Config {
             terminal_mode: TerminalMode::Vte,
             tab_placement: TabPlacement::Sidebar,
             sidebar_view: SidebarView::Tabs,
-            rsh_update_check: RshUpdateCheck::default(),
+            jsh_update_check: JshUpdateCheck::default(),
             sidebar_visible: true,
             sidebar_width: 220,
             tab_width: 180,
@@ -670,7 +670,7 @@ struct FileConfig {
     terminal_mode: Option<String>,
     tab_placement: Option<String>,
     sidebar_view: Option<String>,
-    rsh_update_check: Option<String>,
+    jsh_update_check: Option<String>,
     sidebar_visible: Option<bool>,
     sidebar_width: Option<u32>,
     tab_width: Option<u32>,
@@ -792,8 +792,8 @@ fn load_file_config() -> FileConfig {
             .get("sidebar_view")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
-        rsh_update_check: table
-            .get("rsh_update_check")
+        jsh_update_check: table
+            .get("jsh_update_check")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
         sidebar_visible: table.get("sidebar_visible").and_then(|v| v.as_bool()),
@@ -972,7 +972,7 @@ fn parse_remote_hosts(table: &toml::Table) -> Vec<RemoteHost> {
             let remote_shell = t
                 .get("remote_shell")
                 .and_then(|v| v.as_str())
-                .unwrap_or("rsh")
+                .unwrap_or("jsh")
                 .to_string();
             if !remote_text_is_safe(&remote_shell, true, 16 * 1_024) {
                 return None;
@@ -1196,8 +1196,8 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
             .unwrap_or_else(|| "sidebar".to_string()),
     );
     let sidebar_view = SidebarView::parse(&fc.sidebar_view.unwrap_or_else(|| "tabs".to_string()));
-    let rsh_update_check =
-        RshUpdateCheck::parse(&fc.rsh_update_check.unwrap_or_else(|| "daily".to_string()));
+    let jsh_update_check =
+        JshUpdateCheck::parse(&fc.jsh_update_check.unwrap_or_else(|| "daily".to_string()));
     let sidebar_visible = resolve_sidebar_visibility(fc.sidebar_visible, tab_placement);
     let sidebar_width = fc.sidebar_width.unwrap_or(220).clamp(120, 800);
     let tab_width = fc.tab_width.unwrap_or(180).clamp(80, 480);
@@ -1246,7 +1246,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         terminal_mode,
         tab_placement,
         sidebar_view,
-        rsh_update_check,
+        jsh_update_check,
         sidebar_visible,
         sidebar_width,
         tab_width,
@@ -1370,8 +1370,8 @@ pub(crate) fn choose_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("");
-            if shell_name == "rsh" {
-                if let Some(argv) = wrap_rsh_argv_in_interactive_bash(path) {
+            if shell_name == "jsh" {
+                if let Some(argv) = wrap_jsh_argv_in_interactive_bash(path) {
                     return argv;
                 }
             }
@@ -1383,12 +1383,12 @@ pub(crate) fn choose_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
         );
     }
 
-    // Prefer rsh when it's on PATH.
-    if let Some(rsh_path) = find_executable_in_path("rsh") {
-        if let Some(argv) = wrap_rsh_argv_in_interactive_bash(&rsh_path.to_string_lossy()) {
+    // Prefer jsh when it's on PATH.
+    if let Some(jsh_path) = find_executable_in_path("jsh") {
+        if let Some(argv) = wrap_jsh_argv_in_interactive_bash(&jsh_path.to_string_lossy()) {
             return argv;
         }
-        return vec![rsh_path.to_string_lossy().to_string()];
+        return vec![jsh_path.to_string_lossy().to_string()];
     }
 
     // Fallback: bash
@@ -1409,7 +1409,7 @@ mod tests {
             name: "h".into(),
             host: "203.0.113.10".into(),
             user: Some("tester".into()),
-            remote_shell: "/home/tester/.local/bin/rsh".into(),
+            remote_shell: "/home/tester/.local/bin/jsh".into(),
             session: Some("staging-test".into()),
             ssh_args: Vec::new(),
             login_shell: true,
@@ -1429,7 +1429,7 @@ mod tests {
                 "-t",
                 "--",
                 "tester@203.0.113.10",
-                r#"bash -lc 'exec /home/tester/.local/bin/rsh --session '"'"'staging-test'"'"''"#,
+                r#"bash -lc 'exec /home/tester/.local/bin/jsh --session '"'"'staging-test'"'"''"#,
             ]
         );
     }
@@ -1448,7 +1448,7 @@ mod tests {
         let argv = build_remote_argv(&h);
         assert_eq!(
             argv.last().unwrap(),
-            "/home/tester/.local/bin/rsh --session 'staging-test'"
+            "/home/tester/.local/bin/jsh --session 'staging-test'"
         );
     }
 
@@ -1460,24 +1460,24 @@ mod tests {
         let argv = build_remote_argv(&h);
         assert_eq!(
             argv.last().unwrap(),
-            r#"/home/tester/.local/bin/rsh --session 'it'"'"'s; printf injected'"#
+            r#"/home/tester/.local/bin/jsh --session 'it'"'"'s; printf injected'"#
         );
     }
 
     #[test]
-    fn rsh_wrapper_uses_interactive_bash() {
-        let argv = wrap_rsh_argv_in_interactive_bash("/home/tester/.local/bin/rsh")
+    fn jsh_wrapper_uses_interactive_bash() {
+        let argv = wrap_jsh_argv_in_interactive_bash("/home/tester/.local/bin/jsh")
             .expect("bash should be available in the test environment");
         assert_eq!(argv[1], "-ic");
         assert_eq!(
             &argv[2..],
-            ["exec \"$0\" \"$@\"", "/home/tester/.local/bin/rsh"]
+            ["exec \"$0\" \"$@\"", "/home/tester/.local/bin/jsh"]
         );
     }
 
     #[test]
-    fn saved_session_is_applied_to_direct_and_wrapped_rsh_argv() {
-        let direct = vec!["/usr/bin/rsh".to_string()];
+    fn saved_session_is_applied_to_direct_and_wrapped_jsh_argv() {
+        let direct = vec!["/usr/bin/jsh".to_string()];
         let (direct, applied) = shell_argv_with_session(&direct, Some("session one"));
         assert!(applied);
         assert_eq!(&direct[1..], ["--session", "session one"]);
@@ -1486,7 +1486,7 @@ mod tests {
             "/usr/bin/bash".to_string(),
             "-ic".to_string(),
             "exec \"$0\" \"$@\"".to_string(),
-            "/usr/bin/rsh".to_string(),
+            "/usr/bin/jsh".to_string(),
         ];
         let (wrapped, applied) = shell_argv_with_session(&wrapped, Some("session two"));
         assert!(applied);

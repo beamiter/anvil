@@ -56,7 +56,7 @@ pub(crate) enum PaneLayout {
         /// session file; restore re-resolves the validated live configuration.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         remote_name: Option<String>,
-        /// Stable local rsh identity learned through OSC 7770.
+        /// Stable local jsh identity learned through OSC 7770.
         #[serde(skip_serializing_if = "Option::is_none")]
         sid: Option<String>,
         /// Restorable command argv to replay on restore (e.g. `["ssh", "host"]`).
@@ -1091,18 +1091,18 @@ mod tests {
             cwd: Some("/tmp".to_string()),
             cwd_external: false,
             remote_name: None,
-            sid: Some("rsh-session-42".to_string()),
+            sid: Some("jsh-session-42".to_string()),
             cmds: None,
         };
         let encoded = serde_json::to_string(&with_sid).unwrap();
-        assert!(encoded.contains("rsh-session-42"));
+        assert!(encoded.contains("jsh-session-42"));
         let decoded: PaneLayout = serde_json::from_str(&encoded).unwrap();
         assert!(matches!(
             decoded,
             PaneLayout::Leaf {
                 sid: Some(ref sid),
                 ..
-            } if sid == "rsh-session-42"
+            } if sid == "jsh-session-42"
         ));
 
         let legacy: PaneLayout =

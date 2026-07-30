@@ -236,7 +236,7 @@ PSReadLine. More detail is in
 [`scripts/shell-integration/README.md`](scripts/shell-integration/README.md).
 
 Shell selection follows this order: `JTERM1_SHELL`, the `shell` config key,
-`rsh` when it is executable on `PATH`, `bash -l`, then `sh`.
+`jsh` when it is executable on `PATH`, `bash -l`, then `sh`.
 
 ## Default shortcuts
 
@@ -298,30 +298,30 @@ Slow-block, pinned-block, and non-contextual pinned-navigation actions remain
 available in the command palette and can be assigned in `[keybindings]`, but
 have no default shortcuts.
 
-## Installing and updating rsh
+## Installing and updating jsh
 
-jterm1 prefers its companion shell [`rsh`](https://github.com/beamiter/rsh) and
+jterm1 prefers its companion shell [`jsh`](https://github.com/beamiter/jsh) and
 falls back to bash only when it cannot find one. The palette action
-**Install or update rsh** runs the installer in a dedicated VTE tab: the tab is
+**Install or update jsh** runs the installer in a dedicated VTE tab: the tab is
 the progress UI, so it can be interrupted with Ctrl+C and it waits for Enter
 before closing, instead of a failure flashing past.
 
-The installer is embedded in the binary, so a machine that has never had rsh can
+The installer is embedded in the binary, so a machine that has never had jsh can
 still bootstrap one. It verifies the download's checksum, swaps the binary in
 with `rename(2)` — **shells that are already running keep the version they
 started with; new tabs pick up the new one** — keeps the previous binary for
-rollback, and reports when `PATH` resolves `rsh` to `/usr/bin/rsh`, the BSD
-remote shell on Debian-family systems.
+rollback, and reports when `PATH` resolves `jsh` to some other binary of the
+same name rather than this shell.
 
-When rsh is missing or a newer one is published, a toast offers the same action.
+When jsh is missing or a newer one is published, a toast offers the same action.
 The check runs on a worker thread, never installs anything by itself, and stays
 silent when it cannot reach the network:
 
 ```toml
-rsh_update_check = "daily"    # "startup" every launch, "daily" cached, "never" off
+jsh_update_check = "daily"    # "startup" every launch, "daily" cached, "never" off
 ```
 
-`daily` reuses the installer's own cache (`~/.cache/rsh/update-check.json`), so
+`daily` reuses the installer's own cache (`~/.cache/jsh/update-check.json`), so
 several jterms open at once still cost one request a day.
 
 ## Configuration
@@ -439,7 +439,7 @@ multiplex = true
 ```
 
 jterm1 runs `ssh -t`, passes `ssh_args` before the target, and optionally uses
-OpenSSH ControlMaster sockets. The custom `rsh` remote shell additionally
+OpenSSH ControlMaster sockets. The custom `jsh` remote shell additionally
 supports stable session IDs and block-aware reconnection; a regular remote
 shell works as a normal interactive SSH tab.
 

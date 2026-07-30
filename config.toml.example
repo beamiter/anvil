@@ -27,17 +27,17 @@ sidebar_width = 220
 tab_width = 180
 
 # Shell selection and commands automatically submitted in every new tab.
-# When shell is omitted, jterm1 tries rsh, bash -l, then sh.
+# When shell is omitted, jterm1 tries jsh, bash -l, then sh.
 # shell = "/bin/bash"
 # Separate startup commands with a comma followed by a space.
 # startup_commands = "cd /path/to/project, printf 'ready\\n'"
 
-# When to look for a newer rsh: "startup" checks the network on every launch,
+# When to look for a newer jsh: "startup" checks the network on every launch,
 # "daily" (default) reuses the installer cache shared by every jterm on this
 # machine, "never" disables the check. The check only decides whether the offer
 # appears; installing always stays an explicit choice (palette: "Install or
-# update rsh").
-rsh_update_check = "daily"
+# update jsh").
+jsh_update_check = "daily"
 
 # Lightweight command-only JSONL history used by Ctrl+Shift+H, the palette, and
 # optional AI context. The default path is under $XDG_STATE_HOME/jterm1/.
@@ -177,7 +177,7 @@ remote_hosts = []
 # Example remote profile. Each `name` must be unique because session restore
 # uses it as the stable profile identifier. Remove `remote_hosts = []` above
 # before uncommenting.
-# A regular shell gives a conventional SSH tab. A compatible rsh installation
+# A regular shell gives a conventional SSH tab. A compatible jsh installation
 # can additionally use `session` for block-aware reconnect/resume.
 # [[remote_hosts]]
 # name = "staging"

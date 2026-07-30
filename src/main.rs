@@ -23,6 +23,7 @@ mod host {
     pub const APP_ID: &str = "io.github.beamiter.jterm1";
 }
 
+mod jsh_ops;
 mod keybindings;
 mod navigation_ui;
 mod notebook;
@@ -31,7 +32,6 @@ mod pane_header;
 mod process;
 mod pty;
 mod review_input_ops;
-mod rsh_ops;
 mod search;
 mod session;
 mod settings_ops;
@@ -891,10 +891,10 @@ impl SimpleComponent for AppModel {
 
         model.init_file_tree();
 
-        // jterm1 prefers rsh as its shell, so it is worth noticing when the
+        // jterm1 prefers jsh as its shell, so it is worth noticing when the
         // machine has none or an old one. The check runs on a worker thread and
         // stays silent unless it has something actionable to offer.
-        model.start_rsh_update_check(&sender);
+        model.start_jsh_update_check(&sender);
 
         // Directories and foreground commands are polled, not pushed, so the
         // split panes' headers need a slow tick to stay honest. It touches
@@ -943,7 +943,7 @@ impl SimpleComponent for AppModel {
             }
             AppMsg::ForceQuit => self.force_quit(),
             AppMsg::Toast(message) => self.show_toast(message),
-            AppMsg::RshUpdateChecked(status) => self.offer_rsh_update(&status, &sender),
+            AppMsg::JshUpdateChecked(status) => self.offer_jsh_update(&status, &sender),
             AppMsg::CopyOutputOnly => {
                 if let Some(t) = self.active_terminal() {
                     t.emit(VteInput::CopyOutputOnly);
@@ -1027,8 +1027,8 @@ impl SimpleComponent for AppModel {
                         .as_mut()
                         .filter(|conn| conn.pane_id == pane_id)
                     {
-                        // Learn rsh's session id so a reconnect passes the same
-                        // `--session <id>` and rsh restores cwd/env/aliases.
+                        // Learn jsh's session id so a reconnect passes the same
+                        // `--session <id>` and jsh restores cwd/env/aliases.
                         // Overrides any static value the TOML config set.
                         conn.host.session = Some(id);
                     }

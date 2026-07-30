@@ -123,7 +123,7 @@ impl VtePty {
         // canonical/cooked discipline (ICANON + ECHO + ICRNL + OPOST). That
         // discipline mangles the MITM splice in two ways: ICANON line-buffers
         // VTE's keystrokes so the slave reader only sees a chunk after Enter,
-        // and ICRNL rewrites Enter's `\r` to `\n` — which rsh-style line
+        // and ICRNL rewrites Enter's `\r` to `\n` — which jsh-style line
         // editors treat as a literal newline, not the "execute command"
         // signal. Net effect: typing `pwd` + Enter rendered into the active
         // VTE but the shell never saw a CR, no command ever ran, and OSC 133;C

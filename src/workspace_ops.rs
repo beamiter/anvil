@@ -249,7 +249,7 @@ impl AppModel {
 
     /// Launch an explicit argv in its own named tab, in conventional VTE mode.
     ///
-    /// Used for one-shot helpers such as the rsh installer: they emit no
+    /// Used for one-shot helpers such as the jsh installer: they emit no
     /// shell-integration sequences, so Block mode would have nothing to build
     /// blocks from, and their prompts expect a plain terminal to type into.
     pub(crate) fn add_command_tab(
@@ -810,7 +810,7 @@ impl AppModel {
     }
 
     /// Open a new tab that connects to a remote host via ssh. Uses block mode
-    /// so OSC 133 / 7 / 7770 from the remote rsh drive the block UI; for a remote
+    /// so OSC 133 / 7 / 7770 from the remote jsh drive the block UI; for a remote
     /// shell without OSC 133, block.rs falls back to a streaming raw view, which
     /// is no worse than the bare-VTE path this used to take.
     pub(crate) fn add_remote_tab(

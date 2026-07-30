@@ -24,9 +24,9 @@ pub(crate) enum AppMsg {
     Toast(String),
     CopyOutputOnly,
     Action(Action),
-    /// Result of the background "is a newer rsh published?" check. Boxed so one
+    /// Result of the background "is a newer jsh published?" check. Boxed so one
     /// rare message does not widen every other variant.
-    RshUpdateChecked(Box<jterm_core::rsh_install::Status>),
+    JshUpdateChecked(Box<jterm_core::jsh_install::Status>),
     ReloadConfig,
     PaneLaunchFailed(u64, String),
     PaneExited(u64, u64, i32),

@@ -482,8 +482,8 @@ fn apply_config_to_table(config: &Config, table: &mut toml::Table) {
         toml::Value::Boolean(config.sidebar_visible),
     );
     table.insert(
-        "rsh_update_check".into(),
-        toml::Value::String(config.rsh_update_check.as_str().to_string()),
+        "jsh_update_check".into(),
+        toml::Value::String(config.jsh_update_check.as_str().to_string()),
     );
     table.insert(
         "sidebar_width".into(),
@@ -1066,7 +1066,7 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
         "terminal_mode",
         "tab_placement",
         "sidebar_view",
-        "rsh_update_check",
+        "jsh_update_check",
         "sidebar_visible",
         "sidebar_width",
         "tab_width",

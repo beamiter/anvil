@@ -2100,7 +2100,7 @@ impl ReaderCtx {
                             // Read the typed command directly off the live VTE,
                             // not from a shadow keystroke buffer. The VTE shows
                             // what the user actually saw — including history
-                            // recalls and rsh autosuggestion accepts — so what we
+                            // recalls and jsh autosuggestion accepts — so what we
                             // capture here is faithful to the run. Range goes
                             // from the cursor position captured at PromptEnd to
                             // the current cursor position (right before the
@@ -2919,7 +2919,7 @@ impl TermView {
         let session_id_owned = session_id.map(|s| s.to_string());
         if let Some(ref sid) = session_id_owned {
             if session_applied {
-                env_extra.push(("RSH_SESSION_ID", sid.as_str()));
+                env_extra.push(("JSH_SESSION_ID", sid.as_str()));
             }
         }
 

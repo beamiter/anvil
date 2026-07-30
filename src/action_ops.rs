@@ -218,7 +218,7 @@ impl AppModel {
                     }
                 }
             }
-            Action::InstallRsh => self.install_or_update_rsh(sender),
+            Action::InstallJsh => self.install_or_update_jsh(sender),
             Action::ToggleSearch => self.toggle_search(),
             Action::ReloadConfig => self.reload_config(sender),
             Action::MoveTabLeft => self.move_tab(-1, sender),
