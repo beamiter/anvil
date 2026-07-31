@@ -105,6 +105,10 @@ struct AppModel {
     sidebar_tab_rows: FactoryVecDeque<tab_strip::TabRow>,
     window: adw::ApplicationWindow,
     toast_overlay: adw::ToastOverlay,
+    /// The live opacity-hotkey toast, if one is currently shown. Held so rapid
+    /// Ctrl+Alt+=/- presses update one toast in place instead of queueing a
+    /// separate toast per step.
+    opacity_toast: Rc<RefCell<Option<adw::Toast>>>,
     quit_allowed: Rc<std::cell::Cell<bool>>,
     session_persistence: bool,
     safe_mode: bool,
@@ -700,6 +704,7 @@ impl SimpleComponent for AppModel {
             sidebar_tab_rows,
             window: root.clone(),
             toast_overlay: toast_overlay.clone(),
+            opacity_toast: Rc::new(RefCell::new(None)),
             quit_allowed: quit_allowed.clone(),
             session_persistence,
             safe_mode: init.safe_mode,

@@ -21,6 +21,24 @@ impl AppModel {
         self.window.set_opacity(opacity);
     }
 
+    /// Hotkey feedback: show the current opacity as a percentage. Repeat
+    /// presses update the toast in place rather than queueing one per step.
+    fn show_opacity_toast(&self) {
+        let message = format!("Opacity: {:.0}%", self.window_opacity * 100.0);
+        if let Some(toast) = self.opacity_toast.borrow().as_ref() {
+            toast.set_title(&message);
+            return;
+        }
+        let toast = adw::Toast::new(&message);
+        toast.set_timeout(2);
+        let slot = Rc::clone(&self.opacity_toast);
+        toast.connect_dismissed(move |_| {
+            slot.borrow_mut().take();
+        });
+        *self.opacity_toast.borrow_mut() = Some(toast.clone());
+        self.toast_overlay.add_toast(toast);
+    }
+
     pub(crate) fn toggle_search(&mut self) {
         self.search.emit(search::SearchMsg::Toggle);
     }
@@ -108,11 +126,15 @@ impl AppModel {
             Action::FontReset => self.set_font_scale_all(1.0),
             Action::OpacityIncrease => {
                 let o = (self.window_opacity + OPACITY_STEP).clamp(0.01, 1.0);
-                self.set_window_opacity(o);
+                // Same apply-and-persist path as the settings dialog, so the
+                // hotkey survives restarts like it does in jterm2/jterm3.
+                self.apply_settings_opacity(o);
+                self.show_opacity_toast();
             }
             Action::OpacityDecrease => {
                 let o = (self.window_opacity - OPACITY_STEP).clamp(0.01, 1.0);
-                self.set_window_opacity(o);
+                self.apply_settings_opacity(o);
+                self.show_opacity_toast();
             }
             Action::ToggleSidebar => {
                 self.set_sidebar_visible(!self.sidebar_visible, true);

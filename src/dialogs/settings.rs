@@ -177,6 +177,9 @@ impl Component for SettingsModel {
                             set_value: model.values.opacity,
                             set_hexpand: true,
                             set_size_request: (180, -1),
+                            set_draw_value: true,
+                            set_value_pos: gtk::PositionType::Left,
+                            set_format_value_func: |_, value| format!("{:.0}%", value * 100.0),
                             connect_value_changed[sender] => move |scale| {
                                 sender.input(SettingsMsg::Opacity(scale.value()));
                             },
