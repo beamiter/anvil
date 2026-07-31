@@ -11,6 +11,7 @@ HOME_DIR="${HOME:-}"
 DESTDIR="${DESTDIR:-}"
 PREFIX="${HOME_DIR}/.local"
 BIN_DIR=""
+PREFIX_EXPLICIT=0
 DATA_HOME=""
 BACKEND="auto"
 INSTALL_CONFIG=1
@@ -23,7 +24,8 @@ Usage: ./scripts/install.sh [options]
 
 Options:
   --prefix PATH          Runtime prefix (default: ~/.local)
-  --bin-dir PATH         Runtime binary directory (overrides --prefix)
+  --bin-dir PATH         Runtime binary directory (default: ~/.cargo/bin;
+                         with --prefix, defaults to PREFIX/bin)
   --data-dir PATH        Shared-data base (default: $XDG_DATA_HOME or PREFIX/share)
   --backend auto|nix|cargo
                          Build backend (default: auto; prefers Nix)
@@ -152,10 +154,12 @@ while (($# > 0)); do
         --prefix)
             (($# >= 2)) || die "--prefix requires a path"
             PREFIX="$2"
+            PREFIX_EXPLICIT=1
             shift 2
             ;;
         --prefix=*)
             PREFIX="${1#*=}"
+            PREFIX_EXPLICIT=1
             shift
             ;;
         --bin-dir)
@@ -214,7 +218,11 @@ done
 [[ -n "${HOME_DIR}" ]] || die "HOME is not set"
 [[ -n "${PREFIX}" && "${PREFIX}" == /* ]] || die "--prefix must be an absolute path"
 if [[ -z "${BIN_DIR}" ]]; then
-    BIN_DIR="${PREFIX}/bin"
+    if ((PREFIX_EXPLICIT == 1)); then
+        BIN_DIR="${PREFIX}/bin"
+    else
+        BIN_DIR="${HOME_DIR}/.cargo/bin"
+    fi
 fi
 [[ "${BIN_DIR}" == /* ]] || die "--bin-dir must be an absolute path"
 if [[ -z "${DATA_HOME}" ]]; then
