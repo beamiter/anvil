@@ -52,6 +52,13 @@ impl AppModel {
                 return;
             }
         };
+        // The file monitor also sees our own saves. Reloading those is a no-op
+        // that still costs a full pane refresh and a toast, which is loud once
+        // Ctrl+wheel writes the font scale on every zoom burst.
+        if self.config_revision.borrow().as_ref() == Some(&revision) {
+            log::debug!("configuration reload skipped: file matches the last save");
+            return;
+        }
         let (new_config, themes, new_kb) = load_config();
         let new_shell_argv = Rc::new(choose_shell_argv(new_config.shell.as_deref()));
         let backend_changed = std::mem::discriminant(&self.config.borrow().terminal_mode)

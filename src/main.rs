@@ -74,6 +74,8 @@ use workspace::{ConnStatus, Pane, RemoteConn, Tab, TermCtl, ZoomState};
 
 const FONT_STEP: f64 = 0.025;
 const OPACITY_STEP: f64 = 0.025;
+/// Quiet period after the last font-scale step before the config is written.
+const FONT_PERSIST_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(400);
 const MIN_TAB_WIDTH: u32 = 80;
 const MAX_TAB_WIDTH: u32 = 480;
 
@@ -92,6 +94,9 @@ struct AppModel {
     next_pane_id: u64,
     sidebar_visible: bool,
     font_scale: f64,
+    /// Generation token for the debounced font-scale config write. Ctrl+wheel
+    /// emits a step per notch, so only the last step in a burst reaches disk.
+    font_persist_generation: Rc<std::cell::Cell<u64>>,
     window_opacity: f64,
     stack: gtk::Stack,
     tab_strip: gtk::Box,
@@ -696,6 +701,7 @@ impl SimpleComponent for AppModel {
             // until the user explicitly opens it.
             sidebar_visible,
             font_scale,
+            font_persist_generation: Rc::new(std::cell::Cell::new(0)),
             window_opacity,
             stack: stack.clone(),
             tab_strip: tab_strip.clone(),
@@ -831,6 +837,37 @@ impl SimpleComponent for AppModel {
             });
         }
         root.add_controller(key_controller);
+
+        // Ctrl+wheel zooms the font. Capture phase so it wins over VTE's own
+        // scroll handling and over the block view's mouse reporting; both see
+        // the event only when Ctrl is not held.
+        let scroll_controller =
+            gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+        scroll_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+        {
+            let zsender = sender.clone();
+            scroll_controller.connect_scroll(move |controller, _dx, dy| {
+                if !controller
+                    .current_event_state()
+                    .contains(gtk::gdk::ModifierType::CONTROL_MASK)
+                {
+                    return glib::Propagation::Proceed;
+                }
+                // Touchpads emit fractional deltas; a zero step would still
+                // claim the event, so let those through untouched.
+                if dy == 0.0 {
+                    return glib::Propagation::Proceed;
+                }
+                let action = if dy < 0.0 {
+                    Action::FontIncrease
+                } else {
+                    Action::FontDecrease
+                };
+                zsender.input(AppMsg::Action(action));
+                glib::Propagation::Stop
+            });
+        }
+        root.add_controller(scroll_controller);
 
         // Config file hot reload is intentionally disabled in safe mode: a
         // change on disk must not re-enable startup, persistence, remote, or AI
@@ -1118,6 +1155,7 @@ impl SimpleComponent for AppModel {
             AppMsg::SettingsTheme(idx) => self.apply_settings_theme(idx),
             AppMsg::SettingsFontDesc(desc) => self.apply_settings_font_desc(desc),
             AppMsg::SettingsFontScale(scale) => self.apply_settings_font_scale(scale),
+            AppMsg::PersistFontScale => self.persist_config(),
             AppMsg::SettingsOpacity(opacity) => self.apply_settings_opacity(opacity),
             AppMsg::SettingsScrollback(lines) => self.apply_settings_scrollback(lines),
             AppMsg::SettingsTerminalMode(mode) => self.apply_settings_terminal_mode(mode),

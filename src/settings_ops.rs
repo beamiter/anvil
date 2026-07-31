@@ -41,10 +41,34 @@ impl AppModel {
     }
 
     pub(crate) fn apply_settings_font_scale(&mut self, scale: f64) {
+        self.stage_font_scale(scale);
+        self.persist_config();
+    }
+
+    /// Apply a font scale to the live panes and the in-memory config without
+    /// touching disk. Both the settings dialog and the hotkey/Ctrl+wheel path
+    /// go through here; only the write policy differs.
+    pub(crate) fn stage_font_scale(&mut self, scale: f64) {
         self.config.borrow_mut().default_font_scale = scale;
         self.sync_terminal_configs();
         self.set_font_scale_all(scale);
-        self.persist_config();
+    }
+
+    /// Hotkey / Ctrl+wheel path: apply immediately, write the config once the
+    /// steps stop arriving. A wheel notch train would otherwise rewrite the
+    /// config file on every notch.
+    pub(crate) fn apply_font_scale_step(&mut self, scale: f64, sender: &ComponentSender<AppModel>) {
+        self.stage_font_scale(scale);
+        let generation = self.font_persist_generation.get().wrapping_add(1);
+        self.font_persist_generation.set(generation);
+        let token = Rc::clone(&self.font_persist_generation);
+        let sender = sender.clone();
+        glib::timeout_add_local_once(FONT_PERSIST_DEBOUNCE, move || {
+            // A newer step superseded this one; it owns the write instead.
+            if token.get() == generation {
+                sender.input(AppMsg::PersistFontScale);
+            }
+        });
     }
 
     pub(crate) fn apply_settings_opacity(&mut self, opacity: f64) {

@@ -117,13 +117,15 @@ impl AppModel {
             }
             Action::FontIncrease => {
                 let s = (self.font_scale + FONT_STEP).min(10.0);
-                self.set_font_scale_all(s);
+                // Same apply-and-persist path as the settings dialog, so the
+                // hotkey survives restarts like it does in jterm2/jterm3.
+                self.apply_font_scale_step(s, sender);
             }
             Action::FontDecrease => {
                 let s = (self.font_scale - FONT_STEP).max(0.1);
-                self.set_font_scale_all(s);
+                self.apply_font_scale_step(s, sender);
             }
-            Action::FontReset => self.set_font_scale_all(1.0),
+            Action::FontReset => self.apply_font_scale_step(1.0, sender),
             Action::OpacityIncrease => {
                 let o = (self.window_opacity + OPACITY_STEP).clamp(0.01, 1.0);
                 // Same apply-and-persist path as the settings dialog, so the

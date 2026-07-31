@@ -50,6 +50,9 @@ pub(crate) enum AppMsg {
     SettingsTheme(usize),
     SettingsFontDesc(String),
     SettingsFontScale(f64),
+    /// Debounced write of a font scale already applied by the hotkey or
+    /// Ctrl+wheel path.
+    PersistFontScale,
     SettingsOpacity(f64),
     SettingsScrollback(u32),
     SettingsTerminalMode(usize),
