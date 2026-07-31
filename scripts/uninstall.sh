@@ -154,6 +154,20 @@ remove_dir_if_empty "${SHARE_DIR}/jterm1"
 remove_dir_if_empty "${SHARE_DIR}/doc/jterm1"
 remove_dir_if_empty "${SHARE_DIR}/doc"
 
+# Without this the launcher keeps offering a dead entry and a cached icon.
+if [[ -z "${DESTDIR}" ]] && ((DRY_RUN == 0)); then
+    if command -v update-desktop-database >/dev/null 2>&1 \
+        && [[ -d "${SHARE_DIR}/applications" ]]; then
+        (umask 022 && update-desktop-database "${SHARE_DIR}/applications") \
+            >/dev/null 2>&1 || true
+    fi
+    if command -v gtk-update-icon-cache >/dev/null 2>&1 \
+        && [[ -d "${SHARE_DIR}/icons/hicolor" ]]; then
+        (umask 022 && gtk-update-icon-cache --force --ignore-theme-index --quiet \
+            "${SHARE_DIR}/icons/hicolor") >/dev/null 2>&1 || true
+    fi
+fi
+
 if ((PURGE_CONFIG == 1)); then
     CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME_DIR}/.config}"
     STATE_HOME="${XDG_STATE_HOME:-${HOME_DIR}/.local/state}"

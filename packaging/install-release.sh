@@ -33,8 +33,21 @@ else
     echo "Keeping existing configuration: ${CONFIG_DIR}/config.toml"
 fi
 
-install -Dm644 \
-    "${SCRIPT_DIR}/share/applications/io.github.beamiter.jterm1.desktop" \
+# A desktop session fixes its PATH at login, so `Exec=jterm1` fails TryExec and
+# hides the launcher entry whenever ${INSTALL_DIR} is missing from that PATH.
+# This bundle always installs per-user, so point the entry at the absolute path.
+install -d -m 0755 "${APPLICATIONS_DIR}"
+awk -v exec_path="${INSTALL_DIR}/jterm1" '
+    /^Exec=jterm1([[:space:]]|$)/ || /^TryExec=jterm1([[:space:]]|$)/ {
+        eq = index($0, "=")
+        print substr($0, 1, eq) exec_path substr($0, eq + 7)
+        next
+    }
+    { print }
+' "${SCRIPT_DIR}/share/applications/io.github.beamiter.jterm1.desktop" \
+    >"${APPLICATIONS_DIR}/io.github.beamiter.jterm1.desktop.new"
+chmod 0644 "${APPLICATIONS_DIR}/io.github.beamiter.jterm1.desktop.new"
+mv -f -- "${APPLICATIONS_DIR}/io.github.beamiter.jterm1.desktop.new" \
     "${APPLICATIONS_DIR}/io.github.beamiter.jterm1.desktop"
 rm -f -- "${APPLICATIONS_DIR}/app.jterm1.desktop"
 install -Dm644 \
@@ -71,8 +84,18 @@ install -Dm644 "${SCRIPT_DIR}/share/doc/jterm1/Cargo.lock" \
 install -Dm644 "${SCRIPT_DIR}/share/doc/jterm1/BUILDINFO" \
     "${DOC_DIR}/BUILDINFO"
 
+# The caches below are generated files the desktop shell reads back, so they run
+# under a relaxed umask instead of the owner-only one this script installs with.
+if command -v desktop-file-validate >/dev/null 2>&1; then
+    desktop-file-validate "${APPLICATIONS_DIR}/io.github.beamiter.jterm1.desktop" || true
+fi
 if command -v update-desktop-database >/dev/null 2>&1; then
-    update-desktop-database "${APPLICATIONS_DIR}" >/dev/null 2>&1 || true
+    (umask 022 && update-desktop-database "${APPLICATIONS_DIR}") >/dev/null 2>&1 || true
+fi
+# A stale icon cache shadows the icons installed above, so always rebuild it.
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    (umask 022 && gtk-update-icon-cache --force --ignore-theme-index --quiet \
+        "${DATA_HOME}/icons/hicolor") >/dev/null 2>&1 || true
 fi
 
 cat <<EOF_MESSAGE

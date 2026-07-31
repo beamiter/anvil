@@ -5,6 +5,7 @@ edition = "2021"
 description = "A block-aware Linux terminal workspace built with Rust, GTK 4, Relm4, and VTE"
 repository = "https://github.com/beamiter/jterm1"
 readme = "README.md"
+license = "MIT OR Apache-2.0"
 keywords = ["terminal", "gtk", "rust", "shell", "productivity"]
 categories = ["command-line-utilities", "development-tools"]
 

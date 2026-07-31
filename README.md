@@ -73,10 +73,29 @@ it builds a release binary and installs only user-local files:
 - `~/.local/bin/jterm1`
 - `${XDG_CONFIG_HOME:-$HOME/.config}/jterm1/config.toml`
 - `${XDG_DATA_HOME:-$HOME/.local/share}/applications/io.github.beamiter.jterm1.desktop`
+- icons under
+  `${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/{scalable,128x128,256x256}/apps/`
+  and AppStream metadata under `.../metainfo/`
 - shell integration and examples under
   `${XDG_DATA_HOME:-$HOME/.local/share}/jterm1/`
 - sample workflows under
   `${XDG_DATA_HOME:-$HOME/.local/share}/jterm1/workflows/`
+
+That desktop integration is what makes jterm1 appear in the GNOME/KDE
+application list with its own icon, ready to pin. Two details matter for it to
+show up at all, and the installer handles both:
+
+- `Exec=`/`TryExec=` are rewritten to the binary's absolute path (system
+  prefixes such as `/usr` keep the relocatable bare name). A desktop session
+  fixes its `PATH` at login, so `TryExec=jterm1` fails and hides the entry
+  **completely** when `~/.local/bin` is not on that `PATH` — the usual reason an
+  install produces no launcher icon.
+- `update-desktop-database` and `gtk-update-icon-cache` are refreshed after
+  install and uninstall (a stale icon cache shadows newly installed icons).
+  `DESTDIR` builds skip the refresh and leave it to the package manager.
+
+Verify with `desktop-file-validate <entry>` and `gtk-launch
+io.github.beamiter.jterm1`; use `--no-desktop` to install only the binary.
 
 It never replaces an existing `config.toml`; installed examples live outside
 the user-authored workflow directory. Make sure `~/.local/bin` is in `PATH`,
@@ -569,3 +588,10 @@ packaging/                    desktop integration
 
 Use `cargo fmt`, `cargo clippy --all-targets`, and `cargo test --all-targets`
 before submitting changes.
+
+## License
+
+jterm1 is dual-licensed under **MIT OR Apache-2.0**; pick either at your option.
+Full texts are in [`LICENSE-MIT`](LICENSE-MIT) and
+[`LICENSE-APACHE`](LICENSE-APACHE). Contributions are accepted under the same
+dual terms.

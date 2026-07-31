@@ -7,6 +7,10 @@ versioning for tagged releases while it remains experimental.
 
 ### Added
 
+- Project licensing under `MIT OR Apache-2.0`: canonical `LICENSE-MIT` and
+  `LICENSE-APACHE` texts, a `license` field in `Cargo.toml`, and the matching
+  AppStream `project_license`, which until now claimed `LicenseRef-proprietary`
+  because the repository granted no license at all.
 - The session AI panel now streams replies: assistant text appears in the
   transcript as it generates instead of after the full response. On success
   the streamed text is replaced by the provider's complete reply, so the
@@ -173,6 +177,29 @@ versioning for tagged releases while it remains experimental.
   open with that error rather than starting unmanaged.
 
 ### Fixed
+
+- The desktop integration now actually produces a launcher icon after
+  `./scripts/install.sh`. Three separate causes:
+  - The entry shipped `Exec=jterm1` / `TryExec=jterm1`, which depend on `PATH`.
+    A desktop session fixes its `PATH` at login and the default target
+    `~/.local/bin` is frequently absent from it, so `TryExec` failed and the
+    entry vanished from the application list entirely. Both installers now
+    rewrite those lines to the binary's absolute path; system bin directories
+    such as `/usr/bin` keep the relocatable bare name.
+  - Neither installer refreshed the desktop caches, so new entries and icons
+    waited for the next login, and a stale `icon-theme.cache` could shadow a
+    freshly installed icon indefinitely. Install and uninstall now validate the
+    entry and refresh `update-desktop-database` and `gtk-update-icon-cache`,
+    skipping the refresh for `DESTDIR` staging and generating those caches under
+    a relaxed umask so a `sudo --prefix /usr` install cannot leave `0600` caches
+    that no other user can read.
+  - `StartupWMClass` carried the application ID, but GTK4 derives the X11
+    `WM_CLASS` from the program name (measured: `jterm1`). X11 sessions could
+    not associate a running window with the entry, so the dock showed a second,
+    icon-less item. It is now `jterm1`; Wayland still matches on app_id.
+- The installer now reports `PATH` problems it cannot fix: a target bin
+  directory outside `PATH`, and any other `jterm1` earlier in `PATH` (such as an
+  old `cargo install` copy) that shadows the binary just installed.
 
 - Inline images render again in block mode. The Kitty graphics assembler
   (`terminal/kitty_graphics.rs`) had no caller: block mode re-wrapped every

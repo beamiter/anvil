@@ -10,7 +10,9 @@ Terminal=false
 Categories=System;TerminalEmulator;
 Keywords=terminal;shell;console;command;developer;ssh;blocks;workflow;notebook;AI;
 StartupNotify=true
-StartupWMClass=io.github.beamiter.jterm1
+# GTK4 derives the X11 WM_CLASS from the program name, so this is "jterm1" and
+# not the application ID; on Wayland the app_id already matches this file's name.
+StartupWMClass=jterm1
 X-GNOME-UsesNotifications=true
 Actions=NewWindow;
 
