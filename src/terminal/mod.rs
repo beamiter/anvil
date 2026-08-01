@@ -105,9 +105,23 @@ mod tests {
     }
 
     fn check_optional_syntax(program: &str, arguments: &[&str], path: &Path) {
-        let result = Command::new(program)
-            .args(arguments)
-            .arg(path)
+        check_optional_syntax_with_path_env(program, arguments, path, None);
+    }
+
+    fn check_optional_syntax_with_path_env(
+        program: &str,
+        arguments: &[&str],
+        path: &Path,
+        path_environment: Option<&str>,
+    ) {
+        let mut command = Command::new(program);
+        command.args(arguments);
+        if let Some(environment) = path_environment {
+            command.env(environment, path);
+        } else {
+            command.arg(path);
+        }
+        let result = command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -319,11 +333,13 @@ cwd_sequence=$(__jterm1_report_cwd)
         check_optional_syntax("zsh", &["-n"], &integration_path("jterm1.zsh"));
         check_optional_syntax("fish", &["-n"], &integration_path("jterm1.fish"));
 
+        // `-Command` does not consistently expose trailing native arguments in
+        // `$args`, so pass the path through a process-local environment value.
         let powershell_parser = r#"
 $tokens = $null
 $errors = $null
 [System.Management.Automation.Language.Parser]::ParseFile(
-    $args[0], [ref]$tokens, [ref]$errors
+    $env:JTERM1_PS1_SYNTAX_PATH, [ref]$tokens, [ref]$errors
 ) | Out-Null
 if ($errors.Count -ne 0) {
     $errors | ForEach-Object { [Console]::Error.WriteLine($_) }
@@ -339,7 +355,7 @@ if ($errors.Count -ne 0) {
             .status()
             .is_ok();
         if pwsh_available {
-            check_optional_syntax(
+            check_optional_syntax_with_path_env(
                 "pwsh",
                 &[
                     "-NoProfile",
@@ -348,9 +364,10 @@ if ($errors.Count -ne 0) {
                     powershell_parser,
                 ],
                 &powershell_path,
+                Some("JTERM1_PS1_SYNTAX_PATH"),
             );
         } else {
-            check_optional_syntax(
+            check_optional_syntax_with_path_env(
                 "powershell",
                 &[
                     "-NoProfile",
@@ -359,6 +376,7 @@ if ($errors.Count -ne 0) {
                     powershell_parser,
                 ],
                 &powershell_path,
+                Some("JTERM1_PS1_SYNTAX_PATH"),
             );
         }
     }
