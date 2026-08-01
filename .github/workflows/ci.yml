@@ -108,7 +108,7 @@ jobs:
             python3 -m json.tool >/dev/null
 
           config_root="$(mktemp -d)"
-          mkdir -p "${config_root}/jterm1"
+          install -d -m 0700 "${config_root}/jterm1"
           cp config.toml.example "${config_root}/jterm1/config.toml"
           XDG_CONFIG_HOME="${config_root}" target/release/jterm1 --check-config
           test "$(XDG_CONFIG_HOME="${config_root}" target/release/jterm1 --config-path)" = \
