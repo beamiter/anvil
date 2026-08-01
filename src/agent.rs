@@ -32,8 +32,8 @@ use relm4::gtk;
 use relm4::prelude::*;
 
 pub(crate) use jterm_core::agent::{
-    is_dangerous, AgentState, ApprovedCommand, CancellationToken, ModelOutcome, ProposalId,
-    ProposalStatus, SessionError, Turn,
+    is_dangerous, AgentSessionEpoch, AgentState, ApprovedCommand, CancellationToken, ModelOutcome,
+    ProposalId, ProposalStatus, SessionError, Turn,
 };
 use jterm_core::agent::{parse_action, ParseError, ParsedAction};
 
@@ -41,6 +41,11 @@ use jterm_core::agent::AgentSession as CoreSession;
 
 const MAX_LOCAL_AGENT_COMMAND_BYTES: usize = 16 * 1024;
 const MAX_AGENT_DISPLAY_BYTES: usize = 32 * 1024;
+/// App-level ceiling for one raw model reply, applied before parsing and
+/// before any transcript mutation. The protocol layer bounds each decoded
+/// field, but the raw reply arrives from the provider bounded only by the
+/// transport; a reply this large is a malfunctioning provider, not an action.
+const MAX_AGENT_MODEL_REPLY_BYTES: usize = 128 * 1024;
 
 fn agent_display_text(text: &str, preserve_multiline: bool) -> String {
     crate::text_safety::bounded_display_text(text, MAX_AGENT_DISPLAY_BYTES, preserve_multiline)
@@ -65,6 +70,19 @@ pub(crate) fn local_agent_command_issue(command: &str) -> Option<&'static str> {
 fn local_agent_command_error(command: &str) -> Option<SessionError> {
     local_agent_command_issue(command)
         .map(|issue| SessionError::Protocol(ParseError::InvalidCommand(issue.to_string())))
+}
+
+/// A UI action's binding to one proposal of one session generation.
+///
+/// A transcript index alone identifies a *row*, and rows move: New Task,
+/// a restore, or a replacement session all renumber them while a click,
+/// an edit dialog, or a queued message is still in flight. The epoch makes a
+/// stale action detectable instead of letting it land on whatever proposal now
+/// occupies that row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AgentProposalRef {
+    pub(crate) epoch: AgentSessionEpoch,
+    pub(crate) id: ProposalId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -163,11 +181,14 @@ impl AgentSession {
         self.inner.cancellation_token()
     }
 
-    pub(crate) fn proposal_id_at(&self, transcript_index: usize) -> Option<ProposalId> {
-        match self.inner.transcript().get(transcript_index) {
-            Some(Turn::AssistantProposed { id, .. }) => Some(*id),
-            _ => None,
-        }
+    pub(crate) fn epoch(&self) -> AgentSessionEpoch {
+        self.inner.epoch()
+    }
+
+    /// Resolve a UI action to its proposal, refusing one raised against an
+    /// earlier task generation or a session that has since been replaced.
+    pub(crate) fn resolve_proposal(&self, reference: AgentProposalRef) -> Option<ProposalId> {
+        (reference.epoch == self.inner.epoch()).then_some(reference.id)
     }
 
     pub(crate) fn submit_user(&mut self, message: impl Into<String>) -> Result<(), SessionError> {
@@ -176,6 +197,17 @@ impl AgentSession {
 
     pub(crate) fn accept_model_reply(&mut self, raw: &str) -> Result<ModelOutcome, SessionError> {
         self.in_flight = None;
+        if raw.len() > MAX_AGENT_MODEL_REPLY_BYTES {
+            // Recorded as a provider failure: no turn is consumed, nothing is
+            // parsed, and the oversized bytes never reach the transcript.
+            self.inner.model_failed(format!(
+                "model reply of {} bytes exceeds the {MAX_AGENT_MODEL_REPLY_BYTES}-byte Agent limit",
+                raw.len()
+            ))?;
+            return Err(SessionError::Protocol(ParseError::FieldTooLarge(
+                "model reply",
+            )));
+        }
         if let Ok(ParsedAction::Run { command, .. }) = parse_action(raw) {
             if local_agent_command_issue(&command).is_some() {
                 // Drive the old core through its normal protocol-error
@@ -209,7 +241,7 @@ impl AgentSession {
             }
         }
         let approved = self.inner.approve(id)?;
-        self.arm_approved(&approved);
+        self.arm_approved(&approved)?;
         Ok(approved)
     }
 
@@ -223,20 +255,31 @@ impl AgentSession {
             return Err(error);
         }
         let approved = self.inner.edit_and_approve(id, edited_command)?;
-        self.arm_approved(&approved);
+        self.arm_approved(&approved)?;
         Ok(approved)
     }
 
-    fn arm_approved(&mut self, approved: &ApprovedCommand) {
-        self.next_execution_generation = self.next_execution_generation.wrapping_add(1);
-        if self.next_execution_generation == 0 {
-            self.next_execution_generation = 1;
-        }
+    /// Arm the one-shot execution identity for an approved command.
+    ///
+    /// The counter is checked, never wrapped: a reused generation would let a
+    /// late completion from an earlier execution attach its output to this
+    /// approval. Exhaustion is unreachable in practice — it needs 2^64
+    /// approvals in one session — so the honest response is to seal the
+    /// session rather than to start reusing identities.
+    fn arm_approved(&mut self, approved: &ApprovedCommand) -> Result<(), SessionError> {
+        let Some(generation) = self.next_execution_generation.checked_add(1) else {
+            self.cancel();
+            return Err(SessionError::Protocol(ParseError::InvalidCommand(
+                "Agent execution identities are exhausted".to_string(),
+            )));
+        };
+        self.next_execution_generation = generation;
         self.awaiting_command = Some(PendingAgentCommand {
             proposal_id: approved.proposal_id,
             command: approved.command.clone(),
-            generation: self.next_execution_generation,
+            generation,
         });
+        Ok(())
     }
 
     /// Approval changed the pure protocol state, but the terminal could not
@@ -323,6 +366,9 @@ impl Drop for AgentSession {
 
 #[derive(Debug, Clone)]
 pub(crate) struct AgentPanelView {
+    /// Task generation the transcript below belongs to. Every action the panel
+    /// emits carries it back so a stale click cannot bind to a new proposal.
+    pub(crate) epoch: Option<AgentSessionEpoch>,
     pub(crate) transcript: Vec<Turn>,
     pub(crate) turns_used: u32,
     pub(crate) max_turns: u32,
@@ -350,9 +396,9 @@ pub(crate) enum AgentPanelMsg {
 #[derive(Debug)]
 pub(crate) enum AgentPanelOutput {
     Send(String),
-    Approve(usize),
-    Edit(usize, String),
-    Reject(usize),
+    Approve(AgentProposalRef),
+    Edit(AgentProposalRef, String),
+    Reject(AgentProposalRef),
     Continue,
     NewTask,
     ClearContext,
@@ -480,6 +526,7 @@ impl Component for AgentPanelModel {
         let model = Self {
             parent,
             view: AgentPanelView {
+                epoch: None,
                 transcript: Vec::new(),
                 turns_used: 0,
                 max_turns: 1,
@@ -547,7 +594,7 @@ impl AgentPanelModel {
         while let Some(child) = widgets.transcript_box.first_child() {
             widgets.transcript_box.remove(&child);
         }
-        for (index, turn) in self.view.transcript.iter().enumerate() {
+        for turn in &self.view.transcript {
             let widget = match turn {
                 Turn::User(message) => render_user(message),
                 Turn::AssistantThought(message) => render_thought(message),
@@ -557,7 +604,9 @@ impl AgentPanelModel {
                     command,
                     status,
                 } => render_proposed(
-                    index,
+                    self.view
+                        .epoch
+                        .map(|epoch| AgentProposalRef { epoch, id: *id }),
                     *id,
                     command,
                     *status,
@@ -628,19 +677,21 @@ impl AgentPanelModel {
 
 #[derive(Debug)]
 pub(crate) enum AgentEditMsg {
-    Open(usize, String),
+    Open(AgentProposalRef, String),
     Submit,
     Close,
 }
 
 #[derive(Debug)]
 pub(crate) enum AgentEditOutput {
-    Approved(usize, String),
+    Approved(AgentProposalRef, String),
 }
 
 pub(crate) struct AgentEditModel {
     parent: adw::ApplicationWindow,
-    index: usize,
+    /// The proposal the open dialog is editing. `None` until it is opened, so
+    /// a Submit that somehow arrives first cannot approve anything.
+    reference: Option<AgentProposalRef>,
 }
 
 #[relm4::component(pub(crate))]
@@ -698,7 +749,10 @@ impl Component for AgentEditModel {
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
-        let model = Self { parent, index: 0 };
+        let model = Self {
+            parent,
+            reference: None,
+        };
         let widgets = view_output!();
         ComponentParts { model, widgets }
     }
@@ -711,8 +765,8 @@ impl Component for AgentEditModel {
         root: &Self::Root,
     ) {
         match msg {
-            AgentEditMsg::Open(index, command) => {
-                self.index = index;
+            AgentEditMsg::Open(reference, command) => {
+                self.reference = Some(reference);
                 widgets.entry.set_text(&agent_display_text(&command, false));
                 widgets.entry.select_region(0, -1);
                 root.present(Some(&self.parent));
@@ -721,13 +775,16 @@ impl Component for AgentEditModel {
             AgentEditMsg::Submit => {
                 let command = widgets.entry.text();
                 let command = command.trim();
-                if !command.is_empty() {
+                if let (false, Some(reference)) = (command.is_empty(), self.reference.take()) {
                     root.force_close();
                     let _ =
-                        sender.output(AgentEditOutput::Approved(self.index, command.to_string()));
+                        sender.output(AgentEditOutput::Approved(reference, command.to_string()));
                 }
             }
-            AgentEditMsg::Close => root.force_close(),
+            AgentEditMsg::Close => {
+                self.reference = None;
+                root.force_close();
+            }
         }
     }
 }
@@ -790,7 +847,7 @@ fn render_protocol_error(message: &str) -> gtk::Widget {
 }
 
 fn render_proposed(
-    idx: usize,
+    reference: Option<AgentProposalRef>,
     id: ProposalId,
     command: &str,
     status: ProposalStatus,
@@ -846,29 +903,34 @@ fn render_proposed(
             } else {
                 approve.add_css_class("suggested-action");
             }
-            approve.set_sensitive(is_current && issue.is_none());
+            // Without an epoch the panel is rendering a transcript no live
+            // session owns, so no action may be raised from it at all.
+            let actionable = is_current && reference.is_some();
+            approve.set_sensitive(actionable && issue.is_none());
             let edit = gtk::Button::with_label("Edit");
             let reject = gtk::Button::with_label("Reject");
-            edit.set_sensitive(is_current);
-            reject.set_sensitive(is_current);
-            {
-                let sender = sender.clone();
-                approve.connect_clicked(move |_| {
-                    let _ = sender.output(AgentPanelOutput::Approve(idx));
-                });
-            }
-            {
-                let sender = sender.clone();
-                let cmd_str = command.to_string();
-                edit.connect_clicked(move |_| {
-                    let _ = sender.output(AgentPanelOutput::Edit(idx, cmd_str.clone()));
-                });
-            }
-            {
-                let sender = sender.clone();
-                reject.connect_clicked(move |_| {
-                    let _ = sender.output(AgentPanelOutput::Reject(idx));
-                });
+            edit.set_sensitive(actionable);
+            reject.set_sensitive(actionable);
+            if let Some(reference) = reference {
+                {
+                    let sender = sender.clone();
+                    approve.connect_clicked(move |_| {
+                        let _ = sender.output(AgentPanelOutput::Approve(reference));
+                    });
+                }
+                {
+                    let sender = sender.clone();
+                    let cmd_str = command.to_string();
+                    edit.connect_clicked(move |_| {
+                        let _ = sender.output(AgentPanelOutput::Edit(reference, cmd_str.clone()));
+                    });
+                }
+                {
+                    let sender = sender.clone();
+                    reject.connect_clicked(move |_| {
+                        let _ = sender.output(AgentPanelOutput::Reject(reference));
+                    });
+                }
             }
             btn_row.append(&reject);
             btn_row.append(&edit);
@@ -986,15 +1048,70 @@ mod tests {
     }
 
     #[test]
-    fn proposal_id_at_maps_transcript_rows_to_proposals() {
+    fn a_ui_action_only_resolves_within_its_own_task_generation() {
         let mut s = session(10);
         s.submit_user("run something").unwrap();
         let ModelOutcome::Proposal { id, .. } = s.accept_model_reply(&run_reply("true")).unwrap()
         else {
             panic!("expected proposal");
         };
-        assert_eq!(s.proposal_id_at(0), None, "row 0 is the user turn");
-        assert_eq!(s.proposal_id_at(1), Some(id));
+        let reference = AgentProposalRef {
+            epoch: s.epoch(),
+            id,
+        };
+        assert_eq!(s.resolve_proposal(reference), Some(id));
+
+        // New Task renumbers proposals, so a click still in flight from the
+        // previous transcript must not land on whatever now holds that id.
+        s.reject(id).unwrap();
+        s.accept_model_reply(&serde_json::json!({"action":"done","message":"done"}).to_string())
+            .unwrap();
+        s.start_new_task().unwrap();
+        assert_ne!(s.epoch(), reference.epoch);
+        assert_eq!(s.resolve_proposal(reference), None);
+
+        s.submit_user("run something else").unwrap();
+        let ModelOutcome::Proposal { id: fresh, .. } =
+            s.accept_model_reply(&run_reply("false")).unwrap()
+        else {
+            panic!("expected proposal");
+        };
+        assert_eq!(
+            s.resolve_proposal(AgentProposalRef {
+                epoch: s.epoch(),
+                id: fresh
+            }),
+            Some(fresh)
+        );
+    }
+
+    #[test]
+    fn an_oversized_model_reply_never_reaches_the_parser() {
+        let mut s = session(10);
+        s.submit_user("summarize").unwrap();
+        let oversized = serde_json::json!({
+            "action": "say",
+            "message": "x".repeat(MAX_AGENT_MODEL_REPLY_BYTES),
+        })
+        .to_string();
+        assert!(oversized.len() > MAX_AGENT_MODEL_REPLY_BYTES);
+        assert!(matches!(
+            s.accept_model_reply(&oversized),
+            Err(SessionError::Protocol(ParseError::FieldTooLarge(
+                "model reply"
+            )))
+        ));
+        // Recorded as a provider failure: the model turn is not consumed, so
+        // the user can retry, and no transcript entry carries the reply.
+        assert_eq!(s.turns_used(), 0);
+        assert!(matches!(
+            s.transcript().last(),
+            Some(Turn::ProtocolError(message)) if message.contains("exceeds the")
+        ));
+        assert!(s
+            .transcript()
+            .iter()
+            .all(|turn| !matches!(turn, Turn::AssistantSay(_))));
     }
 
     #[test]

@@ -18,7 +18,7 @@
 
 use gtk::glib;
 use relm4::gtk;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -59,12 +59,25 @@ const MAX_RESTORED_TITLE_BYTES: usize = 4 * 1024;
 const MAX_RESTORED_COMMAND_ARGS: usize = 256;
 const MAX_RESTORED_COMMAND_ARG_BYTES: usize = 64 * 1024;
 const MAX_RESTORED_COMMAND_BYTES: usize = 256 * 1024;
+/// A pane tree with at most `MAX_RESTORED_PANES_PER_TAB` leaves cannot nest
+/// deeper than that, so the same number bounds recursion while decoding — long
+/// before `serde_json`'s own generic recursion limit would notice.
+const MAX_RESTORED_LAYOUT_DEPTH: usize = MAX_RESTORED_PANES_PER_TAB;
+const MAX_RESTORED_MODE_BYTES: usize = 64;
+const MAX_RESTORED_CWD_BYTES: usize = 16 * 1024;
+const MAX_RESTORED_REMOTE_NAME_BYTES: usize = 256;
+const MAX_RESTORED_SID_BYTES: usize = 256;
+const MAX_RESTORED_ENVELOPE_FORMAT_BYTES: usize = 64;
+const MAX_RESTORED_SUPERSEDES_BYTES: usize = 256;
 const OWNER_TOKEN_ATTEMPTS: usize = 128;
 static SNAPSHOT_OWNER: OnceLock<Result<SnapshotOwner, String>> = OnceLock::new();
 
 /// One node of a tab's pane tree: either a terminal leaf or a split of two
 /// subtrees. Mirrors jterm4's `PaneLayout`.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+/// Deliberately not `Deserialize`: [`decode_saved_session`] is the only wire
+/// path, and it enforces the tab, pane, depth, field, and argv budgets while
+/// decoding instead of after a whole snapshot has been allocated.
+#[derive(Serialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub(crate) enum PaneLayout {
     Leaf {
@@ -105,7 +118,7 @@ pub(crate) enum PaneLayout {
     },
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Debug, Clone)]
 pub(crate) struct SavedTab {
     pub title: String,
     pub custom_title: bool,
@@ -116,7 +129,7 @@ pub(crate) struct SavedTab {
     pub layout: PaneLayout,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Debug, Clone, Default)]
 pub(crate) struct SavedSession {
     pub active: usize,
     pub tabs: Vec<SavedTab>,
@@ -127,8 +140,7 @@ pub(crate) struct SavedSession {
 /// The envelope also carries the immediate claimed predecessor: after a crash
 /// between durable checkpoint and claim cleanup, the next owner can finish the
 /// chain without ever reviving an older workspace.
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Serialize)]
 struct SessionEnvelope<T> {
     format: String,
     version: u8,
@@ -137,7 +149,7 @@ struct SessionEnvelope<T> {
     supersedes: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
 #[serde(tag = "kind", content = "session", rename_all = "snake_case")]
 enum SessionEnvelopePayload<T> {
     Workspace(T),
@@ -708,6 +720,605 @@ fn read_snapshot_bounded(path: &Path) -> io::Result<String> {
     read_snapshot_bounded_to(path, MAX_SNAPSHOT_BYTES)
 }
 
+// ---------------------------------------------------------------------------
+// Bounded snapshot decoding
+// ---------------------------------------------------------------------------
+
+/// Pane budget shared by every seed decoding one snapshot.
+///
+/// The file is already capped at `MAX_SNAPSHOT_BYTES`, but 4 MiB describes
+/// thousands of tabs, a pane tree nested as deep as the JSON parser allows, or
+/// a handful of near-file-sized strings. Ordinary Serde deserialization builds
+/// all of that and only then meets `session_within_restore_limits`, so the
+/// seeds below charge as they decode and stop at the first value that does not
+/// fit. The post-decode audit stays as the semantic backstop.
+struct RestoreBudget {
+    remaining_panes: usize,
+}
+
+/// Decode one string, rejecting it before it is owned if it does not fit.
+struct BoundedText {
+    field: &'static str,
+    limit: usize,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for BoundedText {
+    type Value = String;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_str(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for BoundedText {
+    type Value = String;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "a '{}' string of at most {} bytes",
+            self.field, self.limit
+        )
+    }
+
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        if value.len() > self.limit {
+            return Err(E::custom(format_args!(
+                "'{}' exceeds its {}-byte restore limit",
+                self.field, self.limit
+            )));
+        }
+        Ok(value.to_owned())
+    }
+}
+
+/// `Option<String>` with the same bound, for nullable fields.
+struct BoundedOptionalText(BoundedText);
+
+impl<'de> serde::de::DeserializeSeed<'de> for BoundedOptionalText {
+    type Value = Option<String>;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_option(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for BoundedOptionalText {
+    type Value = Option<String>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.expecting(formatter)
+    }
+
+    fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_some<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        serde::de::DeserializeSeed::deserialize(self.0, deserializer).map(Some)
+    }
+}
+
+/// The upstream argv decoder is already counted, byte-bounded, and
+/// spoofing-aware, and it degrades an unusable argv to `None` rather than
+/// failing the whole restore. Reuse it verbatim instead of writing a second,
+/// subtly different rule.
+struct RestorableArgvSeed;
+
+impl<'de> serde::de::DeserializeSeed<'de> for RestorableArgvSeed {
+    type Value = Option<Vec<String>>;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        jterm_core::process::deserialize_restorable_argv(deserializer)
+    }
+}
+
+struct PaneLayoutSeed<'a> {
+    budget: &'a mut RestoreBudget,
+    /// Panes still allowed in the tab being decoded.
+    tab_panes: &'a mut usize,
+    depth: usize,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for PaneLayoutSeed<'_> {
+    type Value = PaneLayout;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for PaneLayoutSeed<'_> {
+    type Value = PaneLayout;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a pane layout node")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        use serde::de::Error as _;
+
+        let Self {
+            budget,
+            tab_panes,
+            depth,
+        } = self;
+        if depth == 0 {
+            return Err(A::Error::custom(format_args!(
+                "pane layout nests deeper than {MAX_RESTORED_LAYOUT_DEPTH} levels"
+            )));
+        }
+
+        // The variants' field sets are disjoint, so every field can be decoded
+        // as it arrives and the tag resolved at the end. That keeps the
+        // internally tagged shape readable in any key order without buffering
+        // the node the way a derived implementation would.
+        let mut kind: Option<String> = None;
+        let mut mode = None;
+        let mut cwd = None;
+        let mut cwd_external = None;
+        let mut remote_name = None;
+        let mut sid = None;
+        let mut cmds = None;
+        let mut orientation = None;
+        let mut position = None;
+        let mut start: Option<Box<PaneLayout>> = None;
+        let mut end: Option<Box<PaneLayout>> = None;
+
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "type" => {
+                    kind = Some(map.next_value_seed(BoundedText {
+                        field: "type",
+                        limit: 32,
+                    })?)
+                }
+                "mode" => {
+                    mode = Some(map.next_value_seed(BoundedText {
+                        field: "mode",
+                        limit: MAX_RESTORED_MODE_BYTES,
+                    })?)
+                }
+                "cwd" => {
+                    cwd = map.next_value_seed(BoundedOptionalText(BoundedText {
+                        field: "cwd",
+                        limit: MAX_RESTORED_CWD_BYTES,
+                    }))?
+                }
+                "cwd_external" => cwd_external = Some(map.next_value::<bool>()?),
+                "remote_name" => {
+                    remote_name = map.next_value_seed(BoundedOptionalText(BoundedText {
+                        field: "remote_name",
+                        limit: MAX_RESTORED_REMOTE_NAME_BYTES,
+                    }))?
+                }
+                "sid" => {
+                    sid = map.next_value_seed(BoundedOptionalText(BoundedText {
+                        field: "sid",
+                        limit: MAX_RESTORED_SID_BYTES,
+                    }))?
+                }
+                "cmds" => cmds = map.next_value_seed(RestorableArgvSeed)?,
+                "orientation" => orientation = Some(map.next_value::<char>()?),
+                "position" => position = Some(map.next_value::<i32>()?),
+                "start" => {
+                    start = Some(Box::new(map.next_value_seed(PaneLayoutSeed {
+                        budget: &mut *budget,
+                        tab_panes: &mut *tab_panes,
+                        depth: depth - 1,
+                    })?))
+                }
+                "end" => {
+                    end = Some(Box::new(map.next_value_seed(PaneLayoutSeed {
+                        budget: &mut *budget,
+                        tab_panes: &mut *tab_panes,
+                        depth: depth - 1,
+                    })?))
+                }
+                // Fields from other releases are ignored, not rejected: a
+                // snapshot written by a newer or older jterm1 must still
+                // restore. `IgnoredAny` skips them without allocating.
+                _ => {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+        }
+
+        match kind.as_deref() {
+            Some("leaf") => {
+                if *tab_panes == 0 {
+                    return Err(A::Error::custom(format_args!(
+                        "tab exceeds its {MAX_RESTORED_PANES_PER_TAB}-pane limit"
+                    )));
+                }
+                if budget.remaining_panes == 0 {
+                    return Err(A::Error::custom(format_args!(
+                        "session exceeds its {MAX_RESTORED_PANES_TOTAL}-pane limit"
+                    )));
+                }
+                *tab_panes -= 1;
+                budget.remaining_panes -= 1;
+                Ok(PaneLayout::Leaf {
+                    mode: mode.ok_or_else(|| A::Error::missing_field("mode"))?,
+                    cwd,
+                    cwd_external: cwd_external.unwrap_or_default(),
+                    remote_name,
+                    sid,
+                    cmds,
+                })
+            }
+            Some("split") => Ok(PaneLayout::Split {
+                orientation: orientation.ok_or_else(|| A::Error::missing_field("orientation"))?,
+                position: position.ok_or_else(|| A::Error::missing_field("position"))?,
+                start: start.ok_or_else(|| A::Error::missing_field("start"))?,
+                end: end.ok_or_else(|| A::Error::missing_field("end"))?,
+            }),
+            Some(other) => Err(A::Error::unknown_variant(other, &["leaf", "split"])),
+            None => Err(A::Error::missing_field("type")),
+        }
+    }
+}
+
+struct SavedTabSeed<'a> {
+    budget: &'a mut RestoreBudget,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for SavedTabSeed<'_> {
+    type Value = SavedTab;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for SavedTabSeed<'_> {
+    type Value = SavedTab;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a saved tab")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        use serde::de::Error as _;
+
+        let budget = self.budget;
+        let mut title = None;
+        let mut custom_title = None;
+        let mut pinned = None;
+        let mut layout = None;
+        let mut tab_panes = MAX_RESTORED_PANES_PER_TAB;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "title" => {
+                    title = Some(map.next_value_seed(BoundedText {
+                        field: "title",
+                        limit: MAX_RESTORED_TITLE_BYTES,
+                    })?)
+                }
+                "custom_title" => custom_title = Some(map.next_value::<bool>()?),
+                "pinned" => pinned = Some(map.next_value::<bool>()?),
+                "layout" => {
+                    layout = Some(map.next_value_seed(PaneLayoutSeed {
+                        budget: &mut *budget,
+                        tab_panes: &mut tab_panes,
+                        depth: MAX_RESTORED_LAYOUT_DEPTH,
+                    })?)
+                }
+                _ => {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(SavedTab {
+            title: title.ok_or_else(|| A::Error::missing_field("title"))?,
+            custom_title: custom_title.ok_or_else(|| A::Error::missing_field("custom_title"))?,
+            pinned: pinned.unwrap_or_default(),
+            layout: layout.ok_or_else(|| A::Error::missing_field("layout"))?,
+        })
+    }
+}
+
+struct SavedTabsSeed<'a> {
+    budget: &'a mut RestoreBudget,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for SavedTabsSeed<'_> {
+    type Value = Vec<SavedTab>;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_seq(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for SavedTabsSeed<'_> {
+    type Value = Vec<SavedTab>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "at most {MAX_RESTORED_TABS} saved tabs")
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        use serde::de::Error as _;
+
+        let budget = self.budget;
+        let mut tabs = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(MAX_RESTORED_TABS));
+        while tabs.len() < MAX_RESTORED_TABS {
+            let Some(tab) = seq.next_element_seed(SavedTabSeed {
+                budget: &mut *budget,
+            })?
+            else {
+                return Ok(tabs);
+            };
+            tabs.push(tab);
+        }
+        // Prove the array is over-wide without building tab 33.
+        if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+            return Err(A::Error::custom(format_args!(
+                "session exceeds its {MAX_RESTORED_TABS}-tab limit"
+            )));
+        }
+        Ok(tabs)
+    }
+}
+
+struct SavedSessionSeed<'a> {
+    budget: &'a mut RestoreBudget,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for SavedSessionSeed<'_> {
+    type Value = SavedSession;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for SavedSessionSeed<'_> {
+    type Value = SavedSession;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a saved session")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        use serde::de::Error as _;
+
+        let budget = self.budget;
+        let mut active = None;
+        let mut tabs = None;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "active" => active = Some(map.next_value::<usize>()?),
+                "tabs" => {
+                    tabs = Some(map.next_value_seed(SavedTabsSeed {
+                        budget: &mut *budget,
+                    })?)
+                }
+                _ => {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(SavedSession {
+            active: active.ok_or_else(|| A::Error::missing_field("active"))?,
+            tabs: tabs.ok_or_else(|| A::Error::missing_field("tabs"))?,
+        })
+    }
+}
+
+/// Decoded form of a versioned envelope. The payload is adjacently tagged, and
+/// the workspace is the only variant carrying content, so both key orders
+/// decode without buffering.
+struct DecodedEnvelope {
+    format: String,
+    version: u8,
+    state: SnapshotState,
+    supersedes: Option<String>,
+}
+
+struct EnvelopeSeed;
+
+impl<'de> serde::de::DeserializeSeed<'de> for EnvelopeSeed {
+    type Value = DecodedEnvelope;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for EnvelopeSeed {
+    type Value = DecodedEnvelope;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a session envelope")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        use serde::de::Error as _;
+
+        let mut budget = RestoreBudget {
+            remaining_panes: MAX_RESTORED_PANES_TOTAL,
+        };
+        let mut format = None;
+        let mut version = None;
+        let mut supersedes = None;
+        let mut kind: Option<String> = None;
+        let mut session = None;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "format" => {
+                    format = Some(map.next_value_seed(BoundedText {
+                        field: "format",
+                        limit: MAX_RESTORED_ENVELOPE_FORMAT_BYTES,
+                    })?)
+                }
+                "version" => version = Some(map.next_value::<u8>()?),
+                "supersedes" => {
+                    supersedes = map.next_value_seed(BoundedOptionalText(BoundedText {
+                        field: "supersedes",
+                        limit: MAX_RESTORED_SUPERSEDES_BYTES,
+                    }))?
+                }
+                "payload" => {
+                    let (payload_kind, payload_session) =
+                        map.next_value_seed(EnvelopePayloadSeed {
+                            budget: &mut budget,
+                        })?;
+                    kind = Some(payload_kind);
+                    session = payload_session;
+                }
+                other => {
+                    return Err(A::Error::unknown_field(
+                        other,
+                        &["format", "version", "payload", "supersedes"],
+                    ))
+                }
+            }
+        }
+        let state = match (kind.as_deref(), session) {
+            (Some("workspace"), Some(session)) => SnapshotState::Workspace(session),
+            (Some("empty"), None) => SnapshotState::Empty,
+            (Some(other), _) => {
+                return Err(A::Error::custom(format_args!(
+                    "session envelope payload '{other}' does not match its content"
+                )))
+            }
+            (None, _) => return Err(A::Error::missing_field("payload")),
+        };
+        Ok(DecodedEnvelope {
+            format: format.ok_or_else(|| A::Error::missing_field("format"))?,
+            version: version.ok_or_else(|| A::Error::missing_field("version"))?,
+            state,
+            supersedes,
+        })
+    }
+}
+
+struct EnvelopePayloadSeed<'a> {
+    budget: &'a mut RestoreBudget,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for EnvelopePayloadSeed<'_> {
+    type Value = (String, Option<SavedSession>);
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for EnvelopePayloadSeed<'_> {
+    type Value = (String, Option<SavedSession>);
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a session envelope payload")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        use serde::de::Error as _;
+
+        let budget = self.budget;
+        let mut kind = None;
+        let mut session = None;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "kind" => {
+                    kind = Some(map.next_value_seed(BoundedText {
+                        field: "kind",
+                        limit: 32,
+                    })?)
+                }
+                "session" => {
+                    session = Some(map.next_value_seed(SavedSessionSeed {
+                        budget: &mut *budget,
+                    })?)
+                }
+                other => return Err(A::Error::unknown_field(other, &["kind", "session"])),
+            }
+        }
+        Ok((
+            kind.ok_or_else(|| A::Error::missing_field("kind"))?,
+            session,
+        ))
+    }
+}
+
+/// Decode a bare legacy snapshot under the restore budgets.
+fn decode_saved_session(contents: &str) -> Result<SavedSession, serde_json::Error> {
+    let mut budget = RestoreBudget {
+        remaining_panes: MAX_RESTORED_PANES_TOTAL,
+    };
+    let mut deserializer = serde_json::Deserializer::from_str(contents);
+    let session = serde::de::DeserializeSeed::deserialize(
+        SavedSessionSeed {
+            budget: &mut budget,
+        },
+        &mut deserializer,
+    )?;
+    deserializer.end()?;
+    Ok(session)
+}
+
+#[cfg(test)]
+fn decode_pane_layout(contents: &str) -> Result<PaneLayout, serde_json::Error> {
+    let mut budget = RestoreBudget {
+        remaining_panes: MAX_RESTORED_PANES_TOTAL,
+    };
+    let mut tab_panes = MAX_RESTORED_PANES_PER_TAB;
+    let mut deserializer = serde_json::Deserializer::from_str(contents);
+    let layout = serde::de::DeserializeSeed::deserialize(
+        PaneLayoutSeed {
+            budget: &mut budget,
+            tab_panes: &mut tab_panes,
+            depth: MAX_RESTORED_LAYOUT_DEPTH,
+        },
+        &mut deserializer,
+    )?;
+    deserializer.end()?;
+    Ok(layout)
+}
+
+/// Decode a versioned envelope under the restore budgets.
+fn decode_session_envelope(contents: &str) -> Result<DecodedEnvelope, serde_json::Error> {
+    let mut deserializer = serde_json::Deserializer::from_str(contents);
+    let envelope = serde::de::DeserializeSeed::deserialize(EnvelopeSeed, &mut deserializer)?;
+    deserializer.end()?;
+    Ok(envelope)
+}
+
 fn pane_layout_within_restore_limits(layout: &PaneLayout) -> Option<usize> {
     fn command_within_limits(argv: &[String]) -> bool {
         if argv.is_empty() || argv.len() > MAX_RESTORED_COMMAND_ARGS {
@@ -744,10 +1355,16 @@ fn pane_layout_within_restore_limits(layout: &PaneLayout) -> Option<usize> {
                 cmds,
                 ..
             } => {
-                if mode.len() > 64
-                    || cwd.as_ref().is_some_and(|value| value.len() > 16 * 1024)
-                    || remote_name.as_ref().is_some_and(|value| value.len() > 256)
-                    || sid.as_ref().is_some_and(|value| value.len() > 256)
+                if mode.len() > MAX_RESTORED_MODE_BYTES
+                    || cwd
+                        .as_ref()
+                        .is_some_and(|value| value.len() > MAX_RESTORED_CWD_BYTES)
+                    || remote_name
+                        .as_ref()
+                        .is_some_and(|value| value.len() > MAX_RESTORED_REMOTE_NAME_BYTES)
+                    || sid
+                        .as_ref()
+                        .is_some_and(|value| value.len() > MAX_RESTORED_SID_BYTES)
                     || cmds
                         .as_deref()
                         .is_some_and(|argv| !command_within_limits(argv))
@@ -1322,7 +1939,7 @@ fn parse_snapshot_payload(
     dir: &Path,
     source_file: &StateFileName,
 ) -> io::Result<(SnapshotState, Option<ClaimReference>)> {
-    match serde_json::from_str::<SessionEnvelope<SavedSession>>(contents) {
+    match decode_session_envelope(contents) {
         Ok(envelope) => {
             if envelope.format != SESSION_ENVELOPE_FORMAT
                 || envelope.version != SESSION_ENVELOPE_VERSION
@@ -1340,8 +1957,8 @@ fn parse_snapshot_payload(
                 .as_deref()
                 .map(|name| superseded_claim_reference(dir, source_file, name))
                 .transpose()?;
-            let state = match envelope.payload {
-                SessionEnvelopePayload::Workspace(mut session) => {
+            let state = match envelope.state {
+                SnapshotState::Workspace(mut session) => {
                     if !session_within_restore_limits(&session) {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -1351,12 +1968,12 @@ fn parse_snapshot_payload(
                     sanitize_restorable_commands(&mut session);
                     SnapshotState::Workspace(session)
                 }
-                SessionEnvelopePayload::Empty => SnapshotState::Empty,
+                SnapshotState::Empty => SnapshotState::Empty,
             };
             Ok((state, supersedes))
         }
         Err(envelope_error) => {
-            let mut session = serde_json::from_str::<SavedSession>(contents).map_err(|legacy_error| {
+            let mut session = decode_saved_session(contents).map_err(|legacy_error| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
@@ -2090,6 +2707,123 @@ mod tests {
         }
     }
 
+    /// A minimal leaf, and a `depth`-deep chain of splits ending in leaves.
+    fn leaf_json() -> String {
+        r#"{"type":"leaf","mode":"block"}"#.to_string()
+    }
+
+    fn nested_layout_json(depth: usize) -> String {
+        let mut layout = leaf_json();
+        for _ in 0..depth {
+            layout = format!(
+                r#"{{"type":"split","orientation":"h","position":100,"start":{layout},"end":{}}}"#,
+                leaf_json()
+            );
+        }
+        layout
+    }
+
+    fn tabs_json(count: usize, layout: &str) -> String {
+        (0..count)
+            .map(|index| {
+                format!(r#"{{"title":"tab {index}","custom_title":false,"layout":{layout}}}"#)
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    fn session_json(tabs: &str) -> String {
+        format!(r#"{{"active":0,"tabs":[{tabs}]}}"#)
+    }
+
+    #[test]
+    fn decoding_stops_before_building_an_over_wide_or_over_deep_snapshot() {
+        let widest = session_json(&tabs_json(MAX_RESTORED_TABS, &leaf_json()));
+        assert_eq!(
+            decode_saved_session(&widest).unwrap().tabs.len(),
+            MAX_RESTORED_TABS
+        );
+
+        // Thousands of tabs still fit the 4 MiB file cap, which is exactly the
+        // amplification the seeds prevent.
+        let over_wide = session_json(&tabs_json(MAX_RESTORED_TABS * 40, &leaf_json()));
+        assert!((over_wide.len() as u64) < MAX_SNAPSHOT_BYTES);
+        assert!(decode_saved_session(&over_wide)
+            .unwrap_err()
+            .to_string()
+            .contains("32-tab limit"));
+
+        // A split chain adds one leaf per level, so the deepest acceptable
+        // tree is one level shallower than the pane budget.
+        let deepest = session_json(&tabs_json(
+            1,
+            &nested_layout_json(MAX_RESTORED_PANES_PER_TAB - 1),
+        ));
+        assert!(decode_saved_session(&deepest).is_ok());
+        let too_deep = session_json(&tabs_json(1, &nested_layout_json(64)));
+        let error = decode_saved_session(&too_deep).unwrap_err().to_string();
+        assert!(
+            error.contains("nests deeper") || error.contains("16-pane limit"),
+            "unexpected error: {error}"
+        );
+
+        // Panes are also budgeted across the whole session, not just per tab.
+        let over_total = session_json(&tabs_json(
+            MAX_RESTORED_TABS,
+            &nested_layout_json(MAX_RESTORED_PANES_PER_TAB - 1),
+        ));
+        assert!(decode_saved_session(&over_total)
+            .unwrap_err()
+            .to_string()
+            .contains("64-pane limit"));
+    }
+
+    #[test]
+    fn decoding_charges_field_and_argv_budgets() {
+        let long_title = "t".repeat(MAX_RESTORED_TITLE_BYTES + 1);
+        let tab = format!(
+            r#"{{"title":"{long_title}","custom_title":false,"layout":{}}}"#,
+            leaf_json()
+        );
+        assert!(decode_saved_session(&session_json(&tab))
+            .unwrap_err()
+            .to_string()
+            .contains("'title' exceeds"));
+
+        // Escaped text is measured after unescaping, so a short encoded field
+        // cannot smuggle a long decoded one.
+        let escaped = "\\u0041".repeat(MAX_RESTORED_TITLE_BYTES + 1);
+        let tab = format!(
+            r#"{{"title":"{escaped}","custom_title":false,"layout":{}}}"#,
+            leaf_json()
+        );
+        assert!(decode_saved_session(&session_json(&tab))
+            .unwrap_err()
+            .to_string()
+            .contains("'title' exceeds"));
+
+        let long_cwd = "c".repeat(MAX_RESTORED_CWD_BYTES + 1);
+        let layout = format!(r#"{{"type":"leaf","mode":"block","cwd":"{long_cwd}"}}"#);
+        assert!(decode_saved_session(&session_json(&tabs_json(1, &layout)))
+            .unwrap_err()
+            .to_string()
+            .contains("'cwd' exceeds"));
+
+        // An argv over its cumulative budget is dropped rather than restored,
+        // and never fails the surrounding snapshot.
+        let argument = "a".repeat(MAX_RESTORED_COMMAND_ARG_BYTES);
+        let argv = (0..8)
+            .map(|_| format!(r#""{argument}""#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let layout = format!(r#"{{"type":"leaf","mode":"block","cmds":[{argv}]}}"#);
+        let decoded = decode_saved_session(&session_json(&tabs_json(1, &layout))).unwrap();
+        assert!(matches!(
+            decoded.tabs[0].layout,
+            PaneLayout::Leaf { cmds: None, .. }
+        ));
+    }
+
     fn workspace(state: &SnapshotState) -> &SavedSession {
         match state {
             SnapshotState::Workspace(session) => session,
@@ -2552,7 +3286,7 @@ mod tests {
         };
         let encoded = serde_json::to_string(&with_sid).unwrap();
         assert!(encoded.contains("jsh-session-42"));
-        let decoded: PaneLayout = serde_json::from_str(&encoded).unwrap();
+        let decoded = decode_pane_layout(&encoded).unwrap();
         assert!(matches!(
             decoded,
             PaneLayout::Leaf {
@@ -2561,8 +3295,8 @@ mod tests {
             } if sid == "jsh-session-42"
         ));
 
-        let legacy: PaneLayout =
-            serde_json::from_str(r#"{"type":"leaf","mode":"block","cwd":"/tmp","cmds":null}"#)
+        let legacy =
+            decode_pane_layout(r#"{"type":"leaf","mode":"block","cwd":"/tmp","cmds":null}"#)
                 .unwrap();
         assert!(matches!(legacy, PaneLayout::Leaf { sid: None, .. }));
     }
@@ -2584,7 +3318,7 @@ mod tests {
         };
 
         let encoded = serde_json::to_string(&layout).unwrap();
-        let decoded: PaneLayout = serde_json::from_str(&encoded).unwrap();
+        let decoded = decode_pane_layout(&encoded).unwrap();
         assert!(matches!(
             decoded,
             PaneLayout::Leaf {
@@ -2598,7 +3332,7 @@ mod tests {
 
     #[test]
     fn legacy_joined_restore_command_is_loaded_but_not_replayed() {
-        let legacy: PaneLayout = serde_json::from_str(
+        let legacy = decode_pane_layout(
             r#"{"type":"leaf","mode":"block","cwd":"/tmp","cmds":"ssh host; touch /tmp/local"}"#,
         )
         .unwrap();
@@ -2618,12 +3352,11 @@ mod tests {
     fn pinned_round_trips_and_legacy_snapshots_default_to_unpinned() {
         let mut current = saved_session("pinned");
         current.tabs[0].pinned = true;
-        let encoded = serde_json::to_vec(&current).expect("serialize pinned session");
-        let decoded: SavedSession =
-            serde_json::from_slice(&encoded).expect("deserialize pinned session");
+        let encoded = serde_json::to_string(&current).expect("serialize pinned session");
+        let decoded = decode_saved_session(&encoded).expect("deserialize pinned session");
         assert!(decoded.tabs[0].pinned);
 
-        let legacy = br#"{
+        let legacy = r#"{
             "active": 0,
             "tabs": [{
                 "title": "legacy",
@@ -2631,8 +3364,7 @@ mod tests {
                 "layout": {"type": "leaf", "mode": "block"}
             }]
         }"#;
-        let decoded: SavedSession =
-            serde_json::from_slice(legacy).expect("deserialize legacy session");
+        let decoded = decode_saved_session(legacy).expect("deserialize legacy session");
         assert!(!decoded.tabs[0].pinned);
     }
 
@@ -2910,10 +3642,10 @@ mod tests {
 
         assert_ne!(first.token, second.token);
         assert_ne!(first.state_path, second.state_path);
-        let first_saved: SavedSession =
-            serde_json::from_str(&fs::read_to_string(&first.state_path).unwrap()).unwrap();
-        let second_saved: SavedSession =
-            serde_json::from_str(&fs::read_to_string(&second.state_path).unwrap()).unwrap();
+        let first_saved =
+            decode_saved_session(&fs::read_to_string(&first.state_path).unwrap()).unwrap();
+        let second_saved =
+            decode_saved_session(&fs::read_to_string(&second.state_path).unwrap()).unwrap();
         assert_eq!(first_saved.tabs[0].title, "first");
         assert_eq!(second_saved.tabs[0].title, "second");
         assert_eq!(

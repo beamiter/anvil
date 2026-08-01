@@ -663,11 +663,11 @@ impl SimpleComponent for AppModel {
             .launch(root.clone())
             .forward(sender.input_sender(), |output| match output {
                 agent::AgentPanelOutput::Send(text) => AppMsg::AgentSend(text),
-                agent::AgentPanelOutput::Approve(index) => AppMsg::AgentApprove(index),
-                agent::AgentPanelOutput::Edit(index, command) => {
-                    AppMsg::AgentEditRequested(index, command)
+                agent::AgentPanelOutput::Approve(reference) => AppMsg::AgentApprove(reference),
+                agent::AgentPanelOutput::Edit(reference, command) => {
+                    AppMsg::AgentEditRequested(reference, command)
                 }
-                agent::AgentPanelOutput::Reject(index) => AppMsg::AgentReject(index),
+                agent::AgentPanelOutput::Reject(reference) => AppMsg::AgentReject(reference),
                 agent::AgentPanelOutput::Continue => AppMsg::AgentContinue,
                 agent::AgentPanelOutput::NewTask => AppMsg::AgentNewTask,
                 agent::AgentPanelOutput::ClearContext => AppMsg::AgentClearContext,
@@ -676,8 +676,8 @@ impl SimpleComponent for AppModel {
         let agent_edit = agent::AgentEditModel::builder()
             .launch(root.clone())
             .forward(sender.input_sender(), |output| match output {
-                agent::AgentEditOutput::Approved(index, command) => {
-                    AppMsg::AgentEditAndApprove(index, command)
+                agent::AgentEditOutput::Approved(reference, command) => {
+                    AppMsg::AgentEditAndApprove(reference, command)
                 }
             });
         // Both tab lists speak the same output vocabulary, so they route
@@ -1258,15 +1258,15 @@ impl SimpleComponent for AppModel {
             AppMsg::AgentContinue => self.agent_continue(),
             AppMsg::AgentNewTask => self.agent_new_task(),
             AppMsg::AgentClearContext => self.agent_clear_context(),
-            AppMsg::AgentApprove(idx) => self.agent_approve(idx, None, &sender),
-            AppMsg::AgentEditAndApprove(idx, new_cmd) => {
-                self.agent_approve(idx, Some(new_cmd), &sender);
+            AppMsg::AgentApprove(reference) => self.agent_approve(reference, None, &sender),
+            AppMsg::AgentEditAndApprove(reference, new_cmd) => {
+                self.agent_approve(reference, Some(new_cmd), &sender);
             }
-            AppMsg::AgentEditRequested(idx, command) => {
+            AppMsg::AgentEditRequested(reference, command) => {
                 self.agent_edit
-                    .emit(agent::AgentEditMsg::Open(idx, command));
+                    .emit(agent::AgentEditMsg::Open(reference, command));
             }
-            AppMsg::AgentReject(idx) => self.agent_reject(idx, &sender),
+            AppMsg::AgentReject(reference) => self.agent_reject(reference, &sender),
             AppMsg::AgentLlmReply(reply) => self.agent_handle_reply(reply, &sender),
             AppMsg::AgentBlockFinished {
                 tab_id: _,

@@ -190,6 +190,7 @@ impl AppModel {
         let session = self.active_agent.borrow();
         let session = session.as_ref()?;
         Some(agent::AgentPanelView {
+            epoch: Some(session.epoch()),
             transcript: session.transcript().to_vec(),
             turns_used: session.turns_used(),
             max_turns: session.max_turns(),
@@ -297,19 +298,20 @@ impl AppModel {
 
     pub(crate) fn agent_approve(
         &self,
-        transcript_index: usize,
+        reference: agent::AgentProposalRef,
         edited: Option<String>,
         _sender: &ComponentSender<AppModel>,
     ) {
-        // The panel is index-based because it renders a transcript, but the
-        // protocol is not: resolve the index to its stable id, then let the
-        // state machine reject stale or already-consumed proposals.
+        // A click, an edit dialog, and a queued message can all outlive the
+        // task generation they were raised against. Bind the action to that
+        // generation and let the state machine reject stale or
+        // already-consumed proposals within it.
         let (proposal_id, tab_id, pane_id) = {
             let guard = self.active_agent.borrow();
             let Some(session) = guard.as_ref() else {
                 return;
             };
-            let Some(proposal_id) = session.proposal_id_at(transcript_index) else {
+            let Some(proposal_id) = session.resolve_proposal(reference) else {
                 self.show_toast("That Agent proposal is no longer available.");
                 return;
             };
@@ -380,13 +382,17 @@ impl AppModel {
         self.refresh_agent_panel();
     }
 
-    pub(crate) fn agent_reject(&self, transcript_index: usize, sender: &ComponentSender<AppModel>) {
+    pub(crate) fn agent_reject(
+        &self,
+        reference: agent::AgentProposalRef,
+        sender: &ComponentSender<AppModel>,
+    ) {
         let result = {
             let mut guard = self.active_agent.borrow_mut();
             let Some(session) = guard.as_mut() else {
                 return;
             };
-            let Some(proposal_id) = session.proposal_id_at(transcript_index) else {
+            let Some(proposal_id) = session.resolve_proposal(reference) else {
                 self.show_toast("That Agent proposal is no longer available.");
                 return;
             };
