@@ -694,15 +694,41 @@ mod tests {
     }
 }
 
-fn ensure_osc8_tag(buffer: &TextBuffer, uri: &str) -> gtk::TextTag {
-    let name = format!("osc8-link:{uri}");
-    let tag_table = buffer.tag_table();
-    if let Some(tag) = tag_table.lookup(&name) {
-        return tag;
+fn osc8_tag_hash(uri: &str) -> u64 {
+    uri.as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        })
+}
+
+fn ensure_osc8_tag(buffer: &TextBuffer, uri: &str) -> Option<gtk::TextTag> {
+    if !super::url::is_url(uri) {
+        return None;
     }
-    let tag = gtk::TextTag::new(Some(&name));
-    tag_table.add(&tag);
-    tag
+    let tag_table = buffer.tag_table();
+    let base = format!("osc8-link-{:016x}", osc8_tag_hash(uri));
+    for collision in 0..32_u8 {
+        let name = if collision == 0 {
+            base.clone()
+        } else {
+            format!("{base}-{collision}")
+        };
+        if let Some(tag) = tag_table.lookup(&name) {
+            if super::url::osc8_uri(&tag).as_deref() == Some(uri) {
+                return Some(tag);
+            }
+            continue;
+        }
+        let tag = gtk::TextTag::new(Some(&name));
+        // Store the untrusted URI as object data, never as an object name.
+        unsafe {
+            tag.set_data(super::url::OSC8_URI_DATA_KEY, uri.to_string());
+        }
+        tag_table.add(&tag);
+        return Some(tag);
+    }
+    None
 }
 
 pub fn apply_ansi_runs_to_buffer(buffer: &TextBuffer, start_offset: usize, runs: &[AnsiTextRun]) {
@@ -718,8 +744,9 @@ pub fn apply_ansi_runs_to_buffer(buffer: &TextBuffer, start_offset: usize, runs:
             buffer.apply_tag(&tag, &s, &e);
         }
         if let Some(uri) = &run.style.hyperlink {
-            let tag = ensure_osc8_tag(buffer, uri);
-            buffer.apply_tag(&tag, &s, &e);
+            if let Some(tag) = ensure_osc8_tag(buffer, uri) {
+                buffer.apply_tag(&tag, &s, &e);
+            }
         }
         offset += len;
     }

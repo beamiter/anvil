@@ -17,13 +17,23 @@ fi
 
 [[ -n ${__JTERM1_ZSH_LOADED:-} ]] && return 0
 __JTERM1_ZSH_LOADED=1
+typeset -g __jterm1_marker_nonce="$$-${RANDOM}-${RANDOM}-${RANDOM}-${RANDOM}-${RANDOM}-${RANDOM}-${RANDOM}-${RANDOM}"
+typeset -gi __jterm1_marker_seq=0
+typeset -g __jterm1_marker_id=""
 
 __jterm1_osc() { printf '\033]%s\007' "$1"; }
 
 __jterm1_prompt_start()  { __jterm1_osc "133;A"; }
 __jterm1_prompt_end()    { __jterm1_osc "133;B"; }
-__jterm1_command_start() { __jterm1_osc "133;C"; }
-__jterm1_command_end()   { __jterm1_osc "133;D;$1"; }
+__jterm1_command_start() {
+    (( __jterm1_marker_seq++ ))
+    __jterm1_marker_id="${__jterm1_marker_nonce}-${__jterm1_marker_seq}"
+    __jterm1_osc "133;C;id=${__jterm1_marker_id}"
+}
+__jterm1_command_end() {
+    __jterm1_osc "133;D;$1;id=${__jterm1_marker_id}"
+    __jterm1_marker_id=""
+}
 
 __jterm1_report_cwd() {
     local host

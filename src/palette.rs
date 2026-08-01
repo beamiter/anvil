@@ -7,6 +7,11 @@
 
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
+use std::collections::HashSet;
+use std::fs::OpenOptions;
+use std::io::{Read, Seek, SeekFrom};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
 use crate::command_history;
@@ -111,6 +116,10 @@ pub(crate) struct Entry {
 }
 
 const HISTORY_SNAPSHOT_LIMIT: usize = 2_000;
+const HISTORY_TAIL_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_HISTORY_RECORD_BYTES: usize = 1024 * 1024;
+const MAX_PALETTE_COMMAND_BYTES: usize = 256 * 1024;
+const MAX_PALETTE_METADATA_DISPLAY_BYTES: usize = 4 * 1024;
 
 /// Read up to `max` newest-first records from a JSONL history file.
 ///
@@ -119,7 +128,105 @@ const HISTORY_SNAPSHOT_LIMIT: usize = 2_000;
 /// [`load_history_snapshot`] once per opening and filter that snapshot in
 /// memory.
 pub(crate) fn read_history(path: &Path, max: usize) -> Vec<command_history::CommandHistoryRecord> {
-    command_history::read_recent(path, max).unwrap_or_default()
+    read_history_checked(path, max.min(HISTORY_SNAPSHOT_LIMIT)).unwrap_or_default()
+}
+
+/// Read the bounded JSONL tail through a no-follow, nonblocking descriptor.
+/// The currently pinned core predates these inode checks, and calling its
+/// pathname-based reader directly from GTK would let a replaced FIFO freeze
+/// the main thread while opening a palette.
+fn read_history_checked(
+    path: &Path,
+    max: usize,
+) -> std::io::Result<Vec<command_history::CommandHistoryRecord>> {
+    if max == 0 {
+        return Ok(Vec::new());
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC);
+    let mut file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "command history is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid has no preconditions and only reads process state.
+        if metadata.uid() != unsafe { nix::libc::geteuid() }
+            || metadata.nlink() != 1
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "command history has unsafe ownership, links, or write permissions",
+            ));
+        }
+    }
+
+    let file_len = metadata.len();
+    if file_len == 0 {
+        return Ok(Vec::new());
+    }
+    let start = file_len.saturating_sub(HISTORY_TAIL_BYTES);
+    let starts_at_line_boundary = if start == 0 {
+        true
+    } else {
+        file.seek(SeekFrom::Start(start - 1))?;
+        let mut previous = [0_u8; 1];
+        file.read(&mut previous)? == 1 && previous[0] == b'\n'
+    };
+    file.seek(SeekFrom::Start(start))?;
+    let mut tail = Vec::with_capacity((file_len - start) as usize);
+    file.take(file_len - start).read_to_end(&mut tail)?;
+    let first_complete = if starts_at_line_boundary {
+        0
+    } else {
+        let Some(newline) = tail.iter().position(|byte| *byte == b'\n') else {
+            return Ok(Vec::new());
+        };
+        newline + 1
+    };
+    let Some(last_newline) = tail.iter().rposition(|byte| *byte == b'\n') else {
+        return Ok(Vec::new());
+    };
+    if first_complete >= last_newline {
+        return Ok(Vec::new());
+    }
+
+    let mut seen = HashSet::new();
+    let mut records = Vec::with_capacity(max.min(256));
+    for line in tail[first_complete..last_newline]
+        .rsplit(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        if line.len().saturating_add(1) > MAX_HISTORY_RECORD_BYTES {
+            continue;
+        }
+        let Ok(record) = serde_json::from_slice::<command_history::CommandHistoryRecord>(line)
+        else {
+            continue;
+        };
+        if !palette_command_is_safe(&record.command) || !seen.insert(record.command.clone()) {
+            continue;
+        }
+        records.push(record);
+        if records.len() == max {
+            break;
+        }
+    }
+    Ok(records)
+}
+
+fn palette_command_is_safe(command: &str) -> bool {
+    !command.trim().is_empty()
+        && command.len() <= MAX_PALETTE_COMMAND_BYTES
+        && !command.chars().any(char::is_control)
+        && !crate::text_safety::contains_visual_spoof(command)
 }
 
 /// Load one newest-first history snapshot for a palette opening.
@@ -207,8 +314,13 @@ pub(crate) fn gather(
                 Accept::TypeCommand(String::new()),
             )
         } else {
+            let display_query = crate::text_safety::bounded_display_text(
+                &query.text,
+                MAX_PALETTE_METADATA_DISPLAY_BYTES,
+                false,
+            );
             (
-                format!("Ask AI: {}", query.text),
+                format!("Ask AI: {display_query}"),
                 Some("Generates a shell command (review before running)".to_string()),
                 Accept::AskAi(query.text.clone()),
             )
@@ -232,11 +344,18 @@ pub(crate) fn gather(
         // matches.
         let len = history.len();
         for (idx, item) in history.iter().enumerate() {
+            if !palette_command_is_safe(&item.command) {
+                continue;
+            }
             let recency = (len - idx) as i64; // 1..=len
             let entry = Entry {
                 tier: 2,
                 score: recency,
-                label: item.command.clone(),
+                label: crate::text_safety::bounded_display_text(
+                    &item.command,
+                    MAX_PALETTE_METADATA_DISPLAY_BYTES,
+                    false,
+                ),
                 sublabel: Some(history_sublabel(item)),
                 right: None,
                 accept: Accept::TypeCommand(item.command.clone()),
@@ -278,11 +397,12 @@ fn push_if_match(matcher: &SkimMatcherV2, needle: &str, mut e: Entry, out: &mut 
 
 fn history_sublabel(item: &command_history::CommandHistoryRecord) -> String {
     let cwd = shorten_path(item.cwd.as_deref().unwrap_or_default());
-    if item.exit_code != 0 {
+    let text = if item.exit_code != 0 {
         format!("{cwd}  · exit {}", item.exit_code)
     } else {
         cwd
-    }
+    };
+    crate::text_safety::bounded_display_text(&text, MAX_PALETTE_METADATA_DISPLAY_BYTES, false)
 }
 
 fn shorten_path(p: &str) -> String {
@@ -290,7 +410,10 @@ fn shorten_path(p: &str) -> String {
         return String::new();
     }
     if let Ok(home) = std::env::var("HOME") {
-        if let Some(rest) = p.strip_prefix(&home) {
+        if p == home {
+            return "~".to_string();
+        }
+        if let Some(rest) = p.strip_prefix(&home).filter(|rest| rest.starts_with('/')) {
             return format!("~{rest}");
         }
     }
@@ -359,6 +482,11 @@ mod tests {
             std::process::id()
         ));
         std::fs::write(&path, "{\"command\":\"before\",\"exit_code\":0}\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let snapshot = load_history_snapshot(Some(&path));
 
         // Simulate another process replacing/appending history while the
@@ -380,5 +508,65 @@ mod tests {
         assert_eq!(reopened[0].label, "after");
 
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn history_palette_rejects_visual_spoof_commands_and_sanitizes_metadata() {
+        let history = vec![
+            command_history::CommandHistoryRecord {
+                command: "echo safe\u{00ad}hidden".into(),
+                cwd: Some("/tmp/hidden\u{e0020}cwd".into()),
+                exit_code: 0,
+                end_time_ms: None,
+            },
+            command_history::CommandHistoryRecord {
+                command: "echo visible".into(),
+                cwd: Some("/tmp/safe\u{202e}cwd".into()),
+                exit_code: 1,
+                end_time_ms: None,
+            },
+        ];
+        let entries = gather(
+            &Query {
+                mode: PaletteMode::History,
+                text: String::new(),
+            },
+            &KeybindingMap::from_defaults(),
+            &history,
+            &[],
+            10,
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].label, "echo visible");
+        let sublabel = entries[0].sublabel.as_deref().unwrap();
+        assert!(!sublabel.contains('\u{202e}'));
+        assert!(sublabel.contains('\u{fffd}'));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_palette_file_open_is_nonblocking_no_follow_and_regular_only() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "jterm1-palette-safe-open-{}-{}",
+            std::process::id(),
+            relm4::gtk::glib::uuid_string_random()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let fifo = root.join("history.fifo");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { nix::libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        let started = std::time::Instant::now();
+        assert!(read_history_checked(&fifo, 10).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+
+        let target = root.join("target.jsonl");
+        std::fs::write(&target, "{\"command\":\"safe\",\"exit_code\":0}\n").unwrap();
+        let link = root.join("history.jsonl");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(read_history_checked(&link, 10).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

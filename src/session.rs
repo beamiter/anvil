@@ -12,19 +12,21 @@
 //! `flock` on that lock for its lifetime, so liveness remains correct across PID
 //! reuse and PID namespaces. The old `tabs.state` and `tabs.<pid>.state` names
 //! remain readable; PID-owned files are retained conservatively because their
-//! owner identity cannot be proven from another namespace.
+//! owner identity cannot be proven from another namespace. New payloads use a
+//! versioned envelope whose explicit empty tombstone and predecessor claim make
+//! restore/close checkpoints recoverable across every rename window.
 
-use crate::snapshot_file;
 use gtk::glib;
 use relm4::gtk;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Read, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const LEGACY_STATE_FILE: &str = "tabs.state";
 const STATE_PREFIX: &str = "tabs.";
@@ -33,11 +35,30 @@ const LOCK_SUFFIX: &str = ".lock";
 const LOCK_PROTOCOL_FILE: &str = ".session-lock-protocol";
 const CLAIM_MARKER: &str = ".claim.";
 const MAX_RECOVERABLE_SNAPSHOTS: usize = 32;
+/// Bound one startup scan independently of directory size. The state directory
+/// is private, but stale files can accumulate after repeated crashes and must
+/// not turn startup into unbounded I/O or serde work.
+const MAX_DIRECTORY_ENTRIES_PER_SCAN: usize = 4_096;
+const MAX_CANDIDATES_PER_SCAN: usize = MAX_RECOVERABLE_SNAPSHOTS;
+const MAX_CANDIDATE_BYTES_PER_SCAN: u64 = 16 * 1024 * 1024;
+const MAX_CLAIM_CHAIN_DEPTH: usize = 32;
+const MAX_CLAIM_CHAIN_BYTES: u64 = 16 * 1024 * 1024;
+const LOCK_PROTOCOL_TIMEOUT: Duration = Duration::from_millis(500);
+const LOCK_PROTOCOL_RETRY_INTERVAL: Duration = Duration::from_millis(5);
+const SESSION_ENVELOPE_FORMAT: &str = "jterm1-session";
+const SESSION_ENVELOPE_VERSION: u8 = 1;
 /// Largest session snapshot this window will read back. A snapshot is a tab list
 /// with one cwd and one argv per pane — kilobytes — so anything past this is a
 /// runaway writer or another program's file at a colliding name, and rejecting
 /// it by size gives a better message than a JSON parse error would.
 const MAX_SNAPSHOT_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_RESTORED_TABS: usize = 32;
+const MAX_RESTORED_PANES_PER_TAB: usize = 16;
+const MAX_RESTORED_PANES_TOTAL: usize = 64;
+const MAX_RESTORED_TITLE_BYTES: usize = 4 * 1024;
+const MAX_RESTORED_COMMAND_ARGS: usize = 256;
+const MAX_RESTORED_COMMAND_ARG_BYTES: usize = 64 * 1024;
+const MAX_RESTORED_COMMAND_BYTES: usize = 256 * 1024;
 const OWNER_TOKEN_ATTEMPTS: usize = 128;
 static SNAPSHOT_OWNER: OnceLock<Result<SnapshotOwner, String>> = OnceLock::new();
 
@@ -101,6 +122,34 @@ pub(crate) struct SavedSession {
     pub tabs: Vec<SavedTab>,
 }
 
+/// New snapshots use a small versioned envelope. `SavedSession` itself remains
+/// unchanged so bare snapshots from every previous release stay readable.
+/// The envelope also carries the immediate claimed predecessor: after a crash
+/// between durable checkpoint and claim cleanup, the next owner can finish the
+/// chain without ever reviving an older workspace.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionEnvelope<T> {
+    format: String,
+    version: u8,
+    payload: SessionEnvelopePayload<T>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    supersedes: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", content = "session", rename_all = "snake_case")]
+enum SessionEnvelopePayload<T> {
+    Workspace(T),
+    Empty,
+}
+
+#[derive(Debug)]
+enum SnapshotState {
+    Workspace(SavedSession),
+    Empty,
+}
+
 fn state_dir() -> PathBuf {
     glib::user_config_dir().join("jterm1")
 }
@@ -155,23 +204,6 @@ fn try_lock_file_exclusive(file: &File) -> io::Result<bool> {
     }
 }
 
-#[cfg(unix)]
-fn lock_file_exclusive(file: &File) -> io::Result<()> {
-    loop {
-        // SAFETY: `file` owns this descriptor for the duration of the call;
-        // flock stores no userspace pointer.
-        let result = unsafe { nix::libc::flock(file.as_raw_fd(), nix::libc::LOCK_EX) };
-        if result == 0 {
-            return Ok(());
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::Interrupted {
-            continue;
-        }
-        return Err(error);
-    }
-}
-
 #[cfg(not(unix))]
 fn try_lock_file_exclusive(_file: &File) -> io::Result<bool> {
     Err(io::Error::new(
@@ -180,55 +212,238 @@ fn try_lock_file_exclusive(_file: &File) -> io::Result<bool> {
     ))
 }
 
-#[cfg(not(unix))]
-fn lock_file_exclusive(_file: &File) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "session lock protocol requires flock",
-    ))
-}
-
 /// Serializes publication and removal of owner-lock pathnames. The file is
 /// intentionally persistent and is never considered by orphan cleanup.
 struct LockProtocolGuard {
+    _directory: File,
     _file: File,
 }
 
+#[cfg(unix)]
+fn unlock_file(file: &File) {
+    // SAFETY: `file` owns a live descriptor. An explicit unlock matters when
+    // another thread forks while this guard is held: the child inherits the
+    // same open-file description, so merely closing the parent's descriptor
+    // would otherwise leave the lock alive until the child execs or exits.
+    let result = unsafe { nix::libc::flock(file.as_raw_fd(), nix::libc::LOCK_UN) };
+    if result != 0 {
+        log::warn!(
+            "Failed to release session lock: {}",
+            io::Error::last_os_error()
+        );
+    }
+}
+
+impl Drop for LockProtocolGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            unlock_file(&self._file);
+            unlock_file(&self._directory);
+        }
+    }
+}
+
+/// A short-lived flock whose logical lifetime must not be extended by a file
+/// descriptor inherited across a concurrent `fork`. Closing the local `File`
+/// is insufficient in that case because the child shares its open-file
+/// description; `LOCK_UN` releases that shared lock at the actual boundary.
+struct TemporaryExclusiveLock<'a> {
+    file: &'a File,
+}
+
+impl Drop for TemporaryExclusiveLock<'_> {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unlock_file(self.file);
+    }
+}
+
+fn try_temporary_exclusive_lock(file: &File) -> io::Result<Option<TemporaryExclusiveLock<'_>>> {
+    try_lock_file_exclusive(file).map(|locked| locked.then_some(TemporaryExclusiveLock { file }))
+}
+
+struct HeldRetiredOwnerLock {
+    token: String,
+    file: File,
+}
+
+impl Drop for HeldRetiredOwnerLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unlock_file(&self.file);
+    }
+}
+
+fn ensure_regular_lock_file(file: &File, path: &Path) -> io::Result<()> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("session lock {} is not a regular file", path.display()),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if metadata.nlink() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("session lock {} has multiple hard links", path.display()),
+            ));
+        }
+        // SAFETY: `geteuid` has no preconditions and only reads process state.
+        if metadata.uid() != unsafe { nix::libc::geteuid() } {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "session lock {} is not owned by the current user",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl LockProtocolGuard {
-    fn open(dir: &Path) -> io::Result<File> {
-        let path = dir.join(LOCK_PROTOCOL_FILE);
+    fn open_directory(dir: &Path) -> io::Result<File> {
         let mut options = OpenOptions::new();
-        options.create(true).read(true).write(true);
+        options.read(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600).custom_flags(nix::libc::O_NOFOLLOW);
+            options.custom_flags(
+                nix::libc::O_DIRECTORY
+                    | nix::libc::O_NOFOLLOW
+                    | nix::libc::O_NONBLOCK
+                    | nix::libc::O_CLOEXEC,
+            );
         }
-        options.open(path)
+        let directory = options.open(dir)?;
+        let metadata = directory.metadata()?;
+        if !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("session state path {} is not a directory", dir.display()),
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            // SAFETY: geteuid has no preconditions and only reads process state.
+            if metadata.uid() != unsafe { nix::libc::geteuid() } {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "session state directory {} is not owned by the current user",
+                        dir.display()
+                    ),
+                ));
+            }
+        }
+        Ok(directory)
     }
 
-    fn from_locked_file(file: File) -> io::Result<Self> {
+    fn open_file(dir: &Path) -> io::Result<File> {
+        let path = dir.join(LOCK_PROTOCOL_FILE);
+        let mut options = OpenOptions::new();
+        options.create(true).read(true).write(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(0o600)
+                .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC);
+        }
+        let file = options.open(&path)?;
+        ensure_regular_lock_file(&file, &path)?;
+        Ok(file)
+    }
+
+    fn from_locked_files(directory: File, file: File) -> io::Result<Self> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            if let Err(error) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
+                unlock_file(&file);
+                unlock_file(&directory);
+                return Err(error);
+            }
         }
-        Ok(Self { _file: file })
+        Ok(Self {
+            _directory: directory,
+            _file: file,
+        })
     }
 
     fn acquire(dir: &Path) -> io::Result<Self> {
-        let file = Self::open(dir)?;
-        lock_file_exclusive(&file)?;
-        Self::from_locked_file(file)
+        Self::acquire_with_timeout(dir, LOCK_PROTOCOL_TIMEOUT)
+    }
+
+    fn acquire_with_timeout(dir: &Path, timeout: Duration) -> io::Result<Self> {
+        let started = Instant::now();
+        let wait = |file: &File| -> io::Result<()> {
+            loop {
+                if try_lock_file_exclusive(file)? {
+                    return Ok(());
+                }
+                let elapsed = started.elapsed();
+                if elapsed >= timeout {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "timed out after {} ms waiting for session lock protocol in {}",
+                            timeout.as_millis(),
+                            dir.display()
+                        ),
+                    ));
+                }
+                std::thread::sleep(LOCK_PROTOCOL_RETRY_INTERVAL.min(timeout - elapsed));
+            }
+        };
+
+        let directory = Self::open_directory(dir)?;
+        wait(&directory)?;
+        let file = match Self::open_file(dir) {
+            Ok(file) => file,
+            Err(error) => {
+                unlock_file(&directory);
+                return Err(error);
+            }
+        };
+        if let Err(error) = wait(&file) {
+            unlock_file(&directory);
+            return Err(error);
+        }
+        Self::from_locked_files(directory, file)
     }
 
     fn try_acquire(dir: &Path) -> io::Result<Option<Self>> {
-        let file = Self::open(dir)?;
-        if try_lock_file_exclusive(&file)? {
-            Self::from_locked_file(file).map(Some)
-        } else {
-            Ok(None)
+        let directory = Self::open_directory(dir)?;
+        if !try_lock_file_exclusive(&directory)? {
+            return Ok(None);
         }
+        let file = match Self::open_file(dir) {
+            Ok(file) => file,
+            Err(error) => {
+                unlock_file(&directory);
+                return Err(error);
+            }
+        };
+        match try_lock_file_exclusive(&file) {
+            Ok(true) => {}
+            Ok(false) => {
+                unlock_file(&directory);
+                return Ok(None);
+            }
+            Err(error) => {
+                unlock_file(&directory);
+                return Err(error);
+            }
+        }
+        Self::from_locked_files(directory, file).map(Some)
     }
 }
 
@@ -238,9 +453,12 @@ fn create_owner_lock(path: &Path, before_flock: &mut dyn FnMut(&Path)) -> io::Re
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options
+            .mode(0o600)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
     }
     let file = options.open(path)?;
+    ensure_regular_lock_file(&file, path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -262,10 +480,22 @@ fn create_owner_lock(path: &Path, before_flock: &mut dyn FnMut(&Path)) -> io::Re
 struct SnapshotOwner {
     token: String,
     state_path: PathBuf,
+    /// A recovered snapshot remains at its claimed name until this owner has
+    /// durably checkpointed the restored workspace. If the process exits or a
+    /// checkpoint fails first, the claim becomes recoverable when this lock is
+    /// released instead of losing the only last-good copy.
+    pending_restore: Mutex<Option<PendingRestoreClaim>>,
     /// Kept open for the process lifetime. Do not unlink this path while the
     /// lock is held: another process could create a new inode under the same
     /// name and incorrectly appear to own the token.
     _lock_file: File,
+}
+
+impl Drop for SnapshotOwner {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unlock_file(&self._lock_file);
+    }
 }
 
 impl SnapshotOwner {
@@ -301,11 +531,18 @@ impl SnapshotOwner {
                 fs::remove_file(&lock_path)?;
                 continue;
             }
-            return Ok(Self {
+            let owner = Self {
                 token,
                 state_path,
+                pending_restore: Mutex::new(None),
                 _lock_file: lock_file,
-            });
+            };
+            // End the publication transaction before the owner escapes to its
+            // caller. Keeping this boundary explicit also prevents later
+            // refactors from accidentally extending the directory-wide lock
+            // across unrelated snapshot probes.
+            drop(_protocol);
+            return Ok(owner);
         }
         Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -348,7 +585,7 @@ fn token_lock_state_in(dir: &Path, token: &str) -> TokenLockState {
         }
     };
     let path = lock_file_path_for_token(dir, token);
-    let file = match OpenOptions::new().read(true).write(true).open(&path) {
+    let file = match open_existing_lock_file(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return TokenLockState::Missing,
         Err(error) => {
@@ -359,9 +596,9 @@ fn token_lock_state_in(dir: &Path, token: &str) -> TokenLockState {
             return TokenLockState::Unknown;
         }
     };
-    match try_lock_file_exclusive(&file) {
-        Ok(true) => TokenLockState::Available,
-        Ok(false) => TokenLockState::Held,
+    let state = match try_temporary_exclusive_lock(&file) {
+        Ok(Some(_lock)) => TokenLockState::Available,
+        Ok(None) => TokenLockState::Held,
         Err(error) => {
             log::warn!(
                 "Cannot probe session owner lock {}: {error}",
@@ -369,6 +606,214 @@ fn token_lock_state_in(dir: &Path, token: &str) -> TokenLockState {
             );
             TokenLockState::Unknown
         }
+    };
+    state
+}
+
+/// Open a published lock without following a replaced pathname, and ensure a
+/// concurrently forked shell cannot inherit the lock across `exec`. Without
+/// `O_CLOEXEC`, a child process can keep a window snapshot looking live after
+/// its actual owner exits, or hold the directory-wide publication protocol for
+/// the lifetime of an unrelated command.
+fn open_existing_lock_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC);
+    }
+    let file = options.open(path)?;
+    ensure_regular_lock_file(&file, path)?;
+    Ok(file)
+}
+
+/// The pinned shared-core revision predates its no-follow snapshot opener, so
+/// enforce the complete persisted-file contract locally until the next core
+/// release is available to pin: bounded, regular, singly linked, current-user,
+/// nonblocking, and close-on-exec.
+fn read_snapshot_bounded_to(path: &Path, max_bytes: u64) -> io::Result<String> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("session snapshot {} is not a regular file", path.display()),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if metadata.nlink() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "session snapshot {} has multiple hard links",
+                    path.display()
+                ),
+            ));
+        }
+        // SAFETY: geteuid has no preconditions and only reads process state.
+        if metadata.uid() != unsafe { nix::libc::geteuid() } {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "session snapshot {} is not owned by the current user",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    if metadata.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            format!(
+                "session snapshot {} exceeds {} bytes",
+                path.display(),
+                max_bytes
+            ),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            format!(
+                "session snapshot {} exceeds {} bytes",
+                path.display(),
+                max_bytes
+            ),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("session snapshot {} is not valid UTF-8", path.display()),
+        )
+    })
+}
+
+#[cfg(test)]
+fn read_snapshot_bounded(path: &Path) -> io::Result<String> {
+    read_snapshot_bounded_to(path, MAX_SNAPSHOT_BYTES)
+}
+
+fn pane_layout_within_restore_limits(layout: &PaneLayout) -> Option<usize> {
+    fn command_within_limits(argv: &[String]) -> bool {
+        if argv.is_empty() || argv.len() > MAX_RESTORED_COMMAND_ARGS {
+            return false;
+        }
+        let mut total = 0usize;
+        for argument in argv {
+            if argument.len() > MAX_RESTORED_COMMAND_ARG_BYTES
+                || argument.chars().any(char::is_control)
+            {
+                return false;
+            }
+            let Some(next) = total
+                .checked_add(argument.len())
+                .and_then(|bytes| bytes.checked_add(1))
+            else {
+                return false;
+            };
+            if next > MAX_RESTORED_COMMAND_BYTES {
+                return false;
+            }
+            total = next;
+        }
+        true
+    }
+
+    fn count(layout: &PaneLayout, remaining: &mut usize) -> Option<usize> {
+        match layout {
+            PaneLayout::Leaf {
+                mode,
+                cwd,
+                remote_name,
+                sid,
+                cmds,
+                ..
+            } => {
+                if mode.len() > 64
+                    || cwd.as_ref().is_some_and(|value| value.len() > 16 * 1024)
+                    || remote_name.as_ref().is_some_and(|value| value.len() > 256)
+                    || sid.as_ref().is_some_and(|value| value.len() > 256)
+                    || cmds
+                        .as_deref()
+                        .is_some_and(|argv| !command_within_limits(argv))
+                    || *remaining == 0
+                {
+                    return None;
+                }
+                *remaining -= 1;
+                Some(1)
+            }
+            PaneLayout::Split { start, end, .. } => {
+                let left = count(start, remaining)?;
+                let right = count(end, remaining)?;
+                left.checked_add(right)
+            }
+        }
+    }
+
+    let mut remaining = MAX_RESTORED_PANES_PER_TAB;
+    count(layout, &mut remaining)
+}
+
+fn session_within_restore_limits(session: &SavedSession) -> bool {
+    if session.tabs.is_empty() || session.tabs.len() > MAX_RESTORED_TABS {
+        return false;
+    }
+    let mut total = 0usize;
+    for tab in &session.tabs {
+        if tab.title.len() > MAX_RESTORED_TITLE_BYTES {
+            return false;
+        }
+        let Some(panes) = pane_layout_within_restore_limits(&tab.layout) else {
+            return false;
+        };
+        let Some(next_total) = total.checked_add(panes) else {
+            return false;
+        };
+        if next_total > MAX_RESTORED_PANES_TOTAL {
+            return false;
+        }
+        total = next_total;
+    }
+    true
+}
+
+/// Reclassify every argv after deserialization and immediately before the
+/// restored layout can reach any pane-spawn path. The serde shape check only
+/// proves that argv boundaries survived; it does not prove an on-disk writer
+/// stored one of the deliberately replayable command families.
+fn sanitize_restorable_commands(session: &mut SavedSession) {
+    fn sanitize_layout(layout: &mut PaneLayout) {
+        match layout {
+            PaneLayout::Leaf { cmds, .. } => {
+                *cmds = cmds
+                    .take()
+                    .and_then(|argv| jterm_core::process::match_restorable_command(&argv));
+            }
+            PaneLayout::Split { start, end, .. } => {
+                sanitize_layout(start);
+                sanitize_layout(end);
+            }
+        }
+    }
+
+    for tab in &mut session.tabs {
+        sanitize_layout(&mut tab.layout);
     }
 }
 
@@ -410,6 +855,91 @@ fn session_snapshot_counts_in(
     (ready, active)
 }
 
+struct BoundedSnapshotWriter {
+    bytes: Vec<u8>,
+}
+
+impl BoundedSnapshotWriter {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::with_capacity(64 * 1024),
+        }
+    }
+}
+
+impl Write for BoundedSnapshotWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let next_len = self
+            .bytes
+            .len()
+            .checked_add(buffer.len())
+            .ok_or_else(|| io::Error::from(io::ErrorKind::FileTooLarge))?;
+        if next_len > MAX_SNAPSHOT_BYTES as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                format!("serialized session snapshot exceeds {MAX_SNAPSHOT_BYTES} bytes"),
+            ));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialize_snapshot_bounded(
+    owner: &SnapshotOwner,
+    session: &SavedSession,
+) -> io::Result<Vec<u8>> {
+    if !session.tabs.is_empty() && !session_within_restore_limits(session) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "session exceeds the {MAX_RESTORED_TABS}-tab, \
+                 {MAX_RESTORED_PANES_PER_TAB}-panes-per-tab, \
+                 {MAX_RESTORED_PANES_TOTAL}-total-pane, or field-size limits"
+            ),
+        ));
+    }
+    let envelope = SessionEnvelope {
+        format: SESSION_ENVELOPE_FORMAT.to_string(),
+        version: SESSION_ENVELOPE_VERSION,
+        payload: if session.tabs.is_empty() {
+            SessionEnvelopePayload::Empty
+        } else {
+            SessionEnvelopePayload::Workspace(session)
+        },
+        supersedes: owner.pending_claim_file_name()?,
+    };
+    let mut writer = BoundedSnapshotWriter::new();
+    serde_json::to_writer(&mut writer, &envelope).map_err(|error| {
+        let kind = error.io_error_kind().unwrap_or(io::ErrorKind::InvalidData);
+        io::Error::new(
+            kind,
+            format!("failed to serialize session snapshot: {error}"),
+        )
+    })?;
+    Ok(writer.bytes)
+}
+
+/// Write the new snapshot durably without committing its predecessor. Kept as
+/// a separate transaction phase so crash-window tests can pin recovery after
+/// the rename/fsync but before claim cleanup.
+fn write_snapshot_for_owner(owner: &SnapshotOwner, session: &SavedSession) -> io::Result<()> {
+    let payload = serialize_snapshot_bounded(owner, session)?;
+    atomic_write(&owner.state_path, &payload)
+}
+
+/// Validate and durably checkpoint either a workspace or the explicit empty
+/// tombstone. The pending restore is committed only after replacement and its
+/// parent directory have been synced.
+fn checkpoint_snapshot_for_owner(owner: &SnapshotOwner, session: &SavedSession) -> io::Result<()> {
+    write_snapshot_for_owner(owner, session)?;
+    owner.commit_pending_restore()
+}
+
 pub(crate) fn save_session(session: &SavedSession) {
     let owner = match snapshot_owner() {
         Ok(owner) => owner,
@@ -419,31 +949,7 @@ pub(crate) fn save_session(session: &SavedSession) {
         }
     };
     let path = &owner.state_path;
-    if session.tabs.is_empty() {
-        // Do not leave an older non-empty snapshot behind after this window's
-        // last tab is closed. A missing per-process file means "start fresh".
-        if let Err(err) = fs::remove_file(path) {
-            if err.kind() != io::ErrorKind::NotFound {
-                log::error!(
-                    "Failed to remove empty session snapshot {}: {err}",
-                    path.display()
-                );
-            }
-        }
-        return;
-    }
-
-    let payload = match serde_json::to_string(session) {
-        Ok(payload) => payload,
-        Err(err) => {
-            log::error!(
-                "Failed to serialize session snapshot {}: {err}",
-                path.display()
-            );
-            return;
-        }
-    };
-    match atomic_write(path, payload.as_bytes()) {
+    match checkpoint_snapshot_for_owner(owner, session) {
         Ok(()) => {
             let directory = state_dir();
             prune_recoverable_snapshots(
@@ -462,7 +968,9 @@ pub(crate) fn save_session(session: &SavedSession) {
     }
 }
 
-/// Load and consume the newest valid snapshot whose owning process has exited.
+/// Claim the newest valid snapshot whose owning process has exited. The claim
+/// remains on disk until [`save_session`] has durably checkpointed the restored
+/// workspace, so a crash during restore never consumes the only copy.
 /// Corrupt/unreadable files are deliberately retained for inspection/recovery.
 pub(crate) fn load_session() -> Option<SavedSession> {
     let directory = state_dir();
@@ -474,7 +982,16 @@ pub(crate) fn load_session() -> Option<SavedSession> {
         }
     };
     let lock_state = |token: &str| token_lock_state_in(&directory, token);
-    let session = load_session_from(&directory, &owner.token, &lock_state);
+    let session = claim_session_from(&directory, &owner.token, &lock_state)
+        .map(|claimed| adopt_claimed_snapshot(owner, claimed))
+        .transpose()
+        .unwrap_or_else(|error| {
+            log::error!(
+                "Cannot adopt claimed session until its checkpoint: {error}; claim left on disk"
+            );
+            None
+        })
+        .flatten();
     prune_recoverable_snapshots(
         &directory,
         Some(&owner.token),
@@ -484,21 +1001,68 @@ pub(crate) fn load_session() -> Option<SavedSession> {
     session
 }
 
+fn adopt_claimed_snapshot(
+    owner: &SnapshotOwner,
+    claimed: ClaimedSnapshot,
+) -> io::Result<Option<SavedSession>> {
+    owner.remember_pending_restore(claimed.pending)?;
+    match claimed.state {
+        SnapshotState::Workspace(session) => Ok(Some(session)),
+        SnapshotState::Empty => {
+            // Propagate the tombstone under the current owner before committing
+            // its claimed predecessor. If this write fails, the old tombstone
+            // stays recoverable and still prevents workspace resurrection.
+            checkpoint_snapshot_for_owner(owner, &SavedSession::default())?;
+            Ok(None)
+        }
+    }
+}
+
 /// Create the state directory and make it private.
 ///
-/// Kept local because the shared module only exposes this as a side effect of
-/// [`snapshot_file::write_atomic_private`], and the owner-lock protocol below
+/// Kept local because the owner-lock protocol below
 /// needs the directory to exist and be `0700` *before* it creates any file in
 /// it: a lock published under a world-readable directory is the window this
 /// guards against.
 fn ensure_private_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
         let mut builder = fs::DirBuilder::new();
         builder.recursive(true).mode(0o700).create(path)?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        // Re-open the final component without following it, then validate and
+        // chmod through that descriptor. `create_dir_all` accepts an existing
+        // symlink-to-directory; a pathname chmod here would otherwise tighten
+        // and populate the symlink target rather than jterm1's own state dir.
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(
+                nix::libc::O_DIRECTORY
+                    | nix::libc::O_NOFOLLOW
+                    | nix::libc::O_NONBLOCK
+                    | nix::libc::O_CLOEXEC,
+            )
+            .open(path)?;
+        let metadata = directory.metadata()?;
+        if !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("session state path {} is not a directory", path.display()),
+            ));
+        }
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions and only reads process state.
+        if metadata.uid() != unsafe { nix::libc::geteuid() } {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "session state directory {} is not owned by the current user",
+                    path.display()
+                ),
+            ));
+        }
+        directory.set_permissions(fs::Permissions::from_mode(0o700))
     }
     #[cfg(not(unix))]
     {
@@ -508,12 +1072,37 @@ fn ensure_private_directory(path: &Path) -> io::Result<()> {
 
 /// Durably replace a snapshot, creating its `0700` directory if needed.
 ///
-/// The temp-write/fsync/rename dance and the `0600` mode are
-/// [`snapshot_file::write_atomic_private`] now. jterm1 owns `~/.config/jterm1`
-/// outright, so letting it tighten the parent directory is the documented case
-/// for that function rather than a surprise chmod of somebody's `$HOME`.
+/// The shared lower-level atomic writer owns the temp-write/fsync/rename dance
+/// and the `0600` mode. jterm1 first validates and tightens its owned directory
+/// through a no-follow descriptor, avoiding a later path-based chmod race.
 fn atomic_write(path: &Path, payload: &[u8]) -> io::Result<()> {
-    snapshot_file::write_atomic_private(path, payload)
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "session snapshot path must have an explicit parent directory",
+            )
+        })?;
+    ensure_private_directory(parent)?;
+    jterm_core::atomic_file::write_atomic(path, payload)
+}
+
+fn sync_directory(path: &Path) -> io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(
+            nix::libc::O_DIRECTORY
+                | nix::libc::O_NOFOLLOW
+                | nix::libc::O_NONBLOCK
+                | nix::libc::O_CLOEXEC,
+        );
+    }
+    options.open(path)?.sync_all()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -540,6 +1129,106 @@ struct StateFileName {
     owner: Option<InstanceIdentity>,
     /// Instance that claimed this file but exited before consuming it.
     claimer: Option<InstanceIdentity>,
+}
+
+struct PendingRestoreClaim {
+    path: PathBuf,
+    source_file: StateFileName,
+    supersedes: Option<ClaimReference>,
+    _retired_owner_locks: Vec<HeldRetiredOwnerLock>,
+}
+
+#[derive(Debug)]
+struct ClaimReference {
+    path: PathBuf,
+    file_name: StateFileName,
+}
+
+struct ClaimedSnapshot {
+    state: SnapshotState,
+    pending: PendingRestoreClaim,
+}
+
+impl SnapshotOwner {
+    fn remember_pending_restore(&self, pending: PendingRestoreClaim) -> io::Result<()> {
+        let mut slot = self.pending_restore.lock().map_err(|_| {
+            io::Error::other("session pending-restore state was poisoned by a panic")
+        })?;
+        if slot.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "this window already has a pending restored-session claim",
+            ));
+        }
+        *slot = Some(pending);
+        Ok(())
+    }
+
+    fn pending_claim_file_name(&self) -> io::Result<Option<String>> {
+        let slot = self.pending_restore.lock().map_err(|_| {
+            io::Error::other("session pending-restore state was poisoned by a panic")
+        })?;
+        slot.as_ref()
+            .map(|pending| {
+                pending
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "claimed session filename is not valid UTF-8",
+                        )
+                    })
+            })
+            .transpose()
+    }
+
+    fn commit_pending_restore(&self) -> io::Result<()> {
+        let mut slot = self.pending_restore.lock().map_err(|_| {
+            io::Error::other("session pending-restore state was poisoned by a panic")
+        })?;
+        let Some(pending) = slot.as_ref() else {
+            return Ok(());
+        };
+        let directory = pending
+            .path
+            .parent()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "claimed session path has no parent directory",
+                )
+            })?
+            .to_path_buf();
+        let mut remaining_bytes = MAX_CLAIM_CHAIN_BYTES;
+        let mut cleaned_files = Vec::new();
+        if let Some(superseded) = &pending.supersedes {
+            remove_superseded_claim_chain(
+                &directory,
+                superseded,
+                0,
+                &mut remaining_bytes,
+                &mut cleaned_files,
+            )?;
+        }
+        match fs::remove_file(&pending.path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        cleaned_files.push(pending.source_file.clone());
+        sync_directory(&directory)?;
+        // Release retired owner flocks before lock-file garbage collection;
+        // otherwise our own chain guard would make every stale lock look live.
+        drop(slot.take().expect("pending restore was present above"));
+        for file in &cleaned_files {
+            cleanup_locks_referenced_by(&directory, file);
+        }
+        cleanup_orphaned_locks(&directory);
+        Ok(())
+    }
 }
 
 fn parse_instance_identity(value: &str) -> Option<InstanceIdentity> {
@@ -576,6 +1265,265 @@ fn parse_state_file_name(name: &str) -> Option<StateFileName> {
         owner,
         claimer: None,
     })
+}
+
+fn superseded_claim_reference(
+    dir: &Path,
+    source_file: &StateFileName,
+    name: &str,
+) -> io::Result<ClaimReference> {
+    let path = Path::new(name);
+    if path.file_name().and_then(|part| part.to_str()) != Some(name) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "session envelope supersedes must be one UTF-8 filename",
+        ));
+    }
+    let file_name = parse_state_file_name(name).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "session envelope supersedes is not a snapshot claim name",
+        )
+    })?;
+    let writer = source_file
+        .owner
+        .as_ref()
+        .and_then(InstanceIdentity::token)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "versioned session envelope has no token owner",
+            )
+        })?;
+    let claimer = file_name
+        .claimer
+        .as_ref()
+        .and_then(InstanceIdentity::token)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session envelope supersedes must name a token-owned claim",
+            )
+        })?;
+    if !claimer.eq_ignore_ascii_case(writer) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "session envelope supersedes was not claimed by its writer",
+        ));
+    }
+    Ok(ClaimReference {
+        path: dir.join(name),
+        file_name,
+    })
+}
+
+fn parse_snapshot_payload(
+    contents: &str,
+    dir: &Path,
+    source_file: &StateFileName,
+) -> io::Result<(SnapshotState, Option<ClaimReference>)> {
+    match serde_json::from_str::<SessionEnvelope<SavedSession>>(contents) {
+        Ok(envelope) => {
+            if envelope.format != SESSION_ENVELOPE_FORMAT
+                || envelope.version != SESSION_ENVELOPE_VERSION
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "unsupported session envelope format/version: {}/{}",
+                        envelope.format, envelope.version
+                    ),
+                ));
+            }
+            let supersedes = envelope
+                .supersedes
+                .as_deref()
+                .map(|name| superseded_claim_reference(dir, source_file, name))
+                .transpose()?;
+            let state = match envelope.payload {
+                SessionEnvelopePayload::Workspace(mut session) => {
+                    if !session_within_restore_limits(&session) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "session envelope workspace exceeds restore limits",
+                        ));
+                    }
+                    sanitize_restorable_commands(&mut session);
+                    SnapshotState::Workspace(session)
+                }
+                SessionEnvelopePayload::Empty => SnapshotState::Empty,
+            };
+            Ok((state, supersedes))
+        }
+        Err(envelope_error) => {
+            let mut session = serde_json::from_str::<SavedSession>(contents).map_err(|legacy_error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "neither a valid session envelope ({envelope_error}) nor a legacy snapshot ({legacy_error})"
+                    ),
+                )
+            })?;
+            if !session_within_restore_limits(&session) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "legacy session snapshot exceeds restore limits",
+                ));
+            }
+            sanitize_restorable_commands(&mut session);
+            Ok((SnapshotState::Workspace(session), None))
+        }
+    }
+}
+
+fn hold_retired_owner_lock(
+    dir: &Path,
+    token: &str,
+    locks: &mut Vec<HeldRetiredOwnerLock>,
+) -> io::Result<bool> {
+    if locks
+        .iter()
+        .any(|lock| lock.token.eq_ignore_ascii_case(token))
+    {
+        return Ok(true);
+    }
+    let file = match open_existing_lock_file(&lock_file_path_for_token(dir, token)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if !try_lock_file_exclusive(&file)? {
+        return Ok(false);
+    }
+    locks.push(HeldRetiredOwnerLock {
+        token: token.to_string(),
+        file,
+    });
+    Ok(true)
+}
+
+fn hold_reference_chain_locks(
+    dir: &Path,
+    reference: &ClaimReference,
+    depth: usize,
+    remaining_bytes: &mut u64,
+    locks: &mut Vec<HeldRetiredOwnerLock>,
+) -> io::Result<bool> {
+    if depth >= MAX_CLAIM_CHAIN_DEPTH || *remaining_bytes == 0 {
+        return Ok(false);
+    }
+    let read_limit = (*remaining_bytes).min(MAX_SNAPSHOT_BYTES);
+    let contents = match read_snapshot_bounded_to(&reference.path, read_limit) {
+        Ok(contents) => contents,
+        // A missing predecessor means an earlier commit completed its unlink;
+        // the current envelope remains valid and there is no branch to lock.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    *remaining_bytes -= contents.len() as u64;
+    let (_, supersedes) = parse_snapshot_payload(&contents, dir, &reference.file_name)?;
+    match supersedes {
+        Some(next) => {
+            // `reference` is protected by its claimer lock, which the caller
+            // already holds. Its owner wrote the nested pointer, so acquire
+            // that owner's lock before descending to the next claim.
+            let Some(writer) = reference
+                .file_name
+                .owner
+                .as_ref()
+                .and_then(InstanceIdentity::token)
+            else {
+                return Ok(false);
+            };
+            if !hold_retired_owner_lock(dir, writer, locks)? {
+                return Ok(false);
+            }
+            hold_reference_chain_locks(dir, &next, depth + 1, remaining_bytes, locks)
+        }
+        None => Ok(true),
+    }
+}
+
+fn hold_candidate_chain_locks(
+    dir: &Path,
+    candidate: &SessionCandidate,
+) -> io::Result<Option<Vec<HeldRetiredOwnerLock>>> {
+    // Preserve the global lock order used by publisher/cleanup paths while
+    // converting available owner locks into held predecessor guards. Without
+    // the protocol, cleanup could unlink a pathname between our open and flock,
+    // leaving us holding only a detached inode that protects no future probe.
+    let _protocol = LockProtocolGuard::acquire(dir)?;
+    let mut locks = Vec::new();
+    if let Some(identity) = candidate
+        .file_name
+        .claimer
+        .as_ref()
+        .or(candidate.file_name.owner.as_ref())
+        .and_then(InstanceIdentity::token)
+    {
+        if !hold_retired_owner_lock(dir, identity, &mut locks)? {
+            return Ok(None);
+        }
+    }
+    if let Some(writer) = candidate
+        .file_name
+        .owner
+        .as_ref()
+        .and_then(InstanceIdentity::token)
+    {
+        if !hold_retired_owner_lock(dir, writer, &mut locks)? {
+            return Ok(None);
+        }
+    }
+    if let Some(supersedes) = &candidate.supersedes {
+        let mut remaining_bytes = MAX_CLAIM_CHAIN_BYTES;
+        if !hold_reference_chain_locks(dir, supersedes, 0, &mut remaining_bytes, &mut locks)? {
+            return Ok(None);
+        }
+    }
+    Ok(Some(locks))
+}
+
+fn remove_superseded_claim_chain(
+    dir: &Path,
+    reference: &ClaimReference,
+    depth: usize,
+    remaining_bytes: &mut u64,
+    cleaned_files: &mut Vec<StateFileName>,
+) -> io::Result<()> {
+    if depth >= MAX_CLAIM_CHAIN_DEPTH {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "session supersedes chain exceeds its depth limit",
+        ));
+    }
+    if *remaining_bytes == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            "session supersedes chain exceeds its byte budget",
+        ));
+    }
+    let read_limit = (*remaining_bytes).min(MAX_SNAPSHOT_BYTES);
+    let contents = match read_snapshot_bounded_to(&reference.path, read_limit) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            cleaned_files.push(reference.file_name.clone());
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    *remaining_bytes -= contents.len() as u64;
+    let (_, supersedes) = parse_snapshot_payload(&contents, dir, &reference.file_name)?;
+    if let Some(next) = &supersedes {
+        remove_superseded_claim_chain(dir, next, depth + 1, remaining_bytes, cleaned_files)?;
+    }
+    match fs::remove_file(&reference.path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    cleaned_files.push(reference.file_name.clone());
+    Ok(())
 }
 
 fn state_file_is_recoverable(
@@ -656,7 +1604,7 @@ fn cleanup_lock_if_unreferenced(dir: &Path, token: &str) {
 /// protocol -> owner lock.
 fn cleanup_lock_if_unreferenced_under_protocol(dir: &Path, token: &str) {
     let path = lock_file_path_for_token(dir, token);
-    let file = match OpenOptions::new().read(true).write(true).open(&path) {
+    let file = match open_existing_lock_file(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return,
         Err(error) => {
@@ -667,8 +1615,8 @@ fn cleanup_lock_if_unreferenced_under_protocol(dir: &Path, token: &str) {
             return;
         }
     };
-    match try_lock_file_exclusive(&file) {
-        Ok(true) => match token_referenced_by_state_files(dir, token) {
+    match try_temporary_exclusive_lock(&file) {
+        Ok(Some(_lock)) => match token_referenced_by_state_files(dir, token) {
             Ok(false) => {
                 if let Err(error) = fs::remove_file(&path) {
                     log::warn!(
@@ -685,14 +1633,14 @@ fn cleanup_lock_if_unreferenced_under_protocol(dir: &Path, token: &str) {
                 );
             }
         },
-        Ok(_) => {}
+        Ok(None) => {}
         Err(error) => {
             log::warn!(
                 "Cannot lock retired session owner lock {}: {error}",
                 path.display()
             );
         }
-    }
+    };
 }
 
 fn cleanup_locks_referenced_by(dir: &Path, file: &StateFileName) {
@@ -784,7 +1732,14 @@ struct SessionCandidate {
     path: PathBuf,
     file_name: StateFileName,
     modified: SystemTime,
-    session: SavedSession,
+    state: SnapshotState,
+    supersedes: Option<ClaimReference>,
+}
+
+struct CandidateDescriptor {
+    path: PathBuf,
+    file_name: StateFileName,
+    modified: SystemTime,
 }
 
 fn sort_candidates_newest_first(candidates: &mut [SessionCandidate]) {
@@ -800,6 +1755,20 @@ fn scan_candidates(
     current_token: Option<&str>,
     lock_state: &dyn Fn(&str) -> TokenLockState,
 ) -> Vec<SessionCandidate> {
+    scan_candidates_with_reader(
+        dir,
+        current_token,
+        lock_state,
+        &mut read_snapshot_bounded_to,
+    )
+}
+
+fn scan_candidates_with_reader(
+    dir: &Path,
+    current_token: Option<&str>,
+    lock_state: &dyn Fn(&str) -> TokenLockState,
+    read_snapshot: &mut dyn FnMut(&Path, u64) -> io::Result<String>,
+) -> Vec<SessionCandidate> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Vec::new(),
@@ -809,8 +1778,20 @@ fn scan_candidates(
         }
     };
 
-    let mut candidates = Vec::new();
-    for entry in entries {
+    // First collect only cheap metadata, then select the newest bounded subset
+    // before reading or parsing any payload. This keeps both resident decoded
+    // sessions and total serde work bounded even if the directory contains a
+    // very large number of plausible snapshot names.
+    let mut descriptors = Vec::new();
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_DIRECTORY_ENTRIES_PER_SCAN {
+            log::warn!(
+                "Session state directory {} exceeds the {}-entry startup scan limit",
+                dir.display(),
+                MAX_DIRECTORY_ENTRIES_PER_SCAN
+            );
+            break;
+        }
         let entry = match entry {
             Ok(entry) => entry,
             Err(err) => {
@@ -833,36 +1814,6 @@ fn scan_candidates(
         }
 
         let path = entry.path();
-        // Bounded: this file was found by scanning a directory, so its size is
-        // not this process's to trust, and an unbounded read happens before
-        // anything can reject the contents.
-        let contents = match snapshot_file::read_bounded(&path, MAX_SNAPSHOT_BYTES) {
-            Ok(contents) => contents,
-            Err(err) => {
-                log::error!(
-                    "Cannot read recoverable session snapshot {}: {err}; file retained",
-                    path.display()
-                );
-                continue;
-            }
-        };
-        let session = match serde_json::from_str::<SavedSession>(&contents) {
-            Ok(session) if !session.tabs.is_empty() => session,
-            Ok(_) => {
-                log::warn!(
-                    "Session snapshot {} contains no tabs; file retained",
-                    path.display()
-                );
-                continue;
-            }
-            Err(err) => {
-                log::error!(
-                    "Corrupt session snapshot {}: {err}; file retained",
-                    path.display()
-                );
-                continue;
-            }
-        };
         let modified = match entry.metadata().and_then(|metadata| metadata.modified()) {
             Ok(modified) => modified,
             Err(err) => {
@@ -873,14 +1824,82 @@ fn scan_candidates(
                 UNIX_EPOCH
             }
         };
-        candidates.push(SessionCandidate {
+        descriptors.push(CandidateDescriptor {
             path,
             file_name,
             modified,
-            session,
         });
     }
 
+    descriptors.sort_by(|a, b| {
+        b.modified
+            .cmp(&a.modified)
+            .then_with(|| b.path.file_name().cmp(&a.path.file_name()))
+    });
+    descriptors.truncate(MAX_CANDIDATES_PER_SCAN);
+
+    let mut candidates = Vec::with_capacity(descriptors.len());
+    let mut remaining_bytes = MAX_CANDIDATE_BYTES_PER_SCAN;
+    for descriptor in descriptors {
+        if remaining_bytes == 0 {
+            break;
+        }
+        let read_limit = remaining_bytes.min(MAX_SNAPSHOT_BYTES);
+        let contents = match read_snapshot(&descriptor.path, read_limit) {
+            Ok(contents) => contents,
+            Err(err) => {
+                log::error!(
+                    "Cannot read recoverable session snapshot {}: {err}; file retained",
+                    descriptor.path.display()
+                );
+                continue;
+            }
+        };
+        let payload_bytes = contents.len() as u64;
+        if payload_bytes > read_limit {
+            log::error!(
+                "Snapshot reader exceeded its {}-byte limit for {}; file retained",
+                read_limit,
+                descriptor.path.display()
+            );
+            break;
+        }
+        remaining_bytes -= payload_bytes;
+
+        let (state, supersedes) =
+            match parse_snapshot_payload(&contents, dir, &descriptor.file_name) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    log::error!(
+                        "Invalid session snapshot {}: {err}; file retained",
+                        descriptor.path.display()
+                    );
+                    continue;
+                }
+            };
+        candidates.push(SessionCandidate {
+            path: descriptor.path,
+            file_name: descriptor.file_name,
+            modified: descriptor.modified,
+            state,
+            supersedes,
+        });
+    }
+
+    // A durable envelope supersedes its predecessor regardless of mtime
+    // granularity or directory iteration order. Removing referenced claims
+    // here ensures two equally-timestamped crash remnants cannot make the old
+    // workspace win merely by filename tie-break.
+    let superseded_paths: HashSet<PathBuf> = candidates
+        .iter()
+        .filter_map(|candidate| {
+            candidate
+                .supersedes
+                .as_ref()
+                .map(|reference| reference.path.clone())
+        })
+        .collect();
+    candidates.retain(|candidate| !superseded_paths.contains(&candidate.path));
     sort_candidates_newest_first(&mut candidates);
     candidates
 }
@@ -931,11 +1950,11 @@ fn rename_noreplace(_source: &Path, _target: &Path) -> io::Result<()> {
     ))
 }
 
-fn load_session_from(
+fn claim_session_from(
     dir: &Path,
     current_token: &str,
     lock_state: &dyn Fn(&str) -> TokenLockState,
-) -> Option<SavedSession> {
+) -> Option<ClaimedSnapshot> {
     // A competing startup can win the rename between our scan and claim. Retry
     // so simultaneous launches can each recover a different exited window
     // without ever consuming the same snapshot.
@@ -947,23 +1966,49 @@ fn load_session_from(
             "{}{}{}",
             candidate.file_name.base_name, CLAIM_MARKER, current_token
         ));
+        let retired_owner_locks = match hold_candidate_chain_locks(dir, &candidate) {
+            Ok(Some(locks)) => locks,
+            Ok(None) => {
+                log::debug!(
+                    "Session snapshot {} or one of its predecessors became live; rescanning",
+                    candidate.path.display()
+                );
+                continue;
+            }
+            Err(error) => {
+                log::error!(
+                    "Cannot lock session snapshot chain rooted at {}: {error}; files retained",
+                    candidate.path.display()
+                );
+                return None;
+            }
+        };
         match rename_noreplace(&candidate.path, &claim_path) {
             Ok(()) => {
-                if let Err(err) = fs::remove_file(&claim_path) {
-                    log::error!(
-                        "Claimed session snapshot {} as {}, but could not consume it: {err}; claimed file retained and no restore performed",
+                if let Err(err) = sync_directory(dir) {
+                    // The rename still has either its old or new durable name
+                    // after a crash. Continue while retaining every predecessor
+                    // lock, so no second instance can restore an older branch.
+                    log::warn!(
+                        "Claimed session snapshot {} as {}, but could not sync the claim directory: {err}; continuing with the recoverable claim",
                         candidate.path.display(),
                         claim_path.display()
                     );
-                    return None;
                 }
-                cleanup_locks_referenced_by(dir, &candidate.file_name);
-                cleanup_orphaned_locks(dir);
                 log::info!(
-                    "Restored and consumed session snapshot {}",
-                    candidate.path.display()
+                    "Claimed session snapshot {} as {}; it will be consumed after a durable checkpoint",
+                    candidate.path.display(),
+                    claim_path.display()
                 );
-                return Some(candidate.session);
+                return Some(ClaimedSnapshot {
+                    state: candidate.state,
+                    pending: PendingRestoreClaim {
+                        path: claim_path,
+                        source_file: candidate.file_name,
+                        supersedes: candidate.supersedes,
+                        _retired_owner_locks: retired_owner_locks,
+                    },
+                });
             }
             Err(err)
                 if matches!(
@@ -1043,6 +2088,456 @@ mod tests {
                 },
             }],
         }
+    }
+
+    fn workspace(state: &SnapshotState) -> &SavedSession {
+        match state {
+            SnapshotState::Workspace(session) => session,
+            SnapshotState::Empty => panic!("expected a workspace snapshot"),
+        }
+    }
+
+    fn layout_with_leaves(count: usize) -> PaneLayout {
+        assert!(count > 0);
+        let leaf = || PaneLayout::Leaf {
+            mode: "block".to_string(),
+            cwd: None,
+            cwd_external: false,
+            remote_name: None,
+            sid: None,
+            cmds: None,
+        };
+        let mut layout = leaf();
+        for _ in 1..count {
+            layout = PaneLayout::Split {
+                orientation: 'h',
+                position: 50,
+                start: Box::new(layout),
+                end: Box::new(leaf()),
+            };
+        }
+        layout
+    }
+
+    #[test]
+    fn restore_limits_bound_tabs_panes_and_user_visible_fields() {
+        let base = saved_session("bounded").tabs.remove(0);
+        let mut maximum = SavedSession {
+            active: 0,
+            tabs: (0..4)
+                .map(|_| SavedTab {
+                    layout: layout_with_leaves(16),
+                    ..base.clone()
+                })
+                .collect(),
+        };
+        assert!(session_within_restore_limits(&maximum));
+
+        maximum.tabs.push(SavedTab {
+            layout: layout_with_leaves(1),
+            ..base.clone()
+        });
+        assert!(!session_within_restore_limits(&maximum));
+
+        let too_many_tabs = SavedSession {
+            active: 0,
+            tabs: vec![base.clone(); MAX_RESTORED_TABS + 1],
+        };
+        assert!(!session_within_restore_limits(&too_many_tabs));
+
+        let too_wide = SavedSession {
+            active: 0,
+            tabs: vec![SavedTab {
+                layout: layout_with_leaves(MAX_RESTORED_PANES_PER_TAB + 1),
+                ..base.clone()
+            }],
+        };
+        assert!(!session_within_restore_limits(&too_wide));
+
+        let oversized_title = SavedSession {
+            active: 0,
+            tabs: vec![SavedTab {
+                title: "x".repeat(MAX_RESTORED_TITLE_BYTES + 1),
+                ..base.clone()
+            }],
+        };
+        assert!(!session_within_restore_limits(&oversized_title));
+
+        for argv in [
+            std::iter::once("ssh".to_string())
+                .chain((0..MAX_RESTORED_COMMAND_ARGS).map(|_| "x".to_string()))
+                .collect::<Vec<_>>(),
+            vec![
+                "ssh".to_string(),
+                "x".repeat(MAX_RESTORED_COMMAND_ARG_BYTES + 1),
+            ],
+            vec!["ssh".to_string(), "host\nname".to_string()],
+        ] {
+            let oversized_command = SavedSession {
+                active: 0,
+                tabs: vec![SavedTab {
+                    layout: PaneLayout::Leaf {
+                        mode: "block".to_string(),
+                        cwd: None,
+                        cwd_external: true,
+                        remote_name: None,
+                        sid: None,
+                        cmds: Some(argv),
+                    },
+                    ..base.clone()
+                }],
+            };
+            assert!(!session_within_restore_limits(&oversized_command));
+        }
+    }
+
+    #[test]
+    fn save_rejects_every_restore_limit_and_keeps_last_good_snapshot() {
+        let dir = TestDir::new("save-limits");
+        let owner = SnapshotOwner::create_in(dir.path()).unwrap();
+        let good = saved_session("last-good");
+        checkpoint_snapshot_for_owner(&owner, &good).unwrap();
+        let expected = fs::read(&owner.state_path).unwrap();
+        let base = good.tabs[0].clone();
+
+        let too_many_tabs = SavedSession {
+            active: 0,
+            tabs: vec![base.clone(); MAX_RESTORED_TABS + 1],
+        };
+        let too_many_in_one_tab = SavedSession {
+            active: 0,
+            tabs: vec![SavedTab {
+                layout: layout_with_leaves(MAX_RESTORED_PANES_PER_TAB + 1),
+                ..base.clone()
+            }],
+        };
+        let too_many_total = SavedSession {
+            active: 0,
+            tabs: (0..5)
+                .map(|_| SavedTab {
+                    layout: layout_with_leaves(13),
+                    ..base.clone()
+                })
+                .collect(),
+        };
+        let oversized_payload = SavedSession {
+            active: 0,
+            tabs: vec![SavedTab {
+                layout: PaneLayout::Leaf {
+                    mode: "block".to_string(),
+                    cwd: None,
+                    cwd_external: true,
+                    remote_name: None,
+                    sid: None,
+                    cmds: Some(vec![
+                        "ssh".to_string(),
+                        "x".repeat(MAX_SNAPSHOT_BYTES as usize),
+                    ]),
+                },
+                ..base
+            }],
+        };
+
+        for rejected in [
+            too_many_tabs,
+            too_many_in_one_tab,
+            too_many_total,
+            oversized_payload,
+        ] {
+            assert!(checkpoint_snapshot_for_owner(&owner, &rejected).is_err());
+            assert_eq!(
+                fs::read(&owner.state_path).unwrap(),
+                expected,
+                "a rejected save must not replace the last-good snapshot"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_tombstone_is_durable_consumed_and_never_restores_old_workspace() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TestDir::new("empty-tombstone");
+        let original = SnapshotOwner::create_in(dir.path()).unwrap();
+        write_session(&original.state_path, "must-not-resurrect");
+        drop(original);
+
+        let closer = SnapshotOwner::create_in(dir.path()).unwrap();
+        let claimed = claim_session_from(dir.path(), &closer.token, &|token| {
+            token_lock_state_in(dir.path(), token)
+        })
+        .expect("claim workspace before closing its final tab");
+        assert_eq!(
+            workspace(&claimed.state).tabs[0].title,
+            "must-not-resurrect"
+        );
+        let old_claim_path = claimed.pending.path.clone();
+        closer.remember_pending_restore(claimed.pending).unwrap();
+        checkpoint_snapshot_for_owner(&closer, &SavedSession::default()).unwrap();
+
+        assert!(!old_claim_path.exists());
+        let tombstone_contents = read_snapshot_bounded(&closer.state_path).unwrap();
+        let closer_file =
+            parse_state_file_name(closer.state_path.file_name().unwrap().to_str().unwrap())
+                .unwrap();
+        let (state, _) =
+            parse_snapshot_payload(&tombstone_contents, dir.path(), &closer_file).unwrap();
+        assert!(matches!(state, SnapshotState::Empty));
+        assert_eq!(
+            fs::metadata(&closer.state_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        drop(closer);
+        let next = SnapshotOwner::create_in(dir.path()).unwrap();
+        let claimed_tombstone = claim_session_from(dir.path(), &next.token, &|token| {
+            token_lock_state_in(dir.path(), token)
+        })
+        .expect("next startup claims the empty tombstone");
+        assert!(matches!(&claimed_tombstone.state, SnapshotState::Empty));
+        let consumed_path = claimed_tombstone.pending.path.clone();
+        assert!(adopt_claimed_snapshot(&next, claimed_tombstone)
+            .unwrap()
+            .is_none());
+        assert!(!consumed_path.exists());
+        assert!(
+            next.state_path.exists(),
+            "empty state must be propagated durably"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn crash_after_durable_tombstone_before_claim_cleanup_finishes_chain() {
+        let dir = TestDir::new("tombstone-crash-window");
+        let original = SnapshotOwner::create_in(dir.path()).unwrap();
+        write_session(&original.state_path, "old-workspace");
+        drop(original);
+
+        let crashed = SnapshotOwner::create_in(dir.path()).unwrap();
+        let claimed = claim_session_from(dir.path(), &crashed.token, &|token| {
+            token_lock_state_in(dir.path(), token)
+        })
+        .expect("claim old workspace");
+        let old_claim_path = claimed.pending.path.clone();
+        crashed.remember_pending_restore(claimed.pending).unwrap();
+        thread::sleep(Duration::from_millis(10));
+        write_snapshot_for_owner(&crashed, &SavedSession::default()).unwrap();
+        assert!(old_claim_path.exists());
+        assert!(crashed.state_path.exists());
+
+        // Simulate process death after the tombstone's rename+fsync and before
+        // commit_pending_restore. The tombstone points to the still-durable old
+        // claim, so a future owner can finish both cleanup steps.
+        drop(crashed);
+        let next = SnapshotOwner::create_in(dir.path()).unwrap();
+        let recovered = claim_session_from(dir.path(), &next.token, &|token| {
+            token_lock_state_in(dir.path(), token)
+        })
+        .expect("recover durable tombstone");
+        assert!(matches!(&recovered.state, SnapshotState::Empty));
+        let tombstone_claim_path = recovered.pending.path.clone();
+
+        let competitor = SnapshotOwner::create_in(dir.path()).unwrap();
+        assert!(
+            claim_session_from(dir.path(), &competitor.token, &|token| {
+                token_lock_state_in(dir.path(), token)
+            })
+            .is_none(),
+            "held predecessor locks must prevent a second startup from reviving the old workspace"
+        );
+        drop(competitor);
+
+        assert!(adopt_claimed_snapshot(&next, recovered).unwrap().is_none());
+        assert!(
+            !old_claim_path.exists(),
+            "superseded workspace claim must be removed"
+        );
+        assert!(
+            !tombstone_claim_path.exists(),
+            "consumed tombstone claim must be removed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn crash_after_durable_workspace_before_claim_cleanup_never_revives_predecessor() {
+        let dir = TestDir::new("workspace-crash-window");
+        let original = SnapshotOwner::create_in(dir.path()).unwrap();
+        write_session(&original.state_path, "old-workspace");
+        drop(original);
+
+        let crashed = SnapshotOwner::create_in(dir.path()).unwrap();
+        let claimed = claim_session_from(dir.path(), &crashed.token, &|token| {
+            token_lock_state_in(dir.path(), token)
+        })
+        .expect("claim old workspace");
+        let old_claim_path = claimed.pending.path.clone();
+        crashed.remember_pending_restore(claimed.pending).unwrap();
+        thread::sleep(Duration::from_millis(10));
+        write_snapshot_for_owner(&crashed, &saved_session("new-workspace")).unwrap();
+        drop(crashed);
+
+        let next = SnapshotOwner::create_in(dir.path()).unwrap();
+        let recovered = claim_session_from(dir.path(), &next.token, &|token| {
+            token_lock_state_in(dir.path(), token)
+        })
+        .expect("recover newest durable workspace");
+        let recovered_claim_path = recovered.pending.path.clone();
+        let session = adopt_claimed_snapshot(&next, recovered)
+            .unwrap()
+            .expect("workspace envelope must restore");
+        assert_eq!(session.tabs[0].title, "new-workspace");
+        checkpoint_snapshot_for_owner(&next, &session).unwrap();
+
+        assert!(!old_claim_path.exists());
+        assert!(!recovered_claim_path.exists());
+        drop(next);
+
+        let final_loader = SnapshotOwner::create_in(dir.path()).unwrap();
+        let final_snapshot = claim_session_from(dir.path(), &final_loader.token, &|token| {
+            token_lock_state_in(dir.path(), token)
+        })
+        .expect("only the replacement workspace remains");
+        assert_eq!(
+            workspace(&final_snapshot.state).tabs[0].title,
+            "new-workspace"
+        );
+    }
+
+    #[test]
+    fn bare_legacy_snapshot_remains_compatible_with_envelope_reader() {
+        let dir = TestDir::new("legacy-envelope-compat");
+        let path = dir.path().join(LEGACY_STATE_FILE);
+        write_session(&path, "legacy-bare");
+
+        let claimed = claim_session_from(dir.path(), &token(99), &|_| TokenLockState::Available)
+            .expect("legacy bare snapshot remains recoverable");
+        assert_eq!(workspace(&claimed.state).tabs[0].title, "legacy-bare");
+        assert!(claimed.pending.supersedes.is_none());
+    }
+
+    #[test]
+    fn malformed_tombstone_is_rejected_and_retained() {
+        let dir = TestDir::new("invalid-tombstone");
+        let path = dir.path().join(LEGACY_STATE_FILE);
+        atomic_write(
+            &path,
+            br#"{"format":"jterm1-session","version":2,"payload":{"kind":"empty"}}"#,
+        )
+        .unwrap();
+
+        assert!(scan_candidates(dir.path(), Some(&token(99)), &|_| {
+            TokenLockState::Available
+        })
+        .is_empty());
+        assert!(path.exists(), "invalid tombstone must remain inspectable");
+    }
+
+    #[test]
+    fn tombstone_rejects_supersedes_path_traversal_without_touching_target() {
+        let root = TestDir::new("tombstone-path-traversal");
+        let dir = root.path().join("state");
+        fs::create_dir(&dir).unwrap();
+        let victim = root.path().join("victim");
+        fs::write(&victim, b"keep").unwrap();
+        let path = state_file_path_for_token(&dir, &token(10));
+        atomic_write(
+            &path,
+            br#"{"format":"jterm1-session","version":1,"payload":{"kind":"empty"},"supersedes":"../victim"}"#,
+        )
+        .unwrap();
+
+        assert!(
+            scan_candidates(&dir, Some(&token(99)), &|_| { TokenLockState::Available }).is_empty()
+        );
+        assert_eq!(fs::read(&victim).unwrap(), b"keep");
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn disk_restore_drops_arbitrary_argv_and_preserves_known_remote_argv() {
+        let dir = TestDir::new("sanitize-restorable-argv");
+        let commands = [
+            vec!["sh", "-c", "touch /tmp/must-not-run"],
+            vec!["ssh", "example.test"],
+            vec!["mosh", "example.test"],
+            vec!["docker", "exec", "container", "bash"],
+            vec!["podman", "compose", "exec", "service", "sh"],
+        ];
+        let tabs = commands
+            .iter()
+            .enumerate()
+            .map(|(index, argv)| SavedTab {
+                title: format!("command-{index}"),
+                custom_title: false,
+                pinned: false,
+                layout: PaneLayout::Leaf {
+                    mode: "block".to_string(),
+                    cwd: None,
+                    cwd_external: index > 0,
+                    remote_name: None,
+                    sid: None,
+                    cmds: Some(argv.iter().map(|part| (*part).to_string()).collect()),
+                },
+            })
+            .collect();
+        let saved = SavedSession { active: 0, tabs };
+        let path = dir.path().join(LEGACY_STATE_FILE);
+        atomic_write(&path, &serde_json::to_vec(&saved).unwrap()).unwrap();
+
+        let claimed = claim_session_from(dir.path(), &token(99), &|_| TokenLockState::Available)
+            .expect("claim test snapshot");
+        let restored: Vec<Option<Vec<String>>> = workspace(&claimed.state)
+            .tabs
+            .iter()
+            .map(|tab| match &tab.layout {
+                PaneLayout::Leaf { cmds, .. } => cmds.clone(),
+                PaneLayout::Split { .. } => unreachable!(),
+            })
+            .collect();
+
+        assert_eq!(restored[0], None, "sh -c must never reach pane spawn");
+        for (actual, expected) in restored[1..].iter().zip(&commands[1..]) {
+            assert_eq!(
+                actual.as_ref().unwrap(),
+                &expected
+                    .iter()
+                    .map(|part| (*part).to_string())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_reader_rejects_symlinks_hard_links_and_fifos() {
+        use nix::sys::stat::Mode;
+        use nix::unistd::mkfifo;
+        use std::os::unix::fs::symlink;
+
+        let dir = TestDir::new("snapshot-file-types");
+        let victim = dir.path().join("victim.json");
+        let link = dir.path().join("link.state");
+        let hard_link = dir.path().join("hard.state");
+        let fifo = dir.path().join("fifo.state");
+        fs::write(&victim, b"{}").unwrap();
+        assert_eq!(read_snapshot_bounded(&victim).unwrap(), "{}");
+
+        symlink(&victim, &link).unwrap();
+        assert!(read_snapshot_bounded(&link).is_err());
+        fs::hard_link(&victim, &hard_link).unwrap();
+        assert!(read_snapshot_bounded(&hard_link).is_err());
+        mkfifo(&fifo, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        let started = std::time::Instant::now();
+        assert!(read_snapshot_bounded(&fifo).is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(fs::read(&victim).unwrap(), b"{}");
     }
 
     #[test]
@@ -1369,7 +2864,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn owner_flock_keeps_live_snapshot_while_exited_snapshot_is_consumed() {
+    fn owner_flock_keeps_live_snapshot_while_exited_snapshot_is_checkpointed() {
         let dir = TestDir::new("live-owner");
         let live_owner = SnapshotOwner::create_in(dir.path()).unwrap();
         write_session(&live_owner.state_path, "live");
@@ -1380,16 +2875,20 @@ mod tests {
         drop(exited_owner);
         let loader = SnapshotOwner::create_in(dir.path()).unwrap();
 
-        let restored = load_session_from(dir.path(), &loader.token, &|token| {
+        let claimed = claim_session_from(dir.path(), &loader.token, &|token| {
             token_lock_state_in(dir.path(), token)
         })
         .expect("restore exited owner");
-        assert_eq!(restored.tabs[0].title, "exited");
+        assert_eq!(workspace(&claimed.state).tabs[0].title, "exited");
+        assert!(claimed.pending.path.exists());
+        let session = workspace(&claimed.state).clone();
+        loader.remember_pending_restore(claimed.pending).unwrap();
+        checkpoint_snapshot_for_owner(&loader, &session).unwrap();
         assert!(
             live_owner.state_path.exists(),
             "live owner's file must remain"
         );
-        assert!(!exited_path.exists(), "restored file must be consumed");
+        assert!(!exited_path.exists(), "restored file must remain claimed");
         assert!(
             !exited_lock.exists(),
             "consuming the last reference must clean its stale owner lock"
@@ -1427,6 +2926,196 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn session_lock_descriptors_close_across_exec() {
+        let dir = TestDir::new("lock-cloexec");
+        let owner = SnapshotOwner::create_in(dir.path()).unwrap();
+        let protocol = LockProtocolGuard::acquire(dir.path()).unwrap();
+        let probe =
+            open_existing_lock_file(&lock_file_path_for_token(dir.path(), &owner.token)).unwrap();
+
+        for descriptor in [
+            owner._lock_file.as_raw_fd(),
+            protocol._file.as_raw_fd(),
+            probe.as_raw_fd(),
+        ] {
+            // SAFETY: every descriptor is owned by a live `File` value above.
+            let flags = unsafe { nix::libc::fcntl(descriptor, nix::libc::F_GETFD) };
+            assert_ne!(flags, -1);
+            assert_ne!(flags & nix::libc::FD_CLOEXEC, 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protocol_acquire_times_out_instead_of_blocking_forever() {
+        let dir = TestDir::new("protocol-timeout");
+        let held = LockProtocolGuard::acquire(dir.path()).unwrap();
+        let started = Instant::now();
+        let error = LockProtocolGuard::acquire_with_timeout(dir.path(), Duration::from_millis(25))
+            .err()
+            .expect("a second protocol acquisition must time out");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(held);
+        assert!(
+            LockProtocolGuard::acquire_with_timeout(dir.path(), Duration::from_millis(25)).is_ok(),
+            "the protocol must remain usable after the holder releases it"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protocol_directory_lock_survives_protocol_entry_replacement() {
+        let dir = TestDir::new("protocol-entry-replacement");
+        let held = LockProtocolGuard::acquire(dir.path()).unwrap();
+        let protocol_path = dir.path().join(LOCK_PROTOCOL_FILE);
+        let retired_path = dir.path().join("retired-protocol-lock");
+        fs::rename(&protocol_path, &retired_path).unwrap();
+
+        let error = LockProtocolGuard::acquire_with_timeout(dir.path(), Duration::from_millis(25))
+            .err()
+            .expect("replacing the lock pathname must not bypass the directory lock");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+
+        drop(held);
+        let reacquired =
+            LockProtocolGuard::acquire_with_timeout(dir.path(), Duration::from_millis(25))
+                .expect("the protocol remains usable after the original guard exits");
+        drop(reacquired);
+        fs::remove_file(retired_path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_logical_guards_unlocks_fork_inherited_descriptors() {
+        use std::os::fd::FromRawFd;
+
+        let dir = TestDir::new("lock-fork-inheritance");
+        let owner = SnapshotOwner::create_in(dir.path()).unwrap();
+        let owner_lock_path = lock_file_path_for_token(dir.path(), &owner.token);
+        // `dup` models the shared open-file description inherited by fork.
+        // SAFETY: `dup` returns a new owned descriptor on success.
+        let inherited_owner_fd = unsafe { nix::libc::dup(owner._lock_file.as_raw_fd()) };
+        assert_ne!(inherited_owner_fd, -1);
+        // SAFETY: the successful `dup` transferred ownership of this descriptor.
+        let inherited_owner = unsafe { File::from_raw_fd(inherited_owner_fd) };
+        drop(owner);
+
+        let owner_probe = open_existing_lock_file(&owner_lock_path).unwrap();
+        assert!(try_lock_file_exclusive(&owner_probe).unwrap());
+        unlock_file(&owner_probe);
+        drop(owner_probe);
+        drop(inherited_owner);
+
+        let protocol = LockProtocolGuard::acquire(dir.path()).unwrap();
+        // SAFETY: same `dup` ownership argument as above.
+        let inherited_protocol_fd = unsafe { nix::libc::dup(protocol._file.as_raw_fd()) };
+        assert_ne!(inherited_protocol_fd, -1);
+        // SAFETY: the successful `dup` transferred ownership of this descriptor.
+        let inherited_protocol = unsafe { File::from_raw_fd(inherited_protocol_fd) };
+        drop(protocol);
+
+        let reacquired = LockProtocolGuard::try_acquire(dir.path())
+            .unwrap()
+            .expect("logical guard drop must unlock despite an inherited descriptor");
+        drop(reacquired);
+        drop(inherited_protocol);
+
+        let probe = open_existing_lock_file(&owner_lock_path).unwrap();
+        // SAFETY: `dup` returns a separately owned descriptor for the same
+        // open-file description, exactly as a concurrent fork would inherit.
+        let inherited_probe_fd = unsafe { nix::libc::dup(probe.as_raw_fd()) };
+        assert_ne!(inherited_probe_fd, -1);
+        // SAFETY: the successful `dup` transferred ownership of this descriptor.
+        let inherited_probe = unsafe { File::from_raw_fd(inherited_probe_fd) };
+        {
+            let _temporary = try_temporary_exclusive_lock(&probe)
+                .unwrap()
+                .expect("retired owner lock must be available");
+        }
+
+        let competing_probe = open_existing_lock_file(&owner_lock_path).unwrap();
+        assert!(
+            try_lock_file_exclusive(&competing_probe).unwrap(),
+            "temporary logical lock drop must unlock an inherited descriptor"
+        );
+        unlock_file(&competing_probe);
+        drop(competing_probe);
+        drop(inherited_probe);
+        drop(probe);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protocol_lock_rejects_symlinks_hard_links_and_special_files() {
+        use nix::sys::stat::Mode;
+        use nix::unistd::mkfifo;
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = TestDir::new("protocol-file-types");
+        let protocol_path = dir.path().join(LOCK_PROTOCOL_FILE);
+        let victim = dir.path().join("victim");
+        fs::write(&victim, b"keep me").unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o640)).unwrap();
+
+        symlink(&victim, &protocol_path).unwrap();
+        assert!(LockProtocolGuard::acquire(dir.path()).is_err());
+        assert_eq!(fs::read(&victim).unwrap(), b"keep me");
+        assert_eq!(
+            fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        fs::remove_file(&protocol_path).unwrap();
+
+        fs::hard_link(&victim, &protocol_path).unwrap();
+        assert!(LockProtocolGuard::acquire(dir.path()).is_err());
+        assert_eq!(
+            fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        fs::remove_file(&protocol_path).unwrap();
+
+        mkfifo(&protocol_path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        let fifo_mode = fs::symlink_metadata(&protocol_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert!(LockProtocolGuard::acquire(dir.path()).is_err());
+        assert_eq!(
+            fs::symlink_metadata(&protocol_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            fifo_mode,
+            "rejected protocol files must not be chmodded"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_directory_symlink_is_never_followed_or_chmodded() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = TestDir::new("state-dir-symlink");
+        let outside = root.path().join("outside");
+        let linked_state_dir = root.path().join("state");
+        fs::create_dir(&outside).unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&outside, &linked_state_dir).unwrap();
+
+        assert!(SnapshotOwner::create_in(&linked_state_dir).is_err());
+        assert_eq!(
+            fs::metadata(&outside).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+    }
+
     #[test]
     fn ambiguous_pid_snapshot_is_retained_and_oldest_legacy_state_still_restores() {
         let dir = TestDir::new("legacy-corrupt");
@@ -1436,11 +3125,15 @@ mod tests {
         write_session(&legacy_path, "legacy");
         let current = token(99);
 
-        let restored = load_session_from(dir.path(), &current, &|_| TokenLockState::Available)
+        let restored = claim_session_from(dir.path(), &current, &|_| TokenLockState::Available)
             .expect("restore valid legacy state");
-        assert_eq!(restored.tabs[0].title, "legacy");
+        assert_eq!(workspace(&restored.state).tabs[0].title, "legacy");
         assert!(pid_path.exists(), "PID-era state must remain conservative");
-        assert!(!legacy_path.exists(), "legacy state must be consumed once");
+        assert!(!legacy_path.exists(), "legacy state must be claimed once");
+        assert!(
+            restored.pending.path.exists(),
+            "claim must await checkpoint"
+        );
     }
 
     #[cfg(unix)]
@@ -1466,14 +3159,88 @@ mod tests {
         drop(crashed_claimer);
         let loader = SnapshotOwner::create_in(dir.path()).unwrap();
 
-        let restored = load_session_from(dir.path(), &loader.token, &|token| {
+        let restored = claim_session_from(dir.path(), &loader.token, &|token| {
             token_lock_state_in(dir.path(), token)
         })
         .expect("recover orphaned claim");
-        assert_eq!(restored.tabs[0].title, "orphaned claim");
+        assert_eq!(workspace(&restored.state).tabs[0].title, "orphaned claim");
+        let session = workspace(&restored.state).clone();
+        loader.remember_pending_restore(restored.pending).unwrap();
+        checkpoint_snapshot_for_owner(&loader, &session).unwrap();
         assert!(!claim_path.exists());
         assert!(!original_lock.exists());
         assert!(!claimer_lock.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn crash_between_claim_and_checkpoint_leaves_snapshot_recoverable() {
+        let dir = TestDir::new("crash-before-checkpoint");
+        let original = SnapshotOwner::create_in(dir.path()).unwrap();
+        write_session(&original.state_path, "survives-crash");
+        drop(original);
+
+        let first_loader = SnapshotOwner::create_in(dir.path()).unwrap();
+        let first_claim = claim_session_from(dir.path(), &first_loader.token, &|token| {
+            token_lock_state_in(dir.path(), token)
+        })
+        .expect("first loader claims snapshot");
+        let first_claim_path = first_claim.pending.path.clone();
+        first_loader
+            .remember_pending_restore(first_claim.pending)
+            .unwrap();
+        assert!(first_claim_path.exists());
+
+        // Dropping the owner models an abrupt exit: no checkpoint or commit
+        // runs, but releasing the claimer lock makes the durable claim eligible
+        // for the next startup.
+        drop(first_loader);
+        let second_loader = SnapshotOwner::create_in(dir.path()).unwrap();
+        let recovered = claim_session_from(dir.path(), &second_loader.token, &|token| {
+            token_lock_state_in(dir.path(), token)
+        })
+        .expect("next loader recovers uncommitted claim");
+        assert_eq!(workspace(&recovered.state).tabs[0].title, "survives-crash");
+        assert!(!first_claim_path.exists());
+        assert!(recovered.pending.path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_checkpoint_keeps_claim_for_next_startup() {
+        let dir = TestDir::new("failed-checkpoint");
+        let original = SnapshotOwner::create_in(dir.path()).unwrap();
+        write_session(&original.state_path, "survives-failure");
+        drop(original);
+
+        let loader = SnapshotOwner::create_in(dir.path()).unwrap();
+        let claimed = claim_session_from(dir.path(), &loader.token, &|token| {
+            token_lock_state_in(dir.path(), token)
+        })
+        .expect("claim snapshot");
+        let claim_path = claimed.pending.path.clone();
+        loader.remember_pending_restore(claimed.pending).unwrap();
+        let invalid = SavedSession {
+            active: 0,
+            tabs: vec![workspace(&claimed.state).tabs[0].clone(); MAX_RESTORED_TABS + 1],
+        };
+        assert!(checkpoint_snapshot_for_owner(&loader, &invalid).is_err());
+        assert!(claim_path.exists(), "failed save must retain the claim");
+        assert!(
+            !loader.state_path.exists(),
+            "rejected checkpoint must not publish a replacement"
+        );
+
+        drop(loader);
+        let next_loader = SnapshotOwner::create_in(dir.path()).unwrap();
+        let recovered = claim_session_from(dir.path(), &next_loader.token, &|token| {
+            token_lock_state_in(dir.path(), token)
+        })
+        .expect("next loader recovers claim after failed checkpoint");
+        assert_eq!(
+            workspace(&recovered.state).tabs[0].title,
+            "survives-failure"
+        );
     }
 
     #[test]
@@ -1483,17 +3250,87 @@ mod tests {
             path: dir.path().join("tabs.1.state"),
             file_name: parse_state_file_name("tabs.1.state").unwrap(),
             modified: UNIX_EPOCH + Duration::from_secs(1),
-            session: saved_session("older"),
+            state: SnapshotState::Workspace(saved_session("older")),
+            supersedes: None,
         };
         let newer = SessionCandidate {
             path: dir.path().join("tabs.2.state"),
             file_name: parse_state_file_name("tabs.2.state").unwrap(),
             modified: UNIX_EPOCH + Duration::from_secs(2),
-            session: saved_session("newer"),
+            state: SnapshotState::Workspace(saved_session("newer")),
+            supersedes: None,
         };
         let mut candidates = vec![older, newer];
         sort_candidates_newest_first(&mut candidates);
-        assert_eq!(candidates[0].session.tabs[0].title, "newer");
+        assert_eq!(workspace(&candidates[0].state).tabs[0].title, "newer");
+    }
+
+    #[test]
+    fn durable_envelope_beats_its_predecessor_even_when_predecessor_mtime_is_newer() {
+        let dir = TestDir::new("supersedes-mtime");
+        let writer = token(20);
+        let predecessor_name = format!(
+            "{}{}{}",
+            state_file_path_for_token(dir.path(), &token(10))
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+            CLAIM_MARKER,
+            writer
+        );
+        let envelope = SessionEnvelope {
+            format: SESSION_ENVELOPE_FORMAT.to_string(),
+            version: SESSION_ENVELOPE_VERSION,
+            payload: SessionEnvelopePayload::Workspace(saved_session("replacement")),
+            supersedes: Some(predecessor_name.clone()),
+        };
+        atomic_write(
+            &state_file_path_for_token(dir.path(), &writer),
+            &serde_json::to_vec(&envelope).unwrap(),
+        )
+        .unwrap();
+        thread::sleep(Duration::from_millis(10));
+        write_session(&dir.path().join(predecessor_name), "predecessor");
+
+        let candidates =
+            scan_candidates(dir.path(), Some(&token(99)), &|_| TokenLockState::Available);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(workspace(&candidates[0].state).tabs[0].title, "replacement");
+    }
+
+    #[test]
+    fn candidate_scan_bounds_payload_reads_before_deserialization() {
+        let dir = TestDir::new("bounded-candidate-scan");
+        for index in 0..(MAX_CANDIDATES_PER_SCAN + 20) {
+            fs::write(
+                state_file_path_for_token(dir.path(), &token(index as u64 + 100)),
+                b"placeholder",
+            )
+            .unwrap();
+        }
+        let encoded = serde_json::to_string(&saved_session("bounded")).unwrap();
+        let mut read_calls = 0usize;
+        let mut payload_bytes = 0u64;
+        let candidates = scan_candidates_with_reader(
+            dir.path(),
+            Some(&token(99)),
+            &|_| TokenLockState::Available,
+            &mut |_path, limit| {
+                read_calls += 1;
+                let mut payload = encoded.clone();
+                payload.push_str(&" ".repeat(limit as usize - payload.len()));
+                payload_bytes += payload.len() as u64;
+                Ok(payload)
+            },
+        );
+
+        assert_eq!(payload_bytes, MAX_CANDIDATE_BYTES_PER_SCAN);
+        assert_eq!(
+            read_calls as u64,
+            MAX_CANDIDATE_BYTES_PER_SCAN / MAX_SNAPSHOT_BYTES
+        );
+        assert!(read_calls <= MAX_CANDIDATES_PER_SCAN);
+        assert_eq!(candidates.len(), read_calls);
     }
 
     #[cfg(target_os = "linux")]
@@ -1561,20 +3398,21 @@ mod tests {
     #[test]
     fn an_oversized_snapshot_is_skipped_and_retained() {
         let dir = TestDir::new("oversize");
-        let good_path = state_file_path_for_token(dir.path(), &token(10));
+        let good_path = dir.path().join(LEGACY_STATE_FILE);
         write_session(&good_path, "reasonable");
 
         // Written second, so it is the newest snapshot and therefore the one the
         // loader prefers: the only reason it is not restored is the size bound.
-        let fat_path = dir.path().join(LEGACY_STATE_FILE);
+        let fat_path = state_file_path_for_token(dir.path(), &token(10));
         let mut fat = serde_json::to_string(&saved_session("too-big")).unwrap();
         fat.push_str(&" ".repeat(MAX_SNAPSHOT_BYTES as usize));
         fs::write(&fat_path, fat.as_bytes()).unwrap();
 
-        let restored = load_session_from(dir.path(), &token(99), &|_| TokenLockState::Available)
+        let restored = claim_session_from(dir.path(), &token(99), &|_| TokenLockState::Available)
             .expect("the snapshot that fits still restores");
         assert_eq!(
-            restored.tabs[0].title, "reasonable",
+            workspace(&restored.state).tabs[0].title,
+            "reasonable",
             "the oversized snapshot must not have been read at all"
         );
         assert!(

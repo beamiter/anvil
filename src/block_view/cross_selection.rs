@@ -27,6 +27,27 @@ use vte4::TerminalExt;
 
 use crate::block_view::blocks::FinishedBlock;
 
+const MAX_CROSS_SELECTION_BYTES: usize = 32 * 1024 * 1024;
+
+fn append_selected_text(output: &mut String, text: &str, max_bytes: usize) -> bool {
+    let separator = usize::from(!output.is_empty());
+    let Some(next_len) = output
+        .len()
+        .checked_add(separator)
+        .and_then(|length| length.checked_add(text.len()))
+    else {
+        return false;
+    };
+    if next_len > max_bytes {
+        return false;
+    }
+    if separator != 0 {
+        output.push('\n');
+    }
+    output.push_str(text);
+    true
+}
+
 pub(crate) struct CrossSelection {
     finished_blocks: Rc<RefCell<Vec<FinishedBlock>>>,
     active_vte: vte4::Terminal,
@@ -143,22 +164,26 @@ impl CrossSelection {
     /// order, joined with newlines. Used by Ctrl+Shift+C when more than one
     /// VTE is selected (e.g. after a cross-block drag).
     pub(crate) fn copy_text(&self) -> Option<String> {
-        let mut parts: Vec<String> = Vec::new();
+        let mut output = String::new();
         for vte in self.ordered_vtes() {
             if !vte.has_selection() {
                 continue;
             }
             if let Some(text) = vte.text_selected(vte4::Format::Text) {
                 let s = text.to_string();
-                if !s.is_empty() {
-                    parts.push(s);
+                if !s.is_empty()
+                    && !append_selected_text(&mut output, &s, MAX_CROSS_SELECTION_BYTES)
+                {
+                    // Never return a partial selection: it could silently omit
+                    // the command/output region the user intended to copy.
+                    return None;
                 }
             }
         }
-        if parts.is_empty() {
+        if output.is_empty() {
             None
         } else {
-            Some(parts.join("\n"))
+            Some(output)
         }
     }
 
@@ -191,4 +216,18 @@ fn widget_contains(haystack: &impl IsA<gtk::Widget>, needle: &gtk::Widget) -> bo
         cur = w.parent();
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::append_selected_text;
+
+    #[test]
+    fn selected_text_aggregation_is_bounded_and_atomic() {
+        let mut output = "first".to_owned();
+        assert!(append_selected_text(&mut output, "two", 9));
+        assert_eq!(output, "first\ntwo");
+        assert!(!append_selected_text(&mut output, "x", 9));
+        assert_eq!(output, "first\ntwo");
+    }
 }

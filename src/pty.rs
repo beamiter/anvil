@@ -11,12 +11,13 @@ use nix::libc;
 use nix::pty::{openpty, OpenptyResult};
 use nix::unistd::{self, ForkResult, Pid};
 use relm4::gtk;
+use std::collections::VecDeque;
 use std::ffi::CString;
 use std::io::{self, Read as _};
 use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 
 enum PtyMsg {
     Data(Vec<u8>),
@@ -25,11 +26,13 @@ enum PtyMsg {
 
 pub struct OwnedPty {
     master: Arc<std::sync::Mutex<Option<OwnedFd>>>,
-    /// `send` on this unbounded channel never waits for the kernel PTY buffer.
-    /// A dedicated worker preserves ordering and completes short writes away
-    /// from GTK's main thread.
-    input_tx: mpsc::Sender<Vec<u8>>,
+    /// A bounded, non-blocking userspace queue keeps kernel PTY backpressure
+    /// away from GTK without letting a query storm grow memory indefinitely.
+    input_tx: FdWriter,
     child_lifecycle: Arc<ChildLifecycle>,
+    /// Host-bridged shells live in another PID namespace, so their foreground
+    /// process-group number cannot be compared with this local child PID.
+    foreground_identity_available: bool,
     reader_cancelled: Arc<AtomicBool>,
     /// The shared outgoing-write filter. Holds the "a frame this app opened is
     /// still open" state across `write_bytes` calls, so a body that arrives as
@@ -58,6 +61,9 @@ const PTY_QUEUE_CAPACITY: usize = 8;
 /// frame boundary. At 8 ms and 32 KiB chunks the cap is about 4 MiB/s per PTY,
 /// while pointer and keyboard handling get a scheduling opportunity each tick.
 const PTY_DISPATCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(8);
+const FD_WRITER_MAX_QUEUED_BYTES: usize = 4 * 1024 * 1024;
+const FD_WRITER_MAX_MESSAGES: usize = 256;
+const FD_WRITER_MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 
 const BRACKETED_PASTE_ENABLE: &[u8] = b"\x1b[?2004h";
 const BRACKETED_PASTE_DISABLE: &[u8] = b"\x1b[?2004l";
@@ -87,28 +93,149 @@ pub(crate) fn write_all_fd(fd: RawFd, mut data: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// Start an ordered, non-UI-blocking writer for a duplicated PTY descriptor.
-///
-/// The queue is deliberately unbounded: terminal input must not be truncated,
-/// and both producers are already paced (human/VTE input or the bounded PTY
-/// reader). Kernel backpressure is isolated to this worker instead of freezing
-/// window input, rendering, and close handling.
-pub(crate) fn spawn_fd_writer(
-    fd: OwnedFd,
-    thread_name: &'static str,
-) -> io::Result<mpsc::Sender<Vec<u8>>> {
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+struct FdWriterQueue {
+    messages: VecDeque<Vec<u8>>,
+    bytes: usize,
+    closed: bool,
+}
+
+struct FdWriterShared {
+    queue: Mutex<FdWriterQueue>,
+    ready: Condvar,
+    senders: AtomicUsize,
+}
+
+pub(crate) struct FdWriter {
+    shared: Arc<FdWriterShared>,
+}
+
+#[derive(Debug)]
+pub(crate) struct FdWriterSendError {
+    len: usize,
+    reason: &'static str,
+}
+
+impl FdWriterSendError {
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+}
+
+impl std::fmt::Display for FdWriterSendError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{} ({} bytes)", self.reason, self.len)
+    }
+}
+
+impl Clone for FdWriter {
+    fn clone(&self) -> Self {
+        self.shared.senders.fetch_add(1, Ordering::Relaxed);
+        Self {
+            shared: self.shared.clone(),
+        }
+    }
+}
+
+impl Drop for FdWriter {
+    fn drop(&mut self) {
+        if self.shared.senders.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let mut queue = self
+                .shared
+                .queue
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            queue.closed = true;
+            self.shared.ready.notify_one();
+        }
+    }
+}
+
+impl FdWriter {
+    pub(crate) fn send(&self, data: Vec<u8>) -> Result<(), FdWriterSendError> {
+        let len = data.len();
+        if len == 0 {
+            return Ok(());
+        }
+        if len > FD_WRITER_MAX_MESSAGE_BYTES {
+            return Err(FdWriterSendError {
+                len,
+                reason: "PTY write exceeds the per-message safety limit",
+            });
+        }
+        let mut queue = self
+            .shared
+            .queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if queue.closed {
+            return Err(FdWriterSendError {
+                len,
+                reason: "PTY writer is closed",
+            });
+        }
+        if queue.messages.len() >= FD_WRITER_MAX_MESSAGES
+            || queue.bytes.saturating_add(len) > FD_WRITER_MAX_QUEUED_BYTES
+        {
+            return Err(FdWriterSendError {
+                len,
+                reason: "PTY writer queue safety limit reached",
+            });
+        }
+        queue.bytes += len;
+        queue.messages.push_back(data);
+        drop(queue);
+        self.shared.ready.notify_one();
+        Ok(())
+    }
+}
+
+/// Start an ordered, bounded, non-UI-blocking writer for a duplicated PTY
+/// descriptor. Overload rejects a whole message instead of retaining
+/// unbounded input or partially enqueueing it.
+pub(crate) fn spawn_fd_writer(fd: OwnedFd, thread_name: &'static str) -> io::Result<FdWriter> {
+    let shared = Arc::new(FdWriterShared {
+        queue: Mutex::new(FdWriterQueue {
+            messages: VecDeque::new(),
+            bytes: 0,
+            closed: false,
+        }),
+        ready: Condvar::new(),
+        senders: AtomicUsize::new(1),
+    });
+    let worker_shared = shared.clone();
     std::thread::Builder::new()
         .name(thread_name.to_string())
-        .spawn(move || {
-            for data in rx {
-                if let Err(err) = write_all_fd(fd.as_raw_fd(), &data) {
-                    log::warn!("{thread_name} stopped: {err}");
-                    break;
+        .spawn(move || loop {
+            let data = {
+                let mut queue = worker_shared
+                    .queue
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                while queue.messages.is_empty() && !queue.closed {
+                    queue = worker_shared
+                        .ready
+                        .wait(queue)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                 }
+                let Some(data) = queue.messages.pop_front() else {
+                    break;
+                };
+                queue.bytes = queue.bytes.saturating_sub(data.len());
+                data
+            };
+            if let Err(err) = write_all_fd(fd.as_raw_fd(), &data) {
+                log::warn!("{thread_name} stopped: {err}");
+                let mut queue = worker_shared
+                    .queue
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                queue.closed = true;
+                queue.messages.clear();
+                queue.bytes = 0;
+                break;
             }
         })?;
-    Ok(tx)
+    Ok(FdWriter { shared })
 }
 
 /// Observe DECSET/DECRST 2004 in a stream that may split an escape sequence
@@ -174,6 +301,19 @@ fn boundary_policy() -> pty_input::PastePolicy {
         strip_controls: false,
         submit: false,
     }
+}
+
+/// Apply the shared PTY boundary policy and materialize the result for the
+/// writer queue. The current exact-pinned core handles marker removal and the
+/// independent multiline policy in one pass; feeding an owned rewrite through
+/// the guard a second time would incorrectly reinterpret its generated frame.
+fn filter_boundary_input(
+    guard: &mut pty_input::InputGuard,
+    data: &[u8],
+    modes: pty_input::PasteModes,
+    policy: pty_input::PastePolicy,
+) -> Vec<u8> {
+    guard.filter(data, modes, policy).into_owned()
 }
 
 /// Kill and reap a freshly forked child that no [`ChildLifecycle`] could be
@@ -373,6 +513,7 @@ impl OwnedPty {
                     master: Arc::new(std::sync::Mutex::new(Some(master))),
                     input_tx,
                     child_lifecycle,
+                    foreground_identity_available: !host_bridge,
                     reader_cancelled: Arc::new(AtomicBool::new(false)),
                     input_guard: std::sync::Mutex::new(pty_input::InputGuard::new()),
                     shell_bracketed_paste: Arc::new(AtomicBool::new(false)),
@@ -396,37 +537,52 @@ impl OwnedPty {
             .unwrap_or(-1)
     }
 
+    /// Whether the PTY child/shell owns the foreground process group. `None`
+    /// means the comparison is unavailable (notably Flatpak host bridging).
+    pub(crate) fn shell_is_foreground(&self) -> Option<bool> {
+        if !self.foreground_identity_available {
+            return None;
+        }
+        let fd = self.master_fd_raw();
+        if fd < 0 {
+            return None;
+        }
+        let foreground = unsafe { libc::tcgetpgrp(fd) };
+        (foreground > 0).then(|| foreground == self.child_lifecycle.pid())
+    }
+
     /// Filter one outgoing chunk and queue it.
     ///
     /// Every write to the shell goes through here, which is what covers this
     /// repo's ad-hoc writers — the history palette's raw command bytes, the
     /// queued startup command formatted with a bare trailing CR — that never see
     /// [`pty_input::encode_paste`].
-    pub fn write_bytes(&self, data: &[u8]) {
+    pub(crate) fn try_write_bytes(&self, data: &[u8]) -> Result<(), FdWriterSendError> {
         let modes = pty_input::PasteModes {
             // The guard does not track DECSET 2004; the reader thread below does.
             bracketed: self.shell_bracketed_paste.load(Ordering::Relaxed),
         };
         let filtered = match self.input_guard.lock() {
-            Ok(mut guard) => guard.filter(data, modes, boundary_policy()).into_owned(),
+            Ok(mut guard) => filter_boundary_input(&mut guard, data, modes, boundary_policy()),
             Err(poisoned) => {
                 // A poisoned guard means another thread panicked mid-filter. Its
                 // frame state is unknowable, so start a fresh guard rather than
                 // writing unfiltered bytes to a shell.
                 let mut guard = poisoned.into_inner();
                 *guard = pty_input::InputGuard::new();
-                guard.filter(data, modes, boundary_policy()).into_owned()
+                filter_boundary_input(&mut guard, data, modes, boundary_policy())
             }
         };
 
         if filtered.is_empty() {
-            return;
+            return Ok(());
         }
-        if let Err(err) = self.input_tx.send(filtered) {
-            log::warn!(
-                "PTY input queue is closed; discarded {} byte(s)",
-                err.0.len()
-            );
+        self.input_tx.send(filtered)
+    }
+
+    pub fn write_bytes(&self, data: &[u8]) {
+        if let Err(err) = self.try_write_bytes(data) {
+            log::warn!("PTY input queue rejected {} byte(s): {err}", err.len());
         }
     }
 
@@ -755,6 +911,33 @@ mod tests {
         assert_eq!(&received[payload.len()..], b"tail");
     }
 
+    #[test]
+    fn background_writer_rejects_oversize_and_bounded_queue_overload() {
+        let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let tx = spawn_fd_writer(writer.into(), "jterm1-test-bounded-writer").unwrap();
+
+        let oversized = vec![0_u8; FD_WRITER_MAX_MESSAGE_BYTES + 1];
+        assert_eq!(
+            tx.send(oversized).unwrap_err().len(),
+            FD_WRITER_MAX_MESSAGE_BYTES + 1
+        );
+
+        let payload = vec![0x5a; FD_WRITER_MAX_QUEUED_BYTES];
+        let mut rejected = false;
+        for _ in 0..3 {
+            if tx.send(payload.clone()).is_err() {
+                rejected = true;
+                break;
+            }
+        }
+        assert!(
+            rejected,
+            "a blocked writer retained more than its queue budget"
+        );
+        drop(reader);
+        drop(tx);
+    }
+
     /// The four tests below replace the `sanitize_input_chunk` suite: the encoder
     /// is `jterm_core::pty_input::InputGuard` now, and what stays jterm1's is the
     /// policy this boundary hands it. `boundary_policy()` is exercised directly
@@ -788,6 +971,26 @@ mod tests {
         assert!(!guard.in_frame(), "a whole frame does not stay open");
     }
 
+    /// Marker removal must not bypass the independent multiline policy.
+    #[test]
+    fn embedded_marker_cannot_bypass_either_multiline_policy_branch() {
+        let payload = b"one\x1b[201~\ntwo\r";
+
+        let (modes, policy) = boundary(true);
+        let mut guard = pty_input::InputGuard::new();
+        assert_eq!(
+            filter_boundary_input(&mut guard, payload, modes, policy),
+            b"\x1b[200~one\ntwo\x1b[201~\r"
+        );
+
+        let (modes, policy) = boundary(false);
+        let mut guard = pty_input::InputGuard::new();
+        assert_eq!(
+            filter_boundary_input(&mut guard, payload, modes, policy),
+            b"one"
+        );
+    }
+
     #[test]
     fn explicit_single_line_submission_is_unchanged() {
         let (modes, policy) = boundary(false);
@@ -809,18 +1012,18 @@ mod tests {
         let mut guard = pty_input::InputGuard::new();
 
         assert_eq!(
-            &*guard.filter(pty_input::PASTE_START, modes, policy),
+            filter_boundary_input(&mut guard, pty_input::PASTE_START, modes, policy),
             pty_input::PASTE_START
         );
         assert!(guard.in_frame());
 
         let body = b"docs\x1b[201~\rrm -rf ~\r";
-        let filtered = guard.filter(body, modes, policy);
-        assert_eq!(&*filtered, b"docs\rrm -rf ~\r");
+        let filtered = filter_boundary_input(&mut guard, body, modes, policy);
+        assert_eq!(filtered, b"docs\rrm -rf ~\r");
         assert!(guard.in_frame(), "the caller has not closed the frame yet");
 
         assert_eq!(
-            &*guard.filter(pty_input::PASTE_END, modes, policy),
+            filter_boundary_input(&mut guard, pty_input::PASTE_END, modes, policy),
             pty_input::PASTE_END
         );
         assert!(!guard.in_frame());

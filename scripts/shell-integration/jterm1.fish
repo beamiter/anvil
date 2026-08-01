@@ -19,6 +19,9 @@ if set -q __jterm1_fish_loaded
     return 0
 end
 set -g __jterm1_fish_loaded 1
+set -g __jterm1_marker_nonce "$fish_pid-"(random)"-"(random)"-"(random)"-"(random)"-"(random)"-"(random)"-"(random)"-"(random)
+set -g __jterm1_marker_seq 0
+set -g __jterm1_marker_id ""
 
 function __jterm1_osc
     printf '\033]%s\007' $argv[1]
@@ -37,8 +40,15 @@ end
 
 function __jterm1_prompt_start  ; __jterm1_osc "133;A" ; end
 function __jterm1_prompt_end    ; __jterm1_osc "133;B" ; end
-function __jterm1_command_start ; __jterm1_osc "133;C" ; end
-function __jterm1_command_end   ; __jterm1_osc "133;D;$argv[1]" ; end
+function __jterm1_command_start
+    set -g __jterm1_marker_seq (math "$__jterm1_marker_seq + 1")
+    set -g __jterm1_marker_id "$__jterm1_marker_nonce-$__jterm1_marker_seq"
+    __jterm1_osc "133;C;id=$__jterm1_marker_id"
+end
+function __jterm1_command_end
+    __jterm1_osc "133;D;$argv[1];id=$__jterm1_marker_id"
+    set -g __jterm1_marker_id ""
+end
 
 function __jterm1_preexec --on-event fish_preexec
     __jterm1_command_start

@@ -32,9 +32,15 @@ impl AppModel {
     /// the tab is the progress UI — the user can read a failure or interrupt it
     /// with Ctrl+C like any other command.
     pub(crate) fn install_or_update_jsh(&mut self, sender: &ComponentSender<AppModel>) {
+        if self.safe_mode {
+            self.show_toast("jsh installation is unavailable in safe mode.");
+            return;
+        }
         match jsh_install::install_argv() {
             Ok(argv) => self.add_command_tab("Install jsh", argv, sender),
             Err(error) => {
+                let error =
+                    crate::text_safety::bounded_display_text(&error.to_string(), 2 * 1024, false);
                 log::warn!("cannot stage the jsh installer: {error}");
                 self.show_toast(format!("Could not write the installer script: {error}"));
             }
@@ -43,6 +49,12 @@ impl AppModel {
 
     /// Ask the installer what is published, off the main loop.
     pub(crate) fn start_jsh_update_check(&self, sender: &ComponentSender<AppModel>) {
+        // Defense in depth with Config::safe_defaults(): even a future config
+        // refactor must not turn the isolated recovery session into a network
+        // or shared-cache producer.
+        if self.safe_mode {
+            return;
+        }
         // "startup" asks the network every launch; "daily" reuses the
         // installer's cache, which every jterm on this machine shares.
         let Some(max_age) = self.config.borrow().jsh_update_check.max_age() else {
@@ -51,10 +63,18 @@ impl AppModel {
 
         let slot: Arc<Mutex<Option<Status>>> = Arc::new(Mutex::new(None));
         let worker = slot.clone();
-        std::thread::spawn(move || {
-            *worker.lock().expect("jsh check slot poisoned") =
-                Some(jsh_install::check_blocking(max_age));
-        });
+        let spawn_result = std::thread::Builder::new()
+            .name("jterm1-jsh-update-check".to_string())
+            .spawn(move || {
+                *worker.lock().expect("jsh check slot poisoned") =
+                    Some(jsh_install::check_blocking(max_age));
+            });
+        if let Err(error) = spawn_result {
+            *slot.lock().expect("jsh check slot poisoned") = Some(Status {
+                error: Some(format!("could not start update-check worker: {error}")),
+                ..Status::default()
+            });
+        }
 
         let sender = sender.clone();
         glib::timeout_add_local(POLL_INTERVAL, move || {
@@ -71,22 +91,31 @@ impl AppModel {
     /// that cannot work.
     pub(crate) fn offer_jsh_update(&self, status: &Status, sender: &ComponentSender<AppModel>) {
         if let Some(error) = &status.error {
+            let error = crate::text_safety::bounded_display_text(error, 2 * 1024, false);
             log::info!("jsh update check unavailable: {error}");
         }
         if let Some(other) = &status.shadowed_by {
             // Some other binary named jsh, earlier on PATH. Installing does not
             // fix PATH order, so the installer explains it in the tab; here it
             // is only worth a log line.
+            let other = crate::text_safety::bounded_display_text(other, 2 * 1024, false);
             log::warn!("PATH resolves jsh to {other}, which jterm1 does not manage");
         }
 
         let Some(prompt) = jsh_install::prompt_for(status) else {
             return;
         };
-        log::info!("jsh notice: {}", prompt.banner_title());
+        let title = crate::text_safety::bounded_display_text(&prompt.banner_title(), 1024, false);
+        let title = if title.is_empty() {
+            "jsh update available".to_string()
+        } else {
+            title
+        };
+        let button = crate::text_safety::bounded_display_text(prompt.button_label(), 128, false);
+        log::info!("jsh notice: {title}");
 
-        let toast = adw::Toast::new(&prompt.banner_title());
-        toast.set_button_label(Some(prompt.button_label()));
+        let toast = adw::Toast::new(&title);
+        toast.set_button_label(Some(&button));
         toast.set_timeout(TOAST_TIMEOUT);
         let sender = sender.clone();
         toast.connect_button_clicked(move |_| sender.input(AppMsg::Action(Action::InstallJsh)));

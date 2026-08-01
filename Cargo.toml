@@ -10,7 +10,8 @@ keywords = ["terminal", "gtk", "rust", "shell", "productivity"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
-jterm_core = { git = "https://github.com/beamiter/jterm_core.git", branch = "master" }
+# Pin the shared contract so a branch move cannot silently change a release build.
+jterm_core = { git = "https://github.com/beamiter/jterm_core.git", rev = "3855746e9e20a1c3658fb56a069ba6340e45935a" }
 relm4 = { version = "0.11", features = ["libadwaita", "gnome_46"] }
 vte4 = { version = "0.10.0", features = ["v0_76"] }
 log = { version = "0.4", features = ["std"] }

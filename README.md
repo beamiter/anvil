@@ -166,8 +166,8 @@ jterm1 --safe-mode
 
 Safe mode starts a local VTE pane with `sh`, skips session restore and persistence,
 ignores configured startup commands and remote hosts, disables AI, notifications,
-repository probes, history, and remote clipboard writes, and refuses to save or
-hot-reload settings for that process.
+repository probes, history, remote clipboard writes, and jsh update/install
+operations, and refuses to save or hot-reload settings for that process.
 
 Create a privacy-preserving support archive with:
 
@@ -440,6 +440,11 @@ the command at the prompt; it does not press Enter. Both `{name}` and
 without a matching argument produce literal braces, such as `{{a,b}}` →
 `{a,b}`. Rendered commands containing line breaks or terminal control
 characters are rejected by the shared review-only input boundary.
+Each workflow file is limited to 256 KiB, directory/file/argument/tag counts
+are capped, and rendered commands are limited to 64 KiB before insertion.
+Special files are rejected without blocking. Display metadata and command
+values containing control, invisible, or bidirectional formatting characters
+are rejected so the palette cannot present a visually reordered command.
 
 ### Remote hosts
 
@@ -482,7 +487,11 @@ recent shell history. `Ctrl+Shift+Q`, or **Ask AI About Block** in a finished
 block's context menu, starts a conversation with a bounded command/output
 snapshot. `?` command generation inserts a command for review without executing
 it. The agent proposes one command per turn and only runs it after the user
-presses Approve; approval submits the command immediately.
+presses Approve; approval submits the command immediately. Approval is bound to
+the current clean prompt, the exact reviewed command, a one-shot local
+generation, and the shell integration's matching OSC 133 start/completion ID.
+If any of those change or the terminal write fails, the proposal is cancelled
+instead of attributing a different command's result to the Agent.
 
 ### Notebooks
 
@@ -497,6 +506,10 @@ process group, so Stop, Stop All, and closing the viewer terminate descendants
 as well as the interpreter. stdout and stderr remain separate, combined output
 is bounded to 256 KiB, and cells run in the notebook's directory, isolated from
 the active terminal but not sandboxed from the system.
+Notebook files are regular UTF-8 files capped at 1 MiB; segment and executable
+cell counts are capped independently. A cell larger than 256 KiB or containing
+hidden/bidirectional or unsafe control characters remains visible (with unsafe
+characters marked) and copyable, but its Run action is disabled.
 
 The installer provides a walkthrough at:
 
@@ -522,8 +535,14 @@ partially published owner cannot be mistaken for an exited process. The legacy
 `tabs.state` and `tabs.<pid>.state` names are still accepted; PID snapshots are
 retained conservatively when their owner cannot be proven dead. Corrupt
 snapshots are retained for inspection inside the 32-snapshot recovery window
-instead of being deleted on parse failure. The state directory is owner-only
-(`0700`), and snapshots and locks are `0600`. Inspect the newest snapshot with:
+instead of being deleted on parse failure. A versioned replacement records the
+snapshot it supersedes, so a crash between publishing the new checkpoint and
+cleaning the old claim cannot revive stale state; closing the final tab writes
+a durable empty tombstone for the same reason. Restore and save both enforce a
+4 MiB payload budget, at most 32 tabs, 16 panes per tab and 64 panes total, plus
+bounded argument counts and lengths for recognized replayable commands. The
+state directory is owner-only (`0700`), and snapshots and locks are `0600`.
+Inspect the newest snapshot with:
 
 ```bash
 ./scripts/show-state.sh
@@ -547,7 +566,9 @@ Command-only history is enabled by default at
 `${XDG_STATE_HOME:-$HOME/.local/state}/jterm1/history.jsonl`. It stores the
 command, working directory, exit status, and completion time, but not terminal
 output. Set `command_history_enabled = false` to disable it or configure an
-absolute `command_history_path`.
+absolute `command_history_path`. Reads, appends, compaction, and shutdown flush
+are size-bounded and serialized across processes; malformed or unterminated
+records are skipped without allowing unbounded allocation.
 
 Each launch is an independent application instance with its own snapshot, so
 concurrent windows no longer overwrite one another. Session restoration is

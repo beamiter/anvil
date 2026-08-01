@@ -19,7 +19,20 @@ use relm4::gtk;
 
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
+
+const MAX_WORKFLOW_FILE_BYTES: u64 = 256 * 1024;
+const MAX_DIRECTORY_ENTRIES: usize = 4_096;
+const MAX_WORKFLOW_FILES_PER_DIRECTORY: usize = 512;
+const MAX_WORKFLOWS: usize = 1_024;
+const MAX_WORKFLOW_DIRECTORIES: usize = 64;
+const MAX_WORKFLOW_NAME_BYTES: usize = 256;
+const MAX_WORKFLOW_DESCRIPTION_BYTES: usize = 4 * 1024;
+const MAX_WORKFLOW_COMMAND_BYTES: usize = 64 * 1024;
+const MAX_WORKFLOW_TAGS: usize = 64;
+const MAX_WORKFLOW_ARGS: usize = 64;
+const MAX_WORKFLOW_FIELD_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Workflow {
@@ -55,7 +68,7 @@ pub(crate) struct WorkflowArg {
 pub(crate) fn load_all(dirs: &[PathBuf]) -> Vec<Workflow> {
     let mut out = Vec::new();
     let mut names = HashSet::new();
-    for dir in dirs {
+    'directories: for dir in dirs.iter().take(MAX_WORKFLOW_DIRECTORIES) {
         if !dir.is_dir() {
             continue;
         }
@@ -67,6 +80,7 @@ pub(crate) fn load_all(dirs: &[PathBuf]) -> Vec<Workflow> {
             }
         };
         let mut paths: Vec<PathBuf> = entries
+            .take(MAX_DIRECTORY_ENTRIES)
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| {
                 p.extension()
@@ -78,6 +92,7 @@ pub(crate) fn load_all(dirs: &[PathBuf]) -> Vec<Workflow> {
                     })
                     .unwrap_or(false)
             })
+            .take(MAX_WORKFLOW_FILES_PER_DIRECTORY)
             .collect();
         // Deterministic order so two runs with the same files produce the same
         // palette ordering — easier to keep muscle memory.
@@ -89,6 +104,9 @@ pub(crate) fn load_all(dirs: &[PathBuf]) -> Vec<Workflow> {
                     // user workflow to replace an installed example by name.
                     if names.insert(wf.name.clone()) {
                         out.push(wf);
+                        if out.len() >= MAX_WORKFLOWS {
+                            break 'directories;
+                        }
                     }
                 }
                 Err(err) => log::warn!("workflows: skipping {}: {err}", path.display()),
@@ -99,7 +117,7 @@ pub(crate) fn load_all(dirs: &[PathBuf]) -> Vec<Workflow> {
 }
 
 pub(crate) fn load_one(path: &Path) -> Result<Workflow, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("read: {e}"))?;
+    let text = read_bounded_workflow(path)?;
     let extension = path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -110,16 +128,139 @@ pub(crate) fn load_one(path: &Path) -> Result<Workflow, String> {
         "yaml" | "yml" => serde_yaml::from_str(&text).map_err(|e| format!("parse YAML: {e}"))?,
         _ => return Err("unsupported workflow extension".to_string()),
     };
-    if wf.name.trim().is_empty() {
-        return Err("workflow has empty name".to_string());
-    }
-    if wf.command.trim().is_empty() {
-        return Err("workflow has empty command".to_string());
-    }
-    crate::review_input::validate(&wf.command)
-        .map_err(|error| format!("command is unsafe for review-only insertion: {error}"))?;
+    validate_workflow(&wf)?;
     wf.source_path = Some(path.to_path_buf());
     Ok(wf)
+}
+
+fn read_bounded_workflow(path: &Path) -> Result<String, String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| format!("read: {error}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("inspect: {error}"))?;
+    if !metadata.is_file() {
+        return Err("source is not a regular file".to_string());
+    }
+    if metadata.len() > MAX_WORKFLOW_FILE_BYTES {
+        return Err(format!(
+            "source exceeds the {MAX_WORKFLOW_FILE_BYTES}-byte limit"
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_WORKFLOW_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read: {error}"))?;
+    if bytes.len() as u64 > MAX_WORKFLOW_FILE_BYTES {
+        return Err(format!(
+            "source exceeds the {MAX_WORKFLOW_FILE_BYTES}-byte limit"
+        ));
+    }
+    String::from_utf8(bytes).map_err(|error| format!("source is not UTF-8: {error}"))
+}
+
+fn validate_workflow(workflow: &Workflow) -> Result<(), String> {
+    validate_display_field("name", &workflow.name, MAX_WORKFLOW_NAME_BYTES, false)?;
+    validate_display_field(
+        "description",
+        &workflow.description,
+        MAX_WORKFLOW_DESCRIPTION_BYTES,
+        true,
+    )?;
+    if workflow.command.trim().is_empty() {
+        return Err("workflow has empty command".to_string());
+    }
+    if workflow.command.len() > MAX_WORKFLOW_COMMAND_BYTES {
+        return Err(format!(
+            "workflow command exceeds {MAX_WORKFLOW_COMMAND_BYTES} bytes"
+        ));
+    }
+    crate::review_input::validate(&workflow.command)
+        .map_err(|error| format!("command is unsafe for review-only insertion: {error}"))?;
+    if crate::text_safety::contains_visual_spoof(&workflow.command) {
+        return Err("workflow command contains an invisible or bidirectional character".into());
+    }
+    if workflow.tags.len() > MAX_WORKFLOW_TAGS {
+        return Err(format!("workflow has more than {MAX_WORKFLOW_TAGS} tags"));
+    }
+    for tag in &workflow.tags {
+        validate_display_field("tag", tag, MAX_WORKFLOW_FIELD_BYTES, false)?;
+    }
+    if let Some(shell) = &workflow.shell {
+        validate_display_field("shell", shell, MAX_WORKFLOW_FIELD_BYTES, false)?;
+    }
+    if workflow.args.len() > MAX_WORKFLOW_ARGS {
+        return Err(format!(
+            "workflow has more than {MAX_WORKFLOW_ARGS} arguments"
+        ));
+    }
+    let mut names = HashSet::new();
+    for argument in &workflow.args {
+        validate_display_field(
+            "argument name",
+            &argument.name,
+            MAX_WORKFLOW_FIELD_BYTES,
+            false,
+        )?;
+        if !names.insert(argument.name.as_str()) {
+            return Err(format!("duplicate workflow argument '{}'", argument.name));
+        }
+        validate_display_field(
+            "argument description",
+            &argument.description,
+            MAX_WORKFLOW_DESCRIPTION_BYTES,
+            true,
+        )?;
+        if let Some(default) = &argument.default {
+            if default.len() > MAX_WORKFLOW_COMMAND_BYTES {
+                return Err(format!(
+                    "default for '{}' exceeds {MAX_WORKFLOW_COMMAND_BYTES} bytes",
+                    argument.name
+                ));
+            }
+            if default
+                .chars()
+                .any(|ch| ch.is_control() || crate::text_safety::is_visual_spoof(ch))
+            {
+                return Err(format!(
+                    "default for '{}' is unsafe for command insertion",
+                    argument.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_display_field(
+    label: &str,
+    value: &str,
+    max_bytes: usize,
+    allow_empty: bool,
+) -> Result<(), String> {
+    if !allow_empty && value.trim().is_empty() {
+        return Err(format!("workflow has empty {label}"));
+    }
+    if value.len() > max_bytes {
+        return Err(format!("workflow {label} exceeds {max_bytes} bytes"));
+    }
+    if value
+        .chars()
+        .any(|ch| ch.is_control() || crate::text_safety::is_visual_spoof(ch))
+    {
+        return Err(format!(
+            "workflow {label} contains a control, invisible, or bidirectional character"
+        ));
+    }
+    Ok(())
 }
 
 /// Standard config dir: `<XDG_CONFIG_HOME>/jterm1/workflows/`.
@@ -156,8 +297,9 @@ pub(crate) fn workflow_dirs() -> Vec<PathBuf> {
             .join("workflows"),
     );
     let mut unique = Vec::new();
-    for dir in dirs {
-        if !unique.contains(&dir) {
+    let mut seen = HashSet::new();
+    for dir in dirs.into_iter().take(MAX_WORKFLOW_DIRECTORIES) {
+        if seen.insert(dir.clone()) {
             unique.push(dir);
         }
     }
@@ -195,16 +337,21 @@ pub(crate) fn welcome_notebook_path() -> Option<PathBuf> {
 /// Unknown single-brace placeholders stay visible. Double braces without a
 /// matching binding emit one literal brace pair, mirroring `format!` escapes.
 /// Iteration advances by Unicode scalar value, never by raw UTF-8 byte.
-pub(crate) fn substitute(template: &str, bindings: &[(String, String)]) -> String {
-    render_template(template, bindings, &HashSet::new()).0
+pub(crate) fn substitute(template: &str, bindings: &[(String, String)]) -> Result<String, String> {
+    render_template(template, bindings, &HashSet::new()).map(|(rendered, _)| rendered)
 }
 
 fn render_template(
     template: &str,
     bindings: &[(String, String)],
     missing_bindings: &HashSet<String>,
-) -> (String, Vec<String>) {
-    let mut out = String::with_capacity(template.len());
+) -> Result<(String, Vec<String>), String> {
+    if template.len() > MAX_WORKFLOW_COMMAND_BYTES {
+        return Err(format!(
+            "workflow command exceeds {MAX_WORKFLOW_COMMAND_BYTES} bytes"
+        ));
+    }
+    let mut out = String::with_capacity(template.len().min(MAX_WORKFLOW_COMMAND_BYTES));
     let bytes = template.as_bytes();
     let mut missing = Vec::new();
     let mut i = 0;
@@ -215,7 +362,7 @@ fn render_template(
                 if let Some(end) = find_close(bytes, i + 2) {
                     let name = template[i + 2..end].trim();
                     if let Some((_, value)) = bindings.iter().find(|(key, _)| key == name) {
-                        out.push_str(value);
+                        push_rendered(&mut out, value)?;
                         i = end + 2;
                         continue;
                     }
@@ -227,12 +374,12 @@ fn render_template(
                         continue;
                     }
                     // No binding means `{{...}}` is a literal-brace escape.
-                    out.push('{');
+                    push_rendered(&mut out, "{")?;
                     i += 2;
                     continue;
                 }
                 // Preserve an unterminated pair exactly as authored.
-                out.push('{');
+                push_rendered(&mut out, "{")?;
                 i += 1;
                 continue;
             }
@@ -241,19 +388,19 @@ fn render_template(
                 let end = i + 1 + end_relative;
                 let name = template[i + 1..end].trim();
                 if let Some((_, value)) = bindings.iter().find(|(key, _)| key == name) {
-                    out.push_str(value);
+                    push_rendered(&mut out, value)?;
                 } else if missing_bindings.contains(name) {
                     if !missing.iter().any(|entry| entry == name) {
                         missing.push(name.to_owned());
                     }
                 } else {
-                    out.push_str(&template[i..=end]);
+                    push_rendered(&mut out, &template[i..=end])?;
                 }
                 i = end + 1;
                 continue;
             }
         } else if bytes[i] == b'}' && i + 1 < bytes.len() && bytes[i + 1] == b'}' {
-            out.push('}');
+            push_rendered(&mut out, "}")?;
             i += 2;
             continue;
         }
@@ -262,11 +409,22 @@ fn render_template(
             .chars()
             .next()
             .expect("i always points to a UTF-8 boundary");
-        out.push(character);
+        let mut encoded = [0_u8; 4];
+        push_rendered(&mut out, character.encode_utf8(&mut encoded))?;
         i += character.len_utf8();
     }
 
-    (out, missing)
+    Ok((out, missing))
+}
+
+fn push_rendered(output: &mut String, addition: &str) -> Result<(), String> {
+    if output.len().saturating_add(addition.len()) > MAX_WORKFLOW_COMMAND_BYTES {
+        return Err(format!(
+            "rendered command exceeds {MAX_WORKFLOW_COMMAND_BYTES} bytes"
+        ));
+    }
+    output.push_str(addition);
+    Ok(())
 }
 
 /// Render a workflow using caller values and declared defaults. Missing
@@ -276,6 +434,28 @@ pub(crate) fn render(
     workflow: &Workflow,
     values: &HashMap<String, String>,
 ) -> Result<String, String> {
+    validate_workflow(workflow)?;
+    if values.len() > MAX_WORKFLOW_ARGS {
+        return Err(format!(
+            "workflow received more than {MAX_WORKFLOW_ARGS} values"
+        ));
+    }
+    for (name, value) in values {
+        validate_display_field("value name", name, MAX_WORKFLOW_FIELD_BYTES, false)?;
+        if value.len() > MAX_WORKFLOW_COMMAND_BYTES {
+            return Err(format!(
+                "value for '{name}' exceeds {MAX_WORKFLOW_COMMAND_BYTES} bytes"
+            ));
+        }
+        if value
+            .chars()
+            .any(|ch| ch.is_control() || crate::text_safety::is_visual_spoof(ch))
+        {
+            return Err(format!(
+                "value for '{name}' is unsafe for review-only insertion"
+            ));
+        }
+    }
     let mut bindings: Vec<(String, String)> = values
         .iter()
         .map(|(name, value)| (name.clone(), value.clone()))
@@ -292,7 +472,7 @@ pub(crate) fn render(
         }
     }
 
-    let (out, missing) = render_template(&workflow.command, &bindings, &missing_bindings);
+    let (out, missing) = render_template(&workflow.command, &bindings, &missing_bindings)?;
     if !missing.is_empty() {
         return Err(format!("missing values: {}", missing.join(", ")));
     }
@@ -398,7 +578,8 @@ mod tests {
             substitute(
                 "你好 {name} / {{name}} / {{x,y}}",
                 &[("name".into(), "世界".into())]
-            ),
+            )
+            .unwrap(),
             "你好 世界 / 世界 / {x,y}"
         );
     }
@@ -502,6 +683,63 @@ default = "api"
             .unwrap_err()
             .contains("unsafe for review-only insertion"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn workflow_files_and_rendered_commands_are_strictly_bounded() {
+        let dir = tempdir();
+        let path = dir.join("oversized.yaml");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_WORKFLOW_FILE_BYTES + 1).unwrap();
+        assert!(load_one(&path).unwrap_err().contains("byte limit"));
+
+        let repeated = "{{value}}".repeat(4_000);
+        let workflow = wf("bounded", &repeated, &[("value", None)]);
+        let values = HashMap::from([("value".to_string(), "x".repeat(MAX_WORKFLOW_COMMAND_BYTES))]);
+        assert!(render(&workflow, &values)
+            .unwrap_err()
+            .contains("rendered command exceeds"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workflow_fifo_is_rejected_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempdir();
+        let path = dir.join("blocked.yaml");
+        let path_c = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: path_c is a live NUL-terminated pathname for this call.
+        assert_eq!(unsafe { nix::libc::mkfifo(path_c.as_ptr(), 0o600) }, 0);
+        let started = std::time::Instant::now();
+        assert!(load_one(&path).unwrap_err().contains("not a regular file"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn workflow_metadata_rejects_duplicates_and_visual_spoofing() {
+        let mut duplicate = wf("duplicate", "echo ok", &[("x", None), ("x", Some("ok"))]);
+        assert!(validate_workflow(&duplicate)
+            .unwrap_err()
+            .contains("duplicate workflow argument"));
+
+        duplicate.args.truncate(1);
+        duplicate.name = "safe\u{202e}txt".into();
+        assert!(validate_workflow(&duplicate)
+            .unwrap_err()
+            .contains("bidirectional"));
+        duplicate.name = "safe".into();
+        duplicate.command = "echo safe\u{200b}hidden".into();
+        assert!(validate_workflow(&duplicate)
+            .unwrap_err()
+            .contains("bidirectional"));
+        duplicate.command = "echo safe\u{e0020}hidden".into();
+        assert!(validate_workflow(&duplicate)
+            .unwrap_err()
+            .contains("bidirectional"));
     }
 
     #[test]

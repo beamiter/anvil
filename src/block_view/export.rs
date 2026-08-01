@@ -40,6 +40,29 @@ fn export_file_name(stamp: &str, extension: &str, attempt: u32) -> String {
 
 #[allow(dead_code)]
 impl TermView {
+    fn write_session_export(
+        &self,
+        writer: &mut impl Write,
+        format: SessionExportFormat,
+    ) -> io::Result<()> {
+        let blocks = self.block_data.borrow();
+        match format {
+            SessionExportFormat::Json => serde_json::to_writer_pretty(writer, &*blocks)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error)),
+            SessionExportFormat::Markdown => {
+                writeln!(writer, "# Terminal Session Export\n")?;
+                writeln!(writer, "Total blocks: {}\n", blocks.len())?;
+                writeln!(writer, "---\n")?;
+                for (index, block) in blocks.iter().enumerate() {
+                    writeln!(writer, "## Block #{}\n", index + 1)?;
+                    writer.write_all(block.to_markdown().as_bytes())?;
+                    writeln!(writer, "\n---\n")?;
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Export a block by ID to JSON format
     pub fn export_block_json(&self, block_id: u64) -> Option<String> {
         let blocks = self.block_data.borrow();
@@ -87,10 +110,6 @@ impl TermView {
     /// data directory. Exports contain command output, so the file is created
     /// exclusively with owner-only permissions like the block history.
     pub fn export_session_to_file(&self, format: SessionExportFormat) -> io::Result<PathBuf> {
-        let contents = match format {
-            SessionExportFormat::Markdown => self.export_session_markdown(),
-            SessionExportFormat::Json => self.export_session_json(),
-        };
         let dir = gtk::glib::user_data_dir().join("jterm1").join("exports");
         fs::create_dir_all(&dir)?;
         let stamp = gtk::glib::DateTime::now_local()
@@ -109,8 +128,19 @@ impl TermView {
             }
             match options.open(&path) {
                 Ok(mut file) => {
-                    file.write_all(contents.as_bytes())?;
-                    file.flush()?;
+                    let result = self
+                        .write_session_export(&mut file, format)
+                        .and_then(|_| file.flush())
+                        .and_then(|_| file.sync_all());
+                    if let Err(error) = result {
+                        drop(file);
+                        let _ = fs::remove_file(&path);
+                        return Err(error);
+                    }
+                    drop(file);
+                    if let Ok(parent) = OpenOptions::new().read(true).open(&dir) {
+                        let _ = parent.sync_all();
+                    }
                     return Ok(path);
                 }
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,

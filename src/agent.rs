@@ -35,8 +35,46 @@ pub(crate) use jterm_core::agent::{
     is_dangerous, AgentState, ApprovedCommand, CancellationToken, ModelOutcome, ProposalId,
     ProposalStatus, SessionError, Turn,
 };
+use jterm_core::agent::{parse_action, ParseError, ParsedAction};
 
 use jterm_core::agent::AgentSession as CoreSession;
+
+const MAX_LOCAL_AGENT_COMMAND_BYTES: usize = 16 * 1024;
+const MAX_AGENT_DISPLAY_BYTES: usize = 32 * 1024;
+
+fn agent_display_text(text: &str, preserve_multiline: bool) -> String {
+    crate::text_safety::bounded_display_text(text, MAX_AGENT_DISPLAY_BYTES, preserve_multiline)
+}
+
+pub(crate) fn local_agent_command_issue(command: &str) -> Option<&'static str> {
+    if command.trim().is_empty() {
+        return Some("command is empty");
+    }
+    if command.len() > MAX_LOCAL_AGENT_COMMAND_BYTES {
+        return Some("command exceeds the local Agent size limit");
+    }
+    if command.chars().any(char::is_control) {
+        return Some("command contains a control character");
+    }
+    if crate::text_safety::contains_visual_spoof(command) {
+        return Some("command contains an invisible or bidirectional formatting character");
+    }
+    None
+}
+
+fn local_agent_command_error(command: &str) -> Option<SessionError> {
+    local_agent_command_issue(command)
+        .map(|issue| SessionError::Protocol(ParseError::InvalidCommand(issue.to_string())))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingAgentCommand {
+    pub(crate) proposal_id: ProposalId,
+    pub(crate) command: String,
+    /// Locally generated one-shot execution identity. It never comes from PTY
+    /// output and must be armed before the approved bytes are written.
+    pub(crate) generation: u64,
+}
 
 /// jterm1's Agent session. The pure protocol state machine (turn caps,
 /// approval transitions, transcript bounds, prompt assembly) lives in
@@ -45,10 +83,11 @@ use jterm_core::agent::AgentSession as CoreSession;
 /// of the in-flight LLM request handle.
 pub(crate) struct AgentSession {
     inner: CoreSession,
-    /// The approved proposal currently executing in the bound pane. Keeping
-    /// the id with the command prevents same-text/stale block completions
-    /// from being attached to the wrong proposal.
-    pub(crate) awaiting_command: Option<(ProposalId, String)>,
+    /// The approved proposal currently executing in the bound pane. Command
+    /// text is only a secondary check; the locally armed generation is the
+    /// authoritative correlation identity.
+    pub(crate) awaiting_command: Option<PendingAgentCommand>,
+    next_execution_generation: u64,
     /// Held so dropping the session cancels an in-flight LLM request.
     pub(crate) in_flight: Option<crate::ai::AiHandle>,
     /// Tab + pane the session is bound to. Commands are typed into this
@@ -69,14 +108,23 @@ impl AgentSession {
 
     /// Rebind a session restored from a cross-restart snapshot to the pane
     /// the user reopened the Agent on.
-    pub(crate) fn from_restored(inner: CoreSession, bound_tab: u64, bound_pane: u64) -> Self {
-        Self::wrap(inner, bound_tab, bound_pane)
+    pub(crate) fn from_restored(
+        inner: CoreSession,
+        bound_tab: u64,
+        bound_pane: u64,
+    ) -> Option<Self> {
+        let safe = inner.transcript().iter().all(|turn| match turn {
+            Turn::AssistantProposed { command, .. } => local_agent_command_issue(command).is_none(),
+            _ => true,
+        });
+        safe.then(|| Self::wrap(inner, bound_tab, bound_pane))
     }
 
     fn wrap(inner: CoreSession, bound_tab: u64, bound_pane: u64) -> Self {
         Self {
             inner,
             awaiting_command: None,
+            next_execution_generation: 0,
             in_flight: None,
             bound_tab,
             bound_pane,
@@ -128,6 +176,16 @@ impl AgentSession {
 
     pub(crate) fn accept_model_reply(&mut self, raw: &str) -> Result<ModelOutcome, SessionError> {
         self.in_flight = None;
+        if let Ok(ParsedAction::Run { command, .. }) = parse_action(raw) {
+            if local_agent_command_issue(&command).is_some() {
+                // Drive the old core through its normal protocol-error
+                // transition so the unsafe proposal is never stored or shown.
+                // The staged jagent release performs this validation itself.
+                return self
+                    .inner
+                    .accept_model_reply(r#"{"action":"run","command":"\n"}"#);
+            }
+        }
         self.inner.accept_model_reply(raw)
     }
 
@@ -138,8 +196,20 @@ impl AgentSession {
     }
 
     pub(crate) fn approve(&mut self, id: ProposalId) -> Result<ApprovedCommand, SessionError> {
+        if let Some(command) = self.inner.transcript().iter().find_map(|turn| match turn {
+            Turn::AssistantProposed {
+                id: proposal_id,
+                command,
+                ..
+            } if *proposal_id == id => Some(command.as_str()),
+            _ => None,
+        }) {
+            if let Some(error) = local_agent_command_error(command) {
+                return Err(error);
+            }
+        }
         let approved = self.inner.approve(id)?;
-        self.awaiting_command = Some((approved.proposal_id, approved.command.clone()));
+        self.arm_approved(&approved);
         Ok(approved)
     }
 
@@ -148,9 +218,38 @@ impl AgentSession {
         id: ProposalId,
         edited_command: impl Into<String>,
     ) -> Result<ApprovedCommand, SessionError> {
+        let edited_command = edited_command.into();
+        if let Some(error) = local_agent_command_error(&edited_command) {
+            return Err(error);
+        }
         let approved = self.inner.edit_and_approve(id, edited_command)?;
-        self.awaiting_command = Some((approved.proposal_id, approved.command.clone()));
+        self.arm_approved(&approved);
         Ok(approved)
+    }
+
+    fn arm_approved(&mut self, approved: &ApprovedCommand) {
+        self.next_execution_generation = self.next_execution_generation.wrapping_add(1);
+        if self.next_execution_generation == 0 {
+            self.next_execution_generation = 1;
+        }
+        self.awaiting_command = Some(PendingAgentCommand {
+            proposal_id: approved.proposal_id,
+            command: approved.command.clone(),
+            generation: self.next_execution_generation,
+        });
+    }
+
+    /// Approval changed the pure protocol state, but the terminal could not
+    /// atomically arm and submit that exact generation. There is no safe
+    /// observation to fabricate or rollback transition, so seal the session.
+    pub(crate) fn execution_start_failed(&mut self, generation: u64) {
+        if self
+            .awaiting_command
+            .as_ref()
+            .is_some_and(|pending| pending.generation == generation)
+        {
+            self.cancel();
+        }
     }
 
     pub(crate) fn reject(&mut self, id: ProposalId) -> Result<(), SessionError> {
@@ -405,6 +504,7 @@ impl Component for AgentPanelModel {
                 provider_name,
                 view,
             } => {
+                let provider_name = agent_display_text(&provider_name, false);
                 widgets.intro.set_label(&format!(
                     "Talk to {provider_name}. The model proposes one command per turn; you approve each before it runs. Output is fed back automatically. Max {} turns.",
                     view.max_turns
@@ -499,7 +599,7 @@ impl AgentPanelModel {
             ),
         };
         let status = match self.view.attached_context.as_deref() {
-            Some(command) => format!("{status} · context: {command}"),
+            Some(command) => format!("{status} · context: {}", agent_display_text(command, false)),
             None => status,
         };
         widgets.status.set_label(&status);
@@ -613,7 +713,7 @@ impl Component for AgentEditModel {
         match msg {
             AgentEditMsg::Open(index, command) => {
                 self.index = index;
-                widgets.entry.set_text(&command);
+                widgets.entry.set_text(&agent_display_text(&command, false));
                 widgets.entry.select_region(0, -1);
                 root.present(Some(&self.parent));
                 widgets.entry.grab_focus();
@@ -636,7 +736,8 @@ fn render_user(msg: &str) -> gtk::Widget {
     let frame = gtk::Frame::new(None);
     frame.add_css_class("card");
     frame.set_halign(gtk::Align::End);
-    let l = gtk::Label::new(Some(msg));
+    let display = agent_display_text(msg, true);
+    let l = gtk::Label::new(Some(&display));
     l.set_wrap(true);
     l.set_xalign(0.0);
     l.set_margin_top(8);
@@ -649,7 +750,7 @@ fn render_user(msg: &str) -> gtk::Widget {
 }
 
 fn render_thought(msg: &str) -> gtk::Widget {
-    let l = gtk::Label::new(Some(&format!("💭 {msg}")));
+    let l = gtk::Label::new(Some(&format!("💭 {}", agent_display_text(msg, true))));
     l.set_wrap(true);
     l.set_xalign(0.0);
     l.set_halign(gtk::Align::Start);
@@ -659,7 +760,8 @@ fn render_thought(msg: &str) -> gtk::Widget {
 }
 
 fn render_say(msg: &str) -> gtk::Widget {
-    let l = gtk::Label::new(Some(msg));
+    let display = agent_display_text(msg, true);
+    let l = gtk::Label::new(Some(&display));
     l.set_wrap(true);
     l.set_xalign(0.0);
     l.set_halign(gtk::Align::Start);
@@ -671,7 +773,10 @@ fn render_protocol_error(message: &str) -> gtk::Widget {
     let frame = gtk::Frame::new(None);
     frame.add_css_class("card");
     frame.add_css_class("error");
-    let label = gtk::Label::new(Some(&format!("Protocol/provider error: {message}")));
+    let label = gtk::Label::new(Some(&format!(
+        "Protocol/provider error: {}",
+        agent_display_text(message, true)
+    )));
     label.set_wrap(true);
     label.set_xalign(0.0);
     label.set_selectable(true);
@@ -700,7 +805,14 @@ fn render_proposed(
     outer.set_margin_start(10);
     outer.set_margin_end(10);
 
+    let issue = local_agent_command_issue(command);
     let danger = is_dangerous(command);
+    if let Some(issue) = issue {
+        let warning = gtk::Label::new(Some(&format!("Blocked unsafe proposal: {issue}")));
+        warning.add_css_class("error");
+        warning.set_halign(gtk::Align::Start);
+        outer.append(&warning);
+    }
     if let Some(reason) = danger {
         let warn = gtk::Label::new(Some(&format!("⚠ destructive — {reason}")));
         warn.add_css_class("error");
@@ -714,7 +826,9 @@ fn render_proposed(
         .monospace(true)
         .wrap_mode(gtk::WrapMode::WordChar)
         .build();
-    cmd_view.buffer().set_text(command);
+    cmd_view
+        .buffer()
+        .set_text(&agent_display_text(command, false));
     cmd_view.add_css_class("ai-explain-body");
     outer.append(&cmd_view);
 
@@ -732,7 +846,7 @@ fn render_proposed(
             } else {
                 approve.add_css_class("suggested-action");
             }
-            approve.set_sensitive(is_current);
+            approve.set_sensitive(is_current && issue.is_none());
             let edit = gtk::Button::with_label("Edit");
             let reject = gtk::Button::with_label("Reject");
             edit.set_sensitive(is_current);
@@ -800,7 +914,8 @@ fn render_observation(exit: i32, output_sample: &str) -> gtk::Widget {
         .monospace(true)
         .wrap_mode(gtk::WrapMode::WordChar)
         .build();
-    view.buffer().set_text(output_sample);
+    view.buffer()
+        .set_text(&agent_display_text(output_sample, true));
     view.add_css_class("ai-explain-body");
     let scroll = gtk::ScrolledWindow::builder()
         .height_request(180)
@@ -848,7 +963,11 @@ mod tests {
         assert_eq!(approved.command, "ls -la");
         assert_eq!(
             s.awaiting_command,
-            Some((id, "ls -la".to_string())),
+            Some(PendingAgentCommand {
+                proposal_id: id,
+                command: "ls -la".to_string(),
+                generation: 1,
+            }),
             "approval must arm the block-completion correlation slot"
         );
         assert_eq!(
@@ -891,8 +1010,75 @@ mod tests {
         assert_eq!(approved.command, "rm -r ./build/tmp");
         assert_eq!(
             s.awaiting_command,
-            Some((id, "rm -r ./build/tmp".to_string()))
+            Some(PendingAgentCommand {
+                proposal_id: id,
+                command: "rm -r ./build/tmp".to_string(),
+                generation: 1,
+            })
         );
+    }
+
+    #[test]
+    fn local_gate_rejects_visual_spoof_model_and_edited_commands_before_arming() {
+        for hidden in ['\u{00ad}', '\u{034f}', '\u{fe0f}', '\u{e0020}', '\u{e0100}'] {
+            let mut proposed = session(10);
+            proposed.submit_user("run something").unwrap();
+            let raw = run_reply(&format!("echo safe{hidden}hidden"));
+            assert!(proposed.accept_model_reply(&raw).is_err());
+            assert_eq!(proposed.state(), AgentState::Ready);
+            assert!(!proposed
+                .transcript()
+                .iter()
+                .any(|turn| matches!(turn, Turn::AssistantProposed { .. })));
+        }
+
+        let mut edited = session(10);
+        edited.submit_user("run something").unwrap();
+        let ModelOutcome::Proposal { id, .. } =
+            edited.accept_model_reply(&run_reply("echo safe")).unwrap()
+        else {
+            panic!("expected proposal");
+        };
+        assert!(edited
+            .edit_and_approve(id, "echo safe\u{1bca0}hidden")
+            .is_err());
+        assert_eq!(
+            edited.state(),
+            AgentState::AwaitingApproval { proposal_id: id }
+        );
+        assert!(edited.awaiting_command.is_none());
+    }
+
+    #[test]
+    fn local_restore_gate_discards_legacy_unsafe_proposals() {
+        let mut core = CoreSession::new(10);
+        core.submit_user("run something").unwrap();
+        let raw = run_reply("echo safe\u{202e}hidden");
+        if core.accept_model_reply(&raw).is_ok() {
+            let snapshot = core.snapshot().expect("pending proposal snapshot");
+            let restored = CoreSession::restore(snapshot).expect("legacy core restores snapshot");
+            assert!(AgentSession::from_restored(restored, 10, 20).is_none());
+        }
+        // Once jagent itself rejects the command, the local fallback is simply
+        // unreachable; both versions satisfy the fail-closed contract.
+    }
+
+    #[test]
+    fn execution_generations_are_monotonic_and_start_failure_fails_closed() {
+        let mut first = session(10);
+        first.submit_user("run").unwrap();
+        let ModelOutcome::Proposal { id, .. } =
+            first.accept_model_reply(&run_reply("true")).unwrap()
+        else {
+            panic!("expected proposal");
+        };
+        let _ = first.approve(id).unwrap();
+        let generation = first.awaiting_command.as_ref().unwrap().generation;
+        first.execution_start_failed(generation.wrapping_add(1));
+        assert!(!first.is_cancelled(), "stale failure must be ignored");
+        first.execution_start_failed(generation);
+        assert!(first.is_cancelled());
+        assert!(first.awaiting_command.is_none());
     }
 
     #[test]

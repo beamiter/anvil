@@ -29,12 +29,17 @@ attach only at the *next* prompt.
 ## What it provides
 
 Each script emits two escape sequence families that jterm1 parses to drive its
-block view (`src/parser.rs`):
+block view (`src/terminal/ansi.rs`):
 
 - **OSC 133 (FTCS)** — `;A` at prompt render, `;B` when prompt finishes,
-  `;C` when a command starts executing, `;D;<exit>` when it returns. This
-  lets jterm1 attribute output to discrete blocks and read the exit code
-  exactly (no error-text heuristics).
+  `;C;id=<id>` when a command starts executing, and
+  `;D;<exit>;id=<id>` when it returns. Each shell instance creates a private,
+  non-exported nonce and monotonic sequence; the matching ID prevents a stale
+  or unrelated completion marker from finishing the wrong command. This lets
+  jterm1 attribute output to discrete blocks and read the exit code exactly
+  (no error-text heuristics). It also binds an approved Agent proposal to the
+  exact prompt generation and command that actually started; a changed prompt,
+  failed write, mismatched start, or mismatched completion fails closed.
 
 - **OSC 7** — reports the current working directory as a `file://` URI so the
   active prompt chip stays in sync with `cd`.

@@ -15,9 +15,7 @@ mod diagnostics;
 mod dialogs;
 mod file_tree;
 mod file_tree_ops;
-use jterm_core::{
-    child_env, command_history, git_meta, notify, parser, pty_input, review_input, snapshot_file,
-};
+use jterm_core::{child_env, command_history, git_meta, notify, parser, pty_input, review_input};
 
 mod host {
     pub use jterm_core::host::*;
@@ -47,6 +45,7 @@ mod sidebar_toggle;
 mod startup_ui;
 mod tab_strip;
 mod terminal;
+mod text_safety;
 mod top_bar;
 mod vte_pty;
 mod workflow_ops;
@@ -203,13 +202,18 @@ fn create_pane(
             command,
             exit_code,
             output_sample,
+            agent_generation,
         } => AppMsg::AgentBlockFinished {
             tab_id,
             pane_id,
             command,
             exit_code,
             output_sample,
+            agent_generation,
         },
+        VteOutput::AgentExecutionStartFailed { generation } => {
+            AppMsg::AgentExecutionStartFailed { generation }
+        }
         VteOutput::AskAiAboutBlock(context) => AppMsg::AskAiAboutBlock(context),
     };
     let terminal = match mode {
@@ -799,7 +803,7 @@ impl SimpleComponent for AppModel {
         }
         if init.safe_mode {
             model.show_toast(
-                "Safe mode: VTE + sh, with startup commands, restore, persistence, remote hosts, and AI disabled.",
+                "Safe mode: VTE + sh, with startup commands, restore, persistence, remote hosts, AI, and jsh updates disabled.",
             );
         }
 
@@ -874,12 +878,13 @@ impl SimpleComponent for AppModel {
         // behavior in the isolated recovery session.
         if !init.safe_mode {
             let config_path = config_file_path();
-            if let Some(parent) = config_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let config_file = gio::File::for_path(&config_path);
-            if let Ok(monitor) =
-                config_file.monitor_file(gio::FileMonitorFlags::NONE, None::<&Cancellable>)
+            if let Err(error) = config_store::ensure_config_parent(&config_path) {
+                log::warn!(
+                    "Config hot reload is unavailable for {}: {error}",
+                    config_path.display()
+                );
+            } else if let Ok(monitor) = gio::File::for_path(&config_path)
+                .monitor_file(gio::FileMonitorFlags::NONE, None::<&Cancellable>)
             {
                 let rsender = sender.clone();
                 let reload_pending = Rc::new(std::cell::Cell::new(false));
@@ -921,10 +926,10 @@ impl SimpleComponent for AppModel {
                 if let Some(id) = active_id {
                     model.select_tab(id, &sender);
                 }
-                // Loading claims and consumes the exited process's snapshot.
-                // Checkpoint the restored workspace under this process now so
-                // a crash or forced termination before another structural tab
-                // change does not lose the recovered session.
+                // Loading durably claims the exited process's snapshot without
+                // consuming it. This checkpoint publishes the restored
+                // workspace under the current owner; only then can the old
+                // claim be committed and removed.
                 model.persist_session();
             }
             None => {
@@ -1269,18 +1274,25 @@ impl SimpleComponent for AppModel {
                 command,
                 exit_code,
                 output_sample,
+                agent_generation,
             } => {
                 if let Some((tab_index, _)) = self.find_pane(pane_id) {
                     let tab_id = self.tabs[tab_index].id;
                     self.agent_handle_block_finished(
-                        tab_id,
-                        pane_id,
-                        command,
-                        exit_code,
-                        output_sample,
+                        agent_ops::AgentBlockCompletion {
+                            tab_id,
+                            pane_id,
+                            command,
+                            exit_code,
+                            output: output_sample,
+                            agent_generation,
+                        },
                         &sender,
                     );
                 }
+            }
+            AppMsg::AgentExecutionStartFailed { generation } => {
+                self.agent_execution_start_failed(generation);
             }
             AppMsg::AgentClose => self.agent_close(),
             AppMsg::PaletteTypeCommand(cmd) => {
@@ -1437,16 +1449,15 @@ fn init_config_file() -> Result<(), String> {
     use std::io::Write;
 
     let path = config_file_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|err| format!("cannot create {}: {err}", parent.display()))?;
-    }
+    config_store::ensure_config_parent(&path).map_err(|err| err.to_string())?;
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options
+            .mode(0o600)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
     }
     let mut file = options.open(&path).map_err(|err| {
         if err.kind() == std::io::ErrorKind::AlreadyExists {
@@ -1459,11 +1470,7 @@ fn init_config_file() -> Result<(), String> {
         .and_then(|_| file.sync_all())
         .map_err(|err| format!("cannot write {}: {err}", path.display()))?;
     drop(file);
-    if let Some(parent) = path.parent() {
-        std::fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|err| format!("cannot sync {}: {err}", parent.display()))?;
-    }
+    config_store::sync_config_parent(&path).map_err(|err| err.to_string())?;
     println!("Created {}", path.display());
     Ok(())
 }

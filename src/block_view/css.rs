@@ -3,6 +3,11 @@ use crate::config::Config;
 use gtk::gdk::RGBA;
 use relm4::gtk;
 use std::cell::RefCell;
+use std::io::Read;
+use std::path::Path;
+
+const MAX_GIT_POINTER_BYTES: u64 = 16 * 1024;
+const MAX_BRANCH_DISPLAY_CHARS: usize = 256;
 
 /// Vertical chrome the `.block-active` holder adds around the live VTE:
 /// 4px top margin + 4px bottom margin + 1px top border + 1px bottom border +
@@ -43,7 +48,7 @@ pub(crate) fn shorten_path(path: &str) -> String {
 /// `.git` dir (or `.git` file for worktrees/submodules), then read `HEAD`. No
 /// subprocess, no dirty-state — just the branch name (or short SHA if detached).
 pub(crate) fn git_branch_for(cwd: &str) -> Option<String> {
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     let mut dir: Option<&Path> = Some(Path::new(cwd));
     while let Some(d) = dir {
         let dot_git = d.join(".git");
@@ -51,7 +56,7 @@ pub(crate) fn git_branch_for(cwd: &str) -> Option<String> {
             Some(dot_git.join("HEAD"))
         } else if dot_git.is_file() {
             // "gitdir: <path>" → real git dir lives elsewhere
-            std::fs::read_to_string(&dot_git).ok().and_then(|c| {
+            read_small_git_file(&dot_git).and_then(|c| {
                 c.strip_prefix("gitdir:").map(|p| {
                     let g = Path::new(p.trim());
                     if g.is_absolute() {
@@ -65,10 +70,10 @@ pub(crate) fn git_branch_for(cwd: &str) -> Option<String> {
             None
         };
         if let Some(hp) = head_path {
-            if let Ok(head) = std::fs::read_to_string(&hp) {
+            if let Some(head) = read_small_git_file(&hp) {
                 let head = head.trim();
                 if let Some(branch) = head.strip_prefix("ref: refs/heads/") {
-                    return Some(branch.to_string());
+                    return sanitize_branch(branch);
                 }
                 // Detached HEAD: show short SHA.
                 if head.len() >= 7 && head.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -80,6 +85,49 @@ pub(crate) fn git_branch_for(cwd: &str) -> Option<String> {
         dir = d.parent();
     }
     None
+}
+
+fn read_small_git_file(path: &Path) -> Option<String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
+    }
+    let file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_GIT_POINTER_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_GIT_POINTER_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_GIT_POINTER_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn sanitize_branch(branch: &str) -> Option<String> {
+    let branch = branch.trim();
+    if branch.is_empty() {
+        return None;
+    }
+    let mut output = String::new();
+    let mut chars = branch.chars();
+    for ch in chars.by_ref().take(MAX_BRANCH_DISPLAY_CHARS) {
+        if ch.is_control() || crate::text_safety::is_visual_spoof(ch) {
+            output.push('\u{fffd}');
+        } else {
+            output.push(ch);
+        }
+    }
+    if chars.next().is_some() {
+        output.push('…');
+    }
+    Some(output)
 }
 
 pub(crate) fn chrono_local_offset_secs() -> i64 {
@@ -657,4 +705,82 @@ pub(crate) fn install_block_css(config: &Config) {
         );
         *prev = Some(provider);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_root(label: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("jterm1-git-chip-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn git_branch_is_bounded_and_visual_controls_are_made_visible() {
+        let root = test_root("branch");
+        let repo = root.join("repo");
+        let git = repo.join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+        let branch = format!(
+            "safe\u{202e}\u{200b}{}",
+            "界".repeat(MAX_BRANCH_DISPLAY_CHARS + 10)
+        );
+        std::fs::write(git.join("HEAD"), format!("ref: refs/heads/{branch}\n")).unwrap();
+
+        let display = git_branch_for(repo.to_str().unwrap()).unwrap();
+        assert!(!display.contains('\u{202e}'));
+        assert!(!display.contains('\u{200b}'));
+        assert!(display.contains("��"));
+        assert!(display.ends_with('…'));
+        assert_eq!(display.chars().count(), MAX_BRANCH_DISPLAY_CHARS + 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn git_worktree_pointer_is_bounded_and_resolves_relative_path() {
+        let root = test_root("worktree");
+        let repo = root.join("repo");
+        let real = root.join("real-git");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(repo.join(".git"), "gitdir: ../real-git\n").unwrap();
+        std::fs::write(real.join("HEAD"), "ref: refs/heads/worktree\n").unwrap();
+        assert_eq!(
+            git_branch_for(repo.to_str().unwrap()).as_deref(),
+            Some("worktree")
+        );
+
+        let oversized = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(repo.join(".git"))
+            .unwrap();
+        oversized.set_len(MAX_GIT_POINTER_BYTES + 1).unwrap();
+        assert!(git_branch_for(repo.to_str().unwrap()).is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_head_fifo_is_rejected_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = test_root("fifo");
+        let repo = root.join("repo");
+        let git = repo.join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+        let head = git.join("HEAD");
+        let head_c = CString::new(head.as_os_str().as_bytes()).unwrap();
+        // SAFETY: head_c is a live NUL-terminated pathname for this call.
+        assert_eq!(unsafe { nix::libc::mkfifo(head_c.as_ptr(), 0o600) }, 0);
+        let started = std::time::Instant::now();
+        assert!(git_branch_for(repo.to_str().unwrap()).is_none());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

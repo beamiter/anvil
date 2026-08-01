@@ -54,6 +54,8 @@ pub(crate) struct PaletteEntry {
 
 /// A run taking longer than this is flagged "slow" for the palette filter.
 pub(crate) const PALETTE_SLOW_MS: u64 = 2000;
+const MAX_PALETTE_ENTRIES: usize = 2_000;
+const MAX_PALETTE_DISPLAY_BYTES: usize = 4 * 1024;
 
 pub(crate) fn show_command_palette(
     parent: &ScrolledWindow,
@@ -108,7 +110,12 @@ pub(crate) fn show_command_palette(
     vbox.append(&scroller);
     popover.set_child(Some(&vbox));
 
-    let entries = Rc::new(entries);
+    let entries = Rc::new(
+        entries
+            .into_iter()
+            .take(MAX_PALETTE_ENTRIES)
+            .collect::<Vec<_>>(),
+    );
     let filtered: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
 
     let populate = {
@@ -132,7 +139,9 @@ pub(crate) fn show_command_palette(
             scored.sort_by_key(|(s, _)| *s);
             let mut keep = Vec::with_capacity(scored.len());
             for (_, c) in scored {
-                let row_label = gtk::Label::new(Some(c));
+                let display =
+                    crate::text_safety::bounded_display_text(c, MAX_PALETTE_DISPLAY_BYTES, false);
+                let row_label = gtk::Label::new(Some(&display));
                 row_label.set_halign(gtk::Align::Start);
                 row_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
                 row_label.add_css_class("command-palette-row");

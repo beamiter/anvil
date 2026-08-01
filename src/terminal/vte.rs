@@ -188,12 +188,6 @@ pub(crate) fn default_tab_title(tab_index_1based: u32, working_directory: Option
     format!("{prefix}{}", out_parts.join("/"))
 }
 
-pub(crate) fn open_uri(uri: &str) {
-    if let Err(err) = gio::AppInfo::launch_default_for_uri(uri, None::<&gio::AppLaunchContext>) {
-        log::warn!("Failed to open URI {uri}: {err}");
-    }
-}
-
 /// Ctrl+Click on a hyperlink opens it; other clicks pass through to VTE selection.
 pub(crate) fn setup_terminal_click_handler(terminal: &Terminal) {
     let click_controller = GestureClick::new();
@@ -205,7 +199,7 @@ pub(crate) fn setup_terminal_click_handler(terminal: &Terminal) {
             let state = controller.current_event_state();
             if state.contains(ModifierType::CONTROL_MASK) {
                 if let Some(uri) = terminal_clone.check_match_at(x, y).0 {
-                    open_uri(&uri);
+                    super::url::open_uri(&uri);
                     controller.set_state(gtk::EventSequenceState::Claimed);
                     return;
                 }
@@ -379,6 +373,12 @@ pub struct PaneProbe {
 #[derive(Debug)]
 pub enum VteInput {
     WriteInput(Vec<u8>),
+    /// Block-mode only: atomically re-check a clean prompt, arm the local
+    /// approval generation, and submit the reviewed command.
+    RunAgentCommand {
+        generation: u64,
+        command: String,
+    },
     Resize(u16, u16),
     GrabFocus,
     Copy,
@@ -463,6 +463,13 @@ pub enum VteOutput {
         /// agent already truncates to its own cap, but block.rs trims first
         /// so we don't ship 256 KB across a relm4 channel.
         output_sample: String,
+        /// One-shot identity armed locally before the reviewed PTY write.
+        agent_generation: Option<u64>,
+    },
+    /// Approval advanced the protocol, but the pane could no longer arm/write
+    /// that exact generation. The Agent integration must fail closed.
+    AgentExecutionStartFailed {
+        generation: u64,
     },
     AskAiAboutBlock(crate::ai::BlockContext),
 }
@@ -599,9 +606,12 @@ impl Component for VteTerminal {
         ComponentParts { model, widgets: () }
     }
 
-    fn update(&mut self, msg: Self::Input, _sender: ComponentSender<Self>, _root: &Self::Root) {
+    fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>, _root: &Self::Root) {
         match msg {
             VteInput::WriteInput(data) => self.terminal.feed_child(&data),
+            VteInput::RunAgentCommand { generation, .. } => {
+                let _ = sender.output(VteOutput::AgentExecutionStartFailed { generation });
+            }
             VteInput::Resize(cols, rows) => {
                 if let Some(pty) = self.terminal.pty() {
                     let _ = pty.set_size(rows as i32, cols as i32);

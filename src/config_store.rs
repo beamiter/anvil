@@ -11,7 +11,7 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,6 +26,7 @@ use crate::keybindings::Action;
 use jterm_core::keybindings::{is_unbind_token, parse, Chord};
 
 const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const FNV_OFFSET: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
 
@@ -213,12 +214,86 @@ fn revision_from_content(content: Option<&[u8]>) -> ConfigRevision {
     content.map_or(ConfigRevision::Missing, fingerprint)
 }
 
-fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, ConfigWriteError> {
-    match fs::read(path) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(io_error("read", path, error)),
+fn validate_private_regular_file(file: &fs::File, path: &Path) -> io::Result<fs::Metadata> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular private file", path.display()),
+        ));
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if metadata.nlink() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{} must have exactly one hard link", path.display()),
+            ));
+        }
+        // SAFETY: geteuid has no preconditions and only reads process state.
+        if metadata.uid() != unsafe { nix::libc::geteuid() } {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{} is not owned by the current user", path.display()),
+            ));
+        }
+    }
+    Ok(metadata)
+}
+
+/// Read a private regular file through a no-follow, nonblocking descriptor.
+/// The second size check catches a file that grows after metadata inspection.
+pub(crate) fn read_private_bytes(path: &Path, max_bytes: u64) -> io::Result<Option<Vec<u8>>> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let metadata = validate_private_regular_file(&file, path)?;
+    if metadata.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            format!("{} exceeds {max_bytes} bytes", path.display()),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            format!("{} exceeds {max_bytes} bytes", path.display()),
+        ));
+    }
+    Ok(Some(bytes))
+}
+
+pub(crate) fn read_config_bytes(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    read_private_bytes(path, MAX_CONFIG_BYTES)
+}
+
+fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, ConfigWriteError> {
+    read_config_bytes(path).map_err(|error| io_error("read", path, error))
+}
+
+pub(crate) fn read_config_text(path: &Path) -> io::Result<Option<String>> {
+    read_config_bytes(path)?.map_or(Ok(None), |bytes| {
+        String::from_utf8(bytes).map(Some).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} is not valid UTF-8", path.display()),
+            )
+        })
+    })
 }
 
 fn revision_at(path: &Path) -> Result<ConfigRevision, ConfigWriteError> {
@@ -249,6 +324,94 @@ fn lock_path_for(path: &Path) -> PathBuf {
 pub(crate) fn backup_paths() -> [PathBuf; 2] {
     let path = config::config_file_path();
     [backup_path_for(&path), secondary_backup_path_for(&path)]
+}
+
+#[cfg(unix)]
+fn validate_existing_parent(parent: &Path) -> Result<fs::File, ConfigWriteError> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(parent)
+        .map_err(|error| io_error("open directory", parent, error))?;
+    let metadata = directory
+        .metadata()
+        .map_err(|error| io_error("inspect directory", parent, error))?;
+    if !metadata.is_dir() {
+        return Err(ConfigWriteError::Io(format!(
+            "{} is not a configuration directory",
+            parent.display()
+        )));
+    }
+    // A pathname lock protects its namespace only while another uid cannot
+    // replace entries behind the descriptor. Owner-readable 0755 project
+    // roots remain valid explicit config parents; writable shared dirs do not.
+    // SAFETY: geteuid has no preconditions and only reads process state.
+    if metadata.uid() != unsafe { nix::libc::geteuid() }
+        || metadata.permissions().mode() & 0o022 != 0
+    {
+        return Err(ConfigWriteError::Io(format!(
+            "{} must be owned by the current user and not group/world writable",
+            parent.display()
+        )));
+    }
+    Ok(directory)
+}
+
+#[cfg(not(unix))]
+fn validate_existing_parent(parent: &Path) -> Result<fs::File, ConfigWriteError> {
+    let directory =
+        fs::File::open(parent).map_err(|error| io_error("open directory", parent, error))?;
+    if directory
+        .metadata()
+        .map_err(|error| io_error("inspect directory", parent, error))?
+        .is_dir()
+    {
+        Ok(directory)
+    } else {
+        Err(ConfigWriteError::Io(format!(
+            "{} is not a configuration directory",
+            parent.display()
+        )))
+    }
+}
+
+/// Create a missing parent privately or validate an existing final directory
+/// entry without following a symlink. Existing directories are never chmodded.
+pub(crate) fn ensure_config_parent(path: &Path) -> Result<(), ConfigWriteError> {
+    if path.file_name().is_none() {
+        return Err(ConfigWriteError::Io(format!(
+            "{} has no file name",
+            path.display()
+        )));
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    match fs::symlink_metadata(parent) {
+        Ok(_) => {
+            validate_existing_parent(parent)?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(parent)
+                    .map_err(|error| io_error("create directory", parent, error))?;
+            }
+            #[cfg(not(unix))]
+            fs::create_dir_all(parent)
+                .map_err(|error| io_error("create directory", parent, error))?;
+            validate_existing_parent(parent)?;
+        }
+        Err(error) => return Err(io_error("inspect directory", parent, error)),
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -293,57 +456,175 @@ fn unlock(file: &fs::File) {
 #[cfg(not(unix))]
 fn unlock(_file: &fs::File) {}
 
-fn open_lock_file(path: &Path) -> Result<fs::File, ConfigWriteError> {
-    let mut options = fs::OpenOptions::new();
-    options.create(true).read(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let file = options
-        .open(path)
-        .map_err(|error| io_error("open lock", path, error))?;
+fn set_private_permissions(file: &fs::File, path: &Path) -> Result<(), ConfigWriteError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(fs::Permissions::from_mode(0o600))
             .map_err(|error| io_error("set permissions on", path, error))?;
     }
+    Ok(())
+}
+
+fn open_lock_file(
+    path: &Path,
+    create: bool,
+    tighten_permissions: bool,
+) -> Result<fs::File, ConfigWriteError> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    if create {
+        options.create(true).write(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| io_error("open lock", path, error))?;
+    validate_private_regular_file(&file, path)
+        .map_err(|error| io_error("inspect lock", path, error))?;
+    if tighten_permissions {
+        set_private_permissions(&file, path)?;
+    }
     Ok(file)
 }
 
-pub(crate) fn lock_status() -> ConfigLockStatus {
-    let path = lock_path_for(&config::config_file_path());
-    if !path.exists() {
-        return ConfigLockStatus::Clear;
-    }
-    let Ok(file) = open_lock_file(&path) else {
-        return ConfigLockStatus::Unavailable;
+fn lock_status_for(config_path: &Path) -> ConfigLockStatus {
+    let path = lock_path_for(config_path);
+    let parent = config_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let directory = match validate_existing_parent(parent) {
+        Ok(directory) => directory,
+        Err(_)
+            if fs::symlink_metadata(parent)
+                .is_err_and(|error| error.kind() == io::ErrorKind::NotFound) =>
+        {
+            return ConfigLockStatus::Clear;
+        }
+        Err(_) => return ConfigLockStatus::Unavailable,
     };
-    match try_lock_exclusive(&file) {
+    match try_lock_exclusive(&directory) {
+        Ok(false) => return ConfigLockStatus::Active,
+        Err(_) => return ConfigLockStatus::Unavailable,
+        Ok(true) => {}
+    }
+
+    // Diagnostics are read-only: never create/chmod a lock merely to report it.
+    let file = match open_lock_file(&path, false, false) {
+        Ok(file) => file,
+        Err(_)
+            if fs::symlink_metadata(&path)
+                .is_err_and(|error| error.kind() == io::ErrorKind::NotFound) =>
+        {
+            unlock(&directory);
+            return ConfigLockStatus::Clear;
+        }
+        Err(_) => {
+            unlock(&directory);
+            return ConfigLockStatus::Unavailable;
+        }
+    };
+    let status = match try_lock_exclusive(&file) {
         Ok(true) => {
             unlock(&file);
             ConfigLockStatus::Clear
         }
         Ok(false) => ConfigLockStatus::Active,
         Err(_) => ConfigLockStatus::Unavailable,
+    };
+    unlock(&directory);
+    status
+}
+
+pub(crate) fn lock_status() -> ConfigLockStatus {
+    lock_status_for(&config::config_file_path())
+}
+
+/// Short-lived namespace lock for other private files stored beside the
+/// configuration (for example the one-shot Agent snapshot). Holding the final
+/// directory inode prevents two jterm1 processes from both consuming the same
+/// pathname or racing a replace against an unlink.
+pub(crate) struct PrivateParentLock {
+    directory: fs::File,
+}
+
+impl PrivateParentLock {
+    pub(crate) fn acquire(target: &Path) -> Result<Self, ConfigWriteError> {
+        ensure_config_parent(target)?;
+        let parent = target
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let directory = validate_existing_parent(parent)?;
+        let started = Instant::now();
+        loop {
+            match try_lock_exclusive(&directory) {
+                Ok(true) => return Ok(Self { directory }),
+                Ok(false) if started.elapsed() < LOCK_TIMEOUT => {
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Ok(false) => {
+                    return Err(ConfigWriteError::Locked {
+                        path: parent.to_path_buf(),
+                    });
+                }
+                Err(error) => return Err(io_error("lock directory", parent, error)),
+            }
+        }
+    }
+}
+
+impl Drop for PrivateParentLock {
+    fn drop(&mut self) {
+        unlock(&self.directory);
     }
 }
 
 struct ConfigFileLock {
+    directory: fs::File,
     file: fs::File,
 }
 
 impl ConfigFileLock {
     fn acquire(config_path: &Path) -> Result<Self, ConfigWriteError> {
+        Self::acquire_with_timeout(config_path, LOCK_TIMEOUT)
+    }
+
+    fn acquire_with_timeout(
+        config_path: &Path,
+        timeout: Duration,
+    ) -> Result<Self, ConfigWriteError> {
+        ensure_config_parent(config_path)?;
+        let parent = config_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let directory = validate_existing_parent(parent)?;
         let path = lock_path_for(config_path);
-        let file = open_lock_file(&path)?;
         let start = Instant::now();
         loop {
+            match try_lock_exclusive(&directory) {
+                Ok(true) => break,
+                Ok(false) if start.elapsed() < timeout => {
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Ok(false) => return Err(ConfigWriteError::Locked { path }),
+                Err(error) => return Err(io_error("lock directory", parent, error)),
+            }
+        }
+
+        let file = open_lock_file(&path, true, true)?;
+        loop {
             match try_lock_exclusive(&file) {
-                Ok(true) => return Ok(Self { file }),
-                Ok(false) if start.elapsed() < LOCK_TIMEOUT => {
+                Ok(true) => return Ok(Self { directory, file }),
+                Ok(false) if start.elapsed() < timeout => {
                     thread::sleep(Duration::from_millis(25));
                 }
                 Ok(false) => return Err(ConfigWriteError::Locked { path }),
@@ -356,19 +637,23 @@ impl ConfigFileLock {
 impl Drop for ConfigFileLock {
     fn drop(&mut self) {
         unlock(&self.file);
+        unlock(&self.directory);
     }
 }
 
 fn unique_sibling(target: &Path, label: &str) -> Result<PathBuf, ConfigWriteError> {
-    let parent = target.parent().ok_or_else(|| {
-        ConfigWriteError::Io(format!("{} has no parent directory", target.display()))
-    })?;
+    let parent = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let name = target
         .file_name()
-        .and_then(|name| name.to_str())
         .ok_or_else(|| ConfigWriteError::Io(format!("{} has no file name", target.display())))?;
     let nonce = UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    Ok(parent.join(format!(".{name}.{label}.{}.{}", std::process::id(), nonce)))
+    let mut staged_name = std::ffi::OsString::from(".");
+    staged_name.push(name);
+    staged_name.push(format!(".{label}.{}.{nonce}", std::process::id()));
+    Ok(parent.join(staged_name))
 }
 
 fn stage_private_file(
@@ -383,21 +668,19 @@ fn stage_private_file(
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+            options
+                .mode(0o600)
+                .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
         }
         let mut file = match options.open(&path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(io_error("create temporary file", &path, error)),
         };
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Err(error) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
-                drop(file);
-                let _ = fs::remove_file(&path);
-                return Err(io_error("set permissions on", &path, error));
-            }
+        if let Err(error) = set_private_permissions(&file, &path) {
+            drop(file);
+            let _ = fs::remove_file(&path);
+            return Err(error);
         }
         if let Err(error) = file.write_all(contents).and_then(|_| file.sync_all()) {
             drop(file);
@@ -413,12 +696,17 @@ fn stage_private_file(
 }
 
 fn sync_parent(path: &Path) -> Result<(), ConfigWriteError> {
-    let parent = path.parent().ok_or_else(|| {
-        ConfigWriteError::Io(format!("{} has no parent directory", path.display()))
-    })?;
-    fs::File::open(parent)
-        .and_then(|directory| directory.sync_all())
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    validate_existing_parent(parent)?
+        .sync_all()
         .map_err(|error| io_error("sync directory", parent, error))
+}
+
+pub(crate) fn sync_config_parent(path: &Path) -> Result<(), ConfigWriteError> {
+    sync_parent(path)
 }
 
 fn replace_with_staged(staged: &Path, target: &Path) -> Result<(), ConfigWriteError> {
@@ -427,12 +715,37 @@ fn replace_with_staged(staged: &Path, target: &Path) -> Result<(), ConfigWriteEr
 }
 
 fn atomic_replace(target: &Path, contents: &[u8]) -> Result<(), ConfigWriteError> {
+    if contents.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(ConfigWriteError::Io(format!(
+            "refusing to write {} bytes to {}; limit is {MAX_CONFIG_BYTES}",
+            contents.len(),
+            target.display()
+        )));
+    }
     let staged = stage_private_file(target, "tmp", contents)?;
     if let Err(error) = replace_with_staged(&staged, target) {
         let _ = fs::remove_file(&staged);
         return Err(error);
     }
     Ok(())
+}
+
+/// Write non-config private state through the same validated parent and atomic
+/// replacement machinery, with the caller's tighter format-specific budget.
+pub(crate) fn write_private_bytes(
+    target: &Path,
+    contents: &[u8],
+    max_bytes: usize,
+) -> Result<(), ConfigWriteError> {
+    if contents.len() > max_bytes {
+        return Err(ConfigWriteError::Io(format!(
+            "refusing to write {} bytes to {}; limit is {max_bytes}",
+            contents.len(),
+            target.display()
+        )));
+    }
+    ensure_config_parent(target)?;
+    atomic_replace(target, contents)
 }
 
 fn rotate_backups(config_path: &Path, current: &[u8]) -> Result<(), ConfigWriteError> {
@@ -578,10 +891,7 @@ fn save_config_to_path(
     config: &Config,
     expected: Option<&ConfigRevision>,
 ) -> Result<ConfigRevision, ConfigWriteError> {
-    let parent = path.parent().ok_or_else(|| {
-        ConfigWriteError::Io(format!("{} has no parent directory", path.display()))
-    })?;
-    fs::create_dir_all(parent).map_err(|error| io_error("create directory", parent, error))?;
+    ensure_config_parent(path)?;
 
     let _lock = ConfigFileLock::acquire(path)?;
     let current = read_optional(path)?;
@@ -626,16 +936,53 @@ fn save_config_to_path(
         rendered.push('\n');
     }
     let rendered = rendered.into_bytes();
+    if rendered.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(ConfigWriteError::Io(format!(
+            "refusing to save {} because the rendered configuration is {} bytes; limit is {MAX_CONFIG_BYTES}",
+            path.display(),
+            rendered.len()
+        )));
+    }
     if current.as_deref() == Some(rendered.as_slice()) {
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
+        }
+        let file = options
+            .open(path)
+            .map_err(|error| io_error("open", path, error))?;
+        validate_private_regular_file(&file, path)
+            .map_err(|error| io_error("inspect", path, error))?;
+        set_private_permissions(&file, path)?;
+        file.sync_all()
+            .map_err(|error| io_error("sync", path, error))?;
         return Ok(actual_revision);
     }
 
     let staged = stage_private_file(path, "next", &rendered)?;
+    if revision_at(path)? != actual_revision {
+        let _ = fs::remove_file(&staged);
+        return Err(ConfigWriteError::Conflict {
+            path: path.to_path_buf(),
+        });
+    }
     if let Some(current) = current.as_deref() {
         if let Err(error) = rotate_backups(path, current) {
             let _ = fs::remove_file(&staged);
             return Err(error);
         }
+    }
+    // Editors do not take our advisory lock. Re-check after backup fsyncs so
+    // bytes written during that slow window are not silently replaced.
+    if revision_at(path)? != actual_revision {
+        let _ = fs::remove_file(&staged);
+        return Err(ConfigWriteError::Conflict {
+            path: path.to_path_buf(),
+        });
     }
     if let Err(error) = replace_with_staged(&staged, path) {
         let _ = fs::remove_file(&staged);
@@ -652,8 +999,16 @@ pub(crate) fn save_config(
 }
 
 fn valid_backup(path: &Path) -> Result<Option<Vec<u8>>, ConfigWriteError> {
-    let Some(bytes) = read_optional(path)? else {
-        return Ok(None);
+    let bytes = match read_optional(path) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Ok(None),
+        Err(error) => {
+            log::warn!(
+                "Ignoring unreadable configuration backup {}: {error}",
+                path.display()
+            );
+            return Ok(None);
+        }
     };
     let Ok(text) = std::str::from_utf8(&bytes) else {
         return Ok(None);
@@ -668,10 +1023,7 @@ fn valid_backup(path: &Path) -> Result<Option<Vec<u8>>, ConfigWriteError> {
 }
 
 fn restore_backup_to_path(path: &Path) -> Result<(PathBuf, ConfigRevision), ConfigWriteError> {
-    let parent = path.parent().ok_or_else(|| {
-        ConfigWriteError::Io(format!("{} has no parent directory", path.display()))
-    })?;
-    fs::create_dir_all(parent).map_err(|error| io_error("create directory", parent, error))?;
+    ensure_config_parent(path)?;
     let _lock = ConfigFileLock::acquire(path)?;
 
     let primary = backup_path_for(path);
@@ -686,12 +1038,26 @@ fn restore_backup_to_path(path: &Path) -> Result<(PathBuf, ConfigRevision), Conf
         });
     };
 
+    let current = read_optional(path)?;
+    let expected_revision = revision_from_content(current.as_deref());
     let staged = stage_private_file(path, "restore", &bytes)?;
-    if let Some(current) = read_optional(path)? {
+    if revision_at(path)? != expected_revision {
+        let _ = fs::remove_file(&staged);
+        return Err(ConfigWriteError::Conflict {
+            path: path.to_path_buf(),
+        });
+    }
+    if let Some(current) = current {
         if let Err(error) = atomic_replace(&before_restore_path_for(path), &current) {
             let _ = fs::remove_file(&staged);
             return Err(error);
         }
+    }
+    if revision_at(path)? != expected_revision {
+        let _ = fs::remove_file(&staged);
+        return Err(ConfigWriteError::Conflict {
+            path: path.to_path_buf(),
+        });
     }
     if let Err(error) = replace_with_staged(&staged, path) {
         let _ = fs::remove_file(&staged);
@@ -1334,9 +1700,9 @@ fn validate_path_with_missing_policy(
     path: &Path,
     missing_is_error: bool,
 ) -> ConfigValidationReport {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+    let bytes = match read_config_bytes(path) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
             let mut report = ConfigValidationReport::new(path, false);
             if missing_is_error {
                 report.error("config", "file does not exist");
@@ -1429,12 +1795,17 @@ mod tests {
     use super::*;
 
     fn temporary_directory(label: &str) -> PathBuf {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
         let nonce = UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
             "jterm1-config-store-{label}-{}-{nonce}",
             std::process::id()
         ));
         fs::create_dir_all(&path).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         path
     }
 
@@ -1462,6 +1833,70 @@ mod tests {
         fs::write(&path, "opacity = 0.6\n").unwrap();
         let second = revision_at(&path).unwrap();
         assert_ne!(first, second);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_reads_reject_links_special_files_and_oversize_input() {
+        use nix::sys::stat::Mode;
+        use nix::unistd::mkfifo;
+        use std::os::unix::fs::symlink;
+
+        let directory = temporary_directory("safe-read");
+        let victim = directory.join("victim.toml");
+        let symbolic = directory.join("symbolic.toml");
+        let hard = directory.join("hard.toml");
+        let fifo = directory.join("fifo.toml");
+        let oversized = directory.join("oversized.toml");
+        fs::write(&victim, b"opacity = 0.5\n").unwrap();
+        assert!(read_config_bytes(&victim).unwrap().is_some());
+
+        symlink(&victim, &symbolic).unwrap();
+        assert!(read_config_bytes(&symbolic).is_err());
+        fs::hard_link(&victim, &hard).unwrap();
+        assert!(read_config_bytes(&hard).is_err());
+        mkfifo(&fifo, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        let started = Instant::now();
+        assert!(read_config_bytes(&fifo).is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        fs::File::create(&oversized)
+            .unwrap()
+            .set_len(MAX_CONFIG_BYTES + 1)
+            .unwrap();
+        assert!(read_config_bytes(&oversized).is_err());
+        assert_eq!(fs::read(&victim).unwrap(), b"opacity = 0.5\n");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_lock_rejects_links_without_chmodding_their_targets() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let directory = temporary_directory("safe-lock");
+        let config_path = directory.join("config.toml");
+        let lock_path = lock_path_for(&config_path);
+        let victim = directory.join("victim");
+        fs::write(&victim, b"keep me").unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o640)).unwrap();
+
+        symlink(&victim, &lock_path).unwrap();
+        assert!(ConfigFileLock::acquire(&config_path).is_err());
+        assert_eq!(fs::read(&victim).unwrap(), b"keep me");
+        assert_eq!(
+            fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        fs::remove_file(&lock_path).unwrap();
+
+        fs::hard_link(&victim, &lock_path).unwrap();
+        assert!(ConfigFileLock::acquire(&config_path).is_err());
+        assert_eq!(
+            fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1525,16 +1960,32 @@ mod tests {
     }
 
     #[test]
+    fn rendered_config_cannot_exceed_the_reader_budget() {
+        let directory = temporary_directory("render-budget");
+        let path = directory.join("config.toml");
+        let original = b"opacity = 0.5\n";
+        fs::write(&path, original).unwrap();
+        let expected = revision_at(&path).unwrap();
+        let mut config = config::load_safe_config().0;
+        config.ai_model = "x".repeat(MAX_CONFIG_BYTES as usize);
+
+        assert!(save_config_to_path(&path, &config, Some(&expected)).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(!backup_path_for(&path).exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn lock_status_tracks_an_active_writer_and_clears_after_drop() {
         let directory = temporary_directory("lock");
         let path = directory.join("config.toml");
         let guard = ConfigFileLock::acquire(&path).unwrap();
         let lock_path = lock_path_for(&path);
-        let observer = open_lock_file(&lock_path).unwrap();
+        let observer = open_lock_file(&lock_path, true, true).unwrap();
         assert!(!try_lock_exclusive(&observer).unwrap());
         drop(observer);
         drop(guard);
-        let observer = open_lock_file(&lock_path).unwrap();
+        let observer = open_lock_file(&lock_path, true, true).unwrap();
         assert!(try_lock_exclusive(&observer).unwrap());
         unlock(&observer);
         fs::remove_dir_all(directory).unwrap();
@@ -1709,6 +2160,89 @@ mod tests {
             "opacity = 0.4\n"
         );
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_lock_survives_lock_entry_replacement() {
+        let directory = temporary_directory("lock-replacement");
+        let path = directory.join("config.toml");
+        let guard = ConfigFileLock::acquire(&path).unwrap();
+        let lock_path = lock_path_for(&path);
+        fs::rename(&lock_path, lock_path.with_extension("old")).unwrap();
+
+        let contender = path.clone();
+        let error = std::thread::spawn(move || {
+            ConfigFileLock::acquire_with_timeout(&contender, Duration::from_millis(30))
+                .err()
+                .expect("replacing the lock entry must not bypass the directory lock")
+        })
+        .join()
+        .unwrap();
+        assert!(matches!(error, ConfigWriteError::Locked { .. }));
+        drop(guard);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_primary_backup_falls_back_to_valid_secondary() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let directory = temporary_directory("restore-unreadable-primary");
+        let path = directory.join("config.toml");
+        fs::write(&path, "not valid toml = [\n").unwrap();
+        let primary = backup_path_for(&path);
+        let primary_name = CString::new(primary.as_os_str().as_bytes()).unwrap();
+        // SAFETY: primary_name is a live NUL-terminated pathname for this call.
+        assert_eq!(
+            unsafe { nix::libc::mkfifo(primary_name.as_ptr(), 0o600) },
+            0
+        );
+        fs::write(secondary_backup_path_for(&path), "opacity = 0.7\n").unwrap();
+
+        let (source, _) = restore_backup_to_path(&path).unwrap();
+        assert_eq!(source, secondary_backup_path_for(&path));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "opacity = 0.7\n");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saves_reject_unsafe_parent_entries_without_write_through() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = temporary_directory("unsafe-parent");
+        let victim = root.join("victim");
+        fs::create_dir(&victim).unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o755)).unwrap();
+        let linked = root.join("linked");
+        symlink(&victim, &linked).unwrap();
+        let config = config::load_safe_config().0;
+        assert!(save_config_to_path(
+            &linked.join("config.toml"),
+            &config,
+            Some(&ConfigRevision::Missing)
+        )
+        .is_err());
+        assert!(!victim.join("config.toml").exists());
+
+        let writable = root.join("world-writable");
+        fs::create_dir(&writable).unwrap();
+        fs::set_permissions(&writable, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(save_config_to_path(
+            &writable.join("config.toml"),
+            &config,
+            Some(&ConfigRevision::Missing)
+        )
+        .is_err());
+        assert!(!writable.join("config.toml").exists());
+        assert_eq!(
+            fs::metadata(&writable).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

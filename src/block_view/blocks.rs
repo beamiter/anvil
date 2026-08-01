@@ -44,6 +44,20 @@ pub(crate) struct BlockData {
     pub(crate) cols: u16,
 }
 
+fn markdown_fence(text: &str) -> String {
+    let mut longest = 0usize;
+    let mut current = 0usize;
+    for ch in text.chars() {
+        if ch == '`' {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    "`".repeat(longest.saturating_add(1).max(3))
+}
+
 impl BlockData {
     pub(crate) fn is_background(&self) -> bool {
         self.cmd.trim().is_empty()
@@ -64,18 +78,22 @@ impl BlockData {
             md.push_str("## Command Block\n\n");
 
             if !self.prompt.is_empty() {
-                md.push_str(&format!("**Prompt:** `{}`\n\n", self.prompt));
+                let fence = markdown_fence(&self.prompt);
+                md.push_str("**Prompt:**\n");
+                md.push_str(&format!("{fence}text\n{}\n{fence}\n\n", self.prompt));
             }
 
-            md.push_str("**Command:**\n```bash\n");
+            let fence = markdown_fence(&self.cmd);
+            md.push_str(&format!("**Command:**\n{fence}bash\n"));
             md.push_str(&self.cmd);
-            md.push_str("\n```\n\n");
+            md.push_str(&format!("\n{fence}\n\n"));
         }
 
         if !self.output.is_empty() {
-            md.push_str("**Output:**\n```\n");
+            let fence = markdown_fence(&self.output);
+            md.push_str(&format!("**Output:**\n{fence}\n"));
             md.push_str(&self.output);
-            md.push_str("\n```\n\n");
+            md.push_str(&format!("\n{fence}\n\n"));
         }
 
         if !self.is_background() {
@@ -665,6 +683,18 @@ mod tests {
         assert!(finished_block(Some(2))
             .to_markdown()
             .contains("**Exit Code:** 2"));
+    }
+
+    #[test]
+    fn markdown_export_uses_fences_longer_than_untrusted_content() {
+        let mut block = finished_block(Some(0));
+        block.prompt = "prompt ``` still prompt".to_owned();
+        block.cmd = "printf '```'".to_owned();
+        block.output = "ok\n```\n# not document markdown".to_owned();
+        let markdown = block.to_markdown();
+        assert!(markdown.contains("````text\nprompt ``` still prompt\n````"));
+        assert!(markdown.contains("````bash\nprintf '```'\n````"));
+        assert!(markdown.contains("````\nok\n```\n# not document markdown\n````"));
     }
 
     #[test]
@@ -1863,13 +1893,14 @@ impl FinishedBlock {
     // These arguments are the distinct shared state cells captured by GTK
     // callbacks; grouping them would only hide the ownership contract.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn connect_actions(
+    pub(super) fn connect_actions(
         &self,
         vte: &Terminal,
         pty: &Rc<crate::pty::OwnedPty>,
         pty_synced: &Rc<Cell<bool>>,
         bracketed_paste: &Rc<Cell<bool>>,
         typed_cmd: &Rc<RefCell<String>>,
+        armed_agent_execution: &Rc<RefCell<Option<super::ArmedAgentExecution>>>,
         bstate: &Rc<Cell<BlockState>>,
         active: &Rc<RefCell<ActiveBlock>>,
     ) {
@@ -1894,6 +1925,7 @@ impl FinishedBlock {
         let pty_synced_for_rerun = pty_synced.clone();
         let bracketed_paste_for_rerun = bracketed_paste.clone();
         let typed_cmd_for_rerun = typed_cmd.clone();
+        let armed_agent_for_rerun = armed_agent_execution.clone();
         let bstate_for_rerun = bstate.clone();
         let active_for_rerun = active.clone();
         let cmd_for_rerun = self.cmd_text.clone();
@@ -1903,6 +1935,7 @@ impl FinishedBlock {
                 &pty_synced_for_rerun,
                 &typed_cmd_for_rerun,
                 bstate_for_rerun.get(),
+                armed_agent_for_rerun.borrow().is_some(),
                 &cmd_for_rerun,
                 bracketed_paste_for_rerun.get(),
             ) {

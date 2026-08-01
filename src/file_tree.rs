@@ -20,6 +20,7 @@ use std::cell::Cell;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -28,7 +29,32 @@ pub(crate) const COL_NAME: u32 = 0;
 pub(crate) const COL_PATH: u32 = 1;
 pub(crate) const COL_IS_DIR: u32 = 2;
 pub(crate) const COL_ICON: u32 = 3;
+pub(crate) const COL_TOOLTIP: u32 = 4;
 const SCAN_POLL_INTERVAL: Duration = Duration::from_millis(16);
+const MAX_DIRECTORY_ENTRIES: usize = 4_096;
+const MAX_FILE_NAME_DISPLAY_BYTES: usize = 512;
+const MAX_FILE_PATH_DISPLAY_BYTES: usize = 4 * 1024;
+const MAX_CONCURRENT_SCANS: usize = 16;
+static ACTIVE_SCANS: AtomicUsize = AtomicUsize::new(0);
+
+struct ScanPermit;
+
+impl ScanPermit {
+    fn acquire() -> io::Result<Self> {
+        ACTIVE_SCANS
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < MAX_CONCURRENT_SCANS).then_some(active + 1)
+            })
+            .map(|_| Self)
+            .map_err(|_| io::Error::other("file-tree scan concurrency limit reached"))
+    }
+}
+
+impl Drop for ScanPermit {
+    fn drop(&mut self) {
+        ACTIVE_SCANS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct FileEntry {
@@ -47,11 +73,19 @@ fn sort_entries(entries: &mut [FileEntry]) {
 
 fn scan_dir(dir: &Path) -> io::Result<Vec<FileEntry>> {
     let mut entries = Vec::new();
-    for entry in std::fs::read_dir(dir)?.flatten() {
+    for entry in std::fs::read_dir(dir)?
+        .take(MAX_DIRECTORY_ENTRIES)
+        .flatten()
+    {
         let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
         entries.push(FileEntry {
             name: entry.file_name().to_string_lossy().into_owned(),
-            is_dir: path.is_dir(),
+            // Do not follow directory symlinks: they can create cycles or turn
+            // one expansion into a scan outside the tree the user selected.
+            is_dir: file_type.is_dir(),
             path,
         });
     }
@@ -63,10 +97,12 @@ pub(crate) fn request_dir_scan<F>(dir: PathBuf, apply: F) -> io::Result<()>
 where
     F: FnOnce(io::Result<Vec<FileEntry>>) + 'static,
 {
+    let permit = ScanPermit::acquire()?;
     let (tx, rx) = mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("jterm1-file-tree-scan".to_string())
         .spawn(move || {
+            let _permit = permit;
             let _ = tx.send(scan_dir(&dir));
         })?;
 
@@ -89,12 +125,13 @@ where
     Ok(())
 }
 
-/// A four-column store: display name, absolute path, is-directory, icon name.
+/// Display name, raw absolute path, is-directory, icon name, safe tooltip.
 pub(crate) fn new_store() -> TreeStore {
     TreeStore::new(&[
         glib::Type::STRING,
         glib::Type::STRING,
         glib::Type::BOOL,
+        glib::Type::STRING,
         glib::Type::STRING,
     ])
 }
@@ -104,7 +141,7 @@ pub(crate) fn new_view(store: &TreeStore) -> TreeView {
     let view = TreeView::with_model(store);
     view.set_headers_visible(false);
     view.set_vexpand(true);
-    view.set_tooltip_column(COL_PATH as i32);
+    view.set_tooltip_column(COL_TOOLTIP as i32);
 
     let column = TreeViewColumn::new();
     let icon = CellRendererPixbuf::new();
@@ -130,14 +167,19 @@ pub(crate) fn append_entries(
             "text-x-generic-symbolic"
         };
         let path_str = path.to_string_lossy().to_string();
+        let display_name =
+            crate::text_safety::bounded_display_text(&name, MAX_FILE_NAME_DISPLAY_BYTES, false);
+        let tooltip =
+            crate::text_safety::bounded_display_text(&path_str, MAX_FILE_PATH_DISPLAY_BYTES, false);
         let iter = store.insert_with_values(
             parent,
             None,
             &[
-                (COL_NAME, &name),
+                (COL_NAME, &display_name),
                 (COL_PATH, &path_str),
                 (COL_IS_DIR, &is_dir),
                 (COL_ICON, &icon),
+                (COL_TOOLTIP, &tooltip),
             ],
         );
         if is_dir {
@@ -150,6 +192,7 @@ pub(crate) fn append_entries(
                     (COL_PATH, &""),
                     (COL_IS_DIR, &false),
                     (COL_ICON, &""),
+                    (COL_TOOLTIP, &""),
                 ],
             );
         }
@@ -236,15 +279,20 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
 
 /// Abbreviate the home directory to `~` for the header label.
 pub(crate) fn display_path(path: &Path) -> String {
-    if let Some(home) = home_dir() {
+    let display = if let Some(home) = home_dir() {
         if let Ok(rel) = path.strip_prefix(&home) {
             if rel.as_os_str().is_empty() {
-                return "~".to_string();
+                "~".to_string()
+            } else {
+                format!("~/{}", rel.to_string_lossy())
             }
-            return format!("~/{}", rel.to_string_lossy());
+        } else {
+            path.to_string_lossy().to_string()
         }
-    }
-    path.to_string_lossy().to_string()
+    } else {
+        path.to_string_lossy().to_string()
+    };
+    crate::text_safety::bounded_display_text(&display, MAX_FILE_PATH_DISPLAY_BYTES, false)
 }
 
 #[cfg(test)]

@@ -25,6 +25,9 @@ $script:__jterm1_loaded = $true
 
 $script:__jterm1_in_cmd = $false
 $script:__jterm1_orig_prompt = ${function:prompt}
+$script:__jterm1_marker_nonce = [Guid]::NewGuid().ToString('N')
+$script:__jterm1_marker_seq = [uint64]0
+$script:__jterm1_marker_id = ''
 
 # Build an OSC payload terminated with BEL. ESC = char 27, BEL = char 7.
 function __jterm1_osc($payload) {
@@ -74,8 +77,9 @@ function global:prompt {
 
     $pre = ''
     if ($script:__jterm1_in_cmd) {
-        $pre += __jterm1_osc "133;D;$ec"
+        $pre += __jterm1_osc "133;D;$ec;id=$($script:__jterm1_marker_id)"
         $script:__jterm1_in_cmd = $false
+        $script:__jterm1_marker_id = ''
     }
     $pre += __jterm1_report_cwd_seq
     $pre += __jterm1_osc "133;A"
@@ -116,7 +120,9 @@ if (Get-Module -ListAvailable PSReadLine) {
         $cursor = $null
         [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
         if ($line -and $line.Trim().Length -gt 0) {
-            [Console]::Write($(__jterm1_osc "133;C"))
+            $script:__jterm1_marker_seq++
+            $script:__jterm1_marker_id = "$($script:__jterm1_marker_nonce)-$($script:__jterm1_marker_seq)"
+            [Console]::Write($(__jterm1_osc "133;C;id=$($script:__jterm1_marker_id)"))
             $script:__jterm1_in_cmd = $true
         }
         [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine($key, $arg)
@@ -129,7 +135,9 @@ if (Get-Module -ListAvailable PSReadLine) {
         $cursor = $null
         [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
         if ($line -and $line.Trim().Length -gt 0) {
-            [Console]::Write($(__jterm1_osc "133;C"))
+            $script:__jterm1_marker_seq++
+            $script:__jterm1_marker_id = "$($script:__jterm1_marker_nonce)-$($script:__jterm1_marker_seq)"
+            [Console]::Write($(__jterm1_osc "133;C;id=$($script:__jterm1_marker_id)"))
             $script:__jterm1_in_cmd = $true
         }
         [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine($key, $arg)

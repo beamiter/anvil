@@ -178,6 +178,20 @@ versioning for tagged releases while it remains experimental.
 
 ### Fixed
 
+- OSC 8 hyperlinks are now bounded and validated before becoming clickable:
+  only the terminal's documented URI schemes are accepted, control/whitespace
+  and oversized targets are rejected, and GTK tag names use opaque hashes so
+  untrusted URI text can no longer become widget object names.
+- Session owner, protocol, and short-lived inspection lock descriptors are now
+  close-on-exec and explicitly unlocked when their logical guard ends. A shell
+  forked concurrently can no longer inherit a lock that makes an exited window
+  look live or prevents another instance from recovering its snapshot. Lock
+  paths now accept only current-user, singly linked regular files, and the
+  session directory is never followed through a symlink. The protocol also
+  holds the directory inode, so renaming or replacing the visible protocol-lock
+  entry cannot let a second cooperating instance enter the protected namespace.
+- Updated `spin` within `flume`'s compatible `0.9` range from the yanked 0.9.8
+  release to 0.9.9.
 - The desktop integration now actually produces a launcher icon after
   `./scripts/install.sh`. Three separate causes:
   - The entry shipped `Exec=jterm1` / `TryExec=jterm1`, which depend on `PATH`.
@@ -264,9 +278,44 @@ versioning for tagged releases while it remains experimental.
   locks, and a serialized publication protocol instead of bare PIDs, preventing
   PID reuse, namespace changes, or lock-creation races from hiding, consuming,
   or overwriting another window's recovery state.
+- Session restore now reads only current-user, singly linked regular files
+  through nonblocking, no-follow descriptors, enforces a 4 MiB byte budget,
+  and rejects more than 32 tabs, 16 panes per tab, or 64 panes total before any
+  child process can be spawned. Replayable argv is independently capped at 256
+  arguments, 64 KiB per argument and 256 KiB total, and is reclassified before
+  spawn; arbitrary legacy shell command strings are never replayed.
+- Session checkpoints now use a versioned envelope with a durable empty
+  tombstone and a predecessor link. A crash after publishing a replacement but
+  before deleting its claimed predecessor can no longer resurrect the old
+  workspace, while a crash before the replacement is durable leaves the claim
+  recoverable by the next process.
+- Configuration reads and write locks apply the same owner, hard-link,
+  symlink, FIFO, close-on-exec, and bounded-input checks; permission tightening
+  is performed on validated descriptors so a substituted path cannot redirect
+  it to an unrelated file or directory. Existing config parents must be owned
+  by the current user and not group/world writable, and the parent directory is
+  locked across revision checks, backup rotation and atomic publication.
 - OSC 7 cwd classification combines a per-pane authenticated authority with
   sticky namespace state and live foreground ancestry (including Flatpak host
   wrappers), preventing remote output from relabeling a remote path as local.
 - Shared command history writes are serialized across processes and compacted
   through unique, atomically replaced temporary files; corrupt unterminated
-  records are skipped with bounded memory.
+  records are skipped with bounded memory. Lock acquisition is time-bounded,
+  the directory inode prevents lock-path replacement bypass, and retired pane
+  identities cannot inherit another pane's saved revision.
+- Agent snapshots are bounded, owner-checked, no-follow files and are consumed
+  exactly once under a directory lock after successful validation. Approved
+  commands are armed only at a clean prompt and correlated by exact command,
+  one-shot local generation, and matching OSC 133 execution ID; stale prompt,
+  write failure, start mismatch, or completion mismatch cancels the proposal.
+- Notebook and workflow inputs now reject special files without blocking and
+  enforce byte, file-count, field-count, segment, cell, and rendered-command
+  budgets. Runnable notebook/workflow commands containing invisible,
+  bidirectional, or unsafe control characters are disabled instead of relying
+  on a visually misleading review surface; Git context labels make those
+  characters visible and bound `.git` pointer/HEAD reads.
+- Both PTY bridge writers and the VTE-response/AI-delta cross-thread queues are
+  bounded. Kernel backpressure, terminal-query storms, or a very fast local
+  model can no longer grow an unbounded userspace queue or monopolize one GTK
+  dispatch; overload drops an entire non-authoritative message and final AI
+  text remains the source of truth.

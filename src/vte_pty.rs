@@ -50,6 +50,8 @@ extern "C" {
 
 const G_IO_IN: u32 = 1;
 const G_PRIORITY_DEFAULT: i32 = 0;
+const VTE_RESPONSE_QUEUE_CAPACITY: usize = 8;
+const VTE_RESPONSES_PER_DISPATCH: usize = 2;
 
 struct FdWatchData<F: FnMut() -> bool> {
     callback: F,
@@ -98,7 +100,7 @@ pub struct VtePty {
     local: Arc<Mutex<Option<OwnedFd>>>,
     /// Ordered bridge writes are completed on a worker so a full VTE-side PTY
     /// can never stall GTK's main loop.
-    write_tx: mpsc::Sender<Vec<u8>>,
+    write_tx: crate::pty::FdWriter,
     /// The `vte4::Pty` holding the master end. The caller passes this to
     /// `Terminal::set_pty`. Stored so it lives as long as VtePty does.
     vte_pty: vte4::Pty,
@@ -162,10 +164,7 @@ impl VtePty {
     /// completes short writes.
     pub fn write_bytes(&self, data: &[u8]) {
         if let Err(err) = self.write_tx.send(data.to_vec()) {
-            log::warn!(
-                "VTE bridge queue is closed; discarded {} byte(s)",
-                err.0.len()
-            );
+            log::warn!("VTE bridge queue rejected {} byte(s): {err}", err.len());
         }
     }
 
@@ -197,28 +196,56 @@ impl VtePty {
     where
         F: FnMut(Vec<u8>) + 'static,
     {
-        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(VTE_RESPONSE_QUEUE_CAPACITY);
         let efd: RawFd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
         if efd < 0 {
-            // No eventfd → fall back to a glib idle poll. VTE's outgoing
-            // traffic is light (only response data + commits), so a 10ms tick
-            // is acceptable here.
-            let local = self.local.clone();
+            // No eventfd → fall back to a nonblocking readiness poll on an
+            // owned duplicate. A direct read on this blocking PTY would freeze
+            // GTK indefinitely whenever VTE had no response bytes available.
+            let Some(reader_fd) = self
+                .local
+                .lock()
+                .ok()
+                .and_then(|guard| guard.as_ref().and_then(|fd| fd.try_clone().ok()))
+            else {
+                return;
+            };
+            let reader = std::fs::File::from(reader_fd);
             glib::timeout_add_local(std::time::Duration::from_millis(10), move || {
-                let raw = match local
-                    .lock()
-                    .ok()
-                    .and_then(|g| g.as_ref().map(|f| f.as_raw_fd()))
-                {
-                    Some(fd) => fd,
-                    None => return glib::ControlFlow::Break,
+                let raw = reader.as_raw_fd();
+                let mut ready = libc::pollfd {
+                    fd: raw,
+                    events: libc::POLLIN,
+                    revents: 0,
                 };
+                let polled = unsafe { libc::poll(&mut ready, 1, 0) };
+                if polled <= 0 {
+                    return glib::ControlFlow::Continue;
+                }
+                if ready.revents & libc::POLLIN == 0 {
+                    return if ready.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+                    {
+                        glib::ControlFlow::Break
+                    } else {
+                        glib::ControlFlow::Continue
+                    };
+                }
                 let mut buf = [0u8; 4096];
                 let n =
                     unsafe { libc::read(raw, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
                 if n > 0 {
                     let n = n as usize;
                     callback(buf[..n].to_vec());
+                } else if n == 0 {
+                    return glib::ControlFlow::Break;
+                } else {
+                    let error = io::Error::last_os_error();
+                    if !matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) {
+                        return glib::ControlFlow::Break;
+                    }
                 }
                 glib::ControlFlow::Continue
             });
@@ -237,39 +264,70 @@ impl VtePty {
             }
         };
         let efd_for_thread = efd;
-        std::thread::spawn(move || {
-            // Own a duplicate instead of borrowing `local`'s raw descriptor;
-            // closing the model can no longer make this thread read a reused
-            // descriptor belonging to an unrelated resource.
-            let mut file = std::fs::File::from(reader_fd);
-            let mut buf = [0u8; 65536];
-            loop {
-                match file.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if tx.send(buf[..n].to_vec()).is_err() {
-                            break;
-                        }
-                        let one: u64 = 1;
-                        unsafe {
-                            libc::write(
-                                efd_for_thread,
-                                &one as *const u64 as *const libc::c_void,
-                                8,
-                            );
+        let spawn_result = std::thread::Builder::new()
+            .name("jterm1-vte-response-reader".to_string())
+            .spawn(move || {
+                // Own a duplicate instead of borrowing `local`'s raw descriptor;
+                // closing the model can no longer make this thread read a reused
+                // descriptor belonging to an unrelated resource.
+                let mut file = std::fs::File::from(reader_fd);
+                let mut buf = [0u8; 65536];
+                loop {
+                    match file.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if tx.send(buf[..n].to_vec()).is_err() {
+                                break;
+                            }
+                            let one: u64 = 1;
+                            unsafe {
+                                libc::write(
+                                    efd_for_thread,
+                                    &one as *const u64 as *const libc::c_void,
+                                    8,
+                                );
+                            }
                         }
                     }
                 }
+                // Wake the GLib source once more after dropping the producer so it
+                // can observe Disconnected, close eventfd, and release its callback
+                // captures even when the final read produced no queued data.
+                drop(tx);
+                let one: u64 = 1;
+                unsafe {
+                    libc::write(efd_for_thread, &one as *const u64 as *const libc::c_void, 8);
+                }
+            });
+        if let Err(error) = spawn_result {
+            log::warn!("could not start VTE response reader: {error}");
+            unsafe {
+                libc::close(efd);
             }
-        });
+            return;
+        }
         unix_fd_add_local(efd, move || {
             let mut val: u64 = 0;
             unsafe {
                 libc::read(efd, &mut val as *mut u64 as *mut libc::c_void, 8);
             }
+            let mut processed = 0usize;
             loop {
                 match rx.try_recv() {
-                    Ok(data) => callback(data),
+                    Ok(data) => {
+                        callback(data);
+                        processed += 1;
+                        if processed >= VTE_RESPONSES_PER_DISPATCH {
+                            // eventfd reads reset its counter. Re-arm it when
+                            // this bounded callback deliberately leaves queued
+                            // responses behind and no producer write may follow.
+                            let one: u64 = 1;
+                            unsafe {
+                                libc::write(efd, &one as *const u64 as *const libc::c_void, 8);
+                            }
+                            return true;
+                        }
+                    }
                     Err(mpsc::TryRecvError::Empty) => return true,
                     Err(mpsc::TryRecvError::Disconnected) => {
                         unsafe {

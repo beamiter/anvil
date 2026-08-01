@@ -97,6 +97,10 @@ pub(crate) enum AppMsg {
         command: String,
         exit_code: i32,
         output_sample: String,
+        agent_generation: Option<u64>,
+    },
+    AgentExecutionStartFailed {
+        generation: u64,
     },
     AgentClose,
     FileTreeGotoCwd,

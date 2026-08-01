@@ -332,9 +332,9 @@ impl Component for AiPanelModel {
                 let (epoch, history) = self.conversation.begin(api_user);
                 append_transcript(&widgets.answer, "You", &visible_question);
                 widgets.entry.buffer().set_text("");
-                widgets
-                    .status
-                    .set_label(&format!("Asking {} …", client.display_name()));
+                let provider =
+                    crate::text_safety::bounded_display_text(&client.display_name(), 256, false);
+                widgets.status.set_label(&format!("Asking {provider} …"));
                 widgets.spinner.set_visible(true);
                 widgets.spinner.start();
                 widgets.ask_button.set_sensitive(false);
@@ -434,6 +434,7 @@ impl Component for AiPanelModel {
                     widgets.spinner.stop();
                     widgets.spinner.set_visible(false);
                     widgets.ask_button.set_sensitive(true);
+                    let error = crate::text_safety::bounded_display_text(&error, 2 * 1024, false);
                     widgets.status.set_label(&format!("AI error: {error}"));
                 }
             },

@@ -265,6 +265,14 @@ mod tests {
                 source.contains(removal),
                 "{file} does not remove the exported token"
             );
+            assert!(
+                source.contains(";id="),
+                "{file} does not correlate OSC 133 C/D with a private id"
+            );
+            assert!(
+                source.contains("__jterm1_marker_id"),
+                "{file} does not retain a private command marker"
+            );
         }
 
         let bash = integration_path("jterm1.bash");

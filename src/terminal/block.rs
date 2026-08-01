@@ -183,13 +183,14 @@ fn connect_view_outputs(
     });
     view.connect_block_finished({
         let sender = sender.clone();
-        move |command, exit_code, output_sample| {
+        move |command, exit_code, output_sample, agent_generation| {
             let _ = sender.output(command_finished_output(exit_code));
             let _ = sender.output(VteOutput::BlockFinished {
                 command,
                 // The agent transcript this feeds still speaks one i32.
                 exit_code: crate::block_view::exit_code_for_i32_api(exit_code),
                 output_sample,
+                agent_generation,
             });
         }
     });
@@ -278,6 +279,11 @@ impl Component for BlockTerminal {
             if matches!(&msg, VteInput::GrabFocus) {
                 root.grab_focus();
             }
+            if let VteInput::RunAgentCommand { generation, .. } = &msg {
+                let _ = sender.output(VteOutput::AgentExecutionStartFailed {
+                    generation: *generation,
+                });
+            }
             return;
         }
         let Some(view) = self.view.as_ref() else {
@@ -285,6 +291,14 @@ impl Component for BlockTerminal {
         };
         match msg {
             VteInput::WriteInput(data) => view.write_input(&data),
+            VteInput::RunAgentCommand {
+                generation,
+                command,
+            } => {
+                if !view.try_run_agent_command(generation, &command) {
+                    let _ = sender.output(VteOutput::AgentExecutionStartFailed { generation });
+                }
+            }
             VteInput::Resize(cols, rows) => view.resize(cols, rows),
             VteInput::GrabFocus => view.grab_focus(),
             VteInput::Copy => view.copy_to_clipboard(),

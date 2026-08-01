@@ -1,8 +1,9 @@
 //! URL detection + Ctrl+click handling for finished-block text views.
 //!
-//! Plain-text URLs are recognised by scheme prefix and made clickable on
-//! Ctrl+click; OSC 8 hyperlinks are carried as `osc8-link:<uri>` tags applied by
-//! [`super::ansi`]. Hovering a URL underlines it and shows the pointer cursor.
+//! Plain-text URLs are recognised by a bounded scheme allowlist and made
+//! clickable on Ctrl+click. OSC 8 targets are stored as private tag data rather
+//! than interpolated into GTK object names. Hovering a URL underlines it and
+//! shows the pointer cursor.
 //! Ported from jterm4's `block_view/url.rs`.
 
 use gtk::gio;
@@ -15,9 +16,16 @@ use super::select::get_semantic_bounds_at_position;
 const SCHEMES: [&str; 7] = [
     "http://", "https://", "file://", "ftp://", "git://", "ssh://", "mailto:",
 ];
+pub(crate) const MAX_URI_BYTES: usize = 8 * 1024;
+pub(crate) const OSC8_URI_DATA_KEY: &str = "jterm1-osc8-uri";
 
 pub fn is_url(text: &str) -> bool {
-    SCHEMES.iter().any(|s| text.starts_with(s))
+    !text.is_empty()
+        && text.len() <= MAX_URI_BYTES
+        && !text.chars().any(|ch| {
+            ch.is_whitespace() || ch.is_control() || crate::text_safety::is_visual_spoof(ch)
+        })
+        && SCHEMES.iter().any(|scheme| text.starts_with(scheme))
 }
 
 fn trim_trailing(text: &str) -> &str {
@@ -30,8 +38,23 @@ fn trim_trailing(text: &str) -> &str {
 }
 
 pub fn open_uri(uri: &str) {
+    if !is_url(uri) {
+        log::warn!("Refusing to open a malformed or unsupported URI");
+        return;
+    }
     if let Err(err) = gio::AppInfo::launch_default_for_uri(uri, None::<&gio::AppLaunchContext>) {
-        eprintln!("Failed to open URI {uri}: {err}");
+        log::warn!(
+            "Failed to open a validated URI: {}",
+            crate::text_safety::bounded_display_text(&err.to_string(), 1024, false)
+        );
+    }
+}
+
+pub(crate) fn osc8_uri(tag: &gtk::TextTag) -> Option<String> {
+    // The String is owned by the tag and lives for exactly as long as it does.
+    unsafe {
+        tag.data::<String>(OSC8_URI_DATA_KEY)
+            .map(|value| value.as_ref().clone())
     }
 }
 
@@ -82,31 +105,28 @@ pub fn get_url_bounds_at_position(
     Some((start, end, trimmed.to_string()))
 }
 
-/// URL at `iter`: prefer an OSC 8 `osc8-link:` tag, else plain-text detection.
+/// URL at `iter`: prefer a validated OSC 8 tag, else plain-text detection.
 pub fn get_url_at_position(buffer: &TextBuffer, iter: &gtk::TextIter) -> Option<String> {
     for tag in iter.tags() {
-        if let Some(name) = tag.name() {
-            if let Some(uri) = name.strip_prefix("osc8-link:") {
-                return Some(uri.to_string());
-            }
+        if let Some(uri) = osc8_uri(&tag).filter(|uri| is_url(uri)) {
+            return Some(uri);
         }
     }
     get_url_bounds_at_position(buffer, iter).map(|(_, _, url)| url)
 }
 
-/// If `iter` lies inside an `osc8-link:` tag span, return that span's bounds
+/// If `iter` lies inside a validated OSC 8 tag span, return that span's bounds
 /// and the URI. Used by the hover handler to underline OSC 8 hyperlinks the
 /// same way plain-text URLs are underlined.
 pub fn get_osc8_bounds_at_position(
     _buffer: &TextBuffer,
     iter: &gtk::TextIter,
 ) -> Option<(gtk::TextIter, gtk::TextIter, String)> {
-    let tag = iter.tags().into_iter().find(|t| {
-        t.name()
-            .map(|n| n.starts_with("osc8-link:"))
-            .unwrap_or(false)
-    })?;
-    let uri = tag.name()?.strip_prefix("osc8-link:")?.to_string();
+    let tag = iter
+        .tags()
+        .into_iter()
+        .find(|tag| osc8_uri(tag).is_some_and(|uri| is_url(&uri)))?;
+    let uri = osc8_uri(&tag)?;
     let mut start = *iter;
     if !start.starts_tag(Some(&tag)) {
         start.backward_to_tag_toggle(Some(&tag));
@@ -206,4 +226,26 @@ pub fn attach_url_handlers(view: &gtk::TextView) {
         });
     }
     view.add_controller(motion);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_url;
+
+    #[test]
+    fn uri_policy_is_bounded_and_scheme_allowlisted() {
+        assert!(is_url("https://example.com/a?b=c"));
+        assert!(is_url("mailto:user@example.com"));
+        assert!(is_url("file:///tmp/report.txt"));
+        assert!(!is_url("javascript:alert(1)"));
+        assert!(!is_url("data:text/html,boom"));
+        assert!(!is_url("https://example.com/a path"));
+        assert!(!is_url("https://example.com/line\nnext"));
+        assert!(!is_url("https://example.com/safe\u{00ad}hidden"));
+        assert!(!is_url("https://example.com/safe\u{e0020}hidden"));
+        assert!(!is_url(&format!(
+            "https://example.com/{}",
+            "x".repeat(8192)
+        )));
+    }
 }

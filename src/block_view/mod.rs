@@ -182,13 +182,98 @@ fn block_duration_ms(
     })
 }
 
+const MAX_RECALLED_COMMAND_BYTES: usize = 256 * 1024;
+const MAX_TYPED_COMMAND_SHADOW_BYTES: usize = MAX_RECALLED_COMMAND_BYTES;
+const MAX_PROMPT_CAPTURE_BYTES: usize = 64 * 1024;
+const MAX_SELECTED_MARKDOWN_BYTES: usize = 32 * 1024 * 1024;
+const MAX_COMMAND_HISTORY_ENTRIES: usize = 2_000;
+
+fn recalled_command_is_safe(command: &str) -> bool {
+    command.len() <= MAX_RECALLED_COMMAND_BYTES
+        && !command
+            .chars()
+            .any(|ch| !ch.is_control() && crate::text_safety::is_visual_spoof(ch))
+}
+
+fn agent_command_is_safe(command: &str) -> bool {
+    crate::agent::local_agent_command_issue(command).is_none()
+}
+
+/// Append terminal-rendered text while retaining only its newest complete UTF-8
+/// suffix. Prompt capture only consumes the last visible line, so keeping the
+/// tail is both the useful behavior and a hard memory bound when a forged or
+/// broken integration never sends PromptEnd.
+fn append_bounded_text_tail(buffer: &mut String, text: &str, max_bytes: usize) {
+    if max_bytes == 0 {
+        buffer.clear();
+        return;
+    }
+
+    if text.len() >= max_bytes {
+        let mut start = text.len() - max_bytes;
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+        buffer.clear();
+        buffer.push_str(&text[start..]);
+        return;
+    }
+
+    let overflow = buffer
+        .len()
+        .checked_add(text.len())
+        .map(|length| length.saturating_sub(max_bytes))
+        .unwrap_or(buffer.len());
+    if overflow != 0 {
+        let mut start = overflow.min(buffer.len());
+        while !buffer.is_char_boundary(start) {
+            start += 1;
+        }
+        buffer.drain(..start);
+    }
+    buffer.push_str(text);
+}
+
+/// Maintain a fail-closed shadow of the shell editor. Once it exceeds the
+/// bound, replace it with an immutable non-empty sentinel until the next
+/// prompt. Keeping a partial prefix/tail would let backspaces empty the local
+/// shadow while the real readline buffer still contains untracked text, which
+/// could incorrectly make the prompt look safe for Agent execution.
+fn append_typed_command_shadow(buffer: &mut String, text: &str) {
+    if buffer == TRUNCATED_COMMAND_PLACEHOLDER || text.is_empty() {
+        return;
+    }
+    let fits = buffer
+        .len()
+        .checked_add(text.len())
+        .is_some_and(|length| length <= MAX_TYPED_COMMAND_SHADOW_BYTES);
+    if fits {
+        buffer.push_str(text);
+    } else {
+        buffer.clear();
+        buffer.push_str(TRUNCATED_COMMAND_PLACEHOLDER);
+    }
+}
+
+fn pop_typed_command_shadow(buffer: &mut String) {
+    if buffer != TRUNCATED_COMMAND_PLACEHOLDER {
+        buffer.pop();
+    }
+}
+
 /// jterm1's paste policy for text this app puts on the shell's prompt (block
-/// recall, the history palette): keep control bytes, because the command came
-/// from this app's own capture of a command the user already ran, and truncate a
-/// multiline payload to its first line when the shell has not advertised DECSET
-/// 2004 — an unframed newline would submit each line as its own command.
+/// recall, the history palette): strip terminal controls even though the text
+/// came from local capture, because a spoofed shell-integration stream can also
+/// populate that capture. Multiline text is kept only when the shell advertised
+/// DECSET 2004 — an unframed newline would submit each line as its own command.
 fn prompt_insert_policy() -> pty_input::PastePolicy {
-    pty_input::PastePolicy::prompt_insert(pty_input::UnbracketedMultiline::FirstLineOnly)
+    // jterm1 currently exact-pins a released jterm_core whose prompt-insert
+    // default predates this hardening, so keep the call-site override until the
+    // staged jterm_core release can be pinned.
+    let mut policy =
+        pty_input::PastePolicy::prompt_insert(pty_input::UnbracketedMultiline::FirstLineOnly);
+    policy.strip_controls = true;
+    policy
 }
 
 /// Encode clipboard text for the shell PTY.
@@ -216,14 +301,15 @@ fn build_clipboard_paste(text: &str, bracketed_paste: bool) -> pty_input::Paste 
 /// there because whatever the user has already typed is not represented by any
 /// flag this app owns, so a conditional `Ctrl+U` appends instead of replacing.
 pub(crate) fn build_command_recall(command: &str, bracketed_paste: bool) -> pty_input::Paste {
-    pty_input::encode_prompt_insert(
-        command,
-        pty_input::PasteModes {
-            bracketed: bracketed_paste,
-        },
-        prompt_insert_policy(),
-        true,
-    )
+    let modes = pty_input::PasteModes {
+        bracketed: bracketed_paste,
+    };
+    if !recalled_command_is_safe(command) {
+        // Return the encoder's canonical empty value: in particular, do not
+        // emit a bare Ctrl+U that would erase text already at the prompt.
+        return pty_input::encode_prompt_insert("", modes, prompt_insert_policy(), true);
+    }
+    pty_input::encode_prompt_insert(command, modes, prompt_insert_policy(), true)
 }
 
 /// Collect commands from a block selection in terminal order. Background
@@ -234,12 +320,51 @@ fn selected_command_text<'a, I>(blocks: I, selected: &HashSet<u64>) -> String
 where
     I: IntoIterator<Item = (u64, &'a str)>,
 {
-    blocks
-        .into_iter()
-        .filter(|(id, command)| selected.contains(id) && !command.trim().is_empty())
-        .map(|(_, command)| command)
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut output = String::new();
+    for (id, command) in blocks {
+        if !selected.contains(&id) || command.trim().is_empty() {
+            continue;
+        }
+        let separator = usize::from(!output.is_empty());
+        let Some(next_len) = output
+            .len()
+            .checked_add(separator)
+            .and_then(|length| length.checked_add(command.len()))
+        else {
+            return String::new();
+        };
+        if next_len > MAX_RECALLED_COMMAND_BYTES {
+            // Do not return a partial selection: it could be a syntactically
+            // different command than the selection the user reviewed.
+            return String::new();
+        }
+        if separator != 0 {
+            output.push('\n');
+        }
+        output.push_str(command);
+    }
+    output
+}
+
+fn append_bounded_section(
+    output: &mut String,
+    separator: &str,
+    part: &str,
+    max_bytes: usize,
+) -> bool {
+    let Some(next_len) = output
+        .len()
+        .checked_add(separator.len())
+        .and_then(|length| length.checked_add(part.len()))
+    else {
+        return false;
+    };
+    if next_len > max_bytes {
+        return false;
+    }
+    output.push_str(separator);
+    output.push_str(part);
+    true
 }
 
 /// Markdown for the block-selection right-click copy: every selected block in
@@ -249,19 +374,29 @@ fn selected_blocks_markdown<'a, I>(blocks: I, selected: &HashSet<u64>, clicked_i
 where
     I: IntoIterator<Item = &'a BlockData>,
 {
-    let mut parts: Vec<String> = Vec::new();
+    let mut output = String::new();
+    let mut selected_count = 0usize;
     let mut clicked_part: Option<String> = None;
     for block in blocks {
         if selected.contains(&block.id) {
-            parts.push(block.to_markdown());
+            selected_count += 1;
+            let part = block.to_markdown();
+            let separator = if output.is_empty() { "" } else { "---\n\n" };
+            if !append_bounded_section(&mut output, separator, &part, MAX_SELECTED_MARKDOWN_BYTES) {
+                // A partial export can misrepresent which commands/results the
+                // user selected, so fail the entire aggregation atomically.
+                return String::new();
+            }
         } else if block.id == clicked_id {
             clicked_part = Some(block.to_markdown());
         }
     }
-    if parts.is_empty() {
-        parts.extend(clicked_part);
+    if selected_count == 0 {
+        return clicked_part
+            .filter(|part| part.len() <= MAX_SELECTED_MARKDOWN_BYTES)
+            .unwrap_or_default();
     }
-    parts.join("---\n\n")
+    output
 }
 
 fn recall_selected_commands_at_prompt(
@@ -279,7 +414,15 @@ fn recall_selected_commands_at_prompt(
             .map(|block| (block.id, block.cmd_text.as_str())),
         selected,
     );
-    recall_command_at_prompt(pty, pty_synced, typed_cmd, state, &command, bracketed_paste)
+    recall_command_at_prompt(
+        pty,
+        pty_synced,
+        typed_cmd,
+        state,
+        false,
+        &command,
+        bracketed_paste,
+    )
 }
 
 /// Mirror text this app wrote to the shell into the live editor shadow.
@@ -307,7 +450,7 @@ fn record_external_input(
     // The shell's line buffer now holds text this app put there, so a later
     // recall must replace the line rather than append to it.
     pty_synced.set(true);
-    typed_cmd.borrow_mut().push_str(text);
+    append_typed_command_shadow(&mut typed_cmd.borrow_mut(), text);
 }
 
 /// Replace the current editable shell line with a finished command.
@@ -320,10 +463,11 @@ pub(crate) fn recall_command_at_prompt(
     pty_synced: &Cell<bool>,
     typed_cmd: &RefCell<String>,
     state: BlockState,
+    agent_submission_pending: bool,
     command: &str,
     bracketed_paste: bool,
 ) -> bool {
-    if state != BlockState::AwaitingCommand {
+    if state != BlockState::AwaitingCommand || agent_submission_pending {
         return false;
     }
 
@@ -989,10 +1133,46 @@ const MIN_INPUT_ROWS: i32 = 6;
 /// `(command, exit status, output sample)`. The status is `None` when the shell
 /// reported none, so a consumer that styles failures can tell "failed" apart from
 /// "outcome unknown".
-type BlockFinishedCallbacks = Rc<RefCell<Vec<Box<dyn Fn(String, Option<i32>, String)>>>>;
+type BlockFinishedCallbacks =
+    Rc<RefCell<Vec<Box<dyn Fn(String, Option<i32>, String, Option<u64>)>>>>;
 type BlockContextCallbacks = Rc<RefCell<Vec<Box<dyn Fn(crate::ai::BlockContext)>>>>;
 type CwdCallbacks = Rc<RefCell<Vec<Box<dyn Fn(&str, bool)>>>>;
 pub(crate) type DebugInfo = Vec<(&'static str, Vec<(String, String)>)>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ArmedAgentExecution {
+    generation: u64,
+    prompt_generation: u64,
+}
+
+fn take_armed_agent_generation(
+    armed: &mut Option<ArmedAgentExecution>,
+    prompt_generation: u64,
+) -> Option<u64> {
+    armed
+        .take()
+        .filter(|armed| armed.prompt_generation == prompt_generation)
+        .map(|armed| armed.generation)
+}
+
+fn command_end_matches_agent_execution(
+    agent_generation: Option<u64>,
+    started_id: Option<&str>,
+    finished_id: Option<&str>,
+) -> bool {
+    agent_generation.is_none() || started_id.is_none() || started_id == finished_id
+}
+
+fn command_end_matches_started_id(started_id: Option<&str>, finished_id: Option<&str>) -> bool {
+    started_id.is_some() && started_id == finished_id
+}
+
+fn agent_prompt_boundary_is_trusted(
+    active_generation: Option<u64>,
+    shell_is_foreground: Option<bool>,
+) -> bool {
+    active_generation.is_none() || shell_is_foreground != Some(false)
+}
 
 pub struct TermView {
     root: gtk::Box,
@@ -1008,6 +1188,11 @@ pub struct TermView {
     /// authoritative finished-command text is read off the live VTE at
     /// CommandStart, so this never has to round-trip to display.
     typed_cmd: Rc<RefCell<String>>,
+    /// One-shot Agent execution identity armed atomically with its PTY write.
+    /// It follows only the next command at the same prompt generation; the
+    /// Agent session performs the secondary command-text check at completion.
+    armed_agent_execution: Rc<RefCell<Option<ArmedAgentExecution>>>,
+    agent_prompt_generation: Rc<Cell<u64>>,
     /// Set once the user has started editing at an idle prompt, so shell echo is
     /// no longer mistaken for asynchronous background output. Shared with the
     /// reader loop; the clipboard paste path has to set it too, since a paste
@@ -1085,6 +1270,7 @@ impl Drop for TermView {
         if let Err(err) = self.save_history() {
             log::warn!("save block history on close: {err}");
         }
+        self.forget_history_revision();
         if let Some(id) = self.resize_tick_id.borrow_mut().take() {
             id.remove();
         }
@@ -1173,6 +1359,9 @@ struct ReaderCtx {
     bookmarks_rc: Rc<RefCell<std::collections::HashSet<u64>>>,
     cmd_running_rc: Rc<Cell<bool>>,
     running_cmd_rc: Rc<RefCell<String>>,
+    armed_agent_execution_rc: Rc<RefCell<Option<ArmedAgentExecution>>>,
+    agent_prompt_generation_rc: Rc<Cell<u64>>,
+    active_agent_generation_rc: Rc<Cell<Option<u64>>>,
     /// Recomputes the compact/full visual live surface. PTY geometry is kept
     /// separately at the full pane viewport.
     layout_active_surface: Rc<dyn Fn()>,
@@ -1346,6 +1535,9 @@ impl ReaderCtx {
             bookmarks_rc,
             cmd_running_rc,
             running_cmd_rc,
+            armed_agent_execution_rc,
+            agent_prompt_generation_rc,
+            active_agent_generation_rc,
             layout_active_surface,
             repo_strip,
             block_finished_cbs,
@@ -1411,7 +1603,11 @@ impl ReaderCtx {
                             let feed_active_vte = match bstate_rc.get() {
                                 BlockState::CollectingPrompt => {
                                     let text = String::from_utf8_lossy(bytes);
-                                    prompt_buf_rc.borrow_mut().push_str(&text);
+                                    append_bounded_text_tail(
+                                        &mut prompt_buf_rc.borrow_mut(),
+                                        &text,
+                                        MAX_PROMPT_CAPTURE_BYTES,
+                                    );
                                     scroll_debouncer.mark_dirty(&block_scroll_rc);
                                     true
                                 }
@@ -1459,6 +1655,25 @@ impl ReaderCtx {
                             ftcs_seen_rc.set(true);
                             let state = bstate_rc.get();
                             if state == BlockState::CollectingOutput || state == BlockState::AltScreen {
+                                continue;
+                            }
+                            if state == BlockState::PostCommand
+                                && !agent_prompt_boundary_is_trusted(
+                                    active_agent_generation_rc.get(),
+                                    pty_for_init.shell_is_foreground(),
+                                )
+                            {
+                                // A foreground child can print a guessed/known
+                                // C/D/A sequence. Its D may have moved us to
+                                // PostCommand, but it cannot return foreground
+                                // ownership to the shell. Resume capture and
+                                // wait for the shell's real D + prompt instead.
+                                log::warn!(
+                                    "Ignoring an Agent prompt marker while a child process still owns the PTY"
+                                );
+                                pending_exit_code_rc.set(None);
+                                cmd_running_rc.set(true);
+                                bstate_rc.set(BlockState::CollectingOutput);
                                 continue;
                             }
                             let background_output = if state == BlockState::AwaitingCommand {
@@ -1668,6 +1883,7 @@ impl ReaderCtx {
                                     &pty_synced_rc,
                                     &bracketed_paste_rc,
                                     &typed_cmd_rc,
+                                    &armed_agent_execution_rc,
                                     &bstate_rc,
                                     &active_rc,
                                 );
@@ -1677,8 +1893,14 @@ impl ReaderCtx {
 
                                 if !is_background {
                                     let output_sample = sample_output_for_event(&output_plain);
+                                    let agent_generation = active_agent_generation_rc.take();
                                     for cb in block_finished_cbs.borrow().iter() {
-                                        cb(cmd.clone(), exit_code, output_sample.clone());
+                                        cb(
+                                            cmd.clone(),
+                                            exit_code,
+                                            output_sample.clone(),
+                                            agent_generation,
+                                        );
                                     }
                                     // Attach this block's output to the shell's own
                                     // journal record. Only jsh sends an execution id,
@@ -1742,6 +1964,7 @@ impl ReaderCtx {
                                 let pty_synced_for_rerun_menu = pty_synced_rc.clone();
                                 let bracketed_paste_for_rerun_menu = bracketed_paste_rc.clone();
                                 let typed_cmd_for_rerun_menu = typed_cmd_rc.clone();
+                                let armed_agent_for_rerun_menu = armed_agent_execution_rc.clone();
                                 let bstate_for_rerun_menu = bstate_rc.clone();
                                 let active_for_rerun_menu = active_rc.clone();
                                 let selected_ids_for_menu = selected_block_ids_rc.clone();
@@ -2043,15 +2266,23 @@ impl ReaderCtx {
                                         let bracketed_paste_for_action =
                                             bracketed_paste_for_rerun_menu.clone();
                                         let typed_cmd_for_action = typed_cmd_for_rerun_menu.clone();
+                                        let armed_agent_for_action =
+                                            armed_agent_for_rerun_menu.clone();
                                         let bstate_for_action = bstate_for_rerun_menu.clone();
                                         let active_for_action = active_for_rerun_menu.clone();
                                         item.set_sensitive(
-                                            bstate_for_action.get() == BlockState::AwaitingCommand,
+                                            bstate_for_action.get() == BlockState::AwaitingCommand
+                                                && armed_agent_for_action.borrow().is_none(),
                                         );
                                         item.connect_clicked(move |_| {
                                             popover_c.popdown();
                                             let finished = finished_for_rerun.borrow();
-                                            let recalled = {
+                                            let recalled = if armed_agent_for_action
+                                                .borrow()
+                                                .is_some()
+                                            {
+                                                false
+                                            } else {
                                                 let selected = selected_ids_for_rerun.borrow();
                                                 recall_selected_commands_at_prompt(
                                                     &pty_for_action,
@@ -2249,6 +2480,13 @@ impl ReaderCtx {
                             vte_typed_cmd_rc.borrow_mut().clear();
                             background_output_rc.borrow_mut().clear();
                             idle_input_dirty_rc.set(false);
+                            agent_prompt_generation_rc
+                                .set(agent_prompt_generation_rc.get().wrapping_add(1));
+                            // An armed write belongs to exactly one prompt. A
+                            // redraw/new prompt before CommandStart invalidates
+                            // it instead of letting same text match later.
+                            armed_agent_execution_rc.borrow_mut().take();
+                            active_agent_generation_rc.set(None);
                             // Snapshot the live VTE cursor at the moment the
                             // prompt finishes drawing — this is where the user's
                             // command starts. CommandStart will read text from
@@ -2280,7 +2518,7 @@ impl ReaderCtx {
                             ftcs_seen_rc.set(true);
                             let state = bstate_rc.get();
                             if state == BlockState::CollectingOutput || state == BlockState::AltScreen {
-                                osc133_depth_rc.set(osc133_depth_rc.get() + 1);
+                                osc133_depth_rc.set(osc133_depth_rc.get().saturating_add(1));
                                 continue;
                             }
                             if state != BlockState::AwaitingCommand {
@@ -2338,6 +2576,16 @@ impl ReaderCtx {
                                     command.len()
                                 );
                             }
+                            // Preserve the local generation even when the shell
+                            // reports different command text. BlockFinished's
+                            // secondary text check then seals the Agent session
+                            // explicitly instead of silently losing the arm and
+                            // waiting forever for an observation.
+                            let matching_generation = take_armed_agent_generation(
+                                &mut armed_agent_execution_rc.borrow_mut(),
+                                agent_prompt_generation_rc.get(),
+                            );
+                            active_agent_generation_rc.set(matching_generation);
                             *vte_typed_cmd_rc.borrow_mut() = command.clone();
                             *running_cmd_rc.borrow_mut() = command;
                             cmd_running_rc.set(true);
@@ -2366,8 +2614,29 @@ impl ReaderCtx {
                             if state != BlockState::CollectingOutput && state != BlockState::AltScreen {
                                 continue;
                             }
-                            if osc133_depth_rc.get() > 0 {
+                            let matches_started_id = command_end_matches_started_id(
+                                execution_id_rc.borrow().as_deref(),
+                                meta.id.as_deref(),
+                            );
+                            if osc133_depth_rc.get() > 0 && !matches_started_id {
                                 osc133_depth_rc.set(osc133_depth_rc.get() - 1);
+                                continue;
+                            }
+                            if matches_started_id {
+                                // A command can print an unmatched nested C
+                                // marker. The shell's private outer C/D id still
+                                // identifies its real completion, so do not let
+                                // hostile output wedge this pane indefinitely.
+                                osc133_depth_rc.set(0);
+                            }
+                            if !command_end_matches_agent_execution(
+                                active_agent_generation_rc.get(),
+                                execution_id_rc.borrow().as_deref(),
+                                meta.id.as_deref(),
+                            ) {
+                                log::warn!(
+                                    "Ignoring an OSC 133 command-end marker whose execution id does not match the armed Agent command"
+                                );
                                 continue;
                             }
                             // Safety net (Warp parity): if the alt-screen app
@@ -2674,6 +2943,7 @@ struct KeyCtx {
     pty_synced_for_key: Rc<Cell<bool>>,
     bracketed_paste_for_key: Rc<Cell<bool>>,
     typed_cmd_for_key: Rc<RefCell<String>>,
+    armed_agent_execution_for_key: Rc<RefCell<Option<ArmedAgentExecution>>>,
     finished_blocks_for_key: Rc<RefCell<Vec<FinishedBlock>>>,
     selected_block_ids_for_key: SelectedBlockIds,
     selected_block_id_for_key: Rc<Cell<Option<u64>>>,
@@ -2690,6 +2960,7 @@ impl KeyCtx {
             pty_synced_for_key,
             bracketed_paste_for_key,
             typed_cmd_for_key,
+            armed_agent_execution_for_key,
             finished_blocks_for_key,
             selected_block_ids_for_key,
             selected_block_id_for_key,
@@ -2813,7 +3084,9 @@ impl KeyCtx {
             if matches!(keyval, Key::Return | Key::KP_Enter) {
                 if selected_block_id_for_key.get().is_some() {
                     let finished = finished_blocks_for_key.borrow();
-                    let recalled = {
+                    let recalled = if armed_agent_execution_for_key.borrow().is_some() {
+                        false
+                    } else {
                         let selected = selected_block_ids_for_key.borrow();
                         recall_selected_commands_at_prompt(
                             &pty_for_key,
@@ -3443,6 +3716,10 @@ impl TermView {
         // plus the command text captured at CommandStart.
         let cmd_running: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let running_cmd: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+        let armed_agent_execution: Rc<RefCell<Option<ArmedAgentExecution>>> =
+            Rc::new(RefCell::new(None));
+        let agent_prompt_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+        let active_agent_generation: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
         let block_start_time: Rc<Cell<Option<SystemTime>>> = Rc::new(Cell::new(None));
         let visible_indices: Rc<RefCell<std::collections::HashSet<usize>>> =
             Rc::new(RefCell::new(std::collections::HashSet::new()));
@@ -3617,6 +3894,9 @@ impl TermView {
                 bookmarks_rc: block_bookmarks.clone(),
                 cmd_running_rc: cmd_running.clone(),
                 running_cmd_rc: running_cmd.clone(),
+                armed_agent_execution_rc: armed_agent_execution.clone(),
+                agent_prompt_generation_rc: agent_prompt_generation.clone(),
+                active_agent_generation_rc: active_agent_generation.clone(),
                 layout_active_surface: layout_active_surface.clone(),
                 repo_strip: repo_strip.clone(),
                 block_finished_cbs: block_finished_callbacks.clone(),
@@ -3823,7 +4103,8 @@ impl TermView {
                     sticky_target.set(None);
                     sticky_jump_bottom.set_visible(false);
                     let cmd = running_cmd.borrow();
-                    let cmd_disp = cmd.trim();
+                    let cmd_disp =
+                        crate::text_safety::bounded_display_text(cmd.trim(), 1024, false);
                     let elapsed = block_start_time
                         .get()
                         .and_then(|st| SystemTime::now().duration_since(st).ok())
@@ -3852,13 +4133,9 @@ impl TermView {
                     let header_bottom = header.y() + header.height();
                     let card_bottom = card.y() + card.height();
                     if header_bottom <= 0.0 && card_bottom > sticky_height + 4.0 {
-                        let command = block
-                            .cmd_text
-                            .lines()
-                            .next()
-                            .unwrap_or("")
-                            .trim()
-                            .to_string();
+                        let command = block.cmd_text.lines().next().unwrap_or("").trim();
+                        let command =
+                            crate::text_safety::bounded_display_text(command, 1024, false);
                         Some((block.id, command, block.long_output))
                     } else {
                         None
@@ -3897,6 +4174,7 @@ impl TermView {
             let pty_for_commit = pty.clone();
             let bstate_for_commit = bstate.clone();
             let typed_cmd_for_commit = typed_cmd.clone();
+            let armed_agent_execution_for_commit = armed_agent_execution.clone();
             let idle_input_dirty_for_commit = idle_input_dirty.clone();
             let pty_synced_for_commit = pty_synced.clone();
             let finished_blocks_for_commit = finished_blocks_rc.clone();
@@ -3904,6 +4182,10 @@ impl TermView {
             let selected_block_id_for_commit = selected_block_id.clone();
             let selection_anchor_id_for_commit = selection_anchor_id.clone();
             active_vte.connect_commit(move |_, text, _size| {
+                if armed_agent_execution_for_commit.borrow().is_some() {
+                    log::warn!("Ignoring VTE commit while an Agent command submission is pending");
+                    return;
+                }
                 // Real terminal input exits historical block selection. Without
                 // this, Enter can recall an old selection after the user has
                 // already begun editing a new command at the live prompt.
@@ -3941,11 +4223,12 @@ impl TermView {
                             // Submitted — leave whatever is in the buffer; it
                             // is cleared at PromptEnd for the next prompt.
                         } else if ch == '\x7f' || ch == '\x08' {
-                            cmd.pop();
+                            pop_typed_command_shadow(&mut cmd);
                         } else if (ch as u32) < 0x20 {
                             // Control bytes: ignore.
                         } else {
-                            cmd.push(ch);
+                            let mut encoded = [0; 4];
+                            append_typed_command_shadow(&mut cmd, ch.encode_utf8(&mut encoded));
                         }
                     }
                 }
@@ -4003,6 +4286,7 @@ impl TermView {
                 pty_synced_for_key: pty_synced.clone(),
                 bracketed_paste_for_key: bracketed_paste.clone(),
                 typed_cmd_for_key,
+                armed_agent_execution_for_key: armed_agent_execution.clone(),
                 finished_blocks_for_key,
                 selected_block_ids_for_key,
                 selected_block_id_for_key,
@@ -4114,6 +4398,8 @@ impl TermView {
             bstate,
             prompt_buf,
             typed_cmd,
+            armed_agent_execution,
+            agent_prompt_generation,
             idle_input_dirty: idle_input_dirty.clone(),
             fullscreen,
             user_scrolled_up: user_scrolled_up.clone(),
@@ -4210,6 +4496,7 @@ impl TermView {
                     &pty_synced,
                     &term_view.bracketed_paste,
                     &term_view.typed_cmd,
+                    &term_view.armed_agent_execution,
                     &term_view.bstate,
                     &term_view.active,
                 );
@@ -4349,12 +4636,25 @@ impl TermView {
 
     /// Send key bytes into the PTY (user input).
     pub fn write_input(&self, data: &[u8]) {
+        // Once an Agent command has been accepted into the ordered writer,
+        // refuse later prompt input until its CommandStart consumes the arm.
+        // Clearing the identity while still queueing bytes would allow a user
+        // action to merge into the reviewed command before the shell sees CR.
+        if self.armed_agent_execution.borrow().is_some() {
+            log::warn!("Ignoring terminal input while an Agent command submission is pending");
+            return;
+        }
+        self.write_input_bytes(data);
+    }
+
+    fn write_input_bytes(&self, data: &[u8]) {
         if self.bstate.get() == BlockState::AwaitingCommand
             && data.iter().any(|byte| !matches!(byte, b'\r' | b'\n'))
         {
-            self.typed_cmd
-                .borrow_mut()
-                .push_str(&String::from_utf8_lossy(data));
+            append_typed_command_shadow(
+                &mut self.typed_cmd.borrow_mut(),
+                &String::from_utf8_lossy(data),
+            );
         }
         self.pty.write_bytes(data);
     }
@@ -4364,6 +4664,36 @@ impl TermView {
         self.bstate.get() == BlockState::AwaitingCommand
             && !self.fullscreen.get()
             && self.typed_cmd.borrow().trim().is_empty()
+            && self.armed_agent_execution.borrow().is_none()
+    }
+
+    /// Re-check prompt readiness, arm a one-shot local identity, and submit
+    /// the reviewed command without yielding to another input path between
+    /// those operations.
+    pub fn try_run_agent_command(&self, generation: u64, command: &str) -> bool {
+        if generation == 0 || !agent_command_is_safe(command) || !self.can_accept_agent_command() {
+            return false;
+        }
+        *self.armed_agent_execution.borrow_mut() = Some(ArmedAgentExecution {
+            generation,
+            prompt_generation: self.agent_prompt_generation.get(),
+        });
+        let mut bytes = command.as_bytes().to_vec();
+        bytes.push(b'\r');
+        match self.pty.try_write_bytes(&bytes) {
+            Ok(()) => {
+                append_typed_command_shadow(&mut self.typed_cmd.borrow_mut(), command);
+                true
+            }
+            Err(error) => {
+                self.armed_agent_execution.borrow_mut().take();
+                log::warn!(
+                    "Agent command was not queued to the PTY ({} bytes): {error}",
+                    error.len()
+                );
+                false
+            }
+        }
     }
 
     /// Resize the PTY.
@@ -4520,12 +4850,17 @@ impl TermView {
         let bracketed_paste = self.bracketed_paste.clone();
         let bstate = self.bstate.clone();
         let typed_cmd = self.typed_cmd.clone();
+        let armed_agent_execution = self.armed_agent_execution.clone();
         let pty_synced = self.pty_synced.clone();
         let idle_input_dirty = self.idle_input_dirty.clone();
         clipboard.read_text_async(None::<&gtk::gio::Cancellable>, move |result| {
             let Ok(Some(text)) = result else {
                 return;
             };
+            if armed_agent_execution.borrow().is_some() {
+                log::warn!("Ignoring paste while an Agent command submission is pending");
+                return;
+            }
             let paste = build_clipboard_paste(text.as_str(), bracketed_paste.get());
             if paste.is_empty() {
                 return;
@@ -4576,7 +4911,7 @@ impl TermView {
 
     pub fn connect_block_finished<F>(&self, f: F)
     where
-        F: Fn(String, Option<i32>, String) + 'static,
+        F: Fn(String, Option<i32>, String, Option<u64>) + 'static,
     {
         self.block_finished_callbacks.borrow_mut().push(Box::new(f));
     }
@@ -4648,7 +4983,7 @@ impl TermView {
     /// prompt. Bracketed paste keeps a multi-selection as a multiline buffer; on
     /// shells without it the existing safe first-line fallback still applies.
     pub fn reinput_selected_commands(&self) {
-        if self.fullscreen.get() {
+        if self.fullscreen.get() || self.armed_agent_execution.borrow().is_some() {
             return;
         }
         let finished = self.finished_blocks.borrow();
@@ -4727,7 +5062,9 @@ impl TermView {
 
         // At an idle prompt, also ask the shell to repaint a clean live input
         // surface. Never inject form-feed into a running/full-screen program.
-        if self.bstate.get() == BlockState::AwaitingCommand {
+        if self.bstate.get() == BlockState::AwaitingCommand
+            && self.armed_agent_execution.borrow().is_none()
+        {
             self.pty.write_bytes(b"\x0c");
         }
         if let Err(err) = self.save_history() {
@@ -4798,6 +5135,7 @@ impl TermView {
                     &self.pty_synced,
                     &self.bracketed_paste,
                     &self.typed_cmd,
+                    &self.armed_agent_execution,
                     &self.bstate,
                     &self.active,
                 );
@@ -5173,15 +5511,18 @@ impl TermView {
     /// the most recent unique command; whitespace-only commands are dropped.
     pub fn command_history(&self) -> Vec<String> {
         let finished = self.finished_blocks.borrow();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let mut out: Vec<String> = Vec::new();
         for block in finished.iter().rev() {
             let cmd = block.cmd_text.trim();
-            if cmd.is_empty() {
+            if cmd.is_empty() || !recalled_command_is_safe(cmd) {
                 continue;
             }
-            if seen.insert(cmd.to_string()) {
+            if seen.insert(cmd) {
                 out.push(cmd.to_string());
+                if out.len() == MAX_COMMAND_HISTORY_ENTRIES {
+                    break;
+                }
             }
         }
         out
@@ -5214,15 +5555,18 @@ impl TermView {
 #[cfg(test)]
 mod tests {
     use super::{
-        background_output_has_visible_text, block_clipboard_text, block_duration_ms,
-        build_clipboard_paste, build_color_query_reply, build_command_recall,
-        build_keyboard_query_reply, clear_dynamic_colors, coalesce_bytes_events,
+        agent_command_is_safe, agent_prompt_boundary_is_trusted, append_bounded_section,
+        append_bounded_text_tail, append_typed_command_shadow, background_output_has_visible_text,
+        block_clipboard_text, block_duration_ms, build_clipboard_paste, build_color_query_reply,
+        build_command_recall, build_keyboard_query_reply, clear_dynamic_colors,
+        coalesce_bytes_events, command_end_matches_agent_execution, command_end_matches_started_id,
         finished_block_config, finished_command, is_post_command_metadata, notification_permitted,
-        parse_color_spec, record_external_input, resolve_command_text, selected_blocks_markdown,
-        selected_command_text, selected_id_range, step_marked_indices, strip_ansi,
-        strip_ansi_with_clear_detect, take_background_output, BlockData, BlockState,
-        CommandTextSource, DynamicColors, DynamicColorsRc, NOTIFICATION_MIN_INTERVAL,
-        TRUNCATED_COMMAND_PLACEHOLDER,
+        parse_color_spec, pop_typed_command_shadow, record_external_input, resolve_command_text,
+        selected_blocks_markdown, selected_command_text, selected_id_range, step_marked_indices,
+        strip_ansi, strip_ansi_with_clear_detect, take_armed_agent_generation,
+        take_background_output, ArmedAgentExecution, BlockData, BlockState, CommandTextSource,
+        DynamicColors, DynamicColorsRc, MAX_RECALLED_COMMAND_BYTES, MAX_TYPED_COMMAND_SHADOW_BYTES,
+        NOTIFICATION_MIN_INTERVAL, TRUNCATED_COMMAND_PLACEHOLDER,
     };
     use crate::config::Config;
     use crate::parser::{ColorKind, CommandMeta, KeyboardProtocolQuery, ParserEvent};
@@ -5555,6 +5899,33 @@ mod tests {
     }
 
     #[test]
+    fn recall_strips_terminal_controls_from_captured_history() {
+        let recall = build_command_recall("echo \x1b[31mred", true);
+        assert_eq!(recall.echo_text, "echo [31mred");
+        assert!(recall.risk.had_controls);
+        assert!(!recall.bytes.contains(&0x1b) || recall.bytes.starts_with(b"\x15\x1b[200~"));
+    }
+
+    #[test]
+    fn recall_rejects_visual_spoofing_and_oversize_without_clearing_the_prompt() {
+        assert!(build_command_recall("echo safe\u{202e}txt", true).is_empty());
+        assert!(build_command_recall("echo safe\u{00ad}txt", true).is_empty());
+        assert!(build_command_recall("echo safe\u{e0020}txt", true).is_empty());
+        assert!(build_command_recall(&"x".repeat(MAX_RECALLED_COMMAND_BYTES + 1), true).is_empty());
+    }
+
+    #[test]
+    fn agent_commands_are_single_line_bounded_and_visually_unambiguous() {
+        assert!(agent_command_is_safe("cargo test"));
+        assert!(!agent_command_is_safe("cargo test\nrm -rf ~"));
+        assert!(!agent_command_is_safe("echo safe\u{2066}hidden"));
+        assert!(!agent_command_is_safe("echo safe\u{fe0f}hidden"));
+        assert!(!agent_command_is_safe(
+            &"x".repeat(MAX_RECALLED_COMMAND_BYTES + 1)
+        ));
+    }
+
+    #[test]
     fn recall_of_an_empty_command_writes_nothing_at_all() {
         // Not even the kill-line: the recall paths bail on this instead of
         // wiping a line the user was editing.
@@ -5749,6 +6120,48 @@ mod tests {
             selected_command_text(blocks, &selected),
             "printf 'a\\n'\nprintf 'b\\n'\necho done"
         );
+    }
+
+    #[test]
+    fn selected_command_aggregation_rejects_the_whole_oversized_selection() {
+        let selected = HashSet::from([7, 8]);
+        let first = "x".repeat(MAX_RECALLED_COMMAND_BYTES / 2);
+        let second = "y".repeat(MAX_RECALLED_COMMAND_BYTES / 2 + 1);
+        assert!(
+            selected_command_text([(7, first.as_str()), (8, second.as_str())], &selected)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn bounded_text_tail_preserves_utf8_and_newest_prompt_content() {
+        let mut buffer = "old-界".to_string();
+        append_bounded_text_tail(&mut buffer, "-new-终", 9);
+        assert!(buffer.len() <= 9);
+        assert!(buffer.ends_with("new-终"));
+
+        append_bounded_text_tail(&mut buffer, "abcdef界", 4);
+        assert_eq!(buffer, "f界");
+    }
+
+    #[test]
+    fn oversized_typed_shadow_stays_nonempty_through_backspaces() {
+        let mut shadow = "x".repeat(MAX_TYPED_COMMAND_SHADOW_BYTES);
+        append_typed_command_shadow(&mut shadow, "y");
+        assert_eq!(shadow, TRUNCATED_COMMAND_PLACEHOLDER);
+        for _ in 0..TRUNCATED_COMMAND_PLACEHOLDER.chars().count() + 1 {
+            pop_typed_command_shadow(&mut shadow);
+        }
+        assert_eq!(shadow, TRUNCATED_COMMAND_PLACEHOLDER);
+    }
+
+    #[test]
+    fn bounded_section_is_atomic_at_the_aggregate_limit() {
+        let mut output = "first".to_string();
+        assert!(append_bounded_section(&mut output, "|", "two", 9));
+        assert_eq!(output, "first|two");
+        assert!(!append_bounded_section(&mut output, "|", "x", 9));
+        assert_eq!(output, "first|two");
     }
 
     #[test]
@@ -6105,5 +6518,69 @@ mod tests {
         let pos = 2;
         assert_eq!(chars[pos - 1], '好');
         assert_eq!(chars[pos], 'w');
+    }
+
+    #[test]
+    fn agent_generation_requires_same_prompt_and_surfaces_command_mismatch() {
+        let armed = || {
+            Some(ArmedAgentExecution {
+                generation: 41,
+                prompt_generation: 7,
+            })
+        };
+
+        let mut exact = armed();
+        assert_eq!(take_armed_agent_generation(&mut exact, 7), Some(41));
+        assert!(exact.is_none(), "a matching generation is one-shot");
+
+        let mut suffix_collision = armed();
+        assert_eq!(
+            take_armed_agent_generation(&mut suffix_collision, 7),
+            Some(41)
+        );
+        assert!(
+            suffix_collision.is_none(),
+            "the command-text check happens at BlockFinished, but the arm is one-shot"
+        );
+
+        let mut stale_prompt = armed();
+        assert_eq!(take_armed_agent_generation(&mut stale_prompt, 8), None);
+        assert!(stale_prompt.is_none());
+
+        assert!(command_end_matches_agent_execution(
+            Some(41),
+            Some("secret-1"),
+            Some("secret-1")
+        ));
+        assert!(!command_end_matches_agent_execution(
+            Some(41),
+            Some("secret-1"),
+            Some("forged")
+        ));
+        assert!(!command_end_matches_agent_execution(
+            Some(41),
+            Some("secret-1"),
+            None
+        ));
+        assert!(command_end_matches_started_id(
+            Some("secret-1"),
+            Some("secret-1")
+        ));
+        assert!(!command_end_matches_started_id(
+            Some("secret-1"),
+            Some("nested-2")
+        ));
+        assert!(
+            command_end_matches_agent_execution(Some(41), None, None),
+            "old bare integrations remain compatible, without claiming id authentication"
+        );
+
+        assert!(!agent_prompt_boundary_is_trusted(Some(41), Some(false)));
+        assert!(agent_prompt_boundary_is_trusted(Some(41), Some(true)));
+        assert!(
+            agent_prompt_boundary_is_trusted(Some(41), None),
+            "host-bridged PID namespaces must fall back to the correlated shell marker"
+        );
+        assert!(agent_prompt_boundary_is_trusted(None, Some(false)));
     }
 }

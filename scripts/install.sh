@@ -343,7 +343,7 @@ if [[ -z "${DESTDIR}" ]]; then
     fi
     SHADOWING_BIN="$(command -v jterm1 2>/dev/null || true)"
     if [[ -n "${SHADOWING_BIN}" && "${SHADOWING_BIN}" != "${BIN_DIR}/jterm1" ]]; then
-        printf '\nNote: typing `jterm1` still runs %s, an older copy earlier in PATH.\n' \
+        printf '\nNote: typing jterm1 still runs %s, an older copy earlier in PATH.\n' \
             "${SHADOWING_BIN}"
         printf 'Remove it, or put %s ahead of it in PATH.\n' "${BIN_DIR}"
         printf 'The launcher entry is unaffected: it runs %s directly.\n' \

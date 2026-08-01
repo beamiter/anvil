@@ -25,6 +25,12 @@ fi
 [[ -n ${__JTERM1_BASH_LOADED:-} ]] && return 0
 __JTERM1_BASH_LOADED=1
 __jterm1_integration_source=${BASH_SOURCE[0]}
+# Private per-shell nonce + monotonic command number correlate C/D pairs.
+# Neither variable is exported. Use enough independent shell-random samples
+# that blind terminal output cannot feasibly guess a valid finish marker.
+__jterm1_marker_nonce="${BASHPID:-$$}-${RANDOM}-${RANDOM}-${RANDOM}-${RANDOM}-${RANDOM}-${RANDOM}-${RANDOM}-${RANDOM}"
+__jterm1_marker_seq=0
+__jterm1_marker_id=""
 
 # Send raw OSC payload terminated with BEL.
 __jterm1_osc() { printf '\033]%s\007' "$1"; }
@@ -35,12 +41,17 @@ __jterm1_prompt_start() { __jterm1_osc "133;A"; }
 __jterm1_prompt_end()   { __jterm1_osc "133;B"; }
 
 # OSC 133 ;C — user submitted, command is running.
-__jterm1_command_start() { __jterm1_osc "133;C"; }
+__jterm1_command_start() {
+    ((__jterm1_marker_seq++)) || true
+    __jterm1_marker_id="${__jterm1_marker_nonce}-${__jterm1_marker_seq}"
+    __jterm1_osc "133;C;id=${__jterm1_marker_id}"
+}
 
 # OSC 133 ;D;<exit> — command finished with the given exit code.
 __jterm1_command_end() {
     local ec=$1
-    __jterm1_osc "133;D;${ec}"
+    __jterm1_osc "133;D;${ec};id=${__jterm1_marker_id}"
+    __jterm1_marker_id=""
 }
 
 # OSC 7 — report current working directory as file:// URI.

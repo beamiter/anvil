@@ -359,7 +359,8 @@ impl Config {
             terminal_mode: TerminalMode::Vte,
             tab_placement: TabPlacement::Sidebar,
             sidebar_view: SidebarView::Tabs,
-            jsh_update_check: JshUpdateCheck::default(),
+            // Recovery mode must not initiate network or shared-cache work.
+            jsh_update_check: JshUpdateCheck::Never,
             sidebar_visible: true,
             sidebar_width: 220,
             tab_width: 180,
@@ -641,12 +642,12 @@ fn safe_absolute_history_path(value: Option<String>, setting: &str) -> Option<St
 /// malformed hand-edited file is never silently replaced with defaults.
 pub(crate) fn config_file_error() -> Option<String> {
     let path = config_file_path();
-    match fs::read_to_string(&path) {
-        Ok(contents) => contents
+    match crate::config_store::read_config_text(&path) {
+        Ok(Some(contents)) => contents
             .parse::<toml::Table>()
             .err()
             .map(|err| format!("{}: {err}", path.display())),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Ok(None) => None,
         Err(err) => Some(format!("{}: {err}", path.display())),
     }
 }
@@ -716,7 +717,7 @@ struct FileConfig {
 
 fn load_file_config() -> FileConfig {
     let path = config_file_path();
-    let Ok(contents) = fs::read_to_string(&path) else {
+    let Ok(Some(contents)) = crate::config_store::read_config_text(&path) else {
         return FileConfig {
             remote_hosts: default_remote_hosts(),
             ..Default::default()
@@ -1711,6 +1712,7 @@ mod tests {
         assert!(config.block_history_path.is_none());
         assert!(!config.ai_enabled);
         assert!(!config.agent_enabled);
+        assert_eq!(config.jsh_update_check, JshUpdateCheck::Never);
         assert_eq!(config.ai_provider, "anthropic");
         assert_eq!(config.ai_model, "claude-sonnet-4-6");
         assert_eq!(config.ai_base_url, "https://api.anthropic.com");

@@ -17,7 +17,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::rc::{Rc, Weak};
@@ -37,10 +37,87 @@ use std::os::unix::process::CommandExt;
 /// Matches the spirit of `block.rs`'s raw-output cap — bounded memory even
 /// for runaway commands.
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+const MAX_NOTEBOOK_BYTES: u64 = 1024 * 1024;
+const MAX_NOTEBOOK_SEGMENTS: usize = 512;
+const MAX_NOTEBOOK_CELLS: usize = 128;
+const MAX_NOTEBOOK_CELL_BYTES: usize = 256 * 1024;
+const MAX_NOTEBOOK_TEXT_SEGMENT_BYTES: usize = 256 * 1024;
+const MAX_NOTEBOOK_PATH_DISPLAY_BYTES: usize = 4 * 1024;
 const OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(40);
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const MAX_OUTPUT_EVENTS_PER_TICK: usize = 32;
+const MAX_CONCURRENT_CELL_WORKERS: usize = 8;
+static ACTIVE_CELL_WORKERS: AtomicI32 = AtomicI32::new(0);
+
+struct CellWorkerPermit;
+
+impl CellWorkerPermit {
+    fn acquire() -> Option<Self> {
+        ACTIVE_CELL_WORKERS
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < MAX_CONCURRENT_CELL_WORKERS as i32).then_some(active + 1)
+            })
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for CellWorkerPermit {
+    fn drop(&mut self) {
+        ACTIVE_CELL_WORKERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 pub(crate) use jterm_core::notebook_text::{parse_segments, render_text_to_pango, Segment};
+
+fn read_notebook_file(path: &Path) -> io::Result<String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "notebook is not a regular file",
+        ));
+    }
+    if metadata.len() > MAX_NOTEBOOK_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            format!("notebook exceeds the {MAX_NOTEBOOK_BYTES}-byte limit"),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_NOTEBOOK_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_NOTEBOOK_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            format!("notebook exceeds the {MAX_NOTEBOOK_BYTES}-byte limit"),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn notebook_cell_issue(source: &str) -> Option<&'static str> {
+    if source.len() > MAX_NOTEBOOK_CELL_BYTES {
+        return Some("cell exceeds the execution size limit");
+    }
+    if source.chars().any(|ch| {
+        !matches!(ch, '\n' | '\t') && (ch.is_control() || crate::text_safety::is_visual_spoof(ch))
+    }) {
+        return Some("cell contains a hidden, bidirectional, or unsafe control character");
+    }
+    None
+}
+
+fn bounded_notebook_display(source: &str, max_bytes: usize) -> String {
+    crate::text_safety::bounded_display_text(source, max_bytes, true)
+}
 
 #[derive(Debug, Clone)]
 struct CommandSpec {
@@ -173,13 +250,28 @@ fn wait_for_shared_child(child_slot: &Arc<Mutex<Option<Child>>>) -> std::io::Res
             let child = guard
                 .as_mut()
                 .ok_or_else(|| std::io::Error::other("child handle missing before exit"))?;
-            match child.try_wait()? {
-                Some(status) => {
-                    let code = status.code().unwrap_or(-1);
+            let pid = i32::try_from(child.id())
+                .map_err(|_| std::io::Error::other("child pid does not fit i32"))?;
+            let flags = nix::sys::wait::WaitPidFlag::WEXITED
+                | nix::sys::wait::WaitPidFlag::WNOHANG
+                | nix::sys::wait::WaitPidFlag::WNOWAIT;
+            match nix::sys::wait::waitid(
+                nix::sys::wait::Id::Pid(nix::unistd::Pid::from_raw(pid)),
+                flags,
+            )
+            .map_err(std::io::Error::other)?
+            {
+                nix::sys::wait::WaitStatus::Exited(..)
+                | nix::sys::wait::WaitStatus::Signaled(..) => {
+                    // Keep the leader unreaped while killing its group. The
+                    // numeric PID/PGID cannot be reused in this window.
+                    signal_process_group(pid);
+                    let code = child.wait()?.code().unwrap_or(-1);
                     guard.take();
                     Some(code)
                 }
-                None => None,
+                nix::sys::wait::WaitStatus::StillAlive => None,
+                _ => None,
             }
         };
         if let Some(code) = result {
@@ -187,6 +279,28 @@ fn wait_for_shared_child(child_slot: &Arc<Mutex<Option<Child>>>) -> std::io::Res
         }
         std::thread::sleep(CHILD_POLL_INTERVAL);
     }
+}
+
+fn fail_cell_io_setup(
+    child_slot: &Arc<Mutex<Option<Child>>>,
+    pgid: &Arc<AtomicI32>,
+    sender: &mpsc::SyncSender<WorkerEvent>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+    error: io::Error,
+) {
+    if let Ok(mut guard) = child_slot.lock() {
+        if let Some(child) = guard.as_mut() {
+            terminate_child_group(child);
+        }
+    }
+    let _ = wait_for_shared_child(child_slot);
+    for thread in threads {
+        let _ = thread.join();
+    }
+    pgid.store(0, Ordering::SeqCst);
+    let _ = sender.send(WorkerEvent::Done(CellOutcome::Failed(format!(
+        "I/O worker thread spawn failed: {error}"
+    ))));
 }
 
 fn spawn_cell_worker(spec: CommandSpec, handle: &CellHandle) -> mpsc::Receiver<WorkerEvent> {
@@ -197,148 +311,183 @@ fn spawn_cell_worker(spec: CommandSpec, handle: &CellHandle) -> mpsc::Receiver<W
     let child_slot = handle.child.clone();
     let cancelled = handle.cancelled.clone();
     let pgid = handle.pgid.clone();
+    let Some(permit) = CellWorkerPermit::acquire() else {
+        let _ = sender.try_send(WorkerEvent::Done(CellOutcome::Failed(format!(
+            "at most {MAX_CONCURRENT_CELL_WORKERS} notebook cells may run concurrently"
+        ))));
+        return receiver;
+    };
+    let spawn_failure_sender = sender.clone();
 
-    std::thread::spawn(move || {
-        let cwd_for_bridge = spec.cwd.to_string_lossy().into_owned();
-        let executable_argv =
-            crate::host::wrap_argv(&spec.argv, Some(cwd_for_bridge.as_str()), &[]);
-        let Some((program, arguments)) = executable_argv.split_first() else {
-            let _ = sender.send(WorkerEvent::Done(CellOutcome::Failed(
-                "no shell executable configured".to_owned(),
-            )));
-            return;
-        };
-
-        let mut command = Command::new(program);
-        command
-            .args(arguments)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        if !crate::host::is_flatpak() {
-            command.current_dir(&spec.cwd);
-        }
-        #[cfg(unix)]
-        command.process_group(0);
-
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(error) => {
-                let _ = sender.send(WorkerEvent::Done(CellOutcome::Failed(format!(
-                    "spawn failed: {error}"
-                ))));
-                return;
-            }
-        };
-        if let Ok(id) = i32::try_from(child.id()) {
-            pgid.store(id, Ordering::SeqCst);
-        }
-
-        let stdin = child.stdin.take();
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        match child_slot.lock() {
-            Ok(mut guard) => {
-                *guard = Some(child);
-                if cancelled.load(Ordering::SeqCst) {
-                    if let Some(child) = guard.as_mut() {
-                        terminate_child_group(child);
-                    }
-                }
-            }
-            Err(_) => {
-                terminate_child_group(&mut child);
-                let _ = child.wait();
+    let spawn = std::thread::Builder::new()
+        .name("jterm1-notebook-cell".to_owned())
+        .spawn(move || {
+            let _permit = permit;
+            let cwd_for_bridge = spec.cwd.to_string_lossy().into_owned();
+            let executable_argv =
+                crate::host::wrap_argv(&spec.argv, Some(cwd_for_bridge.as_str()), &[]);
+            let Some((program, arguments)) = executable_argv.split_first() else {
                 let _ = sender.send(WorkerEvent::Done(CellOutcome::Failed(
-                    "child handle mutex poisoned".to_owned(),
+                    "no shell executable configured".to_owned(),
                 )));
                 return;
+            };
+
+            let mut command = Command::new(program);
+            command
+                .args(arguments)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            if !crate::host::is_flatpak() {
+                command.current_dir(&spec.cwd);
             }
-        }
+            #[cfg(unix)]
+            command.process_group(0);
 
-        // Use stdin instead of a giant `-c` argument. This avoids ARG_MAX and
-        // gives every supported interpreter the exact same source bytes.
-        let source = spec.source;
-        let stdin_thread = stdin.map(|mut input| {
-            std::thread::spawn(move || {
-                let _ = input.write_all(source.as_bytes());
-                if !source.ends_with('\n') {
-                    let _ = input.write_all(b"\n");
+            let mut child = match command.spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    let _ = sender.send(WorkerEvent::Done(CellOutcome::Failed(format!(
+                        "spawn failed: {error}"
+                    ))));
+                    return;
                 }
-            })
-        });
+            };
+            if let Ok(id) = i32::try_from(child.id()) {
+                pgid.store(id, Ordering::SeqCst);
+            }
 
-        let stdout_sender = sender.clone();
-        let stdout_thread = stdout.map(|mut output| {
-            std::thread::spawn(move || {
-                let mut buffer = [0_u8; 4096];
-                loop {
-                    match output.read(&mut buffer) {
-                        Ok(0) => break,
-                        Ok(count) => {
-                            if stdout_sender
-                                .send(WorkerEvent::Output(
-                                    OutputStream::Stdout,
-                                    buffer[..count].to_vec(),
-                                ))
-                                .is_err()
-                            {
-                                break;
-                            }
+            let (Some(mut stdin), Some(mut stdout), Some(mut stderr)) =
+                (child.stdin.take(), child.stdout.take(), child.stderr.take())
+            else {
+                terminate_child_group(&mut child);
+                let _ = child.wait();
+                pgid.store(0, Ordering::SeqCst);
+                let _ = sender.send(WorkerEvent::Done(CellOutcome::Failed(
+                    "spawned shell did not expose all requested pipes".to_owned(),
+                )));
+                return;
+            };
+            match child_slot.lock() {
+                Ok(mut guard) => {
+                    *guard = Some(child);
+                    if cancelled.load(Ordering::SeqCst) {
+                        if let Some(child) = guard.as_mut() {
+                            terminate_child_group(child);
                         }
-                        Err(_) => break,
                     }
                 }
-            })
-        });
-
-        let stderr_sender = sender.clone();
-        let stderr_thread = stderr.map(|mut output| {
-            std::thread::spawn(move || {
-                let mut buffer = [0_u8; 4096];
-                loop {
-                    match output.read(&mut buffer) {
-                        Ok(0) => break,
-                        Ok(count) => {
-                            if stderr_sender
-                                .send(WorkerEvent::Output(
-                                    OutputStream::Stderr,
-                                    buffer[..count].to_vec(),
-                                ))
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
+                Err(_) => {
+                    terminate_child_group(&mut child);
+                    let _ = child.wait();
+                    let _ = sender.send(WorkerEvent::Done(CellOutcome::Failed(
+                        "child handle mutex poisoned".to_owned(),
+                    )));
+                    return;
                 }
-            })
+            }
+
+            // Use stdin instead of a giant `-c` argument. This avoids ARG_MAX and
+            // gives every supported interpreter the exact same source bytes.
+            let mut io_threads = Vec::with_capacity(3);
+            let source = spec.source;
+            match std::thread::Builder::new()
+                .name("jterm1-notebook-stdin".to_owned())
+                .spawn(move || {
+                    let _ = stdin.write_all(source.as_bytes());
+                    if !source.ends_with('\n') {
+                        let _ = stdin.write_all(b"\n");
+                    }
+                }) {
+                Ok(thread) => io_threads.push(thread),
+                Err(error) => {
+                    fail_cell_io_setup(&child_slot, &pgid, &sender, io_threads, error);
+                    return;
+                }
+            }
+
+            let stdout_sender = sender.clone();
+            match std::thread::Builder::new()
+                .name("jterm1-notebook-stdout".to_owned())
+                .spawn(move || {
+                    let mut buffer = [0_u8; 4096];
+                    loop {
+                        match stdout.read(&mut buffer) {
+                            Ok(0) => break,
+                            Ok(count) => {
+                                if stdout_sender
+                                    .send(WorkerEvent::Output(
+                                        OutputStream::Stdout,
+                                        buffer[..count].to_vec(),
+                                    ))
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }) {
+                Ok(thread) => io_threads.push(thread),
+                Err(error) => {
+                    fail_cell_io_setup(&child_slot, &pgid, &sender, io_threads, error);
+                    return;
+                }
+            }
+
+            let stderr_sender = sender.clone();
+            match std::thread::Builder::new()
+                .name("jterm1-notebook-stderr".to_owned())
+                .spawn(move || {
+                    let mut buffer = [0_u8; 4096];
+                    loop {
+                        match stderr.read(&mut buffer) {
+                            Ok(0) => break,
+                            Ok(count) => {
+                                if stderr_sender
+                                    .send(WorkerEvent::Output(
+                                        OutputStream::Stderr,
+                                        buffer[..count].to_vec(),
+                                    ))
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }) {
+                Ok(thread) => io_threads.push(thread),
+                Err(error) => {
+                    fail_cell_io_setup(&child_slot, &pgid, &sender, io_threads, error);
+                    return;
+                }
+            }
+
+            let exit = wait_for_shared_child(&child_slot);
+            // wait_for_shared_child killed the group before reaping its leader, so
+            // joining cannot hang on a descendant retaining stdout/stderr and no
+            // stale numeric PGID is signalled after reuse.
+            for thread in io_threads {
+                let _ = thread.join();
+            }
+
+            let outcome = match exit {
+                Ok(_) if cancelled.load(Ordering::SeqCst) => CellOutcome::Cancelled,
+                Ok(code) => CellOutcome::Exited(code),
+                Err(error) => CellOutcome::Failed(format!("wait failed: {error}")),
+            };
+            pgid.store(0, Ordering::SeqCst);
+            let _ = sender.send(WorkerEvent::Done(outcome));
         });
-
-        let exit = wait_for_shared_child(&child_slot);
-        // A shell can exit while a background child keeps its output pipes and
-        // process group alive. End that group before joining the pipe readers,
-        // both to bound completion time and to prevent orphaned notebook jobs.
-        signal_process_group(pgid.load(Ordering::SeqCst));
-        if let Some(thread) = stdin_thread {
-            let _ = thread.join();
-        }
-        if let Some(thread) = stdout_thread {
-            let _ = thread.join();
-        }
-        if let Some(thread) = stderr_thread {
-            let _ = thread.join();
-        }
-
-        let outcome = match exit {
-            Ok(_) if cancelled.load(Ordering::SeqCst) => CellOutcome::Cancelled,
-            Ok(code) => CellOutcome::Exited(code),
-            Err(error) => CellOutcome::Failed(format!("wait failed: {error}")),
-        };
-        pgid.store(0, Ordering::SeqCst);
-        let _ = sender.send(WorkerEvent::Done(outcome));
-    });
+    if let Err(error) = spawn {
+        let _ = spawn_failure_sender.try_send(WorkerEvent::Done(CellOutcome::Failed(format!(
+            "worker thread spawn failed: {error}"
+        ))));
+    }
 
     receiver
 }
@@ -428,7 +577,7 @@ impl Component for NotebookModel {
                     log::warn!("notebook: ignored open request in safe mode");
                     return;
                 }
-                let text = match std::fs::read_to_string(&path) {
+                let text = match read_notebook_file(&path) {
                     Ok(text) => text,
                     Err(error) => {
                         log::warn!("notebook: cannot read {}: {error}", path.display());
@@ -441,11 +590,13 @@ impl Component for NotebookModel {
                 while let Some(child) = widgets.content.first_child() {
                     widgets.content.remove(&child);
                 }
+                let title = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
                 root.set_title(&format!(
                     "Notebook: {}",
-                    path.file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| path.display().to_string())
+                    bounded_notebook_display(&title, 512)
                 ));
                 let cwd = path
                     .parent()
@@ -471,10 +622,14 @@ impl Component for NotebookModel {
                 actions.append(&run_all_button);
                 widgets.content.append(&actions);
 
+                let segments = parse_segments(&text);
+                let mut content_truncated = segments.len() > MAX_NOTEBOOK_SEGMENTS;
                 let mut cells = Vec::new();
-                for segment in parse_segments(&text) {
+                for segment in segments.into_iter().take(MAX_NOTEBOOK_SEGMENTS) {
                     match segment {
                         Segment::Text(text) => {
+                            let text =
+                                bounded_notebook_display(&text, MAX_NOTEBOOK_TEXT_SEGMENT_BYTES);
                             let label = gtk::Label::new(None);
                             label.set_use_markup(true);
                             label.set_markup(&render_text_to_pango(&text));
@@ -485,6 +640,10 @@ impl Component for NotebookModel {
                             widgets.content.append(&label);
                         }
                         Segment::Code { lang, src } => {
+                            if cells.len() >= MAX_NOTEBOOK_CELLS {
+                                content_truncated = true;
+                                break;
+                            }
                             let cell = CellController::new(
                                 cells.len(),
                                 &lang,
@@ -497,10 +656,23 @@ impl Component for NotebookModel {
                         }
                     }
                 }
+                if content_truncated {
+                    let warning = gtk::Label::new(Some(
+                        "Notebook content was truncated at the safe segment/cell limit.",
+                    ));
+                    warning.set_xalign(0.0);
+                    warning.set_wrap(true);
+                    warning.add_css_class("warning");
+                    widgets.content.append(&warning);
+                }
+                let cwd_display = bounded_notebook_display(
+                    &cwd.to_string_lossy(),
+                    MAX_NOTEBOOK_PATH_DISPLAY_BYTES,
+                );
                 let footer = gtk::Label::new(Some(&format!(
                     "Cells run in isolated process groups with cwd {}. `shell` and unlabeled cells use: {}. Source is provided on stdin; active terminals are never modified.",
-                    cwd.display(),
-                    configured_shell.join(" ")
+                    cwd_display,
+                    bounded_notebook_display(&configured_shell.join(" "), 4 * 1024)
                 )));
                 footer.set_wrap(true);
                 footer.set_xalign(0.0);
@@ -622,7 +794,11 @@ impl CellController {
         configured_shell: &[String],
         cwd: &Path,
     ) -> Rc<Self> {
-        let argv = shell_argv_for_info(info, configured_shell);
+        let source_issue = notebook_cell_issue(source);
+        let argv = source_issue
+            .is_none()
+            .then(|| shell_argv_for_info(info, configured_shell))
+            .flatten();
         let command = argv.map(|argv| CommandSpec {
             argv,
             source: source.to_owned(),
@@ -638,11 +814,11 @@ impl CellController {
         body.set_margin_end(8);
 
         let toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        let language = language_name(info);
+        let language = bounded_notebook_display(language_name(info), 256);
         let language_label = gtk::Label::new(Some(if language.is_empty() {
             "shell"
         } else {
-            language
+            &language
         }));
         language_label.set_xalign(0.0);
         language_label.set_hexpand(true);
@@ -651,6 +827,11 @@ impl CellController {
 
         let copy_button = gtk::Button::with_label("Copy");
         copy_button.add_css_class("flat");
+        if source_issue.is_some() {
+            copy_button.set_tooltip_text(Some(
+                "Copies the original blocked source; inspect it in a control-character-aware editor before use.",
+            ));
+        }
         let source_for_copy = source.to_owned();
         copy_button.connect_clicked(move |_| {
             if let Some(display) = gtk::gdk::Display::default() {
@@ -664,6 +845,11 @@ impl CellController {
         stop_button.set_sensitive(false);
         if command.is_some() {
             run_button.add_css_class("suggested-action");
+        } else if let Some(issue) = source_issue {
+            run_button.set_sensitive(false);
+            run_button.set_tooltip_text(Some(issue));
+            language_label.add_css_class("error");
+            language_label.set_tooltip_text(Some(issue));
         } else {
             run_button.set_sensitive(false);
             run_button.set_tooltip_text(Some(
@@ -675,7 +861,7 @@ impl CellController {
         body.append(&toolbar);
 
         let source_buffer = gtk::TextBuffer::new(None);
-        source_buffer.set_text(source);
+        source_buffer.set_text(&bounded_notebook_display(source, MAX_NOTEBOOK_CELL_BYTES));
         let source_view = gtk::TextView::with_buffer(&source_buffer);
         source_view.set_editable(false);
         source_view.set_cursor_visible(false);
@@ -818,6 +1004,7 @@ impl CellController {
                 return gtk::glib::ControlFlow::Break;
             };
 
+            let mut processed = 0usize;
             loop {
                 match receiver.try_recv() {
                     Ok(WorkerEvent::Output(stream, bytes)) => {
@@ -826,12 +1013,20 @@ impl CellController {
                                 truncated = true;
                                 cell.stderr.append("\n[output truncated]\n");
                             }
+                            processed += 1;
+                            if processed >= MAX_OUTPUT_EVENTS_PER_TICK {
+                                return gtk::glib::ControlFlow::Continue;
+                            }
                             continue;
                         }
                         let remaining = MAX_OUTPUT_BYTES - bytes_seen;
                         let count = bytes.len().min(remaining);
                         bytes_seen += count;
                         cell.append_output(stream, &bytes[..count]);
+                        processed += 1;
+                        if processed >= MAX_OUTPUT_EVENTS_PER_TICK {
+                            return gtk::glib::ControlFlow::Continue;
+                        }
                     }
                     Ok(WorkerEvent::Done(outcome)) => {
                         let is_current = cell
@@ -1020,6 +1215,74 @@ impl NotebookRuntime {
 mod tests {
     use super::*;
 
+    fn notebook_test_dir(label: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("jterm1-notebook-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn notebook_input_is_regular_utf8_and_bounded() {
+        let dir = notebook_test_dir("bounded");
+        let valid = dir.join("valid.md");
+        std::fs::write(&valid, "# hello\n").unwrap();
+        assert_eq!(read_notebook_file(&valid).unwrap(), "# hello\n");
+
+        let invalid = dir.join("invalid.md");
+        std::fs::write(&invalid, [0xff]).unwrap();
+        assert_eq!(
+            read_notebook_file(&invalid).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let oversized = dir.join("oversized.md");
+        let file = std::fs::File::create(&oversized).unwrap();
+        file.set_len(MAX_NOTEBOOK_BYTES + 1).unwrap();
+        assert_eq!(
+            read_notebook_file(&oversized).unwrap_err().kind(),
+            io::ErrorKind::FileTooLarge
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn notebook_fifo_is_rejected_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = notebook_test_dir("fifo");
+        let path = dir.join("blocked.md");
+        let path_c = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: path_c is a live NUL-terminated pathname for this call.
+        assert_eq!(unsafe { nix::libc::mkfifo(path_c.as_ptr(), 0o600) }, 0);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            read_notebook_file(&path).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn executable_cells_reject_hidden_controls_and_oversize_source() {
+        assert_eq!(notebook_cell_issue("echo one\necho two\t# ok"), None);
+        assert!(notebook_cell_issue("echo safe\u{202e}txt").is_some());
+        assert!(notebook_cell_issue("echo safe\u{00ad}txt").is_some());
+        assert!(notebook_cell_issue("echo safe\u{e0020}txt").is_some());
+        assert!(notebook_cell_issue("printf '\u{1b}'").is_some());
+        assert!(notebook_cell_issue(&"x".repeat(MAX_NOTEBOOK_CELL_BYTES + 1)).is_some());
+
+        let display = bounded_notebook_display("safe\u{200b}\u{1b}text", 1024);
+        assert_eq!(display, "safe��text");
+        let truncated = bounded_notebook_display(&"界".repeat(100), 16);
+        assert!(truncated.ends_with("… [truncated]"));
+        assert!(truncated.is_char_boundary(truncated.len()));
+    }
+
     #[test]
     fn shell_fences_select_the_requested_interpreter() {
         let configured = vec!["/bin/zsh".to_owned(), "-l".to_owned()];
@@ -1144,5 +1407,35 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn normal_parent_exit_kills_background_pipe_holders_before_joining_readers() {
+        let handle = CellHandle::new();
+        let receiver = spawn_cell_worker(
+            CommandSpec {
+                argv: vec!["sh".to_owned()],
+                source: "sleep 30 & echo parent-done".to_owned(),
+                cwd: std::env::temp_dir(),
+            },
+            &handle,
+        );
+
+        let mut stdout = Vec::new();
+        let outcome = loop {
+            match receiver
+                .recv_timeout(Duration::from_secs(3))
+                .expect("worker must not hang on a descendant holding stdout")
+            {
+                WorkerEvent::Output(OutputStream::Stdout, bytes) => stdout.extend(bytes),
+                WorkerEvent::Output(OutputStream::Stderr, _) => {}
+                WorkerEvent::Done(outcome) => break outcome,
+            }
+        };
+        assert_eq!(outcome, CellOutcome::Exited(0));
+        assert!(stdout.windows(11).any(|chunk| chunk == b"parent-done"));
+        assert!(handle.child.lock().expect("child slot").is_none());
+        assert_eq!(handle.pgid.load(Ordering::SeqCst), 0);
     }
 }
