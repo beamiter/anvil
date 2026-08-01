@@ -33,6 +33,7 @@ jobs:
             libgtk-4-dev \
             libadwaita-1-dev \
             libvte-2.91-gtk4-dev \
+            xauth \
             xvfb
 
       - name: Install Rust toolchain

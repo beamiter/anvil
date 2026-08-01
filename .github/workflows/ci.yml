@@ -43,6 +43,7 @@ jobs:
             appstream \
             desktop-file-utils \
             file \
+            xauth \
             xvfb
 
       - name: Install Rust toolchain
@@ -103,7 +104,8 @@ jobs:
           target/release/jterm1 --version | grep -Fx "jterm1 ${version}"
           target/release/jterm1 --doctor
           target/release/jterm1 --doctor --json | python3 -m json.tool >/dev/null
-          target/release/jterm1 --check-config --json | python3 -m json.tool >/dev/null
+          target/release/jterm1 --check-config config.toml.example --json | \
+            python3 -m json.tool >/dev/null
 
           config_root="$(mktemp -d)"
           mkdir -p "${config_root}/jterm1"
@@ -131,10 +133,14 @@ jobs:
         run: |
           bash scripts/package-release.sh target/release/jterm1
           (cd target/dist && sha256sum --check *.sha256)
-          JTERM1_BIN=target/release/jterm1 bash scripts/support-bundle.sh target/support
-          tar -tzf target/support/jterm1-support-*.tar.gz | grep -F '/doctor.json'
-          tar -tzf target/support/jterm1-support-*.tar.gz | grep -F '/doctor.txt'
-          if tar -tzf target/support/jterm1-support-*.tar.gz | grep -F '/config-check.json'; then
+          support_dir="$(mktemp -d)"
+          JTERM1_BIN=target/release/jterm1 bash scripts/support-bundle.sh "${support_dir}"
+          support_archives=("${support_dir}"/jterm1-support-*.tar.gz)
+          test "${#support_archives[@]}" -eq 1
+          support_archive="${support_archives[0]}"
+          tar -tzf "${support_archive}" | grep -F '/doctor.json'
+          tar -tzf "${support_archive}" | grep -F '/doctor.txt'
+          if tar -tzf "${support_archive}" | grep -F '/config-check.json'; then
             echo "support bundle unexpectedly contains config-check output" >&2
             exit 1
           fi
