@@ -1317,6 +1317,7 @@ fn validate_remote_hosts(report: &mut ConfigValidationReport, table: &toml::Tabl
         "ssh_args",
         "login_shell",
         "multiplex",
+        "deploy",
     ]
     .into_iter()
     .collect();
@@ -1372,6 +1373,18 @@ fn validate_remote_hosts(report: &mut ConfigValidationReport, table: &toml::Tabl
                 if !value.is_bool() {
                     report.error(format!("{prefix}.{key}"), "must be a boolean");
                 }
+            }
+        }
+        if let Some(value) = host.get("deploy") {
+            match value.as_str() {
+                Some(text) if jterm_core::jsh_remote::Deploy::parse(text).is_some() => {}
+                // Naming the accepted values matters more here than usual: the
+                // difference between them is whether the destination's home
+                // directory gets written to.
+                _ => report.error(
+                    format!("{prefix}.deploy"),
+                    "must be \"off\", \"persist\", or \"incognito\"",
+                ),
             }
         }
         if let Some(value) = host.get("ssh_args") {
@@ -2040,6 +2053,47 @@ mod tests {
         assert!(!json.contains("ProxyCommand"));
         assert!(!json.contains("secret"));
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn validation_names_the_accepted_deploy_modes() {
+        // The error text is the whole point: the three modes differ in whether
+        // the destination's home directory is written to, so a user who typed
+        // one wrong needs to be told what the alternatives are.
+        let deploy_report = |text: &str| {
+            validate_table(
+                Path::new("config.toml"),
+                &text.parse::<toml::Table>().unwrap(),
+            )
+        };
+        let report = deploy_report(concat!(
+            "[[remote_hosts]]\n",
+            "name = 'staging'\n",
+            "host = 'server.example.com'\n",
+            "deploy = 'incognito!'\n",
+        ));
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("remote_hosts[0].deploy"), "{json}");
+        assert!(json.contains("incognito"), "{json}");
+
+        for mode in ["off", "persist", "incognito"] {
+            let report = deploy_report(&format!(
+                "[[remote_hosts]]\nname = 'staging'\nhost = 'server.example.com'\ndeploy = '{mode}'\n"
+            ));
+            let json = serde_json::to_string(&report).unwrap();
+            assert!(!json.contains("deploy"), "{mode} was rejected: {json}");
+        }
+
+        // A non-string is refused too, rather than reaching Deploy::parse.
+        let report = deploy_report(concat!(
+            "[[remote_hosts]]\n",
+            "name = 'staging'\n",
+            "host = 'server.example.com'\n",
+            "deploy = true\n",
+        ));
+        assert!(serde_json::to_string(&report)
+            .unwrap()
+            .contains("remote_hosts[0].deploy"));
     }
 
     #[test]

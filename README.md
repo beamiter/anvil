@@ -467,6 +467,31 @@ OpenSSH ControlMaster sockets. The custom `jsh` remote shell additionally
 supports stable session IDs and block-aware reconnection; a regular remote
 shell works as a normal interactive SSH tab.
 
+#### Hosts that do not have jsh
+
+Blocks, cwd tracking, exit codes, and the Commands timeline all come from jsh,
+so a host with only `bash` on it opens as a plain terminal tab. `deploy` closes
+that without anyone installing anything on the far side:
+
+```toml
+[[remote_hosts]]
+name = "build-box"
+host = "build.example.com"
+deploy = "persist"      # "off" (default), "persist", or "incognito"
+```
+
+The tab then runs `jsh-remote.sh`, which places a verified static jsh on the
+destination for the life of the session and removes it afterwards. Nothing edits
+the destination's `.bashrc`, `.profile`, or login shell, and nothing needs root.
+
+`persist` lets jsh keep its own dot-files and a cached binary in that account's
+`$HOME`, so history survives and later tabs skip the transfer. `incognito`
+sandboxes `HOME` for the session and deletes it on exit, which is what a shared
+account needs. `remote_shell` is ignored when `deploy` is on — choosing the
+shell is the launcher's job. A spelling neither this build nor the launcher
+understands is a config error rather than a silent fall back to `off`, because
+the difference between the modes is whether the destination gets written to.
+
 ### AI
 
 AI surfaces are optional and can be hidden with `ai_enabled = false`. Provider

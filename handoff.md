@@ -10,6 +10,21 @@ their own budgets.
 
 ## Completed since the previous handoff
 
+- `[[remote_hosts]]` gained `deploy` ("off" by default, "persist", or
+  "incognito"). With it on, a remote tab runs `jterm_core::jsh_remote`'s vendored
+  `jsh-remote.sh`, which places a verified static jsh on the destination for the
+  life of the session and removes it afterwards — so blocks, cwd tracking, exit
+  codes and the Commands timeline work on a machine nobody prepared, without
+  anything being installed there, without root, and without touching the
+  destination's `.bashrc`, `.profile`, or login shell. `remote_shell` is ignored
+  in that mode. An unrecognised spelling rejects the host and is reported by
+  config validation; it deliberately does not fall back to "off", because the
+  difference between the modes is whether the destination's `$HOME` is written
+  to. `build_remote_argv` splits into `build_deployed_argv` (pure, given a
+  launcher path) and the publish step, so the argument order is asserted in
+  tests without writing into the real cache directory, and a failure to publish
+  degrades to plain ssh rather than refusing the tab.
+
 - Every Agent UI action carries `AgentProposalRef { epoch, id }` instead of a
   transcript index. `src/agent.rs`, `src/agent_ops.rs`, `src/app_msg.rs`, and
   `src/main.rs` all route the pair, and `resolve_proposal` refuses an action

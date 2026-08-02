@@ -101,6 +101,14 @@ pub struct RemoteHost {
     /// Reuse one ssh connection for repeat tabs to this host (ControlMaster), so
     /// the 2nd+ tab skips the handshake/auth. Defaults to true.
     pub multiplex: bool,
+    /// Put a jsh on the destination for the life of the session instead of
+    /// hoping one is installed there. `off` (the default) keeps the historical
+    /// behaviour: run `remote_shell` over plain ssh and take what is there.
+    ///
+    /// This is what makes a remote tab a *jterm* tab on a machine nobody has
+    /// prepared — blocks, cwd tracking and exit codes all come from jsh, so
+    /// without it a bare `sh` on the far side silently drops them.
+    pub deploy: jterm_core::jsh_remote::Deploy,
 }
 
 /// Directory for ssh ControlMaster sockets. Prefers `$XDG_RUNTIME_DIR`, falls
@@ -187,6 +195,42 @@ pub(crate) fn shell_argv_with_session(
 /// Build the local argv that connects to a remote host via ssh.
 /// Produces e.g. `["ssh", "-t", "-p", "2222", "mm@100.x.x.x", "jsh --session home-main"]`.
 pub(crate) fn build_remote_argv(host: &RemoteHost) -> Vec<String> {
+    if host.deploy.is_enabled() {
+        match jterm_core::jsh_remote::publish_launcher() {
+            Ok(script) => return build_deployed_argv(host, &script),
+            // Publishing the launcher is the only thing that can fail here, and
+            // it fails for reasons that have nothing to do with the host. Plain
+            // ssh still reaches the machine, so degrade to it rather than
+            // refusing to open the tab at all.
+            Err(err) => log::warn!(
+                "Cannot publish jsh-remote.sh for {}: {err}; connecting without deployment",
+                host.name
+            ),
+        }
+    }
+    build_plain_ssh_argv(host)
+}
+
+/// argv for a tab that deploys jsh, given a launcher already on disk. Split out
+/// from [`build_remote_argv`] so it can be asserted without publishing anything.
+fn build_deployed_argv(host: &RemoteHost, script: &std::path::Path) -> Vec<String> {
+    let target = match &host.user {
+        Some(u) => format!("{u}@{}", host.host),
+        None => host.host.clone(),
+    };
+    jterm_core::jsh_remote::launch_argv_with_script(
+        script,
+        &jterm_core::jsh_remote::RemoteTarget {
+            destination: &target,
+            docker: false,
+            session: host.session.as_deref(),
+            ssh_args: &host.ssh_args,
+            deploy: host.deploy,
+        },
+    )
+}
+
+fn build_plain_ssh_argv(host: &RemoteHost) -> Vec<String> {
     let target = match &host.user {
         Some(u) => format!("{u}@{}", host.host),
         None => host.host.clone(),
@@ -1004,6 +1048,20 @@ fn parse_remote_hosts(table: &toml::Table) -> Vec<RemoteHost> {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
             let multiplex = t.get("multiplex").and_then(|v| v.as_bool()).unwrap_or(true);
+            // A spelling this build does not understand rejects the host rather
+            // than falling back to `off`. Silently downgrading `incognito` would
+            // write jsh's dot-files into an account the user asked to leave
+            // untouched, which is the one outcome the mode exists to prevent.
+            let deploy = match t.get("deploy") {
+                None => jterm_core::jsh_remote::Deploy::Off,
+                Some(toml::Value::String(value)) => {
+                    match jterm_core::jsh_remote::Deploy::parse(value) {
+                        Some(deploy) => deploy,
+                        None => return None,
+                    }
+                }
+                Some(_) => return None,
+            };
             Some(RemoteHost {
                 name,
                 host,
@@ -1013,6 +1071,7 @@ fn parse_remote_hosts(table: &toml::Table) -> Vec<RemoteHost> {
                 ssh_args,
                 login_shell,
                 multiplex,
+                deploy,
             })
         })
         .collect()
@@ -1044,6 +1103,14 @@ fn remote_host_to_toml(h: &RemoteHost) -> toml::Value {
     }
     t.insert("login_shell".into(), toml::Value::Boolean(h.login_shell));
     t.insert("multiplex".into(), toml::Value::Boolean(h.multiplex));
+    if h.deploy.is_enabled() {
+        // Only written when it is on, so a config file that never asked for
+        // deployment does not grow a key after a round trip.
+        t.insert(
+            "deploy".into(),
+            toml::Value::String(h.deploy.as_str().to_string()),
+        );
+    }
     toml::Value::Table(t)
 }
 
@@ -1413,7 +1480,75 @@ mod tests {
             // Off by default in tests so exact-argv assertions stay deterministic
             // (multiplex injects an env-dependent ControlPath).
             multiplex: false,
+            // Likewise: deployment publishes a script and its path depends on
+            // the cache directory. The deploy tests below opt in explicitly.
+            deploy: jterm_core::jsh_remote::Deploy::Off,
         }
+    }
+
+    #[test]
+    fn deploy_routes_through_the_remote_launcher_and_keeps_ssh_arguments() {
+        let mut h = host();
+        h.deploy = jterm_core::jsh_remote::Deploy::Incognito;
+        h.ssh_args = vec!["-p".into(), "2222".into()];
+        // A fixed path, not the published one: publishing writes into the real
+        // cache directory, and on a machine where that fails this test would
+        // silently assert the plain-ssh fallback instead.
+        let argv = build_deployed_argv(&h, std::path::Path::new("/c/jsh-remote.sh"));
+
+        assert_eq!(argv[0], "/bin/sh");
+        assert_eq!(argv[1], "/c/jsh-remote.sh");
+        assert!(argv.contains(&"--incognito".to_string()), "{argv:?}");
+        let expected_target = format!("{}@{}", h.user.as_deref().unwrap_or_default(), h.host);
+        assert!(argv.contains(&expected_target), "{argv:?}");
+        // The remote shell is chosen by the launcher, not by remote_shell: the
+        // whole point is that the destination has no jsh to name.
+        assert!(
+            !argv.iter().any(|a| a.contains("/.local/bin/jsh")),
+            "{argv:?}"
+        );
+        let separator = argv.iter().position(|a| a == "--").expect("ssh separator");
+        assert_eq!(&argv[separator + 1..], ["-p", "2222"]);
+    }
+
+    #[test]
+    fn deploy_off_is_byte_for_byte_the_old_ssh_command() {
+        let h = host();
+        assert!(!h.deploy.is_enabled());
+        assert_eq!(build_remote_argv(&h), build_plain_ssh_argv(&h));
+    }
+
+    #[test]
+    fn a_deploy_mode_this_build_cannot_parse_rejects_the_host() {
+        // Not "falls back to off": a typo in `incognito` must never resolve to a
+        // mode that writes into a shared account's home directory.
+        let table: toml::Table = toml::from_str(
+            "[[remote_hosts]]\nname = \"h\"\nhost = \"example.test\"\ndeploy = \"incognito!\"\n",
+        )
+        .expect("toml");
+        assert!(parse_remote_hosts(&table).is_empty());
+
+        let ok: toml::Table = toml::from_str(
+            "[[remote_hosts]]\nname = \"h\"\nhost = \"example.test\"\ndeploy = \"incognito\"\n",
+        )
+        .expect("toml");
+        let hosts = parse_remote_hosts(&ok);
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].deploy, jterm_core::jsh_remote::Deploy::Incognito);
+    }
+
+    #[test]
+    fn deploy_survives_a_config_round_trip_and_is_absent_when_off() {
+        let mut h = host();
+        h.deploy = jterm_core::jsh_remote::Deploy::Persist;
+        let value = remote_host_to_toml(&h);
+        assert_eq!(
+            value.get("deploy").and_then(toml::Value::as_str),
+            Some("persist")
+        );
+
+        h.deploy = jterm_core::jsh_remote::Deploy::Off;
+        assert!(remote_host_to_toml(&h).get("deploy").is_none());
     }
 
     #[test]

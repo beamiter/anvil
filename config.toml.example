@@ -188,3 +188,18 @@ remote_hosts = []
 # login_shell = true
 # multiplex = true
 # session = "staging-main"
+#
+# `deploy` covers the host that has no jsh on it. Blocks, cwd tracking, exit
+# codes and the Commands timeline all come from jsh, so a destination with only
+# bash quietly loses them.
+#   "off"        (default) run remote_shell over ssh and take what is there
+#   "persist"    place a verified static jsh there for the session and remove it
+#                afterwards; jsh's dot-files and a cached binary stay in that
+#                account's $HOME, so history survives and later tabs skip the
+#                transfer
+#   "incognito"  the same, with HOME pointed at a sandbox that is deleted on
+#                exit, so the real remote $HOME is never written to — this is
+#                what a shared account needs
+# Neither mode edits the destination's .bashrc, .profile, or login shell, and
+# neither needs root. `remote_shell` is ignored when deploy is on.
+# deploy = "persist"
