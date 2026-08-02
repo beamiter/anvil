@@ -7,6 +7,15 @@ versioning for tagged releases while it remains experimental.
 
 ### Added
 
+- `[[remote_hosts]]` gained `deploy_artifact`: a jsh built on this machine for
+  `deploy` to push, instead of the published release it would otherwise fetch.
+  It is the only way to deploy where there is no release — a build from a
+  branch, or a machine with no network — and without it such a host spends a
+  few seconds failing to reach the release host and then falls back to shell
+  integration, which keeps blocks but none of jsh. An artifact that is not an
+  absolute path rejects the host rather than being ignored: a relative path
+  would resolve against whatever directory the tab started in, and a leading
+  `-` would be read as an option by the launcher.
 - `[[remote_hosts]]` gained `docker = true`: `host` becomes the name of a
   running container, the tab connects with `docker exec` instead of ssh, and
   `user` becomes the user inside it (`-u`, or `--docker-user` when deploying).

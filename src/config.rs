@@ -96,6 +96,16 @@ pub struct RemoteHost {
     /// `ssh_args`, `multiplex` and `login_shell` have no meaning here and are
     /// ignored, which is also what the shared launcher does with them.
     pub docker: bool,
+    /// A jsh built on this machine for `deploy` to push, instead of the
+    /// published release it would otherwise fetch. Without it, deployment on a
+    /// machine whose jsh has no release — or with no network — spends a few
+    /// seconds failing to reach the release host and then falls back to shell
+    /// integration, which keeps blocks but none of jsh's own behaviour.
+    ///
+    /// Must be an absolute path, and must be a jsh the destination can run:
+    /// the launcher checks the binary's own version banner after it lands, but
+    /// nothing here can tell whether it was built for that libc.
+    pub deploy_artifact: Option<String>,
     /// Shell to launch on the remote side (default "jsh").
     pub remote_shell: String,
     /// Stable session id passed to the remote jsh for resume-on-reconnect.
@@ -233,23 +243,18 @@ fn build_deployed_argv(host: &RemoteHost, script: &std::path::Path) -> Vec<Strin
         (Some(u), false) => format!("{u}@{}", host.host),
         _ => host.host.clone(),
     };
-    let mut argv = jterm_core::jsh_remote::launch_argv_with_script(
+    jterm_core::jsh_remote::launch_argv_with_script(
         script,
         &jterm_core::jsh_remote::RemoteTarget {
             destination: &target,
             docker: host.docker,
+            docker_user: host.docker.then_some(host.user.as_deref()).flatten(),
+            artifact: host.deploy_artifact.as_deref().map(std::path::Path::new),
             session: host.session.as_deref(),
             ssh_args: &host.ssh_args,
             deploy: host.deploy,
         },
-    );
-    if host.docker {
-        if let Some(user) = &host.user {
-            argv.push("--docker-user".to_string());
-            argv.push(user.clone());
-        }
-    }
-    argv
+    )
 }
 
 /// argv for a container tab that deploys nothing, for an image that already
@@ -1090,6 +1095,22 @@ fn parse_remote_hosts(table: &toml::Table) -> Vec<RemoteHost> {
                 .unwrap_or(true);
             let multiplex = t.get("multiplex").and_then(|v| v.as_bool()).unwrap_or(true);
             let docker = t.get("docker").and_then(|v| v.as_bool()).unwrap_or(false);
+            // Rejected rather than dropped, for the same reason a `deploy`
+            // spelling this build does not understand rejects the host: a path
+            // that is quietly ignored looks exactly like deployment working,
+            // right up until the tab is a bash prompt with none of jsh in it.
+            let deploy_artifact = match t.get("deploy_artifact") {
+                None => None,
+                Some(toml::Value::String(value)) => {
+                    if !remote_text_is_safe(value, false, 4_096)
+                        || !std::path::Path::new(value).is_absolute()
+                    {
+                        return None;
+                    }
+                    Some(value.to_string())
+                }
+                Some(_) => return None,
+            };
             // A spelling this build does not understand rejects the host rather
             // than falling back to `off`. Silently downgrading `incognito` would
             // write jsh's dot-files into an account the user asked to leave
@@ -1115,6 +1136,7 @@ fn parse_remote_hosts(table: &toml::Table) -> Vec<RemoteHost> {
                 multiplex,
                 deploy,
                 docker,
+                deploy_artifact,
             })
         })
         .collect()
@@ -1150,6 +1172,12 @@ fn remote_host_to_toml(h: &RemoteHost) -> toml::Value {
         // Same rule as `deploy`: written only when on, so an ssh host does not
         // grow the key on a round trip.
         t.insert("docker".into(), toml::Value::Boolean(true));
+    }
+    if let Some(artifact) = &h.deploy_artifact {
+        t.insert(
+            "deploy_artifact".into(),
+            toml::Value::String(artifact.clone()),
+        );
     }
     if h.deploy.is_enabled() {
         // Only written when it is on, so a config file that never asked for
@@ -1532,6 +1560,46 @@ mod tests {
             // the cache directory. The deploy tests below opt in explicitly.
             deploy: jterm_core::jsh_remote::Deploy::Off,
             docker: false,
+            deploy_artifact: None,
+        }
+    }
+
+    #[test]
+    fn a_host_can_name_the_jsh_it_deploys() {
+        let mut h = host();
+        h.deploy = jterm_core::jsh_remote::Deploy::Incognito;
+        h.deploy_artifact = Some("/home/tester/jsh/target/release/jsh".into());
+
+        let argv = build_deployed_argv(&h, std::path::Path::new("/c/jsh-remote.sh"));
+
+        let artifact = argv
+            .iter()
+            .position(|a| a == "--artifact")
+            .expect("--artifact");
+        assert_eq!(argv[artifact + 1], "/home/tester/jsh/target/release/jsh");
+    }
+
+    #[test]
+    fn an_artifact_that_could_be_read_as_an_option_or_a_relative_path_rejects_the_host() {
+        // Silently ignoring it would look exactly like deployment working,
+        // right up to the moment the tab is a bash prompt.
+        for artifact in ["target/release/jsh", "-artifact", ""] {
+            let mut table = toml::Table::new();
+            let mut entry = toml::Table::new();
+            entry.insert("host".into(), toml::Value::String("h".into()));
+            entry.insert("deploy".into(), toml::Value::String("persist".into()));
+            entry.insert(
+                "deploy_artifact".into(),
+                toml::Value::String(artifact.to_string()),
+            );
+            table.insert(
+                "remote_hosts".into(),
+                toml::Value::Array(vec![toml::Value::Table(entry)]),
+            );
+            assert!(
+                parse_remote_hosts(&table).is_empty(),
+                "accepted deploy_artifact {artifact:?}"
+            );
         }
     }
 
@@ -1929,12 +1997,15 @@ mod tests {
 
         let mut container = host();
         container.docker = true;
+        container.deploy_artifact = Some("/opt/jsh".into());
         let mut table = toml::Table::new();
         table.insert(
             "remote_hosts".into(),
             toml::Value::Array(vec![remote_host_to_toml(&container)]),
         );
-        assert!(parse_remote_hosts(&table)[0].docker);
+        let restored = parse_remote_hosts(&table);
+        assert!(restored[0].docker);
+        assert_eq!(restored[0].deploy_artifact.as_deref(), Some("/opt/jsh"));
     }
 
     #[test]

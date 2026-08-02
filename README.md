@@ -508,7 +508,28 @@ deploy = "persist"
 ```
 
 `ssh_args`, `multiplex`, and `login_shell` mean nothing to a container and are
-ignored. Containers run as root unless told otherwise, and a jsh older than the
+ignored.
+
+`deploy_artifact` names a jsh built on this machine to push, instead of the
+published release `deploy` would otherwise fetch:
+
+```toml
+[[remote_hosts]]
+name = "service"
+host = "my-service"
+docker = true
+deploy = "incognito"
+deploy_artifact = "/home/you/jsh/target/x86_64-unknown-linux-musl/release/jsh"
+```
+
+It is the only way to deploy where there is no release to fetch — a jsh built
+from a branch, or a machine with no network. Without it, deployment on such a
+machine spends a few seconds failing to reach the release host and then falls
+back to shell integration, which keeps blocks and cwd tracking but none of
+jsh's own behaviour. The path must be absolute, and the binary must be one the
+destination can run: a static musl build covers every distribution, and the
+launcher verifies the version banner after it lands but cannot know which libc
+it was built against. Works for ssh destinations too. Containers run as root unless told otherwise, and a jsh older than the
 "root shell trusts the system helpers it could write" fix refuses `/usr/bin/git`
 and `/usr/bin/bash` as untrusted helpers when euid is 0 — Git completion, the
 Git prompt, and the `.bashrc` import all disappear inside the container while
