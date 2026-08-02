@@ -11,7 +11,7 @@ categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 # Pin the shared contract so a branch move cannot silently change a release build.
-jterm_core = { git = "https://github.com/beamiter/jterm_core.git", rev = "9fac3a09ddc263300306ee0ec1118dc5a21755c6" }
+jterm_core = { git = "https://github.com/beamiter/jterm_core.git", rev = "4a559d52de6726d88a0baea5e0a31c2a70c59b49" }
 relm4 = { version = "0.11", features = ["libadwaita", "gnome_46"] }
 vte4 = { version = "0.10.0", features = ["v0_76"] }
 log = { version = "0.4", features = ["std"] }
