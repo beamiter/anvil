@@ -522,14 +522,14 @@ deploy = "incognito"
 deploy_artifact = "/home/you/jsh/target/x86_64-unknown-linux-musl/release/jsh"
 ```
 
-It is the only way to deploy where there is no release to fetch — a jsh built
-from a branch, or a machine with no network. Without it, deployment on such a
-machine spends a few seconds failing to reach the release host and then falls
-back to shell integration, which keeps blocks and cwd tracking but none of
-jsh's own behaviour. The path must be absolute, and the binary must be one the
-destination can run: a static musl build covers every distribution, and the
-launcher verifies the version banner after it lands but cannot know which libc
-it was built against. Works for ssh destinations too. Containers run as root unless told otherwise, and a jsh older than the
+Usually unnecessary: when the local jsh is a static build — which a Linux
+install now is — the launcher lends it automatically, with no release lookup
+and no network, and the destination runs exactly the version that sent it.
+`deploy_artifact` remains for pushing a build *other* than the one you run,
+such as an artifact from a branch. The path must be absolute, and the binary
+must be one the destination can run; the launcher verifies the version banner
+after it lands but cannot know which libc it was built against. Works for ssh
+destinations too. Containers run as root unless told otherwise, and a jsh older than the
 "root shell trusts the system helpers it could write" fix refuses `/usr/bin/git`
 and `/usr/bin/bash` as untrusted helpers when euid is 0 — Git completion, the
 Git prompt, and the `.bashrc` import all disappear inside the container while
