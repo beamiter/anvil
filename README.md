@@ -492,6 +492,28 @@ shell is the launcher's job. A spelling neither this build nor the launcher
 understands is a config error rather than a silent fall back to `off`, because
 the difference between the modes is whether the destination gets written to.
 
+#### Containers
+
+`docker = true` makes `host` the name of a **running** container and the tab
+connects with `docker exec` instead of ssh. `user` becomes the user inside the
+container, and `deploy` works exactly as it does over ssh:
+
+```toml
+[[remote_hosts]]
+name = "service"
+host = "my-service"
+docker = true
+user = "devuser"
+deploy = "persist"
+```
+
+`ssh_args`, `multiplex`, and `login_shell` mean nothing to a container and are
+ignored. Containers run as root unless told otherwise, and a jsh older than the
+"root shell trusts the system helpers it could write" fix refuses `/usr/bin/git`
+and `/usr/bin/bash` as untrusted helpers when euid is 0 — Git completion, the
+Git prompt, and the `.bashrc` import all disappear inside the container while
+working locally. Pair container tabs with a jsh that carries that fix.
+
 ### AI
 
 AI surfaces are optional and can be hidden with `ai_enabled = false`. Provider

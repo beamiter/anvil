@@ -7,6 +7,13 @@ versioning for tagged releases while it remains experimental.
 
 ### Added
 
+- `[[remote_hosts]]` gained `docker = true`: `host` becomes the name of a
+  running container, the tab connects with `docker exec` instead of ssh, and
+  `user` becomes the user inside it (`-u`, or `--docker-user` when deploying).
+  `deploy` behaves as it does over ssh. `jterm_core::jsh_remote` and
+  `jsh-remote.sh` have supported `--docker` all along; jterm1 hardcoded it to
+  `false`, so a container target could not be expressed in the config at all.
+  `ssh_args`, `multiplex`, and `login_shell` are ignored for a container.
 - Project licensing under `MIT OR Apache-2.0`: canonical `LICENSE-MIT` and
   `LICENSE-APACHE` texts, a `license` field in `Cargo.toml`, and the matching
   AppStream `project_license`, which until now claimed `LicenseRef-proprietary`
