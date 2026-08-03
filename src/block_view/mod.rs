@@ -1130,11 +1130,11 @@ const MAX_RAW_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 /// viewport, and is forced to the full viewport only for alt-screen apps.
 const MIN_INPUT_ROWS: i32 = 6;
 
-/// `(command, exit status, output sample)`. The status is `None` when the shell
-/// reported none, so a consumer that styles failures can tell "failed" apart from
-/// "outcome unknown".
+/// `(command, exit status, output sample, agent generation, duration ms)`. The
+/// status is `None` when the shell reported none, so a consumer that styles
+/// failures can tell "failed" apart from "outcome unknown".
 type BlockFinishedCallbacks =
-    Rc<RefCell<Vec<Box<dyn Fn(String, Option<i32>, String, Option<u64>)>>>>;
+    Rc<RefCell<Vec<Box<dyn Fn(String, Option<i32>, String, Option<u64>, Option<u64>)>>>>;
 type BlockContextCallbacks = Rc<RefCell<Vec<Box<dyn Fn(crate::ai::BlockContext)>>>>;
 type CwdCallbacks = Rc<RefCell<Vec<Box<dyn Fn(&str, bool)>>>>;
 pub(crate) type DebugInfo = Vec<(&'static str, Vec<(String, String)>)>;
@@ -1900,6 +1900,7 @@ impl ReaderCtx {
                                             exit_code,
                                             output_sample.clone(),
                                             agent_generation,
+                                            duration_ms,
                                         );
                                     }
                                     // Attach this block's output to the shell's own
@@ -4911,7 +4912,7 @@ impl TermView {
 
     pub fn connect_block_finished<F>(&self, f: F)
     where
-        F: Fn(String, Option<i32>, String, Option<u64>) + 'static,
+        F: Fn(String, Option<i32>, String, Option<u64>, Option<u64>) + 'static,
     {
         self.block_finished_callbacks.borrow_mut().push(Box::new(f));
     }
@@ -5335,6 +5336,12 @@ impl TermView {
         }
 
         *visible = new_visible;
+    }
+
+    /// Grid size (cols, rows) of the live VTE, for the bottom bar's grid
+    /// segment.
+    pub fn grid_size(&self) -> (i64, i64) {
+        (self.active_vte.column_count(), self.active_vte.row_count())
     }
 
     /// Collect a snapshot of internal runtime state for the debug dashboard.

@@ -65,6 +65,10 @@ block_history_compress = true
 preserve_live_scrollback = false
 show_repo_strip = true
 
+# Bottom status bar: cwd, git branch, last command's status/duration, grid
+# size, and tab position. The same key toggles it in every jterm.
+bottom_bar = true
+
 # Terminal protocol and clipboard behavior.
 mouse_reporting_enabled = true
 focus_reporting_enabled = true

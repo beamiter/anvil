@@ -79,6 +79,7 @@ impl AppModel {
         self.content_paned.set_position(sidebar_width);
         self.apply_tab_placement();
         self.set_sidebar_visible(sidebar_visible, false);
+        self.set_bottom_bar_visible(new_config.bottom_bar);
         let font_desc = self.config.borrow().font_desc.clone();
         let scrollback = new_config.terminal_scrollback_lines as i64;
         self.font_scale = new_config.default_font_scale;
@@ -122,6 +123,16 @@ impl AppModel {
         let fr = (fg.red() * 255.0) as u8;
         let fgg = (fg.green() * 255.0) as u8;
         let fb = (fg.blue() * 255.0) as u8;
+        // The bottom bar's positive/negative tones reuse the terminal
+        // palette's ANSI green/red (jterm_core::bottom_bar's Tone contract).
+        let ok = &config.palette[2];
+        let err = &config.palette[1];
+        let okr = (ok.red() * 255.0) as u8;
+        let okg = (ok.green() * 255.0) as u8;
+        let okb = (ok.blue() * 255.0) as u8;
+        let er = (err.red() * 255.0) as u8;
+        let eg = (err.green() * 255.0) as u8;
+        let eb = (err.blue() * 255.0) as u8;
         let css = format!(
             ".terminal-box scrollbar {{ background-color: rgb({br},{bgg},{bb}); }}
              .terminal-box scrollbar trough {{ background-color: rgb({br},{bgg},{bb}); }}
@@ -132,7 +143,11 @@ impl AppModel {
              .top-bar button {{ color: rgb({fr},{fgg},{fb}); }}
              .tab-strip {{ background-color: rgb({br},{bgg},{bb}); }}
              .tab-strip-btn {{ color: rgba({fr},{fgg},{fb},0.6); }}
-             .tab-strip-btn:checked {{ color: rgb({fr},{fgg},{fb}); }}"
+             .tab-strip-btn:checked {{ color: rgb({fr},{fgg},{fb}); }}
+             .bottom-bar {{ background-color: rgb({br},{bgg},{bb}); color: rgb({fr},{fgg},{fb}); border-top-color: rgba({fr},{fgg},{fb},0.2); }}
+             .bottom-bar .bb-muted {{ color: rgba({fr},{fgg},{fb},0.55); }}
+             .bottom-bar .bb-ok {{ color: rgb({okr},{okg},{okb}); }}
+             .bottom-bar .bb-err {{ color: rgb({er},{eg},{eb}); }}"
         );
         self.dyn_css.load_from_data(&css);
     }

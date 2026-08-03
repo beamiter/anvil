@@ -98,6 +98,7 @@ pub(crate) enum AppMsg {
         exit_code: i32,
         output_sample: String,
         agent_generation: Option<u64>,
+        duration_ms: Option<u64>,
     },
     AgentExecutionStartFailed {
         generation: u64,

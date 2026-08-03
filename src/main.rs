@@ -7,6 +7,7 @@ mod ai;
 mod ai_palette_ops;
 mod app_msg;
 mod block_view;
+mod bottom_bar_ui;
 mod cli;
 mod config;
 mod config_ops;
@@ -130,6 +131,11 @@ struct AppModel {
     top_bar: Controller<top_bar::TopBarModel>,
     sidebar_box: gtk::Box,
     content_paned: gtk::Paned,
+    /// Family-wide bottom status bar (`jterm_core::bottom_bar`): the container
+    /// plus its left/right segment holders, refilled on each refresh.
+    bottom_bar: gtk::Box,
+    bottom_bar_left: gtk::Box,
+    bottom_bar_right: gtk::Box,
     sidebar_stack: gtk::Stack,
     sidebar_toggle: Controller<sidebar_toggle::SidebarToggleModel>,
     tab_placement: std::cell::Cell<config::TabPlacement>,
@@ -203,6 +209,7 @@ fn create_pane(
             exit_code,
             output_sample,
             agent_generation,
+            duration_ms,
         } => AppMsg::AgentBlockFinished {
             tab_id,
             pane_id,
@@ -210,6 +217,7 @@ fn create_pane(
             exit_code,
             output_sample,
             agent_generation,
+            duration_ms,
         },
         VteOutput::AgentExecutionStartFailed { generation } => {
             AppMsg::AgentExecutionStartFailed { generation }
@@ -255,6 +263,8 @@ fn create_pane(
         session_id,
         mode,
         probe,
+        last_exit: None,
+        last_duration_ms: None,
     }
 }
 
@@ -313,6 +323,9 @@ impl SimpleComponent for AppModel {
                     content_paned -> gtk::Paned {
                         set_vexpand: true,
                     },
+
+                    #[local_ref]
+                    bottom_bar -> gtk::Box {},
                 },
             }
         }
@@ -482,6 +495,19 @@ impl SimpleComponent for AppModel {
         content_paned.set_shrink_start_child(false);
         content_paned.set_shrink_end_child(true);
         content_paned.set_position(sidebar_width);
+
+        // Bottom status bar: left segments pack from the left edge, right
+        // segments against the right edge, an expanding spacer between them.
+        let bottom_bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        bottom_bar.add_css_class("bottom-bar");
+        let bottom_bar_left = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        let bottom_bar_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        bottom_bar_spacer.set_hexpand(true);
+        let bottom_bar_right = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        bottom_bar.append(&bottom_bar_left);
+        bottom_bar.append(&bottom_bar_spacer);
+        bottom_bar.append(&bottom_bar_right);
+        bottom_bar.set_visible(config.borrow().bottom_bar);
 
         let mut settings_font_names: Vec<String> = root
             .pango_context()
@@ -732,6 +758,9 @@ impl SimpleComponent for AppModel {
             top_bar,
             sidebar_box: sidebar_box.clone(),
             content_paned: content_paned.clone(),
+            bottom_bar: bottom_bar.clone(),
+            bottom_bar_left: bottom_bar_left.clone(),
+            bottom_bar_right: bottom_bar_right.clone(),
             sidebar_stack: sidebar_stack.clone(),
             sidebar_toggle,
             tab_placement: std::cell::Cell::new(tab_placement),
@@ -944,6 +973,7 @@ impl SimpleComponent for AppModel {
         }
 
         model.init_file_tree();
+        model.refresh_bottom_bar();
 
         // jterm1 prefers jsh as its shell, so it is worth noticing when the
         // machine has none or an old one. The check runs on a worker thread and
@@ -1071,6 +1101,7 @@ impl SimpleComponent for AppModel {
                     } else if connection_changed {
                         self.sync_tab_strip();
                     }
+                    self.refresh_bottom_bar();
                 }
             }
             AppMsg::PaneRemoteSessionId(pane_id, id) => {
@@ -1100,10 +1131,15 @@ impl SimpleComponent for AppModel {
                         self.tabs[ti].activity = false;
                         self.sync_tab_strip();
                     }
+                    self.refresh_bottom_bar();
                 }
             }
             AppMsg::SwapPanes { dragged, target } => self.swap_panes(dragged, target),
-            AppMsg::RefreshPaneHeaders => self.refresh_active_pane_headers(),
+            AppMsg::RefreshPaneHeaders => {
+                self.refresh_active_pane_headers();
+                // The bar's running-command and grid segments are polled too.
+                self.refresh_bottom_bar();
+            }
             AppMsg::TitleChanged(pane_id, title) => {
                 if let Some((idx, pane_index)) = self.find_pane(pane_id) {
                     self.tabs[idx].panes[pane_index].title =
@@ -1275,9 +1311,16 @@ impl SimpleComponent for AppModel {
                 exit_code,
                 output_sample,
                 agent_generation,
+                duration_ms,
             } => {
-                if let Some((tab_index, _)) = self.find_pane(pane_id) {
+                if let Some((tab_index, pane_index)) = self.find_pane(pane_id) {
                     let tab_id = self.tabs[tab_index].id;
+                    {
+                        let pane = &mut self.tabs[tab_index].panes[pane_index];
+                        pane.last_exit = Some(exit_code);
+                        pane.last_duration_ms = duration_ms;
+                    }
+                    self.refresh_bottom_bar();
                     self.agent_handle_block_finished(
                         agent_ops::AgentBlockCompletion {
                             tab_id,

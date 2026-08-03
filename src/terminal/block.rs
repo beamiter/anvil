@@ -60,6 +60,12 @@ impl BlockTerminal {
             .is_some_and(|view| view.can_accept_agent_command())
     }
 
+    /// Grid size (cols, rows) of the live VTE; `None` when the PTY failed to
+    /// start and there is no view.
+    pub(crate) fn grid_size(&self) -> Option<(i64, i64)> {
+        self.view.as_ref().map(|view| view.grid_size())
+    }
+
     pub(crate) fn debug_info(&self) -> crate::block_view::DebugInfo {
         self.view.as_ref().map_or_else(
             || {
@@ -183,7 +189,7 @@ fn connect_view_outputs(
     });
     view.connect_block_finished({
         let sender = sender.clone();
-        move |command, exit_code, output_sample, agent_generation| {
+        move |command, exit_code, output_sample, agent_generation, duration_ms| {
             let _ = sender.output(command_finished_output(exit_code));
             let _ = sender.output(VteOutput::BlockFinished {
                 command,
@@ -191,6 +197,7 @@ fn connect_view_outputs(
                 exit_code: crate::block_view::exit_code_for_i32_api(exit_code),
                 output_sample,
                 agent_generation,
+                duration_ms,
             });
         }
     });

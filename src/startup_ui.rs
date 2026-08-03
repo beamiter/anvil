@@ -26,9 +26,13 @@ pub(crate) fn tab_row_output_to_msg(output: tab_strip::TabRowOutput) -> AppMsg {
 
 #[allow(deprecated)]
 pub(crate) fn install_static_css() {
+    // Colors are theme work (`apply_dynamic_css`); only the bar's shape and
+    // canonical height come from the family contract.
+    let bar_height = jterm_core::bottom_bar::BAR_HEIGHT as i32;
     let provider = gtk::CssProvider::new();
     provider.load_from_data(&format!(
-        "{}{}",
+        "{}{}
+         .bottom-bar {{ min-height: {bar_height}px; padding: 0 8px; font-size: 0.85em; border-top: 1px solid rgba(127,127,127,0.4); }}",
         crate::pane_header::PANE_HEADER_CSS,
         ".tab-strip-btn { padding: 4px 8px; border-radius: 4px; margin-bottom: 2px; color: #ffffff; }
          .tab-strip-btn:checked { font-weight: bold; border: 1px solid currentColor; border-radius: 4px; }

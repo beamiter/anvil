@@ -465,6 +465,9 @@ pub enum VteOutput {
         output_sample: String,
         /// One-shot identity armed locally before the reviewed PTY write.
         agent_generation: Option<u64>,
+        /// Wall-clock duration of the block, when one was recorded. Feeds the
+        /// bottom bar's last-command segment.
+        duration_ms: Option<u64>,
     },
     /// Approval advanced the protocol, but the pane could no longer arm/write
     /// that exact generation. The Agent integration must fail closed.

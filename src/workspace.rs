@@ -7,6 +7,7 @@ use relm4::gtk;
 use relm4::gtk::prelude::*;
 use relm4::prelude::Controller;
 use relm4::ComponentController;
+use vte4::TerminalExt;
 
 use crate::config::{self, TerminalMode};
 use crate::process;
@@ -48,6 +49,25 @@ impl TermCtl {
             Self::Block(controller) => Some(controller.model().debug_info()),
         }
     }
+
+    /// Grid size (cols, rows) of this pane's live VTE. `(0, 0)` means unknown
+    /// (e.g. a Block pane whose PTY failed to start), which the bottom bar
+    /// renders as no segment at all.
+    pub(crate) fn grid_size(&self) -> (u16, u16) {
+        let clamp = |count: i64| count.clamp(0, u16::MAX as i64) as u16;
+        match self {
+            Self::Vte(controller) => {
+                let model = controller.model();
+                let terminal = model.terminal();
+                (clamp(terminal.column_count()), clamp(terminal.row_count()))
+            }
+            Self::Block(controller) => controller
+                .model()
+                .grid_size()
+                .map(|(cols, rows)| (clamp(cols), clamp(rows)))
+                .unwrap_or((0, 0)),
+        }
+    }
 }
 
 pub(crate) struct Pane {
@@ -66,6 +86,12 @@ pub(crate) struct Pane {
     pub(crate) session_id: Option<String>,
     pub(crate) mode: TerminalMode,
     pub(crate) probe: terminal::PaneProbe,
+    /// Exit code of the last finished block in this pane. Block mode only:
+    /// plain VTE panes have no block boundary, so both stay `None` and the
+    /// bottom bar simply omits the last-command segment.
+    pub(crate) last_exit: Option<i32>,
+    /// Wall-clock duration of that block, when one was recorded.
+    pub(crate) last_duration_ms: Option<u64>,
 }
 
 impl Pane {

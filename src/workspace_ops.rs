@@ -1085,6 +1085,7 @@ impl AppModel {
         self.file_tree_goto_current_cwd();
         self.refresh_pane_headers(idx);
         self.rebuild_tab_strip(sender);
+        self.refresh_bottom_bar();
     }
 
     pub(crate) fn close_tab(&mut self, id: u64, sender: &ComponentSender<AppModel>) {

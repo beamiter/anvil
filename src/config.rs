@@ -417,6 +417,9 @@ pub struct Config {
     pub(crate) notify_long_blocks: bool,
     pub(crate) notify_long_block_threshold_ms: u64,
     pub(crate) show_repo_strip: bool,
+    /// Show the family-wide bottom status bar (`jterm_core::bottom_bar`).
+    /// File-only toggle, not persisted by the settings dialog.
+    pub(crate) bottom_bar: bool,
     /// Saved SSH targets selectable from the context menu.
     pub(crate) remote_hosts: Vec<RemoteHost>,
 }
@@ -490,6 +493,7 @@ impl Config {
             notify_long_blocks: false,
             notify_long_block_threshold_ms: 10_000,
             show_repo_strip: false,
+            bottom_bar: false,
             remote_hosts: Vec::new(),
         }
     }
@@ -802,6 +806,7 @@ struct FileConfig {
     notify_long_blocks: Option<bool>,
     notify_long_block_threshold_ms: Option<u64>,
     show_repo_strip: Option<bool>,
+    bottom_bar: Option<bool>,
     remote_hosts: Vec<RemoteHost>,
 }
 
@@ -1009,6 +1014,9 @@ fn load_file_config() -> FileConfig {
             .and_then(|v| v.as_integer())
             .and_then(|v| u64::try_from(v).ok()),
         show_repo_strip: table.get("show_repo_strip").and_then(|v| v.as_bool()),
+        bottom_bar: table
+            .get(jterm_core::bottom_bar::CONFIG_KEY)
+            .and_then(|v| v.as_bool()),
         remote_hosts,
     }
 }
@@ -1449,6 +1457,9 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         notify_long_blocks: fc.notify_long_blocks.unwrap_or(true),
         notify_long_block_threshold_ms: fc.notify_long_block_threshold_ms.unwrap_or(10_000),
         show_repo_strip: fc.show_repo_strip.unwrap_or(true),
+        bottom_bar: fc
+            .bottom_bar
+            .unwrap_or(jterm_core::bottom_bar::ENABLED_BY_DEFAULT),
         remote_hosts: fc.remote_hosts,
     };
 
