@@ -1524,6 +1524,7 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
         "notify_long_blocks",
         "notify_long_block_threshold_ms",
         "bottom_bar",
+        "click_moves_cursor",
         "remote_hosts",
     ]
     .into_iter()
@@ -1594,6 +1595,7 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
         "preserve_live_scrollback",
         "notify_long_blocks",
         "bottom_bar",
+        "click_moves_cursor",
     ] {
         check_type(&mut report, table, key, ExpectedType::Boolean);
     }

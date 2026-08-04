@@ -419,6 +419,9 @@ pub struct Config {
     /// Show the family-wide bottom status bar (`jterm_core::bottom_bar`).
     /// File-only toggle, not persisted by the settings dialog.
     pub(crate) bottom_bar: bool,
+    /// A plain click in the live prompt places the shell's edit cursor there
+    /// (`jterm_core::click_cursor`). Same key and default in every jterm.
+    pub(crate) click_moves_cursor: bool,
     /// Saved SSH targets selectable from the context menu.
     pub(crate) remote_hosts: Vec<RemoteHost>,
 }
@@ -492,6 +495,7 @@ impl Config {
             notify_long_blocks: false,
             notify_long_block_threshold_ms: 10_000,
             bottom_bar: false,
+            click_moves_cursor: jterm_core::click_cursor::ENABLED_BY_DEFAULT,
             remote_hosts: Vec::new(),
         }
     }
@@ -804,6 +808,7 @@ struct FileConfig {
     notify_long_blocks: Option<bool>,
     notify_long_block_threshold_ms: Option<u64>,
     bottom_bar: Option<bool>,
+    click_moves_cursor: Option<bool>,
     remote_hosts: Vec<RemoteHost>,
 }
 
@@ -1013,6 +1018,7 @@ fn load_file_config() -> FileConfig {
         bottom_bar: table
             .get(jterm_core::bottom_bar::CONFIG_KEY)
             .and_then(|v| v.as_bool()),
+        click_moves_cursor: table.get("click_moves_cursor").and_then(|v| v.as_bool()),
         remote_hosts,
     }
 }
@@ -1455,6 +1461,9 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         bottom_bar: fc
             .bottom_bar
             .unwrap_or(jterm_core::bottom_bar::ENABLED_BY_DEFAULT),
+        click_moves_cursor: fc
+            .click_moves_cursor
+            .unwrap_or(jterm_core::click_cursor::ENABLED_BY_DEFAULT),
         remote_hosts: fc.remote_hosts,
     };
 

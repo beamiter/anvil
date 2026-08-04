@@ -4255,6 +4255,21 @@ impl TermView {
             active_vte.add_controller(active_click);
         }
 
+        // A plain click in the live prompt places the shell's edit cursor
+        // there, the way an editor would, instead of making the user walk an
+        // arrow key across a long command.
+        crate::terminal::click_cursor::install(
+            &active_vte,
+            crate::terminal::click_cursor::ClickCursorCtx {
+                enabled: config.click_moves_cursor,
+                pty: Rc::clone(&pty),
+                prompt_end_pos: prompt_end_pos.clone(),
+                bstate: bstate.clone(),
+                mouse_mode: mouse_reporting_mode.clone(),
+                fullscreen: fullscreen.clone(),
+            },
+        );
+
         // Wheel handling inside an alt-screen + mouse-reporting app (less / vim /
         // htop). VTE only synthesizes mouse-wheel CSI sequences when it owns the
         // PTY; ours is fed by our reader, so we synthesize and write the bytes
