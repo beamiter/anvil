@@ -485,26 +485,6 @@ pub(crate) fn recall_command_at_prompt(
     true
 }
 
-/// Probe the cwd for git metadata and update the strip label. Hides the
-/// label when cwd is empty, missing, or not inside a repo — the user
-/// shouldn't see a stale branch from a previous pane state.
-fn refresh_repo_strip(label: &gtk::Label, cwd: &str) {
-    if cwd.is_empty() {
-        label.set_visible(false);
-        return;
-    }
-    let path = std::path::Path::new(cwd);
-    match crate::git_meta::read(path) {
-        Some(meta) => {
-            label.set_text(&crate::git_meta::format_strip(&meta));
-            label.set_visible(true);
-        }
-        None => {
-            label.set_visible(false);
-        }
-    }
-}
-
 /// Dynamic OSC 10/11/12 color overrides for one pane.
 ///
 /// The parser passes the original set/reset bytes through, so the live VTE
@@ -1349,7 +1329,6 @@ struct ReaderCtx {
     /// CommandStart. The pane's tracked cwd has already moved on after a `cd`.
     command_cwd_rc: Rc<RefCell<Option<String>>>,
     current_cwd_for_cb: Rc<RefCell<String>>,
-    current_cwd_external_for_cb: Rc<Cell<bool>>,
     event_buf: Rc<RefCell<Vec<ParserEvent>>>,
     unread_count_rc: Rc<Cell<u32>>,
     jump_fab: gtk::Button,
@@ -1365,10 +1344,6 @@ struct ReaderCtx {
     /// Recomputes the compact/full visual live surface. PTY geometry is kept
     /// separately at the full pane viewport.
     layout_active_surface: Rc<dyn Fn()>,
-    /// Bottom-of-pane repo metadata label. Re-probed every time a block
-    /// finishes (the user may have just run `git commit`, `git pull`,
-    /// or anything else that changes branch/dirty/ahead-behind).
-    repo_strip: gtk::Label,
     block_finished_cbs: BlockFinishedCallbacks,
     ask_ai_about_block_cbs: BlockContextCallbacks,
 }
@@ -1525,7 +1500,6 @@ impl ReaderCtx {
             execution_id_rc,
             command_cwd_rc,
             current_cwd_for_cb,
-            current_cwd_external_for_cb,
             event_buf,
             unread_count_rc,
             jump_fab,
@@ -1539,7 +1513,6 @@ impl ReaderCtx {
             agent_prompt_generation_rc,
             active_agent_generation_rc,
             layout_active_surface,
-            repo_strip,
             block_finished_cbs,
             ask_ai_about_block_cbs,
         } = self;
@@ -1944,16 +1917,6 @@ impl ReaderCtx {
                                                 );
                                             }
                                         }
-                                    }
-                                    // Re-probe git state — the command that just
-                                    // finished may have changed branch/dirty/upstream.
-                                    if cfg.show_repo_strip
-                                        && !current_cwd_external_for_cb.get()
-                                    {
-                                        let cwd = current_cwd_for_cb.borrow().clone();
-                                        refresh_repo_strip(&repo_strip, &cwd);
-                                    } else {
-                                        repo_strip.set_visible(false);
                                     }
                                 }
 
@@ -3388,21 +3351,6 @@ impl TermView {
         scroll_overlay.add_overlay(&jump_fab);
         root.append(&scroll_overlay);
 
-        // ── Repo-status strip ────────────────────────────────────────────
-        // A thin always-visible label at the bottom showing the current
-        // pane's git branch + dirty marker + ahead/behind. Refreshed on
-        // cwd change and on every finished block (the user may have just
-        // run `git commit` or `git pull`). Hidden when cwd isn't a repo.
-        let repo_strip = gtk::Label::new(None);
-        repo_strip.set_halign(gtk::Align::Start);
-        repo_strip.set_xalign(0.0);
-        repo_strip.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        repo_strip.add_css_class("repo-strip");
-        repo_strip.set_visible(false);
-        if config.show_repo_strip {
-            root.append(&repo_strip);
-        }
-
         let unread_count: Rc<Cell<u32>> = Rc::new(Cell::new(0));
 
         // ── PTY ───────────────────────────────────────────────────────────
@@ -3738,10 +3686,8 @@ impl TermView {
             let current_cwd_for_signal = current_cwd.clone();
             let current_cwd_external_for_signal = current_cwd_external.clone();
             let vte_for_cwd = active_vte.clone();
-            let repo_strip_for_cwd = repo_strip.clone();
             let pty_for_cwd = pty.clone();
             let cwd_token_for_signal = cwd_token.to_string();
-            let repo_strip_enabled = config.show_repo_strip;
             active_vte.connect_current_directory_uri_notify(move |_| {
                 if let Some(uri) = vte_for_cwd.current_directory_uri() {
                     if let Ok((path, host)) = glib::filename_from_uri(uri.as_str()) {
@@ -3761,11 +3707,6 @@ impl TermView {
                             crate::terminal::resolve_cwd_external(authority, foreground_external);
                         current_cwd_external_for_signal.set(external);
                         *current_cwd_for_signal.borrow_mut() = path.clone();
-                        if repo_strip_enabled && !external {
-                            refresh_repo_strip(&repo_strip_for_cwd, &path);
-                        } else {
-                            repo_strip_for_cwd.set_visible(false);
-                        }
                         for cb in cwd_cbs.borrow().iter() {
                             cb(&path, external);
                         }
@@ -3774,15 +3715,6 @@ impl TermView {
             });
         }
 
-        // Initial probe so the strip is populated for the starting cwd
-        // before the user has cd'd anywhere (the OSC 7 above only fires
-        // on a change).
-        {
-            let initial_cwd = current_cwd.borrow().clone();
-            if config.show_repo_strip && !current_cwd_external.get() {
-                refresh_repo_strip(&repo_strip, &initial_cwd);
-            }
-        }
         {
             let title_cbs = title_callbacks.clone();
             let vte_for_title = active_vte.clone();
@@ -3842,7 +3774,6 @@ impl TermView {
             let block_start_time_for_cb = block_start_time.clone();
             let pending_exit_code_rc = pending_exit_code.clone();
             let current_cwd_for_cb = current_cwd.clone();
-            let current_cwd_external_for_cb = current_cwd_external.clone();
 
             let event_buf: Rc<RefCell<Vec<ParserEvent>>> =
                 Rc::new(RefCell::new(Vec::with_capacity(32)));
@@ -3885,7 +3816,6 @@ impl TermView {
                 execution_id_rc: execution_id.clone(),
                 command_cwd_rc: command_cwd.clone(),
                 current_cwd_for_cb,
-                current_cwd_external_for_cb,
                 event_buf,
                 unread_count_rc: unread_count.clone(),
                 jump_fab: jump_fab.clone(),
@@ -3899,7 +3829,6 @@ impl TermView {
                 agent_prompt_generation_rc: agent_prompt_generation.clone(),
                 active_agent_generation_rc: active_agent_generation.clone(),
                 layout_active_surface: layout_active_surface.clone(),
-                repo_strip: repo_strip.clone(),
                 block_finished_cbs: block_finished_callbacks.clone(),
                 ask_ai_about_block_cbs: ask_ai_about_block_callbacks.clone(),
             }

@@ -1523,7 +1523,6 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
         "preserve_live_scrollback",
         "notify_long_blocks",
         "notify_long_block_threshold_ms",
-        "show_repo_strip",
         "bottom_bar",
         "remote_hosts",
     ]
@@ -1594,7 +1593,6 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
         "scroll_reporting_enabled",
         "preserve_live_scrollback",
         "notify_long_blocks",
-        "show_repo_strip",
         "bottom_bar",
     ] {
         check_type(&mut report, table, key, ExpectedType::Boolean);
