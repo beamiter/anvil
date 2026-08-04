@@ -863,6 +863,19 @@ fn apply_config_to_table(config: &Config, table: &mut toml::Table) {
         toml::Value::Boolean(config.allow_remote_clipboard_write),
     );
 
+    // Replace the whole array: entries are edited as a set in the settings
+    // dialog, so a partial merge could resurrect a removed host. A fresh config
+    // with zero hosts writes no key; an existing key persists as `[]` so an
+    // explicit "no hosts" survives.
+    if table.contains_key("remote_hosts") || !config.remote_hosts.is_empty() {
+        let hosts: Vec<toml::Value> = config
+            .remote_hosts
+            .iter()
+            .map(config::remote_host_to_toml)
+            .collect();
+        table.insert("remote_hosts".into(), toml::Value::Array(hosts));
+    }
+
     let mut colors = table
         .remove("colors")
         .and_then(|value| value.as_table().cloned())
@@ -1312,6 +1325,8 @@ fn validate_remote_hosts(report: &mut ConfigValidationReport, table: &toml::Tabl
         "name",
         "host",
         "user",
+        "docker",
+        "deploy_artifact",
         "remote_shell",
         "session",
         "ssh_args",
@@ -1368,11 +1383,35 @@ fn validate_remote_hosts(report: &mut ConfigValidationReport, table: &toml::Tabl
                 }
             }
         }
-        for key in ["login_shell", "multiplex"] {
+        for key in ["login_shell", "multiplex", "docker"] {
             if let Some(value) = host.get(key) {
                 if !value.is_bool() {
                     report.error(format!("{prefix}.{key}"), "must be a boolean");
                 }
+            }
+        }
+        if let Some(value) = host.get("deploy_artifact") {
+            match value.as_str() {
+                Some(text) if !text.trim().is_empty() => {
+                    validate_remote_text(
+                        report,
+                        format!("{prefix}.deploy_artifact"),
+                        text,
+                        false,
+                        4_096,
+                    );
+                    if !Path::new(text).is_absolute() {
+                        report.error(
+                            format!("{prefix}.deploy_artifact"),
+                            "must be an absolute path",
+                        );
+                    }
+                }
+                Some(_) => report.error(format!("{prefix}.deploy_artifact"), "must not be empty"),
+                None => report.error(
+                    format!("{prefix}.deploy_artifact"),
+                    "must be an absolute path string",
+                ),
             }
         }
         if let Some(value) = host.get("deploy") {
@@ -1971,6 +2010,137 @@ mod tests {
             Some(false)
         );
         assert!(!contents.to_ascii_lowercase().contains("api_key"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn ssh_host() -> config::RemoteHost {
+        config::RemoteHost {
+            name: "staging".into(),
+            host: "server.example.com".into(),
+            user: Some("deploy".into()),
+            docker: false,
+            deploy_artifact: None,
+            remote_shell: "jsh".into(),
+            session: None,
+            ssh_args: vec!["-p".into(), "22".into()],
+            login_shell: true,
+            multiplex: true,
+            deploy: jterm_core::jsh_remote::Deploy::Persist,
+        }
+    }
+
+    fn docker_host() -> config::RemoteHost {
+        config::RemoteHost {
+            name: "dev-container".into(),
+            host: "dev-env".into(),
+            user: None,
+            docker: true,
+            deploy_artifact: Some("/opt/jsh/jsh".into()),
+            remote_shell: "jsh".into(),
+            session: None,
+            ssh_args: Vec::new(),
+            login_shell: true,
+            multiplex: true,
+            deploy: jterm_core::jsh_remote::Deploy::Off,
+        }
+    }
+
+    #[test]
+    fn saving_writes_remote_hosts_into_a_file_that_lacked_the_key() {
+        let directory = temporary_directory("remote-save");
+        let path = directory.join("config.toml");
+        fs::write(&path, "opacity = 0.5\n").unwrap();
+        let expected = revision_at(&path).unwrap();
+        let mut config = config::load_safe_config().0;
+        config.remote_hosts = vec![ssh_host(), docker_host()];
+
+        save_config_to_path(&path, &config, Some(&expected)).unwrap();
+        let table = fs::read_to_string(&path)
+            .unwrap()
+            .parse::<toml::Table>()
+            .unwrap();
+        let written = toml::Value::Array(vec![
+            config::remote_host_to_toml(&ssh_host()),
+            config::remote_host_to_toml(&docker_host()),
+        ]);
+        assert_eq!(table.get("remote_hosts"), Some(&written));
+        // The parser side of the round trip is covered in config.rs; here the
+        // saved file has to come back clean through the schema validator.
+        let report = validate_path(&path);
+        assert_eq!(report.errors(), 0);
+        assert_eq!(report.warnings(), 0);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn emptying_the_remote_host_list_persists_an_empty_array() {
+        let directory = temporary_directory("remote-empty");
+        let path = directory.join("config.toml");
+        fs::write(
+            &path,
+            "[[remote_hosts]]\nname = 'staging'\nhost = 'server.example.com'\n",
+        )
+        .unwrap();
+        let expected = revision_at(&path).unwrap();
+        let config = config::load_safe_config().0;
+        assert!(config.remote_hosts.is_empty());
+
+        save_config_to_path(&path, &config, Some(&expected)).unwrap();
+        let table = fs::read_to_string(&path)
+            .unwrap()
+            .parse::<toml::Table>()
+            .unwrap();
+        assert_eq!(
+            table.get("remote_hosts"),
+            Some(&toml::Value::Array(Vec::new()))
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_fresh_config_with_no_remote_hosts_writes_no_key() {
+        let directory = temporary_directory("remote-fresh");
+        let path = directory.join("config.toml");
+        let config = config::load_safe_config().0;
+
+        save_config_to_path(&path, &config, Some(&ConfigRevision::Missing)).unwrap();
+        let table = fs::read_to_string(&path)
+            .unwrap()
+            .parse::<toml::Table>()
+            .unwrap();
+        assert!(!table.contains_key("remote_hosts"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn validation_knows_the_container_host_keys() {
+        let directory = temporary_directory("remote-container");
+        let path = directory.join("config.toml");
+        fs::write(
+            &path,
+            concat!(
+                "[[remote_hosts]]\n",
+                "name = 'dev'\n",
+                "host = 'dev-env'\n",
+                "docker = true\n",
+                "deploy_artifact = '/opt/jsh/jsh'\n",
+                "deploy = 'persist'\n",
+            ),
+        )
+        .unwrap();
+        let report = validate_path(&path);
+        assert_eq!(report.errors(), 0);
+        assert_eq!(report.warnings(), 0);
+
+        // The parser rejects a relative artifact path; the validator has to
+        // say so instead of skipping the host silently.
+        fs::write(
+            &path,
+            "[[remote_hosts]]\nhost = 'dev-env'\ndeploy_artifact = 'jsh'\n",
+        )
+        .unwrap();
+        let report = validate_path(&path);
+        assert_eq!(report.errors(), 1);
         fs::remove_dir_all(directory).unwrap();
     }
 

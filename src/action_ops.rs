@@ -226,6 +226,7 @@ impl AppModel {
                         safe_mode: self.safe_mode,
                         notifications: config.notify_long_blocks,
                         remote_clipboard: config.allow_remote_clipboard_write,
+                        remote_hosts: config.remote_hosts.clone(),
                     },
                     self.window.clone(),
                 ));

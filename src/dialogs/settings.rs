@@ -9,6 +9,8 @@ use relm4::adw::prelude::*;
 use relm4::gtk;
 use relm4::prelude::*;
 
+use crate::config::{remote_text_is_safe, RemoteHost};
+
 #[derive(Debug, Clone)]
 pub(crate) struct SettingsValues {
     pub(crate) theme: u32,
@@ -35,6 +37,27 @@ pub(crate) struct SettingsValues {
     pub(crate) safe_mode: bool,
     pub(crate) notifications: bool,
     pub(crate) remote_clipboard: bool,
+    pub(crate) remote_hosts: Vec<RemoteHost>,
+}
+
+/// Unsubmitted add-host form state. Lives beside `SettingsValues` rather than
+/// inside it so the two construction sites only carry persisted state.
+#[derive(Debug, Default)]
+struct RemoteDraft {
+    name: String,
+    host: String,
+    user: String,
+    docker: bool,
+    /// Index into the deploy combo: 0 off, 1 persist, 2 incognito.
+    deploy: u32,
+}
+
+/// Which form row carries the validation error, so only that entry turns red.
+#[derive(Clone, Copy, Debug)]
+enum RemoteField {
+    Name,
+    Host,
+    User,
 }
 
 pub(crate) struct SettingsInit {
@@ -67,6 +90,13 @@ pub(crate) enum SettingsMsg {
     AgentMaxTurns(f64),
     Notifications(bool),
     RemoteClipboard(bool),
+    RemoteHostName(String),
+    RemoteHostHost(String),
+    RemoteHostUser(String),
+    RemoteHostDocker(bool),
+    RemoteHostDeploy(u32),
+    RemoteHostAdd,
+    RemoteHostRemove(usize),
 }
 
 #[derive(Debug)]
@@ -92,12 +122,18 @@ pub(crate) enum SettingsOutput {
     AgentMaxTurns(u32),
     Notifications(bool),
     RemoteClipboard(bool),
+    /// The full list after any add or remove; the app replaces and persists it.
+    RemoteHosts(Vec<RemoteHost>),
 }
 
 pub(crate) struct SettingsModel {
     theme_names: Vec<String>,
     font_names: Vec<String>,
     values: SettingsValues,
+    remote_draft: RemoteDraft,
+    /// Host rows currently added to the "Remote Hosts" group. The view! macro
+    /// cannot express a dynamic list, so these are rebuilt imperatively.
+    remote_rows: Vec<adw::ActionRow>,
 }
 
 #[relm4::component(pub(crate))]
@@ -232,6 +268,73 @@ impl Component for SettingsModel {
                         set_active: model.values.command_history,
                         connect_active_notify[sender] => move |row| {
                             sender.input(SettingsMsg::CommandHistory(row.is_active()));
+                        },
+                    },
+                },
+
+                // Host rows are managed imperatively (`rebuild_remote_rows`):
+                // the view! macro cannot express a list that grows and shrinks.
+                #[name(remote_hosts_group)]
+                adw::PreferencesGroup {
+                    set_title: "Remote Hosts",
+                    set_description: Some("Saved ssh and Docker targets for the remote picker"),
+                },
+
+                adw::PreferencesGroup {
+                    set_title: "Add Remote Host",
+
+                    #[name(remote_name_row)]
+                    adw::EntryRow {
+                        set_title: "Name (defaults to host)",
+                        connect_changed[sender] => move |row| {
+                            sender.input(SettingsMsg::RemoteHostName(row.text().to_string()));
+                        },
+                    },
+
+                    #[name(remote_host_row)]
+                    adw::EntryRow {
+                        set_title: "Host or container name",
+                        connect_changed[sender] => move |row| {
+                            sender.input(SettingsMsg::RemoteHostHost(row.text().to_string()));
+                        },
+                    },
+
+                    #[name(remote_user_row)]
+                    adw::EntryRow {
+                        set_title: "User (optional)",
+                        connect_changed[sender] => move |row| {
+                            sender.input(SettingsMsg::RemoteHostUser(row.text().to_string()));
+                        },
+                    },
+
+                    #[name(remote_docker_row)]
+                    adw::SwitchRow {
+                        set_title: "Docker Container",
+                        set_subtitle: "Attach to a running container instead of using ssh",
+                        connect_active_notify[sender] => move |row| {
+                            sender.input(SettingsMsg::RemoteHostDocker(row.is_active()));
+                        },
+                    },
+
+                    #[name(remote_deploy_row)]
+                    adw::ComboRow {
+                        set_title: "Deploy jsh",
+                        set_subtitle: "Place a verified jsh on the destination for the session",
+                        set_model: Some(&gtk::StringList::new(&["Off", "Persist", "Incognito"])),
+                        connect_selected_notify[sender] => move |row| {
+                            sender.input(SettingsMsg::RemoteHostDeploy(row.selected()));
+                        },
+                    },
+
+                    #[name(remote_add_row)]
+                    adw::ActionRow {
+                        set_title: "Add Host",
+                        set_activatable: true,
+                        add_suffix = &gtk::Image {
+                            set_icon_name: Some("list-add-symbolic"),
+                        },
+                        connect_activated[sender] => move |_| {
+                            sender.input(SettingsMsg::RemoteHostAdd);
                         },
                     },
                 },
@@ -387,12 +490,15 @@ impl Component for SettingsModel {
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
-        let model = Self {
+        let mut model = Self {
             theme_names: init.theme_names,
             font_names: init.font_names,
             values: init.values,
+            remote_draft: RemoteDraft::default(),
+            remote_rows: Vec::new(),
         };
         let widgets = view_output!();
+        model.rebuild_remote_rows(&widgets.remote_hosts_group, &sender);
         ComponentParts { model, widgets }
     }
 
@@ -465,6 +571,21 @@ impl Component for SettingsModel {
                 widgets
                     .remote_clipboard_row
                     .set_active(self.values.remote_clipboard);
+                self.remote_draft = RemoteDraft::default();
+                widgets.remote_name_row.set_text("");
+                widgets.remote_host_row.set_text("");
+                widgets.remote_user_row.set_text("");
+                widgets.remote_docker_row.set_active(false);
+                widgets.remote_deploy_row.set_selected(0);
+                widgets.remote_add_row.set_subtitle("");
+                for row in [
+                    &widgets.remote_name_row,
+                    &widgets.remote_host_row,
+                    &widgets.remote_user_row,
+                ] {
+                    row.remove_css_class("error");
+                }
+                self.rebuild_remote_rows(&widgets.remote_hosts_group, &sender);
                 root.present(Some(&parent));
             }
             SettingsMsg::Theme(index) => {
@@ -587,11 +708,174 @@ impl Component for SettingsModel {
                 self.values.remote_clipboard = enabled;
                 let _ = sender.output(SettingsOutput::RemoteClipboard(enabled));
             }
+            SettingsMsg::RemoteHostName(name) => self.remote_draft.name = name,
+            SettingsMsg::RemoteHostHost(host) => self.remote_draft.host = host,
+            SettingsMsg::RemoteHostUser(user) => self.remote_draft.user = user,
+            SettingsMsg::RemoteHostDocker(docker) => self.remote_draft.docker = docker,
+            SettingsMsg::RemoteHostDeploy(mode) => self.remote_draft.deploy = mode,
+            SettingsMsg::RemoteHostAdd => {
+                for row in [
+                    &widgets.remote_name_row,
+                    &widgets.remote_host_row,
+                    &widgets.remote_user_row,
+                ] {
+                    row.remove_css_class("error");
+                }
+                match self.validate_remote_draft() {
+                    Ok(host) => {
+                        self.values.remote_hosts.push(host);
+                        self.remote_draft = RemoteDraft::default();
+                        widgets.remote_name_row.set_text("");
+                        widgets.remote_host_row.set_text("");
+                        widgets.remote_user_row.set_text("");
+                        widgets.remote_docker_row.set_active(false);
+                        widgets.remote_deploy_row.set_selected(0);
+                        widgets.remote_add_row.set_subtitle("");
+                        self.rebuild_remote_rows(&widgets.remote_hosts_group, &sender);
+                        let _ = sender.output(SettingsOutput::RemoteHosts(
+                            self.values.remote_hosts.clone(),
+                        ));
+                    }
+                    Err((field, message)) => {
+                        let row = match field {
+                            RemoteField::Name => &widgets.remote_name_row,
+                            RemoteField::Host => &widgets.remote_host_row,
+                            RemoteField::User => &widgets.remote_user_row,
+                        };
+                        row.add_css_class("error");
+                        row.grab_focus();
+                        widgets.remote_add_row.set_subtitle(message);
+                    }
+                }
+            }
+            SettingsMsg::RemoteHostRemove(index) => {
+                if index < self.values.remote_hosts.len() {
+                    self.values.remote_hosts.remove(index);
+                    self.rebuild_remote_rows(&widgets.remote_hosts_group, &sender);
+                    let _ = sender.output(SettingsOutput::RemoteHosts(
+                        self.values.remote_hosts.clone(),
+                    ));
+                }
+            }
         }
     }
 }
 
 impl SettingsModel {
+    fn rebuild_remote_rows(
+        &mut self,
+        group: &adw::PreferencesGroup,
+        sender: &ComponentSender<Self>,
+    ) {
+        for row in self.remote_rows.drain(..) {
+            group.remove(&row);
+        }
+        for (index, host) in self.values.remote_hosts.iter().enumerate() {
+            let row = adw::ActionRow::new();
+            row.set_use_markup(false);
+            row.set_title(if host.name.is_empty() {
+                &host.host
+            } else {
+                &host.name
+            });
+            // The docker user is `docker exec -u`, not part of the target.
+            let target = if host.docker {
+                host.host.clone()
+            } else {
+                match &host.user {
+                    Some(user) => format!("{user}@{}", host.host),
+                    None => host.host.clone(),
+                }
+            };
+            let transport = if host.docker { "docker" } else { "ssh" };
+            row.set_subtitle(&format!(
+                "{transport} · {target} · deploy {}",
+                host.deploy.as_str()
+            ));
+            let remove = gtk::Button::from_icon_name("user-trash-symbolic");
+            remove.set_valign(gtk::Align::Center);
+            remove.add_css_class("flat");
+            remove.add_css_class("destructive-action");
+            remove.set_tooltip_text(Some("Remove host"));
+            remove.connect_clicked({
+                let sender = sender.clone();
+                move |_| sender.input(SettingsMsg::RemoteHostRemove(index))
+            });
+            row.add_suffix(&remove);
+            group.add(&row);
+            self.remote_rows.push(row);
+        }
+    }
+
+    /// Mirror `parse_remote_hosts`' acceptance rules so a host added here
+    /// always survives the next config load.
+    fn validate_remote_draft(&self) -> Result<RemoteHost, (RemoteField, &'static str)> {
+        let host = self.remote_draft.host.trim().to_string();
+        if host.is_empty() {
+            return Err((RemoteField::Host, "Host is required."));
+        }
+        // ssh and docker would both read a leading dash as an option.
+        if host.starts_with('-') {
+            return Err((RemoteField::Host, "Host must not start with \"-\"."));
+        }
+        if !remote_text_is_safe(&host, false, 1_024) {
+            return Err((
+                RemoteField::Host,
+                "Host must not contain whitespace or control characters.",
+            ));
+        }
+        let name = match self.remote_draft.name.trim() {
+            "" => host.clone(),
+            value => value.to_string(),
+        };
+        if !remote_text_is_safe(&name, true, 256) {
+            return Err((
+                RemoteField::Name,
+                "Name must be at most 256 characters without control characters.",
+            ));
+        }
+        // Session restore uses the display name as the stable profile
+        // identifier; the parser rejects duplicates for the same reason.
+        if self
+            .values
+            .remote_hosts
+            .iter()
+            .any(|existing| existing.name == name)
+        {
+            return Err((RemoteField::Name, "Another host already uses this name."));
+        }
+        let user = match self.remote_draft.user.trim() {
+            "" => None,
+            value => {
+                if value.contains('@') || !remote_text_is_safe(value, false, 256) {
+                    return Err((
+                        RemoteField::User,
+                        "User must not contain \"@\", whitespace, or control characters.",
+                    ));
+                }
+                Some(value.to_string())
+            }
+        };
+        let deploy = match self.remote_draft.deploy {
+            1 => jterm_core::jsh_remote::Deploy::Persist,
+            2 => jterm_core::jsh_remote::Deploy::Incognito,
+            _ => jterm_core::jsh_remote::Deploy::Off,
+        };
+        Ok(RemoteHost {
+            name,
+            host,
+            user,
+            docker: self.remote_draft.docker,
+            deploy_artifact: None,
+            remote_shell: "jsh".to_string(),
+            session: None,
+            ssh_args: Vec::new(),
+            login_shell: true,
+            multiplex: true,
+            deploy,
+        })
+    }
+
     fn output_font(&self, sender: &ComponentSender<Self>) {
         let family = self
             .font_names

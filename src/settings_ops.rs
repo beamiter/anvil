@@ -265,6 +265,17 @@ impl AppModel {
         self.show_toast("Notification preference updated.");
     }
 
+    /// The dialog already validated each entry against the parser's rules; the
+    /// app replaces the whole list so removals persist too.
+    pub(crate) fn apply_settings_remote_hosts(&mut self, hosts: Vec<config::RemoteHost>) {
+        if self.safe_mode {
+            self.show_toast("Remote host changes are not saved in safe mode.");
+            return;
+        }
+        self.config.borrow_mut().remote_hosts = hosts;
+        self.persist_config();
+    }
+
     pub(crate) fn apply_settings_remote_clipboard(&mut self, enabled: bool) {
         if self.safe_mode {
             self.show_toast("Remote clipboard writes are disabled in safe mode.");

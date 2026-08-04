@@ -567,6 +567,7 @@ impl SimpleComponent for AppModel {
                     safe_mode: init.safe_mode,
                     notifications: config.borrow().notify_long_blocks,
                     remote_clipboard: config.borrow().allow_remote_clipboard_write,
+                    remote_hosts: config.borrow().remote_hosts.clone(),
                 },
             })
             .forward(sender.input_sender(), |output| match output {
@@ -623,6 +624,9 @@ impl SimpleComponent for AppModel {
                 }
                 dialogs::settings::SettingsOutput::RemoteClipboard(enabled) => {
                     AppMsg::SettingsRemoteClipboard(enabled)
+                }
+                dialogs::settings::SettingsOutput::RemoteHosts(hosts) => {
+                    AppMsg::SettingsRemoteHosts(hosts)
                 }
             });
         let remote_picker = dialogs::remote_picker::RemotePickerModel::builder()
@@ -1220,6 +1224,7 @@ impl SimpleComponent for AppModel {
             AppMsg::SettingsRemoteClipboard(enabled) => {
                 self.apply_settings_remote_clipboard(enabled)
             }
+            AppMsg::SettingsRemoteHosts(hosts) => self.apply_settings_remote_hosts(hosts),
             AppMsg::SearchChanged(text) => {
                 if let Some(t) = self.active_terminal() {
                     if text.is_empty() {

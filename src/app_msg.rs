@@ -70,6 +70,7 @@ pub(crate) enum AppMsg {
     SettingsAgentMaxTurns(u32),
     SettingsNotifications(bool),
     SettingsRemoteClipboard(bool),
+    SettingsRemoteHosts(Vec<crate::config::RemoteHost>),
     SearchChanged(String),
     SearchNext,
     SearchPrev,

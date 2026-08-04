@@ -1021,7 +1021,7 @@ fn load_file_config() -> FileConfig {
     }
 }
 
-fn remote_text_is_safe(value: &str, allow_whitespace: bool, max_chars: usize) -> bool {
+pub(crate) fn remote_text_is_safe(value: &str, allow_whitespace: bool, max_chars: usize) -> bool {
     !value.trim().is_empty()
         && value.chars().count() <= max_chars
         && !value.chars().any(char::is_control)
@@ -1152,7 +1152,7 @@ fn parse_remote_hosts(table: &toml::Table) -> Vec<RemoteHost> {
 
 /// Serialize a `RemoteHost` back into a TOML table that `parse_remote_hosts`
 /// round-trips. Optional fields are only emitted when present.
-fn remote_host_to_toml(h: &RemoteHost) -> toml::Value {
+pub(crate) fn remote_host_to_toml(h: &RemoteHost) -> toml::Value {
     let mut t = toml::Table::new();
     t.insert("name".into(), toml::Value::String(h.name.clone()));
     t.insert("host".into(), toml::Value::String(h.host.clone()));

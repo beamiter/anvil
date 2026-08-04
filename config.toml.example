@@ -96,8 +96,10 @@ ai_max_tokens = 1024             # 1 .. 32768
 ai_redact_secrets = true
 ai_stream = true                 # stream session AI panel replies as they generate
 
-# Explicitly start with no saved SSH targets. To add targets, remove this line
-# and uncomment one or more [[remote_hosts]] examples at the end of this file.
+# Explicitly start with no saved remote targets. Hosts can be added and removed
+# from the settings dialog, which rewrites this key; to add targets by hand,
+# remove this line and uncomment one or more [[remote_hosts]] examples at the
+# end of this file.
 remote_hosts = []
 
 # Optional color overrides. The 16-color palette still comes from the theme.
@@ -178,20 +180,28 @@ remote_hosts = []
 # export_session_markdown = "Ctrl+Shift+Alt+E"
 # export_session_json = "Ctrl+Shift+Alt+J"
 
-# Example remote profile. Each `name` must be unique because session restore
+# Example remote profiles. Each `name` must be unique because session restore
 # uses it as the stable profile identifier. Remove `remote_hosts = []` above
-# before uncommenting.
-# A regular shell gives a conventional SSH tab. A compatible jsh installation
-# can additionally use `session` for block-aware reconnect/resume.
+# before uncommenting. The settings dialog manages the same list, so hosts
+# added there are saved as [[remote_hosts]] entries.
+#
+# An ssh target. Optional keys not shown: remote_shell (default "jsh"),
+# login_shell, multiplex, and `session` for block-aware reconnect/resume on a
+# compatible jsh installation.
 # [[remote_hosts]]
 # name = "staging"
 # host = "server.example.com"
 # user = "deploy"
-# remote_shell = "bash -l"
 # ssh_args = ["-p", "22"]
-# login_shell = true
-# multiplex = true
-# session = "staging-main"
+# deploy = "persist"
+#
+# A running Docker container: `host` names the container, and `docker` swaps
+# ssh for `docker exec`. ssh_args, login_shell, and multiplex are ignored here.
+# [[remote_hosts]]
+# name = "dev-container"
+# host = "dev-env"
+# docker = true
+# deploy = "persist"
 #
 # `deploy` covers the host that has no jsh on it. Blocks, cwd tracking, exit
 # codes and the Commands timeline all come from jsh, so a destination with only
