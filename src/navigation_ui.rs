@@ -83,7 +83,7 @@ impl AppModel {
         }
     }
 
-    /// Size tab rows for the active placement. Like jterm4, top-bar tabs use
+    /// Size tab rows for the active placement. Like forge, top-bar tabs use
     /// their natural label width rather than a shared fixed width.
     pub(crate) fn apply_strip_row_placement(&self, row: &gtk::Widget) {
         match self.tab_placement.get() {

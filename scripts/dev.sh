@@ -11,7 +11,7 @@ usage() {
     echo "Usage: $0 {run|build|test|check|fmt|clippy|security|verify|package|clean|watch}"
     echo
     echo "Commands:"
-    echo "  run      - Run jterm1 in development mode"
+    echo "  run      - Run anvil in development mode"
     echo "  build    - Build the optimized release binary"
     echo "  test     - Run all tests"
     echo "  check    - Check all Rust targets"
@@ -46,12 +46,12 @@ run_in_nix() {
 
 case "${CMD}" in
     run)
-        echo "Running jterm1 in development mode..."
+        echo "Running anvil in development mode..."
         run_in_nix cargo run --locked
         ;;
 
     build)
-        echo "Building jterm1..."
+        echo "Building anvil..."
         run_in_nix cargo build --release --locked
         ;;
 
@@ -97,7 +97,7 @@ case "${CMD}" in
         run_in_nix bash -c '
             set -euo pipefail
             cargo build --release --locked
-            bash scripts/package-release.sh target/release/jterm1
+            bash scripts/package-release.sh target/release/anvil
         '
         ;;
 

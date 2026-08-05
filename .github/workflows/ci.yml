@@ -99,43 +99,43 @@ jobs:
       - name: Validate CLI and desktop integration
         if: ${{ !cancelled() }}
         run: |
-          target/release/jterm1 --help | grep -F "Block-first terminal workspace"
+          target/release/anvil --help | grep -F "Block-first terminal workspace"
           version="$(awk -F ' *= *' '$1 == "version" { gsub(/"/, "", $2); print $2; exit }' Cargo.toml)"
-          target/release/jterm1 --version | grep -Fx "jterm1 ${version}"
-          target/release/jterm1 --doctor
-          target/release/jterm1 --doctor --json | python3 -m json.tool >/dev/null
-          target/release/jterm1 --check-config config.toml.example --json | \
+          target/release/anvil --version | grep -Fx "anvil ${version}"
+          target/release/anvil --doctor
+          target/release/anvil --doctor --json | python3 -m json.tool >/dev/null
+          target/release/anvil --check-config config.toml.example --json | \
             python3 -m json.tool >/dev/null
 
           config_root="$(mktemp -d)"
-          install -d -m 0700 "${config_root}/jterm1"
-          cp config.toml.example "${config_root}/jterm1/config.toml"
-          XDG_CONFIG_HOME="${config_root}" target/release/jterm1 --check-config
-          test "$(XDG_CONFIG_HOME="${config_root}" target/release/jterm1 --config-path)" = \
-            "${config_root}/jterm1/config.toml"
+          install -d -m 0700 "${config_root}/anvil"
+          cp config.toml.example "${config_root}/anvil/config.toml"
+          XDG_CONFIG_HOME="${config_root}" target/release/anvil --check-config
+          test "$(XDG_CONFIG_HOME="${config_root}" target/release/anvil --config-path)" = \
+            "${config_root}/anvil/config.toml"
 
-          cp "${config_root}/jterm1/config.toml" "${config_root}/jterm1/config.toml.bak"
-          printf 'opacity = "wrong"\n' >"${config_root}/jterm1/config.toml"
-          if XDG_CONFIG_HOME="${config_root}" target/release/jterm1 --check-config; then
+          cp "${config_root}/anvil/config.toml" "${config_root}/anvil/config.toml.bak"
+          printf 'opacity = "wrong"\n' >"${config_root}/anvil/config.toml"
+          if XDG_CONFIG_HOME="${config_root}" target/release/anvil --check-config; then
             echo "invalid configuration unexpectedly passed validation" >&2
             exit 1
           fi
-          XDG_CONFIG_HOME="${config_root}" target/release/jterm1 --restore-config-backup
-          XDG_CONFIG_HOME="${config_root}" target/release/jterm1 --check-config
-          test -s "${config_root}/jterm1/config.toml.before-restore"
-          desktop-file-validate packaging/app.jterm1.desktop
-          appstreamcli validate --no-net packaging/app.jterm1.metainfo.xml
-          file packaging/app.jterm1-128.png | grep -F '128 x 128'
-          file packaging/app.jterm1-256.png | grep -F '256 x 256'
+          XDG_CONFIG_HOME="${config_root}" target/release/anvil --restore-config-backup
+          XDG_CONFIG_HOME="${config_root}" target/release/anvil --check-config
+          test -s "${config_root}/anvil/config.toml.before-restore"
+          desktop-file-validate data/io.github.beamiter.anvil.desktop
+          appstreamcli validate --no-net data/io.github.beamiter.anvil.metainfo.xml
+          file data/io.github.beamiter.anvil-128.png | grep -F '128 x 128'
+          file data/io.github.beamiter.anvil-256.png | grep -F '256 x 256'
 
       - name: Build and verify relocatable release bundle
         if: ${{ !cancelled() }}
         run: |
-          bash scripts/package-release.sh target/release/jterm1
+          bash scripts/package-release.sh target/release/anvil
           (cd target/dist && sha256sum --check *.sha256)
           support_dir="$(mktemp -d)"
-          JTERM1_BIN=target/release/jterm1 bash scripts/support-bundle.sh "${support_dir}"
-          support_archives=("${support_dir}"/jterm1-support-*.tar.gz)
+          ANVIL_BIN=target/release/anvil bash scripts/support-bundle.sh "${support_dir}"
+          support_archives=("${support_dir}"/anvil-support-*.tar.gz)
           test "${#support_archives[@]}" -eq 1
           support_archive="${support_archives[0]}"
           tar -tzf "${support_archive}" | grep -F '/doctor.json'
@@ -149,7 +149,7 @@ jobs:
         if: ${{ success() }}
         uses: actions/upload-artifact@v7
         with:
-          name: jterm1-${{ github.sha }}
+          name: anvil-${{ github.sha }}
           path: target/dist/*
           if-no-files-found: error
           retention-days: 7

@@ -131,11 +131,11 @@ pub struct RemoteHost {
 }
 
 /// Directory for ssh ControlMaster sockets. Prefers `$XDG_RUNTIME_DIR`, falls
-/// back to `~/.cache/jterm1`. Created if missing.
+/// back to `~/.cache/anvil`. Created if missing.
 fn control_socket_dir() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache/jterm1")))?;
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache/anvil")))?;
     if let Err(err) = fs::create_dir_all(&base) {
         log::warn!(
             "Failed to create ssh control socket dir {}: {err}",
@@ -380,7 +380,7 @@ pub struct Config {
     pub(crate) focus_reporting_enabled: bool,
     pub(crate) scroll_reporting_enabled: bool,
     pub(crate) preserve_live_scrollback: bool,
-    /// Show jterm1-side AI surfaces (per-block error explain button, the
+    /// Show anvil-side AI surfaces (per-block error explain button, the
     /// session AI panel, and the `?` palette prefix). Default on; flip to
     /// `false` to hide all AI UI even when API keys are present. The actual
     /// network call still only fires on an explicit user click — this just
@@ -428,7 +428,7 @@ pub struct Config {
 
 impl Config {
     /// Replace the complete configuration with an isolated, built-in VTE
-    /// profile. This deliberately ignores both the user's file and JTERM1_*
+    /// profile. This deliberately ignores both the user's file and ANVIL_*
     /// appearance/behavior overrides, making safe mode useful for diagnosis.
     #[cfg(test)]
     pub(crate) fn apply_safe_mode(&mut self) {
@@ -677,14 +677,14 @@ fn normalize_ai_provider(value: &str) -> Option<&'static str> {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn config_file_path() -> PathBuf {
-    let override_path = std::env::var_os("JTERM1_CONFIG")
+    let override_path = std::env::var_os("ANVIL_CONFIG")
         .filter(|path| !path.is_empty())
         .map(PathBuf::from);
     resolve_config_file_path(override_path, glib::user_config_dir())
 }
 
 fn resolve_config_file_path(override_path: Option<PathBuf>, user_config_dir: PathBuf) -> PathBuf {
-    override_path.unwrap_or_else(|| user_config_dir.join("jterm1").join("config.toml"))
+    override_path.unwrap_or_else(|| user_config_dir.join("anvil").join("config.toml"))
 }
 
 #[cfg(test)]
@@ -702,14 +702,14 @@ mod config_path_tests {
         );
         assert_eq!(
             resolve_config_file_path(None, PathBuf::from("/xdg")),
-            PathBuf::from("/xdg/jterm1/config.toml")
+            PathBuf::from("/xdg/anvil/config.toml")
         );
     }
 }
 
 pub(crate) fn default_command_history_path() -> String {
     glib::user_state_dir()
-        .join("jterm1")
+        .join("anvil")
         .join("history.jsonl")
         .to_string_lossy()
         .into_owned()
@@ -1253,7 +1253,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     let themes = builtin_themes();
 
     // Resolve active theme
-    let theme_name = env_string("JTERM1_THEME")
+    let theme_name = env_string("ANVIL_THEME")
         .or(fc.theme)
         .unwrap_or_else(|| "default".to_string());
     let theme = themes
@@ -1262,19 +1262,19 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         .unwrap_or(&themes[0]);
 
     // Priority: env var > config file > theme default
-    let window_opacity = env_f64("JTERM1_OPACITY")
+    let window_opacity = env_f64("ANVIL_OPACITY")
         .or(fc.opacity)
         .unwrap_or(0.95)
         .clamp(0.01, 1.0);
-    let terminal_scrollback_lines = env_u32("JTERM1_SCROLLBACK")
+    let terminal_scrollback_lines = env_u32("ANVIL_SCROLLBACK")
         .or(fc.scrollback)
         .unwrap_or(5000)
         .min(1_000_000);
-    let default_font_scale = env_f64("JTERM1_FONT_SCALE")
+    let default_font_scale = env_f64("ANVIL_FONT_SCALE")
         .or(fc.font_scale)
         .unwrap_or(1.0)
         .clamp(0.1, 10.0);
-    let font_desc = env_string("JTERM1_FONT")
+    let font_desc = env_string("ANVIL_FONT")
         .or(fc.font)
         // Use the "Mono" (NFM) Nerd Font variant: the plain "Nerd Font" (NF)
         // variant renders proportionally in VTE (glyphs draw at non-cell widths)
@@ -1282,16 +1282,16 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         // like a real terminal. NFM forces single-cell glyphs.
         .unwrap_or_else(|| "SauceCodePro Nerd Font Mono 14".to_string());
 
-    let foreground = env_rgba("JTERM1_FG")
+    let foreground = env_rgba("ANVIL_FG")
         .or_else(|| fc.foreground.as_deref().and_then(|v| RGBA::parse(v).ok()))
         .unwrap_or(theme.foreground);
-    let background = env_rgba("JTERM1_BG")
+    let background = env_rgba("ANVIL_BG")
         .or_else(|| fc.background.as_deref().and_then(|v| RGBA::parse(v).ok()))
         .unwrap_or(theme.background);
-    let cursor = env_rgba("JTERM1_CURSOR")
+    let cursor = env_rgba("ANVIL_CURSOR")
         .or_else(|| fc.cursor.as_deref().and_then(|v| RGBA::parse(v).ok()))
         .unwrap_or(theme.cursor);
-    let cursor_foreground = env_rgba("JTERM1_CURSOR_FG")
+    let cursor_foreground = env_rgba("ANVIL_CURSOR_FG")
         .or_else(|| {
             fc.cursor_foreground
                 .as_deref()
@@ -1300,50 +1300,50 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         .unwrap_or(theme.cursor_foreground);
 
     // Block view optimization settings
-    let ansi_cache_capacity = env_u32("JTERM1_ANSI_CACHE_CAP")
+    let ansi_cache_capacity = env_u32("ANVIL_ANSI_CACHE_CAP")
         .or(fc.ansi_cache_capacity)
         .unwrap_or(256)
         .clamp(1, 65_536);
-    let max_visible_blocks = env_u32("JTERM1_MAX_BLOCKS")
+    let max_visible_blocks = env_u32("ANVIL_MAX_BLOCKS")
         .or(fc.max_visible_blocks)
         .unwrap_or(200)
         .clamp(1, 10_000);
-    let output_batch_min_ms = env_u32("JTERM1_BATCH_MIN")
+    let output_batch_min_ms = env_u32("ANVIL_BATCH_MIN")
         .or(fc.output_batch_min_ms)
         .unwrap_or(10)
         .clamp(1, 1_000);
-    let output_batch_max_ms = env_u32("JTERM1_BATCH_MAX")
+    let output_batch_max_ms = env_u32("ANVIL_BATCH_MAX")
         .or(fc.output_batch_max_ms)
         .unwrap_or(100)
         .clamp(output_batch_min_ms, 5_000);
-    let lazy_load_threshold = env_u32("JTERM1_LAZY_LINES")
+    let lazy_load_threshold = env_u32("ANVIL_LAZY_LINES")
         .or(fc.lazy_load_threshold)
         .unwrap_or(1000)
         .clamp(1, 100_000);
-    let truncation_threshold_lines = env_u32("JTERM1_TRUNCATION_LINES")
+    let truncation_threshold_lines = env_u32("ANVIL_TRUNCATION_LINES")
         .or(fc.truncation_threshold_lines)
         .unwrap_or(50000)
         .clamp(100, 1_000_000);
-    let finished_block_viewport_rows = env_u32("JTERM1_FINISHED_VIEWPORT_ROWS")
+    let finished_block_viewport_rows = env_u32("ANVIL_FINISHED_VIEWPORT_ROWS")
         .or(fc.finished_block_viewport_rows)
         .unwrap_or(24)
         .clamp(3, 5_000);
-    let finished_block_max_expanded_rows = env_u32("JTERM1_FINISHED_MAX_EXPANDED_ROWS")
+    let finished_block_max_expanded_rows = env_u32("ANVIL_FINISHED_MAX_EXPANDED_ROWS")
         .or(fc.finished_block_max_expanded_rows)
         .unwrap_or(5000)
         .clamp(finished_block_viewport_rows, 5000);
-    let max_collapsed_output_lines = env_u32("JTERM1_MAX_COLLAPSED_LINES")
+    let max_collapsed_output_lines = env_u32("ANVIL_MAX_COLLAPSED_LINES")
         .or(fc.max_collapsed_output_lines)
         .unwrap_or(25)
         .min(10_000);
-    let virtual_scroll_margin = env_u32("JTERM1_VSCROLL_MARGIN")
+    let virtual_scroll_margin = env_u32("ANVIL_VSCROLL_MARGIN")
         .or(fc.virtual_scroll_margin)
         .unwrap_or(1)
         .min(100);
     let command_history_enabled = fc.command_history_enabled.unwrap_or(true);
     let command_history_path = command_history_enabled.then(|| {
         safe_absolute_history_path(
-            std::env::var("JTERM1_COMMAND_HISTORY_PATH")
+            std::env::var("ANVIL_COMMAND_HISTORY_PATH")
                 .ok()
                 .or(fc.command_history_path),
             "command_history_path",
@@ -1355,25 +1355,25 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         .unwrap_or(10_000)
         .clamp(100, 100_000);
     let block_history_path = safe_absolute_history_path(
-        std::env::var("JTERM1_HISTORY_PATH")
+        std::env::var("ANVIL_HISTORY_PATH")
             .ok()
             .or(fc.block_history_path),
         "block_history_path",
     );
     let block_history_compress = fc.block_history_compress.unwrap_or(true);
-    let block_compact = match std::env::var("JTERM1_BLOCK_COMPACT").ok().as_deref() {
+    let block_compact = match std::env::var("ANVIL_BLOCK_COMPACT").ok().as_deref() {
         Some("1") | Some("true") => Some(true),
         Some("0") | Some("false") => Some(false),
         _ => None,
     }
     .or(fc.block_compact)
     .unwrap_or(false);
-    let shell = std::env::var("JTERM1_SHELL").ok().or(fc.shell);
+    let shell = std::env::var("ANVIL_SHELL").ok().or(fc.shell);
 
-    // Block mode is jterm1's defining experience and is required for the
+    // Block mode is anvil's defining experience and is required for the
     // command-completion events consumed by Agent and command history. Users
     // can still opt into the compatibility VTE backend explicitly.
-    let terminal_mode_str = env_string("JTERM1_MODE")
+    let terminal_mode_str = env_string("ANVIL_MODE")
         .or(fc.terminal_mode)
         .unwrap_or_else(|| "block".to_string());
     let terminal_mode = match terminal_mode_str.to_lowercase().as_str() {
@@ -1382,7 +1382,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     };
 
     let tab_placement = TabPlacement::parse(
-        &env_string("JTERM1_TAB_PLACEMENT")
+        &env_string("ANVIL_TAB_PLACEMENT")
             .or(fc.tab_placement)
             .unwrap_or_else(|| "sidebar".to_string()),
     );
@@ -1393,7 +1393,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     let sidebar_width = fc.sidebar_width.unwrap_or(220).clamp(120, 800);
     let tab_width = fc.tab_width.unwrap_or(180).clamp(80, 480);
 
-    let requested_ai_provider = env_string("JTERM1_AI_PROVIDER")
+    let requested_ai_provider = env_string("ANVIL_AI_PROVIDER")
         .or(fc.ai_provider)
         .unwrap_or_else(|| "anthropic".to_string());
     let ai_provider = normalize_ai_provider(&requested_ai_provider)
@@ -1410,11 +1410,11 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         "ollama" => ("codellama:7b", "http://localhost:11434"),
         _ => ("claude-sonnet-4-6", "https://api.anthropic.com"),
     };
-    let ai_model = env_string("JTERM1_AI_MODEL")
+    let ai_model = env_string("ANVIL_AI_MODEL")
         .or(fc.ai_model)
         .filter(|model| !model.trim().is_empty())
         .unwrap_or_else(|| default_ai_model.to_string());
-    let ai_base_url = env_string("JTERM1_AI_BASE_URL")
+    let ai_base_url = env_string("ANVIL_AI_BASE_URL")
         .or(fc.ai_base_url)
         .filter(|url| !url.trim().is_empty())
         .unwrap_or_else(|| default_ai_base_url.to_string())
@@ -1463,33 +1463,33 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         focus_reporting_enabled: fc.focus_reporting_enabled.unwrap_or(true),
         scroll_reporting_enabled: fc.scroll_reporting_enabled.unwrap_or(true),
         preserve_live_scrollback: fc.preserve_live_scrollback.unwrap_or(false),
-        ai_enabled: env_bool("JTERM1_AI_ENABLED")
+        ai_enabled: env_bool("ANVIL_AI_ENABLED")
             .or(fc.ai_enabled)
             .unwrap_or(true),
-        agent_enabled: env_bool("JTERM1_AGENT_ENABLED")
+        agent_enabled: env_bool("ANVIL_AGENT_ENABLED")
             .or(fc.agent_enabled)
             .unwrap_or(true),
-        agent_max_turns: env_u32("JTERM1_AGENT_MAX_TURNS")
+        agent_max_turns: env_u32("ANVIL_AGENT_MAX_TURNS")
             .or(fc.agent_max_turns)
             .unwrap_or(20)
             .clamp(1, 100),
         ai_provider,
         ai_base_url,
         ai_model,
-        ai_max_tokens: env_u32("JTERM1_AI_MAX_TOKENS")
+        ai_max_tokens: env_u32("ANVIL_AI_MAX_TOKENS")
             .or(fc.ai_max_tokens)
             .unwrap_or(1_024)
             .clamp(1, 32_768),
-        ai_temperature: env_f32("JTERM1_AI_TEMPERATURE")
+        ai_temperature: env_f32("ANVIL_AI_TEMPERATURE")
             .or(fc.ai_temperature)
             .filter(|t| t.is_finite() && (0.0..=2.0).contains(t)),
-        ai_redact_secrets: env_bool("JTERM1_AI_REDACT_SECRETS")
+        ai_redact_secrets: env_bool("ANVIL_AI_REDACT_SECRETS")
             .or(fc.ai_redact_secrets)
             .unwrap_or(true),
-        ai_stream: env_bool("JTERM1_AI_STREAM")
+        ai_stream: env_bool("ANVIL_AI_STREAM")
             .or(fc.ai_stream)
             .unwrap_or(true),
-        // Unlike the other JTERM1_* overrides, the key-path override is applied
+        // Unlike the other ANVIL_* overrides, the key-path override is applied
         // at client construction (`jterm_core::ai::resolve_api_key_file`), so
         // the environment-managed path can never be persisted back to TOML.
         ai_api_key_file: fc.ai_api_key_file.filter(|value| !value.trim().is_empty()),

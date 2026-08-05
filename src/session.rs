@@ -1,11 +1,11 @@
-//! Session persistence for jterm1 windows.
+//! Session persistence for anvil windows.
 //!
 //! Each tab stores its title, whether it was user-renamed, and a `PaneLayout`
 //! tree mirroring the live GTK `Paned` structure — so nested splits, each pane's
 //! working directory, terminal mode and any restorable command (ssh / nix
 //! develop / docker exec …) are restored.
 //!
-//! jterm1 is a `NON_UNIQUE` application: every launch is a separate process.
+//! anvil is a `NON_UNIQUE` application: every launch is a separate process.
 //! A single `tabs.state` therefore lets unrelated windows overwrite each other.
 //! New snapshots use a random per-process token plus a companion owner lock:
 //! `tabs.<token>.state` and `tabs.<token>.lock`. The process holds an exclusive
@@ -45,7 +45,7 @@ const MAX_CLAIM_CHAIN_DEPTH: usize = 32;
 const MAX_CLAIM_CHAIN_BYTES: u64 = 16 * 1024 * 1024;
 const LOCK_PROTOCOL_TIMEOUT: Duration = Duration::from_millis(500);
 const LOCK_PROTOCOL_RETRY_INTERVAL: Duration = Duration::from_millis(5);
-const SESSION_ENVELOPE_FORMAT: &str = "jterm1-session";
+const SESSION_ENVELOPE_FORMAT: &str = "anvil-session";
 const SESSION_ENVELOPE_VERSION: u8 = 1;
 /// Largest session snapshot this window will read back. A snapshot is a tab list
 /// with one cwd and one argv per pane — kilobytes — so anything past this is a
@@ -73,7 +73,7 @@ const OWNER_TOKEN_ATTEMPTS: usize = 128;
 static SNAPSHOT_OWNER: OnceLock<Result<SnapshotOwner, String>> = OnceLock::new();
 
 /// One node of a tab's pane tree: either a terminal leaf or a split of two
-/// subtrees. Mirrors jterm4's `PaneLayout`.
+/// subtrees. Mirrors forge's `PaneLayout`.
 /// Deliberately not `Deserialize`: [`decode_saved_session`] is the only wire
 /// path, and it enforces the tab, pane, depth, field, and argv budgets while
 /// decoding instead of after a whole snapshot has been allocated.
@@ -163,7 +163,7 @@ enum SnapshotState {
 }
 
 fn state_dir() -> PathBuf {
-    glib::user_config_dir().join("jterm1")
+    glib::user_config_dir().join("anvil")
 }
 
 fn valid_instance_token(token: &str) -> bool {
@@ -935,7 +935,7 @@ impl<'de> serde::de::Visitor<'de> for PaneLayoutSeed<'_> {
                     })?))
                 }
                 // Fields from other releases are ignored, not rejected: a
-                // snapshot written by a newer or older jterm1 must still
+                // snapshot written by a newer or older anvil must still
                 // restore. `IgnoredAny` skips them without allocating.
                 _ => {
                     map.next_value::<serde::de::IgnoredAny>()?;
@@ -1651,7 +1651,7 @@ fn ensure_private_directory(path: &Path) -> io::Result<()> {
         // Re-open the final component without following it, then validate and
         // chmod through that descriptor. `create_dir_all` accepts an existing
         // symlink-to-directory; a pathname chmod here would otherwise tighten
-        // and populate the symlink target rather than jterm1's own state dir.
+        // and populate the symlink target rather than anvil's own state dir.
         let directory = OpenOptions::new()
             .read(true)
             .custom_flags(
@@ -1690,7 +1690,7 @@ fn ensure_private_directory(path: &Path) -> io::Result<()> {
 /// Durably replace a snapshot, creating its `0700` directory if needed.
 ///
 /// The shared lower-level atomic writer owns the temp-write/fsync/rename dance
-/// and the `0600` mode. jterm1 first validates and tightens its owned directory
+/// and the `0600` mode. anvil first validates and tightens its owned directory
 /// through a no-follow descriptor, avoiding a later path-based chmod race.
 fn atomic_write(path: &Path, payload: &[u8]) -> io::Result<()> {
     let parent = path
@@ -2522,7 +2522,7 @@ fn scan_candidates_with_reader(
 }
 
 /// Atomically move a recoverable snapshot to this instance's unique claim name
-/// without replacing any existing file. jterm1 targets Linux; on another
+/// without replacing any existing file. anvil targets Linux; on another
 /// platform the conservative fallback is to leave the snapshot untouched.
 #[cfg(target_os = "linux")]
 fn rename_noreplace(source: &Path, target: &Path) -> io::Result<()> {
@@ -2670,7 +2670,7 @@ mod tests {
         fn new(label: &str) -> Self {
             let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "jterm1-session-{label}-{}-{id}",
+                "anvil-session-{label}-{}-{id}",
                 std::process::id()
             ));
             fs::create_dir_all(&path).expect("create test state dir");
@@ -3162,7 +3162,7 @@ mod tests {
         let path = dir.path().join(LEGACY_STATE_FILE);
         atomic_write(
             &path,
-            br#"{"format":"jterm1-session","version":2,"payload":{"kind":"empty"}}"#,
+            br#"{"format":"anvil-session","version":2,"payload":{"kind":"empty"}}"#,
         )
         .unwrap();
 
@@ -3183,7 +3183,7 @@ mod tests {
         let path = state_file_path_for_token(&dir, &token(10));
         atomic_write(
             &path,
-            br#"{"format":"jterm1-session","version":1,"payload":{"kind":"empty"},"supersedes":"../victim"}"#,
+            br#"{"format":"anvil-session","version":1,"payload":{"kind":"empty"},"supersedes":"../victim"}"#,
         )
         .unwrap();
 

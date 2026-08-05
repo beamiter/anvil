@@ -41,7 +41,7 @@ fn request_bottom_pin(user_scrolled: bool, active: &Cell<bool>, generation: &Cel
     !active.replace(true)
 }
 
-/// Scrolls the block list to follow the live prompt — jterm1's `autoscroll`
+/// Scrolls the block list to follow the live prompt — anvil's `autoscroll`
 /// model, ported faithfully.
 ///
 /// The key (and subtle) property is that the scroll happens **synchronously**,

@@ -705,7 +705,7 @@ mod tests {
 
     fn test_root(label: &str) -> std::path::PathBuf {
         let path =
-            std::env::temp_dir().join(format!("jterm1-git-chip-{label}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("anvil-git-chip-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir(&path).unwrap();
         path

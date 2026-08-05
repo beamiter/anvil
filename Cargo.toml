@@ -1,9 +1,9 @@
 [package]
-name = "jterm1"
+name = "anvil"
 version = "0.2.0"
 edition = "2021"
 description = "A block-aware Linux terminal workspace built with Rust, GTK 4, Relm4, and VTE"
-repository = "https://github.com/beamiter/jterm1"
+repository = "https://github.com/beamiter/anvil"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
 keywords = ["terminal", "gtk", "rust", "shell", "productivity"]

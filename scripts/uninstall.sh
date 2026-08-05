@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Remove jterm1 while preserving user configuration and state by default.
+# Remove anvil while preserving user configuration and state by default.
 
 set -Eeuo pipefail
 
-APP_ID="io.github.beamiter.jterm1"
+APP_ID="io.github.beamiter.anvil"
 HOME_DIR="${HOME:-}"
 DESTDIR="${DESTDIR:-}"
 PREFIX="${HOME_DIR}/.local"
@@ -22,7 +22,7 @@ Options:
   --prefix PATH          Runtime prefix (default: ~/.local)
   --bin-dir PATH         Runtime binary directory (overrides --prefix)
   --data-dir PATH        Shared-data base (default: $XDG_DATA_HOME or PREFIX/share)
-  --purge-config         Also remove jterm1 config and default XDG state
+  --purge-config         Also remove anvil config and default XDG state
   --dry-run              Print commands without changing files
   -h, --help             Show this help
 
@@ -35,7 +35,7 @@ USAGE
 }
 
 die() {
-    printf 'jterm1 uninstall: %s\n' "$*" >&2
+    printf 'anvil uninstall: %s\n' "$*" >&2
     exit 1
 }
 
@@ -128,30 +128,36 @@ if [[ -n "${DESTDIR}" ]]; then
     DESTDIR="${DESTDIR%/}"
 fi
 
-remove_file "${DESTDIR}${BIN_DIR}/jterm1"
-remove_file "${DESTDIR}${BIN_DIR}/jterm1-support-bundle"
+remove_file "${DESTDIR}${BIN_DIR}/anvil"
+remove_file "${DESTDIR}${BIN_DIR}/anvil-support-bundle"
 SHARE_DIR="${DESTDIR}${DATA_HOME}"
 remove_file "${SHARE_DIR}/applications/${APP_ID}.desktop"
+# Desktop integration from before the jterm1 -> anvil rename.
 remove_file "${SHARE_DIR}/applications/app.jterm1.desktop"
+remove_file "${SHARE_DIR}/applications/io.github.beamiter.jterm1.desktop"
+remove_file "${SHARE_DIR}/metainfo/io.github.beamiter.jterm1.metainfo.xml"
+remove_file "${SHARE_DIR}/icons/hicolor/scalable/apps/io.github.beamiter.jterm1.svg"
+remove_file "${SHARE_DIR}/icons/hicolor/128x128/apps/io.github.beamiter.jterm1.png"
+remove_file "${SHARE_DIR}/icons/hicolor/256x256/apps/io.github.beamiter.jterm1.png"
 remove_file "${SHARE_DIR}/metainfo/${APP_ID}.metainfo.xml"
 remove_file "${SHARE_DIR}/icons/hicolor/scalable/apps/${APP_ID}.svg"
 remove_file "${SHARE_DIR}/icons/hicolor/128x128/apps/${APP_ID}.png"
 remove_file "${SHARE_DIR}/icons/hicolor/256x256/apps/${APP_ID}.png"
-for file in README.md jterm1.bash jterm1.zsh jterm1.fish jterm1.ps1; do
-    remove_file "${SHARE_DIR}/jterm1/shell-integration/${file}"
+for file in README.md anvil.bash anvil.zsh anvil.fish anvil.ps1; do
+    remove_file "${SHARE_DIR}/anvil/shell-integration/${file}"
 done
 for file in docker-tail-logs.yaml find-large-files.yaml git-feature.yaml git-rebase-interactive.yaml kill-port.yaml ssh-tunnel.yaml; do
-    remove_file "${SHARE_DIR}/jterm1/workflows/${file}"
+    remove_file "${SHARE_DIR}/anvil/workflows/${file}"
 done
-remove_file "${SHARE_DIR}/jterm1/notebooks/welcome.jtnb.md"
-remove_file "${SHARE_DIR}/doc/jterm1/README.md"
-remove_file "${SHARE_DIR}/doc/jterm1/Cargo.lock"
-remove_file "${SHARE_DIR}/doc/jterm1/BUILDINFO"
-remove_dir_if_empty "${SHARE_DIR}/jterm1/shell-integration"
-remove_dir_if_empty "${SHARE_DIR}/jterm1/workflows"
-remove_dir_if_empty "${SHARE_DIR}/jterm1/notebooks"
-remove_dir_if_empty "${SHARE_DIR}/jterm1"
-remove_dir_if_empty "${SHARE_DIR}/doc/jterm1"
+remove_file "${SHARE_DIR}/anvil/notebooks/welcome.jtnb.md"
+remove_file "${SHARE_DIR}/doc/anvil/README.md"
+remove_file "${SHARE_DIR}/doc/anvil/Cargo.lock"
+remove_file "${SHARE_DIR}/doc/anvil/BUILDINFO"
+remove_dir_if_empty "${SHARE_DIR}/anvil/shell-integration"
+remove_dir_if_empty "${SHARE_DIR}/anvil/workflows"
+remove_dir_if_empty "${SHARE_DIR}/anvil/notebooks"
+remove_dir_if_empty "${SHARE_DIR}/anvil"
+remove_dir_if_empty "${SHARE_DIR}/doc/anvil"
 remove_dir_if_empty "${SHARE_DIR}/doc"
 
 # Without this the launcher keeps offering a dead entry and a cached icon.
@@ -173,7 +179,7 @@ if ((PURGE_CONFIG == 1)); then
     STATE_HOME="${XDG_STATE_HOME:-${HOME_DIR}/.local/state}"
     [[ "${CONFIG_HOME}" == /* ]] || die "XDG_CONFIG_HOME must be an absolute path"
     [[ "${STATE_HOME}" == /* ]] || die "XDG_STATE_HOME must be an absolute path"
-    for directory in "${DESTDIR}${CONFIG_HOME}/jterm1" "${DESTDIR}${STATE_HOME}/jterm1"; do
+    for directory in "${DESTDIR}${CONFIG_HOME}/anvil" "${DESTDIR}${STATE_HOME}/anvil"; do
         if [[ -e "${directory}" ]]; then
             run rm -rf -- "${directory}"
         fi

@@ -969,7 +969,7 @@ mod tests {
                 .unwrap()
                 .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "jterm1-history-{name}-{}-{unique}",
+                "anvil-history-{name}-{}-{unique}",
                 std::process::id()
             ));
             fs::create_dir_all(&path).unwrap();
@@ -1061,8 +1061,8 @@ mod tests {
     fn expands_only_home_slash_prefix() {
         let home = Path::new("/home/tester");
         assert_eq!(
-            expand_home_prefix_with("~/.local/share/jterm1/history", Some(home)),
-            home.join(".local/share/jterm1/history")
+            expand_home_prefix_with("~/.local/share/anvil/history", Some(home)),
+            home.join(".local/share/anvil/history")
         );
         assert_eq!(expand_home_prefix_with("~", Some(home)), PathBuf::from("~"));
         assert_eq!(
@@ -1362,7 +1362,7 @@ mod tests {
     #[test]
     fn retired_pane_cannot_leak_revision_authority_to_a_reused_address() {
         let pane = usize::MAX - 7;
-        let path = Path::new("/tmp/jterm1-history-revision-test");
+        let path = Path::new("/tmp/anvil-history-revision-test");
         set_pane_revision(pane, path, Some(HistoryRevision::Missing));
         assert_eq!(
             remembered_pane_revision(pane, path),

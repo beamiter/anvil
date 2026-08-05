@@ -320,7 +320,7 @@ fn spawn_cell_worker(spec: CommandSpec, handle: &CellHandle) -> mpsc::Receiver<W
     let spawn_failure_sender = sender.clone();
 
     let spawn = std::thread::Builder::new()
-        .name("jterm1-notebook-cell".to_owned())
+        .name("anvil-notebook-cell".to_owned())
         .spawn(move || {
             let _permit = permit;
             let cwd_for_bridge = spec.cwd.to_string_lossy().into_owned();
@@ -393,7 +393,7 @@ fn spawn_cell_worker(spec: CommandSpec, handle: &CellHandle) -> mpsc::Receiver<W
             let mut io_threads = Vec::with_capacity(3);
             let source = spec.source;
             match std::thread::Builder::new()
-                .name("jterm1-notebook-stdin".to_owned())
+                .name("anvil-notebook-stdin".to_owned())
                 .spawn(move || {
                     let _ = stdin.write_all(source.as_bytes());
                     if !source.ends_with('\n') {
@@ -409,7 +409,7 @@ fn spawn_cell_worker(spec: CommandSpec, handle: &CellHandle) -> mpsc::Receiver<W
 
             let stdout_sender = sender.clone();
             match std::thread::Builder::new()
-                .name("jterm1-notebook-stdout".to_owned())
+                .name("anvil-notebook-stdout".to_owned())
                 .spawn(move || {
                     let mut buffer = [0_u8; 4096];
                     loop {
@@ -439,7 +439,7 @@ fn spawn_cell_worker(spec: CommandSpec, handle: &CellHandle) -> mpsc::Receiver<W
 
             let stderr_sender = sender.clone();
             match std::thread::Builder::new()
-                .name("jterm1-notebook-stderr".to_owned())
+                .name("anvil-notebook-stderr".to_owned())
                 .spawn(move || {
                     let mut buffer = [0_u8; 4096];
                     loop {
@@ -1217,7 +1217,7 @@ mod tests {
 
     fn notebook_test_dir(label: &str) -> PathBuf {
         let path =
-            std::env::temp_dir().join(format!("jterm1-notebook-{label}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("anvil-notebook-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir(&path).unwrap();
         path

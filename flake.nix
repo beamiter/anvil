@@ -1,5 +1,5 @@
 {
-  description = "jterm1 — a block-aware Linux terminal workspace";
+  description = "anvil — a block-aware Linux terminal workspace";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -58,50 +58,50 @@
             doCheck = false;
 
             postInstall = ''
-              install -Dm644 packaging/app.jterm1.desktop \
-                "$out/share/applications/io.github.beamiter.jterm1.desktop"
-              install -Dm644 packaging/app.jterm1.metainfo.xml \
-                "$out/share/metainfo/io.github.beamiter.jterm1.metainfo.xml"
-              install -Dm644 packaging/app.jterm1.svg \
-                "$out/share/icons/hicolor/scalable/apps/io.github.beamiter.jterm1.svg"
-              install -Dm644 packaging/app.jterm1-128.png \
-                "$out/share/icons/hicolor/128x128/apps/io.github.beamiter.jterm1.png"
-              install -Dm644 packaging/app.jterm1-256.png \
-                "$out/share/icons/hicolor/256x256/apps/io.github.beamiter.jterm1.png"
+              install -Dm644 data/io.github.beamiter.anvil.desktop \
+                "$out/share/applications/io.github.beamiter.anvil.desktop"
+              install -Dm644 data/io.github.beamiter.anvil.metainfo.xml \
+                "$out/share/metainfo/io.github.beamiter.anvil.metainfo.xml"
+              install -Dm644 data/io.github.beamiter.anvil.svg \
+                "$out/share/icons/hicolor/scalable/apps/io.github.beamiter.anvil.svg"
+              install -Dm644 data/io.github.beamiter.anvil-128.png \
+                "$out/share/icons/hicolor/128x128/apps/io.github.beamiter.anvil.png"
+              install -Dm644 data/io.github.beamiter.anvil-256.png \
+                "$out/share/icons/hicolor/256x256/apps/io.github.beamiter.anvil.png"
               install -Dm644 config.toml.example \
-                "$out/share/doc/jterm1/config.toml.example"
+                "$out/share/doc/anvil/config.toml.example"
               install -Dm644 README.md \
-                "$out/share/doc/jterm1/README.md"
+                "$out/share/doc/anvil/README.md"
               install -Dm644 Cargo.lock \
-                "$out/share/doc/jterm1/Cargo.lock"
+                "$out/share/doc/anvil/Cargo.lock"
               install -Dm755 scripts/support-bundle.sh \
-                "$out/bin/jterm1-support-bundle"
+                "$out/bin/anvil-support-bundle"
 
-              install -d "$out/share/jterm1/shell-integration"
+              install -d "$out/share/anvil/shell-integration"
               install -m644 scripts/shell-integration/README.md \
-                "$out/share/jterm1/shell-integration/"
-              install -m644 scripts/shell-integration/jterm1.* \
-                "$out/share/jterm1/shell-integration/"
+                "$out/share/anvil/shell-integration/"
+              install -m644 scripts/shell-integration/anvil.* \
+                "$out/share/anvil/shell-integration/"
 
-              install -d "$out/share/jterm1/workflows"
+              install -d "$out/share/anvil/workflows"
               install -m644 scripts/workflows/*.yaml \
-                "$out/share/jterm1/workflows/"
+                "$out/share/anvil/workflows/"
 
               install -Dm644 scripts/notebooks/welcome.jtnb.md \
-                "$out/share/jterm1/notebooks/welcome.jtnb.md"
+                "$out/share/anvil/notebooks/welcome.jtnb.md"
             '';
 
             preFixup = ''
               gappsWrapperArgs+=(
-                --set-default JTERM1_WORKFLOW_DIR "$out/share/jterm1/workflows"
-                --set-default JTERM1_ASSET_DIR "$out/share/jterm1"
+                --set-default ANVIL_WORKFLOW_DIR "$out/share/anvil/workflows"
+                --set-default ANVIL_ASSET_DIR "$out/share/anvil"
               )
             '';
 
             meta = with pkgs.lib; {
               description = manifest.package.description;
               homepage = manifest.package.repository;
-              mainProgram = "jterm1";
+              mainProgram = "anvil";
               platforms = platforms.linux;
             };
           };
@@ -152,7 +152,7 @@
               export QT_IM_MODULE="''${QT_IM_MODULE:-fcitx}"
               export GTK_PATH="${pkgs.fcitx5-gtk}/lib/gtk-4.0''${GTK_PATH:+:$GTK_PATH}"
               export FCITX5_GTK_PATH="${pkgs.fcitx5-gtk}/lib/gtk-4.0"
-              echo "jterm1 development environment ready. Run 'make verify'."
+              echo "anvil development environment ready. Run 'make verify'."
             '';
           };
         }

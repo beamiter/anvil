@@ -1,0 +1,104 @@
+app-id: io.github.beamiter.anvil
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: anvil
+
+finish-args:
+  - --share=ipc
+  - --share=network
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --socket=ssh-auth
+  - --device=dri
+  - --filesystem=host
+  - --talk-name=org.freedesktop.Flatpak
+  - --env=ANVIL_ASSET_DIR=/app/share/anvil
+  - --env=ANVIL_WORKFLOW_DIR=/app/share/anvil/workflows
+
+cleanup:
+  - /bin/vte-2.91-gtk4
+  - /include
+  - /lib/cmake
+  - /lib/pkgconfig
+  - /share/doc
+  - /share/gir-1.0
+  - /share/gtk-doc
+  - /share/man
+  - /share/pkgconfig
+  - /share/vala
+  - '*.a'
+  - '*.la'
+
+modules:
+  - name: fast_float
+    buildsystem: cmake-ninja
+    sources:
+      - type: git
+        url: https://github.com/fastfloat/fast_float.git
+        tag: v8.2.5
+        commit: 05087a303dad9c98768b33c829d398223a649bc6
+
+  - name: simdutf
+    buildsystem: cmake-ninja
+    sources:
+      - type: git
+        url: https://github.com/simdutf/simdutf.git
+        tag: v9.0.0
+        commit: ca7acbcea967b5dcbab490066e99e3a6e6925539
+
+  - name: vte
+    buildsystem: meson
+    config-opts:
+      - --buildtype=release
+      - -Dgtk3=false
+      - -Dgtk4=true
+      - -Dglade=false
+      - -Dgir=false
+      - -Dvapi=false
+    sources:
+      - type: archive
+        url: https://download.gnome.org/sources/vte/0.84/vte-0.84.0.tar.xz
+        sha256: 0414e31583836aeb7878da25f67c515f7e8879917ecc37c92e26b83e8d8fc3e3
+
+  - name: anvil
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/anvil/cargo
+        CARGO_NET_OFFLINE: 'true'
+    build-commands:
+      - cargo --offline fetch --manifest-path Cargo.toml --verbose
+      - cargo build --offline --release --locked
+      - install -Dm0755 target/release/anvil ${FLATPAK_DEST}/bin/anvil
+      - install -Dm0755 scripts/support-bundle.sh ${FLATPAK_DEST}/bin/anvil-support-bundle
+      - install -Dm0644 data/io.github.beamiter.anvil.desktop ${FLATPAK_DEST}/share/applications/io.github.beamiter.anvil.desktop
+      - install -Dm0644 data/io.github.beamiter.anvil.metainfo.xml ${FLATPAK_DEST}/share/metainfo/io.github.beamiter.anvil.metainfo.xml
+      - install -Dm0644 data/io.github.beamiter.anvil.svg ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/io.github.beamiter.anvil.svg
+      - install -Dm0644 data/io.github.beamiter.anvil-128.png ${FLATPAK_DEST}/share/icons/hicolor/128x128/apps/io.github.beamiter.anvil.png
+      - install -Dm0644 data/io.github.beamiter.anvil-256.png ${FLATPAK_DEST}/share/icons/hicolor/256x256/apps/io.github.beamiter.anvil.png
+      - install -Dm0644 scripts/shell-integration/README.md ${FLATPAK_DEST}/share/anvil/shell-integration/README.md
+      - install -Dm0644 scripts/shell-integration/anvil.bash ${FLATPAK_DEST}/share/anvil/shell-integration/anvil.bash
+      - install -Dm0644 scripts/shell-integration/anvil.zsh ${FLATPAK_DEST}/share/anvil/shell-integration/anvil.zsh
+      - install -Dm0644 scripts/shell-integration/anvil.fish ${FLATPAK_DEST}/share/anvil/shell-integration/anvil.fish
+      - install -Dm0644 scripts/shell-integration/anvil.ps1 ${FLATPAK_DEST}/share/anvil/shell-integration/anvil.ps1
+      - install -Dm0644 scripts/workflows/docker-tail-logs.yaml ${FLATPAK_DEST}/share/anvil/workflows/docker-tail-logs.yaml
+      - install -Dm0644 scripts/workflows/find-large-files.yaml ${FLATPAK_DEST}/share/anvil/workflows/find-large-files.yaml
+      - install -Dm0644 scripts/workflows/git-feature.yaml ${FLATPAK_DEST}/share/anvil/workflows/git-feature.yaml
+      - install -Dm0644 scripts/workflows/git-rebase-interactive.yaml ${FLATPAK_DEST}/share/anvil/workflows/git-rebase-interactive.yaml
+      - install -Dm0644 scripts/workflows/kill-port.yaml ${FLATPAK_DEST}/share/anvil/workflows/kill-port.yaml
+      - install -Dm0644 scripts/workflows/ssh-tunnel.yaml ${FLATPAK_DEST}/share/anvil/workflows/ssh-tunnel.yaml
+      - install -Dm0644 scripts/notebooks/welcome.jtnb.md ${FLATPAK_DEST}/share/anvil/notebooks/welcome.jtnb.md
+    sources:
+      - type: dir
+        path: ../..
+        skip:
+          - .git
+          - .flatpak-builder
+          - flatpak-build
+          - flatpak-repo
+          - target
+      - cargo-sources.json

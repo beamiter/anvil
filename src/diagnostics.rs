@@ -98,7 +98,7 @@ fn executable_exists(executable: &str) -> bool {
 /// and user-authored values. It is intentionally an internal environment flag,
 /// not a general command-line option.
 fn diagnostics_redacted() -> bool {
-    std::env::var_os("JTERM1_DIAGNOSTICS_REDACT")
+    std::env::var_os("ANVIL_DIAGNOSTICS_REDACT")
         .is_some_and(|value| !value.is_empty() && value != "0")
 }
 
@@ -183,7 +183,7 @@ fn collect() -> DiagnosticReport {
             "config",
             CheckStatus::Error,
             format!(
-                "{} has {} validation error(s); run `jterm1 --check-config`",
+                "{} has {} validation error(s); run `anvil --check-config`",
                 diagnostic_path(&config_path),
                 validation.errors()
             ),
@@ -193,7 +193,7 @@ fn collect() -> DiagnosticReport {
             "config",
             CheckStatus::Warning,
             format!(
-                "{} is readable with {} warning(s); run `jterm1 --check-config`",
+                "{} is readable with {} warning(s); run `anvil --check-config`",
                 diagnostic_path(&config_path),
                 validation.warnings()
             ),
@@ -449,7 +449,7 @@ fn collect() -> DiagnosticReport {
 
 fn print_human(report: &DiagnosticReport) -> io::Result<()> {
     let mut stdout = io::stdout().lock();
-    writeln!(stdout, "jterm1 {} diagnostics\n", report.version)?;
+    writeln!(stdout, "anvil {} diagnostics\n", report.version)?;
     for check in &report.checks {
         let status = match check.status {
             CheckStatus::Ok => "ok",
@@ -478,7 +478,7 @@ pub(crate) fn run(format: ReportFormat) -> bool {
         ReportFormat::Json => print_json(&report),
     };
     if let Err(error) = printed {
-        eprintln!("jterm1: failed to write diagnostics: {error}");
+        eprintln!("anvil: failed to write diagnostics: {error}");
         return false;
     }
     report.healthy()
@@ -494,7 +494,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let path = std::env::temp_dir().join(format!(
-            "jterm1-doctor-shell-permissions-{}",
+            "anvil-doctor-shell-permissions-{}",
             std::process::id()
         ));
         fs::write(&path, "#!/bin/sh\n").unwrap();

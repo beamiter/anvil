@@ -2,7 +2,7 @@
 //!
 //! Wraps a `vte4::Terminal` + `gtk::Scrollbar` in a horizontal box. The shell
 //! is spawned on init. VTE signals (cwd/exit/bell/title/activity) are forwarded
-//! as component Output messages instead of jterm4's callback-Vec observer model.
+//! as component Output messages instead of forge's callback-Vec observer model.
 
 use gtk::gdk::ffi::GDK_BUTTON_PRIMARY;
 use gtk::gdk::ModifierType;
@@ -24,7 +24,7 @@ use vte4::{TerminalExt, TerminalExtManual};
 use crate::child_env;
 use crate::config::Config;
 
-// ─── Terminal widget construction (ported from jterm4 terminal.rs) ──────────
+// ─── Terminal widget construction (ported from forge terminal.rs) ──────────
 
 pub(crate) fn create_terminal(config: &Config) -> Terminal {
     let font_scale = config.default_font_scale;
@@ -288,7 +288,7 @@ pub(crate) fn spawn_shell(
                 Err(error) => {
                     let message = launch_failure_message(&error);
                     log::error!("{message}");
-                    let terminal_message = format!("\r\njterm1: {message}\r\n");
+                    let terminal_message = format!("\r\nanvil: {message}\r\n");
                     terminal_for_pid.feed(terminal_message.as_bytes());
                     let _ = sender.output(VteOutput::LaunchFailed(message));
                     return;
@@ -415,7 +415,7 @@ pub enum VteInput {
     JumpToPrevFailed,
     JumpToNextFailed,
     /// Block-view only: write the whole session's blocks to a Markdown / JSON
-    /// file under the jterm1 data directory.
+    /// file under the anvil data directory.
     ExportSessionMarkdown,
     ExportSessionJson,
     /// Search: set the query and jump to the first match. `use_regex` treats the

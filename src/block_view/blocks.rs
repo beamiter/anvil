@@ -1951,7 +1951,7 @@ impl FinishedBlock {
 // ─── ActiveBlock ──────────────────────────────────────────────────────────────
 
 /// The live area: a single persistent input-enabled VTE pinned to the viewport
-/// height (jterm1 model). The shell's prompt, the user's typing, and command
+/// height (anvil model). The shell's prompt, the user's typing, and command
 /// output all render natively in this one VTE. When a command finishes, its
 /// accumulated output (`raw_output`) is snapshotted into a styled FinishedBlock
 /// stacked above this card.
@@ -1959,7 +1959,7 @@ pub(crate) struct ActiveBlock {
     pub(crate) widget: gtk::Box,
     pub(crate) active_vte: Terminal,
     /// Raw output bytes accumulated during CollectingOutput, consumed by the
-    /// finalize path to build the styled finished block (jterm1's `out_buf`).
+    /// finalize path to build the styled finished block (anvil's `out_buf`).
     pub(crate) raw_output: Rc<RefCell<VecDeque<u8>>>,
 }
 
@@ -2044,7 +2044,7 @@ impl ActiveBlock {
         (self.active_vte.column_count().max(20)) as usize
     }
 
-    /// Reset the live VTE for the next prompt (jterm1 block.rs:1028-1044). `reset`
+    /// Reset the live VTE for the next prompt (anvil block.rs:1028-1044). `reset`
     /// acts immediately, but already-queued feed() bytes are processed async, so the
     /// in-stream clear (fed after them) wipes stale output in the correct order.
     ///

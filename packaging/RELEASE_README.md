@@ -1,6 +1,6 @@
-# jterm1 relocatable Linux bundle
+# anvil relocatable Linux bundle
 
-This archive contains a prebuilt `jterm1` binary plus its desktop entry, shell
+This archive contains a prebuilt `anvil` binary plus its desktop entry, shell
 integrations, example workflows, documented configuration, and welcome notebook.
 It installs only into the current user's XDG directories; root access is not
 required, and an existing `config.toml` is never overwritten.
@@ -20,9 +20,9 @@ provider configured through environment variables.
 From the directory containing the downloaded archive and checksum:
 
 ```bash
-sha256sum --check jterm1-*.tar.gz.sha256
-tar -xzf jterm1-*.tar.gz
-cd jterm1-*/
+sha256sum --check anvil-*.tar.gz.sha256
+tar -xzf anvil-*.tar.gz
+cd anvil-*/
 ./install.sh
 ```
 
@@ -33,18 +33,18 @@ those user files should also be removed.
 After installation:
 
 ```bash
-jterm1 --doctor
-jterm1 --doctor --json
-jterm1 --check-config
-jterm1 --safe-mode
-jterm1
+anvil --doctor
+anvil --doctor --json
+anvil --check-config
+anvil --safe-mode
+anvil
 ```
 
-For support, `jterm1-support-bundle [OUTPUT_DIRECTORY]` creates a privacy-preserving
+For support, `anvil-support-bundle [OUTPUT_DIRECTORY]` creates a privacy-preserving
 archive that excludes configuration contents, terminal history/output, and secret
 values. In-app settings use revision-checked atomic writes and two rotating backups;
-`jterm1 --restore-config-backup` restores the newest valid one while preserving the
+`anvil --restore-config-backup` restores the newest valid one while preserving the
 replaced file.
 
-The installer writes the binary to `~/.local/bin/jterm1` and assets beneath
+The installer writes the binary to `~/.local/bin/anvil` and assets beneath
 `${XDG_DATA_HOME:-$HOME/.local/share}`. Add `~/.local/bin` to `PATH` when needed.

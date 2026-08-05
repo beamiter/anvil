@@ -1,5 +1,5 @@
 //! Small dependency-free command-line contract for launching and diagnosing
-//! jterm1. Parsing stays independent of GTK so `--help`, `--version`, and
+//! anvil. Parsing stays independent of GTK so `--help`, `--version`, and
 //! `--doctor` remain fast and usable on headless machines.
 
 use std::ffi::OsString;
@@ -268,11 +268,11 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<ParsedAr
     })
 }
 
-pub(crate) const HELP: &str = r#"jterm1 — a Block-first terminal workspace
+pub(crate) const HELP: &str = r#"anvil — a Block-first terminal workspace
 
 Usage:
-  jterm1 [OPTIONS] [DIRECTORY]
-  jterm1 [OPTIONS] --execute COMMAND [ARG...]
+  anvil [OPTIONS] [DIRECTORY]
+  anvil [OPTIONS] --execute COMMAND [ARG...]
 
 Global options:
   -c, --config PATH           Use an alternate config file for this process
@@ -297,18 +297,18 @@ Utilities:
   -V, --version                Show the version
 
 Examples:
-  jterm1 ~/project
-  jterm1 --mode block --no-restore
-  jterm1 --safe-mode
-  jterm1 --doctor --json
-  jterm1 --check-config
-  jterm1 --check-config ~/custom-jterm1.toml --json
-  jterm1 --config ~/custom-jterm1.toml --config-path
-  jterm1 --restore-config-backup
-  jterm1 -d /tmp -e bash -lc 'printf "hello\\n"'
-  source <(jterm1 --shell-integration bash)
+  anvil ~/project
+  anvil --mode block --no-restore
+  anvil --safe-mode
+  anvil --doctor --json
+  anvil --check-config
+  anvil --check-config ~/custom-anvil.toml --json
+  anvil --config ~/custom-anvil.toml --config-path
+  anvil --restore-config-backup
+  anvil -d /tmp -e bash -lc 'printf "hello\\n"'
+  source <(anvil --shell-integration bash)
 
-JTERM1_CONFIG provides the same process-local config-path override as --config.
+ANVIL_CONFIG provides the same process-local config-path override as --config.
 "#;
 
 #[cfg(test)]

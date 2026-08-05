@@ -6,7 +6,7 @@
 //! thread and reports back through the normal message loop.
 //!
 //! The decisions live in `jterm_core::jsh_install`, shared with the other
-//! terminals; this file is only jterm1's surface for them.
+//! terminals; this file is only anvil's surface for them.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -64,7 +64,7 @@ impl AppModel {
         let slot: Arc<Mutex<Option<Status>>> = Arc::new(Mutex::new(None));
         let worker = slot.clone();
         let spawn_result = std::thread::Builder::new()
-            .name("jterm1-jsh-update-check".to_string())
+            .name("anvil-jsh-update-check".to_string())
             .spawn(move || {
                 *worker.lock().expect("jsh check slot poisoned") =
                     Some(jsh_install::check_blocking(max_age));
@@ -99,7 +99,7 @@ impl AppModel {
             // fix PATH order, so the installer explains it in the tab; here it
             // is only worth a log line.
             let other = crate::text_safety::bounded_display_text(other, 2 * 1024, false);
-            log::warn!("PATH resolves jsh to {other}, which jterm1 does not manage");
+            log::warn!("PATH resolves jsh to {other}, which anvil does not manage");
         }
 
         let Some(prompt) = jsh_install::prompt_for(status) else {

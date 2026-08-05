@@ -68,6 +68,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "anvil"
+version = "0.2.0"
+dependencies = [
+ "bytecheck",
+ "env_logger",
+ "fuzzy-matcher",
+ "io-lifetimes 3.0.1",
+ "jterm_core",
+ "log",
+ "memchr",
+ "nix",
+ "pcre2-sys",
+ "regex",
+ "relm4",
+ "rkyv",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "toml",
+ "unicode-bidi",
+ "unicode-bidi-mirroring",
+ "unicode-width",
+ "vte4",
+ "zstd",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -814,33 +841,6 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "jterm1"
-version = "0.2.0"
-dependencies = [
- "bytecheck",
- "env_logger",
- "fuzzy-matcher",
- "io-lifetimes 3.0.1",
- "jterm_core",
- "log",
- "memchr",
- "nix",
- "pcre2-sys",
- "regex",
- "relm4",
- "rkyv",
- "serde",
- "serde_json",
- "serde_yaml",
- "toml",
- "unicode-bidi",
- "unicode-bidi-mirroring",
- "unicode-width",
- "vte4",
- "zstd",
 ]
 
 [[package]]

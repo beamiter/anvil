@@ -4,7 +4,7 @@
 //! an optional tag list, a command template with `{arg}` or `{{arg}}`
 //! placeholders, and named arguments with optional defaults and descriptions.
 //!
-//! Files are loaded from `~/.config/jterm1/workflows/`, installed XDG
+//! Files are loaded from `~/.config/anvil/workflows/`, installed XDG
 //! data directories, and the development `scripts/workflows/` directory.
 //! Parse failures are logged and skipped — one broken file never disables the
 //! rest.
@@ -263,10 +263,10 @@ fn validate_display_field(
     Ok(())
 }
 
-/// Standard config dir: `<XDG_CONFIG_HOME>/jterm1/workflows/`.
+/// Standard config dir: `<XDG_CONFIG_HOME>/anvil/workflows/`.
 pub(crate) fn user_workflow_dir() -> PathBuf {
     let base: PathBuf = gtk::glib::user_config_dir();
-    base.join("jterm1").join("workflows")
+    base.join("anvil").join("workflows")
 }
 
 fn installed_asset_dirs(kind: &str) -> Vec<PathBuf> {
@@ -276,20 +276,20 @@ fn installed_asset_dirs(kind: &str) -> Vec<PathBuf> {
 fn asset_dirs_from(data_dirs: impl IntoIterator<Item = PathBuf>, kind: &str) -> Vec<PathBuf> {
     data_dirs
         .into_iter()
-        .map(|base| base.join("jterm1").join(kind))
+        .map(|base| base.join("anvil").join(kind))
         .collect()
 }
 
 /// Workflow search path in precedence order. User-authored config wins,
 /// followed by installed examples, then the source-tree examples used during
-/// development. `JTERM1_WORKFLOW_DIR` may add one or more platform-separated
+/// development. `ANVIL_WORKFLOW_DIR` may add one or more platform-separated
 /// directories without replacing the standard locations.
 pub(crate) fn workflow_dirs() -> Vec<PathBuf> {
     let mut dirs = vec![user_workflow_dir()];
-    if let Some(extra) = std::env::var_os("JTERM1_WORKFLOW_DIR") {
+    if let Some(extra) = std::env::var_os("ANVIL_WORKFLOW_DIR") {
         dirs.extend(std::env::split_paths(&extra));
     }
-    dirs.push(gtk::glib::user_data_dir().join("jterm1").join("workflows"));
+    dirs.push(gtk::glib::user_data_dir().join("anvil").join("workflows"));
     dirs.extend(installed_asset_dirs("workflows"));
     dirs.push(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -310,12 +310,12 @@ pub(crate) fn workflow_dirs() -> Vec<PathBuf> {
 /// center's first-run entry.
 pub(crate) fn welcome_notebook_path() -> Option<PathBuf> {
     let mut candidates = Vec::new();
-    if let Some(asset_dir) = std::env::var_os("JTERM1_ASSET_DIR") {
+    if let Some(asset_dir) = std::env::var_os("ANVIL_ASSET_DIR") {
         candidates.push(PathBuf::from(asset_dir).join("notebooks/welcome.jtnb.md"));
     }
     candidates.push(
         gtk::glib::user_data_dir()
-            .join("jterm1")
+            .join("anvil")
             .join("notebooks")
             .join("welcome.jtnb.md"),
     );
@@ -750,8 +750,8 @@ default = "api"
                 "workflows"
             ),
             [
-                PathBuf::from("/usr/share/jterm1/workflows"),
-                PathBuf::from("/app/share/jterm1/workflows")
+                PathBuf::from("/usr/share/anvil/workflows"),
+                PathBuf::from("/app/share/anvil/workflows")
             ]
         );
     }
@@ -759,7 +759,7 @@ default = "api"
     fn tempdir() -> PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!(
-            "jterm1-workflows-test-{}-{}",
+            "anvil-workflows-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

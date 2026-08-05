@@ -94,9 +94,9 @@ pub(crate) struct PendingAgentCommand {
     pub(crate) generation: u64,
 }
 
-/// jterm1's Agent session. The pure protocol state machine (turn caps,
+/// anvil's Agent session. The pure protocol state machine (turn caps,
 /// approval transitions, transcript bounds, prompt assembly) lives in
-/// `jterm_core::agent`; this wrapper adds what is jterm1-specific: the
+/// `jterm_core::agent`; this wrapper adds what is anvil-specific: the
 /// tab/pane binding, the approved-command correlation slot, and ownership
 /// of the in-flight LLM request handle.
 pub(crate) struct AgentSession {

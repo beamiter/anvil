@@ -3,7 +3,7 @@
 //! A streaming parser that walks output bytes, tracks SGR style state, and emits
 //! styled text runs which are applied to a `TextBuffer` as colored/attributed
 //! tags. `\r` overwrite is handled per-line (so progress bars collapse to their
-//! final frame) without a full terminal grid. Ported/condensed from jterm4's
+//! final frame) without a full terminal grid. Ported/condensed from forge's
 //! `block_view/ansi.rs`.
 
 use gtk::gdk::RGBA;

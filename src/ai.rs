@@ -3,9 +3,9 @@
 //! Client construction, prompt building, transport (host curl with secrets
 //! kept out of argv), request-history budgeting, secret redaction, and
 //! response parsing all live in `jterm_core::ai`. This module keeps only the
-//! jterm1-side glue: Config → settings conversion, the worker-thread +
+//! anvil-side glue: Config → settings conversion, the worker-thread +
 //! `glib::timeout_add_local` completion bridge, and the one prompt builder
-//! whose shape is specific to jterm1's block-chat panel.
+//! whose shape is specific to anvil's block-chat panel.
 //!
 //! Privacy: nothing leaves the machine without an explicit user action
 //! (clicking an Explain button, typing into the panel, hitting `?` in the
@@ -42,8 +42,8 @@ fn settings(config: &crate::config::Config) -> AiSettings {
     }
 }
 
-/// Build a client from jterm1's Config. Errors stay plain strings because
-/// every jterm1 AI surface reports them as status-bar/inline text.
+/// Build a client from anvil's Config. Errors stay plain strings because
+/// every anvil AI surface reports them as status-bar/inline text.
 pub(crate) fn client_from_config(config: &crate::config::Config) -> Result<AiClient, String> {
     AiClient::from_settings(&settings(config)).map_err(|error| error.to_string())
 }
@@ -120,7 +120,7 @@ pub(crate) fn ask_turns(
 
     let worker_token = token.clone();
     let spawn_result = std::thread::Builder::new()
-        .name("jterm1-ai-request".to_string())
+        .name("anvil-ai-request".to_string())
         .spawn(move || {
             // Redaction and request budgeting happen inside the shared client.
             let result = client
@@ -184,7 +184,7 @@ pub(crate) fn ask_turns_streaming(
 
     let worker_token = token.clone();
     let spawn_result = std::thread::Builder::new()
-        .name("jterm1-ai-stream".to_string())
+        .name("anvil-ai-stream".to_string())
         .spawn(move || {
             let result = client
                 .send_turns_streaming_cancellable(

@@ -261,13 +261,13 @@ fn pop_typed_command_shadow(buffer: &mut String) {
     }
 }
 
-/// jterm1's paste policy for text this app puts on the shell's prompt (block
+/// anvil's paste policy for text this app puts on the shell's prompt (block
 /// recall, the history palette): strip terminal controls even though the text
 /// came from local capture, because a spoofed shell-integration stream can also
 /// populate that capture. Multiline text is kept only when the shell advertised
 /// DECSET 2004 — an unframed newline would submit each line as its own command.
 fn prompt_insert_policy() -> pty_input::PastePolicy {
-    // jterm1 currently exact-pins a released jterm_core whose prompt-insert
+    // anvil currently exact-pins a released jterm_core whose prompt-insert
     // default predates this hardening, so keep the call-site override until the
     // staged jterm_core release can be pinned.
     let mut policy =
@@ -278,7 +278,7 @@ fn prompt_insert_policy() -> pty_input::PastePolicy {
 
 /// Encode clipboard text for the shell PTY.
 ///
-/// jterm1's clipboard policy: de-fang controls (a clipboard is untrusted text,
+/// anvil's clipboard policy: de-fang controls (a clipboard is untrusted text,
 /// and an escape sequence in it would drive the terminal rather than the shell)
 /// and truncate a multiline payload to its first line when the shell has not
 /// advertised DECSET 2004. Paste-marker removal is not part of the policy — the
@@ -427,7 +427,7 @@ fn recall_selected_commands_at_prompt(
 
 /// Mirror text this app wrote to the shell into the live editor shadow.
 ///
-/// jterm1 reconstructs the typed line from the live VTE's `commit` signal, which
+/// anvil reconstructs the typed line from the live VTE's `commit` signal, which
 /// a clipboard paste never travels through: block mode writes to its own PTY
 /// directly. Without this the shadow misses everything the user pasted, so the
 /// idle input cell keeps the height of a line the shell no longer has and the
@@ -647,7 +647,7 @@ fn build_keyboard_query_reply(
         KeyboardProtocolQuery::SecondaryDeviceAttributes => "\x1b[>0;0;0c".to_string(),
         KeyboardProtocolQuery::TertiaryDeviceAttributes => "\x1bP!|00000000\x1b\\".to_string(),
         KeyboardProtocolQuery::XtVersion => {
-            format!("\x1bP>|jterm1 {}\x1b\\", env!("CARGO_PKG_VERSION"))
+            format!("\x1bP>|anvil {}\x1b\\", env!("CARGO_PKG_VERSION"))
         }
         KeyboardProtocolQuery::DeviceStatus => "\x1b[0n".to_string(),
         KeyboardProtocolQuery::CursorPosition => format!(
@@ -1158,7 +1158,7 @@ pub struct TermView {
     root: gtk::Box,
     block_scroll: ScrolledWindow,
     block_list: gtk::Box,
-    /// The single persistent live VTE (jterm1 model): prompt + typing + output all
+    /// The single persistent live VTE (anvil model): prompt + typing + output all
     /// render here natively; finished commands snapshot into styled blocks above.
     active_vte: Terminal,
     active: Rc<RefCell<ActiveBlock>>,
@@ -1267,7 +1267,7 @@ struct ReaderCtx {
     /// The live VTE — every byte is fed here; alt-screen toggles feed it 1049h/l.
     active_vte: Terminal,
     bstate_rc: Rc<Cell<BlockState>>,
-    /// State to restore when an alt-screen app exits (jterm1 model).
+    /// State to restore when an alt-screen app exits (anvil model).
     prev_state_rc: Rc<Cell<BlockState>>,
     osc133_depth_rc: Rc<Cell<u32>>,
     prompt_buf_rc: Rc<RefCell<String>>,
@@ -1410,7 +1410,7 @@ thread_local! {
 /// True when enough time has passed since the previous desktop notification.
 /// The first permitted notification stamps `LAST_NOTIFICATION_AT`, so later
 /// requests in the same event batch fail this check and drop silently — at
-/// most one notification per batch, matching jterm3.
+/// most one notification per batch, matching frost.
 fn notification_permitted(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|prev| now.duration_since(prev) >= NOTIFICATION_MIN_INTERVAL)
 }
@@ -2559,7 +2559,7 @@ impl ReaderCtx {
                             // occasionally be empty even for a real command. It
                             // remains the finalize fallback until PromptEnd
                             // clears both command buffers for the next prompt.
-                            // Match jterm1's block-mode runtime model: keep the
+                            // Match anvil's block-mode runtime model: keep the
                             // active VTE as the live surface while the command
                             // runs, then snapshot it into a finished block on the
                             // next prompt. Interactive CLIs such as Codex rely on
@@ -2899,7 +2899,7 @@ fn exit_fullscreen(
 }
 
 /// Captures the handles the live-VTE key handler needs. With the VTE owning line
-/// editing + IME natively (jterm1 model), this is reduced to a Capture-phase
+/// editing + IME natively (anvil model), this is reduced to a Capture-phase
 /// navigation / copy-paste / block-selection handler; printable keys and editing
 /// fall through to the VTE.
 struct KeyCtx {
@@ -3231,7 +3231,7 @@ impl TermView {
 
         // Block list inside a scrolled window
         let block_list = gtk::Box::new(Orientation::Vertical, 0);
-        block_list.set_vexpand(true); // jterm1: expand so the active card fills
+        block_list.set_vexpand(true); // anvil: expand so the active card fills
                                       // the space left below finished blocks.
         block_list.add_css_class("block-list");
 
@@ -3249,7 +3249,7 @@ impl TermView {
         block_scroll.set_focusable(false);
 
         // Active block: a single persistent live VTE pinned at the bottom of the
-        // block list. Prompt + typing + output all render here natively (jterm1
+        // block list. Prompt + typing + output all render here natively (anvil
         // model); finished commands snapshot into styled blocks above it.
         let active = Rc::new(RefCell::new(ActiveBlock::new(config)));
         let active_vte = active.borrow().active_vte.clone();
@@ -3360,7 +3360,7 @@ impl TermView {
 
         // Git defaults LESS to "FRX" when the user has not set it. "F" quits
         // the pager when output fits on one screen, and "X" disables less'
-        // alternate-screen setup. jterm1 defaults it to raw-control-char
+        // alternate-screen setup. anvil defaults it to raw-control-char
         // rendering only: keep colored git output, keep the interactive pager
         // even for a short `git log`, and let less use alt-screen so transient
         // pager content stays ephemeral. An explicit user LESS still wins.
@@ -3565,7 +3565,7 @@ impl TermView {
             });
         }
 
-        // State to restore when an alt-screen app exits (jterm1 model).
+        // State to restore when an alt-screen app exits (anvil model).
         let prev_state: Rc<Cell<BlockState>> = Rc::new(Cell::new(BlockState::Idle));
         let osc133_depth: Rc<Cell<u32>> = Rc::new(Cell::new(0));
         let prompt_buf: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
@@ -4095,7 +4095,7 @@ impl TermView {
         // ── VTE is used as a display-only widget (fed via feed() in alt-screen mode)
         //    so we do NOT attach it to the PTY. Our reader thread handles all I/O.
 
-        // ── Live VTE input → PTY (jterm1 model) ───────────────────────────
+        // ── Live VTE input → PTY (anvil model) ───────────────────────────
         // The active VTE has input_enabled(true), so it translates keystrokes and
         // owns IME natively; its `commit` signal carries the bytes to send. We
         // forward them to the PTY and, while awaiting a command, reconstruct the
@@ -5553,7 +5553,7 @@ mod tests {
             "\x1b[1;1R"
         );
         let version = build_keyboard_query_reply(KeyboardProtocolQuery::XtVersion, 0, 0);
-        assert!(version.starts_with("\x1bP>|jterm1 "));
+        assert!(version.starts_with("\x1bP>|anvil "));
         assert!(version.contains(env!("CARGO_PKG_VERSION")));
         assert!(version.ends_with("\x1b\\"));
     }
@@ -5901,7 +5901,7 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_paste_keeps_jterm1s_first_line_fallback_and_strips_controls() {
+    fn clipboard_paste_keeps_anvils_first_line_fallback_and_strips_controls() {
         let paste = build_clipboard_paste("echo one\necho two", false);
         assert_eq!(paste.echo_text, "echo one");
         assert!(paste.risk.truncated_to_first_line);

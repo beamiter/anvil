@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to jterm1 are documented here. The project follows semantic
+All notable changes to anvil are documented here. The project follows semantic
 versioning for tagged releases while it remains experimental.
 
 ## Unreleased
@@ -36,7 +36,7 @@ versioning for tagged releases while it remains experimental.
   running container, the tab connects with `docker exec` instead of ssh, and
   `user` becomes the user inside it (`-u`, or `--docker-user` when deploying).
   `deploy` behaves as it does over ssh. `jterm_core::jsh_remote` and
-  `jsh-remote.sh` have supported `--docker` all along; jterm1 hardcoded it to
+  `jsh-remote.sh` have supported `--docker` all along; anvil hardcoded it to
   `false`, so a container target could not be expressed in the config at all.
   `ssh_args`, `multiplex`, and `login_shell` are ignored for a container.
 - Project licensing under `MIT OR Apache-2.0`: canonical `LICENSE-MIT` and
@@ -50,15 +50,15 @@ versioning for tagged releases while it remains experimental.
   picks up any trailing token-limit advisory); a mid-stream failure keeps the
   partial text visible and reports the error like any other request error,
   and cancellation still kills the transfer immediately. Controlled by
-  `ai_stream` (`JTERM1_AI_STREAM`, settings toggle, default on); command
+  `ai_stream` (`ANVIL_AI_STREAM`, settings toggle, default on); command
   generation, explain helpers, and agent mode always wait for the complete
   reply.
 - Block mode now honors OSC 9 and OSC 777 desktop notifications: programs
   inside the PTY (including remote ones over SSH) can raise a `notify-send`
   notification through `jterm_core::notify::app_notification`. The parser
-  control-strips and caps the text; jterm1 paces launches app-wide — at most
+  control-strips and caps the text; anvil paces launches app-wide — at most
   one notification per output batch and one every two seconds, extras dropped
-  silently — matching jterm3.
+  silently — matching frost.
 - One-command install and update for the companion shell jsh. The palette
   action "Install or update jsh" runs the installer in its own VTE tab, so the
   tab is the progress UI: it can be interrupted with Ctrl+C and waits for Enter
@@ -77,7 +77,7 @@ versioning for tagged releases while it remains experimental.
   through non-zero-exit blocks with wrap-around, mirroring pinned-block
   navigation (`jump_to_prev_failed` / `jump_to_next_failed`).
 - Whole-session export: "Export session as Markdown/JSON file" writes every
-  completed block to a timestamped, owner-only file under the jterm1 data
+  completed block to a timestamped, owner-only file under the anvil data
   directory and reports the path in a toast.
 - The block right-click menu gained multi-selection-aware "Copy Blocks as
   Markdown", including prompt, command, output, exit code, and duration.
@@ -101,7 +101,7 @@ versioning for tagged releases while it remains experimental.
 - Isolated `--safe-mode` recovery sessions with VTE + `sh`, no restore or
   persistence, and network/state-producing integrations disabled.
 - Machine-readable `--doctor --json` diagnostics and a privacy-preserving
-  `jterm1-support-bundle` archive generator.
+  `anvil-support-bundle` archive generator.
 - A scheduled dependency vulnerability audit, ShellCheck gate, shared
   `make security` command, and repository Rust toolchain contract.
 - Build provenance metadata and the exact Cargo lockfile in relocatable bundles.
@@ -193,7 +193,7 @@ versioning for tagged releases while it remains experimental.
   shortcuts keep the `Ctrl+Shift+Alt` order and "Enter" spelling; the
   sidebar chord now displays as `Ctrl+\` instead of `Ctrl+backslash`, and
   docs follow the displayed modifier order. A new contract test pins
-  jterm1's defaults to the family-wide `DEFAULT_CHORDS` table.
+  anvil's defaults to the family-wide `DEFAULT_CHORDS` table.
 - Block-mode child-process termination now uses the shared
   `jterm_core::process` lifecycle (also seeded from this repository's copy):
   `ChildLifecycle`, `ReapOwner`, and the `EscalationPolicy` ladder replace the
@@ -226,7 +226,7 @@ versioning for tagged releases while it remains experimental.
   release to 0.9.9.
 - The desktop integration now actually produces a launcher icon after
   `./scripts/install.sh`. Three separate causes:
-  - The entry shipped `Exec=jterm1` / `TryExec=jterm1`, which depend on `PATH`.
+  - The entry shipped `Exec=anvil` / `TryExec=anvil`, which depend on `PATH`.
     A desktop session fixes its `PATH` at login and the default target
     `~/.local/bin` is frequently absent from it, so `TryExec` failed and the
     entry vanished from the application list entirely. Both installers now
@@ -240,11 +240,11 @@ versioning for tagged releases while it remains experimental.
     a relaxed umask so a `sudo --prefix /usr` install cannot leave `0600` caches
     that no other user can read.
   - `StartupWMClass` carried the application ID, but GTK4 derives the X11
-    `WM_CLASS` from the program name (measured: `jterm1`). X11 sessions could
+    `WM_CLASS` from the program name (measured: `anvil`). X11 sessions could
     not associate a running window with the entry, so the dock showed a second,
-    icon-less item. It is now `jterm1`; Wayland still matches on app_id.
+    icon-less item. It is now `anvil`; Wayland still matches on app_id.
 - The installer now reports `PATH` problems it cannot fix: a target bin
-  directory outside `PATH`, and any other `jterm1` earlier in `PATH` (such as an
+  directory outside `PATH`, and any other `anvil` earlier in `PATH` (such as an
   old `cargo install` copy) that shadows the binary just installed.
 
 - Inline images render again in block mode. The Kitty graphics assembler
@@ -264,7 +264,7 @@ versioning for tagged releases while it remains experimental.
   (16384 px) caps plus the pre-decode overflow guards are unchanged, and a
   half-uploaded image is discarded whenever the active block resets. Images
   are display-only: block history stays text-only, so restored sessions show
-  the text without them. Ports jterm4's implementation.
+  the text without them. Ports forge's implementation.
 - OSC color queries now answer with dynamic colors. When a program sets the
   foreground, background, or cursor color (OSC 10/11/12 with a value), the
   pane records the override — the raw bytes still pass through, so the live

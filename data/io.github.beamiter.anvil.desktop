@@ -1,21 +1,21 @@
 [Desktop Entry]
 Type=Application
-Name=jterm1
+Name=anvil
 GenericName=Terminal Emulator
 Comment=Block-aware terminal workspace with structured command history
-TryExec=jterm1
-Exec=jterm1
-Icon=io.github.beamiter.jterm1
+TryExec=anvil
+Exec=anvil
+Icon=io.github.beamiter.anvil
 Terminal=false
 Categories=System;TerminalEmulator;
 Keywords=terminal;shell;console;command;developer;ssh;blocks;workflow;notebook;AI;
 StartupNotify=true
-# GTK4 derives the X11 WM_CLASS from the program name, so this is "jterm1" and
+# GTK4 derives the X11 WM_CLASS from the program name, so this is "anvil" and
 # not the application ID; on Wayland the app_id already matches this file's name.
-StartupWMClass=jterm1
+StartupWMClass=anvil
 X-GNOME-UsesNotifications=true
 Actions=NewWindow;
 
 [Desktop Action NewWindow]
 Name=New Window
-Exec=jterm1
+Exec=anvil

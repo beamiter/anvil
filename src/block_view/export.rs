@@ -106,11 +106,11 @@ impl TermView {
         md
     }
 
-    /// Write the whole session's blocks to a timestamped file under the jterm1
+    /// Write the whole session's blocks to a timestamped file under the anvil
     /// data directory. Exports contain command output, so the file is created
     /// exclusively with owner-only permissions like the block history.
     pub fn export_session_to_file(&self, format: SessionExportFormat) -> io::Result<PathBuf> {
-        let dir = gtk::glib::user_data_dir().join("jterm1").join("exports");
+        let dir = gtk::glib::user_data_dir().join("anvil").join("exports");
         fs::create_dir_all(&dir)?;
         let stamp = gtk::glib::DateTime::now_local()
             .ok()

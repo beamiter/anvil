@@ -21,12 +21,12 @@ use jterm_core::{child_env, command_history, git_meta, notify, parser, pty_input
 mod host {
     pub use jterm_core::host::*;
 
-    pub const APP_ID: &str = "io.github.beamiter.jterm1";
+    pub const APP_ID: &str = "io.github.beamiter.anvil";
     /// Also the `TERM_PROGRAM` every spawn path reports, via
     /// `jterm_core::child_env`. The shell-integration snippets gate on this exact
-    /// string (`[[ $TERM_PROGRAM == jterm1 ]] && source …`), so changing it
+    /// string (`[[ $TERM_PROGRAM == anvil ]] && source …`), so changing it
     /// silently disables OSC 133 block detection.
-    pub const APP_NAME: &str = "jterm1";
+    pub const APP_NAME: &str = "anvil";
 }
 
 mod jsh_ops;
@@ -301,7 +301,7 @@ impl SimpleComponent for AppModel {
 
     view! {
         adw::ApplicationWindow {
-            set_title: Some("jterm1"),
+            set_title: Some("anvil"),
             set_default_width: 800,
             set_default_height: 600,
             set_modal: false,
@@ -484,7 +484,7 @@ impl SimpleComponent for AppModel {
         sidebar_box.append(&sidebar_stack);
 
         // A Paned gives the sidebar the visible, draggable divider used by
-        // jterm4. Keep the sidebar at its persisted width on startup.
+        // forge. Keep the sidebar at its persisted width on startup.
         let content_paned = gtk::Paned::new(gtk::Orientation::Horizontal);
         content_paned.set_vexpand(true);
         content_paned.set_wide_handle(true);
@@ -824,12 +824,12 @@ impl SimpleComponent for AppModel {
         } else if let Some(validation) = config_validation {
             if validation.errors() > 0 {
                 model.show_toast(format!(
-                    "Configuration has {} validation error(s). Run `jterm1 --check-config`; invalid values kept safe defaults.",
+                    "Configuration has {} validation error(s). Run `anvil --check-config`; invalid values kept safe defaults.",
                     validation.errors()
                 ));
             } else if validation.warnings() > 0 {
                 model.show_toast(format!(
-                    "Configuration loaded with {} warning(s). Run `jterm1 --check-config` for details.",
+                    "Configuration loaded with {} warning(s). Run `anvil --check-config` for details.",
                     validation.warnings()
                 ));
             }
@@ -979,7 +979,7 @@ impl SimpleComponent for AppModel {
         model.init_file_tree();
         model.refresh_bottom_bar();
 
-        // jterm1 prefers jsh as its shell, so it is worth noticing when the
+        // anvil prefers jsh as its shell, so it is worth noticing when the
         // machine has none or an old one. The check runs on a worker thread and
         // stays silent unless it has something actionable to offer.
         model.start_jsh_update_check(&sender);
@@ -1385,7 +1385,7 @@ fn main() {
     let parsed = match cli::parse(std::env::args_os().skip(1)) {
         Ok(parsed) => parsed,
         Err(error) => {
-            eprintln!("jterm1: {error}\nTry 'jterm1 --help' for usage.");
+            eprintln!("anvil: {error}\nTry 'anvil --help' for usage.");
             std::process::exit(2);
         }
     };
@@ -1393,12 +1393,12 @@ fn main() {
     if let Some(path) = parsed.config_path {
         // SAFETY: CLI parsing is the first operation in main; no GTK runtime,
         // worker thread, or configuration read exists yet.
-        unsafe { std::env::set_var("JTERM1_CONFIG", path) };
+        unsafe { std::env::set_var("ANVIL_CONFIG", path) };
     }
 
     match parsed.command {
         cli::Command::Help => print!("{}", cli::HELP),
-        cli::Command::Version => println!("jterm1 {}", env!("CARGO_PKG_VERSION")),
+        cli::Command::Version => println!("anvil {}", env!("CARGO_PKG_VERSION")),
         cli::Command::Doctor(format) => {
             init_logging();
             if !run_doctor(format) {
@@ -1421,7 +1421,7 @@ fn main() {
                     source.display()
                 ),
                 Err(error) => {
-                    eprintln!("jterm1: {error}");
+                    eprintln!("anvil: {error}");
                     std::process::exit(1);
                 }
             }
@@ -1429,7 +1429,7 @@ fn main() {
         cli::Command::ConfigPath => println!("{}", config_file_path().display()),
         cli::Command::InitConfig => {
             if let Err(error) = init_config_file() {
-                eprintln!("jterm1: {error}");
+                eprintln!("anvil: {error}");
                 std::process::exit(1);
             }
         }
@@ -1437,7 +1437,7 @@ fn main() {
         cli::Command::PrintShellIntegration(shell) => print_shell_integration(shell),
         cli::Command::Run(mut options) => {
             if let Err(error) = validate_launch_options(&mut options) {
-                eprintln!("jterm1: {error}");
+                eprintln!("anvil: {error}");
                 std::process::exit(2);
             }
             init_logging();
@@ -1451,17 +1451,17 @@ fn main() {
                     .flags(gio::ApplicationFlags::NON_UNIQUE)
                     .build(),
             )
-            // jterm1 has already parsed its command line. Passing only argv[0]
+            // anvil has already parsed its command line. Passing only argv[0]
             // prevents GApplication from rejecting our launch options as
             // unknown GTK options during its second-stage initialization.
-            .with_args(vec!["jterm1".to_string()]);
+            .with_args(vec!["anvil".to_string()]);
             app.run::<AppModel>(options);
         }
     }
 }
 
 fn init_logging() {
-    let filter = std::env::var("JTERM1_LOG")
+    let filter = std::env::var("ANVIL_LOG")
         .or_else(|_| std::env::var("RUST_LOG"))
         .unwrap_or_else(|_| "warn".to_string());
     let mut builder = env_logger::Builder::new();
@@ -1525,11 +1525,11 @@ fn init_config_file() -> Result<(), String> {
 
 fn print_shell_integration(shell: cli::ShellIntegration) {
     let script = match shell {
-        cli::ShellIntegration::Bash => include_str!("../scripts/shell-integration/jterm1.bash"),
-        cli::ShellIntegration::Zsh => include_str!("../scripts/shell-integration/jterm1.zsh"),
-        cli::ShellIntegration::Fish => include_str!("../scripts/shell-integration/jterm1.fish"),
+        cli::ShellIntegration::Bash => include_str!("../scripts/shell-integration/anvil.bash"),
+        cli::ShellIntegration::Zsh => include_str!("../scripts/shell-integration/anvil.zsh"),
+        cli::ShellIntegration::Fish => include_str!("../scripts/shell-integration/anvil.fish"),
         cli::ShellIntegration::PowerShell => {
-            include_str!("../scripts/shell-integration/jterm1.ps1")
+            include_str!("../scripts/shell-integration/anvil.ps1")
         }
     };
     print!("{script}");

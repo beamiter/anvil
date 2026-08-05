@@ -14,8 +14,8 @@ pub(crate) use url::open_uri;
 pub(crate) use vte::default_tab_title;
 pub use vte::{InitialCommands, PaneProbe, VteInit, VteInput, VteOutput, VteTerminal};
 
-pub(crate) const CWD_TOKEN_ENV: &str = "JTERM1_CWD_TOKEN";
-const CWD_AUTHORITY_PREFIX: &str = "jterm1-";
+pub(crate) const CWD_TOKEN_ENV: &str = "ANVIL_CWD_TOKEN";
+const CWD_AUTHORITY_PREFIX: &str = "anvil-";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CwdAuthority {
@@ -158,7 +158,7 @@ mod tests {
             CwdAuthority::AuthenticatedLocal
         );
         assert_eq!(
-            classify_cwd_authority(Some("jterm1-ffffffff-ffff-4fff-8fff-ffffffffffff"), token),
+            classify_cwd_authority(Some("anvil-ffffffff-ffff-4fff-8fff-ffffffffffff"), token),
             CwdAuthority::External
         );
         assert_eq!(classify_cwd_authority(None, token), CwdAuthority::Missing);
@@ -224,7 +224,7 @@ mod tests {
     }
 
     /// The shell-integration snippets are sourced from an rc file behind
-    /// `[[ $TERM_PROGRAM == jterm1 ]]`, and `TERM_PROGRAM` now comes from the
+    /// `[[ $TERM_PROGRAM == anvil ]]`, and `TERM_PROGRAM` now comes from the
     /// shared child-environment policy instead of being spelled out per spawn
     /// site. If the identity this app registers ever stops matching that gate,
     /// every shell silently loses OSC 133 and block mode stops finding commands.
@@ -243,13 +243,13 @@ mod tests {
             .iter()
             .find(|(name, _)| name == "TERM_PROGRAM")
             .map(|(_, value)| value.to_string_lossy().to_string());
-        assert_eq!(term_program.as_deref(), Some("jterm1"));
+        assert_eq!(term_program.as_deref(), Some("anvil"));
 
-        for script in ["jterm1.bash", "jterm1.zsh", "jterm1.fish", "jterm1.ps1"] {
+        for script in ["anvil.bash", "anvil.zsh", "anvil.fish", "anvil.ps1"] {
             let source = std::fs::read_to_string(integration_path(script))
                 .unwrap_or_else(|error| panic!("read {script}: {error}"));
             assert!(
-                source.contains("jterm1"),
+                source.contains("anvil"),
                 "{script} must still name the TERM_PROGRAM it is gated on"
             );
         }
@@ -258,12 +258,12 @@ mod tests {
     #[test]
     fn shell_integrations_share_the_token_contract_and_parse_when_available() {
         let scripts = [
-            ("jterm1.bash", "unset JTERM1_CWD_TOKEN"),
-            ("jterm1.zsh", "unset JTERM1_CWD_TOKEN"),
-            ("jterm1.fish", "set --erase JTERM1_CWD_TOKEN"),
+            ("anvil.bash", "unset ANVIL_CWD_TOKEN"),
+            ("anvil.zsh", "unset ANVIL_CWD_TOKEN"),
+            ("anvil.fish", "set --erase ANVIL_CWD_TOKEN"),
             (
-                "jterm1.ps1",
-                "Remove-Item Env:JTERM1_CWD_TOKEN -ErrorAction SilentlyContinue",
+                "anvil.ps1",
+                "Remove-Item Env:ANVIL_CWD_TOKEN -ErrorAction SilentlyContinue",
             ),
         ];
         for (file, removal) in scripts {
@@ -273,7 +273,7 @@ mod tests {
                 "{file} does not read the token"
             );
             assert!(
-                source.contains("jterm1-"),
+                source.contains("anvil-"),
                 "{file} does not emit the authenticated authority"
             );
             assert!(
@@ -285,17 +285,17 @@ mod tests {
                 "{file} does not correlate OSC 133 C/D with a private id"
             );
             assert!(
-                source.contains("__jterm1_marker_id"),
+                source.contains("__anvil_marker_id"),
                 "{file} does not retain a private command marker"
             );
         }
 
-        let bash = integration_path("jterm1.bash");
+        let bash = integration_path("anvil.bash");
         let output = Command::new("bash")
             .arg("-n")
             .arg(&bash)
             .output()
-            .expect("bash is required to build jterm1");
+            .expect("bash is required to build anvil");
         assert!(
             output.status.success(),
             "bash rejected {}: {}",
@@ -310,13 +310,13 @@ mod tests {
                 "-c",
                 r#"
 source "$1"
-[[ ! ${JTERM1_CWD_TOKEN+x} ]]
-[[ $__jterm1_cwd_token == "$2" ]]
-[[ $(export -p) != *JTERM1_CWD_TOKEN* ]]
-cwd_sequence=$(__jterm1_report_cwd)
-[[ $cwd_sequence == *"7;file://jterm1-$2/"* ]]
+[[ ! ${ANVIL_CWD_TOKEN+x} ]]
+[[ $__anvil_cwd_token == "$2" ]]
+[[ $(export -p) != *ANVIL_CWD_TOKEN* ]]
+cwd_sequence=$(__anvil_report_cwd)
+[[ $cwd_sequence == *"7;file://anvil-$2/"* ]]
 "#,
-                "jterm1-cwd-token-test",
+                "anvil-cwd-token-test",
             ])
             .arg(&bash)
             .arg(bash_token)
@@ -325,14 +325,14 @@ cwd_sequence=$(__jterm1_report_cwd)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .output()
-            .expect("bash is required to build jterm1");
+            .expect("bash is required to build anvil");
         assert!(
             bash_runtime.status.success(),
             "bash integration did not consume and authenticate its token: {}",
             String::from_utf8_lossy(&bash_runtime.stderr)
         );
-        check_optional_syntax("zsh", &["-n"], &integration_path("jterm1.zsh"));
-        check_optional_syntax("fish", &["-n"], &integration_path("jterm1.fish"));
+        check_optional_syntax("zsh", &["-n"], &integration_path("anvil.zsh"));
+        check_optional_syntax("fish", &["-n"], &integration_path("anvil.fish"));
 
         // `-Command` does not consistently expose trailing native arguments in
         // `$args`, so pass the path through a process-local environment value.
@@ -340,14 +340,14 @@ cwd_sequence=$(__jterm1_report_cwd)
 $tokens = $null
 $errors = $null
 [System.Management.Automation.Language.Parser]::ParseFile(
-    $env:JTERM1_PS1_SYNTAX_PATH, [ref]$tokens, [ref]$errors
+    $env:ANVIL_PS1_SYNTAX_PATH, [ref]$tokens, [ref]$errors
 ) | Out-Null
 if ($errors.Count -ne 0) {
     $errors | ForEach-Object { [Console]::Error.WriteLine($_) }
     exit 1
 }
 "#;
-        let powershell_path = integration_path("jterm1.ps1");
+        let powershell_path = integration_path("anvil.ps1");
         let pwsh_available = Command::new("pwsh")
             .arg("-Version")
             .stdin(Stdio::null())
@@ -365,7 +365,7 @@ if ($errors.Count -ne 0) {
                     powershell_parser,
                 ],
                 &powershell_path,
-                Some("JTERM1_PS1_SYNTAX_PATH"),
+                Some("ANVIL_PS1_SYNTAX_PATH"),
             );
         } else {
             check_optional_syntax_with_path_env(
@@ -377,7 +377,7 @@ if ($errors.Count -ne 0) {
                     powershell_parser,
                 ],
                 &powershell_path,
-                Some("JTERM1_PS1_SYNTAX_PATH"),
+                Some("ANVIL_PS1_SYNTAX_PATH"),
             );
         }
     }

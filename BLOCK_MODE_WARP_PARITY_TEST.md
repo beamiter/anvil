@@ -1,4 +1,4 @@
-# jterm1 Block Mode / Warp 体验对齐验收清单
+# anvil Block Mode / Warp 体验对齐验收清单
 
 本文用于手工验收 block mode 的块选择、批量操作、命令回填和清空行为。建议按顺序执行；`P0` 项全部通过后，再检查 `P1` 回归项。
 
@@ -8,13 +8,13 @@
 
    ```bash
    cargo build
-   target/debug/jterm1 --mode block --no-restore
+   target/debug/anvil --mode block --no-restore
    ```
 
-2. 确认当前 shell 已加载 jterm1 shell integration。若尚未配置，可在新窗口的 Bash 中执行：
+2. 确认当前 shell 已加载 anvil shell integration。若尚未配置，可在新窗口的 Bash 中执行：
 
    ```bash
-   source <(target/debug/jterm1 --shell-integration bash)
+   source <(target/debug/anvil --shell-integration bash)
    ```
 
 3. 依次执行下列命令，准备成功、失败、长输出和后台输出块：
@@ -99,7 +99,7 @@
 - [ ] 随后执行 `printf 'after-clear\n'`，新块正常显示、选中、复制和回填。
 - [ ] 从命令面板执行 `Clear blocks` 结果相同。
 
-若配置了 `block_history_path`，关闭并重新打开 jterm1 后，被清除的块不应恢复。
+若配置了 `block_history_path`，关闭并重新打开 anvil 后，被清除的块不应恢复。
 
 ### BM-07b 清空撤销（Undo clear blocks）
 
@@ -128,7 +128,7 @@
 
 ### BM-07d 会话导出与 Markdown 复制
 
-- [ ] 从命令面板执行 `Export session as Markdown file`,toast 显示 `Session exported to …/jterm1/exports/session-<时间戳>.md`。
+- [ ] 从命令面板执行 `Export session as Markdown file`,toast 显示 `Session exported to …/anvil/exports/session-<时间戳>.md`。
 - [ ] 文件包含所有块的命令、输出、退出码,权限为 `0600`。
 - [ ] `Export session as JSON file` 同理生成 `.json`,内容为块数组。
 - [ ] 同一秒内连续导出两次,第二个文件带 `-1` 后缀,互不覆盖。
@@ -183,7 +183,7 @@ read -r value; printf 'value=%s\n' "$value"
 1. 启动普通 VTE 模式：
 
    ```bash
-   target/debug/jterm1 --mode vte --no-restore
+   target/debug/anvil --mode vte --no-restore
    ```
 
 - [ ] 执行普通命令、复制粘贴和滚动均无回归。
@@ -217,7 +217,7 @@ for i in $(seq 1 250); do printf 'block-%03d\n' "$i"; done
 结果：通过 / 失败
 桌面环境：X11 / Wayland，桌面或窗口管理器版本
 Shell：bash / zsh / fish / pwsh 及版本
-jterm1 commit：git rev-parse --short HEAD
+anvil commit：git rev-parse --short HEAD
 是否加载 shell integration：是 / 否
 复现步骤：
 实际结果：
@@ -228,6 +228,6 @@ jterm1 commit：git rev-parse --short HEAD
 发现问题时，建议同时附上：
 
 ```bash
-target/debug/jterm1 --doctor
-RUST_LOG=jterm1=debug target/debug/jterm1 --mode block --no-restore
+target/debug/anvil --doctor
+RUST_LOG=anvil=debug target/debug/anvil --mode block --no-restore
 ```

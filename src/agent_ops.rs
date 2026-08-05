@@ -17,7 +17,7 @@ pub(crate) struct AgentBlockCompletion {
     pub(crate) agent_generation: Option<u64>,
 }
 
-/// Read an Agent snapshot through jterm1's descriptor-validated persistence
+/// Read an Agent snapshot through anvil's descriptor-validated persistence
 /// path. Unsafe, oversized, corrupt, and missing entries all fail closed to a
 /// fresh session.
 fn read_agent_snapshot_unlocked(path: &Path) -> Option<AgentSessionSnapshot> {
@@ -34,7 +34,7 @@ fn read_agent_snapshot(path: &Path) -> Option<AgentSessionSnapshot> {
 }
 
 /// Validate, restore, and consume exactly once while holding the directory
-/// namespace lock. Multiple NON_UNIQUE jterm1 processes can open concurrently;
+/// namespace lock. Multiple NON_UNIQUE anvil processes can open concurrently;
 /// only the process that removes the pathname may receive this session.
 fn restore_agent_snapshot_once(path: &Path) -> Option<jterm_core::agent::AgentSession> {
     let _parent_lock = match crate::config_store::PrivateParentLock::acquire(path) {
@@ -665,7 +665,7 @@ mod snapshot_tests {
 
     fn test_directory(label: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
-            "jterm1-agent-snapshot-{label}-{}-{}",
+            "anvil-agent-snapshot-{label}-{}-{}",
             std::process::id(),
             relm4::gtk::glib::uuid_string_random()
         ));

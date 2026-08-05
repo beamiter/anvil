@@ -1,10 +1,10 @@
-# jterm1 Makefile
+# anvil Makefile
 # Convenience wrapper for common development tasks
 
 .PHONY: help build run test check fmt clippy security verify package support-bundle clean install dev watch benchmark debug
 
 help:
-	@echo "jterm1 Development Commands"
+	@echo "anvil Development Commands"
 	@echo "==========================="
 	@echo ""
 	@echo "Build Commands:"

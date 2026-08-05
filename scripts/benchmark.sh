@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Reproducible build/test snapshot for jterm1.
+# Reproducible build/test snapshot for anvil.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
-BINARY="${PROJECT_ROOT}/target/release/jterm1"
+BINARY="${PROJECT_ROOT}/target/release/anvil"
 
 if ! command -v nix >/dev/null 2>&1; then
     echo "Error: Nix with flakes support is required." >&2
@@ -14,7 +14,7 @@ fi
 
 cd "${PROJECT_ROOT}"
 
-echo "jterm1 performance snapshot"
+echo "anvil performance snapshot"
 echo "==========================="
 echo
 
@@ -48,9 +48,9 @@ dependency_lines="$(nix develop --command cargo tree --depth 1 --prefix none | w
 echo "  $((dependency_lines > 0 ? dependency_lines - 1 : 0))"
 echo
 
-echo "Running jterm1 processes:"
-if pgrep -x jterm1 >/dev/null 2>&1; then
-    ps -C jterm1 -o pid=,rss=,args= | awk '{printf "  PID %s: %.1f MiB RSS  %s\n", $1, $2 / 1024, $3}'
+echo "Running anvil processes:"
+if pgrep -x anvil >/dev/null 2>&1; then
+    ps -C anvil -o pid=,rss=,args= | awk '{printf "  PID %s: %.1f MiB RSS  %s\n", $1, $2 / 1024, $3}'
 else
     echo "  None."
 fi

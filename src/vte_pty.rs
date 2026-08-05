@@ -2,7 +2,7 @@
 //!
 //! Background — in block mode the active VTE used to run on a dummy PTY: VTE's
 //! own writes (keypresses + answers to PTY-mediated queries like DSR / DA /
-//! OSC 4 color / mouse / focus / bracketed paste) had nowhere to go. jterm1
+//! OSC 4 color / mouse / focus / bracketed paste) had nowhere to go. anvil
 //! intercepted those queries by sniffing the upstream byte stream and
 //! synthesising replies. That is ~300 lines of fragile parser code that must
 //! be updated every time xterm or the application protocol grows a new escape.
@@ -10,23 +10,23 @@
 //! With a real PTY here, libvte answers everything natively. We open a fresh
 //! PTY pair, hand the *master* end to VTE via [`vte4::Pty::foreign_sync`]
 //! (libvte's foreign_sync requires a master fd — grantpt/unlockpt/ioctl
-//! probes return EINVAL on a slave), and keep the slave end on the jterm1
+//! probes return EINVAL on a slave), and keep the slave end on the anvil
 //! side. Bytes still flow symmetrically across the pair: writes to the slave
 //! arrive at the master (VTE renders them) and writes by VTE on the master
-//! arrive at the slave (jterm1 splices them onto the shell PTY).
+//! arrive at the slave (anvil splices them onto the shell PTY).
 //!
 //! ```text
 //!   shell-PTY  <──┐                          ┌──> active VTE
 //!                 │  parser (OSC 133 only)   │
-//!     shell ── reads/writes ── jterm1 ── reads/writes ── VTE
+//!     shell ── reads/writes ── anvil ── reads/writes ── VTE
 //!                 │                          │
 //!                 └──> finished blocks       └──> VtePty (this module)
 //! ```
 //!
-//! The reader thread on the jterm1-owned (slave) fd delivers VTE's writes
-//! back to jterm1, which forwards them straight to the shell PTY:
+//! The reader thread on the anvil-owned (slave) fd delivers VTE's writes
+//! back to anvil, which forwards them straight to the shell PTY:
 //!
-//!   shell → parser → vte_pty.write_bytes()       (jterm1 → VTE)
+//!   shell → parser → vte_pty.write_bytes()       (anvil → VTE)
 //!   vte_pty reader → shell_pty.write_bytes()     (VTE → shell)
 
 use gtk::glib;
@@ -91,10 +91,10 @@ fn unix_fd_add_local<F: FnMut() -> bool + 'static>(fd: RawFd, func: F) {
     }
 }
 
-/// A PTY pair owned by jterm1 whose *master* end is wrapped in a `vte4::Pty`
+/// A PTY pair owned by anvil whose *master* end is wrapped in a `vte4::Pty`
 /// and attached to the active VTE. Read the module docs for the data flow.
 pub struct VtePty {
-    /// jterm1's local end of the pair — the slave fd. Wrapped in Mutex so
+    /// anvil's local end of the pair — the slave fd. Wrapped in Mutex so
     /// close/drop and writes serialise. Named "local" to avoid confusion: the
     /// master is owned by libvte (and closed when `vte_pty` drops).
     local: Arc<Mutex<Option<OwnedFd>>>,
@@ -147,7 +147,7 @@ impl VtePty {
         let vte_pty = vte4::Pty::foreign_sync(master_fd, None::<&gtk::gio::Cancellable>)
             .map_err(|e| io::Error::other(e.to_string()))?;
         let writer_fd = slave.try_clone()?;
-        let write_tx = crate::pty::spawn_fd_writer(writer_fd, "jterm1-vte-writer")?;
+        let write_tx = crate::pty::spawn_fd_writer(writer_fd, "anvil-vte-writer")?;
         Ok(VtePty {
             local: Arc::new(Mutex::new(Some(slave))),
             write_tx,
@@ -265,7 +265,7 @@ impl VtePty {
         };
         let efd_for_thread = efd;
         let spawn_result = std::thread::Builder::new()
-            .name("jterm1-vte-response-reader".to_string())
+            .name("anvil-vte-response-reader".to_string())
             .spawn(move || {
                 // Own a duplicate instead of borrowing `local`'s raw descriptor;
                 // closing the model can no longer make this thread read a reused

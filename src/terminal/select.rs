@@ -3,7 +3,7 @@
 //! GTK's default double-click selects a plain alnum word. This detects the
 //! semantic token under the cursor — URL, path, file:line:col, IPv4, git SHA,
 //! key=value, quoted string, … — so one double-click grabs the whole unit.
-//! Ported from jterm4's `block_view/select.rs`.
+//! Ported from forge's `block_view/select.rs`.
 
 use gtk::prelude::*;
 use gtk::TextBuffer;

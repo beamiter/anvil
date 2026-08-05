@@ -55,7 +55,7 @@ jobs:
       - name: Build optimized binary and bundle
         run: |
           cargo build --release --locked
-          bash scripts/package-release.sh target/release/jterm1
+          bash scripts/package-release.sh target/release/anvil
           (cd target/dist && sha256sum --check *.sha256)
 
       - name: Publish GitHub release
@@ -76,5 +76,5 @@ jobs:
               "${assets[@]}" \
               --verify-tag \
               --generate-notes \
-              --title "jterm1 ${GITHUB_REF_NAME#v}"
+              --title "anvil ${GITHUB_REF_NAME#v}"
           fi

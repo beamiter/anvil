@@ -1,6 +1,6 @@
-# Contributing to jterm1
+# Contributing to anvil
 
-jterm1 is a Rust/GTK application with two terminal backends and a deliberately
+anvil is a Rust/GTK application with two terminal backends and a deliberately
 strict boundary between terminal I/O, persisted state, and Relm4 UI operations.
 Small, reviewable changes are preferred over broad rewrites.
 

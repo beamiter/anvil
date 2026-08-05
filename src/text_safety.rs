@@ -1,5 +1,5 @@
 //! Local compatibility policy for text that crosses a trusted UI/action
-//! boundary while jterm1 still exact-pins the previous jterm_core release.
+//! boundary while anvil still exact-pins the previous jterm_core release.
 
 /// Characters that can make the visible order or apparent contents differ
 /// from the string acted upon. Keep this in lockstep with jterm_core's review

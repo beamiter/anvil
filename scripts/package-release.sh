@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_ROOT}"
 
-BINARY="${1:-target/release/jterm1}"
+BINARY="${1:-target/release/anvil}"
 DIST_DIR="${DIST_DIR:-${PROJECT_ROOT}/target/dist}"
 VERSION="${VERSION:-$(awk -F ' *= *' '$1 == "version" { gsub(/"/, "", $2); print $2; exit }' Cargo.toml)}"
 TARGET="${TARGET:-$(rustc -vV | sed -n 's/^host: //p')}"
@@ -28,36 +28,36 @@ if [[ ! -x "${BINARY}" ]]; then
     exit 1
 fi
 
-PACKAGE_NAME="jterm1-${VERSION}-${TARGET}"
+PACKAGE_NAME="anvil-${VERSION}-${TARGET}"
 ARCHIVE_NAME="${PACKAGE_NAME}.tar.gz"
 STAGE_DIR="$(mktemp -d)"
 PACKAGE_ROOT="${STAGE_DIR}/${PACKAGE_NAME}"
 trap 'rm -rf -- "${STAGE_DIR}"' EXIT
 
-install -Dm755 "${BINARY}" "${PACKAGE_ROOT}/bin/jterm1"
-install -Dm755 scripts/support-bundle.sh "${PACKAGE_ROOT}/bin/jterm1-support-bundle"
+install -Dm755 "${BINARY}" "${PACKAGE_ROOT}/bin/anvil"
+install -Dm755 scripts/support-bundle.sh "${PACKAGE_ROOT}/bin/anvil-support-bundle"
 install -Dm755 packaging/install-release.sh "${PACKAGE_ROOT}/install.sh"
 install -Dm755 scripts/uninstall.sh "${PACKAGE_ROOT}/uninstall.sh"
 install -Dm644 packaging/RELEASE_README.md "${PACKAGE_ROOT}/README.txt"
 printf '%s\n' "${VERSION}" > "${PACKAGE_ROOT}/VERSION"
 
-install -Dm644 packaging/app.jterm1.desktop \
-    "${PACKAGE_ROOT}/share/applications/io.github.beamiter.jterm1.desktop"
-install -Dm644 packaging/app.jterm1.metainfo.xml \
-    "${PACKAGE_ROOT}/share/metainfo/io.github.beamiter.jterm1.metainfo.xml"
-install -Dm644 packaging/app.jterm1.svg \
-    "${PACKAGE_ROOT}/share/icons/hicolor/scalable/apps/io.github.beamiter.jterm1.svg"
+install -Dm644 data/io.github.beamiter.anvil.desktop \
+    "${PACKAGE_ROOT}/share/applications/io.github.beamiter.anvil.desktop"
+install -Dm644 data/io.github.beamiter.anvil.metainfo.xml \
+    "${PACKAGE_ROOT}/share/metainfo/io.github.beamiter.anvil.metainfo.xml"
+install -Dm644 data/io.github.beamiter.anvil.svg \
+    "${PACKAGE_ROOT}/share/icons/hicolor/scalable/apps/io.github.beamiter.anvil.svg"
 for size in 128 256; do
-    if [[ -f "packaging/app.jterm1-${size}.png" ]]; then
-        install -Dm644 "packaging/app.jterm1-${size}.png" \
-            "${PACKAGE_ROOT}/share/icons/hicolor/${size}x${size}/apps/io.github.beamiter.jterm1.png"
+    if [[ -f "data/io.github.beamiter.anvil-${size}.png" ]]; then
+        install -Dm644 "data/io.github.beamiter.anvil-${size}.png" \
+            "${PACKAGE_ROOT}/share/icons/hicolor/${size}x${size}/apps/io.github.beamiter.anvil.png"
     fi
 done
-install -Dm644 README.md "${PACKAGE_ROOT}/share/doc/jterm1/README.md"
+install -Dm644 README.md "${PACKAGE_ROOT}/share/doc/anvil/README.md"
 install -Dm644 config.toml.example \
-    "${PACKAGE_ROOT}/share/doc/jterm1/config.toml.example"
-install -Dm644 Cargo.lock "${PACKAGE_ROOT}/share/doc/jterm1/Cargo.lock"
-cat >"${PACKAGE_ROOT}/share/doc/jterm1/BUILDINFO" <<EOF_BUILDINFO
+    "${PACKAGE_ROOT}/share/doc/anvil/config.toml.example"
+install -Dm644 Cargo.lock "${PACKAGE_ROOT}/share/doc/anvil/Cargo.lock"
+cat >"${PACKAGE_ROOT}/share/doc/anvil/BUILDINFO" <<EOF_BUILDINFO
 version=${VERSION}
 target=${TARGET}
 source_date_epoch=${SOURCE_DATE_EPOCH}
@@ -65,18 +65,18 @@ git_commit=$(git rev-parse HEAD 2>/dev/null || echo unknown)
 rustc=$(rustc --version)
 EOF_BUILDINFO
 
-install -d "${PACKAGE_ROOT}/share/jterm1/shell-integration"
+install -d "${PACKAGE_ROOT}/share/anvil/shell-integration"
 install -m644 scripts/shell-integration/README.md \
-    "${PACKAGE_ROOT}/share/jterm1/shell-integration/"
-install -m644 scripts/shell-integration/jterm1.* \
-    "${PACKAGE_ROOT}/share/jterm1/shell-integration/"
+    "${PACKAGE_ROOT}/share/anvil/shell-integration/"
+install -m644 scripts/shell-integration/anvil.* \
+    "${PACKAGE_ROOT}/share/anvil/shell-integration/"
 
-install -d "${PACKAGE_ROOT}/share/jterm1/workflows"
+install -d "${PACKAGE_ROOT}/share/anvil/workflows"
 install -m644 scripts/workflows/*.yaml \
-    "${PACKAGE_ROOT}/share/jterm1/workflows/"
+    "${PACKAGE_ROOT}/share/anvil/workflows/"
 
 install -Dm644 scripts/notebooks/welcome.jtnb.md \
-    "${PACKAGE_ROOT}/share/jterm1/notebooks/welcome.jtnb.md"
+    "${PACKAGE_ROOT}/share/anvil/notebooks/welcome.jtnb.md"
 
 mkdir -p "${DIST_DIR}"
 rm -f -- "${DIST_DIR}/${ARCHIVE_NAME}" "${DIST_DIR}/${ARCHIVE_NAME}.sha256"

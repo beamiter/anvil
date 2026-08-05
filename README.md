@@ -1,6 +1,6 @@
-# jterm1
+# anvil
 
-jterm1 is an experimental Linux terminal emulator built with Rust, GTK 4,
+anvil is an experimental Linux terminal emulator built with Rust, GTK 4,
 libadwaita, Relm4, and VTE. It can behave like a conventional VTE terminal or
 turn completed commands into navigable blocks with their command, output, exit
 status, duration, and working directory.
@@ -27,7 +27,7 @@ restoration as the only copy of work in progress.
 
 ## Requirements
 
-jterm1 targets a graphical Linux desktop running X11 or Wayland. The source
+anvil targets a graphical Linux desktop running X11 or Wayland. The source
 installer prefers [Nix with flakes enabled](https://nixos.org/download/) and
 falls back to Cargo when the GTK 4, libadwaita, VTE, and native build
 dependencies are already available through the system toolchain.
@@ -58,11 +58,11 @@ Runtime integrations are optional:
 ## Install
 
 ```bash
-git clone https://github.com/beamiter/jterm1.git
-cd jterm1
+git clone https://github.com/beamiter/anvil.git
+cd anvil
 ./scripts/install.sh
 ./scripts/install.sh --backend cargo
-./scripts/install.sh --prefix /opt/jterm1 --data-dir /opt/jterm1/share
+./scripts/install.sh --prefix /opt/anvil --data-dir /opt/anvil/share
 ./scripts/install.sh --dry-run
 ```
 
@@ -70,24 +70,24 @@ The installer supports `DESTDIR`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, and
 `CARGO_TARGET_DIR`; it never overwrites an existing configuration. By default
 it builds a release binary and installs only user-local files:
 
-- `~/.local/bin/jterm1`
-- `${XDG_CONFIG_HOME:-$HOME/.config}/jterm1/config.toml`
-- `${XDG_DATA_HOME:-$HOME/.local/share}/applications/io.github.beamiter.jterm1.desktop`
+- `~/.local/bin/anvil`
+- `${XDG_CONFIG_HOME:-$HOME/.config}/anvil/config.toml`
+- `${XDG_DATA_HOME:-$HOME/.local/share}/applications/io.github.beamiter.anvil.desktop`
 - icons under
   `${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/{scalable,128x128,256x256}/apps/`
   and AppStream metadata under `.../metainfo/`
 - shell integration and examples under
-  `${XDG_DATA_HOME:-$HOME/.local/share}/jterm1/`
+  `${XDG_DATA_HOME:-$HOME/.local/share}/anvil/`
 - sample workflows under
-  `${XDG_DATA_HOME:-$HOME/.local/share}/jterm1/workflows/`
+  `${XDG_DATA_HOME:-$HOME/.local/share}/anvil/workflows/`
 
-That desktop integration is what makes jterm1 appear in the GNOME/KDE
+That desktop integration is what makes anvil appear in the GNOME/KDE
 application list with its own icon, ready to pin. Two details matter for it to
 show up at all, and the installer handles both:
 
 - `Exec=`/`TryExec=` are rewritten to the binary's absolute path (system
   prefixes such as `/usr` keep the relocatable bare name). A desktop session
-  fixes its `PATH` at login, so `TryExec=jterm1` fails and hides the entry
+  fixes its `PATH` at login, so `TryExec=anvil` fails and hides the entry
   **completely** when `~/.local/bin` is not on that `PATH` — the usual reason an
   install produces no launcher icon.
 - `update-desktop-database` and `gtk-update-icon-cache` are refreshed after
@@ -95,36 +95,36 @@ show up at all, and the installer handles both:
   `DESTDIR` builds skip the refresh and leave it to the package manager.
 
 Verify with `desktop-file-validate <entry>` and `gtk-launch
-io.github.beamiter.jterm1`; use `--no-desktop` to install only the binary.
+io.github.beamiter.anvil`; use `--no-desktop` to install only the binary.
 
 It never replaces an existing `config.toml`; installed examples live outside
 the user-authored workflow directory. Make sure `~/.local/bin` is in `PATH`,
 then run:
 
 ```bash
-jterm1
-jterm1 --doctor
-jterm1 --doctor --json            # machine-readable support diagnostics
-jterm1 --check-config             # validate config without exposing its values
-jterm1 --check-config ~/test.toml # validate one file without changing the active path
-jterm1 -c ~/test.toml --doctor    # use one alternate config for this process
-jterm1 --config-path              # print the active config path
-jterm1 --safe-mode                # isolated VTE + sh recovery session
+anvil
+anvil --doctor
+anvil --doctor --json            # machine-readable support diagnostics
+anvil --check-config             # validate config without exposing its values
+anvil --check-config ~/test.toml # validate one file without changing the active path
+anvil -c ~/test.toml --doctor    # use one alternate config for this process
+anvil --config-path              # print the active config path
+anvil --safe-mode                # isolated VTE + sh recovery session
 ```
 
 Useful headless commands:
 
 ```bash
-jterm1 --help
-jterm1 --version
-jterm1 --init-config                 # create config without overwriting one
-jterm1 --check-config --json         # machine-readable schema validation
-jterm1 --config ~/test.toml --config-path # print an explicit effective path
-jterm1 --restore-config-backup       # restore newest valid rotating backup
-jterm1 --shell-integration bash      # print an integration script
-jterm1 --mode vte --no-restore       # launch a fresh compatibility session
-jterm1 -d /path/to/project           # launch in a directory
-jterm1 -e bash -lc 'printf "hello\n"'
+anvil --help
+anvil --version
+anvil --init-config                 # create config without overwriting one
+anvil --check-config --json         # machine-readable schema validation
+anvil --config ~/test.toml --config-path # print an explicit effective path
+anvil --restore-config-backup       # restore newest valid rotating backup
+anvil --shell-integration bash      # print an integration script
+anvil --mode vte --no-restore       # launch a fresh compatibility session
+anvil -d /path/to/project           # launch in a directory
+anvil -e bash -lc 'printf "hello\n"'
 ```
 
 Remove installed binaries and assets while preserving configuration and state:
@@ -152,7 +152,7 @@ make help      # all helpers
 
 ## Diagnostics and recovery
 
-`jterm1 --doctor` reports configuration, shell, display, integrations, remote
+`anvil --doctor` reports configuration, shell, display, integrations, remote
 readiness, permissions, and session-state metadata. Add `--json` for automation
 or support tooling; neither format includes configuration contents, terminal
 history, command output, environment values, or credentials.
@@ -161,7 +161,7 @@ When configuration, startup commands, session restore, or an integration causes
 a bad launch, use:
 
 ```bash
-jterm1 --safe-mode
+anvil --safe-mode
 ```
 
 Safe mode starts a local VTE pane with `sh`, skips session restore and persistence,
@@ -172,7 +172,7 @@ operations, and refuses to save or hot-reload settings for that process.
 Create a privacy-preserving support archive with:
 
 ```bash
-jterm1-support-bundle ~/Desktop
+anvil-support-bundle ~/Desktop
 ```
 
 Review the archive before sharing it. The bundle contains structured diagnostics,
@@ -182,8 +182,8 @@ Validate configuration keys, types, ranges, colors, shortcuts, and remote-host
 records without starting GTK:
 
 ```bash
-jterm1 --check-config
-jterm1 --check-config --json
+anvil --check-config
+anvil --check-config --json
 ```
 
 The report names keys and problems but never includes configuration values. If a
@@ -191,7 +191,7 @@ bad edit or interrupted recovery leaves the live file unusable, restore the newe
 valid rotating backup with:
 
 ```bash
-jterm1 --restore-config-backup
+anvil --restore-config-backup
 ```
 
 The command preserves the replaced live file as `config.toml.before-restore`.
@@ -217,44 +217,44 @@ and OSC 7 working-directory updates. The installer places the integration files
 under:
 
 ```text
-${XDG_DATA_HOME:-$HOME/.local/share}/jterm1/shell-integration/
+${XDG_DATA_HOME:-$HOME/.local/share}/anvil/shell-integration/
 ```
 
 Source the file for the current shell. Sourcing unconditionally works in both
-jterm1 backends; the scripts protect against being loaded twice, and terminals
+anvil backends; the scripts protect against being loaded twice, and terminals
 that do not understand the OSC sequences ignore them.
 
-After installing jterm1, Bash and Zsh can also load the script embedded in the
+After installing anvil, Bash and Zsh can also load the script embedded in the
 binary:
 
 ```bash
-source <(jterm1 --shell-integration bash)
+source <(anvil --shell-integration bash)
 ```
 
 ```bash
 # ~/.bashrc
-source "${XDG_DATA_HOME:-$HOME/.local/share}/jterm1/shell-integration/jterm1.bash"
+source "${XDG_DATA_HOME:-$HOME/.local/share}/anvil/shell-integration/anvil.bash"
 ```
 
 ```zsh
 # ~/.zshrc
-source "${XDG_DATA_HOME:-$HOME/.local/share}/jterm1/shell-integration/jterm1.zsh"
+source "${XDG_DATA_HOME:-$HOME/.local/share}/anvil/shell-integration/anvil.zsh"
 ```
 
 ```fish
 # ~/.config/fish/config.fish
-set -l jterm1_data_home "$HOME/.local/share"
+set -l anvil_data_home "$HOME/.local/share"
 if set -q XDG_DATA_HOME
-    set jterm1_data_home "$XDG_DATA_HOME"
+    set anvil_data_home "$XDG_DATA_HOME"
 end
-source "$jterm1_data_home/jterm1/shell-integration/jterm1.fish"
+source "$anvil_data_home/anvil/shell-integration/anvil.fish"
 ```
 
-PowerShell users can dot-source `jterm1.ps1`; its Enter hook requires
+PowerShell users can dot-source `anvil.ps1`; its Enter hook requires
 PSReadLine. More detail is in
 [`scripts/shell-integration/README.md`](scripts/shell-integration/README.md).
 
-Shell selection follows this order: `JTERM1_SHELL`, the `shell` config key,
+Shell selection follows this order: `ANVIL_SHELL`, the `shell` config key,
 `jsh` when it is executable on `PATH`, `bash -l`, then `sh`.
 
 ## Default shortcuts
@@ -319,7 +319,7 @@ have no default shortcuts.
 
 ## Installing and updating jsh
 
-jterm1 prefers its companion shell [`jsh`](https://github.com/beamiter/jsh) and
+anvil prefers its companion shell [`jsh`](https://github.com/beamiter/jsh) and
 falls back to bash only when it cannot find one. The palette action
 **Install or update jsh** runs the installer in a dedicated VTE tab: the tab is
 the progress UI, so it can be interrupted with Ctrl+C and it waits for Enter
@@ -348,25 +348,25 @@ several jterms open at once still cost one request a day.
 The configuration file is:
 
 ```text
-${XDG_CONFIG_HOME:-$HOME/.config}/jterm1/config.toml
+${XDG_CONFIG_HOME:-$HOME/.config}/anvil/config.toml
 ```
 
-Create the file safely with `jterm1 --init-config`, or start from
+Create the file safely with `anvil --init-config`, or start from
 [`config.toml.example`](config.toml.example). The command refuses to overwrite
 an existing file. The application watches the file: appearance, scrollback, key
 bindings, and defaults for newly created panes are reloaded while it is running.
 Some advanced options are captured when a pane is constructed, so restart
-jterm1 after changing them for predictable results. Changing `terminal_mode`
+anvil after changing them for predictable results. Changing `terminal_mode`
 affects new or restored local panes; it does not replace an existing terminal
 backend in place. Managed remote sessions stay on Block so their shell
 integration and reconnect metadata remain available.
 
 `-c PATH` / `--config PATH` selects an alternate file for the current process
 and can be combined with a normal launch, `--doctor`, `--check-config`,
-`--config-path`, `--init-config`, or config-backup recovery. `JTERM1_CONFIG`
+`--config-path`, `--init-config`, or config-backup recovery. `ANVIL_CONFIG`
 provides the same process-local override. Separately,
-`jterm1 --check-config PATH [--json]` validates exactly that file without
-changing `JTERM1_CONFIG` or the active path.
+`anvil --check-config PATH [--json]` validates exactly that file without
+changing `ANVIL_CONFIG` or the active path.
 
 Built-in theme names are `default`, `light`, `solarized-dark`,
 `solarized-light`, `gruvbox-dark`, `gruvbox-light`, `dracula`, and `nord`.
@@ -377,14 +377,14 @@ policy. Advanced rendering, remote, and keybinding options remain TOML-only.
 The following environment variables override selected TOML values:
 
 ```text
-JTERM1_MODE                 JTERM1_SHELL
-JTERM1_CONFIG
-JTERM1_THEME                JTERM1_FONT
-JTERM1_FONT_SCALE           JTERM1_OPACITY
-JTERM1_SCROLLBACK           JTERM1_HISTORY_PATH
-JTERM1_COMMAND_HISTORY_PATH
-JTERM1_TAB_PLACEMENT        JTERM1_BLOCK_COMPACT
-JTERM1_FG / BG / CURSOR / CURSOR_FG
+ANVIL_MODE                 ANVIL_SHELL
+ANVIL_CONFIG
+ANVIL_THEME                ANVIL_FONT
+ANVIL_FONT_SCALE           ANVIL_OPACITY
+ANVIL_SCROLLBACK           ANVIL_HISTORY_PATH
+ANVIL_COMMAND_HISTORY_PATH
+ANVIL_TAB_PLACEMENT        ANVIL_BLOCK_COMPACT
+ANVIL_FG / BG / CURSOR / CURSOR_FG
 ```
 
 Advanced block-rendering and history tuning keys are documented in
@@ -394,7 +394,7 @@ Advanced block-rendering and history tuning keys are documented in
 
 Every window records the exact bytes of the configuration it loaded. In-app
 settings saves acquire an advisory process lock and compare that revision with the
-current file before writing. If another jterm1 window or editor changed the file,
+current file before writing. If another anvil window or editor changed the file,
 the stale writer is rejected instead of overwriting newer work; the file watcher
 then reloads the newer version and the user can reapply the setting.
 
@@ -409,12 +409,12 @@ remain on disk while unlocked.
 Workflow files live in:
 
 ```text
-${XDG_CONFIG_HOME:-$HOME/.config}/jterm1/workflows/*.{toml,yaml,yml}
+${XDG_CONFIG_HOME:-$HOME/.config}/anvil/workflows/*.{toml,yaml,yml}
 ```
 
 Installed examples are read from
-`${XDG_DATA_HOME:-$HOME/.local/share}/jterm1/workflows/`; user workflows with
-the same name take precedence. `JTERM1_WORKFLOW_DIR` adds higher-priority search
+`${XDG_DATA_HOME:-$HOME/.local/share}/anvil/workflows/`; user workflows with
+the same name take precedence. `ANVIL_WORKFLOW_DIR` adds higher-priority search
 paths after the user config directory and before user/system data examples.
 Workflow names are deduplicated in that directory-precedence order. Tags,
 optional `shell`, and source-file metadata are retained. Workflows are reloaded
@@ -472,7 +472,7 @@ login_shell = true
 multiplex = true
 ```
 
-jterm1 runs `ssh -t`, passes `ssh_args` before the target, and optionally uses
+anvil runs `ssh -t`, passes `ssh_args` before the target, and optionally uses
 OpenSSH ControlMaster sockets. The custom `jsh` remote shell additionally
 supports stable session IDs and block-aware reconnection; a regular remote
 shell works as a normal interactive SSH tab.
@@ -548,15 +548,15 @@ working locally. Pair container tabs with a jsh that carries that fix.
 ### AI
 
 AI surfaces are optional and can be hidden with `ai_enabled = false`. Provider
-selection is `JTERM1_AI_PROVIDER`, then the `ai_provider` setting, then the
+selection is `ANVIL_AI_PROVIDER`, then the `ai_provider` setting, then the
 Anthropic default. Accepted values are `anthropic`, `openai-compatible` (or
-`openai`), and `ollama`. `JTERM1_AI_MODEL` and `JTERM1_AI_BASE_URL` override the
-matching TOML settings and provider defaults. `JTERM1_AI_API_KEY` overrides the
+`openai`), and `ollama`. `ANVIL_AI_MODEL` and `ANVIL_AI_BASE_URL` override the
+matching TOML settings and provider defaults. `ANVIL_AI_API_KEY` overrides the
 provider-specific `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `OLLAMA_API_KEY`.
 Keep API keys out of the TOML file: either in the environment or in a private
 key file. The Settings dialog's **API Key** row stores a pasted key as a
 0600 single-line file — `ai_api_key_file` if configured, otherwise
-`~/.config/jterm1/ai.key` — and `JTERM1_AI_API_KEY_FILE` overrides the
+`~/.config/anvil/ai.key` — and `ANVIL_AI_API_KEY_FILE` overrides the
 configured path without ever being written back to config.toml.
 
 AI network calls happen only after an explicit AI action. The session panel
@@ -576,7 +576,7 @@ instead of attributing a different command's result to the Agent.
 Activating a `.jtnb.md` file in the sidebar opens the notebook viewer. Markdown
 is intentionally minimal. Unlabelled, `shell`, `bash`, `sh`, `zsh`, `fish`,
 `pwsh`, and `powershell` code fences get Run, Stop, and Copy controls. Unlabelled
-and `shell` cells use jterm1's configured shell (with the same safe fallback as
+and `shell` cells use anvil's configured shell (with the same safe fallback as
 new terminal panes); explicit fences use the named interpreter. Run All executes
 runnable cells sequentially, while Stop All
 terminates the current run and clears its queue. Every run gets a separate Unix
@@ -592,21 +592,21 @@ characters marked) and copyable, but its Run action is disabled.
 The installer provides a walkthrough at:
 
 ```text
-${XDG_DATA_HOME:-$HOME/.local/share}/jterm1/notebooks/welcome.jtnb.md
+${XDG_DATA_HOME:-$HOME/.local/share}/anvil/notebooks/welcome.jtnb.md
 ```
 
 ## State and diagnostics
 
-jterm1 writes one session snapshot and companion lifetime owner lock per
+anvil writes one session snapshot and companion lifetime owner lock per
 process:
 
 ```text
-${XDG_CONFIG_HOME:-$HOME/.config}/jterm1/tabs.<uuid>.state
-${XDG_CONFIG_HOME:-$HOME/.config}/jterm1/tabs.<uuid>.lock
+${XDG_CONFIG_HOME:-$HOME/.config}/anvil/tabs.<uuid>.state
+${XDG_CONFIG_HOME:-$HOME/.config}/anvil/tabs.<uuid>.lock
 ```
 
 It records tab titles, pane layout, working directories, and restorable
-foreground commands. On startup, jterm1 leaves live windows untouched and
+foreground commands. On startup, anvil leaves live windows untouched and
 atomically claims the newest valid snapshot whose owner lock is no longer held.
 Snapshot publication and cleanup share a directory protocol lock so a
 partially published owner cannot be mistaken for an exited process. The legacy
@@ -627,12 +627,12 @@ Inspect the newest snapshot with:
 ./scripts/debug.sh info
 ```
 
-Logging accepts plain levels and target-specific directives. `JTERM1_LOG`
+Logging accepts plain levels and target-specific directives. `ANVIL_LOG`
 takes precedence over the standard `RUST_LOG` variable:
 
 ```bash
-JTERM1_LOG=debug jterm1
-RUST_LOG='warn,jterm1=debug,jterm1::session=trace' jterm1
+ANVIL_LOG=debug anvil
+RUST_LOG='warn,anvil=debug,anvil::session=trace' anvil
 ```
 
 Configuration recovery files live beside `config.toml`: two rotating backups
@@ -641,7 +641,7 @@ when the recovery command replaces a live file. They are private user files and
 can contain the same paths or remote profiles as the main configuration.
 
 Command-only history is enabled by default at
-`${XDG_STATE_HOME:-$HOME/.local/state}/jterm1/history.jsonl`. It stores the
+`${XDG_STATE_HOME:-$HOME/.local/state}/anvil/history.jsonl`. It stores the
 command, working directory, exit status, and completion time, but not terminal
 output. Set `command_history_enabled = false` to disable it or configure an
 absolute `command_history_path`. Reads, appends, compaction, and shutdown flush
@@ -654,7 +654,7 @@ still recovery state rather than durable project storage.
 
 ## Security and privacy
 
-- Shell commands have the same permissions as jterm1. Review commands inserted
+- Shell commands have the same permissions as anvil. Review commands inserted
   by workflows, history, notebooks, remote profiles, or AI before running them.
 - `startup_commands` executes automatically in every new tab. Keep it limited
   to commands you trust.
@@ -682,7 +682,8 @@ src/                         application and terminal backends
 scripts/shell-integration/   OSC 133 / OSC 7 shell hooks
 scripts/workflows/           example workflow definitions
 scripts/notebooks/           example runnable notebook
-packaging/                    desktop integration
+data/                        desktop entry, AppStream metadata, icons
+packaging/                   Flatpak manifest and release installer
 ```
 
 Use `cargo fmt`, `cargo clippy --all-targets`, and `cargo test --all-targets`
@@ -690,7 +691,7 @@ before submitting changes.
 
 ## License
 
-jterm1 is dual-licensed under **MIT OR Apache-2.0**; pick either at your option.
+anvil is dual-licensed under **MIT OR Apache-2.0**; pick either at your option.
 Full texts are in [`LICENSE-MIT`](LICENSE-MIT) and
 [`LICENSE-APACHE`](LICENSE-APACHE). Contributions are accepted under the same
 dual terms.

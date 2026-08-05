@@ -1,64 +1,64 @@
-# jterm1 shell integration for bash.
+# anvil shell integration for bash.
 #
-# Emits FTCS / OSC 133 marks so jterm1 can attribute output to discrete blocks
+# Emits FTCS / OSC 133 marks so anvil can attribute output to discrete blocks
 # and know each command's exit code, plus OSC 7 so it tracks the working dir.
 #
 # Source from ~/.bashrc, e.g.
-#     [[ $TERM_PROGRAM == jterm1 ]] && source /path/to/jterm1.bash
+#     [[ $TERM_PROGRAM == anvil ]] && source /path/to/anvil.bash
 # or unconditionally:
-#     source /path/to/jterm1.bash
+#     source /path/to/anvil.bash
 #
-# Safe to source under non-jterm1 terminals: the OSC sequences are silently
+# Safe to source under non-anvil terminals: the OSC sequences are silently
 # discarded by anything that doesn't parse them.
 
-# Keep jterm1's per-pane cwd authenticator in a private, non-exported shell
+# Keep anvil's per-pane cwd authenticator in a private, non-exported shell
 # variable. Remove the public environment variable before any prompt command
 # (or child process) can inherit it. This intentionally precedes the load guard
 # so re-sourcing cannot leave a newly supplied token exported.
-if [[ ${JTERM1_CWD_TOKEN+x} ]]; then
-    __jterm1_cwd_token=$JTERM1_CWD_TOKEN
-    unset JTERM1_CWD_TOKEN
-    export -n __jterm1_cwd_token
+if [[ ${ANVIL_CWD_TOKEN+x} ]]; then
+    __anvil_cwd_token=$ANVIL_CWD_TOKEN
+    unset ANVIL_CWD_TOKEN
+    export -n __anvil_cwd_token
 fi
 
 # Guard against double-sourcing in the same shell.
-[[ -n ${__JTERM1_BASH_LOADED:-} ]] && return 0
-__JTERM1_BASH_LOADED=1
-__jterm1_integration_source=${BASH_SOURCE[0]}
+[[ -n ${__ANVIL_BASH_LOADED:-} ]] && return 0
+__ANVIL_BASH_LOADED=1
+__anvil_integration_source=${BASH_SOURCE[0]}
 # Private per-shell nonce + monotonic command number correlate C/D pairs.
 # Neither variable is exported. Use enough independent shell-random samples
 # that blind terminal output cannot feasibly guess a valid finish marker.
-__jterm1_marker_nonce="${BASHPID:-$$}-${RANDOM}-${RANDOM}-${RANDOM}-${RANDOM}-${RANDOM}-${RANDOM}-${RANDOM}-${RANDOM}"
-__jterm1_marker_seq=0
-__jterm1_marker_id=""
+__anvil_marker_nonce="${BASHPID:-$$}-${RANDOM}-${RANDOM}-${RANDOM}-${RANDOM}-${RANDOM}-${RANDOM}-${RANDOM}-${RANDOM}"
+__anvil_marker_seq=0
+__anvil_marker_id=""
 
 # Send raw OSC payload terminated with BEL.
-__jterm1_osc() { printf '\033]%s\007' "$1"; }
+__anvil_osc() { printf '\033]%s\007' "$1"; }
 
 # OSC 133 ;A — prompt is about to be drawn.
 # OSC 133 ;B — prompt drawn, waiting for user input.
-__jterm1_prompt_start() { __jterm1_osc "133;A"; }
-__jterm1_prompt_end()   { __jterm1_osc "133;B"; }
+__anvil_prompt_start() { __anvil_osc "133;A"; }
+__anvil_prompt_end()   { __anvil_osc "133;B"; }
 
 # OSC 133 ;C — user submitted, command is running.
-__jterm1_command_start() {
-    ((__jterm1_marker_seq++)) || true
-    __jterm1_marker_id="${__jterm1_marker_nonce}-${__jterm1_marker_seq}"
-    __jterm1_osc "133;C;id=${__jterm1_marker_id}"
+__anvil_command_start() {
+    ((__anvil_marker_seq++)) || true
+    __anvil_marker_id="${__anvil_marker_nonce}-${__anvil_marker_seq}"
+    __anvil_osc "133;C;id=${__anvil_marker_id}"
 }
 
 # OSC 133 ;D;<exit> — command finished with the given exit code.
-__jterm1_command_end() {
+__anvil_command_end() {
     local ec=$1
-    __jterm1_osc "133;D;${ec};id=${__jterm1_marker_id}"
-    __jterm1_marker_id=""
+    __anvil_osc "133;D;${ec};id=${__anvil_marker_id}"
+    __anvil_marker_id=""
 }
 
 # OSC 7 — report current working directory as file:// URI.
-__jterm1_report_cwd() {
+__anvil_report_cwd() {
     local host
-    if [[ -n ${__jterm1_cwd_token:-} ]]; then
-        host="jterm1-${__jterm1_cwd_token}"
+    if [[ -n ${__anvil_cwd_token:-} ]]; then
+        host="anvil-${__anvil_cwd_token}"
     else
         host=${HOSTNAME:-localhost}
     fi
@@ -71,7 +71,7 @@ __jterm1_report_cwd() {
             *) printf -v out '%s%%%02X' "$out" "'$ch" ;;
         esac
     done
-    __jterm1_osc "7;file://${host}${out}"
+    __anvil_osc "7;file://${host}${out}"
 }
 
 # Track command lifecycle. We need two things:
@@ -84,60 +84,60 @@ __jterm1_report_cwd() {
 # PROMPT_COMMAND (fires before each prompt). We use a flag so the DEBUG trap
 # only emits ;C for the first command of a pipeline.
 
-__jterm1_in_command=0
-__jterm1_in_prompt_command=0
+__anvil_in_command=0
+__anvil_in_prompt_command=0
 
-__jterm1_preexec() {
+__anvil_preexec() {
     [[ -n ${COMP_LINE:-} ]] && return
-    [[ ${BASH_SOURCE[1]:-} == "$__jterm1_integration_source" ]] && return
+    [[ ${BASH_SOURCE[1]:-} == "$__anvil_integration_source" ]] && return
 
     # DEBUG also fires inside PROMPT_COMMAND functions. Mark the complete
     # prompt phase so neither our hook nor a user's existing hook creates a
     # phantom command block.
-    if [[ ${BASH_COMMAND} == "__jterm1_prompt_command" ]]; then
-        __jterm1_in_prompt_command=1
+    if [[ ${BASH_COMMAND} == "__anvil_prompt_command" ]]; then
+        __anvil_in_prompt_command=1
         return
     fi
-    (( __jterm1_in_prompt_command == 1 )) && return
+    (( __anvil_in_prompt_command == 1 )) && return
 
-    if (( __jterm1_in_command == 0 )); then
-        __jterm1_in_command=1
-        __jterm1_command_start
+    if (( __anvil_in_command == 0 )); then
+        __anvil_in_command=1
+        __anvil_command_start
     fi
 }
 
-__jterm1_precmd() {
+__anvil_precmd() {
     local ec=$1
-    if (( __jterm1_in_command == 1 )); then
-        __jterm1_command_end "${ec}"
-        __jterm1_in_command=0
+    if (( __anvil_in_command == 1 )); then
+        __anvil_command_end "${ec}"
+        __anvil_in_command=0
     fi
-    __jterm1_report_cwd
-    __jterm1_prompt_start
+    __anvil_report_cwd
+    __anvil_prompt_start
     # Re-inject the user's PS1 with ;B appended so the prompt-end mark sits at
     # the exact spot where input begins. Use \[...\] so the OSC bytes don't
     # count toward readline's column accounting.
-    if [[ -z ${__JTERM1_PS1_HOOKED:-} ]]; then
-        PS1="${PS1}\[$(__jterm1_prompt_end)\]"
-        __JTERM1_PS1_HOOKED=1
+    if [[ -z ${__ANVIL_PS1_HOOKED:-} ]]; then
+        PS1="${PS1}\[$(__anvil_prompt_end)\]"
+        __ANVIL_PS1_HOOKED=1
     fi
 }
 
 # Preserve every existing prompt hook, including Bash 5's array form, while
 # making this dispatcher the sole PROMPT_COMMAND visible to the DEBUG trap.
-__jterm1_saved_prompt_commands=("${PROMPT_COMMAND[@]:-}")
-__jterm1_prompt_command() {
+__anvil_saved_prompt_commands=("${PROMPT_COMMAND[@]:-}")
+__anvil_prompt_command() {
     local ec=$?
     local command
-    __jterm1_in_prompt_command=1
-    __jterm1_precmd "$ec"
-    for command in "${__jterm1_saved_prompt_commands[@]}"; do
+    __anvil_in_prompt_command=1
+    __anvil_precmd "$ec"
+    for command in "${__anvil_saved_prompt_commands[@]}"; do
         [[ -n $command ]] && builtin eval -- "$command"
     done
-    __jterm1_in_prompt_command=0
+    __anvil_in_prompt_command=0
 }
 
 unset PROMPT_COMMAND
-PROMPT_COMMAND=__jterm1_prompt_command
-export TERM_PROGRAM=jterm1
-trap '__jterm1_preexec' DEBUG
+PROMPT_COMMAND=__anvil_prompt_command
+export TERM_PROGRAM=anvil
+trap '__anvil_preexec' DEBUG

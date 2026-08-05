@@ -1,6 +1,6 @@
 //! Owned PTY: fork+exec a shell on a fresh pseudo-terminal, then stream its
 //! output to the GTK main thread via an eventfd-signaled mpsc channel. Ported
-//! from jterm4 — the block view drives its own PTY (rather than vte4's) so it can
+//! from forge — the block view drives its own PTY (rather than vte4's) so it can
 //! intercept the raw stream for OSC 133 block detection.
 
 use crate::child_env;
@@ -271,14 +271,14 @@ fn observe_bracketed_paste_mode(current: bool, tail: &mut Vec<u8>, data: &[u8]) 
     enabled
 }
 
-/// jterm1's child-environment policy for a directly exec'd shell.
+/// anvil's child-environment policy for a directly exec'd shell.
 ///
 /// `less_default` is the one opinion this repo asserts: `LESS=R` keeps colored
 /// git output, keeps the interactive pager even for a short `git log`, and lets
 /// less use the alternate screen so pager content stays ephemeral. (Git would
 /// otherwise default it to `FRX`, where `F` quits for short output and `X`
 /// disables the alternate screen.) Locale rewriting and `LS_COLORS` stay off:
-/// jterm1 draws UTF-8 either way and has never set colour defaults, so turning
+/// anvil draws UTF-8 either way and has never set colour defaults, so turning
 /// them on here would override variables the user chose deliberately.
 fn child_environment_options() -> child_env::ChildEnv<'static> {
     child_env::ChildEnv {
@@ -287,14 +287,14 @@ fn child_environment_options() -> child_env::ChildEnv<'static> {
     }
 }
 
-/// jterm1's policy for the PTY boundary net.
+/// anvil's policy for the PTY boundary net.
 ///
 /// `strip_controls` stays off here: the boundary sees every keystroke and every
 /// escape sequence this app answers a query with, and stripping controls there
 /// would eat the input it exists to protect. Marker removal is unconditional
 /// inside [`pty_input::InputGuard`] regardless of this policy — that is the part
 /// that stops an injected `ESC[201~` from ending a frame early. `FirstLineOnly`
-/// preserves jterm1's existing fallback for unframed multiline input.
+/// preserves anvil's existing fallback for unframed multiline input.
 fn boundary_policy() -> pty_input::PastePolicy {
     pty_input::PastePolicy {
         unbracketed_multiline: pty_input::UnbracketedMultiline::FirstLineOnly,
@@ -386,7 +386,7 @@ impl OwnedPty {
             })
             .transpose()?;
 
-        // Block mode is jterm1's default and libvte never spawns the child here
+        // Block mode is anvil's default and libvte never spawns the child here
         // (it is handed a foreign PTY master), so nothing else injects the
         // terminal identity: before this, the child got `TERM` and no
         // `COLORTERM`, and bat/delta/lazygit fell back to 256 colours.
@@ -501,7 +501,7 @@ impl OwnedPty {
                         return Err(error);
                     }
                 };
-                let input_tx = match spawn_fd_writer(writer_fd, "jterm1-pty-writer") {
+                let input_tx = match spawn_fd_writer(writer_fd, "anvil-pty-writer") {
                     Ok(tx) => tx,
                     Err(error) => {
                         drop(master);
@@ -668,7 +668,7 @@ impl OwnedPty {
         E: FnOnce(i32) + 'static,
     {
         let reader = std::thread::Builder::new()
-            .name("jterm1-pty-reader".to_string())
+            .name("anvil-pty-reader".to_string())
             .spawn(move || {
                 // The reader owns a duplicated descriptor. It can never observe a
                 // different file after the model closes and the kernel reuses the
@@ -843,7 +843,7 @@ mod tests {
     }
 
     /// The identity variables are `jterm_core::child_env`'s to get right (and its
-    /// tests do); what is jterm1's is which of the optional policies it turns on.
+    /// tests do); what is anvil's is which of the optional policies it turns on.
     /// Block mode is the default and libvte never spawns the child here, so this
     /// overlay is the *only* thing that tells the shell what terminal it is in.
     #[test]
@@ -852,9 +852,9 @@ mod tests {
         assert_eq!(options.less_default, Some("R"));
         assert!(
             !options.normalize_locale,
-            "jterm1 draws UTF-8 either way; a deliberate LANG is the user's"
+            "anvil draws UTF-8 either way; a deliberate LANG is the user's"
         );
-        assert!(!options.color_defaults, "jterm1 has never set LS_COLORS");
+        assert!(!options.color_defaults, "anvil has never set LS_COLORS");
         assert_eq!(
             options.vte_version,
             Some(child_env::EMULATED_VTE_VERSION),
@@ -882,11 +882,11 @@ mod tests {
     /// which pinned the local `resolve_executable` this file donated to
     /// `jterm_core::host` (whose own tests cover the lookup rules, including the
     /// empty PATH entry resolving against the child's cwd). What is still
-    /// jterm1's to guarantee is the wiring: resolution happens before `fork`, so
+    /// anvil's to guarantee is the wiring: resolution happens before `fork`, so
     /// the pane that asked gets the error instead of a child that exits 127.
     #[test]
     fn spawn_reports_an_unresolvable_command_before_forking() {
-        let error = OwnedPty::spawn(&["jterm1-command-that-does-not-exist"], None, &[])
+        let error = OwnedPty::spawn(&["anvil-command-that-does-not-exist"], None, &[])
             .err()
             .expect("an unresolvable command must fail the spawn");
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
@@ -895,7 +895,7 @@ mod tests {
     #[test]
     fn background_writer_preserves_large_payload_and_order() {
         let (mut reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
-        let tx = spawn_fd_writer(writer.into(), "jterm1-test-writer").unwrap();
+        let tx = spawn_fd_writer(writer.into(), "anvil-test-writer").unwrap();
 
         // Larger than a typical Unix socket buffer: the worker will encounter
         // kernel backpressure, while both queue sends must return immediately.
@@ -914,7 +914,7 @@ mod tests {
     #[test]
     fn background_writer_rejects_oversize_and_bounded_queue_overload() {
         let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
-        let tx = spawn_fd_writer(writer.into(), "jterm1-test-bounded-writer").unwrap();
+        let tx = spawn_fd_writer(writer.into(), "anvil-test-bounded-writer").unwrap();
 
         let oversized = vec![0_u8; FD_WRITER_MAX_MESSAGE_BYTES + 1];
         assert_eq!(
@@ -939,7 +939,7 @@ mod tests {
     }
 
     /// The four tests below replace the `sanitize_input_chunk` suite: the encoder
-    /// is `jterm_core::pty_input::InputGuard` now, and what stays jterm1's is the
+    /// is `jterm_core::pty_input::InputGuard` now, and what stays anvil's is the
     /// policy this boundary hands it. `boundary_policy()` is exercised directly
     /// because `write_bytes` needs a live child to reach.
     fn boundary(bracketed: bool) -> (pty_input::PasteModes, pty_input::PastePolicy) {
@@ -1029,7 +1029,7 @@ mod tests {
         assert!(!guard.in_frame());
     }
 
-    /// jterm1 keeps control bytes at this boundary: every keystroke and every
+    /// anvil keeps control bytes at this boundary: every keystroke and every
     /// reply this app writes to a capability query passes through here.
     #[test]
     fn the_boundary_does_not_strip_control_bytes() {

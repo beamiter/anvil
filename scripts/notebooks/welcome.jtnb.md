@@ -1,7 +1,7 @@
-# Welcome to jterm1 notebooks
+# Welcome to anvil notebooks
 
 A `.jtnb.md` file is **markdown** with runnable shell code fences. Unlabelled
-and `shell` fences use jterm1's configured shell; explicit `bash`, `sh`, `zsh`,
+and `shell` fences use anvil's configured shell; explicit `bash`, `sh`, `zsh`,
 `fish`, `pwsh`, and `powershell` fences use the named interpreter. Each
 runnable cell has *Run*, *Stop*, and *Copy* controls.
 

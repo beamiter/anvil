@@ -1,9 +1,9 @@
-//! Relm4 adapter around the jterm4 block view.
+//! Relm4 adapter around the forge block view.
 //!
-//! jterm1's application shell expects terminal backends to be Relm4
+//! anvil's application shell expects terminal backends to be Relm4
 //! components that speak `VteInit`/`VteInput`/`VteOutput`. The block-mode
-//! implementation itself is now the jterm4 `block_view::TermView`; this file
-//! only adapts that GTK view to the existing jterm1 component surface.
+//! implementation itself is now the forge `block_view::TermView`; this file
+//! only adapts that GTK view to the existing anvil component surface.
 
 use gtk::pango::FontDescription;
 use gtk::prelude::*;

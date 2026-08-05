@@ -234,7 +234,7 @@ fn palette_command_is_safe(command: &str) -> bool {
 /// UI components call this only from their `Toggle` path. Query changes then
 /// pass the returned slice to [`gather`], keeping per-keystroke filtering free
 /// of filesystem reads and JSON parsing. Closing and reopening creates a fresh
-/// snapshot, so writes from this or another jterm1 process become visible at a
+/// snapshot, so writes from this or another anvil process become visible at a
 /// predictable boundary.
 pub(crate) fn load_history_snapshot(
     path: Option<&Path>,
@@ -478,7 +478,7 @@ mod tests {
     #[test]
     fn query_filtering_uses_snapshot_until_the_next_load() {
         let path = std::env::temp_dir().join(format!(
-            "jterm1-palette-history-snapshot-{}.jsonl",
+            "anvil-palette-history-snapshot-{}.jsonl",
             std::process::id()
         ));
         std::fs::write(&path, "{\"command\":\"before\",\"exit_code\":0}\n").unwrap();
@@ -550,7 +550,7 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
 
         let root = std::env::temp_dir().join(format!(
-            "jterm1-palette-safe-open-{}-{}",
+            "anvil-palette-safe-open-{}-{}",
             std::process::id(),
             relm4::gtk::glib::uuid_string_random()
         ));

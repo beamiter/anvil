@@ -1,13 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>io.github.beamiter.jterm1</id>
+  <id>io.github.beamiter.anvil</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT OR Apache-2.0</project_license>
-  <name>jterm1</name>
+  <name>anvil</name>
   <summary>Block-aware terminal workspace for Linux</summary>
   <description>
     <p>
-      jterm1 combines structured command blocks with a VTE compatibility
+      anvil combines structured command blocks with a VTE compatibility
       backend, tabs, split panes, session restore, searchable history,
       workflows, executable notebooks, SSH sessions, and optional AI tools.
     </p>
@@ -17,14 +17,14 @@
       <li>Remote sessions, an asynchronous file tree, and multi-provider AI</li>
     </ul>
   </description>
-  <launchable type="desktop-id">io.github.beamiter.jterm1.desktop</launchable>
+  <launchable type="desktop-id">io.github.beamiter.anvil.desktop</launchable>
   <developer id="io.github.beamiter">
     <name>beamiter</name>
   </developer>
-  <url type="homepage">https://github.com/beamiter/jterm1</url>
-  <url type="bugtracker">https://github.com/beamiter/jterm1/issues</url>
+  <url type="homepage">https://github.com/beamiter/anvil</url>
+  <url type="bugtracker">https://github.com/beamiter/anvil/issues</url>
   <provides>
-    <binary>jterm1</binary>
+    <binary>anvil</binary>
   </provides>
   <recommends>
     <control>keyboard</control>

@@ -1,6 +1,6 @@
 //! Transactional configuration persistence, validation, and backup recovery.
 //!
-//! jterm1 is a `NON_UNIQUE` application: several windows may hold an in-memory
+//! anvil is a `NON_UNIQUE` application: several windows may hold an in-memory
 //! configuration at once. This module prevents an older window from silently
 //! overwriting a newer on-disk edit by combining a process-safe lock with an
 //! optimistic content revision. Writes use unique sibling temporary files,
@@ -549,7 +549,7 @@ pub(crate) fn lock_status() -> ConfigLockStatus {
 
 /// Short-lived namespace lock for other private files stored beside the
 /// configuration (for example the one-shot Agent snapshot). Holding the final
-/// directory inode prevents two jterm1 processes from both consuming the same
+/// directory inode prevents two anvil processes from both consuming the same
 /// pathname or racing a replace against an unlink.
 pub(crate) struct PrivateParentLock {
     directory: fs::File,
@@ -836,7 +836,7 @@ fn apply_config_to_table(config: &Config, table: &mut toml::Table) {
         toml::Value::Boolean(config.ai_redact_secrets),
     );
     table.insert("ai_stream".into(), toml::Value::Boolean(config.ai_stream));
-    // Only the file-configured key path is persisted; the JTERM1_AI_API_KEY_FILE
+    // Only the file-configured key path is persisted; the ANVIL_AI_API_KEY_FILE
     // override is applied at client construction and never reaches Config.
     match &config.ai_api_key_file {
         Some(path) => {
@@ -1803,7 +1803,7 @@ pub(crate) fn validate_current_config() -> ConfigValidationReport {
 
 fn print_validation_human(report: &ConfigValidationReport) -> io::Result<()> {
     let mut stdout = io::stdout().lock();
-    writeln!(stdout, "jterm1 configuration check")?;
+    writeln!(stdout, "anvil configuration check")?;
     writeln!(stdout, "path: {}\n", report.path)?;
     if report.issues.is_empty() {
         writeln!(stdout, "[ok   ] configuration is valid")?;
@@ -1838,7 +1838,7 @@ pub(crate) fn run_check_path(path: &Path, format: ReportFormat) -> bool {
         ReportFormat::Json => print_validation_json(&report),
     };
     if let Err(error) = result {
-        eprintln!("jterm1: failed to write configuration report: {error}");
+        eprintln!("anvil: failed to write configuration report: {error}");
         return false;
     }
     report.healthy()
@@ -1854,7 +1854,7 @@ mod tests {
 
         let nonce = UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "jterm1-config-store-{label}-{}-{nonce}",
+            "anvil-config-store-{label}-{}-{nonce}",
             std::process::id()
         ));
         fs::create_dir_all(&path).unwrap();

@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Debug helper for jterm1.
+# Debug helper for anvil.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}"
-CONFIG_DIR="${CONFIG_HOME}/jterm1"
+CONFIG_DIR="${CONFIG_HOME}/anvil"
 CONFIG_FILE="${CONFIG_DIR}/config.toml"
 LEGACY_STATE_FILE="${CONFIG_DIR}/tabs.state"
-RELEASE_BINARY="${PROJECT_ROOT}/target/release/jterm1"
-DEBUG_BINARY="${PROJECT_ROOT}/target/debug/jterm1"
+RELEASE_BINARY="${PROJECT_ROOT}/target/release/anvil"
+DEBUG_BINARY="${PROJECT_ROOT}/target/debug/anvil"
 CMD="${1:-info}"
 
 find_binary() {
@@ -18,8 +18,8 @@ find_binary() {
         printf '%s\n' "${RELEASE_BINARY}"
     elif [[ -x "${DEBUG_BINARY}" ]]; then
         printf '%s\n' "${DEBUG_BINARY}"
-    elif command -v jterm1 >/dev/null 2>&1; then
-        command -v jterm1
+    elif command -v anvil >/dev/null 2>&1; then
+        command -v anvil
     else
         return 1
     fi
@@ -28,7 +28,7 @@ find_binary() {
 require_binary() {
     local binary
     if ! binary="$(find_binary)"; then
-        echo "Error: no jterm1 binary found; run 'make build' first." >&2
+        echo "Error: no anvil binary found; run 'make build' first." >&2
         exit 1
     fi
     printf '%s\n' "${binary}"
@@ -36,7 +36,7 @@ require_binary() {
 
 case "${CMD}" in
     info)
-        echo "jterm1 debug information"
+        echo "anvil debug information"
         echo "========================"
         echo
         echo "Paths:"
@@ -66,21 +66,21 @@ case "${CMD}" in
         fi
         echo
         echo "Running processes:"
-        if ! ps -C jterm1 -o pid=,stat=,rss=,args= 2>/dev/null; then
+        if ! ps -C anvil -o pid=,stat=,rss=,args= 2>/dev/null; then
             echo "  None."
         fi
         ;;
 
     logs)
         binary="$(require_binary)"
-        echo "Running jterm1 with debug logging environment..."
-        RUST_BACKTRACE=1 RUST_LOG=jterm1=debug exec "${binary}"
+        echo "Running anvil with debug logging environment..."
+        RUST_BACKTRACE=1 RUST_LOG=anvil=debug exec "${binary}"
         ;;
 
     trace)
         binary="$(require_binary)"
-        echo "Running jterm1 with trace logging environment..."
-        RUST_BACKTRACE=full RUST_LOG=jterm1=trace exec "${binary}"
+        echo "Running anvil with trace logging environment..."
+        RUST_BACKTRACE=full RUST_LOG=anvil=trace exec "${binary}"
         ;;
 
     state)
@@ -126,7 +126,7 @@ case "${CMD}" in
             exit 1
         }
         binary="$(require_binary)"
-        trace_file="${TMPDIR:-/tmp}/jterm1-strace.log"
+        trace_file="${TMPDIR:-/tmp}/anvil-strace.log"
         strace -o "${trace_file}" "${binary}"
         echo "Trace saved to ${trace_file}"
         ;;
@@ -136,8 +136,8 @@ case "${CMD}" in
         echo
         echo "Commands:"
         echo "  info         Show paths, configuration and process information"
-        echo "  logs         Run with RUST_LOG=jterm1=debug"
-        echo "  trace        Run with RUST_LOG=jterm1=trace"
+        echo "  logs         Run with RUST_LOG=anvil=debug"
+        echo "  trace        Run with RUST_LOG=anvil=trace"
         echo "  state        Pretty-print the saved session"
         echo "  clean-state  Remove the saved session"
         echo "  reset-config Back up and replace the config with the example"

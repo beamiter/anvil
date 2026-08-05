@@ -28,7 +28,7 @@
 //! shared preset carrying this repository's historical values.
 //!
 //! Commands that carry an `i=`/`I=` identifier receive an `OK`/error reply on
-//! the PTY via `response_for`, following jterm2 — the family's reference
+//! the PTY via `response_for`, following ember — the family's reference
 //! responder. See that function for the deliberate divergences.
 
 use relm4::gtk;
@@ -64,7 +64,7 @@ pub(crate) enum Outcome {
     QueryOk,
 }
 
-/// Stateful assembler — the shared chunk assembler plus jterm1's decoding.
+/// Stateful assembler — the shared chunk assembler plus anvil's decoding.
 pub(crate) struct Assembler {
     inner: protocol::Assembler,
 }
@@ -125,9 +125,9 @@ impl Assembler {
     }
 }
 
-/// Map the shared module's typed failure onto jterm1's wire codes: a malformed
+/// Map the shared module's typed failure onto anvil's wire codes: a malformed
 /// command is `EINVAL`, anything unsupported or over budget is `ENOTSUP` (see
-/// `response_for` for why jterm1 answers a single unsupported code).
+/// `response_for` for why anvil answers a single unsupported code).
 fn outcome_for(error: Error) -> Outcome {
     match error {
         Error::Invalid(_) => {
@@ -186,14 +186,14 @@ fn query_outcome(command: &Command<'_>) -> Outcome {
 }
 
 /// Build the PTY reply owed for a processed APC G payload, or `None` when the
-/// protocol expects silence. Reply semantics follow jterm2, the family's most
+/// protocol expects silence. Reply semantics follow ember, the family's most
 /// complete responder:
 /// - only commands carrying an `i=`/`I=` identifier are answered (the id is
 ///   the client's correlation key; kitty itself stays silent without one);
 /// - `q=1` suppresses `OK`, `q=2` also suppresses errors;
 /// - a non-zero `p=` placement id is echoed back.
 ///
-/// Deliberate divergences from jterm2, kept small because this responder sits
+/// Deliberate divergences from ember, kept small because this responder sits
 /// on top of a minimal assembler rather than a full placement table:
 /// - every unsupported-but-well-formed command answers `ENOTSUP` instead of
 ///   per-cause `ENOENT`/`ENOSPC` codes;
@@ -342,7 +342,7 @@ mod tests {
             a.feed(b"Ga=T,t=t,s=1,v=1;AQIDBA=="),
             Outcome::Skipped
         ));
-        // The non-standard `f=png` alias jterm3 once accepted is not a format.
+        // The non-standard `f=png` alias frost once accepted is not a format.
         assert!(matches!(
             a.feed(b"Ga=T,f=png,s=1,v=1;AQID"),
             Outcome::Skipped
@@ -352,7 +352,7 @@ mod tests {
     #[test]
     fn format_defaults_to_rgba_not_png() {
         let mut a = Assembler::new();
-        // Four bytes with no `f=` are one RGBA pixel; jterm1 used to read a
+        // Four bytes with no `f=` are one RGBA pixel; anvil used to read a
         // missing `f=` as PNG, but the protocol default is `f=32`.
         assert!(matches!(
             a.feed(b"Ga=T,s=1,v=1;AQIDBA=="),
@@ -373,7 +373,7 @@ mod tests {
             a.feed(b"Ga=T,f=24,s=1,v=1;AQID"),
             Outcome::Complete(_)
         ));
-        // … and trailing slack, which jterm1 used to accept, is now invalid.
+        // … and trailing slack, which anvil used to accept, is now invalid.
         assert!(matches!(
             a.feed(b"Ga=T,f=24,s=1,v=1;AQIDBA=="),
             Outcome::Invalid
@@ -408,7 +408,7 @@ mod tests {
             Outcome::Pending
         ));
         // The protocol sends metadata on the first chunk only; repeating it —
-        // which jterm1 used to route by `i=` — now aborts the upload.
+        // which anvil used to route by `i=` — now aborts the upload.
         assert!(matches!(a.feed(b"Ga=T,i=7,m=0;AA"), Outcome::Invalid));
         assert!(!a.inner.has_pending());
     }
@@ -474,7 +474,7 @@ mod tests {
             a.feed(b"Ga=q,i=1,s=16385,v=1,f=32;AAAA"),
             Outcome::Skipped
         ));
-        // A probe for a transport jterm1 does not implement.
+        // A probe for a transport anvil does not implement.
         assert!(matches!(
             a.feed(b"Ga=q,i=1,t=f,f=100;L3RtcC9hLnBuZw=="),
             Outcome::Skipped

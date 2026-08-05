@@ -4,7 +4,7 @@
 //! clickable on Ctrl+click. OSC 8 targets are stored as private tag data rather
 //! than interpolated into GTK object names. Hovering a URL underlines it and
 //! shows the pointer cursor.
-//! Ported from jterm4's `block_view/url.rs`.
+//! Ported from forge's `block_view/url.rs`.
 
 use gtk::gio;
 use gtk::prelude::*;
@@ -17,7 +17,7 @@ const SCHEMES: [&str; 7] = [
     "http://", "https://", "file://", "ftp://", "git://", "ssh://", "mailto:",
 ];
 pub(crate) const MAX_URI_BYTES: usize = 8 * 1024;
-pub(crate) const OSC8_URI_DATA_KEY: &str = "jterm1-osc8-uri";
+pub(crate) const OSC8_URI_DATA_KEY: &str = "anvil-osc8-uri";
 
 pub fn is_url(text: &str) -> bool {
     !text.is_empty()

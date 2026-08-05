@@ -1,14 +1,14 @@
-# jterm1 configuration example
+# anvil configuration example
 #
 # Install as:
-#   ${XDG_CONFIG_HOME:-$HOME/.config}/jterm1/config.toml
+#   ${XDG_CONFIG_HOME:-$HOME/.config}/anvil/config.toml
 #
-# jterm1 preserves unknown and hand-authored sections when it saves a valid
+# anvil preserves unknown and hand-authored sections when it saves a valid
 # config. In-app writes are locked, revision-checked, and atomically replaced;
 # stale windows cannot overwrite newer edits. Two known-good backups rotate as
 # config.toml.bak and config.toml.bak.1. Malformed or schema-invalid files fall
 # back to safe defaults for loading and are never overwritten by the settings UI.
-# Validate without starting GTK: jterm1 --check-config
+# Validate without starting GTK: anvil --check-config
 
 # Appearance. Built-in themes: default, light, solarized-dark,
 # solarized-light, gruvbox-dark, gruvbox-light, dracula, nord.
@@ -27,7 +27,7 @@ sidebar_width = 220
 tab_width = 180
 
 # Shell selection and commands automatically submitted in every new tab.
-# When shell is omitted, jterm1 tries jsh, bash -l, then sh.
+# When shell is omitted, anvil tries jsh, bash -l, then sh.
 # shell = "/bin/bash"
 # Separate startup commands with a comma followed by a space.
 # startup_commands = "cd /path/to/project, printf 'ready\\n'"
@@ -40,7 +40,7 @@ tab_width = 180
 jsh_update_check = "daily"
 
 # Lightweight command-only JSONL history used by Ctrl+Shift+H, the palette, and
-# optional AI context. The default path is under $XDG_STATE_HOME/jterm1/.
+# optional AI context. The default path is under $XDG_STATE_HOME/anvil/.
 command_history_enabled = true
 # This must be an absolute path; '~' is not expanded here.
 # command_history_path = "/absolute/path/to/history.jsonl"
@@ -60,7 +60,7 @@ max_collapsed_output_lines = 25
 virtual_scroll_margin = 1
 # Unlike command history, this binary file can contain terminal output. It is
 # disabled unless an absolute path is configured; '~' is not expanded here.
-# block_history_path = "/absolute/path/to/jterm1-history.bin"
+# block_history_path = "/absolute/path/to/anvil-history.bin"
 block_history_compress = true
 preserve_live_scrollback = false
 show_repo_strip = true
@@ -79,13 +79,13 @@ allow_remote_clipboard_write = false
 notify_long_blocks = true
 notify_long_block_threshold_ms = 10000
 
-# Optional AI surfaces. Credentials (JTERM1_AI_API_KEY, ANTHROPIC_API_KEY,
+# Optional AI surfaces. Credentials (ANVIL_AI_API_KEY, ANTHROPIC_API_KEY,
 # OPENAI_API_KEY, or OLLAMA_API_KEY) remain environment-only and are never
-# written by jterm1. The generic key takes precedence. Provider aliases
+# written by anvil. The generic key takes precedence. Provider aliases
 # `claude`, `openai`, and `openai_compatible` are accepted and normalized. Environment overrides take
-# precedence over this file: JTERM1_AI_PROVIDER, JTERM1_AI_MODEL,
-# JTERM1_AI_BASE_URL, JTERM1_AI_MAX_TOKENS, JTERM1_AI_REDACT_SECRETS, and
-# JTERM1_AI_STREAM.
+# precedence over this file: ANVIL_AI_PROVIDER, ANVIL_AI_MODEL,
+# ANVIL_AI_BASE_URL, ANVIL_AI_MAX_TOKENS, ANVIL_AI_REDACT_SECRETS, and
+# ANVIL_AI_STREAM.
 ai_enabled = true
 agent_enabled = true
 agent_max_turns = 20

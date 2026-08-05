@@ -1,6 +1,6 @@
 //! alt — VTE builder + small parser helpers for the live terminal.
 //!
-//! jterm4 aligns with Warp's alt-screen model: when an alt-screen app
+//! forge aligns with Warp's alt-screen model: when an alt-screen app
 //! (top/vim/htop/...) sends `?1049h`, the live VTE switches to its alt buffer
 //! and renders full-viewport; when it sends `?1049l`, the alt-screen content
 //! is **discarded** — the active block keeps only the command name + exit code.
@@ -46,7 +46,7 @@ pub(crate) enum MouseReportingMode {
 /// coordinate.
 ///
 /// VTE 4 normally encodes wheel events itself, but only when it owns the PTY;
-/// jterm4's live VTE is fed by our own reader so we synthesize the bytes here.
+/// forge's live VTE is fed by our own reader so we synthesize the bytes here.
 pub(crate) fn encode_mouse_wheel(
     mode: MouseReportingMode,
     delta_y: f64,

@@ -1342,7 +1342,7 @@ impl AppModel {
         self.select_tab(id, sender);
     }
 
-    /// Close every marked tab (marking is the multi-select model in jterm1).
+    /// Close every marked tab (marking is the multi-select model in anvil).
     pub(crate) fn close_marked_tabs(&mut self, sender: &ComponentSender<AppModel>) {
         let ids: Vec<u64> = self
             .tabs

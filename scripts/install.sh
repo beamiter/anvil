@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Build and install jterm1 and its Linux desktop integration.
+# Build and install anvil and its Linux desktop integration.
 
 set -Eeuo pipefail
 umask 077
 
-APP_ID="io.github.beamiter.jterm1"
+APP_ID="io.github.beamiter.anvil"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 HOME_DIR="${HOME:-}"
@@ -43,7 +43,7 @@ USAGE
 }
 
 die() {
-    printf 'jterm1 install: %s\n' "$*" >&2
+    printf 'anvil install: %s\n' "$*" >&2
     exit 1
 }
 
@@ -63,7 +63,7 @@ run() {
 run_optional() {
     print_command "$@"
     if ((DRY_RUN == 0)); then
-        "$@" || printf 'jterm1 install: warning: %s failed (non-fatal)\n' "$1" >&2
+        "$@" || printf 'anvil install: warning: %s failed (non-fatal)\n' "$1" >&2
     fi
 }
 
@@ -74,7 +74,7 @@ run_optional_public() {
     print_command "$@"
     if ((DRY_RUN == 0)); then
         (umask 022 && "$@") \
-            || printf 'jterm1 install: warning: %s failed (non-fatal)\n' "$1" >&2
+            || printf 'anvil install: warning: %s failed (non-fatal)\n' "$1" >&2
     fi
 }
 
@@ -95,13 +95,13 @@ bin_dir_on_path() {
 }
 
 # A desktop session fixes its PATH at login, so an entry that only says
-# `Exec=jterm1` fails TryExec and is hidden from the launcher whenever the
+# `Exec=anvil` fails TryExec and is hidden from the launcher whenever the
 # binary lives in a per-user bin dir that PATH does not list. Point the entry at
 # the real path unless the target is a system bin dir that is always on PATH.
 desktop_exec_path() {
     case "${BIN_DIR}" in
-        /usr/bin | /usr/local/bin | /bin) printf 'jterm1' ;;
-        *) printf '%s/jterm1' "${BIN_DIR}" ;;
+        /usr/bin | /usr/local/bin | /bin) printf 'anvil' ;;
+        *) printf '%s/anvil' "${BIN_DIR}" ;;
     esac
 }
 
@@ -112,7 +112,7 @@ install_desktop_entry() {
     ((DRY_RUN == 0)) || return 0
     install -d -m 0755 "$(dirname -- "${dest}")"
     awk -v exec_path="${exec_path}" '
-        /^Exec=jterm1([[:space:]]|$)/ || /^TryExec=jterm1([[:space:]]|$)/ {
+        /^Exec=anvil([[:space:]]|$)/ || /^TryExec=anvil([[:space:]]|$)/ {
             eq = index($0, "=")
             print substr($0, 1, eq) exec_path substr($0, eq + 7)
             next
@@ -252,7 +252,7 @@ if [[ "${TARGET_DIR}" != /* ]]; then
 fi
 export CARGO_TARGET_DIR="${TARGET_DIR}"
 
-printf 'Building jterm1 with %s...\n' "${BACKEND}"
+printf 'Building anvil with %s...\n' "${BACKEND}"
 case "${BACKEND}" in
     nix)
         require_command nix
@@ -264,7 +264,7 @@ case "${BACKEND}" in
         ;;
 esac
 
-BINARY="${TARGET_DIR}/release/jterm1"
+BINARY="${TARGET_DIR}/release/anvil"
 if ((DRY_RUN == 0)) && [[ ! -x "${BINARY}" ]]; then
     die "release binary was not produced at ${BINARY}"
 fi
@@ -272,22 +272,22 @@ fi
 require_command install
 STAGED_BIN_DIR="${DESTDIR}${BIN_DIR}"
 run install -d -m 0755 "${STAGED_BIN_DIR}"
-run install -m 0755 "${BINARY}" "${STAGED_BIN_DIR}/jterm1"
+run install -m 0755 "${BINARY}" "${STAGED_BIN_DIR}/anvil"
 run install -m 0755 "${PROJECT_ROOT}/scripts/support-bundle.sh" \
-    "${STAGED_BIN_DIR}/jterm1-support-bundle"
+    "${STAGED_BIN_DIR}/anvil-support-bundle"
 
 STAGED_DATA_HOME="${DESTDIR}${DATA_HOME}"
-DATA_DIR="${STAGED_DATA_HOME}/jterm1"
+DATA_DIR="${STAGED_DATA_HOME}/anvil"
 run install -d -m 0755 \
     "${DATA_DIR}/shell-integration" \
     "${DATA_DIR}/workflows" \
     "${DATA_DIR}/notebooks"
 run install -m 0644 \
     "${PROJECT_ROOT}/scripts/shell-integration/README.md" \
-    "${PROJECT_ROOT}/scripts/shell-integration/jterm1.bash" \
-    "${PROJECT_ROOT}/scripts/shell-integration/jterm1.zsh" \
-    "${PROJECT_ROOT}/scripts/shell-integration/jterm1.fish" \
-    "${PROJECT_ROOT}/scripts/shell-integration/jterm1.ps1" \
+    "${PROJECT_ROOT}/scripts/shell-integration/anvil.bash" \
+    "${PROJECT_ROOT}/scripts/shell-integration/anvil.zsh" \
+    "${PROJECT_ROOT}/scripts/shell-integration/anvil.fish" \
+    "${PROJECT_ROOT}/scripts/shell-integration/anvil.ps1" \
     "${DATA_DIR}/shell-integration/"
 run install -m 0644 "${PROJECT_ROOT}"/scripts/workflows/*.yaml \
     "${DATA_DIR}/workflows/"
@@ -295,15 +295,20 @@ run install -m 0644 "${PROJECT_ROOT}/scripts/notebooks/welcome.jtnb.md" \
     "${DATA_DIR}/notebooks/welcome.jtnb.md"
 
 if ((INSTALL_DESKTOP == 1)); then
-    install_desktop_entry "${PROJECT_ROOT}/packaging/app.jterm1.desktop" \
+    install_desktop_entry "${PROJECT_ROOT}/data/${APP_ID}.desktop" \
         "${STAGED_DATA_HOME}/applications/${APP_ID}.desktop"
-    run rm -f -- "${STAGED_DATA_HOME}/applications/app.jterm1.desktop"
-    run install -Dm0644 "${PROJECT_ROOT}/packaging/app.jterm1.metainfo.xml" \
+    # Entries left by installs from before the jterm1 -> anvil rename. Both
+    # spellings existed: the app-id one this script installs today, and a copy
+    # under the source file's own basename. Left in place they show up as extra
+    # "jterm1" launchers beside the new one.
+    run rm -f -- "${STAGED_DATA_HOME}/applications/app.jterm1.desktop" \
+        "${STAGED_DATA_HOME}/applications/io.github.beamiter.jterm1.desktop"
+    run install -Dm0644 "${PROJECT_ROOT}/data/${APP_ID}.metainfo.xml" \
         "${STAGED_DATA_HOME}/metainfo/${APP_ID}.metainfo.xml"
-    run install -Dm0644 "${PROJECT_ROOT}/packaging/app.jterm1.svg" \
+    run install -Dm0644 "${PROJECT_ROOT}/data/${APP_ID}.svg" \
         "${STAGED_DATA_HOME}/icons/hicolor/scalable/apps/${APP_ID}.svg"
     for size in 128 256; do
-        run install -Dm0644 "${PROJECT_ROOT}/packaging/app.jterm1-${size}.png" \
+        run install -Dm0644 "${PROJECT_ROOT}/data/${APP_ID}-${size}.png" \
             "${STAGED_DATA_HOME}/icons/hicolor/${size}x${size}/apps/${APP_ID}.png"
     done
     refresh_desktop_caches
@@ -311,7 +316,7 @@ fi
 
 CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME_DIR}/.config}"
 [[ "${CONFIG_HOME}" == /* ]] || die "XDG_CONFIG_HOME must be an absolute path"
-CONFIG_DIR="${CONFIG_HOME}/jterm1"
+CONFIG_DIR="${CONFIG_HOME}/anvil"
 STAGED_CONFIG_DIR="${DESTDIR}${CONFIG_DIR}"
 if ((INSTALL_CONFIG == 1)); then
     run install -d -m 0700 "${STAGED_CONFIG_DIR}"
@@ -323,31 +328,31 @@ if ((INSTALL_CONFIG == 1)); then
     fi
 fi
 
-printf 'Installed jterm1 to %s\n' "${BIN_DIR}/jterm1"
-printf 'Installed support tool to %s\n' "${BIN_DIR}/jterm1-support-bundle"
-printf 'Installed runtime assets under %s/jterm1\n' "${DATA_HOME}"
+printf 'Installed anvil to %s\n' "${BIN_DIR}/anvil"
+printf 'Installed support tool to %s\n' "${BIN_DIR}/anvil-support-bundle"
+printf 'Installed runtime assets under %s/anvil\n' "${DATA_HOME}"
 if ((INSTALL_DESKTOP == 1)); then
     printf 'Installed desktop integration under %s\n' "${DATA_HOME}"
     printf 'Launcher entry: %s (Exec=%s)\n' \
         "${DATA_HOME}/applications/${APP_ID}.desktop" "$(desktop_exec_path)"
 fi
 if [[ -n "${DESTDIR}" ]]; then
-    printf 'Staged file: %s\n' "${STAGED_BIN_DIR}/jterm1"
+    printf 'Staged file: %s\n' "${STAGED_BIN_DIR}/anvil"
 fi
 if [[ -z "${DESTDIR}" ]]; then
     if ! bin_dir_on_path; then
         printf '\nNote: %s is not in PATH; the launcher entry uses the absolute path,\n' \
             "${BIN_DIR}"
-        printf 'but shells will not find jterm1 until you add it, for example:\n'
+        printf 'but shells will not find anvil until you add it, for example:\n'
         printf "  echo 'export PATH=\"%s:\$PATH\"' >>~/.profile\n" "${BIN_DIR}"
     fi
-    SHADOWING_BIN="$(command -v jterm1 2>/dev/null || true)"
-    if [[ -n "${SHADOWING_BIN}" && "${SHADOWING_BIN}" != "${BIN_DIR}/jterm1" ]]; then
-        printf '\nNote: typing jterm1 still runs %s, an older copy earlier in PATH.\n' \
+    SHADOWING_BIN="$(command -v anvil 2>/dev/null || true)"
+    if [[ -n "${SHADOWING_BIN}" && "${SHADOWING_BIN}" != "${BIN_DIR}/anvil" ]]; then
+        printf '\nNote: typing anvil still runs %s, an older copy earlier in PATH.\n' \
             "${SHADOWING_BIN}"
         printf 'Remove it, or put %s ahead of it in PATH.\n' "${BIN_DIR}"
         printf 'The launcher entry is unaffected: it runs %s directly.\n' \
-            "${BIN_DIR}/jterm1"
+            "${BIN_DIR}/anvil"
     fi
 fi
-printf 'Validate with: %s --doctor\n' "${BIN_DIR}/jterm1"
+printf 'Validate with: %s --doctor\n' "${BIN_DIR}/anvil"

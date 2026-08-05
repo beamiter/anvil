@@ -1,44 +1,44 @@
-# jterm1 shell integration for PowerShell (Windows PowerShell 5+ / pwsh 7+).
+# anvil shell integration for PowerShell (Windows PowerShell 5+ / pwsh 7+).
 #
-# Emits FTCS / OSC 133 marks so jterm1 can attribute output to discrete blocks
+# Emits FTCS / OSC 133 marks so anvil can attribute output to discrete blocks
 # and know each command's exit code, plus OSC 7 so it tracks the working dir.
 #
 # Source from your $PROFILE, e.g.
-#     if ($env:TERM_PROGRAM -eq 'jterm1') { . /path/to/jterm1.ps1 }
+#     if ($env:TERM_PROGRAM -eq 'anvil') { . /path/to/anvil.ps1 }
 # or unconditionally:
-#     . /path/to/jterm1.ps1
+#     . /path/to/anvil.ps1
 #
-# Safe to source under non-jterm1 terminals: the OSC sequences are silently
+# Safe to source under non-anvil terminals: the OSC sequences are silently
 # discarded by anything that doesn't parse them.
 
 # Copy the per-pane cwd authenticator into script scope, then immediately remove
 # its environment spelling so subsequently launched child processes cannot
 # inherit it. Keep this ahead of the load guard for safe re-sourcing.
-if (Test-Path Env:JTERM1_CWD_TOKEN) {
-    $script:__jterm1_cwd_token = $env:JTERM1_CWD_TOKEN
-    Remove-Item Env:JTERM1_CWD_TOKEN -ErrorAction SilentlyContinue
+if (Test-Path Env:ANVIL_CWD_TOKEN) {
+    $script:__anvil_cwd_token = $env:ANVIL_CWD_TOKEN
+    Remove-Item Env:ANVIL_CWD_TOKEN -ErrorAction SilentlyContinue
 }
 
 # Guard against double-sourcing in the same shell session.
-if ($script:__jterm1_loaded) { return }
-$script:__jterm1_loaded = $true
+if ($script:__anvil_loaded) { return }
+$script:__anvil_loaded = $true
 
-$script:__jterm1_in_cmd = $false
-$script:__jterm1_orig_prompt = ${function:prompt}
-$script:__jterm1_marker_nonce = [Guid]::NewGuid().ToString('N')
-$script:__jterm1_marker_seq = [uint64]0
-$script:__jterm1_marker_id = ''
+$script:__anvil_in_cmd = $false
+$script:__anvil_orig_prompt = ${function:prompt}
+$script:__anvil_marker_nonce = [Guid]::NewGuid().ToString('N')
+$script:__anvil_marker_seq = [uint64]0
+$script:__anvil_marker_id = ''
 
 # Build an OSC payload terminated with BEL. ESC = char 27, BEL = char 7.
-function __jterm1_osc($payload) {
+function __anvil_osc($payload) {
     "$([char]27)]${payload}$([char]7)"
 }
 
-function __jterm1_report_cwd_seq {
+function __anvil_report_cwd_seq {
     # OSC 7 — percent-encode the path so non-ASCII / spaces survive.
     $path = (Get-Location).ProviderPath
-    $hostName = if ($script:__jterm1_cwd_token) {
-        "jterm1-$($script:__jterm1_cwd_token)"
+    $hostName = if ($script:__anvil_cwd_token) {
+        "anvil-$($script:__anvil_cwd_token)"
     } elseif ($env:COMPUTERNAME) {
         $env:COMPUTERNAME
     } else {
@@ -57,7 +57,7 @@ function __jterm1_report_cwd_seq {
             [void]$sb.AppendFormat('%{0:X2}', $b)
         }
     }
-    __jterm1_osc "7;file://${hostName}$($sb.ToString())"
+    __anvil_osc "7;file://${hostName}$($sb.ToString())"
 }
 
 # Replace the global `prompt` function. Build a single string composed of:
@@ -76,26 +76,26 @@ function global:prompt {
     $ec = if ($dollarQ) { 0 } elseif ($lastEC) { $lastEC } else { 1 }
 
     $pre = ''
-    if ($script:__jterm1_in_cmd) {
-        $pre += __jterm1_osc "133;D;$ec;id=$($script:__jterm1_marker_id)"
-        $script:__jterm1_in_cmd = $false
-        $script:__jterm1_marker_id = ''
+    if ($script:__anvil_in_cmd) {
+        $pre += __anvil_osc "133;D;$ec;id=$($script:__anvil_marker_id)"
+        $script:__anvil_in_cmd = $false
+        $script:__anvil_marker_id = ''
     }
-    $pre += __jterm1_report_cwd_seq
-    $pre += __jterm1_osc "133;A"
+    $pre += __anvil_report_cwd_seq
+    $pre += __anvil_osc "133;A"
 
-    # Title: keep iTerm2-style "user@host:cwd" so jterm1's tab label reflects pwd.
+    # Title: keep iTerm2-style "user@host:cwd" so anvil's tab label reflects pwd.
     $title = "$($env:USERNAME)@$([System.Net.Dns]::GetHostName()):$(Get-Location)"
     $pre += "$([char]27)]2;${title}$([char]7)"
 
     $orig = ''
     try {
-        $orig = & $script:__jterm1_orig_prompt
+        $orig = & $script:__anvil_orig_prompt
     } catch {
         $orig = "PS $(Get-Location)> "
     }
 
-    $post = __jterm1_osc "133;B"
+    $post = __anvil_osc "133;B"
 
     # Restore exit state so the user-visible $? / $LASTEXITCODE aren't perturbed
     # by anything this function ran. PSReadLine's renderer reads these after
@@ -120,10 +120,10 @@ if (Get-Module -ListAvailable PSReadLine) {
         $cursor = $null
         [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
         if ($line -and $line.Trim().Length -gt 0) {
-            $script:__jterm1_marker_seq++
-            $script:__jterm1_marker_id = "$($script:__jterm1_marker_nonce)-$($script:__jterm1_marker_seq)"
-            [Console]::Write($(__jterm1_osc "133;C;id=$($script:__jterm1_marker_id)"))
-            $script:__jterm1_in_cmd = $true
+            $script:__anvil_marker_seq++
+            $script:__anvil_marker_id = "$($script:__anvil_marker_nonce)-$($script:__anvil_marker_seq)"
+            [Console]::Write($(__anvil_osc "133;C;id=$($script:__anvil_marker_id)"))
+            $script:__anvil_in_cmd = $true
         }
         [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine($key, $arg)
     }
@@ -135,13 +135,13 @@ if (Get-Module -ListAvailable PSReadLine) {
         $cursor = $null
         [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
         if ($line -and $line.Trim().Length -gt 0) {
-            $script:__jterm1_marker_seq++
-            $script:__jterm1_marker_id = "$($script:__jterm1_marker_nonce)-$($script:__jterm1_marker_seq)"
-            [Console]::Write($(__jterm1_osc "133;C;id=$($script:__jterm1_marker_id)"))
-            $script:__jterm1_in_cmd = $true
+            $script:__anvil_marker_seq++
+            $script:__anvil_marker_id = "$($script:__anvil_marker_nonce)-$($script:__anvil_marker_seq)"
+            [Console]::Write($(__anvil_osc "133;C;id=$($script:__anvil_marker_id)"))
+            $script:__anvil_in_cmd = $true
         }
         [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine($key, $arg)
     }
 }
 
-$env:TERM_PROGRAM = 'jterm1'
+$env:TERM_PROGRAM = 'anvil'

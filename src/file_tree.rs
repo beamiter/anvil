@@ -1,7 +1,7 @@
 //! Sidebar file browser: a lazy-loading `TreeView` rooted at the active tab's
 //! working directory (falling back to `$HOME`). Directories expand on demand;
 //! activating a file inserts its shell-quoted path into the active terminal.
-//! Ports jterm4's `ui/file_tree.rs` to jterm1's relm4 structure.
+//! Ports forge's `ui/file_tree.rs` to anvil's relm4 structure.
 //!
 //! GTK4 deprecated the TreeView/TreeStore family in 4.10 in favor of the new
 //! list/column views, but they remain fully functional and a ColumnView rewrite
@@ -100,7 +100,7 @@ where
     let permit = ScanPermit::acquire()?;
     let (tx, rx) = mpsc::sync_channel(1);
     std::thread::Builder::new()
-        .name("jterm1-file-tree-scan".to_string())
+        .name("anvil-file-tree-scan".to_string())
         .spawn(move || {
             let _permit = permit;
             let _ = tx.send(scan_dir(&dir));

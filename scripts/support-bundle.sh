@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Create a privacy-preserving jterm1 support archive without network access.
+# Create a privacy-preserving anvil support archive without network access.
 
 set -Eeuo pipefail
 umask 077
@@ -14,30 +14,30 @@ if (( $# > 1 )); then
 fi
 
 OUTPUT_DIR="${1:-.}"
-JTERM1_BIN="${JTERM1_BIN:-jterm1}"
+ANVIL_BIN="${ANVIL_BIN:-anvil}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-if [[ "${JTERM1_BIN}" == "jterm1" ]] \
-    && ! command -v jterm1 >/dev/null 2>&1 \
-    && [[ -x "${SCRIPT_DIR}/jterm1" ]]; then
-    JTERM1_BIN="${SCRIPT_DIR}/jterm1"
+if [[ "${ANVIL_BIN}" == "anvil" ]] \
+    && ! command -v anvil >/dev/null 2>&1 \
+    && [[ -x "${SCRIPT_DIR}/anvil" ]]; then
+    ANVIL_BIN="${SCRIPT_DIR}/anvil"
 fi
-if [[ "${JTERM1_BIN}" == */* ]]; then
-    [[ -x "${JTERM1_BIN}" ]] || {
-        printf 'Error: jterm1 executable is not usable: %s\n' "${JTERM1_BIN}" >&2
+if [[ "${ANVIL_BIN}" == */* ]]; then
+    [[ -x "${ANVIL_BIN}" ]] || {
+        printf 'Error: anvil executable is not usable: %s\n' "${ANVIL_BIN}" >&2
         exit 1
     }
-    binary_path="${JTERM1_BIN}"
+    binary_path="${ANVIL_BIN}"
 else
-    binary_path="$(command -v -- "${JTERM1_BIN}" 2>/dev/null || true)"
+    binary_path="$(command -v -- "${ANVIL_BIN}" 2>/dev/null || true)"
     [[ -n "${binary_path}" && -x "${binary_path}" ]] || {
-        printf 'Error: jterm1 executable not found: %s\n' "${JTERM1_BIN}" >&2
+        printf 'Error: anvil executable not found: %s\n' "${ANVIL_BIN}" >&2
         exit 1
     }
 fi
 
 mkdir -p -- "${OUTPUT_DIR}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-BUNDLE_NAME="jterm1-support-${STAMP}"
+BUNDLE_NAME="anvil-support-${STAMP}"
 WORK_DIR="$(mktemp -d)"
 BUNDLE_DIR="${WORK_DIR}/${BUNDLE_NAME}"
 trap 'rm -rf -- "${WORK_DIR}"' EXIT
@@ -49,17 +49,17 @@ doctor_status=0
 doctor_json_status=0
 config_status=0
 config_json_status=0
-JTERM1_DIAGNOSTICS_REDACT=1 "${binary_path}" --doctor \
+ANVIL_DIAGNOSTICS_REDACT=1 "${binary_path}" --doctor \
     >"${BUNDLE_DIR}/doctor.txt" 2>/dev/null || doctor_status=$?
-JTERM1_DIAGNOSTICS_REDACT=1 "${binary_path}" --doctor --json \
+ANVIL_DIAGNOSTICS_REDACT=1 "${binary_path}" --doctor --json \
     >"${BUNDLE_DIR}/doctor.json" 2>/dev/null || doctor_json_status=$?
-JTERM1_DIAGNOSTICS_REDACT=1 "${binary_path}" --check-config \
+ANVIL_DIAGNOSTICS_REDACT=1 "${binary_path}" --check-config \
     >/dev/null 2>&1 || config_status=$?
-JTERM1_DIAGNOSTICS_REDACT=1 "${binary_path}" --check-config --json \
+ANVIL_DIAGNOSTICS_REDACT=1 "${binary_path}" --check-config --json \
     >/dev/null 2>&1 || config_json_status=$?
 
 version="$("${binary_path}" --version 2>/dev/null || true)"
-if [[ ! "${version}" =~ ^jterm1[[:space:]][0-9A-Za-z.+_-]+$ ]]; then
+if [[ ! "${version}" =~ ^anvil[[:space:]][0-9A-Za-z.+_-]+$ ]]; then
     version="unavailable"
 fi
 config_path="$("${binary_path}" --config-path 2>/dev/null || true)"
@@ -113,10 +113,10 @@ metadata() {
     else
         printf 'config: path unavailable\n'
     fi
-    metadata 'default command history' "${state_home}/jterm1/history.jsonl"
-    if [[ -d "${config_home}/jterm1" ]]; then
+    metadata 'default command history' "${state_home}/anvil/history.jsonl"
+    if [[ -d "${config_home}/anvil" ]]; then
         shopt -s nullglob
-        snapshots=("${config_home}/jterm1"/tabs.*.state)
+        snapshots=("${config_home}/anvil"/tabs.*.state)
         printf 'session snapshots: present (%s entries)\n' "${#snapshots[@]}"
         shopt -u nullglob
     else
@@ -126,9 +126,9 @@ metadata() {
 
 {
     for name in \
-        JTERM1_AI_API_KEY ANTHROPIC_API_KEY OPENAI_API_KEY OLLAMA_API_KEY \
-        JTERM1_AI_PROVIDER JTERM1_AI_MODEL JTERM1_AI_BASE_URL \
-        JTERM1_ASSET_DIR JTERM1_WORKFLOW_DIR; do
+        ANVIL_AI_API_KEY ANTHROPIC_API_KEY OPENAI_API_KEY OLLAMA_API_KEY \
+        ANVIL_AI_PROVIDER ANVIL_AI_MODEL ANVIL_AI_BASE_URL \
+        ANVIL_ASSET_DIR ANVIL_WORKFLOW_DIR; do
         if [[ -n "${!name:-}" ]]; then
             printf '%s=present\n' "${name}"
         else

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Pretty-print jterm1's JSON session state.
+# Pretty-print anvil's JSON session state.
 
 set -euo pipefail
 
 CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}"
-STATE_DIR="${CONFIG_HOME}/jterm1"
+STATE_DIR="${CONFIG_HOME}/anvil"
 
 if (($# > 1)); then
     echo "Usage: $0 [STATE_FILE]" >&2
@@ -48,7 +48,7 @@ fi
 tab_count="$(jq '.tabs | length' "${STATE_FILE}")"
 active_index="$(jq '.active // 0' "${STATE_FILE}")"
 
-echo "jterm1 session state"
+echo "anvil session state"
 echo "===================="
 echo "File: ${STATE_FILE}"
 echo "Tabs: ${tab_count}"

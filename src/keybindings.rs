@@ -78,7 +78,7 @@ pub(crate) enum Action {
     JumpToPrevFailed,
     JumpToNextFailed,
     /// Write every completed block to a timestamped Markdown / JSON file under
-    /// the jterm1 data directory.
+    /// the anvil data directory.
     ExportSessionMarkdown,
     ExportSessionJson,
     ToggleDebugDashboard,
@@ -591,7 +591,7 @@ mod tests {
         let chord = parse("ctrl+p").expect("valid");
         assert!(chord.mods.ctrl);
         assert_eq!(chord.key, KeySym::Char('p'));
-        // The shared grammar deliberately widens what jterm1 alone used
+        // The shared grammar deliberately widens what anvil alone used
         // to accept: control/option style aliases parse too now.
         assert_eq!(parse("control+p"), Ok(chord));
         assert_eq!(parse("option+left"), parse("alt+left"));
@@ -612,7 +612,7 @@ mod tests {
     /// displays as the literal `\` (the family decision) where the old
     /// code showed the word "backslash".
     #[test]
-    fn display_matches_the_legacy_jterm1_format() {
+    fn display_matches_the_legacy_anvil_format() {
         for (input, want) in [
             ("Ctrl+Shift+T", "Ctrl+Shift+T"),
             ("Ctrl+equal", "Ctrl+="),
@@ -700,7 +700,7 @@ mod tests {
     }
 
     /// The cross-app ergonomic contract: every family default chord maps
-    /// onto a jterm1 action, and `from_defaults` must bind exactly that
+    /// onto an anvil action, and `from_defaults` must bind exactly that
     /// chord to it. `ctrl+shift+a` (SelectAllBlocks here) is deliberately
     /// absent from the shared table — see DEFAULT_CHORDS' exclusion list.
     #[test]
@@ -713,7 +713,7 @@ mod tests {
                 CommonAction::Paste => Action::Paste,
                 CommonAction::NextTab => Action::NextTab,
                 CommonAction::PrevTab => Action::PrevTab,
-                // jterm1 binds the ctrl+page pair to the same tab cycling
+                // anvil binds the ctrl+page pair to the same tab cycling
                 // actions as ctrl+tab / ctrl+shift+tab.
                 CommonAction::NextTabPage => Action::NextTab,
                 CommonAction::PrevTabPage => Action::PrevTab,

@@ -1,24 +1,24 @@
-# jterm1 shell integration
+# anvil shell integration
 
 Source the file matching your shell from its rc file:
 
 | Shell      | File           | Source from |
 |------------|----------------|-------------|
-| bash       | `jterm1.bash`  | `~/.bashrc` |
-| zsh        | `jterm1.zsh`   | `~/.zshrc`  |
-| fish       | `jterm1.fish`  | `~/.config/fish/config.fish` |
-| PowerShell | `jterm1.ps1`   | `$PROFILE`  |
+| bash       | `anvil.bash`  | `~/.bashrc` |
+| zsh        | `anvil.zsh`   | `~/.zshrc`  |
+| fish       | `anvil.fish`  | `~/.config/fish/config.fish` |
+| PowerShell | `anvil.ps1`   | `$PROFILE`  |
 
 Example (bash):
 
 ```bash
-[[ $TERM_PROGRAM == jterm1 ]] && source /path/to/jterm1.bash
+[[ $TERM_PROGRAM == anvil ]] && source /path/to/anvil.bash
 ```
 
 Example (PowerShell):
 
 ```powershell
-if ($env:TERM_PROGRAM -eq 'jterm1') { . /path/to/jterm1.ps1 }
+if ($env:TERM_PROGRAM -eq 'anvil') { . /path/to/anvil.ps1 }
 ```
 
 The PowerShell script requires PSReadLine (bundled with pwsh 7+; preinstalled
@@ -28,7 +28,7 @@ attach only at the *next* prompt.
 
 ## What it provides
 
-Each script emits two escape sequence families that jterm1 parses to drive its
+Each script emits two escape sequence families that anvil parses to drive its
 block view (`src/terminal/ansi.rs`):
 
 - **OSC 133 (FTCS)** — `;A` at prompt render, `;B` when prompt finishes,
@@ -36,7 +36,7 @@ block view (`src/terminal/ansi.rs`):
   `;D;<exit>;id=<id>` when it returns. Each shell instance creates a private,
   non-exported nonce and monotonic sequence; the matching ID prevents a stale
   or unrelated completion marker from finishing the wrong command. This lets
-  jterm1 attribute output to discrete blocks and read the exit code exactly
+  anvil attribute output to discrete blocks and read the exit code exactly
   (no error-text heuristics). It also binds an approved Agent proposal to the
   exact prompt generation and command that actually started; a changed prompt,
   failed write, mismatched start, or mismatched completion fails closed.

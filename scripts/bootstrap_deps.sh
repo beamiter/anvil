@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Provision the native dependencies required to build and install jterm1.
+# Provision the native dependencies required to build and install anvil.
 #
 # `cargo install --path .` (and a plain `cargo build`) needs the GTK 4 stack
 # resolved through pkg-config: glib-2.0 >= 2.80, pango >= 1.52, graphene,
@@ -41,13 +41,13 @@ usage() {
     cat <<'USAGE'
 Usage: ./scripts/bootstrap_deps.sh [options]
 
-Provision the native dependencies for building and installing jterm1.
+Provision the native dependencies for building and installing anvil.
 
 Options:
   --backend auto|nix|system
                     Provisioning strategy (default: auto; prefers Nix).
   --check           Only verify dependencies; install nothing. Exit non-zero
-                    if the selected backend cannot build jterm1.
+                    if the selected backend cannot build anvil.
   --install         After provisioning, run `cargo install --path .` inside
                     the selected backend.
   --yes             Do not prompt before installing Nix or system packages.
@@ -214,7 +214,7 @@ run_nix_backend() {
         log "Verifying the flake dev shell resolves..."
         nix develop --command true ||
             die "nix develop failed; the flake dev shell could not be realized"
-        log "OK: 'nix develop' can build jterm1"
+        log "OK: 'nix develop' can build anvil"
         return 0
     fi
 
@@ -349,9 +349,9 @@ run_system_backend() {
     have cargo || die "cargo (Rust toolchain) is required; see rustup.rs"
 
     if verify_system_deps; then
-        log "OK: system libraries satisfy jterm1's build requirements"
+        log "OK: system libraries satisfy anvil's build requirements"
     elif ((CHECK_ONLY == 1)); then
-        die "system libraries do not satisfy jterm1; see warnings above"
+        die "system libraries do not satisfy anvil; see warnings above"
     else
         local mgr
         mgr="$(detect_pkg_manager)"
@@ -404,7 +404,7 @@ main() {
     if ((CHECK_ONLY == 0)) && ((DO_INSTALL_CRATE == 0)); then
         cat <<EOF
 
-Dependencies ready. To build and install jterm1:
+Dependencies ready. To build and install anvil:
   ${backend}$([[ ${backend} == nix ]] && printf ' develop --command')  cargo install --path . --locked
 
 Or re-run this script with --install to do it now.

@@ -118,7 +118,7 @@ impl AppModel {
             Action::FontIncrease => {
                 let s = (self.font_scale + FONT_STEP).min(10.0);
                 // Same apply-and-persist path as the settings dialog, so the
-                // hotkey survives restarts like it does in jterm2/jterm3.
+                // hotkey survives restarts like it does in ember/frost.
                 self.apply_font_scale_step(s, sender);
             }
             Action::FontDecrease => {
@@ -129,7 +129,7 @@ impl AppModel {
             Action::OpacityIncrease => {
                 let o = (self.window_opacity + OPACITY_STEP).clamp(0.01, 1.0);
                 // Same apply-and-persist path as the settings dialog, so the
-                // hotkey survives restarts like it does in jterm2/jterm3.
+                // hotkey survives restarts like it does in ember/frost.
                 self.apply_settings_opacity(o);
                 self.show_opacity_toast();
             }
@@ -238,7 +238,7 @@ impl AppModel {
                     match workflows::welcome_notebook_path() {
                         Some(path) => self.notebook.emit(notebook::NotebookMsg::Open(path)),
                         None => self.show_toast(
-                            "Welcome notebook was not found. Reinstall jterm1's shared assets.",
+                            "Welcome notebook was not found. Reinstall anvil's shared assets.",
                         ),
                     }
                 }

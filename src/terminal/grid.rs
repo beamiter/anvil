@@ -534,7 +534,7 @@ fn style_key(s: &super::ansi::AnsiStyleState) -> StyleKey {
 
 /// Cursor + style + scroll-region snapshot taken by DECSC (ESC 7) / CSI s
 /// and restored by DECRC (ESC 8) / CSI u. xterm/VTE save SGR and charset
-/// state alongside the cursor; jterm1 matches that so e.g. `dialog` and
+/// state alongside the cursor; anvil matches that so e.g. `dialog` and
 /// `fzf` restore their colors correctly after popping back from a submenu.
 #[derive(Clone)]
 struct SavedState {

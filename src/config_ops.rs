@@ -37,7 +37,7 @@ impl AppModel {
                 validation.errors()
             );
             self.show_toast(format!(
-                "Config reload rejected: {} validation error(s). Run `jterm1 --check-config`.",
+                "Config reload rejected: {} validation error(s). Run `anvil --check-config`.",
                 validation.errors()
             ));
             return;
