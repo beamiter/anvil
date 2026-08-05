@@ -40,8 +40,9 @@ pub(crate) struct SettingsValues {
     pub(crate) remote_hosts: Vec<RemoteHost>,
 }
 
-/// Unsubmitted add-host form state. Lives beside `SettingsValues` rather than
-/// inside it so the two construction sites only carry persisted state.
+/// Unsubmitted host-form state, for a new entry or an existing one under edit.
+/// Lives beside `SettingsValues` rather than inside it so the two construction
+/// sites only carry persisted state.
 #[derive(Debug, Default)]
 struct RemoteDraft {
     name: String,
@@ -50,6 +51,26 @@ struct RemoteDraft {
     docker: bool,
     /// Index into the deploy combo: 0 off, 1 persist, 2 incognito.
     deploy: u32,
+}
+
+impl RemoteDraft {
+    /// The form as it should read while `host` is being edited. Only the fields
+    /// the form owns are copied; `ssh_args`, `session`, `remote_shell`,
+    /// `login_shell`, `multiplex` and `deploy_artifact` have no widget here and
+    /// are carried over untouched when the edit is saved.
+    fn from_host(host: &RemoteHost) -> Self {
+        Self {
+            name: host.name.clone(),
+            host: host.host.clone(),
+            user: host.user.clone().unwrap_or_default(),
+            docker: host.docker,
+            deploy: match host.deploy {
+                jterm_core::jsh_remote::Deploy::Persist => 1,
+                jterm_core::jsh_remote::Deploy::Incognito => 2,
+                _ => 0,
+            },
+        }
+    }
 }
 
 /// Which form row carries the validation error, so only that entry turns red.
@@ -95,7 +116,12 @@ pub(crate) enum SettingsMsg {
     RemoteHostUser(String),
     RemoteHostDocker(bool),
     RemoteHostDeploy(u32),
+    /// Commit the form: append a new host, or replace the one being edited.
     RemoteHostAdd,
+    /// Load an existing host into the form instead of starting a new one.
+    RemoteHostEdit(usize),
+    /// Abandon an in-progress edit and leave the saved host as it was.
+    RemoteHostCancelEdit,
     RemoteHostRemove(usize),
 }
 
@@ -131,6 +157,9 @@ pub(crate) struct SettingsModel {
     font_names: Vec<String>,
     values: SettingsValues,
     remote_draft: RemoteDraft,
+    /// Index of the saved host the form is editing; `None` while the form is
+    /// composing a new one.
+    remote_editing: Option<usize>,
     /// Host rows currently added to the "Remote Hosts" group. The view! macro
     /// cannot express a dynamic list, so these are rebuilt imperatively.
     remote_rows: Vec<adw::ActionRow>,
@@ -280,6 +309,10 @@ impl Component for SettingsModel {
                     set_description: Some("Saved ssh and Docker targets for the remote picker"),
                 },
 
+                // Doubles as the edit form: picking a host above loads it here
+                // and retitles the group, so there is one set of rows to keep
+                // in step with `parse_remote_hosts` rather than two.
+                #[name(remote_form_group)]
                 adw::PreferencesGroup {
                     set_title: "Add Remote Host",
 
@@ -335,6 +368,22 @@ impl Component for SettingsModel {
                         },
                         connect_activated[sender] => move |_| {
                             sender.input(SettingsMsg::RemoteHostAdd);
+                        },
+                    },
+
+                    // Only shown while editing: without it there is no way back
+                    // to composing a new host except saving one you did not mean
+                    // to change.
+                    #[name(remote_cancel_row)]
+                    adw::ActionRow {
+                        set_title: "Cancel Edit",
+                        set_activatable: true,
+                        set_visible: false,
+                        add_suffix = &gtk::Image {
+                            set_icon_name: Some("edit-undo-symbolic"),
+                        },
+                        connect_activated[sender] => move |_| {
+                            sender.input(SettingsMsg::RemoteHostCancelEdit);
                         },
                     },
                 },
@@ -495,6 +544,7 @@ impl Component for SettingsModel {
             font_names: init.font_names,
             values: init.values,
             remote_draft: RemoteDraft::default(),
+            remote_editing: None,
             remote_rows: Vec::new(),
         };
         let widgets = view_output!();
@@ -571,20 +621,13 @@ impl Component for SettingsModel {
                 widgets
                     .remote_clipboard_row
                     .set_active(self.values.remote_clipboard);
+                // A reopened dialog starts on a fresh host: the index an edit
+                // was holding may not survive whatever changed the list while
+                // the dialog was closed.
+                self.remote_editing = None;
                 self.remote_draft = RemoteDraft::default();
-                widgets.remote_name_row.set_text("");
-                widgets.remote_host_row.set_text("");
-                widgets.remote_user_row.set_text("");
-                widgets.remote_docker_row.set_active(false);
-                widgets.remote_deploy_row.set_selected(0);
-                widgets.remote_add_row.set_subtitle("");
-                for row in [
-                    &widgets.remote_name_row,
-                    &widgets.remote_host_row,
-                    &widgets.remote_user_row,
-                ] {
-                    row.remove_css_class("error");
-                }
+                Self::fill_remote_form(widgets, &RemoteDraft::default());
+                Self::sync_remote_form_mode(widgets, None);
                 self.rebuild_remote_rows(&widgets.remote_hosts_group, &sender);
                 root.present(Some(&parent));
             }
@@ -714,23 +757,22 @@ impl Component for SettingsModel {
             SettingsMsg::RemoteHostDocker(docker) => self.remote_draft.docker = docker,
             SettingsMsg::RemoteHostDeploy(mode) => self.remote_draft.deploy = mode,
             SettingsMsg::RemoteHostAdd => {
-                for row in [
-                    &widgets.remote_name_row,
-                    &widgets.remote_host_row,
-                    &widgets.remote_user_row,
-                ] {
-                    row.remove_css_class("error");
-                }
+                Self::clear_remote_errors(widgets);
                 match self.validate_remote_draft() {
                     Ok(host) => {
-                        self.values.remote_hosts.push(host);
+                        match self.remote_editing {
+                            // Replace in place so the host keeps its position in
+                            // the picker; a remove-then-push would move it to the
+                            // end on every edit.
+                            Some(index) if index < self.values.remote_hosts.len() => {
+                                self.values.remote_hosts[index] = host;
+                            }
+                            _ => self.values.remote_hosts.push(host),
+                        }
+                        self.remote_editing = None;
                         self.remote_draft = RemoteDraft::default();
-                        widgets.remote_name_row.set_text("");
-                        widgets.remote_host_row.set_text("");
-                        widgets.remote_user_row.set_text("");
-                        widgets.remote_docker_row.set_active(false);
-                        widgets.remote_deploy_row.set_selected(0);
-                        widgets.remote_add_row.set_subtitle("");
+                        Self::fill_remote_form(widgets, &RemoteDraft::default());
+                        Self::sync_remote_form_mode(widgets, None);
                         self.rebuild_remote_rows(&widgets.remote_hosts_group, &sender);
                         let _ = sender.output(SettingsOutput::RemoteHosts(
                             self.values.remote_hosts.clone(),
@@ -748,9 +790,38 @@ impl Component for SettingsModel {
                     }
                 }
             }
+            SettingsMsg::RemoteHostEdit(index) => {
+                if let Some(host) = self.values.remote_hosts.get(index) {
+                    Self::clear_remote_errors(widgets);
+                    self.remote_draft = RemoteDraft::from_host(host);
+                    self.remote_editing = Some(index);
+                    Self::fill_remote_form(widgets, &self.remote_draft);
+                    Self::sync_remote_form_mode(widgets, Some(host.name.clone()));
+                    // Redraw so the row under edit is the one marked as such.
+                    self.rebuild_remote_rows(&widgets.remote_hosts_group, &sender);
+                    widgets.remote_host_row.grab_focus();
+                }
+            }
+            SettingsMsg::RemoteHostCancelEdit => {
+                Self::clear_remote_errors(widgets);
+                self.remote_editing = None;
+                self.remote_draft = RemoteDraft::default();
+                Self::fill_remote_form(widgets, &RemoteDraft::default());
+                Self::sync_remote_form_mode(widgets, None);
+                self.rebuild_remote_rows(&widgets.remote_hosts_group, &sender);
+            }
             SettingsMsg::RemoteHostRemove(index) => {
                 if index < self.values.remote_hosts.len() {
                     self.values.remote_hosts.remove(index);
+                    // Every later index just shifted. Rather than renumber an
+                    // edit that is mid-flight, drop it: silently retargeting the
+                    // form at a different host is the worse outcome.
+                    if self.remote_editing.is_some() {
+                        self.remote_editing = None;
+                        self.remote_draft = RemoteDraft::default();
+                        Self::fill_remote_form(widgets, &RemoteDraft::default());
+                        Self::sync_remote_form_mode(widgets, None);
+                    }
                     self.rebuild_remote_rows(&widgets.remote_hosts_group, &sender);
                     let _ = sender.output(SettingsOutput::RemoteHosts(
                         self.values.remote_hosts.clone(),
@@ -762,6 +833,50 @@ impl Component for SettingsModel {
 }
 
 impl SettingsModel {
+    /// Drop the red outline left by the previous failed submit, so an error is
+    /// only ever pointing at the field the user is being told about now.
+    fn clear_remote_errors(widgets: &<Self as Component>::Widgets) {
+        for row in [
+            &widgets.remote_name_row,
+            &widgets.remote_host_row,
+            &widgets.remote_user_row,
+        ] {
+            row.remove_css_class("error");
+        }
+    }
+
+    /// Push draft state into the form. A default draft clears it.
+    fn fill_remote_form(widgets: &<Self as Component>::Widgets, draft: &RemoteDraft) {
+        widgets.remote_name_row.set_text(&draft.name);
+        widgets.remote_host_row.set_text(&draft.host);
+        widgets.remote_user_row.set_text(&draft.user);
+        widgets.remote_docker_row.set_active(draft.docker);
+        widgets.remote_deploy_row.set_selected(draft.deploy);
+        widgets.remote_add_row.set_subtitle("");
+    }
+
+    /// Retitle the form for whichever host it is about to write. `editing`
+    /// carries the display name so the group says which one, which matters once
+    /// several hosts differ only in a field the row subtitle truncates.
+    fn sync_remote_form_mode(widgets: &<Self as Component>::Widgets, editing: Option<String>) {
+        match editing {
+            Some(name) => {
+                widgets.remote_form_group.set_title("Edit Remote Host");
+                widgets
+                    .remote_form_group
+                    .set_description(Some(&format!("Editing “{name}”")));
+                widgets.remote_add_row.set_title("Save Changes");
+                widgets.remote_cancel_row.set_visible(true);
+            }
+            None => {
+                widgets.remote_form_group.set_title("Add Remote Host");
+                widgets.remote_form_group.set_description(None);
+                widgets.remote_add_row.set_title("Add Host");
+                widgets.remote_cancel_row.set_visible(false);
+            }
+        }
+    }
+
     fn rebuild_remote_rows(
         &mut self,
         group: &adw::PreferencesGroup,
@@ -788,10 +903,25 @@ impl SettingsModel {
                 }
             };
             let transport = if host.docker { "docker" } else { "ssh" };
-            row.set_subtitle(&format!(
-                "{transport} · {target} · deploy {}",
-                host.deploy.as_str()
-            ));
+            let mut subtitle = format!("{transport} · {target} · deploy {}", host.deploy.as_str());
+            // The form has no widget for these, so say they are there rather
+            // than let an edit look like it silently dropped them.
+            if !host.ssh_args.is_empty() {
+                subtitle.push_str(&format!(" · ssh_args {}", host.ssh_args.join(" ")));
+            }
+            if self.remote_editing == Some(index) {
+                subtitle.push_str(" · editing");
+            }
+            row.set_subtitle(&subtitle);
+            let edit = gtk::Button::from_icon_name("document-edit-symbolic");
+            edit.set_valign(gtk::Align::Center);
+            edit.add_css_class("flat");
+            edit.set_tooltip_text(Some("Edit host"));
+            edit.connect_clicked({
+                let sender = sender.clone();
+                move |_| sender.input(SettingsMsg::RemoteHostEdit(index))
+            });
+            row.add_suffix(&edit);
             let remove = gtk::Button::from_icon_name("user-trash-symbolic");
             remove.set_valign(gtk::Align::Center);
             remove.add_css_class("flat");
@@ -835,12 +965,15 @@ impl SettingsModel {
             ));
         }
         // Session restore uses the display name as the stable profile
-        // identifier; the parser rejects duplicates for the same reason.
+        // identifier; the parser rejects duplicates for the same reason. The
+        // host being edited is not its own duplicate — otherwise no edit that
+        // keeps the name could ever be saved.
         if self
             .values
             .remote_hosts
             .iter()
-            .any(|existing| existing.name == name)
+            .enumerate()
+            .any(|(index, existing)| existing.name == name && Some(index) != self.remote_editing)
         {
             return Err((RemoteField::Name, "Another host already uses this name."));
         }
@@ -861,17 +994,27 @@ impl SettingsModel {
             2 => jterm_core::jsh_remote::Deploy::Incognito,
             _ => jterm_core::jsh_remote::Deploy::Off,
         };
+        // An edit keeps everything the form cannot show. Rebuilding the entry
+        // from the visible rows alone would quietly delete a `-p 2222`, a
+        // pinned session id or a deploy_artifact the moment someone fixed a
+        // typo in the name — the config.toml-only fields are exactly the ones
+        // nobody would think to check afterwards.
+        let existing = self
+            .remote_editing
+            .and_then(|index| self.values.remote_hosts.get(index));
         Ok(RemoteHost {
             name,
             host,
             user,
             docker: self.remote_draft.docker,
-            deploy_artifact: None,
-            remote_shell: "jsh".to_string(),
-            session: None,
-            ssh_args: Vec::new(),
-            login_shell: true,
-            multiplex: true,
+            deploy_artifact: existing.and_then(|h| h.deploy_artifact.clone()),
+            remote_shell: existing
+                .map(|h| h.remote_shell.clone())
+                .unwrap_or_else(|| "jsh".to_string()),
+            session: existing.and_then(|h| h.session.clone()),
+            ssh_args: existing.map(|h| h.ssh_args.clone()).unwrap_or_default(),
+            login_shell: existing.is_none_or(|h| h.login_shell),
+            multiplex: existing.is_none_or(|h| h.multiplex),
             deploy,
         })
     }
@@ -886,5 +1029,122 @@ impl SettingsModel {
             "{family} {}",
             self.values.font_size as i32
         )));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn host_with_hidden_fields() -> RemoteHost {
+        RemoteHost {
+            name: "dev-60".to_string(),
+            host: "10.68.18.60".to_string(),
+            user: Some("root".to_string()),
+            docker: false,
+            deploy_artifact: Some("/opt/jsh/jsh".to_string()),
+            remote_shell: "jsh".to_string(),
+            session: Some("dev-main".to_string()),
+            ssh_args: vec!["-p".to_string(), "2222".to_string()],
+            login_shell: false,
+            multiplex: false,
+            deploy: jterm_core::jsh_remote::Deploy::Persist,
+        }
+    }
+
+    /// A model with no widgets: `validate_remote_draft` reads only model state,
+    /// so the form logic is testable without a display.
+    fn model(hosts: Vec<RemoteHost>, editing: Option<usize>) -> SettingsModel {
+        let draft = editing
+            .and_then(|index| hosts.get(index))
+            .map(RemoteDraft::from_host)
+            .unwrap_or_default();
+        SettingsModel {
+            theme_names: Vec::new(),
+            font_names: Vec::new(),
+            values: SettingsValues {
+                theme: 0,
+                font: 0,
+                font_size: 12.0,
+                font_scale: 1.0,
+                opacity: 1.0,
+                scrollback: 5000.0,
+                terminal_mode: 0,
+                block_compact: false,
+                command_history: true,
+                ai_enabled: false,
+                agent_enabled: false,
+                ai_provider: 0,
+                ai_model: String::new(),
+                ai_base_url: String::new(),
+                ai_api_key_file: None,
+                ai_max_tokens: 1024.0,
+                ai_redact_secrets: true,
+                ai_stream: true,
+                agent_max_turns: 20.0,
+                safe_mode: false,
+                notifications: true,
+                remote_clipboard: false,
+                remote_hosts: hosts,
+            },
+            remote_draft: draft,
+            remote_editing: editing,
+            remote_rows: Vec::new(),
+        }
+    }
+
+    /// The form shows five fields; the entry has ten. Renaming through the form
+    /// must not be a way to lose the other five, because nothing in the dialog
+    /// would show that it happened.
+    #[test]
+    fn editing_preserves_fields_the_form_cannot_show() {
+        let mut model = model(vec![host_with_hidden_fields()], Some(0));
+        model.remote_draft.name = "prod-60".to_string();
+
+        let edited = model.validate_remote_draft().expect("valid draft");
+        assert_eq!(edited.name, "prod-60");
+        assert_eq!(edited.ssh_args, ["-p", "2222"]);
+        assert_eq!(edited.session.as_deref(), Some("dev-main"));
+        assert_eq!(edited.deploy_artifact.as_deref(), Some("/opt/jsh/jsh"));
+        assert!(!edited.login_shell);
+        assert!(!edited.multiplex);
+    }
+
+    /// A new host gets the plain defaults rather than anything left over from a
+    /// previously edited entry.
+    #[test]
+    fn adding_a_host_starts_from_the_defaults() {
+        let mut model = model(vec![host_with_hidden_fields()], None);
+        model.remote_draft.name = "staging".to_string();
+        model.remote_draft.host = "staging.example.com".to_string();
+
+        let added = model.validate_remote_draft().expect("valid draft");
+        assert!(added.ssh_args.is_empty());
+        assert_eq!(added.session, None);
+        assert_eq!(added.deploy_artifact, None);
+        assert!(added.login_shell);
+        assert!(added.multiplex);
+    }
+
+    #[test]
+    fn an_edit_that_keeps_the_name_is_not_a_duplicate() {
+        let mut model = model(vec![host_with_hidden_fields()], Some(0));
+        model.remote_draft.host = "10.68.18.61".to_string();
+
+        let edited = model.validate_remote_draft().expect("valid draft");
+        assert_eq!(edited.name, "dev-60");
+        assert_eq!(edited.host, "10.68.18.61");
+    }
+
+    #[test]
+    fn an_edit_may_not_take_another_hosts_name() {
+        let mut other = host_with_hidden_fields();
+        other.name = "myubuntu".to_string();
+        other.host = "myubuntu".to_string();
+        let mut model = model(vec![host_with_hidden_fields(), other], Some(0));
+        model.remote_draft.name = "myubuntu".to_string();
+
+        let (field, _) = model.validate_remote_draft().expect_err("duplicate name");
+        assert!(matches!(field, RemoteField::Name));
     }
 }

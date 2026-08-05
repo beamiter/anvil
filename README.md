@@ -448,8 +448,18 @@ are rejected so the palette cannot present a visually reordered command.
 
 ### Remote hosts
 
-The example config starts with an explicit empty remote list. To add a host,
-remove `remote_hosts = []` and add one or more `[[remote_hosts]]` tables:
+A config file with no `remote_hosts` key gets two worked entries to copy from —
+one ssh destination and one container — because the two mistakes the grammar
+cannot forgive are invisible in an empty list: the port belongs in `ssh_args`,
+never as `host = "box:22"`, and the login belongs in `user`, never as
+`host = "root@box"`. An explicit list wins, `remote_hosts = []` included, so
+hosts deleted in the settings dialog stay deleted.
+
+The dialog (Ctrl+Shift+O → Remote Hosts) adds, edits and removes entries; the
+pencil loads a host into the form below, and the fields it has no widget for
+(`ssh_args`, `session`, `remote_shell`, `login_shell`, `multiplex`,
+`deploy_artifact`) are carried through an edit untouched. To write them, edit
+one or more `[[remote_hosts]]` tables by hand:
 
 ```toml
 [[remote_hosts]]

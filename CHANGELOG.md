@@ -7,6 +7,22 @@ versioning for tagged releases while it remains experimental.
 
 ### Added
 
+- The Remote Hosts settings group edits saved hosts, not just adds and removes
+  them. The pencil loads a host into the form below, which retitles itself and
+  offers Save Changes / Cancel Edit; the entry is replaced in place so it keeps
+  its position in the picker. Fields the form has no widget for — `ssh_args`,
+  `session`, `remote_shell`, `login_shell`, `multiplex`, `deploy_artifact` — are
+  carried through untouched, and any `ssh_args` are shown in the host row, since
+  losing a `-p 2222` while correcting a typo in a name is exactly the kind of
+  edit nobody would think to check afterwards. Renaming a host no longer trips
+  the duplicate-name check against itself.
+- A config file with no `remote_hosts` key now starts with two worked entries —
+  one ssh destination, one container — rather than an empty list. The two
+  mistakes the grammar cannot forgive are invisible in an empty list: the port
+  belongs in `ssh_args`, never as `host = "box:22"`, and the login belongs in
+  `user`, never as `host = "root@box"`. An explicit list still wins,
+  `remote_hosts = []` included, so deleting them in the dialog (which writes the
+  key back) makes them stay gone.
 - `[[remote_hosts]]` gained `deploy_artifact`: a jsh built on this machine for
   `deploy` to push, instead of the published release it would otherwise fetch.
   It is the only way to deploy where there is no release — a build from a
