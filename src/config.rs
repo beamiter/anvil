@@ -1486,9 +1486,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         ai_redact_secrets: env_bool("ANVIL_AI_REDACT_SECRETS")
             .or(fc.ai_redact_secrets)
             .unwrap_or(true),
-        ai_stream: env_bool("ANVIL_AI_STREAM")
-            .or(fc.ai_stream)
-            .unwrap_or(true),
+        ai_stream: env_bool("ANVIL_AI_STREAM").or(fc.ai_stream).unwrap_or(true),
         // Unlike the other ANVIL_* overrides, the key-path override is applied
         // at client construction (`jterm_core::ai::resolve_api_key_file`), so
         // the environment-managed path can never be persisted back to TOML.
