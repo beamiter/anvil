@@ -53,6 +53,7 @@ fn request_bottom_pin(user_scrolled: bool, active: &Cell<bool>, generation: &Cel
 /// the prompt directly below it. Deferring this to a timer (or re-running it from
 /// the adjustment's `changed` signal) reads the settled, larger `upper` and parks
 /// the view at the bottom of the blank holder, hiding all history.
+#[derive(Clone)]
 pub(crate) struct ScrollDebouncer {
     pub(crate) user_scrolled_up: Rc<Cell<bool>>,
     pub(crate) programmatic_scroll: Rc<Cell<bool>>,

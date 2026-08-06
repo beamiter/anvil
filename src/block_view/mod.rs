@@ -67,6 +67,95 @@ fn set_jump_fab_label(fab: &gtk::Button, unread: u32) {
     }
 }
 
+/// Whether a key press seen while keyboard focus is stranded on a finished
+/// block should hand focus back to the live prompt.
+///
+/// Only typing-shaped keys recover focus. Ctrl/Alt/Super chords stay on their
+/// normal dispatch paths (window shortcuts run in an earlier Capture stage and
+/// never get here, but unbound chords like the Ctrl+C interrupt fallback still
+/// pass through this controller), Tab keeps GTK focus navigation, and
+/// reading/navigation keys keep whatever scroll or selection meaning they have
+/// — block find deliberately lands focus on the picked block so the user can
+/// keep reading there.
+fn stranded_focus_key_recovers(keyval: gtk::gdk::Key, modifiers: gtk::gdk::ModifierType) -> bool {
+    use gtk::gdk::Key;
+
+    if modifiers.intersects(
+        gtk::gdk::ModifierType::CONTROL_MASK
+            | gtk::gdk::ModifierType::ALT_MASK
+            | gtk::gdk::ModifierType::SUPER_MASK
+            | gtk::gdk::ModifierType::META_MASK,
+    ) {
+        return false;
+    }
+
+    !matches!(
+        keyval,
+        // Modifier presses themselves.
+        Key::Shift_L
+            | Key::Shift_R
+            | Key::Control_L
+            | Key::Control_R
+            | Key::Alt_L
+            | Key::Alt_R
+            | Key::Meta_L
+            | Key::Meta_R
+            | Key::Super_L
+            | Key::Super_R
+            | Key::Hyper_L
+            | Key::Hyper_R
+            | Key::Caps_Lock
+            | Key::Num_Lock
+            | Key::Scroll_Lock
+            | Key::ISO_Level3_Shift
+            | Key::ISO_Level5_Shift
+            | Key::Mode_switch
+            // Focus navigation.
+            | Key::Tab
+            | Key::ISO_Left_Tab
+            // Reading/navigation keys.
+            | Key::Up
+            | Key::Down
+            | Key::Left
+            | Key::Right
+            | Key::KP_Up
+            | Key::KP_Down
+            | Key::KP_Left
+            | Key::KP_Right
+            | Key::Page_Up
+            | Key::Page_Down
+            | Key::KP_Page_Up
+            | Key::KP_Page_Down
+            | Key::Home
+            | Key::End
+            | Key::KP_Home
+            | Key::KP_End
+            | Key::Menu
+    )
+}
+
+/// Focused widgets that own their keystrokes even though they live inside the
+/// block pane: text entries (the per-block output filter row, search entries),
+/// popover contents (context menus), and buttons for their activation keys.
+fn focused_widget_keeps_key(focused: &gtk::Widget, keyval: gtk::gdk::Key) -> bool {
+    use gtk::gdk::Key;
+
+    if focused.is::<gtk::Editable>() || focused.is::<gtk::TextView>() {
+        return true;
+    }
+    if focused.ancestor(gtk::Popover::static_type()).is_some() {
+        return true;
+    }
+    if matches!(
+        keyval,
+        Key::Return | Key::KP_Enter | Key::ISO_Enter | Key::space
+    ) && (focused.is::<gtk::Button>() || focused.is::<gtk::CheckButton>())
+    {
+        return true;
+    }
+    false
+}
+
 fn sample_output_for_event(output: &str) -> String {
     const MAX_CHARS: usize = 32 * 1024;
     if output.len() <= MAX_CHARS {
@@ -3412,6 +3501,13 @@ impl TermView {
         // mistake them for a user drag.
         let user_scrolled_up: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let programmatic_scroll: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        // The one coalesced, frame-spaced follow-bottom controller. Shared by
+        // the PTY reader and the stranded-focus key recovery below so their
+        // settling timers coalesce instead of racing each other.
+        let scroll_debouncer = ScrollDebouncer::with_scroll_lock(
+            user_scrolled_up.clone(),
+            programmatic_scroll.clone(),
+        );
         let block_data_rc: Rc<RefCell<VecDeque<BlockData>>> =
             Rc::new(RefCell::new(VecDeque::new()));
         let finished_blocks_rc: Rc<RefCell<Vec<FinishedBlock>>> = Rc::new(RefCell::new(Vec::new()));
@@ -3756,10 +3852,7 @@ impl TermView {
             })));
             let block_data_for_cb = block_data_rc.clone();
             let finished_blocks_for_cb = finished_blocks_rc.clone();
-            let scroll_debouncer = ScrollDebouncer::with_scroll_lock(
-                user_scrolled_up.clone(),
-                programmatic_scroll.clone(),
-            );
+            let scroll_debouncer = scroll_debouncer.clone();
             let widget_pool_for_cb = widget_pool.clone();
             let pty_synced_rc = pty_synced.clone();
             let visible_indices_rc = visible_indices.clone();
@@ -4197,6 +4290,52 @@ impl TermView {
                 glib::Propagation::Proceed
             });
             root.add_controller(root_key);
+        }
+
+        // Read-only snapshot VTEs and header buttons inside finished blocks
+        // are click-focusable, so a click into history strands keyboard focus
+        // where typing goes nowhere. A typing-shaped key press hands focus
+        // back to the live prompt and re-pins the view to the bottom. The
+        // triggering keystroke is consumed rather than forwarded: replaying it
+        // into the PTY would bypass the live VTE's input-method context and
+        // corrupt CJK composition. Bound chords never get here — the
+        // window-level dispatcher captures first and swallows them.
+        {
+            let active_vte_for_refocus = active_vte.clone();
+            let root_for_refocus = root.clone();
+            let scroll_for_refocus = block_scroll.clone();
+            let debouncer_for_refocus = scroll_debouncer.clone();
+            let unread_for_refocus = unread_count.clone();
+            let fab_for_refocus = jump_fab.clone();
+            let refocus_key = gtk::EventControllerKey::new();
+            refocus_key.set_propagation_phase(gtk::PropagationPhase::Capture);
+            refocus_key.connect_key_pressed(move |_controller, keyval, _keycode, modifiers| {
+                if active_vte_for_refocus.has_focus()
+                    || !stranded_focus_key_recovers(keyval, modifiers)
+                {
+                    return glib::Propagation::Proceed;
+                }
+                let Some(focused) = root_for_refocus.root().and_then(|window| window.focus())
+                else {
+                    return glib::Propagation::Proceed;
+                };
+                if focused_widget_keeps_key(&focused, keyval) {
+                    return glib::Propagation::Proceed;
+                }
+                active_vte_for_refocus.grab_focus();
+                unread_for_refocus.set(0);
+                set_jump_fab_label(&fab_for_refocus, 0);
+                fab_for_refocus.set_visible(false);
+                debouncer_for_refocus.reset_scroll_lock();
+                // Focusing the live VTE makes the ScrolledWindow scroll to
+                // reveal the holder's *top* (see the palette-dismissal note in
+                // palette.rs) — pin the bottom right after, and keep pinning
+                // across frames while virtualized blocks settle.
+                debouncer_for_refocus.mark_dirty(&scroll_for_refocus);
+                debouncer_for_refocus.pin_to_bottom_deferred(&scroll_for_refocus);
+                glib::Propagation::Stop
+            });
+            root.add_controller(refocus_key);
         }
 
         // ── Keyboard navigation / copy-paste (Capture phase) ──────────────
@@ -5514,10 +5653,10 @@ mod tests {
         finished_block_config, finished_command, is_post_command_metadata, notification_permitted,
         parse_color_spec, pop_typed_command_shadow, record_external_input, resolve_command_text,
         selected_blocks_markdown, selected_command_text, selected_id_range, step_marked_indices,
-        strip_ansi, strip_ansi_with_clear_detect, take_armed_agent_generation,
-        take_background_output, ArmedAgentExecution, BlockData, BlockState, CommandTextSource,
-        DynamicColors, DynamicColorsRc, MAX_RECALLED_COMMAND_BYTES, MAX_TYPED_COMMAND_SHADOW_BYTES,
-        NOTIFICATION_MIN_INTERVAL, TRUNCATED_COMMAND_PLACEHOLDER,
+        stranded_focus_key_recovers, strip_ansi, strip_ansi_with_clear_detect,
+        take_armed_agent_generation, take_background_output, ArmedAgentExecution, BlockData,
+        BlockState, CommandTextSource, DynamicColors, DynamicColorsRc, MAX_RECALLED_COMMAND_BYTES,
+        MAX_TYPED_COMMAND_SHADOW_BYTES, NOTIFICATION_MIN_INTERVAL, TRUNCATED_COMMAND_PLACEHOLDER,
     };
     use crate::config::Config;
     use crate::parser::{ColorKind, CommandMeta, KeyboardProtocolQuery, ParserEvent};
@@ -5525,6 +5664,77 @@ mod tests {
     use std::collections::{HashSet, VecDeque};
     use std::rc::Rc;
     use std::time::{Instant, SystemTime};
+
+    #[test]
+    fn stranded_focus_recovers_on_typing_keys_only() {
+        use gtk::gdk::{Key, ModifierType};
+        use relm4::gtk;
+
+        // Typing-shaped keys pull focus back to the live prompt.
+        assert!(stranded_focus_key_recovers(Key::a, ModifierType::empty()));
+        assert!(stranded_focus_key_recovers(
+            Key::A,
+            ModifierType::SHIFT_MASK
+        ));
+        assert!(stranded_focus_key_recovers(
+            Key::space,
+            ModifierType::empty()
+        ));
+        assert!(stranded_focus_key_recovers(
+            Key::Return,
+            ModifierType::empty()
+        ));
+        assert!(stranded_focus_key_recovers(
+            Key::BackSpace,
+            ModifierType::empty()
+        ));
+        assert!(stranded_focus_key_recovers(
+            Key::Escape,
+            ModifierType::empty()
+        ));
+
+        // Chords stay on their normal dispatch paths — in particular the
+        // unbound Ctrl+C interrupt fallback in the running-root handler.
+        assert!(!stranded_focus_key_recovers(
+            Key::c,
+            ModifierType::CONTROL_MASK
+        ));
+        assert!(!stranded_focus_key_recovers(Key::a, ModifierType::ALT_MASK));
+        assert!(!stranded_focus_key_recovers(
+            Key::t,
+            ModifierType::SUPER_MASK
+        ));
+
+        // A modifier press on its own is not typing.
+        assert!(!stranded_focus_key_recovers(
+            Key::Shift_L,
+            ModifierType::empty()
+        ));
+        assert!(!stranded_focus_key_recovers(
+            Key::Control_R,
+            ModifierType::CONTROL_MASK
+        ));
+
+        // Focus navigation and reading keys keep their meaning; block find
+        // deliberately lands focus on the picked block for reading.
+        assert!(!stranded_focus_key_recovers(
+            Key::Tab,
+            ModifierType::empty()
+        ));
+        assert!(!stranded_focus_key_recovers(
+            Key::ISO_Left_Tab,
+            ModifierType::SHIFT_MASK
+        ));
+        assert!(!stranded_focus_key_recovers(Key::Up, ModifierType::empty()));
+        assert!(!stranded_focus_key_recovers(
+            Key::Page_Down,
+            ModifierType::empty()
+        ));
+        assert!(!stranded_focus_key_recovers(
+            Key::End,
+            ModifierType::empty()
+        ));
+    }
 
     #[test]
     fn keyboard_protocol_queries_have_safe_fallback_replies() {
