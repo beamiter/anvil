@@ -17,26 +17,27 @@ pub(crate) struct AgentBlockCompletion {
     pub(crate) agent_generation: Option<u64>,
 }
 
-/// Read an Agent snapshot through anvil's descriptor-validated persistence
-/// path. Unsafe, oversized, corrupt, and missing entries all fail closed to a
-/// fresh session.
-fn read_agent_snapshot_unlocked(path: &Path) -> Option<AgentSessionSnapshot> {
+#[cfg(test)]
+fn read_agent_snapshot(path: &Path) -> Option<AgentSessionSnapshot> {
+    let _parent_lock = crate::config_store::PrivateParentLock::acquire(path).ok()?;
     let bytes = crate::config_store::read_private_bytes(path, MAX_AGENT_SNAPSHOT_JSON_BYTES as u64)
         .ok()??;
     let encoded = std::str::from_utf8(&bytes).ok()?;
     AgentSessionSnapshot::from_json(encoded).ok()
 }
 
-#[cfg(test)]
-fn read_agent_snapshot(path: &Path) -> Option<AgentSessionSnapshot> {
-    let _parent_lock = crate::config_store::PrivateParentLock::acquire(path).ok()?;
-    read_agent_snapshot_unlocked(path)
+/// Atomically claim, validate, restore, and consume exactly once while holding
+/// anvil's directory namespace lock. Multiple NON_UNIQUE anvil processes can
+/// open concurrently; only the process that wins the core claim may receive
+/// this session. Invalid evidence is moved aside for inspection.
+fn restore_agent_snapshot_once(path: &Path) -> Option<jterm_core::agent::AgentSession> {
+    restore_agent_snapshot_once_with_sync(path, crate::config_store::sync_config_parent)
 }
 
-/// Validate, restore, and consume exactly once while holding the directory
-/// namespace lock. Multiple NON_UNIQUE anvil processes can open concurrently;
-/// only the process that removes the pathname may receive this session.
-fn restore_agent_snapshot_once(path: &Path) -> Option<jterm_core::agent::AgentSession> {
+fn restore_agent_snapshot_once_with_sync(
+    path: &Path,
+    sync_parent: impl FnOnce(&Path) -> Result<(), crate::config_store::ConfigWriteError>,
+) -> Option<jterm_core::agent::AgentSession> {
     let _parent_lock = match crate::config_store::PrivateParentLock::acquire(path) {
         Ok(lock) => lock,
         Err(error) => {
@@ -44,32 +45,36 @@ fn restore_agent_snapshot_once(path: &Path) -> Option<jterm_core::agent::AgentSe
             return None;
         }
     };
-    let snapshot = read_agent_snapshot_unlocked(path)?;
-    let restored = match jterm_core::agent::AgentSession::restore(snapshot) {
-        Ok(restored) => restored,
-        Err(error) => {
-            log::warn!(
-                "agent: invalid snapshot {} retained for inspection: {error}",
-                path.display()
-            );
-            return None;
+    match jterm_core::agent::claim_session_file(path) {
+        jterm_core::agent::SessionClaim::Vacant => None,
+        jterm_core::agent::SessionClaim::Restored(restored) => {
+            if let Err(error) = sync_parent(path) {
+                log::warn!(
+                    "agent: snapshot claim for {} was not durable: {error}",
+                    path.display()
+                );
+                return None;
+            }
+            Some(restored)
         }
-    };
-    if let Err(error) = std::fs::remove_file(path) {
-        log::warn!(
-            "agent: restored snapshot {} but could not consume it: {error}",
-            path.display()
-        );
-        return None;
+        jterm_core::agent::SessionClaim::Quarantined {
+            path: quarantined,
+            error,
+        } => {
+            log::warn!(
+                "agent: invalid snapshot {} quarantined at {}: {error}",
+                path.display(),
+                quarantined.display()
+            );
+            if let Err(sync_error) = sync_parent(path) {
+                log::warn!(
+                    "agent: snapshot quarantine for {} was not durable: {sync_error}",
+                    path.display()
+                );
+            }
+            None
+        }
     }
-    if let Err(error) = crate::config_store::sync_config_parent(path) {
-        log::warn!(
-            "agent: snapshot removal for {} was not durable: {error}",
-            path.display()
-        );
-        return None;
-    }
-    Some(restored)
 }
 
 /// Serialize and atomically replace an Agent snapshot under the exact shared
@@ -716,6 +721,51 @@ mod snapshot_tests {
             .count();
         assert_eq!(restored, 1);
         assert!(!path.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn one_shot_restore_fails_closed_when_the_namespace_cannot_be_synced() {
+        let root = test_directory("sync-failure");
+        let path = root.join("agent_session.json");
+        write_agent_snapshot(&path, &snapshot_fixture()).unwrap();
+        let sync_called = std::cell::Cell::new(false);
+
+        let restored = restore_agent_snapshot_once_with_sync(&path, |_| {
+            sync_called.set(true);
+            Err(crate::config_store::ConfigWriteError::Io(
+                "injected directory sync failure".to_string(),
+            ))
+        });
+
+        assert!(sync_called.get(), "a successful claim must sync its parent");
+        assert!(restored.is_none(), "an undurable claim must fail closed");
+        assert!(!path.exists(), "the claimed public name remains consumed");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalid_one_shot_restore_is_quarantined_for_inspection() {
+        let root = test_directory("quarantine");
+        let path = root.join("agent_session.json");
+        let evidence = "not an Agent snapshot";
+        std::fs::write(&path, evidence).unwrap();
+
+        assert!(restore_agent_snapshot_once(&path).is_none());
+        assert!(!path.exists(), "the invalid snapshot name must be claimed");
+
+        let quarantined = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|candidate| {
+                candidate != &path
+                    && std::fs::read_to_string(candidate).is_ok_and(|contents| contents == evidence)
+            })
+            .expect("invalid evidence should remain under a quarantine name");
+        assert_ne!(quarantined, path);
+        assert!(restore_agent_snapshot_once(&path).is_none());
+
         std::fs::remove_dir_all(root).unwrap();
     }
 
