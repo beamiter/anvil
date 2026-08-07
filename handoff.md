@@ -1,12 +1,12 @@
 # Engineering handoff
 
-Updated: 2026-08-01
+Updated: 2026-08-08
 
 This baseline exact-pins the hardened shared core and jagent revisions and upgrades
 terminal rendering, history, configuration, persistence, notebook workflows, AI,
-and command review. Agent UI actions are now bound to the session epoch, execution
-identities are checked rather than wrapped, and workspace snapshots decode under
-their own budgets.
+and command review. Agent UI actions, model replies, and terminal execution
+events are now bound to the session epoch; execution counters are checked rather
+than wrapped, and workspace snapshots decode under their own budgets.
 
 ## Completed since the previous handoff
 
@@ -31,8 +31,17 @@ their own budgets.
   raised against an earlier task generation — a stale click, a stale edit dialog,
   or a queued message after New Task or a session replacement. The edit dialog
   also forgets its target on close, so a Submit cannot approve a stale proposal.
-- Execution generations use `checked_add`. Exhaustion seals the session instead of
-  reusing an identity a late completion could attach to.
+- LLM callbacks capture `AgentSessionEpoch` and route it through `AgentLlmReply`.
+  Both the reply handler and the post-`ask` handle writeback require the exact
+  epoch, so a callback queued before New Task or session replacement cannot
+  mutate the new transcript or install its handle there.
+- Terminal execution identity is `AgentExecutionRef { epoch, generation }`, not
+  a naked counter. The typed reference passes unchanged through
+  `PendingAgentCommand`, `VteInput`/`VteOutput`, the block view's armed and active
+  one-shot slots, `AppMsg`, and completion/start-failure handlers. Every accepting
+  edge compares both fields; manual block completions remain the `None` path and
+  still become untrusted context. Generations use `checked_add`, and exhaustion
+  seals the session instead of reusing an identity.
 - A raw model reply over 128 KiB is recorded as a provider failure before parsing
   and before any transcript mutation, so the oversized bytes never reach the
   parser or the transcript, and no model turn is consumed.
@@ -42,24 +51,12 @@ their own budgets.
   `SavedSession`, `SavedTab`, and `PaneLayout` no longer derive `Deserialize`.
   Unknown fields are still ignored so snapshots from other releases restore, and
   `session_within_restore_limits` remains as the post-decode semantic backstop.
+- Agent snapshot restore uses `jterm_core::agent::claim_session_file` while
+  holding the private parent lock. The public name is consumed once, invalid
+  evidence is quarantined, and the parent namespace is synced before a claimed
+  session is accepted.
 
 ## Remaining boundaries
-
-### Adopt the shared atomic claim for the Agent snapshot
-
-`src/agent_ops.rs` still reads the Agent snapshot and removes it as two steps.
-`jterm_core::agent::claim_session_file` now provides a one-winner
-claim/consume primitive that quarantines unusable evidence; adopt it when the
-pinned `jterm_core` revision is advanced, and drop the local read/remove pair.
-
-### Bind execution completions to the epoch as well as the generation
-
-`PendingAgentCommand` carries a checked generation, which is enough to reject a
-stale *execution* completion. A model completion arriving after New Task is
-rejected by the epoch only where the UI routes a proposal reference; the LLM
-reply path still relies on the cancellation token. Carry the epoch into the
-in-flight request handle so a reply for a previous task cannot be accepted by a
-session that has since been reset.
 
 ### Bound the remaining restored strings at their source
 
@@ -74,4 +71,5 @@ would make the decoder's limits provably reachable rather than duplicated.
 cargo fmt --all -- --check
 cargo test --locked --all-targets --all-features --no-fail-fast
 cargo clippy --locked --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked
 ```

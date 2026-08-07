@@ -374,9 +374,9 @@ pub struct PaneProbe {
 pub enum VteInput {
     WriteInput(Vec<u8>),
     /// Block-mode only: atomically re-check a clean prompt, arm the local
-    /// approval generation, and submit the reviewed command.
+    /// Agent execution identity, and submit the reviewed command.
     RunAgentCommand {
-        generation: u64,
+        execution: crate::agent::AgentExecutionRef,
         command: String,
     },
     Resize(u16, u16),
@@ -464,15 +464,15 @@ pub enum VteOutput {
         /// so we don't ship 256 KB across a relm4 channel.
         output_sample: String,
         /// One-shot identity armed locally before the reviewed PTY write.
-        agent_generation: Option<u64>,
+        agent_execution: Option<crate::agent::AgentExecutionRef>,
         /// Wall-clock duration of the block, when one was recorded. Feeds the
         /// bottom bar's last-command segment.
         duration_ms: Option<u64>,
     },
     /// Approval advanced the protocol, but the pane could no longer arm/write
-    /// that exact generation. The Agent integration must fail closed.
+    /// that exact execution. The Agent integration must fail closed.
     AgentExecutionStartFailed {
-        generation: u64,
+        execution: crate::agent::AgentExecutionRef,
     },
     AskAiAboutBlock(crate::ai::BlockContext),
 }
@@ -612,8 +612,8 @@ impl Component for VteTerminal {
     fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>, _root: &Self::Root) {
         match msg {
             VteInput::WriteInput(data) => self.terminal.feed_child(&data),
-            VteInput::RunAgentCommand { generation, .. } => {
-                let _ = sender.output(VteOutput::AgentExecutionStartFailed { generation });
+            VteInput::RunAgentCommand { execution, .. } => {
+                let _ = sender.output(VteOutput::AgentExecutionStartFailed { execution });
             }
             VteInput::Resize(cols, rows) => {
                 if let Some(pty) = self.terminal.pty() {

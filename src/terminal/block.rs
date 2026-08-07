@@ -189,14 +189,14 @@ fn connect_view_outputs(
     });
     view.connect_block_finished({
         let sender = sender.clone();
-        move |command, exit_code, output_sample, agent_generation, duration_ms| {
+        move |command, exit_code, output_sample, agent_execution, duration_ms| {
             let _ = sender.output(command_finished_output(exit_code));
             let _ = sender.output(VteOutput::BlockFinished {
                 command,
                 // The agent transcript this feeds still speaks one i32.
                 exit_code: crate::block_view::exit_code_for_i32_api(exit_code),
                 output_sample,
-                agent_generation,
+                agent_execution,
                 duration_ms,
             });
         }
@@ -286,9 +286,9 @@ impl Component for BlockTerminal {
             if matches!(&msg, VteInput::GrabFocus) {
                 root.grab_focus();
             }
-            if let VteInput::RunAgentCommand { generation, .. } = &msg {
+            if let VteInput::RunAgentCommand { execution, .. } = &msg {
                 let _ = sender.output(VteOutput::AgentExecutionStartFailed {
-                    generation: *generation,
+                    execution: *execution,
                 });
             }
             return;
@@ -298,12 +298,9 @@ impl Component for BlockTerminal {
         };
         match msg {
             VteInput::WriteInput(data) => view.write_input(&data),
-            VteInput::RunAgentCommand {
-                generation,
-                command,
-            } => {
-                if !view.try_run_agent_command(generation, &command) {
-                    let _ = sender.output(VteOutput::AgentExecutionStartFailed { generation });
+            VteInput::RunAgentCommand { execution, command } => {
+                if !view.try_run_agent_command(execution, &command) {
+                    let _ = sender.output(VteOutput::AgentExecutionStartFailed { execution });
                 }
             }
             VteInput::Resize(cols, rows) => view.resize(cols, rows),

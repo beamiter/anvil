@@ -1251,37 +1251,50 @@ const MAX_RAW_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 /// viewport, and is forced to the full viewport only for alt-screen apps.
 const MIN_INPUT_ROWS: i32 = 6;
 
-/// `(command, exit status, output sample, agent generation, duration ms)`. The
+/// `(command, exit status, output sample, Agent execution, duration ms)`. The
 /// status is `None` when the shell reported none, so a consumer that styles
 /// failures can tell "failed" apart from "outcome unknown".
-type BlockFinishedCallbacks =
-    Rc<RefCell<Vec<Box<dyn Fn(String, Option<i32>, String, Option<u64>, Option<u64>)>>>>;
+type BlockFinishedCallbacks = Rc<
+    RefCell<
+        Vec<
+            Box<
+                dyn Fn(
+                    String,
+                    Option<i32>,
+                    String,
+                    Option<crate::agent::AgentExecutionRef>,
+                    Option<u64>,
+                ),
+            >,
+        >,
+    >,
+>;
 type BlockContextCallbacks = Rc<RefCell<Vec<Box<dyn Fn(crate::ai::BlockContext)>>>>;
 type CwdCallbacks = Rc<RefCell<Vec<Box<dyn Fn(&str, bool)>>>>;
 pub(crate) type DebugInfo = Vec<(&'static str, Vec<(String, String)>)>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ArmedAgentExecution {
-    generation: u64,
+    execution: crate::agent::AgentExecutionRef,
     prompt_generation: u64,
 }
 
-fn take_armed_agent_generation(
+fn take_armed_agent_execution(
     armed: &mut Option<ArmedAgentExecution>,
     prompt_generation: u64,
-) -> Option<u64> {
+) -> Option<crate::agent::AgentExecutionRef> {
     armed
         .take()
         .filter(|armed| armed.prompt_generation == prompt_generation)
-        .map(|armed| armed.generation)
+        .map(|armed| armed.execution)
 }
 
 fn command_end_matches_agent_execution(
-    agent_generation: Option<u64>,
+    agent_execution: Option<crate::agent::AgentExecutionRef>,
     started_id: Option<&str>,
     finished_id: Option<&str>,
 ) -> bool {
-    agent_generation.is_none() || started_id.is_none() || started_id == finished_id
+    agent_execution.is_none() || started_id.is_none() || started_id == finished_id
 }
 
 fn command_end_matches_started_id(started_id: Option<&str>, finished_id: Option<&str>) -> bool {
@@ -1289,10 +1302,10 @@ fn command_end_matches_started_id(started_id: Option<&str>, finished_id: Option<
 }
 
 fn agent_prompt_boundary_is_trusted(
-    active_generation: Option<u64>,
+    active_execution: Option<crate::agent::AgentExecutionRef>,
     shell_is_foreground: Option<bool>,
 ) -> bool {
-    active_generation.is_none() || shell_is_foreground != Some(false)
+    active_execution.is_none() || shell_is_foreground != Some(false)
 }
 
 pub struct TermView {
@@ -1485,7 +1498,7 @@ struct ReaderCtx {
     running_cmd_rc: Rc<RefCell<String>>,
     armed_agent_execution_rc: Rc<RefCell<Option<ArmedAgentExecution>>>,
     agent_prompt_generation_rc: Rc<Cell<u64>>,
-    active_agent_generation_rc: Rc<Cell<Option<u64>>>,
+    active_agent_execution_rc: Rc<Cell<Option<crate::agent::AgentExecutionRef>>>,
     /// Recomputes the compact/full visual live surface. PTY geometry is kept
     /// separately at the full pane viewport.
     layout_active_surface: Rc<dyn Fn()>,
@@ -1657,7 +1670,7 @@ impl ReaderCtx {
             running_cmd_rc,
             armed_agent_execution_rc,
             agent_prompt_generation_rc,
-            active_agent_generation_rc,
+            active_agent_execution_rc,
             layout_active_surface,
             block_finished_cbs,
             ask_ai_about_block_cbs,
@@ -1778,7 +1791,7 @@ impl ReaderCtx {
                             }
                             if state == BlockState::PostCommand
                                 && !agent_prompt_boundary_is_trusted(
-                                    active_agent_generation_rc.get(),
+                                    active_agent_execution_rc.get(),
                                     pty_for_init.shell_is_foreground(),
                                 )
                             {
@@ -2016,13 +2029,13 @@ impl ReaderCtx {
 
                                 if !is_background {
                                     let output_sample = sample_output_for_event(&output_plain);
-                                    let agent_generation = active_agent_generation_rc.take();
+                                    let agent_execution = active_agent_execution_rc.take();
                                     for cb in block_finished_cbs.borrow().iter() {
                                         cb(
                                             cmd.clone(),
                                             exit_code,
                                             output_sample.clone(),
-                                            agent_generation,
+                                            agent_execution,
                                             duration_ms,
                                         );
                                     }
@@ -2614,7 +2627,7 @@ impl ReaderCtx {
                             // redraw/new prompt before CommandStart invalidates
                             // it instead of letting same text match later.
                             armed_agent_execution_rc.borrow_mut().take();
-                            active_agent_generation_rc.set(None);
+                            active_agent_execution_rc.set(None);
                             // Snapshot the live VTE cursor at the moment the
                             // prompt finishes drawing — this is where the user's
                             // command starts. CommandStart will read text from
@@ -2709,11 +2722,11 @@ impl ReaderCtx {
                             // secondary text check then seals the Agent session
                             // explicitly instead of silently losing the arm and
                             // waiting forever for an observation.
-                            let matching_generation = take_armed_agent_generation(
+                            let matching_execution = take_armed_agent_execution(
                                 &mut armed_agent_execution_rc.borrow_mut(),
                                 agent_prompt_generation_rc.get(),
                             );
-                            active_agent_generation_rc.set(matching_generation);
+                            active_agent_execution_rc.set(matching_execution);
                             *vte_typed_cmd_rc.borrow_mut() = command.clone();
                             *running_cmd_rc.borrow_mut() = command;
                             cmd_running_rc.set(true);
@@ -2758,7 +2771,7 @@ impl ReaderCtx {
                                 osc133_depth_rc.set(0);
                             }
                             if !command_end_matches_agent_execution(
-                                active_agent_generation_rc.get(),
+                                active_agent_execution_rc.get(),
                                 execution_id_rc.borrow().as_deref(),
                                 meta.id.as_deref(),
                             ) {
@@ -3904,7 +3917,8 @@ impl TermView {
         let armed_agent_execution: Rc<RefCell<Option<ArmedAgentExecution>>> =
             Rc::new(RefCell::new(None));
         let agent_prompt_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
-        let active_agent_generation: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
+        let active_agent_execution: Rc<Cell<Option<crate::agent::AgentExecutionRef>>> =
+            Rc::new(Cell::new(None));
         let block_start_time: Rc<Cell<Option<SystemTime>>> = Rc::new(Cell::new(None));
         let visible_indices: Rc<RefCell<std::collections::HashSet<usize>>> =
             Rc::new(RefCell::new(std::collections::HashSet::new()));
@@ -4061,7 +4075,7 @@ impl TermView {
                 running_cmd_rc: running_cmd.clone(),
                 armed_agent_execution_rc: armed_agent_execution.clone(),
                 agent_prompt_generation_rc: agent_prompt_generation.clone(),
-                active_agent_generation_rc: active_agent_generation.clone(),
+                active_agent_execution_rc: active_agent_execution.clone(),
                 layout_active_surface: layout_active_surface.clone(),
                 block_finished_cbs: block_finished_callbacks.clone(),
                 ask_ai_about_block_cbs: ask_ai_about_block_callbacks.clone(),
@@ -4902,12 +4916,19 @@ impl TermView {
     /// Re-check prompt readiness, arm a one-shot local identity, and submit
     /// the reviewed command without yielding to another input path between
     /// those operations.
-    pub fn try_run_agent_command(&self, generation: u64, command: &str) -> bool {
-        if generation == 0 || !agent_command_is_safe(command) || !self.can_accept_agent_command() {
+    pub fn try_run_agent_command(
+        &self,
+        execution: crate::agent::AgentExecutionRef,
+        command: &str,
+    ) -> bool {
+        if execution.generation == 0
+            || !agent_command_is_safe(command)
+            || !self.can_accept_agent_command()
+        {
             return false;
         }
         *self.armed_agent_execution.borrow_mut() = Some(ArmedAgentExecution {
-            generation,
+            execution,
             prompt_generation: self.agent_prompt_generation.get(),
         });
         let mut bytes = command.as_bytes().to_vec();
@@ -5143,7 +5164,8 @@ impl TermView {
 
     pub fn connect_block_finished<F>(&self, f: F)
     where
-        F: Fn(String, Option<i32>, String, Option<u64>, Option<u64>) + 'static,
+        F: Fn(String, Option<i32>, String, Option<crate::agent::AgentExecutionRef>, Option<u64>)
+            + 'static,
     {
         self.block_finished_callbacks.borrow_mut().push(Box::new(f));
     }
@@ -5816,10 +5838,11 @@ mod tests {
         parse_color_spec, pop_typed_command_shadow, record_external_input, resolve_command_text,
         selected_blocks_markdown, selected_command_text, selected_id_range, step_marked_indices,
         stranded_focus_key_recovers, strip_ansi, strip_ansi_with_clear_detect,
-        take_armed_agent_generation, take_background_output, ArmedAgentExecution, BlockData,
+        take_armed_agent_execution, take_background_output, ArmedAgentExecution, BlockData,
         BlockState, CommandTextSource, DynamicColors, DynamicColorsRc, MAX_RECALLED_COMMAND_BYTES,
         MAX_TYPED_COMMAND_SHADOW_BYTES, NOTIFICATION_MIN_INTERVAL, TRUNCATED_COMMAND_PLACEHOLDER,
     };
+    use crate::agent::{AgentExecutionRef, AgentSession};
     use crate::config::Config;
     use crate::parser::{ColorKind, CommandMeta, KeyboardProtocolQuery, ParserEvent};
     use std::cell::{Cell, RefCell};
@@ -6890,22 +6913,26 @@ mod tests {
     }
 
     #[test]
-    fn agent_generation_requires_same_prompt_and_surfaces_command_mismatch() {
+    fn agent_execution_requires_same_prompt_and_surfaces_command_mismatch() {
+        let execution = AgentExecutionRef {
+            epoch: AgentSession::new(1, 2, 1).epoch(),
+            generation: 41,
+        };
         let armed = || {
             Some(ArmedAgentExecution {
-                generation: 41,
+                execution,
                 prompt_generation: 7,
             })
         };
 
         let mut exact = armed();
-        assert_eq!(take_armed_agent_generation(&mut exact, 7), Some(41));
-        assert!(exact.is_none(), "a matching generation is one-shot");
+        assert_eq!(take_armed_agent_execution(&mut exact, 7), Some(execution));
+        assert!(exact.is_none(), "a matching execution is one-shot");
 
         let mut suffix_collision = armed();
         assert_eq!(
-            take_armed_agent_generation(&mut suffix_collision, 7),
-            Some(41)
+            take_armed_agent_execution(&mut suffix_collision, 7),
+            Some(execution)
         );
         assert!(
             suffix_collision.is_none(),
@@ -6913,21 +6940,21 @@ mod tests {
         );
 
         let mut stale_prompt = armed();
-        assert_eq!(take_armed_agent_generation(&mut stale_prompt, 8), None);
+        assert_eq!(take_armed_agent_execution(&mut stale_prompt, 8), None);
         assert!(stale_prompt.is_none());
 
         assert!(command_end_matches_agent_execution(
-            Some(41),
+            Some(execution),
             Some("secret-1"),
             Some("secret-1")
         ));
         assert!(!command_end_matches_agent_execution(
-            Some(41),
+            Some(execution),
             Some("secret-1"),
             Some("forged")
         ));
         assert!(!command_end_matches_agent_execution(
-            Some(41),
+            Some(execution),
             Some("secret-1"),
             None
         ));
@@ -6940,14 +6967,20 @@ mod tests {
             Some("nested-2")
         ));
         assert!(
-            command_end_matches_agent_execution(Some(41), None, None),
+            command_end_matches_agent_execution(Some(execution), None, None),
             "old bare integrations remain compatible, without claiming id authentication"
         );
 
-        assert!(!agent_prompt_boundary_is_trusted(Some(41), Some(false)));
-        assert!(agent_prompt_boundary_is_trusted(Some(41), Some(true)));
+        assert!(!agent_prompt_boundary_is_trusted(
+            Some(execution),
+            Some(false)
+        ));
+        assert!(agent_prompt_boundary_is_trusted(
+            Some(execution),
+            Some(true)
+        ));
         assert!(
-            agent_prompt_boundary_is_trusted(Some(41), None),
+            agent_prompt_boundary_is_trusted(Some(execution), None),
             "host-bridged PID namespaces must fall back to the correlated shell marker"
         );
         assert!(agent_prompt_boundary_is_trusted(None, Some(false)));

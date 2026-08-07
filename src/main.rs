@@ -212,7 +212,7 @@ fn create_pane(
             command,
             exit_code,
             output_sample,
-            agent_generation,
+            agent_execution,
             duration_ms,
         } => AppMsg::AgentBlockFinished {
             tab_id,
@@ -220,11 +220,11 @@ fn create_pane(
             command,
             exit_code,
             output_sample,
-            agent_generation,
+            agent_execution,
             duration_ms,
         },
-        VteOutput::AgentExecutionStartFailed { generation } => {
-            AppMsg::AgentExecutionStartFailed { generation }
+        VteOutput::AgentExecutionStartFailed { execution } => {
+            AppMsg::AgentExecutionStartFailed { execution }
         }
         VteOutput::AskAiAboutBlock(context) => AppMsg::AskAiAboutBlock(context),
     };
@@ -1409,14 +1409,16 @@ impl SimpleComponent for AppModel {
                     .emit(agent::AgentEditMsg::Open(reference, command));
             }
             AppMsg::AgentReject(reference) => self.agent_reject(reference, &sender),
-            AppMsg::AgentLlmReply(reply) => self.agent_handle_reply(reply, &sender),
+            AppMsg::AgentLlmReply { epoch, reply } => {
+                self.agent_handle_reply(epoch, reply, &sender);
+            }
             AppMsg::AgentBlockFinished {
                 tab_id: _,
                 pane_id,
                 command,
                 exit_code,
                 output_sample,
-                agent_generation,
+                agent_execution,
                 duration_ms,
             } => {
                 if let Some((tab_index, pane_index)) = self.find_pane(pane_id) {
@@ -1434,14 +1436,14 @@ impl SimpleComponent for AppModel {
                             command,
                             exit_code,
                             output: output_sample,
-                            agent_generation,
+                            agent_execution,
                         },
                         &sender,
                     );
                 }
             }
-            AppMsg::AgentExecutionStartFailed { generation } => {
-                self.agent_execution_start_failed(generation);
+            AppMsg::AgentExecutionStartFailed { execution } => {
+                self.agent_execution_start_failed(execution);
             }
             AppMsg::AgentClose => self.agent_close(),
             AppMsg::PaletteTypeCommand(cmd) => {

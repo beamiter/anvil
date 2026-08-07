@@ -14,7 +14,7 @@ pub(crate) struct AgentBlockCompletion {
     pub(crate) command: String,
     pub(crate) exit_code: i32,
     pub(crate) output: String,
-    pub(crate) agent_generation: Option<u64>,
+    pub(crate) agent_execution: Option<agent::AgentExecutionRef>,
 }
 
 #[cfg(test)]
@@ -375,12 +375,12 @@ impl AppModel {
         debug_assert_eq!(pending.proposal_id, approved.proposal_id);
         debug_assert_eq!(pending.command, approved.command);
 
-        // The backend re-checks prompt cleanliness, arms the generation and
+        // The backend re-checks prompt cleanliness, arms the execution and
         // writes the bytes as one UI-thread operation. A queued failure event
         // seals the already-approved protocol state instead of accepting an
         // unrelated completion later.
         terminal.emit(VteInput::RunAgentCommand {
-            generation: pending.generation,
+            execution: pending.execution,
             command: pending.command,
         });
         terminal.emit(VteInput::GrabFocus);
@@ -425,7 +425,7 @@ impl AppModel {
             command,
             exit_code,
             output,
-            agent_generation,
+            agent_execution,
         } = completion;
         let proposal_id = {
             let mut guard = self.active_agent.borrow_mut();
@@ -435,25 +435,24 @@ impl AppModel {
             if session.bound_tab != tab_id || session.bound_pane != pane_id {
                 return;
             }
-            match session.awaiting_command.as_ref() {
-                Some(pending)
-                    if agent_generation == Some(pending.generation)
-                        && pending.command.trim() == command.trim() =>
-                {
-                    pending.proposal_id
-                }
-                Some(pending) if agent_generation == Some(pending.generation) => {
-                    let generation = pending.generation;
-                    session.execution_start_failed(generation);
-                    self.show_toast("Agent stopped because command completion correlation failed.");
-                    return;
-                }
-                // A stale/internal generation can never become model context.
-                _ if agent_generation.is_some() => return,
+            match agent_execution {
+                Some(execution) => match session.correlate_execution(execution, &command) {
+                    agent::AgentExecutionMatch::Matched(proposal_id) => proposal_id,
+                    agent::AgentExecutionMatch::CommandMismatch => {
+                        let failed = session.execution_start_failed(execution);
+                        debug_assert!(failed);
+                        self.show_toast(
+                            "Agent stopped because command completion correlation failed.",
+                        );
+                        return;
+                    }
+                    // A stale/internal execution can never become model context.
+                    agent::AgentExecutionMatch::Stale => return,
+                },
                 // A manual command completed in the bound pane. Never attach
                 // its output to the approved proposal — remember it instead
                 // as untrusted block context for the next model request.
-                _ => {
+                None => {
                     let command = command.trim();
                     if !command.is_empty() {
                         session.last_manual_completed = Some(ai::BlockContext {
@@ -487,20 +486,13 @@ impl AppModel {
         }
     }
 
-    pub(crate) fn agent_execution_start_failed(&self, generation: u64) {
+    pub(crate) fn agent_execution_start_failed(&self, execution: agent::AgentExecutionRef) {
         let failed = {
             let mut guard = self.active_agent.borrow_mut();
             let Some(session) = guard.as_mut() else {
                 return;
             };
-            let matches = session
-                .awaiting_command
-                .as_ref()
-                .is_some_and(|pending| pending.generation == generation);
-            if matches {
-                session.execution_start_failed(generation);
-            }
-            matches
+            session.execution_start_failed(execution)
         };
         if failed {
             self.show_toast("Agent stopped because the target prompt was no longer ready.");
@@ -510,6 +502,7 @@ impl AppModel {
 
     pub(crate) fn agent_handle_reply(
         &self,
+        epoch: agent::AgentSessionEpoch,
         reply: Result<String, String>,
         _sender: &ComponentSender<AppModel>,
     ) {
@@ -518,18 +511,16 @@ impl AppModel {
             let Some(session) = guard.as_mut() else {
                 return;
             };
-            if session.is_cancelled() {
-                return;
-            }
-            match reply {
-                Ok(raw) => session.accept_model_reply(&raw).map(|_| ()),
-                Err(error) => session.model_failed(error),
-            }
+            session.apply_llm_reply(epoch, reply)
         };
-        if let Err(error) = result {
-            // Protocol and provider failures are already recorded as an
-            // explicit ProtocolError turn; the toast is only a concise cue.
-            self.report_agent_error("model reply", &error);
+        match result {
+            Ok(false) => return,
+            Ok(true) => {}
+            Err(error) => {
+                // Protocol and provider failures are already recorded as an
+                // explicit ProtocolError turn; the toast is only a concise cue.
+                self.report_agent_error("model reply", &error);
+            }
         }
         self.refresh_agent_panel();
     }
@@ -557,7 +548,7 @@ impl AppModel {
 
         // Build the prompt only for the single legal request state. This
         // guards direct AppMsg injection as well as disabled panel controls.
-        let (bound_tab, bound_pane, system, user, cancellation) = {
+        let (request_epoch, bound_tab, bound_pane, system, user, cancellation) = {
             let guard = self.active_agent.borrow();
             let Some(session) = guard.as_ref() else {
                 return;
@@ -585,6 +576,7 @@ impl AppModel {
             // Cached repo probe with a bounded UI wait; None outside a repo.
             let git = jterm_core::git_meta::read(std::path::Path::new(cwd));
             (
+                session.epoch(),
                 session.bound_tab,
                 session.bound_pane,
                 ai::build_agent_system_prompt(),
@@ -604,7 +596,10 @@ impl AppModel {
         let callback_cancellation = cancellation.clone();
         let handle = ai::ask(client, system, user, move |result| {
             if !callback_cancellation.is_cancelled() {
-                sender_for_reply.input(AppMsg::AgentLlmReply(result));
+                sender_for_reply.input(AppMsg::AgentLlmReply {
+                    epoch: request_epoch,
+                    reply: result,
+                });
             }
         });
 
@@ -612,7 +607,8 @@ impl AppModel {
         {
             let mut guard = self.active_agent.borrow_mut();
             if let Some(session) = guard.as_mut() {
-                if session.bound_tab == bound_tab
+                if session.epoch() == request_epoch
+                    && session.bound_tab == bound_tab
                     && session.bound_pane == bound_pane
                     && session.state() == agent::AgentState::AwaitingModel
                     && session.in_flight.is_none()

@@ -23,8 +23,9 @@
 //!    `MAX_OBSERVATION_BYTES` of captured output (head+tail).
 //! 7. **Cancel on close.** Closing the dialog calls `AgentSession::cancel`,
 //!    which both flips the cancelled flag (suppressing pending LLM
-//!    callbacks) and clears `awaiting_command` so a late block-finished
-//!    event won't attach to a dead session.
+//!    callbacks) and clears `awaiting_command`. Already-queued replies and
+//!    terminal events also carry the task epoch, so they cannot attach to a
+//!    replacement session.
 
 use adw::prelude::*;
 use relm4::adw;
@@ -85,13 +86,32 @@ pub(crate) struct AgentProposalRef {
     pub(crate) id: ProposalId,
 }
 
+/// One terminal execution belonging to one Agent task generation.
+///
+/// Generations restart when an Agent session is replaced. The epoch therefore
+/// remains part of the identity at every asynchronous terminal boundary; a
+/// generation on its own is never sufficient authority to complete or cancel
+/// the current session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct AgentExecutionRef {
+    pub(crate) epoch: AgentSessionEpoch,
+    pub(crate) generation: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PendingAgentCommand {
     pub(crate) proposal_id: ProposalId,
     pub(crate) command: String,
     /// Locally generated one-shot execution identity. It never comes from PTY
     /// output and must be armed before the approved bytes are written.
-    pub(crate) generation: u64,
+    pub(crate) execution: AgentExecutionRef,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AgentExecutionMatch {
+    Matched(ProposalId),
+    CommandMismatch,
+    Stale,
 }
 
 /// anvil's Agent session. The pure protocol state machine (turn caps,
@@ -102,8 +122,8 @@ pub(crate) struct PendingAgentCommand {
 pub(crate) struct AgentSession {
     inner: CoreSession,
     /// The approved proposal currently executing in the bound pane. Command
-    /// text is only a secondary check; the locally armed generation is the
-    /// authoritative correlation identity.
+    /// text is only a secondary check; the locally armed epoch + generation
+    /// pair is the authoritative correlation identity.
     pub(crate) awaiting_command: Option<PendingAgentCommand>,
     next_execution_generation: u64,
     /// Held so dropping the session cancels an in-flight LLM request.
@@ -221,6 +241,23 @@ impl AgentSession {
         self.inner.accept_model_reply(raw)
     }
 
+    /// Apply an asynchronous provider result only to the task that launched
+    /// it. A callback can already be queued when New Task or replacement
+    /// cancels its request, so cancellation alone is not an ownership check.
+    pub(crate) fn apply_llm_reply(
+        &mut self,
+        epoch: AgentSessionEpoch,
+        reply: Result<String, String>,
+    ) -> Result<bool, SessionError> {
+        if epoch != self.epoch() || self.is_cancelled() {
+            return Ok(false);
+        }
+        match reply {
+            Ok(raw) => self.accept_model_reply(&raw).map(|_| true),
+            Err(error) => self.model_failed(error).map(|_| true),
+        }
+    }
+
     /// Record a provider/transport failure without consuming a model turn.
     pub(crate) fn model_failed(&mut self, message: impl Into<String>) -> Result<(), SessionError> {
         self.in_flight = None;
@@ -277,22 +314,44 @@ impl AgentSession {
         self.awaiting_command = Some(PendingAgentCommand {
             proposal_id: approved.proposal_id,
             command: approved.command.clone(),
-            generation,
+            execution: AgentExecutionRef {
+                epoch: self.epoch(),
+                generation,
+            },
         });
         Ok(())
     }
 
+    /// Correlate a terminal completion without mutating protocol state. Manual
+    /// completions are represented by `None` at the integration layer and do
+    /// not enter this identity-bearing path.
+    pub(crate) fn correlate_execution(
+        &self,
+        execution: AgentExecutionRef,
+        command: &str,
+    ) -> AgentExecutionMatch {
+        match self.awaiting_command.as_ref() {
+            Some(pending) if pending.execution != execution => AgentExecutionMatch::Stale,
+            Some(pending) if pending.command.trim() == command.trim() => {
+                AgentExecutionMatch::Matched(pending.proposal_id)
+            }
+            Some(_) => AgentExecutionMatch::CommandMismatch,
+            None => AgentExecutionMatch::Stale,
+        }
+    }
+
     /// Approval changed the pure protocol state, but the terminal could not
-    /// atomically arm and submit that exact generation. There is no safe
+    /// atomically arm and submit that exact execution. There is no safe
     /// observation to fabricate or rollback transition, so seal the session.
-    pub(crate) fn execution_start_failed(&mut self, generation: u64) {
-        if self
+    pub(crate) fn execution_start_failed(&mut self, execution: AgentExecutionRef) -> bool {
+        let matches = self
             .awaiting_command
             .as_ref()
-            .is_some_and(|pending| pending.generation == generation)
-        {
+            .is_some_and(|pending| pending.execution == execution);
+        if matches {
             self.cancel();
         }
+        matches
     }
 
     pub(crate) fn reject(&mut self, id: ProposalId) -> Result<(), SessionError> {
@@ -1028,7 +1087,10 @@ mod tests {
             Some(PendingAgentCommand {
                 proposal_id: id,
                 command: "ls -la".to_string(),
-                generation: 1,
+                execution: AgentExecutionRef {
+                    epoch: s.epoch(),
+                    generation: 1,
+                },
             }),
             "approval must arm the block-completion correlation slot"
         );
@@ -1130,7 +1192,10 @@ mod tests {
             Some(PendingAgentCommand {
                 proposal_id: id,
                 command: "rm -r ./build/tmp".to_string(),
-                generation: 1,
+                execution: AgentExecutionRef {
+                    epoch: s.epoch(),
+                    generation: 1,
+                },
             })
         );
     }
@@ -1181,7 +1246,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_generations_are_monotonic_and_start_failure_fails_closed() {
+    fn execution_identity_is_checked_and_start_failure_fails_closed() {
         let mut first = session(10);
         first.submit_user("run").unwrap();
         let ModelOutcome::Proposal { id, .. } =
@@ -1190,12 +1255,92 @@ mod tests {
             panic!("expected proposal");
         };
         let _ = first.approve(id).unwrap();
-        let generation = first.awaiting_command.as_ref().unwrap().generation;
-        first.execution_start_failed(generation.wrapping_add(1));
+        let execution = first.awaiting_command.as_ref().unwrap().execution;
+        let stale = AgentExecutionRef {
+            epoch: execution.epoch,
+            generation: execution.generation.wrapping_add(1),
+        };
+        assert!(!first.execution_start_failed(stale));
         assert!(!first.is_cancelled(), "stale failure must be ignored");
-        first.execution_start_failed(generation);
+        assert!(first.execution_start_failed(execution));
         assert!(first.is_cancelled());
         assert!(first.awaiting_command.is_none());
+    }
+
+    #[test]
+    fn queued_llm_reply_cannot_cross_new_task_or_replacement_epoch() {
+        let mut reset = session(10);
+        reset.submit_user("old task").unwrap();
+        let old_epoch = reset.epoch();
+        assert!(reset
+            .apply_llm_reply(
+                old_epoch,
+                Ok(serde_json::json!({"action":"done","message":"old done"}).to_string()),
+            )
+            .unwrap());
+        reset.start_new_task().unwrap();
+        reset.submit_user("new task").unwrap();
+        let reset_transcript = reset.transcript().to_vec();
+        assert!(!reset
+            .apply_llm_reply(old_epoch, Ok(run_reply("touch leaked-from-old-task")))
+            .unwrap());
+        assert_eq!(reset.transcript(), reset_transcript);
+        assert_eq!(reset.state(), AgentState::AwaitingModel);
+
+        let mut old = session(10);
+        old.submit_user("replaced task").unwrap();
+        let replaced_epoch = old.epoch();
+        let mut replacement = session(10);
+        replacement.submit_user("replacement task").unwrap();
+        let replacement_transcript = replacement.transcript().to_vec();
+        assert!(!replacement
+            .apply_llm_reply(
+                replaced_epoch,
+                Ok(run_reply("touch leaked-from-replaced-session")),
+            )
+            .unwrap());
+        assert_eq!(replacement.transcript(), replacement_transcript);
+        assert_eq!(replacement.state(), AgentState::AwaitingModel);
+    }
+
+    #[test]
+    fn old_execution_with_same_command_and_generation_cannot_touch_replacement() {
+        fn armed(command: &str) -> (AgentSession, ProposalId) {
+            let mut session = session(10);
+            session.submit_user("run").unwrap();
+            let ModelOutcome::Proposal { id, .. } =
+                session.accept_model_reply(&run_reply(command)).unwrap()
+            else {
+                panic!("expected proposal");
+            };
+            let _ = session.approve(id).unwrap();
+            (session, id)
+        }
+
+        let (old, _) = armed("true");
+        let old_execution = old.awaiting_command.as_ref().unwrap().execution;
+        let (mut replacement, replacement_id) = armed("true");
+        let replacement_execution = replacement.awaiting_command.as_ref().unwrap().execution;
+
+        assert_eq!(old_execution.generation, replacement_execution.generation);
+        assert_ne!(old_execution.epoch, replacement_execution.epoch);
+        assert_eq!(
+            replacement.correlate_execution(old_execution, "true"),
+            AgentExecutionMatch::Stale,
+            "a stale completion must not resolve by command plus generation"
+        );
+        assert!(!replacement.execution_start_failed(old_execution));
+        assert!(!replacement.is_cancelled());
+        assert_eq!(
+            replacement.correlate_execution(replacement_execution, "true"),
+            AgentExecutionMatch::Matched(replacement_id)
+        );
+        assert_eq!(
+            replacement.state(),
+            AgentState::AwaitingObservation {
+                proposal_id: replacement_id
+            }
+        );
     }
 
     #[test]
