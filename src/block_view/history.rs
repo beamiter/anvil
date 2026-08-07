@@ -3,7 +3,7 @@
 //! The in-memory deque is already bounded and seeded from this file, so saves
 //! replace the file rather than append duplicate records.
 
-use super::{BlockData, TermView};
+use super::{mutate_block_data_and_redraw, BlockData, TermView};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -922,18 +922,23 @@ impl TermView {
         }
 
         let start_index = total_loaded.saturating_sub(recent_blocks.len());
-        let mut blocks = self.block_data.borrow_mut();
-        for (offset, block) in recent_blocks.into_iter().enumerate() {
-            log::debug!(
-                "Loaded historical block #{}: prompt={:?}, cmd={:?}, output_len={}, exit_code={:?}",
-                start_index + offset,
-                block.prompt,
-                block.cmd,
-                block.output.len(),
-                block.exit_code
-            );
-            blocks.push_back(block);
-        }
+        mutate_block_data_and_redraw(
+            &self.block_data,
+            self.failure_marker_redraw.as_ref(),
+            |blocks| {
+                for (offset, block) in recent_blocks.into_iter().enumerate() {
+                    log::debug!(
+                        "Loaded historical block #{}: prompt={:?}, cmd={:?}, output_len={}, exit_code={:?}",
+                        start_index + offset,
+                        block.prompt,
+                        block.cmd,
+                        block.output.len(),
+                        block.exit_code
+                    );
+                    blocks.push_back(block);
+                }
+            },
+        );
         Ok(())
     }
 }

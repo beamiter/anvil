@@ -1,17 +1,21 @@
 //! find — extracted from block_view (mechanical split, no logic changes)
 //!
 //! Find-within-blocks: VTE's native PCRE2 highlighter paints every hit inside
-//! each finished block's command/output VTE; we only track which (block, surface)
-//! each hit belongs to so Next/Prev can step the per-VTE search cursor across
-//! block boundaries. Also hosts the metadata-only filter pass used by the
-//! command palette's failed/slow toggles and by the debug dashboard counts.
+//! each finished block's command/output VTE and the current command's live VTE;
+//! we only track which surface each hit belongs to so Next/Prev can step the
+//! per-VTE search cursor across block boundaries. Also hosts the metadata-only
+//! filter pass used by the command palette's failed/slow toggles and by the
+//! debug dashboard counts.
 
 use gtk::glib;
 use gtk::prelude::*;
 use relm4::gtk;
 use vte4::TerminalExt;
 
-use super::{contains_case_insensitive, replace_finished_block_selection, BlockFilters, TermView};
+use super::{
+    block_status, contains_case_insensitive, replace_finished_block_selection, BlockFilters,
+    BlockStatus, TermView,
+};
 
 /// One hit from a find-within-blocks pass. With VTE-backed blocks the match
 /// position lives inside the VTE itself (highlighted automatically by
@@ -22,6 +26,9 @@ pub(crate) struct FindMatch {
     pub(crate) block_id: u64,
     /// false = command VTE, true = output VTE.
     pub(crate) is_output: bool,
+    /// The hit lives in the live VTE for the command that is still running,
+    /// rather than in a finished block. `block_id` is unused in this case.
+    pub(crate) is_live: bool,
 }
 
 #[derive(Default)]
@@ -59,6 +66,16 @@ fn snippet(line: &str) -> String {
     snippet
 }
 
+/// Only states whose bytes belong to the current command may join the live
+/// search surface. Prompt/editor text must not be counted as command output,
+/// and alt-screen programs own their own interactive viewport.
+fn live_output_is_searchable(state: super::BlockState) -> bool {
+    matches!(
+        state,
+        super::BlockState::CollectingOutput | super::BlockState::PostCommand
+    )
+}
+
 /// Duration-related filters are meaningful only for blocks whose shell
 /// integration reported a duration. Older restored history can legitimately
 /// lack that field; treating `None` as a match made a "slow blocks" jump land
@@ -68,13 +85,22 @@ fn snippet(line: &str) -> String {
 /// `None` is a status the shell never reported, so it satisfies neither: it is
 /// not equal to any code the user filtered for, and it is not a failure this
 /// terminal watched happen.
-fn exit_status_matches(exit_code: Option<i32>, filters: &BlockFilters) -> bool {
+fn exit_status_matches(
+    is_background: bool,
+    exit_code: Option<i32>,
+    filters: &BlockFilters,
+) -> bool {
     if let Some(wanted) = filters.exit_code {
         if exit_code != Some(wanted) {
             return false;
         }
     }
-    if filters.failed_only && exit_code.is_none_or(|code| code == 0) {
+    if filters.failed_only
+        && !matches!(
+            block_status(is_background, exit_code),
+            BlockStatus::Failed(_)
+        )
+    {
         return false;
     }
     true
@@ -107,15 +133,15 @@ fn duration_matches(duration: Option<u64>, filters: &BlockFilters) -> bool {
 // extracted module easier to navigate; production methods continue below.
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::{duration_matches, exit_status_matches, snippet};
-    use crate::block_view::BlockFilters;
+    use super::{duration_matches, exit_status_matches, live_output_is_searchable, snippet};
+    use crate::block_view::{BlockFilters, BlockState};
 
     #[test]
     fn an_unreported_status_matches_neither_exit_filter() {
         let unreported = BlockFilters {
             ..Default::default()
         };
-        assert!(exit_status_matches(None, &unreported));
+        assert!(exit_status_matches(false, None, &unreported));
 
         // "Failed" is a claim about what the shell said, so a block whose status
         // was never reported is not in the failure list.
@@ -123,17 +149,20 @@ mod tests {
             failed_only: true,
             ..Default::default()
         };
-        assert!(!exit_status_matches(None, &failed_only));
-        assert!(!exit_status_matches(Some(0), &failed_only));
-        assert!(exit_status_matches(Some(1), &failed_only));
+        assert!(!exit_status_matches(false, None, &failed_only));
+        assert!(!exit_status_matches(false, Some(0), &failed_only));
+        assert!(exit_status_matches(false, Some(1), &failed_only));
+        // A legacy/synthetic commandless row remains background output even if
+        // it happens to carry a non-zero status.
+        assert!(!exit_status_matches(true, Some(1), &failed_only));
 
         // Nor does it answer to a filter for one specific code, including zero.
         let zero_only = BlockFilters {
             exit_code: Some(0),
             ..Default::default()
         };
-        assert!(!exit_status_matches(None, &zero_only));
-        assert!(exit_status_matches(Some(0), &zero_only));
+        assert!(!exit_status_matches(false, None, &zero_only));
+        assert!(exit_status_matches(false, Some(0), &zero_only));
     }
 
     #[test]
@@ -175,6 +204,21 @@ mod tests {
         assert!(!duration_matches(None, &filters));
         assert!(!duration_matches(Some(999), &filters));
         assert!(duration_matches(Some(1_000), &filters));
+    }
+
+    #[test]
+    fn only_current_command_output_joins_the_live_find_surface() {
+        assert!(live_output_is_searchable(BlockState::CollectingOutput));
+        assert!(live_output_is_searchable(BlockState::PostCommand));
+        for state in [
+            BlockState::Idle,
+            BlockState::CollectingPrompt,
+            BlockState::AwaitingCommand,
+            BlockState::AltScreen,
+            BlockState::RawFallback,
+        ] {
+            assert!(!live_output_is_searchable(state), "{state:?}");
+        }
     }
 }
 
@@ -219,7 +263,7 @@ impl TermView {
                     return false;
                 }
 
-                if !exit_status_matches(b.exit_code, filters) {
+                if !exit_status_matches(b.is_background(), b.exit_code, filters) {
                     return false;
                 }
 
@@ -279,6 +323,7 @@ impl TermView {
                         matches.push(FindMatch {
                             block_id: block.id,
                             is_output: false,
+                            is_live: false,
                         });
                     }
                 }
@@ -289,8 +334,29 @@ impl TermView {
                         matches.push(FindMatch {
                             block_id: block.id,
                             is_output: true,
+                            is_live: false,
                         });
                     }
+                }
+            }
+        }
+
+        // A running command is the last surface in document order, after all
+        // finished blocks. Count from ActiveBlock's bounded raw-output capture
+        // so prompt/editor text is excluded; VTE owns painting and stepping the
+        // matches that are currently visible in its live viewport.
+        if live_output_is_searchable(self.bstate.get()) {
+            let live_text = super::strip_ansi(&self.active.borrow().output_text());
+            let live_count = re.find_iter(&live_text).count();
+            if live_count > 0 {
+                self.active_vte.search_set_regex(Some(&vte_re), 0);
+                self.active_vte.search_set_wrap_around(true);
+                for _ in 0..live_count {
+                    matches.push(FindMatch {
+                        block_id: 0,
+                        is_output: true,
+                        is_live: true,
+                    });
                 }
             }
         }
@@ -343,13 +409,16 @@ impl TermView {
         let Some(fm) = st.matches.get(st.current) else {
             return;
         };
-        let Some(block) = finished.iter().find(|b| b.id == fm.block_id) else {
-            return;
-        };
-        let vte = if fm.is_output {
-            &block.output_vte
+        let vte = if fm.is_live {
+            &self.active_vte
+        } else if let Some(block) = finished.iter().find(|b| b.id == fm.block_id) {
+            if fm.is_output {
+                &block.output_vte
+            } else {
+                &block.command_vte
+            }
         } else {
-            &block.command_vte
+            return;
         };
         if delta >= 0 {
             vte.search_find_next();
@@ -365,13 +434,16 @@ impl TermView {
         let Some(fm) = st.matches.get(st.current) else {
             return;
         };
-        let Some(block) = finished.iter().find(|b| b.id == fm.block_id) else {
-            return;
-        };
-        let vte = if fm.is_output {
-            &block.output_vte
+        let vte = if fm.is_live {
+            &self.active_vte
+        } else if let Some(block) = finished.iter().find(|b| b.id == fm.block_id) {
+            if fm.is_output {
+                &block.output_vte
+            } else {
+                &block.command_vte
+            }
         } else {
-            &block.command_vte
+            return;
         };
         vte.search_find_next();
     }
@@ -382,10 +454,13 @@ impl TermView {
         let Some(fm) = st.matches.get(st.current) else {
             return;
         };
-        let Some(block) = finished.iter().find(|b| b.id == fm.block_id) else {
+        let widget = if fm.is_live {
+            self.active.borrow().widget().clone()
+        } else if let Some(block) = finished.iter().find(|b| b.id == fm.block_id) {
+            block.widget().clone()
+        } else {
             return;
         };
-        let widget = block.widget().clone();
         let scroll = self.block_scroll.clone();
         glib::idle_add_local_once(move || {
             if let Some(point) = widget.compute_point(&scroll, &gtk::graphene::Point::new(0.0, 0.0))
@@ -567,12 +642,13 @@ impl TermView {
                 block.output_vte.search_set_regex(None::<&vte4::Regex>, 0);
             }
         }
+        self.active_vte.search_set_regex(None::<&vte4::Regex>, 0);
         let mut st = self.find_state.borrow_mut();
         st.matches.clear();
         st.current = 0;
     }
 
-    /// Get only failed blocks (exit_code != 0)
+    /// Get only command blocks classified as failed by the shared status model.
     pub fn get_failed_blocks(&self) -> Vec<usize> {
         let filters = BlockFilters {
             failed_only: true,

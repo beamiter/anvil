@@ -251,6 +251,9 @@ pub(crate) fn install_block_css(config: &Config) {
         .block-scroll {{
             background-color: {bg_hex};
         }}
+        .block-failure-markers {{
+            color: rgba({err_r},{err_g},{err_b},0.90);
+        }}
         .block-list {{
             background-color: {bg_hex};
         }}

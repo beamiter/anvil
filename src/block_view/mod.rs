@@ -52,6 +52,58 @@ fn next_block_id() -> u64 {
     BLOCK_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Approximate the vertical positions of failed finished blocks within the
+/// complete scrollback history. The bounded tail caps the number of Cairo marks
+/// for very long sessions while preserving the newest failures, which are
+/// usually the most useful navigation hints. Computing positions still scans
+/// the retained block metadata once.
+fn failed_block_marker_fractions(blocks: &VecDeque<BlockData>) -> Vec<f64> {
+    const MAX_FAILURE_MARKERS: usize = 1024;
+
+    let total_height = blocks.iter().fold(0_u64, |total, block| {
+        total.saturating_add(block.estimated_height.max(1) as u64)
+    });
+    if total_height == 0 {
+        return Vec::new();
+    }
+
+    let mut top = 0_u64;
+    let mut markers = VecDeque::new();
+    for block in blocks {
+        if matches!(
+            block_status(block.is_background(), block.exit_code),
+            BlockStatus::Failed(_)
+        ) {
+            if markers.len() == MAX_FAILURE_MARKERS {
+                markers.pop_front();
+            }
+            markers.push_back((top as f64 / total_height as f64).clamp(0.0, 1.0));
+        }
+        top = top.saturating_add(block.estimated_height.max(1) as u64);
+    }
+
+    markers.into()
+}
+
+type FailureMarkerRedraw = Rc<dyn Fn()>;
+
+/// Mutate the history metadata and schedule its marker overlay only after the
+/// mutable borrow has been released. The draw callback reads the same RefCell,
+/// so keeping this ordering explicit also makes future synchronous redraw
+/// implementations safe.
+fn mutate_block_data_and_redraw<R>(
+    block_data: &RefCell<VecDeque<BlockData>>,
+    redraw: &dyn Fn(),
+    mutate: impl FnOnce(&mut VecDeque<BlockData>) -> R,
+) -> R {
+    let result = {
+        let mut block_data = block_data.borrow_mut();
+        mutate(&mut block_data)
+    };
+    redraw();
+    result
+}
+
 /// Update the jump-to-bottom FAB's label to show an unread-block badge: just the
 /// chevron when nothing is pending, chevron + count (clamped to "99+") otherwise.
 fn set_jump_fab_label(fab: &gtk::Button, unread: u32) {
@@ -1300,6 +1352,9 @@ pub struct TermView {
     dynamic_colors: DynamicColorsRc,
     config: Rc<RefCell<Config>>,
     block_data: Rc<RefCell<VecDeque<BlockData>>>,
+    /// Queue a repaint whenever block metadata changes, even when GTK's scroll
+    /// adjustment geometry happens to remain numerically identical.
+    failure_marker_redraw: FailureMarkerRedraw,
     finished_blocks: Rc<RefCell<Vec<FinishedBlock>>>,
     viewport: Rc<RefCell<ViewportState>>,
     widget_pool: Rc<RefCell<WidgetPool>>,
@@ -1394,6 +1449,7 @@ struct ReaderCtx {
     config_for_cb: Rc<RefCell<Config>>,
     parser: Rc<RefCell<Parser>>,
     block_data_for_cb: Rc<RefCell<VecDeque<BlockData>>>,
+    failure_marker_redraw: FailureMarkerRedraw,
     finished_blocks_for_cb: Rc<RefCell<Vec<FinishedBlock>>>,
     scroll_debouncer: ScrollDebouncer,
     widget_pool_for_cb: Rc<RefCell<WidgetPool>>,
@@ -1574,6 +1630,7 @@ impl ReaderCtx {
             config_for_cb,
             parser,
             block_data_for_cb,
+            failure_marker_redraw,
             finished_blocks_for_cb,
             scroll_debouncer,
             widget_pool_for_cb,
@@ -1886,7 +1943,11 @@ impl ReaderCtx {
                                     cols: cols.clamp(1, u16::MAX as i64) as u16,
                                 };
 
-                                block_data_for_cb.borrow_mut().push_back(block_data);
+                                mutate_block_data_and_redraw(
+                                    &block_data_for_cb,
+                                    failure_marker_redraw.as_ref(),
+                                    |blocks| blocks.push_back(block_data),
+                                );
 
                                 // Drain the kitty-graphics images decoded during
                                 // this command so the finished block mounts them
@@ -2028,6 +2089,8 @@ impl ReaderCtx {
                                 let visible_for_menu = visible_indices_rc.clone();
                                 let widget_pool_for_menu = widget_pool_for_cb.clone();
                                 let ask_ai_cbs_for_menu = ask_ai_about_block_cbs.clone();
+                                let failure_marker_redraw_for_menu =
+                                    failure_marker_redraw.clone();
                                 let block_id = finished_clone.id;
 
                                 let right_click = gtk::GestureClick::new();
@@ -2390,6 +2453,8 @@ impl ReaderCtx {
                                         let bookmarks_for_delete = bookmarks_for_menu.clone();
                                         let visible_for_delete = visible_for_menu.clone();
                                         let widget_pool_for_delete = widget_pool_for_menu.clone();
+                                        let failure_marker_redraw_for_delete =
+                                            failure_marker_redraw_for_menu.clone();
                                         let block_id_del = block_id;
                                         item.connect_clicked(move |_| {
                                             popover_c.popdown();
@@ -2408,7 +2473,13 @@ impl ReaderCtx {
                                                 block_id_del,
                                             );
                                             // Keep block_data in lockstep with the widget list.
-                                            block_data_for_delete.borrow_mut().retain(|b| b.id != block_id_del);
+                                            mutate_block_data_and_redraw(
+                                                &block_data_for_delete,
+                                                failure_marker_redraw_for_delete.as_ref(),
+                                                |blocks| {
+                                                    blocks.retain(|b| b.id != block_id_del)
+                                                },
+                                            );
                                             bookmarks_for_delete.borrow_mut().remove(&block_id_del);
                                             // Index-based virtualization must be recalculated after
                                             // any removal; retaining the old set can hide the block
@@ -2453,7 +2524,11 @@ impl ReaderCtx {
                                 }
 
                                 if block_data_for_cb.borrow().len() > max_blocks {
-                                    block_data_for_cb.borrow_mut().pop_front();
+                                    mutate_block_data_and_redraw(
+                                        &block_data_for_cb,
+                                        failure_marker_redraw.as_ref(),
+                                        VecDeque::pop_front,
+                                    );
                                 }
 
                                 // Keep a small JSONL command index separate from
@@ -3512,6 +3587,63 @@ impl TermView {
             Rc::new(RefCell::new(VecDeque::new()));
         let finished_blocks_rc: Rc<RefCell<Vec<FinishedBlock>>> = Rc::new(RefCell::new(Vec::new()));
 
+        // Paint failures against the full-history track, independently of the
+        // currently visible viewport. This is a visual hint only: the narrow
+        // overlay deliberately cannot intercept pointer events meant for GTK's
+        // scrollbar beneath it.
+        let failure_markers = gtk::DrawingArea::new();
+        failure_markers.add_css_class("block-failure-markers");
+        failure_markers.set_content_width(10);
+        failure_markers.set_hexpand(false);
+        failure_markers.set_vexpand(true);
+        failure_markers.set_halign(gtk::Align::End);
+        failure_markers.set_valign(gtk::Align::Fill);
+        failure_markers.set_can_target(false);
+        {
+            let block_data = block_data_rc.clone();
+            let scroll = block_scroll.downgrade();
+            failure_markers.set_draw_func(move |area, cr, width, height| {
+                let Some(scroll) = scroll.upgrade() else {
+                    return;
+                };
+                let adjustment = scroll.vadjustment();
+                if width <= 0 || height <= 0 || adjustment.upper() <= adjustment.page_size() + 0.5 {
+                    return;
+                }
+
+                let color = area.color();
+                cr.set_source_rgba(
+                    color.red() as f64,
+                    color.green() as f64,
+                    color.blue() as f64,
+                    color.alpha() as f64,
+                );
+                const MARKER_HEIGHT: f64 = 3.0;
+                let span = (f64::from(height) - MARKER_HEIGHT).max(0.0);
+                let marker_width = f64::from(width.min(8));
+                let marker_x = f64::from(width) - marker_width;
+                for fraction in failed_block_marker_fractions(&block_data.borrow()) {
+                    cr.rectangle(marker_x, fraction * span, marker_width, MARKER_HEIGHT);
+                }
+                let _ = cr.fill();
+            });
+        }
+        scroll_overlay.add_overlay(&failure_markers);
+        let failure_marker_redraw: FailureMarkerRedraw = {
+            let failure_markers = failure_markers.downgrade();
+            Rc::new(move || {
+                if let Some(failure_markers) = failure_markers.upgrade() {
+                    failure_markers.queue_draw();
+                }
+            })
+        };
+        {
+            let redraw = failure_marker_redraw.clone();
+            block_scroll.vadjustment().connect_changed(move |_| {
+                redraw();
+            });
+        }
+
         // ── Warp-style input-cell sizing ──────────────────────────────────
         // The live VTE holder hugs its content (prompt + typed command) with a
         // guaranteed minimum height while idle, so finished blocks remain visible
@@ -3527,6 +3659,7 @@ impl TermView {
             let typed_cmd = typed_cmd.clone();
             let finished_for_layout = finished_blocks_rc.clone();
             let block_data_for_layout = block_data_rc.clone();
+            let failure_marker_redraw_for_layout = failure_marker_redraw.clone();
             let config_for_layout = config.clone();
             let last_size_target: Rc<Cell<(i64, i64)>> = Rc::new(Cell::new((0, 0)));
             let last_output_layout: Rc<Cell<(i32, usize)>> = Rc::new(Cell::new((-1, 0)));
@@ -3548,16 +3681,23 @@ impl TermView {
                     }
 
                     let finished = finished_for_layout.borrow();
-                    let mut block_data = block_data_for_layout.borrow_mut();
-                    for block in finished.iter() {
-                        let Some(rows) = block.fit_output_to_height(available) else {
-                            continue;
-                        };
-                        if let Some(data) = block_data.iter_mut().find(|data| data.id == block.id) {
-                            data.estimated_height =
-                                estimated_finished_block_height(&config_for_layout, rows);
-                        }
-                    }
+                    mutate_block_data_and_redraw(
+                        &block_data_for_layout,
+                        failure_marker_redraw_for_layout.as_ref(),
+                        |block_data| {
+                            for block in finished.iter() {
+                                let Some(rows) = block.fit_output_to_height(available) else {
+                                    continue;
+                                };
+                                if let Some(data) =
+                                    block_data.iter_mut().find(|data| data.id == block.id)
+                                {
+                                    data.estimated_height =
+                                        estimated_finished_block_height(&config_for_layout, rows);
+                                }
+                            }
+                        },
+                    );
                 };
                 let cols = vte.column_count().max(1);
                 let state = bstate.get();
@@ -3894,6 +4034,7 @@ impl TermView {
                 config_for_cb,
                 parser,
                 block_data_for_cb,
+                failure_marker_redraw: failure_marker_redraw.clone(),
                 finished_blocks_for_cb,
                 scroll_debouncer,
                 widget_pool_for_cb,
@@ -4505,6 +4646,7 @@ impl TermView {
             dynamic_colors,
             config: Rc::new(RefCell::new(config.clone())),
             block_data: block_data_rc,
+            failure_marker_redraw,
             finished_blocks: finished_blocks_rc,
             viewport: Rc::new(RefCell::new(ViewportState {
                 first_visible: 0,
@@ -4544,58 +4686,63 @@ impl TermView {
         // mid-word). For old saves without a cols field (cols == 0), fall back
         // to the live VTE's current column count.
         {
-            let mut block_data_ref = term_view.block_data.borrow_mut();
             let config = term_view.config.borrow();
             let fallback_cols = term_view.active.borrow().grid_cols() as i64;
-            for block in block_data_ref.iter_mut() {
-                let cols = if block.cols > 0 {
-                    block.cols as i64
-                } else {
-                    fallback_cols
-                };
-                // Older history entries stored an estimate based only on `\n`
-                // count. Recompute it so a restored long wrapped line is not
-                // virtualized away while it is still visible.
-                block.estimated_height =
-                    estimated_finished_block_height_for_text(&config, &block.output, cols);
-                let finished = FinishedBlock::new(
-                    block.id,
-                    &block.prompt,
-                    &block.cmd,
-                    block.cmd_markup.as_deref(),
-                    &block.output,
-                    block.exit_code,
-                    &config,
-                    block.duration_ms,
-                    block.end_time_ms,
-                    block.cwd.as_deref(),
-                    cols,
-                );
-                finished.widget().insert_before(
-                    &term_view.block_list,
-                    Some(term_view.active.borrow().widget()),
-                );
-                finished.connect_actions(
-                    &term_view.active_vte,
-                    &term_view.pty,
-                    &pty_synced,
-                    &term_view.bracketed_paste,
-                    &term_view.typed_cmd,
-                    &term_view.armed_agent_execution,
-                    &term_view.bstate,
-                    &term_view.active,
-                );
-                finished.connect_scroll_forwarding(&term_view.block_scroll);
-                install_finished_block_selection(
-                    &finished,
-                    &term_view.active,
-                    &term_view.finished_blocks,
-                    &term_view.selected_block_ids,
-                    &term_view.selected_block_id,
-                    &term_view.selection_anchor_id,
-                );
-                term_view.finished_blocks.borrow_mut().push(finished);
-            }
+            mutate_block_data_and_redraw(
+                &term_view.block_data,
+                term_view.failure_marker_redraw.as_ref(),
+                |block_data_ref| {
+                    for block in block_data_ref.iter_mut() {
+                        let cols = if block.cols > 0 {
+                            block.cols as i64
+                        } else {
+                            fallback_cols
+                        };
+                        // Older history entries stored an estimate based only on `\n`
+                        // count. Recompute it so a restored long wrapped line is not
+                        // virtualized away while it is still visible.
+                        block.estimated_height =
+                            estimated_finished_block_height_for_text(&config, &block.output, cols);
+                        let finished = FinishedBlock::new(
+                            block.id,
+                            &block.prompt,
+                            &block.cmd,
+                            block.cmd_markup.as_deref(),
+                            &block.output,
+                            block.exit_code,
+                            &config,
+                            block.duration_ms,
+                            block.end_time_ms,
+                            block.cwd.as_deref(),
+                            cols,
+                        );
+                        finished.widget().insert_before(
+                            &term_view.block_list,
+                            Some(term_view.active.borrow().widget()),
+                        );
+                        finished.connect_actions(
+                            &term_view.active_vte,
+                            &term_view.pty,
+                            &pty_synced,
+                            &term_view.bracketed_paste,
+                            &term_view.typed_cmd,
+                            &term_view.armed_agent_execution,
+                            &term_view.bstate,
+                            &term_view.active,
+                        );
+                        finished.connect_scroll_forwarding(&term_view.block_scroll);
+                        install_finished_block_selection(
+                            &finished,
+                            &term_view.active,
+                            &term_view.finished_blocks,
+                            &term_view.selected_block_ids,
+                            &term_view.selected_block_id,
+                            &term_view.selection_anchor_id,
+                        );
+                        term_view.finished_blocks.borrow_mut().push(finished);
+                    }
+                },
+            );
         }
 
         // Initialize viewport and visibility
@@ -5105,7 +5252,11 @@ impl TermView {
         self.clear_find();
         self.active_vte.unselect_all();
 
-        let cleared: Vec<BlockData> = self.block_data.borrow_mut().drain(..).collect();
+        let cleared: Vec<BlockData> = mutate_block_data_and_redraw(
+            &self.block_data,
+            self.failure_marker_redraw.as_ref(),
+            |blocks| blocks.drain(..).collect(),
+        );
         let cleared_count = cleared.len();
         // Keep the previous stash when clearing an already-empty pane, so a
         // reflexive second Ctrl+Shift+K cannot destroy the undo snapshot.
@@ -5236,10 +5387,15 @@ impl TermView {
                 restored.push(finished);
             }
 
-            let mut data = self.block_data.borrow_mut();
-            for block in stash.into_iter().rev() {
-                data.push_front(block);
-            }
+            mutate_block_data_and_redraw(
+                &self.block_data,
+                self.failure_marker_redraw.as_ref(),
+                |data| {
+                    for block in stash.into_iter().rev() {
+                        data.push_front(block);
+                    }
+                },
+            );
         }
         self.finished_blocks.borrow_mut().splice(0..0, restored);
 
@@ -5587,7 +5743,11 @@ impl TermView {
 
         // Keep the serializable record list in lockstep with the widget list;
         // otherwise the two desync and count-based eviction / id lookups drift.
-        self.block_data.borrow_mut().retain(|b| b.id != block_id);
+        mutate_block_data_and_redraw(
+            &self.block_data,
+            self.failure_marker_redraw.as_ref(),
+            |blocks| blocks.retain(|b| b.id != block_id),
+        );
         self.bookmarks.borrow_mut().remove(&block_id);
         // Stored indices no longer identify the same widgets after removal.
         // Recompute them on the next viewport update rather than retaining a
@@ -5651,7 +5811,8 @@ mod tests {
         block_clipboard_text, block_duration_ms, build_clipboard_paste, build_color_query_reply,
         build_command_recall, build_keyboard_query_reply, clear_dynamic_colors,
         coalesce_bytes_events, command_end_matches_agent_execution, command_end_matches_started_id,
-        finished_block_config, finished_command, is_post_command_metadata, notification_permitted,
+        failed_block_marker_fractions, finished_block_config, finished_command,
+        is_post_command_metadata, mutate_block_data_and_redraw, notification_permitted,
         parse_color_spec, pop_typed_command_shadow, record_external_input, resolve_command_text,
         selected_blocks_markdown, selected_command_text, selected_id_range, step_marked_indices,
         stranded_focus_key_recovers, strip_ansi, strip_ansi_with_clear_detect,
@@ -6219,6 +6380,52 @@ mod tests {
             cwd: None,
             cols: 80,
         }
+    }
+
+    #[test]
+    fn failure_markers_follow_weighted_history_positions() {
+        let mut blocks = VecDeque::from([
+            test_block(1, "true", Some(0)),
+            test_block(2, "cargo test", Some(101)),
+            test_block(3, "false", Some(1)),
+        ]);
+        blocks[0].estimated_height = 10;
+        blocks[1].estimated_height = 30;
+        blocks[2].estimated_height = 60;
+
+        assert_eq!(failed_block_marker_fractions(&blocks), vec![0.1, 0.4]);
+    }
+
+    #[test]
+    fn failure_markers_share_block_status_rules_and_keep_a_bounded_tail() {
+        let non_failures = VecDeque::from([
+            // Background output is never a failed command, even if a legacy or
+            // synthetic record happens to carry a non-zero status.
+            test_block(1, "", Some(1)),
+            test_block(2, "status-unreported", None),
+        ]);
+        assert!(failed_block_marker_fractions(&non_failures).is_empty());
+
+        let failures: VecDeque<_> = (0..1025)
+            .map(|id| test_block(id, "false", Some(1)))
+            .collect();
+        let markers = failed_block_marker_fractions(&failures);
+        assert_eq!(markers.len(), 1024);
+        assert!((markers[0] - 1.0 / 1025.0).abs() < f64::EPSILON);
+        assert!((markers[1023] - 1024.0 / 1025.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn block_data_mutation_queues_marker_redraw_after_releasing_the_borrow() {
+        let blocks = RefCell::new(VecDeque::new());
+        let observed_len = Cell::new(0);
+        let redraw = || observed_len.set(blocks.borrow().len());
+
+        mutate_block_data_and_redraw(&blocks, &redraw, |blocks| {
+            blocks.push_back(test_block(1, "false", Some(1)));
+        });
+
+        assert_eq!(observed_len.get(), 1);
     }
 
     #[test]

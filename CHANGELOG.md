@@ -76,6 +76,14 @@ versioning for tagged releases while it remains experimental.
 - Failed-block navigation: "Jump to previous/next failed block" actions step
   through non-zero-exit blocks with wrap-around, mirroring pinned-block
   navigation (`jump_to_prev_failed` / `jump_to_next_failed`).
+- The total-history scrollbar now paints theme-aware failure markers at the
+  approximate positions of failed completed commands, using the same outcome
+  classification as block-card status chrome.
+- Block search now includes output already produced by the command that is
+  still running. Its live VTE joins the same highlighted result sequence after
+  the finished blocks, so next/previous search navigation reaches long-running
+  builds and streaming commands before they finish; closing search clears the
+  live highlight as well.
 - Whole-session export: "Export session as Markdown/JSON file" writes every
   completed block to a timestamped, owner-only file under the anvil data
   directory and reports the path in a toast.
