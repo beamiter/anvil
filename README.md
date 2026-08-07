@@ -206,9 +206,11 @@ Block mode is the default. It keeps a live VTE input cell at the bottom and
 promotes each finished command into a separate block:
 
 The total-history scrollbar adds short theme-red marks at the approximate
-positions of failed completed commands. It uses the same outcome rules as the
-block cards, so background output and commands without a reported status are
-not presented as failures.
+positions of failed completed commands. Block cards, marker/navigation actions,
+and exact-exit filters all use `jterm_core::block_contract` after anvil has
+resolved OSC metadata against its bounded screen capture. Background output —
+even a legacy row carrying a nonzero raw status — and commands without a
+reported status are therefore not presented as failures.
 
 ```toml
 terminal_mode = "block"

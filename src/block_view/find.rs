@@ -12,10 +12,7 @@ use gtk::prelude::*;
 use relm4::gtk;
 use vte4::TerminalExt;
 
-use super::{
-    block_status, contains_case_insensitive, replace_finished_block_selection, BlockFilters,
-    BlockStatus, TermView,
-};
+use super::{contains_case_insensitive, replace_finished_block_selection, BlockFilters, TermView};
 
 /// One hit from a find-within-blocks pass. With VTE-backed blocks the match
 /// position lives inside the VTE itself (highlighted automatically by
@@ -86,21 +83,21 @@ fn live_output_is_searchable(state: super::BlockState) -> bool {
 /// not equal to any code the user filtered for, and it is not a failure this
 /// terminal watched happen.
 fn exit_status_matches(
-    is_background: bool,
-    exit_code: Option<i32>,
+    resolved_command: Option<&str>,
+    reported_exit_code: Option<i32>,
     filters: &BlockFilters,
 ) -> bool {
+    // BlockData owns anvil's already-resolved command (OSC metadata first,
+    // bounded screen scrape second). Classify that value while the exit status
+    // is still an Option, before legacy i32-only surfaces synthesize a zero.
+    let outcome =
+        jterm_core::block_contract::classify_completed(resolved_command, reported_exit_code);
     if let Some(wanted) = filters.exit_code {
-        if exit_code != Some(wanted) {
+        if outcome.reported_exit_code() != Some(wanted) {
             return false;
         }
     }
-    if filters.failed_only
-        && !matches!(
-            block_status(is_background, exit_code),
-            BlockStatus::Failed(_)
-        )
-    {
+    if filters.failed_only && !outcome.is_failed() {
         return false;
     }
     true
@@ -141,7 +138,7 @@ mod tests {
         let unreported = BlockFilters {
             ..Default::default()
         };
-        assert!(exit_status_matches(false, None, &unreported));
+        assert!(exit_status_matches(Some("make"), None, &unreported));
 
         // "Failed" is a claim about what the shell said, so a block whose status
         // was never reported is not in the failure list.
@@ -149,20 +146,27 @@ mod tests {
             failed_only: true,
             ..Default::default()
         };
-        assert!(!exit_status_matches(false, None, &failed_only));
-        assert!(!exit_status_matches(false, Some(0), &failed_only));
-        assert!(exit_status_matches(false, Some(1), &failed_only));
+        assert!(!exit_status_matches(Some("make"), None, &failed_only));
+        assert!(!exit_status_matches(Some("make"), Some(0), &failed_only));
+        assert!(exit_status_matches(Some("make"), Some(1), &failed_only));
         // A legacy/synthetic commandless row remains background output even if
         // it happens to carry a non-zero status.
-        assert!(!exit_status_matches(true, Some(1), &failed_only));
+        assert!(!exit_status_matches(None, Some(1), &failed_only));
 
         // Nor does it answer to a filter for one specific code, including zero.
         let zero_only = BlockFilters {
             exit_code: Some(0),
             ..Default::default()
         };
-        assert!(!exit_status_matches(false, None, &zero_only));
-        assert!(exit_status_matches(false, Some(0), &zero_only));
+        assert!(!exit_status_matches(Some("make"), None, &zero_only));
+        assert!(exit_status_matches(Some("make"), Some(0), &zero_only));
+
+        let one_only = BlockFilters {
+            exit_code: Some(1),
+            ..Default::default()
+        };
+        assert!(exit_status_matches(Some("false"), Some(1), &one_only));
+        assert!(!exit_status_matches(None, Some(1), &one_only));
     }
 
     #[test]
@@ -263,7 +267,7 @@ impl TermView {
                     return false;
                 }
 
-                if !exit_status_matches(b.is_background(), b.exit_code, filters) {
+                if !exit_status_matches(Some(&b.cmd), b.exit_code, filters) {
                     return false;
                 }
 

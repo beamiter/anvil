@@ -70,10 +70,9 @@ fn failed_block_marker_fractions(blocks: &VecDeque<BlockData>) -> Vec<f64> {
     let mut top = 0_u64;
     let mut markers = VecDeque::new();
     for block in blocks {
-        if matches!(
-            block_status(block.is_background(), block.exit_code),
-            BlockStatus::Failed(_)
-        ) {
+        if jterm_core::block_contract::classify_completed(Some(&block.cmd), block.exit_code)
+            .is_failed()
+        {
             if markers.len() == MAX_FAILURE_MARKERS {
                 markers.pop_front();
             }

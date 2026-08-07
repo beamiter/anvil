@@ -129,12 +129,21 @@ pub(crate) enum BlockStatus {
     Unreported,
 }
 
-pub(crate) fn block_status(is_background: bool, exit_code: Option<i32>) -> BlockStatus {
-    match (is_background, exit_code) {
-        (true, _) => BlockStatus::Background,
-        (false, Some(0)) => BlockStatus::Succeeded,
-        (false, Some(code)) => BlockStatus::Failed(code),
-        (false, None) => BlockStatus::Unreported,
+/// Translate the shared completed-block contract into anvil's renderer-owned
+/// status. `resolved_command` is the final block text after OSC metadata and
+/// screen-capture fallback; raw [`crate::parser::CommandMeta::command`] must not
+/// be passed here on its own.
+pub(crate) fn block_status(
+    resolved_command: Option<&str>,
+    reported_exit_code: Option<i32>,
+) -> BlockStatus {
+    use jterm_core::block_contract::{classify_completed, CompletedBlockOutcome};
+
+    match classify_completed(resolved_command, reported_exit_code) {
+        CompletedBlockOutcome::Background => BlockStatus::Background,
+        CompletedBlockOutcome::Success => BlockStatus::Succeeded,
+        CompletedBlockOutcome::Failed(code) => BlockStatus::Failed(code),
+        CompletedBlockOutcome::Unknown => BlockStatus::Unreported,
     }
 }
 
@@ -644,33 +653,38 @@ mod tests {
 
     #[test]
     fn an_unreported_status_never_becomes_a_zero() {
-        assert_eq!(block_status(false, None), BlockStatus::Unreported);
-        assert_eq!(block_status(false, Some(0)), BlockStatus::Succeeded);
-        assert_eq!(block_status(false, Some(130)), BlockStatus::Failed(130));
-        assert_eq!(block_status(true, None), BlockStatus::Background);
+        assert_eq!(block_status(Some("make"), None), BlockStatus::Unreported);
+        assert_eq!(block_status(Some("make"), Some(0)), BlockStatus::Succeeded);
+        assert_eq!(
+            block_status(Some("make"), Some(130)),
+            BlockStatus::Failed(130)
+        );
+        assert_eq!(block_status(None, None), BlockStatus::Background);
         // Background output never was a command, so its absent status is not a
         // "the shell said nothing" case.
-        assert_eq!(block_status(true, Some(0)), BlockStatus::Background);
+        assert_eq!(block_status(Some(" \t"), Some(7)), BlockStatus::Background);
 
         // A number nobody reported cannot be shown, so no badge is rendered.
-        assert_eq!(block_status(false, None).exit_badge(), None);
+        assert_eq!(block_status(Some("make"), None).exit_badge(), None);
         assert_eq!(
-            block_status(false, Some(130)).exit_badge().as_deref(),
+            block_status(Some("make"), Some(130))
+                .exit_badge()
+                .as_deref(),
             Some("exit:130")
         );
-        assert_eq!(block_status(false, Some(0)).exit_badge(), None);
+        assert_eq!(block_status(Some("make"), Some(0)).exit_badge(), None);
         // The one state a check or a cross cannot explain gets a tooltip.
-        assert!(block_status(false, None).icon_tooltip().is_some());
-        assert!(block_status(false, Some(0)).icon_tooltip().is_none());
+        assert!(block_status(Some("make"), None).icon_tooltip().is_some());
+        assert!(block_status(Some("make"), Some(0)).icon_tooltip().is_none());
         // And it is not drawn as either a success or a failure.
         for reported in [Some(0), Some(1)] {
             assert_ne!(
-                block_status(false, None).stripe_class(),
-                block_status(false, reported).stripe_class()
+                block_status(Some("make"), None).stripe_class(),
+                block_status(Some("make"), reported).stripe_class()
             );
             assert_ne!(
-                block_status(false, None).icon(),
-                block_status(false, reported).icon()
+                block_status(Some("make"), None).icon(),
+                block_status(Some("make"), reported).icon()
             );
         }
     }
@@ -1061,7 +1075,7 @@ impl FinishedBlock {
         // Status stripe: green on success, red on failure, cyan for output
         // emitted while the shell prompt was idle (Warp background blocks),
         // neutral when the shell never reported a status.
-        let status = block_status(is_background, exit_code);
+        let status = block_status(Some(cmd), exit_code);
         outer.add_css_class(status.stripe_class());
 
         // Add hover highlighting to show block is interactive (and reveal the

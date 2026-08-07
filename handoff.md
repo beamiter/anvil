@@ -10,6 +10,15 @@ than wrapped, and workspace snapshots decode under their own budgets.
 
 ## Completed since the previous handoff
 
+- Completed block outcome now delegates to the pinned
+  `jterm_core::block_contract` after `resolve_command_text` has combined OSC 133
+  metadata with the bounded screen fallback. Renderer-owned `BlockStatus` and
+  persisted records remain local, while cards, failure markers/navigation, and
+  exact-exit filters share the core four-way result. Classification consumes the
+  raw `Option<i32>` before the legacy i32-only history/notification/Agent
+  adapters synthesize a value, so commandless output carrying a stray nonzero
+  status cannot enter a failure or exact-exit result.
+
 - `[[remote_hosts]]` gained `deploy` ("off" by default, "persist", or
   "incognito"). With it on, a remote tab runs `jterm_core::jsh_remote`'s vendored
   `jsh-remote.sh`, which places a verified static jsh on the destination for the
