@@ -27,11 +27,16 @@
             cargoLock = {
               lockFile = ./Cargo.lock;
               # Git dependencies are not covered by Cargo.lock checksums, so
-              # Nix needs an explicit hash per revision. Update these whenever
-              # the jagent / jterm_core pins in Cargo.lock change.
+              # Nix needs an explicit hash per revision. A jterm_core repin can
+              # also move its transitive jagent pin: compare both source lines
+              # in Cargo.lock, set each affected value to pkgs.lib.fakeHash,
+              # then run `nix flake check --no-write-lock-file` and copy `got:`.
+              # Full revisions beside the hashes make a stale repin conspicuous.
               outputHashes = {
-                "jagent-0.5.0" = "sha256-N1k8LbpYwkbPVQjHNCjZ+k002m/zAV0eqwFs3vapLbc=";
-                "jterm_core-0.1.0" = "sha256-X9sKoTBgeZl/HCapTrmUOZc/Q1DqQCHp90xWhNyyMZE=";
+                # e94469b3b0b706100cfda91ea80281dbbfe6fe6b
+                "jagent-0.5.0" = "sha256-UuHxaZTR9gQB27E2d2iyjCaICBADmecC6E/GNyvCJIE=";
+                # 468b1b5f83c14c53fded02715ccb4bb2a721855d
+                "jterm_core-0.1.0" = "sha256-zMCTbpuMSOXN3b3yNzBEV2FxIYkFmoDIFVzL7AJNuLw=";
               };
             };
             strictDeps = true;
