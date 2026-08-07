@@ -6,16 +6,19 @@
 
 use super::*;
 
+/// GTK keeps per-container focus history across child removal. Clear the root
+/// while the leaf still belongs to its old tree so a later focus traversal
+/// cannot jump back to a widget that was reparented elsewhere.
+fn clear_root_focus_before_reparent(widget: &gtk::Widget) {
+    if let Some(root) = widget.root() {
+        root.set_focus(None::<&gtk::Widget>);
+    }
+}
+
 /// Detach one terminal leaf, remove its immediate split, and promote the sibling
 /// into the validated grandparent slot. Validation happens before mutation so a
 /// malformed widget tree cannot leave the model and GTK hierarchy out of sync.
 fn detach_leaf_and_promote(holder: &gtk::Box, leaf: &gtk::Widget) -> Option<gtk::Widget> {
-    enum Destination {
-        PanedStart(gtk::Paned),
-        PanedEnd(gtk::Paned),
-        Holder,
-    }
-
     let parent = leaf.parent()?.downcast::<gtk::Paned>().ok()?;
     let start = parent.start_child();
     let end = parent.end_child();
@@ -28,33 +31,114 @@ fn detach_leaf_and_promote(holder: &gtk::Box, leaf: &gtk::Widget) -> Option<gtk:
     };
 
     let parent_widget = parent.clone().upcast::<gtk::Widget>();
-    let grandparent = parent_widget.parent()?;
-    let holder_widget = holder.clone().upcast::<gtk::Widget>();
-    let destination = if grandparent == holder_widget {
-        Destination::Holder
-    } else if let Ok(grandparent) = grandparent.downcast::<gtk::Paned>() {
-        if grandparent.start_child().as_ref() == Some(&parent_widget) {
-            Destination::PanedStart(grandparent)
-        } else if grandparent.end_child().as_ref() == Some(&parent_widget) {
-            Destination::PanedEnd(grandparent)
-        } else {
-            return None;
-        }
-    } else {
-        return None;
-    };
+    // Validate the collapsing split through the exact holder boundary before
+    // touching either child. Checking only its immediate grandparent lets a
+    // model leaf that was accidentally attached under another tab mutate that
+    // foreign tree and then be removed from the model that did not own it.
+    let destination = LeafSlot::of(holder, &parent_widget)?;
 
+    clear_root_focus_before_reparent(leaf);
     parent.set_start_child(None::<&gtk::Widget>);
     parent.set_end_child(None::<&gtk::Widget>);
     match destination {
-        Destination::PanedStart(grandparent) => grandparent.set_start_child(Some(&sibling)),
-        Destination::PanedEnd(grandparent) => grandparent.set_end_child(Some(&sibling)),
-        Destination::Holder => {
+        LeafSlot::PanedStart(grandparent) => grandparent.set_start_child(Some(&sibling)),
+        LeafSlot::PanedEnd(grandparent) => grandparent.set_end_child(Some(&sibling)),
+        LeafSlot::Holder(holder) => {
             holder.remove(&parent_widget);
             holder.append(&sibling);
         }
     }
     Some(sibling)
+}
+
+/// Validated location of a pane leaf in one tab's widget tree. Resolve this
+/// before detaching a source session so malformed GTK ancestry remains a
+/// no-op instead of leaving the two ownership representations half-mutated.
+enum LeafSlot {
+    PanedStart(gtk::Paned),
+    PanedEnd(gtk::Paned),
+    Holder(gtk::Box),
+}
+
+impl LeafSlot {
+    fn of(holder: &gtk::Box, leaf: &gtk::Widget) -> Option<Self> {
+        let parent = leaf.parent()?;
+        let holder_widget = holder.clone().upcast::<gtk::Widget>();
+        if parent == holder_widget {
+            return (holder.first_child().as_ref() == Some(leaf) && leaf.next_sibling().is_none())
+                .then(|| Self::Holder(holder.clone()));
+        }
+        let paned = parent.downcast::<gtk::Paned>().ok()?;
+        let slot = if paned.start_child().as_ref() == Some(leaf) {
+            Self::PanedStart(paned.clone())
+        } else if paned.end_child().as_ref() == Some(leaf) {
+            Self::PanedEnd(paned.clone())
+        } else {
+            return None;
+        };
+
+        // The immediate Paned slot is not sufficient: a stale pane can still
+        // be attached to an entirely different tree. Walk every ancestor edge
+        // and require the target holder's sole child to be the exact root.
+        let mut child = paned.upcast::<gtk::Widget>();
+        loop {
+            let ancestor = child.parent()?;
+            if ancestor == holder_widget {
+                return (holder.first_child().as_ref() == Some(&child)
+                    && child.next_sibling().is_none())
+                .then_some(slot);
+            }
+            let ancestor = ancestor.downcast::<gtk::Paned>().ok()?;
+            if ancestor.start_child().as_ref() != Some(&child)
+                && ancestor.end_child().as_ref() != Some(&child)
+            {
+                return None;
+            }
+            child = ancestor.upcast();
+        }
+    }
+
+    fn replace_with_split(
+        self,
+        target: &gtk::Widget,
+        moved: &gtk::Widget,
+        edge: pane_header::PaneDropEdge,
+    ) {
+        let orientation = match edge {
+            pane_header::PaneDropEdge::Left | pane_header::PaneDropEdge::Right => {
+                gtk::Orientation::Horizontal
+            }
+            pane_header::PaneDropEdge::Top | pane_header::PaneDropEdge::Bottom => {
+                gtk::Orientation::Vertical
+            }
+        };
+        let moved_first = matches!(
+            edge,
+            pane_header::PaneDropEdge::Left | pane_header::PaneDropEdge::Top
+        );
+        let paned = gtk::Paned::new(orientation);
+        paned.set_hexpand(true);
+        paned.set_vexpand(true);
+
+        clear_root_focus_before_reparent(target);
+        match &self {
+            Self::PanedStart(parent) => parent.set_start_child(None::<&gtk::Widget>),
+            Self::PanedEnd(parent) => parent.set_end_child(None::<&gtk::Widget>),
+            Self::Holder(holder) => holder.remove(target),
+        }
+        if moved_first {
+            paned.set_start_child(Some(moved));
+            paned.set_end_child(Some(target));
+        } else {
+            paned.set_start_child(Some(target));
+            paned.set_end_child(Some(moved));
+        }
+        match self {
+            Self::PanedStart(parent) => parent.set_start_child(Some(&paned)),
+            Self::PanedEnd(parent) => parent.set_end_child(Some(&paned)),
+            Self::Holder(holder) => holder.append(&paned),
+        }
+    }
 }
 
 /// Pane indices in visual order: depth-first through the `Paned` tree, start
@@ -152,6 +236,171 @@ fn active_index_after_remove(active: usize, removed: usize, remaining: usize) ->
     }
 }
 
+/// Resolve a tab reorder without allowing either side of the pinned prefix to
+/// cross the boundary. `requested` is the target's index before source
+/// removal, matching the tab-row drop contract.
+fn pinned_reorder_destination(pinned: &[bool], from: usize, requested: usize) -> Option<usize> {
+    if pinned.len() < 2 || from >= pinned.len() {
+        return None;
+    }
+    let requested = requested.min(pinned.len() - 1);
+    if from == requested {
+        return None;
+    }
+    let moved_is_pinned = pinned[from];
+    let pinned_boundary = pinned
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != from)
+        .take_while(|(_, is_pinned)| **is_pinned)
+        .count();
+    let destination = if moved_is_pinned {
+        requested.min(pinned_boundary)
+    } else {
+        requested.max(pinned_boundary)
+    };
+    (destination != from).then_some(destination)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DropTabIdentity {
+    id: u64,
+    pane_ids: Vec<u64>,
+    zoomed: bool,
+    remote_pane_id: Option<u64>,
+    remote_status: Option<ConnStatus>,
+}
+
+impl DropTabIdentity {
+    fn from_tab(tab: &Tab) -> Self {
+        Self {
+            id: tab.id,
+            pane_ids: tab.panes.iter().map(|pane| pane.id).collect(),
+            zoomed: tab.zoom.is_some(),
+            remote_pane_id: tab.remote.as_ref().map(|remote| remote.pane_id),
+            remote_status: tab.remote.as_ref().map(|remote| remote.status),
+        }
+    }
+}
+
+fn tab_drop_preview_is_valid(
+    tabs: &[DropTabIdentity],
+    source_tab_id: u64,
+    target_tab_id: u64,
+) -> bool {
+    let Some(source) = tabs.iter().find(|tab| tab.id == source_tab_id) else {
+        return false;
+    };
+    let Some(target) = tabs.iter().find(|tab| tab.id == target_tab_id) else {
+        return false;
+    };
+    source.id != target.id
+        && source.pane_ids.len() == 1
+        && !source.zoomed
+        && !target.zoomed
+        && source.remote_status != Some(ConnStatus::Disconnected)
+        && target.remote_status != Some(ConnStatus::Disconnected)
+        && !(source.remote_pane_id.is_some() && target.remote_pane_id.is_some())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TabIntoPanePlan {
+    source_tab_id: u64,
+    moved_pane_id: u64,
+    target_tab_id: u64,
+    target_pane_id: u64,
+    moves_remote: bool,
+}
+
+fn plan_tab_into_pane(
+    tabs: &[DropTabIdentity],
+    source_tab_id: u64,
+    target_pane_id: u64,
+) -> Option<TabIntoPanePlan> {
+    let source = tabs.iter().find(|tab| tab.id == source_tab_id)?;
+    let target = tabs
+        .iter()
+        .find(|tab| tab.pane_ids.contains(&target_pane_id))?;
+    let [moved_pane_id] = source.pane_ids.as_slice() else {
+        return None;
+    };
+    if source.id == target.id
+        || source.zoomed
+        || target.zoomed
+        || source
+            .remote_pane_id
+            .is_some_and(|pane_id| pane_id != *moved_pane_id)
+        || target
+            .remote_pane_id
+            .is_some_and(|pane_id| !target.pane_ids.contains(&pane_id))
+        || source.remote_status.is_some() != source.remote_pane_id.is_some()
+        || target.remote_status.is_some() != target.remote_pane_id.is_some()
+        || source.remote_status == Some(ConnStatus::Disconnected)
+        || target.remote_status == Some(ConnStatus::Disconnected)
+        || (source.remote_pane_id.is_some() && target.remote_pane_id.is_some())
+    {
+        return None;
+    }
+    Some(TabIntoPanePlan {
+        source_tab_id,
+        moved_pane_id: *moved_pane_id,
+        target_tab_id: target.id,
+        target_pane_id,
+        moves_remote: source.remote_pane_id.is_some(),
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PaneIntoTabPlan {
+    source_tab_id: u64,
+    pane_id: u64,
+    anchor_tab_id: Option<u64>,
+    after: bool,
+    moves_remote: bool,
+}
+
+fn plan_pane_into_tab(
+    tabs: &[DropTabIdentity],
+    pane_id: u64,
+    anchor_tab_id: Option<u64>,
+    after: bool,
+) -> Option<PaneIntoTabPlan> {
+    let source = tabs.iter().find(|tab| tab.pane_ids.contains(&pane_id))?;
+    if source.pane_ids.len() <= 1
+        || source.zoomed
+        || source
+            .remote_pane_id
+            .is_some_and(|remote| !source.pane_ids.contains(&remote))
+    {
+        return None;
+    }
+    if let Some(anchor) = anchor_tab_id {
+        if anchor == source.id || !tabs.iter().any(|tab| tab.id == anchor) {
+            return None;
+        }
+    }
+    Some(PaneIntoTabPlan {
+        source_tab_id: source.id,
+        pane_id,
+        anchor_tab_id,
+        after,
+        moves_remote: source.remote_pane_id == Some(pane_id),
+    })
+}
+
+fn automatic_tab_title(tab: &Tab, index: usize) -> Option<String> {
+    if tab.custom_title {
+        return None;
+    }
+    let pane = tab.panes.get(tab.active_pane)?;
+    Some(
+        pane.title
+            .clone()
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| default_tab_title(index as u32 + 1, pane.cwd.as_deref())),
+    )
+}
+
 fn restored_leaf_mode(configured: TerminalMode, remote_integrated: bool) -> TerminalMode {
     if remote_integrated {
         TerminalMode::Block
@@ -210,6 +459,11 @@ fn running_process_summary_for_tabs<'a>(tabs: impl IntoIterator<Item = &'a Tab>)
 }
 
 impl AppModel {
+    pub(crate) fn can_preview_tab_drop(&self, source_tab_id: u64, target_tab_id: u64) -> bool {
+        let identities: Vec<_> = self.tabs.iter().map(DropTabIdentity::from_tab).collect();
+        tab_drop_preview_is_valid(&identities, source_tab_id, target_tab_id)
+    }
+
     pub(crate) fn add_tab(
         &mut self,
         initial_commands: Option<String>,
@@ -1208,6 +1462,84 @@ impl AppModel {
         self.refresh_pane_headers(ti);
     }
 
+    /// Move an ordinary one-pane tab into another tab as a directional split.
+    /// All identities and both GTK ancestry slots are validated before the
+    /// source holder is detached, so an illegal or stale drop is a no-op.
+    pub(crate) fn move_tab_to_pane(
+        &mut self,
+        source_tab_id: u64,
+        target_pane_id: u64,
+        edge: pane_header::PaneDropEdge,
+        sender: &ComponentSender<AppModel>,
+    ) {
+        let identities: Vec<_> = self.tabs.iter().map(DropTabIdentity::from_tab).collect();
+        let Some(plan) = plan_tab_into_pane(&identities, source_tab_id, target_pane_id) else {
+            return;
+        };
+        let (Some(source_index), Some((target_index, target_pane_index))) = (
+            self.index_of(plan.source_tab_id),
+            self.find_pane(plan.target_pane_id),
+        ) else {
+            return;
+        };
+        if self.tabs[target_index].id != plan.target_tab_id {
+            return;
+        }
+
+        let source_widget = self.tabs[source_index].panes[0].widget();
+        let source_holder = self.tabs[source_index].holder.clone();
+        if source_widget.parent().as_ref() != Some(&source_holder.clone().upcast::<gtk::Widget>())
+            || source_holder.first_child().as_ref() != Some(&source_widget)
+            || source_widget.next_sibling().is_some()
+        {
+            return;
+        }
+        let target_widget = self.tabs[target_index].panes[target_pane_index].widget();
+        let Some(target_slot) = LeafSlot::of(&self.tabs[target_index].holder, &target_widget)
+        else {
+            return;
+        };
+
+        clear_root_focus_before_reparent(&source_widget);
+        let mut source_tab = self.tabs.remove(source_index);
+        self.stack.remove(&source_tab.holder);
+        source_tab.holder.remove(&source_widget);
+        let moved = source_tab
+            .panes
+            .pop()
+            .expect("validated ordinary tab owns exactly one pane");
+        debug_assert_eq!(moved.id, plan.moved_pane_id);
+        let moved_remote = plan
+            .moves_remote
+            .then(|| source_tab.remote.take())
+            .flatten();
+        let moved_widget = moved.widget();
+        drop(source_tab);
+
+        target_slot.replace_with_split(&target_widget, &moved_widget, edge);
+        let Some(target_index) = self.index_of(plan.target_tab_id) else {
+            unreachable!("validated target tab remains after removing a different source tab");
+        };
+        {
+            let target = &mut self.tabs[target_index];
+            if let Some(remote) = moved_remote {
+                debug_assert!(target.remote.is_none());
+                target.remote = Some(remote);
+            }
+            target.panes.push(moved);
+            target.active_pane = target.panes.len() - 1;
+        }
+        if let Some(title) = automatic_tab_title(&self.tabs[target_index], target_index) {
+            self.tabs[target_index].title = title;
+        }
+        if let Some(session) = self.active_agent.borrow_mut().as_mut() {
+            if session.bound_pane == plan.moved_pane_id {
+                session.bound_tab = plan.target_tab_id;
+            }
+        }
+        self.select_tab(plan.target_tab_id, sender);
+    }
+
     /// Foreground processes running in a tab's panes, formatted for one
     /// confirmation dialog. Ordinary shells are omitted by the PTY probe.
     pub(crate) fn tab_running_process_summary(&self, idx: usize) -> Option<String> {
@@ -1251,10 +1583,10 @@ impl AppModel {
         let Some(from) = self.index_of(src_id) else {
             return;
         };
-        let to = to_idx.min(self.tabs.len().saturating_sub(1));
-        if from == to {
+        let pinned: Vec<_> = self.tabs.iter().map(|tab| tab.pinned).collect();
+        let Some(to) = pinned_reorder_destination(&pinned, from, to_idx) else {
             return;
-        }
+        };
         let active_id = self.tabs.get(self.active).map(|t| t.id);
         let tab = self.tabs.remove(from);
         self.tabs.insert(to, tab);
@@ -1284,9 +1616,10 @@ impl AppModel {
         if to < 0 || to >= self.tabs.len() as i32 {
             return;
         }
-        self.tabs.swap(from as usize, to as usize);
-        self.active = to as usize;
-        self.rebuild_tab_strip(sender);
+        let Some(id) = self.tabs.get(self.active).map(|tab| tab.id) else {
+            return;
+        };
+        self.reorder_tab(id, to as usize, sender);
     }
 
     /// Open a new tab inheriting the active tab's mode, cwd and (custom) title.
@@ -1663,29 +1996,46 @@ impl AppModel {
 
     /// Detach the active pane from a split tab and host it in a brand-new tab.
     pub(crate) fn move_pane_to_new_tab(&mut self, sender: &ComponentSender<AppModel>) {
-        let (ti, pi, pane_id, moves_remote) = {
-            let Some(tab) = self.tabs.get(self.active) else {
-                return;
-            };
-            if tab.panes.len() <= 1 || tab.zoom.is_some() {
-                return;
-            }
-            let pane_id = tab.panes[tab.active_pane].id;
-            (
-                self.active,
-                tab.active_pane,
-                pane_id,
-                tab.remote
-                    .as_ref()
-                    .is_some_and(|conn| conn.pane_id == pane_id),
-            )
+        let Some(pane_id) = self
+            .tabs
+            .get(self.active)
+            .and_then(|tab| tab.panes.get(tab.active_pane))
+            .map(|pane| pane.id)
+        else {
+            return;
         };
-        let Some(moved) = self.detach_pane_from_tab(ti, pi) else {
+        self.promote_pane_to_tab(pane_id, None, true, sender);
+    }
+
+    /// Promote any stable pane id from a split into a new ordinary tab. A row
+    /// drop can anchor the insertion beside another stable tab id; blank tab
+    /// bar space inserts beside the source tab.
+    pub(crate) fn promote_pane_to_tab(
+        &mut self,
+        pane_id: u64,
+        anchor_tab_id: Option<u64>,
+        after: bool,
+        sender: &ComponentSender<AppModel>,
+    ) {
+        let identities: Vec<_> = self.tabs.iter().map(DropTabIdentity::from_tab).collect();
+        let Some(plan) = plan_pane_into_tab(&identities, pane_id, anchor_tab_id, after) else {
+            return;
+        };
+        let Some((source_index, pane_index)) = self.find_pane(plan.pane_id) else {
+            return;
+        };
+        if self.tabs[source_index].id != plan.source_tab_id {
+            return;
+        }
+        let Some(moved) = self.detach_pane_from_tab(source_index, pane_index) else {
             log::error!("Failed to detach pane {pane_id} into a new tab");
             return;
         };
 
-        let remote = moves_remote.then(|| self.tabs[ti].remote.take()).flatten();
+        let remote = plan
+            .moves_remote
+            .then(|| self.tabs[source_index].remote.take())
+            .flatten();
         let new_id = self.next_id;
         self.next_id += 1;
         let mw = moved.widget();
@@ -1714,14 +2064,34 @@ impl AppModel {
             remote,
         };
         if let Some(session) = self.active_agent.borrow_mut().as_mut() {
-            if session.bound_pane == pane_id {
+            if session.bound_pane == plan.pane_id {
                 session.bound_tab = new_id;
             }
         }
-        self.insert_tab_after_active(new_tab);
+        let insert_at = match plan.anchor_tab_id {
+            Some(anchor_id) => {
+                let Some(anchor_index) = self.index_of(anchor_id) else {
+                    unreachable!("validated tab-row anchor remains during pane detach");
+                };
+                anchor_index + usize::from(plan.after)
+            }
+            None => {
+                let Some(source_index) = self.index_of(plan.source_tab_id) else {
+                    unreachable!("detaching a non-final pane keeps its source tab");
+                };
+                source_index + 1
+            }
+        }
+        .min(self.tabs.len());
+        self.tabs.insert(insert_at, new_tab);
         // The source tab lost a pane and may be back to one; `select_tab`
         // below only refreshes the destination.
-        self.refresh_pane_headers(ti);
+        if let Some(source_index) = self.index_of(plan.source_tab_id) {
+            if let Some(title) = automatic_tab_title(&self.tabs[source_index], source_index) {
+                self.tabs[source_index].title = title;
+            }
+            self.refresh_pane_headers(source_index);
+        }
         self.select_tab(new_id, sender);
     }
 
@@ -1756,11 +2126,340 @@ fn reconnect_target_is_valid(
 #[cfg(test)]
 mod pane_tree_tests {
     use super::{
-        abbreviate_prefix, active_index_after_remove, format_running_process_summary,
-        pane_header_title, reconnect_target_is_valid, replay_argv_for_unmanaged_leaf,
-        restored_leaf_mode, snapshot_restorable_command,
+        abbreviate_prefix, active_index_after_remove, detach_leaf_and_promote,
+        format_running_process_summary, pane_header_title, pinned_reorder_destination,
+        plan_pane_into_tab, plan_tab_into_pane, reconnect_target_is_valid,
+        replay_argv_for_unmanaged_leaf, restored_leaf_mode, snapshot_restorable_command,
+        tab_drop_preview_is_valid, DropTabIdentity, LeafSlot, PaneIntoTabPlan, TabIntoPanePlan,
     };
     use crate::config::TerminalMode;
+    use crate::workspace::ConnStatus;
+    use relm4::gtk;
+    use relm4::gtk::prelude::*;
+
+    fn drop_tab(
+        id: u64,
+        pane_ids: &[u64],
+        zoomed: bool,
+        remote_pane_id: Option<u64>,
+    ) -> DropTabIdentity {
+        drop_tab_with_status(
+            id,
+            pane_ids,
+            zoomed,
+            remote_pane_id,
+            remote_pane_id.map(|_| ConnStatus::Connected),
+        )
+    }
+
+    fn drop_tab_with_status(
+        id: u64,
+        pane_ids: &[u64],
+        zoomed: bool,
+        remote_pane_id: Option<u64>,
+        remote_status: Option<ConnStatus>,
+    ) -> DropTabIdentity {
+        DropTabIdentity {
+            id,
+            pane_ids: pane_ids.to_vec(),
+            zoomed,
+            remote_pane_id,
+            remote_status,
+        }
+    }
+
+    #[test]
+    fn ordinary_tab_drop_plan_keeps_stable_ids_across_index_shift() {
+        let mut tabs = vec![
+            drop_tab(10, &[100], false, None),
+            drop_tab(20, &[200, 201], false, None),
+            drop_tab(30, &[300], false, None),
+        ];
+        let plan = plan_tab_into_pane(&tabs, 10, 201).unwrap();
+        assert_eq!(
+            plan,
+            TabIntoPanePlan {
+                source_tab_id: 10,
+                moved_pane_id: 100,
+                target_tab_id: 20,
+                target_pane_id: 201,
+                moves_remote: false,
+            }
+        );
+
+        // Removing the source shifts the target's index, but not anything the
+        // mutation plan carries across the GTK reparenting boundary.
+        tabs.remove(0);
+        assert_eq!(
+            tabs.iter().position(|tab| tab.id == plan.target_tab_id),
+            Some(0)
+        );
+        assert!(tabs[0].pane_ids.contains(&plan.target_pane_id));
+    }
+
+    #[test]
+    fn tab_drop_planner_rejects_self_multi_pane_zoom_and_remote_conflicts() {
+        let base = vec![
+            drop_tab(10, &[100], false, None),
+            drop_tab(20, &[200, 201], false, None),
+        ];
+        assert!(plan_tab_into_pane(&base, 10, 100).is_none());
+        assert!(plan_tab_into_pane(&base, 20, 100).is_none());
+
+        let mut zoomed = base.clone();
+        zoomed[1].zoomed = true;
+        assert!(plan_tab_into_pane(&zoomed, 10, 200).is_none());
+
+        let both_remote = vec![
+            drop_tab(10, &[100], false, Some(100)),
+            drop_tab(20, &[200], false, Some(200)),
+        ];
+        assert!(plan_tab_into_pane(&both_remote, 10, 200).is_none());
+        assert_eq!(both_remote[0].pane_ids, vec![100]);
+        assert_eq!(both_remote[1].pane_ids, vec![200]);
+    }
+
+    #[test]
+    fn remote_ordinary_tab_moves_only_when_target_can_own_its_connection() {
+        let tabs = vec![
+            drop_tab(10, &[100], false, Some(100)),
+            drop_tab(20, &[200], false, None),
+        ];
+        assert_eq!(
+            plan_tab_into_pane(&tabs, 10, 200),
+            Some(TabIntoPanePlan {
+                source_tab_id: 10,
+                moved_pane_id: 100,
+                target_tab_id: 20,
+                target_pane_id: 200,
+                moves_remote: true,
+            })
+        );
+    }
+
+    #[test]
+    fn tab_drop_rejects_a_remote_reconnect_countdown_on_either_side() {
+        let disconnected_source = vec![
+            drop_tab_with_status(10, &[100], false, Some(100), Some(ConnStatus::Disconnected)),
+            drop_tab(20, &[200], false, None),
+        ];
+        assert!(plan_tab_into_pane(&disconnected_source, 10, 200).is_none());
+
+        let disconnected_target = vec![
+            drop_tab(10, &[100], false, None),
+            drop_tab_with_status(20, &[200], false, Some(200), Some(ConnStatus::Disconnected)),
+        ];
+        assert!(plan_tab_into_pane(&disconnected_target, 10, 200).is_none());
+        assert!(!tab_drop_preview_is_valid(&disconnected_target, 10, 20));
+    }
+
+    #[test]
+    fn tab_drop_hover_requires_one_unzoomed_source_pane_and_viable_target() {
+        let ordinary = vec![
+            drop_tab(10, &[100], false, None),
+            drop_tab(20, &[200, 201], false, None),
+        ];
+        assert!(tab_drop_preview_is_valid(&ordinary, 10, 20));
+        assert!(!tab_drop_preview_is_valid(&ordinary, 20, 10));
+        assert!(!tab_drop_preview_is_valid(&ordinary, 10, 10));
+
+        let zoomed_target = vec![
+            drop_tab(10, &[100], false, None),
+            drop_tab(20, &[200], true, None),
+        ];
+        assert!(!tab_drop_preview_is_valid(&zoomed_target, 10, 20));
+    }
+
+    #[test]
+    fn native_reorder_clamps_both_sides_of_the_pinned_prefix() {
+        let mut tabs = vec![(10, true), (20, true), (30, false), (40, false)];
+
+        let destination = pinned_reorder_destination(
+            &tabs.iter().map(|(_, pinned)| *pinned).collect::<Vec<_>>(),
+            3,
+            0,
+        )
+        .unwrap();
+        let moved = tabs.remove(3);
+        tabs.insert(destination, moved);
+        assert_eq!(tabs, vec![(10, true), (20, true), (40, false), (30, false)]);
+
+        let destination = pinned_reorder_destination(
+            &tabs.iter().map(|(_, pinned)| *pinned).collect::<Vec<_>>(),
+            0,
+            3,
+        )
+        .unwrap();
+        let moved = tabs.remove(0);
+        tabs.insert(destination, moved);
+        assert_eq!(tabs, vec![(20, true), (10, true), (40, false), (30, false)]);
+        assert!(tabs.iter().take(2).all(|(_, pinned)| *pinned));
+        assert!(tabs.iter().skip(2).all(|(_, pinned)| !*pinned));
+    }
+
+    #[test]
+    fn leaf_slot_requires_the_exact_holder_tree_and_clears_focus_before_reparent() {
+        if gtk::init().is_err() {
+            // Pure planner coverage still runs on headless builders; the live
+            // GTK boundary is exercised whenever a display backend exists.
+            return;
+        }
+
+        let holder = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        let root_split = gtk::Paned::new(gtk::Orientation::Horizontal);
+        let nested_split = gtk::Paned::new(gtk::Orientation::Vertical);
+        let target = gtk::Button::with_label("target");
+        let sibling = gtk::Button::with_label("sibling");
+        nested_split.set_start_child(Some(&target));
+        nested_split.set_end_child(Some(&sibling));
+        root_split.set_start_child(Some(&nested_split));
+        root_split.set_end_child(Some(&gtk::Button::with_label("outer sibling")));
+        holder.append(&root_split);
+
+        let target_widget = target.clone().upcast::<gtk::Widget>();
+        assert!(matches!(
+            LeafSlot::of(&holder, &target_widget),
+            Some(LeafSlot::PanedStart(_))
+        ));
+
+        let foreign_holder = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        let foreign_split = gtk::Paned::new(gtk::Orientation::Horizontal);
+        let foreign_target = gtk::Button::with_label("foreign");
+        foreign_split.set_start_child(Some(&foreign_target));
+        foreign_split.set_end_child(Some(&gtk::Button::with_label("other")));
+        foreign_holder.append(&foreign_split);
+        assert!(LeafSlot::of(&holder, &foreign_target.upcast()).is_none());
+
+        let window = gtk::Window::new();
+        window.set_child(Some(&holder));
+        gtk::prelude::RootExt::set_focus(&window, Some(&target));
+        assert!(gtk::prelude::RootExt::focus(&window).is_some_and(|focus| focus == target_widget));
+
+        let moved = gtk::Button::with_label("moved");
+        let moved_widget = moved.clone().upcast::<gtk::Widget>();
+        let slot = LeafSlot::of(&holder, &target_widget).expect("validated holder ancestry");
+        slot.replace_with_split(
+            &target_widget,
+            &moved_widget,
+            crate::pane_header::PaneDropEdge::Left,
+        );
+
+        assert!(gtk::prelude::RootExt::focus(&window).is_none());
+        let inserted = nested_split
+            .start_child()
+            .and_then(|child| child.downcast::<gtk::Paned>().ok())
+            .expect("target slot replaced by a split");
+        assert_eq!(inserted.start_child().as_ref(), Some(&moved_widget));
+        assert_eq!(inserted.end_child().as_ref(), Some(&target_widget));
+        gtk::prelude::RootExt::set_focus(&window, Some(&moved));
+        assert!(gtk::prelude::RootExt::focus(&window).is_some_and(|focus| focus == moved_widget));
+        window.set_child(None::<&gtk::Widget>);
+
+        // A hostile nested tree under another holder used to pass the
+        // immediate-grandparent check and get partially collapsed.
+        let foreign_holder = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        let foreign_root = gtk::Paned::new(gtk::Orientation::Horizontal);
+        let foreign_parent = gtk::Paned::new(gtk::Orientation::Vertical);
+        let foreign_leaf = gtk::Button::with_label("foreign leaf");
+        let foreign_sibling = gtk::Button::with_label("foreign sibling");
+        foreign_parent.set_start_child(Some(&foreign_leaf));
+        foreign_parent.set_end_child(Some(&foreign_sibling));
+        foreign_root.set_start_child(Some(&foreign_parent));
+        foreign_root.set_end_child(Some(&gtk::Button::with_label("foreign root sibling")));
+        foreign_holder.append(&foreign_root);
+        let foreign_leaf_widget = foreign_leaf.clone().upcast::<gtk::Widget>();
+        assert!(detach_leaf_and_promote(&holder, &foreign_leaf_widget).is_none());
+        assert_eq!(
+            foreign_parent.start_child().as_ref(),
+            Some(&foreign_leaf_widget)
+        );
+
+        // Even the correct holder is rejected when it owns more than the one
+        // exact split root; otherwise collapsing can silently discard a peer.
+        let multi_holder = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        let multi_root = gtk::Paned::new(gtk::Orientation::Horizontal);
+        let multi_parent = gtk::Paned::new(gtk::Orientation::Vertical);
+        let multi_leaf = gtk::Button::with_label("multi leaf");
+        let multi_sibling = gtk::Button::with_label("multi sibling");
+        multi_parent.set_start_child(Some(&multi_leaf));
+        multi_parent.set_end_child(Some(&multi_sibling));
+        multi_root.set_start_child(Some(&multi_parent));
+        multi_root.set_end_child(Some(&gtk::Button::with_label("root sibling")));
+        multi_holder.append(&multi_root);
+        multi_holder.append(&gtk::Button::with_label("unexpected second root"));
+        let multi_leaf_widget = multi_leaf.clone().upcast::<gtk::Widget>();
+        assert!(detach_leaf_and_promote(&multi_holder, &multi_leaf_widget).is_none());
+        assert_eq!(
+            multi_parent.start_child().as_ref(),
+            Some(&multi_leaf_widget)
+        );
+
+        let valid_holder = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        let valid_root = gtk::Paned::new(gtk::Orientation::Horizontal);
+        let valid_parent = gtk::Paned::new(gtk::Orientation::Vertical);
+        let valid_leaf = gtk::Button::with_label("valid leaf");
+        let valid_sibling = gtk::Button::with_label("valid sibling");
+        let valid_sibling_widget = valid_sibling.clone().upcast::<gtk::Widget>();
+        valid_parent.set_start_child(Some(&valid_leaf));
+        valid_parent.set_end_child(Some(&valid_sibling));
+        valid_root.set_start_child(Some(&valid_parent));
+        valid_root.set_end_child(Some(&gtk::Button::with_label("valid root sibling")));
+        valid_holder.append(&valid_root);
+        assert_eq!(
+            detach_leaf_and_promote(&valid_holder, &valid_leaf.upcast()),
+            Some(valid_sibling_widget.clone())
+        );
+        assert_eq!(
+            valid_root.start_child().as_ref(),
+            Some(&valid_sibling_widget)
+        );
+    }
+
+    #[test]
+    fn pane_promotion_plan_uses_stable_source_and_optional_anchor_ids() {
+        let tabs = vec![
+            drop_tab(10, &[100, 101], false, Some(101)),
+            drop_tab(20, &[200], false, None),
+        ];
+        assert_eq!(
+            plan_pane_into_tab(&tabs, 101, Some(20), false),
+            Some(PaneIntoTabPlan {
+                source_tab_id: 10,
+                pane_id: 101,
+                anchor_tab_id: Some(20),
+                after: false,
+                moves_remote: true,
+            })
+        );
+        assert_eq!(
+            plan_pane_into_tab(&tabs, 100, None, true),
+            Some(PaneIntoTabPlan {
+                source_tab_id: 10,
+                pane_id: 100,
+                anchor_tab_id: None,
+                after: true,
+                moves_remote: false,
+            })
+        );
+    }
+
+    #[test]
+    fn pane_promotion_rejects_ordinary_zoomed_missing_and_own_tab_drops() {
+        let tabs = vec![
+            drop_tab(10, &[100, 101], false, None),
+            drop_tab(20, &[200], false, None),
+        ];
+        assert!(plan_pane_into_tab(&tabs, 200, None, true).is_none());
+        assert!(plan_pane_into_tab(&tabs, 999, None, true).is_none());
+        assert!(plan_pane_into_tab(&tabs, 100, Some(10), true).is_none());
+        assert!(plan_pane_into_tab(&tabs, 100, Some(999), true).is_none());
+
+        let zoomed = vec![
+            drop_tab(10, &[100, 101], true, None),
+            drop_tab(20, &[200], false, None),
+        ];
+        assert!(plan_pane_into_tab(&zoomed, 100, Some(20), true).is_none());
+    }
 
     #[test]
     fn home_is_abbreviated_only_at_a_component_boundary() {

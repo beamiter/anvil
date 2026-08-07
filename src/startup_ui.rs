@@ -21,6 +21,40 @@ pub(crate) fn tab_row_output_to_msg(output: tab_strip::TabRowOutput) -> AppMsg {
         tab_strip::TabRowOutput::Reorder { source_id, target } => {
             AppMsg::ReorderTab(source_id, target)
         }
+        tab_strip::TabRowOutput::DragStarted {
+            source_tab_id,
+            drag_id,
+        } => AppMsg::TabDragStarted {
+            source_tab_id,
+            drag_id,
+        },
+        tab_strip::TabRowOutput::DragEnded {
+            source_tab_id,
+            drag_id,
+        } => AppMsg::TabDragEnded {
+            source_tab_id,
+            drag_id,
+        },
+        tab_strip::TabRowOutput::PreviewDropTarget {
+            source_tab_id,
+            target_tab_id,
+            drag_id,
+            hover_generation,
+        } => AppMsg::PreviewTabDrop {
+            source_tab_id,
+            target_tab_id,
+            drag_id,
+            hover_generation,
+        },
+        tab_strip::TabRowOutput::PromotePane {
+            pane_id,
+            anchor_tab_id,
+            after,
+        } => AppMsg::PromotePaneToTab {
+            pane_id,
+            anchor_tab_id: Some(anchor_tab_id),
+            after,
+        },
     }
 }
 

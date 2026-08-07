@@ -15,13 +15,91 @@ use relm4::gtk;
 use relm4::gtk::prelude::*;
 use relm4::gtk::{gdk, glib};
 
-/// Drag payload: the stable pane id of the dragged pane. Ids never move between
-/// panes, unlike the pane's index inside its tab.
+/// Stable workspace identity carried over GTK drag-and-drop.
 ///
-/// Deliberately numeric rather than a string. A `gchararray` payload is exactly
-/// what VTE's own text drop target accepts, so dropping a pane over the grid
-/// would paste the id into the shell instead of rearranging the layout.
-pub(crate) type PaneDragPayload = u64;
+/// Tabs and panes used to both publish a bare `u64`, so a pane target could
+/// mistake a tab id for a pane id. A private boxed GType both distinguishes the
+/// two kinds and prevents VTE's text drop target from claiming the payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkspaceDragItem {
+    Tab(u64),
+    Pane(u64),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, glib::Boxed)]
+#[boxed_type(name = "AnvilWorkspaceDragPayload")]
+pub(crate) struct WorkspaceDragPayload(WorkspaceDragItem);
+
+impl WorkspaceDragPayload {
+    pub(crate) fn tab(id: u64) -> Self {
+        Self(WorkspaceDragItem::Tab(id))
+    }
+
+    pub(crate) fn pane(id: u64) -> Self {
+        Self(WorkspaceDragItem::Pane(id))
+    }
+
+    pub(crate) fn item(&self) -> WorkspaceDragItem {
+        self.0
+    }
+}
+
+/// Edge of a pane where a dropped ordinary tab becomes a split sibling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PaneDropEdge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+const DROP_EDGE_FRACTION: f64 = 0.25;
+
+/// Resolve a four-way edge zone. The center is deliberately not a target, so
+/// an imprecise/cancelled drag cannot rearrange the workspace.
+pub(crate) fn pane_drop_edge(x: f64, y: f64, width: i32, height: i32) -> Option<PaneDropEdge> {
+    if width <= 0
+        || height <= 0
+        || !x.is_finite()
+        || !y.is_finite()
+        || x < 0.0
+        || y < 0.0
+        || x > f64::from(width)
+        || y > f64::from(height)
+    {
+        return None;
+    }
+    let x = x / f64::from(width);
+    let y = y / f64::from(height);
+    let (edge, distance) = [
+        (PaneDropEdge::Left, x),
+        (PaneDropEdge::Right, 1.0 - x),
+        (PaneDropEdge::Top, y),
+        (PaneDropEdge::Bottom, 1.0 - y),
+    ]
+    .into_iter()
+    .min_by(|(_, a), (_, b)| a.total_cmp(b))?;
+    (distance <= DROP_EDGE_FRACTION).then_some(edge)
+}
+
+/// `Some(None)` accepts a pane swap with a neutral outline,
+/// `Some(Some(edge))` accepts a directional tab split, and `None` rejects the
+/// point entirely. Keeping those three states distinct prevents a tab over the
+/// dead center from advertising MOVE like a pane swap.
+fn workspace_drop_preview(
+    item: WorkspaceDragItem,
+    x: f64,
+    y: f64,
+    width: i32,
+    height: i32,
+) -> Option<Option<PaneDropEdge>> {
+    match item {
+        WorkspaceDragItem::Tab(_) => pane_drop_edge(x, y, width, height).map(Some),
+        // Pane-on-pane is a swap. A directional shadow would promise a split
+        // that the drop handler deliberately does not perform.
+        WorkspaceDragItem::Pane(_) => Some(None),
+    }
+}
 
 /// Style rules for the header strip. Installed alongside the app's other
 /// static CSS.
@@ -45,6 +123,11 @@ pub(crate) const PANE_HEADER_CSS: &str = "
     .pane-header-cwd { opacity: 0.65; }
     .pane-header-command { color: #8be9fd; }
     .pane-frame-drop { outline: 2px solid rgba(120,190,255,0.9); outline-offset: -2px; }
+    .pane-frame-drop-left { box-shadow: inset 6px 0 rgba(120,190,255,0.85); }
+    .pane-frame-drop-right { box-shadow: inset -6px 0 rgba(120,190,255,0.85); }
+    .pane-frame-drop-top { box-shadow: inset 0 6px rgba(120,190,255,0.85); }
+    .pane-frame-drop-bottom { box-shadow: inset 0 -6px rgba(120,190,255,0.85); }
+    .pane-to-tab-drop { outline: 2px solid rgba(120,190,255,0.9); outline-offset: -2px; }
 ";
 
 /// One pane's chrome: the status strip plus the terminal beneath it.
@@ -88,7 +171,9 @@ impl PaneFrame {
         // The strip is the drag handle, so tell the user it is grabbable.
         header.set_cursor_from_name(Some("grab"));
         header.set_visible(false);
-        header.set_tooltip_text(Some("Drag onto another pane to swap them"));
+        header.set_tooltip_text(Some(
+            "Drag onto another pane to swap, or onto the tab bar to make a tab",
+        ));
 
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
         root.set_hexpand(true);
@@ -164,49 +249,104 @@ impl PaneFrame {
         }
     }
 
-    /// Attach the drag handle to the strip and the drop zone to the whole
-    /// frame, so a drop anywhere in the target pane counts.
-    ///
-    /// `on_drop` receives the dragged pane's id and returns whether the swap
-    /// happened.
+    /// Attach the pane drag handle to the strip and a typed workspace drop
+    /// target to the whole frame. Pane payloads may swap anywhere; tab payloads
+    /// are accepted only by the directional edge selected at the drop point.
     pub(crate) fn install_drag_and_drop(
         &self,
-        pane_id: PaneDragPayload,
-        on_drop: impl Fn(PaneDragPayload) -> bool + 'static,
+        pane_id: u64,
+        on_drop: impl Fn(WorkspaceDragItem, Option<PaneDropEdge>) -> bool + 'static,
     ) {
         let source = gtk::DragSource::new();
         source.set_actions(gdk::DragAction::MOVE);
         source.connect_prepare(move |_, _, _| {
-            Some(gdk::ContentProvider::for_value(&pane_id.to_value()))
+            let payload = WorkspaceDragPayload::pane(pane_id);
+            Some(gdk::ContentProvider::for_value(&payload.to_value()))
         });
         self.header.add_controller(source);
 
         // The highlight closures hold the frame weakly. A strong capture would
         // make the frame own a controller that owns the frame, and GTK would
         // never free the pane — taking its PTY and scrollback with it.
-        fn set_highlight(frame: &glib::WeakRef<gtk::Box>, on: bool) {
+        fn set_highlight(frame: &glib::WeakRef<gtk::Box>, on: bool, edge: Option<PaneDropEdge>) {
             if let Some(frame) = frame.upgrade() {
+                for class in [
+                    "pane-frame-drop-left",
+                    "pane-frame-drop-right",
+                    "pane-frame-drop-top",
+                    "pane-frame-drop-bottom",
+                ] {
+                    frame.remove_css_class(class);
+                }
                 if on {
                     frame.add_css_class("pane-frame-drop");
+                    let class = match edge {
+                        Some(PaneDropEdge::Left) => Some("pane-frame-drop-left"),
+                        Some(PaneDropEdge::Right) => Some("pane-frame-drop-right"),
+                        Some(PaneDropEdge::Top) => Some("pane-frame-drop-top"),
+                        Some(PaneDropEdge::Bottom) => Some("pane-frame-drop-bottom"),
+                        None => None,
+                    };
+                    if let Some(class) = class {
+                        frame.add_css_class(class);
+                    }
                 } else {
                     frame.remove_css_class("pane-frame-drop");
                 }
             }
         }
 
-        let target = gtk::DropTarget::new(u64::static_type(), gdk::DragAction::MOVE);
+        let target =
+            gtk::DropTarget::new(WorkspaceDragPayload::static_type(), gdk::DragAction::MOVE);
+        target.set_preload(true);
         let frame = self.root.downgrade();
-        target.connect_enter(move |_, _, _| {
-            set_highlight(&frame, true);
-            gdk::DragAction::MOVE
+        target.connect_enter(move |target, x, y| {
+            let preview = target
+                .value()
+                .and_then(|value| value.get::<WorkspaceDragPayload>().ok())
+                .and_then(|payload| {
+                    frame.upgrade().and_then(|frame| {
+                        workspace_drop_preview(payload.item(), x, y, frame.width(), frame.height())
+                    })
+                });
+            if let Some(edge) = preview {
+                set_highlight(&frame, true, edge);
+                gdk::DragAction::MOVE
+            } else {
+                set_highlight(&frame, false, None);
+                gdk::DragAction::empty()
+            }
         });
         let frame = self.root.downgrade();
-        target.connect_leave(move |_| set_highlight(&frame, false));
+        target.connect_motion(move |target, x, y| {
+            let preview = target
+                .value()
+                .and_then(|value| value.get::<WorkspaceDragPayload>().ok())
+                .and_then(|payload| {
+                    frame.upgrade().and_then(|frame| {
+                        workspace_drop_preview(payload.item(), x, y, frame.width(), frame.height())
+                    })
+                });
+            if let Some(edge) = preview {
+                set_highlight(&frame, true, edge);
+                gdk::DragAction::MOVE
+            } else {
+                set_highlight(&frame, false, None);
+                gdk::DragAction::empty()
+            }
+        });
         let frame = self.root.downgrade();
-        target.connect_drop(move |_, value, _, _| {
-            set_highlight(&frame, false);
-            match value.get::<PaneDragPayload>() {
-                Ok(dragged) => on_drop(dragged),
+        target.connect_leave(move |_| set_highlight(&frame, false, None));
+        let frame = self.root.downgrade();
+        target.connect_drop(move |_, value, x, y| {
+            set_highlight(&frame, false, None);
+            match value.get::<WorkspaceDragPayload>() {
+                Ok(payload) => frame
+                    .upgrade()
+                    .and_then(|frame| {
+                        workspace_drop_preview(payload.item(), x, y, frame.width(), frame.height())
+                    })
+                    .is_some_and(|edge| on_drop(payload.item(), edge)),
                 Err(_) => false,
             }
         });
@@ -264,4 +404,69 @@ pub(crate) fn swap_pane_widgets(a: &gtk::Widget, b: &gtk::Widget) -> bool {
     a_slot.fill(b);
     b_slot.fill(a);
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_payload_is_typed_and_round_trips_both_stable_id_kinds() {
+        assert_ne!(WorkspaceDragPayload::static_type(), u64::static_type());
+        assert_ne!(WorkspaceDragPayload::static_type(), String::static_type());
+
+        for expected in [WorkspaceDragItem::Tab(41), WorkspaceDragItem::Pane(73)] {
+            let payload = match expected {
+                WorkspaceDragItem::Tab(id) => WorkspaceDragPayload::tab(id),
+                WorkspaceDragItem::Pane(id) => WorkspaceDragPayload::pane(id),
+            };
+            let restored = payload
+                .to_value()
+                .get::<WorkspaceDragPayload>()
+                .expect("private boxed drag payload should round-trip");
+            assert_eq!(restored.item(), expected);
+        }
+    }
+
+    #[test]
+    fn pane_drop_zones_cover_four_edges_but_not_the_center() {
+        assert_eq!(
+            pane_drop_edge(1.0, 50.0, 100, 100),
+            Some(PaneDropEdge::Left)
+        );
+        assert_eq!(
+            pane_drop_edge(99.0, 50.0, 100, 100),
+            Some(PaneDropEdge::Right)
+        );
+        assert_eq!(pane_drop_edge(50.0, 1.0, 100, 100), Some(PaneDropEdge::Top));
+        assert_eq!(
+            pane_drop_edge(50.0, 99.0, 100, 100),
+            Some(PaneDropEdge::Bottom)
+        );
+        assert_eq!(pane_drop_edge(50.0, 50.0, 100, 100), None);
+    }
+
+    #[test]
+    fn pane_drop_zone_rejects_invalid_or_outside_geometry() {
+        assert_eq!(pane_drop_edge(-1.0, 5.0, 100, 100), None);
+        assert_eq!(pane_drop_edge(5.0, 101.0, 100, 100), None);
+        assert_eq!(pane_drop_edge(f64::NAN, 5.0, 100, 100), None);
+        assert_eq!(pane_drop_edge(5.0, 5.0, 0, 100), None);
+    }
+
+    #[test]
+    fn pane_swap_preview_never_claims_a_directional_split_edge() {
+        assert_eq!(
+            workspace_drop_preview(WorkspaceDragItem::Pane(7), 50.0, 50.0, 100, 100),
+            Some(None)
+        );
+        assert_eq!(
+            workspace_drop_preview(WorkspaceDragItem::Tab(7), 1.0, 50.0, 100, 100),
+            Some(Some(PaneDropEdge::Left))
+        );
+        assert_eq!(
+            workspace_drop_preview(WorkspaceDragItem::Tab(7), 50.0, 50.0, 100, 100),
+            None
+        );
+    }
 }

@@ -90,6 +90,10 @@ struct AppModel {
     shell_argv: Rc<Vec<String>>,
     tabs: Vec<Tab>,
     active: usize,
+    /// Stable source/original-active identities for a tab drag. A delayed
+    /// hover preview is reverted if the source still exists when drag ends.
+    tab_drag_origin: Option<(u64, u64, u64)>,
+    tab_drag_coordinator: Rc<tab_strip::TabDragCoordinator>,
     next_id: u64,
     next_pane_id: u64,
     sidebar_visible: bool,
@@ -237,20 +241,33 @@ fn create_pane(
         ),
     };
     let frame = pane_header::PaneFrame::new(&terminal.widget());
-    // The header is this pane's drag handle and its own drop zone. Ids, not
-    // indices, cross the drag boundary: a pane's index shifts when a sibling
-    // closes, but its id never moves.
+    // The header is this pane's drag handle and its frame is a typed workspace
+    // drop zone. Ids, not indices, cross the drag boundary: pane and tab
+    // positions may both shift while the gesture is in flight.
     {
         let sender = sender.clone();
-        frame.install_drag_and_drop(pane_id, move |dragged| {
-            if dragged == pane_id {
-                return false;
+        frame.install_drag_and_drop(pane_id, move |dragged, edge| match dragged {
+            pane_header::WorkspaceDragItem::Pane(dragged) => {
+                if dragged == pane_id {
+                    return false;
+                }
+                sender.input(AppMsg::SwapPanes {
+                    dragged,
+                    target: pane_id,
+                });
+                true
             }
-            sender.input(AppMsg::SwapPanes {
-                dragged,
-                target: pane_id,
-            });
-            true
+            pane_header::WorkspaceDragItem::Tab(tab_id) => {
+                let Some(edge) = edge else {
+                    return false;
+                };
+                sender.input(AppMsg::MoveTabToPane {
+                    tab_id,
+                    target_pane_id: pane_id,
+                    edge,
+                });
+                true
+            }
         });
     }
     Pane {
@@ -718,9 +735,23 @@ impl SimpleComponent for AppModel {
         let sidebar_tab_rows = FactoryVecDeque::builder()
             .launch(sidebar_tab_strip.clone())
             .forward(sender.input_sender(), startup_ui::tab_row_output_to_msg);
+        // Row targets choose an insertion anchor. The parent targets make the
+        // blank remainder of either tab bar useful as a pane-to-tab drop zone.
+        for tab_bar in [&tab_strip, &sidebar_tab_strip] {
+            let sender = sender.clone();
+            tab_strip::install_pane_drop_target(tab_bar, move |pane_id| {
+                sender.input(AppMsg::PromotePaneToTab {
+                    pane_id,
+                    anchor_tab_id: None,
+                    after: true,
+                });
+                true
+            });
+        }
 
         let toast_overlay = adw::ToastOverlay::new();
         let quit_allowed = Rc::new(std::cell::Cell::new(false));
+        let tab_drag_coordinator = Rc::new(tab_strip::TabDragCoordinator::default());
         let mut model = AppModel {
             config,
             config_revision: RefCell::new(config_revision),
@@ -729,6 +760,8 @@ impl SimpleComponent for AppModel {
             shell_argv,
             tabs: Vec::new(),
             active: 0,
+            tab_drag_origin: None,
+            tab_drag_coordinator,
             next_id: 0,
             next_pane_id: 0,
             // With tabs in the top bar, keep the optional file sidebar closed
@@ -1139,6 +1172,74 @@ impl SimpleComponent for AppModel {
                 }
             }
             AppMsg::SwapPanes { dragged, target } => self.swap_panes(dragged, target),
+            AppMsg::MoveTabToPane {
+                tab_id,
+                target_pane_id,
+                edge,
+            } => self.move_tab_to_pane(tab_id, target_pane_id, edge, &sender),
+            AppMsg::TabDragStarted {
+                source_tab_id,
+                drag_id,
+            } => {
+                if self
+                    .tab_drag_coordinator
+                    .drag_is_current(source_tab_id, drag_id)
+                    && self.index_of(source_tab_id).is_some()
+                {
+                    self.tab_drag_origin = self
+                        .tabs
+                        .get(self.active)
+                        .map(|tab| (source_tab_id, tab.id, drag_id));
+                }
+            }
+            AppMsg::TabDragEnded {
+                source_tab_id,
+                drag_id,
+            } => {
+                if self
+                    .tab_drag_origin
+                    .is_some_and(|(tracked_source_id, _, tracked_drag_id)| {
+                        tracked_source_id == source_tab_id && tracked_drag_id == drag_id
+                    })
+                {
+                    let (_, original_active_id, _) = self
+                        .tab_drag_origin
+                        .take()
+                        .expect("matching drag identity was present");
+                    self.tab_drag_coordinator.invalidate_hover();
+                    if self.index_of(source_tab_id).is_some()
+                        && self.index_of(original_active_id).is_some()
+                    {
+                        self.select_tab(original_active_id, &sender);
+                    }
+                }
+            }
+            AppMsg::PreviewTabDrop {
+                source_tab_id,
+                target_tab_id,
+                drag_id,
+                hover_generation,
+            } => {
+                if self
+                    .tab_drag_origin
+                    .is_some_and(|(tracked_source_id, _, tracked_drag_id)| {
+                        tracked_source_id == source_tab_id && tracked_drag_id == drag_id
+                    })
+                    && self.tab_drag_coordinator.hover_is_current(
+                        source_tab_id,
+                        drag_id,
+                        hover_generation,
+                    )
+                    && self.can_preview_tab_drop(source_tab_id, target_tab_id)
+                {
+                    self.select_tab(target_tab_id, &sender);
+                }
+            }
+            AppMsg::PromotePaneToTab {
+                pane_id,
+                anchor_tab_id,
+                after,
+            } => self.promote_pane_to_tab(pane_id, anchor_tab_id, after, &sender),
             AppMsg::RefreshPaneHeaders => {
                 self.refresh_active_pane_headers();
                 // The bar's running-command and grid segments are polled too.

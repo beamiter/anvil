@@ -5,8 +5,107 @@ use relm4::gtk;
 use relm4::gtk::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::time::Duration;
 
+use crate::pane_header::{WorkspaceDragItem, WorkspaceDragPayload};
 use crate::{MAX_TAB_WIDTH, MIN_TAB_WIDTH};
+
+const TAB_DROP_PREVIEW_DELAY: Duration = Duration::from_millis(450);
+
+/// One process-wide identity boundary for tab drags and delayed hover
+/// previews. Factory rows can be rebuilt while GTK still owns an old timeout,
+/// so neither a row-local counter nor a source id alone is sufficient.
+#[derive(Debug)]
+pub(crate) struct TabDragCoordinator {
+    next_drag_id: Cell<Option<u64>>,
+    active: Cell<Option<(u64, u64)>>,
+    hover_generation: Cell<Option<u64>>,
+}
+
+impl Default for TabDragCoordinator {
+    fn default() -> Self {
+        Self {
+            next_drag_id: Cell::new(Some(0)),
+            active: Cell::new(None),
+            hover_generation: Cell::new(Some(0)),
+        }
+    }
+}
+
+impl TabDragCoordinator {
+    fn advance(cell: &Cell<Option<u64>>) -> Option<u64> {
+        let next = cell.get()?.checked_add(1);
+        cell.set(next);
+        next
+    }
+
+    fn clear_active_hover(&self) {
+        self.active.set(None);
+        self.hover_generation.set(None);
+    }
+
+    fn advance_hover_or_fail(&self) -> Option<u64> {
+        let next = Self::advance(&self.hover_generation);
+        if next.is_none() {
+            self.clear_active_hover();
+        }
+        next
+    }
+
+    fn begin(&self, source_tab_id: u64) -> Option<u64> {
+        let Some(drag_id) = Self::advance(&self.next_drag_id) else {
+            self.clear_active_hover();
+            return None;
+        };
+        self.active.set(Some((source_tab_id, drag_id)));
+        self.advance_hover_or_fail()?;
+        Some(drag_id)
+    }
+
+    fn finish(&self, source_tab_id: u64, drag_id: u64) {
+        if self.active.get() == Some((source_tab_id, drag_id)) {
+            self.active.set(None);
+            self.invalidate_hover();
+        }
+    }
+
+    fn drag_id_for(&self, source_tab_id: u64) -> Option<u64> {
+        self.active
+            .get()
+            .filter(|(source, _)| *source == source_tab_id)
+            .map(|(_, drag_id)| drag_id)
+    }
+
+    pub(crate) fn drag_is_current(&self, source_tab_id: u64, drag_id: u64) -> bool {
+        self.active.get() == Some((source_tab_id, drag_id))
+    }
+
+    fn begin_hover(&self, source_tab_id: u64, drag_id: u64) -> Option<u64> {
+        (self.active.get() == Some((source_tab_id, drag_id)))
+            .then(|| self.advance_hover_or_fail())
+            .flatten()
+    }
+
+    fn cancel_hover(&self, source_tab_id: u64, drag_id: u64) {
+        if self.active.get() == Some((source_tab_id, drag_id)) {
+            self.invalidate_hover();
+        }
+    }
+
+    pub(crate) fn invalidate_hover(&self) {
+        let _ = self.advance_hover_or_fail();
+    }
+
+    pub(crate) fn hover_is_current(
+        &self,
+        source_tab_id: u64,
+        drag_id: u64,
+        hover_generation: u64,
+    ) -> bool {
+        self.active.get() == Some((source_tab_id, drag_id))
+            && self.hover_generation.get() == Some(hover_generation)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConnectionState {
@@ -15,7 +114,7 @@ pub(crate) enum ConnectionState {
     Disconnected,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct TabRowInit {
     pub(crate) id: u64,
     pub(crate) target_index: usize,
@@ -29,6 +128,7 @@ pub(crate) struct TabRowInit {
     pub(crate) remote_hosts: Vec<(u8, String)>,
     pub(crate) tab_width: u32,
     pub(crate) sidebar: bool,
+    pub(crate) drag_coordinator: Rc<TabDragCoordinator>,
 }
 
 #[derive(Debug)]
@@ -46,7 +146,29 @@ pub(crate) enum TabRowOutput {
     Action(u64, TabAction),
     ConnectRemote(u8),
     Resize(u32),
-    Reorder { source_id: u64, target: usize },
+    Reorder {
+        source_id: u64,
+        target: usize,
+    },
+    DragStarted {
+        source_tab_id: u64,
+        drag_id: u64,
+    },
+    DragEnded {
+        source_tab_id: u64,
+        drag_id: u64,
+    },
+    PreviewDropTarget {
+        source_tab_id: u64,
+        target_tab_id: u64,
+        drag_id: u64,
+        hover_generation: u64,
+    },
+    PromotePane {
+        pane_id: u64,
+        anchor_tab_id: u64,
+        after: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -70,6 +192,7 @@ pub(crate) struct TabRow {
     tab_width: u32,
     sidebar: bool,
     action_state: Rc<RefCell<TabRowActionState>>,
+    drag_coordinator: Rc<TabDragCoordinator>,
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +203,7 @@ struct TabRowActionState {
     pinned: bool,
     remote_hosts: Vec<(u8, String)>,
     tab_width: u32,
+    sidebar: bool,
 }
 
 impl TabRowActionState {
@@ -91,6 +215,7 @@ impl TabRowActionState {
             pinned: init.pinned,
             remote_hosts: init.remote_hosts.clone(),
             tab_width: init.tab_width,
+            sidebar: init.sidebar,
         }
     }
 }
@@ -215,7 +340,38 @@ impl FactoryComponent for TabRow {
                 add_controller = gtk::DragSource {
                     set_actions: gtk::gdk::DragAction::MOVE,
                     connect_prepare[id = self.id] => move |_, _, _| {
-                        Some(gtk::gdk::ContentProvider::for_value(&id.to_value()))
+                        let payload = WorkspaceDragPayload::tab(id);
+                        Some(gtk::gdk::ContentProvider::for_value(&payload.to_value()))
+                    },
+                    connect_drag_begin[
+                        sender,
+                        row_drag_id,
+                        drag_coordinator = self.drag_coordinator.clone(),
+                        id = self.id
+                    ] => move |_, _| {
+                        let Some(drag_id) = drag_coordinator.begin(id) else {
+                            return;
+                        };
+                        row_drag_id.set(Some(drag_id));
+                        let _ = sender.output(TabRowOutput::DragStarted {
+                            source_tab_id: id,
+                            drag_id,
+                        });
+                    },
+                    connect_drag_end[
+                        sender,
+                        row_drag_id,
+                        drag_coordinator = self.drag_coordinator.clone(),
+                        id = self.id
+                    ] => move |_, _, _| {
+                        let Some(drag_id) = row_drag_id.take() else {
+                            return;
+                        };
+                        drag_coordinator.finish(id, drag_id);
+                        let _ = sender.output(TabRowOutput::DragEnded {
+                            source_tab_id: id,
+                            drag_id,
+                        });
                     },
                 },
             },
@@ -249,16 +405,127 @@ impl FactoryComponent for TabRow {
             },
 
             add_controller = gtk::DropTarget::new(
-                gtk::glib::Type::U64,
+                WorkspaceDragPayload::static_type(),
                 gtk::gdk::DragAction::MOVE,
             ) {
-                connect_drop[sender, action_state = self.action_state.clone()] => move |_, value, _, _| {
-                    if let Ok(source_id) = value.get::<u64>() {
-                        let target = action_state.borrow().target_index;
-                        let _ = sender.output(TabRowOutput::Reorder { source_id, target });
-                        true
-                    } else {
-                        false
+                set_preload: true,
+                connect_enter[
+                    sender,
+                    select_button,
+                    hover_drag,
+                    drag_coordinator = self.drag_coordinator.clone(),
+                    id = self.id
+                ] => move |target, _, _| {
+                    if let Some((source_tab_id, drag_id)) = hover_drag.take() {
+                        drag_coordinator.cancel_hover(source_tab_id, drag_id);
+                    }
+                    let Some(item) = target
+                        .value()
+                        .and_then(|value| value.get::<WorkspaceDragPayload>().ok())
+                        .map(|payload| payload.item())
+                    else {
+                        return gtk::gdk::DragAction::empty();
+                    };
+                    match item {
+                        WorkspaceDragItem::Pane(_) => {
+                            select_button.add_css_class("pane-to-tab-drop");
+                        }
+                        WorkspaceDragItem::Tab(_) => {
+                            let Some((source_tab_id, target_tab_id)) =
+                                tab_drop_preview(item, id)
+                            else {
+                                return gtk::gdk::DragAction::empty();
+                            };
+                            let Some(drag_id) = drag_coordinator.drag_id_for(source_tab_id) else {
+                                return gtk::gdk::DragAction::empty();
+                            };
+                            let Some(hover_generation) =
+                                drag_coordinator.begin_hover(source_tab_id, drag_id)
+                            else {
+                                return gtk::gdk::DragAction::empty();
+                            };
+                            hover_drag.set(Some((source_tab_id, drag_id)));
+                            select_button.add_css_class("pane-to-tab-drop");
+                            let weak_button = select_button.downgrade();
+                            let drag_coordinator = drag_coordinator.clone();
+                            let sender = sender.clone();
+                            gtk::glib::timeout_add_local_once(
+                                TAB_DROP_PREVIEW_DELAY,
+                                move || {
+                                    let button_is_live = weak_button.upgrade().is_some_and(|button| {
+                                        button.is_mapped()
+                                            && button.has_css_class("pane-to-tab-drop")
+                                    });
+                                    if button_is_live
+                                        && drag_coordinator.hover_is_current(
+                                            source_tab_id,
+                                            drag_id,
+                                            hover_generation,
+                                        )
+                                    {
+                                        let _ = sender.output(
+                                            TabRowOutput::PreviewDropTarget {
+                                                source_tab_id,
+                                                target_tab_id,
+                                                drag_id,
+                                                hover_generation,
+                                            },
+                                        );
+                                    }
+                                },
+                            );
+                        }
+                    }
+                    gtk::gdk::DragAction::MOVE
+                },
+                connect_leave[
+                    select_button,
+                    hover_drag,
+                    drag_coordinator = self.drag_coordinator.clone()
+                ] => move |_| {
+                    select_button.remove_css_class("pane-to-tab-drop");
+                    if let Some((source_tab_id, drag_id)) = hover_drag.take() {
+                        drag_coordinator.cancel_hover(source_tab_id, drag_id);
+                    }
+                },
+                connect_drop[
+                    sender,
+                    select_button,
+                    hover_drag,
+                    drag_coordinator = self.drag_coordinator.clone(),
+                    id = self.id,
+                    action_state = self.action_state.clone()
+                ] => move |_, value, x, y| {
+                    select_button.remove_css_class("pane-to-tab-drop");
+                    if let Some((source_tab_id, drag_id)) = hover_drag.take() {
+                        drag_coordinator.cancel_hover(source_tab_id, drag_id);
+                    }
+                    let Ok(payload) = value.get::<WorkspaceDragPayload>() else {
+                        return false;
+                    };
+                    match payload.item() {
+                        WorkspaceDragItem::Tab(source_id) => {
+                            if source_id == id {
+                                return false;
+                            }
+                            let target = action_state.borrow().target_index;
+                            let _ = sender.output(TabRowOutput::Reorder { source_id, target });
+                            true
+                        }
+                        WorkspaceDragItem::Pane(pane_id) => {
+                            let state = action_state.borrow();
+                            let after = if state.sidebar {
+                                y >= f64::from(select_button.height()) / 2.0
+                            } else {
+                                x >= f64::from(select_button.width()) / 2.0
+                            };
+                            let _ = sender.output(TabRowOutput::PromotePane {
+                                pane_id,
+                                anchor_tab_id: id,
+                                after,
+                            });
+                            true
+                        }
                     }
                 },
             },
@@ -277,6 +544,8 @@ impl FactoryComponent for TabRow {
         sender: FactorySender<Self>,
     ) -> Self::Widgets {
         let start_width = Rc::new(Cell::new(self.tab_width as i32));
+        let row_drag_id = Rc::new(Cell::new(None::<u64>));
+        let hover_drag = Rc::new(Cell::new(None::<(u64, u64)>));
         let widgets = view_output!();
         widgets
     }
@@ -290,6 +559,37 @@ impl FactoryComponent for TabRow {
             TabRowMsg::Sync(init) => self.sync_from(init),
         }
     }
+}
+
+fn tab_drop_preview(item: WorkspaceDragItem, target_tab_id: u64) -> Option<(u64, u64)> {
+    match item {
+        WorkspaceDragItem::Tab(source_tab_id) if source_tab_id != target_tab_id => {
+            Some((source_tab_id, target_tab_id))
+        }
+        WorkspaceDragItem::Tab(_) | WorkspaceDragItem::Pane(_) => None,
+    }
+}
+
+/// Accept a pane header drop on otherwise-empty tab-bar space. Row targets
+/// provide an insertion anchor; this fallback promotes next to the source tab.
+pub(crate) fn install_pane_drop_target(
+    tab_bar: &gtk::Box,
+    on_drop: impl Fn(u64) -> bool + 'static,
+) {
+    let target = gtk::DropTarget::new(
+        WorkspaceDragPayload::static_type(),
+        gtk::gdk::DragAction::MOVE,
+    );
+    target.connect_drop(move |_, value, _, _| {
+        let Ok(payload) = value.get::<WorkspaceDragPayload>() else {
+            return false;
+        };
+        match payload.item() {
+            WorkspaceDragItem::Pane(pane_id) => on_drop(pane_id),
+            WorkspaceDragItem::Tab(_) => false,
+        }
+    });
+    tab_bar.add_controller(target);
 }
 
 impl TabRow {
@@ -309,6 +609,7 @@ impl TabRow {
             tab_width: init.tab_width,
             sidebar: init.sidebar,
             action_state,
+            drag_coordinator: init.drag_coordinator,
         }
     }
 
@@ -329,6 +630,7 @@ impl TabRow {
 
     fn sync_from(&mut self, init: TabRowInit) {
         debug_assert_eq!(self.id, init.id);
+        debug_assert!(Rc::ptr_eq(&self.drag_coordinator, &init.drag_coordinator));
         *self.action_state.borrow_mut() = TabRowActionState::from_init(&init);
         self.target_index = init.target_index;
         self.title = init.title;
@@ -534,6 +836,7 @@ mod tests {
             remote_hosts: vec![(0, "host-a".to_string())],
             tab_width: 180,
             sidebar: true,
+            drag_coordinator: Rc::new(TabDragCoordinator::default()),
         }
     }
 
@@ -541,6 +844,7 @@ mod tests {
     fn sync_updates_visual_and_action_state_without_replacing_identity() {
         let mut row = TabRow::from_init(init());
         let mut updated = init();
+        updated.drag_coordinator = row.drag_coordinator.clone();
         updated.target_index = 4;
         updated.title = "remote".to_string();
         updated.active = true;
@@ -560,5 +864,51 @@ mod tests {
         assert!(actions.marked);
         assert_eq!(actions.remote_hosts.len(), 2);
         assert_eq!(actions.tab_width, 240);
+    }
+
+    #[test]
+    fn hover_preview_uses_stable_tab_ids_and_excludes_self_or_pane_drags() {
+        assert_eq!(
+            tab_drop_preview(WorkspaceDragItem::Tab(71), 93),
+            Some((71, 93))
+        );
+        assert_eq!(tab_drop_preview(WorkspaceDragItem::Tab(71), 71), None);
+        assert_eq!(tab_drop_preview(WorkspaceDragItem::Pane(71), 93), None);
+    }
+
+    #[test]
+    fn global_drag_identity_rejects_stale_hover_and_stale_end() {
+        let coordinator = TabDragCoordinator::default();
+        let first = coordinator.begin(7).unwrap();
+        let old_hover = coordinator.begin_hover(7, first).unwrap();
+        assert!(coordinator.hover_is_current(7, first, old_hover));
+
+        coordinator.finish(7, first);
+        let second = coordinator.begin(7).unwrap();
+        let new_hover = coordinator.begin_hover(7, second).unwrap();
+        coordinator.finish(7, first);
+
+        assert!(!coordinator.hover_is_current(7, first, old_hover));
+        assert!(coordinator.hover_is_current(7, second, new_hover));
+    }
+
+    #[test]
+    fn generation_overflow_clears_every_stale_drag_authority() {
+        let coordinator = TabDragCoordinator::default();
+        coordinator.next_drag_id.set(Some(u64::MAX));
+        coordinator.active.set(Some((7, 41)));
+        coordinator.hover_generation.set(Some(9));
+
+        assert_eq!(coordinator.begin(8), None);
+        assert_eq!(coordinator.active.get(), None);
+        assert_eq!(coordinator.hover_generation.get(), None);
+
+        let coordinator = TabDragCoordinator::default();
+        coordinator.active.set(Some((7, 41)));
+        coordinator.hover_generation.set(Some(u64::MAX));
+
+        assert_eq!(coordinator.begin_hover(7, 41), None);
+        assert_eq!(coordinator.active.get(), None);
+        assert_eq!(coordinator.hover_generation.get(), None);
     }
 }

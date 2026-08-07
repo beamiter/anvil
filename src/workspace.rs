@@ -117,7 +117,7 @@ impl Pane {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ConnStatus {
     Connecting,
     Connected,

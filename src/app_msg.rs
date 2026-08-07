@@ -41,6 +41,38 @@ pub(crate) enum AppMsg {
         dragged: u64,
         target: u64,
     },
+    /// Move the sole pane owned by an ordinary tab beside a target pane.
+    /// Both identities remain stable while tab and pane indices may shift.
+    MoveTabToPane {
+        tab_id: u64,
+        target_pane_id: u64,
+        edge: crate::pane_header::PaneDropEdge,
+    },
+    /// Track a tab drag so a hover-previewed page can be restored when the
+    /// source remains a tab (cancel, invalid drop, or ordinary reorder).
+    TabDragStarted {
+        source_tab_id: u64,
+        drag_id: u64,
+    },
+    TabDragEnded {
+        source_tab_id: u64,
+        drag_id: u64,
+    },
+    /// Select a stable target after the pointer rests over its row long enough
+    /// to expose that page's pane drop zones.
+    PreviewTabDrop {
+        source_tab_id: u64,
+        target_tab_id: u64,
+        drag_id: u64,
+        hover_generation: u64,
+    },
+    /// Detach one pane from a split and promote it to an ordinary tab. A row
+    /// drop supplies a stable anchor; blank tab-bar space leaves it absent.
+    PromotePaneToTab {
+        pane_id: u64,
+        anchor_tab_id: Option<u64>,
+        after: bool,
+    },
     /// Periodic refresh of the split panes' status headers (cwd and the
     /// running command are polled, not pushed).
     RefreshPaneHeaders,

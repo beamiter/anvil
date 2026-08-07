@@ -13,6 +13,10 @@ restoration as the only copy of work in progress.
 
 - VTE and block-aware terminal modes
 - Tabs, nested split panes, pane zoom, directional focus, and session restore
+- Drag a single-pane tab to any edge of a target pane to merge it as a split;
+  drag a split-pane header back to the tab bar to promote it to a normal tab.
+  A short tab hover previews the target page, while center/cancel drops leave
+  every existing PTY untouched
 - Sidebar tab list and a lazy file tree; files are safely shell-quoted before
   being inserted at the prompt
 - Command palette, command-history picker, parameterized TOML/YAML workflows, and

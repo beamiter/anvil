@@ -225,6 +225,7 @@ impl AppModel {
                 remote_hosts: remote_hosts.clone(),
                 tab_width,
                 sidebar,
+                drag_coordinator: self.tab_drag_coordinator.clone(),
             })
             .collect();
 
@@ -237,8 +238,14 @@ impl AppModel {
                 ..row
             })
             .collect();
-        apply_tab_rows(&mut self.tab_rows, rows);
-        apply_tab_rows(&mut self.sidebar_tab_rows, mirror_rows);
+        let rows_rebuilt = apply_tab_rows(&mut self.tab_rows, rows);
+        let mirror_rebuilt = apply_tab_rows(&mut self.sidebar_tab_rows, mirror_rows);
+        // A removed/replaced row may disappear without GTK delivering `leave`.
+        // In-place presentation sync keeps the same live button, however, and
+        // must not silently cancel its deliberate 450 ms hover preview.
+        if rows_rebuilt || mirror_rebuilt {
+            self.tab_drag_coordinator.invalidate_hover();
+        }
 
         self.sync_tab_bar_visibility();
         if persist {
@@ -253,12 +260,11 @@ impl AppModel {
 fn apply_tab_rows(
     factory: &mut FactoryVecDeque<tab_strip::TabRow>,
     rows: Vec<tab_strip::TabRowInit>,
-) {
-    let same_rows = factory.len() == rows.len()
-        && factory
-            .iter()
-            .zip(rows.iter())
-            .all(|(current, next)| current.id == next.id);
+) -> bool {
+    let same_rows = same_row_ids(
+        factory.iter().map(|row| row.id),
+        rows.iter().map(|row| row.id),
+    );
 
     if same_rows {
         let updates: Vec<_> = factory
@@ -271,11 +277,32 @@ fn apply_tab_rows(
         for (index, row) in updates {
             factory.send(index, tab_strip::TabRowMsg::Sync(row));
         }
+        false
     } else {
         let mut guard = factory.guard();
         guard.clear();
         for row in rows {
             guard.push_back(row);
         }
+        true
+    }
+}
+
+fn same_row_ids(
+    current: impl ExactSizeIterator<Item = u64>,
+    desired: impl ExactSizeIterator<Item = u64>,
+) -> bool {
+    current.len() == desired.len() && current.eq(desired)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_row_ids;
+
+    #[test]
+    fn presentation_sync_keeps_hover_but_identity_changes_require_rebuild() {
+        assert!(same_row_ids([10, 20].into_iter(), [10, 20].into_iter()));
+        assert!(!same_row_ids([10, 20].into_iter(), [20, 10].into_iter()));
+        assert!(!same_row_ids([10, 20].into_iter(), [10].into_iter()));
     }
 }
