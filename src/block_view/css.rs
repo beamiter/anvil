@@ -291,12 +291,17 @@ pub(crate) fn install_block_css(config: &Config) {
             background-color: rgba({async_r},{async_g},{async_b},0.07);
             box-shadow: inset 2px 0 0 0 {async_stripe};
         }}
+        .block-correction, .command-suggestion, .command-review-standalone {{
+            border-left-color: rgba({acc_r},{acc_g},{acc_b},0.85);
+            background-color: rgba({acc_r},{acc_g},{acc_b},0.05);
+        }}
         .block-agent {{
             border-left-color: rgba({agent_r},{agent_g},{agent_b},0.85);
             background-color: rgba({agent_r},{agent_g},{agent_b},0.05);
         }}
         .agent-card-icon {{
             color: {agent_hex};
+            font-family: "{font_family}";
         }}
         .agent-card-title {{
             color: {fg_hex};
@@ -313,11 +318,33 @@ pub(crate) fn install_block_css(config: &Config) {
             border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.12);
             border-radius: 9px;
         }}
-        .agent-status-card, .agent-composer, .agent-transcript-card {{
+        .agent-dashboard {{
+            color: {fg_hex};
+            background-color: {bg_hex};
+        }}
+        .agent-overview, .agent-setting-card, .agent-status-card,
+        .agent-composer, .agent-transcript-card {{
             color: {fg_hex};
             background-color: rgba({fg_r},{fg_g},{fg_b},0.055);
             border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.14);
             border-radius: 10px;
+        }}
+        .agent-overview {{
+            padding: 12px;
+        }}
+        .agent-chip {{
+            color: rgba({fg_r},{fg_g},{fg_b},0.78);
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.08);
+            border-radius: 999px;
+            padding: 4px 9px;
+            font-size: 0.82em;
+        }}
+        .agent-safety-chip {{
+            color: {ok_hex};
+            background-color: rgba({ok_r},{ok_g},{ok_b},0.14);
+        }}
+        .agent-setting-card {{
+            padding: 10px 12px;
         }}
         .agent-status-card {{
             padding: 9px 11px;
@@ -347,6 +374,82 @@ pub(crate) fn install_block_css(config: &Config) {
         .agent-prompt-status.agent-prompt-blocked {{
             color: {err_hex};
             background-color: rgba({err_r},{err_g},{err_b},0.10);
+        }}
+        .assistant-card-icon {{
+            color: {accent};
+            font-family: "{font_family}";
+        }}
+        .assistant-card-title {{
+            color: {fg_hex};
+            font-weight: bold;
+        }}
+        .assistant-card-badge {{
+            color: {dim_fg};
+            font-size: 0.85em;
+        }}
+        .assistant-context-chip {{
+            color: {dim_fg};
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.055);
+            border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.12);
+            border-radius: 8px;
+            padding: 5px 8px;
+            font-size: 0.88em;
+        }}
+        .assistant-status-row {{
+            padding: 5px 0;
+        }}
+        .assistant-status {{
+            color: {dim_fg};
+        }}
+        .command-review-embedded {{
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.045);
+            border: 1px solid rgba({acc_r},{acc_g},{acc_b},0.34);
+            border-radius: 9px;
+        }}
+        .command-review-description {{
+            color: {fg_hex};
+        }}
+        .command-review-risk {{
+            color: {dim_fg};
+            font-size: 0.9em;
+        }}
+        .command-review-risk.error, .command-review-feedback.error {{
+            color: {err_hex};
+        }}
+        .command-review-feedback {{
+            color: {dim_fg};
+            font-size: 0.9em;
+        }}
+        .command-review-entry {{
+            font-family: "{font_family}";
+            font-size: {font_size};
+            color: {fg_hex};
+            background-color: {bg_hex};
+            border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.18);
+            border-radius: 6px;
+            padding: 4px 8px;
+        }}
+        .command-review-entry:focus {{
+            border-color: rgba({acc_r},{acc_g},{acc_b},0.75);
+        }}
+        .command-review-actions {{
+            margin-top: 2px;
+        }}
+        .command-review-secondary {{
+            color: {fg_hex};
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.08);
+            border-color: rgba({fg_r},{fg_g},{fg_b},0.16);
+        }}
+        .command-review-secondary:hover {{
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.16);
+        }}
+        .agent-msg-body {{
+            color: {fg_hex};
+            font-family: "{font_family}";
+            font-size: {font_size};
+        }}
+        .agent-msg-error {{
+            color: {err_hex};
         }}
         .agent-proposal-card {{
             padding: 10px;

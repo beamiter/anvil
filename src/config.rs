@@ -395,6 +395,10 @@ pub struct Config {
     /// session is sealed and the user must start a new one — this is a
     /// runaway-loop safety net, not a usability lever.
     pub(crate) agent_max_turns: u32,
+    /// Offer review-first corrections for narrowly classified failed commands.
+    /// Verified local candidates may run only after one explicit exact-command
+    /// action; edits and unverified candidates remain insert-only.
+    pub(crate) command_correction_enabled: bool,
     /// Provider wire protocol: anthropic, openai-compatible, or ollama.
     pub(crate) ai_provider: String,
     /// Provider API root. Endpoint suffixes are added by the AI client.
@@ -484,6 +488,7 @@ impl Config {
             ai_enabled: false,
             agent_enabled: false,
             agent_max_turns: 20,
+            command_correction_enabled: true,
             ai_provider: "anthropic".to_string(),
             ai_base_url: "https://api.anthropic.com".to_string(),
             ai_model: "claude-sonnet-4-6".to_string(),
@@ -793,6 +798,8 @@ struct FileConfig {
     ai_enabled: Option<bool>,
     agent_enabled: Option<bool>,
     agent_max_turns: Option<u32>,
+    agent_auto_approve_readonly: Option<bool>,
+    command_correction_enabled: Option<bool>,
     ai_provider: Option<String>,
     ai_base_url: Option<String>,
     ai_model: Option<String>,
@@ -984,6 +991,12 @@ fn load_file_config() -> FileConfig {
             .get("agent_max_turns")
             .and_then(|v| v.as_integer())
             .and_then(|v| u32::try_from(v).ok()),
+        agent_auto_approve_readonly: table
+            .get("agent_auto_approve_readonly")
+            .and_then(|v| v.as_bool()),
+        command_correction_enabled: table
+            .get("command_correction_enabled")
+            .and_then(|v| v.as_bool()),
         ai_provider: table
             .get("ai_provider")
             .and_then(|v| v.as_str())
@@ -1420,6 +1433,14 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         .unwrap_or_else(|| default_ai_base_url.to_string())
         .trim_end_matches('/')
         .to_string();
+    let requested_agent_auto_approve = env_bool("ANVIL_AGENT_AUTO_APPROVE_READONLY")
+        .or(fc.agent_auto_approve_readonly)
+        .unwrap_or(false);
+    if requested_agent_auto_approve {
+        log::warn!(
+            "agent_auto_approve_readonly is retired; every Agent proposal requires explicit approval"
+        );
+    }
 
     let config = Config {
         window_opacity,
@@ -1473,6 +1494,9 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
             .or(fc.agent_max_turns)
             .unwrap_or(20)
             .clamp(1, 100),
+        command_correction_enabled: env_bool("ANVIL_COMMAND_CORRECTION_ENABLED")
+            .or(fc.command_correction_enabled)
+            .unwrap_or(true),
         ai_provider,
         ai_base_url,
         ai_model,

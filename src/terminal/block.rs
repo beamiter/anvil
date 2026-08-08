@@ -96,6 +96,12 @@ impl BlockTerminal {
             .is_some_and(|view| view.try_insert_agent_command(command))
     }
 
+    pub(crate) fn try_run_review_command(&self, command: &str) -> bool {
+        self.view
+            .as_ref()
+            .is_some_and(|view| view.try_run_review_command(command))
+    }
+
     /// Grid size (cols, rows) of the live VTE; `None` when the PTY failed to
     /// start and there is no view.
     pub(crate) fn grid_size(&self) -> Option<(i64, i64)> {

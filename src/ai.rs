@@ -24,9 +24,9 @@ const MAX_AI_DELTAS_PER_TICK: usize = 64;
 use gtk::glib;
 
 pub(crate) use jterm_core::ai::{
-    agent_user_prompt, build_agent_system_prompt, build_nl_to_cmd_prompt, build_session_prompt,
-    truncate_for_context, user_prompt_with_block_context, AiCancellationToken, AiClient,
-    AiSettings, BlockContext, Role, Turn,
+    agent_user_prompt, build_agent_system_prompt, build_session_prompt, truncate_for_context,
+    user_prompt_with_block_context, AiCancellationToken, AiClient, AiSettings, BlockContext, Role,
+    Turn,
 };
 
 fn settings(config: &crate::config::Config) -> AiSettings {
@@ -95,6 +95,66 @@ pub(crate) fn ask(
         }],
         on_done,
     )
+}
+
+/// Draft one context-aware command for the inline review card. The returned
+/// handle owns cancellation exactly like chat/Agent requests, so callers must
+/// retain it until completion or an explicit Stop/Dismiss action.
+pub(crate) fn generate_command(
+    client: AiClient,
+    request: String,
+    cwd: String,
+    shell: String,
+    block: Option<BlockContext>,
+    on_done: impl FnOnce(AiResult) + 'static,
+) -> AiHandle {
+    let token = AiCancellationToken::new();
+    let suppressed = Arc::new(AtomicBool::new(false));
+    let slot: AiResultSlot = Arc::new(std::sync::Mutex::new(None));
+    let slot_thread = slot.clone();
+    let slot_main = slot.clone();
+    let mut on_done_cell: Option<AiCompletion> = Some(Box::new(on_done));
+
+    let worker_token = token.clone();
+    let spawn_result = std::thread::Builder::new()
+        .name("anvil-ai-command-suggestion".to_string())
+        .spawn(move || {
+            let result = jterm_core::ai::nl_to_command_with_context_blocking_cancellable(
+                &client,
+                &request,
+                &cwd,
+                &shell,
+                std::env::consts::OS,
+                block.as_ref(),
+                &worker_token,
+            )
+            .map_err(|error| error.to_string());
+            if worker_token.is_cancelled() {
+                return;
+            }
+            *slot_thread.lock().expect("AI command slot mutex poisoned") = Some(result);
+        });
+    if let Err(error) = spawn_result {
+        *slot.lock().expect("AI command slot mutex poisoned") =
+            Some(Err(format!("could not start AI command worker: {error}")));
+    }
+
+    let suppressed_main = suppressed.clone();
+    glib::timeout_add_local(Duration::from_millis(50), move || {
+        if suppressed_main.load(Ordering::SeqCst) {
+            return glib::ControlFlow::Break;
+        }
+        let mut guard = slot_main.lock().expect("AI command slot mutex poisoned");
+        if let Some(result) = guard.take() {
+            if let Some(callback) = on_done_cell.take() {
+                callback(result);
+            }
+            return glib::ControlFlow::Break;
+        }
+        glib::ControlFlow::Continue
+    });
+
+    AiHandle { token, suppressed }
 }
 
 /// Fire a provider-neutral multi-turn transcript. Roles are retained all the

@@ -17,6 +17,13 @@ pub(crate) struct AgentBlockCompletion {
     pub(crate) agent_execution: Option<agent::AgentExecutionRef>,
 }
 
+fn should_publish_reply_activity(result: &Result<bool, agent::SessionError>) -> bool {
+    // Ok(false) is the one stale/cancelled callback outcome. Protocol errors
+    // are current replies too, and the state machine records their safe error
+    // turn before returning Err.
+    !matches!(result, Ok(false))
+}
+
 #[cfg(test)]
 fn read_agent_snapshot(path: &Path) -> Option<AgentSessionSnapshot> {
     let _parent_lock = crate::config_store::PrivateParentLock::acquire(path).ok()?;
@@ -119,6 +126,70 @@ fn remove_agent_snapshot(path: &Path) {
 impl AppModel {
     // ── Agent mode ───────────────────────────────────────────────────────
 
+    fn agent_append_activity_at(&self, tab_id: u64, pane_id: u64, speaker: &str, body: &str) {
+        let compact = self.config.borrow().block_compact;
+        let message = agent::build_agent_message_block(speaker, body, compact);
+        let Some(terminal) = self.terminal_for(tab_id, pane_id) else {
+            return;
+        };
+        terminal.insert_inline_notice(&message);
+        if self
+            .active_agent
+            .borrow()
+            .as_ref()
+            .is_some_and(|session| session.bound_tab == tab_id && session.bound_pane == pane_id)
+        {
+            let card: gtk::Widget = self.agent_panel.widget().clone().upcast();
+            terminal.insert_inline_notice(&card);
+        }
+    }
+
+    fn agent_append_activity(&self, speaker: &str, body: &str) {
+        let target = self
+            .active_agent
+            .borrow()
+            .as_ref()
+            .map(|session| (session.bound_tab, session.bound_pane));
+        if let Some((tab_id, pane_id)) = target {
+            self.agent_append_activity_at(tab_id, pane_id, speaker, body);
+        }
+    }
+
+    fn agent_restore_activity(&self, transcript: &[agent::Turn]) {
+        for turn in transcript {
+            match turn {
+                agent::Turn::User(message) => self.agent_append_activity("You", message),
+                agent::Turn::AssistantThought(message) => {
+                    self.agent_append_activity("Agent (thought)", message)
+                }
+                agent::Turn::AssistantSay(message) => self.agent_append_activity("Agent", message),
+                agent::Turn::AssistantProposed {
+                    id,
+                    command,
+                    status,
+                } => {
+                    let verdict = match status {
+                        agent::ProposalStatus::Pending => "awaiting approval",
+                        agent::ProposalStatus::Approved => "approved and ran",
+                        agent::ProposalStatus::Rejected => "rejected",
+                        agent::ProposalStatus::ManualReview => "moved to manual review",
+                    };
+                    self.agent_append_activity(
+                        "Agent",
+                        &format!("Proposed command #{} ({verdict}): {}", id.get(), command),
+                    );
+                }
+                agent::Turn::Observation {
+                    exit_code,
+                    output_sample,
+                    ..
+                } => self
+                    .agent_append_activity("Output", &format!("exit {exit_code}\n{output_sample}")),
+                agent::Turn::ProtocolError(message) => self.agent_append_activity("Error", message),
+            }
+        }
+    }
+
     pub(crate) fn open_agent_panel(&self, sender: &ComponentSender<AppModel>) {
         // Match Forge's stateful top-bar/shortcut behavior: invoking the action
         // again closes the one live inline session.
@@ -180,23 +251,27 @@ impl AppModel {
         // rebound to the pane the user reopened the Agent on.
         let snapshot_file = Self::agent_snapshot_path();
         let restored = restore_agent_snapshot_once(&snapshot_file);
-        let mut session = match restored {
+        let (mut session, was_restored) = match restored {
             Some(inner) => match agent::AgentSession::from_restored(inner, tab_id, pane_id) {
                 Some(session) => {
                     self.show_toast("Restored the previous agent session.");
-                    session
+                    (session, true)
                 }
                 None => {
                     log::warn!(
                         "agent: discarded a restored session containing unsafe command text"
                     );
                     self.show_toast("Discarded an unsafe saved Agent session.");
-                    agent::AgentSession::new(tab_id, pane_id, max_turns)
+                    (agent::AgentSession::new(tab_id, pane_id, max_turns), false)
                 }
             },
-            None => agent::AgentSession::new(tab_id, pane_id, max_turns),
+            None => (agent::AgentSession::new(tab_id, pane_id, max_turns), false),
         };
         session.last_manual_completed = initial_context;
+        // Forge keeps typo correction and the multi-turn Agent mutually
+        // exclusive. Cancel any visible/in-flight correction before the Agent
+        // becomes the pane's active assistant surface.
+        self.close_all_command_corrections();
         *self.active_agent.borrow_mut() = Some(session);
         let panel_generation = self.agent_panel_generation.get().wrapping_add(1);
         self.agent_panel_generation.set(panel_generation);
@@ -220,6 +295,34 @@ impl AppModel {
             .emit(agent::AgentPanelMsg::PromptStatus(prompt_status));
         self.agent_panel.emit(agent::AgentPanelMsg::Focus);
         self.sync_agent_toggle();
+
+        self.agent_append_activity(
+            "Agent",
+            if self
+                .active_agent
+                .borrow()
+                .as_ref()
+                .and_then(|session| session.last_manual_completed.as_ref())
+                .is_some()
+            {
+                "Bound to this Block pane with the selected finished Block attached as untrusted context. I can propose commands, but cannot run one without your explicit approval."
+            } else {
+                "Bound to this Block pane. I can propose commands, but cannot run one without your explicit approval."
+            },
+        );
+        if was_restored {
+            self.agent_append_activity(
+                "Agent",
+                "Restored the previous Agent session from your last run.",
+            );
+            let transcript = self
+                .active_agent
+                .borrow()
+                .as_ref()
+                .map(|session| session.transcript().to_vec())
+                .unwrap_or_default();
+            self.agent_restore_activity(&transcript);
+        }
 
         // Keep the readiness chip live while the card is open without
         // rebuilding the editable proposal or transcript every tick.
@@ -369,6 +472,11 @@ impl AppModel {
         };
         if let Err(error) = result {
             self.report_agent_error("start a new task", &error);
+        } else {
+            self.agent_append_activity(
+                "Agent",
+                "Started a fresh task in this pane. Previous activity remains visible but is no longer sent to the model.",
+            );
         }
         self.refresh_agent_panel();
     }
@@ -382,7 +490,13 @@ impl AppModel {
             session.stop_model_request()
         };
         match result {
-            Ok(true) => self.show_toast("Shell Agent model request stopped."),
+            Ok(true) => {
+                self.show_toast("Shell Agent model request stopped.");
+                self.agent_append_activity(
+                    "Stopped",
+                    "Model request stopped. Retry it or revise the instruction.",
+                );
+            }
             Ok(false) => return,
             Err(error) => self.report_agent_error("stop model request", &error),
         }
@@ -440,12 +554,20 @@ impl AppModel {
         } else {
             "Attached the selected Block to Shell Agent."
         });
+        self.agent_append_activity(
+            "Agent",
+            if replaced {
+                "Replaced the attached Block context with the currently selected finished Block."
+            } else {
+                "Attached the selected finished Block as untrusted context for upcoming instructions."
+            },
+        );
         self.refresh_agent_panel();
     }
 
     /// Detach the selected Block from future model requests.
     pub(crate) fn agent_clear_context(&self) {
-        {
+        let detached = {
             let mut guard = self.active_agent.borrow_mut();
             let Some(session) = guard.as_mut() else {
                 return;
@@ -454,7 +576,13 @@ impl AppModel {
                 self.show_toast("Block context can only be changed while Shell Agent is ready.");
                 return;
             }
-            session.last_manual_completed = None;
+            session.last_manual_completed.take().is_some()
+        };
+        if detached {
+            self.agent_append_activity(
+                "Agent",
+                "Selected Block context detached. Session activity is still retained.",
+            );
         }
         self.refresh_agent_panel();
     }
@@ -486,6 +614,7 @@ impl AppModel {
     /// Submit one user turn. The state machine rejects concurrent sends while
     /// a model, approval, or command observation is outstanding.
     pub(crate) fn agent_send(&self, text: String, sender: &ComponentSender<AppModel>) {
+        let visible_text = text.clone();
         let result = {
             let mut guard = self.active_agent.borrow_mut();
             let Some(session) = guard.as_mut() else {
@@ -498,6 +627,7 @@ impl AppModel {
             self.refresh_agent_panel();
             return;
         }
+        self.agent_append_activity("You", &visible_text);
         self.refresh_agent_panel();
         self.agent_kick_llm(sender);
     }
@@ -532,6 +662,7 @@ impl AppModel {
         let prompt_status = terminal.command_prompt_status();
         if !prompt_status.is_ready() {
             self.show_toast(prompt_status.blocked_message());
+            self.agent_append_activity("Safety check", prompt_status.blocked_message());
             return;
         }
 
@@ -614,6 +745,7 @@ impl AppModel {
         let prompt_status = terminal.command_prompt_status();
         if !prompt_status.is_ready() {
             self.show_toast(prompt_status.blocked_message());
+            self.agent_append_activity("Safety check", prompt_status.blocked_message());
             return;
         }
 
@@ -644,6 +776,10 @@ impl AppModel {
             return;
         }
         self.show_toast("Inserted the proposal for manual review. Shell Agent did not run it.");
+        self.agent_append_activity(
+            "You",
+            "Moved the proposal to the shell prompt for manual review. The Agent did not run it and will not assume a result.",
+        );
         terminal.emit(VteInput::GrabFocus);
         self.refresh_agent_panel();
     }
@@ -669,6 +805,7 @@ impl AppModel {
             self.refresh_agent_panel();
             return;
         }
+        self.agent_append_activity("You", "Rejected proposal; ask for another approach.");
         self.refresh_agent_panel();
         if self.agent_is_awaiting_model() {
             self.agent_kick_llm(sender);
@@ -699,14 +836,11 @@ impl AppModel {
             }
             match agent_execution {
                 Some(execution) => match session.correlate_execution(execution, &command) {
-                    agent::AgentExecutionMatch::Matched(proposal_id) => proposal_id,
+                    agent::AgentExecutionMatch::Matched(proposal_id) => Some(proposal_id),
                     agent::AgentExecutionMatch::CommandMismatch => {
                         let failed = session.execution_start_failed(execution);
                         debug_assert!(failed);
-                        self.show_toast(
-                            "Agent stopped because command completion correlation failed.",
-                        );
-                        return;
+                        None
                     }
                     // A stale/internal execution can never become model context.
                     agent::AgentExecutionMatch::Stale => return,
@@ -715,6 +849,14 @@ impl AppModel {
                 // context. The user explicitly attaches a selected Block.
                 None => return,
             }
+        };
+        let Some(proposal_id) = proposal_id else {
+            self.show_toast("Agent stopped because command completion correlation failed.");
+            self.agent_append_activity(
+                "Safety check",
+                "Agent stopped because command completion correlation failed.",
+            );
+            return;
         };
 
         let result = {
@@ -745,6 +887,10 @@ impl AppModel {
         };
         if failed {
             self.show_toast("Agent stopped because the target prompt was no longer ready.");
+            self.agent_append_activity(
+                "Safety check",
+                "Agent stopped because the target prompt was no longer ready.",
+            );
             self.refresh_agent_panel();
         }
     }
@@ -755,13 +901,34 @@ impl AppModel {
         reply: Result<String, String>,
         _sender: &ComponentSender<AppModel>,
     ) {
-        let result = {
+        let (result, activity) = {
             let mut guard = self.active_agent.borrow_mut();
             let Some(session) = guard.as_mut() else {
                 return;
             };
-            session.apply_llm_reply(epoch, reply)
+            let before = session.transcript().len();
+            let result = session.apply_llm_reply(epoch, reply);
+            let activity = if should_publish_reply_activity(&result) {
+                session.transcript()[before..].to_vec()
+            } else {
+                Vec::new()
+            };
+            (result, activity)
         };
+        for turn in activity {
+            match turn {
+                agent::Turn::AssistantThought(message) => {
+                    self.agent_append_activity("Agent (thought)", &message)
+                }
+                agent::Turn::AssistantSay(message) => self.agent_append_activity("Agent", &message),
+                agent::Turn::ProtocolError(message) => {
+                    self.agent_append_activity("Protocol error", &message)
+                }
+                agent::Turn::User(_)
+                | agent::Turn::AssistantProposed { .. }
+                | agent::Turn::Observation { .. } => {}
+            }
+        }
         match result {
             Ok(false) => return,
             Ok(true) => {}
@@ -790,6 +957,7 @@ impl AppModel {
                 }
                 log::warn!("agent: {error}");
                 self.show_toast(format!("AI provider is unavailable: {error}"));
+                self.agent_append_activity("Error", &error);
                 self.refresh_agent_panel();
                 return;
             }
@@ -891,6 +1059,191 @@ impl AppModel {
         self.sync_agent_toggle();
     }
 
+    /// Small dashboard for Agent identity and safety-adjacent controls. The
+    /// general Settings dialog remains available, but session activity never
+    /// leaves the inline card/Block flow merely to inspect configuration.
+    pub(crate) fn open_agent_settings(&self, sender: &ComponentSender<AppModel>) {
+        let Some((tab_id, pane_id)) = self
+            .active_agent
+            .borrow()
+            .as_ref()
+            .map(|session| (session.bound_tab, session.bound_pane))
+        else {
+            self.show_toast("Open Shell Agent before viewing its dashboard.");
+            return;
+        };
+        let cwd = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.panes.iter().find(|pane| pane.id == pane_id))
+            .and_then(|pane| pane.cwd.clone())
+            .unwrap_or_else(|| ".".to_string());
+        let shell = self
+            .shell_argv
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "sh".to_string());
+        let (provider, model, correction_enabled) = {
+            let config = self.config.borrow();
+            (
+                config.ai_provider.clone(),
+                config.ai_model.clone(),
+                config.command_correction_enabled,
+            )
+        };
+
+        let dialog = adw::Dialog::builder()
+            .title("Shell Agent settings")
+            .content_width(620)
+            .build();
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&adw::HeaderBar::new());
+
+        let body = gtk::Box::new(gtk::Orientation::Vertical, 10);
+        body.add_css_class("agent-dashboard");
+        body.set_margin_start(12);
+        body.set_margin_end(12);
+        body.set_margin_top(10);
+        body.set_margin_bottom(12);
+
+        let overview = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        overview.add_css_class("agent-overview");
+        let identity = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        let icon = gtk::Image::from_icon_name("system-run-symbolic");
+        icon.set_pixel_size(32);
+        let identity_copy = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        identity_copy.set_hexpand(true);
+        let title = gtk::Label::new(Some("Approval-gated shell assistant"));
+        title.set_xalign(0.0);
+        title.add_css_class("title-3");
+        let safe_cwd = crate::text_safety::bounded_display_text(&cwd, 4 * 1024, false);
+        let target = gtk::Label::new(Some(&format!("Bound to Block pane · {safe_cwd}")));
+        target.set_xalign(0.0);
+        target.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        target.set_tooltip_text(Some(&safe_cwd));
+        target.add_css_class("dim-label");
+        identity_copy.append(&title);
+        identity_copy.append(&target);
+        identity.append(&icon);
+        identity.append(&identity_copy);
+        overview.append(&identity);
+
+        let chips = gtk::FlowBox::new();
+        chips.set_selection_mode(gtk::SelectionMode::None);
+        chips.set_homogeneous(false);
+        chips.set_row_spacing(6);
+        chips.set_column_spacing(6);
+        chips.set_min_children_per_line(1);
+        chips.set_max_children_per_line(3);
+        for (index, text) in [
+            format!("{provider} · {model}"),
+            format!("shell: {shell}"),
+            "Review required".to_string(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let text = crate::text_safety::bounded_display_text(&text, 1024, false);
+            let chip = gtk::Label::new(Some(&text));
+            chip.add_css_class("agent-chip");
+            if index == 2 {
+                chip.add_css_class("agent-safety-chip");
+            }
+            chip.set_tooltip_text(Some(&text));
+            chips.append(&chip);
+        }
+        overview.append(&chips);
+        body.append(&overview);
+
+        let auto_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        auto_row.add_css_class("agent-setting-card");
+        let auto_copy = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        auto_copy.set_hexpand(true);
+        let auto_title = gtk::Label::new(Some("Automatic command execution retired"));
+        auto_title.set_xalign(0.0);
+        auto_title.add_css_class("heading");
+        let auto_hint = gtk::Label::new(Some(
+            "Every proposal requires explicit approval; aliases, functions and tool flags make string-only auto-approval unsafe.",
+        ));
+        auto_hint.set_xalign(0.0);
+        auto_hint.set_wrap(true);
+        auto_hint.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        auto_hint.add_css_class("dim-label");
+        auto_copy.append(&auto_title);
+        auto_copy.append(&auto_hint);
+        let auto_switch = gtk::Switch::builder()
+            .active(false)
+            .sensitive(false)
+            .valign(gtk::Align::Center)
+            .build();
+        auto_switch.update_property(&[gtk::accessible::Property::Label(
+            "Automatic command execution (retired and off)",
+        )]);
+        auto_switch.set_tooltip_text(Some("Automatic execution is disabled for safety"));
+        auto_row.append(&auto_copy);
+        auto_row.append(&auto_switch);
+        body.append(&auto_row);
+
+        let correction_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        correction_row.add_css_class("agent-setting-card");
+        let correction_copy = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        correction_copy.set_hexpand(true);
+        let correction_title = gtk::Label::new(Some("AI command correction"));
+        correction_title.set_xalign(0.0);
+        correction_title.add_css_class("heading");
+        let correction_hint = gtk::Label::new(Some(
+            "After typo-like failures, offer an editable correction; never insert or run it automatically.",
+        ));
+        correction_hint.set_xalign(0.0);
+        correction_hint.set_wrap(true);
+        correction_hint.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        correction_hint.add_css_class("dim-label");
+        correction_copy.append(&correction_title);
+        correction_copy.append(&correction_hint);
+        let correction_switch = gtk::Switch::builder()
+            .active(correction_enabled)
+            .valign(gtk::Align::Center)
+            .build();
+        correction_switch
+            .update_property(&[gtk::accessible::Property::Label("AI command correction")]);
+        correction_switch.set_tooltip_text(Some("Enable review-first command correction"));
+        correction_row.append(&correction_copy);
+        correction_row.append(&correction_switch);
+        body.append(&correction_row);
+
+        let full_settings = gtk::Button::with_label("Open full AI settings");
+        full_settings.set_halign(gtk::Align::End);
+        full_settings.add_css_class("flat");
+        body.append(&full_settings);
+
+        {
+            let sender = sender.clone();
+            correction_switch.connect_active_notify(move |toggle| {
+                sender.input(AppMsg::SettingsCommandCorrection(toggle.is_active()));
+            });
+        }
+        {
+            let sender = sender.clone();
+            let dialog = dialog.clone();
+            full_settings.connect_clicked(move |_| {
+                dialog.close();
+                sender.input(AppMsg::Action(Action::ToggleSettings));
+            });
+        }
+
+        let scroll = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vscrollbar_policy(gtk::PolicyType::Automatic)
+            .propagate_natural_height(true)
+            .vexpand(true)
+            .child(&body)
+            .build();
+        toolbar.set_content(Some(&scroll));
+        dialog.set_child(Some(&toolbar));
+        dialog.present(Some(&self.window));
+    }
+
     pub(crate) fn sync_agent_toggle(&self) {
         let cfg = self.config.borrow();
         let available = !self.safe_mode && cfg.ai_enabled && cfg.agent_enabled;
@@ -930,6 +1283,18 @@ mod snapshot_tests {
         let mut session = jterm_core::agent::AgentSession::new(4);
         session.submit_user("persist this session").unwrap();
         session.snapshot().expect("non-empty session snapshots")
+    }
+
+    #[test]
+    fn current_protocol_error_is_published_but_stale_reply_is_not() {
+        let mut session = agent::AgentSession::new(1, 2, 4);
+        session.submit_user("test protocol handling").unwrap();
+        let current = session.apply_llm_reply(session.epoch(), Ok("not json".to_string()));
+        assert!(current.is_err());
+        assert!(should_publish_reply_activity(&current));
+
+        let stale = Ok(false);
+        assert!(!should_publish_reply_activity(&stale));
     }
 
     fn test_directory(label: &str) -> std::path::PathBuf {

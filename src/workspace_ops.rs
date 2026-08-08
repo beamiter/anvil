@@ -986,6 +986,9 @@ impl AppModel {
         }
         self.persist_session();
         self.persist_agent_session();
+        self.agent_close();
+        self.close_command_suggestion();
+        self.close_all_command_corrections();
         if let Err(error) = command_history::flush_pending(std::time::Duration::from_secs(3)) {
             log::warn!("flush command history on exit: {error}");
         }
@@ -1344,6 +1347,15 @@ impl AppModel {
 
     pub(crate) fn close_tab(&mut self, id: u64, sender: &ComponentSender<AppModel>) {
         let Some(idx) = self.index_of(id) else { return };
+        let pane_ids = self.tabs[idx]
+            .panes
+            .iter()
+            .map(|pane| pane.id)
+            .collect::<Vec<_>>();
+        for pane_id in pane_ids {
+            self.close_command_suggestion_for_pane(pane_id);
+            self.close_command_correction_for_pane(pane_id);
+        }
         let closes_agent = self
             .active_agent
             .borrow()
@@ -1719,6 +1731,16 @@ impl AppModel {
             return;
         }
         let selected: std::collections::HashSet<u64> = ids.into_iter().collect();
+        let pane_ids = self
+            .tabs
+            .iter()
+            .filter(|tab| selected.contains(&tab.id))
+            .flat_map(|tab| tab.panes.iter().map(|pane| pane.id))
+            .collect::<Vec<_>>();
+        for pane_id in pane_ids {
+            self.close_command_suggestion_for_pane(pane_id);
+            self.close_command_correction_for_pane(pane_id);
+        }
         let closes_agent = self
             .active_agent
             .borrow()
@@ -1840,6 +1862,8 @@ impl AppModel {
         let Some((ti, pi)) = self.find_pane(pane_id) else {
             return;
         };
+        self.close_command_suggestion_for_pane(pane_id);
+        self.close_command_correction_for_pane(pane_id);
         let closes_agent = self
             .active_agent
             .borrow()

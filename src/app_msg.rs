@@ -92,6 +92,7 @@ pub(crate) enum AppMsg {
     SettingsCommandHistory(bool),
     SettingsAiEnabled(bool),
     SettingsAgentEnabled(bool),
+    SettingsCommandCorrection(bool),
     SettingsAiProvider(usize),
     SettingsAiModel(String),
     SettingsAiBaseUrl(String),
@@ -115,6 +116,7 @@ pub(crate) enum AppMsg {
     FileTreeActivateFile(String),
     OpenNotebook(std::path::PathBuf),
     OpenAgent,
+    OpenAgentSettings,
     AgentSend(String),
     AgentContinue,
     AgentNewTask,
@@ -148,13 +150,36 @@ pub(crate) enum AppMsg {
     SetSidebarView(crate::config::SidebarView),
     PaletteTypeCommand(String),
     PaletteAskAi(String),
-    PaletteReviewAiCommand {
-        pane_id: u64,
-        command: String,
+    PaletteSuggestionReply {
+        generation: u64,
+        request_id: u64,
+        reply: Result<String, String>,
     },
-    PaletteInsertAiCommand {
+    PaletteSuggestionStop(u64),
+    PaletteSuggestionRetry(u64),
+    PaletteSuggestionInsert(u64),
+    PaletteSuggestionDismiss(u64),
+    CommandCorrectionLocalReply {
         pane_id: u64,
-        command: String,
+        generation: u64,
+        candidate: Option<crate::command_correction::CorrectionCandidate>,
+    },
+    CommandCorrectionAiReply {
+        pane_id: u64,
+        generation: u64,
+        reply: Result<String, String>,
+    },
+    CommandCorrectionAccept {
+        pane_id: u64,
+        generation: u64,
+    },
+    CommandCorrectionTimeout {
+        pane_id: u64,
+        generation: u64,
+    },
+    CommandCorrectionDismiss {
+        pane_id: u64,
+        generation: u64,
     },
     OpenAiPanel,
     AskAiAboutBlock(crate::ai::BlockContext),

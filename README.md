@@ -24,8 +24,8 @@ restoration as the only copy of work in progress.
 - Search within terminal output, block selection, output filtering, bookmarks,
   copy/rerun controls, and long-command notifications
 - SSH host picker, connection status, multiplexing, and reconnect support
-- Optional AI command generation, error explanation, session Q&A, and a
-  multi-turn command agent with explicit approval before execution
+- Optional inline AI command generation, review-first command correction,
+  session Q&A, and a multi-turn Shell Agent with explicit approval before execution
 - Runnable Markdown notebooks (`.jtnb.md`) with isolated multi-shell cells
 - Live appearance settings and a hot-reloaded TOML configuration
 
@@ -395,6 +395,8 @@ ANVIL_FONT_SCALE           ANVIL_OPACITY
 ANVIL_SCROLLBACK           ANVIL_HISTORY_PATH
 ANVIL_COMMAND_HISTORY_PATH
 ANVIL_TAB_PLACEMENT        ANVIL_BLOCK_COMPACT
+ANVIL_AGENT_AUTO_APPROVE_READONLY
+ANVIL_COMMAND_CORRECTION_ENABLED
 ANVIL_FG / BG / CURSOR / CURSOR_FG
 ```
 
@@ -570,17 +572,47 @@ key file. The Settings dialog's **API Key** row stores a pasted key as a
 `~/.config/anvil/ai.key` — and `ANVIL_AI_API_KEY_FILE` overrides the
 configured path without ever being written back to config.toml.
 
-AI network calls happen only after an explicit AI action. The session panel
-keeps a multi-turn role history until Clear is pressed and can optionally attach
-recent shell history. `Ctrl+Shift+Q`, or **Ask AI About Block** in a finished
-block's context menu, starts a conversation with a bounded command/output
-snapshot. `?` command generation inserts a command for review without executing
-it. The agent proposes one command per turn and only runs it after the user
-presses Approve; approval submits the command immediately. Approval is bound to
-the current clean prompt, the exact reviewed command, a one-shot local
-generation, and the shell integration's matching OSC 133 start/completion ID.
-If any of those change or the terminal write fails, the proposal is cancelled
-instead of attributing a different command's result to the Agent.
+AI network calls happen only after an explicit AI action, except the optional
+review-first correction fallback after a narrowly classified failed command.
+The session panel keeps a multi-turn role history until Clear is pressed and can
+optionally attach recent shell history. `Ctrl+Shift+Q`, or **Ask AI About Block**
+in a finished block's context menu, starts a conversation with a bounded
+command/output snapshot.
+
+Typing `?` in the command palette opens an inline, pane-bound suggestion card.
+The request can be stopped or retried; a result can be copied, regenerated,
+edited, or inserted at the prompt. Insert never presses Enter. The shared review
+card shows a live risk label and rejects multiline, oversized, control, and
+visually ambiguous edits.
+
+The Shell Agent presents status and settings in a responsive inline dashboard,
+while conversation events remain as separate Block-style cards after the
+dashboard closes or **New task** resets model context. It proposes one command
+per turn and only runs it after **Approve & Run**. **Insert only** leaves the
+edited command at the prompt. Approval is bound to the current clean prompt,
+the exact reviewed command, a one-shot local generation, and the shell
+integration's matching OSC 133 start/completion ID. If any of those change or
+the terminal write fails, the proposal is cancelled instead of attributing a
+different command's result to the Agent.
+
+`command_correction_enabled = true` (or
+`ANVIL_COMMAND_CORRECTION_ENABLED=true`) enables suggestions for unknown
+executables/packages, subcommands, and options. Target output is preferred,
+then bounded local APT/PATH evidence, with AI as a strict-JSON fallback. An
+unchanged, non-dangerous host-verified candidate offers **Run verified
+command**; any edit, new risk, target-output hint, remote candidate, or AI
+candidate immediately uses **Insert for review** instead. Nothing runs or is
+inserted automatically. The option defaults to true and is available in
+Settings and the Agent dashboard.
+
+The legacy `agent_auto_approve_readonly` /
+`ANVIL_AGENT_AUTO_APPROVE_READONLY` setting is accepted only for migration and
+is always normalized to false. Every Agent proposal requires explicit approval.
+
+See [`docs/SMART_COMMAND_CORRECTION.md`](docs/SMART_COMMAND_CORRECTION.md) for
+the correction boundary and
+[`docs/AI_AGENT_ACCEPTANCE.md`](docs/AI_AGENT_ACCEPTANCE.md) for manual
+acceptance checks.
 
 ### Notebooks
 

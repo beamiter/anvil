@@ -71,6 +71,12 @@ impl AppModel {
         *self.config_revision.borrow_mut() = Some(revision);
         self.shell_argv = new_shell_argv;
         self.sync_terminal_configs();
+        if !new_config.ai_enabled {
+            self.close_command_suggestion();
+            self.close_all_command_corrections();
+        } else if !new_config.command_correction_enabled {
+            self.close_all_command_corrections();
+        }
         if !new_config.ai_enabled || !new_config.agent_enabled {
             self.agent_close();
         } else {

@@ -9,6 +9,8 @@ mod app_msg;
 mod block_view;
 mod bottom_bar_ui;
 mod cli;
+mod command_correction;
+mod command_review;
 mod config;
 mod config_ops;
 mod config_store;
@@ -152,6 +154,15 @@ struct AppModel {
     history: Controller<dialogs::history::HistoryModel>,
     workflow_dialog: Controller<dialogs::workflow::WorkflowModel>,
     ai_panel: Controller<dialogs::ai_panel::AiPanelModel>,
+    /// One pane-bound natural-language command draft. Keeping the request
+    /// handle here makes Stop/Dismiss real transport cancellation.
+    command_suggestion: Rc<RefCell<Option<ai_palette_ops::CommandSuggestionSession>>>,
+    command_suggestion_generation: Rc<std::cell::Cell<u64>>,
+    /// Per-pane review-first correction requests/cards. Stable generations
+    /// prevent a late local/AI result from replacing a newer failure.
+    command_corrections:
+        Rc<RefCell<std::collections::HashMap<u64, command_correction::CorrectionSession>>>,
+    command_correction_generation: Rc<std::cell::Cell<u64>>,
     notebook: Controller<notebook::NotebookModel>,
     /// Workflows loaded from disk. Refreshed on demand each time the palette
     /// is opened (cheap — handful of small YAML files) so users see edits
@@ -572,6 +583,7 @@ impl SimpleComponent for AppModel {
                     command_history: config.borrow().command_history_enabled,
                     ai_enabled: config.borrow().ai_enabled,
                     agent_enabled: config.borrow().agent_enabled,
+                    command_correction_enabled: config.borrow().command_correction_enabled,
                     ai_provider: match config.borrow().ai_provider.as_str() {
                         "openai-compatible" => 1,
                         "ollama" => 2,
@@ -616,6 +628,9 @@ impl SimpleComponent for AppModel {
                 }
                 dialogs::settings::SettingsOutput::AgentEnabled(enabled) => {
                     AppMsg::SettingsAgentEnabled(enabled)
+                }
+                dialogs::settings::SettingsOutput::CommandCorrection(enabled) => {
+                    AppMsg::SettingsCommandCorrection(enabled)
                 }
                 dialogs::settings::SettingsOutput::AiProvider(provider) => {
                     AppMsg::SettingsAiProvider(provider)
@@ -726,7 +741,7 @@ impl SimpleComponent for AppModel {
                 agent::AgentPanelOutput::NewTask => AppMsg::AgentNewTask,
                 agent::AgentPanelOutput::AttachContext => AppMsg::AgentAttachContext,
                 agent::AgentPanelOutput::ClearContext => AppMsg::AgentClearContext,
-                agent::AgentPanelOutput::OpenSettings => AppMsg::Action(Action::ToggleSettings),
+                agent::AgentPanelOutput::OpenSettings => AppMsg::OpenAgentSettings,
                 agent::AgentPanelOutput::Closed => AppMsg::AgentClose,
             });
         // Both tab lists speak the same output vocabulary, so they route
@@ -812,6 +827,10 @@ impl SimpleComponent for AppModel {
             history,
             workflow_dialog,
             ai_panel,
+            command_suggestion: Rc::new(RefCell::new(None)),
+            command_suggestion_generation: Rc::new(std::cell::Cell::new(0)),
+            command_corrections: Rc::new(RefCell::new(std::collections::HashMap::new())),
+            command_correction_generation: Rc::new(std::cell::Cell::new(0)),
             notebook,
             workflows,
             active_agent: Rc::new(RefCell::new(None)),
@@ -1312,6 +1331,9 @@ impl SimpleComponent for AppModel {
             AppMsg::SettingsCommandHistory(enabled) => self.apply_settings_command_history(enabled),
             AppMsg::SettingsAiEnabled(enabled) => self.apply_settings_ai_enabled(enabled),
             AppMsg::SettingsAgentEnabled(enabled) => self.apply_settings_agent_enabled(enabled),
+            AppMsg::SettingsCommandCorrection(enabled) => {
+                self.apply_settings_command_correction(enabled)
+            }
             AppMsg::SettingsAiProvider(provider) => self.apply_settings_ai_provider(provider),
             AppMsg::SettingsAiModel(model) => self.apply_settings_ai_model(model),
             AppMsg::SettingsAiKeyFile(path) => self.apply_settings_ai_key_file(path),
@@ -1399,6 +1421,7 @@ impl SimpleComponent for AppModel {
                 }
             }
             AppMsg::OpenAgent => self.open_agent_panel(&sender),
+            AppMsg::OpenAgentSettings => self.open_agent_settings(&sender),
             AppMsg::AgentSend(text) => self.agent_send(text, &sender),
             AppMsg::AgentStopRequest => self.agent_stop_request(),
             AppMsg::AgentRetryRequest => self.agent_retry_request(&sender),
@@ -1434,6 +1457,15 @@ impl SimpleComponent for AppModel {
                         pane.last_duration_ms = duration_ms;
                     }
                     self.refresh_bottom_bar();
+                    self.pin_command_suggestion(pane_id);
+                    self.maybe_start_command_correction(
+                        pane_id,
+                        command.clone(),
+                        exit_code,
+                        output_sample.clone(),
+                        agent_execution.is_some(),
+                        &sender,
+                    );
                     self.agent_handle_block_finished(
                         agent_ops::AgentBlockCompletion {
                             tab_id,
@@ -1457,12 +1489,51 @@ impl SimpleComponent for AppModel {
             AppMsg::PaletteAskAi(query) => {
                 self.handle_palette_ask_ai(query, &sender);
             }
-            AppMsg::PaletteReviewAiCommand { pane_id, command } => {
-                self.review_palette_ai_command(pane_id, command, &sender);
+            AppMsg::PaletteSuggestionReply {
+                generation,
+                request_id,
+                reply,
+            } => {
+                self.command_suggestion_reply(generation, request_id, reply, &sender);
             }
-            AppMsg::PaletteInsertAiCommand { pane_id, command } => {
-                self.insert_palette_ai_command(pane_id, command);
+            AppMsg::PaletteSuggestionStop(generation) => {
+                self.stop_command_suggestion(generation);
             }
+            AppMsg::PaletteSuggestionRetry(generation) => {
+                self.start_command_suggestion(generation, &sender);
+            }
+            AppMsg::PaletteSuggestionInsert(generation) => {
+                self.insert_command_suggestion(generation);
+            }
+            AppMsg::PaletteSuggestionDismiss(generation) => {
+                self.close_command_suggestion_generation(generation);
+            }
+            AppMsg::CommandCorrectionLocalReply {
+                pane_id,
+                generation,
+                candidate,
+            } => {
+                self.command_correction_local_reply(pane_id, generation, candidate, &sender);
+            }
+            AppMsg::CommandCorrectionAiReply {
+                pane_id,
+                generation,
+                reply,
+            } => {
+                self.command_correction_ai_reply(pane_id, generation, reply, &sender);
+            }
+            AppMsg::CommandCorrectionAccept {
+                pane_id,
+                generation,
+            } => self.accept_command_correction(pane_id, generation),
+            AppMsg::CommandCorrectionTimeout {
+                pane_id,
+                generation,
+            } => self.command_correction_timeout(pane_id, generation),
+            AppMsg::CommandCorrectionDismiss {
+                pane_id,
+                generation,
+            } => self.close_command_correction_generation(pane_id, generation),
             AppMsg::OpenAiPanel => {
                 self.show_ai_session_panel();
             }

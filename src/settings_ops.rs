@@ -139,6 +139,8 @@ impl AppModel {
         self.sync_terminal_configs();
         if !enabled {
             self.agent_close();
+            self.close_command_suggestion();
+            self.close_all_command_corrections();
         } else {
             self.sync_agent_toggle();
         }
@@ -158,6 +160,23 @@ impl AppModel {
             self.sync_agent_toggle();
         }
         self.persist_config();
+    }
+
+    pub(crate) fn apply_settings_command_correction(&mut self, enabled: bool) {
+        if self.safe_mode {
+            self.show_toast("AI command correction is disabled in safe mode.");
+            return;
+        }
+        self.config.borrow_mut().command_correction_enabled = enabled;
+        if !enabled {
+            self.close_all_command_corrections();
+        }
+        self.persist_config();
+        self.show_toast(if enabled {
+            "Review-first command correction enabled."
+        } else {
+            "Command correction disabled."
+        });
     }
 
     pub(crate) fn apply_settings_ai_provider(&mut self, provider: usize) {

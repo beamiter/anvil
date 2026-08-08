@@ -211,6 +211,7 @@ impl AppModel {
                         command_history: config.command_history_enabled,
                         ai_enabled: config.ai_enabled,
                         agent_enabled: config.agent_enabled,
+                        command_correction_enabled: config.command_correction_enabled,
                         ai_provider: match config.ai_provider.as_str() {
                             "openai-compatible" => 1,
                             "ollama" => 2,

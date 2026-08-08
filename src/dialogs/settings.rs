@@ -24,6 +24,7 @@ pub(crate) struct SettingsValues {
     pub(crate) command_history: bool,
     pub(crate) ai_enabled: bool,
     pub(crate) agent_enabled: bool,
+    pub(crate) command_correction_enabled: bool,
     pub(crate) ai_provider: u32,
     pub(crate) ai_model: String,
     pub(crate) ai_base_url: String,
@@ -101,6 +102,7 @@ pub(crate) enum SettingsMsg {
     CommandHistory(bool),
     AiEnabled(bool),
     AgentEnabled(bool),
+    CommandCorrection(bool),
     AiProvider(u32),
     AiModel(String),
     AiBaseUrl(String),
@@ -137,6 +139,7 @@ pub(crate) enum SettingsOutput {
     CommandHistory(bool),
     AiEnabled(bool),
     AgentEnabled(bool),
+    CommandCorrection(bool),
     AiProvider(usize),
     AiModel(String),
     AiBaseUrl(String),
@@ -394,7 +397,7 @@ impl Component for SettingsModel {
                     #[name(ai_enabled_row)]
                     adw::SwitchRow {
                         set_title: "AI Features",
-                        set_subtitle: "Requests run only after an explicit action",
+                        set_subtitle: "Requests follow explicit AI actions; enabled correction may use a fallback request after a narrow failure",
                         set_active: model.values.ai_enabled,
                         set_sensitive: !model.values.safe_mode,
                         connect_active_notify[sender] => move |row| {
@@ -410,6 +413,24 @@ impl Component for SettingsModel {
                         set_sensitive: !model.values.safe_mode && model.values.ai_enabled,
                         connect_active_notify[sender] => move |row| {
                             sender.input(SettingsMsg::AgentEnabled(row.is_active()));
+                        },
+                    },
+
+                    adw::SwitchRow {
+                        set_title: "Automatic Agent Approval Retired",
+                        set_subtitle: "Always off; every Agent proposal requires explicit approval",
+                        set_active: false,
+                        set_sensitive: false,
+                    },
+
+                    #[name(command_correction_row)]
+                    adw::SwitchRow {
+                        set_title: "AI Command Correction",
+                        set_subtitle: "Offer editable fixes; only exact host-verified candidates can be explicitly run",
+                        set_active: model.values.command_correction_enabled,
+                        set_sensitive: !model.values.safe_mode && model.values.ai_enabled,
+                        connect_active_notify[sender] => move |row| {
+                            sender.input(SettingsMsg::CommandCorrection(row.is_active()));
                         },
                     },
 
@@ -586,6 +607,9 @@ impl Component for SettingsModel {
                     .agent_enabled_row
                     .set_active(self.values.agent_enabled);
                 widgets
+                    .command_correction_row
+                    .set_active(self.values.command_correction_enabled);
+                widgets
                     .ai_provider_row
                     .set_selected(self.values.ai_provider);
                 widgets.ai_model_row.set_text(&self.values.ai_model);
@@ -605,6 +629,7 @@ impl Component for SettingsModel {
                 let ai_sensitive = !self.values.safe_mode && self.values.ai_enabled;
                 widgets.ai_enabled_row.set_sensitive(!self.values.safe_mode);
                 widgets.agent_enabled_row.set_sensitive(ai_sensitive);
+                widgets.command_correction_row.set_sensitive(ai_sensitive);
                 widgets.ai_provider_row.set_sensitive(ai_sensitive);
                 widgets.ai_model_row.set_sensitive(ai_sensitive);
                 widgets.ai_base_url_row.set_sensitive(ai_sensitive);
@@ -671,6 +696,7 @@ impl Component for SettingsModel {
                 self.values.ai_enabled = enabled;
                 let sensitive = !self.values.safe_mode && enabled;
                 widgets.agent_enabled_row.set_sensitive(sensitive);
+                widgets.command_correction_row.set_sensitive(sensitive);
                 widgets.ai_provider_row.set_sensitive(sensitive);
                 widgets.ai_model_row.set_sensitive(sensitive);
                 widgets.ai_base_url_row.set_sensitive(sensitive);
@@ -689,6 +715,10 @@ impl Component for SettingsModel {
                     .agent_max_turns_row
                     .set_sensitive(!self.values.safe_mode && self.values.ai_enabled && enabled);
                 let _ = sender.output(SettingsOutput::AgentEnabled(enabled));
+            }
+            SettingsMsg::CommandCorrection(enabled) => {
+                self.values.command_correction_enabled = enabled;
+                let _ = sender.output(SettingsOutput::CommandCorrection(enabled));
             }
             SettingsMsg::AiProvider(provider) => {
                 self.values.ai_provider = provider;
@@ -1074,6 +1104,7 @@ mod tests {
                 command_history: true,
                 ai_enabled: false,
                 agent_enabled: false,
+                command_correction_enabled: false,
                 ai_provider: 0,
                 ai_model: String::new(),
                 ai_base_url: String::new(),

@@ -855,6 +855,14 @@ fn apply_config_to_table(config: &Config, table: &mut toml::Table) {
         toml::Value::Integer(config.agent_max_turns as i64),
     );
     table.insert(
+        "agent_auto_approve_readonly".into(),
+        toml::Value::Boolean(false),
+    );
+    table.insert(
+        "command_correction_enabled".into(),
+        toml::Value::Boolean(config.command_correction_enabled),
+    );
+    table.insert(
         "notify_long_blocks".into(),
         toml::Value::Boolean(config.notify_long_blocks),
     );
@@ -1517,6 +1525,8 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
         "ai_api_key_file",
         "agent_enabled",
         "agent_max_turns",
+        "agent_auto_approve_readonly",
+        "command_correction_enabled",
         "mouse_reporting_enabled",
         "focus_reporting_enabled",
         "scroll_reporting_enabled",
@@ -1589,6 +1599,8 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
         "ai_redact_secrets",
         "ai_stream",
         "agent_enabled",
+        "agent_auto_approve_readonly",
+        "command_correction_enabled",
         "mouse_reporting_enabled",
         "focus_reporting_enabled",
         "scroll_reporting_enabled",
@@ -1598,6 +1610,16 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
         "click_moves_cursor",
     ] {
         check_type(&mut report, table, key, ExpectedType::Boolean);
+    }
+    if table
+        .get("agent_auto_approve_readonly")
+        .and_then(toml::Value::as_bool)
+        == Some(true)
+    {
+        report.warning(
+            "agent_auto_approve_readonly",
+            "retired for safety; every Agent proposal requires explicit approval",
+        );
     }
     check_type(&mut report, table, "colors", ExpectedType::Table);
     check_type(&mut report, table, "keybindings", ExpectedType::Table);
@@ -2346,6 +2368,28 @@ mod tests {
                 report.issues
             );
         }
+    }
+
+    #[test]
+    fn retired_agent_auto_approval_is_known_but_warned_when_enabled() {
+        let table = "agent_auto_approve_readonly = true\n"
+            .parse::<toml::Table>()
+            .unwrap();
+        let report = validate_table(Path::new("config.toml"), &table);
+        assert_eq!(report.errors(), 0);
+        assert!(report.issues.iter().any(|issue| {
+            issue.key == "agent_auto_approve_readonly"
+                && issue.message.contains("retired for safety")
+        }));
+
+        let mut normalized = table;
+        apply_config_to_table(&Config::safe_defaults(), &mut normalized);
+        assert_eq!(
+            normalized
+                .get("agent_auto_approve_readonly")
+                .and_then(toml::Value::as_bool),
+            Some(false)
+        );
     }
 
     #[test]

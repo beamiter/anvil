@@ -21,11 +21,10 @@ pub(crate) fn is_visual_spoof(ch: char) -> bool {
                 | '\u{fe00}'..='\u{fe0f}'
                 | '\u{feff}'
                 | '\u{ffa0}'
+                | '\u{fff0}'..='\u{fff8}'
                 | '\u{1bca0}'..='\u{1bca3}'
                 | '\u{1d173}'..='\u{1d17a}'
-                | '\u{e0001}'
-                | '\u{e0020}'..='\u{e007f}'
-                | '\u{e0100}'..='\u{e01ef}'
+                | '\u{e0000}'..='\u{e0fff}'
         )
 }
 
@@ -93,10 +92,12 @@ mod tests {
             '\u{fe0f}',
             '\u{feff}',
             '\u{ffa0}',
+            '\u{fff0}',
             '\u{1bca0}',
             '\u{1d173}',
             '\u{e0001}',
             '\u{e0020}',
+            '\u{e0080}',
             '\u{e0100}',
         ] {
             assert!(is_visual_spoof(ch), "U+{:04X} was accepted", ch as u32);

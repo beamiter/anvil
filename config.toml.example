@@ -82,13 +82,18 @@ notify_long_block_threshold_ms = 10000
 # Optional AI surfaces. Credentials (ANVIL_AI_API_KEY, ANTHROPIC_API_KEY,
 # OPENAI_API_KEY, or OLLAMA_API_KEY) remain environment-only and are never
 # written by anvil. The generic key takes precedence. Provider aliases
-# `claude`, `openai`, and `openai_compatible` are accepted and normalized. Environment overrides take
-# precedence over this file: ANVIL_AI_PROVIDER, ANVIL_AI_MODEL,
+# `claude`, `openai`, and `openai_compatible` are accepted and normalized.
+# Environment overrides take precedence over this file: ANVIL_AI_PROVIDER, ANVIL_AI_MODEL,
 # ANVIL_AI_BASE_URL, ANVIL_AI_MAX_TOKENS, ANVIL_AI_REDACT_SECRETS, and
-# ANVIL_AI_STREAM.
+# ANVIL_AI_STREAM, ANVIL_AGENT_AUTO_APPROVE_READONLY, and
+# ANVIL_COMMAND_CORRECTION_ENABLED. Enabled correction may make an AI fallback
+# request after a narrowly classified failure; no candidate is accepted automatically.
 ai_enabled = true
 agent_enabled = true
 agent_max_turns = 20
+# Retired compatibility key. `true` is ignored; every proposal needs approval.
+agent_auto_approve_readonly = false
+command_correction_enabled = true
 ai_provider = "anthropic"       # anthropic | openai-compatible | ollama
 ai_model = "claude-sonnet-4-6"
 ai_base_url = "https://api.anthropic.com"

@@ -80,6 +80,13 @@ impl TermCtl {
         }
     }
 
+    pub(crate) fn try_run_review_command(&self, command: &str) -> bool {
+        match self {
+            Self::Vte(_) => false,
+            Self::Block(controller) => controller.model().try_run_review_command(command),
+        }
+    }
+
     pub(crate) fn block_debug_info(&self) -> Option<crate::block_view::DebugInfo> {
         match self {
             Self::Vte(_) => None,

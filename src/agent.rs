@@ -33,6 +33,10 @@ use relm4::gtk;
 use relm4::prelude::*;
 use std::rc::Rc;
 
+use crate::command_review::{
+    set_review_feedback, CommandReviewCard, CommandReviewSpec, ReviewPresentation,
+};
+
 pub(crate) use jterm_core::agent::{
     is_dangerous, AgentSessionEpoch, AgentState, ApprovedCommand, CancellationToken, ModelOutcome,
     ProposalId, ProposalStatus, SessionError, Turn,
@@ -43,6 +47,7 @@ use jterm_core::agent::AgentSession as CoreSession;
 
 const MAX_LOCAL_AGENT_COMMAND_BYTES: usize = 16 * 1024;
 const MAX_AGENT_DISPLAY_BYTES: usize = 32 * 1024;
+const MAX_AGENT_INPUT_BYTES: usize = 16 * 1024;
 /// App-level ceiling for one raw model reply, applied before parsing and
 /// before any transcript mutation. The protocol layer bounds each decoded
 /// field, but the raw reply arrives from the provider bounded only by the
@@ -615,12 +620,6 @@ impl Component for AgentPanelModel {
                     },
                 },
 
-                #[name(transcript_box)]
-                gtk::Box {
-                    set_orientation: gtk::Orientation::Vertical,
-                    set_spacing: 6,
-                },
-
                 #[name(proposal_box)]
                 gtk::Box {
                     set_orientation: gtk::Orientation::Vertical,
@@ -652,11 +651,19 @@ impl Component for AgentPanelModel {
                             add_css_class: "agent-status",
                         },
 
+                    },
+
+                    gtk::Box {
+                        set_orientation: gtk::Orientation::Horizontal,
+                        set_spacing: 6,
+                        set_halign: gtk::Align::End,
+
                         #[name(retry_button)]
                         gtk::Button {
                             set_label: "Retry",
                             set_visible: false,
                             set_tooltip_text: Some("Retry the failed model turn without duplicating input"),
+                            add_css_class: "command-review-secondary",
                             connect_clicked => AgentPanelMsg::RetryRequest,
                         },
 
@@ -673,6 +680,7 @@ impl Component for AgentPanelModel {
                         gtk::Button {
                             set_label: "Follow up",
                             set_visible: false,
+                            add_css_class: "command-review-secondary",
                             connect_clicked => AgentPanelMsg::ContinueTask,
                         },
 
@@ -680,8 +688,14 @@ impl Component for AgentPanelModel {
                         gtk::Button {
                             set_label: "New task",
                             set_visible: false,
+                            add_css_class: "command-review-secondary",
                             connect_clicked => AgentPanelMsg::NewTask,
                         },
+                    },
+
+                    gtk::Box {
+                        set_orientation: gtk::Orientation::Horizontal,
+                        set_spacing: 6,
 
                         #[name(prompt_status)]
                         gtk::Label {
@@ -691,6 +705,8 @@ impl Component for AgentPanelModel {
 
                         #[name(turn_label)]
                         gtk::Label {
+                            set_hexpand: true,
+                            set_halign: gtk::Align::End,
                             add_css_class: "agent-turn-label",
                         },
                     },
@@ -715,6 +731,7 @@ impl Component for AgentPanelModel {
                         gtk::Entry {
                             set_placeholder_text: Some("Describe a task for this pane…"),
                             set_hexpand: true,
+                            set_width_chars: 8,
                             add_css_class: "agent-input",
                             connect_activate => AgentPanelMsg::Submit,
                             connect_changed => AgentPanelMsg::InputChanged,
@@ -731,19 +748,22 @@ impl Component for AgentPanelModel {
                     },
 
                     gtk::Box {
-                        set_orientation: gtk::Orientation::Horizontal,
+                        set_orientation: gtk::Orientation::Vertical,
                         set_spacing: 6,
 
                         gtk::Label {
                             set_label: "Enter sends · every proposed command stays editable and requires approval",
                             set_xalign: 0.0,
                             set_hexpand: true,
+                            set_wrap: true,
+                            set_wrap_mode: gtk::pango::WrapMode::WordChar,
                             add_css_class: "agent-input-hint",
                         },
 
                         #[name(attach_context_button)]
                         gtk::Button {
                             set_label: "Attach selected Block",
+                            set_halign: gtk::Align::End,
                             set_tooltip_text: Some("Attach the selected finished Block as untrusted context"),
                             add_css_class: "flat",
                             connect_clicked => AgentPanelMsg::AttachContext,
@@ -777,6 +797,15 @@ impl Component for AgentPanelModel {
             },
         };
         let widgets = view_output!();
+        widgets
+            .input
+            .update_property(&[gtk::accessible::Property::Label("Shell Agent instruction")]);
+        widgets
+            .status
+            .set_accessible_role(gtk::AccessibleRole::Status);
+        widgets
+            .prompt_status
+            .set_accessible_role(gtk::AccessibleRole::Status);
         ComponentParts { model, widgets }
     }
 
@@ -815,6 +844,15 @@ impl Component for AgentPanelModel {
                 }
             }
             AgentPanelMsg::InputChanged => {
+                let value = widgets.input.text().to_string();
+                if value.len() > MAX_AGENT_INPUT_BYTES {
+                    let bounded = bounded_agent_input(value);
+                    widgets.input.set_text(&bounded);
+                    widgets.input.set_position(-1);
+                    widgets
+                        .status
+                        .set_label("Instruction was limited to 16 KiB.");
+                }
                 widgets.send_button.set_sensitive(
                     self.view.state == AgentState::Ready && !widgets.input.text().trim().is_empty(),
                 );
@@ -846,9 +884,6 @@ impl Component for AgentPanelModel {
             AgentPanelMsg::Reset => {
                 root.set_visible(false);
                 widgets.input.set_text("");
-                while let Some(child) = widgets.transcript_box.first_child() {
-                    widgets.transcript_box.remove(&child);
-                }
                 while let Some(child) = widgets.proposal_box.first_child() {
                     widgets.proposal_box.remove(&child);
                 }
@@ -862,76 +897,34 @@ impl Component for AgentPanelModel {
 
 impl AgentPanelModel {
     fn render(&self, widgets: &AgentPanelModelWidgets, sender: ComponentSender<Self>) {
-        while let Some(child) = widgets.transcript_box.first_child() {
-            widgets.transcript_box.remove(&child);
-        }
         while let Some(child) = widgets.proposal_box.first_child() {
             widgets.proposal_box.remove(&child);
         }
         widgets.proposal_box.set_visible(false);
         for turn in &self.view.transcript {
-            match turn {
-                Turn::User(message) => widgets
-                    .transcript_box
-                    .append(&render_message("You", message, false)),
-                Turn::AssistantThought(message) => widgets.transcript_box.append(&render_message(
-                    "Agent (thought)",
-                    message,
-                    false,
-                )),
-                Turn::AssistantSay(message) => widgets
-                    .transcript_box
-                    .append(&render_message("Agent", message, false)),
-                Turn::AssistantProposed {
-                    id,
-                    command,
-                    status,
-                } => {
-                    let current = matches!(
-                        self.view.state,
-                        AgentState::AwaitingApproval { proposal_id } if proposal_id == *id
-                    );
-                    if *status == ProposalStatus::Pending && current {
-                        widgets.proposal_box.set_visible(true);
-                        widgets.proposal_box.append(&render_proposed(
-                            self.view
-                                .epoch
-                                .map(|epoch| AgentProposalRef { epoch, id: *id }),
-                            *id,
-                            command,
-                            sender.clone(),
-                            &self.parent,
-                        ));
-                    } else {
-                        let verdict = match status {
-                            ProposalStatus::Pending => "inactive",
-                            ProposalStatus::Approved => "approved and ran",
-                            ProposalStatus::Rejected => "rejected",
-                            ProposalStatus::ManualReview => "moved to manual review",
-                        };
-                        widgets.transcript_box.append(&render_message(
-                            "Agent",
-                            &format!(
-                                "Proposed command #{} ({verdict}):\n{}",
-                                id.get(),
-                                agent_display_text(command, false)
-                            ),
-                            false,
-                        ));
-                    }
+            if let Turn::AssistantProposed {
+                id,
+                command,
+                status,
+            } = turn
+            {
+                let current = matches!(
+                    self.view.state,
+                    AgentState::AwaitingApproval { proposal_id } if proposal_id == *id
+                );
+                if *status == ProposalStatus::Pending && current {
+                    widgets.proposal_box.set_visible(true);
+                    widgets.proposal_box.append(&render_proposed(
+                        self.view
+                            .epoch
+                            .map(|epoch| AgentProposalRef { epoch, id: *id }),
+                        *id,
+                        command,
+                        sender.clone(),
+                        &self.parent,
+                        self.view.compact,
+                    ));
                 }
-                Turn::Observation {
-                    exit_code,
-                    output_sample,
-                    ..
-                } => widgets.transcript_box.append(&render_message(
-                    &format!("Output · exit {exit_code}"),
-                    output_sample,
-                    *exit_code != 0,
-                )),
-                Turn::ProtocolError(message) => widgets
-                    .transcript_box
-                    .append(&render_message("Error", message, true)),
             }
         }
         let status = match self.view.state {
@@ -967,17 +960,26 @@ impl AgentPanelModel {
                 .context_label
                 .set_tooltip_text(Some(&agent_context_tooltip(context)));
             widgets.context_card.set_visible(true);
+            widgets.input.set_placeholder_text(Some(
+                "Ask about the attached Block or describe the next step…",
+            ));
         } else {
             widgets.context_card.set_visible(false);
+            widgets
+                .input
+                .set_placeholder_text(Some("Describe a task for this pane…"));
         }
 
-        widgets.continue_button.set_visible(
-            self.view.state == AgentState::Completed && self.view.turns_used < self.view.max_turns,
+        let can_follow_up =
+            self.view.state == AgentState::Completed && self.view.turns_used < self.view.max_turns;
+        widgets.continue_button.set_visible(can_follow_up);
+        widgets.new_task_button.set_visible(
+            !can_follow_up
+                && matches!(
+                    self.view.state,
+                    AgentState::Completed | AgentState::TurnLimitReached
+                ),
         );
-        widgets.new_task_button.set_visible(matches!(
-            self.view.state,
-            AgentState::Completed | AgentState::TurnLimitReached
-        ));
         widgets
             .clear_context_button
             .set_visible(self.view.attached_context.is_some());
@@ -1051,7 +1053,12 @@ fn agent_context_label(context: &crate::ai::BlockContext) -> String {
         format!("exit {}", context.exit_code)
     };
     format!(
-        "Attached Block · {exit} · {}",
+        "Attached Block · {exit}{} · {}",
+        if context.truncated {
+            " · output truncated"
+        } else {
+            ""
+        },
         agent_display_text(&context.cmd, false)
     )
 }
@@ -1070,26 +1077,91 @@ fn agent_context_tooltip(context: &crate::ai::BlockContext) -> String {
     )
 }
 
-fn render_message(speaker: &str, message: &str, error: bool) -> gtk::Widget {
-    let card = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    card.add_css_class("agent-transcript-card");
-    let speaker = gtk::Label::new(Some(speaker));
-    speaker.set_xalign(0.0);
-    speaker.add_css_class("agent-section-label");
-    if error {
-        speaker.add_css_class("error");
+fn bounded_agent_input(mut text: String) -> String {
+    if text.len() <= MAX_AGENT_INPUT_BYTES {
+        return text;
     }
+    let mut end = MAX_AGENT_INPUT_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text
+}
+
+/// Render one Agent conversation event as its own transient block immediately
+/// above the pinned dashboard. It remains visible when the dashboard closes or
+/// New task resets the model context.
+pub(crate) fn build_agent_message_block(
+    speaker: &str,
+    message: &str,
+    compact: bool,
+) -> gtk::Widget {
+    let error = matches!(
+        speaker,
+        "Error" | "Protocol error" | "Stopped" | "Safety check"
+    );
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    card.add_css_class("block-finished");
+    card.add_css_class("block-assistant");
+    card.add_css_class("block-agent");
+    card.set_hexpand(true);
+    card.set_vexpand(false);
+    if compact {
+        card.add_css_class("block-compact");
+        card.set_margin_top(1);
+        card.set_margin_bottom(1);
+        card.set_margin_start(4);
+        card.set_margin_end(4);
+    } else {
+        card.set_margin_top(4);
+        card.set_margin_bottom(4);
+        card.set_margin_start(8);
+        card.set_margin_end(8);
+    }
+
+    let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    header.add_css_class("block-header");
+    header.set_margin_start(if compact { 8 } else { 12 });
+    header.set_margin_end(if compact { 6 } else { 8 });
+    header.set_margin_top(if compact { 3 } else { 6 });
+    header.set_margin_bottom(if compact { 1 } else { 2 });
+    let icon = gtk::Image::from_icon_name(if speaker == "You" {
+        "avatar-default-symbolic"
+    } else {
+        "system-run-symbolic"
+    });
+    icon.add_css_class("agent-card-icon");
+    header.append(&icon);
+    let title = gtk::Label::new(Some("Shell Agent"));
+    title.add_css_class("agent-card-title");
+    title.set_xalign(0.0);
+    header.append(&title);
+    let speaker_text = agent_display_text(speaker, false);
+    let speaker_chip = gtk::Label::new(Some(&speaker_text));
+    speaker_chip.add_css_class("agent-chip");
+    if error {
+        speaker_chip.add_css_class("agent-msg-error");
+    }
+    speaker_chip.set_halign(gtk::Align::Start);
+    speaker_chip.set_hexpand(true);
+    header.append(&speaker_chip);
+    card.append(&header);
+
     let body = gtk::Label::new(Some(&agent_display_text(message, true)));
+    body.add_css_class("agent-msg-body");
     body.set_xalign(0.0);
+    body.set_hexpand(true);
     body.set_wrap(true);
+    body.set_wrap_mode(gtk::pango::WrapMode::WordChar);
     body.set_selectable(true);
-    body.set_margin_start(10);
-    body.set_margin_end(10);
-    body.set_margin_bottom(8);
+    body.set_margin_start(if compact { 8 } else { 12 });
+    body.set_margin_end(if compact { 8 } else { 12 });
+    body.set_margin_top(2);
+    body.set_margin_bottom(if compact { 6 } else { 10 });
     if error {
         body.add_css_class("error");
     }
-    card.append(&speaker);
     card.append(&body);
     card.upcast()
 }
@@ -1100,65 +1172,47 @@ fn render_proposed(
     command: &str,
     sender: ComponentSender<AgentPanelModel>,
     parent: &adw::ApplicationWindow,
+    compact: bool,
 ) -> gtk::Widget {
-    let outer = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    let title = gtk::Label::new(Some(&format!(
-        "Command proposal · Shell Agent · #{}",
-        id.get()
-    )));
-    title.set_xalign(0.0);
-    title.add_css_class("agent-section-label");
-    outer.append(&title);
-
-    let issue = local_agent_command_issue(command);
-    if let Some(issue) = issue {
-        let warning = gtk::Label::new(Some(&format!("Blocked unsafe proposal: {issue}")));
-        warning.add_css_class("error");
-        warning.set_halign(gtk::Align::Start);
-        outer.append(&warning);
+    let review = CommandReviewCard::new(CommandReviewSpec {
+        presentation: ReviewPresentation::Embedded,
+        compact,
+        icon_name: "system-run-symbolic",
+        title: "Command proposal".to_string(),
+        badge: format!("Shell Agent · #{}", id.get()),
+        description: "Edit or copy the proposal, insert it for manual review without running, reject it, or explicitly approve execution.".to_string(),
+        command: command.to_string(),
+        primary_label: "Approve & Run".to_string(),
+        primary_executes: true,
+        auxiliary_label: Some("Insert only".to_string()),
+        secondary_label: Some("Reject".to_string()),
+        close_button: false,
+    });
+    let actionable = reference.is_some() && local_agent_command_issue(command).is_none();
+    review.entry.set_sensitive(actionable);
+    review.primary.set_sensitive(actionable);
+    if let Some(button) = review.auxiliary.as_ref() {
+        button.set_sensitive(actionable);
+    }
+    if let Some(button) = review.secondary.as_ref() {
+        button.set_sensitive(actionable);
     }
 
-    let entry = gtk::Entry::new();
-    entry.set_hexpand(true);
-    entry.set_text(&agent_display_text(command, false));
-    entry.add_css_class("agent-input");
-    entry.set_sensitive(reference.is_some() && issue.is_none());
-    outer.append(&entry);
-
-    let feedback = gtk::Label::new(None);
-    feedback.set_xalign(0.0);
-    feedback.set_wrap(true);
-    feedback.set_visible(false);
-    outer.append(&feedback);
-
-    let btn_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    btn_row.set_halign(gtk::Align::End);
-    let reject = gtk::Button::with_label("Reject");
-    let insert = gtk::Button::with_label("Insert only");
-    let approve = gtk::Button::with_label("Approve & Run");
-    approve.add_css_class("suggested-action");
-    let actionable = reference.is_some() && issue.is_none();
-    reject.set_sensitive(actionable);
-    insert.set_sensitive(actionable);
-    approve.set_sensitive(actionable);
-
     if let Some(reference) = reference {
-        {
+        if let Some(reject) = review.secondary.as_ref() {
             let sender = sender.clone();
             reject.connect_clicked(move |_| {
                 let _ = sender.output(AgentPanelOutput::Reject(reference));
             });
         }
-        {
+        if let Some(insert) = review.auxiliary.as_ref() {
             let sender = sender.clone();
-            let entry = entry.clone();
-            let feedback = feedback.clone();
+            let entry = review.entry.clone();
+            let feedback = review.feedback.clone();
             insert.connect_clicked(move |_| {
                 let command = entry.text().trim().to_string();
                 if let Some(issue) = local_agent_command_issue(&command) {
-                    feedback.set_label(&format!("Cannot insert: {issue}"));
-                    feedback.add_css_class("error");
-                    feedback.set_visible(true);
+                    set_review_feedback(&feedback, &format!("Cannot insert: {issue}"), true);
                     return;
                 }
                 let _ = sender.output(AgentPanelOutput::Insert(reference, command));
@@ -1166,15 +1220,13 @@ fn render_proposed(
         }
         let approve_action: Rc<dyn Fn()> = {
             let sender = sender.clone();
-            let entry = entry.clone();
-            let feedback = feedback.clone();
+            let entry = review.entry.clone();
+            let feedback = review.feedback.clone();
             let parent = parent.clone();
             Rc::new(move || {
                 let command = entry.text().trim().to_string();
                 if let Some(issue) = local_agent_command_issue(&command) {
-                    feedback.set_label(&format!("Cannot approve: {issue}"));
-                    feedback.add_css_class("error");
-                    feedback.set_visible(true);
+                    set_review_feedback(&feedback, &format!("Cannot approve: {issue}"), true);
                     return;
                 }
                 if let Some(reason) = is_dangerous(&command) {
@@ -1209,20 +1261,25 @@ fn render_proposed(
         };
         {
             let approve_action = approve_action.clone();
-            approve.connect_clicked(move |_| approve_action());
+            review.primary.connect_clicked(move |_| approve_action());
         }
-        entry.connect_activate(move |_| approve_action());
+        review.entry.connect_activate(move |_| approve_action());
     }
-    btn_row.append(&reject);
-    btn_row.append(&insert);
-    btn_row.append(&approve);
-    outer.append(&btn_row);
-    outer.upcast()
+    review.root.upcast()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_input_limit_preserves_utf8_boundaries() {
+        let input = format!("{}界", "a".repeat(MAX_AGENT_INPUT_BYTES.saturating_sub(1)));
+        let bounded = bounded_agent_input(input);
+        assert!(bounded.len() <= MAX_AGENT_INPUT_BYTES);
+        assert!(bounded.is_char_boundary(bounded.len()));
+        assert_eq!(bounded, "a".repeat(MAX_AGENT_INPUT_BYTES - 1));
+    }
 
     fn session(max_turns: u32) -> AgentSession {
         AgentSession::new(10, 20, max_turns)

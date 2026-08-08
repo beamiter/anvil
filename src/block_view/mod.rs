@@ -5048,6 +5048,31 @@ impl TermView {
         true
     }
 
+    /// Submit one explicitly approved, locally verified review command without
+    /// arming Agent observation. Readiness, validation, command bytes, and the
+    /// terminating carriage return are admitted as one UI-thread operation so
+    /// another input path cannot alter the reviewed text in between.
+    pub fn try_run_review_command(&self, command: &str) -> bool {
+        if !agent_command_is_safe(command) || !self.can_accept_agent_command() {
+            return false;
+        }
+        let mut bytes = command.as_bytes().to_vec();
+        bytes.push(b'\r');
+        match self.pty.try_write_bytes(&bytes) {
+            Ok(()) => {
+                append_typed_command_shadow(&mut self.typed_cmd.borrow_mut(), command);
+                true
+            }
+            Err(error) => {
+                log::warn!(
+                    "Verified review command was not queued to the PTY ({} bytes): {error}",
+                    error.len()
+                );
+                false
+            }
+        }
+    }
+
     /// Re-check prompt readiness, arm a one-shot local identity, and submit
     /// the reviewed command without yielding to another input path between
     /// those operations.
