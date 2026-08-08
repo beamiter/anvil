@@ -60,10 +60,12 @@ than wrapped, and workspace snapshots decode under their own budgets.
   `SavedSession`, `SavedTab`, and `PaneLayout` no longer derive `Deserialize`.
   Unknown fields are still ignored so snapshots from other releases restore, and
   `session_within_restore_limits` remains as the post-decode semantic backstop.
-- Agent snapshot restore uses `jterm_core::agent::claim_session_file` while
+- Agent snapshot restore uses `jterm_core::agent::try_claim_session_file` while
   holding the private parent lock. The public name is consumed once, invalid
-  evidence is quarantined, and the parent namespace is synced before a claimed
-  session is accepted.
+  evidence is quarantined, typed claim-acquisition errors retain the public
+  path, and the parent namespace is synced before a claimed session is accepted.
+  `jterm_core` is pinned to `48d25f155b960417609ffc85a98b7c9ba44c5772`
+  (transitively jagent `a09fd1563b862f96bed7047834720aeb31c163e2`).
 
 ## Remaining boundaries
 

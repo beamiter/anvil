@@ -45,9 +45,9 @@ fn restore_agent_snapshot_once_with_sync(
             return None;
         }
     };
-    match jterm_core::agent::claim_session_file(path) {
-        jterm_core::agent::SessionClaim::Vacant => None,
-        jterm_core::agent::SessionClaim::Restored(restored) => {
+    match jterm_core::agent::try_claim_session_file(path) {
+        Ok(jterm_core::agent::SessionClaim::Vacant) => None,
+        Ok(jterm_core::agent::SessionClaim::Restored(restored)) => {
             if let Err(error) = sync_parent(path) {
                 log::warn!(
                     "agent: snapshot claim for {} was not durable: {error}",
@@ -57,10 +57,10 @@ fn restore_agent_snapshot_once_with_sync(
             }
             Some(restored)
         }
-        jterm_core::agent::SessionClaim::Quarantined {
+        Ok(jterm_core::agent::SessionClaim::Quarantined {
             path: quarantined,
             error,
-        } => {
+        }) => {
             log::warn!(
                 "agent: invalid snapshot {} quarantined at {}: {error}",
                 path.display(),
@@ -72,6 +72,13 @@ fn restore_agent_snapshot_once_with_sync(
                     path.display()
                 );
             }
+            None
+        }
+        Err(error) => {
+            log::warn!(
+                "agent: could not atomically claim snapshot {}: {error}",
+                path.display()
+            );
             None
         }
     }
@@ -737,6 +744,30 @@ mod snapshot_tests {
         assert!(sync_called.get(), "a successful claim must sync its parent");
         assert!(restored.is_none(), "an undurable claim must fail closed");
         assert!(!path.exists(), "the claimed public name remains consumed");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn claim_error_keeps_the_public_path_and_does_not_sync() {
+        let root = test_directory("claim-error");
+        let path = root.join("agent_session.json");
+        std::fs::create_dir(&path).unwrap();
+        let sync_called = std::cell::Cell::new(false);
+
+        assert!(restore_agent_snapshot_once_with_sync(&path, |_| {
+            sync_called.set(true);
+            Ok(())
+        })
+        .is_none());
+        assert!(
+            !sync_called.get(),
+            "a failed claim did not mutate the namespace"
+        );
+        assert!(
+            path.is_dir(),
+            "claim errors must retain the public evidence"
+        );
+
         std::fs::remove_dir_all(root).unwrap();
     }
 
