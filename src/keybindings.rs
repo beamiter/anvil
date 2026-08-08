@@ -181,7 +181,7 @@ impl Action {
             Action::OpenAiPanel => "Open AI panel",
             Action::AskAiAboutSelectedBlock => "Ask AI about selected block",
             Action::OpenWorkflows => "Open workflows",
-            Action::OpenAgent => "Open AI agent",
+            Action::OpenAgent => "Toggle Shell Agent",
             Action::CrossBlockSearch => "Search across blocks (ripgrep)",
         }
     }

@@ -1344,6 +1344,14 @@ impl AppModel {
 
     pub(crate) fn close_tab(&mut self, id: u64, sender: &ComponentSender<AppModel>) {
         let Some(idx) = self.index_of(id) else { return };
+        let closes_agent = self
+            .active_agent
+            .borrow()
+            .as_ref()
+            .is_some_and(|session| session.bound_tab == id);
+        if closes_agent {
+            self.agent_close();
+        }
         let tab = self.tabs.remove(idx);
         self.stack.remove(&tab.holder);
         drop(tab);
@@ -1711,6 +1719,14 @@ impl AppModel {
             return;
         }
         let selected: std::collections::HashSet<u64> = ids.into_iter().collect();
+        let closes_agent = self
+            .active_agent
+            .borrow()
+            .as_ref()
+            .is_some_and(|session| selected.contains(&session.bound_tab));
+        if closes_agent {
+            self.agent_close();
+        }
         let Some(first_removed) = self.tabs.iter().position(|tab| selected.contains(&tab.id))
         else {
             return;
@@ -1824,6 +1840,14 @@ impl AppModel {
         let Some((ti, pi)) = self.find_pane(pane_id) else {
             return;
         };
+        let closes_agent = self
+            .active_agent
+            .borrow()
+            .as_ref()
+            .is_some_and(|session| session.bound_pane == pane_id);
+        if closes_agent {
+            self.agent_close();
+        }
         if self.tabs[ti].zoom.is_some() {
             self.toggle_pane_zoom_for(ti);
         }

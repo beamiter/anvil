@@ -60,6 +60,42 @@ impl BlockTerminal {
             .is_some_and(|view| view.can_accept_agent_command())
     }
 
+    pub(crate) fn command_prompt_status(&self) -> crate::block_view::CommandPromptStatus {
+        self.view.as_ref().map_or(
+            crate::block_view::CommandPromptStatus::ShellIntegrationUnavailable,
+            |view| view.command_prompt_status(),
+        )
+    }
+
+    pub(crate) fn selected_block_context(
+        &self,
+        max_output_lines: usize,
+    ) -> Option<crate::ai::BlockContext> {
+        self.view
+            .as_ref()
+            .and_then(|view| view.selected_block_context(max_output_lines))
+    }
+
+    pub(crate) fn insert_inline_notice(&self, widget: &gtk::Widget) -> bool {
+        let Some(view) = self.view.as_ref() else {
+            return false;
+        };
+        view.insert_inline_notice(widget);
+        true
+    }
+
+    pub(crate) fn remove_inline_notice(&self, widget: &gtk::Widget) {
+        if let Some(view) = self.view.as_ref() {
+            view.remove_inline_notice(widget);
+        }
+    }
+
+    pub(crate) fn try_insert_agent_command(&self, command: &str) -> bool {
+        self.view
+            .as_ref()
+            .is_some_and(|view| view.try_insert_agent_command(command))
+    }
+
     /// Grid size (cols, rows) of the live VTE; `None` when the PTY failed to
     /// start and there is no view.
     pub(crate) fn grid_size(&self) -> Option<(i64, i64)> {

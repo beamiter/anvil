@@ -43,6 +43,43 @@ impl TermCtl {
         }
     }
 
+    pub(crate) fn command_prompt_status(&self) -> crate::block_view::CommandPromptStatus {
+        match self {
+            Self::Vte(_) => crate::block_view::CommandPromptStatus::ShellIntegrationUnavailable,
+            Self::Block(controller) => controller.model().command_prompt_status(),
+        }
+    }
+
+    pub(crate) fn selected_block_context(
+        &self,
+        max_output_lines: usize,
+    ) -> Option<crate::ai::BlockContext> {
+        match self {
+            Self::Vte(_) => None,
+            Self::Block(controller) => controller.model().selected_block_context(max_output_lines),
+        }
+    }
+
+    pub(crate) fn insert_inline_notice(&self, widget: &gtk::Widget) -> bool {
+        match self {
+            Self::Vte(_) => false,
+            Self::Block(controller) => controller.model().insert_inline_notice(widget),
+        }
+    }
+
+    pub(crate) fn remove_inline_notice(&self, widget: &gtk::Widget) {
+        if let Self::Block(controller) = self {
+            controller.model().remove_inline_notice(widget);
+        }
+    }
+
+    pub(crate) fn try_insert_agent_command(&self, command: &str) -> bool {
+        match self {
+            Self::Vte(_) => false,
+            Self::Block(controller) => controller.model().try_insert_agent_command(command),
+        }
+    }
+
     pub(crate) fn block_debug_info(&self) -> Option<crate::block_view::DebugInfo> {
         match self {
             Self::Vte(_) => None,

@@ -139,19 +139,23 @@ impl AppModel {
         self.sync_terminal_configs();
         if !enabled {
             self.agent_close();
+        } else {
+            self.sync_agent_toggle();
         }
         self.persist_config();
     }
 
     pub(crate) fn apply_settings_agent_enabled(&mut self, enabled: bool) {
         if self.safe_mode {
-            self.show_toast("AI Agent is disabled in safe mode.");
+            self.show_toast("Shell Agent is disabled in safe mode.");
             return;
         }
         self.config.borrow_mut().agent_enabled = enabled;
         self.sync_terminal_configs();
         if !enabled {
             self.agent_close();
+        } else {
+            self.sync_agent_toggle();
         }
         self.persist_config();
     }
@@ -247,7 +251,7 @@ impl AppModel {
 
     pub(crate) fn apply_settings_agent_max_turns(&mut self, turns: u32) {
         if self.safe_mode {
-            self.show_toast("AI Agent is disabled in safe mode.");
+            self.show_toast("Shell Agent is disabled in safe mode.");
             return;
         }
         self.config.borrow_mut().agent_max_turns = turns.clamp(1, 100);

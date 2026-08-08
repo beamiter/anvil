@@ -210,6 +210,14 @@ pub(crate) fn install_block_css(config: &Config) {
     let fg_g = (fg.green() * 255.0) as u8;
     let fg_b = (fg.blue() * 255.0) as u8;
 
+    // Shell Agent cards use the theme's blue so they remain distinct from
+    // success/correction accents (palette 2).
+    let agent = &config.palette[4];
+    let agent_hex = rgba_to_hex(agent);
+    let agent_r = (agent.red() * 255.0) as u8;
+    let agent_g = (agent.green() * 255.0) as u8;
+    let agent_b = (agent.blue() * 255.0) as u8;
+
     // Slightly different background for finished blocks (3% toward fg)
     let bg_r = (bg.red() * 255.0) as u8;
     let bg_g = (bg.green() * 255.0) as u8;
@@ -282,6 +290,107 @@ pub(crate) fn install_block_css(config: &Config) {
             border-left-color: {async_stripe};
             background-color: rgba({async_r},{async_g},{async_b},0.07);
             box-shadow: inset 2px 0 0 0 {async_stripe};
+        }}
+        .block-agent {{
+            border-left-color: rgba({agent_r},{agent_g},{agent_b},0.85);
+            background-color: rgba({agent_r},{agent_g},{agent_b},0.05);
+        }}
+        .agent-card-icon {{
+            color: {agent_hex};
+        }}
+        .agent-card-title {{
+            color: {fg_hex};
+            font-weight: bold;
+        }}
+        .agent-card-binding {{
+            color: {dim_fg};
+            font-size: 0.85em;
+        }}
+        .agent-context-card {{
+            padding: 8px 10px;
+            color: {fg_hex};
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.045);
+            border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.12);
+            border-radius: 9px;
+        }}
+        .agent-status-card, .agent-composer, .agent-transcript-card {{
+            color: {fg_hex};
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.055);
+            border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.14);
+            border-radius: 10px;
+        }}
+        .agent-status-card {{
+            padding: 9px 11px;
+        }}
+        .agent-status {{
+            color: rgba({fg_r},{fg_g},{fg_b},0.78);
+        }}
+        .agent-status-card progressbar trough {{
+            min-height: 4px;
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.10);
+            border-radius: 999px;
+        }}
+        .agent-status-card progressbar progress {{
+            min-height: 4px;
+            background-color: {agent_hex};
+            border-radius: 999px;
+        }}
+        .agent-prompt-status {{
+            border-radius: 999px;
+            padding: 2px 7px;
+            font-size: 0.82em;
+        }}
+        .agent-prompt-status.agent-prompt-ready {{
+            color: {ok_hex};
+            background-color: rgba({ok_r},{ok_g},{ok_b},0.10);
+        }}
+        .agent-prompt-status.agent-prompt-blocked {{
+            color: {err_hex};
+            background-color: rgba({err_r},{err_g},{err_b},0.10);
+        }}
+        .agent-proposal-card {{
+            padding: 10px;
+            color: {fg_hex};
+            background-color: {bg_hex};
+            border: 1px solid rgba({agent_r},{agent_g},{agent_b},0.48);
+            border-radius: 10px;
+        }}
+        .agent-danger-command {{
+            padding: 8px;
+            font-family: "{font_family}";
+            background-color: rgba({err_r},{err_g},{err_b},0.16);
+            border-radius: 7px;
+        }}
+        .agent-composer {{
+            padding: 9px;
+        }}
+        .agent-input {{
+            min-height: 34px;
+            color: {fg_hex};
+            caret-color: {fg_hex};
+            background-color: rgba({bg_r},{bg_g},{bg_b},0.62);
+            border-color: rgba({fg_r},{fg_g},{fg_b},0.20);
+        }}
+        .agent-input text {{
+            color: {fg_hex};
+            caret-color: {fg_hex};
+        }}
+        .agent-turn-label {{
+            color: rgba({fg_r},{fg_g},{fg_b},0.68);
+        }}
+        .agent-send {{
+            min-width: 72px;
+            min-height: 34px;
+        }}
+        .agent-input-hint {{
+            color: rgba({fg_r},{fg_g},{fg_b},0.58);
+            font-size: 0.82em;
+        }}
+        .agent-section-label {{
+            color: rgba({fg_r},{fg_g},{fg_b},0.62);
+            font-size: 0.80em;
+            font-weight: bold;
+            padding: 7px 9px 5px 9px;
         }}
         /* The shell reported no status. Deliberately not tinted like a failure
            and not striped like a success: nothing is known about the outcome. */

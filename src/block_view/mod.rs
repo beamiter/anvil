@@ -48,6 +48,57 @@ pub(crate) fn prof_enabled() -> bool {
 // Global block ID counter
 static BLOCK_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Why a review-gated command can or cannot be written to the live Block
+/// prompt. Agent controls use this richer status to explain the exact recovery
+/// step without weakening the clean, idle-prompt boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommandPromptStatus {
+    Ready,
+    HasInput,
+    Running,
+    Fullscreen,
+    Initializing,
+    ShellIntegrationUnavailable,
+}
+
+impl CommandPromptStatus {
+    pub(crate) fn is_ready(self) -> bool {
+        self == Self::Ready
+    }
+
+    pub(crate) fn short_label(self) -> &'static str {
+        match self {
+            Self::Ready => "Prompt ready",
+            Self::HasInput => "Prompt has input",
+            Self::Running => "Command running",
+            Self::Fullscreen => "Full-screen app active",
+            Self::Initializing => "Prompt initializing",
+            Self::ShellIntegrationUnavailable => "Shell integration required",
+        }
+    }
+
+    pub(crate) fn blocked_message(self) -> &'static str {
+        match self {
+            Self::Ready => "The pinned Block prompt is ready.",
+            Self::HasInput => {
+                "The pinned shell prompt already contains input. Clear it and press Enter to reach a fresh prompt, then try again."
+            }
+            Self::Running => {
+                "A command is still running in the pinned Block pane. Wait for it to finish and for a fresh prompt, then try again."
+            }
+            Self::Fullscreen => {
+                "A full-screen terminal application owns the pinned pane. Exit it before inserting or approving a command."
+            }
+            Self::Initializing => {
+                "The pinned Block prompt is still initializing. Wait for the shell prompt, then try again."
+            }
+            Self::ShellIntegrationUnavailable => {
+                "Shell integration is not active, so anvil cannot safely verify an idle prompt. Load the anvil shell integration and open a new shell."
+            }
+        }
+    }
+}
+
 fn next_block_id() -> u64 {
     BLOCK_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
@@ -591,6 +642,31 @@ fn record_external_input(
     // recall must replace the line rather than append to it.
     pty_synced.set(true);
     append_typed_command_shadow(&mut typed_cmd.borrow_mut(), text);
+}
+
+fn classify_command_prompt_status(
+    state: BlockState,
+    fullscreen: bool,
+    idle_input_dirty: bool,
+    pty_synced: bool,
+    typed_command_empty: bool,
+) -> CommandPromptStatus {
+    if fullscreen || state == BlockState::AltScreen {
+        return CommandPromptStatus::Fullscreen;
+    }
+    match state {
+        BlockState::AwaitingCommand => {
+            if idle_input_dirty || pty_synced || !typed_command_empty {
+                CommandPromptStatus::HasInput
+            } else {
+                CommandPromptStatus::Ready
+            }
+        }
+        BlockState::CollectingOutput | BlockState::PostCommand => CommandPromptStatus::Running,
+        BlockState::RawFallback => CommandPromptStatus::ShellIntegrationUnavailable,
+        BlockState::Idle | BlockState::CollectingPrompt => CommandPromptStatus::Initializing,
+        BlockState::AltScreen => CommandPromptStatus::Fullscreen,
+    }
 }
 
 /// Replace the current editable shell line with a finished command.
@@ -4879,6 +4955,45 @@ impl TermView {
         self.root.clone().upcast()
     }
 
+    /// Insert a transient card directly above the live prompt. Agent UI is
+    /// deliberately not a finished block, so it stays out of history,
+    /// selection, virtualization, and persistence metadata.
+    ///
+    /// Calling this for an already-inserted widget re-pins it below any newly
+    /// completed command block.
+    pub fn insert_inline_notice(&self, widget: &gtk::Widget) {
+        let active_widget = self.active.borrow().widget().clone();
+        let already_inserted = widget
+            .parent()
+            .is_some_and(|parent| parent == *self.block_list.upcast_ref::<gtk::Widget>());
+        if already_inserted {
+            let anchor = active_widget.prev_sibling();
+            if anchor.as_ref() != Some(widget) {
+                self.block_list.reorder_child_after(widget, anchor.as_ref());
+            }
+        } else {
+            widget.insert_before(&self.block_list, Some(&active_widget));
+        }
+        self.block_list.queue_allocate();
+        ScrollDebouncer::with_scroll_lock(
+            self.user_scrolled_up.clone(),
+            self.programmatic_scroll.clone(),
+        )
+        .pin_to_bottom_deferred(&self.block_scroll);
+    }
+
+    /// Remove a transient inline card. Safe when the widget was already
+    /// detached as part of pane teardown.
+    pub fn remove_inline_notice(&self, widget: &gtk::Widget) {
+        if widget
+            .parent()
+            .is_some_and(|parent| parent == *self.block_list.upcast_ref::<gtk::Widget>())
+        {
+            self.block_list.remove(widget);
+            self.block_list.queue_allocate();
+        }
+    }
+
     /// Send key bytes into the PTY (user input).
     pub fn write_input(&self, data: &[u8]) {
         // Once an Agent command has been accepted into the ordered writer,
@@ -4904,12 +5019,33 @@ impl TermView {
         self.pty.write_bytes(data);
     }
 
-    /// Agent commands may only be submitted into a clean, idle shell editor.
+    /// Review-gated commands may only target a clean, idle shell editor. The
+    /// diagnostic status is shared by the inline Agent card and execution
+    /// boundary so the UI never advertises a weaker condition than the write.
+    pub(crate) fn command_prompt_status(&self) -> CommandPromptStatus {
+        classify_command_prompt_status(
+            self.bstate.get(),
+            self.fullscreen.get(),
+            self.idle_input_dirty.get(),
+            self.pty_synced.get(),
+            self.typed_cmd.borrow().trim().is_empty(),
+        )
+    }
+
     pub fn can_accept_agent_command(&self) -> bool {
-        self.bstate.get() == BlockState::AwaitingCommand
-            && !self.fullscreen.get()
-            && self.typed_cmd.borrow().trim().is_empty()
-            && self.armed_agent_execution.borrow().is_none()
+        self.command_prompt_status().is_ready() && self.armed_agent_execution.borrow().is_none()
+    }
+
+    /// Put an Agent proposal at the prompt for ordinary manual review without
+    /// submitting it or arming an Agent observation. This is synchronous on
+    /// the GTK thread so the readiness check and write cannot be interleaved
+    /// with another application action.
+    pub fn try_insert_agent_command(&self, command: &str) -> bool {
+        if !agent_command_is_safe(command) || !self.can_accept_agent_command() {
+            return false;
+        }
+        self.write_input(command.as_bytes());
+        true
     }
 
     /// Re-check prompt readiness, arm a one-shot local identity, and submit
@@ -5830,16 +5966,17 @@ mod tests {
         agent_command_is_safe, agent_prompt_boundary_is_trusted, append_bounded_section,
         append_bounded_text_tail, append_typed_command_shadow, background_output_has_visible_text,
         block_clipboard_text, block_duration_ms, build_clipboard_paste, build_color_query_reply,
-        build_command_recall, build_keyboard_query_reply, clear_dynamic_colors,
-        coalesce_bytes_events, command_end_matches_agent_execution, command_end_matches_started_id,
-        failed_block_marker_fractions, finished_block_config, finished_command,
-        is_post_command_metadata, mutate_block_data_and_redraw, notification_permitted,
-        parse_color_spec, pop_typed_command_shadow, record_external_input, resolve_command_text,
-        selected_blocks_markdown, selected_command_text, selected_id_range, step_marked_indices,
-        stranded_focus_key_recovers, strip_ansi, strip_ansi_with_clear_detect,
+        build_command_recall, build_keyboard_query_reply, classify_command_prompt_status,
+        clear_dynamic_colors, coalesce_bytes_events, command_end_matches_agent_execution,
+        command_end_matches_started_id, failed_block_marker_fractions, finished_block_config,
+        finished_command, is_post_command_metadata, mutate_block_data_and_redraw,
+        notification_permitted, parse_color_spec, pop_typed_command_shadow, record_external_input,
+        resolve_command_text, selected_blocks_markdown, selected_command_text, selected_id_range,
+        step_marked_indices, stranded_focus_key_recovers, strip_ansi, strip_ansi_with_clear_detect,
         take_armed_agent_execution, take_background_output, ArmedAgentExecution, BlockData,
-        BlockState, CommandTextSource, DynamicColors, DynamicColorsRc, MAX_RECALLED_COMMAND_BYTES,
-        MAX_TYPED_COMMAND_SHADOW_BYTES, NOTIFICATION_MIN_INTERVAL, TRUNCATED_COMMAND_PLACEHOLDER,
+        BlockState, CommandPromptStatus, CommandTextSource, DynamicColors, DynamicColorsRc,
+        MAX_RECALLED_COMMAND_BYTES, MAX_TYPED_COMMAND_SHADOW_BYTES, NOTIFICATION_MIN_INTERVAL,
+        TRUNCATED_COMMAND_PLACEHOLDER,
     };
     use crate::agent::{AgentExecutionRef, AgentSession};
     use crate::config::Config;
@@ -5848,6 +5985,37 @@ mod tests {
     use std::collections::{HashSet, VecDeque};
     use std::rc::Rc;
     use std::time::{Instant, SystemTime};
+
+    #[test]
+    fn command_prompt_status_explains_every_agent_gate() {
+        assert_eq!(
+            classify_command_prompt_status(BlockState::AwaitingCommand, false, false, false, true,),
+            CommandPromptStatus::Ready
+        );
+        for status in [
+            classify_command_prompt_status(BlockState::AwaitingCommand, false, true, false, true),
+            classify_command_prompt_status(BlockState::AwaitingCommand, false, false, true, true),
+            classify_command_prompt_status(BlockState::AwaitingCommand, false, false, false, false),
+        ] {
+            assert_eq!(status, CommandPromptStatus::HasInput);
+        }
+        assert_eq!(
+            classify_command_prompt_status(BlockState::CollectingOutput, false, false, false, true,),
+            CommandPromptStatus::Running
+        );
+        assert_eq!(
+            classify_command_prompt_status(BlockState::AwaitingCommand, true, false, false, true,),
+            CommandPromptStatus::Fullscreen
+        );
+        assert_eq!(
+            classify_command_prompt_status(BlockState::Idle, false, false, false, true),
+            CommandPromptStatus::Initializing
+        );
+        assert_eq!(
+            classify_command_prompt_status(BlockState::RawFallback, false, false, false, true),
+            CommandPromptStatus::ShellIntegrationUnavailable
+        );
+    }
 
     #[test]
     fn stranded_focus_recovers_on_typing_keys_only() {

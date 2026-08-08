@@ -160,8 +160,10 @@ struct AppModel {
     /// At most one agent session is active per app. Opening the panel
     /// while another session is alive cancels the previous one.
     active_agent: Rc<RefCell<Option<agent::AgentSession>>>,
+    /// UI-lifetime identity for the inline card. Unlike the protocol epoch it
+    /// deliberately survives New Task, but changes when the card is replaced.
+    agent_panel_generation: Rc<std::cell::Cell<u64>>,
     agent_panel: Controller<agent::AgentPanelModel>,
-    agent_edit: Controller<agent::AgentEditModel>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -460,6 +462,7 @@ impl SimpleComponent for AppModel {
                 top_bar::TopBarOutput::ToggleTabPlacement => {
                     AppMsg::Action(Action::ToggleTabPlacement)
                 }
+                top_bar::TopBarOutput::ToggleAgent => AppMsg::OpenAgent,
                 top_bar::TopBarOutput::NewTab => AppMsg::NewTab,
                 top_bar::TopBarOutput::MinimizeWindow => AppMsg::MinimizeWindow,
                 top_bar::TopBarOutput::ToggleMaximizedWindow => AppMsg::ToggleMaximizedWindow,
@@ -710,22 +713,21 @@ impl SimpleComponent for AppModel {
             .launch(root.clone())
             .forward(sender.input_sender(), |output| match output {
                 agent::AgentPanelOutput::Send(text) => AppMsg::AgentSend(text),
-                agent::AgentPanelOutput::Approve(reference) => AppMsg::AgentApprove(reference),
-                agent::AgentPanelOutput::Edit(reference, command) => {
-                    AppMsg::AgentEditRequested(reference, command)
-                }
-                agent::AgentPanelOutput::Reject(reference) => AppMsg::AgentReject(reference),
-                agent::AgentPanelOutput::Continue => AppMsg::AgentContinue,
-                agent::AgentPanelOutput::NewTask => AppMsg::AgentNewTask,
-                agent::AgentPanelOutput::ClearContext => AppMsg::AgentClearContext,
-                agent::AgentPanelOutput::Closed => AppMsg::AgentClose,
-            });
-        let agent_edit = agent::AgentEditModel::builder()
-            .launch(root.clone())
-            .forward(sender.input_sender(), |output| match output {
-                agent::AgentEditOutput::Approved(reference, command) => {
+                agent::AgentPanelOutput::Approve(reference, command) => {
                     AppMsg::AgentEditAndApprove(reference, command)
                 }
+                agent::AgentPanelOutput::Insert(reference, command) => {
+                    AppMsg::AgentInsert(reference, command)
+                }
+                agent::AgentPanelOutput::Reject(reference) => AppMsg::AgentReject(reference),
+                agent::AgentPanelOutput::StopRequest => AppMsg::AgentStopRequest,
+                agent::AgentPanelOutput::RetryRequest => AppMsg::AgentRetryRequest,
+                agent::AgentPanelOutput::Continue => AppMsg::AgentContinue,
+                agent::AgentPanelOutput::NewTask => AppMsg::AgentNewTask,
+                agent::AgentPanelOutput::AttachContext => AppMsg::AgentAttachContext,
+                agent::AgentPanelOutput::ClearContext => AppMsg::AgentClearContext,
+                agent::AgentPanelOutput::OpenSettings => AppMsg::Action(Action::ToggleSettings),
+                agent::AgentPanelOutput::Closed => AppMsg::AgentClose,
             });
         // Both tab lists speak the same output vocabulary, so they route
         // through one translation.
@@ -813,9 +815,10 @@ impl SimpleComponent for AppModel {
             notebook,
             workflows,
             active_agent: Rc::new(RefCell::new(None)),
+            agent_panel_generation: Rc::new(std::cell::Cell::new(0)),
             agent_panel,
-            agent_edit,
         };
+        model.sync_agent_toggle();
 
         let search_bar = model.search.widget();
         // WindowHandle gives the custom Relm4 toolbar native titlebar move,
@@ -1397,18 +1400,20 @@ impl SimpleComponent for AppModel {
             }
             AppMsg::OpenAgent => self.open_agent_panel(&sender),
             AppMsg::AgentSend(text) => self.agent_send(text, &sender),
+            AppMsg::AgentStopRequest => self.agent_stop_request(),
+            AppMsg::AgentRetryRequest => self.agent_retry_request(&sender),
             AppMsg::AgentContinue => self.agent_continue(),
             AppMsg::AgentNewTask => self.agent_new_task(),
+            AppMsg::AgentAttachContext => self.agent_attach_context(),
             AppMsg::AgentClearContext => self.agent_clear_context(),
-            AppMsg::AgentApprove(reference) => self.agent_approve(reference, None, &sender),
             AppMsg::AgentEditAndApprove(reference, new_cmd) => {
                 self.agent_approve(reference, Some(new_cmd), &sender);
             }
-            AppMsg::AgentEditRequested(reference, command) => {
-                self.agent_edit
-                    .emit(agent::AgentEditMsg::Open(reference, command));
+            AppMsg::AgentInsert(reference, command) => {
+                self.agent_insert_for_manual_review(reference, command);
             }
             AppMsg::AgentReject(reference) => self.agent_reject(reference, &sender),
+            AppMsg::AgentRefreshPrompt(epoch) => self.agent_refresh_prompt(epoch),
             AppMsg::AgentLlmReply { epoch, reply } => {
                 self.agent_handle_reply(epoch, reply, &sender);
             }

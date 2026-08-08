@@ -9,6 +9,7 @@ pub(crate) enum TopBarOutput {
     OpenPalette,
     ToggleSidebar,
     ToggleTabPlacement,
+    ToggleAgent,
     NewTab,
     MinimizeWindow,
     ToggleMaximizedWindow,
@@ -18,6 +19,7 @@ pub(crate) enum TopBarOutput {
 #[derive(Debug)]
 pub(crate) enum TopBarMsg {
     SetMaximized(bool),
+    SetAgentState { available: bool, active: bool },
 }
 
 pub(crate) struct TopBarModel {
@@ -89,6 +91,17 @@ impl Component for TopBarModel {
                 set_valign: gtk::Align::Center,
                 add_css_class: "top-bar-actions",
                 add_css_class: "window-controls",
+
+                #[name(agent_toggle)]
+                gtk::ToggleButton {
+                    set_icon_name: "system-run-symbolic",
+                    set_focus_on_click: false,
+                    set_tooltip_text: Some("Activate Shell Agent (Ctrl+Alt+G)"),
+                    add_css_class: "flat",
+                    connect_clicked[sender] => move |_| {
+                        let _ = sender.output(TopBarOutput::ToggleAgent);
+                    },
+                },
 
                 gtk::Button {
                     set_icon_name: "list-add-symbolic",
@@ -164,6 +177,19 @@ impl Component for TopBarModel {
                 };
                 widgets.maximize_button.set_icon_name(icon_name);
                 widgets.maximize_button.set_tooltip_text(Some(tooltip));
+            }
+            TopBarMsg::SetAgentState { available, active } => {
+                widgets.agent_toggle.set_sensitive(available);
+                widgets.agent_toggle.set_active(available && active);
+                widgets.agent_toggle.set_tooltip_text(Some(if available {
+                    if active {
+                        "Close Shell Agent (Ctrl+Alt+G)"
+                    } else {
+                        "Activate Shell Agent (Ctrl+Alt+G)"
+                    }
+                } else {
+                    "Shell Agent is disabled in Settings or safe mode"
+                }));
             }
         }
     }

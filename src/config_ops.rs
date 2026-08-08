@@ -71,6 +71,12 @@ impl AppModel {
         *self.config_revision.borrow_mut() = Some(revision);
         self.shell_argv = new_shell_argv;
         self.sync_terminal_configs();
+        if !new_config.ai_enabled || !new_config.agent_enabled {
+            self.agent_close();
+        } else {
+            self.sync_agent_toggle();
+            self.refresh_agent_panel();
+        }
 
         self.set_window_opacity(new_config.window_opacity);
         self.tab_placement.set(tab_placement);

@@ -119,9 +119,16 @@ fn remove_agent_snapshot(path: &Path) {
 impl AppModel {
     // ── Agent mode ───────────────────────────────────────────────────────
 
-    pub(crate) fn open_agent_panel(&self, _sender: &ComponentSender<AppModel>) {
+    pub(crate) fn open_agent_panel(&self, sender: &ComponentSender<AppModel>) {
+        // Match Forge's stateful top-bar/shortcut behavior: invoking the action
+        // again closes the one live inline session.
+        if self.active_agent.borrow().is_some() {
+            self.agent_close();
+            return;
+        }
         if self.safe_mode {
-            self.show_toast("AI Agent is unavailable in safe mode.");
+            self.show_toast("Shell Agent is unavailable in safe mode.");
+            self.sync_agent_toggle();
             return;
         }
         let cfg = self.config.borrow();
@@ -131,7 +138,8 @@ impl AppModel {
                 cfg.ai_enabled,
                 cfg.agent_enabled
             );
-            self.show_toast("AI Agent is disabled in configuration.");
+            self.show_toast("Shell Agent is disabled in Settings.");
+            self.sync_agent_toggle();
             return;
         }
         let max_turns = cfg.agent_max_turns;
@@ -140,24 +148,28 @@ impl AppModel {
             Err(error) => {
                 log::warn!("agent: {error}");
                 self.show_toast(format!("AI provider is unavailable: {error}"));
+                self.sync_agent_toggle();
                 return;
             }
         };
         drop(cfg);
 
         let Some(tab) = self.tabs.get(self.active) else {
+            self.sync_agent_toggle();
             return;
         };
         let Some(pane) = tab.panes.get(tab.active_pane) else {
+            self.sync_agent_toggle();
             return;
         };
         if !matches!(pane.mode, TerminalMode::Block) {
-            self.show_toast(
-                "AI Agent requires a Block-mode pane so command results can be observed.",
-            );
+            self.show_toast("Shell Agent requires an active Block pane.");
+            self.sync_agent_toggle();
             return;
         }
         let (tab_id, pane_id) = (tab.id, pane.id);
+        let initial_context = pane.terminal.selected_block_context(80);
+        let prompt_status = pane.terminal.command_prompt_status();
 
         // Replacing a session invalidates both its provider callback and any
         // late BlockFinished event before the new identity becomes visible.
@@ -168,7 +180,7 @@ impl AppModel {
         // rebound to the pane the user reopened the Agent on.
         let snapshot_file = Self::agent_snapshot_path();
         let restored = restore_agent_snapshot_once(&snapshot_file);
-        let session = match restored {
+        let mut session = match restored {
             Some(inner) => match agent::AgentSession::from_restored(inner, tab_id, pane_id) {
                 Some(session) => {
                     self.show_toast("Restored the previous agent session.");
@@ -184,7 +196,10 @@ impl AppModel {
             },
             None => agent::AgentSession::new(tab_id, pane_id, max_turns),
         };
+        session.last_manual_completed = initial_context;
         *self.active_agent.borrow_mut() = Some(session);
+        let panel_generation = self.agent_panel_generation.get().wrapping_add(1);
+        self.agent_panel_generation.set(panel_generation);
 
         if let Some(view) = self.agent_panel_view() {
             self.agent_panel.emit(agent::AgentPanelMsg::Open {
@@ -192,33 +207,138 @@ impl AppModel {
                 view,
             });
         }
+        let card: gtk::Widget = self.agent_panel.widget().clone().upcast();
+        let inserted = self
+            .terminal_for(tab_id, pane_id)
+            .is_some_and(|terminal| terminal.insert_inline_notice(&card));
+        if !inserted {
+            self.show_toast("Shell Agent target pane is no longer available.");
+            self.agent_close();
+            return;
+        }
+        self.agent_panel
+            .emit(agent::AgentPanelMsg::PromptStatus(prompt_status));
+        self.agent_panel.emit(agent::AgentPanelMsg::Focus);
+        self.sync_agent_toggle();
+
+        // Keep the readiness chip live while the card is open without
+        // rebuilding the editable proposal or transcript every tick.
+        let active_agent = self.active_agent.clone();
+        let live_generation = self.agent_panel_generation.clone();
+        let prompt_sender = sender.clone();
+        gtk::glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
+            if live_generation.get() != panel_generation {
+                return gtk::glib::ControlFlow::Break;
+            }
+            let epoch = active_agent
+                .borrow()
+                .as_ref()
+                .and_then(|session| (!session.is_cancelled()).then_some(session.epoch()));
+            let Some(epoch) = epoch else {
+                return gtk::glib::ControlFlow::Break;
+            };
+            prompt_sender.input(AppMsg::AgentRefreshPrompt(epoch));
+            gtk::glib::ControlFlow::Continue
+        });
         // A restored session may have died mid-request; resume it.
         if self.agent_is_awaiting_model() {
-            self.agent_kick_llm(_sender);
+            self.agent_kick_llm(sender);
         }
     }
 
     pub(crate) fn agent_panel_view(&self) -> Option<agent::AgentPanelView> {
-        let session = self.active_agent.borrow();
-        let session = session.as_ref()?;
+        let (
+            epoch,
+            transcript,
+            turns_used,
+            max_turns,
+            state,
+            loading,
+            can_retry_model,
+            bound_tab,
+            bound_pane,
+            attached_context,
+        ) = {
+            let session = self.active_agent.borrow();
+            let session = session.as_ref()?;
+            (
+                session.epoch(),
+                session.transcript().to_vec(),
+                session.turns_used(),
+                session.max_turns(),
+                session.state(),
+                session.in_flight.is_some(),
+                session.can_retry_model(),
+                session.bound_tab,
+                session.bound_pane,
+                session.last_manual_completed.clone(),
+            )
+        };
+        let terminal = self.terminal_for(bound_tab, bound_pane);
+        let prompt_status = terminal.map_or(
+            crate::block_view::CommandPromptStatus::ShellIntegrationUnavailable,
+            TermCtl::command_prompt_status,
+        );
+        let cwd = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == bound_tab)
+            .and_then(|tab| tab.panes.iter().find(|pane| pane.id == bound_pane))
+            .and_then(|pane| pane.cwd.as_deref())
+            .map(str::trim)
+            .filter(|cwd| !cwd.is_empty())
+            .unwrap_or(".")
+            .to_string();
         Some(agent::AgentPanelView {
-            epoch: Some(session.epoch()),
-            transcript: session.transcript().to_vec(),
-            turns_used: session.turns_used(),
-            max_turns: session.max_turns(),
-            state: session.state(),
-            loading: session.in_flight.is_some(),
-            attached_context: session
-                .last_manual_completed
-                .as_ref()
-                .map(|context| context.cmd.clone()),
+            epoch: Some(epoch),
+            transcript,
+            turns_used,
+            max_turns,
+            state,
+            loading,
+            can_retry_model,
+            prompt_status,
+            cwd,
+            compact: self.config.borrow().block_compact,
+            attached_context,
         })
     }
 
     pub(crate) fn refresh_agent_panel(&self) {
         if let Some(view) = self.agent_panel_view() {
             self.agent_panel.emit(agent::AgentPanelMsg::Render(view));
+            self.pin_agent_panel();
         }
+    }
+
+    fn pin_agent_panel(&self) {
+        let target = self
+            .active_agent
+            .borrow()
+            .as_ref()
+            .map(|session| (session.bound_tab, session.bound_pane));
+        let Some((tab_id, pane_id)) = target else {
+            return;
+        };
+        let card: gtk::Widget = self.agent_panel.widget().clone().upcast();
+        if let Some(terminal) = self.terminal_for(tab_id, pane_id) {
+            terminal.insert_inline_notice(&card);
+        }
+    }
+
+    pub(crate) fn agent_refresh_prompt(&self, epoch: agent::AgentSessionEpoch) {
+        let target = self.active_agent.borrow().as_ref().and_then(|session| {
+            (session.epoch() == epoch).then_some((session.bound_tab, session.bound_pane))
+        });
+        let Some((tab_id, pane_id)) = target else {
+            return;
+        };
+        let status = self.terminal_for(tab_id, pane_id).map_or(
+            crate::block_view::CommandPromptStatus::ShellIntegrationUnavailable,
+            TermCtl::command_prompt_status,
+        );
+        self.agent_panel
+            .emit(agent::AgentPanelMsg::PromptStatus(status));
     }
 
     /// Reopen a completed task for a follow-up question in the same
@@ -253,13 +373,87 @@ impl AppModel {
         self.refresh_agent_panel();
     }
 
-    /// Detach the remembered manual command from future model requests.
+    pub(crate) fn agent_stop_request(&self) {
+        let result = {
+            let mut guard = self.active_agent.borrow_mut();
+            let Some(session) = guard.as_mut() else {
+                return;
+            };
+            session.stop_model_request()
+        };
+        match result {
+            Ok(true) => self.show_toast("Shell Agent model request stopped."),
+            Ok(false) => return,
+            Err(error) => self.report_agent_error("stop model request", &error),
+        }
+        self.refresh_agent_panel();
+    }
+
+    pub(crate) fn agent_retry_request(&self, sender: &ComponentSender<AppModel>) {
+        let result = {
+            let mut guard = self.active_agent.borrow_mut();
+            let Some(session) = guard.as_mut() else {
+                return;
+            };
+            session.retry_model()
+        };
+        if let Err(error) = result {
+            self.report_agent_error("retry model request", &error);
+            self.refresh_agent_panel();
+            return;
+        }
+        self.refresh_agent_panel();
+        self.agent_kick_llm(sender);
+    }
+
+    /// Attach or replace the currently selected finished Block in the bound
+    /// pane. Context remains explicitly user-chosen; unrelated manual command
+    /// completions never silently replace it.
+    pub(crate) fn agent_attach_context(&self) {
+        let target = {
+            let guard = self.active_agent.borrow();
+            let Some(session) = guard.as_ref() else {
+                return;
+            };
+            if session.state() != agent::AgentState::Ready || session.in_flight.is_some() {
+                self.show_toast("Block context can only be changed while Shell Agent is ready.");
+                return;
+            }
+            (session.epoch(), session.bound_tab, session.bound_pane)
+        };
+        let Some(context) = self
+            .terminal_for(target.1, target.2)
+            .and_then(|terminal| terminal.selected_block_context(80))
+        else {
+            self.show_toast("Select a finished Block in the Agent pane first.");
+            return;
+        };
+        let replaced = {
+            let mut guard = self.active_agent.borrow_mut();
+            let Some(session) = guard.as_mut().filter(|session| session.epoch() == target.0) else {
+                return;
+            };
+            session.last_manual_completed.replace(context).is_some()
+        };
+        self.show_toast(if replaced {
+            "Replaced the Shell Agent's attached Block context."
+        } else {
+            "Attached the selected Block to Shell Agent."
+        });
+        self.refresh_agent_panel();
+    }
+
+    /// Detach the selected Block from future model requests.
     pub(crate) fn agent_clear_context(&self) {
         {
             let mut guard = self.active_agent.borrow_mut();
             let Some(session) = guard.as_mut() else {
                 return;
             };
+            if session.state() != agent::AgentState::Ready || session.in_flight.is_some() {
+                self.show_toast("Block context can only be changed while Shell Agent is ready.");
+                return;
+            }
             session.last_manual_completed = None;
         }
         self.refresh_agent_panel();
@@ -335,10 +529,9 @@ impl AppModel {
             self.agent_close();
             return;
         };
-        if !terminal.can_accept_agent_command() {
-            self.show_toast(
-                "Agent target prompt is busy or already contains input; clear it before approval.",
-            );
+        let prompt_status = terminal.command_prompt_status();
+        if !prompt_status.is_ready() {
+            self.show_toast(prompt_status.blocked_message());
             return;
         }
 
@@ -394,6 +587,67 @@ impl AppModel {
         self.refresh_agent_panel();
     }
 
+    /// Move a proposal to the normal shell editor without submitting it. The
+    /// Agent records ManualReview and will not attribute a later manual run to
+    /// itself or assume an observation.
+    pub(crate) fn agent_insert_for_manual_review(
+        &self,
+        reference: agent::AgentProposalRef,
+        command: String,
+    ) {
+        let (proposal_id, tab_id, pane_id) = {
+            let guard = self.active_agent.borrow();
+            let Some(session) = guard.as_ref() else {
+                return;
+            };
+            let Some(proposal_id) = session.resolve_proposal(reference) else {
+                self.show_toast("That Shell Agent proposal is no longer available.");
+                return;
+            };
+            (proposal_id, session.bound_tab, session.bound_pane)
+        };
+        let Some(terminal) = self.terminal_for(tab_id, pane_id) else {
+            self.show_toast("Shell Agent target pane is no longer available.");
+            self.agent_close();
+            return;
+        };
+        let prompt_status = terminal.command_prompt_status();
+        if !prompt_status.is_ready() {
+            self.show_toast(prompt_status.blocked_message());
+            return;
+        }
+
+        let reviewed = {
+            let mut guard = self.active_agent.borrow_mut();
+            let Some(session) = guard.as_mut() else {
+                return;
+            };
+            session.edit_for_manual_review(proposal_id, command)
+        };
+        let command = match reviewed {
+            Ok(command) => command,
+            Err(error) => {
+                self.report_agent_error("move proposal to manual review", &error);
+                self.refresh_agent_panel();
+                return;
+            }
+        };
+        if !terminal.try_insert_agent_command(&command) {
+            // The direct Block-model call is synchronous, so this can only be
+            // a target/backend invariant failure after the pre-check. The
+            // protocol cannot safely roll ManualReview back to Pending.
+            if let Some(session) = self.active_agent.borrow_mut().as_mut() {
+                session.cancel();
+            }
+            self.show_toast("Shell Agent stopped because the target prompt was no longer ready.");
+            self.refresh_agent_panel();
+            return;
+        }
+        self.show_toast("Inserted the proposal for manual review. Shell Agent did not run it.");
+        terminal.emit(VteInput::GrabFocus);
+        self.refresh_agent_panel();
+    }
+
     pub(crate) fn agent_reject(
         &self,
         reference: agent::AgentProposalRef,
@@ -434,6 +688,7 @@ impl AppModel {
             output,
             agent_execution,
         } = completion;
+        self.pin_agent_panel();
         let proposal_id = {
             let mut guard = self.active_agent.borrow_mut();
             let Some(session) = guard.as_mut() else {
@@ -456,22 +711,9 @@ impl AppModel {
                     // A stale/internal execution can never become model context.
                     agent::AgentExecutionMatch::Stale => return,
                 },
-                // A manual command completed in the bound pane. Never attach
-                // its output to the approved proposal — remember it instead
-                // as untrusted block context for the next model request.
-                None => {
-                    let command = command.trim();
-                    if !command.is_empty() {
-                        session.last_manual_completed = Some(ai::BlockContext {
-                            cmd: command.to_string(),
-                            output: output.clone(),
-                            cwd: None,
-                            exit_code,
-                            truncated: output.contains("elided"),
-                        });
-                    }
-                    return;
-                }
+                // A manual command is never silently promoted to Agent
+                // context. The user explicitly attaches a selected Block.
+                None => return,
             }
         };
 
@@ -634,10 +876,29 @@ impl AppModel {
     }
 
     pub(crate) fn agent_close(&self) {
-        self.agent_edit.emit(agent::AgentEditMsg::Close);
-        if let Some(mut previous) = self.active_agent.borrow_mut().take() {
+        self.agent_panel_generation
+            .set(self.agent_panel_generation.get().wrapping_add(1));
+        let previous = self.active_agent.borrow_mut().take();
+        if let Some(mut previous) = previous {
+            let target = (previous.bound_tab, previous.bound_pane);
             previous.cancel();
+            let card: gtk::Widget = self.agent_panel.widget().clone().upcast();
+            if let Some(terminal) = self.terminal_for(target.0, target.1) {
+                terminal.remove_inline_notice(&card);
+            }
         }
+        self.agent_panel.emit(agent::AgentPanelMsg::Reset);
+        self.sync_agent_toggle();
+    }
+
+    pub(crate) fn sync_agent_toggle(&self) {
+        let cfg = self.config.borrow();
+        let available = !self.safe_mode && cfg.ai_enabled && cfg.agent_enabled;
+        drop(cfg);
+        self.top_bar.emit(top_bar::TopBarMsg::SetAgentState {
+            available,
+            active: available && self.active_agent.borrow().is_some(),
+        });
     }
 
     fn agent_is_awaiting_model(&self) -> bool {

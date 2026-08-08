@@ -31,6 +31,7 @@ use adw::prelude::*;
 use relm4::adw;
 use relm4::gtk;
 use relm4::prelude::*;
+use std::rc::Rc;
 
 pub(crate) use jterm_core::agent::{
     is_dangerous, AgentSessionEpoch, AgentState, ApprovedCommand, CancellationToken, ModelOutcome,
@@ -264,6 +265,29 @@ impl AgentSession {
         self.inner.model_failed(message)
     }
 
+    pub(crate) fn can_retry_model(&self) -> bool {
+        self.inner.can_retry_model()
+    }
+
+    pub(crate) fn retry_model(&mut self) -> Result<(), SessionError> {
+        self.inner.retry_model()
+    }
+
+    /// Cancel only the current provider request and return the protocol to a
+    /// retryable Ready state. This differs from closing the Agent, which seals
+    /// the entire session and invalidates its epoch.
+    pub(crate) fn stop_model_request(&mut self) -> Result<bool, SessionError> {
+        if self.inner.state() != AgentState::AwaitingModel || self.in_flight.is_none() {
+            return Ok(false);
+        }
+        if let Some(handle) = self.in_flight.take() {
+            handle.cancel();
+        }
+        self.inner
+            .model_failed("Model request stopped. Retry it or revise the instruction.")?;
+        Ok(true)
+    }
+
     pub(crate) fn approve(&mut self, id: ProposalId) -> Result<ApprovedCommand, SessionError> {
         if let Some(command) = self.inner.transcript().iter().find_map(|turn| match turn {
             Turn::AssistantProposed {
@@ -358,6 +382,18 @@ impl AgentSession {
         self.inner.reject(id)
     }
 
+    pub(crate) fn edit_for_manual_review(
+        &mut self,
+        id: ProposalId,
+        edited_command: impl Into<String>,
+    ) -> Result<String, SessionError> {
+        let edited_command = edited_command.into();
+        if let Some(error) = local_agent_command_error(&edited_command) {
+            return Err(error);
+        }
+        self.inner.edit_for_manual_review(id, edited_command)
+    }
+
     pub(crate) fn observe(
         &mut self,
         id: ProposalId,
@@ -396,7 +432,6 @@ impl AgentSession {
             handle.cancel();
         }
         self.awaiting_command = None;
-        self.last_manual_completed = None;
         self.inner.start_new_task()
     }
 
@@ -433,9 +468,13 @@ pub(crate) struct AgentPanelView {
     pub(crate) max_turns: u32,
     pub(crate) state: AgentState,
     pub(crate) loading: bool,
-    /// Command line of the manual block attached as untrusted context to the
-    /// next model request, if any.
-    pub(crate) attached_context: Option<String>,
+    pub(crate) can_retry_model: bool,
+    pub(crate) prompt_status: crate::block_view::CommandPromptStatus,
+    pub(crate) cwd: String,
+    pub(crate) compact: bool,
+    /// Selected finished Block attached as untrusted context to upcoming model
+    /// requests, if any.
+    pub(crate) attached_context: Option<crate::ai::BlockContext>,
 }
 
 #[derive(Debug)]
@@ -445,27 +484,40 @@ pub(crate) enum AgentPanelMsg {
         view: AgentPanelView,
     },
     Render(AgentPanelView),
+    PromptStatus(crate::block_view::CommandPromptStatus),
     Submit,
+    InputChanged,
+    StopRequest,
+    RetryRequest,
     ContinueTask,
     NewTask,
+    AttachContext,
     ClearContext,
+    OpenSettings,
     Closed,
+    Reset,
+    Focus,
 }
 
 #[derive(Debug)]
 pub(crate) enum AgentPanelOutput {
     Send(String),
-    Approve(AgentProposalRef),
-    Edit(AgentProposalRef, String),
+    Approve(AgentProposalRef, String),
+    Insert(AgentProposalRef, String),
     Reject(AgentProposalRef),
+    StopRequest,
+    RetryRequest,
     Continue,
     NewTask,
+    AttachContext,
     ClearContext,
+    OpenSettings,
     Closed,
 }
 
 pub(crate) struct AgentPanelModel {
     parent: adw::ApplicationWindow,
+    provider_name: String,
     view: AgentPanelView,
 }
 
@@ -477,62 +529,150 @@ impl Component for AgentPanelModel {
     type CommandOutput = ();
 
     view! {
-        root = adw::Dialog {
-            set_title: "AI agent",
-            set_content_width: 820,
-            set_content_height: 640,
-            connect_closed => AgentPanelMsg::Closed,
+        root = gtk::Box {
+            set_orientation: gtk::Orientation::Vertical,
+            set_spacing: 0,
+            set_hexpand: true,
+            set_vexpand: false,
+            set_visible: false,
+            add_css_class: "block-finished",
+            add_css_class: "block-assistant",
+            add_css_class: "block-agent",
 
-            #[wrap(Some)]
-            set_child = &adw::ToolbarView {
-                add_top_bar = &adw::HeaderBar {},
+            gtk::Box {
+                set_orientation: gtk::Orientation::Horizontal,
+                set_spacing: 8,
+                add_css_class: "block-header",
+                set_margin_start: 12,
+                set_margin_end: 8,
+                set_margin_top: 6,
+                set_margin_bottom: 2,
 
-                #[wrap(Some)]
-                set_content = &gtk::Box {
+                gtk::Image {
+                    set_icon_name: Some("system-run-symbolic"),
+                    add_css_class: "agent-card-icon",
+                },
+
+                gtk::Label {
+                    set_label: "Shell Agent",
+                    set_xalign: 0.0,
+                    add_css_class: "agent-card-title",
+                },
+
+                #[name(binding_label)]
+                gtk::Label {
+                    set_hexpand: true,
+                    set_halign: gtk::Align::End,
+                    set_ellipsize: gtk::pango::EllipsizeMode::Middle,
+                    add_css_class: "agent-card-binding",
+                },
+
+                gtk::Button {
+                    set_icon_name: "emblem-system-symbolic",
+                    set_focus_on_click: false,
+                    set_tooltip_text: Some("Shell Agent settings"),
+                    add_css_class: "flat",
+                    connect_clicked => AgentPanelMsg::OpenSettings,
+                },
+
+                gtk::Button {
+                    set_icon_name: "window-close-symbolic",
+                    set_focus_on_click: false,
+                    set_tooltip_text: Some("Cancel Agent and close this card"),
+                    add_css_class: "flat",
+                    connect_clicked => AgentPanelMsg::Closed,
+                },
+            },
+
+            gtk::Box {
+                set_orientation: gtk::Orientation::Vertical,
+                set_spacing: 8,
+                set_margin_start: 12,
+                set_margin_end: 12,
+                set_margin_top: 2,
+                set_margin_bottom: 10,
+
+                #[name(context_card)]
+                gtk::Box {
+                    set_orientation: gtk::Orientation::Horizontal,
+                    set_spacing: 8,
+                    set_visible: false,
+                    add_css_class: "agent-context-card",
+
+                    #[name(context_label)]
+                    gtk::Label {
+                        set_xalign: 0.0,
+                        set_hexpand: true,
+                        set_ellipsize: gtk::pango::EllipsizeMode::Middle,
+                    },
+
+                    #[name(clear_context_button)]
+                    gtk::Button {
+                        set_icon_name: "window-close-symbolic",
+                        set_tooltip_text: Some("Detach selected Block context"),
+                        add_css_class: "flat",
+                        connect_clicked => AgentPanelMsg::ClearContext,
+                    },
+                },
+
+                #[name(transcript_box)]
+                gtk::Box {
+                    set_orientation: gtk::Orientation::Vertical,
+                    set_spacing: 6,
+                },
+
+                #[name(proposal_box)]
+                gtk::Box {
                     set_orientation: gtk::Orientation::Vertical,
                     set_spacing: 8,
-                    set_margin_all: 12,
+                    set_visible: false,
+                    add_css_class: "agent-proposal-card",
+                },
 
-                    #[name(intro)]
-                    gtk::Label {
-                        set_wrap: true,
-                        set_halign: gtk::Align::Start,
-                        add_css_class: "dim-label",
-                    },
-
-                    gtk::ScrolledWindow {
-                        set_hexpand: true,
-                        set_vexpand: true,
-
-                        #[name(transcript_box)]
-                        gtk::Box {
-                            set_orientation: gtk::Orientation::Vertical,
-                            set_spacing: 10,
-                            set_margin_top: 4,
-                        },
-                    },
+                gtk::Box {
+                    set_orientation: gtk::Orientation::Vertical,
+                    set_spacing: 6,
+                    add_css_class: "agent-status-card",
 
                     gtk::Box {
                         set_orientation: gtk::Orientation::Horizontal,
                         set_spacing: 8,
-
-                        #[name(status)]
-                        gtk::Label {
-                            set_halign: gtk::Align::Start,
-                            set_hexpand: true,
-                            add_css_class: "dim-label",
-                        },
 
                         #[name(spinner)]
                         gtk::Spinner {
                             set_visible: false,
                         },
 
+                        #[name(status)]
+                        gtk::Label {
+                            set_halign: gtk::Align::Start,
+                            set_hexpand: true,
+                            set_wrap: true,
+                            set_xalign: 0.0,
+                            add_css_class: "agent-status",
+                        },
+
+                        #[name(retry_button)]
+                        gtk::Button {
+                            set_label: "Retry",
+                            set_visible: false,
+                            set_tooltip_text: Some("Retry the failed model turn without duplicating input"),
+                            connect_clicked => AgentPanelMsg::RetryRequest,
+                        },
+
+                        #[name(stop_button)]
+                        gtk::Button {
+                            set_label: "Stop",
+                            set_visible: false,
+                            set_tooltip_text: Some("Stop this model request and keep the Agent session"),
+                            add_css_class: "destructive-action",
+                            connect_clicked => AgentPanelMsg::StopRequest,
+                        },
+
                         #[name(continue_button)]
                         gtk::Button {
-                            set_label: "Continue task",
+                            set_label: "Follow up",
                             set_visible: false,
-                            add_css_class: "suggested-action",
                             connect_clicked => AgentPanelMsg::ContinueTask,
                         },
 
@@ -543,16 +683,29 @@ impl Component for AgentPanelModel {
                             connect_clicked => AgentPanelMsg::NewTask,
                         },
 
-                        #[name(clear_context_button)]
-                        gtk::Button {
-                            set_label: "Detach context",
-                            set_visible: false,
-                            set_tooltip_text: Some(
-                                "Stop attaching the last manual command to model requests",
-                            ),
-                            connect_clicked => AgentPanelMsg::ClearContext,
+                        #[name(prompt_status)]
+                        gtk::Label {
+                            add_css_class: "agent-prompt-status",
+                            add_css_class: "agent-prompt-blocked",
+                        },
+
+                        #[name(turn_label)]
+                        gtk::Label {
+                            add_css_class: "agent-turn-label",
                         },
                     },
+
+                    #[name(turn_progress)]
+                    gtk::ProgressBar {
+                        set_hexpand: true,
+                        set_fraction: 0.0,
+                    },
+                },
+
+                gtk::Box {
+                    set_orientation: gtk::Orientation::Vertical,
+                    set_spacing: 6,
+                    add_css_class: "agent-composer",
 
                     gtk::Box {
                         set_orientation: gtk::Orientation::Horizontal,
@@ -560,16 +713,40 @@ impl Component for AgentPanelModel {
 
                         #[name(input)]
                         gtk::Entry {
-                            set_placeholder_text: Some("What do you want to do? (Enter to send)"),
+                            set_placeholder_text: Some("Describe a task for this pane…"),
                             set_hexpand: true,
+                            add_css_class: "agent-input",
                             connect_activate => AgentPanelMsg::Submit,
+                            connect_changed => AgentPanelMsg::InputChanged,
                         },
 
                         #[name(send_button)]
                         gtk::Button {
                             set_label: "Send",
+                            set_sensitive: false,
                             add_css_class: "suggested-action",
+                            add_css_class: "agent-send",
                             connect_clicked => AgentPanelMsg::Submit,
+                        },
+                    },
+
+                    gtk::Box {
+                        set_orientation: gtk::Orientation::Horizontal,
+                        set_spacing: 6,
+
+                        gtk::Label {
+                            set_label: "Enter sends · every proposed command stays editable and requires approval",
+                            set_xalign: 0.0,
+                            set_hexpand: true,
+                            add_css_class: "agent-input-hint",
+                        },
+
+                        #[name(attach_context_button)]
+                        gtk::Button {
+                            set_label: "Attach selected Block",
+                            set_tooltip_text: Some("Attach the selected finished Block as untrusted context"),
+                            add_css_class: "flat",
+                            connect_clicked => AgentPanelMsg::AttachContext,
                         },
                     },
                 },
@@ -584,6 +761,7 @@ impl Component for AgentPanelModel {
     ) -> ComponentParts<Self> {
         let model = Self {
             parent,
+            provider_name: String::new(),
             view: AgentPanelView {
                 epoch: None,
                 transcript: Vec::new(),
@@ -591,6 +769,10 @@ impl Component for AgentPanelModel {
                 max_turns: 1,
                 state: AgentState::Ready,
                 loading: false,
+                can_retry_model: false,
+                prompt_status: crate::block_view::CommandPromptStatus::Initializing,
+                cwd: ".".to_string(),
+                compact: false,
                 attached_context: None,
             },
         };
@@ -610,19 +792,19 @@ impl Component for AgentPanelModel {
                 provider_name,
                 view,
             } => {
-                let provider_name = agent_display_text(&provider_name, false);
-                widgets.intro.set_label(&format!(
-                    "Talk to {provider_name}. The model proposes one command per turn; you approve each before it runs. Output is fed back automatically. Max {} turns.",
-                    view.max_turns
-                ));
+                self.provider_name = agent_display_text(&provider_name, false);
                 self.view = view;
                 self.render(widgets, sender);
-                root.present(Some(&self.parent));
+                root.set_visible(true);
                 widgets.input.grab_focus();
             }
             AgentPanelMsg::Render(view) => {
                 self.view = view;
                 self.render(widgets, sender);
+            }
+            AgentPanelMsg::PromptStatus(status) => {
+                self.view.prompt_status = status;
+                render_prompt_status(widgets, status);
             }
             AgentPanelMsg::Submit => {
                 let text = widgets.input.text();
@@ -632,17 +814,47 @@ impl Component for AgentPanelModel {
                     widgets.input.set_text("");
                 }
             }
+            AgentPanelMsg::InputChanged => {
+                widgets.send_button.set_sensitive(
+                    self.view.state == AgentState::Ready && !widgets.input.text().trim().is_empty(),
+                );
+            }
+            AgentPanelMsg::StopRequest => {
+                let _ = sender.output(AgentPanelOutput::StopRequest);
+            }
+            AgentPanelMsg::RetryRequest => {
+                let _ = sender.output(AgentPanelOutput::RetryRequest);
+            }
             AgentPanelMsg::ContinueTask => {
                 let _ = sender.output(AgentPanelOutput::Continue);
             }
             AgentPanelMsg::NewTask => {
                 let _ = sender.output(AgentPanelOutput::NewTask);
             }
+            AgentPanelMsg::AttachContext => {
+                let _ = sender.output(AgentPanelOutput::AttachContext);
+            }
             AgentPanelMsg::ClearContext => {
                 let _ = sender.output(AgentPanelOutput::ClearContext);
             }
+            AgentPanelMsg::OpenSettings => {
+                let _ = sender.output(AgentPanelOutput::OpenSettings);
+            }
             AgentPanelMsg::Closed => {
                 let _ = sender.output(AgentPanelOutput::Closed);
+            }
+            AgentPanelMsg::Reset => {
+                root.set_visible(false);
+                widgets.input.set_text("");
+                while let Some(child) = widgets.transcript_box.first_child() {
+                    widgets.transcript_box.remove(&child);
+                }
+                while let Some(child) = widgets.proposal_box.first_child() {
+                    widgets.proposal_box.remove(&child);
+                }
+            }
+            AgentPanelMsg::Focus => {
+                widgets.input.grab_focus();
             }
         }
     }
@@ -653,64 +865,112 @@ impl AgentPanelModel {
         while let Some(child) = widgets.transcript_box.first_child() {
             widgets.transcript_box.remove(&child);
         }
+        while let Some(child) = widgets.proposal_box.first_child() {
+            widgets.proposal_box.remove(&child);
+        }
+        widgets.proposal_box.set_visible(false);
         for turn in &self.view.transcript {
-            let widget = match turn {
-                Turn::User(message) => render_user(message),
-                Turn::AssistantThought(message) => render_thought(message),
-                Turn::AssistantSay(message) => render_say(message),
+            match turn {
+                Turn::User(message) => widgets
+                    .transcript_box
+                    .append(&render_message("You", message, false)),
+                Turn::AssistantThought(message) => widgets.transcript_box.append(&render_message(
+                    "Agent (thought)",
+                    message,
+                    false,
+                )),
+                Turn::AssistantSay(message) => widgets
+                    .transcript_box
+                    .append(&render_message("Agent", message, false)),
                 Turn::AssistantProposed {
                     id,
                     command,
                     status,
-                } => render_proposed(
-                    self.view
-                        .epoch
-                        .map(|epoch| AgentProposalRef { epoch, id: *id }),
-                    *id,
-                    command,
-                    *status,
-                    sender.clone(),
-                    matches!(
+                } => {
+                    let current = matches!(
                         self.view.state,
                         AgentState::AwaitingApproval { proposal_id } if proposal_id == *id
-                    ),
-                ),
+                    );
+                    if *status == ProposalStatus::Pending && current {
+                        widgets.proposal_box.set_visible(true);
+                        widgets.proposal_box.append(&render_proposed(
+                            self.view
+                                .epoch
+                                .map(|epoch| AgentProposalRef { epoch, id: *id }),
+                            *id,
+                            command,
+                            sender.clone(),
+                            &self.parent,
+                        ));
+                    } else {
+                        let verdict = match status {
+                            ProposalStatus::Pending => "inactive",
+                            ProposalStatus::Approved => "approved and ran",
+                            ProposalStatus::Rejected => "rejected",
+                            ProposalStatus::ManualReview => "moved to manual review",
+                        };
+                        widgets.transcript_box.append(&render_message(
+                            "Agent",
+                            &format!(
+                                "Proposed command #{} ({verdict}):\n{}",
+                                id.get(),
+                                agent_display_text(command, false)
+                            ),
+                            false,
+                        ));
+                    }
+                }
                 Turn::Observation {
                     exit_code,
                     output_sample,
                     ..
-                } => render_observation(*exit_code, output_sample),
-                Turn::ProtocolError(message) => render_protocol_error(message),
-            };
-            widgets.transcript_box.append(&widget);
+                } => widgets.transcript_box.append(&render_message(
+                    &format!("Output · exit {exit_code}"),
+                    output_sample,
+                    *exit_code != 0,
+                )),
+                Turn::ProtocolError(message) => widgets
+                    .transcript_box
+                    .append(&render_message("Error", message, true)),
+            }
         }
         let status = match self.view.state {
-            AgentState::Ready => format!(
-                "Ready — turn {}/{}",
-                self.view.turns_used, self.view.max_turns
-            ),
+            AgentState::Ready => "Ready for the next instruction".to_string(),
             AgentState::AwaitingModel => format!(
-                "Waiting for model — turn {}/{}",
-                self.view.turns_used, self.view.max_turns
+                "Thinking with {} · turn {}/{}",
+                self.provider_name,
+                self.view.turns_used.saturating_add(1),
+                self.view.max_turns,
             ),
             AgentState::AwaitingApproval { proposal_id } => {
-                format!("Proposal #{} needs approval", proposal_id.get())
+                format!("Proposal #{} is waiting for review", proposal_id.get())
             }
-            AgentState::AwaitingObservation { proposal_id } => {
-                format!("Waiting for proposal #{} output…", proposal_id.get())
+            AgentState::AwaitingObservation { .. } => "Running the approved command…".to_string(),
+            AgentState::Completed => "Task completed".to_string(),
+            AgentState::Cancelled => "Agent cancelled".to_string(),
+            AgentState::TurnLimitReached => {
+                "Turn limit reached. Start a new task to reset the context and budget.".to_string()
             }
-            AgentState::Completed => "Completed.".to_string(),
-            AgentState::Cancelled => "Cancelled.".to_string(),
-            AgentState::TurnLimitReached => format!(
-                "Turn limit reached ({}/{}).",
-                self.view.turns_used, self.view.max_turns
-            ),
-        };
-        let status = match self.view.attached_context.as_deref() {
-            Some(command) => format!("{status} · context: {}", agent_display_text(command, false)),
-            None => status,
         };
         widgets.status.set_label(&status);
+        widgets.binding_label.set_label(&format!(
+            "{} · review required · every command needs approval",
+            agent_display_text(&self.view.cwd, false)
+        ));
+        widgets.binding_label.set_tooltip_text(Some(&self.view.cwd));
+
+        if let Some(context) = self.view.attached_context.as_ref() {
+            widgets
+                .context_label
+                .set_label(&agent_context_label(context));
+            widgets
+                .context_label
+                .set_tooltip_text(Some(&agent_context_tooltip(context)));
+            widgets.context_card.set_visible(true);
+        } else {
+            widgets.context_card.set_visible(false);
+        }
+
         widgets.continue_button.set_visible(
             self.view.state == AgentState::Completed && self.view.turns_used < self.view.max_turns,
         );
@@ -722,328 +982,242 @@ impl AgentPanelModel {
             .clear_context_button
             .set_visible(self.view.attached_context.is_some());
         let can_submit = self.view.state == AgentState::Ready;
-        widgets.send_button.set_sensitive(can_submit);
+        widgets
+            .send_button
+            .set_sensitive(can_submit && !widgets.input.text().trim().is_empty());
         widgets.input.set_sensitive(can_submit);
+        widgets.attach_context_button.set_sensitive(can_submit);
+        widgets.clear_context_button.set_sensitive(can_submit);
+        widgets
+            .retry_button
+            .set_visible(can_submit && self.view.can_retry_model);
         let loading = self.view.loading || self.view.state == AgentState::AwaitingModel;
+        widgets.stop_button.set_visible(self.view.loading);
+        widgets.stop_button.set_sensitive(self.view.loading);
         widgets.spinner.set_visible(loading);
         if loading {
             widgets.spinner.start();
         } else {
             widgets.spinner.stop();
         }
-    }
-}
+        widgets.turn_label.set_label(&format!(
+            "{} / {} turns",
+            self.view.turns_used, self.view.max_turns
+        ));
+        widgets
+            .turn_progress
+            .set_fraction(f64::from(self.view.turns_used) / f64::from(self.view.max_turns.max(1)));
+        render_prompt_status(widgets, self.view.prompt_status);
 
-#[derive(Debug)]
-pub(crate) enum AgentEditMsg {
-    Open(AgentProposalRef, String),
-    Submit,
-    Close,
-}
-
-#[derive(Debug)]
-pub(crate) enum AgentEditOutput {
-    Approved(AgentProposalRef, String),
-}
-
-pub(crate) struct AgentEditModel {
-    parent: adw::ApplicationWindow,
-    /// The proposal the open dialog is editing. `None` until it is opened, so
-    /// a Submit that somehow arrives first cannot approve anything.
-    reference: Option<AgentProposalRef>,
-}
-
-#[relm4::component(pub(crate))]
-impl Component for AgentEditModel {
-    type Init = adw::ApplicationWindow;
-    type Input = AgentEditMsg;
-    type Output = AgentEditOutput;
-    type CommandOutput = ();
-
-    view! {
-        root = adw::Dialog {
-            set_title: "Edit command",
-            set_content_width: 560,
-            set_content_height: 180,
-
-            #[wrap(Some)]
-            set_child = &adw::ToolbarView {
-                add_top_bar = &adw::HeaderBar {},
-
-                #[wrap(Some)]
-                set_content = &gtk::Box {
-                    set_orientation: gtk::Orientation::Vertical,
-                    set_spacing: 8,
-                    set_margin_all: 12,
-
-                    #[name(entry)]
-                    gtk::Entry {
-                        set_hexpand: true,
-                        connect_activate => AgentEditMsg::Submit,
-                    },
-
-                    gtk::Box {
-                        set_orientation: gtk::Orientation::Horizontal,
-                        set_spacing: 6,
-                        set_halign: gtk::Align::End,
-
-                        gtk::Button {
-                            set_label: "Cancel",
-                            connect_clicked => AgentEditMsg::Close,
-                        },
-
-                        gtk::Button {
-                            set_label: "Run",
-                            add_css_class: "suggested-action",
-                            connect_clicked => AgentEditMsg::Submit,
-                        },
-                    },
-                },
-            },
-        }
-    }
-
-    fn init(
-        parent: Self::Init,
-        root: Self::Root,
-        sender: ComponentSender<Self>,
-    ) -> ComponentParts<Self> {
-        let model = Self {
-            parent,
-            reference: None,
-        };
-        let widgets = view_output!();
-        ComponentParts { model, widgets }
-    }
-
-    fn update_with_view(
-        &mut self,
-        widgets: &mut Self::Widgets,
-        msg: Self::Input,
-        sender: ComponentSender<Self>,
-        root: &Self::Root,
-    ) {
-        match msg {
-            AgentEditMsg::Open(reference, command) => {
-                self.reference = Some(reference);
-                widgets.entry.set_text(&agent_display_text(&command, false));
-                widgets.entry.select_region(0, -1);
-                root.present(Some(&self.parent));
-                widgets.entry.grab_focus();
-            }
-            AgentEditMsg::Submit => {
-                let command = widgets.entry.text();
-                let command = command.trim();
-                if let (false, Some(reference)) = (command.is_empty(), self.reference.take()) {
-                    root.force_close();
-                    let _ =
-                        sender.output(AgentEditOutput::Approved(reference, command.to_string()));
-                }
-            }
-            AgentEditMsg::Close => {
-                self.reference = None;
-                root.force_close();
-            }
+        if self.view.compact {
+            widgets.root.add_css_class("block-compact");
+            widgets.root.set_margin_top(1);
+            widgets.root.set_margin_bottom(1);
+            widgets.root.set_margin_start(4);
+            widgets.root.set_margin_end(4);
+        } else {
+            widgets.root.remove_css_class("block-compact");
+            widgets.root.set_margin_top(4);
+            widgets.root.set_margin_bottom(4);
+            widgets.root.set_margin_start(8);
+            widgets.root.set_margin_end(8);
         }
     }
 }
 
-fn render_user(msg: &str) -> gtk::Widget {
-    let frame = gtk::Frame::new(None);
-    frame.add_css_class("card");
-    frame.set_halign(gtk::Align::End);
-    let display = agent_display_text(msg, true);
-    let l = gtk::Label::new(Some(&display));
-    l.set_wrap(true);
-    l.set_xalign(0.0);
-    l.set_margin_top(8);
-    l.set_margin_bottom(8);
-    l.set_margin_start(10);
-    l.set_margin_end(10);
-    l.set_selectable(true);
-    frame.set_child(Some(&l));
-    frame.upcast()
+fn render_prompt_status(
+    widgets: &AgentPanelModelWidgets,
+    status: crate::block_view::CommandPromptStatus,
+) {
+    widgets.prompt_status.set_label(status.short_label());
+    widgets
+        .prompt_status
+        .set_tooltip_text(Some(status.blocked_message()));
+    widgets.prompt_status.remove_css_class("agent-prompt-ready");
+    widgets
+        .prompt_status
+        .remove_css_class("agent-prompt-blocked");
+    widgets.prompt_status.add_css_class(if status.is_ready() {
+        "agent-prompt-ready"
+    } else {
+        "agent-prompt-blocked"
+    });
 }
 
-fn render_thought(msg: &str) -> gtk::Widget {
-    let l = gtk::Label::new(Some(&format!("💭 {}", agent_display_text(msg, true))));
-    l.set_wrap(true);
-    l.set_xalign(0.0);
-    l.set_halign(gtk::Align::Start);
-    l.add_css_class("dim-label");
-    l.set_selectable(true);
-    l.upcast()
+fn agent_context_label(context: &crate::ai::BlockContext) -> String {
+    let exit = if context.exit_code == 0 {
+        "exit 0".to_string()
+    } else {
+        format!("exit {}", context.exit_code)
+    };
+    format!(
+        "Attached Block · {exit} · {}",
+        agent_display_text(&context.cmd, false)
+    )
 }
 
-fn render_say(msg: &str) -> gtk::Widget {
-    let display = agent_display_text(msg, true);
-    let l = gtk::Label::new(Some(&display));
-    l.set_wrap(true);
-    l.set_xalign(0.0);
-    l.set_halign(gtk::Align::Start);
-    l.set_selectable(true);
-    l.upcast()
+fn agent_context_tooltip(context: &crate::ai::BlockContext) -> String {
+    let cwd = context.cwd.as_deref().unwrap_or("unknown cwd");
+    format!(
+        "Command: {}\nWorking directory: {cwd}\nExit: {}{}",
+        agent_display_text(&context.cmd, false),
+        context.exit_code,
+        if context.truncated {
+            "\nOutput was truncated."
+        } else {
+            ""
+        }
+    )
 }
 
-fn render_protocol_error(message: &str) -> gtk::Widget {
-    let frame = gtk::Frame::new(None);
-    frame.add_css_class("card");
-    frame.add_css_class("error");
-    let label = gtk::Label::new(Some(&format!(
-        "Protocol/provider error: {}",
-        agent_display_text(message, true)
-    )));
-    label.set_wrap(true);
-    label.set_xalign(0.0);
-    label.set_selectable(true);
-    label.set_margin_top(8);
-    label.set_margin_bottom(8);
-    label.set_margin_start(10);
-    label.set_margin_end(10);
-    label.add_css_class("error");
-    frame.set_child(Some(&label));
-    frame.upcast()
+fn render_message(speaker: &str, message: &str, error: bool) -> gtk::Widget {
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    card.add_css_class("agent-transcript-card");
+    let speaker = gtk::Label::new(Some(speaker));
+    speaker.set_xalign(0.0);
+    speaker.add_css_class("agent-section-label");
+    if error {
+        speaker.add_css_class("error");
+    }
+    let body = gtk::Label::new(Some(&agent_display_text(message, true)));
+    body.set_xalign(0.0);
+    body.set_wrap(true);
+    body.set_selectable(true);
+    body.set_margin_start(10);
+    body.set_margin_end(10);
+    body.set_margin_bottom(8);
+    if error {
+        body.add_css_class("error");
+    }
+    card.append(&speaker);
+    card.append(&body);
+    card.upcast()
 }
 
 fn render_proposed(
     reference: Option<AgentProposalRef>,
     id: ProposalId,
     command: &str,
-    status: ProposalStatus,
     sender: ComponentSender<AgentPanelModel>,
-    is_current: bool,
+    parent: &adw::ApplicationWindow,
 ) -> gtk::Widget {
-    let frame = gtk::Frame::new(None);
-    frame.add_css_class("card");
     let outer = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    outer.set_margin_top(8);
-    outer.set_margin_bottom(8);
-    outer.set_margin_start(10);
-    outer.set_margin_end(10);
+    let title = gtk::Label::new(Some(&format!(
+        "Command proposal · Shell Agent · #{}",
+        id.get()
+    )));
+    title.set_xalign(0.0);
+    title.add_css_class("agent-section-label");
+    outer.append(&title);
 
     let issue = local_agent_command_issue(command);
-    let danger = is_dangerous(command);
     if let Some(issue) = issue {
         let warning = gtk::Label::new(Some(&format!("Blocked unsafe proposal: {issue}")));
         warning.add_css_class("error");
         warning.set_halign(gtk::Align::Start);
         outer.append(&warning);
     }
-    if let Some(reason) = danger {
-        let warn = gtk::Label::new(Some(&format!("⚠ destructive — {reason}")));
-        warn.add_css_class("error");
-        warn.set_halign(gtk::Align::Start);
-        outer.append(&warn);
-    }
 
-    let cmd_view = gtk::TextView::builder()
-        .editable(false)
-        .cursor_visible(false)
-        .monospace(true)
-        .wrap_mode(gtk::WrapMode::WordChar)
-        .build();
-    cmd_view
-        .buffer()
-        .set_text(&agent_display_text(command, false));
-    cmd_view.add_css_class("ai-explain-body");
-    outer.append(&cmd_view);
+    let entry = gtk::Entry::new();
+    entry.set_hexpand(true);
+    entry.set_text(&agent_display_text(command, false));
+    entry.add_css_class("agent-input");
+    entry.set_sensitive(reference.is_some() && issue.is_none());
+    outer.append(&entry);
+
+    let feedback = gtk::Label::new(None);
+    feedback.set_xalign(0.0);
+    feedback.set_wrap(true);
+    feedback.set_visible(false);
+    outer.append(&feedback);
 
     let btn_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     btn_row.set_halign(gtk::Align::End);
-    match status {
-        ProposalStatus::Pending => {
-            let approve = gtk::Button::with_label(if danger.is_some() {
-                "Approve & Run (destructive)"
-            } else {
-                "Approve & Run"
-            });
-            if danger.is_some() {
-                approve.add_css_class("destructive-action");
-            } else {
-                approve.add_css_class("suggested-action");
-            }
-            // Without an epoch the panel is rendering a transcript no live
-            // session owns, so no action may be raised from it at all.
-            let actionable = is_current && reference.is_some();
-            approve.set_sensitive(actionable && issue.is_none());
-            let edit = gtk::Button::with_label("Edit");
-            let reject = gtk::Button::with_label("Reject");
-            edit.set_sensitive(actionable);
-            reject.set_sensitive(actionable);
-            if let Some(reference) = reference {
-                {
-                    let sender = sender.clone();
-                    approve.connect_clicked(move |_| {
-                        let _ = sender.output(AgentPanelOutput::Approve(reference));
-                    });
-                }
-                {
-                    let sender = sender.clone();
-                    let cmd_str = command.to_string();
-                    edit.connect_clicked(move |_| {
-                        let _ = sender.output(AgentPanelOutput::Edit(reference, cmd_str.clone()));
-                    });
-                }
-                {
-                    let sender = sender.clone();
-                    reject.connect_clicked(move |_| {
-                        let _ = sender.output(AgentPanelOutput::Reject(reference));
-                    });
-                }
-            }
-            btn_row.append(&reject);
-            btn_row.append(&edit);
-            btn_row.append(&approve);
-            if !is_current {
-                let stale = gtk::Label::new(Some(&format!("proposal #{} inactive", id.get())));
-                stale.add_css_class("dim-label");
-                btn_row.prepend(&stale);
-            }
-        }
-        ProposalStatus::Approved => {
-            let l = gtk::Label::new(Some("✓ ran"));
-            l.add_css_class("dim-label");
-            btn_row.append(&l);
-        }
-        ProposalStatus::Rejected => {
-            let l = gtk::Label::new(Some("✗ rejected"));
-            l.add_css_class("dim-label");
-            btn_row.append(&l);
-        }
-        ProposalStatus::ManualReview => {
-            let l = gtk::Label::new(Some("moved to prompt for manual review"));
-            l.add_css_class("dim-label");
-            btn_row.append(&l);
-        }
-    }
-    outer.append(&btn_row);
-    frame.set_child(Some(&outer));
-    frame.upcast()
-}
+    let reject = gtk::Button::with_label("Reject");
+    let insert = gtk::Button::with_label("Insert only");
+    let approve = gtk::Button::with_label("Approve & Run");
+    approve.add_css_class("suggested-action");
+    let actionable = reference.is_some() && issue.is_none();
+    reject.set_sensitive(actionable);
+    insert.set_sensitive(actionable);
+    approve.set_sensitive(actionable);
 
-fn render_observation(exit: i32, output_sample: &str) -> gtk::Widget {
-    let exp = gtk::Expander::new(Some(&format!(
-        "Output (exit {exit}, {} bytes)",
-        output_sample.len()
-    )));
-    if exit != 0 {
-        exp.add_css_class("error");
+    if let Some(reference) = reference {
+        {
+            let sender = sender.clone();
+            reject.connect_clicked(move |_| {
+                let _ = sender.output(AgentPanelOutput::Reject(reference));
+            });
+        }
+        {
+            let sender = sender.clone();
+            let entry = entry.clone();
+            let feedback = feedback.clone();
+            insert.connect_clicked(move |_| {
+                let command = entry.text().trim().to_string();
+                if let Some(issue) = local_agent_command_issue(&command) {
+                    feedback.set_label(&format!("Cannot insert: {issue}"));
+                    feedback.add_css_class("error");
+                    feedback.set_visible(true);
+                    return;
+                }
+                let _ = sender.output(AgentPanelOutput::Insert(reference, command));
+            });
+        }
+        let approve_action: Rc<dyn Fn()> = {
+            let sender = sender.clone();
+            let entry = entry.clone();
+            let feedback = feedback.clone();
+            let parent = parent.clone();
+            Rc::new(move || {
+                let command = entry.text().trim().to_string();
+                if let Some(issue) = local_agent_command_issue(&command) {
+                    feedback.set_label(&format!("Cannot approve: {issue}"));
+                    feedback.add_css_class("error");
+                    feedback.set_visible(true);
+                    return;
+                }
+                if let Some(reason) = is_dangerous(&command) {
+                    let dialog = adw::AlertDialog::new(
+                        Some("Run a potentially destructive command?"),
+                        Some(&format!(
+                            "{reason}. Verify the exact command below before continuing."
+                        )),
+                    );
+                    dialog.add_responses(&[("cancel", "Cancel"), ("run", "Run Command")]);
+                    dialog.set_default_response(Some("cancel"));
+                    dialog.set_close_response("cancel");
+                    dialog.set_response_appearance("run", adw::ResponseAppearance::Destructive);
+                    let preview = gtk::Label::new(Some(&command));
+                    preview.set_selectable(true);
+                    preview.set_wrap(true);
+                    preview.set_xalign(0.0);
+                    preview.add_css_class("agent-danger-command");
+                    dialog.set_extra_child(Some(&preview));
+                    let sender = sender.clone();
+                    dialog.connect_response(None, move |_, response| {
+                        if response == "run" {
+                            let _ = sender
+                                .output(AgentPanelOutput::Approve(reference, command.clone()));
+                        }
+                    });
+                    dialog.present(Some(&parent));
+                } else {
+                    let _ = sender.output(AgentPanelOutput::Approve(reference, command));
+                }
+            })
+        };
+        {
+            let approve_action = approve_action.clone();
+            approve.connect_clicked(move |_| approve_action());
+        }
+        entry.connect_activate(move |_| approve_action());
     }
-    let view = gtk::TextView::builder()
-        .editable(false)
-        .cursor_visible(false)
-        .monospace(true)
-        .wrap_mode(gtk::WrapMode::WordChar)
-        .build();
-    view.buffer()
-        .set_text(&agent_display_text(output_sample, true));
-    view.add_css_class("ai-explain-body");
-    let scroll = gtk::ScrolledWindow::builder()
-        .height_request(180)
-        .child(&view)
-        .build();
-    exp.set_child(Some(&scroll));
-    exp.upcast()
+    btn_row.append(&reject);
+    btn_row.append(&insert);
+    btn_row.append(&approve);
+    outer.append(&btn_row);
+    outer.upcast()
 }
 
 #[cfg(test)]
@@ -1377,6 +1551,34 @@ mod tests {
         s.model_failed("network down").unwrap();
         assert_eq!(s.turns_used(), used);
         assert_eq!(s.state(), AgentState::Ready);
+        assert!(s.can_retry_model());
+        s.retry_model().unwrap();
+        assert_eq!(s.state(), AgentState::AwaitingModel);
+        assert_eq!(s.turns_used(), used);
+    }
+
+    #[test]
+    fn manual_review_records_non_execution_and_does_not_arm_observation() {
+        let mut s = session(10);
+        s.submit_user("show files").unwrap();
+        let ModelOutcome::Proposal { id, .. } = s.accept_model_reply(&run_reply("ls -la")).unwrap()
+        else {
+            panic!("expected proposal");
+        };
+        let command = s.edit_for_manual_review(id, "ls -lah").unwrap();
+        assert_eq!(command, "ls -lah");
+        assert_eq!(s.state(), AgentState::Ready);
+        assert!(s.awaiting_command.is_none());
+        assert!(matches!(
+            s.transcript().iter().find(|turn| matches!(
+                turn,
+                Turn::AssistantProposed { id: proposal_id, .. } if *proposal_id == id
+            )),
+            Some(Turn::AssistantProposed {
+                status: ProposalStatus::ManualReview,
+                ..
+            })
+        ));
     }
 
     #[test]

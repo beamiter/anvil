@@ -404,7 +404,7 @@ impl Component for SettingsModel {
 
                     #[name(agent_enabled_row)]
                     adw::SwitchRow {
-                        set_title: "AI Agent",
+                        set_title: "Shell Agent",
                         set_subtitle: "Commands always require approval",
                         set_active: model.values.agent_enabled,
                         set_sensitive: !model.values.safe_mode && model.values.ai_enabled,
@@ -502,7 +502,7 @@ impl Component for SettingsModel {
                         1.0,
                         0,
                     ) {
-                        set_title: "Agent Turn Limit",
+                        set_title: "Shell Agent Turn Limit",
                         set_sensitive: !model.values.safe_mode
                             && model.values.ai_enabled
                             && model.values.agent_enabled,
