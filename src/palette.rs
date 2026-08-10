@@ -229,7 +229,8 @@ fn palette_command_is_safe(command: &str) -> bool {
         && !crate::text_safety::contains_visual_spoof(command)
 }
 
-/// Load one newest-first history snapshot for a palette opening.
+/// Load one newest-first history snapshot for a palette opening, preferring
+/// the active Block's in-memory commands before older persisted JSONL rows.
 ///
 /// UI components call this only from their `Toggle` path. Query changes then
 /// pass the returned slice to [`gather`], keeping per-keystroke filtering free
@@ -238,9 +239,38 @@ fn palette_command_is_safe(command: &str) -> bool {
 /// predictable boundary.
 pub(crate) fn load_history_snapshot(
     path: Option<&Path>,
+    live_commands: &[String],
 ) -> Vec<command_history::CommandHistoryRecord> {
-    path.map(|path| read_history(path, HISTORY_SNAPSHOT_LIMIT))
-        .unwrap_or_default()
+    let mut seen = HashSet::with_capacity(HISTORY_SNAPSHOT_LIMIT.min(256));
+    let mut snapshot = Vec::with_capacity(HISTORY_SNAPSHOT_LIMIT.min(256));
+
+    for command in live_commands {
+        if !palette_command_is_safe(command) || !seen.insert(command.clone()) {
+            continue;
+        }
+        snapshot.push(command_history::CommandHistoryRecord {
+            command: command.clone(),
+            cwd: None,
+            exit_code: 0,
+            end_time_ms: None,
+        });
+        if snapshot.len() == HISTORY_SNAPSHOT_LIMIT {
+            return snapshot;
+        }
+    }
+
+    if let Some(path) = path {
+        for record in read_history(path, HISTORY_SNAPSHOT_LIMIT) {
+            if !palette_command_is_safe(&record.command) || !seen.insert(record.command.clone()) {
+                continue;
+            }
+            snapshot.push(record);
+            if snapshot.len() == HISTORY_SNAPSHOT_LIMIT {
+                break;
+            }
+        }
+    }
+    snapshot
 }
 
 /// Run the query against all enabled sources, score, sort, and return up to
@@ -487,7 +517,7 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
-        let snapshot = load_history_snapshot(Some(&path));
+        let snapshot = load_history_snapshot(Some(&path), &[]);
 
         // Simulate another process replacing/appending history while the
         // palette remains open. Filtering the existing snapshot must not touch
@@ -502,10 +532,54 @@ mod tests {
         assert_eq!(cached.len(), 1);
         assert_eq!(cached[0].label, "before");
 
-        let refreshed = load_history_snapshot(Some(&path));
+        let refreshed = load_history_snapshot(Some(&path), &[]);
         let reopened = gather(&query, &kbmap, &refreshed, &[], 10);
         assert_eq!(reopened.len(), 1);
         assert_eq!(reopened[0].label, "after");
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn opening_snapshot_merges_live_then_persisted_with_safe_dedup_and_bound() {
+        let path = std::env::temp_dir().join(format!(
+            "anvil-palette-merged-history-{}.jsonl",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"command\":\"persisted oldest\",\"exit_code\":0}\n",
+                "{\"command\":\"duplicate\",\"exit_code\":1}\n",
+                "{\"command\":\"persisted newest\",\"exit_code\":0}\n",
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let live = vec![
+            "live newest".to_string(),
+            "duplicate".to_string(),
+            "bad\ncommand".to_string(),
+        ];
+        let snapshot = load_history_snapshot(Some(&path), &live);
+        let commands: Vec<_> = snapshot
+            .iter()
+            .map(|record| record.command.as_str())
+            .collect();
+        assert_eq!(
+            commands,
+            [
+                "live newest",
+                "duplicate",
+                "persisted newest",
+                "persisted oldest",
+            ]
+        );
 
         std::fs::remove_file(path).unwrap();
     }

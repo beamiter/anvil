@@ -118,6 +118,24 @@ fn chars_between(vte: &Terminal, from: core_click::Cell, to: core_click::Cell) -
     text_between(vte, from, to).chars().count() as i64
 }
 
+/// Strict reviewed-execution check for everything to the right of the cursor.
+/// Visual colour and prompt geometry are deliberately irrelevant here: real
+/// editable input can imitate suggestion styling. VTE emits CR/LF separators
+/// for structurally empty rows, so those alone are allowed.
+pub(crate) fn verified_suffix_is_empty(vte: &Terminal) -> Option<bool> {
+    let (cursor_col, cursor_row) = vte.cursor_position();
+    let bottom_row = cursor_row.saturating_add(vte.row_count().max(1));
+    vte.text_range_format(
+        vte4::Format::Text,
+        cursor_row,
+        cursor_col,
+        bottom_row,
+        vte.column_count(),
+    )
+    .0
+    .map(|text| text.bytes().all(|byte| matches!(byte, b'\r' | b'\n')))
+}
+
 /// One character as VTE will paint it: `color` is `None` for the default
 /// foreground.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

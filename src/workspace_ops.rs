@@ -6,6 +6,87 @@
 
 use super::*;
 
+/// Run every fallible preparation step before allowing a structural commit.
+/// Split uses this with an injected constructor in tests and with Relm4's
+/// synchronously initialized Block component in production.
+fn prepare_then_commit<T, E>(
+    prepare: impl FnOnce() -> Result<T, E>,
+    commit: impl FnOnce(T),
+) -> Result<(), E> {
+    let prepared = prepare()?;
+    commit(prepared);
+    Ok(())
+}
+
+/// Combine the number of equal pane slots below two children for one axis.
+/// A same-axis split consumes both spans; a cross-axis split stacks them and
+/// therefore consumes only the larger span on the measured axis.
+fn combined_axis_span(same_axis: bool, start: u32, end: u32) -> u32 {
+    if same_axis {
+        start.saturating_add(end)
+    } else {
+        start.max(end)
+    }
+}
+
+fn pane_axis_span(widget: &gtk::Widget, axis: gtk::Orientation) -> u32 {
+    let Ok(paned) = widget.clone().downcast::<gtk::Paned>() else {
+        return 1;
+    };
+    let (Some(start), Some(end)) = (paned.start_child(), paned.end_child()) else {
+        return 1;
+    };
+    combined_axis_span(
+        paned.orientation() == axis,
+        pane_axis_span(&start, axis),
+        pane_axis_span(&end, axis),
+    )
+}
+
+fn balanced_split_position(extent: i32, start_span: u32, end_span: u32) -> Option<i32> {
+    if extent <= 1 || start_span == 0 || end_span == 0 {
+        return None;
+    }
+    let total_span = u64::from(start_span) + u64::from(end_span);
+    let position = i64::from(extent) * i64::from(start_span) / total_span as i64;
+    Some(position.clamp(1, i64::from(extent - 1)) as i32)
+}
+
+/// Rebalance nested panes from their subtree spans. Repeated same-axis splits
+/// then receive one equal slot per leaf instead of geometrically shrinking the
+/// newest half (1/2, 1/4, 1/8, ...).
+fn rebalance_pane_tree(widget: &gtk::Widget) {
+    let Ok(paned) = widget.clone().downcast::<gtk::Paned>() else {
+        return;
+    };
+    let (Some(start), Some(end)) = (paned.start_child(), paned.end_child()) else {
+        return;
+    };
+    let axis = paned.orientation();
+    let extent = if axis == gtk::Orientation::Horizontal {
+        paned.width()
+    } else {
+        paned.height()
+    };
+    let start_span = pane_axis_span(&start, axis);
+    let end_span = pane_axis_span(&end, axis);
+    if let Some(position) = balanced_split_position(extent, start_span, end_span) {
+        paned.set_position(position);
+    }
+    rebalance_pane_tree(&start);
+    rebalance_pane_tree(&end);
+}
+
+pub(super) fn schedule_pane_rebalance(root: gtk::Widget) {
+    // The first idle observes the newly inserted Paned. Moving an ancestor
+    // divider changes nested allocations, so a second pass settles descendants.
+    gtk::glib::idle_add_local_once(move || {
+        rebalance_pane_tree(&root);
+        let root = root.clone();
+        gtk::glib::idle_add_local_once(move || rebalance_pane_tree(&root));
+    });
+}
+
 /// GTK keeps per-container focus history across child removal. Clear the root
 /// while the leaf still belongs to its old tree so a later focus traversal
 /// cannot jump back to a widget that was reparented elsewhere.
@@ -119,6 +200,18 @@ impl LeafSlot {
         let paned = gtk::Paned::new(orientation);
         paned.set_hexpand(true);
         paned.set_vexpand(true);
+        paned.set_resize_start_child(true);
+        paned.set_resize_end_child(true);
+        paned.set_shrink_start_child(true);
+        paned.set_shrink_end_child(true);
+        let target_extent = if orientation == gtk::Orientation::Horizontal {
+            target.width()
+        } else {
+            target.height()
+        };
+        if let Some(position) = balanced_split_position(target_extent, 1, 1) {
+            paned.set_position(position);
+        }
 
         clear_root_focus_before_reparent(target);
         match &self {
@@ -543,6 +636,7 @@ impl AppModel {
         let title_cwd = working_directory.clone();
         let pane = create_pane(
             &self.config,
+            &self.organism_hub,
             &shell_argv,
             id,
             pane_id,
@@ -683,6 +777,7 @@ impl AppModel {
                     let shell_argv = Rc::new(config::build_remote_argv(&host));
                     let pane = create_pane(
                         &self.config,
+                        &self.organism_hub,
                         &shell_argv,
                         tab_id,
                         pane_id,
@@ -742,6 +837,7 @@ impl AppModel {
                 }
                 let pane = create_pane(
                     &self.config,
+                    &self.organism_hub,
                     &self.shell_argv,
                     tab_id,
                     pane_id,
@@ -916,6 +1012,7 @@ impl AppModel {
         session::SavedSession {
             active: self.active,
             tabs,
+            ai_conversation: self.ai_conversation.clone(),
         }
     }
 
@@ -972,14 +1069,31 @@ impl AppModel {
     pub(crate) fn force_quit(&self) {
         if !self.safe_mode {
             let width = self.content_paned.position().clamp(120, 800) as u32;
+            let ai_width = self
+                .ai_panel_visible
+                .get()
+                .then(|| {
+                    self.ai_paned
+                        .width()
+                        .saturating_sub(self.ai_paned.position())
+                })
+                .filter(|width| *width >= MIN_AI_PANEL_WIDTH as i32)
+                .map(|width| (width as u32).clamp(MIN_AI_PANEL_WIDTH, MAX_AI_PANEL_WIDTH));
             let changed = {
                 let config = self.config.borrow();
-                config.sidebar_width != width || config.sidebar_visible != self.sidebar_visible
+                config.sidebar_width != width
+                    || config.sidebar_visible != self.sidebar_visible
+                    || config.ai_panel_visible != self.ai_panel_visible.get()
+                    || ai_width.is_some_and(|width| config.ai_panel_width != width)
             };
             if changed {
                 let mut config = self.config.borrow_mut();
                 config.sidebar_width = width;
                 config.sidebar_visible = self.sidebar_visible;
+                config.ai_panel_visible = self.ai_panel_visible.get();
+                if let Some(width) = ai_width {
+                    config.ai_panel_width = width;
+                }
                 drop(config);
                 self.persist_config();
             }
@@ -991,6 +1105,17 @@ impl AppModel {
         self.close_all_command_corrections();
         if let Err(error) = command_history::flush_pending(std::time::Duration::from_secs(3)) {
             log::warn!("flush command history on exit: {error}");
+        }
+        if let Err(error) =
+            crate::organism_memory::flush_pending(std::time::Duration::from_millis(500))
+        {
+            log::warn!("ASCII organism memory could not be queued for shutdown: {error}");
+        }
+        if let Err(error) = crate::persistence::shutdown(std::time::Duration::from_secs(3)) {
+            log::warn!("persistence worker did not flush before shutdown: {error}");
+        }
+        for failure in crate::persistence::drain_failures() {
+            log::error!("persistence failure during shutdown: {failure}");
         }
         self.quit_allowed.set(true);
         self.window.close();
@@ -1086,6 +1211,7 @@ impl AppModel {
         let mode = TerminalMode::Block;
         let pane = create_pane(
             &self.config,
+            &self.organism_hub,
             &argv,
             id,
             pane_id,
@@ -1253,6 +1379,7 @@ impl AppModel {
         let mode = TerminalMode::Block;
         let pane = create_pane(
             &self.config,
+            &self.organism_hub,
             &argv,
             self.tabs[idx].id,
             new_pane_id,
@@ -1353,6 +1480,7 @@ impl AppModel {
             .map(|pane| pane.id)
             .collect::<Vec<_>>();
         for pane_id in pane_ids {
+            self.pending_split_spawns.remove(&pane_id);
             self.close_command_suggestion_for_pane(pane_id);
             self.close_command_correction_for_pane(pane_id);
         }
@@ -1472,6 +1600,13 @@ impl AppModel {
         if ti != tj || di == tj_index || self.tabs[ti].zoom.is_some() {
             return;
         }
+        if self.tabs[ti]
+            .panes
+            .iter()
+            .any(|pane| self.pending_split_spawns.contains_key(&pane.id))
+        {
+            return;
+        }
         let dragged_widget = self.tabs[ti].panes[di].widget();
         let target_widget = self.tabs[ti].panes[tj_index].widget();
         if !crate::pane_header::swap_pane_widgets(&dragged_widget, &target_widget) {
@@ -1503,6 +1638,17 @@ impl AppModel {
             return;
         };
         if self.tabs[target_index].id != plan.target_tab_id {
+            return;
+        }
+        if self.tabs[target_index]
+            .panes
+            .iter()
+            .any(|pane| self.pending_split_spawns.contains_key(&pane.id))
+            || self.tabs[source_index]
+                .panes
+                .iter()
+                .any(|pane| self.pending_split_spawns.contains_key(&pane.id))
+        {
             return;
         }
 
@@ -1662,6 +1808,7 @@ impl AppModel {
         let mode = self.config.borrow().terminal_mode;
         let pane = create_pane(
             &self.config,
+            &self.organism_hub,
             &self.shell_argv,
             id,
             pane_id,
@@ -1738,6 +1885,7 @@ impl AppModel {
             .flat_map(|tab| tab.panes.iter().map(|pane| pane.id))
             .collect::<Vec<_>>();
         for pane_id in pane_ids {
+            self.pending_split_spawns.remove(&pane_id);
             self.close_command_suggestion_for_pane(pane_id);
             self.close_command_correction_for_pane(pane_id);
         }
@@ -1783,7 +1931,9 @@ impl AppModel {
         None
     }
 
-    /// Split the active pane using the configured local terminal backend.
+    /// Split the active pane using that pane's backend. The setting controls
+    /// future tabs; it must not silently turn a Block split into VTE (or vice
+    /// versa) inside an existing mixed-backend workspace.
     pub(crate) fn split_active(
         &mut self,
         orientation: gtk::Orientation,
@@ -1798,70 +1948,172 @@ impl AppModel {
         let ti = self.active;
         let tab_id = tab.id;
         let api = tab.active_pane;
+        let source_pane_id = tab.panes[api].id;
+        if tab
+            .panes
+            .iter()
+            .any(|pane| self.pending_split_spawns.contains_key(&pane.id))
+        {
+            // Do not nest another transaction below a leaf whose asynchronous
+            // VTE spawn may still require exact structural rollback.
+            return;
+        }
         let cur_widget = tab.panes[api].widget();
         let wd = tab.panes[api].local_cwd().map(str::to_string);
-        let mode = self.config.borrow().terminal_mode;
+        let mode = tab.panes[api].terminal.mode();
+        // Validate the exact holder ancestry before even launching the new
+        // component. A stale/malformed leaf must not create an unattached pane
+        // in the model or mutate a foreign tab tree.
+        let Some(slot) = LeafSlot::of(&tab.holder, &cur_widget) else {
+            log::error!("Cannot split pane {source_pane_id}: invalid pane-tree ancestry");
+            return;
+        };
 
         let pane_id = self.next_pane_id;
         self.next_pane_id += 1;
-        let new_pane = create_pane(
-            &self.config,
-            &self.shell_argv,
-            tab_id,
-            pane_id,
-            mode,
-            InitialCommands::default(),
-            wd,
-            None,
-            false,
-            sender,
+        let config = self.config.clone();
+        let organism_hub = self.organism_hub.clone();
+        let shell_argv = self.shell_argv.clone();
+        let split = prepare_then_commit(
+            || {
+                let pane = create_pane(
+                    &config,
+                    &organism_hub,
+                    &shell_argv,
+                    tab_id,
+                    pane_id,
+                    mode,
+                    InitialCommands::default(),
+                    wd,
+                    None,
+                    false,
+                    sender,
+                );
+                if let Some(error) = pane.terminal.synchronous_launch_error() {
+                    Err(error)
+                } else {
+                    Ok(pane)
+                }
+            },
+            |new_pane| {
+                let new_widget = new_pane.widget();
+                let edge = if orientation == gtk::Orientation::Horizontal {
+                    pane_header::PaneDropEdge::Right
+                } else {
+                    pane_header::PaneDropEdge::Bottom
+                };
+                slot.replace_with_split(&cur_widget, &new_widget, edge);
+
+                let tab = &mut self.tabs[ti];
+                tab.panes.push(new_pane);
+                tab.active_pane = tab.panes.len() - 1;
+                // libvte reports spawn completion asynchronously. Until its
+                // success event arrives, this stable id can roll back exactly
+                // the new leaf without guessing from a shifted pane index.
+                if matches!(mode, TerminalMode::Vte) {
+                    self.pending_split_spawns
+                        .insert(pane_id, (tab_id, source_pane_id));
+                } else if let Some(root) = tab.holder.first_child() {
+                    schedule_pane_rebalance(root);
+                }
+                tab.panes[tab.active_pane]
+                    .terminal
+                    .emit(VteInput::GrabFocus);
+                // The tab just became split, so every pane's header appears now.
+                self.refresh_pane_headers(ti);
+            },
         );
-        let new_widget = new_pane.widget();
+        if let Err(error) = split {
+            log::error!("Terminal spawn failed while preparing split pane {pane_id}: {error}");
+            self.show_toast(format!(
+                "Terminal failed to start: {error}. The existing pane layout was left unchanged."
+            ));
+        }
+    }
 
-        let paned = gtk::Paned::new(orientation);
-        paned.set_hexpand(true);
-        paned.set_vexpand(true);
+    /// Remove exactly the asynchronously spawned split leaf and promote its
+    /// sibling back into the validated slot. The stable pane id, not a shifted
+    /// vector index, is the rollback authority.
+    pub(crate) fn rollback_failed_split(
+        &mut self,
+        pane_id: u64,
+        source_tab_id: u64,
+        source_pane_id: u64,
+    ) -> bool {
+        let Some((tab_index, pane_index)) = self.find_pane(pane_id) else {
+            return false;
+        };
+        if self.tabs[tab_index].id != source_tab_id
+            || self.tabs[tab_index].panes.len() <= 1
+            || self.tabs[tab_index].zoom.is_some()
+        {
+            return false;
+        }
+        let was_active_tab = self.active == tab_index;
+        let failed_was_active = self.tabs[tab_index].active_pane == pane_index;
+        let Some(removed) = self.detach_pane_from_tab(tab_index, pane_index) else {
+            return false;
+        };
+        drop(removed);
 
-        if let Some(parent) = cur_widget.parent() {
-            if let Ok(pp) = parent.clone().downcast::<gtk::Paned>() {
-                let is_start = pp.start_child().as_ref() == Some(&cur_widget);
-                if is_start {
-                    pp.set_start_child(None::<&gtk::Widget>);
-                } else {
-                    pp.set_end_child(None::<&gtk::Widget>);
-                }
-                paned.set_start_child(Some(&cur_widget));
-                paned.set_end_child(Some(&new_widget));
-                if is_start {
-                    pp.set_start_child(Some(&paned));
-                } else {
-                    pp.set_end_child(Some(&paned));
-                }
-            } else {
-                let holder = &self.tabs[ti].holder;
-                holder.remove(&cur_widget);
-                paned.set_start_child(Some(&cur_widget));
-                paned.set_end_child(Some(&new_widget));
-                holder.append(&paned);
+        let Some(source_index) = self.tabs[tab_index]
+            .panes
+            .iter()
+            .position(|pane| pane.id == source_pane_id)
+        else {
+            log::error!(
+                "Split rollback removed pane {pane_id}, but source pane {source_pane_id} disappeared"
+            );
+            self.refresh_pane_headers(tab_index);
+            return true;
+        };
+        if failed_was_active {
+            self.tabs[tab_index].active_pane = source_index;
+            if was_active_tab {
+                self.tabs[tab_index].panes[source_index]
+                    .terminal
+                    .emit(VteInput::GrabFocus);
             }
         }
-
-        let tab = &mut self.tabs[ti];
-        tab.panes.push(new_pane);
-        tab.active_pane = tab.panes.len() - 1;
-        tab.panes[tab.active_pane]
-            .terminal
-            .emit(VteInput::GrabFocus);
-        // The tab just became split, so every pane's header appears now.
-        self.refresh_pane_headers(ti);
+        self.refresh_pane_headers(tab_index);
+        true
     }
 
     /// Remove a pane from its tab, collapsing the Paned tree and promoting the
     /// sibling. Closes the whole tab if it was the last pane.
     pub(crate) fn close_pane(&mut self, pane_id: u64, sender: &ComponentSender<AppModel>) {
-        let Some((ti, pi)) = self.find_pane(pane_id) else {
+        let Some((mut ti, mut pi)) = self.find_pane(pane_id) else {
+            self.pending_split_spawns.remove(&pane_id);
             return;
         };
+        let pending_in_tab = self.tabs[ti].panes.iter().find_map(|pane| {
+            self.pending_split_spawns
+                .get(&pane.id)
+                .copied()
+                .map(|metadata| (pane.id, metadata))
+        });
+        if let Some((pending_pane_id, (source_tab_id, source_pane_id))) = pending_in_tab {
+            self.pending_split_spawns.remove(&pending_pane_id);
+            if pending_pane_id != pane_id {
+                // Closing another leaf while a VTE split is still preparing
+                // would destroy the exact sibling slot needed on failure.
+                // Abort that split first, then honor the requested close on
+                // the restored tree.
+                if !self.rollback_failed_split(pending_pane_id, source_tab_id, source_pane_id) {
+                    self.pending_split_spawns
+                        .insert(pending_pane_id, (source_tab_id, source_pane_id));
+                    log::error!(
+                        "Refusing to close pane {pane_id}: pending split {pending_pane_id} could not be rolled back safely"
+                    );
+                    return;
+                }
+                let Some((new_ti, new_pi)) = self.find_pane(pane_id) else {
+                    return;
+                };
+                ti = new_ti;
+                pi = new_pi;
+            }
+        }
         self.close_command_suggestion_for_pane(pane_id);
         self.close_command_correction_for_pane(pane_id);
         let closes_agent = self
@@ -1993,6 +2245,13 @@ impl AppModel {
     }
 
     pub(crate) fn toggle_pane_zoom_for(&mut self, ti: usize) {
+        if self.tabs.get(ti).is_some_and(|tab| {
+            tab.panes
+                .iter()
+                .any(|pane| self.pending_split_spawns.contains_key(&pane.id))
+        }) {
+            return;
+        }
         let Some(tab) = self.tabs.get_mut(ti) else {
             return;
         };
@@ -2073,6 +2332,13 @@ impl AppModel {
             return;
         };
         if self.tabs[source_index].id != plan.source_tab_id {
+            return;
+        }
+        if self.tabs[source_index]
+            .panes
+            .iter()
+            .any(|pane| self.pending_split_spawns.contains_key(&pane.id))
+        {
             return;
         }
         let Some(moved) = self.detach_pane_from_tab(source_index, pane_index) else {
@@ -2174,16 +2440,18 @@ fn reconnect_target_is_valid(
 #[cfg(test)]
 mod pane_tree_tests {
     use super::{
-        abbreviate_prefix, active_index_after_remove, detach_leaf_and_promote,
-        format_running_process_summary, pane_header_title, pinned_reorder_destination,
-        plan_pane_into_tab, plan_tab_into_pane, reconnect_target_is_valid,
-        replay_argv_for_unmanaged_leaf, restored_leaf_mode, snapshot_restorable_command,
-        tab_drop_preview_is_valid, DropTabIdentity, LeafSlot, PaneIntoTabPlan, TabIntoPanePlan,
+        abbreviate_prefix, active_index_after_remove, balanced_split_position, combined_axis_span,
+        detach_leaf_and_promote, format_running_process_summary, pane_header_title,
+        pinned_reorder_destination, plan_pane_into_tab, plan_tab_into_pane, prepare_then_commit,
+        reconnect_target_is_valid, replay_argv_for_unmanaged_leaf, restored_leaf_mode,
+        snapshot_restorable_command, tab_drop_preview_is_valid, DropTabIdentity, LeafSlot,
+        PaneIntoTabPlan, TabIntoPanePlan,
     };
     use crate::config::TerminalMode;
     use crate::workspace::ConnStatus;
     use relm4::gtk;
     use relm4::gtk::prelude::*;
+    use std::cell::Cell;
 
     fn drop_tab(
         id: u64,
@@ -2214,6 +2482,62 @@ mod pane_tree_tests {
             remote_pane_id,
             remote_status,
         }
+    }
+
+    #[test]
+    fn failed_split_preparation_never_runs_the_structural_commit() {
+        let committed = Cell::new(false);
+        let result = prepare_then_commit(
+            || -> std::io::Result<()> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "injected terminal spawn failure",
+                ))
+            },
+            |()| committed.set(true),
+        );
+
+        assert_eq!(
+            result.expect_err("preparation must fail").kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert!(!committed.get());
+    }
+
+    #[test]
+    fn repeated_same_axis_splits_rebalance_to_equal_leaf_slots() {
+        assert_eq!(balanced_split_position(1_200, 1, 1), Some(600));
+        assert_eq!(balanced_split_position(1_200, 1, 2), Some(400));
+        assert_eq!(balanced_split_position(1_200, 2, 1), Some(800));
+        assert_eq!(balanced_split_position(1_200, 3, 1), Some(900));
+
+        let nested_right_span = combined_axis_span(true, 1, 1);
+        assert_eq!(nested_right_span, 2);
+
+        // Shape: A | (B | C). A receives 1/3 of the root and B/C split the
+        // remaining 2/3 equally, producing three 400px leaves.
+        let root_position = balanced_split_position(1_200, 1, nested_right_span).unwrap();
+        let nested_position = balanced_split_position(1_200 - root_position, 1, 1).unwrap();
+        assert_eq!(
+            [
+                root_position,
+                nested_position,
+                1_200 - root_position - nested_position,
+            ],
+            [400, 400, 400]
+        );
+
+        // Cross-axis children stack rather than consuming another slot on the
+        // measured axis, which keeps mixed grids proportional.
+        assert_eq!(combined_axis_span(false, 2, 1), 2);
+    }
+
+    #[test]
+    fn balanced_split_position_rejects_unallocated_or_empty_inputs() {
+        assert_eq!(balanced_split_position(0, 1, 1), None);
+        assert_eq!(balanced_split_position(1, 1, 1), None);
+        assert_eq!(balanced_split_position(100, 0, 1), None);
+        assert_eq!(balanced_split_position(100, 1, 0), None);
     }
 
     #[test]
@@ -2401,6 +2725,17 @@ mod pane_tree_tests {
         assert_eq!(inserted.end_child().as_ref(), Some(&target_widget));
         gtk::prelude::RootExt::set_focus(&window, Some(&moved));
         assert!(gtk::prelude::RootExt::focus(&window).is_some_and(|focus| focus == moved_widget));
+        assert_eq!(
+            detach_leaf_and_promote(&holder, &moved_widget),
+            Some(target_widget.clone()),
+            "failed split rollback promotes the exact original leaf"
+        );
+        assert_eq!(
+            nested_split.start_child().as_ref(),
+            Some(&target_widget),
+            "rollback restores the original tree slot"
+        );
+        assert!(gtk::prelude::RootExt::focus(&window).is_none());
         window.set_child(None::<&gtk::Widget>);
 
         // A hostile nested tree under another holder used to pass the

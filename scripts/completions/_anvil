@@ -1,0 +1,27 @@
+#compdef anvil
+
+_anvil()
+{
+  _arguments -s -S \
+    '(-h --help)'{-h,--help}'[show command help]' \
+    '(-V --version)'{-V,--version}'[show version]' \
+    '(-c --config)'{-c,--config}'[use an alternate config file]:config file:_files' \
+    '(-d --working-directory)'{-d,--working-directory}'[start in a directory]:directory:_directories' \
+    '(-e --execute)'{-e,--execute}'[run a command instead of the configured shell]:command:_command_names:*::arguments:_normal' \
+    '--mode=[override terminal backend]:backend:(block vte)' \
+    '--no-restore[start a fresh persistable workspace]' \
+    '--safe-mode[use isolated VTE defaults without persistence]' \
+    '--doctor[run headless environment diagnostics]' \
+    '--json[format doctor or config-check output as JSON]' \
+    '--check-config=-[validate configuration]:config file:_files' \
+    '--restore-config-backup[restore the newest valid config backup]' \
+    '--config-path[print the effective config path]' \
+    '--init-config[create a documented config if absent]' \
+    '--print-default-config[print the bundled example config]' \
+    '--shell-integration=[print shell integration]:shell:(bash zsh fish pwsh)' \
+    '--generate-completion=[print command completion]:shell:(bash zsh fish pwsh)' \
+    '--completion=[alias for --generate-completion]:shell:(bash zsh fish pwsh)' \
+    '*:working directory:_directories'
+}
+
+_anvil "$@"

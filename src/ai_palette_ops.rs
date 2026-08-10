@@ -572,9 +572,8 @@ impl AppModel {
     }
 
     fn ai_command_target_is_ready(&self, pane_id: u64) -> bool {
-        self.terminal_for_pane(pane_id).is_some_and(|terminal| {
-            terminal.command_prompt_status().is_ready() && terminal.can_accept_agent_command()
-        })
+        self.terminal_for_pane(pane_id)
+            .is_some_and(|terminal| terminal.command_prompt_status().is_ready())
     }
 
     fn terminal_for_pane(&self, pane_id: u64) -> Option<&TermCtl> {
@@ -595,6 +594,15 @@ impl AppModel {
             self.show_toast("AI is unavailable in safe mode.");
             return;
         }
+        if !self.config.borrow().ai_enabled {
+            self.show_toast("AI features are disabled in Settings.");
+            return;
+        }
+        // Visibility is a panel preference, not proof that provider
+        // credentials are currently usable. This also matches startup, where
+        // a restored panel stays visible and explains provider errors in
+        // place instead of silently changing the saved preference.
+        self.set_ai_panel_visible(true, true);
         let client = match ai::client_from_config(&self.config.borrow()) {
             Ok(client) => client,
             Err(error) => {
@@ -606,14 +614,64 @@ impl AppModel {
             history_path: self.config.borrow().command_history_path.clone(),
             client,
             stream: self.config.borrow().ai_stream,
+            redact_secrets: self.config.borrow().ai_redact_secrets,
             initial_context,
+        });
+    }
+
+    pub(crate) fn set_ai_panel_visible(&self, visible: bool, persist: bool) {
+        let visible = visible && !self.safe_mode && self.config.borrow().ai_enabled;
+        if self.ai_panel_visible.get() == visible && self.ai_panel.widget().is_visible() == visible
+        {
+            if visible {
+                self.restore_ai_panel_width();
+            }
+            return;
+        }
+        if !visible && self.ai_panel_visible.get() {
+            let measured = self
+                .ai_paned
+                .width()
+                .saturating_sub(self.ai_paned.position());
+            if measured >= MIN_AI_PANEL_WIDTH as i32 {
+                self.config.borrow_mut().ai_panel_width =
+                    (measured as u32).clamp(MIN_AI_PANEL_WIDTH, MAX_AI_PANEL_WIDTH);
+            }
+        }
+        self.ai_panel_visible.set(visible);
+        self.ai_panel.widget().set_visible(visible);
+        self.config.borrow_mut().ai_panel_visible = visible;
+        if visible {
+            self.restore_ai_panel_width();
+        }
+        if persist {
+            self.persist_config();
+        }
+    }
+
+    pub(crate) fn restore_ai_panel_width(&self) {
+        if !self.ai_panel_visible.get() {
+            return;
+        }
+        let paned = self.ai_paned.clone();
+        let requested = self.config.borrow().ai_panel_width;
+        if let Some(position) = restored_ai_panel_position(paned.width(), requested) {
+            paned.set_position(position);
+        }
+        gtk::glib::idle_add_local_once(move || {
+            if let Some(position) = restored_ai_panel_position(paned.width(), requested) {
+                paned.set_position(position);
+            }
         });
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{compact_one_line, suggestion_reply_is_current};
+    use super::{
+        ai_panel_width_from_geometry, compact_one_line, restored_ai_panel_position,
+        suggestion_reply_is_current,
+    };
 
     #[test]
     fn compact_preview_collapses_and_bounds_untrusted_text() {
@@ -628,5 +686,15 @@ mod tests {
         assert!(!suggestion_reply_is_current(4, 2, false, 4, 2));
         assert!(!suggestion_reply_is_current(4, 3, true, 4, 2));
         assert!(!suggestion_reply_is_current(5, 2, true, 4, 2));
+    }
+
+    #[test]
+    fn ai_panel_width_restore_preserves_a_usable_terminal() {
+        assert_eq!(restored_ai_panel_position(800, 360), Some(440));
+        assert_eq!(restored_ai_panel_position(2_000, 1_800), Some(200));
+        assert_eq!(restored_ai_panel_position(440, 360), None);
+        assert_eq!(ai_panel_width_from_geometry(800, 440), Some(360));
+        assert_eq!(ai_panel_width_from_geometry(2_000, 100), Some(1_200));
+        assert_eq!(ai_panel_width_from_geometry(800, 800), None);
     }
 }

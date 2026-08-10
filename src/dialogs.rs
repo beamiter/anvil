@@ -6,10 +6,10 @@ use relm4::ComponentSender;
 
 use crate::{AppModel, AppMsg};
 
+pub(crate) mod ai_chat_store;
 pub(crate) mod ai_panel;
 pub(crate) mod command_palette;
 pub(crate) mod debug_dashboard;
-pub(crate) mod history;
 pub(crate) mod remote_picker;
 pub(crate) mod settings;
 pub(crate) mod workflow;

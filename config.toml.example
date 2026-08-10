@@ -25,6 +25,8 @@ sidebar_view = "tabs"       # "tabs" or "files"
 sidebar_visible = true
 sidebar_width = 220
 tab_width = 180
+ai_panel_visible = false
+ai_panel_width = 360
 
 # Shell selection and commands automatically submitted in every new tab.
 # When shell is omitted, anvil tries jsh, bash -l, then sh.
@@ -42,16 +44,17 @@ jsh_update_check = "daily"
 # Lightweight command-only JSONL history used by Ctrl+Shift+H, the palette, and
 # optional AI context. The default path is under $XDG_STATE_HOME/anvil/.
 command_history_enabled = true
-# This must be an absolute path; '~' is not expanded here.
-# command_history_path = "/absolute/path/to/history.jsonl"
+# This must be an absolute path or begin with ~/.
+# command_history_path = "~/.local/state/anvil/history.jsonl"
 command_history_max_entries = 10000
 
 # Block view behavior and optional full-output persistence.
 block_compact = false
+# Experimental native ASCII organism. Motion: "full", "calm", "static", or
+# omit the motion key to follow the desktop animation preference.
+ascii_organism_enabled = false
+# ascii_organism_motion = "calm"
 max_visible_blocks = 200
-ansi_cache_capacity = 256
-output_batch_min_ms = 10
-output_batch_max_ms = 100
 lazy_load_threshold = 1000
 truncation_threshold_lines = 50000
 finished_block_viewport_rows = 24
@@ -59,11 +62,10 @@ finished_block_max_expanded_rows = 5000
 max_collapsed_output_lines = 25
 virtual_scroll_margin = 1
 # Unlike command history, this binary file can contain terminal output. It is
-# disabled unless an absolute path is configured; '~' is not expanded here.
-# block_history_path = "/absolute/path/to/anvil-history.bin"
+# disabled unless an absolute or ~/ path is configured.
+# block_history_path = "~/.local/state/anvil/block-history.bin"
 block_history_compress = true
 preserve_live_scrollback = false
-show_repo_strip = true
 
 # Bottom status bar: cwd, git branch, last command's status/duration, grid
 # size, and tab position. The same key toggles it in every jterm.
@@ -97,7 +99,7 @@ command_correction_enabled = true
 ai_provider = "anthropic"       # anthropic | openai-compatible | ollama
 ai_model = "claude-sonnet-4-6"
 ai_base_url = "https://api.anthropic.com"
-ai_max_tokens = 1024             # 1 .. 32768
+ai_max_tokens = 1024             # 64 .. 32768
 ai_redact_secrets = true
 ai_stream = true                 # stream session AI panel replies as they generate
 
@@ -140,6 +142,7 @@ remote_hosts = []
 # scroll_up = "Ctrl+Up"
 # scroll_down = "Ctrl+Down"
 # show_remote_picker = "Ctrl+Shift+S"
+# connect_remote_1 = "F4"  # direct-connect saved remote 1; supports 1 through 9
 # resize_pane_left = "Ctrl+Shift+Alt+Left"
 # resize_pane_right = "Ctrl+Shift+Alt+Right"
 # resize_pane_up = "Ctrl+Shift+Alt+Up"
@@ -158,7 +161,7 @@ remote_hosts = []
 # clear_blocks = "Ctrl+Shift+K"
 # reinput_selected_commands = "Ctrl+Shift+I"
 # toggle_debug_dashboard = "F12"
-# open_ai_panel = "Ctrl+Shift+Alt+A"
+# toggle_ai_panel = "Ctrl+Shift+Alt+A"
 # ask_ai_about_selected_block = "Ctrl+Shift+Q"
 # open_workflows = "Ctrl+Shift+M"
 # open_agent = "Ctrl+Alt+G"
@@ -167,6 +170,7 @@ remote_hosts = []
 # choose combinations that do not collide with the defaults above.
 # close_tab = "Ctrl+Alt+W"
 # open_palette = "Ctrl+Alt+P"
+# open_ai_panel = "F6"  # compatibility action: opens but never closes the panel
 # close_selected_tabs = "Ctrl+Alt+X"
 # move_tab_left = "Ctrl+Alt+PageUp"
 # move_tab_right = "Ctrl+Alt+PageDown"

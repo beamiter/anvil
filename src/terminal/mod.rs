@@ -288,6 +288,18 @@ mod tests {
                 source.contains("__anvil_marker_id"),
                 "{file} does not retain a private command marker"
             );
+            assert!(
+                source.contains("ANVIL_SHELL_INTEGRATION_FD")
+                    && source.contains("ANVIL_SHELL_INTEGRATION_TOKEN"),
+                "{file} does not scrub the reserved Agent integration environment"
+            );
+        }
+
+        for file in ["anvil.bash", "anvil.zsh"] {
+            let source = std::fs::read_to_string(integration_path(file)).unwrap();
+            assert!(source.contains("7771;${__anvil_command_token}"));
+            assert!(source.contains("__anvil_token_fd"));
+            assert!(source.contains("__anvil_command_token}-${__anvil_marker_seq}"));
         }
 
         let bash = integration_path("anvil.bash");

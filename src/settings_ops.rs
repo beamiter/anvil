@@ -130,6 +130,34 @@ impl AppModel {
         self.show_toast("Command history preference updated.");
     }
 
+    pub(crate) fn apply_settings_ascii_organism(&mut self, enabled: bool) {
+        if self.safe_mode {
+            self.show_toast("ASCII organism is disabled in safe mode.");
+            return;
+        }
+        self.config.borrow_mut().ascii_organism_enabled = enabled;
+        self.persist_config();
+        self.show_toast(if enabled {
+            "ASCII organism will appear in new local Block panes."
+        } else {
+            "ASCII organism disabled for new panes."
+        });
+    }
+
+    pub(crate) fn apply_settings_ascii_organism_motion(&mut self, motion: u32) {
+        if self.safe_mode {
+            self.show_toast("ASCII organism is disabled in safe mode.");
+            return;
+        }
+        self.config.borrow_mut().ascii_organism_motion = match motion {
+            1 => Some(config::OrganismMotion::Full),
+            2 => Some(config::OrganismMotion::Calm),
+            3 => Some(config::OrganismMotion::Static),
+            _ => None,
+        };
+        self.persist_config();
+    }
+
     pub(crate) fn apply_settings_ai_enabled(&mut self, enabled: bool) {
         if self.safe_mode {
             self.show_toast("AI is disabled in safe mode.");
@@ -138,11 +166,35 @@ impl AppModel {
         self.config.borrow_mut().ai_enabled = enabled;
         self.sync_terminal_configs();
         if !enabled {
+            self.set_ai_panel_visible(false, false);
             self.agent_close();
             self.close_command_suggestion();
             self.close_all_command_corrections();
         } else {
             self.sync_agent_toggle();
+        }
+        self.persist_config();
+    }
+
+    pub(crate) fn apply_settings_ai_panel_visible(&mut self, visible: bool) {
+        if self.safe_mode || !self.config.borrow().ai_enabled {
+            return;
+        }
+        if visible {
+            self.show_ai_session_panel();
+        } else {
+            self.set_ai_panel_visible(false, true);
+        }
+    }
+
+    pub(crate) fn apply_settings_ai_panel_width(&mut self, width: u32) {
+        if self.safe_mode {
+            return;
+        }
+        let width = width.clamp(MIN_AI_PANEL_WIDTH, MAX_AI_PANEL_WIDTH);
+        self.config.borrow_mut().ai_panel_width = width;
+        if self.ai_panel_visible.get() {
+            self.restore_ai_panel_width();
         }
         self.persist_config();
     }
@@ -227,12 +279,11 @@ impl AppModel {
             return;
         }
         let base_url = base_url.trim().trim_end_matches('/');
-        let valid = (base_url.starts_with("http://") || base_url.starts_with("https://"))
-            && base_url
-                .split_once("://")
-                .is_some_and(|(_, authority)| !authority.is_empty())
-            && !base_url.chars().any(char::is_whitespace);
-        if !valid {
+        let provider = self.config.borrow().ai_provider.clone();
+        if !config::ai_base_url_is_safe(&provider, base_url) {
+            self.show_toast(
+                "AI endpoint must use HTTPS; HTTP is allowed only for loopback Ollama.",
+            );
             return;
         }
         self.config.borrow_mut().ai_base_url = base_url.to_string();
@@ -244,7 +295,7 @@ impl AppModel {
             self.show_toast("AI is disabled in safe mode.");
             return;
         }
-        self.config.borrow_mut().ai_max_tokens = max_tokens.clamp(1, 32_768);
+        self.config.borrow_mut().ai_max_tokens = max_tokens.clamp(64, 32_768);
         self.persist_config();
     }
 

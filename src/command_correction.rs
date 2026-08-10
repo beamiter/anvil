@@ -1376,6 +1376,14 @@ impl AppModel {
             }
         });
         if queued {
+            if let Some(view) = self
+                .correction_terminal(pane_id)
+                .and_then(TermCtl::term_view)
+            {
+                self.organism_hub
+                    .correction_signal()
+                    .note_accepted(crate::organism_ui::pane_token(&view));
+            }
             if let Some(terminal) = self.correction_terminal(pane_id) {
                 terminal.emit(VteInput::GrabFocus);
             }
@@ -1412,6 +1420,18 @@ impl AppModel {
             .get(&pane_id)
             .is_some_and(|session| session.generation == generation);
         if matches {
+            self.close_command_correction_for_pane(pane_id);
+        }
+    }
+
+    pub(crate) fn dismiss_command_correction(&self, pane_id: u64, generation: u64) {
+        let matches = self
+            .command_corrections
+            .borrow()
+            .get(&pane_id)
+            .is_some_and(|session| session.generation == generation);
+        if matches {
+            self.organism_hub.correction_signal().note_dismissed();
             self.close_command_correction_for_pane(pane_id);
         }
     }

@@ -7,6 +7,19 @@ versioning for tagged releases while it remains experimental.
 
 ### Added
 
+- A persistent Relm4-native **AI Chats** side panel with a searchable retained
+  chat library, per-chat drafts and selected-Block context, automatic titles,
+  rename/archive/delete, concurrent owner-bound streaming requests, Stop/Retry,
+  dragged-width persistence, and bounded versioned session recovery.
+- The same local, no-LLM ASCII organism available in Forge, rebuilt behind a
+  Relm4 adapter: shared reducer/memory semantics, automatic/full/calm/static
+  motion, focused-pane ownership, live/sticky/inline Block surfaces, Agent and
+  command lifecycle reactions, and durable bounded shutdown flushing.
+- Built-in Bash, Zsh, Fish, and PowerShell CLI completion generation through
+  `--generate-completion` (with `--completion` as an alias), plus the matching
+  shipped completion assets.
+- Configurable `connect_remote_1` through `connect_remote_9` actions, including
+  command-palette entries and safe-mode/out-of-range feedback.
 - The Remote Hosts settings group edits saved hosts, not just adds and removes
   them. The pencil loads a host into the form below, which retitles itself and
   offers Save Changes / Cancel Edit; the entry is replaced in place so it keeps
@@ -170,9 +183,10 @@ versioning for tagged releases while it remains experimental.
 - CI now validates the headless CLI, desktop entry, release bundle, checksum,
   and Nix package in addition to Rust formatting, tests, lints, docs, and the
   optimized build.
-- New splits and every restored local split leaf consistently use the configured
-  terminal backend; integrated remote restores stay on Block, and Block-only
-  actions now explain when invoked from an incompatible VTE pane.
+- New tabs and restored local leaves use the configured terminal backend; a new
+  split inherits the focused pane's backend, matching Forge for both Block and
+  VTE layouts. Integrated remote restores stay on Block, and Block-only actions
+  explain when invoked from an incompatible VTE pane.
 - Long-running Block output and asynchronous prompt output now use bounded ring
   buffers, avoiding repeated multi-megabyte front shifts.
 - Command-history writes and compaction now run through a bounded worker and
@@ -345,9 +359,12 @@ versioning for tagged releases while it remains experimental.
   identities cannot inherit another pane's saved revision.
 - Agent snapshots are bounded, owner-checked, no-follow files and are consumed
   exactly once under a directory lock after successful validation. Approved
-  commands are armed only at a clean prompt and correlated by exact command,
-  one-shot local generation, and matching OSC 133 execution ID; stale prompt,
-  write failure, start mismatch, or completion mismatch cancels the proposal.
+  commands are armed only at a clean prompt after a private inherited-FD shell
+  capability handshake. The reviewed text is inserted without Enter, read back
+  exactly from VTE with an empty suffix, and only then submitted separately;
+  prompt generation, foreground ownership, token-bound OSC IDs, timeout, and
+  completion must all match. Unsupported shells, remote/Flatpak bridges, stale
+  prompts, write failures, and lost correlation fail closed.
 - Notebook and workflow inputs now reject special files without blocking and
   enforce byte, file-count, field-count, segment, cell, and rendered-command
   budgets. Runnable notebook/workflow commands containing invisible,

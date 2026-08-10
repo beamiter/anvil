@@ -44,6 +44,33 @@ impl TabPlacement {
     }
 }
 
+/// Motion level for the optional ASCII organism. `None` means automatic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrganismMotion {
+    Full,
+    Calm,
+    Static,
+}
+
+impl OrganismMotion {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Calm => "calm",
+            Self::Static => "static",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "full" => Some(Self::Full),
+            "calm" => Some(Self::Calm),
+            "static" => Some(Self::Static),
+            _ => None,
+        }
+    }
+}
+
 fn resolve_sidebar_visibility(explicit: Option<bool>, placement: TabPlacement) -> bool {
     explicit.unwrap_or(placement == TabPlacement::Sidebar)
 }
@@ -78,6 +105,10 @@ impl SidebarView {
 // ---------------------------------------------------------------------------
 // Remote host
 // ---------------------------------------------------------------------------
+
+pub(crate) const MAX_REMOTE_HOSTS: usize = 128;
+const MAX_CONFIG_PATH_BYTES: usize = 16 * 1024;
+const MAX_AI_BASE_URL_BYTES: usize = 4 * 1024;
 
 /// A saved SSH target. A new tab can be opened that runs the remote shell over
 /// `ssh -t`, reusing all local PTY/terminal infrastructure (OSC 133 markers
@@ -349,11 +380,7 @@ pub struct Config {
     pub(crate) sidebar_width: u32,
     /// Width of each tab in the top tab bar, in pixels.
     pub(crate) tab_width: u32,
-    // Block view optimizations
-    pub(crate) ansi_cache_capacity: u32,
     pub(crate) max_visible_blocks: u32,
-    pub(crate) output_batch_min_ms: u32,
-    pub(crate) output_batch_max_ms: u32,
     pub(crate) lazy_load_threshold: u32,
     pub(crate) truncation_threshold_lines: u32,
     pub(crate) finished_block_viewport_rows: u32,
@@ -370,7 +397,8 @@ pub struct Config {
     pub(crate) block_history_compress: bool,
     /// Compact (denser) block-mode spacing, matching Warp's compact density.
     pub(crate) block_compact: bool,
-    pub(crate) editor_input: bool,
+    pub(crate) ascii_organism_enabled: bool,
+    pub(crate) ascii_organism_motion: Option<OrganismMotion>,
     /// Allow OSC 52 SET (`\e]52;c;<base64>\e\\`) from remote/local apps to
     /// overwrite the system clipboard. Off by default — a malicious or buggy
     /// remote process can otherwise silently replace the user's clipboard
@@ -386,6 +414,10 @@ pub struct Config {
     /// network call still only fires on an explicit user click — this just
     /// removes the entry points.
     pub(crate) ai_enabled: bool,
+    /// Whether the persistent right-side AI Chats panel is open.
+    pub(crate) ai_panel_visible: bool,
+    /// Requested panel width in pixels.
+    pub(crate) ai_panel_width: u32,
     /// Show the agent-mode entry point (`Ctrl+Alt+G` / palette). Default
     /// on, but suppressed when `ai_enabled` is false. Independent toggle so
     /// users who like the per-block AI helpers but find agent mode too
@@ -463,10 +495,7 @@ impl Config {
             sidebar_visible: true,
             sidebar_width: 220,
             tab_width: 180,
-            ansi_cache_capacity: 256,
             max_visible_blocks: 200,
-            output_batch_min_ms: 10,
-            output_batch_max_ms: 100,
             lazy_load_threshold: 1_000,
             truncation_threshold_lines: 50_000,
             finished_block_viewport_rows: 24,
@@ -479,16 +508,19 @@ impl Config {
             block_history_path: None,
             block_history_compress: true,
             block_compact: false,
-            editor_input: true,
+            ascii_organism_enabled: false,
+            ascii_organism_motion: None,
             allow_remote_clipboard_write: false,
             mouse_reporting_enabled: true,
             focus_reporting_enabled: true,
             scroll_reporting_enabled: true,
             preserve_live_scrollback: false,
             ai_enabled: false,
+            ai_panel_visible: false,
+            ai_panel_width: 360,
             agent_enabled: false,
             agent_max_turns: 20,
-            command_correction_enabled: true,
+            command_correction_enabled: false,
             ai_provider: "anthropic".to_string(),
             ai_base_url: "https://api.anthropic.com".to_string(),
             ai_model: "claude-sonnet-4-6".to_string(),
@@ -499,7 +531,7 @@ impl Config {
             ai_api_key_file: None,
             notify_long_blocks: false,
             notify_long_block_threshold_ms: 10_000,
-            bottom_bar: false,
+            bottom_bar: true,
             click_moves_cursor: jterm_core::click_cursor::ENABLED_BY_DEFAULT,
             remote_hosts: Vec::new(),
         }
@@ -720,21 +752,123 @@ pub(crate) fn default_command_history_path() -> String {
         .into_owned()
 }
 
-fn safe_absolute_history_path(value: Option<String>, setting: &str) -> Option<String> {
+/// Private native-schema memory for the optional ASCII organism.
+pub(crate) fn default_ascii_organism_memory_path() -> PathBuf {
+    glib::user_state_dir()
+        .join("anvil")
+        .join("ascii-organism-native.json")
+}
+
+fn setting_text_is_safe(value: &str, max_bytes: usize) -> bool {
+    !value.trim().is_empty()
+        && value.len() <= max_bytes
+        && !value.chars().any(char::is_control)
+        && !crate::text_safety::contains_visual_spoof(value)
+}
+
+pub(crate) fn configured_path_is_safe(value: &str, require_absolute_or_home: bool) -> bool {
+    setting_text_is_safe(value, MAX_CONFIG_PATH_BYTES)
+        && (!require_absolute_or_home
+            || Path::new(value).is_absolute()
+            || (value.starts_with("~/") && !value.starts_with("~//")))
+}
+
+fn expand_configured_path_with(value: &str, home: Option<&Path>) -> Option<String> {
+    if !configured_path_is_safe(value, true) {
+        return None;
+    }
+    if let Some(rest) = value.strip_prefix("~/") {
+        let home = home.filter(|home| home.is_absolute())?;
+        return home.join(rest).into_os_string().into_string().ok();
+    }
+    Some(value.to_string())
+}
+
+fn safe_history_path(value: Option<String>, setting: &str) -> Option<String> {
     match value {
-        Some(path)
-            if !path.trim().is_empty()
-                && path.chars().count() <= 16 * 1_024
-                && !path.chars().any(char::is_control)
-                && Path::new(&path).is_absolute() =>
-        {
-            Some(path)
-        }
-        Some(_) => {
-            log::warn!("{setting} is not a safe absolute path; using its safe default");
-            None
+        Some(path) => {
+            let home = std::env::var_os("HOME")
+                .filter(|home| !home.is_empty())
+                .map(PathBuf::from);
+            let expanded = expand_configured_path_with(&path, home.as_deref());
+            if expanded.is_none() {
+                log::warn!("{setting} is not a safe absolute or ~/ path; using its safe default");
+            }
+            expanded
         }
         None => None,
+    }
+}
+
+pub(crate) fn ai_base_url_is_structurally_safe(value: &str) -> bool {
+    let value = value.trim();
+    if !setting_text_is_safe(value, MAX_AI_BASE_URL_BYTES)
+        || !(value.starts_with("http://") || value.starts_with("https://"))
+        || value.chars().any(char::is_whitespace)
+        || value.contains(['?', '#', '\\'])
+    {
+        return false;
+    }
+    value.split_once("://").is_some_and(|(_, remainder)| {
+        let authority = remainder.split('/').next().unwrap_or_default();
+        !authority.is_empty() && !authority.contains('@')
+    })
+}
+
+fn is_port(port: &str) -> bool {
+    !port.is_empty() && port.chars().all(|digit| digit.is_ascii_digit())
+}
+
+fn is_loopback_authority(authority: &str) -> bool {
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        let Some((literal, port)) = rest.split_once(']') else {
+            return false;
+        };
+        if !port.is_empty() && !port.strip_prefix(':').is_some_and(is_port) {
+            return false;
+        }
+        literal
+    } else {
+        match authority.split_once(':') {
+            Some((host, port)) if is_port(port) => host,
+            Some(_) => return false,
+            None => authority,
+        }
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|address| address.is_loopback())
+        || host
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+pub(crate) fn ai_base_url_is_safe(provider: &str, value: &str) -> bool {
+    if !ai_base_url_is_structurally_safe(value) {
+        return false;
+    }
+    let value = value.trim();
+    let Some((scheme, remainder)) = value.split_once("://") else {
+        return false;
+    };
+    let authority = remainder.split('/').next().unwrap_or_default();
+    match scheme {
+        "https" => normalize_ai_provider(provider).is_some(),
+        "http" => {
+            normalize_ai_provider(provider) == Some("ollama") && is_loopback_authority(authority)
+        }
+        _ => false,
+    }
+}
+
+fn resolve_ai_base_url(requested: Option<String>, default: &str) -> String {
+    match requested {
+        None => default.to_string(),
+        Some(value) if ai_base_url_is_structurally_safe(&value) => {
+            value.trim().trim_end_matches('/').to_string()
+        }
+        Some(_) => String::new(),
     }
 }
 
@@ -777,10 +911,7 @@ struct FileConfig {
     sidebar_width: Option<u32>,
     tab_width: Option<u32>,
     // Block view optimizations
-    ansi_cache_capacity: Option<u32>,
     max_visible_blocks: Option<u32>,
-    output_batch_min_ms: Option<u32>,
-    output_batch_max_ms: Option<u32>,
     lazy_load_threshold: Option<u32>,
     truncation_threshold_lines: Option<u32>,
     finished_block_viewport_rows: Option<u32>,
@@ -793,9 +924,12 @@ struct FileConfig {
     block_history_path: Option<String>,
     block_history_compress: Option<bool>,
     block_compact: Option<bool>,
-    editor_input: Option<bool>,
+    ascii_organism_enabled: Option<bool>,
+    ascii_organism_motion: Option<String>,
     allow_remote_clipboard_write: Option<bool>,
     ai_enabled: Option<bool>,
+    ai_panel_visible: Option<bool>,
+    ai_panel_width: Option<u32>,
     agent_enabled: Option<bool>,
     agent_max_turns: Option<u32>,
     agent_auto_approve_readonly: Option<bool>,
@@ -910,20 +1044,8 @@ fn load_file_config() -> FileConfig {
             .get("tab_width")
             .and_then(|v| v.as_integer())
             .and_then(|v| u32::try_from(v).ok()),
-        ansi_cache_capacity: table
-            .get("ansi_cache_capacity")
-            .and_then(|v| v.as_integer())
-            .and_then(|v| u32::try_from(v).ok()),
         max_visible_blocks: table
             .get("max_visible_blocks")
-            .and_then(|v| v.as_integer())
-            .and_then(|v| u32::try_from(v).ok()),
-        output_batch_min_ms: table
-            .get("output_batch_min_ms")
-            .and_then(|v| v.as_integer())
-            .and_then(|v| u32::try_from(v).ok()),
-        output_batch_max_ms: table
-            .get("output_batch_max_ms")
             .and_then(|v| v.as_integer())
             .and_then(|v| u32::try_from(v).ok()),
         lazy_load_threshold: table
@@ -969,7 +1091,13 @@ fn load_file_config() -> FileConfig {
             .get("block_history_compress")
             .and_then(|v| v.as_bool()),
         block_compact: table.get("block_compact").and_then(|v| v.as_bool()),
-        editor_input: table.get("editor_input").and_then(|v| v.as_bool()),
+        ascii_organism_enabled: table
+            .get("ascii_organism_enabled")
+            .and_then(|v| v.as_bool()),
+        ascii_organism_motion: table
+            .get("ascii_organism_motion")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
         allow_remote_clipboard_write: table
             .get("allow_remote_clipboard_write")
             .and_then(|v| v.as_bool()),
@@ -986,6 +1114,11 @@ fn load_file_config() -> FileConfig {
             .get("preserve_live_scrollback")
             .and_then(|v| v.as_bool()),
         ai_enabled: table.get("ai_enabled").and_then(|v| v.as_bool()),
+        ai_panel_visible: table.get("ai_panel_visible").and_then(|v| v.as_bool()),
+        ai_panel_width: table
+            .get("ai_panel_width")
+            .and_then(|v| v.as_integer())
+            .and_then(|v| u32::try_from(v).ok()),
         agent_enabled: table.get("agent_enabled").and_then(|v| v.as_bool()),
         agent_max_turns: table
             .get("agent_max_turns")
@@ -1056,10 +1189,11 @@ fn parse_remote_hosts(table: &toml::Table) -> Vec<RemoteHost> {
     };
     let mut names = HashSet::new();
     arr.iter()
+        .take(MAX_REMOTE_HOSTS)
         .filter_map(|v| v.as_table())
         .filter_map(|t| {
             let host = t.get("host").and_then(|v| v.as_str())?.to_string();
-            if !remote_text_is_safe(&host, false, 1_024) {
+            if !remote_text_is_safe(&host, false, 1_024) || host.starts_with('-') {
                 return None;
             }
             let name = match t.get("name").and_then(|v| v.as_str()) {
@@ -1079,7 +1213,7 @@ fn parse_remote_hosts(table: &toml::Table) -> Vec<RemoteHost> {
                 .map(|s| s.to_string());
             if user
                 .as_deref()
-                .is_some_and(|value| !remote_text_is_safe(value, false, 256))
+                .is_some_and(|value| !remote_text_is_safe(value, false, 256) || value.contains('@'))
             {
                 return None;
             }
@@ -1313,30 +1447,18 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         .unwrap_or(theme.cursor_foreground);
 
     // Block view optimization settings
-    let ansi_cache_capacity = env_u32("ANVIL_ANSI_CACHE_CAP")
-        .or(fc.ansi_cache_capacity)
-        .unwrap_or(256)
-        .clamp(1, 65_536);
     let max_visible_blocks = env_u32("ANVIL_MAX_BLOCKS")
         .or(fc.max_visible_blocks)
         .unwrap_or(200)
-        .clamp(1, 10_000);
-    let output_batch_min_ms = env_u32("ANVIL_BATCH_MIN")
-        .or(fc.output_batch_min_ms)
-        .unwrap_or(10)
-        .clamp(1, 1_000);
-    let output_batch_max_ms = env_u32("ANVIL_BATCH_MAX")
-        .or(fc.output_batch_max_ms)
-        .unwrap_or(100)
-        .clamp(output_batch_min_ms, 5_000);
+        .clamp(1, 100_000);
     let lazy_load_threshold = env_u32("ANVIL_LAZY_LINES")
         .or(fc.lazy_load_threshold)
         .unwrap_or(1000)
-        .clamp(1, 100_000);
+        .clamp(1, 10_000_000);
     let truncation_threshold_lines = env_u32("ANVIL_TRUNCATION_LINES")
         .or(fc.truncation_threshold_lines)
         .unwrap_or(50000)
-        .clamp(100, 1_000_000);
+        .clamp(1, 10_000_000);
     let finished_block_viewport_rows = env_u32("ANVIL_FINISHED_VIEWPORT_ROWS")
         .or(fc.finished_block_viewport_rows)
         .unwrap_or(24)
@@ -1348,26 +1470,26 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     let max_collapsed_output_lines = env_u32("ANVIL_MAX_COLLAPSED_LINES")
         .or(fc.max_collapsed_output_lines)
         .unwrap_or(25)
-        .min(10_000);
+        .clamp(1, 1_000_000);
     let virtual_scroll_margin = env_u32("ANVIL_VSCROLL_MARGIN")
         .or(fc.virtual_scroll_margin)
         .unwrap_or(1)
-        .min(100);
+        .min(10_000);
     let command_history_enabled = fc.command_history_enabled.unwrap_or(true);
-    let command_history_path = command_history_enabled.then(|| {
-        safe_absolute_history_path(
-            std::env::var("ANVIL_COMMAND_HISTORY_PATH")
-                .ok()
-                .or(fc.command_history_path),
-            "command_history_path",
-        )
-        .unwrap_or_else(default_command_history_path)
-    });
+    let command_history_path = if command_history_enabled {
+        let requested = std::env::var("ANVIL_COMMAND_HISTORY_PATH")
+            .ok()
+            .or(fc.command_history_path)
+            .unwrap_or_else(default_command_history_path);
+        safe_history_path(Some(requested), "command_history_path")
+    } else {
+        None
+    };
     let command_history_max_entries = fc
         .command_history_max_entries
         .unwrap_or(10_000)
-        .clamp(100, 100_000);
-    let block_history_path = safe_absolute_history_path(
+        .clamp(100, 1_000_000);
+    let block_history_path = safe_history_path(
         std::env::var("ANVIL_HISTORY_PATH")
             .ok()
             .or(fc.block_history_path),
@@ -1405,6 +1527,13 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     let sidebar_visible = resolve_sidebar_visibility(fc.sidebar_visible, tab_placement);
     let sidebar_width = fc.sidebar_width.unwrap_or(220).clamp(120, 800);
     let tab_width = fc.tab_width.unwrap_or(180).clamp(80, 480);
+    let ascii_organism_enabled = env_bool("ANVIL_ASCII_ORGANISM_ENABLED")
+        .or(fc.ascii_organism_enabled)
+        .unwrap_or(false);
+    let ascii_organism_motion = env_string("ANVIL_ASCII_ORGANISM_MOTION")
+        .or(fc.ascii_organism_motion)
+        .as_deref()
+        .and_then(OrganismMotion::parse);
 
     let requested_ai_provider = env_string("ANVIL_AI_PROVIDER")
         .or(fc.ai_provider)
@@ -1427,12 +1556,10 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         .or(fc.ai_model)
         .filter(|model| !model.trim().is_empty())
         .unwrap_or_else(|| default_ai_model.to_string());
-    let ai_base_url = env_string("ANVIL_AI_BASE_URL")
-        .or(fc.ai_base_url)
-        .filter(|url| !url.trim().is_empty())
-        .unwrap_or_else(|| default_ai_base_url.to_string())
-        .trim_end_matches('/')
-        .to_string();
+    let ai_base_url = resolve_ai_base_url(
+        env_string("ANVIL_AI_BASE_URL").or(fc.ai_base_url),
+        default_ai_base_url,
+    );
     let requested_agent_auto_approve = env_bool("ANVIL_AGENT_AUTO_APPROVE_READONLY")
         .or(fc.agent_auto_approve_readonly)
         .unwrap_or(false);
@@ -1462,10 +1589,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         sidebar_visible,
         sidebar_width,
         tab_width,
-        ansi_cache_capacity,
         max_visible_blocks,
-        output_batch_min_ms,
-        output_batch_max_ms,
         lazy_load_threshold,
         truncation_threshold_lines,
         finished_block_viewport_rows,
@@ -1478,7 +1602,8 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         block_history_path,
         block_history_compress,
         block_compact,
-        editor_input: fc.editor_input.unwrap_or(true),
+        ascii_organism_enabled,
+        ascii_organism_motion,
         allow_remote_clipboard_write: fc.allow_remote_clipboard_write.unwrap_or(false),
         mouse_reporting_enabled: fc.mouse_reporting_enabled.unwrap_or(true),
         focus_reporting_enabled: fc.focus_reporting_enabled.unwrap_or(true),
@@ -1487,6 +1612,8 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         ai_enabled: env_bool("ANVIL_AI_ENABLED")
             .or(fc.ai_enabled)
             .unwrap_or(true),
+        ai_panel_visible: fc.ai_panel_visible.unwrap_or(false),
+        ai_panel_width: fc.ai_panel_width.unwrap_or(360).clamp(240, 1_200),
         agent_enabled: env_bool("ANVIL_AGENT_ENABLED")
             .or(fc.agent_enabled)
             .unwrap_or(true),
@@ -1503,7 +1630,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         ai_max_tokens: env_u32("ANVIL_AI_MAX_TOKENS")
             .or(fc.ai_max_tokens)
             .unwrap_or(1_024)
-            .clamp(1, 32_768),
+            .clamp(64, 32_768),
         ai_temperature: env_f32("ANVIL_AI_TEMPERATURE")
             .or(fc.ai_temperature)
             .filter(|t| t.is_finite() && (0.0..=2.0).contains(t)),
@@ -1514,7 +1641,9 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         // Unlike the other ANVIL_* overrides, the key-path override is applied
         // at client construction (`jterm_core::ai::resolve_api_key_file`), so
         // the environment-managed path can never be persisted back to TOML.
-        ai_api_key_file: fc.ai_api_key_file.filter(|value| !value.trim().is_empty()),
+        ai_api_key_file: fc
+            .ai_api_key_file
+            .filter(|value| configured_path_is_safe(value, true)),
         notify_long_blocks: fc.notify_long_blocks.unwrap_or(true),
         notify_long_block_threshold_ms: fc.notify_long_block_threshold_ms.unwrap_or(10_000),
         bottom_bar: fc
@@ -1977,14 +2106,31 @@ mod tests {
     }
 
     #[test]
-    fn history_paths_must_be_safe_and_absolute() {
+    fn history_paths_accept_absolute_or_home_and_expand_consistently() {
+        let home = Path::new("/home/tester");
         assert_eq!(
-            safe_absolute_history_path(Some("/tmp/history.jsonl".to_string()), "history"),
+            expand_configured_path_with("/tmp/history.jsonl", Some(home)),
             Some("/tmp/history.jsonl".to_string())
         );
-        for path in ["Cargo.toml", "", "/tmp/bad\nname"] {
-            assert!(safe_absolute_history_path(Some(path.to_string()), "history").is_none());
+        assert_eq!(
+            expand_configured_path_with("~/.local/state/anvil/history.jsonl", Some(home)),
+            Some("/home/tester/.local/state/anvil/history.jsonl".to_string())
+        );
+        assert!(expand_configured_path_with("~/history", None).is_none());
+        for path in [
+            "Cargo.toml",
+            "",
+            "/tmp/bad\nname",
+            "/tmp/visual\u{202e}spoof",
+            "~//etc/passwd",
+        ] {
+            assert!(
+                expand_configured_path_with(path, Some(home)).is_none(),
+                "accepted {path:?}"
+            );
         }
+        let oversized = format!("/tmp/{}", "x".repeat(MAX_CONFIG_PATH_BYTES));
+        assert!(expand_configured_path_with(&oversized, Some(home)).is_none());
     }
 
     #[test]
@@ -2005,6 +2151,15 @@ mod tests {
             "ssh_args = ['-p', 2222]\n",
             "\n",
             "[[remote_hosts]]\n",
+            "name = 'option-shaped-host'\n",
+            "host = '-oProxyCommand=bad'\n",
+            "\n",
+            "[[remote_hosts]]\n",
+            "name = 'embedded-user-target'\n",
+            "host = 'user.example'\n",
+            "user = 'root@other.example'\n",
+            "\n",
+            "[[remote_hosts]]\n",
             "name = 'safe'\n",
             "host = 'safe.example'\n",
             "ssh_args = ['-p', '2222']\n",
@@ -2015,6 +2170,24 @@ mod tests {
         assert_eq!(hosts.len(), 1);
         assert_eq!(hosts[0].name, "safe");
         assert_eq!(hosts[0].host, "safe.example");
+    }
+
+    #[test]
+    fn remote_host_collection_is_bounded() {
+        let entries = (0..MAX_REMOTE_HOSTS + 5)
+            .map(|index| {
+                let mut entry = toml::Table::new();
+                entry.insert(
+                    "host".to_string(),
+                    toml::Value::String(format!("host-{index}.example")),
+                );
+                toml::Value::Table(entry)
+            })
+            .collect();
+        let mut table = toml::Table::new();
+        table.insert("remote_hosts".to_string(), toml::Value::Array(entries));
+
+        assert_eq!(parse_remote_hosts(&table).len(), MAX_REMOTE_HOSTS);
     }
 
     #[test]
@@ -2062,6 +2235,68 @@ mod tests {
         }
         assert_eq!(normalize_ai_provider("ollama"), Some("ollama"));
         assert_eq!(normalize_ai_provider("unknown"), None);
+    }
+
+    #[test]
+    fn ai_base_url_matches_the_provider_transport_contract() {
+        assert!(ai_base_url_is_safe(
+            "openai-compatible",
+            "https://api.example.com/v1"
+        ));
+        assert!(!ai_base_url_is_safe(
+            "openai-compatible",
+            "http://127.0.0.1:8000/v1"
+        ));
+        for url in [
+            "http://localhost:11434",
+            "http://127.0.0.1:11434",
+            "http://127.12.3.4:11434",
+            "http://[::1]:11434",
+        ] {
+            assert!(ai_base_url_is_safe("ollama", url), "rejected {url:?}");
+        }
+        assert!(!ai_base_url_is_safe(
+            "ollama",
+            "http://models.example.com:11434"
+        ));
+        for value in [
+            "https://user:secret@example.com/v1",
+            "https://example.com/v1?key=secret",
+            "https://example.com/v1#fragment",
+            "https://example.com\\@attacker.invalid/v1",
+            "https:///missing-authority",
+            "https://example.com/\u{fe0f}",
+        ] {
+            assert!(
+                !ai_base_url_is_safe("openai-compatible", value),
+                "accepted {value:?}"
+            );
+        }
+        let oversized = format!("https://example.com/{}", "x".repeat(MAX_AI_BASE_URL_BYTES));
+        assert!(!ai_base_url_is_safe("openai-compatible", &oversized));
+    }
+
+    #[test]
+    fn explicit_invalid_ai_endpoint_never_drifts_to_a_public_default() {
+        let insecure_loopback = "http://127.0.0.1:8000/v1";
+        assert_eq!(
+            resolve_ai_base_url(
+                Some(insecure_loopback.to_string()),
+                "https://api.openai.com/v1"
+            ),
+            insecure_loopback
+        );
+        assert_eq!(
+            resolve_ai_base_url(
+                Some("https://user:secret@example.com/v1".to_string()),
+                "https://api.openai.com/v1"
+            ),
+            ""
+        );
+        assert_eq!(
+            resolve_ai_base_url(None, "https://api.openai.com/v1"),
+            "https://api.openai.com/v1"
+        );
     }
 
     #[test]
@@ -2135,6 +2370,7 @@ mod tests {
         assert!(config.block_history_path.is_none());
         assert!(!config.ai_enabled);
         assert!(!config.agent_enabled);
+        assert!(!config.command_correction_enabled);
         assert_eq!(config.jsh_update_check, JshUpdateCheck::Never);
         assert_eq!(config.ai_provider, "anthropic");
         assert_eq!(config.ai_model, "claude-sonnet-4-6");
@@ -2143,6 +2379,24 @@ mod tests {
         assert!(config.ai_redact_secrets);
         assert!(!config.notify_long_blocks);
         assert!(!config.allow_remote_clipboard_write);
+        assert!(config.bottom_bar);
         assert!(config.remote_hosts.is_empty());
+    }
+
+    #[test]
+    fn forge_compatible_panel_and_organism_defaults_are_safe() {
+        let config = Config::safe_defaults();
+        assert!(!config.ai_panel_visible);
+        assert_eq!(config.ai_panel_width, 360);
+        assert!(!config.ascii_organism_enabled);
+        assert_eq!(config.ascii_organism_motion, None);
+        assert_eq!(OrganismMotion::parse("FULL"), Some(OrganismMotion::Full));
+        assert_eq!(OrganismMotion::parse("calm"), Some(OrganismMotion::Calm));
+        assert_eq!(
+            OrganismMotion::parse("static"),
+            Some(OrganismMotion::Static)
+        );
+        assert_eq!(OrganismMotion::parse("sleepy"), None);
+        assert!(default_ascii_organism_memory_path().ends_with("anvil/ascii-organism-native.json"));
     }
 }

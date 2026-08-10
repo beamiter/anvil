@@ -40,12 +40,24 @@ fn export_notice(result: std::io::Result<std::path::PathBuf>) -> String {
 
 pub struct BlockTerminal {
     view: Option<Rc<TermView>>,
+    /// Block PTY construction runs synchronously inside Relm4 component init.
+    /// Split preparation can inspect this after `launch()` and avoid committing
+    /// an error page into the pane tree.
+    launch_error: Option<String>,
     terminal_done: Rc<Cell<bool>>,
     config: Rc<RefCell<crate::config::Config>>,
     cross_block_search_dialog: Rc<RefCell<Option<relm4::adw::Dialog>>>,
 }
 
 impl BlockTerminal {
+    pub(crate) fn term_view(&self) -> Option<Rc<TermView>> {
+        self.view.clone()
+    }
+
+    pub(crate) fn launch_error(&self) -> Option<&str> {
+        self.launch_error.as_deref()
+    }
+
     fn terminate_once(&self) {
         if !self.terminal_done.replace(true) {
             if let Some(view) = self.view.as_ref() {
@@ -64,6 +76,13 @@ impl BlockTerminal {
         self.view.as_ref().map_or(
             crate::block_view::CommandPromptStatus::ShellIntegrationUnavailable,
             |view| view.command_prompt_status(),
+        )
+    }
+
+    pub(crate) fn agent_command_prompt_status(&self) -> crate::block_view::CommandPromptStatus {
+        self.view.as_ref().map_or(
+            crate::block_view::CommandPromptStatus::ShellIntegrationUnavailable,
+            |view| view.agent_command_prompt_status(),
         )
     }
 
@@ -229,6 +248,13 @@ fn connect_view_outputs(
             });
         }
     });
+    view.connect_agent_execution_lost({
+        let sender = sender.clone();
+        move |execution, reason| {
+            log::warn!("Agent execution lost terminal correlation: {reason}");
+            let _ = sender.output(VteOutput::AgentExecutionStartFailed { execution });
+        }
+    });
     view.connect_block_finished({
         let sender = sender.clone();
         move |command, exit_code, output_sample, agent_execution, duration_ms| {
@@ -285,6 +311,7 @@ impl Component for BlockTerminal {
         }
         .map(Rc::new);
 
+        let mut launch_error = None;
         let view = match view {
             Ok(view) => {
                 init.probe.shell_pid.set(view.pid_i32());
@@ -298,6 +325,7 @@ impl Component for BlockTerminal {
             Err(error) => {
                 terminal_done.set(true);
                 log::error!("Block terminal failed to start: {error}");
+                launch_error = Some(error.to_string());
                 root.set_focusable(true);
                 root.set_focus_on_click(true);
                 if let Some(container) = root.downcast_ref::<gtk::Box>() {
@@ -316,6 +344,7 @@ impl Component for BlockTerminal {
 
         let model = BlockTerminal {
             view,
+            launch_error,
             terminal_done,
             config,
             cross_block_search_dialog: Rc::new(RefCell::new(None)),

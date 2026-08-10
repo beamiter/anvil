@@ -13,6 +13,13 @@ use crate::cli::ReportFormat;
 use crate::config::{choose_shell_argv, config_file_path, load_config, TerminalMode};
 use crate::config_store::{self, ConfigLockStatus};
 
+const OPTIONAL_RUNTIME_TOOLS: [(&str, &str); 4] = [
+    ("git", "repository status"),
+    ("ssh", "remote sessions"),
+    ("curl", "AI panel"),
+    ("notify-send", "long-command notifications"),
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum CheckStatus {
@@ -358,25 +365,43 @@ fn collect() -> DiagnosticReport {
         },
     );
 
+    let curl_available = crate::host::command_available("curl");
     if !config.ai_enabled {
         report.push("AI", CheckStatus::Warning, "disabled by configuration");
     } else {
         match crate::ai::client_from_config(&config) {
             Ok(client) => report.push(
                 "AI",
-                CheckStatus::Ok,
+                if curl_available {
+                    CheckStatus::Ok
+                } else {
+                    CheckStatus::Warning
+                },
                 if diagnostics_redacted() {
                     format!(
-                        "{} configured; API key {}",
+                        "{} configured; API key {}; curl {}",
                         client.provider.display_name(),
                         if client.api_key.is_some() {
                             "present"
                         } else {
                             "not set (optional for local/compatible endpoints)"
+                        },
+                        if curl_available {
+                            "available"
+                        } else {
+                            "missing"
                         }
                     )
                 } else {
-                    client.display_name()
+                    format!(
+                        "{}; curl {}",
+                        client.display_name(),
+                        if curl_available {
+                            "available"
+                        } else {
+                            "missing"
+                        }
+                    )
                 },
             ),
             Err(error) => report.push(
@@ -391,12 +416,12 @@ fn collect() -> DiagnosticReport {
         }
     }
 
-    for (name, purpose) in [
-        ("git", "repository status"),
-        ("ssh", "remote sessions"),
-        ("notify-send", "long-command notifications"),
-    ] {
-        let available = crate::host::command_available(name);
+    for (name, purpose) in OPTIONAL_RUNTIME_TOOLS {
+        let available = if name == "curl" {
+            curl_available
+        } else {
+            crate::host::command_available(name)
+        };
         report.push(
             name,
             if available {
@@ -412,21 +437,46 @@ fn collect() -> DiagnosticReport {
         );
     }
 
-    if config.remote_hosts.is_empty() {
-        report.push("remote hosts", CheckStatus::Ok, "none configured");
-    } else if crate::host::command_available("ssh") {
-        report.push(
-            "remote hosts",
-            CheckStatus::Ok,
-            format!("{} configured; ssh available", config.remote_hosts.len()),
-        );
+    let containers = config
+        .remote_hosts
+        .iter()
+        .filter(|host| host.docker)
+        .count();
+    let over_ssh = config.remote_hosts.len().saturating_sub(containers);
+    let ssh_available = over_ssh == 0 || crate::host::command_available("ssh");
+    let docker_available = containers == 0 || crate::host::command_available("docker");
+    let remote_status = if ssh_available && docker_available {
+        CheckStatus::Ok
     } else {
-        report.push(
-            "remote hosts",
-            CheckStatus::Error,
-            format!("{} configured; ssh is missing", config.remote_hosts.len()),
-        );
-    }
+        CheckStatus::Error
+    };
+    let remote_detail = if config.remote_hosts.is_empty() {
+        "none configured".to_string()
+    } else {
+        let mut detail = format!("{} configured", config.remote_hosts.len());
+        if over_ssh > 0 {
+            detail.push_str(&format!(
+                "; {over_ssh} over ssh, which is {}",
+                if ssh_available {
+                    "available"
+                } else {
+                    "missing"
+                }
+            ));
+        }
+        if containers > 0 {
+            detail.push_str(&format!(
+                "; {containers} in containers, and docker is {}",
+                if docker_available {
+                    "available"
+                } else {
+                    "missing"
+                }
+            ));
+        }
+        detail
+    };
+    report.push("remote hosts", remote_status, remote_detail);
 
     report.push(
         "terminal mode",
@@ -511,6 +561,13 @@ mod tests {
         assert!(workflow_file(Path::new("two.YAML")));
         assert!(workflow_file(Path::new("three.yml")));
         assert!(!workflow_file(Path::new("README.md")));
+    }
+
+    #[test]
+    fn doctor_checks_curl_for_the_ai_panel() {
+        assert!(OPTIONAL_RUNTIME_TOOLS
+            .iter()
+            .any(|(name, purpose)| *name == "curl" && *purpose == "AI panel"));
     }
 
     #[test]

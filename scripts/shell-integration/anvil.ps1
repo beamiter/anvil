@@ -19,6 +19,11 @@ if (Test-Path Env:ANVIL_CWD_TOKEN) {
     Remove-Item Env:ANVIL_CWD_TOKEN -ErrorAction SilentlyContinue
 }
 
+# PowerShell is not an authenticated Agent-execution shell. Reserve and clear
+# the private-channel names so they cannot leak into user commands.
+Remove-Item Env:ANVIL_SHELL_INTEGRATION_FD -ErrorAction SilentlyContinue
+Remove-Item Env:ANVIL_SHELL_INTEGRATION_TOKEN -ErrorAction SilentlyContinue
+
 # Guard against double-sourcing in the same shell session.
 if ($script:__anvil_loaded) { return }
 $script:__anvil_loaded = $true

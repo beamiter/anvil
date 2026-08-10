@@ -28,6 +28,7 @@ mod history;
 #[allow(dead_code)]
 mod palette;
 mod scroll;
+mod selection_hold;
 pub(crate) use alt_screen::*;
 pub(crate) use ansi::*;
 pub(crate) use blocks::*;
@@ -38,6 +39,7 @@ pub(crate) use find::*;
 #[allow(unused_imports)]
 pub(crate) use palette::*;
 pub(crate) use scroll::*;
+use selection_hold::SelectionFeedHold;
 
 // ── perf profiling (env JTERM_PROF=1) ───────────────────────────────────────
 pub(crate) fn prof_enabled() -> bool {
@@ -93,7 +95,7 @@ impl CommandPromptStatus {
                 "The pinned Block prompt is still initializing. Wait for the shell prompt, then try again."
             }
             Self::ShellIntegrationUnavailable => {
-                "Shell integration is not active, so anvil cannot safely verify an idle prompt. Load the anvil shell integration and open a new shell."
+                "Automatic execution requires a direct local bash/zsh pane with the bundled token-aware shell integration. Remote and Flatpak host-bridge panes remain insert-only."
             }
         }
     }
@@ -283,17 +285,201 @@ fn sample_output_for_event(output: &str) -> String {
     )
 }
 
-/// Strip an exact prompt prefix when a shell integration reports PromptEnd
-/// before its prompt has finished rendering into the VTE range.
-fn normalize_captured_command(captured: &str, prompt: &str) -> String {
-    let captured = captured.trim();
-    let prompt = prompt.trim();
-    if !prompt.is_empty() {
-        if let Some(command) = captured.strip_prefix(prompt) {
-            return command.trim_start().to_string();
+/// Normalize cells captured after the trusted PromptEnd anchor.
+///
+/// Never strip a text prefix merely because it resembles the visible prompt:
+/// `$HOME` under a `$` prompt and `git status` under a `git` prompt are valid
+/// commands. Text equality cannot distinguish prompt furniture from input.
+fn normalize_captured_command(captured: &str, _prompt: &str) -> String {
+    captured.trim().to_string()
+}
+
+fn command_id_uses_shell_token(id: &str, token: &str) -> bool {
+    !token.is_empty()
+        && id
+            .strip_prefix(token)
+            .and_then(|suffix| suffix.strip_prefix('-'))
+            .is_some_and(|sequence| {
+                !sequence.is_empty() && sequence.bytes().all(|byte| byte.is_ascii_digit())
+            })
+}
+
+fn shell_argv_uses_jsh(argv: &[String]) -> bool {
+    argv.iter().any(|argument| {
+        argument.split_ascii_whitespace().any(|word| {
+            let word = word
+                .trim_matches(|ch: char| matches!(ch, '\'' | '"' | ';' | '(' | ')' | '[' | ']'));
+            std::path::Path::new(word)
+                .file_name()
+                .and_then(|name| name.to_str())
+                == Some("jsh")
+        })
+    })
+}
+
+/// Only direct, interactive bundled bash/zsh startup can consume the private
+/// descriptor before user code. Wrappers, remote commands and `-c` execution
+/// cannot provide the same inherited-FD and prompt-lifecycle guarantees.
+fn shell_argv_supports_agent_ids(argv: &[String]) -> bool {
+    let direct_shell = argv
+        .first()
+        .and_then(|argument| std::path::Path::new(argument).file_name())
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, "bash" | "zsh"));
+    let runs_one_command = argv.iter().skip(1).any(|argument| {
+        argument == "--command"
+            || (argument.starts_with('-')
+                && !argument.starts_with("--")
+                && argument[1..].bytes().any(|byte| byte == b'c'))
+    });
+    direct_shell && !runs_one_command && !shell_argv_uses_jsh(argv)
+}
+
+const MAX_CAPABILITY_OSC_BYTES: usize = 128;
+
+#[derive(Default)]
+struct ShellCapabilityObserver {
+    state: CapabilityOscState,
+    collecting_prompt: bool,
+}
+
+#[derive(Default)]
+enum CapabilityOscState {
+    #[default]
+    Ground,
+    Escape,
+    Osc(Vec<u8>),
+    OscEscape(Vec<u8>),
+    Discard,
+    DiscardEscape,
+}
+
+impl ShellCapabilityObserver {
+    /// Observe the raw stream without replacing the shared terminal parser.
+    /// This exact-pinned jterm_core predates OSC 7771, so Anvil consumes only
+    /// this hidden capability packet locally while the normal parser continues
+    /// to own every display/lifecycle event.
+    fn feed(&mut self, bytes: &[u8], expected: &str, ready: &Cell<bool>) {
+        for &byte in bytes {
+            let state = std::mem::take(&mut self.state);
+            self.state = match state {
+                CapabilityOscState::Ground => {
+                    if byte == 0x1b {
+                        CapabilityOscState::Escape
+                    } else {
+                        CapabilityOscState::Ground
+                    }
+                }
+                CapabilityOscState::Escape => match byte {
+                    b']' => CapabilityOscState::Osc(Vec::new()),
+                    0x1b => CapabilityOscState::Escape,
+                    _ => CapabilityOscState::Ground,
+                },
+                CapabilityOscState::Osc(mut payload) => match byte {
+                    0x07 => {
+                        self.finish_osc(&payload, expected, ready);
+                        CapabilityOscState::Ground
+                    }
+                    0x1b => CapabilityOscState::OscEscape(payload),
+                    _ if payload.len() < MAX_CAPABILITY_OSC_BYTES => {
+                        payload.push(byte);
+                        CapabilityOscState::Osc(payload)
+                    }
+                    _ => CapabilityOscState::Discard,
+                },
+                CapabilityOscState::OscEscape(payload) => match byte {
+                    b'\\' => {
+                        self.finish_osc(&payload, expected, ready);
+                        CapabilityOscState::Ground
+                    }
+                    0x1b => CapabilityOscState::OscEscape(payload),
+                    _ => CapabilityOscState::Discard,
+                },
+                CapabilityOscState::Discard => {
+                    if byte == 0x1b {
+                        CapabilityOscState::DiscardEscape
+                    } else if byte == 0x07 {
+                        CapabilityOscState::Ground
+                    } else {
+                        CapabilityOscState::Discard
+                    }
+                }
+                CapabilityOscState::DiscardEscape => match byte {
+                    b'\\' => CapabilityOscState::Ground,
+                    0x1b => CapabilityOscState::DiscardEscape,
+                    _ => CapabilityOscState::Discard,
+                },
+            };
         }
     }
-    captured.to_string()
+
+    fn finish_osc(&mut self, payload: &[u8], expected: &str, ready: &Cell<bool>) {
+        if payload.starts_with(b"133;A") && payload.get(5).is_none_or(|byte| *byte == b';') {
+            self.collecting_prompt = true;
+            ready.set(false);
+            return;
+        }
+        if payload.starts_with(b"133;B") && payload.get(5).is_none_or(|byte| *byte == b';') {
+            self.collecting_prompt = false;
+            return;
+        }
+        let Some(announced) = payload.strip_prefix(b"7771;") else {
+            return;
+        };
+        if self.collecting_prompt
+            && expected.len() == 32
+            && expected.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && announced == expected.as_bytes()
+        {
+            ready.set(true);
+        }
+    }
+}
+
+fn reviewed_submission_matches(
+    shell_command: Option<&str>,
+    rendered_command: &str,
+    approved_command: &str,
+    identity_feed_tainted: bool,
+) -> bool {
+    if identity_feed_tainted {
+        return false;
+    }
+    if let Some(shell_command) = shell_command {
+        return shell_command == approved_command;
+    }
+    rendered_command == approved_command
+        || rendered_command.strip_suffix('\n') == Some(approved_command)
+}
+
+/// Only cell-neutral presentation bytes are allowed between the separately
+/// queued Enter and the shell's CommandStart mark.
+fn reviewed_pre_command_bytes_are_identity_neutral(mut bytes: &[u8]) -> bool {
+    while let Some((&byte, rest)) = bytes.split_first() {
+        if matches!(byte, b'\r' | b'\n') {
+            bytes = rest;
+            continue;
+        }
+        if !bytes.starts_with(b"\x1b[") {
+            return false;
+        }
+        let Some(final_offset) = bytes[2..]
+            .iter()
+            .position(|byte| (0x40..=0x7e).contains(byte))
+        else {
+            return false;
+        };
+        let final_index = final_offset + 2;
+        let params = &bytes[2..final_index];
+        let final_byte = bytes[final_index];
+        let sgr = final_byte == b'm';
+        let bracketed_paste_mode = params == b"?2004" && matches!(final_byte, b'h' | b'l');
+        if !sgr && !bracketed_paste_mode {
+            return false;
+        }
+        bytes = &bytes[final_index + 1..];
+    }
+    true
 }
 
 /// Stand-in command text for a block whose shell reported that it *had* a
@@ -1320,6 +1506,47 @@ fn install_finished_block_selection(
 /// command's output.
 const MAX_RAW_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 
+/// Keep moving bodies clear of the running-output scrollbar. The overlay
+/// itself remains full-width so clipping follows the live terminal exactly.
+const LIVE_ORGANISM_RIGHT_GUTTER: i32 = 20;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LiveOrganismSurfaceMetrics {
+    pub(crate) width: i32,
+    pub(crate) height: i32,
+    pub(crate) cell_width: i32,
+    pub(crate) cell_height: i32,
+    pub(crate) right_gutter: i32,
+    pub(crate) alt_screen: bool,
+    /// On-screen grid row of the cursor, i.e. the live output growth edge.
+    pub(crate) cursor_row: i32,
+}
+
+/// Accepted direct-human input, intentionally containing no typed bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HumanInputKind {
+    Keyboard,
+    Clipboard,
+    ProcessControl,
+    StickyStop,
+}
+
+/// Authoritative foreground-command lifecycle event emitted at OSC 133 `C`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommandStartedEvent {
+    pub(crate) command: String,
+    pub(crate) cwd: Option<String>,
+}
+
+/// Authoritative foreground-command lifecycle event emitted at OSC 133 `D`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommandFinishedEvent {
+    pub(crate) command: String,
+    pub(crate) cwd: Option<String>,
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) duration_ms: Option<u64>,
+}
+
 /// Minimum rows the live input cell is guaranteed when idle (warp-style compact
 /// input): it shrinks to fit the prompt + typed command but never below this, so
 /// there is always usable room to type. It grows with multiline input up to the
@@ -1346,12 +1573,334 @@ type BlockFinishedCallbacks = Rc<
 >;
 type BlockContextCallbacks = Rc<RefCell<Vec<Box<dyn Fn(crate::ai::BlockContext)>>>>;
 type CwdCallbacks = Rc<RefCell<Vec<Box<dyn Fn(&str, bool)>>>>;
+type AgentExecutionLostCallbacks =
+    Rc<RefCell<Vec<Box<dyn Fn(crate::agent::AgentExecutionRef, &'static str)>>>>;
+type CommandStartedCallbacks = Rc<RefCell<Vec<Box<dyn Fn(CommandStartedEvent)>>>>;
+type CommandFinishedCallbacks = Rc<RefCell<Vec<Box<dyn Fn(CommandFinishedEvent)>>>>;
+type HumanInputCallbacks = Rc<RefCell<Vec<Box<dyn Fn(HumanInputKind)>>>>;
+
+fn emit_command_started(callbacks: &CommandStartedCallbacks, event: CommandStartedEvent) {
+    for callback in callbacks.borrow().iter() {
+        callback(event.clone());
+    }
+}
+
+fn emit_command_finished(callbacks: &CommandFinishedCallbacks, event: CommandFinishedEvent) {
+    for callback in callbacks.borrow().iter() {
+        callback(event.clone());
+    }
+}
+
+fn emit_human_input(callbacks: &HumanInputCallbacks, kind: HumanInputKind) {
+    for callback in callbacks.borrow().iter() {
+        callback(kind);
+    }
+}
 pub(crate) type DebugInfo = Vec<(&'static str, Vec<(String, String)>)>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ArmedAgentExecution {
     execution: crate::agent::AgentExecutionRef,
     prompt_generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReviewedSubmissionPhase {
+    Inserting,
+    Submitted,
+}
+
+#[derive(Clone, Debug)]
+struct ReviewedSubmission {
+    command: String,
+    execution: Option<crate::agent::AgentExecutionRef>,
+    prompt_generation: u64,
+    phase: ReviewedSubmissionPhase,
+    identity_feed_tainted: bool,
+}
+
+const VERIFIED_SUBMISSION_POLL: std::time::Duration = std::time::Duration::from_millis(16);
+const VERIFIED_SUBMISSION_MAX_POLLS: u32 = 120;
+const REVIEWED_COMMAND_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const VERIFIED_SUBMISSION_LOST: &str =
+    "the rendered shell editor did not exactly match the approved command before execution";
+const REVIEWED_COMMAND_START_LOST: &str =
+    "the shell did not report the exact reviewed command starting before the safety deadline";
+
+fn emit_agent_execution_lost(
+    callbacks: &AgentExecutionLostCallbacks,
+    execution: crate::agent::AgentExecutionRef,
+    reason: &'static str,
+) {
+    for callback in callbacks.borrow().iter() {
+        callback(execution, reason);
+    }
+}
+
+fn command_capture_range_is_bounded(start_row: i64, end_row: i64, columns: i64) -> bool {
+    end_row
+        .checked_sub(start_row)
+        .and_then(|rows| rows.checked_add(1))
+        .filter(|rows| *rows > 0)
+        .and_then(|rows| rows.checked_mul(columns.max(1)))
+        .and_then(|cells| usize::try_from(cells).ok())
+        .is_some_and(|cells| cells <= MAX_RECALLED_COMMAND_BYTES)
+}
+
+fn visible_editor_text(vte: &Terminal, anchor: (i64, i64)) -> Option<String> {
+    let (end_col, end_row) = vte.cursor_position();
+    let (start_col, start_row) = anchor;
+    if !command_capture_range_is_bounded(start_row, end_row, vte.column_count()) {
+        return None;
+    }
+    if (start_row, start_col) == (end_row, end_col) {
+        return Some(String::new());
+    }
+    vte.text_range_format(vte4::Format::Text, start_row, start_col, end_row, end_col)
+        .0
+        .map(|text| text.to_string())
+}
+
+fn approved_command_submission_payload(command: &str) -> Result<Vec<u8>, String> {
+    crate::review_input::validate(command)
+        .map_err(|error| format!("rejected unsafe reviewed command: {error}"))?;
+    if command != command.trim() {
+        return Err(
+            "reviewed execution rejects leading or trailing whitespace; insert it for manual review instead"
+                .to_string(),
+        );
+    }
+    Ok(command.as_bytes().to_vec())
+}
+
+/// Two-phase execution boundary shared by corrections and Shell Agent. It
+/// inserts without Enter, reads the exact rendered editor back from VTE, then
+/// admits Enter as a separate ordered write. Any lifecycle ambiguity loses the
+/// Agent identity rather than binding a later block to the approval.
+#[derive(Clone)]
+struct VerifiedSubmissionCtx {
+    active_vte: Terminal,
+    bstate: Rc<Cell<BlockState>>,
+    pty: Rc<OwnedPty>,
+    typed_cmd: Rc<RefCell<String>>,
+    idle_input_dirty: Rc<Cell<bool>>,
+    pty_synced: Rc<Cell<bool>>,
+    prompt_end_pos: Rc<Cell<(i64, i64)>>,
+    prompt_anchor_ready: Rc<Cell<bool>>,
+    prompt_generation: Rc<Cell<u64>>,
+    contents_generation: Rc<Cell<u64>>,
+    submission: Rc<RefCell<Option<ReviewedSubmission>>>,
+    source_id: Rc<RefCell<Option<glib::SourceId>>>,
+    armed_agent_execution: Rc<RefCell<Option<ArmedAgentExecution>>>,
+    agent_execution_supported: Rc<Cell<bool>>,
+    agent_execution_lost_callbacks: AgentExecutionLostCallbacks,
+}
+
+impl VerifiedSubmissionCtx {
+    fn fail(&self, reason: &'static str) {
+        let pending = self.submission.borrow_mut().take();
+        self.armed_agent_execution.borrow_mut().take();
+        if let Some(execution) = pending.and_then(|submission| submission.execution) {
+            emit_agent_execution_lost(&self.agent_execution_lost_callbacks, execution, reason);
+        } else {
+            log::warn!("reviewed command verification failed closed: {reason}");
+        }
+    }
+
+    fn cancel_if_pending(&self, reason: &'static str) -> bool {
+        if self.submission.borrow().is_none() {
+            return false;
+        }
+        if let Some(source) = self.source_id.borrow_mut().take() {
+            source.remove();
+        }
+        self.fail(reason);
+        true
+    }
+
+    fn arm_command_start_deadline(&self) {
+        let ctx = self.clone();
+        let source = glib::timeout_add_local_once(REVIEWED_COMMAND_START_TIMEOUT, move || {
+            ctx.source_id.borrow_mut().take();
+            let still_submitted =
+                ctx.submission.borrow().as_ref().is_some_and(|submission| {
+                    submission.phase == ReviewedSubmissionPhase::Submitted
+                });
+            if still_submitted {
+                ctx.fail(REVIEWED_COMMAND_START_LOST);
+            }
+        });
+        *self.source_id.borrow_mut() = Some(source);
+    }
+
+    fn begin(
+        &self,
+        command: &str,
+        execution: Option<crate::agent::AgentExecutionRef>,
+    ) -> Result<(), String> {
+        let payload = approved_command_submission_payload(command)?;
+        if execution.is_some() && !self.agent_execution_supported.get() {
+            return Err(
+                "Shell Agent execution requires the bundled token-aware bash/zsh integration"
+                    .to_string(),
+            );
+        }
+        if self.source_id.borrow().is_some() || self.submission.borrow().is_some() {
+            return Err("another reviewed command is still being verified".to_string());
+        }
+        if self.bstate.get() != BlockState::AwaitingCommand
+            || !self.prompt_anchor_ready.get()
+            || self.idle_input_dirty.get()
+            || self.pty_synced.get()
+            || self.pty.shell_is_foreground() != Some(true)
+        {
+            return Err("the shell prompt is no longer verified empty".to_string());
+        }
+        let anchor = self.prompt_end_pos.get();
+        if self.active_vte.cursor_position() != anchor
+            || crate::terminal::click_cursor::verified_suffix_is_empty(&self.active_vte)
+                != Some(true)
+        {
+            return Err("the shell prompt visibly contains input".to_string());
+        }
+
+        self.pty
+            .try_write_bytes(&payload)
+            .map_err(|error| error.to_string())?;
+        *self.typed_cmd.borrow_mut() = command.to_string();
+        self.idle_input_dirty.set(true);
+        self.pty_synced.set(true);
+        let prompt_generation = self.prompt_generation.get();
+        *self.submission.borrow_mut() = Some(ReviewedSubmission {
+            command: command.to_string(),
+            execution,
+            prompt_generation,
+            phase: ReviewedSubmissionPhase::Inserting,
+            identity_feed_tainted: false,
+        });
+
+        let ctx = self.clone();
+        let command = command.to_string();
+        let contents_before = self.contents_generation.get();
+        let attempts = Rc::new(Cell::new(0_u32));
+        let last_observed = Rc::new(Cell::new(None::<(u64, i64, i64)>));
+        let stable_polls = Rc::new(Cell::new(0_u8));
+        let source = glib::timeout_add_local(VERIFIED_SUBMISSION_POLL, move || {
+            let attempt = attempts.get().saturating_add(1);
+            attempts.set(attempt);
+            let still_current = ctx.submission.borrow().as_ref().is_some_and(|submission| {
+                submission.phase == ReviewedSubmissionPhase::Inserting
+                    && submission.command == command
+                    && submission.execution == execution
+                    && submission.prompt_generation == prompt_generation
+            });
+            if !still_current
+                || ctx.bstate.get() != BlockState::AwaitingCommand
+                || !ctx.prompt_anchor_ready.get()
+                || ctx.prompt_generation.get() != prompt_generation
+                || ctx.pty.shell_is_foreground() != Some(true)
+                || attempt >= VERIFIED_SUBMISSION_MAX_POLLS
+            {
+                ctx.source_id.borrow_mut().take();
+                ctx.fail(VERIFIED_SUBMISSION_LOST);
+                return glib::ControlFlow::Break;
+            }
+
+            let contents = ctx.contents_generation.get();
+            if contents == contents_before {
+                return glib::ControlFlow::Continue;
+            }
+            let (col, row) = ctx.active_vte.cursor_position();
+            let observed = (contents, col, row);
+            if last_observed.get() == Some(observed) {
+                stable_polls.set(stable_polls.get().saturating_add(1));
+            } else {
+                last_observed.set(Some(observed));
+                stable_polls.set(0);
+                return glib::ControlFlow::Continue;
+            }
+            if stable_polls.get() < 1 {
+                return glib::ControlFlow::Continue;
+            }
+
+            let rendered = visible_editor_text(&ctx.active_vte, ctx.prompt_end_pos.get());
+            let suffix_empty =
+                crate::terminal::click_cursor::verified_suffix_is_empty(&ctx.active_vte);
+            if rendered.as_deref() != Some(command.as_str()) || suffix_empty != Some(true) {
+                ctx.source_id.borrow_mut().take();
+                ctx.fail(VERIFIED_SUBMISSION_LOST);
+                return glib::ControlFlow::Break;
+            }
+
+            if let Err(error) = ctx.pty.try_write_bytes(b"\r") {
+                log::warn!("verified Enter was not queued: {error}");
+                ctx.source_id.borrow_mut().take();
+                ctx.fail(VERIFIED_SUBMISSION_LOST);
+                return glib::ControlFlow::Break;
+            }
+            if let Some(submission) = ctx.submission.borrow_mut().as_mut() {
+                submission.phase = ReviewedSubmissionPhase::Submitted;
+            }
+            if let Some(execution) = execution {
+                *ctx.armed_agent_execution.borrow_mut() = Some(ArmedAgentExecution {
+                    execution,
+                    prompt_generation,
+                });
+            }
+            ctx.source_id.borrow_mut().take();
+            ctx.arm_command_start_deadline();
+            glib::ControlFlow::Break
+        });
+        *self.source_id.borrow_mut() = Some(source);
+        Ok(())
+    }
+
+    fn command_start_observed(
+        &self,
+        shell_command: Option<&str>,
+        rendered_command: &str,
+        trusted_id: bool,
+    ) -> Option<crate::agent::AgentExecutionRef> {
+        if let Some(source) = self.source_id.borrow_mut().take() {
+            source.remove();
+        }
+        let Some(submission) = self.submission.borrow_mut().take() else {
+            self.armed_agent_execution.borrow_mut().take();
+            return None;
+        };
+        let identity_matches = submission.phase == ReviewedSubmissionPhase::Submitted
+            && submission.prompt_generation == self.prompt_generation.get()
+            && reviewed_submission_matches(
+                shell_command,
+                rendered_command,
+                &submission.command,
+                submission.identity_feed_tainted,
+            );
+        let armed = take_armed_agent_execution(
+            &mut self.armed_agent_execution.borrow_mut(),
+            self.prompt_generation.get(),
+        );
+        let Some(execution) = submission.execution else {
+            if !identity_matches {
+                log::warn!("reviewed command start did not match the verified insertion");
+            }
+            return None;
+        };
+        if identity_matches
+            && trusted_id
+            && self.pty.shell_is_foreground() == Some(true)
+            && armed == Some(execution)
+        {
+            Some(execution)
+        } else {
+            emit_agent_execution_lost(
+                &self.agent_execution_lost_callbacks,
+                execution,
+                "the shell command start could not be correlated to the approved command",
+            );
+            None
+        }
+    }
 }
 
 fn take_armed_agent_execution(
@@ -1364,23 +1913,39 @@ fn take_armed_agent_execution(
         .map(|armed| armed.execution)
 }
 
-fn command_end_matches_agent_execution(
-    agent_execution: Option<crate::agent::AgentExecutionRef>,
-    started_id: Option<&str>,
-    finished_id: Option<&str>,
-) -> bool {
-    agent_execution.is_none() || started_id.is_none() || started_id == finished_id
-}
-
 fn command_end_matches_started_id(started_id: Option<&str>, finished_id: Option<&str>) -> bool {
     started_id.is_some() && started_id == finished_id
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentCommandEndDecision {
+    Accept,
+    IgnoreUntilShellOwnsForeground,
+    AcceptWithoutAgentCorrelation,
+}
+
+fn decide_agent_command_end(
+    has_agent_execution: bool,
+    shell_is_foreground: Option<bool>,
+    trusted_matching_id: bool,
+) -> AgentCommandEndDecision {
+    if !has_agent_execution {
+        return AgentCommandEndDecision::Accept;
+    }
+    if shell_is_foreground == Some(false) {
+        return AgentCommandEndDecision::IgnoreUntilShellOwnsForeground;
+    }
+    if shell_is_foreground != Some(true) || !trusted_matching_id {
+        return AgentCommandEndDecision::AcceptWithoutAgentCorrelation;
+    }
+    AgentCommandEndDecision::Accept
 }
 
 fn agent_prompt_boundary_is_trusted(
     active_execution: Option<crate::agent::AgentExecutionRef>,
     shell_is_foreground: Option<bool>,
 ) -> bool {
-    active_execution.is_none() || shell_is_foreground != Some(false)
+    active_execution.is_none() || shell_is_foreground == Some(true)
 }
 
 pub struct TermView {
@@ -1397,11 +1962,22 @@ pub struct TermView {
     /// authoritative finished-command text is read off the live VTE at
     /// CommandStart, so this never has to round-trip to display.
     typed_cmd: Rc<RefCell<String>>,
+    /// Immutable PromptEnd cursor anchor used for empty-editor verification.
+    prompt_end_pos: Rc<Cell<(i64, i64)>>,
+    /// VTE feed is asynchronous; approval remains unavailable until a short
+    /// post-PromptEnd fence confirms that no input raced the captured anchor.
+    prompt_anchor_ready: Rc<Cell<bool>>,
     /// One-shot Agent execution identity armed atomically with its PTY write.
     /// It follows only the next command at the same prompt generation; the
     /// Agent session performs the secondary command-text check at completion.
     armed_agent_execution: Rc<RefCell<Option<ArmedAgentExecution>>>,
     agent_prompt_generation: Rc<Cell<u64>>,
+    /// True only after a token-aware integration announces the exact private
+    /// token inside the current prompt boundary.
+    agent_execution_supported: Rc<Cell<bool>>,
+    verified_submission: VerifiedSubmissionCtx,
+    /// Identity-verified Agent command currently owning the foreground block.
+    active_agent_execution: Rc<Cell<Option<crate::agent::AgentExecutionRef>>>,
     /// Set once the user has started editing at an idle prompt, so shell echo is
     /// no longer mistaken for asynchronous background output. Shared with the
     /// reader loop; the clipboard paste path has to set it too, since a paste
@@ -1428,6 +2004,9 @@ pub struct TermView {
     bell_callbacks: VoidCallbacks,
     title_callbacks: StrCallbacks,
     activity_callbacks: VoidCallbacks,
+    human_input_callbacks: HumanInputCallbacks,
+    command_started_callbacks: CommandStartedCallbacks,
+    command_finished_callbacks: CommandFinishedCallbacks,
     block_finished_callbacks: BlockFinishedCallbacks,
     ask_ai_about_block_callbacks: BlockContextCallbacks,
     mouse_reporting_mode: Rc<Cell<MouseReportingMode>>,
@@ -1460,6 +2039,8 @@ pub struct TermView {
     /// all of the visible block-history state atomically.
     unread_count: Rc<Cell<u32>>,
     jump_fab: gtk::Button,
+    /// Compact organism representation inside the sticky running header.
+    sticky_organism_slot: gtk::Box,
     /// Find-within-blocks state: every match across the finished blocks plus a
     /// cursor into it, so Ctrl+F highlights all hits and Next/Prev step through
     /// them (Warp's FindWithinBlock). Tags are stripped on close via clear_find.
@@ -1475,6 +2056,13 @@ pub struct TermView {
     /// Tracks per-VTE selections so a drag that crosses block boundaries can be
     /// copied as one contiguous string via Ctrl+Shift+C.
     cross_selection: Rc<CrossSelection>,
+    /// Defers raw PTY chunks while a user selection covers the streaming live
+    /// VTE, then replays them through the original parser/state pipeline.
+    selection_feed_hold: Rc<SelectionFeedHold>,
+    /// Recompute live sizing and finished-card geometry after font or viewport
+    /// metrics change. Keeping the closure here makes programmatic font updates
+    /// follow the same refit path as GTK allocation signals.
+    layout_active_surface: Rc<dyn Fn()>,
 }
 
 impl Drop for TermView {
@@ -1487,6 +2075,9 @@ impl Drop for TermView {
             id.remove();
         }
         if let Some(id) = self.sticky_timer_id.borrow_mut().take() {
+            id.remove();
+        }
+        if let Some(id) = self.verified_submission.source_id.borrow_mut().take() {
             id.remove();
         }
     }
@@ -1519,6 +2110,7 @@ struct ReaderCtx {
     /// VTE cursor position (col, row) captured at PromptEnd; the start anchor
     /// for the text-range read that produces `vte_typed_cmd_rc`.
     prompt_end_pos_rc: Rc<Cell<(i64, i64)>>,
+    prompt_anchor_ready_rc: Rc<Cell<bool>>,
     /// Rendered prompt (last non-empty line) captured at PromptEnd, used by the
     /// finalize path since prompt_buf is cleared once the prompt ends.
     prompt_display_rc: Rc<RefCell<String>>,
@@ -1527,6 +2119,8 @@ struct ReaderCtx {
     remote_session_cbs: StrCallbacks,
     exited_cbs: IntCallbacks,
     activity_cbs: VoidCallbacks,
+    command_started_cbs: CommandStartedCallbacks,
+    command_finished_cbs: CommandFinishedCallbacks,
     mouse_reporting_rc: Rc<Cell<MouseReportingMode>>,
     bracketed_paste_rc: Rc<Cell<bool>>,
     /// Dynamic OSC 10/11/12 overrides for this pane: consulted for OSC color
@@ -1558,6 +2152,8 @@ struct ReaderCtx {
     /// The shell's execution id for the running command (jsh only): the key its
     /// execution journal keeps the record under.
     execution_id_rc: Rc<RefCell<Option<String>>>,
+    execution_id_trusted_rc: Rc<Cell<bool>>,
+    agent_completion_trusted_rc: Rc<Cell<bool>>,
     /// cwd the running command was started in, as the shell reported it at
     /// CommandStart. The pane's tracked cwd has already moved on after a `cd`.
     command_cwd_rc: Rc<RefCell<Option<String>>>,
@@ -1574,11 +2170,14 @@ struct ReaderCtx {
     armed_agent_execution_rc: Rc<RefCell<Option<ArmedAgentExecution>>>,
     agent_prompt_generation_rc: Rc<Cell<u64>>,
     active_agent_execution_rc: Rc<Cell<Option<crate::agent::AgentExecutionRef>>>,
+    agent_execution_supported_rc: Rc<Cell<bool>>,
+    verified_submission: VerifiedSubmissionCtx,
     /// Recomputes the compact/full visual live surface. PTY geometry is kept
     /// separately at the full pane viewport.
     layout_active_surface: Rc<dyn Fn()>,
     block_finished_cbs: BlockFinishedCallbacks,
     ask_ai_about_block_cbs: BlockContextCallbacks,
+    selection_feed_hold: Rc<SelectionFeedHold>,
 }
 
 /// Fold every run of consecutive `ParserEvent::Bytes(_)` entries in `events`
@@ -1706,12 +2305,15 @@ impl ReaderCtx {
             idle_input_dirty_rc,
             vte_typed_cmd_rc,
             prompt_end_pos_rc,
+            prompt_anchor_ready_rc,
             prompt_display_rc,
             block_list_rc,
             block_scroll_rc,
             remote_session_cbs,
             exited_cbs,
             activity_cbs,
+            command_started_cbs,
+            command_finished_cbs,
             mouse_reporting_rc,
             bracketed_paste_rc,
             dynamic_colors_rc,
@@ -1732,6 +2334,8 @@ impl ReaderCtx {
             pending_exit_code_rc,
             shell_duration_ms_rc,
             execution_id_rc,
+            execution_id_trusted_rc,
+            agent_completion_trusted_rc,
             command_cwd_rc,
             current_cwd_for_cb,
             event_buf,
@@ -1746,9 +2350,12 @@ impl ReaderCtx {
             armed_agent_execution_rc,
             agent_prompt_generation_rc,
             active_agent_execution_rc,
+            agent_execution_supported_rc,
+            verified_submission,
             layout_active_surface,
             block_finished_cbs,
             ask_ai_about_block_cbs,
+            selection_feed_hold,
         } = self;
         let active_alt_screen_mode_rc: Rc<Cell<Option<u32>>> = Rc::new(Cell::new(None));
         // Kitty graphics (APC G) — multi-chunk uploads assemble here; completed
@@ -1760,8 +2367,19 @@ impl ReaderCtx {
         let kitty_pending_images_rc: Rc<RefCell<Vec<gtk::gdk::Texture>>> =
             Rc::new(RefCell::new(Vec::new()));
         let kitty_pending_bytes_rc: Rc<Cell<usize>> = Rc::new(Cell::new(0));
-        pty.start_reader(
+        let shell_token = pty
+            .shell_integration_token()
+            .unwrap_or_default()
+            .to_string();
+        let mut capability_observer = ShellCapabilityObserver::default();
+        selection_feed_hold.install_vte_hooks(&active_vte);
+
+        // Keep the complete security-observer → parser → Block state machine
+        // behind one replayable closure. A selection hold intercepts raw chunks
+        // before this boundary and flushes them back through this exact path.
+        let process_chunk: Rc<RefCell<dyn FnMut(Vec<u8>)>> = Rc::new(RefCell::new(
             move |data: Vec<u8>| {
+                capability_observer.feed(&data, &shell_token, &agent_execution_supported_rc);
                 let mut events = event_buf.borrow_mut();
                 events.clear();
                 parser.borrow_mut().feed(&data, &mut events);
@@ -1793,7 +2411,9 @@ impl ReaderCtx {
                                 (1002, true) => Some(MouseReportingMode::Button),
                                 (1003, true) => Some(MouseReportingMode::Motion),
                                 (1006, true) => Some(MouseReportingMode::Sgr),
-                                (1000 | 1002 | 1003 | 1006, false) => Some(MouseReportingMode::None),
+                                (1000 | 1002 | 1003 | 1006, false) => {
+                                    Some(MouseReportingMode::None)
+                                }
                                 _ => None,
                             };
                             if let Some(m) = new_mode {
@@ -1801,6 +2421,17 @@ impl ReaderCtx {
                             }
                         }
                         ParserEvent::Bytes(bytes) => {
+                            if state == BlockState::AwaitingCommand {
+                                if let Some(submission) =
+                                    verified_submission.submission.borrow_mut().as_mut()
+                                {
+                                    if submission.phase == ReviewedSubmissionPhase::Submitted
+                                        && !reviewed_pre_command_bytes_are_identity_neutral(bytes)
+                                    {
+                                        submission.identity_feed_tainted = true;
+                                    }
+                                }
+                            }
                             // No shell integration seen yet: once real output flows,
                             // stream everything into the live VTE (raw fallback).
                             if state == BlockState::Idle {
@@ -1861,7 +2492,9 @@ impl ReaderCtx {
                         ParserEvent::PromptStart => {
                             ftcs_seen_rc.set(true);
                             let state = bstate_rc.get();
-                            if state == BlockState::CollectingOutput || state == BlockState::AltScreen {
+                            if state == BlockState::CollectingOutput
+                                || state == BlockState::AltScreen
+                            {
                                 continue;
                             }
                             if state == BlockState::PostCommand
@@ -1882,6 +2515,17 @@ impl ReaderCtx {
                                 cmd_running_rc.set(true);
                                 bstate_rc.set(BlockState::CollectingOutput);
                                 continue;
+                            }
+                            if state == BlockState::PostCommand
+                                && !agent_completion_trusted_rc.get()
+                            {
+                                if let Some(execution) = active_agent_execution_rc.take() {
+                                    emit_agent_execution_lost(
+                                        &verified_submission.agent_execution_lost_callbacks,
+                                        execution,
+                                        "the shell prompt arrived without a trusted matching command end",
+                                    );
+                                }
                             }
                             let background_output = if state == BlockState::AwaitingCommand {
                                 take_background_output(&background_output_rc)
@@ -1943,7 +2587,8 @@ impl ReaderCtx {
 
                                 let output_plain = strip_ansi(&output_with_ansi).to_string();
 
-                                let truncation_limit = config_for_cb.borrow().truncation_threshold_lines as usize;
+                                let truncation_limit =
+                                    config_for_cb.borrow().truncation_threshold_lines as usize;
                                 let output_trimmed = {
                                     let trimmed = output_plain.trim();
                                     let lines: Vec<&str> = trimmed.lines().collect();
@@ -1963,8 +2608,15 @@ impl ReaderCtx {
                                     block_start_time_for_cb.get()
                                 };
                                 let now = SystemTime::now();
-                                let end_time_ms = now.duration_since(SystemTime::UNIX_EPOCH).ok().map(|d| d.as_millis() as u64);
-                                let start_time_ms = start_time.and_then(|st| st.duration_since(SystemTime::UNIX_EPOCH).ok().map(|d| d.as_millis() as u64));
+                                let end_time_ms = now
+                                    .duration_since(SystemTime::UNIX_EPOCH)
+                                    .ok()
+                                    .map(|d| d.as_millis() as u64);
+                                let start_time_ms = start_time.and_then(|st| {
+                                    st.duration_since(SystemTime::UNIX_EPOCH)
+                                        .ok()
+                                        .map(|d| d.as_millis() as u64)
+                                });
                                 // Commandless background output has no shell-reported
                                 // figure of its own, so it keeps the local timer only.
                                 let shell_duration_ms = if is_background {
@@ -1972,7 +2624,8 @@ impl ReaderCtx {
                                 } else {
                                     shell_duration_ms_rc.take()
                                 };
-                                let duration_ms = block_duration_ms(shell_duration_ms, start_time, now);
+                                let duration_ms =
+                                    block_duration_ms(shell_duration_ms, start_time, now);
 
                                 let block_cwd = {
                                     // The cwd the shell said the command ran in wins
@@ -1986,7 +2639,11 @@ impl ReaderCtx {
                                     };
                                     reported.or_else(|| {
                                         let cwd_str = current_cwd_for_cb.borrow().clone();
-                                        if cwd_str.is_empty() { None } else { Some(cwd_str) }
+                                        if cwd_str.is_empty() {
+                                            None
+                                        } else {
+                                            Some(cwd_str)
+                                        }
                                     })
                                 };
 
@@ -2069,9 +2726,10 @@ impl ReaderCtx {
                                     &kitty_images,
                                     recycled,
                                 );
-                                finished
-                                    .widget()
-                                    .insert_before(&block_list_rc, Some(active_rc.borrow().widget()));
+                                finished.widget().insert_before(
+                                    &block_list_rc,
+                                    Some(active_rc.borrow().widget()),
+                                );
 
                                 let was_user_scrolled = scroll_debouncer.user_scrolled_up.get();
 
@@ -2130,14 +2788,17 @@ impl ReaderCtx {
                                         // the live buffer's byte cap dropping the *head*
                                         // of a very long stream — a gap, not a claim.)
                                         let total_bytes = output_plain.trim().len();
-                                        let submitted = jterm_core::execution_journal::CompletedExecution {
-                                            id,
-                                            output: output_trimmed.clone(),
-                                            output_available: true,
-                                            truncated: output_trimmed.len() != total_bytes,
-                                            total_bytes,
-                                        };
-                                        if let Err(error) = jterm_core::execution_journal::submit(submitted) {
+                                        let submitted =
+                                            jterm_core::execution_journal::CompletedExecution {
+                                                id,
+                                                output: output_trimmed.clone(),
+                                                output_available: true,
+                                                truncated: output_trimmed.len() != total_bytes,
+                                                total_bytes,
+                                            };
+                                        if let Err(error) =
+                                            jterm_core::execution_journal::submit(submitted)
+                                        {
                                             log::warn!("jsh execution journal rejected a block's output: {error:?}");
                                         }
                                     }
@@ -2177,8 +2838,7 @@ impl ReaderCtx {
                                 let visible_for_menu = visible_indices_rc.clone();
                                 let widget_pool_for_menu = widget_pool_for_cb.clone();
                                 let ask_ai_cbs_for_menu = ask_ai_about_block_cbs.clone();
-                                let failure_marker_redraw_for_menu =
-                                    failure_marker_redraw.clone();
+                                let failure_marker_redraw_for_menu = failure_marker_redraw.clone();
                                 let block_id = finished_clone.id;
 
                                 let right_click = gtk::GestureClick::new();
@@ -2200,7 +2860,10 @@ impl ReaderCtx {
                                     }
 
                                     let popover = gtk::Popover::new();
-                                    let widget: &gtk::Widget = &finished_menu_clone.widget().clone().upcast::<gtk::Widget>();
+                                    let widget: &gtk::Widget = &finished_menu_clone
+                                        .widget()
+                                        .clone()
+                                        .upcast::<gtk::Widget>();
                                     popover.set_parent(widget);
                                     popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(
                                         x as i32, y as i32, 1, 1,
@@ -2263,18 +2926,22 @@ impl ReaderCtx {
                                         let callbacks_for_ai = ask_ai_cbs_for_menu.clone();
                                         item.connect_clicked(move |_| {
                                             popover_c.popdown();
-                                            let output = finished_for_ai.with_stripped_output(|text| {
-                                                crate::ai::truncate_for_context(text, 80)
-                                            });
+                                            let output =
+                                                finished_for_ai.with_stripped_output(|text| {
+                                                    crate::ai::truncate_for_context(text, 80)
+                                                });
                                             let data = block_data_for_ai.borrow();
-                                            let record = data.iter().find(|block| block.id == block_id);
+                                            let record =
+                                                data.iter().find(|block| block.id == block_id);
                                             let truncated = output.contains("lines elided")
                                                 || output.contains("bytes elided");
                                             let context = crate::ai::BlockContext {
                                                 cmd: finished_for_ai.cmd_text.clone(),
                                                 output,
                                                 cwd: record.and_then(|block| block.cwd.clone()),
-                                                exit_code: exit_code_for_i32_api(record.and_then(|block| block.exit_code)),
+                                                exit_code: exit_code_for_i32_api(
+                                                    record.and_then(|block| block.exit_code),
+                                                ),
                                                 truncated,
                                             };
                                             for callback in callbacks_for_ai.borrow().iter() {
@@ -2408,9 +3075,7 @@ impl ReaderCtx {
                                         });
                                         vbox.append(&item);
                                     }
-                                    vbox.append(&gtk::Separator::new(
-                                        gtk::Orientation::Horizontal,
-                                    ));
+                                    vbox.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
                                     {
                                         let item = make_item(if selected_count > 1 {
@@ -2446,7 +3111,9 @@ impl ReaderCtx {
                                         item.connect_clicked(move |_| {
                                             popover_c.popdown();
                                             let blocks = block_data_for_json.borrow();
-                                            if let Some(block) = blocks.iter().find(|b| b.id == block_id_json) {
+                                            if let Some(block) =
+                                                blocks.iter().find(|b| b.id == block_id_json)
+                                            {
                                                 let json = block.to_json();
                                                 vte_for_json.clipboard().set_text(&json);
                                             }
@@ -2466,7 +3133,8 @@ impl ReaderCtx {
                                         let selected_for_rerun = selected_for_menu.clone();
                                         let anchor_for_rerun = anchor_for_menu.clone();
                                         let pty_for_action = pty_for_rerun_menu.clone();
-                                        let pty_synced_for_action = pty_synced_for_rerun_menu.clone();
+                                        let pty_synced_for_action =
+                                            pty_synced_for_rerun_menu.clone();
                                         let bracketed_paste_for_action =
                                             bracketed_paste_for_rerun_menu.clone();
                                         let typed_cmd_for_action = typed_cmd_for_rerun_menu.clone();
@@ -2481,23 +3149,21 @@ impl ReaderCtx {
                                         item.connect_clicked(move |_| {
                                             popover_c.popdown();
                                             let finished = finished_for_rerun.borrow();
-                                            let recalled = if armed_agent_for_action
-                                                .borrow()
-                                                .is_some()
-                                            {
-                                                false
-                                            } else {
-                                                let selected = selected_ids_for_rerun.borrow();
-                                                recall_selected_commands_at_prompt(
-                                                    &pty_for_action,
-                                                    &pty_synced_for_action,
-                                                    &typed_cmd_for_action,
-                                                    bstate_for_action.get(),
-                                                    &finished,
-                                                    &selected,
-                                                    bracketed_paste_for_action.get(),
-                                                )
-                                            };
+                                            let recalled =
+                                                if armed_agent_for_action.borrow().is_some() {
+                                                    false
+                                                } else {
+                                                    let selected = selected_ids_for_rerun.borrow();
+                                                    recall_selected_commands_at_prompt(
+                                                        &pty_for_action,
+                                                        &pty_synced_for_action,
+                                                        &typed_cmd_for_action,
+                                                        bstate_for_action.get(),
+                                                        &finished,
+                                                        &selected,
+                                                        bracketed_paste_for_action.get(),
+                                                    )
+                                                };
                                             if recalled {
                                                 clear_finished_block_selection(
                                                     &finished,
@@ -2521,7 +3187,9 @@ impl ReaderCtx {
                                         item.connect_clicked(move |_| {
                                             popover_c.popdown();
                                             let blocks = block_data_for_md.borrow();
-                                            if let Some(block) = blocks.iter().find(|b| b.id == block_id_md) {
+                                            if let Some(block) =
+                                                blocks.iter().find(|b| b.id == block_id_md)
+                                            {
                                                 let markdown = block.to_markdown();
                                                 vte_for_md.clipboard().set_text(&markdown);
                                             }
@@ -2532,7 +3200,8 @@ impl ReaderCtx {
                                     {
                                         let item = make_item("Delete Block");
                                         let popover_c = popover.clone();
-                                        let finished_blocks_for_delete = finished_blocks_for_menu.clone();
+                                        let finished_blocks_for_delete =
+                                            finished_blocks_for_menu.clone();
                                         let block_list_for_delete = block_list_for_menu.clone();
                                         let block_data_for_delete = block_data_for_export.clone();
                                         let selected_ids_for_delete = selected_ids_for_menu.clone();
@@ -2546,8 +3215,11 @@ impl ReaderCtx {
                                         let block_id_del = block_id;
                                         item.connect_clicked(move |_| {
                                             popover_c.popdown();
-                                            let mut blocks = finished_blocks_for_delete.borrow_mut();
-                                            if let Some(pos) = blocks.iter().position(|b| b.id == block_id_del) {
+                                            let mut blocks =
+                                                finished_blocks_for_delete.borrow_mut();
+                                            if let Some(pos) =
+                                                blocks.iter().position(|b| b.id == block_id_del)
+                                            {
                                                 let block = blocks.remove(pos);
                                                 let widget = block.widget().clone();
                                                 block_list_for_delete.remove(&widget);
@@ -2564,9 +3236,7 @@ impl ReaderCtx {
                                             mutate_block_data_and_redraw(
                                                 &block_data_for_delete,
                                                 failure_marker_redraw_for_delete.as_ref(),
-                                                |blocks| {
-                                                    blocks.retain(|b| b.id != block_id_del)
-                                                },
+                                                |blocks| blocks.retain(|b| b.id != block_id_del),
                                             );
                                             bookmarks_for_delete.borrow_mut().remove(&block_id_del);
                                             // Index-based virtualization must be recalculated after
@@ -2678,6 +3348,9 @@ impl ReaderCtx {
                             if bstate_rc.get() != BlockState::CollectingPrompt {
                                 continue;
                             }
+                            verified_submission.cancel_if_pending(
+                                "a new prompt arrived before the reviewed command start was verified",
+                            );
                             // Capture the rendered prompt (last non-empty line) for the
                             // finished block / export.
                             let prompt_line = {
@@ -2696,13 +3369,16 @@ impl ReaderCtx {
                             vte_typed_cmd_rc.borrow_mut().clear();
                             background_output_rc.borrow_mut().clear();
                             idle_input_dirty_rc.set(false);
-                            agent_prompt_generation_rc
-                                .set(agent_prompt_generation_rc.get().wrapping_add(1));
+                            let prompt_generation =
+                                agent_prompt_generation_rc.get().wrapping_add(1);
+                            agent_prompt_generation_rc.set(prompt_generation);
                             // An armed write belongs to exactly one prompt. A
                             // redraw/new prompt before CommandStart invalidates
                             // it instead of letting same text match later.
                             armed_agent_execution_rc.borrow_mut().take();
                             active_agent_execution_rc.set(None);
+                            agent_completion_trusted_rc.set(false);
+                            execution_id_trusted_rc.set(false);
                             // Snapshot the live VTE cursor at the moment the
                             // prompt finishes drawing — this is where the user's
                             // command starts. CommandStart will read text from
@@ -2710,8 +3386,35 @@ impl ReaderCtx {
                             // command as it really appeared on screen.
                             let (col, row) = active_vte.cursor_position();
                             prompt_end_pos_rc.set((col, row));
+                            prompt_anchor_ready_rc.set(false);
                             pty_synced_rc.set(false);
                             bstate_rc.set(BlockState::AwaitingCommand);
+                            // VTE applies feed asynchronously. Keep the cursor
+                            // captured at the authenticated PromptEnd boundary
+                            // immutable, then expose it after a short fence only
+                            // if no input or new prompt raced it. Moving this
+                            // anchor to the later live cursor could absorb text
+                            // printed after PromptEnd (for example a line-editor
+                            // prefill) into trusted prompt furniture.
+                            {
+                                let state = bstate_rc.clone();
+                                let dirty = idle_input_dirty_rc.clone();
+                                let synced = pty_synced_rc.clone();
+                                let generation = agent_prompt_generation_rc.clone();
+                                let ready = prompt_anchor_ready_rc.clone();
+                                glib::timeout_add_local_once(
+                                    std::time::Duration::from_millis(32),
+                                    move || {
+                                        if state.get() == BlockState::AwaitingCommand
+                                            && generation.get() == prompt_generation
+                                            && !dirty.get()
+                                            && !synced.get()
+                                        {
+                                            ready.set(true);
+                                        }
+                                    },
+                                );
+                            }
                             layout_active_surface();
                             if active_vte.has_focus() {
                                 let active_for_focus = active_rc.clone();
@@ -2723,6 +3426,8 @@ impl ReaderCtx {
                             // Feed next initial command if any.
                             if let Some(cmd) = init_cmds_queue_for_cb.borrow_mut().pop_front() {
                                 let text = format!("{}\r", cmd);
+                                idle_input_dirty_rc.set(true);
+                                pty_synced_rc.set(true);
                                 pty_for_init.write_bytes(text.as_bytes());
                             }
 
@@ -2733,7 +3438,9 @@ impl ReaderCtx {
                         ParserEvent::CommandStart(meta) => {
                             ftcs_seen_rc.set(true);
                             let state = bstate_rc.get();
-                            if state == BlockState::CollectingOutput || state == BlockState::AltScreen {
+                            if state == BlockState::CollectingOutput
+                                || state == BlockState::AltScreen
+                            {
                                 osc133_depth_rc.set(osc133_depth_rc.get().saturating_add(1));
                                 continue;
                             }
@@ -2756,6 +3463,13 @@ impl ReaderCtx {
                             // under, so the output captured below can be attached
                             // to the record instead of living only in this window.
                             *execution_id_rc.borrow_mut() = meta.id.clone();
+                            let trusted_execution_id = meta.id.as_deref().is_some_and(|id| {
+                                pty_for_init
+                                    .shell_integration_token()
+                                    .is_some_and(|token| command_id_uses_shell_token(id, token))
+                            });
+                            execution_id_trusted_rc.set(trusted_execution_id);
+                            agent_completion_trusted_rc.set(false);
                             // The cwd the command runs *in*. The pane's tracked cwd
                             // comes from an OSC 7 the shell emits with its next
                             // prompt, which for `cd`/`pushd` is already the new
@@ -2780,7 +3494,8 @@ impl ReaderCtx {
                                 .0
                                 .map(|gs| gs.to_string())
                                 .unwrap_or_default();
-                            let scraped = normalize_captured_command(&captured, &prompt_display_rc.borrow());
+                            let scraped =
+                                normalize_captured_command(&captured, &prompt_display_rc.borrow());
                             let (command, source) = resolve_command_text(
                                 meta.command.as_deref(),
                                 meta.command_truncated,
@@ -2792,17 +3507,20 @@ impl ReaderCtx {
                                     command.len()
                                 );
                             }
-                            // Preserve the local generation even when the shell
-                            // reports different command text. BlockFinished's
-                            // secondary text check then seals the Agent session
-                            // explicitly instead of silently losing the arm and
-                            // waiting forever for an observation.
-                            let matching_execution = take_armed_agent_execution(
-                                &mut armed_agent_execution_rc.borrow_mut(),
-                                agent_prompt_generation_rc.get(),
+                            let matching_execution = verified_submission.command_start_observed(
+                                meta.command.as_deref(),
+                                &captured,
+                                trusted_execution_id,
                             );
                             active_agent_execution_rc.set(matching_execution);
                             *vte_typed_cmd_rc.borrow_mut() = command.clone();
+                            emit_command_started(
+                                &command_started_cbs,
+                                CommandStartedEvent {
+                                    command: command.clone(),
+                                    cwd: command_cwd_rc.borrow().clone(),
+                                },
+                            );
                             *running_cmd_rc.borrow_mut() = command;
                             cmd_running_rc.set(true);
                             bstate_rc.set(BlockState::CollectingOutput);
@@ -2827,7 +3545,9 @@ impl ReaderCtx {
 
                         ParserEvent::CommandEnd { exit, meta } => {
                             let state = bstate_rc.get();
-                            if state != BlockState::CollectingOutput && state != BlockState::AltScreen {
+                            if state != BlockState::CollectingOutput
+                                && state != BlockState::AltScreen
+                            {
                                 continue;
                             }
                             let matches_started_id = command_end_matches_started_id(
@@ -2845,15 +3565,43 @@ impl ReaderCtx {
                                 // hostile output wedge this pane indefinitely.
                                 osc133_depth_rc.set(0);
                             }
-                            if !command_end_matches_agent_execution(
-                                active_agent_execution_rc.get(),
-                                execution_id_rc.borrow().as_deref(),
-                                meta.id.as_deref(),
-                            ) {
-                                log::warn!(
-                                    "Ignoring an OSC 133 command-end marker whose execution id does not match the armed Agent command"
+                            let active_agent_execution = active_agent_execution_rc.get();
+                            let shell_is_foreground = pty_for_init.shell_is_foreground();
+                            let trusted_match = execution_id_trusted_rc.get()
+                                && command_end_matches_started_id(
+                                    execution_id_rc.borrow().as_deref(),
+                                    meta.id.as_deref(),
                                 );
-                                continue;
+                            match decide_agent_command_end(
+                                active_agent_execution.is_some(),
+                                shell_is_foreground,
+                                trusted_match,
+                            ) {
+                                AgentCommandEndDecision::IgnoreUntilShellOwnsForeground => {
+                                    // A foreground job can emit arbitrary OSC.
+                                    // Wait until the interactive shell actually
+                                    // regains ownership before accepting its D.
+                                    log::warn!(
+                                        "Ignoring an Agent command-end marker while a child process owns the PTY"
+                                    );
+                                    continue;
+                                }
+                                AgentCommandEndDecision::Accept => {
+                                    if active_agent_execution.is_some() {
+                                        agent_completion_trusted_rc.set(true);
+                                    }
+                                }
+                                AgentCommandEndDecision::AcceptWithoutAgentCorrelation => {
+                                    let execution = active_agent_execution
+                                        .expect("decision requires an active Agent execution");
+                                    active_agent_execution_rc.set(None);
+                                    agent_completion_trusted_rc.set(false);
+                                    emit_agent_execution_lost(
+                                        &verified_submission.agent_execution_lost_callbacks,
+                                        execution,
+                                        "the shell command end lacked a trusted matching id or foreground owner",
+                                    );
+                                }
                             }
                             // Safety net (Warp parity): if the alt-screen app
                             // crashed or exited without rmcup, force the UI back
@@ -2867,6 +3615,7 @@ impl ReaderCtx {
                                     &visible_indices_rc,
                                     &fullscreen_rc,
                                 );
+                                active_rc.borrow().set_live_organism_alt_screen(false);
                                 layout_active_surface();
                             }
                             // `None` stays `None`: a shell that reported no status
@@ -2883,6 +3632,25 @@ impl ReaderCtx {
                             if meta.id.is_some() {
                                 *execution_id_rc.borrow_mut() = meta.id.clone();
                             }
+                            let duration_ms = shell_duration_ms_rc.get().or_else(|| {
+                                block_start_time_for_cb.get().and_then(|started| {
+                                    SystemTime::now()
+                                        .duration_since(started)
+                                        .ok()
+                                        .map(|elapsed| {
+                                            elapsed.as_millis().min(u64::MAX as u128) as u64
+                                        })
+                                })
+                            });
+                            emit_command_finished(
+                                &command_finished_cbs,
+                                CommandFinishedEvent {
+                                    command: running_cmd_rc.borrow().clone(),
+                                    cwd: command_cwd_rc.borrow().clone(),
+                                    exit_code: *exit,
+                                    duration_ms,
+                                },
+                            );
                             cmd_running_rc.set(false);
                             bstate_rc.set(BlockState::PostCommand);
                             scroll_debouncer.mark_dirty(&block_scroll_rc);
@@ -2898,6 +3666,11 @@ impl ReaderCtx {
                             prev_state_rc.set(from_state);
                             bstate_rc.set(BlockState::AltScreen);
                             active_alt_screen_mode_rc.set(Some(*mode));
+                            {
+                                let active = active_rc.borrow();
+                                active.set_live_organism_visible(false);
+                                active.set_live_organism_alt_screen(true);
+                            }
                             // Hand the viewport to the alt-screen app: hide finished
                             // blocks so the live VTE fills the scroll area.
                             enter_fullscreen(
@@ -2925,6 +3698,7 @@ impl ReaderCtx {
                             // NOT merged into the block. The active block keeps
                             // just the command name + exit code.
                             active_alt_screen_mode_rc.set(None);
+                            active_rc.borrow().set_live_organism_alt_screen(false);
                             let leave = format!("\x1b[?{mode}l");
                             active_vte.feed(leave.as_bytes());
                             exit_fullscreen(
@@ -3057,11 +3831,33 @@ impl ReaderCtx {
                     }
                 }
             },
-            move |exit_code| {
-                log::debug!("Shell exited with code {}", exit_code);
-                for cb in exited_cbs.borrow().iter() {
-                    cb(exit_code);
+        ));
+
+        selection_feed_hold.set_flush({
+            let process_chunk = Rc::downgrade(&process_chunk);
+            move |bytes| {
+                if let Some(process_chunk) = process_chunk.upgrade() {
+                    (process_chunk.borrow_mut())(bytes);
                 }
+            }
+        });
+
+        let hold_for_reader = selection_feed_hold.clone();
+        let hold_for_exit = selection_feed_hold.clone();
+        pty.start_reader(
+            move |data: Vec<u8>| {
+                if hold_for_reader.try_buffer(&data) {
+                    return;
+                }
+                (process_chunk.borrow_mut())(data);
+            },
+            move |exit_code| {
+                hold_for_exit.flush_then(|| {
+                    log::debug!("Shell exited with code {}", exit_code);
+                    for cb in exited_cbs.borrow().iter() {
+                        cb(exit_code);
+                    }
+                });
             },
         )
     }
@@ -3111,6 +3907,155 @@ fn viewport_rows_for(vte: &Terminal, scroll: &ScrolledWindow) -> Option<i64> {
     };
     let usable = (page - chrome).max(cell_h);
     Some(((usable / cell_h).max(1)) as i64)
+}
+
+type FinishedLayoutKey = (i32, i32, i32, usize);
+
+fn finished_layout_key(
+    page_width: i32,
+    available_height: i32,
+    cell_height: i32,
+    block_count: usize,
+) -> FinishedLayoutKey {
+    (
+        page_width,
+        available_height,
+        cell_height.max(1),
+        block_count,
+    )
+}
+
+fn compute_viewport_state(
+    block_data: &VecDeque<BlockData>,
+    visible_top: i32,
+    visible_bottom: i32,
+) -> ViewportState {
+    let mut y = 0_i32;
+    let mut first = None;
+    let mut last = 0;
+    let mut iter = block_data.iter().enumerate();
+
+    while let Some((index, block)) = iter.next() {
+        let block_top = y;
+        let block_bottom = y.saturating_add(block.estimated_height.max(1));
+        if first.is_none() && block_bottom > visible_top {
+            first = Some(index);
+        }
+        if block_top < visible_bottom {
+            last = index;
+        }
+        y = block_bottom;
+
+        if first.is_some() && y >= visible_bottom {
+            for (_, block) in iter {
+                y = y.saturating_add(block.estimated_height.max(1));
+            }
+            break;
+        }
+    }
+
+    ViewportState {
+        first_visible: first.unwrap_or(0),
+        last_visible: last,
+        total_height: y,
+    }
+}
+
+/// Convert mapped GTK scroll geometry into a block range. Notebook/tab
+/// transitions temporarily expose zero-sized adjustments; retaining the last
+/// valid set avoids virtualizing every card during that transient frame.
+fn viewport_state_for_scroll(
+    block_data: &VecDeque<BlockData>,
+    scroll_top: f64,
+    viewport_height: f64,
+    margin_pages: u32,
+) -> Option<ViewportState> {
+    if !scroll_top.is_finite() || !viewport_height.is_finite() || viewport_height < 1.0 {
+        return None;
+    }
+    let scroll_top = scroll_top.max(0.0) as i32;
+    let viewport_height = viewport_height as i32;
+    if viewport_height <= 0 {
+        return None;
+    }
+    let margin_pages = i32::try_from(margin_pages).unwrap_or(i32::MAX);
+    let margin = viewport_height.saturating_mul(margin_pages);
+    let visible_top = scroll_top.saturating_sub(margin).max(0);
+    let visible_bottom = scroll_top
+        .saturating_add(viewport_height)
+        .saturating_add(margin);
+    (visible_bottom > visible_top)
+        .then(|| compute_viewport_state(block_data, visible_top, visible_bottom))
+}
+
+/// `changed` also fires when hiding a card changes only `upper`. Recompute on
+/// real page-size changes, not on the virtualization side effect itself.
+fn viewport_page_size_changed(last_page_size: &Cell<Option<f64>>, page_size: f64) -> bool {
+    if !page_size.is_finite() {
+        return false;
+    }
+    let changed = last_page_size
+        .get()
+        .is_none_or(|last| (last - page_size).abs() > 0.5);
+    if changed {
+        last_page_size.set(Some(page_size));
+    }
+    changed
+}
+
+fn visible_indices_for_viewport(vp: &ViewportState) -> HashSet<usize> {
+    (vp.first_visible..=vp.last_visible.min(vp.first_visible.saturating_add(1000))).collect()
+}
+
+/// Strict visibility plus one extra margin page for cards already rendered.
+/// This hysteresis prevents boundary cards from alternating visibility when a
+/// geometry shrink clamps the bottom-pinned scroll value on the next frame.
+fn stable_visible_indices(
+    strict: &ViewportState,
+    loose: Option<&ViewportState>,
+    current: &HashSet<usize>,
+) -> HashSet<usize> {
+    let mut next = visible_indices_for_viewport(strict);
+    if let Some(loose) = loose {
+        let keep = visible_indices_for_viewport(loose);
+        next.extend(current.iter().copied().filter(|index| keep.contains(index)));
+    }
+    next
+}
+
+fn apply_visible_indices(
+    finished: &[FinishedBlock],
+    block_data: &mut VecDeque<BlockData>,
+    visible: &mut HashSet<usize>,
+    new_visible: HashSet<usize>,
+) {
+    for (index, block) in finished.iter().enumerate() {
+        let should_render = new_visible.contains(&index);
+        let was_rendered = block.widget().is_visible();
+        // Capture real geometry before hiding as well as after showing. Font
+        // estimates otherwise drift enough for pixel→index mapping to move a
+        // still-visible boundary card outside the viewport.
+        if was_rendered {
+            let allocated = block.widget().height();
+            if allocated > 1 {
+                if let Some(data) = block_data.get_mut(index) {
+                    data.estimated_height = allocated;
+                }
+            }
+        }
+        if was_rendered != should_render {
+            block.widget().set_visible(should_render);
+        }
+        if should_render {
+            let allocated = block.widget().height();
+            if allocated > 1 {
+                if let Some(data) = block_data.get_mut(index) {
+                    data.estimated_height = allocated;
+                }
+            }
+        }
+    }
+    *visible = new_visible;
 }
 
 /// Hand the viewport to an alt-screen app: hide every finished block so the live
@@ -3561,9 +4506,22 @@ impl TermView {
         sticky_minimize_btn.add_css_class("flat");
         sticky_minimize_btn.set_focusable(false);
 
+        let sticky_stop_btn = gtk::Button::with_label("\u{f04d}");
+        sticky_stop_btn.set_tooltip_text(Some("Interrupt the running command (Ctrl+C)"));
+        sticky_stop_btn.add_css_class("sticky-header-control");
+        sticky_stop_btn.add_css_class("flat");
+        sticky_stop_btn.set_focusable(false);
+        sticky_stop_btn.set_visible(false);
+
+        let sticky_organism_slot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        sticky_organism_slot.set_can_target(false);
+        sticky_organism_slot.set_focusable(false);
+        sticky_organism_slot.set_visible(false);
         let sticky_bar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         sticky_bar.add_css_class("sticky-running-header");
+        sticky_bar.append(&sticky_organism_slot);
         sticky_bar.append(&sticky_label);
+        sticky_bar.append(&sticky_stop_btn);
         sticky_bar.append(&sticky_jump_bottom_btn);
         sticky_bar.append(&sticky_minimize_btn);
         sticky_bar.set_halign(gtk::Align::Fill);
@@ -3579,12 +4537,14 @@ impl TermView {
             let minimized = sticky_minimized.clone();
             let label = sticky_label.clone();
             let jump = sticky_jump_bottom_btn.clone();
+            let stop = sticky_stop_btn.clone();
             let bar = sticky_bar.clone();
             sticky_minimize_btn.connect_clicked(move |button| {
                 let now_minimized = !minimized.get();
                 minimized.set(now_minimized);
                 label.set_visible(!now_minimized);
                 jump.set_visible(false);
+                stop.set_visible(false);
                 if now_minimized {
                     bar.add_css_class("sticky-minimized");
                     button.set_label("\u{f078}");
@@ -3601,6 +4561,31 @@ impl TermView {
         scroll_overlay.set_child(Some(&block_scroll));
         scroll_overlay.add_overlay(&sticky_bar);
         scroll_overlay.add_overlay(&jump_fab);
+
+        // Streaming output would normally repaint away a live-VTE selection.
+        // Park the raw feed during that drag and explain the frozen surface only
+        // after the first chunk is actually deferred.
+        let selection_feed_hold = SelectionFeedHold::new();
+        {
+            let hold_badge = gtk::Label::new(Some("\u{f04c}  Output paused — selection"));
+            hold_badge.add_css_class("feed-hold-badge");
+            hold_badge.set_tooltip_text(Some(
+                "Streaming output is held so your selection survives. Copy it, click elsewhere, or wait a few seconds to resume.",
+            ));
+            hold_badge.set_halign(gtk::Align::Start);
+            hold_badge.set_valign(gtk::Align::End);
+            hold_badge.set_margin_start(14);
+            hold_badge.set_margin_bottom(14);
+            hold_badge.set_visible(false);
+            hold_badge.set_can_focus(false);
+            scroll_overlay.add_overlay(&hold_badge);
+            let badge = hold_badge.downgrade();
+            selection_feed_hold.set_state_listener(move |parked| {
+                if let Some(badge) = badge.upgrade() {
+                    badge.set_visible(parked);
+                }
+            });
+        }
         root.append(&scroll_overlay);
 
         let unread_count: Rc<Cell<u32>> = Rc::new(Cell::new(0));
@@ -3609,6 +4594,7 @@ impl TermView {
         let (argv_vec, session_applied) =
             crate::config::shell_argv_with_session(shell_argv, session_id);
         let argv: Vec<&str> = argv_vec.iter().map(|s| s.as_str()).collect();
+        let request_shell_token = shell_argv_supports_agent_ids(&argv_vec);
 
         // Git defaults LESS to "FRX" when the user has not set it. "F" quits
         // the pager when output fits on one screen, and "X" disables less'
@@ -3629,7 +4615,12 @@ impl TermView {
             }
         }
 
-        let pty = Rc::new(OwnedPty::spawn(&argv, cwd, &env_extra)?);
+        let pty = Rc::new(OwnedPty::spawn_with_shell_token(
+            &argv,
+            cwd,
+            &env_extra,
+            request_shell_token,
+        )?);
 
         // Store child PID on the live VTE so kill_all_terminal_children can find it
         unsafe {
@@ -3656,6 +4647,7 @@ impl TermView {
         // VTE cursor position (col, row) right after the prompt finished
         // drawing — anchor for the text-range read at CommandStart.
         let prompt_end_pos: Rc<Cell<(i64, i64)>> = Rc::new(Cell::new((0, 0)));
+        let prompt_anchor_ready: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
         // Scroll-lock flags shared across the contents_changed pin, value_changed
         // detector, FAB, and ScrollDebouncer. `user_scrolled_up` suppresses the
@@ -3740,18 +4732,26 @@ impl TermView {
         // the height is frozen at the idle value (no per-chunk resize / SIGWINCH
         // thrash); the full output is snapshotted into a finished block when done.
         let layout_active_surface: Rc<dyn Fn()> = {
-            let holder = active.borrow().widget().clone();
-            let vte = active_vte.clone();
-            let scroll = block_scroll.clone();
+            // This callback is retained by adjustment/VTE signals as well as
+            // TermView.  Keep every widget edge weak so closing a pane cannot
+            // form signal -> callback -> ancestor/terminal reference cycles.
+            let holder = active.borrow().widget().downgrade();
+            let vte = active_vte.downgrade();
+            let scroll = block_scroll.downgrade();
             let bstate = bstate.clone();
             let typed_cmd = typed_cmd.clone();
             let finished_for_layout = finished_blocks_rc.clone();
             let block_data_for_layout = block_data_rc.clone();
             let failure_marker_redraw_for_layout = failure_marker_redraw.clone();
-            let config_for_layout = config.clone();
             let last_size_target: Rc<Cell<(i64, i64)>> = Rc::new(Cell::new((0, 0)));
-            let last_output_layout: Rc<Cell<(i32, usize)>> = Rc::new(Cell::new((-1, 0)));
+            let last_output_layout: Rc<Cell<FinishedLayoutKey>> =
+                Rc::new(Cell::new((-1, -1, -1, 0)));
             Rc::new(move || {
+                let (Some(holder), Some(vte), Some(scroll)) =
+                    (holder.upgrade(), vte.upgrade(), scroll.upgrade())
+                else {
+                    return;
+                };
                 let cell_h = (vte.char_height() as i32).max(1);
                 let Some(viewport_rows) = viewport_rows_for(&vte, &scroll) else {
                     return;
@@ -3762,8 +4762,10 @@ impl TermView {
                         .saturating_mul(cell_h)
                         .saturating_add(css::BLOCK_ACTIVE_VCHROME_PX);
                     let available = page_height.saturating_sub(input_height).max(cell_h * 3);
+                    let page_width = scroll.hadjustment().page_size() as i32;
                     let block_count = finished_for_layout.borrow().len();
-                    let layout_key = (available, block_count);
+                    let layout_key =
+                        finished_layout_key(page_width, available, cell_h, block_count);
                     if last_output_layout.replace(layout_key) == layout_key {
                         return;
                     }
@@ -3774,14 +4776,13 @@ impl TermView {
                         failure_marker_redraw_for_layout.as_ref(),
                         |block_data| {
                             for block in finished.iter() {
-                                let Some(rows) = block.fit_output_to_height(available) else {
+                                let Some(height) = block.refit_output_to_geometry(available) else {
                                     continue;
                                 };
                                 if let Some(data) =
                                     block_data.iter_mut().find(|data| data.id == block.id)
                                 {
-                                    data.estimated_height =
-                                        estimated_finished_block_height(&config_for_layout, rows);
+                                    data.estimated_height = height;
                                 }
                             }
                         },
@@ -3846,6 +4847,7 @@ impl TermView {
         // Coalesces follow-bottom pins so a burst of contents-changed signals
         // schedules at most one deferred scroll.
         let pin_pending: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let contents_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
         {
             // Drive sizing from the data path (contents changed: prompt printed,
             // user typing, output streaming, alt-screen toggle), and follow the
@@ -3859,11 +4861,14 @@ impl TermView {
             // per content burst, AFTER layout settles (so `upper` is final), and is
             // never re-triggered by the visibility side-effects of its own scroll.
             let f = layout_active_surface.clone();
-            let scroll = block_scroll.clone();
+            let scroll = block_scroll.downgrade();
             let user_scrolled = user_scrolled_up.clone();
             let programmatic = programmatic_scroll.clone();
             let pin_pending = pin_pending.clone();
+            let contents_generation_for_signal = contents_generation.clone();
             active_vte.connect_contents_changed(move |_| {
+                contents_generation_for_signal
+                    .set(contents_generation_for_signal.get().wrapping_add(1));
                 f();
                 if user_scrolled.get() || pin_pending.get() {
                     return;
@@ -3878,6 +4883,9 @@ impl TermView {
                     if user_scrolled.get() {
                         return;
                     }
+                    let Some(scroll) = scroll.upgrade() else {
+                        return;
+                    };
                     let adj = scroll.vadjustment();
                     let target = (adj.upper() - adj.page_size()).max(adj.lower());
                     if (adj.value() - target).abs() > 1.0 {
@@ -3915,6 +4923,9 @@ impl TermView {
         }
         let title_callbacks: StrCallbacks = Rc::new(RefCell::new(vec![]));
         let activity_callbacks: VoidCallbacks = Rc::new(RefCell::new(vec![]));
+        let human_input_callbacks: HumanInputCallbacks = Rc::new(RefCell::new(vec![]));
+        let command_started_callbacks: CommandStartedCallbacks = Rc::new(RefCell::new(vec![]));
+        let command_finished_callbacks: CommandFinishedCallbacks = Rc::new(RefCell::new(vec![]));
         let block_finished_callbacks: BlockFinishedCallbacks = Rc::new(RefCell::new(vec![]));
         let ask_ai_about_block_callbacks: BlockContextCallbacks = Rc::new(RefCell::new(vec![]));
         let mouse_reporting_mode: Rc<Cell<MouseReportingMode>> =
@@ -3973,6 +4984,8 @@ impl TermView {
         // Metadata jsh attaches to the same marks (see ParserEvent::CommandStart).
         let shell_duration_ms: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
         let execution_id: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let execution_id_trusted: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let agent_completion_trusted: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let command_cwd: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
 
         let widget_pool: Rc<RefCell<WidgetPool>> = Rc::new(RefCell::new(WidgetPool::new()));
@@ -3994,6 +5007,30 @@ impl TermView {
         let agent_prompt_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
         let active_agent_execution: Rc<Cell<Option<crate::agent::AgentExecutionRef>>> =
             Rc::new(Cell::new(None));
+        let agent_execution_supported: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let agent_execution_lost_callbacks: AgentExecutionLostCallbacks =
+            Rc::new(RefCell::new(Vec::new()));
+        let reviewed_submission: Rc<RefCell<Option<ReviewedSubmission>>> =
+            Rc::new(RefCell::new(None));
+        let verified_submission_source_id: Rc<RefCell<Option<glib::SourceId>>> =
+            Rc::new(RefCell::new(None));
+        let verified_submission = VerifiedSubmissionCtx {
+            active_vte: active_vte.clone(),
+            bstate: bstate.clone(),
+            pty: pty.clone(),
+            typed_cmd: typed_cmd.clone(),
+            idle_input_dirty: idle_input_dirty.clone(),
+            pty_synced: pty_synced.clone(),
+            prompt_end_pos: prompt_end_pos.clone(),
+            prompt_anchor_ready: prompt_anchor_ready.clone(),
+            prompt_generation: agent_prompt_generation.clone(),
+            contents_generation: contents_generation.clone(),
+            submission: reviewed_submission,
+            source_id: verified_submission_source_id,
+            armed_agent_execution: armed_agent_execution.clone(),
+            agent_execution_supported: agent_execution_supported.clone(),
+            agent_execution_lost_callbacks,
+        };
         let block_start_time: Rc<Cell<Option<SystemTime>>> = Rc::new(Cell::new(None));
         let visible_indices: Rc<RefCell<std::collections::HashSet<usize>>> =
             Rc::new(RefCell::new(std::collections::HashSet::new()));
@@ -4111,12 +5148,15 @@ impl TermView {
                 idle_input_dirty_rc: idle_input_dirty.clone(),
                 vte_typed_cmd_rc,
                 prompt_end_pos_rc,
+                prompt_anchor_ready_rc: prompt_anchor_ready.clone(),
                 prompt_display_rc,
                 block_list_rc,
                 block_scroll_rc,
                 remote_session_cbs: remote_session_callbacks.clone(),
                 exited_cbs,
                 activity_cbs,
+                command_started_cbs: command_started_callbacks.clone(),
+                command_finished_cbs: command_finished_callbacks.clone(),
                 mouse_reporting_rc,
                 bracketed_paste_rc,
                 dynamic_colors_rc,
@@ -4137,6 +5177,8 @@ impl TermView {
                 pending_exit_code_rc,
                 shell_duration_ms_rc: shell_duration_ms.clone(),
                 execution_id_rc: execution_id.clone(),
+                execution_id_trusted_rc: execution_id_trusted.clone(),
+                agent_completion_trusted_rc: agent_completion_trusted.clone(),
                 command_cwd_rc: command_cwd.clone(),
                 current_cwd_for_cb,
                 event_buf,
@@ -4151,9 +5193,12 @@ impl TermView {
                 armed_agent_execution_rc: armed_agent_execution.clone(),
                 agent_prompt_generation_rc: agent_prompt_generation.clone(),
                 active_agent_execution_rc: active_agent_execution.clone(),
+                agent_execution_supported_rc: agent_execution_supported.clone(),
+                verified_submission: verified_submission.clone(),
                 layout_active_surface: layout_active_surface.clone(),
                 block_finished_cbs: block_finished_callbacks.clone(),
                 ask_ai_about_block_cbs: ask_ai_about_block_callbacks.clone(),
+                selection_feed_hold: selection_feed_hold.clone(),
             }
             .install(&pty)?;
 
@@ -4201,8 +5246,8 @@ impl TermView {
             let user_scrolled = user_scrolled_up.clone();
             let fab = jump_fab.clone();
             let unread = unread_count.clone();
-            let scroll = block_scroll.clone();
-            let holder = active.borrow().widget().clone();
+            let scroll = block_scroll.downgrade();
+            let holder = active.borrow().widget().downgrade();
             let programmatic_scroll = programmatic_scroll.clone();
             let check_pending = Rc::new(Cell::new(false));
             let pending_programmatic_only = Rc::new(Cell::new(true));
@@ -4235,6 +5280,10 @@ impl TermView {
                         if pending_programmatic_only.replace(true) {
                             return;
                         }
+                        let (Some(scroll), Some(holder)) = (scroll.upgrade(), holder.upgrade())
+                        else {
+                            return;
+                        };
                         let vp_h = scroll.height() as f64;
                         let at_bottom = holder
                             .compute_bounds(&scroll)
@@ -4271,6 +5320,21 @@ impl TermView {
                 }
             });
         }
+        // Width-only split changes leave the vertical page untouched but alter
+        // finished VTE wrapping, so they need the same geometry refit sweep.
+        {
+            let f = layout_active_surface.clone();
+            let last_page = Rc::new(Cell::new(0.0f64));
+            block_scroll
+                .hadjustment()
+                .connect_changed(move |adjustment| {
+                    let page = adjustment.page_size();
+                    if (page - last_page.get()).abs() > 0.5 {
+                        last_page.set(page);
+                        f();
+                    }
+                });
+        }
 
         // ── Jump-to-bottom FAB click: return to the live prompt ───────────
         {
@@ -4279,6 +5343,7 @@ impl TermView {
             let user_scrolled = user_scrolled_up.clone();
             let unread = unread_count.clone();
             let fab = jump_fab.clone();
+            let live_vte = active_vte.downgrade();
             jump_fab.connect_clicked(move |_| {
                 // Returning to the live prompt is not a single set_value: blocks
                 // below the viewport are virtualized to 0 height, so `upper` only
@@ -4288,6 +5353,14 @@ impl TermView {
                 user_scrolled.set(false);
                 unread.set(0);
                 fab.set_visible(false);
+                if let Some(adjustment) = live_vte
+                    .upgrade()
+                    .and_then(|terminal| terminal.vadjustment())
+                {
+                    adjustment.set_value(
+                        (adjustment.upper() - adjustment.page_size()).max(adjustment.lower()),
+                    );
+                }
                 let adj = scroll.vadjustment();
                 programmatic.set(true);
                 adj.set_value((adj.upper() - adj.page_size()).max(adj.lower()));
@@ -4324,10 +5397,22 @@ impl TermView {
         // Running commands keep their existing status header while the user reads
         // history. Finished oversized blocks pin their command when the original
         // header has scrolled above the viewport but the block still spans it.
+        {
+            let pty = pty.clone();
+            let human_input = human_input_callbacks.clone();
+            let selection_feed_hold = selection_feed_hold.clone();
+            sticky_stop_btn.connect_clicked(move |_| {
+                selection_feed_hold.flush_now();
+                pty.write_bytes(b"\x03");
+                emit_human_input(&human_input, HumanInputKind::StickyStop);
+            });
+        }
         let sticky_timer_id = {
             let sticky = sticky_bar.clone();
             let sticky_label = sticky_label.clone();
             let sticky_jump_bottom = sticky_jump_bottom_btn.clone();
+            let sticky_stop = sticky_stop_btn.clone();
+            let sticky_organism = sticky_organism_slot.clone();
             let sticky_target = sticky_target_id.clone();
             let sticky_minimized = sticky_minimized.clone();
             let cmd_running = cmd_running.clone();
@@ -4336,18 +5421,29 @@ impl TermView {
             let user_scrolled = user_scrolled_up.clone();
             let finished = finished_blocks_rc.clone();
             let scroll = block_scroll.clone();
+            let fullscreen = fullscreen.clone();
             glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
                 if sticky.parent().is_none() {
                     return glib::ControlFlow::Break;
                 }
 
                 let minimized = sticky_minimized.get();
+                if fullscreen.get() {
+                    sticky_target.set(None);
+                    sticky_jump_bottom.set_visible(false);
+                    sticky_stop.set_visible(false);
+                    sticky_organism.set_visible(false);
+                    sticky.set_visible(false);
+                    return glib::ControlFlow::Continue;
+                }
                 // At the live prompt there is no sticky header to compute. Avoid
                 // walking every finished block and querying GTK geometry on a
                 // permanent timer while the terminal is idle.
                 if !user_scrolled.get() {
                     sticky_target.set(None);
                     sticky_jump_bottom.set_visible(false);
+                    sticky_stop.set_visible(false);
+                    sticky_organism.set_visible(false);
                     sticky.set_visible(false);
                     return glib::ControlFlow::Continue;
                 }
@@ -4355,6 +5451,12 @@ impl TermView {
                 if cmd_running.get() {
                     sticky_target.set(None);
                     sticky_jump_bottom.set_visible(false);
+                    sticky_stop.set_visible(!minimized);
+                    sticky_organism.set_visible(
+                        sticky_organism
+                            .first_child()
+                            .is_some_and(|child| child.is_visible()),
+                    );
                     let cmd = running_cmd.borrow();
                     let cmd_disp =
                         crate::text_safety::bounded_display_text(cmd.trim(), 1024, false);
@@ -4363,7 +5465,9 @@ impl TermView {
                         .and_then(|st| SystemTime::now().duration_since(st).ok())
                         .map(|duration| duration.as_secs())
                         .unwrap_or(0);
-                    let elapsed_str = if elapsed >= 60 {
+                    let elapsed_str = if elapsed >= 3600 {
+                        format!("{}h{:02}m", elapsed / 3600, (elapsed % 3600) / 60)
+                    } else if elapsed >= 60 {
                         format!("{}m{:02}s", elapsed / 60, elapsed % 60)
                     } else {
                         format!("{}s", elapsed)
@@ -4397,6 +5501,8 @@ impl TermView {
 
                 if let Some((id, command, long_output)) = candidate {
                     sticky_target.set(Some(id));
+                    sticky_stop.set_visible(false);
+                    sticky_organism.set_visible(false);
                     let command = if command.is_empty() {
                         "Background output".to_string()
                     } else {
@@ -4409,6 +5515,8 @@ impl TermView {
                 } else {
                     sticky_target.set(None);
                     sticky_jump_bottom.set_visible(false);
+                    sticky_stop.set_visible(false);
+                    sticky_organism.set_visible(false);
                     sticky.set_visible(false);
                 }
                 glib::ControlFlow::Continue
@@ -4428,14 +5536,18 @@ impl TermView {
             let bstate_for_commit = bstate.clone();
             let typed_cmd_for_commit = typed_cmd.clone();
             let armed_agent_execution_for_commit = armed_agent_execution.clone();
+            let verified_submission_for_commit = verified_submission.clone();
             let idle_input_dirty_for_commit = idle_input_dirty.clone();
             let pty_synced_for_commit = pty_synced.clone();
             let finished_blocks_for_commit = finished_blocks_rc.clone();
             let selected_block_ids_for_commit = selected_block_ids.clone();
             let selected_block_id_for_commit = selected_block_id.clone();
             let selection_anchor_id_for_commit = selection_anchor_id.clone();
+            let human_input_for_commit = human_input_callbacks.clone();
             active_vte.connect_commit(move |_, text, _size| {
-                if armed_agent_execution_for_commit.borrow().is_some() {
+                if armed_agent_execution_for_commit.borrow().is_some()
+                    || verified_submission_for_commit.submission.borrow().is_some()
+                {
                     log::warn!("Ignoring VTE commit while an Agent command submission is pending");
                     return;
                 }
@@ -4453,6 +5565,7 @@ impl TermView {
                 }
 
                 pty_for_commit.write_bytes(text.as_bytes());
+                emit_human_input(&human_input_for_commit, HumanInputKind::Keyboard);
                 // The finished-block command text comes from a live-VTE
                 // text_range read at CommandStart (see PromptEnd / CommandStart
                 // handlers), so this shadow buffer is only used to size the
@@ -4496,6 +5609,8 @@ impl TermView {
         {
             let pty_for_root_key = pty.clone();
             let bstate_for_root_key = bstate.clone();
+            let hold_for_root_key = selection_feed_hold.clone();
+            let human_input_for_root_key = human_input_callbacks.clone();
             let root_key = gtk::EventControllerKey::new();
             root_key.set_propagation_phase(gtk::PropagationPhase::Capture);
             root_key.connect_key_pressed(move |_controller, keyval, _keycode, modifiers| {
@@ -4510,11 +5625,13 @@ impl TermView {
                 let ctrl = modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK);
                 let alt = modifiers.contains(gtk::gdk::ModifierType::ALT_MASK);
                 if ctrl && !alt && matches!(keyval, Key::c | Key::C) {
-                    pty_for_root_key.write_bytes(b"\x03");
+                    hold_for_root_key.flush_then(|| pty_for_root_key.write_bytes(b"\x03"));
+                    emit_human_input(&human_input_for_root_key, HumanInputKind::ProcessControl);
                     return glib::Propagation::Stop;
                 }
                 if ctrl && !alt && matches!(keyval, Key::d | Key::D) {
-                    pty_for_root_key.write_bytes(b"\x04");
+                    hold_for_root_key.flush_then(|| pty_for_root_key.write_bytes(b"\x04"));
+                    emit_human_input(&human_input_for_root_key, HumanInputKind::ProcessControl);
                     return glib::Propagation::Stop;
                 }
                 glib::Propagation::Proceed
@@ -4675,6 +5792,9 @@ impl TermView {
             let scroll_enabled = config.scroll_reporting_enabled;
             let pty_for_scroll = pty.clone();
             let pointer_for_scroll = pointer_cell.clone();
+            let bstate_for_scroll = bstate.clone();
+            let vte_for_scroll = active_vte.downgrade();
+            let outer_for_scroll = block_scroll.downgrade();
             let scroll_ctrl = gtk::EventControllerScroll::new(
                 gtk::EventControllerScrollFlags::VERTICAL
                     | gtk::EventControllerScrollFlags::HORIZONTAL,
@@ -4683,25 +5803,85 @@ impl TermView {
             scroll_ctrl.connect_scroll(move |_, _dx, dy| {
                 let in_mouse_app = fullscreen_for_scroll.get()
                     && mouse_mode_for_scroll.get() != MouseReportingMode::None;
-                if !in_mouse_app {
-                    return glib::Propagation::Proceed;
-                }
-                if !scroll_enabled {
+                if in_mouse_app {
+                    if !scroll_enabled {
+                        return glib::Propagation::Stop;
+                    }
+                    let (col, row) = pointer_for_scroll.get();
+                    if let Some(bytes) =
+                        encode_mouse_wheel(mouse_mode_for_scroll.get(), dy, col, row)
+                    {
+                        pty_for_scroll.write_bytes(&bytes);
+                    }
                     return glib::Propagation::Stop;
                 }
-                let (col, row) = pointer_for_scroll.get();
-                if let Some(bytes) = encode_mouse_wheel(mouse_mode_for_scroll.get(), dy, col, row) {
-                    pty_for_scroll.write_bytes(&bytes);
+                // Alt-screen programs without mouse reporting use VTE's native
+                // wheel-to-arrow fallback.
+                if bstate_for_scroll.get() == BlockState::AltScreen {
+                    return glib::Propagation::Proceed;
                 }
+                // The still-running VTE is a first-class scroll surface. Hand
+                // wheel motion to history only once its own buffer reaches an
+                // edge, and never let idle VTE fallback swallow the event.
+                if matches!(
+                    bstate_for_scroll.get(),
+                    BlockState::CollectingOutput
+                        | BlockState::PostCommand
+                        | BlockState::RawFallback
+                ) {
+                    if let Some(adjustment) = vte_for_scroll
+                        .upgrade()
+                        .and_then(|terminal| terminal.vadjustment())
+                    {
+                        if scroll_adjustment_by_wheel(&adjustment, dy) {
+                            return glib::Propagation::Stop;
+                        }
+                    }
+                }
+                let Some(outer) = outer_for_scroll.upgrade() else {
+                    return glib::Propagation::Proceed;
+                };
+                forward_outer_scroll(&outer, dy);
                 glib::Propagation::Stop
             });
             active_vte.add_controller(scroll_ctrl);
+
+            // The overlay scrollbar follows the same live-buffer → history
+            // handoff instead of becoming a dead wheel target at its edges.
+            let live_scrollbar = active.borrow().live_scrollbar.clone();
+            let scrollbar_scroll =
+                gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+            scrollbar_scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
+            let vte_for_scrollbar = active_vte.downgrade();
+            let outer_for_scrollbar = block_scroll.downgrade();
+            scrollbar_scroll.connect_scroll(move |_, _dx, dy| {
+                if let Some(adjustment) = vte_for_scrollbar
+                    .upgrade()
+                    .and_then(|terminal| terminal.vadjustment())
+                {
+                    if scroll_adjustment_by_wheel(&adjustment, dy) {
+                        return glib::Propagation::Stop;
+                    }
+                }
+                let Some(outer) = outer_for_scrollbar.upgrade() else {
+                    return glib::Propagation::Proceed;
+                };
+                forward_outer_scroll(&outer, dy);
+                glib::Propagation::Stop
+            });
+            live_scrollbar.add_controller(scrollbar_scroll);
         }
 
         let cross_selection = CrossSelection::install(
             &block_scroll,
             finished_blocks_rc.clone(),
             active_vte.clone(),
+            selected_block_ids.clone(),
+            selected_block_id.clone(),
+            selection_anchor_id.clone(),
+            selection_feed_hold.clone(),
+            bstate.clone(),
+            mouse_reporting_mode.clone(),
         );
 
         let term_view = TermView {
@@ -4713,8 +5893,13 @@ impl TermView {
             bstate,
             prompt_buf,
             typed_cmd,
+            prompt_end_pos,
+            prompt_anchor_ready,
             armed_agent_execution,
             agent_prompt_generation,
+            agent_execution_supported,
+            verified_submission,
+            active_agent_execution,
             idle_input_dirty: idle_input_dirty.clone(),
             fullscreen,
             user_scrolled_up: user_scrolled_up.clone(),
@@ -4728,6 +5913,9 @@ impl TermView {
             bell_callbacks,
             title_callbacks,
             activity_callbacks,
+            human_input_callbacks,
+            command_started_callbacks,
+            command_finished_callbacks,
             block_finished_callbacks,
             ask_ai_about_block_callbacks,
             mouse_reporting_mode,
@@ -4751,11 +5939,14 @@ impl TermView {
             cleared_stash: RefCell::new(Vec::new()),
             unread_count,
             jump_fab,
+            sticky_organism_slot,
             find_state: Rc::new(RefCell::new(FindState::default())),
             current_cwd: current_cwd.clone(),
             resize_tick_id: RefCell::new(None),
             sticky_timer_id: RefCell::new(Some(sticky_timer_id)),
             cross_selection,
+            selection_feed_hold,
+            layout_active_surface,
         };
 
         // Load history if configured
@@ -4841,90 +6032,96 @@ impl TermView {
         // Wire virtual scrolling: connect scroll signals
         {
             let viewport = term_view.viewport.clone();
-            let block_scroll = term_view.block_scroll.clone();
+            let block_scroll = term_view.block_scroll.downgrade();
             let block_data = term_view.block_data.clone();
             let config = term_view.config.clone();
-            let finished_blocks = term_view.finished_blocks.clone();
+            let finished_blocks = Rc::downgrade(&term_view.finished_blocks);
             let visible_indices = term_view.visible_indices.clone();
             let fullscreen = term_view.fullscreen.clone();
+            let failure_marker_redraw = term_view.failure_marker_redraw.clone();
             let visibility_update_pending = Rc::new(Cell::new(false));
+            let last_page_size = Rc::new(Cell::new(None::<f64>));
 
-            let vadjust = block_scroll.vadjustment();
-            vadjust.connect_changed(move |_| {
-                if fullscreen.get() {
+            let schedule_visibility_update: Rc<dyn Fn()> = Rc::new(move || {
+                let Some(scroll) = block_scroll.upgrade() else {
+                    return;
+                };
+                if fullscreen.get()
+                    || !scroll.is_mapped()
+                    || visibility_update_pending.replace(true)
+                {
                     return;
                 }
-                // Update viewport on scroll change
-                let adj = block_scroll.vadjustment();
-                let scroll_top = adj.value() as i32;
-                let viewport_height = adj.page_size() as i32;
-                let margin = (config.borrow().virtual_scroll_margin as i32) * viewport_height;
-
-                let visible_top = (scroll_top - margin).max(0);
-                let visible_bottom = scroll_top + viewport_height + margin;
-
-                let block_data_ref = block_data.borrow();
-                let mut y = 0;
-                let mut first = None;
-                let mut last = 0;
-
-                for (i, block) in block_data_ref.iter().enumerate() {
-                    if first.is_none() && y + block.estimated_height > visible_top {
-                        first = Some(i);
-                    }
-                    if y < visible_bottom {
-                        last = i;
-                    }
-                    y += block.estimated_height;
-                }
-
-                let mut vp = viewport.borrow_mut();
-                vp.first_visible = first.unwrap_or(0);
-                vp.last_visible = last;
-                vp.total_height = y;
-                drop(vp);
-
-                // Scroll adjustments can fire many times before GTK reaches
-                // idle. The viewport above always holds the newest values, so
-                // one pending realization pass is sufficient.
-                if visibility_update_pending.replace(true) {
+                let Some(finished) = finished_blocks.upgrade() else {
+                    visibility_update_pending.set(false);
                     return;
-                }
+                };
 
-                // Schedule visibility update on next idle
-                let vp = viewport.clone();
-                let finished = finished_blocks.clone();
+                let viewport = viewport.clone();
+                let block_data = block_data.clone();
+                let config = config.clone();
                 let visible = visible_indices.clone();
                 let fullscreen = fullscreen.clone();
                 let pending = visibility_update_pending.clone();
+                let failure_marker_redraw = failure_marker_redraw.clone();
                 glib::idle_add_local_once(move || {
                     pending.set(false);
-                    if fullscreen.get() {
+                    if fullscreen.get() || !scroll.is_mapped() {
                         return;
                     }
-                    let vp_ref = vp.borrow();
-                    let mut new_visible = std::collections::HashSet::new();
+                    let adjustment = scroll.vadjustment();
+                    let margin = config.borrow().virtual_scroll_margin;
+                    let block_data_ref = block_data.borrow();
+                    let Some(strict) = viewport_state_for_scroll(
+                        &block_data_ref,
+                        adjustment.value(),
+                        adjustment.page_size(),
+                        margin,
+                    ) else {
+                        return;
+                    };
+                    let loose = viewport_state_for_scroll(
+                        &block_data_ref,
+                        adjustment.value(),
+                        adjustment.page_size(),
+                        margin.saturating_add(1),
+                    );
+                    drop(block_data_ref);
 
-                    for i in
-                        vp_ref.first_visible..=vp_ref.last_visible.min(vp_ref.first_visible + 1000)
-                    {
-                        new_visible.insert(i);
-                    }
+                    let new_visible =
+                        stable_visible_indices(&strict, loose.as_ref(), &visible.borrow());
+                    *viewport.borrow_mut() = strict;
 
                     let finished_ref = finished.borrow();
+                    let mut block_data_ref = block_data.borrow_mut();
                     let mut visible_ref = visible.borrow_mut();
-
-                    for (i, block) in finished_ref.iter().enumerate() {
-                        if new_visible.contains(&i) && !visible_ref.contains(&i) {
-                            block.widget().set_visible(true);
-                        } else if !new_visible.contains(&i) && visible_ref.contains(&i) {
-                            block.widget().set_visible(false);
-                        }
-                    }
-
-                    *visible_ref = new_visible;
+                    apply_visible_indices(
+                        &finished_ref,
+                        &mut block_data_ref,
+                        &mut visible_ref,
+                        new_visible,
+                    );
+                    failure_marker_redraw();
                 });
             });
+
+            let adjustment = term_view.block_scroll.vadjustment();
+            {
+                let schedule = schedule_visibility_update.clone();
+                let last_page_size = last_page_size.clone();
+                adjustment.connect_changed(move |adjustment| {
+                    if viewport_page_size_changed(&last_page_size, adjustment.page_size()) {
+                        schedule();
+                    }
+                });
+            }
+            {
+                let schedule = schedule_visibility_update.clone();
+                adjustment.connect_value_changed(move |_| schedule());
+            }
+            term_view
+                .block_scroll
+                .connect_map(move |_| schedule_visibility_update());
         }
 
         // ── Resize handler: sync PTY cols/rows when widget allocation changes ──
@@ -4953,6 +6150,73 @@ impl TermView {
     /// Root GTK widget to embed in the notebook page.
     pub fn widget(&self) -> gtk::Widget {
         self.root.clone().upcast()
+    }
+
+    /// Attach a pass-through body to the live VTE overlay. Repeating this for
+    /// the same body acts as a move; widgets owned elsewhere are rejected.
+    pub(crate) fn put_live_organism_body(&self, body: &gtk::Widget, x: f64, y: f64) -> bool {
+        if !x.is_finite() || !y.is_finite() {
+            return false;
+        }
+        let surface = self.active.borrow().live_organism_surface.clone();
+        let surface_widget: gtk::Widget = surface.clone().upcast();
+        match body.parent() {
+            None => surface.put(body, x, y),
+            Some(parent) if parent == surface_widget => surface.move_(body, x, y),
+            Some(_) => return false,
+        }
+        true
+    }
+
+    pub(crate) fn move_live_organism_body(&self, body: &gtk::Widget, x: f64, y: f64) -> bool {
+        if !x.is_finite() || !y.is_finite() {
+            return false;
+        }
+        let surface = self.active.borrow().live_organism_surface.clone();
+        let surface_widget: gtk::Widget = surface.clone().upcast();
+        if body.parent().as_ref() != Some(&surface_widget) {
+            return false;
+        }
+        surface.move_(body, x, y);
+        true
+    }
+
+    pub(crate) fn set_live_organism_visible(&self, visible: bool) {
+        self.active.borrow().set_live_organism_visible(visible);
+    }
+
+    pub(crate) fn live_organism_surface_metrics(&self) -> LiveOrganismSurfaceMetrics {
+        let active = self.active.borrow();
+        LiveOrganismSurfaceMetrics {
+            // The hidden surface may not be allocated yet. The always-mapped
+            // VTE is its measured child and shares the same clipped space.
+            width: active.active_vte.width().max(0),
+            height: active.active_vte.height().max(0),
+            cell_width: (active.active_vte.char_width() as i32).max(1),
+            cell_height: (active.active_vte.char_height() as i32).max(1),
+            right_gutter: LIVE_ORGANISM_RIGHT_GUTTER,
+            alt_screen: active.live_organism_alt_screen(),
+            cursor_row: {
+                let (_, cursor_row) = active.active_vte.cursor_position();
+                let top_row = gtk::prelude::ScrollableExt::vadjustment(&active.active_vte)
+                    .map(|adjustment| adjustment.value().floor() as i64)
+                    .unwrap_or(0);
+                let visible_rows = active.active_vte.row_count().max(1);
+                cursor_row
+                    .saturating_sub(top_row)
+                    .clamp(0, visible_rows.saturating_sub(1)) as i32
+            },
+        }
+    }
+
+    pub(crate) fn put_sticky_organism_avatar(&self, avatar: &gtk::Widget) -> bool {
+        let slot_widget: gtk::Widget = self.sticky_organism_slot.clone().upcast();
+        match avatar.parent() {
+            None => self.sticky_organism_slot.append(avatar),
+            Some(parent) if parent == slot_widget => {}
+            Some(_) => return false,
+        }
+        true
     }
 
     /// Insert a transient card directly above the live prompt. Agent UI is
@@ -5000,10 +6264,13 @@ impl TermView {
         // refuse later prompt input until its CommandStart consumes the arm.
         // Clearing the identity while still queueing bytes would allow a user
         // action to merge into the reviewed command before the shell sees CR.
-        if self.armed_agent_execution.borrow().is_some() {
-            log::warn!("Ignoring terminal input while an Agent command submission is pending");
+        if self.armed_agent_execution.borrow().is_some()
+            || self.verified_submission.submission.borrow().is_some()
+        {
+            log::warn!("Ignoring terminal input while a reviewed command submission is pending");
             return;
         }
+        self.selection_feed_hold.flush_now();
         self.write_input_bytes(data);
     }
 
@@ -5023,17 +6290,48 @@ impl TermView {
     /// diagnostic status is shared by the inline Agent card and execution
     /// boundary so the UI never advertises a weaker condition than the write.
     pub(crate) fn command_prompt_status(&self) -> CommandPromptStatus {
-        classify_command_prompt_status(
+        let status = classify_command_prompt_status(
             self.bstate.get(),
             self.fullscreen.get(),
             self.idle_input_dirty.get(),
             self.pty_synced.get(),
             self.typed_cmd.borrow().trim().is_empty(),
-        )
+        );
+        if status != CommandPromptStatus::Ready {
+            return status;
+        }
+        if !self.prompt_anchor_ready.get() {
+            return CommandPromptStatus::Initializing;
+        }
+        match self.pty.shell_is_foreground() {
+            Some(false) => CommandPromptStatus::Running,
+            None => CommandPromptStatus::ShellIntegrationUnavailable,
+            Some(true) => {
+                if self.active_vte.cursor_position() == self.prompt_end_pos.get()
+                    && crate::terminal::click_cursor::verified_suffix_is_empty(&self.active_vte)
+                        == Some(true)
+                {
+                    CommandPromptStatus::Ready
+                } else {
+                    CommandPromptStatus::HasInput
+                }
+            }
+        }
     }
 
     pub fn can_accept_agent_command(&self) -> bool {
-        self.command_prompt_status().is_ready() && self.armed_agent_execution.borrow().is_none()
+        self.agent_execution_supported.get()
+            && self.command_prompt_status().is_ready()
+            && self.armed_agent_execution.borrow().is_none()
+            && self.verified_submission.submission.borrow().is_none()
+    }
+
+    pub(crate) fn agent_command_prompt_status(&self) -> CommandPromptStatus {
+        if self.agent_execution_supported.get() {
+            self.command_prompt_status()
+        } else {
+            CommandPromptStatus::ShellIntegrationUnavailable
+        }
     }
 
     /// Put an Agent proposal at the prompt for ordinary manual review without
@@ -5041,7 +6339,10 @@ impl TermView {
     /// the GTK thread so the readiness check and write cannot be interleaved
     /// with another application action.
     pub fn try_insert_agent_command(&self, command: &str) -> bool {
-        if !agent_command_is_safe(command) || !self.can_accept_agent_command() {
+        if !agent_command_is_safe(command)
+            || !self.command_prompt_status().is_ready()
+            || self.verified_submission.submission.borrow().is_some()
+        {
             return false;
         }
         self.write_input(command.as_bytes());
@@ -5053,21 +6354,13 @@ impl TermView {
     /// terminating carriage return are admitted as one UI-thread operation so
     /// another input path cannot alter the reviewed text in between.
     pub fn try_run_review_command(&self, command: &str) -> bool {
-        if !agent_command_is_safe(command) || !self.can_accept_agent_command() {
+        if !agent_command_is_safe(command) {
             return false;
         }
-        let mut bytes = command.as_bytes().to_vec();
-        bytes.push(b'\r');
-        match self.pty.try_write_bytes(&bytes) {
-            Ok(()) => {
-                append_typed_command_shadow(&mut self.typed_cmd.borrow_mut(), command);
-                true
-            }
+        match self.verified_submission.begin(command, None) {
+            Ok(()) => true,
             Err(error) => {
-                log::warn!(
-                    "Verified review command was not queued to the PTY ({} bytes): {error}",
-                    error.len()
-                );
+                log::warn!("Could not begin verified review command: {error}");
                 false
             }
         }
@@ -5087,23 +6380,10 @@ impl TermView {
         {
             return false;
         }
-        *self.armed_agent_execution.borrow_mut() = Some(ArmedAgentExecution {
-            execution,
-            prompt_generation: self.agent_prompt_generation.get(),
-        });
-        let mut bytes = command.as_bytes().to_vec();
-        bytes.push(b'\r');
-        match self.pty.try_write_bytes(&bytes) {
-            Ok(()) => {
-                append_typed_command_shadow(&mut self.typed_cmd.borrow_mut(), command);
-                true
-            }
+        match self.verified_submission.begin(command, Some(execution)) {
+            Ok(()) => true,
             Err(error) => {
-                self.armed_agent_execution.borrow_mut().take();
-                log::warn!(
-                    "Agent command was not queued to the PTY ({} bytes): {error}",
-                    error.len()
-                );
+                log::warn!("Could not begin verified Agent command: {error}");
                 false
             }
         }
@@ -5188,6 +6468,7 @@ impl TermView {
                         text.len()
                     );
                     self.active_vte.clipboard().set_text(&text);
+                    self.selection_feed_hold.flush_now();
                     return;
                 }
             }
@@ -5197,14 +6478,25 @@ impl TermView {
         // user dragged across block boundaries, see cross_selection.rs), copy
         // the concatenated text in widget order instead of just one widget's.
         if self.cross_selection.has_cross_selection() {
-            if let Some(text) = self.cross_selection.copy_text() {
-                log::debug!(
-                    ">>> TermView copy: got {} chars from cross-block selection",
-                    text.len()
-                );
-                self.active_vte.clipboard().set_text(&text);
-                return;
+            match self.cross_selection.copy_text() {
+                Some(text) => {
+                    log::debug!(
+                        ">>> TermView copy: got {} chars from cross-block selection",
+                        text.len()
+                    );
+                    self.active_vte.clipboard().set_text(&text);
+                }
+                None => {
+                    // Aggregation is deliberately atomic. Falling through to a
+                    // single VTE here would silently copy only part of an
+                    // oversized cross-surface selection.
+                    log::warn!(
+                        "Cross-block selection exceeds the clipboard safety limit; copied nothing"
+                    );
+                }
             }
+            self.selection_feed_hold.flush_now();
+            return;
         }
 
         // (1) Live VTE selection
@@ -5212,6 +6504,7 @@ impl TermView {
             if !text.is_empty() {
                 log::debug!(">>> TermView copy: got {} chars from VTE", text.len());
                 self.active_vte.clipboard().set_text(&text);
+                self.selection_feed_hold.flush_now();
                 return;
             }
         }
@@ -5229,6 +6522,7 @@ impl TermView {
                             s.len()
                         );
                         self.active_vte.clipboard().set_text(&s);
+                        self.selection_feed_hold.flush_now();
                         return;
                     }
                 }
@@ -5258,20 +6552,25 @@ impl TermView {
     /// removes paste markers from the body unconditionally and returns the whole
     /// payload as one buffer, so there is no longer a body write to attack.
     pub fn paste_from_clipboard(&self) {
+        self.selection_feed_hold.flush_now();
         let clipboard = self.active_vte.clipboard();
         let pty = self.pty.clone();
         let bracketed_paste = self.bracketed_paste.clone();
         let bstate = self.bstate.clone();
         let typed_cmd = self.typed_cmd.clone();
         let armed_agent_execution = self.armed_agent_execution.clone();
+        let reviewed_submission = self.verified_submission.submission.clone();
         let pty_synced = self.pty_synced.clone();
         let idle_input_dirty = self.idle_input_dirty.clone();
+        let human_input = self.human_input_callbacks.clone();
         clipboard.read_text_async(None::<&gtk::gio::Cancellable>, move |result| {
             let Ok(Some(text)) = result else {
                 return;
             };
-            if armed_agent_execution.borrow().is_some() {
-                log::warn!("Ignoring paste while an Agent command submission is pending");
+            if armed_agent_execution.borrow().is_some()
+                || reviewed_submission.borrow().is_some()
+            {
+                log::warn!("Ignoring paste while a reviewed command submission is pending");
                 return;
             }
             let paste = build_clipboard_paste(text.as_str(), bracketed_paste.get());
@@ -5284,6 +6583,7 @@ impl TermView {
                 );
             }
             pty.write_bytes(&paste.bytes);
+            emit_human_input(&human_input, HumanInputKind::Clipboard);
             // Mirror what the child actually received into the editor shadow, or
             // the live input cell keeps the height of a command the shell no
             // longer has and the next history recall appends to a line it thinks
@@ -5320,6 +6620,45 @@ impl TermView {
 
     pub fn connect_activity<F: Fn() + 'static>(&self, f: F) {
         self.activity_callbacks.borrow_mut().push(Box::new(f));
+    }
+
+    /// Observe accepted direct-human PTY input without exposing its contents.
+    pub(crate) fn connect_human_input<F: Fn(HumanInputKind) + 'static>(&self, f: F) {
+        self.human_input_callbacks.borrow_mut().push(Box::new(f));
+    }
+
+    pub(crate) fn connect_command_started<F>(&self, f: F)
+    where
+        F: Fn(CommandStartedEvent) + 'static,
+    {
+        self.command_started_callbacks
+            .borrow_mut()
+            .push(Box::new(f));
+    }
+
+    pub(crate) fn connect_command_finished<F>(&self, f: F)
+    where
+        F: Fn(CommandFinishedEvent) + 'static,
+    {
+        self.command_finished_callbacks
+            .borrow_mut()
+            .push(Box::new(f));
+    }
+
+    /// Whether an identity-verified Agent command currently owns this block.
+    /// Only the fact crosses into the organism; no proposal or command text.
+    pub(crate) fn agent_command_active(&self) -> bool {
+        self.active_agent_execution.get().is_some()
+    }
+
+    pub(crate) fn connect_agent_execution_lost<F>(&self, f: F)
+    where
+        F: Fn(crate::agent::AgentExecutionRef, &'static str) + 'static,
+    {
+        self.verified_submission
+            .agent_execution_lost_callbacks
+            .borrow_mut()
+            .push(Box::new(f));
     }
 
     pub fn connect_block_finished<F>(&self, f: F)
@@ -5690,6 +7029,9 @@ impl TermView {
         // Update config and regenerate CSS with new font
         self.config.borrow_mut().font_desc = font_desc.to_string();
         install_block_css(&self.config.borrow());
+        (self.layout_active_surface)();
+        let refit = self.layout_active_surface.clone();
+        glib::idle_add_local_once(move || refit());
     }
 
     /// Update font scale for VTE terminal and block view CSS.
@@ -5702,62 +7044,54 @@ impl TermView {
         self.config.borrow_mut().default_font_scale = scale;
         // Regenerate CSS with updated font scale
         install_block_css(&self.config.borrow());
+        (self.layout_active_surface)();
+        let refit = self.layout_active_surface.clone();
+        glib::idle_add_local_once(move || refit());
     }
 
     /// Update virtual scrolling viewport state based on scroll position.
     pub fn update_viewport(&self) {
-        let adj = self.block_scroll.vadjustment();
-        let scroll_top = adj.value() as i32;
-        let viewport_height = adj.page_size() as i32;
-        let margin = (self.config.borrow().virtual_scroll_margin as i32) * viewport_height;
-
-        let visible_top = (scroll_top - margin).max(0);
-        let visible_bottom = scroll_top + viewport_height + margin;
-
+        let adjustment = self.block_scroll.vadjustment();
         let block_data = self.block_data.borrow();
-        let mut y = 0;
-        let mut first = None;
-        let mut last = 0;
-
-        for (i, block) in block_data.iter().enumerate() {
-            if first.is_none() && y + block.estimated_height > visible_top {
-                first = Some(i);
-            }
-            if y < visible_bottom {
-                last = i;
-            }
-            y += block.estimated_height;
-        }
-
-        let mut vp = self.viewport.borrow_mut();
-        vp.first_visible = first.unwrap_or(0);
-        vp.last_visible = last;
-        vp.total_height = y;
+        let Some(viewport) = viewport_state_for_scroll(
+            &block_data,
+            adjustment.value(),
+            adjustment.page_size(),
+            self.config.borrow().virtual_scroll_margin,
+        ) else {
+            return;
+        };
+        *self.viewport.borrow_mut() = viewport;
     }
 
     /// Update block visibility based on viewport: show visible blocks, hide off-screen ones.
     pub fn update_block_visibility(&self) {
-        let vp = self.viewport.borrow().clone();
-        let mut new_visible = std::collections::HashSet::new();
-
-        // Only show blocks in the visible range
-        for i in vp.first_visible..=vp.last_visible.min(vp.first_visible + 1000) {
-            new_visible.insert(i);
-        }
-
+        let adjustment = self.block_scroll.vadjustment();
+        let margin = self.config.borrow().virtual_scroll_margin;
+        let block_data = self.block_data.borrow();
+        let Some(strict) = viewport_state_for_scroll(
+            &block_data,
+            adjustment.value(),
+            adjustment.page_size(),
+            margin,
+        ) else {
+            return;
+        };
+        let loose = viewport_state_for_scroll(
+            &block_data,
+            adjustment.value(),
+            adjustment.page_size(),
+            margin.saturating_add(1),
+        );
+        drop(block_data);
+        let new_visible =
+            stable_visible_indices(&strict, loose.as_ref(), &self.visible_indices.borrow());
+        *self.viewport.borrow_mut() = strict;
         let finished = self.finished_blocks.borrow();
+        let mut block_data = self.block_data.borrow_mut();
         let mut visible = self.visible_indices.borrow_mut();
-
-        // Update visibility: hide blocks not in new_visible, show blocks in new_visible
-        for (i, block) in finished.iter().enumerate() {
-            if new_visible.contains(&i) && !visible.contains(&i) {
-                block.widget().set_visible(true);
-            } else if !new_visible.contains(&i) && visible.contains(&i) {
-                block.widget().set_visible(false);
-            }
-        }
-
-        *visible = new_visible;
+        apply_visible_indices(&finished, &mut block_data, &mut visible, new_visible);
+        (self.failure_marker_redraw)();
     }
 
     /// Grid size (cols, rows) of the live VTE, for the bottom bar's grid
@@ -5989,19 +7323,24 @@ impl TermView {
 mod tests {
     use super::{
         agent_command_is_safe, agent_prompt_boundary_is_trusted, append_bounded_section,
-        append_bounded_text_tail, append_typed_command_shadow, background_output_has_visible_text,
-        block_clipboard_text, block_duration_ms, build_clipboard_paste, build_color_query_reply,
-        build_command_recall, build_keyboard_query_reply, classify_command_prompt_status,
-        clear_dynamic_colors, coalesce_bytes_events, command_end_matches_agent_execution,
-        command_end_matches_started_id, failed_block_marker_fractions, finished_block_config,
-        finished_command, is_post_command_metadata, mutate_block_data_and_redraw,
-        notification_permitted, parse_color_spec, pop_typed_command_shadow, record_external_input,
-        resolve_command_text, selected_blocks_markdown, selected_command_text, selected_id_range,
-        step_marked_indices, stranded_focus_key_recovers, strip_ansi, strip_ansi_with_clear_detect,
-        take_armed_agent_execution, take_background_output, ArmedAgentExecution, BlockData,
-        BlockState, CommandPromptStatus, CommandTextSource, DynamicColors, DynamicColorsRc,
-        MAX_RECALLED_COMMAND_BYTES, MAX_TYPED_COMMAND_SHADOW_BYTES, NOTIFICATION_MIN_INTERVAL,
-        TRUNCATED_COMMAND_PLACEHOLDER,
+        append_bounded_text_tail, append_typed_command_shadow, approved_command_submission_payload,
+        background_output_has_visible_text, block_clipboard_text, block_duration_ms,
+        build_clipboard_paste, build_color_query_reply, build_command_recall,
+        build_keyboard_query_reply, classify_command_prompt_status, clear_dynamic_colors,
+        coalesce_bytes_events, command_end_matches_started_id, command_id_uses_shell_token,
+        decide_agent_command_end, failed_block_marker_fractions, finished_block_config,
+        finished_command, finished_layout_key, is_post_command_metadata,
+        mutate_block_data_and_redraw, normalize_captured_command, notification_permitted,
+        parse_color_spec, pop_typed_command_shadow, record_external_input, resolve_command_text,
+        reviewed_pre_command_bytes_are_identity_neutral, reviewed_submission_matches,
+        selected_blocks_markdown, selected_command_text, selected_id_range,
+        shell_argv_supports_agent_ids, stable_visible_indices, step_marked_indices,
+        stranded_focus_key_recovers, strip_ansi, strip_ansi_with_clear_detect,
+        take_armed_agent_execution, take_background_output, viewport_page_size_changed,
+        viewport_state_for_scroll, visible_indices_for_viewport, AgentCommandEndDecision,
+        ArmedAgentExecution, BlockData, BlockState, CommandPromptStatus, CommandTextSource,
+        DynamicColors, DynamicColorsRc, ShellCapabilityObserver, MAX_RECALLED_COMMAND_BYTES,
+        MAX_TYPED_COMMAND_SHADOW_BYTES, NOTIFICATION_MIN_INTERVAL, TRUNCATED_COMMAND_PLACEHOLDER,
     };
     use crate::agent::{AgentExecutionRef, AgentSession};
     use crate::config::Config;
@@ -6010,6 +7349,165 @@ mod tests {
     use std::collections::{HashSet, VecDeque};
     use std::rc::Rc;
     use std::time::{Instant, SystemTime};
+
+    #[test]
+    fn private_command_ids_require_the_exact_token_and_decimal_sequence() {
+        let token = "0123456789abcdef0123456789abcdef";
+        assert!(command_id_uses_shell_token(
+            "0123456789abcdef0123456789abcdef-17",
+            token
+        ));
+        assert!(!command_id_uses_shell_token(token, token));
+        assert!(!command_id_uses_shell_token(
+            "0123456789abcdef0123456789abcdef-other",
+            token
+        ));
+        assert!(!command_id_uses_shell_token("anvil-bash-1-17", token));
+    }
+
+    #[test]
+    fn agent_token_request_is_limited_to_direct_interactive_bash_and_zsh() {
+        let strings = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(shell_argv_supports_agent_ids(&strings(&["bash", "-l"])));
+        assert!(shell_argv_supports_agent_ids(&strings(&["/bin/zsh", "-i"])));
+        assert!(!shell_argv_supports_agent_ids(&strings(&[
+            "bash", "-lc", "true"
+        ])));
+        assert!(!shell_argv_supports_agent_ids(&strings(&[
+            "zsh",
+            "--command",
+            "true"
+        ])));
+        assert!(!shell_argv_supports_agent_ids(&strings(&["fish"])));
+        assert!(!shell_argv_supports_agent_ids(&strings(&[
+            "ssh", "host", "bash"
+        ])));
+        assert!(!shell_argv_supports_agent_ids(&strings(&[
+            "bash",
+            "/usr/bin/jsh"
+        ])));
+    }
+
+    #[test]
+    fn capability_observer_is_strict_hidden_streaming_and_prompt_scoped() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let ready = Cell::new(false);
+        let mut observer = ShellCapabilityObserver::default();
+
+        observer.feed(
+            b"\x1b]7771;0123456789abcdef0123456789abcdef\x07",
+            token,
+            &ready,
+        );
+        assert!(
+            !ready.get(),
+            "an announcement outside A..B is not a capability"
+        );
+        observer.feed(b"\x1b]133;A\x07\x1b]7771;0123456789ab", token, &ready);
+        assert!(!ready.get(), "a split packet is not accepted early");
+        observer.feed(b"cdef0123456789abcdef\x1b\\", token, &ready);
+        assert!(ready.get());
+        observer.feed(b"\x1b]133;B\x07", token, &ready);
+        assert!(
+            ready.get(),
+            "PromptEnd retains capability for that idle prompt"
+        );
+        observer.feed(b"\x1b]133;A\x07", token, &ready);
+        assert!(!ready.get(), "the next prompt must announce again");
+        observer.feed(
+            b"\x1b]7771;ffffffffffffffffffffffffffffffff\x07",
+            token,
+            &ready,
+        );
+        assert!(!ready.get(), "a different well-formed token is untrusted");
+
+        let mut oversized = b"\x1b]".to_vec();
+        oversized.extend(std::iter::repeat_n(b'x', 256));
+        oversized
+            .extend_from_slice(b"\x07\x1b]133;A\x07\x1b]7771;0123456789abcdef0123456789abcdef\x07");
+        observer.feed(&oversized, token, &ready);
+        assert!(
+            ready.get(),
+            "discarding an oversized OSC must recover at BEL"
+        );
+    }
+
+    #[test]
+    fn reviewed_identity_is_exact_and_post_enter_bytes_fail_closed() {
+        assert_eq!(normalize_captured_command("$HOME", "$"), "$HOME");
+        assert_eq!(
+            normalize_captured_command("git status", "git"),
+            "git status"
+        );
+        assert!(reviewed_submission_matches(
+            None,
+            "printf ok",
+            "printf ok",
+            false
+        ));
+        assert!(!reviewed_submission_matches(
+            None,
+            " printf ok",
+            "printf ok",
+            false
+        ));
+        assert!(!reviewed_submission_matches(
+            None,
+            "printf ok",
+            "printf ok",
+            true
+        ));
+        assert!(!reviewed_submission_matches(
+            Some("printf other"),
+            "printf ok",
+            "printf ok",
+            false
+        ));
+
+        assert!(reviewed_pre_command_bytes_are_identity_neutral(
+            b"\r\n\x1b[?2004l\x1b[0m"
+        ));
+        assert!(!reviewed_pre_command_bytes_are_identity_neutral(b"suffix"));
+        assert!(!reviewed_pre_command_bytes_are_identity_neutral(b"\x1b[2K"));
+    }
+
+    #[test]
+    fn reviewed_execution_payload_rejects_whitespace_and_controls() {
+        assert_eq!(
+            approved_command_submission_payload("printf ok").unwrap(),
+            b"printf ok"
+        );
+        assert!(approved_command_submission_payload(" printf ok").is_err());
+        assert!(approved_command_submission_payload("printf ok ").is_err());
+        assert!(approved_command_submission_payload("printf ok\nwhoami").is_err());
+    }
+
+    #[test]
+    fn agent_command_end_requires_shell_foreground_and_a_trusted_pair() {
+        assert_eq!(
+            decide_agent_command_end(false, None, false),
+            AgentCommandEndDecision::Accept
+        );
+        assert_eq!(
+            decide_agent_command_end(true, Some(false), true),
+            AgentCommandEndDecision::IgnoreUntilShellOwnsForeground
+        );
+        for (foreground, trusted) in [(None, true), (Some(true), false)] {
+            assert_eq!(
+                decide_agent_command_end(true, foreground, trusted),
+                AgentCommandEndDecision::AcceptWithoutAgentCorrelation
+            );
+        }
+        assert_eq!(
+            decide_agent_command_end(true, Some(true), true),
+            AgentCommandEndDecision::Accept
+        );
+    }
 
     #[test]
     fn command_prompt_status_explains_every_agent_gate() {
@@ -6597,6 +8095,63 @@ mod tests {
         }
     }
 
+    fn block_with_height(height: i32) -> BlockData {
+        let mut block = test_block(height as u64, "true", Some(0));
+        block.estimated_height = height;
+        block
+    }
+
+    #[test]
+    fn transient_zero_viewport_keeps_the_last_visibility_set() {
+        let blocks = VecDeque::from([block_with_height(20), block_with_height(20)]);
+        assert!(viewport_state_for_scroll(&blocks, 0.0, 0.0, 1).is_none());
+        assert!(viewport_state_for_scroll(&blocks, 0.0, 0.5, 1).is_none());
+        assert!(viewport_state_for_scroll(&blocks, f64::NAN, 40.0, 1).is_none());
+    }
+
+    #[test]
+    fn upper_only_adjustment_changes_do_not_recompute_visibility() {
+        let last_page_size = Cell::new(None);
+        assert!(viewport_page_size_changed(&last_page_size, 300.0));
+        assert!(!viewport_page_size_changed(&last_page_size, 300.0));
+        assert!(!viewport_page_size_changed(&last_page_size, 300.4));
+        assert!(viewport_page_size_changed(&last_page_size, 301.0));
+        assert!(!viewport_page_size_changed(&last_page_size, f64::NAN));
+    }
+
+    #[test]
+    fn font_metric_changes_invalidate_finished_block_layout() {
+        let before = finished_layout_key(800, 600, 16, 4);
+        assert_eq!(before, finished_layout_key(800, 600, 16, 4));
+        assert_ne!(before, finished_layout_key(800, 600, 18, 4));
+    }
+
+    #[test]
+    fn boundary_jitter_cannot_toggle_a_rendered_block() {
+        let blocks: VecDeque<BlockData> =
+            std::iter::repeat_n(20, 10).map(block_with_height).collect();
+        let strict = viewport_state_for_scroll(&blocks, 120.0, 40.0, 1).unwrap();
+        let loose = viewport_state_for_scroll(&blocks, 120.0, 40.0, 2).unwrap();
+        assert_eq!(
+            visible_indices_for_viewport(&strict),
+            HashSet::from_iter(4..=9)
+        );
+
+        let current = HashSet::from_iter(2..=9);
+        assert_eq!(
+            stable_visible_indices(&strict, Some(&loose), &current),
+            HashSet::from_iter(2..=9)
+        );
+        assert_eq!(
+            stable_visible_indices(&strict, Some(&loose), &HashSet::from([0])),
+            HashSet::from_iter(4..=9)
+        );
+        assert_eq!(
+            stable_visible_indices(&strict, Some(&loose), &HashSet::new()),
+            HashSet::from_iter(4..=9)
+        );
+    }
+
     #[test]
     fn failure_markers_follow_weighted_history_positions() {
         let mut blocks = VecDeque::from([
@@ -7135,21 +8690,6 @@ mod tests {
         assert_eq!(take_armed_agent_execution(&mut stale_prompt, 8), None);
         assert!(stale_prompt.is_none());
 
-        assert!(command_end_matches_agent_execution(
-            Some(execution),
-            Some("secret-1"),
-            Some("secret-1")
-        ));
-        assert!(!command_end_matches_agent_execution(
-            Some(execution),
-            Some("secret-1"),
-            Some("forged")
-        ));
-        assert!(!command_end_matches_agent_execution(
-            Some(execution),
-            Some("secret-1"),
-            None
-        ));
         assert!(command_end_matches_started_id(
             Some("secret-1"),
             Some("secret-1")
@@ -7158,11 +8698,6 @@ mod tests {
             Some("secret-1"),
             Some("nested-2")
         ));
-        assert!(
-            command_end_matches_agent_execution(Some(execution), None, None),
-            "old bare integrations remain compatible, without claiming id authentication"
-        );
-
         assert!(!agent_prompt_boundary_is_trusted(
             Some(execution),
             Some(false)
@@ -7171,10 +8706,7 @@ mod tests {
             Some(execution),
             Some(true)
         ));
-        assert!(
-            agent_prompt_boundary_is_trusted(Some(execution), None),
-            "host-bridged PID namespaces must fall back to the correlated shell marker"
-        );
+        assert!(!agent_prompt_boundary_is_trusted(Some(execution), None));
         assert!(agent_prompt_boundary_is_trusted(None, Some(false)));
     }
 }

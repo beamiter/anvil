@@ -1,242 +1,342 @@
-//! Relm4 component for session-level AI questions.
+//! Persistent Relm4 AI chat sidebar.
+//!
+//! The component stays mounted beside the terminal stack. Its pure
+//! [`ChatStore`] owns every chat while GTK renders only the selected one.
+
+use std::collections::HashMap;
 
 use relm4::adw;
 use relm4::adw::prelude::*;
 use relm4::gtk;
 use relm4::prelude::*;
 
+use super::ai_chat_store::{
+    ChatStatus, ChatStore, ChatStoreError, RequestToken, MAX_LIVE_MESSAGE_BYTES,
+};
 use crate::{ai, palette};
+
+const STOPPED_STATUS: &str = "Response stopped. You can retry when ready.";
+const CHAT_PAGE: &str = "chat";
+const LIBRARY_PAGE: &str = "library";
+// The outer session JSON escapes this JSON string again. Keeping the inner
+// value at 1 MiB leaves ample room below session.rs's 4 MiB hard limit.
+const SESSION_SNAPSHOT_AI_BUDGET: usize = 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ComposerKeyAction {
+    Send,
+    Newline,
+    Proceed,
+}
+
+fn classify_composer_key(key: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> ComposerKeyAction {
+    use gtk::gdk::{Key, ModifierType};
+
+    if !matches!(key, Key::Return | Key::KP_Enter) {
+        return ComposerKeyAction::Proceed;
+    }
+    if state.contains(ModifierType::SHIFT_MASK) {
+        ComposerKeyAction::Newline
+    } else if state.intersects(
+        ModifierType::ALT_MASK
+            | ModifierType::SUPER_MASK
+            | ModifierType::HYPER_MASK
+            | ModifierType::META_MASK,
+    ) {
+        ComposerKeyAction::Proceed
+    } else {
+        ComposerKeyAction::Send
+    }
+}
+
+pub(crate) struct AiPanelInit {
+    pub(crate) redact_secrets: bool,
+}
+
+#[derive(Clone, Debug)]
+struct RequestPayload {
+    user_text: String,
+    context: Option<ai::BlockContext>,
+    restore_pending_as_draft: bool,
+}
 
 #[derive(Debug)]
 pub(crate) enum AiPanelMsg {
     Open {
         history_path: Option<String>,
         client: ai::AiClient,
-        /// Stream replies incrementally (`ai_stream`); off falls back to the
-        /// single-callback blocking transport.
         stream: bool,
+        redact_secrets: bool,
         initial_context: Option<ai::BlockContext>,
     },
+    Restore(String),
     Ask,
-    Clear,
-    /// One streamed assistant text fragment for the request begun at `epoch`.
+    Stop,
+    Retry,
     Delta {
-        epoch: u64,
+        token: RequestToken,
         text: String,
     },
     Result {
-        epoch: u64,
+        token: RequestToken,
         result: Result<String, String>,
     },
-    Closed,
+    DraftChanged(String),
+    PublishDraft(u64),
+    NewChat,
+    SelectChat(u64),
+    SearchChanged(String),
+    ShowLibrary,
+    ShowChat,
+    Rename(String),
+    ToggleArchive,
+    Delete,
+    DeleteConfirmed,
+    ClearContext,
+    IncludeRecent(bool),
+    CopyFocused,
+    PasteFocused,
+    Close,
 }
 
-#[derive(Default)]
-struct ConversationState {
-    history: Vec<ai::Turn>,
-    epoch: u64,
-    active_epoch: Option<u64>,
-    /// Streamed fragments shown so far for the active request. The complete
-    /// text returned on success — never this accumulation — is what enters
-    /// `history`: it can carry a trailing token-limit advisory that never
-    /// arrived as a delta, and replacing the shown partial with it heals any
-    /// dropped fragment.
-    partial: String,
-}
-
-impl ConversationState {
-    fn is_busy(&self) -> bool {
-        self.active_epoch.is_some()
-    }
-
-    fn begin(&mut self, user: String) -> (u64, Vec<ai::Turn>) {
-        self.epoch = self.epoch.wrapping_add(1);
-        self.active_epoch = Some(self.epoch);
-        self.partial.clear();
-        self.history.push(ai::Turn {
-            role: ai::Role::User,
-            text: user,
-        });
-        (self.epoch, self.history.clone())
-    }
-
-    /// Accumulate one streamed fragment; stale-epoch fragments are dropped.
-    fn push_delta(&mut self, epoch: u64, fragment: &str) -> bool {
-        if self.active_epoch != Some(epoch) {
-            return false;
-        }
-        self.partial.push_str(fragment);
-        true
-    }
-
-    /// The streamed text shown for the active request; empty for blocking
-    /// requests and once a request settles.
-    fn shown_partial(&self) -> &str {
-        &self.partial
-    }
-
-    fn complete_success(&mut self, epoch: u64, answer: String) -> bool {
-        if self.active_epoch != Some(epoch) {
-            return false;
-        }
-        self.active_epoch = None;
-        self.partial.clear();
-        self.history.push(ai::Turn {
-            role: ai::Role::Assistant,
-            text: answer,
-        });
-        true
-    }
-
-    fn complete_error(&mut self, epoch: u64) -> bool {
-        if self.active_epoch != Some(epoch) {
-            return false;
-        }
-        self.active_epoch = None;
-        self.partial.clear();
-        if self
-            .history
-            .last()
-            .is_some_and(|turn| turn.role == ai::Role::User)
-        {
-            self.history.pop();
-        }
-        true
-    }
-
-    fn cancel_active(&mut self) {
-        if let Some(epoch) = self.active_epoch {
-            self.complete_error(epoch);
-        }
-        self.epoch = self.epoch.wrapping_add(1);
-    }
-
-    fn clear(&mut self) {
-        self.epoch = self.epoch.wrapping_add(1);
-        self.active_epoch = None;
-        self.partial.clear();
-        self.history.clear();
-    }
+#[derive(Debug)]
+pub(crate) enum AiPanelOutput {
+    SnapshotChanged(String),
+    CloseRequested,
 }
 
 pub(crate) struct AiPanelModel {
-    parent: adw::ApplicationWindow,
     history_path: Option<String>,
     client: Option<ai::AiClient>,
     stream: bool,
-    in_flight: Option<ai::AiHandle>,
-    pending_block_context: Option<ai::BlockContext>,
-    conversation_system: Option<String>,
-    conversation: ConversationState,
-    /// Marks where the streamed assistant body begins in the transcript so
-    /// the final complete text can replace it in place. Present only while a
-    /// streamed request has shown at least one fragment.
-    stream_anchor: Option<gtk::TextMark>,
+    redact_secrets: bool,
+    store: ChatStore,
+    requests: HashMap<RequestToken, ai::AiHandle>,
+    retry_payloads: HashMap<u64, RequestPayload>,
+    conversation_systems: HashMap<u64, String>,
+    include_recent: HashMap<u64, bool>,
+    search: String,
+    draft_generation: u64,
+    rendering: bool,
 }
 
 #[relm4::component(pub(crate))]
 impl Component for AiPanelModel {
-    type Init = adw::ApplicationWindow;
+    type Init = AiPanelInit;
     type Input = AiPanelMsg;
-    type Output = ();
+    type Output = AiPanelOutput;
     type CommandOutput = ();
 
     view! {
-        root = adw::Dialog {
-            set_title: "Ask AI",
-            set_content_width: 640,
-            set_content_height: 520,
-            connect_closed => AiPanelMsg::Closed,
+        root = gtk::Box {
+            set_orientation: gtk::Orientation::Vertical,
+            set_width_request: 280,
+            set_hexpand: false,
+            set_vexpand: true,
+            add_css_class: "ai-panel",
 
-            #[wrap(Some)]
-            set_child = &adw::ToolbarView {
-                add_top_bar = &adw::HeaderBar {},
+            gtk::Box {
+                set_orientation: gtk::Orientation::Horizontal,
+                set_spacing: 4,
+                set_margin_all: 6,
 
-                #[wrap(Some)]
-                set_content = &gtk::Box {
+                gtk::Button {
+                    set_label: "Chats",
+                    add_css_class: "flat",
+                    set_tooltip_text: Some("Browse saved and archived chats"),
+                    connect_clicked => AiPanelMsg::ShowLibrary,
+                },
+
+                #[name(title_entry)]
+                gtk::Entry {
+                    set_hexpand: true,
+                    set_tooltip_text: Some("Rename this chat"),
+                    connect_changed[sender] => move |entry| {
+                        sender.input(AiPanelMsg::Rename(entry.text().to_string()));
+                    },
+                },
+
+                gtk::Button {
+                    set_icon_name: "list-add-symbolic",
+                    add_css_class: "flat",
+                    set_tooltip_text: Some("New chat"),
+                    connect_clicked => AiPanelMsg::NewChat,
+                },
+
+                gtk::Button {
+                    set_icon_name: "window-close-symbolic",
+                    add_css_class: "flat",
+                    set_tooltip_text: Some("Close AI panel"),
+                    connect_clicked => AiPanelMsg::Close,
+                },
+            },
+
+            #[name(page_stack)]
+            gtk::Stack {
+                set_hexpand: true,
+                set_vexpand: true,
+
+                add_named[Some(CHAT_PAGE)] = &gtk::Box {
                     set_orientation: gtk::Orientation::Vertical,
-                    set_spacing: 8,
-                    set_margin_all: 12,
+                    set_spacing: 6,
+                    set_margin_all: 8,
 
-                    gtk::Label {
-                        set_label: "Your question:",
-                        set_halign: gtk::Align::Start,
-                        add_css_class: "dim-label",
+                    #[name(context_row)]
+                    gtk::Box {
+                        set_orientation: gtk::Orientation::Horizontal,
+                        set_spacing: 4,
+                        set_visible: false,
+
+                        #[name(context_label)]
+                        gtk::Label {
+                            set_halign: gtk::Align::Start,
+                            set_hexpand: true,
+                            set_ellipsize: gtk::pango::EllipsizeMode::Middle,
+                            add_css_class: "dim-label",
+                        },
+
+                        gtk::Button {
+                            set_icon_name: "edit-clear-symbolic",
+                            add_css_class: "flat",
+                            set_tooltip_text: Some("Clear selected Block context"),
+                            connect_clicked => AiPanelMsg::ClearContext,
+                        },
                     },
 
                     gtk::ScrolledWindow {
                         set_hexpand: true,
-                        set_min_content_height: 80,
+                        set_vexpand: true,
+                        set_policy: (gtk::PolicyType::Never, gtk::PolicyType::Automatic),
 
-                        #[name(entry)]
+                        #[name(transcript)]
                         gtk::TextView {
+                            set_editable: false,
+                            set_cursor_visible: false,
                             set_wrap_mode: gtk::WrapMode::WordChar,
-                            set_height_request: 80,
-                            add_css_class: "ai-panel-entry",
-
-                            add_controller = gtk::EventControllerKey {
-                                connect_key_pressed[sender] => move |_, key, _, state| {
-                                    use gtk::gdk::{Key, ModifierType};
-                                    if matches!(key, Key::Return | Key::KP_Enter)
-                                        && state.contains(ModifierType::CONTROL_MASK)
-                                    {
-                                        sender.input(AiPanelMsg::Ask);
-                                        gtk::glib::Propagation::Stop
-                                    } else {
-                                        gtk::glib::Propagation::Proceed
-                                    }
-                                },
-                            },
+                            set_left_margin: 6,
+                            set_right_margin: 6,
+                            add_css_class: "ai-explain-body",
                         },
                     },
 
-                    #[name(attach_context)]
+                    #[name(include_recent)]
                     gtk::CheckButton {
                         set_label: Some("Include recent shell context"),
                         set_active: true,
                     },
 
+                    gtk::ScrolledWindow {
+                        set_hexpand: true,
+                        set_min_content_height: 72,
+                        set_max_content_height: 160,
+
+                        #[name(composer)]
+                        gtk::TextView {
+                            set_wrap_mode: gtk::WrapMode::WordChar,
+                            set_height_request: 72,
+                            add_css_class: "ai-panel-entry",
+                        },
+                    },
+
                     gtk::Box {
                         set_orientation: gtk::Orientation::Horizontal,
                         set_spacing: 6,
-                        set_halign: gtk::Align::End,
+
+                        #[name(spinner)]
+                        gtk::Spinner {
+                            set_visible: false,
+                        },
 
                         #[name(status)]
                         gtk::Label {
                             set_halign: gtk::Align::Start,
                             set_hexpand: true,
+                            set_wrap: true,
+                            set_xalign: 0.0,
+                            set_selectable: true,
                             add_css_class: "dim-label",
                         },
 
+                        #[name(retry_button)]
                         gtk::Button {
-                            set_label: "Clear",
-                            add_css_class: "flat",
-                            connect_clicked => AiPanelMsg::Clear,
+                            set_label: "Retry",
+                            set_visible: false,
+                            connect_clicked => AiPanelMsg::Retry,
                         },
 
-                        #[name(ask_button)]
+                        #[name(stop_button)]
                         gtk::Button {
-                            set_label: "Ask",
+                            set_label: "Stop",
+                            set_visible: false,
+                            add_css_class: "destructive-action",
+                            connect_clicked => AiPanelMsg::Stop,
+                        },
+
+                        #[name(send_button)]
+                        gtk::Button {
+                            set_label: "Send",
+                            set_tooltip_text: Some(
+                                "Send (Enter / Ctrl+Enter) · New line (Shift+Enter)"
+                            ),
                             add_css_class: "suggested-action",
                             connect_clicked => AiPanelMsg::Ask,
                         },
                     },
 
-                    #[name(spinner)]
-                    gtk::Spinner {
-                        set_visible: false,
+                    gtk::Box {
+                        set_orientation: gtk::Orientation::Horizontal,
+                        set_spacing: 4,
+
+                        #[name(archive_button)]
+                        gtk::Button {
+                            set_label: "Archive",
+                            add_css_class: "flat",
+                            connect_clicked => AiPanelMsg::ToggleArchive,
+                        },
+
+                        gtk::Button {
+                            set_label: "Delete",
+                            add_css_class: "flat",
+                            add_css_class: "destructive-action",
+                            connect_clicked => AiPanelMsg::Delete,
+                        },
+                    },
+                },
+
+                add_named[Some(LIBRARY_PAGE)] = &gtk::Box {
+                    set_orientation: gtk::Orientation::Vertical,
+                    set_spacing: 6,
+                    set_margin_all: 8,
+
+                    gtk::Box {
+                        set_orientation: gtk::Orientation::Horizontal,
+                        set_spacing: 6,
+
+                        gtk::Button {
+                            set_icon_name: "go-previous-symbolic",
+                            add_css_class: "flat",
+                            set_tooltip_text: Some("Back to conversation"),
+                            connect_clicked => AiPanelMsg::ShowChat,
+                        },
+
+                        #[name(search)]
+                        gtk::SearchEntry {
+                            set_hexpand: true,
+                            set_placeholder_text: Some("Search chats"),
+                            connect_search_changed[sender] => move |entry| {
+                                sender.input(AiPanelMsg::SearchChanged(entry.text().to_string()));
+                            },
+                        },
                     },
 
                     gtk::ScrolledWindow {
                         set_hexpand: true,
                         set_vexpand: true,
 
-                        #[name(answer)]
-                        gtk::TextView {
-                            set_editable: false,
-                            set_cursor_visible: false,
-                            set_wrap_mode: gtk::WrapMode::WordChar,
-                            add_css_class: "ai-explain-body",
+                        #[name(chat_list)]
+                        gtk::ListBox {
+                            set_selection_mode: gtk::SelectionMode::None,
+                            add_css_class: "boxed-list",
                         },
                     },
                 },
@@ -245,23 +345,73 @@ impl Component for AiPanelModel {
     }
 
     fn init(
-        parent: Self::Init,
+        init: Self::Init,
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
         let model = Self {
-            parent,
             history_path: None,
             client: None,
             stream: true,
-            in_flight: None,
-            pending_block_context: None,
-            conversation_system: None,
-            conversation: ConversationState::default(),
-            stream_anchor: None,
+            redact_secrets: init.redact_secrets,
+            store: ChatStore::default(),
+            requests: HashMap::new(),
+            retry_payloads: HashMap::new(),
+            conversation_systems: HashMap::new(),
+            include_recent: HashMap::new(),
+            search: String::new(),
+            draft_generation: 0,
+            rendering: false,
         };
         let widgets = view_output!();
-        ComponentParts { model, widgets }
+
+        {
+            let sender = sender.clone();
+            widgets.composer.buffer().connect_changed(move |buffer| {
+                let (start, end) = buffer.bounds();
+                sender.input(AiPanelMsg::DraftChanged(
+                    buffer.text(&start, &end, true).to_string(),
+                ));
+            });
+        }
+        {
+            let key = gtk::EventControllerKey::new();
+            key.set_propagation_phase(gtk::PropagationPhase::Capture);
+            let sender = sender.clone();
+            let composer = widgets.composer.clone();
+            key.connect_key_pressed(move |controller, key, _, state| {
+                let action = classify_composer_key(key, state);
+                if action != ComposerKeyAction::Proceed {
+                    if let Some(event) = controller.current_event() {
+                        // An active IME candidate owns Enter before the chat
+                        // composer can interpret it as Send or Newline.
+                        if composer.im_context_filter_keypress(&event) {
+                            return gtk::glib::Propagation::Stop;
+                        }
+                    }
+                }
+                match action {
+                    ComposerKeyAction::Send => {
+                        sender.input(AiPanelMsg::Ask);
+                        gtk::glib::Propagation::Stop
+                    }
+                    ComposerKeyAction::Newline | ComposerKeyAction::Proceed => {
+                        gtk::glib::Propagation::Proceed
+                    }
+                }
+            });
+            widgets.composer.add_controller(key);
+        }
+        {
+            let sender = sender.clone();
+            widgets.include_recent.connect_toggled(move |button| {
+                sender.input(AiPanelMsg::IncludeRecent(button.is_active()));
+            });
+        }
+
+        let mut parts = ComponentParts { model, widgets };
+        parts.model.render_all(&mut parts.widgets, &sender);
+        parts
     }
 
     fn update_with_view(
@@ -276,185 +426,594 @@ impl Component for AiPanelModel {
                 history_path,
                 client,
                 stream,
+                redact_secrets,
                 initial_context,
             } => {
-                self.cancel();
-                self.conversation.clear();
-                self.drop_stream_anchor(&widgets.answer);
                 self.history_path = history_path;
                 self.client = Some(client);
                 self.stream = stream;
-                self.pending_block_context = initial_context;
-                self.conversation_system = None;
-                widgets.status.set_label("");
-                widgets.answer.buffer().set_text("");
-                widgets.entry.buffer().set_text("");
-                root.present(Some(&self.parent));
-                widgets.entry.grab_focus();
-                if let Some(context) = self.pending_block_context.as_ref() {
-                    widgets.entry.buffer().set_text(if context.exit_code == 0 {
-                        "Explain what this command does and what its output means."
-                    } else {
-                        "This command failed. Diagnose the error and suggest a fix."
-                    });
-                    sender.input(AiPanelMsg::Ask);
-                }
-            }
-            AiPanelMsg::Ask => {
-                if self.conversation.is_busy() {
-                    return;
-                }
-                let buffer = widgets.entry.buffer();
-                let (start, end) = buffer.bounds();
-                let question = buffer.text(&start, &end, true);
-                let question = question.trim();
-                if question.is_empty() {
-                    widgets.status.set_label("(question is empty)");
-                    return;
-                }
-                let Some(client) = self.client.clone() else {
-                    widgets.status.set_label("No AI provider is configured.");
-                    return;
-                };
-                let (new_system, api_user) =
-                    if let Some(context) = self.pending_block_context.take() {
-                        ai::build_block_chat_prompt(question, &context)
-                    } else {
-                        let context = if widgets.attach_context.is_active() {
-                            self.recent_context()
+                self.redact_secrets = redact_secrets;
+                widgets.page_stack.set_visible_child_name(CHAT_PAGE);
+                if let Some(context) = initial_context {
+                    if self.store.active_archived() {
+                        let _ = self.store.new_chat();
+                    }
+                    if self.store.active_request_token().is_none() {
+                        let prompt = if context.exit_code == 0 {
+                            "Explain what this command does and what its output means."
                         } else {
-                            None
+                            "This command failed. Diagnose the error and suggest a fix."
                         };
-                        ai::build_session_prompt(question, context.as_deref())
-                    };
-                let system = self.conversation_system.get_or_insert(new_system).clone();
-                let visible_question = question.to_string();
-                let (epoch, history) = self.conversation.begin(api_user);
-                append_transcript(&widgets.answer, "You", &visible_question);
-                widgets.entry.buffer().set_text("");
-                let provider =
-                    crate::text_safety::bounded_display_text(&client.display_name(), 256, false);
-                widgets.status.set_label(&format!("Asking {provider} …"));
-                widgets.spinner.set_visible(true);
-                widgets.spinner.start();
-                widgets.ask_button.set_sensitive(false);
-                self.in_flight = Some(if self.stream {
-                    let delta_sender = sender.clone();
-                    ai::ask_turns_streaming(
-                        client,
-                        system,
-                        history,
-                        move |text| delta_sender.input(AiPanelMsg::Delta { epoch, text }),
-                        move |result| sender.input(AiPanelMsg::Result { epoch, result }),
-                    )
-                } else {
-                    ai::ask_turns(client, system, history, move |result| {
-                        sender.input(AiPanelMsg::Result { epoch, result });
-                    })
-                });
-            }
-            AiPanelMsg::Clear => {
-                self.cancel();
-                self.conversation.clear();
-                self.drop_stream_anchor(&widgets.answer);
-                self.pending_block_context = None;
-                self.conversation_system = None;
-                widgets.entry.buffer().set_text("");
-                widgets.answer.buffer().set_text("");
-                widgets.status.set_label("");
-                widgets.spinner.stop();
-                widgets.spinner.set_visible(false);
-                widgets.ask_button.set_sensitive(true);
-                widgets.entry.grab_focus();
-            }
-            AiPanelMsg::Delta { epoch, text } => {
-                if !self.conversation.push_delta(epoch, &text) {
-                    return;
+                        self.start_request(
+                            widgets,
+                            &sender,
+                            RequestPayload {
+                                user_text: prompt.into(),
+                                context: Some(context),
+                                restore_pending_as_draft: false,
+                            },
+                            false,
+                        );
+                    }
                 }
-                let buffer = widgets.answer.buffer();
-                if self.stream_anchor.is_none() {
-                    // Lazily open the assistant section on the first fragment
-                    // so an early failure never leaves an empty heading, and
-                    // anchor the body start (left gravity) so the complete
-                    // text can replace the partial in place.
-                    let mut end = buffer.end_iter();
-                    if buffer.char_count() > 0 {
-                        buffer.insert(&mut end, "\n\n");
-                    }
-                    buffer.insert(&mut end, "Assistant\n");
-                    let end = buffer.end_iter();
-                    self.stream_anchor = Some(buffer.create_mark(None, &end, true));
-                }
-                let mut end = buffer.end_iter();
-                buffer.insert(&mut end, &text);
-                scroll_to_end(&widgets.answer);
+                self.render_all(widgets, &sender);
+                widgets.composer.grab_focus();
             }
-            AiPanelMsg::Result { epoch, result } => match result {
-                Ok(answer) => {
-                    let answer = answer.trim().to_string();
-                    let partial_matches = self.conversation.shown_partial() == answer;
-                    if !self.conversation.complete_success(epoch, answer.clone()) {
-                        return;
-                    }
-                    self.in_flight = None;
-                    widgets.spinner.stop();
-                    widgets.spinner.set_visible(false);
-                    widgets.ask_button.set_sensitive(true);
-                    widgets.status.set_label("");
-                    match self.stream_anchor.take() {
-                        Some(anchor) => {
-                            // The returned complete text is the single source
-                            // of truth; swap it in unless the streamed
-                            // fragments already add up to exactly the same
-                            // bytes.
-                            if !partial_matches {
-                                let buffer = widgets.answer.buffer();
-                                let mut start = buffer.iter_at_mark(&anchor);
-                                let mut end = buffer.end_iter();
-                                buffer.delete(&mut start, &mut end);
-                                let mut end = buffer.end_iter();
-                                buffer.insert(&mut end, &answer);
-                                scroll_to_end(&widgets.answer);
-                            }
-                            widgets.answer.buffer().delete_mark(&anchor);
-                        }
-                        None => append_transcript(&widgets.answer, "Assistant", &answer),
-                    }
+            AiPanelMsg::Restore(encoded) => match ai::ConversationSnapshot::from_json(&encoded) {
+                Ok(snapshot) => {
+                    self.cancel_all();
+                    self.store = ChatStore::restore(snapshot);
+                    self.retry_payloads.clear();
+                    self.conversation_systems.clear();
+                    self.render_all(widgets, &sender);
                 }
                 Err(error) => {
-                    if !self.conversation.complete_error(epoch) {
-                        return;
-                    }
-                    self.in_flight = None;
-                    // A mid-stream failure keeps the fragments already shown;
-                    // only the replace anchor is released.
-                    if let Some(anchor) = self.stream_anchor.take() {
-                        widgets.answer.buffer().delete_mark(&anchor);
-                    }
-                    widgets.spinner.stop();
-                    widgets.spinner.set_visible(false);
-                    widgets.ask_button.set_sensitive(true);
-                    let error = crate::text_safety::bounded_display_text(&error, 2 * 1024, false);
-                    widgets.status.set_label(&format!("AI error: {error}"));
+                    widgets
+                        .status
+                        .set_label(&format!("Saved AI chats were not restored: {error}"));
                 }
             },
-            AiPanelMsg::Closed => self.cancel(),
+            AiPanelMsg::Ask => {
+                if self.store.active_request_token().is_some() {
+                    return;
+                }
+                let text = text_view_text(&widgets.composer);
+                let text = text.trim().to_string();
+                self.start_request(
+                    widgets,
+                    &sender,
+                    RequestPayload {
+                        user_text: text,
+                        context: None,
+                        restore_pending_as_draft: true,
+                    },
+                    true,
+                );
+            }
+            AiPanelMsg::Stop => {
+                let Some(token) = self.store.active_request_token() else {
+                    return;
+                };
+                let Some(handle) = self.requests.remove(&token) else {
+                    return;
+                };
+                handle.cancel();
+                let _ = self.store.cancel_request(token, STOPPED_STATUS.to_string());
+                self.render_all(widgets, &sender);
+                self.publish_snapshot(&sender);
+            }
+            AiPanelMsg::Retry => {
+                let id = self.store.active_id();
+                let Some(payload) = self.retry_payloads.get(&id).cloned() else {
+                    return;
+                };
+                let remaining =
+                    draft_without_retry_message(&payload.user_text, self.store.active_draft());
+                let original = self.store.active_draft().to_string();
+                self.store.set_active_draft(remaining);
+                if !self.start_request(widgets, &sender, payload, false) {
+                    self.store.set_active_draft(original);
+                    self.render_all(widgets, &sender);
+                }
+            }
+            AiPanelMsg::Delta { token, text } => {
+                if self.store.push_delta(token, &text) == Some(true) {
+                    self.render_transcript(widgets);
+                }
+            }
+            AiPanelMsg::Result { token, result } => {
+                if self.requests.remove(&token).is_none() {
+                    return;
+                }
+                let keep_failed_partial = result.is_err()
+                    && self.store.active_request_token() == Some(token)
+                    && !self.store.active_partial().is_empty();
+                match result {
+                    Ok(answer) => {
+                        if self
+                            .store
+                            .complete_success(token, answer.trim().to_string())
+                            .is_some()
+                        {
+                            self.retry_payloads.remove(&token.chat_id);
+                        }
+                    }
+                    Err(error) => {
+                        let error =
+                            crate::text_safety::bounded_display_text(&error, 2 * 1024, false);
+                        let _ = self
+                            .store
+                            .complete_error(token, format!("AI error: {error}"));
+                    }
+                }
+                if keep_failed_partial {
+                    // Preserve the streamed evidence already visible. The
+                    // durable store has rolled the failed turn back into the
+                    // draft; switching chats or retrying rematerializes from
+                    // that authoritative state and removes this transient row.
+                    self.rendering = true;
+                    widgets
+                        .composer
+                        .buffer()
+                        .set_text(self.store.active_draft());
+                    self.rendering = false;
+                    self.render_context(widgets);
+                    self.render_status(widgets);
+                    self.refresh_library(&widgets.chat_list, &sender);
+                } else {
+                    self.render_all(widgets, &sender);
+                }
+                self.publish_snapshot(&sender);
+            }
+            AiPanelMsg::DraftChanged(draft) => {
+                if self.rendering || !self.store.set_active_draft(draft) {
+                    return;
+                }
+                self.draft_generation = self.draft_generation.wrapping_add(1);
+                let generation = self.draft_generation;
+                let sender = sender.clone();
+                gtk::glib::timeout_add_local_once(
+                    std::time::Duration::from_millis(250),
+                    move || sender.input(AiPanelMsg::PublishDraft(generation)),
+                );
+            }
+            AiPanelMsg::PublishDraft(generation) => {
+                if generation == self.draft_generation {
+                    self.publish_snapshot(&sender);
+                    self.refresh_library(&widgets.chat_list, &sender);
+                }
+            }
+            AiPanelMsg::NewChat => match self.store.new_chat() {
+                Ok(_) => {
+                    widgets.page_stack.set_visible_child_name(CHAT_PAGE);
+                    self.render_all(widgets, &sender);
+                    self.publish_snapshot(&sender);
+                    widgets.composer.grab_focus();
+                }
+                Err(ChatStoreError::LimitReached) => widgets
+                    .status
+                    .set_label("50 chats are already saved. Delete one before creating another."),
+                Err(_) => {}
+            },
+            AiPanelMsg::SelectChat(id) => {
+                if self.store.select_chat(id) {
+                    self.render_all(widgets, &sender);
+                    self.publish_snapshot(&sender);
+                }
+                widgets.page_stack.set_visible_child_name(CHAT_PAGE);
+            }
+            AiPanelMsg::SearchChanged(query) => {
+                self.search = query.chars().take(1_024).collect();
+                self.refresh_library(&widgets.chat_list, &sender);
+            }
+            AiPanelMsg::ShowLibrary => {
+                self.refresh_library(&widgets.chat_list, &sender);
+                widgets.page_stack.set_visible_child_name(LIBRARY_PAGE);
+                widgets.search.grab_focus();
+            }
+            AiPanelMsg::ShowChat => {
+                widgets.page_stack.set_visible_child_name(CHAT_PAGE);
+            }
+            AiPanelMsg::Rename(title) => {
+                if !self.rendering && self.store.rename_active(&title) {
+                    self.refresh_library(&widgets.chat_list, &sender);
+                    self.publish_snapshot(&sender);
+                }
+            }
+            AiPanelMsg::ToggleArchive => match self.store.toggle_archive_active() {
+                Ok(_) => {
+                    self.render_all(widgets, &sender);
+                    self.publish_snapshot(&sender);
+                }
+                Err(ChatStoreError::Busy) => {
+                    widgets
+                        .status
+                        .set_label("Stop this response before archiving the chat.");
+                }
+                Err(_) => {}
+            },
+            AiPanelMsg::Delete => {
+                let title = crate::text_safety::bounded_display_text(
+                    self.store.active_title(),
+                    1_024,
+                    false,
+                );
+                let dialog = adw::AlertDialog::new(
+                    Some("Delete this chat?"),
+                    Some(&format!(
+                        "“{title}” and its saved messages will be permanently removed."
+                    )),
+                );
+                dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Delete")]);
+                dialog.set_default_response(Some("cancel"));
+                dialog.set_close_response("cancel");
+                dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+                let sender = sender.clone();
+                dialog.connect_response(None, move |_, response| {
+                    if response == "delete" {
+                        sender.input(AiPanelMsg::DeleteConfirmed);
+                    }
+                });
+                dialog.present(Some(root));
+            }
+            AiPanelMsg::DeleteConfirmed => match self.store.delete_active() {
+                Ok(id) => {
+                    self.retry_payloads.remove(&id);
+                    self.conversation_systems.remove(&id);
+                    self.render_all(widgets, &sender);
+                    self.publish_snapshot(&sender);
+                }
+                Err(ChatStoreError::Busy) => {
+                    widgets
+                        .status
+                        .set_label("Stop this response before deleting the chat.");
+                }
+                Err(_) => {}
+            },
+            AiPanelMsg::ClearContext => match self.store.clear_active_context() {
+                Ok(changed) => {
+                    if let Some(payload) = self.retry_payloads.get_mut(&self.store.active_id()) {
+                        payload.context = None;
+                    }
+                    self.render_context(widgets);
+                    if changed {
+                        self.publish_snapshot(&sender);
+                    }
+                }
+                Err(ChatStoreError::Busy) => {
+                    widgets
+                        .status
+                        .set_label("Stop this response before clearing its context.");
+                }
+                Err(_) => {}
+            },
+            AiPanelMsg::IncludeRecent(enabled) => {
+                if !self.rendering {
+                    self.include_recent.insert(self.store.active_id(), enabled);
+                }
+            }
+            AiPanelMsg::CopyFocused => copy_focused_selection(widgets),
+            AiPanelMsg::PasteFocused => {
+                paste_focused_text(widgets, self.store.active_archived());
+            }
+            AiPanelMsg::Close => {
+                self.publish_snapshot(&sender);
+                let _ = sender.output(AiPanelOutput::CloseRequested);
+            }
         }
     }
 }
 
-impl AiPanelModel {
-    fn cancel(&mut self) {
-        if let Some(handle) = self.in_flight.take() {
-            handle.cancel();
+fn editable_text_delegate(editable: &impl IsA<gtk::Editable>) -> Option<gtk::Text> {
+    editable.delegate()?.downcast::<gtk::Text>().ok()
+}
+
+fn editable_has_focus(editable: &(impl IsA<gtk::Editable> + IsA<gtk::Widget>)) -> bool {
+    editable.has_focus() || editable_text_delegate(editable).is_some_and(|text| text.has_focus())
+}
+
+fn copy_focused_selection(widgets: &AiPanelModelWidgets) {
+    if editable_has_focus(&widgets.title_entry) {
+        if let Some(text) = editable_text_delegate(&widgets.title_entry) {
+            text.emit_copy_clipboard();
         }
-        self.conversation.cancel_active();
+        return;
+    }
+    if editable_has_focus(&widgets.search) {
+        if let Some(text) = editable_text_delegate(&widgets.search) {
+            text.emit_copy_clipboard();
+        }
+        return;
+    }
+    if widgets.composer.has_focus() {
+        widgets.composer.emit_copy_clipboard();
+    } else if widgets.transcript.has_focus() {
+        widgets.transcript.emit_copy_clipboard();
+    } else if widgets.status.has_focus() {
+        widgets.status.emit_copy_clipboard();
+    }
+}
+
+fn paste_focused_text(widgets: &AiPanelModelWidgets, archived: bool) {
+    if editable_has_focus(&widgets.title_entry) {
+        if let Some(text) = editable_text_delegate(&widgets.title_entry) {
+            text.emit_paste_clipboard();
+        }
+        return;
+    }
+    if editable_has_focus(&widgets.search) {
+        if let Some(text) = editable_text_delegate(&widgets.search) {
+            text.emit_paste_clipboard();
+        }
+        return;
+    }
+    if widgets.composer.has_focus() && !archived {
+        widgets.composer.emit_paste_clipboard();
+    }
+}
+
+impl AiPanelModel {
+    fn start_request(
+        &mut self,
+        widgets: &mut AiPanelModelWidgets,
+        sender: &ComponentSender<Self>,
+        mut payload: RequestPayload,
+        clear_composer: bool,
+    ) -> bool {
+        if payload.user_text.trim().is_empty() {
+            widgets.status.set_label("Message is empty.");
+            return false;
+        }
+        if payload.user_text.len() > MAX_LIVE_MESSAGE_BYTES {
+            widgets
+                .status
+                .set_label("Message is too large (64 KiB limit).");
+            return false;
+        }
+        let Some(client) = self.client.clone() else {
+            widgets.status.set_label("No AI provider is configured.");
+            return false;
+        };
+        payload.user_text = payload.user_text.trim().to_string();
+        let provider = crate::text_safety::bounded_display_text(&client.display_name(), 256, false);
+        let start = match self.store.begin_turn(
+            payload.user_text.clone(),
+            payload.context.clone(),
+            format!("Thinking… ({provider})"),
+            payload.restore_pending_as_draft,
+        ) {
+            Ok(start) => start,
+            Err(ChatStoreError::Archived) => {
+                widgets
+                    .status
+                    .set_label("Unarchive this chat before sending.");
+                return false;
+            }
+            Err(ChatStoreError::Busy) => return false,
+            Err(ChatStoreError::EmptyMessage) => {
+                widgets.status.set_label("Message is empty.");
+                return false;
+            }
+            Err(ChatStoreError::MessageTooLarge) => {
+                widgets
+                    .status
+                    .set_label("Message is too large (64 KiB limit).");
+                return false;
+            }
+            Err(_) => return false,
+        };
+        if clear_composer {
+            self.rendering = true;
+            widgets.composer.buffer().set_text("");
+            self.rendering = false;
+            self.store.set_active_draft(String::new());
+        }
+
+        let mut request_history = start.history;
+        let recent = if payload.context.is_none() && widgets.include_recent.is_active() {
+            self.recent_context()
+        } else {
+            None
+        };
+        let (new_system, api_user) = if let Some(context) = start.effective_context.as_ref() {
+            ai::build_block_chat_prompt(&payload.user_text, context)
+        } else {
+            ai::build_session_prompt(&payload.user_text, recent.as_deref())
+        };
+        if let Some(last) = request_history
+            .iter_mut()
+            .rev()
+            .find(|turn| turn.role == ai::Role::User)
+        {
+            last.text = api_user;
+        }
+        let system = self
+            .conversation_systems
+            .entry(start.token.chat_id)
+            .or_insert(new_system)
+            .clone();
+        let token = start.token;
+        self.retry_payloads.insert(token.chat_id, payload);
+        let handle = if self.stream {
+            let delta_sender = sender.clone();
+            let done_sender = sender.clone();
+            ai::ask_turns_streaming(
+                client,
+                system,
+                request_history,
+                move |text| delta_sender.input(AiPanelMsg::Delta { token, text }),
+                move |result| done_sender.input(AiPanelMsg::Result { token, result }),
+            )
+        } else {
+            let done_sender = sender.clone();
+            ai::ask_turns(client, system, request_history, move |result| {
+                done_sender.input(AiPanelMsg::Result { token, result });
+            })
+        };
+        self.requests.insert(token, handle);
+        self.render_all(widgets, sender);
+        self.publish_snapshot(sender);
+        true
     }
 
-    /// Release the in-place replace anchor without touching the shown text.
-    fn drop_stream_anchor(&mut self, answer: &gtk::TextView) {
-        if let Some(anchor) = self.stream_anchor.take() {
-            answer.buffer().delete_mark(&anchor);
+    fn cancel_all(&mut self) {
+        let requests = std::mem::take(&mut self.requests);
+        for (token, handle) in requests {
+            handle.cancel();
+            let _ = self
+                .store
+                .cancel_request(token, "Request cancelled during restore.".into());
+        }
+    }
+
+    fn publish_snapshot(&self, sender: &ComponentSender<Self>) {
+        let mut durable = self.store.clone();
+        for (chat_id, payload) in &self.retry_payloads {
+            durable.recover_retry_payload(*chat_id, &payload.user_text, payload.context.clone());
+        }
+        let Ok(mut snapshot) = durable.snapshot(self.redact_secrets) else {
+            return;
+        };
+        if snapshot
+            .compact_to_measured_limit(SESSION_SNAPSHOT_AI_BUDGET, |candidate| {
+                candidate.to_json().ok().map(|encoded| encoded.len())
+            })
+            .is_none()
+        {
+            return;
+        }
+        if let Ok(encoded) = snapshot.to_json() {
+            let _ = sender.output(AiPanelOutput::SnapshotChanged(encoded));
+        }
+    }
+
+    fn render_all(&mut self, widgets: &mut AiPanelModelWidgets, sender: &ComponentSender<Self>) {
+        self.rendering = true;
+        widgets.title_entry.set_text(self.store.active_title());
+        widgets
+            .archive_button
+            .set_label(if self.store.active_archived() {
+                "Unarchive"
+            } else {
+                "Archive"
+            });
+        widgets.include_recent.set_active(
+            *self
+                .include_recent
+                .entry(self.store.active_id())
+                .or_insert(true),
+        );
+        widgets
+            .composer
+            .buffer()
+            .set_text(self.store.active_draft());
+        self.rendering = false;
+        self.render_transcript(widgets);
+        self.render_context(widgets);
+        self.render_status(widgets);
+        self.refresh_library(&widgets.chat_list, sender);
+    }
+
+    fn render_transcript(&self, widgets: &AiPanelModelWidgets) {
+        let buffer = widgets.transcript.buffer();
+        buffer.set_text("");
+        for turn in self.store.active_history() {
+            append_transcript(
+                &widgets.transcript,
+                if turn.role == ai::Role::User {
+                    "You"
+                } else {
+                    "Assistant"
+                },
+                &turn.text,
+            );
+        }
+        if !self.store.active_partial().is_empty() {
+            append_transcript(
+                &widgets.transcript,
+                "Assistant",
+                self.store.active_partial(),
+            );
+        }
+        scroll_to_end(&widgets.transcript);
+    }
+
+    fn render_context(&self, widgets: &AiPanelModelWidgets) {
+        let context = self
+            .retry_payloads
+            .get(&self.store.active_id())
+            .and_then(|payload| payload.context.as_ref())
+            .or_else(|| self.store.active_context());
+        if let Some(context) = context {
+            let command = crate::text_safety::bounded_display_text(&context.cmd, 4 * 1024, false);
+            widgets
+                .context_label
+                .set_label(&format!("Block: {command} (exit {})", context.exit_code));
+            widgets.context_row.set_visible(true);
+        } else {
+            widgets.context_row.set_visible(false);
+        }
+    }
+
+    fn render_status(&self, widgets: &AiPanelModelWidgets) {
+        let busy = self.store.active_request_token().is_some();
+        let status = match self.store.active_status() {
+            ChatStatus::Idle => "",
+            ChatStatus::Thinking(text) | ChatStatus::Info(text) | ChatStatus::Error(text) => text,
+        };
+        widgets.status.set_label(status);
+        widgets.spinner.set_visible(busy);
+        if busy {
+            widgets.spinner.start();
+        } else {
+            widgets.spinner.stop();
+        }
+        widgets.stop_button.set_visible(busy);
+        widgets.send_button.set_visible(!busy);
+        widgets
+            .send_button
+            .set_sensitive(!self.store.active_archived());
+        widgets
+            .retry_button
+            .set_visible(!busy && self.retry_payloads.contains_key(&self.store.active_id()));
+    }
+
+    fn refresh_library(&self, list: &gtk::ListBox, sender: &ComponentSender<Self>) {
+        while let Some(child) = list.first_child() {
+            list.remove(&child);
+        }
+        for summary in self.store.summaries(&self.search) {
+            let row = gtk::Button::new();
+            row.add_css_class("flat");
+            let body = gtk::Box::new(gtk::Orientation::Vertical, 2);
+            let title = gtk::Label::new(Some(&summary.title));
+            title.set_halign(gtk::Align::Start);
+            title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            if summary.active {
+                title.add_css_class("heading");
+            }
+            let mut meta = summary.preview;
+            if summary.archived {
+                meta.push_str(" · Archived");
+            }
+            if summary.busy {
+                meta.push_str(" · Thinking…");
+            } else if summary.error {
+                meta.push_str(" · Error");
+            } else if summary.unread {
+                meta.push_str(" · New reply");
+            }
+            let preview = gtk::Label::new(Some(&meta));
+            preview.set_halign(gtk::Align::Start);
+            preview.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            preview.add_css_class("dim-label");
+            body.append(&title);
+            body.append(&preview);
+            row.set_child(Some(&body));
+            let id = summary.id;
+            let sender = sender.clone();
+            row.connect_clicked(move |_| sender.input(AiPanelMsg::SelectChat(id)));
+            list.append(&row);
         }
     }
 
@@ -464,12 +1023,31 @@ impl AiPanelModel {
         if items.is_empty() {
             return None;
         }
-        let mut context = String::new();
-        for item in items.iter().rev() {
-            context.push_str(&format!("$ {} (exit {})\n", item.command, item.exit_code));
-        }
-        Some(context)
+        Some(
+            items
+                .iter()
+                .rev()
+                .map(|item| format!("$ {} (exit {})", item.command, item.exit_code))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
     }
+}
+
+fn text_view_text(view: &gtk::TextView) -> String {
+    let buffer = view.buffer();
+    let (start, end) = buffer.bounds();
+    buffer.text(&start, &end, true).to_string()
+}
+
+fn draft_without_retry_message(retry: &str, draft: &str) -> String {
+    if draft == retry {
+        return String::new();
+    }
+    draft
+        .strip_prefix(retry)
+        .and_then(|rest| rest.strip_prefix("\n\n"))
+        .map_or_else(|| draft.to_string(), str::to_string)
 }
 
 fn append_transcript(view: &gtk::TextView, label: &str, body: &str) {
@@ -481,7 +1059,6 @@ fn append_transcript(view: &gtk::TextView, label: &str, body: &str) {
     buffer.insert(&mut end, label);
     buffer.insert(&mut end, "\n");
     buffer.insert(&mut end, body);
-    scroll_to_end(view);
 }
 
 fn scroll_to_end(view: &gtk::TextView) {
@@ -497,66 +1074,76 @@ mod tests {
     use super::*;
 
     #[test]
-    fn successful_turns_alternate_and_errors_do_not_poison_history() {
-        let mut state = ConversationState::default();
-        let (one, _) = state.begin("one".into());
-        assert!(state.complete_success(one, "answer".into()));
-        let (two, sent) = state.begin("two".into());
-        assert_eq!(sent.len(), 3);
-        assert_eq!(sent[0].role, ai::Role::User);
-        assert_eq!(sent[1].role, ai::Role::Assistant);
-        assert_eq!(sent[2].role, ai::Role::User);
-        assert!(state.complete_error(two));
-        assert_eq!(state.history.len(), 2);
+    fn session_embedding_budget_is_below_the_outer_snapshot_limit() {
+        const { assert!(SESSION_SNAPSHOT_AI_BUDGET < 4 * 1024 * 1024) }
     }
 
     #[test]
-    fn streamed_fragments_accumulate_only_for_the_active_request() {
-        let mut state = ConversationState::default();
-        let (epoch, _) = state.begin("question".into());
-        assert!(state.push_delta(epoch, "Hel"));
-        assert!(state.push_delta(epoch, "lo"));
-        assert!(!state.push_delta(epoch.wrapping_add(1), "stale"));
-        assert_eq!(state.shown_partial(), "Hello");
+    fn request_token_can_key_parallel_request_maps() {
+        let one = RequestToken {
+            chat_id: 1,
+            epoch: 2,
+        };
+        let two = RequestToken {
+            chat_id: 2,
+            epoch: 2,
+        };
+        let mut payloads = HashMap::new();
+        payloads.insert(one, "one");
+        payloads.insert(two, "two");
+        assert_eq!(payloads[&one], "one");
+        assert_eq!(payloads[&two], "two");
     }
 
     #[test]
-    fn final_text_replaces_the_streamed_partial_in_history() {
-        let mut state = ConversationState::default();
-        let (epoch, _) = state.begin("question".into());
-        assert!(state.push_delta(epoch, "Hello"));
-        // The complete text carries a trailing advisory that never streamed;
-        // it — not the accumulated fragments — must be recorded.
-        assert!(state.complete_success(epoch, "Hello\n\n[reply truncated]".into()));
-        assert_eq!(state.shown_partial(), "");
-        let recorded = state.history.last().unwrap();
-        assert_eq!(recorded.role, ai::Role::Assistant);
-        assert_eq!(recorded.text, "Hello\n\n[reply truncated]");
+    fn retry_removes_only_the_recovered_prefix_from_the_draft() {
+        assert_eq!(draft_without_retry_message("failed", "failed"), "");
+        assert_eq!(
+            draft_without_retry_message("failed", "failed\n\nfollow-up"),
+            "follow-up"
+        );
+        assert_eq!(
+            draft_without_retry_message("failed", "edited failed"),
+            "edited failed"
+        );
     }
 
     #[test]
-    fn a_failed_stream_resets_partial_and_history_like_the_blocking_path() {
-        let mut state = ConversationState::default();
-        let (epoch, _) = state.begin("question".into());
-        assert!(state.push_delta(epoch, "partial answer"));
-        assert!(state.complete_error(epoch));
-        assert_eq!(state.shown_partial(), "");
-        assert!(state.history.is_empty());
-        // A retry starts from the same clean state the blocking path leaves
-        // behind and streams under its own epoch.
-        let (retry, sent) = state.begin("question".into());
-        assert_eq!(sent.len(), 1);
-        assert!(state.push_delta(retry, "again"));
-        assert_eq!(state.shown_partial(), "again");
-    }
+    fn composer_enter_semantics_match_chat_conventions() {
+        use gtk::gdk::{Key, ModifierType};
 
-    #[test]
-    fn clear_invalidates_a_late_response() {
-        let mut state = ConversationState::default();
-        let (epoch, _) = state.begin("question".into());
-        state.clear();
-        assert!(!state.complete_success(epoch, "late".into()));
-        assert!(state.history.is_empty());
-        assert!(!state.is_busy());
+        let cases = [
+            (Key::Return, ModifierType::empty(), ComposerKeyAction::Send),
+            (
+                Key::Return,
+                ModifierType::CONTROL_MASK,
+                ComposerKeyAction::Send,
+            ),
+            (
+                Key::KP_Enter,
+                ModifierType::CONTROL_MASK | ModifierType::LOCK_MASK,
+                ComposerKeyAction::Send,
+            ),
+            (
+                Key::Return,
+                ModifierType::SHIFT_MASK,
+                ComposerKeyAction::Newline,
+            ),
+            (
+                Key::KP_Enter,
+                ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK,
+                ComposerKeyAction::Newline,
+            ),
+            (
+                Key::Return,
+                ModifierType::ALT_MASK,
+                ComposerKeyAction::Proceed,
+            ),
+            (Key::a, ModifierType::empty(), ComposerKeyAction::Proceed),
+        ];
+
+        for (key, state, expected) in cases {
+            assert_eq!(classify_composer_key(key, state), expected);
+        }
     }
 }

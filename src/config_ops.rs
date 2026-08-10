@@ -83,6 +83,11 @@ impl AppModel {
             self.sync_agent_toggle();
             self.refresh_agent_panel();
         }
+        if new_config.ai_enabled && new_config.ai_panel_visible {
+            self.show_ai_session_panel();
+        } else {
+            self.set_ai_panel_visible(false, false);
+        }
 
         self.set_window_opacity(new_config.window_opacity);
         self.tab_placement.set(tab_placement);

@@ -46,6 +46,7 @@ pub(crate) enum Command {
     InitConfig,
     PrintDefaultConfig,
     PrintShellIntegration(ShellIntegration),
+    PrintCompletion(ShellIntegration),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -130,6 +131,15 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<ParsedAr
                     Command::PrintShellIntegration(parse_shell(shell)?),
                 )?;
             }
+            "--generate-completion" | "--completion" => {
+                index += 1;
+                let shell = args
+                    .get(index)
+                    .ok_or_else(|| format!("{option} requires a shell"))?
+                    .to_str()
+                    .ok_or_else(|| "shell name must be valid UTF-8".to_string())?;
+                set_utility(&mut utility, Command::PrintCompletion(parse_shell(shell)?))?;
+            }
             "--json" => report_json = true,
             "-c" | "--config" => {
                 index += 1;
@@ -198,6 +208,22 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<ParsedAr
                     &mut utility,
                     Command::PrintShellIntegration(parse_shell(
                         option.trim_start_matches("--shell-integration="),
+                    )?),
+                )?;
+            }
+            _ if option.starts_with("--generate-completion=") => {
+                set_utility(
+                    &mut utility,
+                    Command::PrintCompletion(parse_shell(
+                        option.trim_start_matches("--generate-completion="),
+                    )?),
+                )?;
+            }
+            _ if option.starts_with("--completion=") => {
+                set_utility(
+                    &mut utility,
+                    Command::PrintCompletion(parse_shell(
+                        option.trim_start_matches("--completion="),
                     )?),
                 )?;
             }
@@ -293,6 +319,7 @@ Utilities:
       --init-config            Create a documented config without overwriting one
       --print-default-config   Print the bundled example configuration
       --shell-integration SH   Print integration for bash, zsh, fish, or pwsh
+      --generate-completion SH Print CLI completion for bash, zsh, fish, or pwsh
   -h, --help                   Show this help
   -V, --version                Show the version
 
@@ -307,6 +334,7 @@ Examples:
   anvil --restore-config-backup
   anvil -d /tmp -e bash -lc 'printf "hello\\n"'
   source <(anvil --shell-integration bash)
+  source <(anvil --generate-completion bash)
 
 ANVIL_CONFIG provides the same process-local config-path override as --config.
 "#;
@@ -355,6 +383,34 @@ mod tests {
             parse_command(&["--shell-integration", "pwsh"]).unwrap(),
             Command::PrintShellIntegration(ShellIntegration::PowerShell)
         );
+    }
+
+    #[test]
+    fn parses_completion_utility_and_alias() {
+        assert_eq!(
+            parse_command(&["--generate-completion=fish"]).unwrap(),
+            Command::PrintCompletion(ShellIntegration::Fish)
+        );
+        assert_eq!(
+            parse_command(&["--completion", "powershell"]).unwrap(),
+            Command::PrintCompletion(ShellIntegration::PowerShell)
+        );
+    }
+
+    #[test]
+    fn bundled_completions_cover_every_shell_and_core_option() {
+        for script in [
+            include_str!("../scripts/completions/anvil.bash"),
+            include_str!("../scripts/completions/_anvil"),
+            include_str!("../scripts/completions/anvil.fish"),
+            include_str!("../scripts/completions/anvil.ps1"),
+        ] {
+            assert!(script.contains("anvil"));
+            assert!(script.contains("generate-completion"));
+            assert!(script.contains("shell-integration"));
+            assert!(script.contains("working-directory"));
+            assert!(script.contains("safe-mode"));
+        }
     }
 
     #[test]

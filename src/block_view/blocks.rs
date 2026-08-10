@@ -261,6 +261,15 @@ pub(crate) struct FinishedBlock {
     /// Current non-expanded row target, recomputed from the pane height minus
     /// the live input block height.
     dynamic_viewport_rows: Rc<Cell<i64>>,
+    /// Render geometry plus filtered-text generation. A remap at the same
+    /// geometry must not re-feed and transiently reset the card height.
+    render_stamp: Rc<Cell<(i64, i64, bool, u64)>>,
+    displayed_generation: Rc<Cell<u64>>,
+    command_bytes: Rc<Vec<u8>>,
+    command_render_cols: Rc<Cell<i64>>,
+    command_base_rows: i64,
+    capture_rows: i64,
+    max_expanded_cap: i64,
     output_rows: i64,
     expanded: Rc<Cell<bool>>,
     expand_btn: gtk::Button,
@@ -296,6 +305,13 @@ impl Clone for FinishedBlock {
             cols: self.cols,
             viewport_cap: self.viewport_cap,
             dynamic_viewport_rows: self.dynamic_viewport_rows.clone(),
+            render_stamp: self.render_stamp.clone(),
+            displayed_generation: self.displayed_generation.clone(),
+            command_bytes: self.command_bytes.clone(),
+            command_render_cols: self.command_render_cols.clone(),
+            command_base_rows: self.command_base_rows,
+            capture_rows: self.capture_rows,
+            max_expanded_cap: self.max_expanded_cap,
             output_rows: self.output_rows,
             expanded: self.expanded.clone(),
             expand_btn: self.expand_btn.clone(),
@@ -505,6 +521,21 @@ pub(crate) fn output_visual_row_count(text: &str, cols: i64) -> i64 {
         .max(1)
 }
 
+/// Finished VTEs follow their pixel allocation once a split becomes narrower
+/// than the columns recorded with the block. Row and height math must use that
+/// same width or map/refit passes alternate between two geometries.
+fn effective_render_cols(vte: &vte4::Terminal, recorded_cols: i64) -> i64 {
+    clamp_render_cols(recorded_cols, vte.width() as i64, vte.char_width())
+}
+
+fn clamp_render_cols(recorded_cols: i64, width_px: i64, cell_width_px: i64) -> i64 {
+    let recorded = recorded_cols.max(1);
+    if width_px <= 0 || cell_width_px <= 0 {
+        return recorded;
+    }
+    recorded.min((width_px / cell_width_px).max(2))
+}
+
 fn output_display_text(text: &str) -> &str {
     let text = if let Some(stripped) = text.strip_prefix("\r\n") {
         stripped
@@ -564,7 +595,7 @@ fn settle_vte_to_top(vte: &vte4::Terminal) {
     });
 }
 
-fn forward_outer_scroll(outer: &gtk::ScrolledWindow, dy: f64) {
+pub(crate) fn forward_outer_scroll(outer: &gtk::ScrolledWindow, dy: f64) {
     let outer_adj = outer.vadjustment();
     let step = outer_adj.step_increment().max(outer_adj.page_size() * 0.1);
     let max_value = (outer_adj.upper() - outer_adj.page_size()).max(outer_adj.lower());
@@ -597,7 +628,7 @@ fn block_edge_scroll_target(
 /// Move one adjustment for a wheel/trackpad delta. Returns true when that
 /// adjustment consumed movement, allowing nested scroll surfaces to hand off
 /// only at their actual top/bottom boundary.
-fn scroll_adjustment(adj: &gtk::Adjustment, dy: f64) -> bool {
+pub(crate) fn scroll_adjustment_by_wheel(adj: &gtk::Adjustment, dy: f64) -> bool {
     let Some(target) = scroll_target(
         adj.value(),
         adj.lower(),
@@ -771,6 +802,33 @@ mod tests {
     }
 
     #[test]
+    fn render_cols_follow_a_pane_narrower_than_the_recorded_width() {
+        assert_eq!(clamp_render_cols(46, 31 * 10, 10), 31);
+        assert_eq!(clamp_render_cols(46, 80 * 10, 10), 46);
+        assert_eq!(clamp_render_cols(46, 46 * 10, 10), 46);
+        assert_eq!(clamp_render_cols(46, 0, 10), 46);
+        assert_eq!(clamp_render_cols(46, 310, 0), 46);
+        assert_eq!(clamp_render_cols(46, 5, 10), 2);
+    }
+
+    #[test]
+    fn narrow_pane_wraps_wide_glyph_rows_like_vte() {
+        let line = "已最新已最新已最新已";
+        assert_eq!(output_visual_row_count(line, 31), 1);
+        assert_eq!(output_visual_row_count(line, 12), 2);
+        assert_eq!(output_visual_row_count(line, 4), 5);
+    }
+
+    #[test]
+    fn narrowed_render_cols_grow_the_height_row_count() {
+        let line = "x".repeat(40);
+        let recorded = 46;
+        let clamped = clamp_render_cols(recorded, 31 * 10, 10);
+        assert_eq!(output_visual_row_count(&line, recorded), 1);
+        assert_eq!(output_visual_row_count(&line, clamped), 2);
+    }
+
+    #[test]
     fn visual_row_count_ignores_ansi_and_overwritten_progress_rows() {
         let apt_like = concat!(
             "\r0% [Working]",
@@ -837,6 +895,18 @@ mod tests {
             block_edge_scroll_target(1500.0, 100.0, 800.0, 200.0, 0.0, 1800.0, true),
             1600.0
         );
+    }
+
+    #[test]
+    fn alt_screen_exit_never_restores_stale_organism_visibility() {
+        let entered = live_organism_alt_transition(true, true);
+        assert_eq!(entered, (false, true));
+        assert!(!live_organism_is_visible(entered.0, entered.1));
+
+        let exited = live_organism_alt_transition(entered.0, false);
+        assert_eq!(exited, (false, false));
+        assert!(!live_organism_is_visible(exited.0, exited.1));
+        assert!(live_organism_is_visible(true, exited.1));
     }
 }
 
@@ -1269,12 +1339,13 @@ impl FinishedBlock {
         };
         // Captured command strings use logical newlines. Convert them to CRLF
         // for VTE so every pasted/continued line begins at the command column.
-        let cmd_bytes = terminalize_line_breaks(&cmd_bytes);
+        let cmd_bytes = Rc::new(terminalize_line_breaks(&cmd_bytes));
         // Allocate every logical command row up front; VTE's post-feed pass
         // adds any further rows caused by soft wrapping or control sequences.
         let cmd_rows = cmd_bytes.iter().filter(|&&b| b == b'\n').count() as i64 + 1;
         let command_vte =
             create_finished_terminal(config, cols, cmd_rows.max(1), cmd_rows.max(1), true);
+        let command_render_cols = Rc::new(Cell::new(0_i64));
         // Defer feeds until the widget is actually mapped — VTE's internal
         // grid resize from set_size() doesn't take effect until the widget is
         // realized, so feeding immediately wraps content at a smaller default
@@ -1285,19 +1356,27 @@ impl FinishedBlock {
             let cmd_bytes_for_map = cmd_bytes.clone();
             let cols_for_map = cols.max(1);
             let cmd_rows_for_map = cmd_rows.max(1);
-            let fed = Cell::new(false);
+            let command_render_cols = command_render_cols.clone();
             command_vte.connect_map(move |w| {
-                if fed.get() {
+                let effective_cols = effective_render_cols(w, cols_for_map);
+                if command_render_cols.replace(effective_cols) == effective_cols {
                     return;
                 }
-                fed.set(true);
-                w.set_size(cols_for_map, cmd_rows_for_map);
-                w.feed(&cmd_bytes_for_map);
+                let rendered_rows = output_visual_row_count(
+                    &String::from_utf8_lossy(cmd_bytes_for_map.as_slice()),
+                    effective_cols,
+                )
+                .max(cmd_rows_for_map);
+                w.set_size(effective_cols, rendered_rows);
+                w.reset(true, true);
+                w.set_size(effective_cols, rendered_rows);
+                w.feed(cmd_bytes_for_map.as_slice());
+                settle_finished_terminal_after_feed(w);
                 // Gtk may otherwise allocate this VTE at one row, leaving the
                 // continuation lines in its internal scrollback.
                 let ch = w.char_height() as i32;
                 if ch > 0 {
-                    w.set_height_request(cmd_rows_for_map as i32 * ch);
+                    w.set_height_request(rendered_rows as i32 * ch);
                 }
             });
         }
@@ -1321,6 +1400,8 @@ impl FinishedBlock {
         // Tracks whether the user has toggled this block to its expanded
         // height. Survives unmap/remap so re-feeding picks the right cap.
         let expanded: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let render_stamp: Rc<Cell<(i64, i64, bool, u64)>> = Rc::new(Cell::new((0, 0, false, 0)));
+        let displayed_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
         {
             let cols_for_map = cols.max(1);
             let cap_for_map = dynamic_viewport_rows.clone();
@@ -1328,35 +1409,45 @@ impl FinishedBlock {
             let full_for_map = full_output.clone();
             let displayed_for_map = displayed_output.clone();
             let expanded_for_map = expanded.clone();
-            let fed = Cell::new(false);
+            let render_stamp_for_map = render_stamp.clone();
+            let displayed_generation_for_map = displayed_generation.clone();
+            let expand_btn_for_map = expand_btn.downgrade();
+            let jump_btn_for_map = jump_bottom_btn.downgrade();
             output_vte.connect_map(move |w| {
-                if fed.get() {
-                    if !output_scrollable {
-                        pin_vte_to_top(w);
-                        let w = w.clone();
-                        glib::idle_add_local_once(move || pin_vte_to_top(&w));
-                    }
-                    return;
-                }
-                fed.set(true);
                 let full = full_for_map.borrow();
                 let displayed = displayed_for_map.borrow();
                 let text = displayed.as_deref().unwrap_or(full.as_str());
-                let rows = output_visual_row_count(text, cols_for_map);
+                let effective_cols = effective_render_cols(w, cols_for_map);
+                let rows = output_visual_row_count(text, effective_cols);
                 let cap = if expanded_for_map.get() {
                     max_for_map
                 } else {
                     cap_for_map.get()
                 };
+                if let Some(expand_btn) = expand_btn_for_map.upgrade() {
+                    expand_btn.set_visible(rows > cap_for_map.get());
+                }
+                if let Some(jump_btn) = jump_btn_for_map.upgrade() {
+                    jump_btn.set_visible(rows > cap_for_map.get());
+                }
+                let stamp = (
+                    effective_cols,
+                    cap,
+                    expanded_for_map.get(),
+                    displayed_generation_for_map.get(),
+                );
+                if render_stamp_for_map.replace(stamp) == stamp {
+                    return;
+                }
                 let visible_rows = rows.min(cap).clamp(1, 32);
                 render_bytes_into_finished_vte(
                     w,
                     text,
-                    cols_for_map,
+                    effective_cols,
                     rows,
                     cap,
                     capture_rows,
-                    !output_scrollable,
+                    rows <= cap,
                 );
                 // Pin a minimum pixel height so GTK's vertical Box layout cannot
                 // shrink this VTE below what set_size requested. Without this,
@@ -1369,7 +1460,7 @@ impl FinishedBlock {
                 if ch > 0 {
                     w.set_height_request((visible_rows as i32) * ch);
                 }
-                if !output_scrollable {
+                if rows <= cap {
                     pin_vte_to_top(w);
                     let w = w.clone();
                     glib::idle_add_local_once(move || pin_vte_to_top(&w));
@@ -1381,13 +1472,16 @@ impl FinishedBlock {
         // Click swaps the output VTE between capped and expanded heights and
         // updates the icon (expand ↔ compress). The map handler reads the
         // shared `expanded` flag so a re-feed after scroll-off/on respects it.
-        if output_rows > viewport_cap {
+        expand_btn.set_visible(output_rows > viewport_cap);
+        {
             let expand_for_btn = expanded.clone();
             let viewport_for_btn = dynamic_viewport_rows.clone();
             let output_vte_for_btn = output_vte.clone();
             let full_for_btn = full_output.clone();
             let displayed_for_btn = displayed_output.clone();
             let cols_for_btn = cols.max(1);
+            let render_stamp_for_btn = render_stamp.clone();
+            let displayed_generation_for_btn = displayed_generation.clone();
             expand_btn.connect_clicked(move |btn| {
                 let now_expanded = !expand_for_btn.get();
                 expand_for_btn.set(now_expanded);
@@ -1399,9 +1493,24 @@ impl FinishedBlock {
                 let full = full_for_btn.borrow();
                 let displayed = displayed_for_btn.borrow();
                 let text = displayed.as_deref().unwrap_or(full.as_str());
-                let rows = output_visual_row_count(text, cols_for_btn);
+                let effective_cols = effective_render_cols(&output_vte_for_btn, cols_for_btn);
+                let rows = output_visual_row_count(text, effective_cols);
                 let visible_rows = rows.min(cap).max(1);
-                output_vte_for_btn.set_size(cols_for_btn, visible_rows);
+                render_stamp_for_btn.set((
+                    effective_cols,
+                    cap,
+                    now_expanded,
+                    displayed_generation_for_btn.get(),
+                ));
+                render_bytes_into_finished_vte(
+                    &output_vte_for_btn,
+                    text,
+                    effective_cols,
+                    rows,
+                    cap,
+                    capture_rows,
+                    rows <= cap,
+                );
                 let ch = output_vte_for_btn.char_height() as i32;
                 if ch > 0 {
                     output_vte_for_btn.set_height_request((visible_rows as i32) * ch);
@@ -1413,8 +1522,6 @@ impl FinishedBlock {
                     "Expand block"
                 }));
             });
-        } else {
-            expand_btn.set_visible(false);
         }
 
         // Command row: Warp-style accent prompt chevron + the command VTE.
@@ -1435,6 +1542,19 @@ impl FinishedBlock {
         output_scrollbar.add_css_class("block-output-scrollbar");
         output_scrollbar.set_visible(output_scrollable);
         output_scrollbar.set_tooltip_text(Some("Scroll within this block"));
+        if let Some(adjustment) = output_vte.vadjustment() {
+            let scrollbar = output_scrollbar.downgrade();
+            let sync_visibility = move |adjustment: &gtk::Adjustment| {
+                if let Some(scrollbar) = scrollbar.upgrade() {
+                    scrollbar.set_visible(
+                        adjustment.upper() - adjustment.lower()
+                            > adjustment.page_size() + f64::EPSILON,
+                    );
+                }
+            };
+            sync_visibility(&adjustment);
+            adjustment.connect_changed(sync_visibility);
+        }
         output_box.append(&output_scrollbar);
         let output_widget: gtk::Widget = output_box.clone().upcast::<gtk::Widget>();
         outer.append(&output_box);
@@ -1630,6 +1750,8 @@ impl FinishedBlock {
                 let dynamic_viewport_rows = dynamic_viewport_rows.clone();
                 let collapsed_summary = collapsed_summary.downgrade();
                 let filter_enabled = filter_enabled.clone();
+                let render_stamp = render_stamp.clone();
+                let displayed_generation = displayed_generation.clone();
                 move || {
                     let (
                         Some(output_vte),
@@ -1673,16 +1795,20 @@ impl FinishedBlock {
                         )
                     };
                     let shown_rows = output_row_count(&shown);
-                    let shown_visual_rows = output_visual_row_count(&shown, cols);
+                    let effective_cols = effective_render_cols(&output_vte, cols);
+                    let shown_visual_rows = output_visual_row_count(&shown, effective_cols);
                     let active_cap = if expanded.get() {
                         max_expanded_cap
                     } else {
                         dynamic_viewport_rows.get()
                     };
+                    let generation = displayed_generation.get().wrapping_add(1);
+                    displayed_generation.set(generation);
+                    render_stamp.set((effective_cols, active_cap, expanded.get(), generation));
                     render_bytes_into_finished_vte(
                         &output_vte,
                         &shown,
-                        cols,
+                        effective_cols,
                         shown_visual_rows,
                         active_cap,
                         capture_rows,
@@ -1795,6 +1921,13 @@ impl FinishedBlock {
             cols,
             viewport_cap,
             dynamic_viewport_rows,
+            render_stamp,
+            displayed_generation,
+            command_bytes: cmd_bytes,
+            command_render_cols,
+            command_base_rows: cmd_rows,
+            capture_rows,
+            max_expanded_cap,
             output_rows,
             expanded,
             expand_btn,
@@ -1830,30 +1963,83 @@ impl FinishedBlock {
         });
     }
 
-    /// Size a long output surface to the pane space left above the live input
-    /// block. Returns the visible row count when this is a dynamically-sized
-    /// block so the virtualization metadata can stay in lockstep with GTK.
-    pub(crate) fn fit_output_to_height(&self, available_px: i32) -> Option<i64> {
-        if !self.output_scrollable {
+    /// Re-render a mapped snapshot when pane height, width, or filter text
+    /// changes. Width is part of the stamp because VTE follows its allocation
+    /// below the recorded columns; ignoring it causes the narrow-pane two-frame
+    /// height oscillation this method is designed to prevent.
+    pub(crate) fn refit_output_to_geometry(&self, available_px: i32) -> Option<i32> {
+        let cell_height = (self.output_vte.char_height() as i32).max(1);
+        let effective_cols = effective_render_cols(&self.output_vte, self.cols);
+        let full = self.full_output.borrow();
+        let displayed = self.displayed_output.borrow();
+        let text = displayed.as_deref().unwrap_or(full.as_str());
+        let output_rows = output_visual_row_count(text, effective_cols);
+        let fitted_rows = fitted_output_rows(available_px, cell_height, output_rows);
+        let generation = self.displayed_generation.get();
+        if !self.output_vte.is_mapped() {
+            self.dynamic_viewport_rows.set(fitted_rows);
             return None;
         }
-        let cell_height = (self.output_vte.char_height() as i32).max(1);
-        let rows = fitted_output_rows(available_px, cell_height, self.output_rows);
-        if self.dynamic_viewport_rows.replace(rows) == rows {
-            return Some(rows);
+        let (last_cols, ..) = self.render_stamp.get();
+        let geometry_changed =
+            last_cols != effective_cols || self.dynamic_viewport_rows.get() != fitted_rows;
+        let command_effective_cols = effective_render_cols(&self.command_vte, self.cols);
+        let command_needs_refit = self.command_vte.is_mapped()
+            && self.command_render_cols.get() != command_effective_cols;
+        if !geometry_changed && !command_needs_refit {
+            return None;
         }
 
-        // Dynamic pane sizing is authoritative; leave the manual expanded
-        // state when the window or input block changes size.
+        self.dynamic_viewport_rows.set(fitted_rows);
         self.expanded.set(false);
         self.expand_btn.set_label("\u{f065}");
         self.expand_btn.set_tooltip_text(Some("Expand block"));
-        self.output_vte.set_size(self.cols.max(1), rows);
+        self.expand_btn.set_visible(output_rows > fitted_rows);
+        let stamp = (effective_cols, fitted_rows, false, generation);
+        self.render_stamp.set(stamp);
+        render_bytes_into_finished_vte(
+            &self.output_vte,
+            text,
+            effective_cols,
+            output_rows,
+            fitted_rows,
+            self.capture_rows,
+            output_rows <= fitted_rows,
+        );
+        let visible_rows = output_rows.min(fitted_rows).max(1);
         self.output_vte
-            .set_height_request((rows as i32).saturating_mul(cell_height));
-        self.output_scrollbar.set_visible(self.output_rows > rows);
+            .set_height_request((visible_rows as i32).saturating_mul(cell_height));
+        self.output_scrollbar.set_visible(output_rows > fitted_rows);
         self.output_vte.queue_allocate();
-        Some(rows)
+
+        let command_text = String::from_utf8_lossy(self.command_bytes.as_slice());
+        let command_rows = if self.is_background {
+            0
+        } else {
+            output_visual_row_count(&command_text, command_effective_cols)
+                .max(self.command_base_rows)
+        };
+        if command_needs_refit {
+            self.command_render_cols.set(command_effective_cols);
+            self.command_vte
+                .set_size(command_effective_cols, command_rows.max(1));
+            self.command_vte.reset(true, true);
+            self.command_vte
+                .set_size(command_effective_cols, command_rows.max(1));
+            self.command_vte.feed(self.command_bytes.as_slice());
+            settle_finished_terminal_after_feed(&self.command_vte);
+            self.command_vte
+                .set_height_request((command_rows.max(1) as i32).saturating_mul(cell_height));
+        }
+
+        let rows_for_height = visible_rows
+            .saturating_add(2)
+            .saturating_add(command_rows.saturating_sub(1));
+        Some(
+            (rows_for_height.clamp(1, i32::MAX as i64) as i32)
+                .saturating_mul(cell_height)
+                .saturating_add(34),
+        )
     }
 
     /// Give a long block first refusal on wheel events while the pointer is over
@@ -1879,20 +2065,15 @@ impl FinishedBlock {
             scroll_ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
             let vte = self.output_vte.downgrade();
             let outer_for_vte = outer.downgrade();
-            let output_scrollable = self.output_scrollable;
             scroll_ctrl.connect_scroll(move |_, _dx, dy| {
                 let (Some(vte), Some(outer_for_vte)) = (vte.upgrade(), outer_for_vte.upgrade())
                 else {
                     return glib::Propagation::Proceed;
                 };
-                if output_scrollable {
-                    if let Some(inner_adj) = vte.vadjustment() {
-                        if scroll_adjustment(&inner_adj, dy) {
-                            return glib::Propagation::Stop;
-                        }
+                if let Some(inner_adj) = vte.vadjustment() {
+                    if scroll_adjustment_by_wheel(&inner_adj, dy) {
+                        return glib::Propagation::Stop;
                     }
-                } else {
-                    pin_vte_to_top(&vte);
                 }
                 forward_outer_scroll(&outer_for_vte, dy);
                 glib::Propagation::Stop
@@ -1972,6 +2153,17 @@ impl FinishedBlock {
 pub(crate) struct ActiveBlock {
     pub(crate) widget: gtk::Box,
     pub(crate) active_vte: Terminal,
+    /// Pass-through, non-measuring surface for small live widgets. The VTE
+    /// remains the overlay's measured child, so the organism never changes
+    /// the terminal grid or steals input.
+    pub(crate) live_organism_surface: gtk::Fixed,
+    /// Overlay scrollbar for a still-running command. It is painted above the
+    /// organism surface and therefore remains reachable at every pane width.
+    pub(crate) live_scrollbar: gtk::Scrollbar,
+    /// Feature-requested visibility. Alternate-screen applications suppress
+    /// it without allowing stale pre-TUI coordinates to reappear on exit.
+    live_organism_visible: Cell<bool>,
+    live_organism_alt_screen: Cell<bool>,
     /// Raw output bytes accumulated during CollectingOutput, consumed by the
     /// finalize path to build the styled finished block (anvil's `out_buf`).
     pub(crate) raw_output: Rc<RefCell<VecDeque<u8>>>,
@@ -2022,11 +2214,54 @@ impl ActiveBlock {
         let active_vte = create_active_terminal(config);
         active_vte.set_hexpand(true);
         active_vte.set_vexpand(false);
-        widget.append(&active_vte);
+        let vte_overlay = gtk::Overlay::new();
+        vte_overlay.set_hexpand(true);
+        vte_overlay.set_vexpand(false);
+        vte_overlay.set_child(Some(&active_vte));
+
+        let live_organism_surface = gtk::Fixed::new();
+        live_organism_surface.set_hexpand(true);
+        live_organism_surface.set_vexpand(true);
+        live_organism_surface.set_halign(gtk::Align::Fill);
+        live_organism_surface.set_valign(gtk::Align::Fill);
+        live_organism_surface.set_overflow(gtk::Overflow::Hidden);
+        live_organism_surface.set_can_target(false);
+        live_organism_surface.set_focusable(false);
+        live_organism_surface.set_visible(false);
+        vte_overlay.add_overlay(&live_organism_surface);
+        vte_overlay.set_measure_overlay(&live_organism_surface, false);
+        vte_overlay.set_clip_overlay(&live_organism_surface, true);
+
+        let live_scrollbar =
+            gtk::Scrollbar::new(Orientation::Vertical, active_vte.vadjustment().as_ref());
+        live_scrollbar.add_css_class("block-output-scrollbar");
+        live_scrollbar.set_tooltip_text(Some("Scroll within the running output"));
+        live_scrollbar.set_halign(gtk::Align::End);
+        live_scrollbar.set_visible(false);
+        // Added last so it paints above the pass-through organism surface.
+        vte_overlay.add_overlay(&live_scrollbar);
+        widget.append(&vte_overlay);
+        if let Some(adjustment) = active_vte.vadjustment() {
+            let scrollbar = live_scrollbar.downgrade();
+            let sync_visibility = move |adjustment: &gtk::Adjustment| {
+                let Some(scrollbar) = scrollbar.upgrade() else {
+                    return;
+                };
+                let overflows =
+                    adjustment.upper() - adjustment.lower() > adjustment.page_size() + f64::EPSILON;
+                scrollbar.set_visible(overflows);
+            };
+            sync_visibility(&adjustment);
+            adjustment.connect_changed(sync_visibility);
+        }
 
         ActiveBlock {
             widget,
             active_vte,
+            live_organism_surface,
+            live_scrollbar,
+            live_organism_visible: Cell::new(false),
+            live_organism_alt_screen: Cell::new(false),
             raw_output: Rc::new(RefCell::new(VecDeque::new())),
         }
     }
@@ -2085,6 +2320,45 @@ impl ActiveBlock {
     pub(crate) fn grab_focus(&self) {
         self.active_vte.grab_focus();
     }
+
+    pub(crate) fn set_live_organism_visible(&self, visible: bool) {
+        self.live_organism_visible.set(visible);
+        self.sync_live_organism_visibility();
+    }
+
+    pub(crate) fn set_live_organism_alt_screen(&self, alt_screen: bool) {
+        let (desired, alt_screen) =
+            live_organism_alt_transition(self.live_organism_visible.get(), alt_screen);
+        self.live_organism_visible.set(desired);
+        self.live_organism_alt_screen.set(alt_screen);
+        self.sync_live_organism_visibility();
+    }
+
+    pub(crate) fn live_organism_alt_screen(&self) -> bool {
+        self.live_organism_alt_screen.get()
+    }
+
+    fn sync_live_organism_visibility(&self) {
+        self.live_organism_surface
+            .set_visible(live_organism_is_visible(
+                self.live_organism_visible.get(),
+                self.live_organism_alt_screen.get(),
+            ));
+    }
+}
+
+fn live_organism_alt_transition(desired: bool, entering: bool) -> (bool, bool) {
+    if entering {
+        // Exit only removes the override; a later measured heartbeat opts in
+        // again instead of resurrecting stale pre-TUI coordinates.
+        (false, true)
+    } else {
+        (desired, false)
+    }
+}
+
+fn live_organism_is_visible(desired: bool, alt_screen: bool) -> bool {
+    desired && !alt_screen
 }
 
 // ─── TermView state machine ───────────────────────────────────────────────────

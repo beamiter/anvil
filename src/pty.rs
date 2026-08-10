@@ -13,8 +13,8 @@ use nix::unistd::{self, ForkResult, Pid};
 use relm4::gtk;
 use std::collections::VecDeque;
 use std::ffi::CString;
-use std::io::{self, Read as _};
-use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::io::{self, Read as _, Write as _};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
@@ -44,6 +44,69 @@ pub struct OwnedPty {
     /// At an interactive prompt this lets insertion-only multiline input be
     /// wrapped safely instead of executing one command per line.
     shell_bracketed_paste: Arc<AtomicBool>,
+    /// One-shot secret delivered to the interactive shell through an inherited
+    /// pipe descriptor. The token itself is never placed in argv or the
+    /// environment, and the bundled integration closes the descriptor before
+    /// any user command can inherit it.
+    shell_integration_token: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+fn move_fd_above_stdio(fd: OwnedFd) -> io::Result<OwnedFd> {
+    if fd.as_raw_fd() > libc::STDERR_FILENO {
+        return Ok(fd);
+    }
+    // SAFETY: the source is an owned, live descriptor. The duplicate is the
+    // first free descriptor at or above 3 and remains CLOEXEC until the child
+    // explicitly admits only the read end across exec.
+    let duplicated = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+    if duplicated < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fcntl returned a new descriptor owned by this process.
+    Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
+}
+
+#[cfg(target_os = "linux")]
+fn shell_token_channel() -> io::Result<Option<(String, OwnedFd, OwnedFd)>> {
+    let mut random = [0_u8; 16];
+    // SAFETY: `random` is writable for the exact supplied length.
+    let read = unsafe {
+        libc::getrandom(
+            random.as_mut_ptr().cast(),
+            random.len(),
+            libc::GRND_NONBLOCK,
+        )
+    };
+    if read != random.len() as isize {
+        // Entropy temporarily being unavailable disables Agent execution; it
+        // must never fall back to a predictable token.
+        return Ok(None);
+    }
+    let mut token = String::with_capacity(random.len() * 2);
+    for byte in random {
+        use std::fmt::Write as _;
+        let _ = write!(token, "{byte:02x}");
+    }
+
+    let mut fds = [-1; 2];
+    // SAFETY: `fds` points to two writable integers. Both ends start CLOEXEC;
+    // only the child-side read end is deliberately opened across exec later.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: pipe2 returned two fresh descriptors. Take ownership of both
+    // before either fallible duplicate, so an error cannot leak the other end.
+    let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    let read_fd = move_fd_above_stdio(read_fd)?;
+    let write_fd = move_fd_above_stdio(write_fd)?;
+    Ok(Some((token, read_fd, write_fd)))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn shell_token_channel() -> io::Result<Option<(String, OwnedFd, OwnedFd)>> {
+    Ok(None)
 }
 
 /// Process exactly one bounded chunk per GLib dispatch. Even at idle priority,
@@ -343,8 +406,40 @@ impl OwnedPty {
     }
 
     pub fn spawn(argv: &[&str], cwd: Option<&str>, env_extra: &[(&str, &str)]) -> io::Result<Self> {
+        Self::spawn_inner(argv, cwd, env_extra, false)
+    }
+
+    /// Spawn a shell with an optional private shell-integration token channel.
+    /// Host-bridged/Flatpak children deliberately never receive this channel:
+    /// the descriptor cannot cross that process boundary with equivalent
+    /// ownership guarantees, so Agent execution remains fail-closed there.
+    pub(crate) fn spawn_with_shell_token(
+        argv: &[&str],
+        cwd: Option<&str>,
+        env_extra: &[(&str, &str)],
+        enable_shell_token: bool,
+    ) -> io::Result<Self> {
+        Self::spawn_inner(argv, cwd, env_extra, enable_shell_token)
+    }
+
+    fn spawn_inner(
+        argv: &[&str],
+        cwd: Option<&str>,
+        env_extra: &[(&str, &str)],
+        enable_shell_token: bool,
+    ) -> io::Result<Self> {
         let argv_owned: Vec<String> = argv.iter().map(|value| (*value).to_string()).collect();
         let host_bridge = crate::host::is_flatpak();
+        let sanitized_extra: Vec<(&str, &str)> = env_extra
+            .iter()
+            .copied()
+            .filter(|(name, _)| {
+                !matches!(
+                    *name,
+                    "ANVIL_SHELL_INTEGRATION_FD" | "ANVIL_SHELL_INTEGRATION_TOKEN"
+                )
+            })
+            .collect();
         let effective_cwd = cwd.filter(|directory| {
             let usable = crate::host::working_directory_available(directory);
             if !usable {
@@ -352,7 +447,7 @@ impl OwnedPty {
             }
             usable
         });
-        let executable_argv = crate::host::wrap_argv(&argv_owned, effective_cwd, env_extra);
+        let executable_argv = crate::host::wrap_argv(&argv_owned, effective_cwd, &sanitized_extra);
         if executable_argv.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -395,8 +490,31 @@ impl OwnedPty {
         // Flatpak mode `crate::host::wrap_argv` has already turned it into
         // `flatpak-spawn --env=` arguments for the host child, so passing it here
         // as well would set it in the sandbox process too.
-        let bridged_extra: &[(&str, &str)] = if host_bridge { &[] } else { env_extra };
-        let c_environment = child_env::envp(&child_environment_options(), bridged_extra)?;
+        let bridged_extra: &[(&str, &str)] = if host_bridge { &[] } else { &sanitized_extra };
+        let mut c_environment = child_env::envp(&child_environment_options(), bridged_extra)?;
+        let token_channel = if host_bridge || !enable_shell_token {
+            None
+        } else {
+            shell_token_channel()?
+        };
+        // Neither caller-supplied spelling is authoritative. The public token
+        // spelling is never used at all; the fd spelling is reconstructed from
+        // the owned descriptor immediately below.
+        c_environment.retain(|entry| {
+            !entry.as_bytes().starts_with(b"ANVIL_SHELL_INTEGRATION_FD=")
+                && !entry
+                    .as_bytes()
+                    .starts_with(b"ANVIL_SHELL_INTEGRATION_TOKEN=")
+        });
+        if let Some((_, read_fd, _)) = token_channel.as_ref() {
+            c_environment.push(
+                CString::new(format!(
+                    "ANVIL_SHELL_INTEGRATION_FD={}",
+                    read_fd.as_raw_fd()
+                ))
+                .expect("numeric shell integration descriptor contains no NUL"),
+            );
+        }
         // Resolve against the PATH the *child* will run with, which the overlay
         // above never rewrites, so this cannot silently search a different PATH
         // than the one the shell inherits.
@@ -422,6 +540,15 @@ impl OwnedPty {
             .collect::<Vec<_>>();
         c_environment_ptrs.push(std::ptr::null());
 
+        let token_read_fd = token_channel
+            .as_ref()
+            .map(|(_, fd, _)| fd.as_raw_fd())
+            .unwrap_or(-1);
+        let token_write_fd = token_channel
+            .as_ref()
+            .map(|(_, _, fd)| fd.as_raw_fd())
+            .unwrap_or(-1);
+
         let initial_size = nix::pty::Winsize {
             ws_row: 24,
             ws_col: 80,
@@ -434,6 +561,10 @@ impl OwnedPty {
         match unsafe { unistd::fork() } {
             Ok(ForkResult::Child) => {
                 drop(master);
+                if token_write_fd >= 0 {
+                    // SAFETY: this is the child-side copy of a live pipe end.
+                    unsafe { libc::close(token_write_fd) };
+                }
                 let slave_fd = slave.into_raw_fd();
                 unsafe {
                     if libc::setsid() < 0 {
@@ -461,6 +592,9 @@ impl OwnedPty {
                     if slave_fd > libc::STDERR_FILENO {
                         libc::close(slave_fd);
                     }
+                    if token_read_fd >= 0 && libc::fcntl(token_read_fd, libc::F_SETFD, 0) < 0 {
+                        libc::_exit(126);
+                    }
                 }
 
                 if let Some(directory) = c_cwd.as_ref() {
@@ -481,6 +615,27 @@ impl OwnedPty {
                 }
             }
             Ok(ForkResult::Parent { child }) => {
+                let shell_integration_token =
+                    if let Some((token, read_fd, write_fd)) = token_channel {
+                        drop(read_fd);
+                        let mut writer = std::fs::File::from(write_fd);
+                        if writer
+                            .write_all(format!("{token}\n").as_bytes())
+                            .and_then(|()| writer.flush())
+                            .is_err()
+                        {
+                            drop(master);
+                            drop(slave);
+                            kill_and_reap_unreferenced_child(child);
+                            return Err(io::Error::new(
+                                io::ErrorKind::BrokenPipe,
+                                "could not deliver the shell integration token",
+                            ));
+                        }
+                        Some(token)
+                    } else {
+                        None
+                    };
                 drop(slave);
                 // Take ownership of the child's termination path first: from
                 // here on every failure below can tear it down through the
@@ -517,6 +672,7 @@ impl OwnedPty {
                     reader_cancelled: Arc::new(AtomicBool::new(false)),
                     input_guard: std::sync::Mutex::new(pty_input::InputGuard::new()),
                     shell_bracketed_paste: Arc::new(AtomicBool::new(false)),
+                    shell_integration_token,
                 })
             }
             Err(e) => Err(io::Error::other(e)),
@@ -525,6 +681,10 @@ impl OwnedPty {
 
     pub fn pid_i32(&self) -> i32 {
         self.child_lifecycle.pid()
+    }
+
+    pub(crate) fn shell_integration_token(&self) -> Option<&str> {
+        self.shell_integration_token.as_deref()
     }
 
     /// Raw master-side fd, or -1 if already closed. Borrowed for the lifetime of
@@ -548,7 +708,8 @@ impl OwnedPty {
             return None;
         }
         let foreground = unsafe { libc::tcgetpgrp(fd) };
-        (foreground > 0).then(|| foreground == self.child_lifecycle.pid())
+        let shell_group = unsafe { libc::getpgid(self.child_lifecycle.pid()) };
+        (foreground > 0 && shell_group > 0).then_some(foreground == shell_group)
     }
 
     /// Filter one outgoing chunk and queue it.
@@ -833,6 +994,136 @@ impl Drop for OwnedPty {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn token_pipe_is_private_bounded_and_above_standard_io() {
+        let (token, read_fd, write_fd) = shell_token_channel()
+            .expect("create token pipe")
+            .expect("Linux provides getrandom and pipe2");
+        assert_eq!(token.len(), 32);
+        assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(read_fd.as_raw_fd() > libc::STDERR_FILENO);
+        assert!(write_fd.as_raw_fd() > libc::STDERR_FILENO);
+
+        let mut writer = std::fs::File::from(write_fd);
+        writer.write_all(format!("{token}\n").as_bytes()).unwrap();
+        drop(writer);
+        let mut reader = std::fs::File::from(read_fd);
+        let mut delivered = String::new();
+        reader.read_to_string(&mut delivered).unwrap();
+        assert_eq!(delivered, format!("{token}\n"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bundled_bash_consumes_fd_announces_token_and_scrubs_environment() {
+        let integration = format!(
+            "{}/scripts/shell-integration/anvil.bash",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let pty = OwnedPty::spawn_with_shell_token(
+            &[
+                "/bin/bash",
+                "--noprofile",
+                "--rcfile",
+                integration.as_str(),
+                "-i",
+            ],
+            None,
+            &[
+                ("PS1", "anvil-fd-test$ "),
+                ("ANVIL_SHELL_INTEGRATION_FD", "0"),
+                ("ANVIL_SHELL_INTEGRATION_TOKEN", "forged"),
+                ("__anvil_command_token", "export-seed"),
+            ],
+            true,
+        )
+        .expect("spawn token-aware bash");
+        let token = pty
+            .shell_integration_token()
+            .expect("token was issued")
+            .to_string();
+        let ready = format!("\x1b]7771;{token}\x07");
+        let output = read_until(
+            pty.master_fd_raw(),
+            ready.as_bytes(),
+            Duration::from_secs(5),
+        );
+        assert!(
+            output
+                .windows(ready.len())
+                .any(|window| window == ready.as_bytes()),
+            "integration did not announce the issued token: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+
+        let mut resource = format!("source '{}'", integration.replace('\'', "'\\''")).into_bytes();
+        resource.push(b'\r');
+        pty.write_bytes(&resource);
+        let output = read_until(
+            pty.master_fd_raw(),
+            ready.as_bytes(),
+            Duration::from_secs(5),
+        );
+        assert!(
+            output
+                .windows(ready.len())
+                .any(|window| window == ready.as_bytes()),
+            "re-sourcing replaced the private token capability: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+
+        let mut command = br#"printf '\n__ANVIL_ENV[%s][%s][%s]__\n' "${ANVIL_SHELL_INTEGRATION_FD+leak}" "${ANVIL_SHELL_INTEGRATION_TOKEN+leak}" "$(env | grep -q '^__anvil_command_token=' && printf leak)""#.to_vec();
+        command.push(b'\r');
+        pty.write_bytes(&command);
+        let clean = b"__ANVIL_ENV[][][]__";
+        let output = read_until(pty.master_fd_raw(), clean, Duration::from_secs(5));
+        assert!(
+            output.windows(clean.len()).any(|window| window == clean),
+            "integration metadata leaked into a user command: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+        pty.kill();
+    }
+
+    fn read_until(fd: RawFd, needle: &[u8], timeout: Duration) -> Vec<u8> {
+        let deadline = Instant::now() + timeout;
+        let mut output = Vec::new();
+        while Instant::now() < deadline {
+            let mut poll_fd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: poll_fd is valid for one entry and the borrowed master
+            // descriptor remains owned by `OwnedPty` for the test duration.
+            if unsafe { libc::poll(&mut poll_fd, 1, 100) } <= 0 {
+                continue;
+            }
+            let mut buffer = [0_u8; 256];
+            // SAFETY: buffer is writable and fd is the live PTY master.
+            let read =
+                unsafe { libc::read(fd, buffer.as_mut_ptr().cast::<libc::c_void>(), buffer.len()) };
+            if read < 0
+                && matches!(
+                    io::Error::last_os_error().kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                )
+            {
+                continue;
+            }
+            if read <= 0 {
+                break;
+            }
+            output.extend_from_slice(&buffer[..read as usize]);
+            if output.windows(needle.len()).any(|window| window == needle) {
+                break;
+            }
+        }
+        output
+    }
 
     #[test]
     fn spawn_rejects_nul_before_forking() {

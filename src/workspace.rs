@@ -20,6 +20,13 @@ pub(crate) enum TermCtl {
 }
 
 impl TermCtl {
+    pub(crate) fn mode(&self) -> TerminalMode {
+        match self {
+            Self::Vte(_) => TerminalMode::Vte,
+            Self::Block(_) => TerminalMode::Block,
+        }
+    }
+
     pub(crate) fn emit(&self, msg: VteInput) {
         match self {
             Self::Vte(controller) => controller.emit(msg),
@@ -31,6 +38,36 @@ impl TermCtl {
         match self {
             Self::Vte(controller) => controller.widget().clone().upcast(),
             Self::Block(controller) => controller.widget().clone().upcast(),
+        }
+    }
+
+    /// Block construction is synchronous in its Relm4 `init`; VTE child spawn
+    /// completion arrives later as an output message and therefore has no
+    /// synchronous error to expose here.
+    pub(crate) fn synchronous_launch_error(&self) -> Option<String> {
+        match self {
+            Self::Vte(_) => None,
+            Self::Block(controller) => controller.model().launch_error().map(str::to_owned),
+        }
+    }
+
+    pub(crate) fn term_view(&self) -> Option<std::rc::Rc<crate::block_view::TermView>> {
+        match self {
+            Self::Vte(_) => None,
+            Self::Block(controller) => controller.model().term_view(),
+        }
+    }
+
+    /// Most-recent-first command snapshot from the active Block backend.
+    /// Plain VTE panes have no structured finished-block history.
+    pub(crate) fn command_history(&self) -> Vec<String> {
+        match self {
+            Self::Vte(_) => Vec::new(),
+            Self::Block(controller) => controller
+                .model()
+                .term_view()
+                .map(|view| view.command_history())
+                .unwrap_or_default(),
         }
     }
 
@@ -47,6 +84,13 @@ impl TermCtl {
         match self {
             Self::Vte(_) => crate::block_view::CommandPromptStatus::ShellIntegrationUnavailable,
             Self::Block(controller) => controller.model().command_prompt_status(),
+        }
+    }
+
+    pub(crate) fn agent_command_prompt_status(&self) -> crate::block_view::CommandPromptStatus {
+        match self {
+            Self::Vte(_) => crate::block_view::CommandPromptStatus::ShellIntegrationUnavailable,
+            Self::Block(controller) => controller.model().agent_command_prompt_status(),
         }
     }
 

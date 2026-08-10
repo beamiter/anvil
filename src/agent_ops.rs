@@ -240,7 +240,7 @@ impl AppModel {
         }
         let (tab_id, pane_id) = (tab.id, pane.id);
         let initial_context = pane.terminal.selected_block_context(80);
-        let prompt_status = pane.terminal.command_prompt_status();
+        let prompt_status = pane.terminal.agent_command_prompt_status();
 
         // Replacing a session invalidates both its provider callback and any
         // late BlockFinished event before the new identity becomes visible.
@@ -380,7 +380,7 @@ impl AppModel {
         let terminal = self.terminal_for(bound_tab, bound_pane);
         let prompt_status = terminal.map_or(
             crate::block_view::CommandPromptStatus::ShellIntegrationUnavailable,
-            TermCtl::command_prompt_status,
+            TermCtl::agent_command_prompt_status,
         );
         let cwd = self
             .tabs
@@ -409,6 +409,27 @@ impl AppModel {
 
     pub(crate) fn refresh_agent_panel(&self) {
         if let Some(view) = self.agent_panel_view() {
+            let pulse = if view.loading {
+                Some(crate::organism::AgentPulse::Working)
+            } else {
+                match view.state {
+                    agent::AgentState::Ready => None,
+                    agent::AgentState::AwaitingModel
+                    | agent::AgentState::AwaitingObservation { .. } => {
+                        Some(crate::organism::AgentPulse::Working)
+                    }
+                    agent::AgentState::AwaitingApproval { .. } => {
+                        Some(crate::organism::AgentPulse::AskingReview)
+                    }
+                    agent::AgentState::Completed | agent::AgentState::TurnLimitReached => {
+                        Some(crate::organism::AgentPulse::Finished)
+                    }
+                    agent::AgentState::Cancelled => Some(crate::organism::AgentPulse::Gone),
+                }
+            };
+            if let Some(pulse) = pulse {
+                self.organism_hub.agent_signal().note_phase(pulse);
+            }
             self.agent_panel.emit(agent::AgentPanelMsg::Render(view));
             self.pin_agent_panel();
         }
@@ -438,7 +459,7 @@ impl AppModel {
         };
         let status = self.terminal_for(tab_id, pane_id).map_or(
             crate::block_view::CommandPromptStatus::ShellIntegrationUnavailable,
-            TermCtl::command_prompt_status,
+            TermCtl::agent_command_prompt_status,
         );
         self.agent_panel
             .emit(agent::AgentPanelMsg::PromptStatus(status));
@@ -659,7 +680,7 @@ impl AppModel {
             self.agent_close();
             return;
         };
-        let prompt_status = terminal.command_prompt_status();
+        let prompt_status = terminal.agent_command_prompt_status();
         if !prompt_status.is_ready() {
             self.show_toast(prompt_status.blocked_message());
             self.agent_append_activity("Safety check", prompt_status.blocked_message());
@@ -1048,6 +1069,9 @@ impl AppModel {
             .set(self.agent_panel_generation.get().wrapping_add(1));
         let previous = self.active_agent.borrow_mut().take();
         if let Some(mut previous) = previous {
+            self.organism_hub
+                .agent_signal()
+                .note_phase(crate::organism::AgentPulse::Gone);
             let target = (previous.bound_tab, previous.bound_pane);
             previous.cancel();
             let card: gtk::Widget = self.agent_panel.widget().clone().upcast();

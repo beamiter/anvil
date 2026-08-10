@@ -67,6 +67,7 @@ const MAX_RESTORED_MODE_BYTES: usize = 64;
 const MAX_RESTORED_CWD_BYTES: usize = 16 * 1024;
 const MAX_RESTORED_REMOTE_NAME_BYTES: usize = 256;
 const MAX_RESTORED_SID_BYTES: usize = 256;
+const MAX_RESTORED_AI_CONVERSATION_BYTES: usize = 2 * 1024 * 1024;
 const MAX_RESTORED_ENVELOPE_FORMAT_BYTES: usize = 64;
 const MAX_RESTORED_SUPERSEDES_BYTES: usize = 256;
 const OWNER_TOKEN_ATTEMPTS: usize = 128;
@@ -133,6 +134,9 @@ pub(crate) struct SavedTab {
 pub(crate) struct SavedSession {
     pub active: usize,
     pub tabs: Vec<SavedTab>,
+    /// Bounded, versioned JSON produced by `jterm_core::ai::ConversationSnapshot`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_conversation: Option<String>,
 }
 
 /// New snapshots use a small versioned envelope. `SavedSession` itself remains
@@ -1114,6 +1118,7 @@ impl<'de> serde::de::Visitor<'de> for SavedSessionSeed<'_> {
         let budget = self.budget;
         let mut active = None;
         let mut tabs = None;
+        let mut ai_conversation = None;
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
                 "active" => active = Some(map.next_value::<usize>()?),
@@ -1121,6 +1126,17 @@ impl<'de> serde::de::Visitor<'de> for SavedSessionSeed<'_> {
                     tabs = Some(map.next_value_seed(SavedTabsSeed {
                         budget: &mut *budget,
                     })?)
+                }
+                "ai_conversation" => {
+                    let encoded = map.next_value_seed(BoundedText {
+                        field: "ai_conversation",
+                        limit: MAX_RESTORED_AI_CONVERSATION_BYTES,
+                    })?;
+                    if jterm_core::ai::ConversationSnapshot::from_json(&encoded).is_ok() {
+                        ai_conversation = Some(encoded);
+                    } else {
+                        log::warn!("Ignoring invalid AI conversation in session snapshot");
+                    }
                 }
                 _ => {
                     map.next_value::<serde::de::IgnoredAny>()?;
@@ -1130,6 +1146,7 @@ impl<'de> serde::de::Visitor<'de> for SavedSessionSeed<'_> {
         Ok(SavedSession {
             active: active.ok_or_else(|| A::Error::missing_field("active"))?,
             tabs: tabs.ok_or_else(|| A::Error::missing_field("tabs"))?,
+            ai_conversation,
         })
     }
 }
@@ -1389,6 +1406,12 @@ fn pane_layout_within_restore_limits(layout: &PaneLayout) -> Option<usize> {
 
 fn session_within_restore_limits(session: &SavedSession) -> bool {
     if session.tabs.is_empty() || session.tabs.len() > MAX_RESTORED_TABS {
+        return false;
+    }
+    if session.ai_conversation.as_ref().is_some_and(|encoded| {
+        encoded.len() > MAX_RESTORED_AI_CONVERSATION_BYTES
+            || jterm_core::ai::ConversationSnapshot::from_json(encoded).is_err()
+    }) {
         return false;
     }
     let mut total = 0usize;
@@ -2702,6 +2725,7 @@ mod tests {
                     cmds: None,
                 },
             }],
+            ai_conversation: None,
         }
     }
 
@@ -2852,6 +2876,50 @@ mod tests {
     }
 
     #[test]
+    fn session_round_trip_restores_a_bounded_ai_chat_collection() {
+        let turns = vec![
+            jterm_core::ai::Turn {
+                role: jterm_core::ai::Role::User,
+                text: "why did this fail?".into(),
+            },
+            jterm_core::ai::Turn {
+                role: jterm_core::ai::Role::Assistant,
+                text: "because the file is missing".into(),
+            },
+        ];
+        let chat = jterm_core::ai::ChatSnapshot::from_completed_history(
+            1,
+            "Failure",
+            false,
+            &turns,
+            None,
+            "next question",
+        );
+        let conversation = jterm_core::ai::ConversationSnapshot::from_chats(1, vec![chat])
+            .unwrap()
+            .to_json()
+            .unwrap();
+        let mut saved = saved_session("workspace");
+        saved.ai_conversation = Some(conversation.clone());
+        let decoded = decode_saved_session(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert_eq!(
+            decoded.ai_conversation.as_deref(),
+            Some(conversation.as_str())
+        );
+    }
+
+    #[test]
+    fn invalid_ai_chat_json_does_not_poison_workspace_restore() {
+        let encoded = session_json(&tabs_json(1, &leaf_json())).replace(
+            r#""tabs":"#,
+            r#""ai_conversation":"not a snapshot","tabs":"#,
+        );
+        let decoded = decode_saved_session(&encoded).unwrap();
+        assert!(decoded.ai_conversation.is_none());
+        assert_eq!(decoded.tabs.len(), 1);
+    }
+
+    #[test]
     fn restore_limits_bound_tabs_panes_and_user_visible_fields() {
         let base = saved_session("bounded").tabs.remove(0);
         let mut maximum = SavedSession {
@@ -2862,6 +2930,7 @@ mod tests {
                     ..base.clone()
                 })
                 .collect(),
+            ai_conversation: None,
         };
         assert!(session_within_restore_limits(&maximum));
 
@@ -2874,6 +2943,7 @@ mod tests {
         let too_many_tabs = SavedSession {
             active: 0,
             tabs: vec![base.clone(); MAX_RESTORED_TABS + 1],
+            ai_conversation: None,
         };
         assert!(!session_within_restore_limits(&too_many_tabs));
 
@@ -2883,6 +2953,7 @@ mod tests {
                 layout: layout_with_leaves(MAX_RESTORED_PANES_PER_TAB + 1),
                 ..base.clone()
             }],
+            ai_conversation: None,
         };
         assert!(!session_within_restore_limits(&too_wide));
 
@@ -2892,6 +2963,7 @@ mod tests {
                 title: "x".repeat(MAX_RESTORED_TITLE_BYTES + 1),
                 ..base.clone()
             }],
+            ai_conversation: None,
         };
         assert!(!session_within_restore_limits(&oversized_title));
 
@@ -2918,6 +2990,7 @@ mod tests {
                     },
                     ..base.clone()
                 }],
+                ai_conversation: None,
             };
             assert!(!session_within_restore_limits(&oversized_command));
         }
@@ -2935,6 +3008,7 @@ mod tests {
         let too_many_tabs = SavedSession {
             active: 0,
             tabs: vec![base.clone(); MAX_RESTORED_TABS + 1],
+            ai_conversation: None,
         };
         let too_many_in_one_tab = SavedSession {
             active: 0,
@@ -2942,6 +3016,7 @@ mod tests {
                 layout: layout_with_leaves(MAX_RESTORED_PANES_PER_TAB + 1),
                 ..base.clone()
             }],
+            ai_conversation: None,
         };
         let too_many_total = SavedSession {
             active: 0,
@@ -2951,6 +3026,7 @@ mod tests {
                     ..base.clone()
                 })
                 .collect(),
+            ai_conversation: None,
         };
         let oversized_payload = SavedSession {
             active: 0,
@@ -2968,6 +3044,7 @@ mod tests {
                 },
                 ..base
             }],
+            ai_conversation: None,
         };
 
         for rejected in [
@@ -3219,7 +3296,11 @@ mod tests {
                 },
             })
             .collect();
-        let saved = SavedSession { active: 0, tabs };
+        let saved = SavedSession {
+            active: 0,
+            tabs,
+            ai_conversation: None,
+        };
         let path = dir.path().join(LEGACY_STATE_FILE);
         atomic_write(&path, &serde_json::to_vec(&saved).unwrap()).unwrap();
 
@@ -3953,6 +4034,7 @@ mod tests {
         let invalid = SavedSession {
             active: 0,
             tabs: vec![workspace(&claimed.state).tabs[0].clone(); MAX_RESTORED_TABS + 1],
+            ai_conversation: None,
         };
         assert!(checkpoint_snapshot_for_owner(&loader, &invalid).is_err());
         assert!(claim_path.exists(), "failed save must retain the claim");

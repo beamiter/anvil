@@ -73,6 +73,9 @@ pub(crate) enum PaletteMsg {
     Toggle {
         mode: PaletteMode,
         history_path: Option<PathBuf>,
+        /// Current Block commands, already newest-first. The component merges
+        /// these into its persisted snapshot only when the dialog opens.
+        live_history: Vec<String>,
     },
     Search(String),
     Activate(Accept),
@@ -207,14 +210,18 @@ impl Component for PaletteModel {
         root: &Self::Root,
     ) {
         match msg {
-            PaletteMsg::Toggle { mode, history_path } => {
+            PaletteMsg::Toggle {
+                mode,
+                history_path,
+                live_history,
+            } => {
                 if root.parent().is_some() {
                     root.force_close();
                     return;
                 }
                 self.mode = mode;
                 self.history_snapshot =
-                    palette_data::load_history_snapshot(history_path.as_deref());
+                    palette_data::load_history_snapshot(history_path.as_deref(), &live_history);
                 self.query.clear();
                 root.set_title(title(mode));
                 widgets

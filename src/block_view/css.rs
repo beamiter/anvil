@@ -206,6 +206,14 @@ pub(crate) fn install_block_css(config: &Config) {
     let acc_g = (acc.green() * 255.0) as u8;
     let acc_b = (acc.blue() * 255.0) as u8;
 
+    // Unknown outcomes and the organism's caution state use theme yellow.
+    let warn = &config.palette[3];
+    let warn_hex = rgba_to_hex(warn);
+    let warn_r = (warn.red() * 255.0) as u8;
+    let warn_g = (warn.green() * 255.0) as u8;
+    let warn_b = (warn.blue() * 255.0) as u8;
+    let warn_stripe = format!("rgba({warn_r},{warn_g},{warn_b},0.62)");
+
     let fg_r = (fg.red() * 255.0) as u8;
     let fg_g = (fg.green() * 255.0) as u8;
     let fg_b = (fg.blue() * 255.0) as u8;
@@ -299,6 +307,78 @@ pub(crate) fn install_block_css(config: &Config) {
             border-left-color: rgba({agent_r},{agent_g},{agent_b},0.85);
             background-color: rgba({agent_r},{agent_g},{agent_b},0.05);
         }}
+        .block-organism {{
+            border-left-color: rgba({agent_r},{agent_g},{agent_b},0.70);
+            background-color: rgba({agent_r},{agent_g},{agent_b},0.035);
+        }}
+        .block-organism.organism-active {{
+            border-left-color: rgba({acc_r},{acc_g},{acc_b},0.90);
+            background-color: rgba({acc_r},{acc_g},{acc_b},0.07);
+        }}
+        .block-organism.organism-success {{
+            border-left-color: {ok_stripe};
+            background-color: rgba({ok_r},{ok_g},{ok_b},0.08);
+        }}
+        .block-organism.organism-error {{
+            border-left-color: {err_stripe};
+            background-color: rgba({err_r},{err_g},{err_b},0.10);
+        }}
+        .block-organism.organism-warning {{
+            border-left-color: {warn_stripe};
+            background-color: rgba({warn_r},{warn_g},{warn_b},0.07);
+        }}
+        .organism-sprite {{
+            color: {agent_hex};
+            font-family: "{font_family}";
+            font-weight: bold;
+        }}
+        .organism-live-body {{
+            color: {agent_hex};
+            background-color: rgba({bg_r},{bg_g},{bg_b},0.80);
+            border: 1px solid rgba({agent_r},{agent_g},{agent_b},0.32);
+            border-radius: 6px;
+            padding: 3px 6px;
+            font-family: "{font_family}";
+            font-size: {font_size};
+            font-weight: bold;
+        }}
+        .organism-live-body.organism-active {{
+            color: {accent};
+            border-color: rgba({acc_r},{acc_g},{acc_b},0.50);
+        }}
+        .organism-live-body.organism-success {{
+            color: {ok_hex};
+            border-color: rgba({ok_r},{ok_g},{ok_b},0.50);
+        }}
+        .organism-live-body.organism-error {{
+            color: {err_hex};
+            border-color: rgba({err_r},{err_g},{err_b},0.55);
+        }}
+        .organism-live-body.organism-warning {{
+            color: {warn_hex};
+            border-color: rgba({warn_r},{warn_g},{warn_b},0.50);
+        }}
+        .organism-sticky-avatar {{
+            color: {agent_hex};
+            font-family: "{font_family}";
+            font-weight: bold;
+            margin-right: 6px;
+        }}
+        .organism-sticky-avatar.organism-error {{ color: {err_hex}; }}
+        .organism-sticky-avatar.organism-success {{ color: {ok_hex}; }}
+        .organism-sticky-avatar.organism-warning {{ color: {warn_hex}; }}
+        .organism-title {{
+            color: {fg_hex};
+            font-weight: bold;
+        }}
+        .organism-badge, .organism-state {{
+            color: {dim_fg};
+            font-family: "{font_family}";
+            font-size: 0.82em;
+        }}
+        .organism-status {{ color: {fg_hex}; }}
+        .organism-error .organism-status {{ color: {err_hex}; }}
+        .organism-success .organism-status {{ color: {ok_hex}; }}
         .agent-card-icon {{
             color: {agent_hex};
             font-family: "{font_family}";
@@ -862,6 +942,18 @@ pub(crate) fn install_block_css(config: &Config) {
             padding: 2px 8px;
             background-color: rgba({bg_r},{bg_g},{bg_b},0.92);
             box-shadow: 0 1px 4px rgba(0,0,0,0.24);
+        }}
+        .feed-hold-badge {{
+            color: {bg_hex};
+            background-color: {accent};
+            background-image: none;
+            border: 1px solid rgba({acc_r},{acc_g},{acc_b},0.55);
+            border-radius: 999px;
+            font-family: "{font_family}";
+            font-size: 0.85em;
+            font-weight: bold;
+            padding: 4px 12px;
+            box-shadow: 0 4px 14px rgba(0,0,0,0.35);
         }}
         .command-palette > contents {{
             background-color: {block_bg_hex};

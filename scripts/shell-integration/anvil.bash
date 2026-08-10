@@ -21,19 +21,50 @@ if [[ ${ANVIL_CWD_TOKEN+x} ]]; then
     export -n __anvil_cwd_token
 fi
 
-# Guard against double-sourcing in the same shell.
-[[ -n ${__ANVIL_BASH_LOADED:-} ]] && return 0
+# Consume the Agent command authenticator from the inherited one-shot pipe and
+# remove both public spellings before any user hook or command can inherit
+# them. The token value itself was never present in the environment.
+__anvil_token_fd=${ANVIL_SHELL_INTEGRATION_FD:-}
+unset ANVIL_SHELL_INTEGRATION_FD ANVIL_SHELL_INTEGRATION_TOKEN
+# Re-sourcing must scrub/close a newly supplied public descriptor without
+# replacing the private token already driving this shell's command IDs.
+if [[ -n ${__ANVIL_BASH_LOADED:-} ]]; then
+    if [[ $__anvil_token_fd =~ ^[0-9]+$ ]] && (( __anvil_token_fd > 2 )); then
+        eval "exec ${__anvil_token_fd}<&-"
+    fi
+    unset __anvil_token_fd
+    return 0
+fi
 __ANVIL_BASH_LOADED=1
+__anvil_command_token=
+if [[ $__anvil_token_fd =~ ^[0-9]+$ ]] && (( __anvil_token_fd > 2 )); then
+    IFS= read -r -u "$__anvil_token_fd" __anvil_command_token || __anvil_command_token=
+    # The descriptor number passed the numeric/range checks above. Close it
+    # before a prompt hook or user command can inherit the private channel.
+    eval "exec ${__anvil_token_fd}<&-"
+fi
+unset __anvil_token_fd
+# An inherited exported variable keeps its export attribute across assignment.
+# Remove it explicitly so even a hostile parent environment cannot make the
+# pipe-delivered token visible to user commands.
+export -n __anvil_command_token
 __anvil_integration_source=${BASH_SOURCE[0]}
-# Private per-shell nonce + monotonic command number correlate C/D pairs.
-# Neither variable is exported. Use enough independent shell-random samples
-# that blind terminal output cannot feasibly guess a valid finish marker.
-__anvil_marker_nonce="${BASHPID:-$$}-${RANDOM}-${RANDOM}-${RANDOM}-${RANDOM}-${RANDOM}-${RANDOM}-${RANDOM}-${RANDOM}"
-__anvil_marker_seq=0
-__anvil_marker_id=""
-
 # Send raw OSC payload terminated with BEL.
 __anvil_osc() { printf '\033]%s\007' "$1"; }
+
+if [[ $__anvil_command_token =~ ^[[:xdigit:]]{32}$ ]]; then
+    # Announced inside every A..B prompt boundary. Anvil accepts the capability
+    # only when it exactly matches the token retained by the parent PTY.
+    __anvil_agent_ready() { __anvil_osc "7771;${__anvil_command_token}"; }
+else
+    # Ordinary/non-native shells still receive correlated block markers, but a
+    # predictable fallback never enables review-gated Agent execution.
+    __anvil_command_token=anvil-bash-${BASHPID:-$$}
+    __anvil_agent_ready() { :; }
+fi
+__anvil_marker_seq=0
+__anvil_marker_id=""
+export -n __anvil_marker_seq __anvil_marker_id
 
 # OSC 133 ;A — prompt is about to be drawn.
 # OSC 133 ;B — prompt drawn, waiting for user input.
@@ -43,7 +74,7 @@ __anvil_prompt_end()   { __anvil_osc "133;B"; }
 # OSC 133 ;C — user submitted, command is running.
 __anvil_command_start() {
     ((__anvil_marker_seq++)) || true
-    __anvil_marker_id="${__anvil_marker_nonce}-${__anvil_marker_seq}"
+    __anvil_marker_id="${__anvil_command_token}-${__anvil_marker_seq}"
     __anvil_osc "133;C;id=${__anvil_marker_id}"
 }
 
@@ -114,6 +145,7 @@ __anvil_precmd() {
     fi
     __anvil_report_cwd
     __anvil_prompt_start
+    __anvil_agent_ready
     # Re-inject the user's PS1 with ;B appended so the prompt-end mark sits at
     # the exact spot where input begins. Use \[...\] so the OSC bytes don't
     # count toward readline's column accounting.

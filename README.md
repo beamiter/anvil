@@ -12,7 +12,8 @@ restoration as the only copy of work in progress.
 ## Highlights
 
 - VTE and block-aware terminal modes
-- Tabs, nested split panes, pane zoom, directional focus, and session restore
+- Tabs, backend-inheriting nested split panes, pane zoom, directional focus,
+  and session restore
 - Drag a single-pane tab to any edge of a target pane to merge it as a split;
   drag a split-pane header back to the tab bar to promote it to a normal tab.
   A short tab hover previews the target page, while center/cancel drops leave
@@ -24,8 +25,11 @@ restoration as the only copy of work in progress.
 - Search within terminal output, block selection, output filtering, bookmarks,
   copy/rerun controls, and long-command notifications
 - SSH host picker, connection status, multiplexing, and reconnect support
-- Optional inline AI command generation, review-first command correction,
-  session Q&A, and a multi-turn Shell Agent with explicit approval before execution
+- Optional persistent multi-chat AI workspace, inline command generation,
+  review-first correction, and a multi-turn Shell Agent with explicit approval
+  before execution
+- Optional local, no-LLM ASCII organism with durable bounded memory and
+  desktop-aware motion modes
 - Runnable Markdown notebooks (`.jtnb.md`) with isolated multi-shell cells
 - Live appearance settings and a hot-reloaded TOML configuration
 
@@ -265,6 +269,17 @@ PowerShell users can dot-source `anvil.ps1`; its Enter hook requires
 PSReadLine. More detail is in
 [`scripts/shell-integration/README.md`](scripts/shell-integration/README.md).
 
+CLI completions are embedded for the same four shells. For example, load Bash
+completion for the current session with:
+
+```bash
+source <(anvil --generate-completion bash)
+```
+
+`--completion` is an alias for `--generate-completion`; use `zsh`, `fish`, or
+`pwsh` to print those formats for installation in the shell's normal completion
+directory.
+
 Shell selection follows this order: `ANVIL_SHELL`, the `shell` config key,
 `jsh` when it is executable on `PATH`, `bash -l`, then `sh`.
 
@@ -281,15 +296,15 @@ are currently active.
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy / paste |
 | `Ctrl+Shift+Alt+C` | In block mode, copy the selected block's output only |
 | `Ctrl+Shift+E` / `Ctrl+Shift+D` | Split left/right / top/bottom |
-| `Ctrl+Alt+Arrow` | Focus the pane in that direction |
-| `Ctrl+Shift+Alt+Arrow` | Resize the active split |
+| `Ctrl+Alt+Arrow` or `Ctrl+Alt+H/J/K/L` | Focus the pane in that direction |
+| `Ctrl+Shift+Alt+Arrow` or `Ctrl+Alt+Shift+H/J/K/L` | Resize the active split |
 | `Ctrl+Shift+Z` | Toggle pane zoom |
 | `Ctrl+Shift+!` | Move the focused pane into a new tab |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab |
 | `Ctrl+PageDown/PageUp` | Next / previous tab |
 | `Ctrl+1` ... `Ctrl+8` | First ... eighth tab |
 | `Ctrl+9` | Last tab |
-| `Ctrl+Shift+P` | Command palette |
+| `Ctrl+Shift+P` | Unified command palette (actions, history, workflows, AI) |
 | `Ctrl+Shift+H` | History palette; `Ctrl+R` and `Ctrl+P` remain available to the shell |
 | `Ctrl+Shift+F` | Search finished blocks and the currently running command's output (`/pattern/` enables regex) |
 | `Ctrl+Shift+G` | In block mode, search command and output lines across all finished blocks |
@@ -368,8 +383,10 @@ an existing file. The application watches the file: appearance, scrollback, key
 bindings, and defaults for newly created panes are reloaded while it is running.
 Some advanced options are captured when a pane is constructed, so restart
 anvil after changing them for predictable results. Changing `terminal_mode`
-affects new or restored local panes; it does not replace an existing terminal
-backend in place. Managed remote sessions stay on Block so their shell
+affects new tabs and restored leaves; it does not replace an existing terminal
+backend in place. Splitting always inherits the focused pane's backend, so a
+later setting change cannot turn one side of an existing Block/VTE layout into
+a different backend. Managed remote sessions stay on Block so their shell
 integration and reconnect metadata remain available.
 
 `-c PATH` / `--config PATH` selects an alternate file for the current process
@@ -574,10 +591,20 @@ configured path without ever being written back to config.toml.
 
 AI network calls happen only after an explicit AI action, except the optional
 review-first correction fallback after a narrowly classified failed command.
-The session panel keeps a multi-turn role history until Clear is pressed and can
-optionally attach recent shell history. `Ctrl+Shift+Q`, or **Ask AI About Block**
-in a finished block's context menu, starts a conversation with a bounded
-command/output snapshot.
+The persistent right-side **AI Chats** panel keeps a searchable library of up
+to 50 conversations. **New chat** retains older conversations; each chat owns
+its title, draft, selected-Block context, archive state, in-flight request,
+Stop/Retry state, and streamed response. Chats can be renamed, archived,
+unarchived, or deleted after confirmation. Switching chats never redirects a
+background response, and a late response cannot recreate a deleted chat.
+
+The panel divider, visibility, selected chat, drafts, retryable questions, and
+bounded conversation snapshot survive a normal session restart. Press Enter or
+Ctrl+Enter to send and Shift+Enter for a newline; IME candidate confirmation is
+given first refusal. `Ctrl+Shift+Q`, or **Ask AI About Block** in a finished
+block's context menu, attaches a visible, clearable bounded command/output
+snapshot without replacing text already being edited. Optional recent shell
+history remains an explicit per-request context switch.
 
 Typing `?` in the command palette opens an inline, pane-bound suggestion card.
 The request can be stopped or retried; a result can be copied, regenerated,
@@ -590,10 +617,14 @@ while conversation events remain as separate Block-style cards after the
 dashboard closes or **New task** resets model context. It proposes one command
 per turn and only runs it after **Approve & Run**. **Insert only** leaves the
 edited command at the prompt. Approval is bound to the current clean prompt,
-the exact reviewed command, a one-shot local generation, and the shell
-integration's matching OSC 133 start/completion ID. If any of those change or
-the terminal write fails, the proposal is cancelled instead of attributing a
-different command's result to the Agent.
+the exact reviewed command, a one-shot local generation, and bash/zsh shell
+integration authenticated by a private inherited-FD token. Anvil inserts the
+approved text without Enter, reads the rendered editor back exactly (including
+an empty suffix), and only then submits Enter separately. OSC 7771 proves the
+integration consumed the token; token-bound OSC 133 start/completion IDs and
+PTY foreground ownership correlate the lifecycle. If any proof changes, times
+out, or is unavailable (including remote/Flatpak bridges), execution fails
+closed instead of attributing a different command's result to the Agent.
 
 `command_correction_enabled = true` (or
 `ANVIL_COMMAND_CORRECTION_ENABLED=true`) enables suggestions for unknown
@@ -612,7 +643,25 @@ is always normalized to false. Every Agent proposal requires explicit approval.
 See [`docs/SMART_COMMAND_CORRECTION.md`](docs/SMART_COMMAND_CORRECTION.md) for
 the correction boundary and
 [`docs/AI_AGENT_ACCEPTANCE.md`](docs/AI_AGENT_ACCEPTANCE.md) for manual
-acceptance checks.
+acceptance checks. The shared behavior boundary between this Relm4 frontend and
+Forge's GTK4 frontend is recorded in
+[`docs/FRONTEND_PARITY.md`](docs/FRONTEND_PARITY.md).
+
+### ASCII organism
+
+Set `ascii_organism_enabled = true` to attach the optional local organism to
+new Block panes. It reacts only to content-free command lifecycle facts,
+focused-pane presence, elapsed time, exit status/duration, and Agent state; it
+does not run commands, use an LLM, or persist command/output text. Its bounded
+memory lives under `${XDG_STATE_HOME:-~/.local/state}/anvil/` and is flushed on
+normal shutdown through the same durable persistence worker as other local
+state.
+
+`ascii_organism_motion = "full" | "calm" | "static"` selects animation and
+spatial behavior. Omitting it follows the desktop animation preference.
+Settings exposes the same four choices as Forge: Automatic, Full, Calm, and
+Static. Changes apply to newly created Block panes; existing pane-local life
+continues without being replaced mid-command.
 
 ### Notebooks
 

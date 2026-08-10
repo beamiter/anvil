@@ -22,7 +22,12 @@ pub(crate) struct SettingsValues {
     pub(crate) terminal_mode: u32,
     pub(crate) block_compact: bool,
     pub(crate) command_history: bool,
+    pub(crate) ascii_organism_enabled: bool,
+    /// 0 automatic, 1 full, 2 calm, 3 static.
+    pub(crate) ascii_organism_motion: u32,
     pub(crate) ai_enabled: bool,
+    pub(crate) ai_panel_visible: bool,
+    pub(crate) ai_panel_width: f64,
     pub(crate) agent_enabled: bool,
     pub(crate) command_correction_enabled: bool,
     pub(crate) ai_provider: u32,
@@ -77,9 +82,21 @@ impl RemoteDraft {
 /// Which form row carries the validation error, so only that entry turns red.
 #[derive(Clone, Copy, Debug)]
 enum RemoteField {
+    Form,
     Name,
     Host,
     User,
+}
+
+/// Widgets owned by the independent Add/Edit dialog. Keeping them together
+/// lets the Relm4 update loop validate and focus fields without putting
+/// application state in GTK signal closures.
+struct RemoteDialogUi {
+    dialog: adw::Dialog,
+    name: adw::EntryRow,
+    host: adw::EntryRow,
+    user: adw::EntryRow,
+    error: gtk::Label,
 }
 
 pub(crate) struct SettingsInit {
@@ -100,7 +117,11 @@ pub(crate) enum SettingsMsg {
     TerminalMode(u32),
     BlockCompact(bool),
     CommandHistory(bool),
+    AsciiOrganism(bool),
+    AsciiOrganismMotion(u32),
     AiEnabled(bool),
+    AiPanelVisible(bool),
+    AiPanelWidth(f64),
     AgentEnabled(bool),
     CommandCorrection(bool),
     AiProvider(u32),
@@ -118,13 +139,18 @@ pub(crate) enum SettingsMsg {
     RemoteHostUser(String),
     RemoteHostDocker(bool),
     RemoteHostDeploy(u32),
-    /// Commit the form: append a new host, or replace the one being edited.
-    RemoteHostAdd,
+    RemoteHostOpenAdd,
+    /// Commit the independent dialog: append or replace in place.
+    RemoteHostSave,
     /// Load an existing host into the form instead of starting a new one.
     RemoteHostEdit(usize),
     /// Abandon an in-progress edit and leave the saved host as it was.
-    RemoteHostCancelEdit,
+    RemoteHostCancel,
     RemoteHostRemove(usize),
+    RemoteHostRemoveConfirmed {
+        index: usize,
+        name: String,
+    },
 }
 
 #[derive(Debug)]
@@ -137,7 +163,11 @@ pub(crate) enum SettingsOutput {
     TerminalMode(usize),
     BlockCompact(bool),
     CommandHistory(bool),
+    AsciiOrganism(bool),
+    AsciiOrganismMotion(u32),
     AiEnabled(bool),
+    AiPanelVisible(bool),
+    AiPanelWidth(u32),
     AgentEnabled(bool),
     CommandCorrection(bool),
     AiProvider(usize),
@@ -163,6 +193,7 @@ pub(crate) struct SettingsModel {
     /// Index of the saved host the form is editing; `None` while the form is
     /// composing a new one.
     remote_editing: Option<usize>,
+    remote_dialog: Option<RemoteDialogUi>,
     /// Host rows currently added to the "Remote Hosts" group. The view! macro
     /// cannot express a dynamic list, so these are rebuilt imperatively.
     remote_rows: Vec<adw::ActionRow>,
@@ -267,6 +298,7 @@ impl Component for SettingsModel {
                             sender.input(SettingsMsg::Scrollback(row.value()));
                         },
                     },
+
                 },
 
                 adw::PreferencesGroup {
@@ -278,6 +310,7 @@ impl Component for SettingsModel {
                         set_subtitle: "Applies to new and restored local panes",
                         set_model: Some(&gtk::StringList::new(&["Block", "VTE compatibility"])),
                         set_selected: model.values.terminal_mode,
+                        set_sensitive: !model.values.safe_mode,
                         connect_selected_notify[sender] => move |row| {
                             sender.input(SettingsMsg::TerminalMode(row.selected()));
                         },
@@ -288,6 +321,7 @@ impl Component for SettingsModel {
                         set_title: "Compact Block Layout",
                         set_subtitle: "Use denser spacing in new Block panes",
                         set_active: model.values.block_compact,
+                        set_sensitive: !model.values.safe_mode,
                         connect_active_notify[sender] => move |row| {
                             sender.input(SettingsMsg::BlockCompact(row.is_active()));
                         },
@@ -296,97 +330,37 @@ impl Component for SettingsModel {
                     #[name(command_history_row)]
                     adw::SwitchRow {
                         set_title: "Command History Index",
-                        set_subtitle: "Store commands and status, never output",
+                        set_subtitle: "Store commands, cwd and status; never terminal output",
                         set_active: model.values.command_history,
+                        set_sensitive: !model.values.safe_mode,
                         connect_active_notify[sender] => move |row| {
                             sender.input(SettingsMsg::CommandHistory(row.is_active()));
                         },
                     },
-                },
 
-                // Host rows are managed imperatively (`rebuild_remote_rows`):
-                // the view! macro cannot express a list that grows and shrinks.
-                #[name(remote_hosts_group)]
-                adw::PreferencesGroup {
-                    set_title: "Remote Hosts",
-                    set_description: Some("Saved ssh and Docker targets for the remote picker"),
-                },
-
-                // Doubles as the edit form: picking a host above loads it here
-                // and retitles the group, so there is one set of rows to keep
-                // in step with `parse_remote_hosts` rather than two.
-                #[name(remote_form_group)]
-                adw::PreferencesGroup {
-                    set_title: "Add Remote Host",
-
-                    #[name(remote_name_row)]
-                    adw::EntryRow {
-                        set_title: "Name (defaults to host)",
-                        connect_changed[sender] => move |row| {
-                            sender.input(SettingsMsg::RemoteHostName(row.text().to_string()));
-                        },
-                    },
-
-                    #[name(remote_host_row)]
-                    adw::EntryRow {
-                        set_title: "Host or container name",
-                        connect_changed[sender] => move |row| {
-                            sender.input(SettingsMsg::RemoteHostHost(row.text().to_string()));
-                        },
-                    },
-
-                    #[name(remote_user_row)]
-                    adw::EntryRow {
-                        set_title: "User (optional)",
-                        connect_changed[sender] => move |row| {
-                            sender.input(SettingsMsg::RemoteHostUser(row.text().to_string()));
-                        },
-                    },
-
-                    #[name(remote_docker_row)]
+                    #[name(ascii_organism_row)]
                     adw::SwitchRow {
-                        set_title: "Docker Container",
-                        set_subtitle: "Attach to a running container instead of using ssh",
+                        set_title: "ASCII Organism",
+                        set_subtitle: "Show the local, no-LLM organism in new Block panes",
+                        set_active: model.values.ascii_organism_enabled,
+                        set_sensitive: !model.values.safe_mode,
                         connect_active_notify[sender] => move |row| {
-                            sender.input(SettingsMsg::RemoteHostDocker(row.is_active()));
+                            sender.input(SettingsMsg::AsciiOrganism(row.is_active()));
                         },
                     },
 
-                    #[name(remote_deploy_row)]
+                    #[name(ascii_organism_motion_row)]
                     adw::ComboRow {
-                        set_title: "Deploy jsh",
-                        set_subtitle: "Place a verified jsh on the destination for the session",
-                        set_model: Some(&gtk::StringList::new(&["Off", "Persist", "Incognito"])),
+                        set_title: "Organism Motion",
+                        set_subtitle: "Automatic follows the desktop animation preference",
+                        set_model: Some(&gtk::StringList::new(
+                            &["Automatic", "Full", "Calm", "Static"]
+                        )),
+                        set_selected: model.values.ascii_organism_motion,
+                        set_sensitive: !model.values.safe_mode
+                            && model.values.ascii_organism_enabled,
                         connect_selected_notify[sender] => move |row| {
-                            sender.input(SettingsMsg::RemoteHostDeploy(row.selected()));
-                        },
-                    },
-
-                    #[name(remote_add_row)]
-                    adw::ActionRow {
-                        set_title: "Add Host",
-                        set_activatable: true,
-                        add_suffix = &gtk::Image {
-                            set_icon_name: Some("list-add-symbolic"),
-                        },
-                        connect_activated[sender] => move |_| {
-                            sender.input(SettingsMsg::RemoteHostAdd);
-                        },
-                    },
-
-                    // Only shown while editing: without it there is no way back
-                    // to composing a new host except saving one you did not mean
-                    // to change.
-                    #[name(remote_cancel_row)]
-                    adw::ActionRow {
-                        set_title: "Cancel Edit",
-                        set_activatable: true,
-                        set_visible: false,
-                        add_suffix = &gtk::Image {
-                            set_icon_name: Some("edit-undo-symbolic"),
-                        },
-                        connect_activated[sender] => move |_| {
-                            sender.input(SettingsMsg::RemoteHostCancelEdit);
+                            sender.input(SettingsMsg::AsciiOrganismMotion(row.selected()));
                         },
                     },
                 },
@@ -394,10 +368,37 @@ impl Component for SettingsModel {
                 adw::PreferencesGroup {
                     set_title: &gtk::glib::markup_escape_text("Features & Privacy"),
 
+                    #[name(notifications_row)]
+                    adw::SwitchRow {
+                        set_title: "Long-command Notifications",
+                        set_active: model.values.notifications,
+                        set_sensitive: !model.values.safe_mode,
+                        connect_active_notify[sender] => move |row| {
+                            sender.input(SettingsMsg::Notifications(row.is_active()));
+                        },
+                    },
+
+                    #[name(remote_clipboard_row)]
+                    adw::SwitchRow {
+                        set_title: "Allow OSC 52 Clipboard Writes",
+                        set_subtitle: "Enable only for trusted local and remote programs",
+                        set_active: model.values.remote_clipboard,
+                        set_sensitive: !model.values.safe_mode,
+                        connect_active_notify[sender] => move |row| {
+                            sender.input(SettingsMsg::RemoteClipboard(row.is_active()));
+                        },
+                    },
+                },
+
+                adw::PreferencesGroup {
+                    set_title: &gtk::glib::markup_escape_text("AI & Agent"),
+                    set_description: Some(
+                        "Environment variables take priority. Keys entered here are stored in a private ai.key file, never in config.toml"
+                    ),
+
                     #[name(ai_enabled_row)]
                     adw::SwitchRow {
-                        set_title: "AI Features",
-                        set_subtitle: "Requests follow explicit AI actions; enabled correction may use a fallback request after a narrow failure",
+                        set_title: "Enable AI Features",
                         set_active: model.values.ai_enabled,
                         set_sensitive: !model.values.safe_mode,
                         connect_active_notify[sender] => move |row| {
@@ -405,10 +406,36 @@ impl Component for SettingsModel {
                         },
                     },
 
+                    #[name(ai_panel_visible_row)]
+                    adw::SwitchRow {
+                        set_title: "Show AI Chats at Startup",
+                        set_subtitle: "Keep the persistent right-side chat panel open",
+                        set_active: model.values.ai_panel_visible,
+                        set_sensitive: !model.values.safe_mode && model.values.ai_enabled,
+                        connect_active_notify[sender] => move |row| {
+                            sender.input(SettingsMsg::AiPanelVisible(row.is_active()));
+                        },
+                    },
+
+                    #[name(ai_panel_width_row)]
+                    adw::SpinRow::new(
+                        Some(&gtk::Adjustment::new(
+                            model.values.ai_panel_width, 240.0, 1_200.0, 10.0, 50.0, 0.0
+                        )),
+                        10.0,
+                        0,
+                    ) {
+                        set_title: "AI Chats Width",
+                        set_sensitive: !model.values.safe_mode && model.values.ai_enabled,
+                        connect_value_notify[sender] => move |row| {
+                            sender.input(SettingsMsg::AiPanelWidth(row.value()));
+                        },
+                    },
+
                     #[name(agent_enabled_row)]
                     adw::SwitchRow {
-                        set_title: "Shell Agent",
-                        set_subtitle: "Commands always require approval",
+                        set_title: "Enable Approval-gated Agent",
+                        set_subtitle: "Every proposed command remains editable and requires approval",
                         set_active: model.values.agent_enabled,
                         set_sensitive: !model.values.safe_mode && model.values.ai_enabled,
                         connect_active_notify[sender] => move |row| {
@@ -417,16 +444,16 @@ impl Component for SettingsModel {
                     },
 
                     adw::SwitchRow {
-                        set_title: "Automatic Agent Approval Retired",
-                        set_subtitle: "Always off; every Agent proposal requires explicit approval",
+                        set_title: "Automatic Agent Execution Retired",
+                        set_subtitle: "Every proposal requires explicit approval; command text cannot prove what aliases, helpers, or flags will execute",
                         set_active: false,
                         set_sensitive: false,
                     },
 
                     #[name(command_correction_row)]
                     adw::SwitchRow {
-                        set_title: "AI Command Correction",
-                        set_subtitle: "Offer editable fixes; only exact host-verified candidates can be explicitly run",
+                        set_title: "Correct Mistyped Block Commands",
+                        set_subtitle: "Offer an editable correction after typo-like failures; never run automatically",
                         set_active: model.values.command_correction_enabled,
                         set_sensitive: !model.values.safe_mode && model.values.ai_enabled,
                         connect_active_notify[sender] => move |row| {
@@ -436,8 +463,7 @@ impl Component for SettingsModel {
 
                     #[name(ai_provider_row)]
                     adw::ComboRow {
-                        set_title: "AI Provider",
-                        set_subtitle: "Key from a private key file or environment variables",
+                        set_title: "Provider",
                         set_model: Some(&gtk::StringList::new(
                             &["Anthropic", "OpenAI-compatible", "Ollama"]
                         )),
@@ -450,7 +476,7 @@ impl Component for SettingsModel {
 
                     #[name(ai_model_row)]
                     adw::EntryRow {
-                        set_title: "AI Model",
+                        set_title: "Model",
                         set_text: &model.values.ai_model,
                         set_sensitive: !model.values.safe_mode && model.values.ai_enabled,
                         connect_changed[sender] => move |row| {
@@ -460,7 +486,7 @@ impl Component for SettingsModel {
 
                     #[name(ai_base_url_row)]
                     adw::EntryRow {
-                        set_title: "AI Base URL",
+                        set_title: "Base URL",
                         set_text: &model.values.ai_base_url,
                         set_sensitive: !model.values.safe_mode && model.values.ai_enabled,
                         connect_changed[sender] => move |row| {
@@ -470,7 +496,7 @@ impl Component for SettingsModel {
 
                     #[name(ai_api_key_row)]
                     adw::PasswordEntryRow {
-                        set_title: "API Key",
+                        set_title: "API Key — enter a new value and press Apply",
                         set_show_apply_button: true,
                         set_sensitive: !model.values.safe_mode && model.values.ai_enabled,
                         connect_apply[sender] => move |row| {
@@ -481,7 +507,7 @@ impl Component for SettingsModel {
                     #[name(ai_max_tokens_row)]
                     adw::SpinRow::new(
                         Some(&gtk::Adjustment::new(
-                            model.values.ai_max_tokens, 1.0, 32_768.0, 64.0, 512.0, 0.0
+                            model.values.ai_max_tokens, 64.0, 32_768.0, 64.0, 512.0, 0.0
                         )),
                         64.0,
                         0,
@@ -493,28 +519,6 @@ impl Component for SettingsModel {
                         },
                     },
 
-                    #[name(ai_redact_secrets_row)]
-                    adw::SwitchRow {
-                        set_title: "Redact Common Secrets",
-                        set_subtitle: "Apply before terminal context is sent",
-                        set_active: model.values.ai_redact_secrets,
-                        set_sensitive: !model.values.safe_mode && model.values.ai_enabled,
-                        connect_active_notify[sender] => move |row| {
-                            sender.input(SettingsMsg::AiRedactSecrets(row.is_active()));
-                        },
-                    },
-
-                    #[name(ai_stream_row)]
-                    adw::SwitchRow {
-                        set_title: "Stream AI Panel Replies",
-                        set_subtitle: "Show the answer while it is being generated",
-                        set_active: model.values.ai_stream,
-                        set_sensitive: !model.values.safe_mode && model.values.ai_enabled,
-                        connect_active_notify[sender] => move |row| {
-                            sender.input(SettingsMsg::AiStream(row.is_active()));
-                        },
-                    },
-
                     #[name(agent_max_turns_row)]
                     adw::SpinRow::new(
                         Some(&gtk::Adjustment::new(
@@ -523,7 +527,7 @@ impl Component for SettingsModel {
                         1.0,
                         0,
                     ) {
-                        set_title: "Shell Agent Turn Limit",
+                        set_title: "Agent Turn Limit",
                         set_sensitive: !model.values.safe_mode
                             && model.values.ai_enabled
                             && model.values.agent_enabled,
@@ -532,23 +536,48 @@ impl Component for SettingsModel {
                         },
                     },
 
-                    #[name(notifications_row)]
+                    #[name(ai_stream_row)]
                     adw::SwitchRow {
-                        set_title: "Long-command Notifications",
-                        set_active: model.values.notifications,
+                        set_title: "Stream Chat Responses",
+                        set_subtitle: "Show AI chat replies incrementally while they are generated",
+                        set_active: model.values.ai_stream,
+                        set_sensitive: !model.values.safe_mode && model.values.ai_enabled,
                         connect_active_notify[sender] => move |row| {
-                            sender.input(SettingsMsg::Notifications(row.is_active()));
+                            sender.input(SettingsMsg::AiStream(row.is_active()));
                         },
                     },
 
-                    #[name(remote_clipboard_row)]
+                    #[name(ai_redact_secrets_row)]
                     adw::SwitchRow {
-                        set_title: "Allow OSC 52 Clipboard Writes",
-                        set_subtitle: "Enable only for trusted local and remote programs",
-                        set_active: model.values.remote_clipboard,
+                        set_title: "Redact Common Secrets",
+                        set_subtitle: "Apply before terminal context is sent to a provider",
+                        set_active: model.values.ai_redact_secrets,
+                        set_sensitive: !model.values.safe_mode && model.values.ai_enabled,
                         connect_active_notify[sender] => move |row| {
-                            sender.input(SettingsMsg::RemoteClipboard(row.is_active()));
+                            sender.input(SettingsMsg::AiRedactSecrets(row.is_active()));
                         },
+                    },
+
+                },
+
+                // Host rows are managed imperatively (`rebuild_remote_rows`):
+                // the view! macro cannot express a list that grows and shrinks.
+                #[name(remote_hosts_group)]
+                adw::PreferencesGroup {
+                    set_title: "Remote Hosts",
+                    set_description: Some(
+                        "Targets for the Ctrl+Shift+S picker. Advanced fields (ssh_args, session, deploy_artifact) are edited in config.toml"
+                    ),
+                    set_sensitive: !model.values.safe_mode,
+
+                    #[wrap(Some)]
+                    set_header_suffix = &gtk::Button {
+                        set_icon_name: "list-add-symbolic",
+                        add_css_class: "flat",
+                        set_valign: gtk::Align::Center,
+                        set_tooltip_text: Some("Add Remote Host"),
+                        update_property: &[gtk::accessible::Property::Label("Add Remote Host")],
+                        connect_clicked => SettingsMsg::RemoteHostOpenAdd,
                     },
                 },
             },
@@ -566,6 +595,7 @@ impl Component for SettingsModel {
             values: init.values,
             remote_draft: RemoteDraft::default(),
             remote_editing: None,
+            remote_dialog: None,
             remote_rows: Vec::new(),
         };
         let widgets = view_output!();
@@ -597,12 +627,39 @@ impl Component for SettingsModel {
                     .terminal_mode_row
                     .set_selected(self.values.terminal_mode);
                 widgets
+                    .terminal_mode_row
+                    .set_sensitive(!self.values.safe_mode);
+                widgets
                     .block_compact_row
                     .set_active(self.values.block_compact);
                 widgets
+                    .block_compact_row
+                    .set_sensitive(!self.values.safe_mode);
+                widgets
                     .command_history_row
                     .set_active(self.values.command_history);
+                widgets
+                    .command_history_row
+                    .set_sensitive(!self.values.safe_mode);
+                widgets
+                    .ascii_organism_row
+                    .set_active(self.values.ascii_organism_enabled);
+                widgets
+                    .ascii_organism_motion_row
+                    .set_selected(self.values.ascii_organism_motion);
+                widgets
+                    .ascii_organism_row
+                    .set_sensitive(!self.values.safe_mode);
+                widgets
+                    .ascii_organism_motion_row
+                    .set_sensitive(!self.values.safe_mode && self.values.ascii_organism_enabled);
                 widgets.ai_enabled_row.set_active(self.values.ai_enabled);
+                widgets
+                    .ai_panel_visible_row
+                    .set_active(self.values.ai_panel_visible);
+                widgets
+                    .ai_panel_width_row
+                    .set_value(self.values.ai_panel_width);
                 widgets
                     .agent_enabled_row
                     .set_active(self.values.agent_enabled);
@@ -615,7 +672,9 @@ impl Component for SettingsModel {
                 widgets.ai_model_row.set_text(&self.values.ai_model);
                 widgets.ai_base_url_row.set_text(&self.values.ai_base_url);
                 widgets.ai_api_key_row.set_text("");
-                widgets.ai_api_key_row.set_title("API Key");
+                widgets
+                    .ai_api_key_row
+                    .set_title("API Key — enter a new value and press Apply");
                 widgets
                     .ai_max_tokens_row
                     .set_value(self.values.ai_max_tokens);
@@ -628,6 +687,8 @@ impl Component for SettingsModel {
                     .set_value(self.values.agent_max_turns);
                 let ai_sensitive = !self.values.safe_mode && self.values.ai_enabled;
                 widgets.ai_enabled_row.set_sensitive(!self.values.safe_mode);
+                widgets.ai_panel_visible_row.set_sensitive(ai_sensitive);
+                widgets.ai_panel_width_row.set_sensitive(ai_sensitive);
                 widgets.agent_enabled_row.set_sensitive(ai_sensitive);
                 widgets.command_correction_row.set_sensitive(ai_sensitive);
                 widgets.ai_provider_row.set_sensitive(ai_sensitive);
@@ -644,15 +705,22 @@ impl Component for SettingsModel {
                     .notifications_row
                     .set_active(self.values.notifications);
                 widgets
+                    .notifications_row
+                    .set_sensitive(!self.values.safe_mode);
+                widgets
                     .remote_clipboard_row
                     .set_active(self.values.remote_clipboard);
+                widgets
+                    .remote_clipboard_row
+                    .set_sensitive(!self.values.safe_mode);
                 // A reopened dialog starts on a fresh host: the index an edit
                 // was holding may not survive whatever changed the list while
                 // the dialog was closed.
+                if let Some(ui) = self.remote_dialog.take() {
+                    ui.dialog.close();
+                }
                 self.remote_editing = None;
                 self.remote_draft = RemoteDraft::default();
-                Self::fill_remote_form(widgets, &RemoteDraft::default());
-                Self::sync_remote_form_mode(widgets, None);
                 self.rebuild_remote_rows(&widgets.remote_hosts_group, &sender);
                 root.present(Some(&parent));
             }
@@ -692,10 +760,23 @@ impl Component for SettingsModel {
                 self.values.command_history = enabled;
                 let _ = sender.output(SettingsOutput::CommandHistory(enabled));
             }
+            SettingsMsg::AsciiOrganism(enabled) => {
+                self.values.ascii_organism_enabled = enabled;
+                widgets
+                    .ascii_organism_motion_row
+                    .set_sensitive(!self.values.safe_mode && enabled);
+                let _ = sender.output(SettingsOutput::AsciiOrganism(enabled));
+            }
+            SettingsMsg::AsciiOrganismMotion(motion) => {
+                self.values.ascii_organism_motion = motion;
+                let _ = sender.output(SettingsOutput::AsciiOrganismMotion(motion));
+            }
             SettingsMsg::AiEnabled(enabled) => {
                 self.values.ai_enabled = enabled;
                 let sensitive = !self.values.safe_mode && enabled;
                 widgets.agent_enabled_row.set_sensitive(sensitive);
+                widgets.ai_panel_visible_row.set_sensitive(sensitive);
+                widgets.ai_panel_width_row.set_sensitive(sensitive);
                 widgets.command_correction_row.set_sensitive(sensitive);
                 widgets.ai_provider_row.set_sensitive(sensitive);
                 widgets.ai_model_row.set_sensitive(sensitive);
@@ -708,6 +789,14 @@ impl Component for SettingsModel {
                     .agent_max_turns_row
                     .set_sensitive(sensitive && self.values.agent_enabled);
                 let _ = sender.output(SettingsOutput::AiEnabled(enabled));
+            }
+            SettingsMsg::AiPanelVisible(visible) => {
+                self.values.ai_panel_visible = visible;
+                let _ = sender.output(SettingsOutput::AiPanelVisible(visible));
+            }
+            SettingsMsg::AiPanelWidth(width) => {
+                self.values.ai_panel_width = width;
+                let _ = sender.output(SettingsOutput::AiPanelWidth(width as u32));
             }
             SettingsMsg::AgentEnabled(enabled) => {
                 self.values.agent_enabled = enabled;
@@ -786,8 +875,11 @@ impl Component for SettingsModel {
             SettingsMsg::RemoteHostUser(user) => self.remote_draft.user = user,
             SettingsMsg::RemoteHostDocker(docker) => self.remote_draft.docker = docker,
             SettingsMsg::RemoteHostDeploy(mode) => self.remote_draft.deploy = mode,
-            SettingsMsg::RemoteHostAdd => {
-                Self::clear_remote_errors(widgets);
+            SettingsMsg::RemoteHostOpenAdd => {
+                self.present_remote_host_dialog(None, root, &sender);
+            }
+            SettingsMsg::RemoteHostSave => {
+                self.clear_remote_errors();
                 match self.validate_remote_draft() {
                     Ok(host) => {
                         match self.remote_editing {
@@ -799,59 +891,60 @@ impl Component for SettingsModel {
                             }
                             _ => self.values.remote_hosts.push(host),
                         }
+                        if let Some(ui) = self.remote_dialog.take() {
+                            ui.dialog.close();
+                        }
                         self.remote_editing = None;
                         self.remote_draft = RemoteDraft::default();
-                        Self::fill_remote_form(widgets, &RemoteDraft::default());
-                        Self::sync_remote_form_mode(widgets, None);
                         self.rebuild_remote_rows(&widgets.remote_hosts_group, &sender);
                         let _ = sender.output(SettingsOutput::RemoteHosts(
                             self.values.remote_hosts.clone(),
                         ));
                     }
                     Err((field, message)) => {
-                        let row = match field {
-                            RemoteField::Name => &widgets.remote_name_row,
-                            RemoteField::Host => &widgets.remote_host_row,
-                            RemoteField::User => &widgets.remote_user_row,
-                        };
-                        row.add_css_class("error");
-                        row.grab_focus();
-                        widgets.remote_add_row.set_subtitle(message);
+                        self.show_remote_error(field, message);
                     }
                 }
             }
             SettingsMsg::RemoteHostEdit(index) => {
-                if let Some(host) = self.values.remote_hosts.get(index) {
-                    Self::clear_remote_errors(widgets);
-                    self.remote_draft = RemoteDraft::from_host(host);
-                    self.remote_editing = Some(index);
-                    Self::fill_remote_form(widgets, &self.remote_draft);
-                    Self::sync_remote_form_mode(widgets, Some(host.name.clone()));
-                    // Redraw so the row under edit is the one marked as such.
-                    self.rebuild_remote_rows(&widgets.remote_hosts_group, &sender);
-                    widgets.remote_host_row.grab_focus();
-                }
+                self.present_remote_host_dialog(Some(index), root, &sender);
             }
-            SettingsMsg::RemoteHostCancelEdit => {
-                Self::clear_remote_errors(widgets);
+            SettingsMsg::RemoteHostCancel => {
+                if let Some(ui) = self.remote_dialog.take() {
+                    ui.dialog.close();
+                }
                 self.remote_editing = None;
                 self.remote_draft = RemoteDraft::default();
-                Self::fill_remote_form(widgets, &RemoteDraft::default());
-                Self::sync_remote_form_mode(widgets, None);
-                self.rebuild_remote_rows(&widgets.remote_hosts_group, &sender);
             }
             SettingsMsg::RemoteHostRemove(index) => {
-                if index < self.values.remote_hosts.len() {
-                    self.values.remote_hosts.remove(index);
-                    // Every later index just shifted. Rather than renumber an
-                    // edit that is mid-flight, drop it: silently retargeting the
-                    // form at a different host is the worse outcome.
-                    if self.remote_editing.is_some() {
-                        self.remote_editing = None;
-                        self.remote_draft = RemoteDraft::default();
-                        Self::fill_remote_form(widgets, &RemoteDraft::default());
-                        Self::sync_remote_form_mode(widgets, None);
-                    }
+                if let Some(host) = self.values.remote_hosts.get(index) {
+                    let name = host.name.clone();
+                    let display = crate::text_safety::bounded_display_text(&name, 1_024, false);
+                    let dialog = adw::AlertDialog::new(
+                        Some("Remove this host?"),
+                        Some(&format!(
+                            "“{display}” will be removed from config.toml. Nothing on the destination is touched."
+                        )),
+                    );
+                    dialog.add_responses(&[("cancel", "Cancel"), ("remove", "Remove")]);
+                    dialog.set_default_response(Some("cancel"));
+                    dialog.set_close_response("cancel");
+                    dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+                    let sender = sender.clone();
+                    dialog.connect_response(None, move |_, response| {
+                        if response == "remove" {
+                            sender.input(SettingsMsg::RemoteHostRemoveConfirmed {
+                                index,
+                                name: name.clone(),
+                            });
+                        }
+                    });
+                    dialog.present(Some(root));
+                }
+            }
+            SettingsMsg::RemoteHostRemoveConfirmed { index, name } => {
+                let removed = remove_remote_host(&mut self.values.remote_hosts, index, &name);
+                if removed {
                     self.rebuild_remote_rows(&widgets.remote_hosts_group, &sender);
                     let _ = sender.output(SettingsOutput::RemoteHosts(
                         self.values.remote_hosts.clone(),
@@ -865,46 +958,183 @@ impl Component for SettingsModel {
 impl SettingsModel {
     /// Drop the red outline left by the previous failed submit, so an error is
     /// only ever pointing at the field the user is being told about now.
-    fn clear_remote_errors(widgets: &<Self as Component>::Widgets) {
-        for row in [
-            &widgets.remote_name_row,
-            &widgets.remote_host_row,
-            &widgets.remote_user_row,
-        ] {
+    fn clear_remote_errors(&self) {
+        let Some(ui) = self.remote_dialog.as_ref() else {
+            return;
+        };
+        for row in [&ui.name, &ui.host, &ui.user] {
             row.remove_css_class("error");
         }
+        ui.error.set_visible(false);
     }
 
-    /// Push draft state into the form. A default draft clears it.
-    fn fill_remote_form(widgets: &<Self as Component>::Widgets, draft: &RemoteDraft) {
-        widgets.remote_name_row.set_text(&draft.name);
-        widgets.remote_host_row.set_text(&draft.host);
-        widgets.remote_user_row.set_text(&draft.user);
-        widgets.remote_docker_row.set_active(draft.docker);
-        widgets.remote_deploy_row.set_selected(draft.deploy);
-        widgets.remote_add_row.set_subtitle("");
+    fn show_remote_error(&self, field: RemoteField, message: &str) {
+        let Some(ui) = self.remote_dialog.as_ref() else {
+            return;
+        };
+        let row = match field {
+            RemoteField::Form => None,
+            RemoteField::Name => Some(&ui.name),
+            RemoteField::Host => Some(&ui.host),
+            RemoteField::User => Some(&ui.user),
+        };
+        if let Some(row) = row {
+            row.add_css_class("error");
+            row.grab_focus();
+        }
+        ui.error.set_label(message);
+        ui.error.set_visible(true);
     }
 
-    /// Retitle the form for whichever host it is about to write. `editing`
-    /// carries the display name so the group says which one, which matters once
-    /// several hosts differ only in a field the row subtitle truncates.
-    fn sync_remote_form_mode(widgets: &<Self as Component>::Widgets, editing: Option<String>) {
-        match editing {
-            Some(name) => {
-                widgets.remote_form_group.set_title("Edit Remote Host");
-                widgets
-                    .remote_form_group
-                    .set_description(Some(&format!("Editing “{name}”")));
-                widgets.remote_add_row.set_title("Save Changes");
-                widgets.remote_cancel_row.set_visible(true);
-            }
-            None => {
-                widgets.remote_form_group.set_title("Add Remote Host");
-                widgets.remote_form_group.set_description(None);
-                widgets.remote_add_row.set_title("Add Host");
-                widgets.remote_cancel_row.set_visible(false);
+    fn present_remote_host_dialog(
+        &mut self,
+        editing: Option<usize>,
+        parent: &adw::PreferencesDialog,
+        sender: &ComponentSender<Self>,
+    ) {
+        if let Some(ui) = self.remote_dialog.take() {
+            ui.dialog.close();
+        }
+        let existing = editing.and_then(|index| {
+            self.values
+                .remote_hosts
+                .get(index)
+                .cloned()
+                .map(|host| (index, host))
+        });
+        if editing.is_some() && existing.is_none() {
+            return;
+        }
+        self.remote_editing = existing.as_ref().map(|(index, _)| *index);
+        self.remote_draft = existing
+            .as_ref()
+            .map(|(_, host)| RemoteDraft::from_host(host))
+            .unwrap_or_default();
+
+        let dialog = adw::Dialog::builder()
+            .title(if existing.is_some() {
+                "Edit Remote Host"
+            } else {
+                "Add Remote Host"
+            })
+            .content_width(420)
+            .build();
+        let name = adw::EntryRow::new();
+        name.set_title("Name (optional)");
+        name.set_text(&self.remote_draft.name);
+        let host = adw::EntryRow::new();
+        host.set_title("Host / container");
+        host.set_text(&self.remote_draft.host);
+        let user = adw::EntryRow::new();
+        user.set_title("User (optional)");
+        user.set_text(&self.remote_draft.user);
+        let docker = adw::SwitchRow::builder()
+            .title("Docker Container")
+            .subtitle("Attach to a running container with docker exec instead of ssh")
+            .active(self.remote_draft.docker)
+            .build();
+        let deploy_model = gtk::StringList::new(&["Off", "Persist", "Incognito"]);
+        let deploy = adw::ComboRow::builder()
+            .title("Deploy jsh")
+            .subtitle("Put a jsh on the destination for the life of the session")
+            .model(&deploy_model)
+            .selected(self.remote_draft.deploy)
+            .build();
+
+        let list = gtk::ListBox::new();
+        list.set_selection_mode(gtk::SelectionMode::None);
+        list.add_css_class("boxed-list");
+        list.append(&name);
+        list.append(&host);
+        list.append(&user);
+        list.append(&docker);
+        list.append(&deploy);
+
+        let error = gtk::Label::new(None);
+        error.add_css_class("error");
+        error.set_wrap(true);
+        error.set_xalign(0.0);
+        error.set_visible(false);
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        content.set_margin_all(12);
+        content.append(&list);
+        if let Some((_, existing)) = existing.as_ref() {
+            if let Some(note) = advanced_fields_note(existing) {
+                let note = crate::text_safety::bounded_display_text(&note, 4 * 1024, false);
+                let label = gtk::Label::new(Some(&note));
+                label.add_css_class("dim-label");
+                label.set_wrap(true);
+                label.set_xalign(0.0);
+                content.append(&label);
             }
         }
+        content.append(&error);
+
+        let header = adw::HeaderBar::new();
+        header.set_show_start_title_buttons(false);
+        header.set_show_end_title_buttons(false);
+        let cancel = gtk::Button::with_label("Cancel");
+        let save = gtk::Button::with_label(if existing.is_some() { "Save" } else { "Add" });
+        save.add_css_class("suggested-action");
+        header.pack_start(&cancel);
+        header.pack_end(&save);
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&header);
+        toolbar.set_content(Some(&content));
+        dialog.set_child(Some(&toolbar));
+
+        {
+            let sender = sender.clone();
+            name.connect_changed(move |row| {
+                sender.input(SettingsMsg::RemoteHostName(row.text().to_string()));
+            });
+        }
+        {
+            let sender = sender.clone();
+            host.connect_changed(move |row| {
+                sender.input(SettingsMsg::RemoteHostHost(row.text().to_string()));
+            });
+        }
+        {
+            let sender = sender.clone();
+            user.connect_changed(move |row| {
+                sender.input(SettingsMsg::RemoteHostUser(row.text().to_string()));
+            });
+        }
+        {
+            let sender = sender.clone();
+            docker.connect_active_notify(move |row| {
+                sender.input(SettingsMsg::RemoteHostDocker(row.is_active()));
+            });
+        }
+        {
+            let sender = sender.clone();
+            deploy.connect_selected_notify(move |row| {
+                sender.input(SettingsMsg::RemoteHostDeploy(row.selected()));
+            });
+        }
+        {
+            let sender = sender.clone();
+            cancel.connect_clicked(move |_| sender.input(SettingsMsg::RemoteHostCancel));
+        }
+        {
+            let sender = sender.clone();
+            save.connect_clicked(move |_| sender.input(SettingsMsg::RemoteHostSave));
+        }
+        {
+            let sender = sender.clone();
+            dialog.connect_closed(move |_| sender.input(SettingsMsg::RemoteHostCancel));
+        }
+
+        self.remote_dialog = Some(RemoteDialogUi {
+            dialog: dialog.clone(),
+            name,
+            host: host.clone(),
+            user,
+            error,
+        });
+        dialog.present(Some(parent));
+        host.grab_focus();
     }
 
     fn rebuild_remote_rows(
@@ -915,22 +1145,29 @@ impl SettingsModel {
         for row in self.remote_rows.drain(..) {
             group.remove(&row);
         }
+        if self.values.remote_hosts.is_empty() {
+            let row = adw::ActionRow::new();
+            row.set_title("No remote hosts configured");
+            row.set_subtitle("Add an ssh destination or a running container");
+            row.set_sensitive(false);
+            group.add(&row);
+            self.remote_rows.push(row);
+            return;
+        }
         for (index, host) in self.values.remote_hosts.iter().enumerate() {
             let row = adw::ActionRow::new();
             row.set_use_markup(false);
-            row.set_title(if host.name.is_empty() {
+            let title = if host.name.is_empty() {
                 &host.host
             } else {
                 &host.name
-            });
-            // The docker user is `docker exec -u`, not part of the target.
-            let target = if host.docker {
-                host.host.clone()
-            } else {
-                match &host.user {
-                    Some(user) => format!("{user}@{}", host.host),
-                    None => host.host.clone(),
-                }
+            };
+            row.set_title(&crate::text_safety::bounded_display_text(
+                title, 1_024, false,
+            ));
+            let target = match &host.user {
+                Some(user) => format!("{user}@{}", host.host),
+                None => host.host.clone(),
             };
             let transport = if host.docker { "docker" } else { "ssh" };
             let mut subtitle = format!("{transport} · {target} · deploy {}", host.deploy.as_str());
@@ -939,14 +1176,15 @@ impl SettingsModel {
             if !host.ssh_args.is_empty() {
                 subtitle.push_str(&format!(" · ssh_args {}", host.ssh_args.join(" ")));
             }
-            if self.remote_editing == Some(index) {
-                subtitle.push_str(" · editing");
-            }
-            row.set_subtitle(&subtitle);
+            row.set_subtitle(&crate::text_safety::bounded_display_text(
+                &subtitle,
+                4 * 1024,
+                false,
+            ));
             let edit = gtk::Button::from_icon_name("document-edit-symbolic");
             edit.set_valign(gtk::Align::Center);
             edit.add_css_class("flat");
-            edit.set_tooltip_text(Some("Edit host"));
+            edit.set_tooltip_text(Some("Edit Host"));
             edit.connect_clicked({
                 let sender = sender.clone();
                 move |_| sender.input(SettingsMsg::RemoteHostEdit(index))
@@ -956,7 +1194,7 @@ impl SettingsModel {
             remove.set_valign(gtk::Align::Center);
             remove.add_css_class("flat");
             remove.add_css_class("destructive-action");
-            remove.set_tooltip_text(Some("Remove host"));
+            remove.set_tooltip_text(Some("Remove Host"));
             remove.connect_clicked({
                 let sender = sender.clone();
                 move |_| sender.input(SettingsMsg::RemoteHostRemove(index))
@@ -970,6 +1208,11 @@ impl SettingsModel {
     /// Mirror `parse_remote_hosts`' acceptance rules so a host added here
     /// always survives the next config load.
     fn validate_remote_draft(&self) -> Result<RemoteHost, (RemoteField, &'static str)> {
+        if self.remote_editing.is_none()
+            && self.values.remote_hosts.len() >= crate::config::MAX_REMOTE_HOSTS
+        {
+            return Err((RemoteField::Form, "The remote host limit is reached."));
+        }
         let host = self.remote_draft.host.trim().to_string();
         if host.is_empty() {
             return Err((RemoteField::Host, "Host is required."));
@@ -1062,6 +1305,39 @@ impl SettingsModel {
     }
 }
 
+fn advanced_fields_note(host: &RemoteHost) -> Option<String> {
+    let mut kept = Vec::new();
+    if !host.ssh_args.is_empty() {
+        kept.push(format!("ssh_args = {:?}", host.ssh_args));
+    }
+    if let Some(session) = &host.session {
+        kept.push(format!("session = {session:?}"));
+    }
+    if host.remote_shell != "jsh" {
+        kept.push(format!("remote_shell = {:?}", host.remote_shell));
+    }
+    if !host.login_shell {
+        kept.push("login_shell = false".into());
+    }
+    if !host.multiplex {
+        kept.push("multiplex = false".into());
+    }
+    if let Some(artifact) = &host.deploy_artifact {
+        kept.push(format!("deploy_artifact = {artifact:?}"));
+    }
+    (!kept.is_empty()).then(|| format!("Kept as configured: {}", kept.join(", ")))
+}
+
+fn remove_remote_host(hosts: &mut Vec<RemoteHost>, index: usize, name: &str) -> bool {
+    if hosts.get(index).is_some_and(|host| host.name == name) {
+        hosts.remove(index);
+        return true;
+    }
+    let before = hosts.len();
+    hosts.retain(|host| host.name != name);
+    before != hosts.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1102,7 +1378,11 @@ mod tests {
                 terminal_mode: 0,
                 block_compact: false,
                 command_history: true,
+                ascii_organism_enabled: false,
+                ascii_organism_motion: 0,
                 ai_enabled: false,
+                ai_panel_visible: false,
+                ai_panel_width: 360.0,
                 agent_enabled: false,
                 command_correction_enabled: false,
                 ai_provider: 0,
@@ -1120,6 +1400,7 @@ mod tests {
             },
             remote_draft: draft,
             remote_editing: editing,
+            remote_dialog: None,
             remote_rows: Vec::new(),
         }
     }
@@ -1158,6 +1439,26 @@ mod tests {
     }
 
     #[test]
+    fn adding_is_refused_at_the_shared_remote_host_limit() {
+        let hosts = (0..crate::config::MAX_REMOTE_HOSTS)
+            .map(|index| {
+                let mut host = host_with_hidden_fields();
+                host.name = format!("host-{index}");
+                host.host = format!("host-{index}.example");
+                host
+            })
+            .collect();
+        let mut model = model(hosts, None);
+        model.remote_draft.host = "one-too-many.example".to_string();
+
+        let (field, message) = model
+            .validate_remote_draft()
+            .expect_err("host limit must be enforced");
+        assert!(matches!(field, RemoteField::Form));
+        assert_eq!(message, "The remote host limit is reached.");
+    }
+
+    #[test]
     fn an_edit_that_keeps_the_name_is_not_a_duplicate() {
         let mut model = model(vec![host_with_hidden_fields()], Some(0));
         model.remote_draft.host = "10.68.18.61".to_string();
@@ -1177,5 +1478,75 @@ mod tests {
 
         let (field, _) = model.validate_remote_draft().expect_err("duplicate name");
         assert!(matches!(field, RemoteField::Name));
+    }
+
+    #[test]
+    fn edit_dialog_draft_loads_every_visible_field() {
+        let host = host_with_hidden_fields();
+        let draft = RemoteDraft::from_host(&host);
+
+        assert_eq!(draft.name, "dev-60");
+        assert_eq!(draft.host, "10.68.18.60");
+        assert_eq!(draft.user, "root");
+        assert!(!draft.docker);
+        assert_eq!(draft.deploy, 1);
+    }
+
+    #[test]
+    fn advanced_note_discloses_every_preserved_field() {
+        let mut host = host_with_hidden_fields();
+        host.remote_shell = "/bin/bash".to_string();
+        let note = advanced_fields_note(&host).expect("host has advanced fields");
+
+        for field in [
+            "ssh_args",
+            "session",
+            "remote_shell",
+            "login_shell",
+            "multiplex",
+            "deploy_artifact",
+        ] {
+            assert!(note.contains(field), "missing {field} in {note:?}");
+        }
+    }
+
+    #[test]
+    fn default_host_has_no_advanced_note() {
+        let mut host = host_with_hidden_fields();
+        host.ssh_args.clear();
+        host.session = None;
+        host.remote_shell = "jsh".to_string();
+        host.login_shell = true;
+        host.multiplex = true;
+        host.deploy_artifact = None;
+
+        assert_eq!(advanced_fields_note(&host), None);
+    }
+
+    #[test]
+    fn confirmed_delete_uses_index_when_it_still_matches() {
+        let first = host_with_hidden_fields();
+        let mut second = host_with_hidden_fields();
+        second.name = "staging".to_string();
+        let mut hosts = vec![first, second];
+
+        assert!(remove_remote_host(&mut hosts, 1, "staging"));
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].name, "dev-60");
+    }
+
+    #[test]
+    fn confirmed_delete_falls_back_to_name_after_list_changes() {
+        let target = host_with_hidden_fields();
+        let mut other = host_with_hidden_fields();
+        other.name = "staging".to_string();
+        let mut hosts = vec![other, target];
+
+        // The confirmation captured index zero before another update changed
+        // the ordering. The stable profile name must still identify the row.
+        assert!(remove_remote_host(&mut hosts, 0, "dev-60"));
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].name, "staging");
+        assert!(!remove_remote_host(&mut hosts, 9, "missing"));
     }
 }

@@ -43,6 +43,13 @@ impl AppModel {
         self.search.emit(search::SearchMsg::Toggle);
     }
 
+    fn ai_panel_contains_focus(&self) -> bool {
+        self.ai_panel.widget().is_visible()
+            && gtk::prelude::RootExt::focus(&self.window).is_some_and(|focus| {
+                widget_is_within(focus, self.ai_panel.widget().upcast_ref::<gtk::Widget>())
+            })
+    }
+
     fn emit_block_action(&self, input: VteInput, feature: &str) {
         let pane = self
             .tabs
@@ -106,12 +113,18 @@ impl AppModel {
             Action::TogglePaneZoom => self.toggle_pane_zoom(),
             Action::MovePaneToNewTab => self.move_pane_to_new_tab(sender),
             Action::Copy => {
-                if let Some(t) = self.active_terminal() {
+                if self.ai_panel_contains_focus() {
+                    self.ai_panel
+                        .emit(dialogs::ai_panel::AiPanelMsg::CopyFocused);
+                } else if let Some(t) = self.active_terminal() {
                     t.emit(VteInput::Copy);
                 }
             }
             Action::Paste => {
-                if let Some(t) = self.active_terminal() {
+                if self.ai_panel_contains_focus() {
+                    self.ai_panel
+                        .emit(dialogs::ai_panel::AiPanelMsg::PasteFocused);
+                } else if let Some(t) = self.active_terminal() {
                     t.emit(VteInput::Paste);
                 }
             }
@@ -144,38 +157,60 @@ impl AppModel {
             Action::ToggleCommandPalette => {
                 self.reload_workflows();
                 let history = self.config.borrow().command_history_path.clone();
+                let live_history = self
+                    .active_terminal()
+                    .map(TermCtl::command_history)
+                    .unwrap_or_default();
                 self.command_palette
                     .emit(dialogs::command_palette::PaletteMsg::Toggle {
-                        mode: palette::PaletteMode::Commands,
+                        // Match Forge's command center: the default entry point
+                        // searches actions, history, workflows and AI together.
+                        // Prefixes still narrow the same surface immediately.
+                        mode: palette::PaletteMode::All,
                         history_path: history.map(std::path::PathBuf::from),
+                        live_history,
                     });
             }
             Action::OpenPalette => {
                 self.reload_workflows();
                 let history = self.config.borrow().command_history_path.clone();
+                let live_history = self
+                    .active_terminal()
+                    .map(TermCtl::command_history)
+                    .unwrap_or_default();
                 self.command_palette
                     .emit(dialogs::command_palette::PaletteMsg::Toggle {
                         mode: palette::PaletteMode::All,
                         history_path: history.map(std::path::PathBuf::from),
+                        live_history,
                     });
             }
             Action::OpenHistoryPalette => {
                 self.reload_workflows();
                 let history = self.config.borrow().command_history_path.clone();
-                if let Some(term) = self.active_terminal() {
-                    self.history.emit(dialogs::history::HistoryMsg::Toggle {
-                        anchor: term.widget(),
+                let live_history = self
+                    .active_terminal()
+                    .map(TermCtl::command_history)
+                    .unwrap_or_default();
+                self.command_palette
+                    .emit(dialogs::command_palette::PaletteMsg::Toggle {
+                        mode: palette::PaletteMode::History,
                         history_path: history.map(std::path::PathBuf::from),
+                        live_history,
                     });
-                }
             }
             Action::OpenWorkflows => {
                 self.reload_workflows();
                 let history = self.config.borrow().command_history_path.clone();
+                let live_history = self
+                    .active_terminal()
+                    .map(TermCtl::command_history)
+                    .unwrap_or_default();
                 self.command_palette
                     .emit(dialogs::command_palette::PaletteMsg::Toggle {
                         mode: palette::PaletteMode::Workflows,
                         history_path: history.map(std::path::PathBuf::from),
+                        live_history,
                     });
             }
             Action::ToggleSettings => {
@@ -209,7 +244,16 @@ impl AppModel {
                         },
                         block_compact: config.block_compact,
                         command_history: config.command_history_enabled,
+                        ascii_organism_enabled: config.ascii_organism_enabled,
+                        ascii_organism_motion: match config.ascii_organism_motion {
+                            None => 0,
+                            Some(config::OrganismMotion::Full) => 1,
+                            Some(config::OrganismMotion::Calm) => 2,
+                            Some(config::OrganismMotion::Static) => 3,
+                        },
                         ai_enabled: config.ai_enabled,
+                        ai_panel_visible: config.ai_panel_visible,
+                        ai_panel_width: config.ai_panel_width as f64,
                         agent_enabled: config.agent_enabled,
                         command_correction_enabled: config.command_correction_enabled,
                         ai_provider: match config.ai_provider.as_str() {
@@ -370,8 +414,12 @@ impl AppModel {
                     self.show_toast("That remote host is no longer configured.");
                 }
             }
-            Action::OpenAiPanel => {
-                self.show_ai_session_panel();
+            Action::ToggleAiPanel | Action::OpenAiPanel => {
+                match action.ai_panel_target_visibility(self.ai_panel_visible.get()) {
+                    Some(true) => self.show_ai_session_panel(),
+                    Some(false) => self.set_ai_panel_visible(false, true),
+                    None => unreachable!("matched only AI-panel actions"),
+                }
             }
             Action::AskAiAboutSelectedBlock => {
                 self.emit_block_action(

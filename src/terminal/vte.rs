@@ -284,6 +284,7 @@ pub(crate) fn spawn_shell(
                         use std::os::fd::AsRawFd;
                         probe.pty_fd.set(pty.fd().as_raw_fd());
                     }
+                    let _ = sender.output(VteOutput::Launched);
                 }
                 Err(error) => {
                     let message = launch_failure_message(&error);
@@ -433,6 +434,10 @@ pub enum VteInput {
 
 #[derive(Debug)]
 pub enum VteOutput {
+    /// The backend's child process was created successfully. Conventional VTE
+    /// spawning is asynchronous, so split transactions use this acknowledgement
+    /// to retire their rollback authority.
+    Launched,
     CwdChanged {
         path: String,
         external: bool,

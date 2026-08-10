@@ -15,13 +15,17 @@ if set -q ANVIL_CWD_TOKEN
     set --erase ANVIL_CWD_TOKEN
 end
 
+# Fish does not participate in authenticated Agent execution, but scrub the
+# reserved channel spellings before any child process can inherit them.
+set --erase ANVIL_SHELL_INTEGRATION_FD ANVIL_SHELL_INTEGRATION_TOKEN
+
 if set -q __anvil_fish_loaded
     return 0
 end
 set -g __anvil_fish_loaded 1
-set -g __anvil_marker_nonce "$fish_pid-"(random)"-"(random)"-"(random)"-"(random)"-"(random)"-"(random)"-"(random)"-"(random)
-set -g __anvil_marker_seq 0
-set -g __anvil_marker_id ""
+set --global --unexport __anvil_command_token "anvil-fish-$fish_pid"
+set --global --unexport __anvil_marker_seq 0
+set --global --unexport __anvil_marker_id ""
 
 function __anvil_osc
     printf '\033]%s\007' $argv[1]
@@ -42,7 +46,7 @@ function __anvil_prompt_start  ; __anvil_osc "133;A" ; end
 function __anvil_prompt_end    ; __anvil_osc "133;B" ; end
 function __anvil_command_start
     set -g __anvil_marker_seq (math "$__anvil_marker_seq + 1")
-    set -g __anvil_marker_id "$__anvil_marker_nonce-$__anvil_marker_seq"
+    set -g __anvil_marker_id "$__anvil_command_token-$__anvil_marker_seq"
     __anvil_osc "133;C;id=$__anvil_marker_id"
 end
 function __anvil_command_end

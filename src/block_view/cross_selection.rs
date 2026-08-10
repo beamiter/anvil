@@ -25,7 +25,10 @@ use std::rc::Rc;
 use gtk::prelude::*;
 use vte4::TerminalExt;
 
-use crate::block_view::blocks::FinishedBlock;
+use super::selection_hold::{feed_hold_eligible, SelectionFeedHold};
+use super::{
+    clear_finished_block_selection, BlockState, FinishedBlock, MouseReportingMode, SelectedBlockIds,
+};
 
 const MAX_CROSS_SELECTION_BYTES: usize = 32 * 1024 * 1024;
 
@@ -51,52 +54,109 @@ fn append_selected_text(output: &mut String, text: &str, max_bytes: usize) -> bo
 pub(crate) struct CrossSelection {
     finished_blocks: Rc<RefCell<Vec<FinishedBlock>>>,
     active_vte: vte4::Terminal,
+    selected_block_ids: SelectedBlockIds,
+    selected_block_id: Rc<Cell<Option<u64>>>,
+    selection_anchor_id: Rc<Cell<Option<u64>>>,
     /// Index in widget-order of where the current drag began (None when idle
     /// or the drag started outside any tracked VTE).
     start_idx: Cell<Option<usize>>,
     /// Once we've claimed the gesture and started painting cross-block
     /// selection, stay claimed for the rest of the drag.
     claimed: Cell<bool>,
+    /// Parks the PTY feed while a drag covers the live VTE, so streaming
+    /// repaints cannot clear the selection out from under the pointer.
+    feed_hold: Rc<SelectionFeedHold>,
+    bstate: Rc<Cell<BlockState>>,
+    mouse_reporting: Rc<Cell<MouseReportingMode>>,
 }
 
 impl CrossSelection {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn install(
         block_scroll: &gtk::ScrolledWindow,
         finished_blocks: Rc<RefCell<Vec<FinishedBlock>>>,
         active_vte: vte4::Terminal,
+        selected_block_ids: SelectedBlockIds,
+        selected_block_id: Rc<Cell<Option<u64>>>,
+        selection_anchor_id: Rc<Cell<Option<u64>>>,
+        feed_hold: Rc<SelectionFeedHold>,
+        bstate: Rc<Cell<BlockState>>,
+        mouse_reporting: Rc<Cell<MouseReportingMode>>,
     ) -> Rc<Self> {
         let this = Rc::new(Self {
             finished_blocks,
             active_vte,
+            selected_block_ids,
+            selected_block_id,
+            selection_anchor_id,
             start_idx: Cell::new(None),
             claimed: Cell::new(false),
+            feed_hold,
+            bstate,
+            mouse_reporting,
         });
+
+        // A native selection starts a new selection model. Clear stale text
+        // selections on other surfaces and any whole-card selection first.
+        let click = gtk::GestureClick::new();
+        click.set_button(gtk::gdk::BUTTON_PRIMARY);
+        click.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let scroll_for_click = block_scroll.downgrade();
+        let this_for_click = Rc::downgrade(&this);
+        click.connect_pressed(move |gesture, _n_press, x, y| {
+            let (Some(this), Some(scroll)) = (this_for_click.upgrade(), scroll_for_click.upgrade())
+            else {
+                return;
+            };
+            let target = this.vte_at(&scroll, x, y);
+            if target.is_some() {
+                this.clear_block_selection();
+            }
+            this.clear_other_selections(target.as_ref());
+            // Preserve VTE ownership of cell/word/line selection.
+            gesture.set_state(gtk::EventSequenceState::Denied);
+        });
+        block_scroll.add_controller(click);
 
         let drag = gtk::GestureDrag::new();
         drag.set_button(gtk::gdk::BUTTON_PRIMARY);
         drag.set_propagation_phase(gtk::PropagationPhase::Capture);
 
-        let scroll_for_begin = block_scroll.clone();
-        let this_for_begin = this.clone();
-        drag.connect_drag_begin(move |_, x, y| {
-            this_for_begin
-                .start_idx
-                .set(this_for_begin.vte_index_at(&scroll_for_begin, x, y));
-            this_for_begin.claimed.set(false);
+        let scroll_for_begin = block_scroll.downgrade();
+        let this_for_begin = Rc::downgrade(&this);
+        drag.connect_drag_begin(move |gesture, x, y| {
+            let (Some(this), Some(scroll)) = (this_for_begin.upgrade(), scroll_for_begin.upgrade())
+            else {
+                return;
+            };
+            let start = this.vte_index_at(&scroll, x, y);
+            this.start_idx.set(start);
+            this.claimed.set(false);
+            if let Some(start) = start {
+                this.clear_block_selection();
+                let vtes = this.ordered_vtes();
+                this.maybe_hold_active_feed(vtes.get(start), shift_held(gesture));
+                this.clear_other_selections(vtes.get(start));
+            }
         });
 
-        let scroll_for_update = block_scroll.clone();
-        let this_for_update = this.clone();
+        let scroll_for_update = block_scroll.downgrade();
+        let this_for_update = Rc::downgrade(&this);
         drag.connect_drag_update(move |gesture, dx, dy| {
-            let Some(start) = this_for_update.start_idx.get() else {
+            let (Some(this), Some(scroll)) =
+                (this_for_update.upgrade(), scroll_for_update.upgrade())
+            else {
+                return;
+            };
+            let Some(start) = this.start_idx.get() else {
                 return;
             };
             let Some((sx, sy)) = gesture.start_point() else {
                 return;
             };
-            let cur = this_for_update.vte_index_at(&scroll_for_update, sx + dx, sy + dy);
+            let cur = this.vte_index_at(&scroll, sx + dx, sy + dy);
             let Some(cur_idx) = cur else { return };
-            if cur_idx == start && !this_for_update.claimed.get() {
+            if cur_idx == start && !this.claimed.get() {
                 // Still within the original widget — let VTE's native gesture
                 // own the per-cell selection.
                 return;
@@ -104,33 +164,94 @@ impl CrossSelection {
             // Crossed a boundary: claim and paint per-widget select_all on the
             // covered range.
             gesture.set_state(gtk::EventSequenceState::Claimed);
-            this_for_update.claimed.set(true);
-            this_for_update.paint_range(start, cur_idx);
+            this.claimed.set(true);
+            this.paint_range(start, cur_idx);
+            let vtes = this.ordered_vtes();
+            this.maybe_hold_active_feed(vtes.get(start.max(cur_idx)), shift_held(gesture));
         });
 
-        let this_for_end = this.clone();
+        let this_for_end = Rc::downgrade(&this);
         drag.connect_drag_end(move |_, _, _| {
-            this_for_end.start_idx.set(None);
+            if let Some(this) = this_for_end.upgrade() {
+                this.start_idx.set(None);
+                this.end_active_feed_hold();
+            }
             // Leave `claimed` and the painted selections in place so the user
             // can copy with Ctrl+Shift+C after releasing.
+        });
+
+        let this_for_cancel = Rc::downgrade(&this);
+        drag.connect_cancel(move |_, _| {
+            if let Some(this) = this_for_cancel.upgrade() {
+                this.start_idx.set(None);
+                this.end_active_feed_hold();
+            }
         });
 
         block_scroll.add_controller(drag);
         this
     }
 
-    /// Total VTE widgets in document order: each finished block contributes one
-    /// (its output_vte — the command_vte is a single row above it and rarely
-    /// the drag target), and the live active_vte sits at the end.
+    fn maybe_hold_active_feed(&self, vte: Option<&vte4::Terminal>, shift_held: bool) {
+        if vte == Some(&self.active_vte)
+            && feed_hold_eligible(self.bstate.get(), self.mouse_reporting.get(), shift_held)
+        {
+            self.feed_hold.begin_drag();
+        }
+    }
+
+    fn end_active_feed_hold(&self) {
+        self.feed_hold.end_drag(self.active_vte.has_selection());
+    }
+
+    fn clear_block_selection(&self) {
+        if self.selected_block_id.get().is_none() {
+            return;
+        }
+        let finished = self.finished_blocks.borrow();
+        clear_finished_block_selection(
+            &finished,
+            &self.selected_block_ids,
+            &self.selected_block_id,
+            &self.selection_anchor_id,
+        );
+    }
+
+    /// Every terminal surface in document order, including hidden ones used
+    /// when clearing stale selections.
+    fn all_vtes(&self) -> Vec<vte4::Terminal> {
+        let finished = self.finished_blocks.borrow();
+        let mut vtes = Vec::with_capacity(finished.len().saturating_mul(2) + 1);
+        for block in finished.iter() {
+            vtes.push(block.command_vte.clone());
+            vtes.push(block.output_vte.clone());
+        }
+        vtes.push(self.active_vte.clone());
+        vtes
+    }
+
+    /// Hidden, collapsed, or virtualized surfaces cannot contribute invisible
+    /// text to cross-selection or copy.
     fn ordered_vtes(&self) -> Vec<vte4::Terminal> {
-        let mut v: Vec<vte4::Terminal> = self
-            .finished_blocks
-            .borrow()
-            .iter()
-            .map(|b| b.output_vte.clone())
-            .collect();
-        v.push(self.active_vte.clone());
-        v
+        self.all_vtes()
+            .into_iter()
+            .filter(|vte| vte.is_mapped() && vte.is_visible())
+            .collect()
+    }
+
+    fn clear_other_selections(&self, keep: Option<&vte4::Terminal>) {
+        for vte in self.all_vtes() {
+            if keep.map(|target| target != &vte).unwrap_or(true) {
+                vte.unselect_all();
+            }
+        }
+    }
+
+    fn vte_at(&self, block_scroll: &gtk::ScrolledWindow, x: f64, y: f64) -> Option<vte4::Terminal> {
+        let picked = block_scroll.pick(x, y, gtk::PickFlags::DEFAULT)?;
+        self.ordered_vtes()
+            .into_iter()
+            .find(|vte| widget_contains(vte, &picked))
     }
 
     /// Find which VTE in `ordered_vtes()` the pointer `(x, y)` (in
@@ -150,13 +271,19 @@ impl CrossSelection {
     /// Set selection on every VTE in [min(a,b)..=max(a,b)] and clear all
     /// others. Idempotent — safe to call on every drag-update frame.
     fn paint_range(&self, a: usize, b: usize) {
+        let vtes = self.ordered_vtes();
         let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-        for (i, vte) in self.ordered_vtes().iter().enumerate() {
+        self.clear_all();
+        for (i, vte) in vtes.iter().enumerate() {
             if i >= lo && i <= hi {
                 vte.select_all();
-            } else {
-                vte.unselect_all();
             }
+        }
+    }
+
+    pub(crate) fn clear_all(&self) {
+        for vte in self.all_vtes() {
+            vte.unselect_all();
         }
     }
 
@@ -201,6 +328,12 @@ impl CrossSelection {
         }
         false
     }
+}
+
+fn shift_held(gesture: &gtk::GestureDrag) -> bool {
+    gesture
+        .current_event_state()
+        .contains(gtk::gdk::ModifierType::SHIFT_MASK)
 }
 
 /// True if `needle` is `haystack` or one of its descendants. GTK's `pick()`

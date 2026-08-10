@@ -15,11 +15,34 @@ if (( ${+ANVIL_CWD_TOKEN} )); then
     typeset -g +x __anvil_cwd_token
 fi
 
-[[ -n ${__ANVIL_ZSH_LOADED:-} ]] && return 0
+typeset -g __anvil_token_fd=${ANVIL_SHELL_INTEGRATION_FD:-}
+unset ANVIL_SHELL_INTEGRATION_FD ANVIL_SHELL_INTEGRATION_TOKEN
+if [[ -n ${__ANVIL_ZSH_LOADED:-} ]]; then
+    if [[ $__anvil_token_fd == <-> ]] && (( __anvil_token_fd > 2 )); then
+        eval "exec ${__anvil_token_fd}<&-"
+    fi
+    unset __anvil_token_fd
+    return 0
+fi
 __ANVIL_ZSH_LOADED=1
-typeset -g __anvil_marker_nonce="$$-${RANDOM}-${RANDOM}-${RANDOM}-${RANDOM}-${RANDOM}-${RANDOM}-${RANDOM}-${RANDOM}"
+typeset -g __anvil_command_token=
+if [[ $__anvil_token_fd == <-> ]] && (( __anvil_token_fd > 2 )); then
+    IFS= read -r -u "$__anvil_token_fd" __anvil_command_token || __anvil_command_token=
+    # The descriptor number passed the numeric/range checks above.
+    eval "exec ${__anvil_token_fd}<&-"
+fi
+unset __anvil_token_fd
+typeset -g +x __anvil_command_token
+if (( ${#__anvil_command_token} == 32 )) \
+    && [[ $__anvil_command_token != *[^[:xdigit:]]* ]]; then
+    __anvil_agent_ready() { __anvil_osc "7771;${__anvil_command_token}"; }
+else
+    __anvil_command_token=anvil-zsh-$$
+    __anvil_agent_ready() { :; }
+fi
 typeset -gi __anvil_marker_seq=0
 typeset -g __anvil_marker_id=""
+typeset -g +x __anvil_marker_seq __anvil_marker_id
 
 __anvil_osc() { printf '\033]%s\007' "$1"; }
 
@@ -27,7 +50,7 @@ __anvil_prompt_start()  { __anvil_osc "133;A"; }
 __anvil_prompt_end()    { __anvil_osc "133;B"; }
 __anvil_command_start() {
     (( __anvil_marker_seq++ ))
-    __anvil_marker_id="${__anvil_marker_nonce}-${__anvil_marker_seq}"
+    __anvil_marker_id="${__anvil_command_token}-${__anvil_marker_seq}"
     __anvil_osc "133;C;id=${__anvil_marker_id}"
 }
 __anvil_command_end() {
@@ -69,6 +92,7 @@ __anvil_precmd() {
     fi
     __anvil_report_cwd
     __anvil_prompt_start
+    __anvil_agent_ready
 }
 
 # Append the prompt-end mark to PS1 inside %{...%} so widths stay correct.

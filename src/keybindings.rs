@@ -82,9 +82,12 @@ pub(crate) enum Action {
     ExportSessionMarkdown,
     ExportSessionJson,
     ToggleDebugDashboard,
+    /// Show or hide the session-level AI panel. This is the canonical action
+    /// exposed by defaults, shared configuration, and the command palette.
+    ToggleAiPanel,
     /// Open the session-level AI panel for free-form questions about the
-    /// current shell context (Ctrl+Shift+Alt+A by default; Ctrl+Shift+A is the
-    /// Warp-compatible Select All Blocks action).
+    /// current shell context without closing an already-visible panel.
+    /// Retained for existing `open_ai_panel` configurations.
     OpenAiPanel,
     /// Send the selected finished Block command/output to the AI panel. The
     /// model response is displayed only; it is never inserted or executed.
@@ -112,7 +115,7 @@ impl Action {
             Action::OpacityIncrease => "Opacity increase",
             Action::OpacityDecrease => "Opacity decrease",
             Action::ToggleSearch => "Toggle search",
-            Action::ToggleCommandPalette => "Command palette (actions)",
+            Action::ToggleCommandPalette => "Command palette",
             Action::OpenPalette => "Palette: search everything",
             Action::OpenHistoryPalette => "Palette: search history",
             Action::ToggleSettings => "Toggle settings panel",
@@ -140,7 +143,17 @@ impl Action {
                 8 => "Switch to tab 9",
                 _ => "Switch to last tab",
             },
-            Action::ConnectRemote(_) => "Connect to remote host",
+            Action::ConnectRemote(index) => match index {
+                0 => "Connect to remote host 1",
+                1 => "Connect to remote host 2",
+                2 => "Connect to remote host 3",
+                3 => "Connect to remote host 4",
+                4 => "Connect to remote host 5",
+                5 => "Connect to remote host 6",
+                6 => "Connect to remote host 7",
+                7 => "Connect to remote host 8",
+                _ => "Connect to remote host 9",
+            },
             Action::ShowRemotePicker => "Connect to remote host…",
             Action::ResizePaneLeft => "Resize pane left",
             Action::ResizePaneRight => "Resize pane right",
@@ -178,6 +191,7 @@ impl Action {
             Action::UndoClearBlocks => "Undo clear blocks",
             Action::ReinputSelectedCommands => "Reinput selected commands",
             Action::ToggleDebugDashboard => "Toggle debug dashboard",
+            Action::ToggleAiPanel => "Toggle AI panel",
             Action::OpenAiPanel => "Open AI panel",
             Action::AskAiAboutSelectedBlock => "Ask AI about selected block",
             Action::OpenWorkflows => "Open workflows",
@@ -217,7 +231,18 @@ impl Action {
             Action::CyclePaneFocusForward => Some("cycle_pane_focus_forward"),
             Action::CyclePaneFocusBackward => Some("cycle_pane_focus_backward"),
             Action::QuickSwitchTab(_) => None,
-            Action::ConnectRemote(_) => None,
+            Action::ConnectRemote(index) => match index {
+                0 => Some("connect_remote_1"),
+                1 => Some("connect_remote_2"),
+                2 => Some("connect_remote_3"),
+                3 => Some("connect_remote_4"),
+                4 => Some("connect_remote_5"),
+                5 => Some("connect_remote_6"),
+                6 => Some("connect_remote_7"),
+                7 => Some("connect_remote_8"),
+                8 => Some("connect_remote_9"),
+                _ => None,
+            },
             Action::ShowRemotePicker => Some("show_remote_picker"),
             Action::ResizePaneLeft => Some("resize_pane_left"),
             Action::ResizePaneRight => Some("resize_pane_right"),
@@ -252,11 +277,24 @@ impl Action {
             Action::UndoClearBlocks => Some("undo_clear_blocks"),
             Action::ReinputSelectedCommands => Some("reinput_selected_commands"),
             Action::ToggleDebugDashboard => Some("toggle_debug_dashboard"),
+            Action::ToggleAiPanel => Some("toggle_ai_panel"),
             Action::OpenAiPanel => Some("open_ai_panel"),
             Action::AskAiAboutSelectedBlock => Some("ask_ai_about_selected_block"),
             Action::OpenWorkflows => Some("open_workflows"),
             Action::OpenAgent => Some("open_agent"),
             Action::CrossBlockSearch => Some("cross_block_search"),
+        }
+    }
+
+    /// Resolve the visibility requested by an AI-panel action. Keeping this
+    /// tiny policy pure makes it difficult for the keyboard and palette
+    /// dispatch paths to accidentally turn the legacy open action into a
+    /// toggle (or vice versa).
+    pub(crate) fn ai_panel_target_visibility(self, currently_visible: bool) -> Option<bool> {
+        match self {
+            Action::ToggleAiPanel => Some(!currently_visible),
+            Action::OpenAiPanel => Some(true),
+            _ => None,
         }
     }
 
@@ -289,6 +327,15 @@ impl Action {
             Action::ScrollDown,
             Action::CyclePaneFocusForward,
             Action::CyclePaneFocusBackward,
+            Action::ConnectRemote(0),
+            Action::ConnectRemote(1),
+            Action::ConnectRemote(2),
+            Action::ConnectRemote(3),
+            Action::ConnectRemote(4),
+            Action::ConnectRemote(5),
+            Action::ConnectRemote(6),
+            Action::ConnectRemote(7),
+            Action::ConnectRemote(8),
             Action::ShowRemotePicker,
             Action::ResizePaneLeft,
             Action::ResizePaneRight,
@@ -323,6 +370,7 @@ impl Action {
             Action::UndoClearBlocks,
             Action::ReinputSelectedCommands,
             Action::ToggleDebugDashboard,
+            Action::ToggleAiPanel,
             Action::OpenAiPanel,
             Action::AskAiAboutSelectedBlock,
             Action::OpenWorkflows,
@@ -482,7 +530,16 @@ impl KeybindingMap {
         bind("Ctrl+Alt+Right", Action::FocusPaneRight);
         bind("Ctrl+Alt+Up", Action::FocusPaneUp);
         bind("Ctrl+Alt+Down", Action::FocusPaneDown);
-        bind("Ctrl+Alt+Shift+A", Action::OpenAiPanel);
+        // Letter fallbacks remain usable when GNOME reserves Ctrl+Alt+Arrow.
+        bind("Ctrl+Alt+H", Action::FocusPaneLeft);
+        bind("Ctrl+Alt+J", Action::FocusPaneDown);
+        bind("Ctrl+Alt+K", Action::FocusPaneUp);
+        bind("Ctrl+Alt+L", Action::FocusPaneRight);
+        bind("Ctrl+Alt+Shift+H", Action::ResizePaneLeft);
+        bind("Ctrl+Alt+Shift+J", Action::ResizePaneDown);
+        bind("Ctrl+Alt+Shift+K", Action::ResizePaneUp);
+        bind("Ctrl+Alt+Shift+L", Action::ResizePaneRight);
+        bind("Ctrl+Alt+Shift+A", Action::ToggleAiPanel);
         bind("Ctrl+Shift+Q", Action::AskAiAboutSelectedBlock);
         bind("Ctrl+Shift+M", Action::OpenWorkflows);
         bind("Ctrl+Alt+G", Action::OpenAgent);
@@ -499,6 +556,11 @@ impl KeybindingMap {
                 key_to_action.insert(key, action);
             }
         }
+        // Accept Forge's canonical spellings so one shared [keybindings]
+        // table works in both frontends. Anvil's historical keys remain the
+        // emitted/documented names for backward compatibility.
+        key_to_action.insert("history_palette", Action::OpenHistoryPalette);
+        key_to_action.insert("workflows_palette", Action::OpenWorkflows);
 
         for (config_key, value) in table {
             let Some(&action) = key_to_action.get(config_key.as_str()) else {
@@ -561,6 +623,11 @@ impl KeybindingMap {
     pub(crate) fn all_bound_actions(&self) -> Vec<(Action, String)> {
         let mut result = Vec::new();
         for action in Action::all_actions() {
+            // `open_ai_panel` remains dispatchable from legacy configuration,
+            // but the palette presents one unambiguous, canonical AI action.
+            if action == Action::OpenAiPanel {
+                continue;
+            }
             let display = self.binding_display(&action);
             result.push((action, display));
         }
@@ -852,7 +919,15 @@ mod tests {
             ("Ctrl+Alt+Right", Action::FocusPaneRight),
             ("Ctrl+Alt+Up", Action::FocusPaneUp),
             ("Ctrl+Alt+Down", Action::FocusPaneDown),
-            ("Ctrl+Alt+Shift+A", Action::OpenAiPanel),
+            ("Ctrl+Alt+H", Action::FocusPaneLeft),
+            ("Ctrl+Alt+J", Action::FocusPaneDown),
+            ("Ctrl+Alt+K", Action::FocusPaneUp),
+            ("Ctrl+Alt+L", Action::FocusPaneRight),
+            ("Ctrl+Alt+Shift+H", Action::ResizePaneLeft),
+            ("Ctrl+Alt+Shift+J", Action::ResizePaneDown),
+            ("Ctrl+Alt+Shift+K", Action::ResizePaneUp),
+            ("Ctrl+Alt+Shift+L", Action::ResizePaneRight),
+            ("Ctrl+Alt+Shift+A", Action::ToggleAiPanel),
             ("Ctrl+Shift+Q", Action::AskAiAboutSelectedBlock),
             ("Ctrl+Shift+M", Action::OpenWorkflows),
             ("Ctrl+Alt+G", Action::OpenAgent),
@@ -897,7 +972,6 @@ mod tests {
             "Ctrl+Shift+Y",
             "Ctrl+Shift++",
             "Ctrl+Shift+J",
-            "Ctrl+Alt+Shift+K",
         ] {
             let combo = parse(binding).expect("valid reserved binding");
             assert_eq!(map.lookup(&combo), None, "{binding} must stay unbound");
@@ -919,5 +993,62 @@ mod tests {
             .binding_display(&Action::ExportSessionMarkdown)
             .is_empty());
         assert!(map.binding_display(&Action::ExportSessionJson).is_empty());
+    }
+
+    #[test]
+    fn ai_panel_parser_and_dispatch_contract_keeps_legacy_open_distinct() {
+        let default = parse("Ctrl+Alt+Shift+A").unwrap();
+        let mut map = KeybindingMap::from_defaults();
+        assert_eq!(map.lookup(&default), Some(Action::ToggleAiPanel));
+
+        let table = "open_ai_panel = 'F5'".parse::<toml::Table>().unwrap();
+        map.apply_user_overrides(&table);
+        assert_eq!(map.lookup(&parse("F5").unwrap()), Some(Action::OpenAiPanel));
+
+        assert_eq!(
+            Action::ToggleAiPanel.ai_panel_target_visibility(false),
+            Some(true)
+        );
+        assert_eq!(
+            Action::ToggleAiPanel.ai_panel_target_visibility(true),
+            Some(false)
+        );
+        assert_eq!(
+            Action::OpenAiPanel.ai_panel_target_visibility(false),
+            Some(true)
+        );
+        assert_eq!(
+            Action::OpenAiPanel.ai_panel_target_visibility(true),
+            Some(true)
+        );
+
+        let palette_actions = map.all_bound_actions();
+        assert!(palette_actions
+            .iter()
+            .any(|(action, _)| *action == Action::ToggleAiPanel));
+        assert!(palette_actions
+            .iter()
+            .all(|(action, _)| *action != Action::OpenAiPanel));
+    }
+
+    #[test]
+    fn indexed_remote_actions_share_the_forge_config_contract() {
+        let actions = Action::all_actions();
+        for index in 0..9u8 {
+            let action = Action::ConnectRemote(index);
+            let expected = format!("connect_remote_{}", index + 1);
+            assert_eq!(action.config_key(), Some(expected.as_str()));
+            assert!(actions.contains(&action));
+        }
+        assert_eq!(Action::ConnectRemote(9).config_key(), None);
+
+        let mut table = toml::Table::new();
+        table.insert("connect_remote_1".into(), toml::Value::String("F4".into()));
+        let mut map = KeybindingMap::from_defaults();
+        map.apply_user_overrides(&table);
+        assert_eq!(
+            map.lookup(&parse("F4").unwrap()),
+            Some(Action::ConnectRemote(0))
+        );
     }
 }

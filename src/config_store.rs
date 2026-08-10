@@ -128,7 +128,9 @@ impl ConfigIssueSeverity {
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct ConfigIssue {
     severity: ConfigIssueSeverity,
+    level: ConfigIssueSeverity,
     key: String,
+    path: String,
     message: String,
 }
 
@@ -136,6 +138,7 @@ pub(crate) struct ConfigIssue {
 pub(crate) struct ConfigValidationReport {
     path: String,
     exists: bool,
+    valid: bool,
     issues: Vec<ConfigIssue>,
     errors: usize,
     warnings: usize,
@@ -146,6 +149,7 @@ impl ConfigValidationReport {
         Self {
             path: path.display().to_string(),
             exists,
+            valid: true,
             issues: Vec::new(),
             errors: 0,
             warnings: 0,
@@ -160,11 +164,17 @@ impl ConfigValidationReport {
     ) {
         match severity {
             ConfigIssueSeverity::Warning => self.warnings += 1,
-            ConfigIssueSeverity::Error => self.errors += 1,
+            ConfigIssueSeverity::Error => {
+                self.errors += 1;
+                self.valid = false;
+            }
         }
+        let key = key.into();
         self.issues.push(ConfigIssue {
             severity,
-            key: key.into(),
+            level: severity,
+            path: key.clone(),
+            key,
             message: message.into(),
         });
     }
@@ -811,10 +821,30 @@ fn apply_config_to_table(config: &Config, table: &mut toml::Table) {
         toml::Value::Boolean(config.block_compact),
     );
     table.insert(
+        "ascii_organism_enabled".into(),
+        toml::Value::Boolean(config.ascii_organism_enabled),
+    );
+    if let Some(motion) = config.ascii_organism_motion {
+        table.insert(
+            "ascii_organism_motion".into(),
+            toml::Value::String(motion.as_str().to_string()),
+        );
+    } else {
+        table.remove("ascii_organism_motion");
+    }
+    table.insert(
         "command_history_enabled".into(),
         toml::Value::Boolean(config.command_history_enabled),
     );
     table.insert("ai_enabled".into(), toml::Value::Boolean(config.ai_enabled));
+    table.insert(
+        "ai_panel_visible".into(),
+        toml::Value::Boolean(config.ai_panel_visible),
+    );
+    table.insert(
+        "ai_panel_width".into(),
+        toml::Value::Integer(config.ai_panel_width as i64),
+    );
     table.insert(
         "ai_provider".into(),
         toml::Value::String(config.ai_provider.clone()),
@@ -1242,6 +1272,22 @@ fn check_absolute_path(report: &mut ConfigValidationReport, table: &toml::Table,
     }
 }
 
+fn check_absolute_or_home_path(
+    report: &mut ConfigValidationReport,
+    table: &toml::Table,
+    key: &str,
+) {
+    let Some(value) = table.get(key).and_then(toml::Value::as_str) else {
+        return;
+    };
+    if !config::configured_path_is_safe(value, true) {
+        report.error(
+            key,
+            "must be a non-empty absolute or ~/ path of at most 16384 bytes without control or invisible formatting characters",
+        );
+    }
+}
+
 fn validate_colors(report: &mut ConfigValidationReport, table: &toml::Table) {
     let Some(colors) = table.get("colors").and_then(toml::Value::as_table) else {
         return;
@@ -1269,10 +1315,11 @@ fn validate_keybindings(report: &mut ConfigValidationReport, table: &toml::Table
     let Some(keybindings) = table.get("keybindings").and_then(toml::Value::as_table) else {
         return;
     };
-    let known: HashSet<&str> = Action::all_actions()
+    let mut known: HashSet<&str> = Action::all_actions()
         .into_iter()
         .filter_map(|action| action.config_key())
         .collect();
+    known.extend(["toggle_ai_panel", "history_palette", "workflows_palette"]);
     let mut seen: HashMap<Chord, String> = HashMap::new();
     for (key, value) in keybindings {
         let path = format!("keybindings.{key}");
@@ -1329,6 +1376,15 @@ fn validate_remote_hosts(report: &mut ConfigValidationReport, table: &toml::Tabl
     let Some(hosts) = table.get("remote_hosts").and_then(toml::Value::as_array) else {
         return;
     };
+    if hosts.len() > config::MAX_REMOTE_HOSTS {
+        report.error(
+            "remote_hosts",
+            format!(
+                "must not contain more than {} entries",
+                config::MAX_REMOTE_HOSTS
+            ),
+        );
+    }
     let known: HashSet<&str> = [
         "name",
         "host",
@@ -1345,7 +1401,7 @@ fn validate_remote_hosts(report: &mut ConfigValidationReport, table: &toml::Tabl
     .into_iter()
     .collect();
     let mut names = HashSet::new();
-    for (index, value) in hosts.iter().enumerate() {
+    for (index, value) in hosts.iter().take(config::MAX_REMOTE_HOSTS).enumerate() {
         let prefix = format!("remote_hosts[{index}]");
         let Some(host) = value.as_table() else {
             report.error(prefix, "must be a table");
@@ -1362,6 +1418,9 @@ fn validate_remote_hosts(report: &mut ConfigValidationReport, table: &toml::Tabl
         match host.get("host").and_then(toml::Value::as_str) {
             Some(value) if !value.trim().is_empty() => {
                 validate_remote_text(report, format!("{prefix}.host"), value, false, 1_024);
+                if value.starts_with('-') {
+                    report.error(format!("{prefix}.host"), "must not begin with '-'");
+                }
             }
             Some(_) => report.error(format!("{prefix}.host"), "must not be empty"),
             None => report.error(format!("{prefix}.host"), "is required and must be a string"),
@@ -1385,6 +1444,9 @@ fn validate_remote_hosts(report: &mut ConfigValidationReport, table: &toml::Tabl
                             allow_whitespace,
                             max_chars,
                         );
+                        if key == "user" && value.contains('@') {
+                            report.error(format!("{prefix}.user"), "must not contain '@'");
+                        }
                     }
                 } else {
                     report.error(format!("{prefix}.{key}"), "must be a string");
@@ -1496,10 +1558,7 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
         "sidebar_visible",
         "sidebar_width",
         "tab_width",
-        "ansi_cache_capacity",
         "max_visible_blocks",
-        "output_batch_min_ms",
-        "output_batch_max_ms",
         "lazy_load_threshold",
         "truncation_threshold_lines",
         "finished_block_viewport_rows",
@@ -1512,9 +1571,12 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
         "block_history_path",
         "block_history_compress",
         "block_compact",
-        "editor_input",
+        "ascii_organism_enabled",
+        "ascii_organism_motion",
         "allow_remote_clipboard_write",
         "ai_enabled",
+        "ai_panel_visible",
+        "ai_panel_width",
         "ai_provider",
         "ai_base_url",
         "ai_model",
@@ -1554,11 +1616,9 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
     for key in [
         "scrollback",
         "sidebar_width",
+        "ai_panel_width",
         "tab_width",
-        "ansi_cache_capacity",
         "max_visible_blocks",
-        "output_batch_min_ms",
-        "output_batch_max_ms",
         "lazy_load_threshold",
         "truncation_threshold_lines",
         "finished_block_viewport_rows",
@@ -1580,11 +1640,14 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
         "terminal_mode",
         "tab_placement",
         "sidebar_view",
+        "jsh_update_check",
         "command_history_path",
         "block_history_path",
         "ai_provider",
         "ai_base_url",
+        "ai_api_key_file",
         "ai_model",
+        "ascii_organism_motion",
     ] {
         check_type(&mut report, table, key, ExpectedType::String);
     }
@@ -1592,10 +1655,11 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
         "command_history_enabled",
         "block_history_compress",
         "block_compact",
-        "editor_input",
         "allow_remote_clipboard_write",
         "sidebar_visible",
         "ai_enabled",
+        "ai_panel_visible",
+        "ascii_organism_enabled",
         "ai_redact_secrets",
         "ai_stream",
         "agent_enabled",
@@ -1629,7 +1693,6 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
     check_nonempty_string(&mut report, table, "theme");
     check_nonempty_string(&mut report, table, "shell");
     check_nonempty_string(&mut report, table, "ai_provider");
-    check_nonempty_string(&mut report, table, "ai_base_url");
     check_nonempty_string(&mut report, table, "ai_model");
     check_absolute_path(&mut report, table, "shell");
     check_enum(
@@ -1673,20 +1736,33 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
         "sidebar_view",
         &["tabs", "files", "file", "filetree", "file_tree"],
     );
-    check_absolute_path(&mut report, table, "command_history_path");
-    check_absolute_path(&mut report, table, "block_history_path");
+    check_enum(
+        &mut report,
+        table,
+        "ascii_organism_motion",
+        &["full", "calm", "static"],
+    );
+    check_enum(
+        &mut report,
+        table,
+        "jsh_update_check",
+        &[
+            "startup", "launch", "always", "daily", "never", "off", "disabled",
+        ],
+    );
+    check_absolute_or_home_path(&mut report, table, "command_history_path");
+    check_absolute_or_home_path(&mut report, table, "block_history_path");
+    check_absolute_or_home_path(&mut report, table, "ai_api_key_file");
 
     if let Some(url) = table.get("ai_base_url").and_then(toml::Value::as_str) {
-        let url = url.trim();
-        let valid = (url.starts_with("http://") || url.starts_with("https://"))
-            && url
-                .split_once("://")
-                .is_some_and(|(_, authority)| !authority.is_empty())
-            && !url.chars().any(char::is_whitespace);
-        if !valid {
+        let provider = table
+            .get("ai_provider")
+            .and_then(toml::Value::as_str)
+            .unwrap_or("anthropic");
+        if !config::ai_base_url_is_safe(provider, url) {
             report.error(
                 "ai_base_url",
-                "must be an absolute http(s) URL without whitespace",
+                "must be a bounded absolute HTTPS URL without credentials or ambiguous components; plain HTTP is allowed only for a loopback Ollama endpoint",
             );
         }
     }
@@ -1695,18 +1771,16 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
     check_number_range(&mut report, table, "font_scale", 0.1, 10.0);
     check_integer_range(&mut report, table, "scrollback", 0, 1_000_000);
     check_integer_range(&mut report, table, "sidebar_width", 120, 800);
+    check_integer_range(&mut report, table, "ai_panel_width", 240, 1_200);
     check_integer_range(&mut report, table, "tab_width", 80, 480);
-    check_integer_range(&mut report, table, "ansi_cache_capacity", 1, 65_536);
-    check_integer_range(&mut report, table, "max_visible_blocks", 1, 10_000);
-    check_integer_range(&mut report, table, "output_batch_min_ms", 1, 1_000);
-    check_integer_range(&mut report, table, "output_batch_max_ms", 1, 5_000);
-    check_integer_range(&mut report, table, "lazy_load_threshold", 1, 100_000);
+    check_integer_range(&mut report, table, "max_visible_blocks", 1, 100_000);
+    check_integer_range(&mut report, table, "lazy_load_threshold", 1, 10_000_000);
     check_integer_range(
         &mut report,
         table,
         "truncation_threshold_lines",
-        100,
-        1_000_000,
+        1,
+        10_000_000,
     );
     check_integer_range(&mut report, table, "finished_block_viewport_rows", 3, 5_000);
     check_integer_range(
@@ -1716,16 +1790,22 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
         3,
         5_000,
     );
-    check_integer_range(&mut report, table, "max_collapsed_output_lines", 0, 10_000);
-    check_integer_range(&mut report, table, "virtual_scroll_margin", 0, 100);
+    check_integer_range(
+        &mut report,
+        table,
+        "max_collapsed_output_lines",
+        1,
+        1_000_000,
+    );
+    check_integer_range(&mut report, table, "virtual_scroll_margin", 0, 10_000);
     check_integer_range(
         &mut report,
         table,
         "command_history_max_entries",
         100,
-        100_000,
+        1_000_000,
     );
-    check_integer_range(&mut report, table, "ai_max_tokens", 1, 32_768);
+    check_integer_range(&mut report, table, "ai_max_tokens", 64, 32_768);
     check_integer_range(&mut report, table, "agent_max_turns", 1, 100);
     check_integer_range(
         &mut report,
@@ -1735,21 +1815,6 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
         i64::MAX,
     );
 
-    if let (Some(minimum), Some(maximum)) = (
-        table
-            .get("output_batch_min_ms")
-            .and_then(toml::Value::as_integer),
-        table
-            .get("output_batch_max_ms")
-            .and_then(toml::Value::as_integer),
-    ) {
-        if maximum < minimum {
-            report.error(
-                "output_batch_max_ms",
-                "must be greater than or equal to output_batch_min_ms",
-            );
-        }
-    }
     if let (Some(viewport), Some(expanded)) = (
         table
             .get("finished_block_viewport_rows")
@@ -1759,9 +1824,9 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
             .and_then(toml::Value::as_integer),
     ) {
         if expanded < viewport {
-            report.error(
+            report.warning(
                 "finished_block_max_expanded_rows",
-                "must be greater than or equal to finished_block_viewport_rows",
+                "is below finished_block_viewport_rows; it will be clamped",
             );
         }
     }
@@ -1901,6 +1966,36 @@ mod tests {
     }
 
     #[test]
+    fn validation_json_is_a_backward_compatible_forge_superset() {
+        let warning_table = "ai_max_tokens = 1\n".parse::<toml::Table>().unwrap();
+        let warning = validate_table(Path::new("config.toml"), &warning_table);
+        assert!(
+            warning.healthy(),
+            "warnings must keep --check-config at exit 0"
+        );
+        let json = serde_json::to_value(&warning).unwrap();
+        assert_eq!(json["exists"], true);
+        assert_eq!(json["valid"], true);
+        assert_eq!(json["issues"][0]["severity"], "warning");
+        assert_eq!(json["issues"][0]["level"], "warning");
+        assert_eq!(json["issues"][0]["key"], "ai_max_tokens");
+        assert_eq!(json["issues"][0]["path"], "ai_max_tokens");
+
+        let error_table = "ai_api_key_file = 'relative.key'\n"
+            .parse::<toml::Table>()
+            .unwrap();
+        let error = validate_table(Path::new("config.toml"), &error_table);
+        assert!(!error.healthy(), "errors must make --check-config exit 1");
+        let json = serde_json::to_value(&error).unwrap();
+        assert_eq!(json["exists"], true);
+        assert_eq!(json["valid"], false);
+        assert_eq!(json["issues"][0]["severity"], "error");
+        assert_eq!(json["issues"][0]["level"], "error");
+        assert_eq!(json["issues"][0]["key"], "ai_api_key_file");
+        assert_eq!(json["issues"][0]["path"], "ai_api_key_file");
+    }
+
+    #[test]
     fn revisions_detect_external_changes() {
         let directory = temporary_directory("revision");
         let path = directory.join("config.toml");
@@ -2001,6 +2096,8 @@ mod tests {
         config.ai_max_tokens = 2_048;
         config.ai_redact_secrets = false;
         config.ai_stream = false;
+        config.ai_panel_visible = true;
+        config.ai_panel_width = 444;
 
         save_config_to_path(&path, &config, Some(&ConfigRevision::Missing)).unwrap();
         let contents = fs::read_to_string(&path).unwrap();
@@ -2031,7 +2128,49 @@ mod tests {
             table.get("ai_stream").and_then(toml::Value::as_bool),
             Some(false)
         );
+        assert_eq!(
+            table.get("ai_panel_visible").and_then(toml::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            table
+                .get("ai_panel_width")
+                .and_then(toml::Value::as_integer),
+            Some(444)
+        );
         assert!(!contents.to_ascii_lowercase().contains("api_key"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn ascii_organism_settings_are_persisted_and_validated() {
+        let directory = temporary_directory("ascii-organism");
+        let path = directory.join("config.toml");
+        let mut config = config::load_safe_config().0;
+        config.ascii_organism_enabled = true;
+        config.ascii_organism_motion = Some(config::OrganismMotion::Calm);
+        save_config_to_path(&path, &config, Some(&ConfigRevision::Missing)).unwrap();
+        let table = fs::read_to_string(&path)
+            .unwrap()
+            .parse::<toml::Table>()
+            .unwrap();
+        assert_eq!(
+            table
+                .get("ascii_organism_enabled")
+                .and_then(toml::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            table
+                .get("ascii_organism_motion")
+                .and_then(toml::Value::as_str),
+            Some("calm")
+        );
+        let invalid = "ascii_organism_motion = 'sleepy'\n"
+            .parse::<toml::Table>()
+            .unwrap();
+        let report = validate_table(Path::new("config.toml"), &invalid);
+        assert_eq!(report.errors(), 1);
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -2225,8 +2364,8 @@ mod tests {
             concat!(
                 "[[remote_hosts]]\n",
                 "name = 'staging'\n",
-                "host = 'bad host'\n",
-                "user = 'bad user'\n",
+                "host = '-ProxyCommand=secret'\n",
+                "user = 'root@secret'\n",
                 "remote_shell = ''\n",
                 "session = \"prod\\tsecret\"\n",
                 "ssh_args = [\"-p\", \"22\\tProxyCommand=secret\"]\n",
@@ -2247,6 +2386,28 @@ mod tests {
         assert!(!json.contains("ProxyCommand"));
         assert!(!json.contains("secret"));
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn validation_rejects_more_than_the_shared_remote_host_limit() {
+        let hosts = (0..config::MAX_REMOTE_HOSTS + 1)
+            .map(|index| {
+                let mut host = toml::Table::new();
+                host.insert(
+                    "host".to_string(),
+                    toml::Value::String(format!("host-{index}.example")),
+                );
+                toml::Value::Table(host)
+            })
+            .collect();
+        let mut table = toml::Table::new();
+        table.insert("remote_hosts".to_string(), toml::Value::Array(hosts));
+
+        let report = validate_table(Path::new("config.toml"), &table);
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| { issue.key == "remote_hosts" && issue.message.contains("128") }));
     }
 
     #[test]
@@ -2346,13 +2507,120 @@ mod tests {
             );
         }
 
-        let aliases = "ai_provider = 'openai_compatible'\nai_base_url = 'http://localhost:8000/v1'\nai_model = 'local-model'\nai_max_tokens = 1\nai_redact_secrets = true\n"
+        let aliases = "ai_provider = 'openai_compatible'\nai_base_url = 'https://localhost:8000/v1'\nai_model = 'local-model'\nai_max_tokens = 64\nai_redact_secrets = true\n"
             .parse::<toml::Table>()
             .unwrap();
         assert_eq!(
             validate_table(Path::new("config.toml"), &aliases).errors(),
             0
         );
+    }
+
+    #[test]
+    fn validation_checks_jsh_update_policy_type_and_enum() {
+        for value in [
+            "startup", "launch", "always", "daily", "never", "off", "disabled",
+        ] {
+            let table = format!("jsh_update_check = '{value}'\n")
+                .parse::<toml::Table>()
+                .unwrap();
+            assert_eq!(
+                validate_table(Path::new("config.toml"), &table).errors(),
+                0,
+                "rejected {value:?}"
+            );
+        }
+        for source in ["jsh_update_check = 'weekly'\n", "jsh_update_check = 1\n"] {
+            let table = source.parse::<toml::Table>().unwrap();
+            let report = validate_table(Path::new("config.toml"), &table);
+            assert!(report
+                .issues
+                .iter()
+                .any(|issue| issue.key == "jsh_update_check"));
+            assert!(!report.healthy());
+        }
+    }
+
+    #[test]
+    fn validation_checks_ai_key_file_and_history_paths() {
+        for source in [
+            "ai_api_key_file = '/run/secrets/provider.key'\n",
+            "ai_api_key_file = '~/.config/anvil/ai.key'\n",
+            "command_history_path = '~/.local/state/anvil/history.jsonl'\n",
+            "block_history_path = '/tmp/anvil-history.bin'\n",
+        ] {
+            let table = source.parse::<toml::Table>().unwrap();
+            assert_eq!(
+                validate_table(Path::new("config.toml"), &table).errors(),
+                0,
+                "rejected {source:?}"
+            );
+        }
+
+        for (key, value) in [
+            ("ai_api_key_file", "relative.key"),
+            ("command_history_path", "relative-history.jsonl"),
+            ("block_history_path", "~other/history.bin"),
+            ("ai_api_key_file", "/tmp/key\u{202e}txt"),
+        ] {
+            let mut table = toml::Table::new();
+            table.insert(key.into(), toml::Value::String(value.into()));
+            let report = validate_table(Path::new("config.toml"), &table);
+            assert!(
+                report
+                    .issues
+                    .iter()
+                    .any(|issue| issue.key == key && issue.severity == ConfigIssueSeverity::Error),
+                "accepted {key}={value:?}: {:?}",
+                report.issues
+            );
+        }
+
+        let wrong_type = "ai_api_key_file = false\n".parse::<toml::Table>().unwrap();
+        assert!(!validate_table(Path::new("config.toml"), &wrong_type).healthy());
+
+        let mut oversized = toml::Table::new();
+        oversized.insert(
+            "ai_api_key_file".into(),
+            toml::Value::String(format!("/tmp/{}", "x".repeat(16 * 1_024))),
+        );
+        assert!(!validate_table(Path::new("config.toml"), &oversized).healthy());
+    }
+
+    #[test]
+    fn validation_enforces_provider_aware_ai_transport_security() {
+        for source in [
+            "ai_provider = 'openai-compatible'\nai_base_url = 'https://api.example.com/v1'\n",
+            "ai_provider = 'ollama'\nai_base_url = 'http://localhost:11434'\n",
+            "ai_provider = 'ollama'\nai_base_url = 'http://127.0.0.1:11434'\n",
+            "ai_provider = 'ollama'\nai_base_url = 'http://[::1]:11434'\n",
+        ] {
+            let table = source.parse::<toml::Table>().unwrap();
+            assert_eq!(
+                validate_table(Path::new("config.toml"), &table).errors(),
+                0,
+                "rejected {source:?}"
+            );
+        }
+        for url in [
+            "http://127.0.0.1:8000/v1",
+            "http://models.example.com:11434",
+            "https://user:secret@example.com/v1",
+            "https://example.com/v1?key=secret",
+            "https://example.com/v1#fragment",
+            "https://example.com\\@attacker.invalid/v1",
+            "https:///missing-authority",
+        ] {
+            let table = format!("ai_provider = 'openai-compatible'\nai_base_url = {url:?}\n")
+                .parse::<toml::Table>()
+                .unwrap();
+            let report = validate_table(Path::new("config.toml"), &table);
+            assert!(report
+                .issues
+                .iter()
+                .any(|issue| issue.key == "ai_base_url"
+                    && issue.severity == ConfigIssueSeverity::Error));
+        }
     }
 
     #[test]

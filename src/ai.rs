@@ -25,8 +25,8 @@ use gtk::glib;
 
 pub(crate) use jterm_core::ai::{
     agent_user_prompt, build_agent_system_prompt, build_session_prompt, truncate_for_context,
-    user_prompt_with_block_context, AiCancellationToken, AiClient, AiSettings, BlockContext, Role,
-    Turn,
+    user_prompt_with_block_context, AiCancellationToken, AiClient, AiSettings, BlockContext,
+    ChatSnapshot, ConversationSnapshot, Role, Turn, MAX_PERSISTED_CHATS,
 };
 
 fn settings(config: &crate::config::Config) -> AiSettings {
@@ -45,6 +45,14 @@ fn settings(config: &crate::config::Config) -> AiSettings {
 /// Build a client from anvil's Config. Errors stay plain strings because
 /// every anvil AI surface reports them as status-bar/inline text.
 pub(crate) fn client_from_config(config: &crate::config::Config) -> Result<AiClient, String> {
+    if config.ai_enabled
+        && !crate::config::ai_base_url_is_safe(&config.ai_provider, &config.ai_base_url)
+    {
+        return Err(
+            "invalid AI endpoint: HTTPS is required; HTTP is allowed only for loopback Ollama"
+                .to_string(),
+        );
+    }
     AiClient::from_settings(&settings(config)).map_err(|error| error.to_string())
 }
 
@@ -335,6 +343,24 @@ mod tests {
         config.ai_max_tokens = 512;
         let client = client_from_config(&config).expect("ollama needs no key");
         assert_eq!(client.provider, jterm_core::ai::Provider::Ollama);
+    }
+
+    #[test]
+    fn client_gate_rejects_unsafe_endpoints_before_credentials_or_transport() {
+        for (provider, endpoint) in [
+            ("openai-compatible", "http://127.0.0.1:8000/v1"),
+            ("ollama", "http://models.example.com:11434"),
+            ("anthropic", "https://user:secret@example.com"),
+        ] {
+            let mut config = crate::config::Config::safe_defaults();
+            config.ai_enabled = true;
+            config.ai_provider = provider.into();
+            config.ai_base_url = endpoint.into();
+            config.ai_api_key_file = Some("/definitely/not/read/provider.key".into());
+            let error = client_from_config(&config).unwrap_err();
+            assert!(error.contains("invalid AI endpoint"), "{error}");
+            assert!(!error.contains(endpoint));
+        }
     }
 
     #[test]

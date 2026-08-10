@@ -6,6 +6,7 @@ mod agent_ops;
 mod ai;
 mod ai_palette_ops;
 mod app_msg;
+mod atomic_file;
 mod block_view;
 mod bottom_bar_ui;
 mod cli;
@@ -35,8 +36,12 @@ mod jsh_ops;
 mod keybindings;
 mod navigation_ui;
 mod notebook;
+mod organism;
+mod organism_memory;
+mod organism_ui;
 mod palette;
 mod pane_header;
+mod persistence;
 mod process;
 mod pty;
 mod review_input_ops;
@@ -45,6 +50,7 @@ mod session;
 mod settings_ops;
 mod sidebar;
 mod sidebar_toggle;
+mod snapshot_file;
 mod startup_ui;
 mod tab_strip;
 mod terminal;
@@ -80,12 +86,48 @@ const OPACITY_STEP: f64 = 0.025;
 const FONT_PERSIST_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(400);
 const MIN_TAB_WIDTH: u32 = 80;
 const MAX_TAB_WIDTH: u32 = 480;
+const MIN_AI_PANEL_WIDTH: u32 = 240;
+const MAX_AI_PANEL_WIDTH: u32 = 1_200;
+const MIN_AI_WORKSPACE_WIDTH: i32 = 200;
+
+fn restored_ai_panel_position(total_width: i32, requested_width: u32) -> Option<i32> {
+    if total_width <= MIN_AI_PANEL_WIDTH as i32 + MIN_AI_WORKSPACE_WIDTH {
+        return None;
+    }
+    let available = total_width - MIN_AI_WORKSPACE_WIDTH;
+    let panel_width = (requested_width as i32).clamp(MIN_AI_PANEL_WIDTH as i32, available);
+    Some(total_width - panel_width)
+}
+
+fn ai_panel_width_from_geometry(total_width: i32, position: i32) -> Option<u32> {
+    if total_width <= 0 || position < 0 || position >= total_width {
+        return None;
+    }
+    Some(
+        (total_width - position).clamp(MIN_AI_PANEL_WIDTH as i32, MAX_AI_PANEL_WIDTH as i32) as u32,
+    )
+}
+
+fn widget_is_within(mut current: gtk::Widget, ancestor: &gtk::Widget) -> bool {
+    loop {
+        if current == *ancestor {
+            return true;
+        }
+        let Some(parent) = current.parent() else {
+            return false;
+        };
+        current = parent;
+    }
+}
 
 // `file_tree_store: gtk::TreeStore` uses the GTK4 TreeStore family deprecated in
 // 4.10; it stays functional and a ColumnView rewrite is out of scope.
 #[allow(deprecated)]
 struct AppModel {
     config: Rc<RefCell<Config>>,
+    /// Shared native-organism state; Relm4 remains responsible for resolving
+    /// which Block component owns focus and for attaching new panes.
+    organism_hub: Rc<organism_ui::OrganismHub>,
     config_revision: RefCell<Option<config_store::ConfigRevision>>,
     themes: Rc<Vec<Theme>>,
     kbmap: Rc<RefCell<KeybindingMap>>,
@@ -98,6 +140,10 @@ struct AppModel {
     tab_drag_coordinator: Rc<tab_strip::TabDragCoordinator>,
     next_id: u64,
     next_pane_id: u64,
+    /// Conventional VTE split spawns complete asynchronously. Until their
+    /// success acknowledgement arrives, the new stable pane id owns rollback
+    /// authority back to `(source tab id, source pane id)`.
+    pending_split_spawns: std::collections::HashMap<u64, (u64, u64)>,
     sidebar_visible: bool,
     font_scale: f64,
     /// Generation token for the debounced font-scale config write. Ctrl+wheel
@@ -137,6 +183,7 @@ struct AppModel {
     top_bar: Controller<top_bar::TopBarModel>,
     sidebar_box: gtk::Box,
     content_paned: gtk::Paned,
+    ai_paned: gtk::Paned,
     /// Family-wide bottom status bar (`jterm_core::bottom_bar`): the container
     /// plus its left/right segment holders, refilled on each refresh.
     bottom_bar: gtk::Box,
@@ -151,9 +198,11 @@ struct AppModel {
     settings_font_names: Rc<Vec<String>>,
     remote_picker: Controller<dialogs::remote_picker::RemotePickerModel>,
     debug_dashboard: Controller<dialogs::debug_dashboard::DebugDashboardModel>,
-    history: Controller<dialogs::history::HistoryModel>,
     workflow_dialog: Controller<dialogs::workflow::WorkflowModel>,
     ai_panel: Controller<dialogs::ai_panel::AiPanelModel>,
+    ai_panel_visible: std::cell::Cell<bool>,
+    ai_panel_width_generation: Rc<std::cell::Cell<u64>>,
+    ai_conversation: Option<String>,
     /// One pane-bound natural-language command draft. Keeping the request
     /// handle here makes Stop/Dismiss real transport cancellation.
     command_suggestion: Rc<RefCell<Option<ai_palette_ops::CommandSuggestionSession>>>,
@@ -180,6 +229,7 @@ struct AppModel {
 #[allow(clippy::too_many_arguments)]
 fn create_pane(
     config: &Rc<RefCell<Config>>,
+    organism_hub: &Rc<organism_ui::OrganismHub>,
     shell_argv: &Rc<Vec<String>>,
     tab_id: u64,
     pane_id: u64,
@@ -205,6 +255,7 @@ fn create_pane(
         probe: probe.clone(),
     };
     let forward = move |out| match out {
+        VteOutput::Launched => AppMsg::PaneLaunched(pane_id),
         VteOutput::LaunchFailed(message) => AppMsg::PaneLaunchFailed(pane_id, message),
         VteOutput::Exited(code) => AppMsg::PaneExited(tab_id, pane_id, code),
         VteOutput::CwdChanged { path, external } => {
@@ -242,11 +293,15 @@ fn create_pane(
         VteOutput::AskAiAboutBlock(context) => AppMsg::AskAiAboutBlock(context),
     };
     let terminal = match mode {
-        TerminalMode::Block => TermCtl::Block(
-            BlockTerminal::builder()
+        TerminalMode::Block => {
+            let controller = BlockTerminal::builder()
                 .launch(init)
-                .forward(sender.input_sender(), forward),
-        ),
+                .forward(sender.input_sender(), forward);
+            if let Some(view) = controller.model().term_view() {
+                organism_hub.attach_ascii_organism_to_view(&view, cwd_external);
+            }
+            TermCtl::Block(controller)
+        }
         TerminalMode::Vte => TermCtl::Vte(
             VteTerminal::builder()
                 .launch(init)
@@ -416,6 +471,7 @@ impl SimpleComponent for AppModel {
         let window_opacity = config.window_opacity;
         let font_scale = config.default_font_scale;
         let config = Rc::new(RefCell::new(config));
+        let organism_hub = organism_ui::OrganismHub::new(config.clone());
         let kbmap = Rc::new(RefCell::new(kbmap));
         let workflows = Rc::new(RefCell::new(Vec::new()));
 
@@ -514,13 +570,23 @@ impl SimpleComponent for AppModel {
         sidebar_box.append(toggle_row);
         sidebar_box.append(&sidebar_stack);
 
-        // A Paned gives the sidebar the visible, draggable divider used by
-        // forge. Keep the sidebar at its persisted width on startup.
+        // The outer divider owns the file/tab sidebar. The inner divider owns
+        // the persistent right-side AI Chats panel while the terminal stack
+        // remains its expanding start child.
+        let ai_paned = gtk::Paned::new(gtk::Orientation::Horizontal);
+        ai_paned.set_vexpand(true);
+        ai_paned.set_wide_handle(true);
+        ai_paned.set_start_child(Some(&stack));
+        ai_paned.set_resize_start_child(true);
+        ai_paned.set_resize_end_child(false);
+        ai_paned.set_shrink_start_child(true);
+        ai_paned.set_shrink_end_child(false);
+
         let content_paned = gtk::Paned::new(gtk::Orientation::Horizontal);
         content_paned.set_vexpand(true);
         content_paned.set_wide_handle(true);
         content_paned.set_start_child(Some(&sidebar_box));
-        content_paned.set_end_child(Some(&stack));
+        content_paned.set_end_child(Some(&ai_paned));
         content_paned.set_resize_start_child(false);
         content_paned.set_resize_end_child(true);
         content_paned.set_shrink_start_child(false);
@@ -581,7 +647,16 @@ impl SimpleComponent for AppModel {
                     },
                     block_compact: config.borrow().block_compact,
                     command_history: config.borrow().command_history_enabled,
+                    ascii_organism_enabled: config.borrow().ascii_organism_enabled,
+                    ascii_organism_motion: match config.borrow().ascii_organism_motion {
+                        None => 0,
+                        Some(config::OrganismMotion::Full) => 1,
+                        Some(config::OrganismMotion::Calm) => 2,
+                        Some(config::OrganismMotion::Static) => 3,
+                    },
                     ai_enabled: config.borrow().ai_enabled,
+                    ai_panel_visible: config.borrow().ai_panel_visible,
+                    ai_panel_width: config.borrow().ai_panel_width as f64,
                     agent_enabled: config.borrow().agent_enabled,
                     command_correction_enabled: config.borrow().command_correction_enabled,
                     ai_provider: match config.borrow().ai_provider.as_str() {
@@ -623,8 +698,20 @@ impl SimpleComponent for AppModel {
                 dialogs::settings::SettingsOutput::CommandHistory(enabled) => {
                     AppMsg::SettingsCommandHistory(enabled)
                 }
+                dialogs::settings::SettingsOutput::AsciiOrganism(enabled) => {
+                    AppMsg::SettingsAsciiOrganism(enabled)
+                }
+                dialogs::settings::SettingsOutput::AsciiOrganismMotion(motion) => {
+                    AppMsg::SettingsAsciiOrganismMotion(motion)
+                }
                 dialogs::settings::SettingsOutput::AiEnabled(enabled) => {
                     AppMsg::SettingsAiEnabled(enabled)
+                }
+                dialogs::settings::SettingsOutput::AiPanelVisible(visible) => {
+                    AppMsg::SettingsAiPanelVisible(visible)
+                }
+                dialogs::settings::SettingsOutput::AiPanelWidth(width) => {
+                    AppMsg::SettingsAiPanelWidth(width)
                 }
                 dialogs::settings::SettingsOutput::AgentEnabled(enabled) => {
                     AppMsg::SettingsAgentEnabled(enabled)
@@ -689,21 +776,6 @@ impl SimpleComponent for AppModel {
                     AppMsg::PaletteRunWorkflow(path)
                 }
             });
-        let history = dialogs::history::HistoryModel::builder()
-            .launch(dialogs::history::HistoryInit {
-                keybindings: kbmap.clone(),
-                workflows: workflows.clone(),
-            })
-            .forward(sender.input_sender(), |output| match output {
-                dialogs::history::HistoryOutput::Action(action) => AppMsg::Action(action),
-                dialogs::history::HistoryOutput::TypeCommand(command) => {
-                    AppMsg::PaletteTypeCommand(command)
-                }
-                dialogs::history::HistoryOutput::AskAi(query) => AppMsg::PaletteAskAi(query),
-                dialogs::history::HistoryOutput::RunWorkflow(path) => {
-                    AppMsg::PaletteRunWorkflow(path)
-                }
-            });
         let debug_dashboard = dialogs::debug_dashboard::DebugDashboardModel::builder()
             .launch(root.clone())
             .detach();
@@ -714,9 +786,30 @@ impl SimpleComponent for AppModel {
                     AppMsg::PaletteTypeCommand(command)
                 }
             });
+        let initial_ai_panel_visible =
+            config.borrow().ai_enabled && config.borrow().ai_panel_visible && !init.safe_mode;
+        let initial_ai_panel_width = config.borrow().ai_panel_width;
         let ai_panel = dialogs::ai_panel::AiPanelModel::builder()
-            .launch(root.clone())
-            .detach();
+            .launch(dialogs::ai_panel::AiPanelInit {
+                redact_secrets: config.borrow().ai_redact_secrets,
+            })
+            .forward(sender.input_sender(), |output| match output {
+                dialogs::ai_panel::AiPanelOutput::SnapshotChanged(snapshot) => {
+                    AppMsg::AiConversationSnapshot(snapshot)
+                }
+                dialogs::ai_panel::AiPanelOutput::CloseRequested => AppMsg::AiPanelCloseRequested,
+            });
+        ai_panel.widget().set_visible(initial_ai_panel_visible);
+        ai_paned.set_end_child(Some(ai_panel.widget()));
+        // The initial window is 800 px wide and the left sidebar has already
+        // claimed its configured share. A map-time idle below corrects this
+        // estimate against the compositor's actual allocation.
+        let initial_inner_width = 800_i32.saturating_sub(sidebar_width);
+        if let Some(position) =
+            restored_ai_panel_position(initial_inner_width, initial_ai_panel_width)
+        {
+            ai_paned.set_position(position);
+        }
         let notebook = notebook::NotebookModel::builder()
             .launch(notebook::NotebookInit {
                 parent: root.clone(),
@@ -771,6 +864,7 @@ impl SimpleComponent for AppModel {
         let tab_drag_coordinator = Rc::new(tab_strip::TabDragCoordinator::default());
         let mut model = AppModel {
             config,
+            organism_hub,
             config_revision: RefCell::new(config_revision),
             themes: Rc::new(themes),
             kbmap,
@@ -781,6 +875,7 @@ impl SimpleComponent for AppModel {
             tab_drag_coordinator,
             next_id: 0,
             next_pane_id: 0,
+            pending_split_spawns: std::collections::HashMap::new(),
             // With tabs in the top bar, keep the optional file sidebar closed
             // until the user explicitly opens it.
             sidebar_visible,
@@ -812,6 +907,7 @@ impl SimpleComponent for AppModel {
             top_bar,
             sidebar_box: sidebar_box.clone(),
             content_paned: content_paned.clone(),
+            ai_paned: ai_paned.clone(),
             bottom_bar: bottom_bar.clone(),
             bottom_bar_left: bottom_bar_left.clone(),
             bottom_bar_right: bottom_bar_right.clone(),
@@ -824,9 +920,11 @@ impl SimpleComponent for AppModel {
             settings_font_names: Rc::new(settings_font_names),
             remote_picker,
             debug_dashboard,
-            history,
             workflow_dialog,
             ai_panel,
+            ai_panel_visible: std::cell::Cell::new(initial_ai_panel_visible),
+            ai_panel_width_generation: Rc::new(std::cell::Cell::new(0)),
+            ai_conversation: None,
             command_suggestion: Rc::new(RefCell::new(None)),
             command_suggestion_generation: Rc::new(std::cell::Cell::new(0)),
             command_corrections: Rc::new(RefCell::new(std::collections::HashMap::new())),
@@ -838,6 +936,31 @@ impl SimpleComponent for AppModel {
             agent_panel,
         };
         model.sync_agent_toggle();
+
+        {
+            let width_sender = sender.clone();
+            let panel = model.ai_panel.widget().clone();
+            model.ai_paned.connect_position_notify(move |paned| {
+                if !panel.is_visible() {
+                    return;
+                }
+                if let Some(measured) =
+                    ai_panel_width_from_geometry(paned.width(), paned.position())
+                {
+                    width_sender.input(AppMsg::AiPanelWidthChanged(measured));
+                }
+            });
+        }
+        if initial_ai_panel_visible {
+            let paned = model.ai_paned.clone();
+            gtk::glib::idle_add_local_once(move || {
+                if let Some(position) =
+                    restored_ai_panel_position(paned.width(), initial_ai_panel_width)
+                {
+                    paned.set_position(position);
+                }
+            });
+        }
 
         let search_bar = model.search.widget();
         // WindowHandle gives the custom Relm4 toolbar native titlebar move,
@@ -869,6 +992,14 @@ impl SimpleComponent for AppModel {
             let window_sender = sender.clone();
             root.connect_maximized_notify(move |window| {
                 window_sender.input(AppMsg::WindowMaximized(window.is_maximized()));
+            });
+        }
+        {
+            let organism_hub = model.organism_hub.clone();
+            root.connect_is_active_notify(move |window| {
+                if !window.is_active() {
+                    organism_hub.revoke_organism_presence();
+                }
             });
         }
 
@@ -905,7 +1036,19 @@ impl SimpleComponent for AppModel {
         {
             let kb = model.kbmap.clone();
             let ksender = sender.clone();
+            let window = root.clone();
+            let ai_panel_root = model.ai_panel.widget().clone().upcast::<gtk::Widget>();
             key_controller.connect_key_pressed(move |_c, keyval, _kc, state| {
+                let ai_panel_focused = gtk::prelude::RootExt::focus(&window)
+                    .is_some_and(|focus| widget_is_within(focus, &ai_panel_root));
+                // Composer/search/list Enter semantics and IME candidate
+                // confirmation belong to the focused AI child before any
+                // optional global binding for Enter.
+                if matches!(keyval, gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter)
+                    && ai_panel_focused
+                {
+                    return glib::Propagation::Proceed;
+                }
                 // The GTK edge: keysym + modifier state -> toolkit-neutral
                 // chord. `None` means no chord string could name this key.
                 let Some(chord) = chord_from_gdk(keyval, state) else {
@@ -921,7 +1064,11 @@ impl SimpleComponent for AppModel {
                     let mut stripped = chord;
                     stripped.mods.alt = false;
                     if kb.borrow().lookup(&stripped) == Some(Action::Copy) {
-                        ksender.input(AppMsg::CopyOutputOnly);
+                        ksender.input(if ai_panel_focused {
+                            AppMsg::Action(Action::Copy)
+                        } else {
+                            AppMsg::CopyOutputOnly
+                        });
                         return glib::Propagation::Stop;
                     }
                 }
@@ -1004,6 +1151,12 @@ impl SimpleComponent for AppModel {
         // otherwise open a single fresh tab running startup_commands.
         match restore_session.then(session::load_session).flatten() {
             Some(saved) => {
+                model.ai_conversation = saved.ai_conversation.clone();
+                if let Some(snapshot) = saved.ai_conversation.clone() {
+                    model
+                        .ai_panel
+                        .emit(dialogs::ai_panel::AiPanelMsg::Restore(snapshot));
+                }
                 for tab in &saved.tabs {
                     model.restore_tab(tab, &sender);
                 }
@@ -1028,6 +1181,20 @@ impl SimpleComponent for AppModel {
                     InitialCommands::from_config(startup.as_deref())
                 };
                 model.add_tab_with(initial_commands, requested_cwd, initial_argv, &sender);
+            }
+        }
+
+        // A panel restored as visible must be immediately usable, not merely
+        // painted with its saved transcript while lacking a provider client.
+        if initial_ai_panel_visible {
+            if let Ok(client) = ai::client_from_config(&model.config.borrow()) {
+                model.ai_panel.emit(dialogs::ai_panel::AiPanelMsg::Open {
+                    history_path: model.config.borrow().command_history_path.clone(),
+                    client,
+                    stream: model.config.borrow().ai_stream,
+                    redact_secrets: model.config.borrow().ai_redact_secrets,
+                    initial_context: None,
+                });
             }
         }
 
@@ -1094,8 +1261,39 @@ impl SimpleComponent for AppModel {
             }
             AppMsg::Action(action) => self.execute_action(action, &sender),
             AppMsg::ReloadConfig => self.reload_config(&sender),
+            AppMsg::PaneLaunched(pane_id) => {
+                if let Some((source_tab_id, _)) = self.pending_split_spawns.remove(&pane_id) {
+                    if let Some((tab_index, _)) = self.find_pane(pane_id) {
+                        if self.tabs[tab_index].id == source_tab_id {
+                            if let Some(root) = self.tabs[tab_index].holder.first_child() {
+                                workspace_ops::schedule_pane_rebalance(root);
+                            }
+                        }
+                    }
+                }
+            }
             AppMsg::PaneLaunchFailed(pane_id, message) => {
-                if let Some((idx, _)) = self.find_pane(pane_id) {
+                if let Some((source_tab_id, source_pane_id)) =
+                    self.pending_split_spawns.remove(&pane_id)
+                {
+                    let restored =
+                        self.rollback_failed_split(pane_id, source_tab_id, source_pane_id);
+                    if restored {
+                        log::error!(
+                            "{message} Rolled back failed split pane {pane_id} to source pane {source_pane_id}."
+                        );
+                        self.show_toast(format!(
+                            "{message} The failed split was rolled back and the existing layout was restored."
+                        ));
+                    } else {
+                        log::error!(
+                            "{message} Could not safely roll back failed split pane {pane_id}."
+                        );
+                        self.show_toast(format!(
+                            "{message} The failed split could not be rolled back safely."
+                        ));
+                    }
+                } else if let Some((idx, _)) = self.find_pane(pane_id) {
                     if let Some(connection) = self.tabs[idx]
                         .remote
                         .as_mut()
@@ -1104,8 +1302,13 @@ impl SimpleComponent for AppModel {
                         connection.status = ConnStatus::Disconnected;
                     }
                     self.sync_tab_strip();
+                    self.show_toast(message);
+                } else {
+                    // A synchronously rejected Block split drops its prepared
+                    // component before commit and reports its own toast. Ignore
+                    // the component's deferred stale failure output.
+                    log::debug!("Ignoring launch failure for retired pane {pane_id}: {message}");
                 }
-                self.show_toast(message);
             }
             AppMsg::SetTabWidth(width) => {
                 self.config.borrow_mut().tab_width = width.clamp(MIN_TAB_WIDTH, MAX_TAB_WIDTH);
@@ -1181,6 +1384,8 @@ impl SimpleComponent for AppModel {
             AppMsg::PaneFocused(_, pane_id) => {
                 if let Some((ti, pi)) = self.find_pane(pane_id) {
                     self.tabs[ti].active_pane = pi;
+                    let focused = self.tabs[ti].panes[pi].terminal.term_view();
+                    self.organism_hub.focus_view(focused.as_ref());
                     self.refresh_pane_headers(ti);
                     // The tab shows its selected pane, so the label follows
                     // focus across a split.
@@ -1329,7 +1534,15 @@ impl SimpleComponent for AppModel {
             AppMsg::SettingsTerminalMode(mode) => self.apply_settings_terminal_mode(mode),
             AppMsg::SettingsBlockCompact(enabled) => self.apply_settings_block_compact(enabled),
             AppMsg::SettingsCommandHistory(enabled) => self.apply_settings_command_history(enabled),
+            AppMsg::SettingsAsciiOrganism(enabled) => self.apply_settings_ascii_organism(enabled),
+            AppMsg::SettingsAsciiOrganismMotion(motion) => {
+                self.apply_settings_ascii_organism_motion(motion)
+            }
             AppMsg::SettingsAiEnabled(enabled) => self.apply_settings_ai_enabled(enabled),
+            AppMsg::SettingsAiPanelVisible(visible) => {
+                self.apply_settings_ai_panel_visible(visible)
+            }
+            AppMsg::SettingsAiPanelWidth(width) => self.apply_settings_ai_panel_width(width),
             AppMsg::SettingsAgentEnabled(enabled) => self.apply_settings_agent_enabled(enabled),
             AppMsg::SettingsCommandCorrection(enabled) => {
                 self.apply_settings_command_correction(enabled)
@@ -1533,12 +1746,43 @@ impl SimpleComponent for AppModel {
             AppMsg::CommandCorrectionDismiss {
                 pane_id,
                 generation,
-            } => self.close_command_correction_generation(pane_id, generation),
+            } => self.dismiss_command_correction(pane_id, generation),
             AppMsg::OpenAiPanel => {
                 self.show_ai_session_panel();
             }
             AppMsg::AskAiAboutBlock(context) => {
                 self.show_ai_session_panel_with_context(Some(context));
+            }
+            AppMsg::AiConversationSnapshot(snapshot) => {
+                self.ai_conversation = Some(snapshot);
+                self.persist_session();
+            }
+            AppMsg::AiPanelCloseRequested => {
+                self.set_ai_panel_visible(false, true);
+            }
+            AppMsg::AiPanelWidthChanged(width) => {
+                let width = width.clamp(MIN_AI_PANEL_WIDTH, MAX_AI_PANEL_WIDTH);
+                if self.config.borrow().ai_panel_width == width {
+                    return;
+                }
+                self.config.borrow_mut().ai_panel_width = width;
+                let generation = self.ai_panel_width_generation.get().wrapping_add(1);
+                self.ai_panel_width_generation.set(generation);
+                let sender = sender.clone();
+                let token = self.ai_panel_width_generation.clone();
+                gtk::glib::timeout_add_local_once(
+                    std::time::Duration::from_millis(300),
+                    move || {
+                        if token.get() == generation {
+                            sender.input(AppMsg::PersistAiPanelWidth(generation));
+                        }
+                    },
+                );
+            }
+            AppMsg::PersistAiPanelWidth(generation) => {
+                if self.ai_panel_width_generation.get() == generation {
+                    self.persist_config();
+                }
             }
             AppMsg::PaletteRunWorkflow(path) => {
                 self.run_workflow_from_path(path, &sender);
@@ -1614,6 +1858,7 @@ fn main() {
         }
         cli::Command::PrintDefaultConfig => print!("{}", include_str!("../config.toml.example")),
         cli::Command::PrintShellIntegration(shell) => print_shell_integration(shell),
+        cli::Command::PrintCompletion(shell) => print_completion(shell),
         cli::Command::Run(mut options) => {
             if let Err(error) = validate_launch_options(&mut options) {
                 eprintln!("anvil: {error}");
@@ -1710,6 +1955,16 @@ fn print_shell_integration(shell: cli::ShellIntegration) {
         cli::ShellIntegration::PowerShell => {
             include_str!("../scripts/shell-integration/anvil.ps1")
         }
+    };
+    print!("{script}");
+}
+
+fn print_completion(shell: cli::ShellIntegration) {
+    let script = match shell {
+        cli::ShellIntegration::Bash => include_str!("../scripts/completions/anvil.bash"),
+        cli::ShellIntegration::Zsh => include_str!("../scripts/completions/_anvil"),
+        cli::ShellIntegration::Fish => include_str!("../scripts/completions/anvil.fish"),
+        cli::ShellIntegration::PowerShell => include_str!("../scripts/completions/anvil.ps1"),
     };
     print!("{script}");
 }
