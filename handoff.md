@@ -3,14 +3,31 @@
 Updated: 2026-08-10
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
-keeps session persistence off the GTK thread, makes search state visible across
-both terminal backends, removes the default Nerd Font dependency, and preserves
-raw Linux file-tree path identity. Agent UI actions, model replies, and terminal
-execution events remain bound to the session epoch; workspace snapshots now
-enforce the same budgets while being captured, queued, written, and restored.
+keeps session persistence plus Palette workflow/history reads off the GTK
+thread, makes search state visible across both terminal backends, removes the
+default Nerd Font dependency, and preserves raw Linux file-tree path identity.
+Agent UI actions, model replies, and terminal execution events remain bound to
+the session epoch; workspace snapshots enforce the same budgets while being
+captured, queued, written, and restored.
 
 ## Completed since the previous handoff
 
+- Workflow discovery is a startup-prewarmed, single-flight cache refresh; the
+  Palette presents immediately and accepts only the matching asynchronous
+  history snapshot for its current opening. Slow results from a closed or
+  replaced dialog are discarded, and worker failures leave actions/workflows
+  available with visible status instead of freezing GTK.
+- Background persistence failures are surfaced during the session through a
+  bounded, aggregated, per-operation rate limiter. The shutdown drain remains
+  as the final catch for failures produced after the last UI tick.
+- CLI cwd validation stops raw non-UTF-8 paths before the terminal's UTF-8
+  launch boundary, eliminating U+FFFD path substitution. Config reads now
+  reject group/other write bits, and automatic command-correction helpers use
+  canonical non-writable system targets (Flatpak probes fail closed).
+- Source installation, release installation, documentation, and uninstall now
+  converge on `${PREFIX}/bin`; legacy `~/.cargo/bin/anvil` copies receive a
+  migration warning only. Top-bar, file-tree, remote-host, AI, and Agent
+  icon-only controls also expose explicit and state-aware AT-SPI labels.
 - `src/session.rs` captures only budget-valid pane/tab fields and queues owned
   snapshots through `src/persistence.rs`. JSON work, atomic replace, both fsyncs,
   claim cleanup, and pruning run on a dedicated capacity-one coalescing lane;

@@ -11,6 +11,9 @@ use relm4::prelude::*;
 
 use crate::config::{remote_text_is_safe, RemoteHost};
 
+const EDIT_REMOTE_HOST_LABEL: &str = "Edit remote host";
+const REMOVE_REMOTE_HOST_LABEL: &str = "Remove remote host";
+
 #[derive(Debug, Clone)]
 pub(crate) struct SettingsValues {
     pub(crate) theme: u32,
@@ -1234,6 +1237,7 @@ impl SettingsModel {
             edit.set_valign(gtk::Align::Center);
             edit.add_css_class("flat");
             edit.set_tooltip_text(Some("Edit Host"));
+            edit.update_property(&[gtk::accessible::Property::Label(EDIT_REMOTE_HOST_LABEL)]);
             edit.connect_clicked({
                 let sender = sender.clone();
                 move |_| sender.input(SettingsMsg::RemoteHostEdit(index))
@@ -1244,6 +1248,7 @@ impl SettingsModel {
             remove.add_css_class("flat");
             remove.add_css_class("destructive-action");
             remove.set_tooltip_text(Some("Remove Host"));
+            remove.update_property(&[gtk::accessible::Property::Label(REMOVE_REMOTE_HOST_LABEL)]);
             remove.connect_clicked({
                 let sender = sender.clone();
                 move |_| sender.input(SettingsMsg::RemoteHostRemove(index))
@@ -1386,6 +1391,13 @@ fn remove_remote_host(hosts: &mut Vec<RemoteHost>, index: usize, name: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_host_icon_buttons_have_distinct_accessible_labels() {
+        assert!(!EDIT_REMOTE_HOST_LABEL.is_empty());
+        assert!(!REMOVE_REMOTE_HOST_LABEL.is_empty());
+        assert_ne!(EDIT_REMOTE_HOST_LABEL, REMOVE_REMOTE_HOST_LABEL);
+    }
 
     #[test]
     fn missing_generic_family_stays_selected_for_size_changes() {

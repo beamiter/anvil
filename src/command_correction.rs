@@ -11,11 +11,13 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use serde::Deserialize;
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::fs;
 use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
-use std::process::{Child, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const MAX_CORRECTION_COMMAND_BYTES: usize = 16 * 1024;
@@ -27,6 +29,7 @@ const MAX_RANKED_NAMES: usize = 12;
 const MAX_RANKED_INPUTS: usize = 50_000;
 const MAX_NAME_BYTES: usize = 256;
 const CORRECTION_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const TRUSTED_CORRECTION_HELPER_PATH: &str = "/usr/bin:/bin";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum FailureKind {
@@ -593,32 +596,33 @@ fn rank_names(needle: &str, names: impl IntoIterator<Item = String>) -> Vec<Stri
 }
 
 fn list_path_commands(cancellation: &ai::AiCancellationToken, deadline: Instant) -> Vec<String> {
-    if crate::host::command_available("bash") {
-        if let Some(output) = run_capture(
-            "bash",
-            &[
-                "--noprofile",
-                "--norc",
-                "-lc",
-                "compgen -c | LC_ALL=C sort -u",
-            ],
-            cancellation,
-            deadline,
-        ) {
-            let commands = output
-                .lines()
-                .map(str::trim)
-                .filter(|name| !name.is_empty() && name.len() <= MAX_NAME_BYTES)
-                .take(MAX_RANKED_INPUTS)
-                .map(str::to_string)
-                .collect::<Vec<_>>();
-            if !commands.is_empty() {
-                return commands;
-            }
-        }
-    }
+    // The Flatpak bridge cannot prove which host PATH entry it would execute.
+    // Local correction is optional evidence, so fail closed instead of routing
+    // an automatic helper through the host's ordinary command lookup.
     if crate::host::is_flatpak() {
         return Vec::new();
+    }
+    if let Some(output) = run_capture(
+        "bash",
+        &[
+            "--noprofile",
+            "--norc",
+            "-lc",
+            "compgen -c | LC_ALL=C sort -u",
+        ],
+        cancellation,
+        deadline,
+    ) {
+        let commands = output
+            .lines()
+            .map(str::trim)
+            .filter(|name| !name.is_empty() && name.len() <= MAX_NAME_BYTES)
+            .take(MAX_RANKED_INPUTS)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if !commands.is_empty() {
+            return commands;
+        }
     }
 
     let mut names = HashSet::new();
@@ -653,13 +657,104 @@ fn list_path_commands(cancellation: &ai::AiCancellationToken, deadline: Instant)
     names.into_iter().collect()
 }
 
-fn correction_helper_command(program: &str) -> Option<std::process::Command> {
-    if !matches!(program, "apt-cache" | "bash" | "sh" | "sleep" | "head")
-        || !crate::host::command_available(program)
+fn correction_helper_allowed(program: &str) -> bool {
+    matches!(program, "apt-cache" | "bash" | "sh" | "sleep" | "head")
+}
+
+fn helper_owner_or_mode_is_untrusted(owner_uid: u32, mode: u32, euid: u32) -> bool {
+    // A current-user-owned object is mutable even when its write bits are
+    // clear: its owner can chmod it and then replace either the executable or
+    // an ancestor directory. Group/other write access is unsafe regardless of
+    // ownership because it exposes the same namespace race to another actor.
+    owner_uid == euid || mode & 0o022 != 0
+}
+
+fn metadata_is_untrusted_for_helper(metadata: &fs::Metadata, euid: u32) -> bool {
+    helper_owner_or_mode_is_untrusted(metadata.uid(), metadata.permissions().mode(), euid)
+}
+
+/// Canonicalize an automatic helper and prove neither its file nor any parent
+/// namespace can be modified by this process's user, group, or other users.
+/// Returning the canonical target closes the validate-symlink/execute-symlink
+/// race as long as the validated namespace remains non-writable.
+fn trusted_native_executable(candidate: &Path) -> Option<PathBuf> {
+    trusted_native_executable_with_boundary(candidate, None)
+}
+
+fn trusted_native_executable_with_boundary(
+    candidate: &Path,
+    boundary: Option<&Path>,
+) -> Option<PathBuf> {
+    let canonical = fs::canonicalize(candidate).ok()?;
+    let boundary = boundary.map(fs::canonicalize).transpose().ok()?;
+    // SAFETY: geteuid has no preconditions and only reads process state.
+    let euid = unsafe { nix::libc::geteuid() };
+    let metadata = fs::metadata(&canonical).ok()?;
+    if !metadata.is_file()
+        || metadata.permissions().mode() & 0o111 == 0
+        || metadata_is_untrusted_for_helper(&metadata, euid)
     {
         return None;
     }
-    Some(crate::host::command(program))
+
+    let mut reached_boundary = boundary.as_deref() == Some(canonical.as_path());
+    for ancestor in canonical.ancestors().skip(1) {
+        let metadata = fs::metadata(ancestor).ok()?;
+        if !metadata.is_dir() || metadata_is_untrusted_for_helper(&metadata, euid) {
+            return None;
+        }
+        if boundary.as_deref() == Some(ancestor) {
+            reached_boundary = true;
+            break;
+        }
+    }
+    if boundary.is_some() && !reached_boundary {
+        return None;
+    }
+    Some(canonical)
+}
+
+fn resolve_trusted_native_helper_with(
+    program: &str,
+    path: Option<&OsStr>,
+    mut validate: impl FnMut(&Path) -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    if !correction_helper_allowed(program) {
+        return None;
+    }
+    std::env::split_paths(path?)
+        .filter(|directory| directory.is_absolute())
+        .find_map(|directory| validate(&directory.join(program)))
+}
+
+fn resolve_trusted_native_helper(program: &str, path: Option<&OsStr>) -> Option<PathBuf> {
+    resolve_trusted_native_helper_with(program, path, trusted_native_executable)
+}
+
+fn command_for_trusted_helper(executable: &Path) -> Command {
+    let mut command = Command::new(executable);
+    command.env("PATH", TRUSTED_CORRECTION_HELPER_PATH);
+    command
+}
+
+fn correction_helper_command_for(
+    program: &str,
+    flatpak: bool,
+    path: Option<&OsStr>,
+) -> Option<Command> {
+    if flatpak {
+        return None;
+    }
+    let executable = resolve_trusted_native_helper(program, path)?;
+    Some(command_for_trusted_helper(&executable))
+}
+
+fn correction_helper_command(program: &str) -> Option<Command> {
+    correction_helper_command_for(
+        program,
+        crate::host::is_flatpak(),
+        std::env::var_os("PATH").as_deref(),
+    )
 }
 
 fn run_capture(
@@ -1625,6 +1720,102 @@ mod tests {
         .expect("bounded local probe");
         assert_eq!(output.len(), MAX_PROBE_BYTES);
         assert!(correction_helper_command("/bin/sh").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_user_owned_read_only_helper_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "anvil-correction-helper-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let fake = bin.join("bash");
+        fs::write(&fake, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let metadata = fs::metadata(&fake).unwrap();
+        // SAFETY: geteuid has no preconditions and only reads process state.
+        let euid = unsafe { nix::libc::geteuid() };
+        assert_eq!(metadata.uid(), euid);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o555);
+        assert!(
+            trusted_native_executable_with_boundary(&fake, Some(&root)).is_none(),
+            "removing write bits cannot make a current-user-owned helper trusted"
+        );
+        assert!(helper_owner_or_mode_is_untrusted(euid, 0o555, euid));
+        assert!(helper_owner_or_mode_is_untrusted(
+            euid.wrapping_add(1),
+            0o575,
+            euid
+        ));
+        assert!(helper_owner_or_mode_is_untrusted(
+            euid.wrapping_add(1),
+            0o557,
+            euid
+        ));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn automatic_helper_resolution_uses_absolute_whitelisted_first_trusted_path() {
+        let rejected_bin = Path::new("/untrusted-helper-bin");
+        let trusted_bin = Path::new("/trusted-helper-bin");
+        let later_bin = Path::new("/later-helper-bin");
+        let mixed_path = std::env::join_paths([
+            Path::new("relative-bin"),
+            rejected_bin,
+            trusted_bin,
+            later_bin,
+        ])
+        .unwrap();
+        let trusted_candidate = trusted_bin.join("bash");
+        let selected_canonical = PathBuf::from("/canonical-system-bin/bash");
+        let mut visited = Vec::new();
+        let selected = resolve_trusted_native_helper_with("bash", Some(&mixed_path), |candidate| {
+            visited.push(candidate.to_path_buf());
+            (candidate == trusted_candidate).then(|| selected_canonical.clone())
+        })
+        .expect("the first injected trusted helper should be selected");
+        assert_eq!(selected, selected_canonical);
+        assert_eq!(
+            visited,
+            vec![rejected_bin.join("bash"), trusted_candidate],
+            "relative PATH entries must be skipped and scanning must stop at the first trusted helper"
+        );
+
+        let mut validator_called = false;
+        assert!(
+            resolve_trusted_native_helper_with("not-a-helper", Some(&mixed_path), |_| {
+                validator_called = true;
+                Some(PathBuf::from("/must-not-be-selected"))
+            },)
+            .is_none()
+        );
+        assert!(
+            !validator_called,
+            "non-whitelisted helpers must not be probed"
+        );
+
+        let command = command_for_trusted_helper(&selected);
+        assert_eq!(command.get_program(), selected.as_os_str());
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(name, _)| *name == OsStr::new("PATH"))
+                .and_then(|(_, value)| value),
+            Some(OsStr::new(TRUSTED_CORRECTION_HELPER_PATH))
+        );
+        assert!(correction_helper_command_for("bash", true, Some(&mixed_path)).is_none());
     }
 
     #[test]

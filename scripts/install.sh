@@ -11,7 +11,6 @@ HOME_DIR="${HOME:-}"
 DESTDIR="${DESTDIR:-}"
 PREFIX="${HOME_DIR}/.local"
 BIN_DIR=""
-PREFIX_EXPLICIT=0
 DATA_HOME=""
 BACKEND="auto"
 INSTALL_CONFIG=1
@@ -24,8 +23,7 @@ Usage: ./scripts/install.sh [options]
 
 Options:
   --prefix PATH          Runtime prefix (default: ~/.local)
-  --bin-dir PATH         Runtime binary directory (default: ~/.cargo/bin;
-                         with --prefix, defaults to PREFIX/bin)
+  --bin-dir PATH         Runtime binary directory (default: PREFIX/bin)
   --data-dir PATH        Shared-data base (default: $XDG_DATA_HOME or PREFIX/share)
   --backend auto|nix|cargo
                          Build backend (default: auto; prefers Nix)
@@ -154,12 +152,10 @@ while (($# > 0)); do
         --prefix)
             (($# >= 2)) || die "--prefix requires a path"
             PREFIX="$2"
-            PREFIX_EXPLICIT=1
             shift 2
             ;;
         --prefix=*)
             PREFIX="${1#*=}"
-            PREFIX_EXPLICIT=1
             shift
             ;;
         --bin-dir)
@@ -218,11 +214,7 @@ done
 [[ -n "${HOME_DIR}" ]] || die "HOME is not set"
 [[ -n "${PREFIX}" && "${PREFIX}" == /* ]] || die "--prefix must be an absolute path"
 if [[ -z "${BIN_DIR}" ]]; then
-    if ((PREFIX_EXPLICIT == 1)); then
-        BIN_DIR="${PREFIX}/bin"
-    else
-        BIN_DIR="${HOME_DIR}/.cargo/bin"
-    fi
+    BIN_DIR="${PREFIX}/bin"
 fi
 [[ "${BIN_DIR}" == /* ]] || die "--bin-dir must be an absolute path"
 if [[ -z "${DATA_HOME}" ]]; then
@@ -340,14 +332,26 @@ if [[ -n "${DESTDIR}" ]]; then
     printf 'Staged file: %s\n' "${STAGED_BIN_DIR}/anvil"
 fi
 if [[ -z "${DESTDIR}" ]]; then
+    LEGACY_SOURCE_BIN="${HOME_DIR}/.cargo/bin/anvil"
+    SHADOWING_BIN="$(command -v anvil 2>/dev/null || true)"
+    if [[ "${LEGACY_SOURCE_BIN}" != "${BIN_DIR}/anvil" ]] \
+        && [[ -e "${LEGACY_SOURCE_BIN}" || -L "${LEGACY_SOURCE_BIN}" ]]; then
+        printf '\nNote: a legacy source install remains at %s.\n' "${LEGACY_SOURCE_BIN}"
+        printf 'It was not removed automatically; verify the new install before removing it manually.\n'
+        if [[ "${SHADOWING_BIN}" == "${LEGACY_SOURCE_BIN}" ]]; then
+            printf 'Typing anvil currently resolves to that legacy path; put %s ahead of it on PATH.\n' \
+                "${BIN_DIR}"
+        fi
+    fi
     if ! bin_dir_on_path; then
         printf '\nNote: %s is not in PATH; the launcher entry uses the absolute path,\n' \
             "${BIN_DIR}"
         printf 'but shells will not find anvil until you add it, for example:\n'
         printf "  echo 'export PATH=\"%s:\$PATH\"' >>~/.profile\n" "${BIN_DIR}"
     fi
-    SHADOWING_BIN="$(command -v anvil 2>/dev/null || true)"
-    if [[ -n "${SHADOWING_BIN}" && "${SHADOWING_BIN}" != "${BIN_DIR}/anvil" ]]; then
+    if [[ -n "${SHADOWING_BIN}" \
+        && "${SHADOWING_BIN}" != "${BIN_DIR}/anvil" \
+        && "${SHADOWING_BIN}" != "${LEGACY_SOURCE_BIN}" ]]; then
         printf '\nNote: typing anvil still runs %s, an older copy earlier in PATH.\n' \
             "${SHADOWING_BIN}"
         printf 'Remove it, or put %s ahead of it in PATH.\n' "${BIN_DIR}"

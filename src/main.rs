@@ -168,6 +168,10 @@ struct AppModel {
     opacity_toast: Rc<RefCell<Option<adw::Toast>>>,
     quit_allowed: Rc<std::cell::Cell<bool>>,
     session_persistence: bool,
+    /// Last user-visible background-save warning per operation. Worker errors
+    /// remain logged immediately; this map prevents a failing mount from
+    /// queueing one toast every second while autosave continues.
+    persistence_failure_notices: std::collections::HashMap<String, std::time::Instant>,
     safe_mode: bool,
     dyn_css: gtk::CssProvider,
     search: Controller<search::SearchModel>,
@@ -214,9 +218,10 @@ struct AppModel {
     command_correction_generation: Rc<std::cell::Cell<u64>>,
     notebook: Controller<notebook::NotebookModel>,
     /// Workflows loaded from disk. Refreshed on demand each time the palette
-    /// is opened (cheap — handful of small YAML files) so users see edits
-    /// without a restart.
+    /// is opened, with one background prewarm at startup. The palette always
+    /// presents immediately from the last completed snapshot.
     workflows: Rc<RefCell<Vec<workflows::Workflow>>>,
+    workflow_refresh: workflow_ops::WorkflowRefreshState,
     /// At most one agent session is active per app. Opening the panel
     /// while another session is alive cancels the previous one.
     active_agent: Rc<RefCell<Option<agent::AgentSession>>>,
@@ -459,10 +464,11 @@ impl SimpleComponent for AppModel {
             Rc::new(choose_shell_argv(config.shell.as_deref()))
         };
         let startup = config.startup_commands.clone();
-        let requested_cwd = init
-            .working_directory
-            .as_ref()
-            .map(|path| path.to_string_lossy().into_owned());
+        let requested_cwd = init.working_directory.as_ref().map(|path| {
+            path.to_str()
+                .expect("launch validation rejects non-UTF-8 working directories")
+                .to_owned()
+        });
         let execute_argv = init.execute.clone().map(Rc::new);
         let restore_session = !init.safe_mode
             && !init.no_restore
@@ -889,6 +895,7 @@ impl SimpleComponent for AppModel {
             opacity_toast: Rc::new(RefCell::new(None)),
             quit_allowed: quit_allowed.clone(),
             session_persistence,
+            persistence_failure_notices: std::collections::HashMap::new(),
             safe_mode: init.safe_mode,
             dyn_css,
             search,
@@ -928,11 +935,19 @@ impl SimpleComponent for AppModel {
             command_correction_generation: Rc::new(std::cell::Cell::new(0)),
             notebook,
             workflows,
+            workflow_refresh: workflow_ops::WorkflowRefreshState::default(),
             active_agent: Rc::new(RefCell::new(None)),
             agent_panel_generation: Rc::new(std::cell::Cell::new(0)),
             agent_panel,
         };
         model.sync_agent_toggle();
+
+        // Populate the palette cache opportunistically without adding startup
+        // latency. Safe mode avoids reading user workflow directories until an
+        // explicit palette action asks for them.
+        if !model.safe_mode {
+            model.refresh_workflows_async(&sender);
+        }
 
         {
             let width_sender = sender.clone();
@@ -1251,6 +1266,7 @@ impl SimpleComponent for AppModel {
             AppMsg::ForceQuit => self.force_quit(),
             AppMsg::Toast(message) => self.show_toast(message),
             AppMsg::JshUpdateChecked(status) => self.offer_jsh_update(&status, &sender),
+            AppMsg::WorkflowRefreshFinished(result) => self.finish_workflow_refresh(result),
             AppMsg::CopyOutputOnly => {
                 if let Some(t) = self.active_terminal() {
                     t.emit(VteInput::CopyOutputOnly);
@@ -1483,6 +1499,10 @@ impl SimpleComponent for AppModel {
                 self.refresh_active_pane_headers();
                 // The bar's running-command and grid segments are polled too.
                 self.refresh_bottom_bar();
+                // Persistence workers cannot touch GTK. Surface their bounded
+                // failure queue here so a session-save error is visible before
+                // the user closes the window.
+                self.report_persistence_failures();
             }
             AppMsg::TitleChanged(pane_id, title) => {
                 if let Some((idx, pane_index)) = self.find_pane(pane_id) {
@@ -1928,6 +1948,12 @@ fn validate_launch_options(options: &mut cli::LaunchOptions) -> Result<(), Strin
         if !canonical.is_dir() {
             return Err(format!("{} is not a directory", canonical.display()));
         }
+        if canonical.to_str().is_none() {
+            return Err(format!(
+                "working directory {} contains non-UTF-8 bytes and cannot be passed to the terminal safely",
+                canonical.display()
+            ));
+        }
         *directory = canonical;
     }
     if let Some(argv) = &options.execute {
@@ -2029,5 +2055,52 @@ fn init_input_method_env() {
     }
     if is_unset("XMODIFIERS") {
         unsafe { std::env::set_var("XMODIFIERS", "@im=fcitx") };
+    }
+}
+
+#[cfg(all(test, unix))]
+mod launch_validation_tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory(std::path::PathBuf);
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn launch_validation_rejects_a_non_utf8_working_directory() {
+        let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "anvil-launch-validation-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).expect("create launch-validation root");
+        let _cleanup = TestDirectory(root.clone());
+
+        let mut name = OsString::from("raw-");
+        name.push(OsString::from_vec(vec![0xff]));
+        let raw_directory = root.join(name);
+        std::fs::create_dir(&raw_directory).expect("create non-UTF-8 directory");
+
+        // A lossy conversion would redirect this raw path to a different UTF-8
+        // directory when one happens to exist. Validation must fail before the
+        // path reaches the terminal's String-only launch boundary.
+        std::fs::create_dir(root.join("raw-�")).expect("create lossy replacement directory");
+        let mut options = cli::LaunchOptions {
+            working_directory: Some(raw_directory),
+            ..cli::LaunchOptions::default()
+        };
+
+        let error = validate_launch_options(&mut options)
+            .expect_err("non-UTF-8 launch directory must be rejected");
+        assert!(error.contains("contains non-UTF-8 bytes"), "{error}");
     }
 }

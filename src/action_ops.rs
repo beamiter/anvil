@@ -155,7 +155,7 @@ impl AppModel {
                 self.set_sidebar_visible(!self.sidebar_visible, true);
             }
             Action::ToggleCommandPalette => {
-                self.reload_workflows();
+                self.refresh_workflows_async(sender);
                 let history = self.config.borrow().command_history_path.clone();
                 let live_history = self
                     .active_terminal()
@@ -172,7 +172,7 @@ impl AppModel {
                     });
             }
             Action::OpenPalette => {
-                self.reload_workflows();
+                self.refresh_workflows_async(sender);
                 let history = self.config.borrow().command_history_path.clone();
                 let live_history = self
                     .active_terminal()
@@ -186,7 +186,7 @@ impl AppModel {
                     });
             }
             Action::OpenHistoryPalette => {
-                self.reload_workflows();
+                self.refresh_workflows_async(sender);
                 let history = self.config.borrow().command_history_path.clone();
                 let live_history = self
                     .active_terminal()
@@ -200,7 +200,7 @@ impl AppModel {
                     });
             }
             Action::OpenWorkflows => {
-                self.reload_workflows();
+                self.refresh_workflows_async(sender);
                 let history = self.config.borrow().command_history_path.clone();
                 let live_history = self
                     .active_terminal()

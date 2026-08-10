@@ -146,6 +146,17 @@ versioning for tagged releases while it remains experimental.
 
 ### Changed
 
+- Command Palette disk discovery no longer blocks GTK. Workflow directories
+  are prewarmed through a single-flight background refresh and each opening
+  reads its bounded command-history tail asynchronously with generation checks;
+  actions and the last workflow cache remain usable while fresh rows load.
+- Source install and uninstall now agree on `${PREFIX}/bin` (normally
+  `~/.local/bin`). A legacy `~/.cargo/bin/anvil` is reported for manual
+  migration but never removed without an explicit `--bin-dir`.
+- Top-bar, file-tree navigation, remote-host, AI-panel, and Agent icon buttons
+  expose explicit AT-SPI names. Dynamic maximize/restore and Shell Agent
+  controls update their accessible action name together with their icon and
+  tooltip.
 - Session snapshots now leave the GTK thread after capturing owned Rust state.
   JSON validation/encoding, atomic replacement, file and directory sync,
   predecessor cleanup, and pruning run through the bounded coalescing
@@ -250,6 +261,12 @@ versioning for tagged releases while it remains experimental.
 
 ### Fixed
 
+- Background session and organism save failures are drained on the UI loop and
+  reported before shutdown, with bounded text, per-operation aggregation, and
+  a cooldown that prevents a failing filesystem from creating a toast storm.
+- A CLI working directory containing non-UTF-8 bytes is rejected explicitly at
+  the terminal's String-only boundary. It can no longer be changed silently
+  into a different U+FFFD-named directory by `to_string_lossy`.
 - Live session capture now shares the decoder's field budgets and session IDs
   consistently accept the configured 1024-byte boundary. Workspace growth is
   stopped with actionable feedback at the restorable 32-tab, 16-pane-per-tab,
@@ -347,6 +364,15 @@ versioning for tagged releases while it remains experimental.
 
 ### Security
 
+- Configuration reads reject group- or world-writable files in addition to
+  enforcing ownership, regular-file, link-count, and no-follow rules. This
+  closes the local multi-user command-injection boundary for alternate or
+  manually chmodded configs that control shells and startup commands.
+- Automatic command-correction helpers are resolved only from absolute `PATH`
+  entries to canonical executable files whose entire target namespace is not
+  writable by the current user, group, or others. The child receives a fixed
+  system PATH; Flatpak helper probing fails closed until the host bridge can
+  provide the same proof.
 - AI command-palette responses containing newlines or terminal control
   characters are rejected before any bytes reach the live PTY.
 - Potentially destructive AI-generated commands are highlighted for review.

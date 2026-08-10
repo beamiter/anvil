@@ -45,6 +45,10 @@ use jterm_core::agent::{parse_action, ParseError, ParsedAction};
 
 use jterm_core::agent::AgentSession as CoreSession;
 
+const OPEN_AGENT_SETTINGS_LABEL: &str = "Open Shell Agent settings";
+const CANCEL_AND_CLOSE_AGENT_LABEL: &str = "Cancel Shell Agent and close";
+const DETACH_BLOCK_CONTEXT_LABEL: &str = "Detach selected Block context";
+
 const MAX_LOCAL_AGENT_COMMAND_BYTES: usize = 16 * 1024;
 const MAX_AGENT_DISPLAY_BYTES: usize = 32 * 1024;
 const MAX_AGENT_INPUT_BYTES: usize = 16 * 1024;
@@ -576,6 +580,9 @@ impl Component for AgentPanelModel {
                     set_icon_name: "emblem-system-symbolic",
                     set_focus_on_click: false,
                     set_tooltip_text: Some("Shell Agent settings"),
+                    update_property: &[
+                        gtk::accessible::Property::Label(OPEN_AGENT_SETTINGS_LABEL),
+                    ],
                     add_css_class: "flat",
                     connect_clicked => AgentPanelMsg::OpenSettings,
                 },
@@ -584,6 +591,9 @@ impl Component for AgentPanelModel {
                     set_icon_name: "window-close-symbolic",
                     set_focus_on_click: false,
                     set_tooltip_text: Some("Cancel Agent and close this card"),
+                    update_property: &[
+                        gtk::accessible::Property::Label(CANCEL_AND_CLOSE_AGENT_LABEL),
+                    ],
                     add_css_class: "flat",
                     connect_clicked => AgentPanelMsg::Closed,
                 },
@@ -615,6 +625,9 @@ impl Component for AgentPanelModel {
                     gtk::Button {
                         set_icon_name: "window-close-symbolic",
                         set_tooltip_text: Some("Detach selected Block context"),
+                        update_property: &[
+                            gtk::accessible::Property::Label(DETACH_BLOCK_CONTEXT_LABEL),
+                        ],
                         add_css_class: "flat",
                         connect_clicked => AgentPanelMsg::ClearContext,
                     },
@@ -1271,6 +1284,19 @@ fn render_proposed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_icon_buttons_have_distinct_accessible_labels() {
+        let labels = [
+            OPEN_AGENT_SETTINGS_LABEL,
+            CANCEL_AND_CLOSE_AGENT_LABEL,
+            DETACH_BLOCK_CONTEXT_LABEL,
+        ];
+        assert!(labels.iter().all(|label| !label.is_empty()));
+        for (index, label) in labels.iter().enumerate() {
+            assert!(!labels[..index].contains(label), "duplicate label: {label}");
+        }
+    }
 
     #[test]
     fn agent_input_limit_preserves_utf8_boundaries() {

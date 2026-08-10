@@ -249,6 +249,15 @@ fn validate_private_regular_file(file: &fs::File, path: &Path) -> io::Result<fs:
                 format!("{} is not owned by the current user", path.display()),
             ));
         }
+        if metadata.mode() & 0o022 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} must not be writable by group or other users",
+                    path.display()
+                ),
+            ));
+        }
     }
     Ok(metadata)
 }
@@ -2038,6 +2047,47 @@ mod tests {
             .unwrap();
         assert!(read_config_bytes(&oversized).is_err());
         assert_eq!(fs::read(&victim).unwrap(), b"opacity = 0.5\n");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_reads_reject_group_or_other_write_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = temporary_directory("safe-read-permissions");
+        for (mode, accepted) in [(0o600, true), (0o644, true), (0o620, false), (0o666, false)] {
+            let path = directory.join(format!("mode-{mode:o}.toml"));
+            fs::write(&path, b"opacity = 0.5\n").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+
+            if accepted {
+                assert_eq!(
+                    read_config_bytes(&path).unwrap().as_deref(),
+                    Some(b"opacity = 0.5\n".as_slice()),
+                    "mode {mode:o} should be readable"
+                );
+                assert!(
+                    validate_path(&path).healthy(),
+                    "mode {mode:o} should pass config validation"
+                );
+            } else {
+                let error = read_config_bytes(&path).unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+                assert!(
+                    error
+                        .to_string()
+                        .contains("must not be writable by group or other users"),
+                    "unexpected error for mode {mode:o}: {error}"
+                );
+                let report = validate_path(&path);
+                assert_eq!(report.errors(), 1);
+                assert!(
+                    !report.healthy(),
+                    "mode {mode:o} must fail config validation"
+                );
+            }
+        }
         fs::remove_dir_all(directory).unwrap();
     }
 

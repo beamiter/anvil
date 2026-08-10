@@ -18,6 +18,10 @@ use crate::{ai, palette};
 const STOPPED_STATUS: &str = "Response stopped. You can retry when ready.";
 const CHAT_PAGE: &str = "chat";
 const LIBRARY_PAGE: &str = "library";
+const NEW_CHAT_LABEL: &str = "New chat";
+const CLOSE_AI_PANEL_LABEL: &str = "Close AI panel";
+const CLEAR_BLOCK_CONTEXT_LABEL: &str = "Clear selected Block context";
+const BACK_TO_CONVERSATION_LABEL: &str = "Back to conversation";
 // The outer session JSON escapes this JSON string again. Keeping the inner
 // value at 1 MiB leaves ample room below session.rs's 4 MiB hard limit.
 const SESSION_SNAPSHOT_AI_BUDGET: usize = 1024 * 1024;
@@ -160,6 +164,9 @@ impl Component for AiPanelModel {
                     set_icon_name: "list-add-symbolic",
                     add_css_class: "flat",
                     set_tooltip_text: Some("New chat"),
+                    update_property: &[
+                        gtk::accessible::Property::Label(NEW_CHAT_LABEL),
+                    ],
                     connect_clicked => AiPanelMsg::NewChat,
                 },
 
@@ -167,6 +174,9 @@ impl Component for AiPanelModel {
                     set_icon_name: "window-close-symbolic",
                     add_css_class: "flat",
                     set_tooltip_text: Some("Close AI panel"),
+                    update_property: &[
+                        gtk::accessible::Property::Label(CLOSE_AI_PANEL_LABEL),
+                    ],
                     connect_clicked => AiPanelMsg::Close,
                 },
             },
@@ -199,6 +209,9 @@ impl Component for AiPanelModel {
                             set_icon_name: "edit-clear-symbolic",
                             add_css_class: "flat",
                             set_tooltip_text: Some("Clear selected Block context"),
+                            update_property: &[
+                                gtk::accessible::Property::Label(CLEAR_BLOCK_CONTEXT_LABEL),
+                            ],
                             connect_clicked => AiPanelMsg::ClearContext,
                         },
                     },
@@ -316,6 +329,9 @@ impl Component for AiPanelModel {
                             set_icon_name: "go-previous-symbolic",
                             add_css_class: "flat",
                             set_tooltip_text: Some("Back to conversation"),
+                            update_property: &[
+                                gtk::accessible::Property::Label(BACK_TO_CONVERSATION_LABEL),
+                            ],
                             connect_clicked => AiPanelMsg::ShowChat,
                         },
 
@@ -1072,6 +1088,20 @@ fn scroll_to_end(view: &gtk::TextView) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ai_panel_icon_buttons_have_distinct_accessible_labels() {
+        let labels = [
+            NEW_CHAT_LABEL,
+            CLOSE_AI_PANEL_LABEL,
+            CLEAR_BLOCK_CONTEXT_LABEL,
+            BACK_TO_CONVERSATION_LABEL,
+        ];
+        assert!(labels.iter().all(|label| !label.is_empty()));
+        for (index, label) in labels.iter().enumerate() {
+            assert!(!labels[..index].contains(label), "duplicate label: {label}");
+        }
+    }
 
     #[test]
     fn session_embedding_budget_is_below_the_outer_snapshot_limit() {

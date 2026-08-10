@@ -94,7 +94,22 @@ jobs:
             scripts/support-bundle.sh packaging/install-release.sh
           scripts/install.sh --help >/dev/null
           scripts/uninstall.sh --help >/dev/null
-          scripts/install.sh --backend cargo --no-config --no-desktop --dry-run >/dev/null
+          install_plan="$(scripts/install.sh --backend cargo --no-config --no-desktop --dry-run)"
+          grep -F "Installed anvil to ${HOME}/.local/bin/anvil" <<<"${install_plan}"
+
+          prefix_plan="$(scripts/install.sh --backend cargo --no-config --no-desktop \
+            --prefix /opt/anvil-prefix --dry-run)"
+          grep -F "Installed anvil to /opt/anvil-prefix/bin/anvil" <<<"${prefix_plan}"
+
+          bin_plan="$(scripts/install.sh --backend cargo --no-config --no-desktop \
+            --prefix /opt/anvil-prefix --bin-dir /opt/anvil-bin --dry-run)"
+          grep -F "Installed anvil to /opt/anvil-bin/anvil" <<<"${bin_plan}"
+
+          uninstall_stage="$(mktemp -d)"
+          trap 'rm -rf -- "${uninstall_stage}"' EXIT
+          install -Dm0755 /bin/true "${uninstall_stage}${HOME}/.local/bin/anvil"
+          uninstall_plan="$(DESTDIR="${uninstall_stage}" scripts/uninstall.sh --dry-run)"
+          grep -F "${uninstall_stage}${HOME}/.local/bin/anvil" <<<"${uninstall_plan}"
 
       - name: Validate CLI and desktop integration
         if: ${{ !cancelled() }}

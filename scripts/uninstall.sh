@@ -20,7 +20,7 @@ Usage:
 
 Options:
   --prefix PATH          Runtime prefix (default: ~/.local)
-  --bin-dir PATH         Runtime binary directory (overrides --prefix)
+  --bin-dir PATH         Runtime binary directory (default: PREFIX/bin)
   --data-dir PATH        Shared-data base (default: $XDG_DATA_HOME or PREFIX/share)
   --purge-config         Also remove anvil config and default XDG state
   --dry-run              Print commands without changing files
@@ -130,6 +130,12 @@ fi
 
 remove_file "${DESTDIR}${BIN_DIR}/anvil"
 remove_file "${DESTDIR}${BIN_DIR}/anvil-support-bundle"
+LEGACY_SOURCE_BIN="${HOME_DIR}/.cargo/bin/anvil"
+if [[ -z "${DESTDIR}" \
+    && "${LEGACY_SOURCE_BIN}" != "${BIN_DIR}/anvil" \
+    && ( -e "${LEGACY_SOURCE_BIN}" || -L "${LEGACY_SOURCE_BIN}" ) ]]; then
+    printf 'Note: legacy source install left untouched at %s.\n' "${LEGACY_SOURCE_BIN}"
+fi
 SHARE_DIR="${DESTDIR}${DATA_HOME}"
 remove_file "${SHARE_DIR}/applications/${APP_ID}.desktop"
 # Desktop integration from before the jterm1 -> anvil rename.

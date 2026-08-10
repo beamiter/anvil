@@ -27,6 +27,10 @@ pub(crate) enum AppMsg {
     /// Result of the background "is a newer jsh published?" check. Boxed so one
     /// rare message does not widen every other variant.
     JshUpdateChecked(Box<jterm_core::jsh_install::Status>),
+    /// Completion of the single-flight workflow cache refresh. Discovery and
+    /// parsing happen off the GTK thread; the app loop owns the cache swap and
+    /// any user-facing error.
+    WorkflowRefreshFinished(Result<Vec<crate::workflows::Workflow>, String>),
     ReloadConfig,
     PaneLaunched(u64),
     PaneLaunchFailed(u64, String),

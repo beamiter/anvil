@@ -4,6 +4,9 @@ use relm4::gtk;
 use relm4::gtk::prelude::*;
 use relm4::prelude::*;
 
+const PARENT_DIRECTORY_LABEL: &str = "Go to parent directory";
+const CURRENT_DIRECTORY_LABEL: &str = "Go to current terminal directory";
+
 #[derive(Debug)]
 pub(crate) enum TabFilterMsg {
     Focus,
@@ -82,6 +85,9 @@ impl Component for FileHeaderModel {
             gtk::Button {
                 set_icon_name: "go-up-symbolic",
                 set_tooltip_text: Some("Parent directory"),
+                update_property: &[
+                    gtk::accessible::Property::Label(PARENT_DIRECTORY_LABEL),
+                ],
                 connect_clicked[sender] => move |_| {
                     let _ = sender.output(FileHeaderOutput::Up);
                 },
@@ -90,6 +96,9 @@ impl Component for FileHeaderModel {
             gtk::Button {
                 set_icon_name: "go-home-symbolic",
                 set_tooltip_text: Some("Go to current directory"),
+                update_property: &[
+                    gtk::accessible::Property::Label(CURRENT_DIRECTORY_LABEL),
+                ],
                 connect_clicked[sender] => move |_| {
                     let _ = sender.output(FileHeaderOutput::CurrentDirectory);
                 },
@@ -133,5 +142,17 @@ impl Component for FileHeaderModel {
                 widgets.root_label.set_tooltip_text(Some(&self.tooltip));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_header_icon_buttons_have_distinct_accessible_labels() {
+        assert!(!PARENT_DIRECTORY_LABEL.is_empty());
+        assert!(!CURRENT_DIRECTORY_LABEL.is_empty());
+        assert_ne!(PARENT_DIRECTORY_LABEL, CURRENT_DIRECTORY_LABEL);
     }
 }

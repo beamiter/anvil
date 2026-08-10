@@ -137,6 +137,11 @@ anvil -d /path/to/project           # launch in a directory
 anvil -e bash -lc 'printf "hello\n"'
 ```
 
+Source installs made by anvil versions that defaulted to
+`~/.cargo/bin/anvil` are not removed automatically. After verifying the new
+`~/.local/bin/anvil`, remove that legacy copy manually if it would otherwise
+shadow the new binary on `PATH`.
+
 Remove installed binaries and assets while preserving configuration and state:
 
 ```bash
@@ -433,6 +438,9 @@ then reloads the newer version and the user can reapply the setting.
 Successful saves use a unique sibling temporary file, `fsync`, atomic rename, and
 a directory sync. Two known-good states rotate through `config.toml.bak` and
 `config.toml.bak.1`. Invalid TOML or schema errors are never overwritten by the UI.
+Configuration files may be owner- or system-managed read-only, but are rejected
+when group or other users can write them; a writable config can select a shell
+and startup commands, so anvil will not load or hot-reload it.
 The lock anchor is `config.toml.lock`; it contains no configuration data and may
 remain on disk while unlocked.
 

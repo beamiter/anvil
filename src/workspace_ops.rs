@@ -6,6 +6,8 @@
 
 use super::*;
 
+const PERSISTENCE_FAILURE_NOTICE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Run every fallible preparation step before allowing a structural commit.
 /// Split uses this with an injected constructor in tests and with Relm4's
 /// synchronously initialized Block component in production.
@@ -1023,6 +1025,27 @@ impl AppModel {
     pub(crate) fn show_toast(&self, message: impl AsRef<str>) {
         self.toast_overlay
             .add_toast(adw::Toast::new(message.as_ref()));
+    }
+
+    /// Drain failures on the GTK thread and turn them into a bounded,
+    /// rate-limited warning. The persistence workers already collapse failures
+    /// by target until they are drained or a later save succeeds; the UI adds
+    /// a short per-operation cooldown so a continuously failing mount does not
+    /// make the application unusable with repeated notifications.
+    pub(crate) fn report_persistence_failures(&mut self) {
+        let failures = crate::persistence::drain_failures();
+        if failures.is_empty() {
+            return;
+        }
+        let Some(message) = persistence_failure_notice(
+            failures,
+            &mut self.persistence_failure_notices,
+            std::time::Instant::now(),
+        ) else {
+            return;
+        };
+        let message = crate::text_safety::bounded_display_text(&message, 1024, false);
+        self.show_toast(message);
     }
 
     pub(crate) fn persist_config(&self) {
@@ -2485,21 +2508,129 @@ fn reconnect_target_is_valid(
     panes_len == 1 && !zoomed && remote_pane_id == Some(event_pane_id)
 }
 
+fn persistence_failure_notice(
+    failures: Vec<crate::persistence::PersistenceFailure>,
+    reported: &mut std::collections::HashMap<String, std::time::Instant>,
+    now: std::time::Instant,
+) -> Option<String> {
+    reported.retain(|_, last_reported| {
+        now.saturating_duration_since(*last_reported) < PERSISTENCE_FAILURE_NOTICE_COOLDOWN
+    });
+
+    let mut reportable = Vec::new();
+    for failure in failures {
+        let is_recent = reported
+            .get(&failure.operation)
+            .is_some_and(|last_reported| {
+                now.saturating_duration_since(*last_reported) < PERSISTENCE_FAILURE_NOTICE_COOLDOWN
+            });
+        if is_recent {
+            continue;
+        }
+        reported.insert(failure.operation.clone(), now);
+        reportable.push(failure);
+    }
+
+    match reportable.as_slice() {
+        [] => None,
+        [failure] => Some(format!(
+            "Background save failed — {}: {}. Recent state may not be saved.",
+            crate::text_safety::bounded_display_text(&failure.operation, 160, false),
+            crate::text_safety::bounded_display_text(&failure.error, 512, false)
+        )),
+        failures => {
+            let operations = failures
+                .iter()
+                .take(4)
+                .map(|failure| {
+                    crate::text_safety::bounded_display_text(&failure.operation, 96, false)
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let remainder = failures.len().saturating_sub(4);
+            let remainder = (remainder > 0).then(|| format!(" (+{remainder} more)"));
+            Some(format!(
+                "Background saves failed for {} operations: {operations}{}. Recent state may not be saved.",
+                failures.len(),
+                remainder.as_deref().unwrap_or("")
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod pane_tree_tests {
     use super::{
         abbreviate_prefix, active_index_after_remove, balanced_split_position, combined_axis_span,
         detach_leaf_and_promote, format_running_process_summary, pane_header_title,
-        pinned_reorder_destination, plan_pane_into_tab, plan_tab_into_pane, prepare_then_commit,
-        reconnect_target_is_valid, replay_argv_for_unmanaged_leaf, restored_leaf_mode,
-        snapshot_restorable_command, tab_drop_preview_is_valid, DropTabIdentity, LeafSlot,
-        PaneIntoTabPlan, TabIntoPanePlan,
+        persistence_failure_notice, pinned_reorder_destination, plan_pane_into_tab,
+        plan_tab_into_pane, prepare_then_commit, reconnect_target_is_valid,
+        replay_argv_for_unmanaged_leaf, restored_leaf_mode, snapshot_restorable_command,
+        tab_drop_preview_is_valid, DropTabIdentity, LeafSlot, PaneIntoTabPlan, TabIntoPanePlan,
+        PERSISTENCE_FAILURE_NOTICE_COOLDOWN,
     };
     use crate::config::TerminalMode;
     use crate::workspace::ConnStatus;
     use relm4::gtk;
     use relm4::gtk::prelude::*;
     use std::cell::Cell;
+
+    fn persistence_failure(operation: &str, error: &str) -> crate::persistence::PersistenceFailure {
+        crate::persistence::PersistenceFailure {
+            operation: operation.to_string(),
+            error: error.to_string(),
+        }
+    }
+
+    #[test]
+    fn persistence_failure_notices_deduplicate_and_rearm_after_the_cooldown() {
+        let start = std::time::Instant::now();
+        let mut reported = std::collections::HashMap::new();
+        let repeated = vec![
+            persistence_failure("save session snapshot", "disk full"),
+            persistence_failure("save session snapshot", "disk full again"),
+        ];
+
+        let first = persistence_failure_notice(repeated.clone(), &mut reported, start)
+            .expect("first failure is visible");
+        assert!(first.contains("save session snapshot"), "{first}");
+        assert_eq!(reported.len(), 1);
+        assert!(
+            persistence_failure_notice(
+                repeated.clone(),
+                &mut reported,
+                start + std::time::Duration::from_secs(1),
+            )
+            .is_none(),
+            "the same operation must not create a toast storm"
+        );
+
+        let rearmed = persistence_failure_notice(
+            repeated,
+            &mut reported,
+            start + PERSISTENCE_FAILURE_NOTICE_COOLDOWN,
+        )
+        .expect("the operation is reportable after its cooldown");
+        assert!(rearmed.contains("disk full"), "{rearmed}");
+    }
+
+    #[test]
+    fn persistence_failure_notice_combines_distinct_operations() {
+        let mut reported = std::collections::HashMap::new();
+        let notice = persistence_failure_notice(
+            vec![
+                persistence_failure("save session snapshot", "disk full"),
+                persistence_failure("Save ASCII organism memory", "permission denied"),
+            ],
+            &mut reported,
+            std::time::Instant::now(),
+        )
+        .expect("distinct failures should be visible");
+
+        assert!(notice.contains("2 operations"), "{notice}");
+        assert!(notice.contains("save session snapshot"), "{notice}");
+        assert!(notice.contains("Save ASCII organism memory"), "{notice}");
+    }
 
     fn drop_tab(
         id: u64,

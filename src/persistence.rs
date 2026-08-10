@@ -498,7 +498,11 @@ pub(crate) fn enqueue_session(
 pub(crate) fn drain_failures() -> Vec<PersistenceFailure> {
     match PERSISTENCE_WORKERS.get() {
         Some(Ok(workers)) => workers.drain_failures(),
-        _ => Vec::new(),
+        Some(Err(error)) => vec![PersistenceFailure {
+            operation: "start background persistence".to_string(),
+            error: error.clone(),
+        }],
+        None => Vec::new(),
     }
 }
 
