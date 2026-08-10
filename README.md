@@ -18,11 +18,13 @@ restoration as the only copy of work in progress.
   drag a split-pane header back to the tab bar to promote it to a normal tab.
   A short tab hover previews the target page, while center/cancel drops leave
   every existing PTY untouched
-- Sidebar tab list and a lazy file tree; files are safely shell-quoted before
-  being inserted at the prompt
+- Sidebar tab list and a lazy file tree with byte-exact Linux path identity;
+  files are safely shell-quoted before being inserted at the prompt, while a
+  non-UTF-8 path is shown unambiguously and never rewritten into another name
 - Command palette, command-history picker, parameterized TOML/YAML workflows, and
   fuzzy search
-- Search within terminal output, block selection, output filtering, bookmarks,
+- Search within terminal output with match counts, previous/next controls and
+  visible regex errors, plus block selection, output filtering, bookmarks,
   copy/rerun controls, and long-command notifications
 - SSH host picker, connection status, multiplexing, and reconnect support
 - Optional persistent multi-chat AI workspace, inline command generation,
@@ -306,7 +308,7 @@ are currently active.
 | `Ctrl+9` | Last tab |
 | `Ctrl+Shift+P` | Unified command palette (actions, history, workflows, AI) |
 | `Ctrl+Shift+H` | History palette; `Ctrl+R` and `Ctrl+P` remain available to the shell |
-| `Ctrl+Shift+F` | Search finished blocks and the currently running command's output (`/pattern/` enables regex) |
+| `Ctrl+Shift+F` | Search terminal output with result count and previous/next controls (`/pattern/` enables regex) |
 | `Ctrl+Shift+G` | In block mode, search command and output lines across all finished blocks |
 | `Ctrl+Shift+O` | Settings |
 | `Ctrl+Shift+R` | Reload configuration |
@@ -700,6 +702,11 @@ ${XDG_CONFIG_HOME:-$HOME/.config}/anvil/tabs.<uuid>.lock
 It records tab titles, pane layout, working directories, and restorable
 foreground commands. On startup, anvil leaves live windows untouched and
 atomically claims the newest valid snapshot whose owner lock is no longer held.
+Live GTK state is captured quickly on the UI thread; JSON encoding, atomic
+replacement, file and directory sync, and cleanup run on a bounded coalescing
+session worker, with the newest pending snapshot winning for each window. Its
+dedicated lane prevents a slow history or organism write from delaying the
+final workspace checkpoint during shutdown.
 Snapshot publication and cleanup share a directory protocol lock so a
 partially published owner cannot be mistaken for an exited process. The legacy
 `tabs.state` and `tabs.<pid>.state` names are still accepted; PID snapshots are
@@ -710,7 +717,11 @@ snapshot it supersedes, so a crash between publishing the new checkpoint and
 cleaning the old claim cannot revive stale state; closing the final tab writes
 a durable empty tombstone for the same reason. Restore and save both enforce a
 4 MiB payload budget, at most 32 tabs, 16 panes per tab and 64 panes total, plus
-bounded argument counts and lengths for recognized replayable commands. The
+bounded argument counts and lengths for recognized replayable commands. These
+structural limits are enforced while the workspace grows, before an
+unrestorable layout can be created. If individually valid optional AI or command
+state would push the aggregate snapshot over 4 MiB, anvil keeps the tab/pane
+workspace and retries without that optional payload. The
 state directory is owner-only (`0700`), and snapshots and locks are `0600`.
 Inspect the newest snapshot with:
 

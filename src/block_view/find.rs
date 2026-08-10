@@ -298,6 +298,7 @@ impl TermView {
         };
         let re = match regex::RegexBuilder::new(&pattern)
             .case_insensitive(true)
+            .multi_line(true)
             .build()
         {
             Ok(re) => re,

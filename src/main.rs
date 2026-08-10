@@ -272,6 +272,7 @@ fn create_pane(
         VteOutput::CommandFinished(false) => AppMsg::Bell(pane_id),
         VteOutput::RemoteSessionId(id) => AppMsg::PaneRemoteSessionId(pane_id, id),
         VteOutput::Notice(message) => AppMsg::Toast(message),
+        VteOutput::SearchStatus(status) => AppMsg::SearchStatus(pane_id, status),
         VteOutput::BlockFinished {
             command,
             exit_code,
@@ -606,25 +607,21 @@ impl SimpleComponent for AppModel {
         bottom_bar.append(&bottom_bar_right);
         bottom_bar.set_visible(config.borrow().bottom_bar);
 
-        let mut settings_font_names: Vec<String> = root
+        let settings_font_names: Vec<String> = root
             .pango_context()
             .list_families()
             .iter()
             .filter(|family| family.is_monospace())
             .map(|family| family.name().to_string())
             .collect();
-        settings_font_names.sort_by_key(|name| name.to_lowercase());
-
         let current_font_desc =
             gtk::pango::FontDescription::from_string(&config.borrow().font_desc);
         let current_family = current_font_desc
             .family()
             .map(|family| family.to_string())
             .unwrap_or_default();
-        let current_font = settings_font_names
-            .iter()
-            .position(|family| family == &current_family)
-            .unwrap_or(0) as u32;
+        let (settings_font_names, current_font) =
+            dialogs::settings::font_choices(settings_font_names, &current_family);
         let current_theme = themes
             .iter()
             .position(|theme| theme.name == config.borrow().theme_name)
@@ -1383,6 +1380,18 @@ impl SimpleComponent for AppModel {
             }
             AppMsg::PaneFocused(_, pane_id) => {
                 if let Some((ti, pi)) = self.find_pane(pane_id) {
+                    let previous_pane_id = self
+                        .tabs
+                        .get(self.active)
+                        .and_then(|tab| tab.panes.get(tab.active_pane))
+                        .map(|pane| pane.id);
+                    let active_pane_changed = ti == self.active
+                        && search::active_pane_changed(previous_pane_id, Some(pane_id));
+                    if active_pane_changed {
+                        if let Some(terminal) = self.active_terminal() {
+                            terminal.emit(VteInput::SearchClear);
+                        }
+                    }
                     self.tabs[ti].active_pane = pi;
                     let focused = self.tabs[ti].panes[pi].terminal.term_view();
                     self.organism_hub.focus_view(focused.as_ref());
@@ -1396,6 +1405,9 @@ impl SimpleComponent for AppModel {
                         self.sync_tab_strip();
                     }
                     self.refresh_bottom_bar();
+                    if active_pane_changed {
+                        self.search.emit(search::SearchMsg::ActivePaneChanged);
+                    }
                 }
             }
             AppMsg::SwapPanes { dragged, target } => self.swap_panes(dragged, target),
@@ -1590,6 +1602,16 @@ impl SimpleComponent for AppModel {
                     terminal.emit(VteInput::GrabFocus);
                 }
             }
+            AppMsg::SearchStatus(pane_id, status) => {
+                let is_active_pane = self
+                    .tabs
+                    .get(self.active)
+                    .and_then(|tab| tab.panes.get(tab.active_pane))
+                    .is_some_and(|pane| pane.id == pane_id);
+                if is_active_pane {
+                    self.search.emit(search::SearchMsg::Status(status));
+                }
+            }
             AppMsg::RenameTab(id, title) => {
                 if let Some(idx) = self.index_of(id) {
                     let trimmed = title.trim();
@@ -1623,8 +1645,14 @@ impl SimpleComponent for AppModel {
                 self.sync_tab_strip();
             }
             AppMsg::FileTreeActivateFile(path) => {
-                let snippet = format!("{} ", process::shell_quote_path(&path));
-                self.insert_review_text(&snippet);
+                if let Some(path) = path.to_str() {
+                    let snippet = format!("{} ", process::shell_quote_path(path));
+                    self.insert_review_text(&snippet);
+                } else {
+                    self.show_toast(
+                        "File path contains non-UTF-8 bytes and cannot be inserted safely.",
+                    );
+                }
             }
             AppMsg::OpenNotebook(path) => {
                 if self.safe_mode {

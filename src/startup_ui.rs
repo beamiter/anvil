@@ -155,15 +155,19 @@ pub(crate) fn build_file_tree(sender: &ComponentSender<AppModel>) -> FileTreeUi 
                 return;
             }
 
-            let file_path: String = store
+            let path_identity: String = store
                 .get_value(&iter, file_tree::COL_PATH as i32)
                 .get()
                 .unwrap_or_default();
-            if file_path.is_empty() {
+            if path_identity.is_empty() {
                 return;
             }
-            if file_path.ends_with(".jtnb.md") {
-                sender.input(AppMsg::OpenNotebook(std::path::PathBuf::from(file_path)));
+            let Some(file_path) = file_tree::decode_path_identity(&path_identity) else {
+                log::warn!("file-tree activation ignored an invalid path identity");
+                return;
+            };
+            if file_tree::is_notebook_path(&file_path) {
+                sender.input(AppMsg::OpenNotebook(file_path));
             } else {
                 sender.input(AppMsg::FileTreeActivateFile(file_path));
             }

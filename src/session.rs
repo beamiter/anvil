@@ -52,9 +52,9 @@ const SESSION_ENVELOPE_VERSION: u8 = 1;
 /// runaway writer or another program's file at a colliding name, and rejecting
 /// it by size gives a better message than a JSON parse error would.
 const MAX_SNAPSHOT_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_RESTORED_TABS: usize = 32;
-const MAX_RESTORED_PANES_PER_TAB: usize = 16;
-const MAX_RESTORED_PANES_TOTAL: usize = 64;
+pub(crate) const MAX_RESTORED_TABS: usize = 32;
+pub(crate) const MAX_RESTORED_PANES_PER_TAB: usize = 16;
+pub(crate) const MAX_RESTORED_PANES_TOTAL: usize = 64;
 const MAX_RESTORED_TITLE_BYTES: usize = 4 * 1024;
 const MAX_RESTORED_COMMAND_ARGS: usize = 256;
 const MAX_RESTORED_COMMAND_ARG_BYTES: usize = 64 * 1024;
@@ -66,7 +66,7 @@ const MAX_RESTORED_LAYOUT_DEPTH: usize = MAX_RESTORED_PANES_PER_TAB;
 const MAX_RESTORED_MODE_BYTES: usize = 64;
 const MAX_RESTORED_CWD_BYTES: usize = 16 * 1024;
 const MAX_RESTORED_REMOTE_NAME_BYTES: usize = 256;
-const MAX_RESTORED_SID_BYTES: usize = 256;
+const MAX_RESTORED_SID_BYTES: usize = crate::config::MAX_SESSION_ID_BYTES;
 const MAX_RESTORED_AI_CONVERSATION_BYTES: usize = 2 * 1024 * 1024;
 const MAX_RESTORED_ENVELOPE_FORMAT_BYTES: usize = 64;
 const MAX_RESTORED_SUPERSEDES_BYTES: usize = 256;
@@ -119,6 +119,78 @@ pub(crate) enum PaneLayout {
     },
 }
 
+fn truncate_string_to_bytes(mut value: String, limit: usize) -> String {
+    if value.len() <= limit {
+        return value;
+    }
+    let mut end = limit;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    value
+}
+
+fn retain_bounded_string(value: Option<String>, limit: usize) -> Option<String> {
+    value.filter(|text| text.len() <= limit)
+}
+
+fn restorable_command_within_limits(argv: &[String]) -> bool {
+    if argv.is_empty() || argv.len() > MAX_RESTORED_COMMAND_ARGS {
+        return false;
+    }
+    let mut total = 0usize;
+    for argument in argv {
+        if argument.len() > MAX_RESTORED_COMMAND_ARG_BYTES || argument.chars().any(char::is_control)
+        {
+            return false;
+        }
+        let Some(next) = total
+            .checked_add(argument.len())
+            .and_then(|bytes| bytes.checked_add(1))
+        else {
+            return false;
+        };
+        if next > MAX_RESTORED_COMMAND_BYTES {
+            return false;
+        }
+        total = next;
+    }
+    true
+}
+
+impl PaneLayout {
+    /// Build one live pane snapshot under the exact budgets enforced by the
+    /// decoder. Display-only text may be shortened, while identity-bearing
+    /// fields are dropped whole so truncation can never select a different
+    /// directory, remote profile, session, or command.
+    pub(crate) fn captured_leaf(
+        mode: String,
+        cwd: Option<String>,
+        cwd_external: bool,
+        remote_name: Option<String>,
+        sid: Option<String>,
+        cmds: Option<Vec<String>>,
+    ) -> Self {
+        Self::Leaf {
+            mode: if mode.len() <= MAX_RESTORED_MODE_BYTES {
+                mode
+            } else {
+                "block".to_string()
+            },
+            cwd: retain_bounded_string(cwd, MAX_RESTORED_CWD_BYTES),
+            cwd_external,
+            remote_name: retain_bounded_string(remote_name, MAX_RESTORED_REMOTE_NAME_BYTES),
+            sid: retain_bounded_string(sid, MAX_RESTORED_SID_BYTES),
+            cmds: cmds.filter(|argv| restorable_command_within_limits(argv)),
+        }
+    }
+
+    pub(crate) fn empty_leaf() -> Self {
+        Self::captured_leaf("block".to_string(), None, false, None, None, None)
+    }
+}
+
 #[derive(Serialize, Debug, Clone)]
 pub(crate) struct SavedTab {
     pub title: String,
@@ -130,6 +202,22 @@ pub(crate) struct SavedTab {
     pub layout: PaneLayout,
 }
 
+impl SavedTab {
+    pub(crate) fn captured(
+        title: String,
+        custom_title: bool,
+        pinned: bool,
+        layout: PaneLayout,
+    ) -> Self {
+        Self {
+            title: truncate_string_to_bytes(title, MAX_RESTORED_TITLE_BYTES),
+            custom_title,
+            pinned,
+            layout,
+        }
+    }
+}
+
 #[derive(Serialize, Debug, Clone, Default)]
 pub(crate) struct SavedSession {
     pub active: usize,
@@ -137,6 +225,35 @@ pub(crate) struct SavedSession {
     /// Bounded, versioned JSON produced by `jterm_core::ai::ConversationSnapshot`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_conversation: Option<String>,
+}
+
+impl SavedSession {
+    pub(crate) fn captured(
+        active: usize,
+        tabs: Vec<SavedTab>,
+        ai_conversation: Option<String>,
+    ) -> Self {
+        Self {
+            active,
+            tabs,
+            // Semantic validation parses up to 2 MiB of JSON, so it belongs in
+            // the persistence worker rather than the GTK capture path.
+            ai_conversation: ai_conversation
+                .filter(|encoded| encoded.len() <= MAX_RESTORED_AI_CONVERSATION_BYTES),
+        }
+    }
+}
+
+pub(crate) fn can_add_persisted_tab(
+    current_tabs: usize,
+    current_panes: usize,
+    adds_pane: bool,
+) -> bool {
+    current_tabs < MAX_RESTORED_TABS && (!adds_pane || current_panes < MAX_RESTORED_PANES_TOTAL)
+}
+
+pub(crate) fn can_add_persisted_pane(current_tab_panes: usize, current_panes: usize) -> bool {
+    current_tab_panes < MAX_RESTORED_PANES_PER_TAB && current_panes < MAX_RESTORED_PANES_TOTAL
 }
 
 /// New snapshots use a small versioned envelope. `SavedSession` itself remains
@@ -1337,31 +1454,6 @@ fn decode_session_envelope(contents: &str) -> Result<DecodedEnvelope, serde_json
 }
 
 fn pane_layout_within_restore_limits(layout: &PaneLayout) -> Option<usize> {
-    fn command_within_limits(argv: &[String]) -> bool {
-        if argv.is_empty() || argv.len() > MAX_RESTORED_COMMAND_ARGS {
-            return false;
-        }
-        let mut total = 0usize;
-        for argument in argv {
-            if argument.len() > MAX_RESTORED_COMMAND_ARG_BYTES
-                || argument.chars().any(char::is_control)
-            {
-                return false;
-            }
-            let Some(next) = total
-                .checked_add(argument.len())
-                .and_then(|bytes| bytes.checked_add(1))
-            else {
-                return false;
-            };
-            if next > MAX_RESTORED_COMMAND_BYTES {
-                return false;
-            }
-            total = next;
-        }
-        true
-    }
-
     fn count(layout: &PaneLayout, remaining: &mut usize) -> Option<usize> {
         match layout {
             PaneLayout::Leaf {
@@ -1384,7 +1476,7 @@ fn pane_layout_within_restore_limits(layout: &PaneLayout) -> Option<usize> {
                         .is_some_and(|value| value.len() > MAX_RESTORED_SID_BYTES)
                     || cmds
                         .as_deref()
-                        .is_some_and(|argv| !command_within_limits(argv))
+                        .is_some_and(|argv| !restorable_command_within_limits(argv))
                     || *remaining == 0
                 {
                     return None;
@@ -1580,31 +1672,97 @@ fn checkpoint_snapshot_for_owner(owner: &SnapshotOwner, session: &SavedSession) 
     owner.commit_pending_restore()
 }
 
-pub(crate) fn save_session(session: &SavedSession) {
-    let owner = match snapshot_owner() {
-        Ok(owner) => owner,
-        Err(err) => {
-            log::error!("Cannot initialize session snapshot owner: {err}");
-            return;
+fn drop_restorable_commands(layout: &mut PaneLayout) -> usize {
+    match layout {
+        PaneLayout::Leaf { cmds, .. } => usize::from(cmds.take().is_some()),
+        PaneLayout::Split { start, end, .. } => {
+            drop_restorable_commands(start) + drop_restorable_commands(end)
         }
-    };
-    let path = &owner.state_path;
-    match checkpoint_snapshot_for_owner(owner, session) {
-        Ok(()) => {
-            let directory = state_dir();
-            prune_recoverable_snapshots(
-                &directory,
-                Some(&owner.token),
-                &|token| token_lock_state_in(&directory, token),
-                MAX_RECOVERABLE_SNAPSHOTS,
-            );
+    }
+}
+
+fn drop_invalid_ai_conversation(session: &mut SavedSession) -> bool {
+    let invalid = session
+        .ai_conversation
+        .as_ref()
+        .is_some_and(|encoded| jterm_core::ai::ConversationSnapshot::from_json(encoded).is_err());
+    if invalid {
+        session.ai_conversation = None;
+    }
+    invalid
+}
+
+/// Keep the terminal workspace recoverable even when individually valid AI
+/// and argv fields combine into a payload larger than the aggregate disk cap.
+/// A failed bounded serialization has not touched the prior snapshot, so it is
+/// safe to retry after dropping optional payloads in least-essential order.
+fn checkpoint_snapshot_resilient(
+    owner: &SnapshotOwner,
+    mut session: SavedSession,
+) -> io::Result<()> {
+    if drop_invalid_ai_conversation(&mut session) {
+        log::warn!("Ignoring invalid AI conversation state while saving the terminal workspace");
+    }
+    match checkpoint_snapshot_for_owner(owner, &session) {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::FileTooLarge => {}
+        Err(error) => return Err(error),
+    }
+
+    if session.ai_conversation.take().is_some() {
+        log::warn!(
+            "Session snapshot exceeded {} bytes; retrying without optional AI conversation state",
+            MAX_SNAPSHOT_BYTES
+        );
+        match checkpoint_snapshot_for_owner(owner, &session) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::FileTooLarge => {}
+            Err(error) => return Err(error),
         }
-        Err(err) => {
-            log::error!(
-                "Failed to atomically save session snapshot {}: {err}",
-                path.display()
-            );
-        }
+    }
+
+    let dropped_commands: usize = session
+        .tabs
+        .iter_mut()
+        .map(|tab| drop_restorable_commands(&mut tab.layout))
+        .sum();
+    if dropped_commands == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            format!("session snapshot still exceeds {MAX_SNAPSHOT_BYTES} bytes"),
+        ));
+    }
+    log::warn!(
+        "Session snapshot exceeded {} bytes; retrying without {dropped_commands} optional restorable command(s)",
+        MAX_SNAPSHOT_BYTES
+    );
+    checkpoint_snapshot_for_owner(owner, &session)
+}
+
+fn save_session_now(session: SavedSession) -> io::Result<()> {
+    let owner = snapshot_owner()?;
+    checkpoint_snapshot_resilient(owner, session)?;
+    let directory = state_dir();
+    prune_recoverable_snapshots(
+        &directory,
+        Some(&owner.token),
+        &|token| token_lock_state_in(&directory, token),
+        MAX_RECOVERABLE_SNAPSHOTS,
+    );
+    Ok(())
+}
+
+/// Queue a main-thread snapshot for bounded, coalescing background persistence.
+/// Capturing GTK-owned state stays synchronous; JSON encoding, atomic replace,
+/// file/directory fsync, claim cleanup, and pruning all run on the worker.
+pub(crate) fn save_session(session: SavedSession) {
+    let key = crate::persistence::PersistenceKey::for_path("session", &state_dir());
+    if let Err(error) =
+        crate::persistence::enqueue_session(key, "save session snapshot", move || {
+            save_session_now(session)
+        })
+    {
+        log::error!("Cannot queue session snapshot: {error}");
     }
 }
 
@@ -2875,6 +3033,25 @@ mod tests {
         layout
     }
 
+    fn set_command_on_leaves(layout: &mut PaneLayout, argv: &[String]) {
+        match layout {
+            PaneLayout::Leaf { cmds, .. } => *cmds = Some(argv.to_vec()),
+            PaneLayout::Split { start, end, .. } => {
+                set_command_on_leaves(start, argv);
+                set_command_on_leaves(end, argv);
+            }
+        }
+    }
+
+    fn layout_commands_are_empty(layout: &PaneLayout) -> bool {
+        match layout {
+            PaneLayout::Leaf { cmds, .. } => cmds.is_none(),
+            PaneLayout::Split { start, end, .. } => {
+                layout_commands_are_empty(start) && layout_commands_are_empty(end)
+            }
+        }
+    }
+
     #[test]
     fn session_round_trip_restores_a_bounded_ai_chat_collection() {
         let turns = vec![
@@ -2997,6 +3174,77 @@ mod tests {
     }
 
     #[test]
+    fn capture_constructors_enforce_the_same_field_budgets_as_restore() {
+        let maximum_sid = "s".repeat(MAX_RESTORED_SID_BYTES);
+        let layout = PaneLayout::captured_leaf(
+            "m".repeat(MAX_RESTORED_MODE_BYTES + 1),
+            Some("c".repeat(MAX_RESTORED_CWD_BYTES + 1)),
+            true,
+            Some("r".repeat(MAX_RESTORED_REMOTE_NAME_BYTES + 1)),
+            Some(maximum_sid.clone()),
+            Some(vec![
+                "ssh".to_string(),
+                "x".repeat(MAX_RESTORED_COMMAND_ARG_BYTES + 1),
+            ]),
+        );
+        assert!(matches!(
+            &layout,
+            PaneLayout::Leaf {
+                mode,
+                cwd: None,
+                cwd_external: true,
+                remote_name: None,
+                sid: Some(sid),
+                cmds: None,
+            } if mode == "block" && sid == &maximum_sid
+        ));
+
+        let oversized_sid = PaneLayout::captured_leaf(
+            "block".to_string(),
+            None,
+            false,
+            None,
+            Some("s".repeat(MAX_RESTORED_SID_BYTES + 1)),
+            None,
+        );
+        assert!(matches!(oversized_sid, PaneLayout::Leaf { sid: None, .. }));
+
+        let title = "界".repeat(MAX_RESTORED_TITLE_BYTES / "界".len() + 2);
+        let tab = SavedTab::captured(title, true, false, layout);
+        assert!(tab.title.len() <= MAX_RESTORED_TITLE_BYTES);
+        assert!(tab.title.is_char_boundary(tab.title.len()));
+        let mut captured = SavedSession::captured(0, vec![tab], Some("not a chat snapshot".into()));
+        assert!(captured.ai_conversation.is_some());
+        assert!(drop_invalid_ai_conversation(&mut captured));
+        assert!(captured.ai_conversation.is_none());
+        assert!(session_within_restore_limits(&captured));
+    }
+
+    #[test]
+    fn live_workspace_growth_stops_at_the_restore_capacity() {
+        assert!(can_add_persisted_tab(
+            MAX_RESTORED_TABS - 1,
+            MAX_RESTORED_PANES_TOTAL - 1,
+            true
+        ));
+        assert!(!can_add_persisted_tab(
+            MAX_RESTORED_TABS,
+            MAX_RESTORED_TABS,
+            false
+        ));
+        assert!(!can_add_persisted_tab(1, MAX_RESTORED_PANES_TOTAL, true));
+        assert!(can_add_persisted_pane(
+            MAX_RESTORED_PANES_PER_TAB - 1,
+            MAX_RESTORED_PANES_TOTAL - 1
+        ));
+        assert!(!can_add_persisted_pane(
+            MAX_RESTORED_PANES_PER_TAB,
+            MAX_RESTORED_PANES_PER_TAB
+        ));
+        assert!(!can_add_persisted_pane(1, MAX_RESTORED_PANES_TOTAL));
+    }
+
+    #[test]
     fn save_rejects_every_restore_limit_and_keeps_last_good_snapshot() {
         let dir = TestDir::new("save-limits");
         let owner = SnapshotOwner::create_in(dir.path()).unwrap();
@@ -3060,6 +3308,51 @@ mod tests {
                 "a rejected save must not replace the last-good snapshot"
             );
         }
+    }
+
+    #[test]
+    fn aggregate_size_fallback_keeps_the_workspace_without_optional_commands() {
+        let dir = TestDir::new("aggregate-save-budget");
+        let owner = SnapshotOwner::create_in(dir.path()).unwrap();
+        let base = saved_session("large-but-valid").tabs.remove(0);
+        let argv = vec![
+            "ssh".to_string(),
+            "x".repeat(MAX_RESTORED_COMMAND_ARG_BYTES),
+        ];
+        let tabs = (0..4)
+            .map(|index| {
+                let mut layout = layout_with_leaves(MAX_RESTORED_PANES_PER_TAB);
+                set_command_on_leaves(&mut layout, &argv);
+                SavedTab {
+                    title: format!("tab-{index}"),
+                    layout,
+                    ..base.clone()
+                }
+            })
+            .collect();
+        let session = SavedSession {
+            active: 2,
+            tabs,
+            ai_conversation: None,
+        };
+        assert!(session_within_restore_limits(&session));
+        assert_eq!(
+            serialize_snapshot_bounded(&owner, &session)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::FileTooLarge
+        );
+
+        checkpoint_snapshot_resilient(&owner, session).unwrap();
+        let encoded = read_snapshot_bounded(&owner.state_path).unwrap();
+        let decoded = decode_session_envelope(&encoded).unwrap();
+        let restored = workspace(&decoded.state);
+        assert_eq!(restored.active, 2);
+        assert_eq!(restored.tabs.len(), 4);
+        assert!(restored
+            .tabs
+            .iter()
+            .all(|tab| layout_commands_are_empty(&tab.layout)));
     }
 
     #[cfg(unix)]

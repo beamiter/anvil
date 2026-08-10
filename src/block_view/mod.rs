@@ -156,19 +156,40 @@ fn mutate_block_data_and_redraw<R>(
     result
 }
 
-/// Update the jump-to-bottom FAB's label to show an unread-block badge: just the
-/// chevron when nothing is pending, chevron + count (clamped to "99+") otherwise.
+/// Give an icon-only button a stable tooltip and an explicit accessible name.
+/// GTK symbolic icons come from the active icon theme, so these controls do not
+/// depend on glyphs supplied only by patched terminal fonts.
+fn set_icon_button(button: &gtk::Button, icon_name: &str, label: &str) {
+    button.set_icon_name(icon_name);
+    button.set_tooltip_text(Some(label));
+    button.update_property(&[gtk::accessible::Property::Label(label)]);
+}
+
+fn icon_button(icon_name: &str, label: &str) -> gtk::Button {
+    let button = gtk::Button::from_icon_name(icon_name);
+    set_icon_button(&button, icon_name, label);
+    button
+}
+
+/// Update the jump-to-bottom FAB to show an unread-block badge: just the
+/// symbolic icon when nothing is pending, icon + count (clamped to "99+")
+/// otherwise.
 fn set_jump_fab_label(fab: &gtk::Button, unread: u32) {
+    let content = gtk::Box::new(Orientation::Horizontal, 6);
+    content.append(&gtk::Image::from_icon_name("go-bottom-symbolic"));
     if unread > 0 {
         let n = if unread > 99 {
             "99+".to_string()
         } else {
             unread.to_string()
         };
-        fab.set_label(&format!("\u{f078}  {}", n));
+        content.append(&gtk::Label::new(Some(&n)));
+        let accessible = format!("Jump to latest, {n} unread blocks");
+        fab.update_property(&[gtk::accessible::Property::Label(&accessible)]);
     } else {
-        fab.set_label("\u{f078}");
+        fab.update_property(&[gtk::accessible::Property::Label("Jump to latest")]);
     }
+    fab.set_child(Some(&content));
 }
 
 /// Whether a key press seen while keyboard focus is stranded on a finished
@@ -4474,8 +4495,8 @@ impl TermView {
         let jump_fab = gtk::Button::new();
         jump_fab.add_css_class("jump-bottom-fab");
         jump_fab.add_css_class("flat");
-        jump_fab.set_label("\u{f078}"); // nf-fa-chevron_down
         jump_fab.set_tooltip_text(Some("Jump to latest"));
+        set_jump_fab_label(&jump_fab, 0);
         jump_fab.set_halign(gtk::Align::End);
         jump_fab.set_valign(gtk::Align::End);
         jump_fab.set_margin_end(18);
@@ -4493,21 +4514,22 @@ impl TermView {
         sticky_label.set_hexpand(true);
         sticky_label.add_css_class("sticky-running-label");
 
-        let sticky_jump_bottom_btn = gtk::Button::with_label("\u{f103}");
-        sticky_jump_bottom_btn.set_tooltip_text(Some("Jump to bottom of this block"));
+        let sticky_jump_bottom_btn =
+            icon_button("go-bottom-symbolic", "Jump to bottom of this block");
         sticky_jump_bottom_btn.add_css_class("sticky-header-control");
         sticky_jump_bottom_btn.add_css_class("flat");
         sticky_jump_bottom_btn.set_focusable(false);
         sticky_jump_bottom_btn.set_visible(false);
 
-        let sticky_minimize_btn = gtk::Button::with_label("\u{f077}");
-        sticky_minimize_btn.set_tooltip_text(Some("Minimize sticky command header"));
+        let sticky_minimize_btn = icon_button("go-up-symbolic", "Minimize sticky command header");
         sticky_minimize_btn.add_css_class("sticky-header-control");
         sticky_minimize_btn.add_css_class("flat");
         sticky_minimize_btn.set_focusable(false);
 
-        let sticky_stop_btn = gtk::Button::with_label("\u{f04d}");
-        sticky_stop_btn.set_tooltip_text(Some("Interrupt the running command (Ctrl+C)"));
+        let sticky_stop_btn = icon_button(
+            "media-playback-stop-symbolic",
+            "Interrupt the running command (Ctrl+C)",
+        );
         sticky_stop_btn.add_css_class("sticky-header-control");
         sticky_stop_btn.add_css_class("flat");
         sticky_stop_btn.set_focusable(false);
@@ -4547,12 +4569,10 @@ impl TermView {
                 stop.set_visible(false);
                 if now_minimized {
                     bar.add_css_class("sticky-minimized");
-                    button.set_label("\u{f078}");
-                    button.set_tooltip_text(Some("Expand sticky command header"));
+                    set_icon_button(button, "go-down-symbolic", "Expand sticky command header");
                 } else {
                     bar.remove_css_class("sticky-minimized");
-                    button.set_label("\u{f077}");
-                    button.set_tooltip_text(Some("Minimize sticky command header"));
+                    set_icon_button(button, "go-up-symbolic", "Minimize sticky command header");
                 }
             });
         }
@@ -4567,8 +4587,12 @@ impl TermView {
         // after the first chunk is actually deferred.
         let selection_feed_hold = SelectionFeedHold::new();
         {
-            let hold_badge = gtk::Label::new(Some("\u{f04c}  Output paused — selection"));
+            let hold_badge = gtk::Label::new(Some("Output paused — selection"));
             hold_badge.add_css_class("feed-hold-badge");
+            hold_badge.set_accessible_role(gtk::AccessibleRole::Status);
+            hold_badge.update_property(&[gtk::accessible::Property::Label(
+                "Output paused while text is selected",
+            )]);
             hold_badge.set_tooltip_text(Some(
                 "Streaming output is held so your selection survives. Copy it, click elsewhere, or wait a few seconds to resume.",
             ));

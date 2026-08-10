@@ -10,6 +10,8 @@ use crate::keybindings::KeybindingMap;
 use jterm_core::host::find_executable_in_path;
 use jterm_core::process::shell_single_quote;
 
+const DEFAULT_FONT_DESC: &str = "Monospace 14";
+
 // ---------------------------------------------------------------------------
 // Terminal Mode
 // ---------------------------------------------------------------------------
@@ -107,6 +109,7 @@ impl SidebarView {
 // ---------------------------------------------------------------------------
 
 pub(crate) const MAX_REMOTE_HOSTS: usize = 128;
+pub(crate) const MAX_SESSION_ID_BYTES: usize = 1024;
 const MAX_CONFIG_PATH_BYTES: usize = 16 * 1024;
 const MAX_AI_BASE_URL_BYTES: usize = 4 * 1024;
 
@@ -198,7 +201,9 @@ fn wrap_jsh_argv_in_interactive_bash(jsh_path: &str) -> Option<Vec<String>> {
 }
 
 pub(crate) fn valid_session_id(session_id: &str) -> bool {
-    !session_id.is_empty() && session_id.len() <= 1024 && !session_id.chars().any(char::is_control)
+    !session_id.is_empty()
+        && session_id.len() <= MAX_SESSION_ID_BYTES
+        && !session_id.chars().any(char::is_control)
 }
 
 /// Apply a saved jsh session id to either a direct jsh argv or the exact
@@ -477,7 +482,7 @@ impl Config {
         Self {
             window_opacity: 0.95,
             terminal_scrollback_lines: 5_000,
-            font_desc: "SauceCodePro Nerd Font Mono 14".to_string(),
+            font_desc: DEFAULT_FONT_DESC.to_string(),
             default_font_scale: 1.0,
             theme_name: theme.name.clone(),
             foreground: theme.foreground,
@@ -1231,7 +1236,7 @@ fn parse_remote_hosts(table: &toml::Table) -> Vec<RemoteHost> {
                 .map(|s| s.to_string());
             if session
                 .as_deref()
-                .is_some_and(|value| !remote_text_is_safe(value, true, 1_024))
+                .is_some_and(|value| !remote_text_is_safe(value, true, MAX_SESSION_ID_BYTES))
             {
                 return None;
             }
@@ -1423,11 +1428,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         .clamp(0.1, 10.0);
     let font_desc = env_string("ANVIL_FONT")
         .or(fc.font)
-        // Use the "Mono" (NFM) Nerd Font variant: the plain "Nerd Font" (NF)
-        // variant renders proportionally in VTE (glyphs draw at non-cell widths)
-        // even though fontconfig reports it spacing=100, so output never aligns
-        // like a real terminal. NFM forces single-cell glyphs.
-        .unwrap_or_else(|| "SauceCodePro Nerd Font Mono 14".to_string());
+        .unwrap_or_else(|| DEFAULT_FONT_DESC.to_string());
 
     let foreground = env_rgba("ANVIL_FG")
         .or_else(|| fc.foreground.as_deref().and_then(|v| RGBA::parse(v).ok()))
@@ -1747,6 +1748,19 @@ pub(crate) fn choose_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn portable_font_default_matches_the_example_config() {
+        assert_eq!(Config::safe_defaults().font_desc, DEFAULT_FONT_DESC);
+
+        let example = include_str!("../config.toml.example")
+            .parse::<toml::Table>()
+            .expect("example config must remain valid TOML");
+        assert_eq!(
+            example.get("font").and_then(toml::Value::as_str),
+            Some(DEFAULT_FONT_DESC)
+        );
+    }
+
     fn host() -> RemoteHost {
         RemoteHost {
             name: "h".into(),
@@ -2015,6 +2029,14 @@ mod tests {
 
         let (_, applied) = shell_argv_with_session(&wrapped, Some("bad\nsession"));
         assert!(!applied);
+    }
+
+    #[test]
+    fn session_id_budget_is_shared_with_persisted_panes() {
+        assert!(valid_session_id(&"s".repeat(MAX_SESSION_ID_BYTES)));
+        assert!(!valid_session_id(&"s".repeat(MAX_SESSION_ID_BYTES + 1)));
+        assert!(!valid_session_id(""));
+        assert!(!valid_session_id("session\nspoof"));
     }
 
     #[test]

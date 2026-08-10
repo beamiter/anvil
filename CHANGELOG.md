@@ -97,6 +97,12 @@ versioning for tagged releases while it remains experimental.
   the finished blocks, so next/previous search navigation reaches long-running
   builds and streaming commands before they finish; closing search clears the
   live highlight as well.
+- Find-in-terminal now reports `No results`, the current/total match position,
+  counts that cannot be proven exact with a `+`, and invalid-regex errors in the
+  search bar. Both Block and VTE backends feed the same status model, rebind the
+  current query when the active pane changes, and expose accessible
+  previous/next/close buttons while Enter, Shift+Enter, and Escape retain their
+  keyboard behavior.
 - Whole-session export: "Export session as Markdown/JSON file" writes every
   completed block to a timestamped, owner-only file under the anvil data
   directory and reports the path in a toast.
@@ -139,6 +145,18 @@ versioning for tagged releases while it remains experimental.
 - Contribution, architecture, and private vulnerability reporting guidance.
 
 ### Changed
+
+- Session snapshots now leave the GTK thread after capturing owned Rust state.
+  JSON validation/encoding, atomic replacement, file and directory sync,
+  predecessor cleanup, and pruning run through the bounded coalescing
+  session lane; repeated changes keep only the newest pending snapshot and
+  normal shutdown flushes it before the ordinary history/organism lane, so an
+  unrelated slow target cannot hold the final workspace behind it.
+- The out-of-box terminal font is the portable Pango `Monospace 14` alias.
+  Block status and action affordances use GTK symbolic icons or explicit text,
+  so a clean Linux install no longer needs a separately installed Nerd Font.
+  An explicitly configured custom font remains selectable even when Pango does
+  not include it in its enumerated family list.
 
 - The Kitty graphics protocol now parses through
   `jterm_core::kitty_graphics`: control data, chunk assembly, base64, raw
@@ -231,6 +249,22 @@ versioning for tagged releases while it remains experimental.
   open with that error rather than starting unmanaged.
 
 ### Fixed
+
+- Live session capture now shares the decoder's field budgets and session IDs
+  consistently accept the configured 1024-byte boundary. Workspace growth is
+  stopped with actionable feedback at the restorable 32-tab, 16-pane-per-tab,
+  and 64-pane limits; an aggregate-size retry drops optional AI state and then
+  replay commands while preserving the tab/pane layout.
+- Persistence failures are generation-aware: a recovered write clears only
+  older errors, draining an error allows a later failure to be reported again,
+  and an older in-flight success cannot hide a newer rejected update.
+- File-tree rows retain raw Unix path bytes in a reversible bounded identity
+  instead of round-tripping through lossy UTF-8. Distinct invalid byte names no
+  longer collide; notebook activation preserves the original `PathBuf`, and a
+  normal non-UTF-8 file is refused with feedback rather than inserting a path
+  containing U+FFFD. Flatpak notebook execution likewise fails explicitly when
+  its working directory cannot cross the UTF-8-only host bridge, rather than
+  running in a lossy replacement path.
 
 - OSC 8 hyperlinks are now bounded and validated before becoming clickable:
   only the terminal's documented URI schemes are accepted, control/whitespace

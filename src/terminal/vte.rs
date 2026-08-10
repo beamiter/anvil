@@ -23,6 +23,7 @@ use vte4::{TerminalExt, TerminalExtManual};
 
 use crate::child_env;
 use crate::config::Config;
+use crate::search::{invalid_regex_message, SearchStatus};
 
 // ─── Terminal widget construction (ported from forge terminal.rs) ──────────
 
@@ -458,6 +459,9 @@ pub enum VteOutput {
     /// User-facing feedback for a backend action (e.g. undo-clear, export)
     /// that the application surfaces as a toast.
     Notice(String),
+    /// Current find-in-terminal result. Both backends emit the same state so
+    /// the window search bar never has to infer a count or regex failure.
+    SearchStatus(SearchStatus),
     /// A finished block, with the full reconstructed command + exit + a
     /// captured-output sample. Drives agent-mode's run-observe loop. Emitted
     /// by BlockTerminal only (the plain VTE wrapper has no block concept).
@@ -485,6 +489,7 @@ pub enum VteOutput {
 pub struct VteTerminal {
     terminal: Terminal,
     config: Rc<RefCell<Config>>,
+    search_status: SearchStatus,
 }
 
 impl VteTerminal {
@@ -610,6 +615,7 @@ impl Component for VteTerminal {
         let model = VteTerminal {
             terminal,
             config: init.config,
+            search_status: SearchStatus::Idle,
         };
         ComponentParts { model, widgets: () }
     }
@@ -689,25 +695,43 @@ impl Component for VteTerminal {
             | VteInput::ExportSessionMarkdown
             | VteInput::ExportSessionJson => {}
             VteInput::SearchSet(query, use_regex) => {
-                let pattern = if use_regex {
-                    query
-                } else {
-                    gtk::glib::Regex::escape_string(&query).to_string()
+                let pattern = search_pattern(&query, use_regex);
+                self.search_status = match vte4::Regex::for_search(
+                    &pattern,
+                    pcre2_sys::PCRE2_CASELESS | pcre2_sys::PCRE2_MULTILINE,
+                ) {
+                    Ok(regex) => {
+                        self.terminal.search_set_regex(Some(&regex), 0);
+                        self.terminal.search_set_wrap_around(true);
+                        let found = self.terminal.search_find_next();
+                        search_status_for_vte(
+                            compile_count_regex(&pattern).ok().as_ref(),
+                            terminal_search_snapshot(&self.terminal),
+                            found,
+                            !use_regex,
+                        )
+                    }
+                    Err(error) => {
+                        self.terminal.search_set_regex(None::<&vte4::Regex>, 0);
+                        SearchStatus::Error(invalid_regex_message(error))
+                    }
                 };
-                if let Ok(regex) = vte4::Regex::for_search(&pattern, pcre2_sys::PCRE2_CASELESS) {
-                    self.terminal.search_set_regex(Some(&regex), 0);
-                    self.terminal.search_set_wrap_around(true);
-                    self.terminal.search_find_next();
-                }
+                let _ = sender.output(VteOutput::SearchStatus(self.search_status.clone()));
             }
             VteInput::SearchNext => {
-                self.terminal.search_find_next();
+                let found = self.terminal.search_find_next();
+                self.search_status = self.search_status.stepped(1, found);
+                let _ = sender.output(VteOutput::SearchStatus(self.search_status.clone()));
             }
             VteInput::SearchPrev => {
-                self.terminal.search_find_previous();
+                let found = self.terminal.search_find_previous();
+                self.search_status = self.search_status.stepped(-1, found);
+                let _ = sender.output(VteOutput::SearchStatus(self.search_status.clone()));
             }
             VteInput::SearchClear => {
                 self.terminal.search_set_regex(None::<&vte4::Regex>, 0);
+                self.search_status = SearchStatus::Idle;
+                let _ = sender.output(VteOutput::SearchStatus(SearchStatus::Idle));
             }
             VteInput::CrossBlockSearch => {}
             VteInput::AskAiAboutSelectedBlock => {}
@@ -715,9 +739,132 @@ impl Component for VteTerminal {
     }
 }
 
+pub(super) fn search_pattern(query: &str, use_regex: bool) -> String {
+    if use_regex {
+        query.to_string()
+    } else {
+        regex::escape(query)
+    }
+}
+
+/// Compile the Rust-regex mirror used by Block search and by VTE result
+/// counting. VTE installs its native PCRE2 regex first: a PCRE2 feature such as
+/// look-around may be uncountable here, but it remains searchable and is shown
+/// with an explicitly inexact `+` total instead of being rejected.
+pub(super) fn compile_count_regex(pattern: &str) -> Result<regex::Regex, String> {
+    regex::RegexBuilder::new(pattern)
+        .case_insensitive(true)
+        // Native terminal search uses PCRE2_MULTILINE. Keep anchors aligned in
+        // the mirror counter; regex totals remain marked approximate because
+        // the two engines still differ in other grammar and semantics.
+        .multi_line(true)
+        .build()
+        .map_err(invalid_regex_message)
+}
+
+const VTE_SEARCH_SCAN_MAX_ROWS: i64 = 10_000;
+const VTE_SEARCH_SCAN_MAX_BYTES: usize = 2 * 1024 * 1024;
+const MAX_UTF8_BYTES_PER_CELL: usize = 4;
+
+#[derive(Debug)]
+struct TerminalSearchSnapshot {
+    text: String,
+    truncated: bool,
+}
+
+/// VTE exposes next/previous success but no total match count. Count only a
+/// bounded suffix: at most 10k rows, with a conservative cell-derived 2 MiB
+/// budget and a hard post-extraction byte cap. The returned `truncated` bit is
+/// part of the user-visible result (`N+`), never hidden as an exact total.
+fn terminal_search_snapshot(terminal: &Terminal) -> TerminalSearchSnapshot {
+    let columns = terminal.column_count();
+    if columns <= 0 {
+        return TerminalSearchSnapshot {
+            text: String::new(),
+            truncated: false,
+        };
+    }
+    let (_, cursor_row) = terminal.cursor_position();
+    let (start_row, end_row) = terminal
+        .vadjustment()
+        .map_or((0, cursor_row), |adjustment| {
+            let start = adjustment.lower().floor() as i64;
+            let adjustment_end = (adjustment.upper().ceil() as i64).saturating_sub(1);
+            (start.min(cursor_row), adjustment_end.max(cursor_row))
+        });
+    if end_row < start_row {
+        return TerminalSearchSnapshot {
+            text: String::new(),
+            truncated: false,
+        };
+    }
+
+    let columns_usize = usize::try_from(columns).unwrap_or(usize::MAX).max(1);
+    let rows_from_cell_budget = VTE_SEARCH_SCAN_MAX_BYTES
+        .saturating_sub(VTE_SEARCH_SCAN_MAX_ROWS as usize)
+        .checked_div(columns_usize.saturating_mul(MAX_UTF8_BYTES_PER_CELL).max(1))
+        .unwrap_or(0)
+        .max(1);
+    let row_budget = VTE_SEARCH_SCAN_MAX_ROWS.min(rows_from_cell_budget as i64);
+    let scan_start = end_row
+        .saturating_sub(row_budget.saturating_sub(1))
+        .max(start_row);
+    let rows_truncated = scan_start > start_row;
+    let mut text = terminal
+        .text_range_format(
+            vte4::Format::Text,
+            scan_start,
+            0,
+            end_row,
+            columns.saturating_sub(1),
+        )
+        .0
+        .map(|text| text.to_string())
+        .unwrap_or_default();
+    let bytes_truncated = text.len() > VTE_SEARCH_SCAN_MAX_BYTES;
+    if bytes_truncated {
+        let mut keep_from = text.len() - VTE_SEARCH_SCAN_MAX_BYTES;
+        while !text.is_char_boundary(keep_from) {
+            keep_from += 1;
+        }
+        text = text.split_off(keep_from);
+    }
+    TerminalSearchSnapshot {
+        text,
+        truncated: rows_truncated || bytes_truncated,
+    }
+}
+
+fn search_status_for_vte(
+    counter: Option<&regex::Regex>,
+    snapshot: TerminalSearchSnapshot,
+    native_found: bool,
+    counter_matches_native_semantics: bool,
+) -> SearchStatus {
+    // Native VTE searched the complete scrollback, so failure is an exact zero
+    // even when our count snapshot was bounded.
+    if !native_found {
+        return SearchStatus::results(0, 0);
+    }
+    let Some(counter) = counter else {
+        // Legal PCRE2 outside Rust regex's grammar remains fully searchable.
+        return SearchStatus::partial_results(1, 1);
+    };
+    let counted = counter.find_iter(&snapshot.text).count();
+    if !counter_matches_native_semantics || snapshot.truncated || counted == 0 {
+        SearchStatus::partial_results(1, counted.max(1))
+    } else {
+        SearchStatus::results(1, counted)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{launch_failure_message, InitialCommands};
+    use super::{
+        compile_count_regex, launch_failure_message, search_pattern, search_status_for_vte,
+        InitialCommands, TerminalSearchSnapshot,
+    };
+    use crate::search::SearchStatus;
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
@@ -730,6 +877,104 @@ mod tests {
             commands.as_slice(),
             strings(&["cd /tmp", "printf ready"]).as_slice()
         );
+    }
+
+    #[test]
+    fn search_query_compilation_is_literal_by_default_and_reports_bad_block_regex() {
+        let literal = compile_count_regex(&search_pattern("a+b", false)).unwrap();
+        assert_eq!(literal.find_iter("A+B aab").count(), 1);
+
+        let regex = compile_count_regex(&search_pattern("a+b", true)).unwrap();
+        assert_eq!(regex.find_iter("A+B aab").count(), 1);
+
+        let error = compile_count_regex(&search_pattern("(", true)).unwrap_err();
+        assert!(error.starts_with("Invalid regex:"));
+        assert!(!error.contains('\n'));
+    }
+
+    #[test]
+    fn bounded_or_pcre_only_counts_are_explicitly_inexact() {
+        let counter = compile_count_regex("hit").unwrap();
+        assert_eq!(
+            search_status_for_vte(
+                Some(&counter),
+                TerminalSearchSnapshot {
+                    text: "hit hit".into(),
+                    truncated: false,
+                },
+                true,
+                true,
+            ),
+            SearchStatus::results(1, 2)
+        );
+        let partial = search_status_for_vte(
+            Some(&counter),
+            TerminalSearchSnapshot {
+                text: "hit hit".into(),
+                truncated: true,
+            },
+            true,
+            true,
+        );
+        assert_eq!(partial, SearchStatus::partial_results(1, 2));
+
+        // Look-ahead is valid PCRE2 but deliberately outside Rust regex. VTE
+        // accepts it natively; lack of a mirror counter must not become an error.
+        assert!(compile_count_regex("(?=hit)").is_err());
+        assert!(vte4::Regex::for_search("(?=hit)", pcre2_sys::PCRE2_CASELESS).is_ok());
+        assert_eq!(
+            search_status_for_vte(
+                None,
+                TerminalSearchSnapshot {
+                    text: "hit".into(),
+                    truncated: false,
+                },
+                true,
+                false,
+            ),
+            SearchStatus::partial_results(1, 1)
+        );
+        assert_eq!(
+            search_status_for_vte(
+                None,
+                TerminalSearchSnapshot {
+                    text: String::new(),
+                    truncated: true,
+                },
+                false,
+                false,
+            ),
+            SearchStatus::results(0, 0)
+        );
+    }
+
+    #[test]
+    fn regex_counts_are_partial_even_when_both_engines_compile() {
+        let pattern = "[a&&a]";
+        let counter = compile_count_regex(pattern).unwrap();
+        assert!(vte4::Regex::for_search(
+            pattern,
+            pcre2_sys::PCRE2_CASELESS | pcre2_sys::PCRE2_MULTILINE,
+        )
+        .is_ok());
+        assert_eq!(
+            search_status_for_vte(
+                Some(&counter),
+                TerminalSearchSnapshot {
+                    text: "a".into(),
+                    truncated: false,
+                },
+                true,
+                false,
+            ),
+            SearchStatus::partial_results(1, 1)
+        );
+    }
+
+    #[test]
+    fn mirror_counter_uses_the_native_multiline_anchor_mode() {
+        let counter = compile_count_regex("^hit$").unwrap();
+        assert_eq!(counter.find_iter("miss\nhit\ntail").count(), 1);
     }
 
     #[test]

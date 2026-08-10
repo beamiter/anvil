@@ -17,7 +17,9 @@ use gtk::{
     TreeViewColumn,
 };
 use std::cell::Cell;
+use std::ffi::{OsStr, OsString};
 use std::io;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -34,6 +36,8 @@ const SCAN_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const MAX_DIRECTORY_ENTRIES: usize = 4_096;
 const MAX_FILE_NAME_DISPLAY_BYTES: usize = 512;
 const MAX_FILE_PATH_DISPLAY_BYTES: usize = 4 * 1024;
+const MAX_FILE_PATH_IDENTITY_BYTES: usize = 64 * 1024;
+const PATH_IDENTITY_PREFIX: &str = "unix-path-v1:";
 const MAX_CONCURRENT_SCANS: usize = 16;
 static ACTIVE_SCANS: AtomicUsize = AtomicUsize::new(0);
 
@@ -82,7 +86,7 @@ fn scan_dir(dir: &Path) -> io::Result<Vec<FileEntry>> {
             continue;
         };
         entries.push(FileEntry {
-            name: entry.file_name().to_string_lossy().into_owned(),
+            name: display_os_str(&entry.file_name()),
             // Do not follow directory symlinks: they can create cycles or turn
             // one expansion into a scan outside the tree the user selected.
             is_dir: file_type.is_dir(),
@@ -91,6 +95,96 @@ fn scan_dir(dir: &Path) -> io::Result<Vec<FileEntry>> {
     }
     sort_entries(&mut entries);
     Ok(entries)
+}
+
+/// Encode a Linux path for storage in GTK's string-only tree model without
+/// ever treating its bytes as UTF-8. The versioned hex form is reversible and
+/// explicitly bounded before its 2x expansion.
+pub(crate) fn encode_path_identity(path: &Path) -> Option<String> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.len() > MAX_FILE_PATH_IDENTITY_BYTES {
+        return None;
+    }
+    let encoded_len = PATH_IDENTITY_PREFIX
+        .len()
+        .checked_add(bytes.len().checked_mul(2)?)?;
+    let mut encoded = String::with_capacity(encoded_len);
+    encoded.push_str(PATH_IDENTITY_PREFIX);
+    for &byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    Some(encoded)
+}
+
+/// Recover the exact Linux path bytes stored by [`encode_path_identity`].
+/// Malformed, unversioned, or oversized model values are rejected.
+pub(crate) fn decode_path_identity(encoded: &str) -> Option<PathBuf> {
+    let hex = encoded.strip_prefix(PATH_IDENTITY_PREFIX)?;
+    if hex.len() % 2 != 0 || hex.len() / 2 > MAX_FILE_PATH_IDENTITY_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    for pair in hex.as_bytes().chunks_exact(2) {
+        let high = hex_nibble(pair[0])?;
+        let low = hex_nibble(pair[1])?;
+        bytes.push((high << 4) | low);
+    }
+    Some(PathBuf::from(OsString::from_vec(bytes)))
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+/// Render valid UTF-8 normally and make every invalid byte visible. Escaping
+/// literal backslashes keeps a real `\\xff` name distinct from a raw `0xff`.
+pub(crate) fn display_os_str(value: &OsStr) -> String {
+    let mut remaining = value.as_bytes();
+    let mut display = String::with_capacity(remaining.len());
+    while !remaining.is_empty() {
+        match std::str::from_utf8(remaining) {
+            Ok(valid) => {
+                push_valid_display(&mut display, valid);
+                break;
+            }
+            Err(error) => {
+                let valid_len = error.valid_up_to();
+                let valid = std::str::from_utf8(&remaining[..valid_len])
+                    .expect("Utf8Error::valid_up_to must end on a UTF-8 boundary");
+                push_valid_display(&mut display, valid);
+                let invalid_len = error
+                    .error_len()
+                    .unwrap_or_else(|| remaining.len().saturating_sub(valid_len));
+                for &byte in &remaining[valid_len..valid_len + invalid_len] {
+                    use std::fmt::Write as _;
+                    let _ = write!(display, "\\x{byte:02x}");
+                }
+                remaining = &remaining[valid_len + invalid_len..];
+            }
+        }
+    }
+    display
+}
+
+fn push_valid_display(display: &mut String, valid: &str) {
+    for ch in valid.chars() {
+        if ch == '\\' {
+            display.push_str("\\\\");
+        } else {
+            display.push(ch);
+        }
+    }
+}
+
+pub(crate) fn is_notebook_path(path: &Path) -> bool {
+    path.as_os_str().as_bytes().ends_with(b".jtnb.md")
 }
 
 pub(crate) fn request_dir_scan<F>(dir: PathBuf, apply: F) -> io::Result<()>
@@ -125,7 +219,7 @@ where
     Ok(())
 }
 
-/// Display name, raw absolute path, is-directory, icon name, safe tooltip.
+/// Display name, reversible path identity, is-directory, icon name, safe tooltip.
 pub(crate) fn new_store() -> TreeStore {
     TreeStore::new(&[
         glib::Type::STRING,
@@ -166,17 +260,23 @@ pub(crate) fn append_entries(
         } else {
             "text-x-generic-symbolic"
         };
-        let path_str = path.to_string_lossy().to_string();
+        let Some(path_identity) = encode_path_identity(&path) else {
+            log::warn!(
+                "file-tree path exceeds the {}-byte identity limit: {}",
+                MAX_FILE_PATH_IDENTITY_BYTES,
+                display_full_path(&path)
+            );
+            continue;
+        };
         let display_name =
             crate::text_safety::bounded_display_text(&name, MAX_FILE_NAME_DISPLAY_BYTES, false);
-        let tooltip =
-            crate::text_safety::bounded_display_text(&path_str, MAX_FILE_PATH_DISPLAY_BYTES, false);
+        let tooltip = display_full_path(&path);
         let iter = store.insert_with_values(
             parent,
             None,
             &[
                 (COL_NAME, &display_name),
-                (COL_PATH, &path_str),
+                (COL_PATH, &path_identity),
                 (COL_IS_DIR, &is_dir),
                 (COL_ICON, &icon),
                 (COL_TOOLTIP, &tooltip),
@@ -219,13 +319,17 @@ pub(crate) fn on_expand(store: &TreeStore, iter: &TreeIter, scan_generation: &Rc
     if scan_in_progress {
         return;
     }
-    let dir_path: String = store
+    let dir_identity: String = store
         .get_value(iter, COL_PATH as i32)
         .get()
         .unwrap_or_default();
-    if dir_path.is_empty() {
+    if dir_identity.is_empty() {
         return;
     }
+    let Some(dir_path) = decode_path_identity(&dir_identity) else {
+        log::warn!("file-tree row contains an invalid path identity");
+        return;
+    };
     let Some(row_ref) = TreeRowReference::new(store, &store.path(iter)) else {
         return;
     };
@@ -234,8 +338,9 @@ pub(crate) fn on_expand(store: &TreeStore, iter: &TreeIter, scan_generation: &Rc
     let store_for_result = store.clone();
     let active_generation = scan_generation.clone();
     let generation = active_generation.get();
-    let expected_path = dir_path.clone();
-    if let Err(error) = request_dir_scan(PathBuf::from(dir_path), move |result| {
+    let expected_identity = dir_identity.clone();
+    let expected_display = display_full_path(&dir_path);
+    if let Err(error) = request_dir_scan(dir_path, move |result| {
         if active_generation.get() != generation {
             return;
         }
@@ -249,7 +354,7 @@ pub(crate) fn on_expand(store: &TreeStore, iter: &TreeIter, scan_generation: &Rc
             .get_value(&parent, COL_PATH as i32)
             .get()
             .unwrap_or_default();
-        if current_path != expected_path {
+        if current_path != expected_identity {
             return;
         }
         let Some(placeholder) = store_for_result.iter_children(Some(&parent)) else {
@@ -265,7 +370,7 @@ pub(crate) fn on_expand(store: &TreeStore, iter: &TreeIter, scan_generation: &Rc
         store_for_result.remove(&placeholder);
         match result {
             Ok(entries) => append_entries(&store_for_result, Some(&parent), entries),
-            Err(error) => log::warn!("failed to scan directory {expected_path}: {error}"),
+            Err(error) => log::warn!("failed to scan directory {expected_display}: {error}"),
         }
     }) {
         store.set(&first_child, &[(COL_IS_DIR, &false)]);
@@ -284,20 +389,29 @@ pub(crate) fn display_path(path: &Path) -> String {
             if rel.as_os_str().is_empty() {
                 "~".to_string()
             } else {
-                format!("~/{}", rel.to_string_lossy())
+                format!("~/{}", display_os_str(rel.as_os_str()))
             }
         } else {
-            path.to_string_lossy().to_string()
+            display_os_str(path.as_os_str())
         }
     } else {
-        path.to_string_lossy().to_string()
+        display_os_str(path.as_os_str())
     };
     crate::text_safety::bounded_display_text(&display, MAX_FILE_PATH_DISPLAY_BYTES, false)
+}
+
+pub(crate) fn display_full_path(path: &Path) -> String {
+    crate::text_safety::bounded_display_text(
+        &display_os_str(path.as_os_str()),
+        MAX_FILE_PATH_DISPLAY_BYTES,
+        false,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStringExt;
 
     #[test]
     fn entries_sort_directories_first_then_by_name() {
@@ -328,5 +442,32 @@ mod tests {
 
         let names: Vec<_> = entries.iter().map(|entry| entry.name.as_str()).collect();
         assert_eq!(names, ["Able", "beta", "Alpha.txt", "Zulu.txt"]);
+    }
+
+    #[test]
+    fn non_utf8_path_identities_round_trip_without_colliding() {
+        let ff = PathBuf::from(OsString::from_vec(b"a\xff".to_vec()));
+        let fe = PathBuf::from(OsString::from_vec(b"a\xfe".to_vec()));
+
+        let ff_identity = encode_path_identity(&ff).expect("bounded path should encode");
+        let fe_identity = encode_path_identity(&fe).expect("bounded path should encode");
+
+        assert_ne!(ff_identity, fe_identity);
+        assert_eq!(decode_path_identity(&ff_identity), Some(ff.clone()));
+        assert_eq!(decode_path_identity(&fe_identity), Some(fe.clone()));
+        assert_eq!(display_os_str(ff.as_os_str()), r"a\xff");
+        assert_eq!(display_os_str(fe.as_os_str()), r"a\xfe");
+    }
+
+    #[test]
+    fn path_identity_rejects_malformed_or_oversized_values() {
+        assert_eq!(decode_path_identity(""), None);
+        assert_eq!(decode_path_identity("unix-path-v1:0"), None);
+        assert_eq!(decode_path_identity("unix-path-v1:gg"), None);
+        let oversized = PathBuf::from(OsString::from_vec(vec![
+            b'a';
+            MAX_FILE_PATH_IDENTITY_BYTES + 1
+        ]));
+        assert_eq!(encode_path_identity(&oversized), None);
     }
 }

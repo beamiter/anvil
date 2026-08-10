@@ -552,6 +552,24 @@ fn running_process_summary_for_tabs<'a>(tabs: impl IntoIterator<Item = &'a Tab>)
 }
 
 impl AppModel {
+    fn current_pane_count(&self) -> usize {
+        self.tabs.iter().map(|tab| tab.panes.len()).sum()
+    }
+
+    fn ensure_persisted_tab_capacity(&self, adds_pane: bool) -> bool {
+        if !self.session_persistence
+            || session::can_add_persisted_tab(self.tabs.len(), self.current_pane_count(), adds_pane)
+        {
+            return true;
+        }
+        self.show_toast(format!(
+            "Session capacity reached ({} tabs, {} panes total). Close a tab or pane before opening another.",
+            session::MAX_RESTORED_TABS,
+            session::MAX_RESTORED_PANES_TOTAL,
+        ));
+        false
+    }
+
     pub(crate) fn can_preview_tab_drop(&self, source_tab_id: u64, target_tab_id: u64) -> bool {
         let identities: Vec<_> = self.tabs.iter().map(DropTabIdentity::from_tab).collect();
         tab_drop_preview_is_valid(&identities, source_tab_id, target_tab_id)
@@ -624,6 +642,9 @@ impl AppModel {
         command: Option<(TerminalMode, String)>,
         sender: &ComponentSender<AppModel>,
     ) {
+        if !self.ensure_persisted_tab_capacity(true) {
+            return;
+        }
         let id = self.next_id;
         self.next_id += 1;
         let pane_id = self.next_pane_id;
@@ -901,14 +922,7 @@ impl AppModel {
             .or_else(|| tab.holder.first_child());
         match root {
             Some(w) => self.serialize_widget(tab, &w),
-            None => session::PaneLayout::Leaf {
-                mode: "block".to_string(),
-                cwd: None,
-                cwd_external: false,
-                remote_name: None,
-                sid: None,
-                cmds: None,
-            },
+            None => session::PaneLayout::empty_leaf(),
         }
     }
 
@@ -959,14 +973,7 @@ impl AppModel {
                 }
                 None => ("block".to_string(), None, false, None, None, None),
             };
-            session::PaneLayout::Leaf {
-                mode,
-                cwd,
-                cwd_external,
-                remote_name,
-                sid,
-                cmds,
-            }
+            session::PaneLayout::captured_leaf(mode, cwd, cwd_external, remote_name, sid, cmds)
         }
     }
 
@@ -986,14 +993,7 @@ impl AppModel {
                 return self.serialize_widget(tab, &z.pane_widget);
             }
         }
-        session::PaneLayout::Leaf {
-            mode: "block".to_string(),
-            cwd: None,
-            cwd_external: false,
-            remote_name: None,
-            sid: None,
-            cmds: None,
-        }
+        session::PaneLayout::empty_leaf()
     }
 
     /// Capture the current tab list as a persistable snapshot, including each
@@ -1002,23 +1002,21 @@ impl AppModel {
         let tabs = self
             .tabs
             .iter()
-            .map(|t| session::SavedTab {
-                title: t.title.clone(),
-                custom_title: t.custom_title,
-                pinned: t.pinned,
-                layout: self.serialize_layout(t),
+            .map(|t| {
+                session::SavedTab::captured(
+                    t.title.clone(),
+                    t.custom_title,
+                    t.pinned,
+                    self.serialize_layout(t),
+                )
             })
             .collect();
-        session::SavedSession {
-            active: self.active,
-            tabs,
-            ai_conversation: self.ai_conversation.clone(),
-        }
+        session::SavedSession::captured(self.active, tabs, self.ai_conversation.clone())
     }
 
     pub(crate) fn persist_session(&self) {
         if self.session_persistence {
-            session::save_session(&self.snapshot_session());
+            session::save_session(self.snapshot_session());
         }
     }
 
@@ -1200,6 +1198,9 @@ impl AppModel {
         host: &config::RemoteHost,
         sender: &ComponentSender<AppModel>,
     ) {
+        if !self.ensure_persisted_tab_capacity(true) {
+            return;
+        }
         let id = self.next_id;
         self.next_id += 1;
         let pane_id = self.next_pane_id;
@@ -1455,6 +1456,25 @@ impl AppModel {
 
     pub(crate) fn select_tab(&mut self, id: u64, sender: &ComponentSender<AppModel>) {
         let Some(idx) = self.index_of(id) else { return };
+        let previous_pane_id = self
+            .tabs
+            .get(self.active)
+            .and_then(|tab| tab.panes.get(tab.active_pane))
+            .map(|pane| pane.id);
+        let next_pane_id = self.tabs[idx]
+            .panes
+            .get(self.tabs[idx].active_pane)
+            .map(|pane| pane.id);
+        let active_pane_changed = search::active_pane_changed(previous_pane_id, next_pane_id);
+        if active_pane_changed {
+            // Search regexes and highlights live inside a terminal backend.
+            // Clear the old owner before changing `self.active`; its delayed
+            // Idle response is pane-tagged and therefore cannot reset the new
+            // pane's replayed status.
+            if let Some(terminal) = self.active_terminal() {
+                terminal.emit(VteInput::SearchClear);
+            }
+        }
         self.active = idx;
         self.stack.set_visible_child_name(&id.to_string());
         {
@@ -1465,6 +1485,9 @@ impl AppModel {
         let tab = &self.tabs[idx];
         if let Some(pane) = tab.panes.get(tab.active_pane) {
             pane.terminal.emit(VteInput::GrabFocus);
+        }
+        if active_pane_changed {
+            self.search.emit(search::SearchMsg::ActivePaneChanged);
         }
         self.file_tree_goto_current_cwd();
         self.refresh_pane_headers(idx);
@@ -1640,6 +1663,15 @@ impl AppModel {
         if self.tabs[target_index].id != plan.target_tab_id {
             return;
         }
+        if self.session_persistence
+            && self.tabs[target_index].panes.len() >= session::MAX_RESTORED_PANES_PER_TAB
+        {
+            self.show_toast(format!(
+                "A tab can contain at most {} restorable panes.",
+                session::MAX_RESTORED_PANES_PER_TAB
+            ));
+            return;
+        }
         if self.tabs[target_index]
             .panes
             .iter()
@@ -1790,6 +1822,9 @@ impl AppModel {
 
     /// Open a new tab inheriting the active tab's mode, cwd and (custom) title.
     pub(crate) fn duplicate_active_tab(&mut self, sender: &ComponentSender<AppModel>) {
+        if !self.ensure_persisted_tab_capacity(true) {
+            return;
+        }
         let Some(src) = self.tabs.get(self.active) else {
             return;
         };
@@ -1942,6 +1977,16 @@ impl AppModel {
         let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
+        if self.session_persistence
+            && !session::can_add_persisted_pane(tab.panes.len(), self.current_pane_count())
+        {
+            self.show_toast(format!(
+                "Session capacity reached ({} panes per tab, {} panes total). Close a pane before splitting again.",
+                session::MAX_RESTORED_PANES_PER_TAB,
+                session::MAX_RESTORED_PANES_TOTAL,
+            ));
+            return;
+        }
         if tab.zoom.is_some() {
             return;
         }
@@ -2324,6 +2369,9 @@ impl AppModel {
         after: bool,
         sender: &ComponentSender<AppModel>,
     ) {
+        if !self.ensure_persisted_tab_capacity(false) {
+            return;
+        }
         let identities: Vec<_> = self.tabs.iter().map(DropTabIdentity::from_tab).collect();
         let Some(plan) = plan_pane_into_tab(&identities, pane_id, anchor_tab_id, after) else {
             return;

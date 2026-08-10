@@ -14,7 +14,7 @@ impl AppModel {
         self.file_tree_store.clear();
         self.file_header.emit(sidebar::FileHeaderMsg::SetRoot {
             display: file_tree::display_path(&root),
-            tooltip: root.to_string_lossy().into_owned(),
+            tooltip: file_tree::display_full_path(&root),
         });
         *self.file_tree_root.borrow_mut() = root.clone();
 

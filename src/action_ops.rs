@@ -220,11 +220,10 @@ impl AppModel {
                     .family()
                     .map(|family| family.to_string())
                     .unwrap_or_default();
-                let font = self
-                    .settings_font_names
-                    .iter()
-                    .position(|candidate| candidate == &family)
-                    .unwrap_or(0) as u32;
+                let (font_names, font) = dialogs::settings::font_choices(
+                    self.settings_font_names.as_ref().clone(),
+                    &family,
+                );
                 let theme = self
                     .themes
                     .iter()
@@ -273,6 +272,7 @@ impl AppModel {
                         remote_clipboard: config.allow_remote_clipboard_write,
                         remote_hosts: config.remote_hosts.clone(),
                     },
+                    font_names,
                     self.window.clone(),
                 ));
             }

@@ -15,6 +15,7 @@ use std::time::Duration;
 use vte4::prelude::TerminalExt;
 
 use crate::block_view::TermView;
+use crate::search::SearchStatus;
 
 use super::cross_block_search;
 
@@ -47,6 +48,49 @@ pub struct BlockTerminal {
     terminal_done: Rc<Cell<bool>>,
     config: Rc<RefCell<crate::config::Config>>,
     cross_block_search_dialog: Rc<RefCell<Option<relm4::adw::Dialog>>>,
+    /// Last result belongs to the regex currently installed in this pane.
+    /// Keeping it backend-side prevents navigation after a compile error from
+    /// turning that diagnostic into a misleading `(0, 0)` result.
+    search_status: SearchStatus,
+}
+
+fn validate_block_search_pattern(pattern: &str) -> Result<(), String> {
+    super::vte::compile_count_regex(pattern)?;
+    vte4::Regex::for_search(
+        pattern,
+        pcre2_sys::PCRE2_CASELESS | pcre2_sys::PCRE2_MULTILINE,
+    )
+    .map(|_| ())
+    .map_err(crate::search::invalid_regex_message)
+}
+
+fn block_result_status(current: usize, total: usize, use_regex: bool) -> SearchStatus {
+    if use_regex {
+        // Match enumeration uses Rust regex while painting/cursor movement is
+        // native PCRE2. Even when both compile their semantics can differ, so
+        // never present a regex total as exact.
+        SearchStatus::partial_results(current, total)
+    } else {
+        SearchStatus::results(current, total)
+    }
+}
+
+fn block_navigation_status(
+    previous: &SearchStatus,
+    result: Option<(usize, usize)>,
+) -> SearchStatus {
+    match (previous, result) {
+        (
+            SearchStatus::Results {
+                truncated: true, ..
+            },
+            Some((current, total)),
+        ) => SearchStatus::partial_results(current, total),
+        (SearchStatus::Results { .. }, Some((current, total))) => {
+            SearchStatus::results(current, total)
+        }
+        _ => previous.clone(),
+    }
 }
 
 impl BlockTerminal {
@@ -348,6 +392,7 @@ impl Component for BlockTerminal {
             terminal_done,
             config,
             cross_block_search_dialog: Rc::new(RefCell::new(None)),
+            search_status: SearchStatus::Idle,
         };
         ComponentParts { model, widgets: () }
     }
@@ -361,6 +406,18 @@ impl Component for BlockTerminal {
                 let _ = sender.output(VteOutput::AgentExecutionStartFailed {
                     execution: *execution,
                 });
+            }
+            match &msg {
+                VteInput::SearchSet(..) | VteInput::SearchNext | VteInput::SearchPrev => {
+                    self.search_status =
+                        SearchStatus::Error("Terminal is unavailable.".to_string());
+                    let _ = sender.output(VteOutput::SearchStatus(self.search_status.clone()));
+                }
+                VteInput::SearchClear => {
+                    self.search_status = SearchStatus::Idle;
+                    let _ = sender.output(VteOutput::SearchStatus(self.search_status.clone()));
+                }
+                _ => {}
             }
             return;
         }
@@ -431,15 +488,42 @@ impl Component for BlockTerminal {
                 let _ = sender.output(VteOutput::Notice(message));
             }
             VteInput::SearchSet(query, use_regex) => {
-                let _ = view.find_in_blocks(&query, use_regex);
+                let pattern = super::vte::search_pattern(&query, use_regex);
+                self.search_status = match validate_block_search_pattern(&pattern) {
+                    Ok(_) => {
+                        let (current, total) = view.find_in_blocks(&query, use_regex);
+                        block_result_status(current, total, use_regex)
+                    }
+                    Err(error) => {
+                        view.clear_find();
+                        SearchStatus::Error(error)
+                    }
+                };
+                let _ = sender.output(VteOutput::SearchStatus(self.search_status.clone()));
             }
             VteInput::SearchNext => {
-                let _ = view.find_next();
+                let result = matches!(
+                    self.search_status,
+                    SearchStatus::Results { total, .. } if total > 0
+                )
+                .then(|| view.find_next());
+                self.search_status = block_navigation_status(&self.search_status, result);
+                let _ = sender.output(VteOutput::SearchStatus(self.search_status.clone()));
             }
             VteInput::SearchPrev => {
-                let _ = view.find_prev();
+                let result = matches!(
+                    self.search_status,
+                    SearchStatus::Results { total, .. } if total > 0
+                )
+                .then(|| view.find_prev());
+                self.search_status = block_navigation_status(&self.search_status, result);
+                let _ = sender.output(VteOutput::SearchStatus(self.search_status.clone()));
             }
-            VteInput::SearchClear => view.clear_find(),
+            VteInput::SearchClear => {
+                view.clear_find();
+                self.search_status = SearchStatus::Idle;
+                let _ = sender.output(VteOutput::SearchStatus(self.search_status.clone()));
+            }
             VteInput::CrossBlockSearch => {
                 cross_block_search::toggle(view.clone(), self.cross_block_search_dialog.clone())
             }
@@ -458,7 +542,11 @@ impl Component for BlockTerminal {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_finished_output, VteOutput};
+    use super::{
+        block_navigation_status, block_result_status, command_finished_output,
+        validate_block_search_pattern, VteOutput,
+    };
+    use crate::search::SearchStatus;
 
     #[test]
     fn block_exit_status_maps_to_command_finished_success() {
@@ -480,5 +568,36 @@ mod tests {
             command_finished_output(None),
             VteOutput::CommandFinished(true)
         ));
+    }
+
+    #[test]
+    fn invalid_search_stays_an_error_when_navigation_is_requested() {
+        let error = SearchStatus::Error("Invalid regex: missing closing parenthesis".into());
+        assert_eq!(block_navigation_status(&error, Some((0, 0))), error);
+    }
+
+    #[test]
+    fn block_regex_counts_remain_explicitly_approximate_while_literals_are_exact() {
+        assert_eq!(
+            block_result_status(1, 3, true),
+            SearchStatus::partial_results(1, 3)
+        );
+        assert_eq!(
+            block_result_status(1, 3, false),
+            SearchStatus::results(1, 3)
+        );
+        assert_eq!(
+            block_result_status(0, 0, true),
+            SearchStatus::partial_results(0, 0)
+        );
+    }
+
+    #[test]
+    fn block_search_validates_the_native_pcre_pattern_too() {
+        // Rust regex permits locally disabling Unicode for an ASCII-only
+        // subexpression; PCRE2 does not recognize that inline `u` flag.
+        assert!(super::super::vte::compile_count_regex("(?-u:a)").is_ok());
+        let error = validate_block_search_pattern("(?-u:a)").unwrap_err();
+        assert!(error.starts_with("Invalid regex:"));
     }
 }

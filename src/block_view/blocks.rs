@@ -158,14 +158,26 @@ impl BlockStatus {
         }
     }
 
-    /// Header status glyph (Nerd Font) and the CSS class that colours it.
-    fn icon(self) -> (&'static str, &'static str) {
+    /// Header status icon, the CSS class that colours it, and its accessible
+    /// name. Symbolic theme icons keep the status portable across font setups.
+    fn icon(self) -> (&'static str, &'static str, &'static str) {
         match self {
-            // nf-fa-spinner, nf-fa-check, nf-fa-close, nf-fa-question
-            Self::Background => ("\u{f110}", "block-status-background"),
-            Self::Succeeded => ("\u{f00c}", "block-status-ok"),
-            Self::Failed(_) => ("\u{f00d}", "block-status-bad"),
-            Self::Unreported => ("\u{f128}", "block-status-unknown"),
+            Self::Background => (
+                "view-refresh-symbolic",
+                "block-status-background",
+                "Background output",
+            ),
+            Self::Succeeded => ("emblem-ok-symbolic", "block-status-ok", "Command succeeded"),
+            Self::Failed(_) => (
+                "dialog-error-symbolic",
+                "block-status-bad",
+                "Command failed",
+            ),
+            Self::Unreported => (
+                "dialog-question-symbolic",
+                "block-status-unknown",
+                "Command exit status not reported",
+            ),
         }
     }
 
@@ -251,8 +263,8 @@ pub(crate) struct FinishedBlock {
     pub(crate) toggle_filter: Rc<dyn Fn()>,
     /// Explicit Warp-style navigation affordance for oversized output.
     pub(crate) jump_bottom_btn: gtk::Button,
-    pub(crate) bookmark_star: gtk::Label,
-    pub(crate) status_icon: gtk::Label,
+    pub(crate) bookmark_star: gtk::Image,
+    pub(crate) status_icon: gtk::Image,
     /// Column count the output VTE is sized to — needed for re-feed (filter).
     pub(crate) cols: i64,
     /// Number of rows allocated to this finished output. Kept with the widget
@@ -704,10 +716,22 @@ mod tests {
             Some("exit:130")
         );
         assert_eq!(block_status(Some("make"), Some(0)).exit_badge(), None);
-        // The one state a check or a cross cannot explain gets a tooltip.
+        // The one state that cannot explain itself gets a tooltip.
         assert!(block_status(Some("make"), None).icon_tooltip().is_some());
         assert!(block_status(Some("make"), Some(0)).icon_tooltip().is_none());
-        // And it is not drawn as either a success or a failure.
+        // Every state uses a theme icon and carries a non-empty accessible
+        // name, independently of whichever terminal font the user selected.
+        for status in [
+            BlockStatus::Background,
+            BlockStatus::Succeeded,
+            BlockStatus::Failed(1),
+            BlockStatus::Unreported,
+        ] {
+            let (icon_name, _class, accessible_label) = status.icon();
+            assert!(icon_name.ends_with("-symbolic"));
+            assert!(!accessible_label.is_empty());
+        }
+        // And the unreported state is not drawn as either success or failure.
         for reported in [Some(0), Some(1)] {
             assert_ne!(
                 block_status(Some("make"), None).stripe_class(),
@@ -717,6 +741,27 @@ mod tests {
                 block_status(Some("make"), None).icon(),
                 block_status(Some("make"), reported).icon()
             );
+        }
+    }
+
+    #[test]
+    fn block_chrome_has_no_private_use_font_icons() {
+        for source in [include_str!("blocks.rs"), include_str!("mod.rs")] {
+            assert!(source
+                .chars()
+                .all(|ch| !(0xe000..=0xf8ff).contains(&(ch as u32))));
+            for escaped in source.split("\\u{").skip(1) {
+                let Some(hex) = escaped.split('}').next() else {
+                    continue;
+                };
+                let Ok(codepoint) = u32::from_str_radix(hex, 16) else {
+                    continue;
+                };
+                assert!(
+                    !(0xe000..=0xf8ff).contains(&codepoint),
+                    "BMP private-use escape remains in block chrome: {hex}"
+                );
+            }
         }
     }
 
@@ -949,15 +994,19 @@ pub(crate) fn estimated_finished_block_height_for_text(
     estimated_finished_block_height(config, visible_rows)
 }
 
-fn flash_button_label(btn: &gtk::Button, label: &'static str, tooltip: &'static str) {
-    let old_label = btn.label().map(|s| s.to_string()).unwrap_or_default();
+fn flash_button_icon(btn: &gtk::Button, icon_name: &'static str, tooltip: &'static str) {
+    let old_icon = btn.icon_name().map(|s| s.to_string());
     let old_tooltip = btn.tooltip_text().map(|s| s.to_string());
-    btn.set_label(label);
-    btn.set_tooltip_text(Some(tooltip));
+    set_icon_button(btn, icon_name, tooltip);
     let btn_for_restore = btn.clone();
     glib::timeout_add_local_once(std::time::Duration::from_millis(900), move || {
-        btn_for_restore.set_label(&old_label);
+        if let Some(icon_name) = old_icon.as_deref() {
+            btn_for_restore.set_icon_name(icon_name);
+        }
         btn_for_restore.set_tooltip_text(old_tooltip.as_deref());
+        if let Some(accessible_label) = old_tooltip.as_deref() {
+            btn_for_restore.update_property(&[gtk::accessible::Property::Label(accessible_label)]);
+        }
     });
 }
 
@@ -1176,19 +1225,21 @@ impl FinishedBlock {
             header_row.set_margin_bottom(2);
         }
 
-        // Bookmark star (gutter marker), hidden until the block is bookmarked.
-        let bookmark_star = gtk::Label::new(Some("\u{f02e}")); // nf-fa-bookmark
+        // Bookmark marker (gutter marker), hidden until the block is bookmarked.
+        let bookmark_star = gtk::Image::from_icon_name("user-bookmarks-symbolic");
         bookmark_star.add_css_class("block-bookmark-star");
+        bookmark_star.update_property(&[gtk::accessible::Property::Label("Bookmarked block")]);
         bookmark_star.set_halign(gtk::Align::Start);
         bookmark_star.set_visible(false);
         header_row.append(&bookmark_star);
 
-        // Status icon: ✓ for success, ✗ for failure, spinner for an
-        // asynchronous/background block, ? when the shell reported nothing.
-        let (status_glyph, status_class) = status.icon();
-        let status_icon = gtk::Label::new(Some(status_glyph));
+        // Status icon: success, failure, asynchronous/background output, or an
+        // unknown result when the shell reported nothing.
+        let (status_icon_name, status_class, status_accessible_label) = status.icon();
+        let status_icon = gtk::Image::from_icon_name(status_icon_name);
         status_icon.add_css_class(status_class);
         status_icon.set_tooltip_text(status.icon_tooltip());
+        status_icon.update_property(&[gtk::accessible::Property::Label(status_accessible_label)]);
         status_icon.set_halign(gtk::Align::Start);
         header_row.append(&status_icon);
 
@@ -1202,17 +1253,15 @@ impl FinishedBlock {
         // Context chips (Warp-style): cwd pill + git-branch pill.
         if let Some(cwd_path) = cwd {
             let shortened = shorten_path(cwd_path);
-            // nf-fa-folder () prefix
-            let cwd_chip = gtk::Label::new(Some(&format!("\u{f07b} {}", shortened)));
+            let cwd_chip = gtk::Label::new(Some(&format!("Folder: {shortened}")));
             cwd_chip.add_css_class("block-chip");
             cwd_chip.set_halign(gtk::Align::Start);
             cwd_chip.set_ellipsize(gtk::pango::EllipsizeMode::Start);
             cwd_chip.set_max_width_chars(40);
             header_row.append(&cwd_chip);
 
-            // git-branch chip (nf-dev-git-branch )
             if let Some(branch) = git_branch_for(cwd_path) {
-                let git_chip = gtk::Label::new(Some(&format!("\u{e725} {}", branch)));
+                let git_chip = gtk::Label::new(Some(&format!("Branch: {branch}")));
                 git_chip.add_css_class("block-chip-git");
                 git_chip.set_halign(gtk::Align::Start);
                 git_chip.set_ellipsize(gtk::pango::EllipsizeMode::End);
@@ -1270,27 +1319,21 @@ impl FinishedBlock {
         // right and the action button group, so they read as separate units
         // rather than one undifferentiated cluster.
         action_box.set_margin_start(6);
-        let copy_cmd_btn = gtk::Button::with_label("\u{f0c5}"); // nf-fa-copy  copy command
-        copy_cmd_btn.set_tooltip_text(Some("Copy command"));
-        let copy_output_btn = gtk::Button::with_label("\u{f0ea}"); // nf-fa-clipboard  copy output
-        copy_output_btn.set_tooltip_text(Some("Copy output"));
-        let rerun_btn = gtk::Button::with_label("\u{f021}"); // nf-fa-refresh  recall command
-        rerun_btn.set_tooltip_text(Some("Insert command at prompt"));
+        let copy_cmd_btn = icon_button("edit-copy-symbolic", "Copy command");
+        let copy_output_btn = icon_button("edit-copy-symbolic", "Copy output");
+        let rerun_btn = icon_button("edit-paste-symbolic", "Insert command at prompt");
         // Commandless background blocks retain output actions, find/filter,
         // bookmarks and selection, but cannot copy or recall a command.
         copy_cmd_btn.set_visible(!is_background);
         rerun_btn.set_visible(!is_background);
-        let filter_btn = gtk::Button::with_label("\u{f0b0}"); // nf-fa-filter  filter output
-        filter_btn.set_tooltip_text(Some("Filter output"));
-        let jump_bottom_btn = gtk::Button::with_label("\u{f103}"); // nf-fa-angle-double-down
-        jump_bottom_btn.set_tooltip_text(Some("Jump to bottom of this block"));
+        let filter_btn = icon_button("edit-find-symbolic", "Filter output");
+        let jump_bottom_btn = icon_button("go-bottom-symbolic", "Jump to bottom of this block");
         jump_bottom_btn.set_visible(long_output);
         // Expand button: appears only when output_rows > viewport_cap; toggles
         // the output VTE between the capped height and a roomier expanded height
         // (`finished_block_max_expanded_rows`). Wired below once output_rows and
         // the output VTE exist.
-        let expand_btn = gtk::Button::with_label("\u{f065}"); // nf-fa-expand
-        expand_btn.set_tooltip_text(Some("Expand block"));
+        let expand_btn = icon_button("view-fullscreen-symbolic", "Expand block");
         for btn in [
             &copy_cmd_btn,
             &copy_output_btn,
@@ -1323,7 +1366,7 @@ impl FinishedBlock {
         outer.add_controller(hover_ctrl);
 
         // Collapse toggle button
-        let collapse_btn = gtk::Button::with_label("\u{f078}"); // nf-fa-chevron_down
+        let collapse_btn = icon_button("go-down-symbolic", "Hide output");
         collapse_btn.add_css_class("block-collapse-btn");
         collapse_btn.add_css_class("flat");
         header_row.append(&collapse_btn);
@@ -1515,12 +1558,11 @@ impl FinishedBlock {
                 if ch > 0 {
                     output_vte_for_btn.set_height_request((visible_rows as i32) * ch);
                 }
-                btn.set_label(if now_expanded { "\u{f066}" } else { "\u{f065}" });
-                btn.set_tooltip_text(Some(if now_expanded {
-                    "Collapse to default height"
+                if now_expanded {
+                    set_icon_button(btn, "view-restore-symbolic", "Collapse to default height");
                 } else {
-                    "Expand block"
-                }));
+                    set_icon_button(btn, "view-fullscreen-symbolic", "Expand block");
+                }
             });
         }
 
@@ -1636,12 +1678,13 @@ impl FinishedBlock {
         // working chevron so their Pictures can be folded away.
         if !has_output && !has_images {
             collapse_btn.set_sensitive(false);
-            collapse_btn.set_tooltip_text(Some("No output"));
+            set_icon_button(&collapse_btn, "go-next-symbolic", "No output");
         } else if has_output {
-            collapse_btn.set_tooltip_text(Some(&format!(
-                "Toggle output ({})",
-                line_count_text(output_rows)
-            )));
+            set_icon_button(
+                &collapse_btn,
+                "go-down-symbolic",
+                &format!("Toggle output ({})", line_count_text(output_rows)),
+            );
         }
         let set_collapsed: Rc<dyn Fn(bool)> = {
             let output_widget = output_widget.downgrade();
@@ -1663,12 +1706,19 @@ impl FinishedBlock {
                     ib.set_visible(!collapsed);
                 }
                 collapsed_summary.set_visible(collapsed);
-                collapse_btn.set_label(if collapsed { "\u{f054}" } else { "\u{f078}" });
-                collapse_btn.set_tooltip_text(Some(if collapsed {
-                    "Show output"
-                } else {
-                    "Hide output"
-                }));
+                set_icon_button(
+                    &collapse_btn,
+                    if collapsed {
+                        "go-next-symbolic"
+                    } else {
+                        "go-down-symbolic"
+                    },
+                    if collapsed {
+                        "Show output"
+                    } else {
+                        "Hide output"
+                    },
+                );
             })
         };
         {
@@ -1688,7 +1738,7 @@ impl FinishedBlock {
             collapsed_summary.connect_clicked(move |_| set_collapsed(false));
         }
         if !has_output && !has_images {
-            collapse_btn.set_label("\u{f054}"); // nf-fa-chevron_right
+            set_icon_button(&collapse_btn, "go-next-symbolic", "No output");
             collapsed_summary.set_visible(false);
         }
 
@@ -1992,8 +2042,7 @@ impl FinishedBlock {
 
         self.dynamic_viewport_rows.set(fitted_rows);
         self.expanded.set(false);
-        self.expand_btn.set_label("\u{f065}");
-        self.expand_btn.set_tooltip_text(Some("Expand block"));
+        set_icon_button(&self.expand_btn, "view-fullscreen-symbolic", "Expand block");
         self.expand_btn.set_visible(output_rows > fitted_rows);
         let stamp = (effective_cols, fitted_rows, false, generation);
         self.render_stamp.set(stamp);
@@ -2103,7 +2152,7 @@ impl FinishedBlock {
         let cmd_for_copy = self.cmd_text.clone();
         self.copy_cmd_btn.connect_clicked(move |btn| {
             vte_for_cmd.clipboard().set_text(&cmd_for_copy);
-            flash_button_label(btn, "\u{f00c}", "Command copied");
+            flash_button_icon(btn, "emblem-ok-symbolic", "Command copied");
         });
 
         let vte_for_out = vte.clone();
@@ -2113,7 +2162,7 @@ impl FinishedBlock {
         self.copy_output_btn.connect_clicked(move |btn| {
             let text = strip_ansi(&full_output_for_copy.borrow());
             vte_for_out.clipboard().set_text(&text);
-            flash_button_label(btn, "\u{f00c}", "Output copied");
+            flash_button_icon(btn, "emblem-ok-symbolic", "Output copied");
         });
 
         let pty_for_rerun = Rc::clone(pty);
@@ -2135,9 +2184,13 @@ impl FinishedBlock {
                 bracketed_paste_for_rerun.get(),
             ) {
                 active_for_rerun.borrow().grab_focus();
-                flash_button_label(btn, "\u{f00c}", "Command inserted");
+                flash_button_icon(btn, "emblem-ok-symbolic", "Command inserted");
             } else {
-                flash_button_label(btn, "\u{f071}", "Wait for an editable prompt");
+                flash_button_icon(
+                    btn,
+                    "dialog-warning-symbolic",
+                    "Wait for an editable prompt",
+                );
             }
         });
     }

@@ -1,14 +1,44 @@
 # Engineering handoff
 
-Updated: 2026-08-08
+Updated: 2026-08-10
 
-This baseline exact-pins the hardened shared core and jagent revisions and upgrades
-terminal rendering, history, configuration, persistence, notebook workflows, AI,
-and command review. Agent UI actions, model replies, and terminal execution
-events are now bound to the session epoch; execution counters are checked rather
-than wrapped, and workspace snapshots decode under their own budgets.
+This baseline exact-pins the hardened shared core and jagent revisions and now
+keeps session persistence off the GTK thread, makes search state visible across
+both terminal backends, removes the default Nerd Font dependency, and preserves
+raw Linux file-tree path identity. Agent UI actions, model replies, and terminal
+execution events remain bound to the session epoch; workspace snapshots now
+enforce the same budgets while being captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- `src/session.rs` captures only budget-valid pane/tab fields and queues owned
+  snapshots through `src/persistence.rs`. JSON work, atomic replace, both fsyncs,
+  claim cleanup, and pruning run on a dedicated capacity-one coalescing lane;
+  shutdown stops both lanes under one deadline and joins session persistence
+  before ordinary history/organism work. Runtime growth stops before exceeding
+  the 32-tab / 16-pane-per-tab / 64-pane restore envelope, and a 4 MiB aggregate
+  overflow retries without optional AI state and then replay argv while keeping
+  the workspace structure.
+- Persistence failure suppression carries a monotonic attempt number. A success
+  clears only failures no newer than itself, drained targets can report a later
+  failure, and a completed old write cannot erase a newer enqueue rejection.
+- Find-in-terminal has a backend-neutral status contract. Block search keeps a
+  deterministic navigation sequence; VTE uses native PCRE2 as the search
+  authority and a bounded
+  10,000-row / 2 MiB Rust-regex mirror for counts. Bounded, PCRE2-only, or
+  cross-engine regex totals are marked with `+`; switching the active pane
+  clears the old backend and replays the open query. The bar exposes counts,
+  regex errors, and accessible previous/next/close controls.
+- File-tree model rows store versioned bounded hex for the original Unix path
+  bytes. Non-UTF-8 names display as escaped bytes without collisions, notebook
+  paths stay as `PathBuf`, and prompt insertion rejects paths that cannot cross
+  the application's UTF-8 review boundary safely. A Flatpak notebook cell also
+  fails explicitly when its raw cwd cannot cross the host bridge, rather than
+  executing under a U+FFFD replacement path.
+- The default font is `Monospace 14`; Block UI status/action PUA glyphs are GTK
+  symbolic icons or text with accessible names. The Settings font list injects
+  the active configured family when Pango does not enumerate it, preserving
+  custom Nerd Font configurations during size changes.
 
 - Completed block outcome now delegates to the pinned
   `jterm_core::block_contract` after `resolve_command_text` has combined OSC 133
@@ -69,12 +99,11 @@ than wrapped, and workspace snapshots decode under their own budgets.
 
 ## Remaining boundaries
 
-### Bound the remaining restored strings at their source
-
-Decoding bounds `title`, `mode`, `cwd`, `remote_name`, and `sid`, but the
-constants live in `src/session.rs` while the same shapes are produced by the
-capture path. A shared constructor that cannot build an over-budget `PaneLayout`
-would make the decoder's limits provably reachable rather than duplicated.
+The current session transaction protects cooperating anvil writers with locks,
+revision checks, atomic replacement, and durable directory sync. As with most
+Unix editors, a non-cooperating external process can still replace a watched
+configuration path outside that protocol; conflict detection is advisory at
+that boundary.
 
 ## Release checks
 

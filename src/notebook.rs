@@ -303,6 +303,18 @@ fn fail_cell_io_setup(
     ))));
 }
 
+const NON_UTF8_FLATPAK_CWD_ERROR: &str =
+    "Notebook working directory contains non-UTF-8 bytes; Flatpak cannot pass it to the host safely.";
+
+fn host_bridge_cwd(cwd: &Path, host_bridge: bool) -> Result<Option<String>, &'static str> {
+    if !host_bridge {
+        return Ok(None);
+    }
+    cwd.to_str()
+        .map(|cwd| Some(cwd.to_owned()))
+        .ok_or(NON_UTF8_FLATPAK_CWD_ERROR)
+}
+
 fn spawn_cell_worker(spec: CommandSpec, handle: &CellHandle) -> mpsc::Receiver<WorkerEvent> {
     // Bound queued output as well as the rendered buffers: a command that
     // writes faster than GTK can paint applies backpressure instead of growing
@@ -311,6 +323,14 @@ fn spawn_cell_worker(spec: CommandSpec, handle: &CellHandle) -> mpsc::Receiver<W
     let child_slot = handle.child.clone();
     let cancelled = handle.cancelled.clone();
     let pgid = handle.pgid.clone();
+    let host_bridge = crate::host::is_flatpak();
+    let cwd_for_bridge = match host_bridge_cwd(&spec.cwd, host_bridge) {
+        Ok(cwd) => cwd,
+        Err(error) => {
+            let _ = sender.try_send(WorkerEvent::Done(CellOutcome::Failed(error.to_owned())));
+            return receiver;
+        }
+    };
     let Some(permit) = CellWorkerPermit::acquire() else {
         let _ = sender.try_send(WorkerEvent::Done(CellOutcome::Failed(format!(
             "at most {MAX_CONCURRENT_CELL_WORKERS} notebook cells may run concurrently"
@@ -323,9 +343,8 @@ fn spawn_cell_worker(spec: CommandSpec, handle: &CellHandle) -> mpsc::Receiver<W
         .name("anvil-notebook-cell".to_owned())
         .spawn(move || {
             let _permit = permit;
-            let cwd_for_bridge = spec.cwd.to_string_lossy().into_owned();
             let executable_argv =
-                crate::host::wrap_argv(&spec.argv, Some(cwd_for_bridge.as_str()), &[]);
+                crate::host::wrap_argv(&spec.argv, cwd_for_bridge.as_deref(), &[]);
             let Some((program, arguments)) = executable_argv.split_first() else {
                 let _ = sender.send(WorkerEvent::Done(CellOutcome::Failed(
                     "no shell executable configured".to_owned(),
@@ -339,7 +358,7 @@ fn spawn_cell_worker(spec: CommandSpec, handle: &CellHandle) -> mpsc::Receiver<W
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
-            if !crate::host::is_flatpak() {
+            if !host_bridge {
                 command.current_dir(&spec.cwd);
             }
             #[cfg(unix)]
@@ -592,8 +611,8 @@ impl Component for NotebookModel {
                 }
                 let title = path
                     .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.display().to_string());
+                    .map(crate::file_tree::display_os_str)
+                    .unwrap_or_else(|| crate::file_tree::display_full_path(&path));
                 root.set_title(&format!(
                     "Notebook: {}",
                     bounded_notebook_display(&title, 512)
@@ -666,7 +685,7 @@ impl Component for NotebookModel {
                     widgets.content.append(&warning);
                 }
                 let cwd_display = bounded_notebook_display(
-                    &cwd.to_string_lossy(),
+                    &crate::file_tree::display_full_path(&cwd),
                     MAX_NOTEBOOK_PATH_DISPLAY_BYTES,
                 );
                 let footer = gtk::Label::new(Some(&format!(
@@ -1221,6 +1240,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir(&path).unwrap();
         path
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn flatpak_bridge_never_rewrites_a_non_utf8_working_directory() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let non_utf8 = PathBuf::from(OsString::from_vec(b"/tmp/notebook-\xff".to_vec()));
+        assert_eq!(host_bridge_cwd(&non_utf8, false), Ok(None));
+        assert_eq!(
+            host_bridge_cwd(&non_utf8, true),
+            Err(NON_UTF8_FLATPAK_CWD_ERROR)
+        );
+        assert_eq!(
+            host_bridge_cwd(Path::new("/tmp/notebook"), true),
+            Ok(Some("/tmp/notebook".to_owned()))
+        );
     }
 
     #[test]

@@ -105,9 +105,48 @@ pub(crate) struct SettingsInit {
     pub(crate) values: SettingsValues,
 }
 
+/// Build the font list around the description that is actually active.
+///
+/// Pango's generic `Monospace` family and configured fonts that are not
+/// installed locally do not necessarily appear in `list_families()`. Keeping
+/// the active family in the list prevents a size-only edit from silently
+/// selecting whichever installed family happened to sort first.
+pub(crate) fn font_choices(
+    mut available_families: Vec<String>,
+    current_family: &str,
+) -> (Vec<String>, u32) {
+    let current_family = match current_family.trim() {
+        "" => "Monospace",
+        family => family,
+    };
+    available_families.retain(|family| !family.trim().is_empty());
+    if !available_families
+        .iter()
+        .any(|family| family.eq_ignore_ascii_case(current_family))
+    {
+        available_families.push(current_family.to_string());
+    }
+    available_families.sort_by_cached_key(|family| family.to_lowercase());
+    available_families.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+
+    let selected = available_families
+        .iter()
+        .position(|family| family.eq_ignore_ascii_case(current_family))
+        .expect("the active font family was inserted above") as u32;
+    (available_families, selected)
+}
+
+fn font_desc_for_choice(font_names: &[String], selected: u32, size: f64) -> String {
+    let family = font_names
+        .get(selected as usize)
+        .map(String::as_str)
+        .unwrap_or("Monospace");
+    format!("{family} {}", size as i32)
+}
+
 #[derive(Debug)]
 pub(crate) enum SettingsMsg {
-    Toggle(SettingsValues, adw::ApplicationWindow),
+    Toggle(SettingsValues, Vec<String>, adw::ApplicationWindow),
     Theme(u32),
     Font(u32),
     FontSize(f64),
@@ -611,14 +650,24 @@ impl Component for SettingsModel {
         root: &Self::Root,
     ) {
         match msg {
-            SettingsMsg::Toggle(values, parent) => {
+            SettingsMsg::Toggle(values, font_names, parent) => {
                 if root.parent().is_some() {
                     root.force_close();
                     return;
                 }
                 self.values = values;
+                self.font_names = font_names;
+                let font_notify_guard = widgets.font_row.freeze_notify();
+                widgets.font_row.set_model(Some(&gtk::StringList::new(
+                    &self
+                        .font_names
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                )));
                 widgets.theme_row.set_selected(self.values.theme);
                 widgets.font_row.set_selected(self.values.font);
+                drop(font_notify_guard);
                 widgets.font_size_row.set_value(self.values.font_size);
                 widgets.font_scale_row.set_value(self.values.font_scale);
                 widgets.opacity_scale.set_value(self.values.opacity);
@@ -1293,14 +1342,10 @@ impl SettingsModel {
     }
 
     fn output_font(&self, sender: &ComponentSender<Self>) {
-        let family = self
-            .font_names
-            .get(self.values.font as usize)
-            .map(String::as_str)
-            .unwrap_or("Monospace");
-        let _ = sender.output(SettingsOutput::FontDesc(format!(
-            "{family} {}",
-            self.values.font_size as i32
+        let _ = sender.output(SettingsOutput::FontDesc(font_desc_for_choice(
+            &self.font_names,
+            self.values.font,
+            self.values.font_size,
         )));
     }
 }
@@ -1341,6 +1386,46 @@ fn remove_remote_host(hosts: &mut Vec<RemoteHost>, index: usize, name: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_generic_family_stays_selected_for_size_changes() {
+        let (font_names, selected) = font_choices(vec!["DejaVu Sans Mono".into()], "Monospace");
+
+        assert_eq!(font_names[selected as usize], "Monospace");
+        assert_eq!(
+            font_desc_for_choice(&font_names, selected, 18.0),
+            "Monospace 18"
+        );
+    }
+
+    #[test]
+    fn configured_nerd_font_is_kept_when_pango_does_not_list_it() {
+        let configured = "SauceCodePro Nerd Font Mono";
+        let (font_names, selected) = font_choices(vec!["DejaVu Sans Mono".into()], configured);
+
+        assert_eq!(font_names[selected as usize], configured);
+        assert_eq!(
+            font_desc_for_choice(&font_names, selected, 16.0),
+            "SauceCodePro Nerd Font Mono 16"
+        );
+    }
+
+    #[test]
+    fn an_existing_current_family_is_not_duplicated() {
+        let (font_names, selected) = font_choices(
+            vec!["monospace".into(), "DejaVu Sans Mono".into()],
+            "Monospace",
+        );
+
+        assert_eq!(font_names[selected as usize], "monospace");
+        assert_eq!(
+            font_names
+                .iter()
+                .filter(|family| family.eq_ignore_ascii_case("Monospace"))
+                .count(),
+            1
+        );
+    }
 
     fn host_with_hidden_fields() -> RemoteHost {
         RemoteHost {
