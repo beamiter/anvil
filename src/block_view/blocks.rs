@@ -885,6 +885,49 @@ mod tests {
     }
 
     #[test]
+    fn every_snapshot_feed_carries_its_own_reset() {
+        // The reset must ride in the byte stream, not be a separate reset() call:
+        // VTE parses feeds asynchronously, so an immediate reset cannot drop an
+        // earlier render's queued bytes and the two feeds get parsed back to back.
+        let payload = snapshot_payload(b"listing");
+        assert!(payload.starts_with(b"\x1bc"));
+        assert_eq!(&payload[2..], b"listing");
+    }
+
+    #[test]
+    fn a_cap_that_does_not_change_the_rows_on_screen_keeps_the_same_render() {
+        // The regression that doubled `ls` output: a block is rendered on map
+        // against the configured viewport cap, then the layout's first fitted pass
+        // hands it a much smaller cap in the same main-loop iteration. A 3-row
+        // result shows the same 3 rows either way, so it must not be re-fed.
+        assert_eq!(
+            output_render_stamp(137, 3, 24, 0),
+            output_render_stamp(137, 3, 3, 0)
+        );
+    }
+
+    #[test]
+    fn a_render_that_would_look_different_is_not_skipped() {
+        let base = output_render_stamp(137, 40, 24, 0);
+        // Narrower pane: same text wraps into more rows.
+        assert_ne!(base, output_render_stamp(135, 40, 24, 0));
+        // A cap that clips more of the output.
+        assert_ne!(base, output_render_stamp(137, 40, 12, 0));
+        // Expanded past the content: all 40 rows on screen, and no longer clipped.
+        assert_ne!(base, output_render_stamp(137, 40, 200, 0));
+        // New filter text.
+        assert_ne!(base, output_render_stamp(137, 40, 24, 1));
+    }
+
+    #[test]
+    fn snapshot_rows_stay_within_the_cap_the_layout_gave_the_block() {
+        assert_eq!(snapshot_visible_rows(3, 24), 3);
+        assert_eq!(snapshot_visible_rows(40, 24), 24);
+        assert_eq!(snapshot_visible_rows(0, 24), 1);
+        assert_eq!(snapshot_visible_rows(5, 0), 1);
+    }
+
+    #[test]
     fn long_output_rows_fill_space_left_above_input() {
         assert_eq!(fitted_output_rows(600, 20, 500), 30);
         assert_eq!(fitted_output_rows(25, 20, 500), 3);
@@ -1010,6 +1053,59 @@ fn flash_button_icon(btn: &gtk::Button, icon_name: &'static str, tooltip: &'stat
     });
 }
 
+/// Feed one snapshot into a read-only finished VTE so the render is atomic with
+/// respect to VTE's parse queue.
+///
+/// `Terminal::feed` only *queues* bytes; VTE parses them from its own main-loop
+/// source. An immediate `reset()` therefore cannot drop what an earlier render
+/// already queued, so two renders in the same main-loop iteration were parsed
+/// back to back and the block showed its output twice — the doubled `ls` listing
+/// this fixes. RIS (`ESC c`) travels *with* these bytes, so it clears whatever is
+/// still queued ahead of them, in order, whether or not VTE has caught up yet.
+fn feed_snapshot_bytes(vte: &vte4::Terminal, bytes: &[u8]) {
+    vte.feed(&snapshot_payload(bytes));
+}
+
+/// In-stream terminal reset carried at the head of every snapshot feed.
+const SNAPSHOT_RESET: &[u8] = b"\x1bc";
+
+fn snapshot_payload(bytes: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(bytes.len() + SNAPSHOT_RESET.len());
+    payload.extend_from_slice(SNAPSHOT_RESET);
+    payload.extend_from_slice(bytes);
+    payload
+}
+
+/// Rows a snapshot render shows: the content height, bounded by the viewport cap
+/// the layout gave this block.
+fn snapshot_visible_rows(content_rows: i64, viewport_cap: i64) -> i64 {
+    content_rows.min(viewport_cap.max(1)).max(1)
+}
+
+/// Identity of one rendered snapshot: columns, the rows it shows, whether it
+/// fits its cap (so it settles to its content instead of scrolling internally),
+/// and the generation of the text being displayed.
+///
+/// Two renders with equal stamps produce identical bytes and geometry, so the
+/// second is pure churn — and churn is not free here: a re-feed within the same
+/// main-loop iteration is what duplicated block output. Keying this on the *cap*
+/// instead of the rows it yields is what made every new block render twice — a
+/// short block's height is its content either way, but the cap it was measured
+/// against changes from the map-time default to the layout's fitted value.
+fn output_render_stamp(
+    cols: i64,
+    content_rows: i64,
+    viewport_cap: i64,
+    generation: u64,
+) -> (i64, i64, bool, u64) {
+    (
+        cols,
+        snapshot_visible_rows(content_rows, viewport_cap),
+        content_rows <= viewport_cap,
+        generation,
+    )
+}
+
 /// Render `bytes` into a read-only finished VTE. Keep a generous temporary
 /// scrollback while feeding: the logical/visual row estimate can still be smaller
 /// than VTE's real result for cursor movement, CR redraws, combining glyphs and
@@ -1042,9 +1138,9 @@ pub(crate) fn render_bytes_into_finished_vte(
     vte.reset(true, true);
     vte.set_size(cols.max(1), visible_rows);
     vte.set_scrollback_lines(scrollback);
-    vte.feed(display_text.as_bytes());
+    feed_snapshot_bytes(vte, display_text.as_bytes());
     if expand_to_buffer {
-        settle_finished_terminal_after_feed(vte);
+        settle_finished_terminal_after_feed(vte, visible_rows, viewport_cap.max(visible_rows));
     }
     if let Some(adj) = vte.vadjustment() {
         adj.set_value(adj.lower());
@@ -1413,8 +1509,8 @@ impl FinishedBlock {
                 w.set_size(effective_cols, rendered_rows);
                 w.reset(true, true);
                 w.set_size(effective_cols, rendered_rows);
-                w.feed(cmd_bytes_for_map.as_slice());
-                settle_finished_terminal_after_feed(w);
+                feed_snapshot_bytes(w, cmd_bytes_for_map.as_slice());
+                settle_finished_terminal_after_feed(w, rendered_rows, rendered_rows);
                 // Gtk may otherwise allocate this VTE at one row, leaving the
                 // continuation lines in its internal scrollback.
                 let ch = w.char_height() as i32;
@@ -1473,16 +1569,16 @@ impl FinishedBlock {
                 if let Some(jump_btn) = jump_btn_for_map.upgrade() {
                     jump_btn.set_visible(rows > cap_for_map.get());
                 }
-                let stamp = (
+                let stamp = output_render_stamp(
                     effective_cols,
+                    rows,
                     cap,
-                    expanded_for_map.get(),
                     displayed_generation_for_map.get(),
                 );
                 if render_stamp_for_map.replace(stamp) == stamp {
                     return;
                 }
-                let visible_rows = rows.min(cap).clamp(1, 32);
+                let visible_rows = snapshot_visible_rows(rows, cap);
                 render_bytes_into_finished_vte(
                     w,
                     text,
@@ -1538,11 +1634,11 @@ impl FinishedBlock {
                 let text = displayed.as_deref().unwrap_or(full.as_str());
                 let effective_cols = effective_render_cols(&output_vte_for_btn, cols_for_btn);
                 let rows = output_visual_row_count(text, effective_cols);
-                let visible_rows = rows.min(cap).max(1);
-                render_stamp_for_btn.set((
+                let visible_rows = snapshot_visible_rows(rows, cap);
+                render_stamp_for_btn.set(output_render_stamp(
                     effective_cols,
+                    rows,
                     cap,
-                    now_expanded,
                     displayed_generation_for_btn.get(),
                 ));
                 render_bytes_into_finished_vte(
@@ -1854,7 +1950,12 @@ impl FinishedBlock {
                     };
                     let generation = displayed_generation.get().wrapping_add(1);
                     displayed_generation.set(generation);
-                    render_stamp.set((effective_cols, active_cap, expanded.get(), generation));
+                    render_stamp.set(output_render_stamp(
+                        effective_cols,
+                        shown_visual_rows,
+                        active_cap,
+                        generation,
+                    ));
                     render_bytes_into_finished_vte(
                         &output_vte,
                         &shown,
@@ -2044,18 +2145,24 @@ impl FinishedBlock {
         self.expanded.set(false);
         set_icon_button(&self.expand_btn, "view-fullscreen-symbolic", "Expand block");
         self.expand_btn.set_visible(output_rows > fitted_rows);
-        let stamp = (effective_cols, fitted_rows, false, generation);
-        self.render_stamp.set(stamp);
-        render_bytes_into_finished_vte(
-            &self.output_vte,
-            text,
-            effective_cols,
-            output_rows,
-            fitted_rows,
-            self.capture_rows,
-            output_rows <= fitted_rows,
-        );
-        let visible_rows = output_rows.min(fitted_rows).max(1);
+        let stamp = output_render_stamp(effective_cols, output_rows, fitted_rows, generation);
+        let visible_rows = snapshot_visible_rows(output_rows, fitted_rows);
+        // Only re-feed when this pass would actually draw something different.
+        // A cap that changed without changing the rows on screen (the layout's
+        // first fitted pass over a short block always does this) leaves the
+        // snapshot as it is: re-feeding it in the same main-loop iteration as the
+        // map-time render is what made block output appear twice.
+        if self.render_stamp.replace(stamp) != stamp {
+            render_bytes_into_finished_vte(
+                &self.output_vte,
+                text,
+                effective_cols,
+                output_rows,
+                fitted_rows,
+                self.capture_rows,
+                output_rows <= fitted_rows,
+            );
+        }
         self.output_vte
             .set_height_request((visible_rows as i32).saturating_mul(cell_height));
         self.output_scrollbar.set_visible(output_rows > fitted_rows);
@@ -2075,8 +2182,12 @@ impl FinishedBlock {
             self.command_vte.reset(true, true);
             self.command_vte
                 .set_size(command_effective_cols, command_rows.max(1));
-            self.command_vte.feed(self.command_bytes.as_slice());
-            settle_finished_terminal_after_feed(&self.command_vte);
+            feed_snapshot_bytes(&self.command_vte, self.command_bytes.as_slice());
+            settle_finished_terminal_after_feed(
+                &self.command_vte,
+                command_rows.max(1),
+                command_rows.max(1),
+            );
             self.command_vte
                 .set_height_request((command_rows.max(1) as i32).saturating_mul(cell_height));
         }

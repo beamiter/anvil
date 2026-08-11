@@ -77,42 +77,65 @@ pub(crate) fn encode_mouse_wheel(
     }
 }
 
-/// Convert VTE's adjustment extent into the number of rows currently retained
-/// by the snapshot. `lower` is negative when wrapped/overflow rows live in
-/// scrollback, while `upper - lower` covers both scrollback and the visible grid.
-fn finished_buffer_rows_from_adjustment(lower: f64, upper: f64, visible_rows: i64) -> i64 {
-    let visible_rows = visible_rows.max(1);
-    if !lower.is_finite() || !upper.is_finite() || upper <= lower {
-        return visible_rows;
+/// Rows a finished snapshot's own content occupies, from where VTE left the
+/// cursor (`cursor_row`, an absolute scrollback row) and the first row its ring
+/// still holds (`first_row`, the vertical adjustment's lower bound).
+///
+/// The adjustment *span* (`upper - lower`) cannot be used for this. It counts
+/// every row the ring retains, and each time the block layout squeezes a
+/// snapshot VTE the rows it was showing move into scrollback rather than being
+/// dropped — so the span grows on every squeeze. Sizing the widget from it grew
+/// the block, the next squeeze added more rows, and a one-line `ls` result
+/// ratcheted taller while every re-render flipped it back to the estimate. The
+/// cursor sits on the last row the feed wrote, so this measure holds still under
+/// layout churn and shrinks again for a shorter snapshot.
+fn finished_content_rows(first_row: f64, cursor_row: i64, fallback_rows: i64) -> i64 {
+    let fallback_rows = fallback_rows.max(1);
+    if !first_row.is_finite() || first_row < i64::MIN as f64 {
+        return fallback_rows;
     }
-    let span = (upper - lower).ceil();
-    if span >= i64::MAX as f64 {
-        i64::MAX
-    } else {
-        (span as i64).max(visible_rows)
+    let first = first_row.floor();
+    if first > cursor_row as f64 {
+        return fallback_rows;
     }
+    (cursor_row - first as i64).saturating_add(1).max(1)
 }
 
-/// Grow a read-only finished VTE from its provisional grid to every row VTE
-/// actually rendered. This is intentionally based on the terminal buffer after
-/// `feed()`, not a string-width estimate: ANSI controls, wide/combining glyphs,
-/// tabs, carriage-return redraws and automatic wrapping are all already resolved
-/// by VTE at this point.
-pub(crate) fn expand_finished_terminal_to_buffer(terminal: &Terminal) {
-    let visible_rows = terminal.row_count().max(1);
-    let rows = terminal
+/// Fit a read-only finished VTE to the rows its snapshot actually occupies:
+/// never below `floor_rows` (the caller's own row estimate, which still counts
+/// rows a cursor-up sequence left below the cursor) and never above `max_rows`
+/// (the viewport cap the layout gave this block — past it the block's own
+/// scrollbar takes over).
+///
+/// VTE resolves wrapping, wide glyphs, tabs and cursor motion itself, so it is
+/// the authority on how tall a snapshot really is. It also parses `feed()`
+/// asynchronously, so an early settling pass can still be measuring the
+/// *previous* snapshot; the target is therefore recomputed from the content on
+/// every pass — never from the grid a previous pass set — so a later pass
+/// corrects a stale measurement downwards as well as upwards.
+pub(crate) fn fit_finished_terminal_to_content(
+    terminal: &Terminal,
+    floor_rows: i64,
+    max_rows: i64,
+) {
+    let floor_rows = floor_rows.max(1);
+    let max_rows = max_rows.max(floor_rows);
+    let first_row = terminal
         .vadjustment()
-        .map(|adj| finished_buffer_rows_from_adjustment(adj.lower(), adj.upper(), visible_rows))
-        .unwrap_or(visible_rows);
+        .map(|adj| adj.lower())
+        .unwrap_or(f64::NAN);
+    let (_, cursor_row) = terminal.cursor_position();
+    let rows = finished_content_rows(first_row, cursor_row, terminal.row_count())
+        .clamp(floor_rows, max_rows);
     let cols = terminal.column_count().max(1);
 
-    if rows > visible_rows {
+    if terminal.row_count() != rows {
         terminal.set_size(cols, rows);
     }
-    // Keep the capture capacity armed after expansion. The configured value is
-    // only a limit, so unused rows do not create an inner scroll range. More
-    // importantly, an older idle-settling callback can no longer clear the
-    // scrollback needed by a newer filter render before VTE has processed it.
+    // The capture capacity stays armed: the configured value is only a limit, so
+    // unused rows do not create an inner scroll range, and an older idle-settling
+    // callback can no longer clear the scrollback a newer filter render needs
+    // before VTE has processed it.
 
     let cell_height = (terminal.char_height() as i32).max(1);
     let rows_i32 = rows.clamp(1, i32::MAX as i64) as i32;
@@ -123,18 +146,23 @@ pub(crate) fn expand_finished_terminal_to_buffer(terminal: &Terminal) {
     }
 }
 
-/// Settle a finished snapshot after bytes have been fed. VTE updates its grid
-/// and adjustment asynchronously, so use two idle passes: the first folds any
-/// overflow/soft-wrapped rows into the widget, and the second observes any
-/// adjustment changes caused by that resize. Capture capacity remains armed so
-/// overlapping filter renders cannot invalidate one another.
-pub(crate) fn settle_finished_terminal_after_feed(terminal: &Terminal) {
+/// Settle a finished snapshot after bytes have been fed. VTE parses `feed()`
+/// asynchronously, so use two idle passes: the first folds any overflow /
+/// soft-wrapped rows into the widget, and the second re-measures once VTE has
+/// caught up, correcting the first in either direction. `floor_rows` / `max_rows`
+/// bound both passes, so a measurement taken mid-parse can never resize the
+/// block past the height its own render asked for.
+pub(crate) fn settle_finished_terminal_after_feed(
+    terminal: &Terminal,
+    floor_rows: i64,
+    max_rows: i64,
+) {
     let terminal = terminal.clone();
     glib::idle_add_local_once(move || {
-        expand_finished_terminal_to_buffer(&terminal);
+        fit_finished_terminal_to_content(&terminal, floor_rows, max_rows);
         let terminal = terminal.clone();
         glib::idle_add_local_once(move || {
-            expand_finished_terminal_to_buffer(&terminal);
+            fit_finished_terminal_to_content(&terminal, floor_rows, max_rows);
             let terminal = terminal.clone();
             glib::idle_add_local_once(move || {
                 if let Some(adj) = terminal.vadjustment() {
@@ -222,14 +250,29 @@ mod tests {
     }
 
     #[test]
-    fn finished_buffer_rows_include_wrapped_scrollback() {
-        assert_eq!(finished_buffer_rows_from_adjustment(-7.0, 5.0, 5), 12);
+    fn content_rows_span_the_ring_from_its_first_row_to_the_cursor() {
+        // Wrapped rows sit between the ring's first row and the cursor: three
+        // rows of content with the cursor on the last one.
+        assert_eq!(finished_content_rows(-7.0, -5, 1), 3);
+        assert_eq!(finished_content_rows(0.0, 0, 4), 1);
     }
 
     #[test]
-    fn finished_buffer_rows_never_shrink_the_provisional_grid() {
-        assert_eq!(finished_buffer_rows_from_adjustment(0.0, 1.0, 5), 5);
-        assert_eq!(finished_buffer_rows_from_adjustment(f64::NAN, 1.0, 3), 3);
+    fn content_rows_ignore_rows_a_squeeze_pushed_into_scrollback() {
+        // One 3-row snapshot, measured while the widget is allocated a single row
+        // (the other two are in scrollback) and again while allocated eight. A
+        // span-based measure reports 3 then 8 and ratchets the block taller; the
+        // cursor reports the content either way.
+        assert_eq!(finished_content_rows(10.0, 12, 1), 3);
+        assert_eq!(finished_content_rows(10.0, 12, 8), 3);
+    }
+
+    #[test]
+    fn content_rows_fall_back_when_vte_cannot_describe_a_height() {
+        assert_eq!(finished_content_rows(f64::NAN, 4, 3), 3);
+        // A cursor above the ring's first row cannot describe a height.
+        assert_eq!(finished_content_rows(9.0, 4, 5), 5);
+        assert_eq!(finished_content_rows(f64::NAN, 4, 0), 1);
     }
 }
 
@@ -345,12 +388,13 @@ pub(crate) fn create_finished_terminal(
     // one constructor-level hook for command snapshots and other one-shot users;
     // every explicit re-feed also calls the same settling helper.
     if expand_to_buffer {
-        let expanded = std::cell::Cell::new(false);
+        let settled = std::cell::Cell::new(false);
+        let cap = viewport_cap.max(visible_rows);
         terminal.connect_map(move |terminal| {
-            if expanded.replace(true) {
+            if settled.replace(true) {
                 return;
             }
-            settle_finished_terminal_after_feed(terminal);
+            settle_finished_terminal_after_feed(terminal, visible_rows, cap);
         });
     }
 
