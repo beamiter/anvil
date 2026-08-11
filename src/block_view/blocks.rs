@@ -1602,7 +1602,7 @@ impl FinishedBlock {
                 // continuation lines in its internal scrollback.
                 let ch = w.char_height() as i32;
                 if ch > 0 {
-                    w.set_height_request(rendered_rows as i32 * ch);
+                    w.set_height_request(finished_vte_height_px(rendered_rows, ch));
                 }
             });
         }
@@ -1621,8 +1621,10 @@ impl FinishedBlock {
             initial_visible_rows,
             !output_scrollable,
         );
-        output_vte
-            .set_height_request(initial_visible_rows as i32 * estimated_cell_height_px(config));
+        output_vte.set_height_request(finished_vte_height_px(
+            initial_visible_rows,
+            estimated_cell_height_px(config),
+        ));
         // Tracks whether the user has toggled this block to its expanded
         // height. Survives unmap/remap so re-feeding picks the right cap.
         let expanded: Rc<Cell<bool>> = Rc::new(Cell::new(false));
@@ -1691,7 +1693,7 @@ impl FinishedBlock {
                 // remap is skipped or coalesced.
                 let ch = w.char_height() as i32;
                 if ch > 0 {
-                    w.set_height_request((visible_rows as i32) * ch);
+                    w.set_height_request(finished_vte_height_px(visible_rows, ch));
                 }
                 if rows <= cap {
                     pin_vte_to_top(w);
@@ -1746,7 +1748,7 @@ impl FinishedBlock {
                 );
                 let ch = output_vte_for_btn.char_height() as i32;
                 if ch > 0 {
-                    output_vte_for_btn.set_height_request((visible_rows as i32) * ch);
+                    output_vte_for_btn.set_height_request(finished_vte_height_px(visible_rows, ch));
                 }
                 if now_expanded {
                     set_icon_button(btn, "view-restore-symbolic", "Collapse to default height");
@@ -1972,7 +1974,7 @@ impl FinishedBlock {
             filter_row.append(&filter_status);
 
             content.append(&filter_row);
-            outer.reorder_child_after(&filter_row, Some(&cmd_row));
+            content.reorder_child_after(&filter_row, Some(&cmd_row));
 
             let apply = {
                 let output_vte = output_vte.downgrade();
@@ -2062,7 +2064,7 @@ impl FinishedBlock {
                     let ch = output_vte.char_height() as i32;
                     if ch > 0 {
                         let probe_rows = shown_visual_rows.min(active_cap).clamp(1, 32);
-                        output_vte.set_height_request((probe_rows as i32) * ch);
+                        output_vte.set_height_request(finished_vte_height_px(probe_rows, ch));
                     }
                     let has_query = filter_enabled.get() && !q.trim().is_empty();
                     if has_query {
@@ -2302,7 +2304,7 @@ impl FinishedBlock {
             );
         }
         self.output_vte
-            .set_height_request((visible_rows as i32).saturating_mul(cell_height));
+            .set_height_request(finished_vte_height_px(visible_rows, cell_height));
         self.output_scrollbar.set_visible(output_rows > fitted_rows);
         self.output_vte.queue_allocate();
 
@@ -2327,7 +2329,7 @@ impl FinishedBlock {
                 command_rows.max(1),
             );
             self.command_vte
-                .set_height_request((command_rows.max(1) as i32).saturating_mul(cell_height));
+                .set_height_request(finished_vte_height_px(command_rows.max(1), cell_height));
         }
 
         let rows_for_height = visible_rows

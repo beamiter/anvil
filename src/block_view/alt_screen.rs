@@ -19,6 +19,22 @@ use vte4::{TerminalExt, TerminalExtManual};
 /// monospace fonts paint almost up to VTE's default cell boundary.
 pub(crate) const BLOCK_CELL_HEIGHT_SCALE: f64 = 1.12;
 
+/// Headroom for a finished VTE's pixel-height request.
+///
+/// VTE derives its grid rows from the allocated content height. GTK/CSS rounding
+/// can leave an exact `rows * cell_height` request a few pixels short, dropping
+/// one row into scrollback. The output scrollbar then appears, changes the
+/// sibling allocation enough to restore the row, disappears again, and repeats.
+/// Keep the slack below one cell so it cannot create a phantom terminal row.
+const FINISHED_VTE_HEIGHT_SLACK_PX: i32 = 6;
+
+pub(crate) fn finished_vte_height_px(rows: i64, cell_height: i32) -> i32 {
+    let cell = cell_height.max(1);
+    (rows.clamp(1, i32::MAX as i64) as i32)
+        .saturating_mul(cell)
+        .saturating_add(FINISHED_VTE_HEIGHT_SLACK_PX.min(cell - 1))
+}
+
 // ─── Mouse Reporting Mode ─────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -138,8 +154,7 @@ pub(crate) fn fit_finished_terminal_to_content(
     // before VTE has processed it.
 
     let cell_height = (terminal.char_height() as i32).max(1);
-    let rows_i32 = rows.clamp(1, i32::MAX as i64) as i32;
-    terminal.set_height_request(rows_i32.saturating_mul(cell_height));
+    terminal.set_height_request(finished_vte_height_px(rows, cell_height));
 
     if let Some(adj) = terminal.vadjustment() {
         adj.set_value(adj.lower());
@@ -273,6 +288,14 @@ mod tests {
         // A cursor above the ring's first row cannot describe a height.
         assert_eq!(finished_content_rows(9.0, 4, 5), 5);
         assert_eq!(finished_content_rows(f64::NAN, 4, 0), 1);
+    }
+
+    #[test]
+    fn finished_vte_height_keeps_rounding_slack_below_one_row() {
+        let height = finished_vte_height_px(2, 28);
+        assert!(height > 2 * 28);
+        assert!(height < 3 * 28);
+        assert_eq!(finished_vte_height_px(2, 1), 2);
     }
 }
 
