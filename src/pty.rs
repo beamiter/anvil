@@ -34,6 +34,10 @@ pub struct OwnedPty {
     /// process-group number cannot be compared with this local child PID.
     foreground_identity_available: bool,
     reader_cancelled: Arc<AtomicBool>,
+    /// Linux wakeup for a reader blocked on an idle PTY. `None` means eventfd
+    /// creation failed (or this is not Linux), so the reader retains its 50 ms
+    /// cancellation polling fallback.
+    reader_cancel_eventfd: Option<Arc<OwnedFd>>,
     /// The shared outgoing-write filter. Holds the "a frame this app opened is
     /// still open" state across `write_bytes` calls, so a body that arrives as
     /// its own write still has paste markers removed instead of being waved
@@ -171,6 +175,126 @@ fn unix_fd_add_local<F: FnMut() -> bool + 'static>(fd: RawFd, func: F) {
             fd_watch_destroy::<F>,
         );
     }
+}
+
+const READER_CANCEL_FALLBACK_POLL_MS: i32 = 50;
+
+#[derive(Debug)]
+enum ReaderPoll {
+    PtyReady,
+    Cancelled,
+    TimedOut,
+    /// The cancel descriptor could not be watched. The caller must discard it
+    /// and continue with the bounded polling fallback instead of stopping the
+    /// otherwise healthy PTY reader.
+    CancelUnavailable(io::Error),
+}
+
+#[cfg(target_os = "linux")]
+fn create_reader_cancel_eventfd() -> Option<Arc<OwnedFd>> {
+    // SAFETY: eventfd returns a fresh descriptor on success; ownership moves
+    // immediately into OwnedFd. Nonblocking keeps kill/Drop unable to stall.
+    let raw = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+    if raw < 0 {
+        log::warn!(
+            "PTY reader cancel eventfd unavailable; using {} ms polling: {}",
+            READER_CANCEL_FALLBACK_POLL_MS,
+            io::Error::last_os_error()
+        );
+        return None;
+    }
+    // SAFETY: `raw` is a fresh successful eventfd result owned by this process.
+    Some(Arc::new(unsafe { OwnedFd::from_raw_fd(raw) }))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn create_reader_cancel_eventfd() -> Option<Arc<OwnedFd>> {
+    None
+}
+
+/// Wait until the PTY can be read or teardown requests reader cancellation.
+///
+/// With a cancel fd this blocks indefinitely, so an idle reader has no timer
+/// wakeups. Without one it preserves the historical 50 ms atomic check. PTY
+/// HUP/ERR are reported as readable so the following `read` observes EOF/EIO;
+/// an invalid PTY fd remains a real reader failure.
+fn poll_pty_or_reader_cancel(pty_fd: RawFd, cancel_fd: Option<RawFd>) -> io::Result<ReaderPoll> {
+    loop {
+        let mut ready = [
+            libc::pollfd {
+                fd: pty_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: cancel_fd.unwrap_or(-1),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let has_cancel_fd = cancel_fd.is_some();
+        let descriptor_count: libc::nfds_t = if has_cancel_fd { 2 } else { 1 };
+        let timeout = if has_cancel_fd {
+            -1
+        } else {
+            READER_CANCEL_FALLBACK_POLL_MS
+        };
+        // SAFETY: `ready` contains `descriptor_count` initialized pollfd values
+        // and remains writable for the duration of this blocking call.
+        let polled = unsafe { libc::poll(ready.as_mut_ptr(), descriptor_count, timeout) };
+        if polled < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return if has_cancel_fd {
+                Ok(ReaderPoll::CancelUnavailable(error))
+            } else {
+                Err(error)
+            };
+        }
+        if polled == 0 {
+            return Ok(ReaderPoll::TimedOut);
+        }
+
+        if has_cancel_fd {
+            let cancel_events = ready[1].revents;
+            if cancel_events & libc::POLLIN != 0 {
+                return Ok(ReaderPoll::Cancelled);
+            }
+            if cancel_events & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                return Ok(ReaderPoll::CancelUnavailable(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    format!("cancel eventfd poll failure: revents={cancel_events:#x}"),
+                )));
+            }
+        }
+
+        let pty_events = ready[0].revents;
+        if pty_events & libc::POLLNVAL != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "PTY reader descriptor became invalid",
+            ));
+        }
+        if pty_events & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 {
+            return Ok(ReaderPoll::PtyReady);
+        }
+        // A signal or platform-specific event may produce no relevant bits.
+        // Rebuild pollfd values so stale revents can never leak into a retry.
+    }
+}
+
+fn request_reader_cancel(cancelled: &AtomicBool, cancel_eventfd: Option<&OwnedFd>) {
+    cancelled.store(true, Ordering::Release);
+    #[cfg(target_os = "linux")]
+    if let Some(cancel_eventfd) = cancel_eventfd {
+        if let Err(error) = signal_eventfd(cancel_eventfd.as_raw_fd()) {
+            log::warn!("could not wake PTY reader cancellation poll: {error}");
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = cancel_eventfd;
 }
 
 /// Process exactly one bounded chunk per GLib dispatch. Even at idle priority,
@@ -734,6 +858,7 @@ impl OwnedPty {
                     child_lifecycle,
                     foreground_identity_available: !host_bridge,
                     reader_cancelled: Arc::new(AtomicBool::new(false)),
+                    reader_cancel_eventfd: create_reader_cancel_eventfd(),
                     input_guard: std::sync::Mutex::new(pty_input::InputGuard::new()),
                     shell_bracketed_paste: Arc::new(AtomicBool::new(false)),
                     shell_integration_token,
@@ -828,7 +953,10 @@ impl OwnedPty {
     }
 
     pub fn kill(&self) {
-        self.reader_cancelled.store(true, Ordering::Release);
+        request_reader_cancel(
+            &self.reader_cancelled,
+            self.reader_cancel_eventfd.as_deref(),
+        );
         self.close_master_fd();
         self.child_lifecycle
             .terminate(EscalationPolicy::SESSION_DRAIN);
@@ -892,6 +1020,7 @@ impl OwnedPty {
         F: FnMut(Vec<u8>) + 'static,
         E: FnOnce(i32) + 'static,
     {
+        let reader_cancel_eventfd = self.reader_cancel_eventfd.as_ref().map(Arc::clone);
         #[cfg(target_os = "linux")]
         let eventfd = {
             // SAFETY: eventfd returns a fresh descriptor on success; ownership
@@ -908,6 +1037,7 @@ impl OwnedPty {
         let reader = std::thread::Builder::new()
             .name("anvil-pty-reader".to_string())
             .spawn(move || {
+                let mut reader_cancel_eventfd = reader_cancel_eventfd;
                 let notify = || {
                     #[cfg(target_os = "linux")]
                     if let Some(eventfd) = eventfd_for_thread.as_deref() {
@@ -926,22 +1056,28 @@ impl OwnedPty {
                     if reader_cancelled.load(Ordering::Acquire) {
                         break;
                     }
-                    let mut ready = libc::pollfd {
+                    match poll_pty_or_reader_cancel(
                         fd,
-                        events: libc::POLLIN,
-                        revents: 0,
-                    };
-                    let polled = unsafe { libc::poll(&mut ready, 1, 50) };
-                    if polled < 0 {
-                        if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                        reader_cancel_eventfd.as_ref().map(|eventfd| eventfd.as_raw_fd()),
+                    ) {
+                        Ok(ReaderPoll::PtyReady) => {}
+                        Ok(ReaderPoll::Cancelled) => break,
+                        Ok(ReaderPoll::TimedOut) => continue,
+                        Ok(ReaderPoll::CancelUnavailable(error)) => {
+                            log::warn!(
+                                "PTY reader cancel eventfd unavailable; reverting to {} ms polling: {error}",
+                                READER_CANCEL_FALLBACK_POLL_MS
+                            );
+                            reader_cancel_eventfd = None;
                             continue;
                         }
-                        break;
-                    }
-                    if polled == 0 {
-                        continue;
+                        Err(error) => {
+                            log::warn!("PTY reader poll stopped: {error}");
+                            break;
+                        }
                     }
                     match file.read(&mut buf) {
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                         Ok(0) | Err(_) => {
                             break;
                         }
@@ -1186,7 +1322,10 @@ fn signal_eventfd(eventfd: RawFd) -> io::Result<()> {
 
 impl Drop for OwnedPty {
     fn drop(&mut self) {
-        self.reader_cancelled.store(true, Ordering::Release);
+        request_reader_cancel(
+            &self.reader_cancelled,
+            self.reader_cancel_eventfd.as_deref(),
+        );
         self.close_master_fd();
         self.child_lifecycle
             .terminate(EscalationPolicy::SESSION_DRAIN);
@@ -1235,6 +1374,73 @@ mod tests {
         };
         assert_eq!(read as usize, std::mem::size_of::<u64>());
         assert_eq!(value, 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reader_cancel_eventfd_keeps_idle_poll_asleep_and_wakes_it() {
+        let (reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let cancel_eventfd = create_reader_cancel_eventfd().expect("create cancel eventfd");
+        let cancel_for_reader = Arc::clone(&cancel_eventfd);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            result_tx
+                .send(poll_pty_or_reader_cancel(
+                    reader.as_raw_fd(),
+                    Some(cancel_for_reader.as_raw_fd()),
+                ))
+                .unwrap();
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        match result_rx.recv_timeout(Duration::from_millis(120)) {
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Ok(result) => {
+                reader.join().unwrap();
+                panic!("idle reader poll returned without input or cancellation: {result:?}");
+            }
+            Err(error) => {
+                reader.join().unwrap();
+                panic!("reader poll result channel failed: {error}");
+            }
+        }
+
+        let cancelled = AtomicBool::new(false);
+        request_reader_cancel(&cancelled, Some(&cancel_eventfd));
+        let result = result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancel eventfd must wake the idle reader poll");
+        reader.join().unwrap();
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(matches!(result, Ok(ReaderPoll::Cancelled)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn invalid_cancel_fd_downgrades_to_bounded_polling() {
+        let (reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let result = poll_pty_or_reader_cancel(reader.as_raw_fd(), Some(i32::MAX)).unwrap();
+        assert!(matches!(result, ReaderPoll::CancelUnavailable(_)));
+
+        let started = Instant::now();
+        let result = poll_pty_or_reader_cancel(reader.as_raw_fd(), None).unwrap();
+        assert!(matches!(result, ReaderPoll::TimedOut));
+        assert!(started.elapsed() >= Duration::from_millis(40));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reader_poll_reports_pty_hangup_as_readable() {
+        let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let cancel_eventfd = create_reader_cancel_eventfd().expect("create cancel eventfd");
+        drop(writer);
+
+        let result =
+            poll_pty_or_reader_cancel(reader.as_raw_fd(), Some(cancel_eventfd.as_raw_fd()))
+                .unwrap();
+        assert!(matches!(result, ReaderPoll::PtyReady));
     }
 
     #[cfg(target_os = "linux")]

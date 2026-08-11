@@ -4,9 +4,10 @@ use gtk::prelude::*;
 use gtk::{glib, Orientation, ScrolledWindow};
 use relm4::gtk;
 use std::cell::{Cell, RefCell};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::{Instant, SystemTime};
 use vte4::Terminal;
 use vte4::TerminalExt;
@@ -47,8 +48,56 @@ pub(crate) fn prof_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("JTERM_PROF").is_ok())
 }
 
-// Global block ID counter
+// A random per-process 32-bit namespace prevents concurrently running Anvil
+// processes from emitting the same persisted ids. The low 32 bits remain a
+// checked monotonic sequence (over four billion completed blocks per process).
 static BLOCK_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+static BLOCK_ID_NAMESPACE: OnceLock<u64> = OnceLock::new();
+const BLOCK_ID_SEQUENCE_LIMIT: u64 = 1_u64 << 32;
+
+fn process_block_id_namespace() -> u64 {
+    *BLOCK_ID_NAMESPACE.get_or_init(|| {
+        let mut random = [0_u8; std::mem::size_of::<u32>()];
+        // SAFETY: `random` is a writable buffer of the exact supplied length;
+        // nonblocking entropy failure falls through to a time/pid mix.
+        let read = unsafe {
+            nix::libc::getrandom(
+                random.as_mut_ptr().cast(),
+                random.len(),
+                nix::libc::GRND_NONBLOCK,
+            )
+        };
+        let namespace = if read == random.len() as isize {
+            u32::from_ne_bytes(random)
+        } else {
+            let nanos = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            let mut mixed = nanos
+                ^ u64::from(std::process::id())
+                ^ (&BLOCK_ID_COUNTER as *const AtomicU64 as usize as u64);
+            // SplitMix64 finalizer: diffuse the fallback's time, pid, and ASLR
+            // inputs before selecting the namespace bits.
+            mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            (mixed ^ (mixed >> 31)) as u32
+        };
+        u64::from(namespace.max(1)) << 32
+    })
+}
+
+fn claim_next_unused_block_id(
+    reserved: &mut HashSet<u64>,
+    mut next_candidate: impl FnMut() -> u64,
+) -> u64 {
+    loop {
+        let candidate = next_candidate();
+        if !reserved.remove(&candidate) {
+            return candidate;
+        }
+    }
+}
 
 /// Why a review-gated command can or cannot be written to the live Block
 /// prompt. Agent controls use this richer status to explain the exact recovery
@@ -101,8 +150,18 @@ impl CommandPromptStatus {
     }
 }
 
-fn next_block_id() -> u64 {
-    BLOCK_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+fn next_block_id(reserved: &RefCell<HashSet<u64>>) -> u64 {
+    let mut reserved = reserved.borrow_mut();
+    claim_next_unused_block_id(&mut reserved, || {
+        let sequence = BLOCK_ID_COUNTER
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current
+                    .checked_add(1)
+                    .filter(|next| *next <= BLOCK_ID_SEQUENCE_LIMIT)
+            })
+            .unwrap_or_else(|_| panic!("completed-block id sequence exhausted"));
+        process_block_id_namespace() | sequence
+    })
 }
 
 /// Approximate the vertical positions of failed finished blocks within the
@@ -190,6 +249,26 @@ fn set_jump_fab_label(fab: &gtk::Button, unread: u32) {
         fab.update_property(&[gtk::accessible::Property::Label("Jump to latest")]);
     }
     fab.set_child(Some(&content));
+}
+
+/// Unread blocks are the newest suffix of the retained finished list. Prefix
+/// retention must subtract only the part of that suffix it actually evicted.
+fn unread_after_prefix_eviction(total_before: usize, unread: u32, evicted: usize) -> u32 {
+    let unread = (unread as usize).min(total_before);
+    let read_prefix = total_before.saturating_sub(unread);
+    let evicted_unread = evicted.min(total_before).saturating_sub(read_prefix);
+    u32::try_from(unread.saturating_sub(evicted_unread)).unwrap_or(u32::MAX)
+}
+
+fn unread_after_index_removal(total_before: usize, unread: u32, removed: usize) -> u32 {
+    let unread = (unread as usize).min(total_before);
+    let unread_start = total_before.saturating_sub(unread);
+    let remaining = if removed < total_before && removed >= unread_start {
+        unread.saturating_sub(1)
+    } else {
+        unread
+    };
+    u32::try_from(remaining).unwrap_or(u32::MAX)
 }
 
 /// Whether a key press seen while keyboard focus is stranded on a finished
@@ -1305,6 +1384,171 @@ fn remove_finished_block_from_selection(
     sync_finished_block_selection(finished, selected_block_ids, selected_block_id);
 }
 
+struct BlockRemovalRefs<'a> {
+    selected_ids: &'a SelectedBlockIds,
+    selected: &'a Rc<Cell<Option<u64>>>,
+    anchor: &'a Rc<Cell<Option<u64>>>,
+    bookmarks: &'a Rc<RefCell<HashSet<u64>>>,
+    visible_indices: &'a Rc<RefCell<HashSet<usize>>>,
+    failure_marker_redraw: &'a dyn Fn(),
+    unread_count: &'a Rc<Cell<u32>>,
+    jump_fab: &'a gtk::Button,
+}
+
+fn plan_completed_block_retention_with_restored(
+    restored: &[BlockData],
+    finished: &[FinishedBlock],
+    max_blocks: usize,
+) -> CompletedBlockRetentionPlan {
+    let candidates: Vec<(u64, usize)> = restored
+        .iter()
+        .map(|block| (block.id, block.estimated_restored_retained_bytes()))
+        .chain(
+            finished
+                .iter()
+                .map(|block| (block.id, block.estimated_retained_bytes())),
+        )
+        .collect();
+    completed_block_retention_plan(&candidates, max_blocks, MAX_COMPLETED_BLOCK_RETAINED_BYTES)
+}
+
+fn plan_completed_block_retention_with_newest(
+    finished: &[FinishedBlock],
+    newest_id: u64,
+    newest_estimated_bytes: usize,
+    max_blocks: usize,
+) -> CompletedBlockRetentionPlan {
+    let candidates: Vec<(u64, usize)> = finished
+        .iter()
+        .map(|block| (block.id, block.estimated_retained_bytes()))
+        .chain(std::iter::once((newest_id, newest_estimated_bytes)))
+        .collect();
+    completed_block_retention_plan(&candidates, max_blocks, MAX_COMPLETED_BLOCK_RETAINED_BYTES)
+}
+
+fn log_completed_block_retention(context: &str, plan: CompletedBlockRetentionPlan) {
+    if plan.byte_budget_evictions > 0 {
+        log::info!(
+            "{context}: completed-block byte budget evicted {} additional oldest block(s) ({} total with count limit); retained {} block(s), estimated {} bytes of {}",
+            plan.byte_budget_evictions,
+            plan.evict_prefix,
+            plan.retained_count,
+            plan.retained_estimated_bytes,
+            MAX_COMPLETED_BLOCK_RETAINED_BYTES,
+        );
+    }
+    if plan.newest_exceeds_byte_budget {
+        log::warn!(
+            "{context}: newest completed block alone is estimated at {} bytes, above the {}-byte per-pane cap; retaining it by newest-wins policy",
+            plan.retained_estimated_bytes,
+            MAX_COMPLETED_BLOCK_RETAINED_BYTES,
+        );
+    }
+}
+
+fn clear_find_handles(
+    finished_blocks: &Rc<RefCell<Vec<FinishedBlock>>>,
+    active_vte: &Terminal,
+    find_state: &Rc<RefCell<FindState>>,
+) {
+    for block in finished_blocks.borrow().iter() {
+        block.command_vte.search_set_regex(None::<&vte4::Regex>, 0);
+        block.output_vte.search_set_regex(None::<&vte4::Regex>, 0);
+    }
+    active_vte.search_set_regex(None::<&vte4::Regex>, 0);
+    let mut state = find_state.borrow_mut();
+    state.matches.clear();
+    state.current = 0;
+}
+
+/// Remove an oldest prefix and every piece of state indexed by those blocks.
+/// The widget pool strips the heavyweight child tree on every release.
+fn evict_finished_block_prefix(
+    requested: usize,
+    finished_blocks: &Rc<RefCell<Vec<FinishedBlock>>>,
+    block_data: &Rc<RefCell<VecDeque<BlockData>>>,
+    block_list: &gtk::Box,
+    widget_pool: &Rc<RefCell<WidgetPool>>,
+    refs: BlockRemovalRefs<'_>,
+) -> usize {
+    let (total_before, evicted): (usize, Vec<_>) = {
+        let mut finished = finished_blocks.borrow_mut();
+        let total_before = finished.len();
+        let count = requested.min(finished.len());
+        (total_before, finished.drain(..count).collect())
+    };
+    if evicted.is_empty() {
+        return 0;
+    }
+
+    let evicted_count = evicted.len();
+    let unread = unread_after_prefix_eviction(total_before, refs.unread_count.get(), evicted_count);
+    refs.unread_count.set(unread);
+    set_jump_fab_label(refs.jump_fab, unread);
+    let evicted_ids: HashSet<_> = evicted.iter().map(|block| block.id).collect();
+    mutate_block_data_and_redraw(block_data, refs.failure_marker_redraw, |blocks| {
+        let prefixes_match = blocks
+            .iter()
+            .take(evicted_count)
+            .map(|block| block.id)
+            .eq(evicted.iter().map(|block| block.id));
+        if !prefixes_match {
+            log::error!(
+                "completed-block retention found desynchronized widget/data prefixes (widgets={}, data={})",
+                evicted_count,
+                blocks.len(),
+            );
+        }
+        debug_assert!(prefixes_match);
+        blocks.drain(..evicted_count.min(blocks.len()));
+    });
+    refs.selected_ids
+        .borrow_mut()
+        .retain(|id| !evicted_ids.contains(id));
+    let finished = finished_blocks.borrow();
+    let selected = refs.selected_ids.borrow();
+    let fallback = finished
+        .iter()
+        .rev()
+        .find(|block| selected.contains(&block.id))
+        .map(|block| block.id);
+    if refs
+        .selected
+        .get()
+        .is_some_and(|id| evicted_ids.contains(&id) || !selected.contains(&id))
+    {
+        refs.selected.set(fallback);
+    }
+    if refs
+        .anchor
+        .get()
+        .is_some_and(|id| evicted_ids.contains(&id) || !selected.contains(&id))
+    {
+        refs.anchor.set(refs.selected.get());
+    }
+    drop(selected);
+    sync_finished_block_selection(&finished, refs.selected_ids, refs.selected);
+    drop(finished);
+
+    refs.bookmarks
+        .borrow_mut()
+        .retain(|id| !evicted_ids.contains(id));
+    {
+        let mut visible = refs.visible_indices.borrow_mut();
+        *visible = visible
+            .iter()
+            .filter_map(|&index| index.checked_sub(evicted_count))
+            .collect();
+    }
+    for block in evicted {
+        let widget = block.widget().clone();
+        block_list.remove(&widget);
+        widget_pool.borrow_mut().release(widget);
+    }
+    block_list.queue_allocate();
+    evicted_count
+}
+
 /// Bring a selected block into the upper third of the viewport. `compute_point`
 /// returns viewport-relative coordinates, so add the current adjustment before
 /// calculating the new absolute scroll position.
@@ -2040,6 +2284,10 @@ pub struct TermView {
     dynamic_colors: DynamicColorsRc,
     config: Rc<RefCell<Config>>,
     block_data: Rc<RefCell<VecDeque<BlockData>>>,
+    /// Persisted ids this pane's live allocator has not encountered yet. The
+    /// loader replaces this bounded set transactionally after a full scan;
+    /// ReaderCtx removes ids as the process-wide monotonic counter reaches them.
+    reserved_history_block_ids: Rc<RefCell<HashSet<u64>>>,
     /// Queue a repaint whenever block metadata changes, even when GTK's scroll
     /// adjustment geometry happens to remain numerically identical.
     failure_marker_redraw: FailureMarkerRedraw,
@@ -2055,6 +2303,12 @@ pub struct TermView {
     /// explicit undo can rebuild their widgets. Single-level: a later clear
     /// with content replaces it; cleared again only when consumed by undo.
     cleared_stash: RefCell<Vec<BlockData>>,
+    /// Per-path load/save observations move with the pane and never depend on
+    /// a transient allocation address.
+    history_baselines: RefCell<HashMap<std::path::PathBuf, history::HistoryBaseline>>,
+    /// Clear Blocks deletion authorities bound to resolved paths and codecs.
+    /// Keep each ordered target armed until that exact replacement succeeds.
+    history_explicit_replace_pending: RefCell<VecDeque<history::HistoryTarget>>,
     /// Number shown on the jump-to-latest affordance while history is scrolled
     /// away from the live prompt. Kept on TermView so Clear Blocks can reset
     /// all of the visible block-history state atomically.
@@ -2091,7 +2345,20 @@ impl Drop for TermView {
         if let Err(err) = self.save_history() {
             log::warn!("save block history on close: {err}");
         }
-        self.forget_history_revision();
+        // Outer gesture controllers capture pane-owned Rc state, while child
+        // buttons/VTEs own their signal closures. Explicitly sever both sides
+        // before the widget tree disappears so closing a pane cannot leave its
+        // completed blocks, PTY handles, or VTE grids in a reference cycle.
+        let finished_widgets: Vec<gtk::Box> = self
+            .finished_blocks
+            .borrow_mut()
+            .drain(..)
+            .map(|block| block.widget().clone())
+            .collect();
+        for widget in finished_widgets {
+            self.block_list.remove(&widget);
+            WidgetPool::teardown(&widget);
+        }
         if let Some(id) = self.resize_tick_id.borrow_mut().take() {
             id.remove();
         }
@@ -2152,6 +2419,7 @@ struct ReaderCtx {
     config_for_cb: Rc<RefCell<Config>>,
     parser: Rc<RefCell<Parser>>,
     block_data_for_cb: Rc<RefCell<VecDeque<BlockData>>>,
+    reserved_history_block_ids: Rc<RefCell<HashSet<u64>>>,
     failure_marker_redraw: FailureMarkerRedraw,
     finished_blocks_for_cb: Rc<RefCell<Vec<FinishedBlock>>>,
     scroll_debouncer: ScrollDebouncer,
@@ -2186,6 +2454,7 @@ struct ReaderCtx {
     selected_block_id_rc: Rc<Cell<Option<u64>>>,
     selection_anchor_id_rc: Rc<Cell<Option<u64>>>,
     bookmarks_rc: Rc<RefCell<std::collections::HashSet<u64>>>,
+    find_state_rc: Rc<RefCell<FindState>>,
     cmd_running_rc: Rc<Cell<bool>>,
     running_cmd_rc: Rc<RefCell<String>>,
     armed_agent_execution_rc: Rc<RefCell<Option<ArmedAgentExecution>>>,
@@ -2341,6 +2610,7 @@ impl ReaderCtx {
             config_for_cb,
             parser,
             block_data_for_cb,
+            reserved_history_block_ids,
             failure_marker_redraw,
             finished_blocks_for_cb,
             scroll_debouncer,
@@ -2366,6 +2636,7 @@ impl ReaderCtx {
             selected_block_id_rc,
             selection_anchor_id_rc,
             bookmarks_rc,
+            find_state_rc,
             cmd_running_rc,
             running_cmd_rc,
             armed_agent_execution_rc,
@@ -2681,13 +2952,15 @@ impl ReaderCtx {
                                 // Single id shared by the serializable BlockData and
                                 // the GTK FinishedBlock so id-keyed lookups (export,
                                 // delete) resolve in both lists.
-                                let block_id = next_block_id();
+                                let block_id = next_block_id(&reserved_history_block_ids);
                                 // Capture cols now (live VTE is allocated by the time
                                 // a command finishes) and store it on BlockData so
                                 // session restore can recreate the finished VTE at
                                 // the same width — preserving column-formatted output
                                 // (ls, git log, etc.) instead of reflowing it.
-                                let cols = active_rc.borrow().grid_cols() as i64;
+                                let cols = bounded_finished_vte_columns(
+                                    active_rc.borrow().grid_cols() as i64,
+                                );
                                 let estimated_height = estimated_finished_block_height_for_text(
                                     &config_for_cb.borrow(),
                                     &output_plain,
@@ -2706,8 +2979,62 @@ impl ReaderCtx {
                                     end_time_ms,
                                     duration_ms,
                                     cwd: block_cwd.clone(),
-                                    cols: cols.clamp(1, u16::MAX as i64) as u16,
+                                    cols: cols as u16,
                                 };
+
+                                let max_blocks = config_for_cb.borrow().max_visible_blocks as usize;
+                                let newest_estimated_bytes = {
+                                    let images = kitty_pending_images_rc.borrow();
+                                    estimated_live_finished_block_retained_bytes(
+                                        &prompt,
+                                        &cmd,
+                                        None,
+                                        &output_with_ansi,
+                                        output_plain.len(),
+                                        block_cwd.as_deref(),
+                                        cols,
+                                        &images,
+                                    )
+                                };
+                                let prebuild_retention_plan = {
+                                    let finished = finished_blocks_for_cb.borrow();
+                                    plan_completed_block_retention_with_newest(
+                                        &finished,
+                                        block_id,
+                                        newest_estimated_bytes,
+                                        max_blocks,
+                                    )
+                                };
+                                log_completed_block_retention(
+                                    "preparing live block",
+                                    prebuild_retention_plan,
+                                );
+                                if prebuild_retention_plan.evict_prefix > 0 {
+                                    // Retention changes block indices and may
+                                    // remove the VTE owning a highlighted hit.
+                                    clear_find_handles(
+                                        &finished_blocks_for_cb,
+                                        &active_vte,
+                                        &find_state_rc,
+                                    );
+                                }
+                                evict_finished_block_prefix(
+                                    prebuild_retention_plan.evict_prefix,
+                                    &finished_blocks_for_cb,
+                                    &block_data_for_cb,
+                                    &block_list_rc,
+                                    &widget_pool_for_cb,
+                                    BlockRemovalRefs {
+                                        selected_ids: &selected_block_ids_rc,
+                                        selected: &selected_block_id_rc,
+                                        anchor: &selection_anchor_id_rc,
+                                        bookmarks: &bookmarks_rc,
+                                        visible_indices: &visible_indices_rc,
+                                        failure_marker_redraw: failure_marker_redraw.as_ref(),
+                                        unread_count: &unread_count_rc,
+                                        jump_fab: &jump_fab,
+                                    },
+                                );
 
                                 mutate_block_data_and_redraw(
                                     &block_data_for_cb,
@@ -2745,6 +3072,7 @@ impl ReaderCtx {
                                     block_cwd.as_deref(),
                                     cols,
                                     &kitty_images,
+                                    output_plain.len(),
                                     recycled,
                                 );
                                 finished.widget().insert_before(
@@ -2763,7 +3091,6 @@ impl ReaderCtx {
                                     jump_fab.set_visible(true);
                                 }
 
-                                let max_blocks = config_for_cb.borrow().max_visible_blocks as usize;
                                 let finished_clone = finished.clone();
                                 let finished_widget = finished_clone.widget().clone();
 
@@ -2860,6 +3187,8 @@ impl ReaderCtx {
                                 let widget_pool_for_menu = widget_pool_for_cb.clone();
                                 let ask_ai_cbs_for_menu = ask_ai_about_block_cbs.clone();
                                 let failure_marker_redraw_for_menu = failure_marker_redraw.clone();
+                                let unread_for_menu = unread_count_rc.clone();
+                                let jump_fab_for_menu = jump_fab.clone();
                                 let block_id = finished_clone.id;
 
                                 let right_click = gtk::GestureClick::new();
@@ -3233,14 +3562,23 @@ impl ReaderCtx {
                                         let widget_pool_for_delete = widget_pool_for_menu.clone();
                                         let failure_marker_redraw_for_delete =
                                             failure_marker_redraw_for_menu.clone();
+                                        let unread_for_delete = unread_for_menu.clone();
+                                        let jump_fab_for_delete = jump_fab_for_menu.clone();
                                         let block_id_del = block_id;
                                         item.connect_clicked(move |_| {
                                             popover_c.popdown();
                                             let mut blocks =
                                                 finished_blocks_for_delete.borrow_mut();
-                                            if let Some(pos) =
-                                                blocks.iter().position(|b| b.id == block_id_del)
-                                            {
+                                            let removed_pos =
+                                                blocks.iter().position(|b| b.id == block_id_del);
+                                            if let Some(pos) = removed_pos {
+                                                let unread = unread_after_index_removal(
+                                                    blocks.len(),
+                                                    unread_for_delete.get(),
+                                                    pos,
+                                                );
+                                                unread_for_delete.set(unread);
+                                                set_jump_fab_label(&jump_fab_for_delete, unread);
                                                 let block = blocks.remove(pos);
                                                 let widget = block.widget().clone();
                                                 block_list_for_delete.remove(&widget);
@@ -3257,7 +3595,15 @@ impl ReaderCtx {
                                             mutate_block_data_and_redraw(
                                                 &block_data_for_delete,
                                                 failure_marker_redraw_for_delete.as_ref(),
-                                                |blocks| blocks.retain(|b| b.id != block_id_del),
+                                                |blocks| {
+                                                    if let Some(pos) = removed_pos {
+                                                        let removed = blocks.remove(pos);
+                                                        debug_assert_eq!(
+                                                            removed.as_ref().map(|block| block.id),
+                                                            Some(block_id_del),
+                                                        );
+                                                    }
+                                                },
                                             );
                                             bookmarks_for_delete.borrow_mut().remove(&block_id_del);
                                             // Index-based virtualization must be recalculated after
@@ -3286,29 +3632,46 @@ impl ReaderCtx {
                                     &selection_anchor_id_rc,
                                 );
 
-                                if finished_blocks_for_cb.borrow().len() > max_blocks {
-                                    let oldest = finished_blocks_for_cb.borrow_mut().remove(0);
-                                    remove_finished_block_from_selection(
-                                        &finished_blocks_for_cb.borrow(),
-                                        &selected_block_ids_rc,
-                                        &selected_block_id_rc,
-                                        &selection_anchor_id_rc,
-                                        oldest.id,
+                                // Recheck with the widget's actual retained
+                                // estimate. Normally this matches the pre-build
+                                // plan; the second pass closes any estimator
+                                // drift without ever evicting the newest card.
+                                let retention_plan = {
+                                    let finished = finished_blocks_for_cb.borrow();
+                                    plan_completed_block_retention_with_restored(
+                                        &[],
+                                        &finished,
+                                        max_blocks,
+                                    )
+                                };
+                                log_completed_block_retention(
+                                    "finalizing live block",
+                                    retention_plan,
+                                );
+                                if retention_plan.evict_prefix > 0 {
+                                    clear_find_handles(
+                                        &finished_blocks_for_cb,
+                                        &active_vte,
+                                        &find_state_rc,
                                     );
-                                    bookmarks_rc.borrow_mut().remove(&oldest.id);
-                                    let widget_to_release = oldest.widget().clone();
-                                    block_list_rc.remove(&widget_to_release);
-                                    widget_pool_for_cb.borrow_mut().release(widget_to_release);
-                                    visible_indices_rc.borrow_mut().clear();
                                 }
-
-                                if block_data_for_cb.borrow().len() > max_blocks {
-                                    mutate_block_data_and_redraw(
-                                        &block_data_for_cb,
-                                        failure_marker_redraw.as_ref(),
-                                        VecDeque::pop_front,
-                                    );
-                                }
+                                evict_finished_block_prefix(
+                                    retention_plan.evict_prefix,
+                                    &finished_blocks_for_cb,
+                                    &block_data_for_cb,
+                                    &block_list_rc,
+                                    &widget_pool_for_cb,
+                                    BlockRemovalRefs {
+                                        selected_ids: &selected_block_ids_rc,
+                                        selected: &selected_block_id_rc,
+                                        anchor: &selection_anchor_id_rc,
+                                        bookmarks: &bookmarks_rc,
+                                        visible_indices: &visible_indices_rc,
+                                        failure_marker_redraw: failure_marker_redraw.as_ref(),
+                                        unread_count: &unread_count_rc,
+                                        jump_fab: &jump_fab,
+                                    },
+                                );
 
                                 // Keep a small JSONL command index separate from
                                 // optional full-output block history. This powers
@@ -4680,7 +5043,10 @@ impl TermView {
         );
         let block_data_rc: Rc<RefCell<VecDeque<BlockData>>> =
             Rc::new(RefCell::new(VecDeque::new()));
+        let reserved_history_block_ids: Rc<RefCell<HashSet<u64>>> =
+            Rc::new(RefCell::new(HashSet::new()));
         let finished_blocks_rc: Rc<RefCell<Vec<FinishedBlock>>> = Rc::new(RefCell::new(Vec::new()));
+        let find_state: Rc<RefCell<FindState>> = Rc::new(RefCell::new(FindState::default()));
 
         // Paint failures against the full-history track, independently of the
         // currently visible viewport. This is a visual hint only: the narrow
@@ -5183,6 +5549,7 @@ impl TermView {
                 config_for_cb,
                 parser,
                 block_data_for_cb,
+                reserved_history_block_ids: reserved_history_block_ids.clone(),
                 failure_marker_redraw: failure_marker_redraw.clone(),
                 finished_blocks_for_cb,
                 scroll_debouncer,
@@ -5208,6 +5575,7 @@ impl TermView {
                 selected_block_id_rc: selected_block_id.clone(),
                 selection_anchor_id_rc: selection_anchor_id.clone(),
                 bookmarks_rc: block_bookmarks.clone(),
+                find_state_rc: find_state.clone(),
                 cmd_running_rc: cmd_running.clone(),
                 running_cmd_rc: running_cmd.clone(),
                 armed_agent_execution_rc: armed_agent_execution.clone(),
@@ -5943,6 +6311,7 @@ impl TermView {
             dynamic_colors,
             config: Rc::new(RefCell::new(config.clone())),
             block_data: block_data_rc,
+            reserved_history_block_ids,
             failure_marker_redraw,
             finished_blocks: finished_blocks_rc,
             viewport: Rc::new(RefCell::new(ViewportState {
@@ -5956,10 +6325,12 @@ impl TermView {
             selection_anchor_id,
             bookmarks: block_bookmarks,
             cleared_stash: RefCell::new(Vec::new()),
+            history_baselines: RefCell::new(HashMap::new()),
+            history_explicit_replace_pending: RefCell::new(VecDeque::new()),
             unread_count,
             jump_fab,
             sticky_organism_slot,
-            find_state: Rc::new(RefCell::new(FindState::default())),
+            find_state,
             current_cwd: current_cwd.clone(),
             resize_tick_id: RefCell::new(None),
             sticky_timer_id: RefCell::new(Some(sticky_timer_id)),
@@ -5971,14 +6342,6 @@ impl TermView {
         // Load history if configured
         let _ = term_view.load_history();
 
-        // Restored blocks keep their persisted ids while the global counter
-        // restarts at 0 every launch. Seed it past every restored id so a new
-        // block can never alias one — selection, bookmarks, undo-clear, and
-        // the block context menu all key on id uniqueness.
-        if let Some(max_id) = term_view.block_data.borrow().iter().map(|b| b.id).max() {
-            BLOCK_ID_COUNTER.fetch_max(max_id + 1, Ordering::Relaxed);
-        }
-
         // Create widgets for loaded blocks. Each block's `cols` is what the live
         // VTE was wrapping at when the command ran; restoring at the same cols
         // reproduces the exact line breaks (so `ls` columns don't get split
@@ -5986,17 +6349,18 @@ impl TermView {
         // to the live VTE's current column count.
         {
             let config = term_view.config.borrow();
-            let fallback_cols = term_view.active.borrow().grid_cols() as i64;
+            let fallback_cols =
+                bounded_finished_vte_columns(term_view.active.borrow().grid_cols() as i64);
             mutate_block_data_and_redraw(
                 &term_view.block_data,
                 term_view.failure_marker_redraw.as_ref(),
                 |block_data_ref| {
                     for block in block_data_ref.iter_mut() {
-                        let cols = if block.cols > 0 {
+                        let cols = bounded_finished_vte_columns(if block.cols > 0 {
                             block.cols as i64
                         } else {
                             fallback_cols
-                        };
+                        });
                         // Older history entries stored an estimate based only on `\n`
                         // count. Recompute it so a restored long wrapped line is not
                         // virtualized away while it is still visible.
@@ -6789,6 +7153,10 @@ impl TermView {
     /// Remove every finished block. Returns how many blocks were cleared; the
     /// removed data is stashed so `undo_clear_blocks` can rebuild it.
     pub fn clear_blocks(&self) -> usize {
+        // Bind deletion authority before mutating UI state. A failed save keeps
+        // this exact resolved target armed across config path/codec changes,
+        // and Undo or Drop retries it with the pane's then-current state.
+        self.arm_history_explicit_replace();
         self.clear_find();
         self.active_vte.unselect_all();
 
@@ -6857,11 +7225,47 @@ impl TermView {
             // hidden; keep the stash so undo still works after it exits.
             return 0;
         }
-        let stash: Vec<BlockData> = std::mem::take(&mut *self.cleared_stash.borrow_mut());
+        let mut stash: Vec<BlockData> = std::mem::take(&mut *self.cleared_stash.borrow_mut());
         if stash.is_empty() {
             return 0;
         }
+        self.clear_find();
+        let max_blocks = self.config.borrow().max_visible_blocks as usize;
+        let retention_plan = {
+            let finished = self.finished_blocks.borrow();
+            plan_completed_block_retention_with_restored(&stash, &finished, max_blocks)
+        };
+        log_completed_block_retention("restoring cleared blocks", retention_plan);
+        let restored_evictions = retention_plan.evict_prefix.min(stash.len());
+        stash.drain(..restored_evictions);
+        let live_evictions = retention_plan
+            .evict_prefix
+            .saturating_sub(restored_evictions);
+        evict_finished_block_prefix(
+            live_evictions,
+            &self.finished_blocks,
+            &self.block_data,
+            &self.block_list,
+            &self.widget_pool,
+            BlockRemovalRefs {
+                selected_ids: &self.selected_block_ids,
+                selected: &self.selected_block_id,
+                anchor: &self.selection_anchor_id,
+                bookmarks: &self.bookmarks,
+                visible_indices: &self.visible_indices,
+                failure_marker_redraw: self.failure_marker_redraw.as_ref(),
+                unread_count: &self.unread_count,
+                jump_fab: &self.jump_fab,
+            },
+        );
         let restored_count = stash.len();
+
+        if restored_count == 0 {
+            if let Err(err) = self.save_history() {
+                log::warn!("save byte-pruned undo state: {err}");
+            }
+            return 0;
+        }
 
         let mut restored: Vec<FinishedBlock> = Vec::with_capacity(restored_count);
         {
@@ -6869,7 +7273,8 @@ impl TermView {
             // dynamic OSC 10/11/12 color is active, restored blocks must match
             // the recolored live view instead of reverting to theme colors.
             let config = finished_block_config(&self.dynamic_colors, &self.config.borrow());
-            let fallback_cols = self.active.borrow().grid_cols() as i64;
+            let fallback_cols =
+                bounded_finished_vte_columns(self.active.borrow().grid_cols() as i64);
             // Everything restored predates the current finished blocks, so the
             // insertion anchor is the pane's first finished widget — or the
             // live input block when the pane has none.
@@ -6879,13 +7284,12 @@ impl TermView {
                 .first()
                 .map(|block| block.widget().clone().upcast())
                 .unwrap_or_else(|| self.active.borrow().widget().clone().upcast());
-            let mut stash = stash;
             for block in stash.iter_mut() {
-                let cols = if block.cols > 0 {
+                let cols = bounded_finished_vte_columns(if block.cols > 0 {
                     block.cols as i64
                 } else {
                     fallback_cols
-                };
+                });
                 block.estimated_height =
                     estimated_finished_block_height_for_text(&config, &block.output, cols);
                 let finished = FinishedBlock::new(
@@ -7264,6 +7668,9 @@ impl TermView {
         let Some(pos) = finished.iter().position(|b| b.id == block_id) else {
             return;
         };
+        let unread = unread_after_index_removal(finished.len(), self.unread_count.get(), pos);
+        self.unread_count.set(unread);
+        set_jump_fab_label(&self.jump_fab, unread);
         let block_to_remove = finished.remove(pos);
         let widget_to_release = block_to_remove.widget().clone();
         self.block_list.remove(&widget_to_release);
@@ -7283,7 +7690,10 @@ impl TermView {
         mutate_block_data_and_redraw(
             &self.block_data,
             self.failure_marker_redraw.as_ref(),
-            |blocks| blocks.retain(|b| b.id != block_id),
+            |blocks| {
+                let removed = blocks.remove(pos);
+                debug_assert_eq!(removed.as_ref().map(|block| block.id), Some(block_id));
+            },
         );
         self.bookmarks.borrow_mut().remove(&block_id);
         // Stored indices no longer identify the same widgets after removal.
@@ -7347,20 +7757,22 @@ mod tests {
         append_bounded_text_tail, append_typed_command_shadow, approved_command_submission_payload,
         background_output_has_visible_text, block_clipboard_text, block_duration_ms,
         build_clipboard_paste, build_color_query_reply, build_command_recall,
-        build_keyboard_query_reply, classify_command_prompt_status, clear_dynamic_colors,
-        coalesce_bytes_events, command_end_matches_started_id, command_id_uses_shell_token,
-        decide_agent_command_end, failed_block_marker_fractions, finished_block_config,
-        finished_command, finished_layout_key, is_post_command_metadata,
+        build_keyboard_query_reply, claim_next_unused_block_id, classify_command_prompt_status,
+        clear_dynamic_colors, coalesce_bytes_events, command_end_matches_started_id,
+        command_id_uses_shell_token, decide_agent_command_end, failed_block_marker_fractions,
+        finished_block_config, finished_command, finished_layout_key, is_post_command_metadata,
         mutate_block_data_and_redraw, normalize_captured_command, notification_permitted,
-        parse_color_spec, pop_typed_command_shadow, record_external_input, resolve_command_text,
+        parse_color_spec, pop_typed_command_shadow, process_block_id_namespace,
+        record_external_input, resolve_command_text,
         reviewed_pre_command_bytes_are_identity_neutral, reviewed_submission_matches,
         selected_blocks_markdown, selected_command_text, selected_id_range,
         shell_argv_supports_agent_ids, stable_visible_indices, step_marked_indices,
         stranded_focus_key_recovers, strip_ansi, strip_ansi_with_clear_detect,
-        take_armed_agent_execution, take_background_output, viewport_page_size_changed,
-        viewport_state_for_scroll, visible_indices_for_viewport, AgentCommandEndDecision,
-        ArmedAgentExecution, BlockData, BlockState, CommandPromptStatus, CommandTextSource,
-        DynamicColors, DynamicColorsRc, ShellCapabilityObserver, MAX_RECALLED_COMMAND_BYTES,
+        take_armed_agent_execution, take_background_output, unread_after_index_removal,
+        unread_after_prefix_eviction, viewport_page_size_changed, viewport_state_for_scroll,
+        visible_indices_for_viewport, AgentCommandEndDecision, ArmedAgentExecution, BlockData,
+        BlockState, CommandPromptStatus, CommandTextSource, DynamicColors, DynamicColorsRc,
+        ShellCapabilityObserver, BLOCK_ID_SEQUENCE_LIMIT, MAX_RECALLED_COMMAND_BYTES,
         MAX_TYPED_COMMAND_SHADOW_BYTES, NOTIFICATION_MIN_INTERVAL, TRUNCATED_COMMAND_PLACEHOLDER,
     };
     use crate::agent::{AgentExecutionRef, AgentSession};
@@ -7370,6 +7782,43 @@ mod tests {
     use std::collections::{HashSet, VecDeque};
     use std::rc::Rc;
     use std::time::{Instant, SystemTime};
+
+    #[test]
+    fn block_id_allocator_skips_reserved_history_without_retaining_live_ids() {
+        let mut reserved = HashSet::from([0, 2, u64::MAX]);
+        let mut candidate = 0_u64;
+        let claimed = claim_next_unused_block_id(&mut reserved, || {
+            let current = candidate;
+            candidate += 1;
+            current
+        });
+        assert_eq!(claimed, 1);
+        assert!(!reserved.contains(&0));
+        assert!(reserved.contains(&2));
+        assert!(reserved.contains(&u64::MAX));
+        assert!(!reserved.contains(&1));
+    }
+
+    #[test]
+    fn process_block_ids_have_a_random_namespace_and_checked_sequence_space() {
+        let namespace = process_block_id_namespace();
+        assert_ne!(namespace, 0);
+        assert_eq!(namespace & (BLOCK_ID_SEQUENCE_LIMIT - 1), 0);
+        assert!(namespace.checked_add(BLOCK_ID_SEQUENCE_LIMIT - 1).is_some());
+    }
+
+    #[test]
+    fn unread_badge_tracks_only_retained_newest_blocks() {
+        // Three read blocks followed by two unread blocks.
+        assert_eq!(unread_after_prefix_eviction(5, 2, 2), 2);
+        assert_eq!(unread_after_prefix_eviction(5, 2, 4), 1);
+        assert_eq!(unread_after_prefix_eviction(5, 2, 5), 0);
+
+        assert_eq!(unread_after_index_removal(5, 2, 1), 2);
+        assert_eq!(unread_after_index_removal(5, 2, 3), 1);
+        assert_eq!(unread_after_index_removal(5, 2, 4), 1);
+        assert_eq!(unread_after_prefix_eviction(1, u32::MAX, 1), 0);
+    }
 
     #[test]
     fn private_command_ids_require_the_exact_token_and_decimal_sequence() {

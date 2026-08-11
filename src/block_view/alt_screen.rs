@@ -28,6 +28,30 @@ pub(crate) const BLOCK_CELL_HEIGHT_SCALE: f64 = 1.12;
 /// Keep the slack below one cell so it cannot create a phantom terminal row.
 const FINISHED_VTE_HEIGHT_SLACK_PX: i32 = 6;
 
+/// Absolute cell bound for each read-only finished VTE. Full text remains in
+/// BlockData/copy/export; the renderer retains only a bounded terminal grid.
+pub(crate) const MAX_FINISHED_VTE_GRID_CELLS: usize = 1_048_576;
+/// Defensive ceiling for hostile or legacy persisted column counts.
+pub(crate) const MAX_FINISHED_VTE_COLUMNS: i64 = 4_096;
+
+pub(crate) fn bounded_finished_vte_columns(cols: i64) -> i64 {
+    cols.clamp(1, MAX_FINISHED_VTE_COLUMNS)
+}
+
+pub(crate) fn bounded_finished_vte_geometry(
+    cols: i64,
+    visible_rows: i64,
+    requested_scrollback_rows: i64,
+) -> (i64, i64, i64) {
+    let cols = bounded_finished_vte_columns(cols);
+    let max_rows = (MAX_FINISHED_VTE_GRID_CELLS / cols as usize).max(1) as i64;
+    let visible_rows = visible_rows.clamp(1, max_rows);
+    let scrollback_rows = requested_scrollback_rows
+        .max(0)
+        .min(max_rows.saturating_sub(visible_rows));
+    (cols, visible_rows, scrollback_rows)
+}
+
 pub(crate) fn finished_vte_height_px(rows: i64, cell_height: i32) -> i32 {
     let cell = cell_height.max(1);
     (rows.clamp(1, i32::MAX as i64) as i32)
@@ -143,15 +167,15 @@ pub(crate) fn fit_finished_terminal_to_content(
     let (_, cursor_row) = terminal.cursor_position();
     let rows = finished_content_rows(first_row, cursor_row, terminal.row_count())
         .clamp(floor_rows, max_rows);
-    let cols = terminal.column_count().max(1);
+    let (cols, rows, scrollback_rows) =
+        bounded_finished_vte_geometry(terminal.column_count(), rows, i64::MAX);
 
-    if terminal.row_count() != rows {
+    if terminal.row_count() != rows || terminal.column_count() != cols {
         terminal.set_size(cols, rows);
     }
-    // The capture capacity stays armed: the configured value is only a limit, so
-    // unused rows do not create an inner scroll range, and an older idle-settling
-    // callback can no longer clear the scrollback a newer filter render needs
-    // before VTE has processed it.
+    // Preserve the unused portion of the one-grid budget as scrollback. An
+    // older asynchronous settle cannot then discard a newer feed's tail.
+    terminal.set_scrollback_lines(scrollback_rows);
 
     let cell_height = (terminal.char_height() as i32).max(1);
     terminal.set_height_request(finished_vte_height_px(rows, cell_height));
@@ -297,6 +321,40 @@ mod tests {
         assert!(height < 3 * 28);
         assert_eq!(finished_vte_height_px(2, 1), 2);
     }
+
+    #[test]
+    fn finished_vte_geometry_caps_columns_and_total_cells() {
+        let (cols, visible, scrollback) =
+            bounded_finished_vte_geometry(i64::MAX, i64::MAX, i64::MAX);
+        assert_eq!(cols, MAX_FINISHED_VTE_COLUMNS);
+        assert_eq!(
+            visible,
+            (MAX_FINISHED_VTE_GRID_CELLS / cols as usize) as i64
+        );
+        assert_eq!(scrollback, 0);
+        assert!((visible + scrollback) as usize * cols as usize <= MAX_FINISHED_VTE_GRID_CELLS);
+    }
+
+    #[test]
+    fn finished_vte_columns_clamp_before_metadata_height_math() {
+        assert_eq!(bounded_finished_vte_columns(0), 1);
+        assert_eq!(bounded_finished_vte_columns(80), 80);
+        assert_eq!(
+            bounded_finished_vte_columns(i64::MAX),
+            MAX_FINISHED_VTE_COLUMNS
+        );
+    }
+
+    #[test]
+    fn finished_vte_geometry_shares_one_budget_with_scrollback() {
+        let (cols, visible, scrollback) = bounded_finished_vte_geometry(80, 20, i64::MAX);
+        assert_eq!(cols, 80);
+        assert_eq!(visible, 20);
+        assert_eq!(
+            visible + scrollback,
+            (MAX_FINISHED_VTE_GRID_CELLS / 80) as i64
+        );
+    }
 }
 
 // ─── VTE builder ─────────────────────────────────────────────────────────────
@@ -375,7 +433,7 @@ pub(crate) fn create_finished_terminal(
     viewport_cap: i64,
     expand_to_buffer: bool,
 ) -> Terminal {
-    let visible_rows = output_rows.min(viewport_cap).max(1);
+    let requested_visible_rows = output_rows.min(viewport_cap).max(1);
     // The caller's estimate can be too small (most notably a long single-line
     // command that wraps). Keep enough temporary scrollback to retain those rows
     // until the post-feed expansion below makes them part of the widget itself.
@@ -384,7 +442,9 @@ pub(crate) fn create_finished_terminal(
         .max(viewport_cap)
         .max(config.truncation_threshold_lines as i64)
         .max(4096)
-        .clamp(1, u32::MAX as i64) as u32;
+        .clamp(1, u32::MAX as i64);
+    let (cols, visible_rows, capture_rows) =
+        bounded_finished_vte_geometry(cols, requested_visible_rows, capture_rows);
     let terminal = Terminal::builder()
         .hexpand(true)
         .vexpand(false)
@@ -392,20 +452,23 @@ pub(crate) fn create_finished_terminal(
         .allow_hyperlink(true)
         .bold_is_bright(true)
         .input_enabled(false)
-        .scrollback_lines(capture_rows)
+        .scrollback_lines(capture_rows as u32)
         .cursor_blink_mode(CursorBlinkMode::Off)
         .cursor_shape(CursorShape::Block)
         .font_scale(config.default_font_scale)
         .cell_height_scale(BLOCK_CELL_HEIGHT_SCALE)
         .opacity(1.0)
         .pointer_autohide(true)
-        .enable_sixel(true)
+        // Images decoded from the live surface are mounted separately under a
+        // completed card. Replaying arbitrary DCS here would bypass both the
+        // finished-grid and kitty-image ledgers.
+        .enable_sixel(false)
         .scroll_on_output(false)
         .scroll_on_keystroke(false)
         .build();
     terminal.set_mouse_autohide(true);
     apply_snapshot_theme_to_vte(&terminal, config);
-    terminal.set_size(cols.max(1), visible_rows);
+    terminal.set_size(cols, visible_rows);
 
     // `blocks.rs` performs the actual feed from its map/filter paths. Keep
     // one constructor-level hook for command snapshots and other one-shot users;
@@ -428,8 +491,14 @@ pub(crate) fn create_finished_terminal(
     {
         let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
         scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
-        let terminal_for_scroll = terminal.clone();
+        // The controller is owned by `terminal`; a strong clone here would
+        // form terminal -> controller -> closure -> terminal and keep every
+        // evicted finished VTE (including its scrollback grid) alive forever.
+        let terminal_for_scroll = terminal.downgrade();
         scroll.connect_scroll(move |_, _dx, dy| {
+            let Some(terminal_for_scroll) = terminal_for_scroll.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
             if forward_command_surface_scroll(&terminal_for_scroll, dy) {
                 glib::Propagation::Stop
             } else {

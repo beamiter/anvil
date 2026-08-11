@@ -213,23 +213,29 @@ impl WidgetPool {
         self.available.pop()
     }
 
-    pub(crate) fn release(&mut self, widget: gtk::Box) {
-        if self.available.len() < self.max_pool_size {
-            // A recycled finished-block container has gesture/motion controllers
-            // whose closures capture the old block ID and action handles. Keeping
-            // them makes a newly rendered block react as its predecessor (and
-            // stacks duplicate hover/right-click handlers on each reuse).
-            // Controllers belong only to this short-lived outer Box, so clear
-            // them before pooling; `FinishedBlock::new_with_pool` installs the
-            // fresh handlers for the new block.
-            let controllers = widget.observe_controllers();
-            while let Some(controller) = controllers.item(0) {
-                if let Ok(controller) = controller.downcast::<gtk::EventController>() {
-                    widget.remove_controller(&controller);
-                } else {
-                    break;
-                }
+    pub(crate) fn teardown(widget: &gtk::Box) {
+        // Pool only the lightweight outer shell. A finished card's child tree
+        // owns both VTEs and their scrollback; retaining it here would put up to
+        // twenty evicted cards outside the completed-block byte ledger.
+        while let Some(child) = widget.first_child() {
+            widget.remove(&child);
+        }
+        // Outer controllers can themselves retain the old FinishedBlock and
+        // its VTEs through action closures. Tear them down even when the pool is
+        // already full and this shell will be dropped instead of recycled.
+        let controllers = widget.observe_controllers();
+        while let Some(controller) = controllers.item(0) {
+            if let Ok(controller) = controller.downcast::<gtk::EventController>() {
+                widget.remove_controller(&controller);
+            } else {
+                break;
             }
+        }
+    }
+
+    pub(crate) fn release(&mut self, widget: gtk::Box) {
+        Self::teardown(&widget);
+        if self.available.len() < self.max_pool_size {
             self.available.push(widget);
         }
     }
@@ -276,5 +282,53 @@ mod tests {
         assert!(!request_bottom_pin(true, &active, &generation));
         assert!(!active.get());
         assert_eq!(generation.get(), 2);
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK process and display"]
+    fn widget_pool_releases_heavy_children_and_stale_controllers() {
+        gtk::init().expect("isolated widget-pool test requires a GTK display");
+        let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        outer.append(&gtk::Label::new(Some("heavy child stand-in")));
+        outer.add_controller(gtk::GestureClick::new());
+        assert!(outer.first_child().is_some());
+        assert!(outer.observe_controllers().n_items() > 0);
+
+        let mut pool = WidgetPool::new();
+        pool.release(outer);
+        let recycled = pool.acquire().expect("outer shell should be pooled");
+        assert!(recycled.first_child().is_none());
+        assert_eq!(recycled.observe_controllers().n_items(), 0);
+
+        let dropped = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        dropped.append(&gtk::Label::new(Some("full-pool child stand-in")));
+        dropped.add_controller(gtk::GestureClick::new());
+        let dropped_probe = dropped.clone();
+        pool.max_pool_size = 0;
+        pool.release(dropped);
+        assert!(dropped_probe.first_child().is_none());
+        assert_eq!(dropped_probe.observe_controllers().n_items(), 0);
+        assert!(pool.acquire().is_none());
+
+        let config = crate::config::Config::safe_defaults();
+        let block = crate::block_view::FinishedBlock::new(
+            77,
+            "$ ",
+            "printf test",
+            None,
+            "test\n",
+            Some(0),
+            &config,
+            Some(1),
+            None,
+            None,
+            80,
+        );
+        let output_vte = block.output_vte.downgrade();
+        let outer = block.widget().clone();
+        block.connect_scroll_forwarding(&gtk::ScrolledWindow::new());
+        drop(block);
+        pool.release(outer);
+        assert!(output_vte.upgrade().is_none());
     }
 }
