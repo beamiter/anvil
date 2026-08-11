@@ -236,14 +236,6 @@ impl FactoryComponent for TabRow {
             #[watch]
             set_css_classes: &self.row_classes(),
 
-            gtk::Label {
-                set_label: "\u{25CF}",
-                #[watch]
-                set_visible: self.connection.is_some(),
-                #[watch]
-                set_css_classes: &self.connection_classes(),
-            },
-
             #[name(select_button)]
             gtk::ToggleButton {
                 set_widget_name: &format!("tab-{}", self.id),
@@ -251,7 +243,8 @@ impl FactoryComponent for TabRow {
                 set_active: self.active,
                 #[watch]
                 set_hexpand: self.sidebar,
-                set_width_request: -1,
+                #[watch]
+                set_width_request: if self.sidebar { -1 } else { self.tab_width as i32 },
                 #[watch]
                 set_css_classes: &self.button_classes(),
                 #[watch]
@@ -263,6 +256,14 @@ impl FactoryComponent for TabRow {
                 gtk::Box {
                     set_orientation: gtk::Orientation::Horizontal,
                     set_spacing: 4,
+
+                    gtk::Label {
+                        set_label: "\u{25CF}",
+                        #[watch]
+                        set_visible: self.connection.is_some(),
+                        #[watch]
+                        set_css_classes: &self.connection_classes(),
+                    },
 
                     gtk::Label {
                         #[watch]
@@ -278,6 +279,43 @@ impl FactoryComponent for TabRow {
                         set_icon_name: Some("window-close-symbolic"),
                         add_css_class: "tab-strip-close",
                         set_opacity: 0.0,
+                    },
+
+                    gtk::Box {
+                        set_orientation: gtk::Orientation::Vertical,
+                        #[watch]
+                        set_visible: !self.sidebar,
+                        add_css_class: "tab-resize-handle",
+                        set_cursor_from_name: Some("col-resize"),
+                        set_tooltip_text: Some("Drag to resize tabs"),
+                        update_property: &[
+                            gtk::accessible::Property::Label("Resize tabs"),
+                        ],
+
+                        add_controller = gtk::GestureDrag {
+                            set_button: gtk::gdk::BUTTON_PRIMARY,
+                            set_propagation_phase: gtk::PropagationPhase::Capture,
+                            connect_drag_begin[
+                                start_width,
+                                action_state = self.action_state.clone()
+                            ] => move |gesture, _, _| {
+                                gesture.set_state(gtk::EventSequenceState::Claimed);
+                                start_width.set(action_state.borrow().tab_width as i32);
+                            },
+                            connect_drag_update[select_button, start_width] => move |gesture, dx, _| {
+                                gesture.set_state(gtk::EventSequenceState::Claimed);
+                                let width = (start_width.get() + dx as i32)
+                                    .clamp(MIN_TAB_WIDTH as i32, MAX_TAB_WIDTH as i32);
+                                select_button.set_width_request(width);
+                            },
+                            connect_drag_end[sender, start_width] => move |gesture, dx, _| {
+                                gesture.set_state(gtk::EventSequenceState::Claimed);
+                                let width = (start_width.get() + dx as i32)
+                                    .clamp(MIN_TAB_WIDTH as i32, MAX_TAB_WIDTH as i32)
+                                    as u32;
+                                let _ = sender.output(TabRowOutput::Resize(width));
+                            },
+                        },
                     },
                 },
 
@@ -372,34 +410,6 @@ impl FactoryComponent for TabRow {
                             source_tab_id: id,
                             drag_id,
                         });
-                    },
-                },
-            },
-
-            gtk::Box {
-                set_orientation: gtk::Orientation::Vertical,
-                set_visible: false,
-                add_css_class: "tab-resize-handle",
-                set_tooltip_text: Some("Drag to resize tabs"),
-
-                add_controller = gtk::GestureDrag {
-                    set_button: gtk::gdk::BUTTON_PRIMARY,
-                    connect_drag_begin[
-                        start_width,
-                        action_state = self.action_state.clone()
-                    ] => move |_, _, _| {
-                        start_width.set(action_state.borrow().tab_width as i32);
-                    },
-                    connect_drag_update[select_button, start_width] => move |_, dx, _| {
-                        let width = (start_width.get() + dx as i32)
-                            .clamp(MIN_TAB_WIDTH as i32, MAX_TAB_WIDTH as i32);
-                        select_button.set_width_request(width);
-                    },
-                    connect_drag_end[sender, start_width] => move |_, dx, _| {
-                        let width = (start_width.get() + dx as i32)
-                            .clamp(MIN_TAB_WIDTH as i32, MAX_TAB_WIDTH as i32)
-                            as u32;
-                        let _ = sender.output(TabRowOutput::Resize(width));
                     },
                 },
             },

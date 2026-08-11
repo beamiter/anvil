@@ -19,7 +19,8 @@ mod diagnostics;
 mod dialogs;
 mod file_tree;
 mod file_tree_ops;
-use jterm_core::{child_env, command_history, git_meta, notify, parser, pty_input, review_input};
+mod git_meta_ui;
+use jterm_core::{child_env, command_history, notify, parser, pty_input, review_input};
 
 mod host {
     pub use jterm_core::host::*;
@@ -189,10 +190,13 @@ struct AppModel {
     content_paned: gtk::Paned,
     ai_paned: gtk::Paned,
     /// Family-wide bottom status bar (`jterm_core::bottom_bar`): the container
-    /// plus its left/right segment holders, refilled on each refresh.
+    /// plus its left/right segment holders.
     bottom_bar: gtk::Box,
     bottom_bar_left: gtk::Box,
     bottom_bar_right: gtk::Box,
+    /// Last composed content. The one-second status tick is intentionally a
+    /// no-op when none of the visible segments changed.
+    bottom_bar_content: Rc<RefCell<jterm_core::bottom_bar::Content>>,
     sidebar_stack: gtk::Stack,
     sidebar_toggle: Controller<sidebar_toggle::SidebarToggleModel>,
     tab_placement: std::cell::Cell<config::TabPlacement>,
@@ -915,6 +919,7 @@ impl SimpleComponent for AppModel {
             bottom_bar: bottom_bar.clone(),
             bottom_bar_left: bottom_bar_left.clone(),
             bottom_bar_right: bottom_bar_right.clone(),
+            bottom_bar_content: Rc::new(RefCell::new(Default::default())),
             sidebar_stack: sidebar_stack.clone(),
             sidebar_toggle,
             tab_placement: std::cell::Cell::new(tab_placement),

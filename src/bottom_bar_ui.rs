@@ -57,7 +57,9 @@ impl AppModel {
             .and_then(|tab| tab.panes.get(tab.active_pane));
         let cwd = pane.and_then(Pane::local_cwd).map(std::path::PathBuf::from);
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-        let git = cwd.as_deref().and_then(git_meta::read);
+        let git = cwd
+            .as_deref()
+            .and_then(crate::git_meta_ui::read_cached_and_refresh);
         let (cols, rows) = pane.map(|p| p.terminal.grid_size()).unwrap_or((0, 0));
         let content = bottom_bar::compose(&bottom_bar::Snapshot {
             cwd: cwd.as_deref(),
@@ -71,8 +73,12 @@ impl AppModel {
             tab_index: self.active,
             tab_count: self.tabs.len(),
         });
+        if *self.bottom_bar_content.borrow() == content {
+            return;
+        }
         fill_segments(&self.bottom_bar_left, &content.left);
         fill_segments(&self.bottom_bar_right, &content.right);
+        *self.bottom_bar_content.borrow_mut() = content;
     }
 }
 

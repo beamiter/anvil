@@ -109,6 +109,70 @@ fn shell_token_channel() -> io::Result<Option<(String, OwnedFd, OwnedFd)>> {
     Ok(None)
 }
 
+// Raw GLib FFI for g_unix_fd_add_full (not exposed by glib-rs 0.22).
+// This source replaces the permanent 8 ms polling timer on Linux: GTK sleeps
+// while the PTY is idle and is woken only when the reader enqueues a message.
+#[cfg(target_os = "linux")]
+extern "C" {
+    fn g_unix_fd_add_full(
+        priority: i32,
+        fd: i32,
+        condition: u32,
+        function: extern "C" fn(fd: i32, condition: u32, user_data: *mut std::ffi::c_void) -> i32,
+        user_data: *mut std::ffi::c_void,
+        notify: extern "C" fn(data: *mut std::ffi::c_void),
+    ) -> u32;
+}
+
+#[cfg(target_os = "linux")]
+const G_IO_IN: u32 = 1;
+#[cfg(target_os = "linux")]
+const G_PRIORITY_DEFAULT_IDLE: i32 = 200;
+
+#[cfg(target_os = "linux")]
+struct FdWatchData<F: FnMut() -> bool> {
+    callback: F,
+}
+
+#[cfg(target_os = "linux")]
+extern "C" fn fd_watch_callback<F: FnMut() -> bool>(
+    _fd: i32,
+    _condition: u32,
+    user_data: *mut std::ffi::c_void,
+) -> i32 {
+    // SAFETY: `unix_fd_add_local` passes a live `FdWatchData<F>` allocation
+    // and GLib serializes this local source on the owning main context.
+    let data = unsafe { &mut *(user_data as *mut FdWatchData<F>) };
+    i32::from((data.callback)())
+}
+
+#[cfg(target_os = "linux")]
+extern "C" fn fd_watch_destroy<F: FnMut() -> bool>(user_data: *mut std::ffi::c_void) {
+    // SAFETY: GLib invokes the destroy notifier once for the allocation handed
+    // to `g_unix_fd_add_full` below.
+    unsafe {
+        drop(Box::from_raw(user_data as *mut FdWatchData<F>));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn unix_fd_add_local<F: FnMut() -> bool + 'static>(fd: RawFd, func: F) {
+    let data = Box::new(FdWatchData { callback: func });
+    let ptr = Box::into_raw(data) as *mut std::ffi::c_void;
+    // SAFETY: `fd` remains owned by the callback, and `ptr` remains owned by
+    // GLib until it invokes `fd_watch_destroy`.
+    unsafe {
+        g_unix_fd_add_full(
+            G_PRIORITY_DEFAULT_IDLE,
+            fd,
+            G_IO_IN,
+            fd_watch_callback::<F>,
+            ptr,
+            fd_watch_destroy::<F>,
+        );
+    }
+}
+
 /// Process exactly one bounded chunk per GLib dispatch. Even at idle priority,
 /// one callback must return quickly enough for GTK to run input/layout sources.
 /// Eight 256 KiB chunks used to keep the main thread inside VTE feeding for
@@ -828,9 +892,28 @@ impl OwnedPty {
         F: FnMut(Vec<u8>) + 'static,
         E: FnOnce(i32) + 'static,
     {
+        #[cfg(target_os = "linux")]
+        let eventfd = {
+            // SAFETY: eventfd returns a fresh descriptor on success; ownership
+            // transfers immediately to `OwnedFd`.
+            let raw = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+            (raw >= 0).then(|| Arc::new(unsafe { OwnedFd::from_raw_fd(raw) }))
+        };
+        #[cfg(target_os = "linux")]
+        let wake_pending = Arc::new(AtomicBool::new(false));
+        #[cfg(target_os = "linux")]
+        let eventfd_for_thread = eventfd.as_ref().map(Arc::clone);
+        #[cfg(target_os = "linux")]
+        let wake_pending_for_thread = Arc::clone(&wake_pending);
         let reader = std::thread::Builder::new()
             .name("anvil-pty-reader".to_string())
             .spawn(move || {
+                let notify = || {
+                    #[cfg(target_os = "linux")]
+                    if let Some(eventfd) = eventfd_for_thread.as_deref() {
+                        notify_eventfd_once(eventfd, &wake_pending_for_thread);
+                    }
+                };
                 // The reader owns a duplicated descriptor. It can never observe a
                 // different file after the model closes and the kernel reuses the
                 // original descriptor number.
@@ -875,6 +958,7 @@ impl OwnedPty {
                             if tx.send(PtyMsg::Data(combined)).is_err() {
                                 break;
                             }
+                            notify();
                         }
                     }
                 }
@@ -883,9 +967,12 @@ impl OwnedPty {
                     // which removes its source and releases all captured
                     // widgets/OwnedPty handles even if a descendant keeps the
                     // slave side open.
+                    drop(tx);
+                    notify();
                     return;
                 }
                 reap_child(&child_lifecycle, &tx);
+                notify();
             });
         if let Err(error) = reader {
             self.close_master_fd();
@@ -893,6 +980,58 @@ impl OwnedPty {
             return Err(error);
         }
 
+        #[cfg(target_os = "linux")]
+        if let Some(eventfd) = eventfd {
+            let on_exit = std::cell::Cell::new(Some(on_exit));
+
+            unix_fd_add_local(eventfd.as_raw_fd(), move || {
+                let _ = drain_eventfd(eventfd.as_raw_fd());
+
+                // A producer may enqueue between the first empty read and
+                // clearing `wake_pending`. Recheck after clearing so that
+                // transition cannot lose its only eventfd notification.
+                let message = match rx.try_recv() {
+                    Ok(message) => message,
+                    Err(mpsc::TryRecvError::Empty) => {
+                        wake_pending.store(false, Ordering::Release);
+                        match rx.try_recv() {
+                            Ok(message) => {
+                                wake_pending.store(true, Ordering::Release);
+                                let _ = drain_eventfd(eventfd.as_raw_fd());
+                                message
+                            }
+                            Err(mpsc::TryRecvError::Empty) => return true,
+                            Err(mpsc::TryRecvError::Disconnected) => return false,
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => return false,
+                };
+
+                match message {
+                    PtyMsg::Data(data) => {
+                        callback(data);
+                        let eventfd = Arc::clone(&eventfd);
+                        let wake_pending = Arc::clone(&wake_pending);
+                        glib::timeout_add_local_once(PTY_DISPATCH_INTERVAL, move || {
+                            if signal_eventfd(eventfd.as_raw_fd()).is_err() {
+                                wake_pending.store(false, Ordering::Release);
+                            }
+                        });
+                        true
+                    }
+                    PtyMsg::Exit(code) => {
+                        if let Some(f) = on_exit.take() {
+                            f(code);
+                        }
+                        false
+                    }
+                }
+            });
+            return Ok(());
+        }
+
+        // eventfd is Linux-specific and can also fail under descriptor
+        // pressure. Retain the original timer transport as a safe fallback.
         let on_exit = std::cell::Cell::new(Some(on_exit));
         let rx = std::cell::RefCell::new(rx);
 
@@ -982,6 +1121,69 @@ fn coalesce_pending(fd: RawFd, file: &mut std::fs::File, buf: &mut [u8], combine
     }
 }
 
+#[cfg(target_os = "linux")]
+fn notify_eventfd_once(eventfd: &OwnedFd, wake_pending: &AtomicBool) {
+    if !wake_pending.swap(true, Ordering::AcqRel) && signal_eventfd(eventfd.as_raw_fd()).is_err() {
+        // Do not leave the queue permanently armed without a kernel wakeup.
+        // EINTR is retried below; this covers any other write failure.
+        wake_pending.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn drain_eventfd(eventfd: RawFd) -> io::Result<()> {
+    let mut value = 0u64;
+    loop {
+        // SAFETY: eventfd reads exactly one native u64. The descriptor is
+        // nonblocking, so a raced or redundant drain is harmless.
+        let read = unsafe {
+            libc::read(
+                eventfd,
+                (&mut value as *mut u64).cast::<libc::c_void>(),
+                std::mem::size_of::<u64>(),
+            )
+        };
+        if read == std::mem::size_of::<u64>() as isize {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if error.kind() == io::ErrorKind::WouldBlock {
+            return Ok(());
+        }
+        return Err(error);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn signal_eventfd(eventfd: RawFd) -> io::Result<()> {
+    let value = 1u64;
+    loop {
+        // SAFETY: eventfd writes exactly one native u64. EAGAIN is harmless:
+        // it means a kernel wakeup is already pending in the counter.
+        let written = unsafe {
+            libc::write(
+                eventfd,
+                (&value as *const u64).cast::<libc::c_void>(),
+                std::mem::size_of::<u64>(),
+            )
+        };
+        if written == std::mem::size_of::<u64>() as isize {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if error.kind() == io::ErrorKind::WouldBlock {
+            return Ok(());
+        }
+        return Err(error);
+    }
+}
+
 impl Drop for OwnedPty {
     fn drop(&mut self) {
         self.reader_cancelled.store(true, Ordering::Release);
@@ -995,6 +1197,45 @@ impl Drop for OwnedPty {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn eventfd_wakeup_is_coalesced_until_consumer_rearms() {
+        // Use a blocking eventfd so a missing notification fails this focused
+        // unit test deterministically instead of producing an EAGAIN branch.
+        let raw = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+        assert!(raw >= 0);
+        // SAFETY: eventfd returned a fresh descriptor owned by this test.
+        let eventfd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let wake_pending = AtomicBool::new(false);
+
+        notify_eventfd_once(&eventfd, &wake_pending);
+        notify_eventfd_once(&eventfd, &wake_pending);
+
+        let mut value = 0u64;
+        let read = unsafe {
+            libc::read(
+                eventfd.as_raw_fd(),
+                (&mut value as *mut u64).cast::<libc::c_void>(),
+                std::mem::size_of::<u64>(),
+            )
+        };
+        assert_eq!(read as usize, std::mem::size_of::<u64>());
+        assert_eq!(value, 1);
+
+        wake_pending.store(false, Ordering::Release);
+        notify_eventfd_once(&eventfd, &wake_pending);
+        value = 0;
+        let read = unsafe {
+            libc::read(
+                eventfd.as_raw_fd(),
+                (&mut value as *mut u64).cast::<libc::c_void>(),
+                std::mem::size_of::<u64>(),
+            )
+        };
+        assert_eq!(read as usize, std::mem::size_of::<u64>());
+        assert_eq!(value, 1);
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

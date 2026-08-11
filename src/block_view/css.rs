@@ -153,8 +153,9 @@ pub(crate) fn install_block_css(config: &Config) {
         (fg.green() * 255.0) as u8,
         (fg.blue() * 255.0) as u8,
     );
-    // Accent color for active chevron (use palette color 2 = green-ish)
-    let accent = rgba_to_hex(&config.palette[2]);
+    // Cyan is the navigation/focus accent; keep it distinct from the green
+    // success hue, matching Forge's semantic palette contract.
+    let accent = rgba_to_hex(&config.palette[6]);
     // Error color for bad exit codes — use the theme's red (palette 1) so it
     // matches what VTE would render, instead of a hard-coded swatch.
     let err = &config.palette[1];
@@ -199,9 +200,8 @@ pub(crate) fn install_block_css(config: &Config) {
     let err_r = (err.red() * 255.0) as u8;
     let err_g = (err.green() * 255.0) as u8;
     let err_b = (err.blue() * 255.0) as u8;
-    // Accent == palette[2] (same green as success); reused for the active-card
-    // focus ring and prompt chevron.
-    let acc = &config.palette[2];
+    // Active focus is navigation state, not command success.
+    let acc = &config.palette[6];
     let acc_r = (acc.red() * 255.0) as u8;
     let acc_g = (acc.green() * 255.0) as u8;
     let acc_b = (acc.blue() * 255.0) as u8;

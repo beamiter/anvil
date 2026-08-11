@@ -185,7 +185,6 @@ impl ScrollDebouncer {
 pub(crate) struct ViewportState {
     pub(crate) first_visible: usize,
     pub(crate) last_visible: usize,
-    pub(crate) total_height: i32,
 }
 
 impl Clone for ViewportState {
@@ -193,7 +192,6 @@ impl Clone for ViewportState {
         Self {
             first_visible: self.first_visible,
             last_visible: self.last_visible,
-            total_height: self.total_height,
         }
     }
 }

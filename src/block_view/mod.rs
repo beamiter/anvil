@@ -3952,9 +3952,7 @@ fn compute_viewport_state(
     let mut y = 0_i32;
     let mut first = None;
     let mut last = 0;
-    let mut iter = block_data.iter().enumerate();
-
-    while let Some((index, block)) = iter.next() {
+    for (index, block) in block_data.iter().enumerate() {
         let block_top = y;
         let block_bottom = y.saturating_add(block.estimated_height.max(1));
         if first.is_none() && block_bottom > visible_top {
@@ -3966,9 +3964,6 @@ fn compute_viewport_state(
         y = block_bottom;
 
         if first.is_some() && y >= visible_bottom {
-            for (_, block) in iter {
-                y = y.saturating_add(block.estimated_height.max(1));
-            }
             break;
         }
     }
@@ -3976,7 +3971,6 @@ fn compute_viewport_state(
     ViewportState {
         first_visible: first.unwrap_or(0),
         last_visible: last,
-        total_height: y,
     }
 }
 
@@ -5954,7 +5948,6 @@ impl TermView {
             viewport: Rc::new(RefCell::new(ViewportState {
                 first_visible: 0,
                 last_visible: 0,
-                total_height: 0,
             })),
             widget_pool,
             visible_indices,
@@ -6839,7 +6832,6 @@ impl TermView {
             let mut viewport = self.viewport.borrow_mut();
             viewport.first_visible = 0;
             viewport.last_visible = 0;
-            viewport.total_height = 0;
         }
         self.block_list.queue_allocate();
 
@@ -7142,6 +7134,12 @@ impl TermView {
             .iter()
             .map(|b| b.output.len())
             .sum();
+        let total_height: i64 = self
+            .block_data
+            .borrow()
+            .iter()
+            .map(|block| i64::from(block.estimated_height.max(1)))
+            .sum();
         let viewport = self.viewport.borrow().clone();
         let visible = self.visible_indices.borrow().len();
         let selected = self
@@ -7209,10 +7207,7 @@ impl TermView {
                         "Last visible".to_string(),
                         viewport.last_visible.to_string(),
                     ),
-                    (
-                        "Total height".to_string(),
-                        format!("{}px", viewport.total_height),
-                    ),
+                    ("Total height".to_string(), format!("{total_height}px")),
                     ("Realized widgets".to_string(), visible.to_string()),
                     ("Profiling".to_string(), prof_enabled().to_string()),
                 ],

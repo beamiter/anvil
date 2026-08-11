@@ -83,8 +83,8 @@ impl AppModel {
         }
     }
 
-    /// Size tab rows for the active placement. Like forge, top-bar tabs use
-    /// their natural label width rather than a shared fixed width.
+    /// Size tab rows for the active placement. Top-bar tabs use the persisted
+    /// draggable width; sidebar rows fill the available column.
     pub(crate) fn apply_strip_row_placement(&self, row: &gtk::Widget) {
         match self.tab_placement.get() {
             config::TabPlacement::Sidebar => {
@@ -97,24 +97,19 @@ impl AppModel {
                             button.set_width_request(-1);
                         }
                     }
-                    if widget.has_css_class("tab-resize-handle") {
-                        widget.set_visible(false);
-                    }
                     child = widget.next_sibling();
                 }
             }
             config::TabPlacement::TopBar => {
                 row.set_hexpand(false);
+                let width = self.config.borrow().tab_width as i32;
                 let mut child = row.first_child();
                 while let Some(widget) = child {
                     if let Ok(button) = widget.clone().downcast::<gtk::ToggleButton>() {
                         if button.has_css_class("tab-strip-btn") {
                             button.set_hexpand(false);
-                            button.set_width_request(-1);
+                            button.set_width_request(width);
                         }
-                    }
-                    if widget.has_css_class("tab-resize-handle") {
-                        widget.set_visible(false);
                     }
                     child = widget.next_sibling();
                 }

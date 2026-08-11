@@ -68,11 +68,11 @@ pub(crate) fn install_static_css() {
         "{}{}
          .bottom-bar {{ min-height: {bar_height}px; padding: 0 8px; font-size: 0.85em; border-top: 1px solid rgba(127,127,127,0.4); }}",
         crate::pane_header::PANE_HEADER_CSS,
-        ".tab-strip-btn { padding: 4px 8px; border-radius: 4px; margin-bottom: 2px; color: #ffffff; }
-         .tab-strip-btn:checked { font-weight: bold; border: 1px solid currentColor; border-radius: 4px; }
-         .tab-strip-close { min-width: 16px; min-height: 16px; color: #ffffff; }
-         .tab-resize-handle { min-width: 6px; margin: 0 1px; border-left: 1px solid rgba(255,255,255,0.38); }
-         .tab-resize-handle:hover { border-left-color: rgba(255,255,255,0.9); }
+        ".tab-strip-btn { padding: 4px 8px; border-radius: 4px; border-bottom: 1px solid alpha(currentColor, 0.1); margin-bottom: 2px; color: #ffffff; }
+         .tab-strip-btn:checked { font-weight: bold; border-radius: 4px; background-color: alpha(currentColor, 0.14); outline: 2px solid alpha(currentColor, 0.8); outline-offset: -2px; }
+         .tab-strip-close { min-width: 16px; min-height: 16px; padding: 0; margin: 0; color: #ffffff; }
+         .tab-resize-handle { min-width: 8px; margin-left: 2px; border-left: 1px solid alpha(currentColor, 0.24); }
+         .tab-resize-handle:hover { border-left-color: currentColor; }
          .tab-strip { min-width: 140px; padding: 2px 4px; }
          .file-tree { padding: 2px; }
          .sidebar-toggle { color: #ffffff; }
@@ -90,6 +90,7 @@ pub(crate) fn install_static_css() {
          .conn-connected { color: #50fa7b; }
          .conn-disconnected { color: #ff5555; }
          .top-tabs { } .top-tabs .tab-row { margin-right: 2px; }
+         .top-tabs .tab-strip-btn { border-bottom: none; margin-bottom: 0; }
          .top-tab-scroll, .top-tab-scroll > viewport { min-width: 0; }
          .sidebar-toggle-row { margin-bottom: 2px; }
          .sidebar-toggle { padding: 2px 6px; }",
