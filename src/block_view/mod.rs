@@ -3930,20 +3930,18 @@ fn viewport_rows_for(vte: &Terminal, scroll: &ScrolledWindow) -> Option<i64> {
     Some(((usable / cell_h).max(1)) as i64)
 }
 
-type FinishedLayoutKey = (i32, i32, i32, usize);
+type FinishedLayoutKey = (i32, i32, i32);
 
-fn finished_layout_key(
-    page_width: i32,
-    available_height: i32,
-    cell_height: i32,
-    block_count: usize,
-) -> FinishedLayoutKey {
-    (
-        page_width,
-        available_height,
-        cell_height.max(1),
-        block_count,
-    )
+/// Change detector for the finished-block re-fit.
+///
+/// Deliberately *pure pane geometry*: the history's own page size and the cell
+/// height (font zoom). It must not depend on the live input cell's height, nor
+/// on how many blocks exist — both change on every command, and re-fitting a
+/// block re-feeds its VTE, so folding either in made the entire history clear
+/// and repaint on each Enter. A newly appended block fits itself from its own
+/// `connect_map` handler instead.
+fn finished_layout_key(page_width: i32, page_height: i32, cell_height: i32) -> FinishedLayoutKey {
+    (page_width, page_height, cell_height.max(1))
 }
 
 fn compute_viewport_state(
@@ -4052,28 +4050,27 @@ fn apply_visible_indices(
 ) {
     for (index, block) in finished.iter().enumerate() {
         let should_render = new_visible.contains(&index);
-        let was_rendered = block.widget().is_visible();
-        // Capture real geometry before hiding as well as after showing. Font
-        // estimates otherwise drift enough for pixel→index mapping to move a
-        // still-visible boundary card outside the viewport.
-        if was_rendered {
+        // Off-screen cards become fixed-height placeholders rather than
+        // disappearing, so the document's height — and with it the scroll
+        // position the user is reading at — does not move as blocks cross the
+        // viewport edge.
+        let placeholder_height = block.set_virtualized(!should_render);
+        let height = if should_render {
+            // Keep the metadata document converged on real allocations for
+            // rendered cards: the font-metric estimate drifts from what GTK
+            // actually allocates, and `compute_viewport_state` accumulates that
+            // drift until the boundary lands on a card that is still on screen.
             let allocated = block.widget().height();
             if allocated > 1 {
-                if let Some(data) = block_data.get_mut(index) {
-                    data.estimated_height = allocated;
-                }
+                allocated
+            } else {
+                continue;
             }
-        }
-        if was_rendered != should_render {
-            block.widget().set_visible(should_render);
-        }
-        if should_render {
-            let allocated = block.widget().height();
-            if allocated > 1 {
-                if let Some(data) = block_data.get_mut(index) {
-                    data.estimated_height = allocated;
-                }
-            }
+        } else {
+            placeholder_height
+        };
+        if let Some(data) = block_data.get_mut(index) {
+            data.estimated_height = height;
         }
     }
     *visible = new_visible;
@@ -4090,12 +4087,10 @@ fn enter_fullscreen(
         return;
     }
     let finished = finished.borrow();
-    let mut visible = visible_indices.borrow_mut();
-    visible.clear();
-    for (i, block) in finished.iter().enumerate() {
-        if block.widget().is_visible() {
-            visible.insert(i);
-        }
+    // Virtual-scroll state is untouched: each card remembers whether it was
+    // parked, so exiting restores exactly the pre-TUI document.
+    let _visible = visible_indices.borrow();
+    for block in finished.iter() {
         block.widget().set_visible(false);
     }
 }
@@ -4110,9 +4105,11 @@ fn exit_fullscreen(
     if !fullscreen.replace(false) {
         return;
     }
-    let visible = visible_indices.borrow();
-    for (i, block) in finished.borrow().iter().enumerate() {
-        block.widget().set_visible(visible.contains(&i));
+    let _visible = visible_indices.borrow();
+    for block in finished.borrow().iter() {
+        // The placeholder is part of the history document either way; each
+        // card's contents remember whether virtual scrolling had parked them.
+        block.widget().set_visible(true);
     }
 }
 
@@ -4768,8 +4765,7 @@ impl TermView {
             let block_data_for_layout = block_data_rc.clone();
             let failure_marker_redraw_for_layout = failure_marker_redraw.clone();
             let last_size_target: Rc<Cell<(i64, i64)>> = Rc::new(Cell::new((0, 0)));
-            let last_output_layout: Rc<Cell<FinishedLayoutKey>> =
-                Rc::new(Cell::new((-1, -1, -1, 0)));
+            let last_output_layout: Rc<Cell<FinishedLayoutKey>> = Rc::new(Cell::new((-1, -1, -1)));
             Rc::new(move || {
                 let (Some(holder), Some(vte), Some(scroll)) =
                     (holder.upgrade(), vte.upgrade(), scroll.upgrade())
@@ -4780,31 +4776,37 @@ impl TermView {
                 let Some(viewport_rows) = viewport_rows_for(&vte, &scroll) else {
                     return;
                 };
-                let fit_finished_outputs = |input_rows: i64| {
+                // Re-fit blocks that are already on screen to a resized pane.
+                // Cards that scrolled off and back re-fit themselves on map.
+                let fit_finished_outputs = || {
                     let page_height = scroll.vadjustment().page_size() as i32;
-                    let input_height = (input_rows as i32)
-                        .saturating_mul(cell_h)
-                        .saturating_add(css::BLOCK_ACTIVE_VCHROME_PX);
-                    let available = page_height.saturating_sub(input_height).max(cell_h * 3);
                     let page_width = scroll.hadjustment().page_size() as i32;
-                    let block_count = finished_for_layout.borrow().len();
-                    let layout_key =
-                        finished_layout_key(page_width, available, cell_h, block_count);
+                    let layout_key = finished_layout_key(page_width, page_height, cell_h);
                     if last_output_layout.replace(layout_key) == layout_key {
                         return;
                     }
 
-                    let finished = finished_for_layout.borrow();
+                    // Collect first, write after: re-fitting touches GTK
+                    // widgets, and holding the metadata borrow across that would
+                    // turn a re-entrant layout pass into a RefCell panic.
+                    let resized: Vec<(u64, i32)> = {
+                        let finished = finished_for_layout.borrow();
+                        finished
+                            .iter()
+                            .filter_map(|block| {
+                                block.refit_output_to_viewport().map(|h| (block.id, h))
+                            })
+                            .collect()
+                    };
+                    if resized.is_empty() {
+                        return;
+                    }
                     mutate_block_data_and_redraw(
                         &block_data_for_layout,
                         failure_marker_redraw_for_layout.as_ref(),
                         |block_data| {
-                            for block in finished.iter() {
-                                let Some(height) = block.refit_output_to_geometry(available) else {
-                                    continue;
-                                };
-                                if let Some(data) =
-                                    block_data.iter_mut().find(|data| data.id == block.id)
+                            for (id, height) in resized {
+                                if let Some(data) = block_data.iter_mut().find(|data| data.id == id)
                                 {
                                     data.estimated_height = height;
                                 }
@@ -4825,7 +4827,7 @@ impl TermView {
                     }
                     holder.set_visible(true);
                     holder.set_height_request((viewport_rows as i32) * cell_h);
-                    fit_finished_outputs(viewport_rows);
+                    fit_finished_outputs();
                     return;
                 }
                 holder.set_visible(true);
@@ -4865,7 +4867,7 @@ impl TermView {
                     last_size_target.set(target);
                 }
                 holder.set_height_request((target_rows as i32) * cell_h);
-                fit_finished_outputs(target_rows);
+                fit_finished_outputs();
             })
         };
         // Coalesces follow-bottom pins so a burst of contents-changed signals
@@ -8145,9 +8147,24 @@ mod tests {
 
     #[test]
     fn font_metric_changes_invalidate_finished_block_layout() {
-        let before = finished_layout_key(800, 600, 16, 4);
-        assert_eq!(before, finished_layout_key(800, 600, 16, 4));
-        assert_ne!(before, finished_layout_key(800, 600, 18, 4));
+        let before = finished_layout_key(800, 600, 16);
+        assert_eq!(before, finished_layout_key(800, 600, 16));
+        assert_ne!(before, finished_layout_key(800, 600, 18));
+    }
+
+    /// Pane resizes are the only thing that may re-fit the history. A command
+    /// starting or ending grows and shrinks the live input cell, and a finished
+    /// command appends a block — neither may move this key, because a moved key
+    /// re-feeds every finished block's VTE and the whole history visibly blinks.
+    #[test]
+    fn running_a_command_does_not_invalidate_finished_block_layout() {
+        let idle = finished_layout_key(800, 600, 16);
+        // Same pane, same font: identical whatever the live cell or history is
+        // doing. The key has no input-height or block-count component to move.
+        assert_eq!(idle, finished_layout_key(800, 600, 16));
+        // Real geometry still invalidates.
+        assert_ne!(idle, finished_layout_key(800, 540, 16));
+        assert_ne!(idle, finished_layout_key(780, 600, 16));
     }
 
     #[test]

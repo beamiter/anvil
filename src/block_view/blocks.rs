@@ -230,6 +230,14 @@ pub(crate) struct FinishedBlock {
     /// Commandless output emitted while the shell prompt was idle.
     pub(crate) is_background: bool,
     pub(crate) widget: gtk::Box,
+    /// Everything the card draws, wrapped one level below `widget` so
+    /// virtualization can hide the contents while `widget` stays in the
+    /// document at a pinned placeholder height. See
+    /// [`FinishedBlock::set_virtualized`].
+    content: gtk::Box,
+    /// Last real allocation of this card, kept as the placeholder height.
+    virtualized_height: Rc<Cell<i32>>,
+    virtualized: Rc<Cell<bool>>,
     pub(crate) prompt_text: String,
     /// Read-only VTE displaying the executed command line (single-row typically).
     pub(crate) command_vte: vte4::Terminal,
@@ -297,6 +305,9 @@ impl Clone for FinishedBlock {
             id: self.id,
             is_background: self.is_background,
             widget: self.widget.clone(),
+            content: self.content.clone(),
+            virtualized_height: self.virtualized_height.clone(),
+            virtualized: self.virtualized.clone(),
             prompt_text: self.prompt_text.clone(),
             command_vte: self.command_vte.clone(),
             output_vte: self.output_vte.clone(),
@@ -582,9 +593,48 @@ fn collapsed_output_summary(rows: i64) -> String {
     format!("▸ {} hidden — click to show", line_count_text(rows))
 }
 
-fn fitted_output_rows(available_px: i32, cell_height: i32, output_rows: i64) -> i64 {
-    let cell_height = cell_height.max(1);
-    ((available_px.max(cell_height * 3) / cell_height) as i64).clamp(3, output_rows.max(3))
+/// Rows a finished block spends on chrome that is not its output: the command
+/// row plus the card's own padding. Reserved alongside the live input cell so a
+/// capped block still leaves the prompt visible beneath it.
+const FINISHED_BLOCK_NON_OUTPUT_ROWS: i64 = 3;
+
+/// Rows of output a finished block may show, derived from the history
+/// viewport's own height.
+///
+/// The reserve is the live input cell's *minimum* height, never its current
+/// one. A cap that followed the live cell would change twice per command — the
+/// cell grows to the full viewport while a command runs and collapses back at
+/// the next prompt — and every change re-feeds every finished block's VTE, so
+/// the whole history visibly collapsed to three rows and re-expanded on each
+/// Enter. Keeping the reserve constant makes the cap a pure function of pane
+/// geometry, so a command run re-fits nothing.
+fn fitted_output_rows_for_viewport(
+    viewport_rows: Option<i64>,
+    fallback_rows: i64,
+    output_rows: i64,
+) -> i64 {
+    let output_rows = output_rows.max(1);
+    let reserve = super::MIN_INPUT_ROWS as i64 + FINISHED_BLOCK_NON_OUTPUT_ROWS;
+    viewport_rows
+        .map(|rows| rows.saturating_sub(reserve))
+        .unwrap_or(fallback_rows)
+        .max(3)
+        .min(output_rows)
+}
+
+/// [`fitted_output_rows_for_viewport`] against the pane this block actually
+/// hangs in. Falls back to the caller's rows while the block has no
+/// `ScrolledWindow` ancestor yet (construction, before the card is inserted).
+fn fitted_output_rows_for_widget(
+    vte: &vte4::Terminal,
+    fallback_rows: i64,
+    output_rows: i64,
+) -> i64 {
+    let viewport_rows = vte
+        .ancestor(gtk::ScrolledWindow::static_type())
+        .and_then(|widget| widget.downcast::<gtk::ScrolledWindow>().ok())
+        .and_then(|scroll| super::viewport_rows_for(vte, &scroll));
+    fitted_output_rows_for_viewport(viewport_rows, fallback_rows, output_rows)
 }
 
 fn pin_vte_to_top(vte: &vte4::Terminal) {
@@ -928,10 +978,32 @@ mod tests {
     }
 
     #[test]
-    fn long_output_rows_fill_space_left_above_input() {
-        assert_eq!(fitted_output_rows(600, 20, 500), 30);
-        assert_eq!(fitted_output_rows(25, 20, 500), 3);
-        assert_eq!(fitted_output_rows(600, 20, 12), 12);
+    fn long_output_rows_fill_the_viewport_minus_a_constant_reserve() {
+        let reserve = super::super::MIN_INPUT_ROWS as i64 + FINISHED_BLOCK_NON_OUTPUT_ROWS;
+        assert_eq!(
+            fitted_output_rows_for_viewport(Some(40), 24, 500),
+            40 - reserve
+        );
+        // Never below three rows, however cramped the pane.
+        assert_eq!(fitted_output_rows_for_viewport(Some(4), 24, 500), 3);
+        // Short output is its own cap.
+        assert_eq!(fitted_output_rows_for_viewport(Some(40), 24, 12), 12);
+        // No pane yet: fall back to the block's configured rows.
+        assert_eq!(fitted_output_rows_for_viewport(None, 24, 500), 24);
+    }
+
+    /// A capped block always leaves room for the live input cell's minimum, so
+    /// the layout never has to claw rows back from the history once a command
+    /// starts — the re-fit that made the whole history blink twice per command.
+    #[test]
+    fn block_cap_always_leaves_room_for_the_minimum_input_cell() {
+        for viewport in [12_i64, 24, 40, 80, 200] {
+            let cap = fitted_output_rows_for_viewport(Some(viewport), 24, 10_000);
+            assert!(
+                cap + super::super::MIN_INPUT_ROWS as i64 <= viewport,
+                "cap {cap} leaves no room for the input cell in a {viewport}-row pane"
+            );
+        }
     }
 
     #[test]
@@ -1273,6 +1345,21 @@ impl FinishedBlock {
             b.add_css_class("block-finished");
             b
         };
+        // Pooled cards must not inherit the placeholder geometry of whatever
+        // block last used them; virtualization owns this request from here on.
+        outer.set_hexpand(true);
+        outer.set_vexpand(false);
+        outer.set_height_request(-1);
+        // A pooled card may also have been hidden outright by an alt-screen
+        // takeover; a new block always starts on screen.
+        outer.set_visible(true);
+        // One level below the card: virtualization hides this and pins the
+        // card's height, so an off-screen block keeps its place in the document
+        // instead of collapsing it. See `set_virtualized`.
+        let content = gtk::Box::new(Orientation::Vertical, 0);
+        content.set_hexpand(true);
+        content.set_vexpand(false);
+        outer.append(&content);
         if config.block_compact {
             outer.add_css_class("block-compact");
             outer.set_margin_top(1);
@@ -1467,7 +1554,7 @@ impl FinishedBlock {
         collapse_btn.add_css_class("flat");
         header_row.append(&collapse_btn);
 
-        outer.append(&header_row);
+        content.append(&header_row);
 
         // ── VTE-rendered command + output ─────────────────────────────────
         // Command VTE: single-row read-only renderer for the executed command.
@@ -1544,6 +1631,7 @@ impl FinishedBlock {
         {
             let cols_for_map = cols.max(1);
             let cap_for_map = dynamic_viewport_rows.clone();
+            let fallback_cap_for_map = viewport_cap;
             let max_for_map = max_expanded_cap;
             let full_for_map = full_output.clone();
             let displayed_for_map = displayed_output.clone();
@@ -1558,16 +1646,22 @@ impl FinishedBlock {
                 let text = displayed.as_deref().unwrap_or(full.as_str());
                 let effective_cols = effective_render_cols(w, cols_for_map);
                 let rows = output_visual_row_count(text, effective_cols);
+                // Fit against the pane this card just entered. The global
+                // layout pass now runs only on a real geometry change, so a
+                // freshly appended (or re-virtualized) card has to establish
+                // its own cap here rather than waiting to be swept up.
+                let fitted_cap = fitted_output_rows_for_widget(w, fallback_cap_for_map, rows);
+                cap_for_map.set(fitted_cap);
                 let cap = if expanded_for_map.get() {
                     max_for_map
                 } else {
-                    cap_for_map.get()
+                    fitted_cap
                 };
                 if let Some(expand_btn) = expand_btn_for_map.upgrade() {
-                    expand_btn.set_visible(rows > cap_for_map.get());
+                    expand_btn.set_visible(rows > fitted_cap);
                 }
                 if let Some(jump_btn) = jump_btn_for_map.upgrade() {
-                    jump_btn.set_visible(rows > cap_for_map.get());
+                    jump_btn.set_visible(rows > fitted_cap);
                 }
                 let stamp = output_render_stamp(
                     effective_cols,
@@ -1670,7 +1764,7 @@ impl FinishedBlock {
         cmd_row.append(&chevron);
         cmd_row.append(&command_vte);
 
-        outer.append(&cmd_row);
+        content.append(&cmd_row);
         cmd_row.set_visible(!is_background);
         let output_box = gtk::Box::new(Orientation::Horizontal, 0);
         output_box.set_hexpand(true);
@@ -1695,7 +1789,7 @@ impl FinishedBlock {
         }
         output_box.append(&output_scrollbar);
         let output_widget: gtk::Widget = output_box.clone().upcast::<gtk::Widget>();
-        outer.append(&output_box);
+        content.append(&output_box);
 
         // Kitty graphics: append each decoded texture as a Picture under the
         // text output. Pictures preserve aspect ratio inside a max-height bound
@@ -1719,7 +1813,7 @@ impl FinishedBlock {
                 pic.set_size_request(-1, tex.height().clamp(64, 600));
                 ib.append(&pic);
             }
-            outer.append(&ib);
+            content.append(&ib);
             Some(ib)
         };
 
@@ -1732,7 +1826,7 @@ impl FinishedBlock {
         collapsed_summary.set_margin_bottom(4);
         collapsed_summary.set_tooltip_text(Some("Show block output"));
         collapsed_summary.set_visible(false);
-        outer.append(&collapsed_summary);
+        content.append(&collapsed_summary);
 
         // Ctrl+click on a URL inside the output VTE → open in browser.
         // VTE's `match_add_regex` (registered in create_finished_terminal) makes
@@ -1877,7 +1971,7 @@ impl FinishedBlock {
             filter_row.append(&ctx_spin);
             filter_row.append(&filter_status);
 
-            outer.append(&filter_row);
+            content.append(&filter_row);
             outer.reorder_child_after(&filter_row, Some(&cmd_row));
 
             let apply = {
@@ -2052,6 +2146,11 @@ impl FinishedBlock {
             id,
             is_background,
             widget: outer,
+            content,
+            virtualized_height: Rc::new(Cell::new(estimated_finished_block_height_for_text(
+                config, output, cols,
+            ))),
+            virtualized: Rc::new(Cell::new(false)),
             prompt_text: prompt.to_string(),
             command_vte,
             output_vte,
@@ -2118,14 +2217,50 @@ impl FinishedBlock {
     /// changes. Width is part of the stamp because VTE follows its allocation
     /// below the recorded columns; ignoring it causes the narrow-pane two-frame
     /// height oscillation this method is designed to prevent.
-    pub(crate) fn refit_output_to_geometry(&self, available_px: i32) -> Option<i32> {
+    /// Park this card as a fixed-height placeholder, or restore it.
+    ///
+    /// Virtualizing hides the card's *contents* while the card itself stays in
+    /// the document at the height it last really occupied. Hiding the card
+    /// outright instead — which is what this used to do — drops its height to
+    /// zero, so the history's scroll `upper` moves every time a block crosses
+    /// the viewport edge: the page shifts under the reader, the follow-bottom
+    /// pin chases it, and blocks flip in and out. Returns the height the card
+    /// now claims, so the caller can keep its virtualization metadata in step.
+    pub(crate) fn set_virtualized(&self, virtualized: bool) -> i32 {
+        if self.virtualized.replace(virtualized) == virtualized {
+            return self.virtualized_height.get().max(1);
+        }
+        if virtualized {
+            let allocated = self.widget.height();
+            if allocated > 1 {
+                self.virtualized_height.set(allocated);
+            }
+            let height = self.virtualized_height.get().max(1);
+            self.widget.set_height_request(height);
+            self.content.set_visible(false);
+            height
+        } else {
+            self.content.set_visible(true);
+            self.widget.set_height_request(-1);
+            self.virtualized_height.get().max(1)
+        }
+    }
+
+    /// Re-fit this block's output to the pane's current geometry.
+    ///
+    /// The cap comes from the pane the block hangs in, not from a value the
+    /// caller computed against the live input cell — see
+    /// [`fitted_output_rows_for_viewport`]. Virtualized (unmapped) cards are
+    /// left alone; their own `connect_map` handler fits them on the way back in.
+    pub(crate) fn refit_output_to_viewport(&self) -> Option<i32> {
         let cell_height = (self.output_vte.char_height() as i32).max(1);
         let effective_cols = effective_render_cols(&self.output_vte, self.cols);
         let full = self.full_output.borrow();
         let displayed = self.displayed_output.borrow();
         let text = displayed.as_deref().unwrap_or(full.as_str());
         let output_rows = output_visual_row_count(text, effective_cols);
-        let fitted_rows = fitted_output_rows(available_px, cell_height, output_rows);
+        let fitted_rows =
+            fitted_output_rows_for_widget(&self.output_vte, self.viewport_cap, output_rows);
         let generation = self.displayed_generation.get();
         if !self.output_vte.is_mapped() {
             self.dynamic_viewport_rows.set(fitted_rows);
@@ -2142,8 +2277,11 @@ impl FinishedBlock {
         }
 
         self.dynamic_viewport_rows.set(fitted_rows);
-        self.expanded.set(false);
-        set_icon_button(&self.expand_btn, "view-fullscreen-symbolic", "Expand block");
+        // Pane sizing is authoritative over a manual expansion: a block expanded
+        // for the old geometry must not outlive it.
+        if self.expanded.replace(false) {
+            set_icon_button(&self.expand_btn, "view-fullscreen-symbolic", "Expand block");
+        }
         self.expand_btn.set_visible(output_rows > fitted_rows);
         let stamp = output_render_stamp(effective_cols, output_rows, fitted_rows, generation);
         let visible_rows = snapshot_visible_rows(output_rows, fitted_rows);

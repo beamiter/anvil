@@ -261,6 +261,28 @@ versioning for tagged releases while it remains experimental.
 
 ### Fixed
 
+- Block mode no longer clears and repaints the whole history on every command.
+  A finished block's output cap was derived from the space left over *above the
+  live input cell*, and that cell grows to the full viewport while a command
+  runs and collapses back at the next prompt — so every Enter squeezed each
+  finished block down to three rows and expanded it again, re-feeding each
+  block's VTE (a `reset` plus a re-render) twice per command. The block count
+  was folded into the same change detector, so appending a block re-fitted every
+  earlier one as well. The cap is now a constant reserve below the pane's own
+  height, matching Forge, and the re-fit key is pure pane geometry: a real
+  resize or font zoom re-fits, a command run does not. Measured over a
+  five-command session, full-history layout passes went from 14 to 1 and block
+  VTE re-feeds from 10 to 0.
+- Scrolling the Block history no longer shifts under the reader. Virtualized
+  blocks now stay in the document as fixed-height placeholders with their
+  contents hidden, instead of being hidden outright and collapsing to zero
+  height — which moved the scroll `upper` every time a block crossed the
+  viewport edge, so the follow-bottom pin chased the change and blocks flipped
+  in and out. Block height metadata now matches what the document really
+  allocates, on screen and off.
+- A pane resize no longer silently re-collapses a block the user had expanded
+  unless the expansion was actually in effect, and no longer rewrites the expand
+  button's icon and label on every pass.
 - Background session and organism save failures are drained on the UI loop and
   reported before shutdown, with bounded text, per-operation aggregation, and
   a cooldown that prevents a failing filesystem from creating a toast storm.
