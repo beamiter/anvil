@@ -2929,10 +2929,18 @@ trait RenderBackend {
     fn cursor_position_report(&self) -> (i64, i64);
     /// Rebase the prompt anchor captured at PromptEnd (`provisional`) onto the
     /// surface as it stands at CommandStart. Anchor cells are in the backend's
-    /// surface coordinates and each backend owns its rebase policy: Block's
-    /// live VTE keeps one monotonic text buffer across the two marks, so its
-    /// policy is the identity; a surface that reflows or re-allocates its grid
-    /// between PromptEnd and CommandStart must shift the anchor here.
+    /// surface coordinates and each backend owns its rebase policy. Block's
+    /// policy is the identity because that is what the pre-split path did, not
+    /// because the grid holds still: `layout_active_surface` shrinks the live
+    /// VTE to `compact_rows()` between the two marks. VTE's cursor rows are
+    /// ring-absolute, so the resize does not move them; a backend whose rows
+    /// are screen-relative must shift the anchor here (cf. forge's
+    /// `rebase_prompt_anchor`, which corrects a row-count delta).
+    ///
+    /// Engine-side command-capture path only. The reviewed-submission guard,
+    /// its verification poll, `command_prompt_status` and `click_cursor` read
+    /// `prompt_end_pos` raw; a non-identity implementation must rebase there
+    /// too or those readers desynchronize.
     fn command_capture_anchor(&self, provisional: (i64, i64)) -> (i64, i64);
     /// The column count finished blocks pre-wrap at (live grid, floored).
     fn grid_cols(&self) -> i64;
@@ -3060,7 +3068,10 @@ struct ReaderCtx {
     pty_for_init: Rc<OwnedPty>,
     block_start_time_for_cb: Rc<Cell<Option<SystemTime>>>,
     /// The shell's execution id for the running command (jsh only): the key its
-    /// execution journal keeps the record under.
+    /// execution journal keeps the record under. Engine-private, but kept out
+    /// of `EngineState` so the `if let Some(id) = ...take()` at the journal
+    /// submit can hold its scrutinee borrow across the submit without pinning
+    /// the whole engine cell.
     execution_id_rc: Rc<RefCell<Option<String>>>,
     current_cwd_for_cb: Rc<RefCell<String>>,
     event_buf: Rc<RefCell<Vec<ParserEvent>>>,
@@ -4214,9 +4225,9 @@ impl RenderBackend for BlockBackend {
 
     fn command_capture_anchor(&self, provisional: (i64, i64)) -> (i64, i64) {
         // Verbatim pre-split behaviour: Block mode captures the command from
-        // the PromptEnd anchor exactly as recorded. The live VTE keeps one
-        // monotonic text buffer between the two marks, so there is no
-        // row-count delta to correct for here.
+        // the PromptEnd anchor exactly as recorded. The grid does resize
+        // between the marks (compact prompt layout), but VTE cursor rows are
+        // ring-absolute, so nothing needs correcting.
         provisional
     }
 
