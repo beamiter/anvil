@@ -2817,8 +2817,10 @@ pub(crate) struct ActiveBlock {
     /// it without allowing stale pre-TUI coordinates to reappear on exit.
     live_organism_visible: Cell<bool>,
     live_organism_alt_screen: Cell<bool>,
-    /// Raw output bytes accumulated during CollectingOutput, consumed by the
-    /// finalize path to build the styled finished block (anvil's `out_buf`).
+    /// Raw output bytes accumulated during CollectingOutput (anvil's
+    /// `out_buf`). Engine-owned shared state constructed in `TermView::new`:
+    /// the reader engine appends, clears, and snapshots it directly; this
+    /// clone exists only so live-find can read it ([`Self::output_text`]).
     pub(crate) raw_output: Rc<RefCell<VecDeque<u8>>>,
 }
 
@@ -2847,7 +2849,9 @@ pub(super) fn append_bounded_output(buffer: &mut VecDeque<u8>, bytes: &[u8], lim
 }
 
 impl ActiveBlock {
-    pub(crate) fn new(config: &Config) -> Self {
+    /// `pub(super)`: only `TermView::new` constructs the live block, and it is
+    /// the owner of the engine-side `raw_output` ring passed in here.
+    pub(super) fn new(config: &Config, raw_output: Rc<RefCell<VecDeque<u8>>>) -> Self {
         let widget = gtk::Box::new(Orientation::Vertical, 0);
         widget.add_css_class("block-active");
         if config.block_compact {
@@ -2915,29 +2919,14 @@ impl ActiveBlock {
             live_scrollbar,
             live_organism_visible: Cell::new(false),
             live_organism_alt_screen: Cell::new(false),
-            raw_output: Rc::new(RefCell::new(VecDeque::new())),
+            raw_output,
         }
     }
 
-    /// Append raw command-output bytes to the snapshot buffer (bounded). The bytes
-    /// are also fed to the live VTE separately by the reader; this buffer is only
-    /// the source the finalize path styles into a finished block.
-    pub(crate) fn accumulate_output(&self, raw_bytes: &[u8]) {
-        let mut buf = self.raw_output.borrow_mut();
-        append_bounded_output(&mut buf, raw_bytes, super::MAX_RAW_OUTPUT_BYTES);
-    }
-
+    /// Snapshot the engine-owned capture for live-find. The engine reads the
+    /// same ring through `super::live_output_text` at finalize.
     pub(crate) fn output_text(&self) -> String {
-        let mut raw = self.raw_output.borrow_mut();
-        if raw.is_empty() {
-            return String::new();
-        }
-        String::from_utf8_lossy(raw.make_contiguous()).into_owned()
-    }
-
-    /// Clear the accumulated output buffer (without touching the VTE).
-    pub(crate) fn reset_output_buffer(&self) {
-        self.raw_output.borrow_mut().clear();
+        super::live_output_text(&self.raw_output)
     }
 
     /// The column count the live VTE is wrapping at — the single source of truth
@@ -2951,11 +2940,14 @@ impl ActiveBlock {
     /// in-stream clear (fed after them) wipes stale output in the correct order.
     ///
     /// `preserve_scrollback`: when true, keep the VTE's buffer + scrollback intact
-    /// (only the accumulated raw_output snapshot for the *next* block is cleared,
-    /// and SGR state is soft-reset). This mirrors a traditional VTE where PageUp
+    /// (SGR state is soft-reset). This mirrors a traditional VTE where PageUp
     /// at a prompt reveals the previous command's output tail. The default (false)
     /// wipes the live VTE on every PromptStart, since the finished blocks above
     /// already hold the authoritative scrollback.
+    ///
+    /// Deliberately does NOT touch the `raw_output` ring: that is engine-owned
+    /// state, cleared explicitly by the reader engine around this reset (see
+    /// `RenderBackend::reset_active_surface`).
     pub(crate) fn reset_active(&self, preserve_scrollback: bool) {
         if preserve_scrollback {
             self.active_vte.feed(b"\x1b[0m");
@@ -2963,7 +2955,6 @@ impl ActiveBlock {
             self.active_vte.reset(true, true);
             self.active_vte.feed(b"\x1b[H\x1b[2J\x1b[3J");
         }
-        self.raw_output.borrow_mut().clear();
     }
 
     pub(crate) fn widget(&self) -> &gtk::Box {

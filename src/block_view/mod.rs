@@ -1765,483 +1765,439 @@ fn install_finished_block_selection(
     block.widget().add_controller(left_click);
 }
 
-/// Handles for [`install_finished_block_context_menu`], cloned per finished
-/// block by the finalize path. Field names mirror the reader-closure locals
-/// they are cloned from.
-struct FinishedBlockMenuCtx {
-    finished_blocks_for_cb: Rc<RefCell<Vec<FinishedBlock>>>,
-    block_list_rc: gtk::Box,
-    active_vte: Terminal,
-    pty_for_init: Rc<OwnedPty>,
-    pty_synced_rc: Rc<Cell<bool>>,
-    bracketed_paste_rc: Rc<Cell<bool>>,
-    typed_cmd_rc: Rc<RefCell<String>>,
-    armed_agent_execution_rc: Rc<RefCell<Option<ArmedAgentExecution>>>,
-    bstate_rc: Rc<Cell<BlockState>>,
-    active_rc: Rc<RefCell<ActiveBlock>>,
-    selected_block_ids_rc: SelectedBlockIds,
-    selected_block_id_rc: Rc<Cell<Option<u64>>>,
-    selection_anchor_id_rc: Rc<Cell<Option<u64>>>,
-    bookmarks_rc: Rc<RefCell<std::collections::HashSet<u64>>>,
-    block_scroll_rc: ScrolledWindow,
-    visible_indices_rc: Rc<RefCell<std::collections::HashSet<usize>>>,
-    widget_pool_for_cb: Rc<RefCell<WidgetPool>>,
-    ask_ai_about_block_cbs: BlockContextCallbacks,
-    failure_marker_redraw: FailureMarkerRedraw,
-    unread_count_rc: Rc<Cell<u32>>,
-    jump_fab: gtk::Button,
-    /// Root widget of the finished block; the right-click gesture attaches here.
-    finished_widget: gtk::Box,
-    finished_menu_clone: FinishedBlock,
-    block_data_for_export: Rc<RefCell<VecDeque<BlockData>>>,
-    block_id: u64,
-}
+impl BlockBackend {
+    /// Install the right-click context menu on a finished block.
+    ///
+    /// Live-finalize path only: `undo_clear_blocks` and session restore
+    /// deliberately rebuild blocks without this menu. Inherent rather than
+    /// part of [`RenderBackend`]: the menu is Block-mode chrome, and the
+    /// `*_for_menu` clones below are the closure's own captures — the
+    /// per-finalize context bundle that used to re-clone them is gone.
+    ///
+    /// `finished_widget` is the root widget of the finished block; the
+    /// right-click gesture attaches there.
+    fn install_finished_block_context_menu(
+        &self,
+        finished_widget: gtk::Box,
+        finished_menu_clone: FinishedBlock,
+        block_id: u64,
+    ) {
+        let block_data_for_export = self.block_data_for_cb.clone();
+        let finished_blocks_for_menu = self.finished_blocks_for_cb.clone();
+        let block_list_for_menu = self.block_list_rc.clone();
+        let vte_for_copy = self.active_vte.clone();
+        let pty_for_rerun_menu = self.pty_for_init.clone();
+        let pty_synced_for_rerun_menu = self.pty_synced_rc.clone();
+        let bracketed_paste_for_rerun_menu = self.bracketed_paste_rc.clone();
+        let typed_cmd_for_rerun_menu = self.typed_cmd_rc.clone();
+        let armed_agent_for_rerun_menu = self.armed_agent_execution_rc.clone();
+        let bstate_for_rerun_menu = self.bstate_rc.clone();
+        let active_for_rerun_menu = self.active_rc.clone();
+        let selected_ids_for_menu = self.selected_block_ids_rc.clone();
+        let selected_for_menu = self.selected_block_id_rc.clone();
+        let anchor_for_menu = self.selection_anchor_id_rc.clone();
+        let bookmarks_for_menu = self.bookmarks_rc.clone();
+        let block_scroll_for_menu = self.block_scroll_rc.clone();
+        let visible_for_menu = self.visible_indices_rc.clone();
+        let widget_pool_for_menu = self.widget_pool_for_cb.clone();
+        let ask_ai_cbs_for_menu = self.ask_ai_about_block_cbs.clone();
+        let failure_marker_redraw_for_menu = self.failure_marker_redraw.clone();
+        let unread_for_menu = self.unread_count_rc.clone();
+        let jump_fab_for_menu = self.jump_fab.clone();
 
-/// Install the right-click context menu on a finished block.
-///
-/// Live-finalize path only: `undo_clear_blocks` and session restore
-/// deliberately rebuild blocks without this menu.
-fn install_finished_block_context_menu(ctx: FinishedBlockMenuCtx) {
-    let FinishedBlockMenuCtx {
-        finished_blocks_for_cb,
-        block_list_rc,
-        active_vte,
-        pty_for_init,
-        pty_synced_rc,
-        bracketed_paste_rc,
-        typed_cmd_rc,
-        armed_agent_execution_rc,
-        bstate_rc,
-        active_rc,
-        selected_block_ids_rc,
-        selected_block_id_rc,
-        selection_anchor_id_rc,
-        bookmarks_rc,
-        block_scroll_rc,
-        visible_indices_rc,
-        widget_pool_for_cb,
-        ask_ai_about_block_cbs,
-        failure_marker_redraw,
-        unread_count_rc,
-        jump_fab,
-        finished_widget,
-        finished_menu_clone,
-        block_data_for_export,
-        block_id,
-    } = ctx;
+        let right_click = gtk::GestureClick::new();
+        right_click.set_button(3);
 
-    let finished_blocks_for_menu = finished_blocks_for_cb.clone();
-    let block_list_for_menu = block_list_rc.clone();
-    let vte_for_copy = active_vte.clone();
-    let pty_for_rerun_menu = pty_for_init.clone();
-    let pty_synced_for_rerun_menu = pty_synced_rc.clone();
-    let bracketed_paste_for_rerun_menu = bracketed_paste_rc.clone();
-    let typed_cmd_for_rerun_menu = typed_cmd_rc.clone();
-    let armed_agent_for_rerun_menu = armed_agent_execution_rc.clone();
-    let bstate_for_rerun_menu = bstate_rc.clone();
-    let active_for_rerun_menu = active_rc.clone();
-    let selected_ids_for_menu = selected_block_ids_rc.clone();
-    let selected_for_menu = selected_block_id_rc.clone();
-    let anchor_for_menu = selection_anchor_id_rc.clone();
-    let bookmarks_for_menu = bookmarks_rc.clone();
-    let block_scroll_for_menu = block_scroll_rc.clone();
-    let visible_for_menu = visible_indices_rc.clone();
-    let widget_pool_for_menu = widget_pool_for_cb.clone();
-    let ask_ai_cbs_for_menu = ask_ai_about_block_cbs.clone();
-    let failure_marker_redraw_for_menu = failure_marker_redraw.clone();
-    let unread_for_menu = unread_count_rc.clone();
-    let jump_fab_for_menu = jump_fab.clone();
-
-    let right_click = gtk::GestureClick::new();
-    right_click.set_button(3);
-
-    right_click.connect_pressed(move |gesture, _n_press, x, y| {
-        gesture.set_state(gtk::EventSequenceState::Claimed);
-        {
-            let finished = finished_blocks_for_menu.borrow();
-            activate_finished_block_selection(
-                &finished,
-                &selected_ids_for_menu,
-                &selected_for_menu,
-                &anchor_for_menu,
-                block_id,
-            );
-        }
-
-        let popover = gtk::Popover::new();
-        let widget: &gtk::Widget = &finished_menu_clone.widget().clone().upcast::<gtk::Widget>();
-        popover.set_parent(widget);
-        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-        popover.set_has_arrow(false);
-
-        let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        vbox.add_css_class("menu");
-
-        let make_item = |label: &str| -> gtk::Button {
-            let btn = gtk::Button::with_label(label);
-            btn.set_has_frame(false);
-            btn.set_halign(gtk::Align::Fill);
-            if let Some(child) = btn.child() {
-                child.set_halign(gtk::Align::Start);
+        right_click.connect_pressed(move |gesture, _n_press, x, y| {
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            {
+                let finished = finished_blocks_for_menu.borrow();
+                activate_finished_block_selection(
+                    &finished,
+                    &selected_ids_for_menu,
+                    &selected_for_menu,
+                    &anchor_for_menu,
+                    block_id,
+                );
             }
-            btn.add_css_class("flat");
-            btn
-        };
 
-        let selected_count = selected_ids_for_menu.borrow().len();
-        let has_selected_commands = {
-            let selected = selected_ids_for_menu.borrow();
-            block_data_for_export
-                .borrow()
-                .iter()
-                .any(|block| selected.contains(&block.id) && !block.cmd.trim().is_empty())
-        };
+            let popover = gtk::Popover::new();
+            let widget: &gtk::Widget =
+                &finished_menu_clone.widget().clone().upcast::<gtk::Widget>();
+            popover.set_parent(widget);
+            popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            popover.set_has_arrow(false);
 
-        if has_selected_commands {
-            let item = make_item(if selected_count > 1 {
-                "Copy Commands"
-            } else {
-                "Copy Command"
-            });
-            let popover_c = popover.clone();
-            let block_data_for_copy = block_data_for_export.clone();
-            let selected_ids_for_copy = selected_ids_for_menu.clone();
-            let vte_for_action = vte_for_copy.clone();
-            item.connect_clicked(move |_| {
-                popover_c.popdown();
-                let selected = selected_ids_for_copy.borrow();
-                let blocks = block_data_for_copy.borrow();
-                let text = selected_command_text(
-                    blocks.iter().map(|block| (block.id, block.cmd.as_str())),
-                    &selected,
-                );
-                vte_for_action.clipboard().set_text(&text);
-            });
-            vbox.append(&item);
-        }
+            let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            vbox.add_css_class("menu");
 
-        {
-            let item = make_item("Ask AI About Block");
-            let popover_c = popover.clone();
-            let finished_for_ai = finished_menu_clone.clone();
-            let block_data_for_ai = block_data_for_export.clone();
-            let callbacks_for_ai = ask_ai_cbs_for_menu.clone();
-            item.connect_clicked(move |_| {
-                popover_c.popdown();
-                let output = finished_for_ai
-                    .with_stripped_output(|text| crate::ai::truncate_for_context(text, 80));
-                let data = block_data_for_ai.borrow();
-                let record = data.iter().find(|block| block.id == block_id);
-                let truncated = output.contains("lines elided") || output.contains("bytes elided");
-                let context = crate::ai::BlockContext {
-                    cmd: finished_for_ai.cmd_text.clone(),
-                    output,
-                    cwd: record.and_then(|block| block.cwd.clone()),
-                    exit_code: exit_code_for_i32_api(record.and_then(|block| block.exit_code)),
-                    truncated,
-                };
-                for callback in callbacks_for_ai.borrow().iter() {
-                    callback(context.clone());
+            let make_item = |label: &str| -> gtk::Button {
+                let btn = gtk::Button::with_label(label);
+                btn.set_has_frame(false);
+                btn.set_halign(gtk::Align::Fill);
+                if let Some(child) = btn.child() {
+                    child.set_halign(gtk::Align::Start);
                 }
-            });
-            vbox.append(&item);
-        }
-        {
-            let item = make_item(if selected_count > 1 {
-                "Copy Outputs"
-            } else {
-                "Copy Output"
-            });
-            let popover_c = popover.clone();
-            let block_data_for_copy = block_data_for_export.clone();
-            let selected_ids_for_copy = selected_ids_for_menu.clone();
-            let vte_for_action = vte_for_copy.clone();
-            item.connect_clicked(move |_| {
-                popover_c.popdown();
-                let selected = selected_ids_for_copy.borrow();
-                let blocks = block_data_for_copy.borrow();
-                let text = blocks
+                btn.add_css_class("flat");
+                btn
+            };
+
+            let selected_count = selected_ids_for_menu.borrow().len();
+            let has_selected_commands = {
+                let selected = selected_ids_for_menu.borrow();
+                block_data_for_export
+                    .borrow()
                     .iter()
-                    .filter(|block| selected.contains(&block.id))
-                    .map(|block| strip_ansi(&block.output))
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
-                vte_for_action.clipboard().set_text(&text);
-            });
-            vbox.append(&item);
-        }
+                    .any(|block| selected.contains(&block.id) && !block.cmd.trim().is_empty())
+            };
 
-        {
-            let item = make_item(if selected_count > 1 {
-                "Copy Blocks"
-            } else {
-                "Copy Block"
-            });
-            let popover_c = popover.clone();
-            let block_data_for_copy = block_data_for_export.clone();
-            let selected_ids_for_copy = selected_ids_for_menu.clone();
-            let vte_for_action = vte_for_copy.clone();
-            item.connect_clicked(move |_| {
-                popover_c.popdown();
-                let selected = selected_ids_for_copy.borrow();
-                let blocks = block_data_for_copy.borrow();
-                let text = blocks
-                    .iter()
-                    .filter(|block| selected.contains(&block.id))
-                    .map(|block| {
-                        block_clipboard_text(&block.cmd, &strip_ansi(&block.output), false)
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
-                vte_for_action.clipboard().set_text(&text);
-            });
-            vbox.append(&item);
-        }
-
-        {
-            let item = make_item("Scroll to Top of Block");
-            let popover_c = popover.clone();
-            let finished_for_scroll = finished_menu_clone.clone();
-            let scroll_for_action = block_scroll_for_menu.clone();
-            item.connect_clicked(move |_| {
-                popover_c.popdown();
-                finished_for_scroll.scroll_to_edge(&scroll_for_action, false);
-            });
-            vbox.append(&item);
-        }
-        if finished_menu_clone.long_output {
-            let item = make_item("Jump to Bottom of Block");
-            let popover_c = popover.clone();
-            let finished_for_scroll = finished_menu_clone.clone();
-            let scroll_for_action = block_scroll_for_menu.clone();
-            item.connect_clicked(move |_| {
-                popover_c.popdown();
-                finished_for_scroll.scroll_to_edge(&scroll_for_action, true);
-            });
-            vbox.append(&item);
-        }
-        {
-            let item = make_item("Toggle Output Filter");
-            let popover_c = popover.clone();
-            let finished_for_filter = finished_menu_clone.clone();
-            item.connect_clicked(move |_| {
-                popover_c.popdown();
-                (finished_for_filter.toggle_filter)();
-            });
-            vbox.append(&item);
-        }
-        {
-            let bookmarked = bookmarks_for_menu.borrow().contains(&block_id);
-            let item = make_item(if bookmarked {
-                "Remove Bookmark"
-            } else {
-                "Bookmark Block"
-            });
-            let popover_c = popover.clone();
-            let finished_for_bookmark = finished_menu_clone.clone();
-            let bookmarks_for_action = bookmarks_for_menu.clone();
-            item.connect_clicked(move |_| {
-                popover_c.popdown();
-                let mut marks = bookmarks_for_action.borrow_mut();
-                let now_bookmarked = if marks.remove(&block_id) {
-                    false
+            if has_selected_commands {
+                let item = make_item(if selected_count > 1 {
+                    "Copy Commands"
                 } else {
-                    marks.insert(block_id);
-                    true
-                };
-                finished_for_bookmark
-                    .bookmark_star
-                    .set_visible(now_bookmarked);
-                if now_bookmarked {
-                    finished_for_bookmark
-                        .widget()
-                        .add_css_class("block-bookmarked");
-                } else {
-                    finished_for_bookmark
-                        .widget()
-                        .remove_css_class("block-bookmarked");
-                }
-            });
-            vbox.append(&item);
-        }
-        vbox.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-
-        {
-            let item = make_item(if selected_count > 1 {
-                "Copy Blocks as Markdown"
-            } else {
-                "Copy Block as Markdown"
-            });
-            let popover_c = popover.clone();
-            let block_data_for_md = block_data_for_export.clone();
-            let selected_ids_for_md = selected_ids_for_menu.clone();
-            let vte_for_action = vte_for_copy.clone();
-            let block_id_md = block_id;
-            item.connect_clicked(move |_| {
-                popover_c.popdown();
-                let selected = selected_ids_for_md.borrow();
-                let blocks = block_data_for_md.borrow();
-                let text = selected_blocks_markdown(blocks.iter(), &selected, block_id_md);
-                vte_for_action.clipboard().set_text(&text);
-            });
-            vbox.append(&item);
-        }
-
-        {
-            let item = make_item("Export as JSON");
-            let popover_c = popover.clone();
-            let block_data_for_json = block_data_for_export.clone();
-            let vte_for_json = vte_for_copy.clone();
-            let block_id_json = block_id;
-            item.connect_clicked(move |_| {
-                popover_c.popdown();
-                let blocks = block_data_for_json.borrow();
-                if let Some(block) = blocks.iter().find(|b| b.id == block_id_json) {
-                    let json = block.to_json();
-                    vte_for_json.clipboard().set_text(&json);
-                }
-            });
-            vbox.append(&item);
-        }
-
-        if has_selected_commands {
-            let item = make_item(if selected_count > 1 {
-                "Insert Commands at Prompt"
-            } else {
-                "Insert Command at Prompt"
-            });
-            let popover_c = popover.clone();
-            let finished_for_rerun = finished_blocks_for_menu.clone();
-            let selected_ids_for_rerun = selected_ids_for_menu.clone();
-            let selected_for_rerun = selected_for_menu.clone();
-            let anchor_for_rerun = anchor_for_menu.clone();
-            let pty_for_action = pty_for_rerun_menu.clone();
-            let pty_synced_for_action = pty_synced_for_rerun_menu.clone();
-            let bracketed_paste_for_action = bracketed_paste_for_rerun_menu.clone();
-            let typed_cmd_for_action = typed_cmd_for_rerun_menu.clone();
-            let armed_agent_for_action = armed_agent_for_rerun_menu.clone();
-            let bstate_for_action = bstate_for_rerun_menu.clone();
-            let active_for_action = active_for_rerun_menu.clone();
-            item.set_sensitive(
-                bstate_for_action.get() == BlockState::AwaitingCommand
-                    && armed_agent_for_action.borrow().is_none(),
-            );
-            item.connect_clicked(move |_| {
-                popover_c.popdown();
-                let finished = finished_for_rerun.borrow();
-                let recalled = if armed_agent_for_action.borrow().is_some() {
-                    false
-                } else {
-                    let selected = selected_ids_for_rerun.borrow();
-                    recall_selected_commands_at_prompt(
-                        &pty_for_action,
-                        &pty_synced_for_action,
-                        &typed_cmd_for_action,
-                        bstate_for_action.get(),
-                        &finished,
+                    "Copy Command"
+                });
+                let popover_c = popover.clone();
+                let block_data_for_copy = block_data_for_export.clone();
+                let selected_ids_for_copy = selected_ids_for_menu.clone();
+                let vte_for_action = vte_for_copy.clone();
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    let selected = selected_ids_for_copy.borrow();
+                    let blocks = block_data_for_copy.borrow();
+                    let text = selected_command_text(
+                        blocks.iter().map(|block| (block.id, block.cmd.as_str())),
                         &selected,
-                        bracketed_paste_for_action.get(),
-                    )
-                };
-                if recalled {
-                    clear_finished_block_selection(
-                        &finished,
-                        &selected_ids_for_rerun,
-                        &selected_for_rerun,
-                        &anchor_for_rerun,
                     );
-                    active_for_action.borrow().grab_focus();
-                }
-            });
-            vbox.append(&item);
-        }
-        vbox.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+                    vte_for_action.clipboard().set_text(&text);
+                });
+                vbox.append(&item);
+            }
 
-        {
-            let item = make_item("Export as Markdown");
-            let popover_c = popover.clone();
-            let block_data_for_md = block_data_for_export.clone();
-            let vte_for_md = vte_for_copy.clone();
-            let block_id_md = block_id;
-            item.connect_clicked(move |_| {
-                popover_c.popdown();
-                let blocks = block_data_for_md.borrow();
-                if let Some(block) = blocks.iter().find(|b| b.id == block_id_md) {
-                    let markdown = block.to_markdown();
-                    vte_for_md.clipboard().set_text(&markdown);
-                }
-            });
-            vbox.append(&item);
-        }
+            {
+                let item = make_item("Ask AI About Block");
+                let popover_c = popover.clone();
+                let finished_for_ai = finished_menu_clone.clone();
+                let block_data_for_ai = block_data_for_export.clone();
+                let callbacks_for_ai = ask_ai_cbs_for_menu.clone();
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    let output = finished_for_ai
+                        .with_stripped_output(|text| crate::ai::truncate_for_context(text, 80));
+                    let data = block_data_for_ai.borrow();
+                    let record = data.iter().find(|block| block.id == block_id);
+                    let truncated =
+                        output.contains("lines elided") || output.contains("bytes elided");
+                    let context = crate::ai::BlockContext {
+                        cmd: finished_for_ai.cmd_text.clone(),
+                        output,
+                        cwd: record.and_then(|block| block.cwd.clone()),
+                        exit_code: exit_code_for_i32_api(record.and_then(|block| block.exit_code)),
+                        truncated,
+                    };
+                    for callback in callbacks_for_ai.borrow().iter() {
+                        callback(context.clone());
+                    }
+                });
+                vbox.append(&item);
+            }
+            {
+                let item = make_item(if selected_count > 1 {
+                    "Copy Outputs"
+                } else {
+                    "Copy Output"
+                });
+                let popover_c = popover.clone();
+                let block_data_for_copy = block_data_for_export.clone();
+                let selected_ids_for_copy = selected_ids_for_menu.clone();
+                let vte_for_action = vte_for_copy.clone();
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    let selected = selected_ids_for_copy.borrow();
+                    let blocks = block_data_for_copy.borrow();
+                    let text = blocks
+                        .iter()
+                        .filter(|block| selected.contains(&block.id))
+                        .map(|block| strip_ansi(&block.output))
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    vte_for_action.clipboard().set_text(&text);
+                });
+                vbox.append(&item);
+            }
 
-        {
-            let item = make_item("Delete Block");
-            let popover_c = popover.clone();
-            let finished_blocks_for_delete = finished_blocks_for_menu.clone();
-            let block_list_for_delete = block_list_for_menu.clone();
-            let block_data_for_delete = block_data_for_export.clone();
-            let selected_ids_for_delete = selected_ids_for_menu.clone();
-            let selected_for_delete = selected_for_menu.clone();
-            let anchor_for_delete = anchor_for_menu.clone();
-            let bookmarks_for_delete = bookmarks_for_menu.clone();
-            let visible_for_delete = visible_for_menu.clone();
-            let widget_pool_for_delete = widget_pool_for_menu.clone();
-            let failure_marker_redraw_for_delete = failure_marker_redraw_for_menu.clone();
-            let unread_for_delete = unread_for_menu.clone();
-            let jump_fab_for_delete = jump_fab_for_menu.clone();
-            let block_id_del = block_id;
-            item.connect_clicked(move |_| {
-                popover_c.popdown();
-                let mut blocks = finished_blocks_for_delete.borrow_mut();
-                let removed_pos = blocks.iter().position(|b| b.id == block_id_del);
-                if let Some(pos) = removed_pos {
-                    let unread =
-                        unread_after_index_removal(blocks.len(), unread_for_delete.get(), pos);
-                    unread_for_delete.set(unread);
-                    set_jump_fab_label(&jump_fab_for_delete, unread);
-                    let block = blocks.remove(pos);
-                    let widget = block.widget().clone();
-                    block_list_for_delete.remove(&widget);
-                    widget_pool_for_delete.borrow_mut().release(widget);
-                }
-                remove_finished_block_from_selection(
-                    &blocks,
-                    &selected_ids_for_delete,
-                    &selected_for_delete,
-                    &anchor_for_delete,
-                    block_id_del,
+            {
+                let item = make_item(if selected_count > 1 {
+                    "Copy Blocks"
+                } else {
+                    "Copy Block"
+                });
+                let popover_c = popover.clone();
+                let block_data_for_copy = block_data_for_export.clone();
+                let selected_ids_for_copy = selected_ids_for_menu.clone();
+                let vte_for_action = vte_for_copy.clone();
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    let selected = selected_ids_for_copy.borrow();
+                    let blocks = block_data_for_copy.borrow();
+                    let text = blocks
+                        .iter()
+                        .filter(|block| selected.contains(&block.id))
+                        .map(|block| {
+                            block_clipboard_text(&block.cmd, &strip_ansi(&block.output), false)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    vte_for_action.clipboard().set_text(&text);
+                });
+                vbox.append(&item);
+            }
+
+            {
+                let item = make_item("Scroll to Top of Block");
+                let popover_c = popover.clone();
+                let finished_for_scroll = finished_menu_clone.clone();
+                let scroll_for_action = block_scroll_for_menu.clone();
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    finished_for_scroll.scroll_to_edge(&scroll_for_action, false);
+                });
+                vbox.append(&item);
+            }
+            if finished_menu_clone.long_output {
+                let item = make_item("Jump to Bottom of Block");
+                let popover_c = popover.clone();
+                let finished_for_scroll = finished_menu_clone.clone();
+                let scroll_for_action = block_scroll_for_menu.clone();
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    finished_for_scroll.scroll_to_edge(&scroll_for_action, true);
+                });
+                vbox.append(&item);
+            }
+            {
+                let item = make_item("Toggle Output Filter");
+                let popover_c = popover.clone();
+                let finished_for_filter = finished_menu_clone.clone();
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    (finished_for_filter.toggle_filter)();
+                });
+                vbox.append(&item);
+            }
+            {
+                let bookmarked = bookmarks_for_menu.borrow().contains(&block_id);
+                let item = make_item(if bookmarked {
+                    "Remove Bookmark"
+                } else {
+                    "Bookmark Block"
+                });
+                let popover_c = popover.clone();
+                let finished_for_bookmark = finished_menu_clone.clone();
+                let bookmarks_for_action = bookmarks_for_menu.clone();
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    let mut marks = bookmarks_for_action.borrow_mut();
+                    let now_bookmarked = if marks.remove(&block_id) {
+                        false
+                    } else {
+                        marks.insert(block_id);
+                        true
+                    };
+                    finished_for_bookmark
+                        .bookmark_star
+                        .set_visible(now_bookmarked);
+                    if now_bookmarked {
+                        finished_for_bookmark
+                            .widget()
+                            .add_css_class("block-bookmarked");
+                    } else {
+                        finished_for_bookmark
+                            .widget()
+                            .remove_css_class("block-bookmarked");
+                    }
+                });
+                vbox.append(&item);
+            }
+            vbox.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+
+            {
+                let item = make_item(if selected_count > 1 {
+                    "Copy Blocks as Markdown"
+                } else {
+                    "Copy Block as Markdown"
+                });
+                let popover_c = popover.clone();
+                let block_data_for_md = block_data_for_export.clone();
+                let selected_ids_for_md = selected_ids_for_menu.clone();
+                let vte_for_action = vte_for_copy.clone();
+                let block_id_md = block_id;
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    let selected = selected_ids_for_md.borrow();
+                    let blocks = block_data_for_md.borrow();
+                    let text = selected_blocks_markdown(blocks.iter(), &selected, block_id_md);
+                    vte_for_action.clipboard().set_text(&text);
+                });
+                vbox.append(&item);
+            }
+
+            {
+                let item = make_item("Export as JSON");
+                let popover_c = popover.clone();
+                let block_data_for_json = block_data_for_export.clone();
+                let vte_for_json = vte_for_copy.clone();
+                let block_id_json = block_id;
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    let blocks = block_data_for_json.borrow();
+                    if let Some(block) = blocks.iter().find(|b| b.id == block_id_json) {
+                        let json = block.to_json();
+                        vte_for_json.clipboard().set_text(&json);
+                    }
+                });
+                vbox.append(&item);
+            }
+
+            if has_selected_commands {
+                let item = make_item(if selected_count > 1 {
+                    "Insert Commands at Prompt"
+                } else {
+                    "Insert Command at Prompt"
+                });
+                let popover_c = popover.clone();
+                let finished_for_rerun = finished_blocks_for_menu.clone();
+                let selected_ids_for_rerun = selected_ids_for_menu.clone();
+                let selected_for_rerun = selected_for_menu.clone();
+                let anchor_for_rerun = anchor_for_menu.clone();
+                let pty_for_action = pty_for_rerun_menu.clone();
+                let pty_synced_for_action = pty_synced_for_rerun_menu.clone();
+                let bracketed_paste_for_action = bracketed_paste_for_rerun_menu.clone();
+                let typed_cmd_for_action = typed_cmd_for_rerun_menu.clone();
+                let armed_agent_for_action = armed_agent_for_rerun_menu.clone();
+                let bstate_for_action = bstate_for_rerun_menu.clone();
+                let active_for_action = active_for_rerun_menu.clone();
+                item.set_sensitive(
+                    bstate_for_action.get() == BlockState::AwaitingCommand
+                        && armed_agent_for_action.borrow().is_none(),
                 );
-                // Keep block_data in lockstep with the widget list.
-                mutate_block_data_and_redraw(
-                    &block_data_for_delete,
-                    failure_marker_redraw_for_delete.as_ref(),
-                    |blocks| {
-                        if let Some(pos) = removed_pos {
-                            let removed = blocks.remove(pos);
-                            debug_assert_eq!(
-                                removed.as_ref().map(|block| block.id),
-                                Some(block_id_del),
-                            );
-                        }
-                    },
-                );
-                bookmarks_for_delete.borrow_mut().remove(&block_id_del);
-                // Index-based virtualization must be recalculated after
-                // any removal; retaining the old set can hide the block
-                // that shifted into this slot until the next full scroll.
-                visible_for_delete.borrow_mut().clear();
-                block_list_for_delete.queue_allocate();
-            });
-            vbox.append(&item);
-        }
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    let finished = finished_for_rerun.borrow();
+                    let recalled = if armed_agent_for_action.borrow().is_some() {
+                        false
+                    } else {
+                        let selected = selected_ids_for_rerun.borrow();
+                        recall_selected_commands_at_prompt(
+                            &pty_for_action,
+                            &pty_synced_for_action,
+                            &typed_cmd_for_action,
+                            bstate_for_action.get(),
+                            &finished,
+                            &selected,
+                            bracketed_paste_for_action.get(),
+                        )
+                    };
+                    if recalled {
+                        clear_finished_block_selection(
+                            &finished,
+                            &selected_ids_for_rerun,
+                            &selected_for_rerun,
+                            &anchor_for_rerun,
+                        );
+                        active_for_action.borrow().grab_focus();
+                    }
+                });
+                vbox.append(&item);
+            }
+            vbox.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
-        popover.set_child(Some(&vbox));
-        popover.connect_closed(move |p| {
-            p.unparent();
+            {
+                let item = make_item("Export as Markdown");
+                let popover_c = popover.clone();
+                let block_data_for_md = block_data_for_export.clone();
+                let vte_for_md = vte_for_copy.clone();
+                let block_id_md = block_id;
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    let blocks = block_data_for_md.borrow();
+                    if let Some(block) = blocks.iter().find(|b| b.id == block_id_md) {
+                        let markdown = block.to_markdown();
+                        vte_for_md.clipboard().set_text(&markdown);
+                    }
+                });
+                vbox.append(&item);
+            }
+
+            {
+                let item = make_item("Delete Block");
+                let popover_c = popover.clone();
+                let finished_blocks_for_delete = finished_blocks_for_menu.clone();
+                let block_list_for_delete = block_list_for_menu.clone();
+                let block_data_for_delete = block_data_for_export.clone();
+                let selected_ids_for_delete = selected_ids_for_menu.clone();
+                let selected_for_delete = selected_for_menu.clone();
+                let anchor_for_delete = anchor_for_menu.clone();
+                let bookmarks_for_delete = bookmarks_for_menu.clone();
+                let visible_for_delete = visible_for_menu.clone();
+                let widget_pool_for_delete = widget_pool_for_menu.clone();
+                let failure_marker_redraw_for_delete = failure_marker_redraw_for_menu.clone();
+                let unread_for_delete = unread_for_menu.clone();
+                let jump_fab_for_delete = jump_fab_for_menu.clone();
+                let block_id_del = block_id;
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    let mut blocks = finished_blocks_for_delete.borrow_mut();
+                    let removed_pos = blocks.iter().position(|b| b.id == block_id_del);
+                    if let Some(pos) = removed_pos {
+                        let unread =
+                            unread_after_index_removal(blocks.len(), unread_for_delete.get(), pos);
+                        unread_for_delete.set(unread);
+                        set_jump_fab_label(&jump_fab_for_delete, unread);
+                        let block = blocks.remove(pos);
+                        let widget = block.widget().clone();
+                        block_list_for_delete.remove(&widget);
+                        widget_pool_for_delete.borrow_mut().release(widget);
+                    }
+                    remove_finished_block_from_selection(
+                        &blocks,
+                        &selected_ids_for_delete,
+                        &selected_for_delete,
+                        &anchor_for_delete,
+                        block_id_del,
+                    );
+                    // Keep block_data in lockstep with the widget list.
+                    mutate_block_data_and_redraw(
+                        &block_data_for_delete,
+                        failure_marker_redraw_for_delete.as_ref(),
+                        |blocks| {
+                            if let Some(pos) = removed_pos {
+                                let removed = blocks.remove(pos);
+                                debug_assert_eq!(
+                                    removed.as_ref().map(|block| block.id),
+                                    Some(block_id_del),
+                                );
+                            }
+                        },
+                    );
+                    bookmarks_for_delete.borrow_mut().remove(&block_id_del);
+                    // Index-based virtualization must be recalculated after
+                    // any removal; retaining the old set can hide the block
+                    // that shifted into this slot until the next full scroll.
+                    visible_for_delete.borrow_mut().clear();
+                    block_list_for_delete.queue_allocate();
+                });
+                vbox.append(&item);
+            }
+
+            popover.set_child(Some(&vbox));
+            popover.connect_closed(move |p| {
+                p.unparent();
+            });
+            popover.popup();
         });
-        popover.popup();
-    });
-    finished_widget.add_controller(right_click);
+        finished_widget.add_controller(right_click);
+    }
 }
 
 /// Cap on the retained raw output buffer for a single running command. The raw
@@ -2900,26 +2856,188 @@ struct EngineState {
     active_alt_screen_mode: Option<u32>,
 }
 
-/// Captures the shared handles the PTY reader/exit callbacks need, so
-/// `TermView::new` does not carry the reader closure inline.
-struct ReaderCtx {
+/// Rendering seam for the OSC 133 block lifecycle. Every statement in the
+/// [`ReaderCtx`] handlers that touches a widget-owning handle goes through
+/// one of these effect methods, and every widget/surface read that feeds a
+/// lifecycle decision is a query method. [`BlockBackend`] is the GTK/VTE
+/// implementation; a second implementation (a future unified surface, or a
+/// recording stub in tests) reuses the whole lifecycle unchanged.
+///
+/// Effects must not re-enter the reader dispatch: engine-side `RefCell`
+/// borrows are never held across a call into this trait (the discipline the
+/// [`EngineState`] doc states).
+trait RenderBackend {
+    // ── live surface ──
+    /// Feed bytes to the live terminal surface (including re-synthesized
+    /// `\x1b[?..h/l` alt-screen toggles).
+    fn feed_live(&self, bytes: &[u8]);
+    /// Reset the live surface for the next prompt. `preserve_scrollback` is
+    /// Block-surface mechanics (the engine passes the config knob through; a
+    /// backend without a persistent live scrollback may ignore it). Does NOT
+    /// touch the running command's output snapshot: the raw-output ring is
+    /// engine-owned shared state and the engine clears it explicitly.
+    fn reset_active_surface(&self, preserve_scrollback: bool);
+    /// Focus the live surface once the current main-loop turn finishes, but
+    /// only if it already holds focus — the guard is a surface query, so it
+    /// belongs on this side of the seam with the effect it gates.
+    fn focus_live_deferred(&self);
+    /// Lay out the live surface and push the viewport grid to the PTY
+    /// synchronously (TIOCSWINSZ before the child's next read).
+    fn sync_geometry_to_pty(&self);
+    /// Re-run only the live-surface layout (compact vs full-screen).
+    fn layout_active_surface(&self);
+    // ── autoscroll ──
+    fn mark_scroll_dirty(&self);
+    fn reset_scroll_lock(&self);
+    // ── finished blocks ──
+    /// Mount a finished command as a history block and reset the live
+    /// surface; subsumes the whole ordered finalize sub-step chain.
+    fn finalize_block(&self, block_data: BlockData, args: FinalizedBlockArgs);
+    // ── alt-screen chrome ──
+    fn enter_alt_screen_chrome(&self);
+    fn exit_alt_screen_chrome(&self);
+    fn enter_fullscreen(&self);
+    fn exit_fullscreen(&self);
+    // ── kitty graphics (APC G) ──
+    /// Assemble one APC payload. On `Complete` the decoded texture stays
+    /// backend-side as the pending admission — textures never cross this
+    /// trait — and any previous pending admission is dropped first, so an
+    /// admit the engine skipped cannot leak across events. The caller must
+    /// write the protocol reply before consuming a `Complete` via
+    /// [`Self::kitty_admit_pending`] — clients block on the `i=`-keyed answer.
+    /// That reply-between-feed-and-admit ordering is engine-side and holds for
+    /// any implementation, including a headless recording one.
+    fn kitty_feed(&self, payload: &[u8]) -> kitty_graphics::FeedStatus;
+    /// Admit the texture parked by the last `Complete` [`Self::kitty_feed`]
+    /// against the per-block image budget. No-op when nothing is pending.
+    fn kitty_admit_pending(&self);
+    /// Drop half-uploaded chunks and undisplayed images (the empty-command
+    /// bail's parity with what `reset_active` used to imply).
+    fn reset_kitty_pipeline(&self);
+    // ── system ──
+    fn set_system_clipboard(&self, text: &str);
+    fn desktop_notify(&self, title: Option<&str>, body: &str);
+    // ── queries ──
+    /// Current cursor position `(col, row)`. Rows are text-buffer (ring) rows
+    /// — monotonic as scrollback grows — NOT screen rows; prompt anchors and
+    /// capture ranges live in this coordinate space.
+    fn cursor_position(&self) -> (i64, i64);
+    /// Cursor position `(col, row)` for the DSR 6 cursor-position report
+    /// (`ESC[{row+1};{col+1}R`). Block reports the text-buffer row here
+    /// (pre-existing quirk kept for compatibility); a correct implementation
+    /// reports screen-relative coordinates as the CPR protocol expects.
+    fn cursor_position_report(&self) -> (i64, i64);
+    /// Rebase the prompt anchor captured at PromptEnd (`provisional`) onto the
+    /// surface as it stands at CommandStart. Anchor cells are in the backend's
+    /// surface coordinates and each backend owns its rebase policy: Block's
+    /// live VTE keeps one monotonic text buffer across the two marks, so its
+    /// policy is the identity; a surface that reflows or re-allocates its grid
+    /// between PromptEnd and CommandStart must shift the anchor here.
+    fn command_capture_anchor(&self, provisional: (i64, i64)) -> (i64, i64);
+    /// The column count finished blocks pre-wrap at (live grid, floored).
+    fn grid_cols(&self) -> i64;
+    /// Plain text between two grid positions, `None` when the surface has
+    /// nothing there. Bounding/normalizing the result stays engine-side.
+    fn capture_text_range(
+        &self,
+        start_row: i64,
+        start_col: i64,
+        end_row: i64,
+        end_col: i64,
+    ) -> Option<String>;
+}
+
+/// The GTK/VTE implementation of [`RenderBackend`] for Block mode: owns the
+/// widget-owning handles the reader lifecycle drives. Shared-`Rc` fields keep
+/// the `_rc`/`_for_cb` names of the former [`ReaderCtx`] fields they moved
+/// from. The lifecycle cells at the bottom are the same `Rc` cells
+/// `ReaderCtx` holds — finished-block actions and the context menu rebind
+/// them when the user re-runs a command from history.
+struct BlockBackend {
     active_rc: Rc<RefCell<ActiveBlock>>,
     /// The live VTE — every byte is fed here; alt-screen toggles feed it 1049h/l.
     active_vte: Terminal,
+    block_list_rc: gtk::Box,
+    block_scroll_rc: ScrolledWindow,
+    jump_fab: gtk::Button,
+    scroll_debouncer: ScrollDebouncer,
+    failure_marker_redraw: FailureMarkerRedraw,
+    finished_blocks_for_cb: Rc<RefCell<Vec<FinishedBlock>>>,
+    widget_pool_for_cb: Rc<RefCell<WidgetPool>>,
+    find_state_rc: Rc<RefCell<FindState>>,
+    visible_indices_rc: Rc<RefCell<std::collections::HashSet<usize>>>,
+    fullscreen_rc: Rc<Cell<bool>>,
+    selected_block_ids_rc: SelectedBlockIds,
+    selected_block_id_rc: Rc<Cell<Option<u64>>>,
+    selection_anchor_id_rc: Rc<Cell<Option<u64>>>,
+    bookmarks_rc: Rc<RefCell<std::collections::HashSet<u64>>>,
+    block_data_for_cb: Rc<RefCell<VecDeque<BlockData>>>,
+    unread_count_rc: Rc<Cell<u32>>,
+    /// Switches the live surface between compact prompt and full-screen
+    /// layouts. PTY geometry is deliberately synchronized separately.
+    layout_active_surface: Rc<dyn Fn()>,
+    /// Same shared cell as the `ReaderCtx` clone (see the config-aliasing
+    /// invariants at the cell's construction).
+    config_for_cb: Rc<RefCell<Config>>,
+    /// Written engine-side (OSC 10/11/12 set/reset), read at finalize so a
+    /// finished block matches a recolored live VTE.
+    dynamic_colors_rc: DynamicColorsRc,
+    /// Same PTY as the `ReaderCtx` clone: geometry sync and finished-block
+    /// re-run writes here, protocol replies and foreground queries engine-side.
+    pty_for_init: Rc<OwnedPty>,
+    /// Menu-only ("Ask AI About Block"); the block-finished and
+    /// agent-execution-lost fan-outs are engine policy and live on
+    /// [`ReaderCtx`] alone.
+    ask_ai_about_block_cbs: BlockContextCallbacks,
+    // Lifecycle cells rebound by finished-block actions / the context menu.
+    bstate_rc: Rc<Cell<BlockState>>,
+    typed_cmd_rc: Rc<RefCell<String>>,
+    armed_agent_execution_rc: Rc<RefCell<Option<ArmedAgentExecution>>>,
+    bracketed_paste_rc: Rc<Cell<bool>>,
+    pty_synced_rc: Rc<Cell<bool>>,
+    /// Kitty graphics (APC G) — multi-chunk uploads assemble here; completed
+    /// textures wait against the running command until its block finishes.
+    /// The byte counter enforces the shared per-block budget so a runaway
+    /// shell cannot balloon RSS between prompts. Backend methods are the only
+    /// users post-split, so the group lives here as plain cells.
+    kitty_assembler: RefCell<kitty_graphics::Assembler>,
+    kitty_pending_images: RefCell<Vec<gtk::gdk::Texture>>,
+    kitty_pending_bytes: Cell<usize>,
+    /// Texture decoded by the last `Complete` `kitty_feed`, parked until the
+    /// engine has written the protocol reply and calls `kitty_admit_pending`.
+    /// Kept backend-side so `gdk::Texture` never crosses [`RenderBackend`];
+    /// cleared at the start of every feed, by `reset_kitty_pipeline`, and in
+    /// finalize's kitty tail, so a skipped admit cannot leak a stale texture
+    /// across events.
+    kitty_pending_admission: RefCell<Option<gtk::gdk::Texture>>,
+}
+
+/// Captures the shared handles the PTY reader/exit callbacks need, so
+/// `TermView::new` does not carry the reader closure inline. Widget-owning
+/// handles live behind [`ReaderCtx::backend`]; the fields here are the parse
+/// pipeline, the engine state, and the shared lifecycle cells.
+struct ReaderCtx {
+    /// Every widget/surface effect and query goes through this seam.
+    backend: Rc<dyn RenderBackend>,
     bstate_rc: Rc<Cell<BlockState>>,
     engine: RefCell<EngineState>,
+    /// Bounded raw-output ring for the running command — engine-owned shared
+    /// state, deliberately NOT a backend query: the reader appends during
+    /// CollectingOutput, CommandStart and the finalize path clear it, and
+    /// [`ActiveBlock`] holds a clone only so live-find can snapshot it
+    /// (`output_text`). Shared as an `Rc` cell rather than living in
+    /// [`EngineState`] for exactly that one reader.
+    live_raw_output_rc: Rc<RefCell<VecDeque<u8>>>,
     /// Keystroke-shadow input line, used only as a fallback if the VTE-text
     /// capture at CommandStart returns empty.
     typed_cmd_rc: Rc<RefCell<String>>,
     /// Once the user starts editing at an idle prompt, output is intentionally left
     /// inline: shell echo/completion and true background output are ambiguous then.
     idle_input_dirty_rc: Rc<Cell<bool>>,
-    /// VTE cursor position (col, row) captured at PromptEnd; the start anchor
-    /// for the text-range read that produces `EngineState::vte_typed_cmd`.
+    /// Live-surface cursor position (col, row) captured at PromptEnd; the start
+    /// anchor for the text-range read that produces `EngineState::vte_typed_cmd`.
     prompt_end_pos_rc: Rc<Cell<(i64, i64)>>,
     prompt_anchor_ready_rc: Rc<Cell<bool>>,
-    block_list_rc: gtk::Box,
-    block_scroll_rc: ScrolledWindow,
     remote_session_cbs: StrCallbacks,
     exited_cbs: IntCallbacks,
     activity_cbs: VoidCallbacks,
@@ -2935,52 +3053,32 @@ struct ReaderCtx {
     dynamic_colors_rc: DynamicColorsRc,
     config_for_cb: Rc<RefCell<Config>>,
     parser: Rc<RefCell<Parser>>,
-    block_data_for_cb: Rc<RefCell<VecDeque<BlockData>>>,
     reserved_history_block_ids: Rc<RefCell<HashSet<u64>>>,
-    failure_marker_redraw: FailureMarkerRedraw,
-    finished_blocks_for_cb: Rc<RefCell<Vec<FinishedBlock>>>,
-    scroll_debouncer: ScrollDebouncer,
-    widget_pool_for_cb: Rc<RefCell<WidgetPool>>,
     pty_synced_rc: Rc<Cell<bool>>,
-    visible_indices_rc: Rc<RefCell<std::collections::HashSet<usize>>>,
-    fullscreen_rc: Rc<Cell<bool>>,
     ftcs_seen_rc: Rc<Cell<bool>>,
     init_cmds_queue_for_cb: Rc<RefCell<std::collections::VecDeque<String>>>,
     pty_for_init: Rc<OwnedPty>,
     block_start_time_for_cb: Rc<Cell<Option<SystemTime>>>,
     /// The shell's execution id for the running command (jsh only): the key its
-    /// execution journal keeps the record under. Still shared because the
-    /// finalize path consumes it.
+    /// execution journal keeps the record under.
     execution_id_rc: Rc<RefCell<Option<String>>>,
     current_cwd_for_cb: Rc<RefCell<String>>,
     event_buf: Rc<RefCell<Vec<ParserEvent>>>,
-    unread_count_rc: Rc<Cell<u32>>,
-    jump_fab: gtk::Button,
-    selected_block_ids_rc: SelectedBlockIds,
-    selected_block_id_rc: Rc<Cell<Option<u64>>>,
-    selection_anchor_id_rc: Rc<Cell<Option<u64>>>,
-    bookmarks_rc: Rc<RefCell<std::collections::HashSet<u64>>>,
-    find_state_rc: Rc<RefCell<FindState>>,
     cmd_running_rc: Rc<Cell<bool>>,
     running_cmd_rc: Rc<RefCell<String>>,
     armed_agent_execution_rc: Rc<RefCell<Option<ArmedAgentExecution>>>,
     agent_prompt_generation_rc: Rc<Cell<u64>>,
+    /// Agent identity consumed at CommandStart and emitted with this command's
+    /// eventual trusted BlockFinished event.
     active_agent_execution_rc: Rc<Cell<Option<crate::agent::AgentExecutionRef>>>,
     agent_execution_supported_rc: Rc<Cell<bool>>,
     verified_submission: VerifiedSubmissionCtx,
-    /// Recomputes the compact/full visual live surface. PTY geometry is kept
-    /// separately at the full pane viewport.
-    layout_active_surface: Rc<dyn Fn()>,
+    /// Fired engine-side after `finalize_block` returns; carries the resolved
+    /// Agent correlation, so the trust policy behind it stays out of backends.
     block_finished_cbs: BlockFinishedCallbacks,
-    ask_ai_about_block_cbs: BlockContextCallbacks,
+    /// Parks incoming PTY chunks while the user drag-selects text on the live
+    /// VTE, so streaming repaints can't destroy the selection mid-drag.
     selection_feed_hold: Rc<SelectionFeedHold>,
-    /// Kitty graphics (APC G) — multi-chunk uploads assemble here; completed
-    /// textures wait against the running command until its block finishes.
-    /// The byte counter enforces the shared per-block budget so a runaway
-    /// shell cannot balloon RSS between prompts.
-    kitty_assembler_rc: Rc<RefCell<kitty_graphics::Assembler>>,
-    kitty_pending_images_rc: Rc<RefCell<Vec<gtk::gdk::Texture>>>,
-    kitty_pending_bytes_rc: Rc<Cell<usize>>,
 }
 
 /// Per-event handlers for the PTY reader pipeline: one method per
@@ -3061,7 +3159,7 @@ impl ReaderCtx {
                     &text,
                     MAX_PROMPT_CAPTURE_BYTES,
                 );
-                self.scroll_debouncer.mark_dirty(&self.block_scroll_rc);
+                self.backend.mark_scroll_dirty();
                 true
             }
             BlockState::AwaitingCommand => {
@@ -3077,14 +3175,18 @@ impl ReaderCtx {
                         MAX_RAW_OUTPUT_BYTES,
                     );
                 }
-                self.scroll_debouncer.mark_dirty(&self.block_scroll_rc);
+                self.backend.mark_scroll_dirty();
                 true
             }
             BlockState::CollectingOutput | BlockState::PostCommand => {
                 if self.bstate_rc.get() != BlockState::PostCommand
                     || !is_post_command_metadata(bytes)
                 {
-                    self.active_rc.borrow().accumulate_output(bytes);
+                    append_bounded_output(
+                        &mut self.live_raw_output_rc.borrow_mut(),
+                        bytes,
+                        MAX_RAW_OUTPUT_BYTES,
+                    );
                 }
                 for cb in self.activity_cbs.borrow().iter() {
                     cb();
@@ -3100,7 +3202,7 @@ impl ReaderCtx {
         };
 
         if feed_active_vte {
-            self.active_vte.feed(bytes);
+            self.backend.feed_live(bytes);
         }
     }
 
@@ -3166,18 +3268,20 @@ impl ReaderCtx {
             if cmd.is_empty() && !is_background {
                 // Nothing meaningful to record; just reset.
                 let preserve = self.config_for_cb.borrow().preserve_live_scrollback;
-                self.active_rc.borrow().reset_active(preserve);
+                self.backend.reset_active_surface(preserve);
+                // The surface reset no longer drops the capture
+                // (the ring is engine-owned now); clear it here
+                // for parity with the pre-split `reset_active`.
+                self.live_raw_output_rc.borrow_mut().clear();
                 // No block is created here, so half-uploaded
                 // kitty chunks and undisplayed images have
                 // nowhere to land: drop them with the rest of
                 // the active state instead of leaking into
                 // the next command.
-                self.kitty_assembler_rc.borrow_mut().reset();
-                self.kitty_pending_images_rc.borrow_mut().clear();
-                self.kitty_pending_bytes_rc.set(0);
+                self.backend.reset_kitty_pipeline();
                 self.bstate_rc.set(BlockState::CollectingPrompt);
                 self.engine.borrow_mut().prompt_buf.clear();
-                self.scroll_debouncer.mark_dirty(&self.block_scroll_rc);
+                self.backend.mark_scroll_dirty();
                 return;
             }
 
@@ -3195,7 +3299,7 @@ impl ReaderCtx {
             // we feed the captured bytes verbatim, with no
             // reconstruction pass.
             let output_with_ansi =
-                background_output.unwrap_or_else(|| self.active_rc.borrow().output_text());
+                background_output.unwrap_or_else(|| live_output_text(&self.live_raw_output_rc));
 
             let output_plain = strip_ansi(&output_with_ansi).to_string();
 
@@ -3281,7 +3385,7 @@ impl ReaderCtx {
             // session restore can recreate the finished VTE at
             // the same width — preserving column-formatted output
             // (ls, git log, etc.) instead of reflowing it.
-            let cols = bounded_finished_vte_columns(self.active_rc.borrow().grid_cols() as i64);
+            let cols = bounded_finished_vte_columns(self.backend.grid_cols());
             let estimated_height = estimated_finished_block_height_for_text(
                 &self.config_for_cb.borrow(),
                 &output_plain,
@@ -3303,49 +3407,25 @@ impl ReaderCtx {
                 cols: cols as u16,
             };
 
-            render_finalized_block(
-                FinalizeRenderCtx {
-                    active_rc: self.active_rc.clone(),
-                    active_vte: self.active_vte.clone(),
-                    bstate_rc: self.bstate_rc.clone(),
-                    typed_cmd_rc: self.typed_cmd_rc.clone(),
-                    bracketed_paste_rc: self.bracketed_paste_rc.clone(),
-                    armed_agent_execution_rc: self.armed_agent_execution_rc.clone(),
-                    active_agent_execution_rc: self.active_agent_execution_rc.clone(),
-                    execution_id_rc: self.execution_id_rc.clone(),
-                    config_for_cb: self.config_for_cb.clone(),
-                    dynamic_colors_rc: self.dynamic_colors_rc.clone(),
-                    block_data_for_cb: self.block_data_for_cb.clone(),
-                    failure_marker_redraw: self.failure_marker_redraw.clone(),
-                    finished_blocks_for_cb: self.finished_blocks_for_cb.clone(),
-                    find_state_rc: self.find_state_rc.clone(),
-                    scroll_debouncer: self.scroll_debouncer.clone(),
-                    widget_pool_for_cb: self.widget_pool_for_cb.clone(),
-                    pty_synced_rc: self.pty_synced_rc.clone(),
-                    visible_indices_rc: self.visible_indices_rc.clone(),
-                    pty_for_init: self.pty_for_init.clone(),
-                    unread_count_rc: self.unread_count_rc.clone(),
-                    jump_fab: self.jump_fab.clone(),
-                    selected_block_ids_rc: self.selected_block_ids_rc.clone(),
-                    selected_block_id_rc: self.selected_block_id_rc.clone(),
-                    selection_anchor_id_rc: self.selection_anchor_id_rc.clone(),
-                    bookmarks_rc: self.bookmarks_rc.clone(),
-                    block_list_rc: self.block_list_rc.clone(),
-                    block_scroll_rc: self.block_scroll_rc.clone(),
-                    block_finished_cbs: self.block_finished_cbs.clone(),
-                    ask_ai_about_block_cbs: self.ask_ai_about_block_cbs.clone(),
-                    kitty_assembler_rc: self.kitty_assembler_rc.clone(),
-                    kitty_pending_images_rc: self.kitty_pending_images_rc.clone(),
-                    kitty_pending_bytes_rc: self.kitty_pending_bytes_rc.clone(),
-                },
+            // Sampled before `output_plain` moves out of scope; the
+            // block-finished fan-out below runs after the backend returns.
+            let output_sample = if is_background {
+                String::new()
+            } else {
+                sample_output_for_event(&output_plain)
+            };
+            // The journal reports bytes against the trimmed full capture, so
+            // the same measurement has to be taken before the args are built.
+            let total_bytes = output_plain.trim().len();
+            let plain_output_bytes = output_plain.len();
+            self.backend.finalize_block(
                 block_data,
                 FinalizedBlockArgs {
                     block_id,
                     prompt,
-                    cmd,
+                    cmd: cmd.clone(),
                     output_with_ansi,
-                    output_plain,
-                    output_trimmed,
+                    plain_output_bytes,
                     block_cwd,
                     cols,
                     exit_code,
@@ -3354,6 +3434,70 @@ impl ReaderCtx {
                     is_background,
                 },
             );
+            // The backend's live-surface reset no longer clears output state;
+            // the engine-owned ring is cleared here instead (pre-split parity:
+            // the clear rode inside finalize's tail reset_active).
+            self.live_raw_output_rc.borrow_mut().clear();
+            // DECISION: the block-finished fan-out — and the jsh journal
+            // submission bundled with it — is engine policy and now runs AFTER
+            // the whole backend finalize. Pre-split it ran mid-finalize: after
+            // the finished-blocks push, before the long-block notification, the
+            // context menu and selection installs, the second retention pass,
+            // the command-history enqueue, reset_active, and the deferred scroll
+            // pin. Audit of every registered connect_block_finished consumer:
+            // terminal/block.rs (relm4 `sender.output` of CommandFinished +
+            // BlockFinished — queued messages, no widget reads) and
+            // organism_ui.rs (re-pins the inline organism card before the live
+            // widget, which finalize never replaces, then defers a bottom pin).
+            // Neither reads pre-reset_active surface state synchronously, so
+            // the later emission point is observationally equivalent; bstate is
+            // still PostCommand here, exactly as at the old emission point.
+            // The Agent correlation resolved into the fan-out stays engine-side
+            // by construction: on_prompt_start's foreground/trusted-completion
+            // guards above already dropped an untrusted execution as lost
+            // before this point, so finalize never sees the trust decision. The
+            // `take` below therefore only moved later, not earlier — the sole
+            // reader of the cell outside this engine is `agent_command_active`,
+            // which the organism calls from a command-started handler, never
+            // from a widget callback finalize installs or runs.
+            if !is_background {
+                let agent_execution = self.active_agent_execution_rc.take();
+                for cb in self.block_finished_cbs.borrow().iter() {
+                    cb(
+                        cmd.clone(),
+                        exit_code,
+                        output_sample.clone(),
+                        agent_execution,
+                        duration_ms,
+                    );
+                }
+                // Attach this block's output to the shell's own
+                // journal record. Only jsh sends an execution id,
+                // and only it writes the record this completes —
+                // without the id there is nothing to correlate,
+                // which is why the capture used to stay stranded
+                // in this window.
+                if let Some(id) = self.execution_id_rc.borrow_mut().take() {
+                    // The journal gets the line-capped text this
+                    // pane kept, with `truncated` set from the same
+                    // cap. `total_bytes` is measured against the
+                    // trimmed full capture, so a record that merely
+                    // lost surrounding blank lines is not reported
+                    // as truncated. (What this layer cannot see is
+                    // the live buffer's byte cap dropping the *head*
+                    // of a very long stream — a gap, not a claim.)
+                    let submitted = jterm_core::execution_journal::CompletedExecution {
+                        id,
+                        output: output_trimmed.clone(),
+                        output_available: true,
+                        truncated: output_trimmed.len() != total_bytes,
+                        total_bytes,
+                    };
+                    if let Err(error) = jterm_core::execution_journal::submit(submitted) {
+                        log::warn!("jsh execution journal rejected a block's output: {error:?}");
+                    }
+                }
+            }
         }
         self.bstate_rc.set(BlockState::CollectingPrompt);
         self.engine.borrow_mut().prompt_buf.clear();
@@ -3361,13 +3505,8 @@ impl ReaderCtx {
         // now that no command is running. Sync the PTY size
         // so the shell sees the new winsize before it reads
         // anything past the prompt.
-        sync_active_to_pty(
-            &self.layout_active_surface,
-            &self.active_vte,
-            &self.block_scroll_rc,
-            &self.pty_for_init,
-        );
-        self.scroll_debouncer.mark_dirty(&self.block_scroll_rc);
+        self.backend.sync_geometry_to_pty();
+        self.backend.mark_scroll_dirty();
     }
 
     fn on_prompt_end(&self) {
@@ -3409,7 +3548,7 @@ impl ReaderCtx {
         // command starts. CommandStart will read text from
         // here to the cursor's then-position to recover the
         // command as it really appeared on screen.
-        let (col, row) = self.active_vte.cursor_position();
+        let (col, row) = self.backend.cursor_position();
         self.prompt_end_pos_rc.set((col, row));
         self.prompt_anchor_ready_rc.set(false);
         self.pty_synced_rc.set(false);
@@ -3437,13 +3576,8 @@ impl ReaderCtx {
                 }
             });
         }
-        (self.layout_active_surface)();
-        if self.active_vte.has_focus() {
-            let active_for_focus = self.active_rc.clone();
-            glib::idle_add_local_once(move || {
-                active_for_focus.borrow().grab_focus();
-            });
-        }
+        self.backend.layout_active_surface();
+        self.backend.focus_live_deferred();
 
         // Feed next initial command if any.
         if let Some(cmd) = self.init_cmds_queue_for_cb.borrow_mut().pop_front() {
@@ -3453,8 +3587,8 @@ impl ReaderCtx {
             self.pty_for_init.write_bytes(text.as_bytes());
         }
 
-        self.scroll_debouncer.reset_scroll_lock();
-        self.scroll_debouncer.mark_dirty(&self.block_scroll_rc);
+        self.backend.reset_scroll_lock();
+        self.backend.mark_scroll_dirty();
     }
 
     fn on_command_start(&self, meta: &CommandMeta) {
@@ -3474,7 +3608,9 @@ impl ReaderCtx {
         // visible in the live VTE but do not merge them into the
         // command's output block.
         self.engine.borrow_mut().background_output.clear();
-        self.active_rc.borrow().reset_output_buffer();
+        // Engine-owned ring: the previous command's capture is dropped here,
+        // exactly where `ActiveBlock::reset_output_buffer` used to do it.
+        self.live_raw_output_rc.borrow_mut().clear();
         self.block_start_time_for_cb.set(Some(SystemTime::now()));
         // The shell may attach its own measurement to either
         // mark; jsh puts it on D. Reset it here so the previous
@@ -3502,19 +3638,13 @@ impl ReaderCtx {
         // before the shell echoes a newline) is what the user
         // saw, including history recalls and jsh autosuggestion
         // accepts.
-        let (cmd_end_col, cmd_end_row) = self.active_vte.cursor_position();
-        let (start_col, start_row) = self.prompt_end_pos_rc.get();
+        let (cmd_end_col, cmd_end_row) = self.backend.cursor_position();
+        let (start_col, start_row) = self
+            .backend
+            .command_capture_anchor(self.prompt_end_pos_rc.get());
         let captured = self
-            .active_vte
-            .text_range_format(
-                vte4::Format::Text,
-                start_row,
-                start_col,
-                cmd_end_row,
-                cmd_end_col,
-            )
-            .0
-            .map(|gs| gs.to_string())
+            .backend
+            .capture_text_range(start_row, start_col, cmd_end_row, cmd_end_col)
             .unwrap_or_default();
         let scraped = normalize_captured_command(&captured, &self.engine.borrow().prompt_display);
         let (command, source) =
@@ -3555,13 +3685,8 @@ impl ReaderCtx {
         // runs, then snapshot it into a finished block on the
         // next prompt. Interactive CLIs such as Codex rely on
         // VTE applying cursor positioning/redraws directly.
-        sync_active_to_pty(
-            &self.layout_active_surface,
-            &self.active_vte,
-            &self.block_scroll_rc,
-            &self.pty_for_init,
-        );
-        self.scroll_debouncer.mark_dirty(&self.block_scroll_rc);
+        self.backend.sync_geometry_to_pty();
+        self.backend.mark_scroll_dirty();
     }
 
     fn on_command_end(&self, exit: Option<i32>, meta: &CommandMeta) {
@@ -3631,15 +3756,11 @@ impl ReaderCtx {
             let mode = self.engine.borrow_mut().active_alt_screen_mode.take();
             let mode = mode.unwrap_or(1049);
             let leave = format!("\x1b[?{mode}l");
-            self.active_vte.feed(leave.as_bytes());
-            exit_fullscreen(
-                &self.finished_blocks_for_cb,
-                &self.visible_indices_rc,
-                &self.fullscreen_rc,
-            );
-            self.active_rc.borrow().set_live_organism_alt_screen(false);
+            self.backend.feed_live(leave.as_bytes());
+            self.backend.exit_fullscreen();
+            self.backend.exit_alt_screen_chrome();
             emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Left);
-            (self.layout_active_surface)();
+            self.backend.layout_active_surface();
         }
         // `None` stays `None`: a shell that reported no status
         // is not a shell that reported success, and this used
@@ -3677,7 +3798,7 @@ impl ReaderCtx {
         );
         self.cmd_running_rc.set(false);
         self.bstate_rc.set(BlockState::PostCommand);
-        self.scroll_debouncer.mark_dirty(&self.block_scroll_rc);
+        self.backend.mark_scroll_dirty();
     }
 
     fn on_alt_screen_enter(&self, mode: u32) {
@@ -3688,29 +3809,16 @@ impl ReaderCtx {
         self.engine.borrow_mut().prev_state = from_state;
         self.bstate_rc.set(BlockState::AltScreen);
         self.engine.borrow_mut().active_alt_screen_mode = Some(mode);
-        {
-            let active = self.active_rc.borrow();
-            active.set_live_organism_visible(false);
-            active.set_live_organism_alt_screen(true);
-        }
+        self.backend.enter_alt_screen_chrome();
         emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Entered);
         // Hand the viewport to the alt-screen app: hide finished
         // blocks so the live VTE fills the scroll area.
-        enter_fullscreen(
-            &self.finished_blocks_for_cb,
-            &self.visible_indices_rc,
-            &self.fullscreen_rc,
-        );
+        self.backend.enter_fullscreen();
         // Grow the live VTE to the full viewport before the
         // app draws (see sync_active_to_pty doc).
-        sync_active_to_pty(
-            &self.layout_active_surface,
-            &self.active_vte,
-            &self.block_scroll_rc,
-            &self.pty_for_init,
-        );
+        self.backend.sync_geometry_to_pty();
         let enter = format!("\x1b[?{mode}h");
-        self.active_vte.feed(enter.as_bytes());
+        self.backend.feed_live(enter.as_bytes());
     }
 
     fn on_alt_screen_leave(&self, mode: u32) {
@@ -3721,40 +3829,25 @@ impl ReaderCtx {
         // NOT merged into the block. The active block keeps
         // just the command name + exit code.
         self.engine.borrow_mut().active_alt_screen_mode = None;
-        self.active_rc.borrow().set_live_organism_alt_screen(false);
+        self.backend.exit_alt_screen_chrome();
         emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Left);
         let leave = format!("\x1b[?{mode}l");
-        self.active_vte.feed(leave.as_bytes());
-        exit_fullscreen(
-            &self.finished_blocks_for_cb,
-            &self.visible_indices_rc,
-            &self.fullscreen_rc,
-        );
+        self.backend.feed_live(leave.as_bytes());
+        self.backend.exit_fullscreen();
         self.engine.borrow_mut().osc133_depth = 0;
         let prev_state = self.engine.borrow().prev_state;
         self.bstate_rc.set(prev_state);
         // Collapse the live VTE back to the compact input cell
         // now that the alt app has released the viewport.
-        sync_active_to_pty(
-            &self.layout_active_surface,
-            &self.active_vte,
-            &self.block_scroll_rc,
-            &self.pty_for_init,
-        );
-        if self.active_vte.has_focus() {
-            let active_for_idle = self.active_rc.clone();
-            glib::idle_add_local_once(move || {
-                active_for_idle.borrow().grab_focus();
-            });
-        }
+        self.backend.sync_geometry_to_pty();
+        self.backend.focus_live_deferred();
     }
 
     fn on_clipboard_set(&self, text: &str) {
-        if self.config_for_cb.borrow().allow_remote_clipboard_write {
-            if let Some(display) = gtk::gdk::Display::default() {
-                let clipboard = display.clipboard();
-                clipboard.set_text(text);
-            }
+        // The policy read stays engine-side; only the write crosses the seam.
+        let allowed = self.config_for_cb.borrow().allow_remote_clipboard_write;
+        if allowed {
+            self.backend.set_system_clipboard(text);
         }
     }
 
@@ -3788,7 +3881,7 @@ impl ReaderCtx {
     }
 
     fn on_keyboard_protocol_query(&self, query: KeyboardProtocolQuery) {
-        let (col, row) = self.active_vte.cursor_position();
+        let (col, row) = self.backend.cursor_position_report();
         let reply = build_keyboard_query_reply(query, col, row);
         self.pty_for_init.write_bytes(reply.as_bytes());
     }
@@ -3806,34 +3899,16 @@ impl ReaderCtx {
         // Non-G APC payloads keep today's behaviour: consumed
         // silently, since libvte would ignore them anyway.
         if jterm_core::kitty_graphics::is_graphics_payload(payload) {
-            let outcome = self.kitty_assembler_rc.borrow_mut().feed(payload);
+            let status = self.backend.kitty_feed(payload);
             // Answer before consuming the outcome: clients
             // like `kitten icat` block on the `i=`-keyed
-            // OK/error reply.
-            if let Some(reply) = kitty_graphics::response_for(payload, &outcome) {
+            // OK/error reply. Keeping this ordering engine-side
+            // is what makes the seam headlessly recordable.
+            if let Some(reply) = kitty_graphics::response_for(payload, &status) {
                 self.pty_for_init.write_bytes(&reply);
             }
-            if let kitty_graphics::Outcome::Complete(texture) = outcome {
-                // Rough memory bound: width*height*4 (bytes
-                // per RGBA pixel). Once the shared per-block
-                // budget is exhausted, further images drop —
-                // the transmission was still acknowledged
-                // above, only the display is skipped.
-                let approx = (texture.width() as usize)
-                    .saturating_mul(texture.height() as usize)
-                    .saturating_mul(4);
-                let used = self.kitty_pending_bytes_rc.get();
-                if used + approx <= kitty_graphics::MAX_PENDING_BYTES_PER_BLOCK {
-                    self.kitty_pending_bytes_rc.set(used + approx);
-                    self.kitty_pending_images_rc.borrow_mut().push(texture);
-                } else {
-                    log::warn!(
-                        "kitty graphics: per-block image budget exhausted ({} + {} > {}), dropping",
-                        used,
-                        approx,
-                        kitty_graphics::MAX_PENDING_BYTES_PER_BLOCK
-                    );
-                }
+            if status == kitty_graphics::FeedStatus::Complete {
+                self.backend.kitty_admit_pending();
             }
         }
     }
@@ -3847,7 +3922,7 @@ impl ReaderCtx {
         LAST_NOTIFICATION_AT.with(|last| {
             if notification_permitted(last.get(), now) {
                 last.set(Some(now));
-                crate::notify::app_notification(title.as_deref(), body);
+                self.backend.desktop_notify(title.as_deref(), body);
             }
         });
     }
@@ -3937,6 +4012,17 @@ fn background_output_has_visible_text(bytes: &[u8]) -> bool {
         .any(|ch| !ch.is_whitespace() && !ch.is_control())
 }
 
+/// Snapshot the engine-owned raw-output ring as lossy UTF-8. Raw PTY bytes may
+/// split a multi-byte sequence at either end of the bounded window, so the
+/// conversion is deliberately lossy rather than fallible.
+pub(super) fn live_output_text(ring: &RefCell<VecDeque<u8>>) -> String {
+    let mut raw = ring.borrow_mut();
+    if raw.is_empty() {
+        return String::new();
+    }
+    String::from_utf8_lossy(raw.make_contiguous()).into_owned()
+}
+
 fn take_background_output(pending: &mut VecDeque<u8>) -> Option<String> {
     if pending.is_empty() {
         return None;
@@ -3963,17 +4049,19 @@ fn finished_command(vte_capture: &str, input_shadow: &str) -> String {
     }
 }
 
-/// Per-block lifecycle values the reader closure computes before the render
+/// Per-block lifecycle values the reader engine computes before the render
 /// path runs; their computation stays engine-side. The string fields are the
-/// pre-trim originals the finished widgets are built from, plus the
-/// line-capped `output_trimmed` copy the jsh execution journal consumes.
+/// pre-trim originals the finished widgets are built from, and `cols` is the
+/// already-bounded live-grid width.
 struct FinalizedBlockArgs {
     block_id: u64,
     prompt: String,
     cmd: String,
     output_with_ansi: String,
-    output_plain: String,
-    output_trimmed: String,
+    /// Pre-trim plain length: the finished widgets charge both plain-text
+    /// owners against the larger figure, and the text itself never leaves the
+    /// engine (the jsh journal and the block-finished sample read it there).
+    plain_output_bytes: usize,
     block_cwd: Option<String>,
     cols: i64,
     exit_code: Option<i32>,
@@ -3982,384 +4070,438 @@ struct FinalizedBlockArgs {
     is_background: bool,
 }
 
-/// Shared handles for [`render_finalized_block`], cloned per finished block
-/// by the reader closure. Field names mirror the reader-closure locals they
-/// are cloned from.
-struct FinalizeRenderCtx {
-    active_rc: Rc<RefCell<ActiveBlock>>,
-    active_vte: Terminal,
-    bstate_rc: Rc<Cell<BlockState>>,
-    typed_cmd_rc: Rc<RefCell<String>>,
-    bracketed_paste_rc: Rc<Cell<bool>>,
-    armed_agent_execution_rc: Rc<RefCell<Option<ArmedAgentExecution>>>,
-    active_agent_execution_rc: Rc<Cell<Option<crate::agent::AgentExecutionRef>>>,
-    execution_id_rc: Rc<RefCell<Option<String>>>,
-    config_for_cb: Rc<RefCell<Config>>,
-    dynamic_colors_rc: DynamicColorsRc,
-    block_data_for_cb: Rc<RefCell<VecDeque<BlockData>>>,
-    failure_marker_redraw: FailureMarkerRedraw,
-    finished_blocks_for_cb: Rc<RefCell<Vec<FinishedBlock>>>,
-    find_state_rc: Rc<RefCell<FindState>>,
-    scroll_debouncer: ScrollDebouncer,
-    widget_pool_for_cb: Rc<RefCell<WidgetPool>>,
-    pty_synced_rc: Rc<Cell<bool>>,
-    visible_indices_rc: Rc<RefCell<std::collections::HashSet<usize>>>,
-    pty_for_init: Rc<OwnedPty>,
-    unread_count_rc: Rc<Cell<u32>>,
-    jump_fab: gtk::Button,
-    selected_block_ids_rc: SelectedBlockIds,
-    selected_block_id_rc: Rc<Cell<Option<u64>>>,
-    selection_anchor_id_rc: Rc<Cell<Option<u64>>>,
-    bookmarks_rc: Rc<RefCell<std::collections::HashSet<u64>>>,
-    block_list_rc: gtk::Box,
-    block_scroll_rc: ScrolledWindow,
-    block_finished_cbs: BlockFinishedCallbacks,
-    ask_ai_about_block_cbs: BlockContextCallbacks,
-    kitty_assembler_rc: Rc<RefCell<kitty_graphics::Assembler>>,
-    kitty_pending_images_rc: Rc<RefCell<Vec<gtk::gdk::Texture>>>,
-    kitty_pending_bytes_rc: Rc<Cell<usize>>,
-}
+/// The GTK/VTE rendering seam. Bodies moved verbatim from the former
+/// `ReaderCtx` handler statements and `render_finalized_block`; the free
+/// helper functions they wrap stay module-level because non-reader paths
+/// (restore, resize, submit) share them.
+impl RenderBackend for BlockBackend {
+    fn feed_live(&self, bytes: &[u8]) {
+        self.active_vte.feed(bytes);
+    }
 
-/// Mount a finished command as a history block and reset the live surface.
-///
-/// Statement order is load-bearing: find state clears before eviction can
-/// drop a block, the `BlockData` record lands before the widget mounts, the
-/// callback fan-out runs only after the block is in `finished_blocks_for_cb`,
-/// and the live-surface reset comes last.
-fn render_finalized_block(ctx: FinalizeRenderCtx, block_data: BlockData, args: FinalizedBlockArgs) {
-    let FinalizeRenderCtx {
-        active_rc,
-        active_vte,
-        bstate_rc,
-        typed_cmd_rc,
-        bracketed_paste_rc,
-        armed_agent_execution_rc,
-        active_agent_execution_rc,
-        execution_id_rc,
-        config_for_cb,
-        dynamic_colors_rc,
-        block_data_for_cb,
-        failure_marker_redraw,
-        finished_blocks_for_cb,
-        find_state_rc,
-        scroll_debouncer,
-        widget_pool_for_cb,
-        pty_synced_rc,
-        visible_indices_rc,
-        pty_for_init,
-        unread_count_rc,
-        jump_fab,
-        selected_block_ids_rc,
-        selected_block_id_rc,
-        selection_anchor_id_rc,
-        bookmarks_rc,
-        block_list_rc,
-        block_scroll_rc,
-        block_finished_cbs,
-        ask_ai_about_block_cbs,
-        kitty_assembler_rc,
-        kitty_pending_images_rc,
-        kitty_pending_bytes_rc,
-    } = ctx;
-    let FinalizedBlockArgs {
-        block_id,
-        prompt,
-        cmd,
-        output_with_ansi,
-        output_plain,
-        output_trimmed,
-        block_cwd,
-        cols,
-        exit_code,
-        duration_ms,
-        end_time_ms,
-        is_background,
-    } = args;
+    fn reset_active_surface(&self, preserve_scrollback: bool) {
+        self.active_rc.borrow().reset_active(preserve_scrollback);
+    }
 
-    let max_blocks = config_for_cb.borrow().max_visible_blocks as usize;
-    let newest_estimated_bytes = {
-        let images = kitty_pending_images_rc.borrow();
-        estimated_live_finished_block_retained_bytes(
+    fn focus_live_deferred(&self) {
+        if !self.active_vte.has_focus() {
+            return;
+        }
+        let active_for_focus = self.active_rc.clone();
+        glib::idle_add_local_once(move || {
+            active_for_focus.borrow().grab_focus();
+        });
+    }
+
+    fn sync_geometry_to_pty(&self) {
+        sync_active_to_pty(
+            &self.layout_active_surface,
+            &self.active_vte,
+            &self.block_scroll_rc,
+            &self.pty_for_init,
+        );
+    }
+
+    fn layout_active_surface(&self) {
+        (self.layout_active_surface)();
+    }
+
+    fn mark_scroll_dirty(&self) {
+        self.scroll_debouncer.mark_dirty(&self.block_scroll_rc);
+    }
+
+    fn reset_scroll_lock(&self) {
+        self.scroll_debouncer.reset_scroll_lock();
+    }
+
+    fn enter_alt_screen_chrome(&self) {
+        let active = self.active_rc.borrow();
+        active.set_live_organism_visible(false);
+        active.set_live_organism_alt_screen(true);
+    }
+
+    fn exit_alt_screen_chrome(&self) {
+        self.active_rc.borrow().set_live_organism_alt_screen(false);
+    }
+
+    fn enter_fullscreen(&self) {
+        enter_fullscreen(
+            &self.finished_blocks_for_cb,
+            &self.visible_indices_rc,
+            &self.fullscreen_rc,
+        );
+    }
+
+    fn exit_fullscreen(&self) {
+        exit_fullscreen(
+            &self.finished_blocks_for_cb,
+            &self.visible_indices_rc,
+            &self.fullscreen_rc,
+        );
+    }
+
+    fn kitty_feed(&self, payload: &[u8]) -> kitty_graphics::FeedStatus {
+        // A pending admission the engine never consumed must not survive into
+        // this feed's outcome (trait contract: cleared at the start of feed).
+        self.kitty_pending_admission.borrow_mut().take();
+        let outcome = self.kitty_assembler.borrow_mut().feed(payload);
+        let status = outcome.status();
+        // Park a completed texture backend-side; only the texture-free status
+        // crosses the trait, and `kitty_admit_pending` consumes the parked
+        // texture after the engine has written the protocol reply.
+        if let kitty_graphics::Outcome::Complete(texture) = outcome {
+            *self.kitty_pending_admission.borrow_mut() = Some(texture);
+        }
+        status
+    }
+
+    fn kitty_admit_pending(&self) {
+        let Some(texture) = self.kitty_pending_admission.borrow_mut().take() else {
+            return;
+        };
+        // Rough memory bound: width*height*4 (bytes
+        // per RGBA pixel). Once the shared per-block
+        // budget is exhausted, further images drop —
+        // the transmission was still acknowledged
+        // by the engine, only the display is skipped.
+        let approx = (texture.width() as usize)
+            .saturating_mul(texture.height() as usize)
+            .saturating_mul(4);
+        let used = self.kitty_pending_bytes.get();
+        if used + approx <= kitty_graphics::MAX_PENDING_BYTES_PER_BLOCK {
+            self.kitty_pending_bytes.set(used + approx);
+            self.kitty_pending_images.borrow_mut().push(texture);
+        } else {
+            log::warn!(
+                "kitty graphics: per-block image budget exhausted ({} + {} > {}), dropping",
+                used,
+                approx,
+                kitty_graphics::MAX_PENDING_BYTES_PER_BLOCK
+            );
+        }
+    }
+
+    fn reset_kitty_pipeline(&self) {
+        self.kitty_assembler.borrow_mut().reset();
+        self.kitty_pending_images.borrow_mut().clear();
+        self.kitty_pending_bytes.set(0);
+        self.kitty_pending_admission.borrow_mut().take();
+    }
+
+    fn set_system_clipboard(&self, text: &str) {
+        if let Some(display) = gtk::gdk::Display::default() {
+            let clipboard = display.clipboard();
+            clipboard.set_text(text);
+        }
+    }
+
+    fn desktop_notify(&self, title: Option<&str>, body: &str) {
+        crate::notify::app_notification(title, body);
+    }
+
+    fn cursor_position(&self) -> (i64, i64) {
+        self.active_vte.cursor_position()
+    }
+
+    fn cursor_position_report(&self) -> (i64, i64) {
+        // Bug-compatible on purpose: VTE's `cursor_position()` row is a
+        // text-buffer (ring) row, and the pre-split code fed exactly this
+        // value into the `ESC[{row+1};{col+1}R` reply. Kept so the reply
+        // bytes do not change under the trait split; see the CPR note on
+        // `RenderBackend::cursor_position_report`.
+        self.active_vte.cursor_position()
+    }
+
+    fn command_capture_anchor(&self, provisional: (i64, i64)) -> (i64, i64) {
+        // Verbatim pre-split behaviour: Block mode captures the command from
+        // the PromptEnd anchor exactly as recorded. The live VTE keeps one
+        // monotonic text buffer between the two marks, so there is no
+        // row-count delta to correct for here.
+        provisional
+    }
+
+    fn grid_cols(&self) -> i64 {
+        self.active_rc.borrow().grid_cols() as i64
+    }
+
+    fn capture_text_range(
+        &self,
+        start_row: i64,
+        start_col: i64,
+        end_row: i64,
+        end_col: i64,
+    ) -> Option<String> {
+        self.active_vte
+            .text_range_format(vte4::Format::Text, start_row, start_col, end_row, end_col)
+            .0
+            .map(|gs| gs.to_string())
+    }
+
+    /// Mount a finished command as a history block and reset the live surface.
+    ///
+    /// Statement order is load-bearing: find state clears before eviction can
+    /// drop a block, the `BlockData` record lands before the widget mounts, and
+    /// the live-surface reset comes last. The block-finished fan-out and the
+    /// jsh journal submission are engine policy and run after this returns (see
+    /// `on_prompt_start`); the raw-output ring clear that used to ride on the
+    /// tail `reset_active` is likewise the engine's now.
+    fn finalize_block(&self, block_data: BlockData, args: FinalizedBlockArgs) {
+        let FinalizedBlockArgs {
+            block_id,
+            prompt,
+            cmd,
+            output_with_ansi,
+            plain_output_bytes,
+            block_cwd,
+            cols,
+            exit_code,
+            duration_ms,
+            end_time_ms,
+            is_background,
+        } = args;
+
+        let max_blocks = self.config_for_cb.borrow().max_visible_blocks as usize;
+        let newest_estimated_bytes = {
+            let images = self.kitty_pending_images.borrow();
+            estimated_live_finished_block_retained_bytes(
+                &prompt,
+                &cmd,
+                None,
+                &output_with_ansi,
+                plain_output_bytes,
+                block_cwd.as_deref(),
+                cols,
+                &images,
+            )
+        };
+        let prebuild_retention_plan = {
+            let finished = self.finished_blocks_for_cb.borrow();
+            plan_completed_block_retention_with_newest(
+                &finished,
+                block_id,
+                newest_estimated_bytes,
+                max_blocks,
+            )
+        };
+        log_completed_block_retention("preparing live block", prebuild_retention_plan);
+        if prebuild_retention_plan.evict_prefix > 0 {
+            // Retention changes block indices and may
+            // remove the VTE owning a highlighted hit.
+            clear_find_handles(
+                &self.finished_blocks_for_cb,
+                &self.active_vte,
+                &self.find_state_rc,
+            );
+        }
+        evict_finished_block_prefix(
+            prebuild_retention_plan.evict_prefix,
+            &self.finished_blocks_for_cb,
+            &self.block_data_for_cb,
+            &self.block_list_rc,
+            &self.widget_pool_for_cb,
+            BlockRemovalRefs {
+                selected_ids: &self.selected_block_ids_rc,
+                selected: &self.selected_block_id_rc,
+                anchor: &self.selection_anchor_id_rc,
+                bookmarks: &self.bookmarks_rc,
+                visible_indices: &self.visible_indices_rc,
+                failure_marker_redraw: self.failure_marker_redraw.as_ref(),
+                unread_count: &self.unread_count_rc,
+                jump_fab: &self.jump_fab,
+            },
+        );
+
+        mutate_block_data_and_redraw(
+            &self.block_data_for_cb,
+            self.failure_marker_redraw.as_ref(),
+            |blocks| blocks.push_back(block_data),
+        );
+
+        // Drain the kitty-graphics images decoded during
+        // this command so the finished block mounts them
+        // below its text output. Images are display-only:
+        // BlockData/history stay text-only, so a restored
+        // session simply omits them.
+        let kitty_images: Vec<gtk::gdk::Texture> =
+            self.kitty_pending_images.borrow_mut().drain(..).collect();
+        self.kitty_pending_bytes.set(0);
+
+        let recycled = self.widget_pool_for_cb.borrow_mut().acquire();
+        // Snapshot VTEs must match what the live view
+        // showed: overlay any dynamic OSC 10/11/12
+        // colors onto the theme for this block.
+        let block_config =
+            finished_block_config(&self.dynamic_colors_rc, &self.config_for_cb.borrow());
+        let finished = FinishedBlock::new_with_pool(
+            block_id,
             &prompt,
             &cmd,
             None,
             &output_with_ansi,
-            output_plain.len(),
+            exit_code,
+            &block_config,
+            duration_ms,
+            end_time_ms,
             block_cwd.as_deref(),
             cols,
-            &images,
-        )
-    };
-    let prebuild_retention_plan = {
-        let finished = finished_blocks_for_cb.borrow();
-        plan_completed_block_retention_with_newest(
-            &finished,
-            block_id,
-            newest_estimated_bytes,
-            max_blocks,
-        )
-    };
-    log_completed_block_retention("preparing live block", prebuild_retention_plan);
-    if prebuild_retention_plan.evict_prefix > 0 {
-        // Retention changes block indices and may
-        // remove the VTE owning a highlighted hit.
-        clear_find_handles(&finished_blocks_for_cb, &active_vte, &find_state_rc);
-    }
-    evict_finished_block_prefix(
-        prebuild_retention_plan.evict_prefix,
-        &finished_blocks_for_cb,
-        &block_data_for_cb,
-        &block_list_rc,
-        &widget_pool_for_cb,
-        BlockRemovalRefs {
-            selected_ids: &selected_block_ids_rc,
-            selected: &selected_block_id_rc,
-            anchor: &selection_anchor_id_rc,
-            bookmarks: &bookmarks_rc,
-            visible_indices: &visible_indices_rc,
-            failure_marker_redraw: failure_marker_redraw.as_ref(),
-            unread_count: &unread_count_rc,
-            jump_fab: &jump_fab,
-        },
-    );
+            &kitty_images,
+            plain_output_bytes,
+            recycled,
+        );
+        finished
+            .widget()
+            .insert_before(&self.block_list_rc, Some(self.active_rc.borrow().widget()));
 
-    mutate_block_data_and_redraw(
-        &block_data_for_cb,
-        failure_marker_redraw.as_ref(),
-        |blocks| blocks.push_back(block_data),
-    );
+        let was_user_scrolled = self.scroll_debouncer.user_scrolled_up.get();
 
-    // Drain the kitty-graphics images decoded during
-    // this command so the finished block mounts them
-    // below its text output. Images are display-only:
-    // BlockData/history stay text-only, so a restored
-    // session simply omits them.
-    let kitty_images: Vec<gtk::gdk::Texture> =
-        kitty_pending_images_rc.borrow_mut().drain(..).collect();
-    kitty_pending_bytes_rc.set(0);
-
-    let recycled = widget_pool_for_cb.borrow_mut().acquire();
-    // Snapshot VTEs must match what the live view
-    // showed: overlay any dynamic OSC 10/11/12
-    // colors onto the theme for this block.
-    let block_config = finished_block_config(&dynamic_colors_rc, &config_for_cb.borrow());
-    let finished = FinishedBlock::new_with_pool(
-        block_id,
-        &prompt,
-        &cmd,
-        None,
-        &output_with_ansi,
-        exit_code,
-        &block_config,
-        duration_ms,
-        end_time_ms,
-        block_cwd.as_deref(),
-        cols,
-        &kitty_images,
-        output_plain.len(),
-        recycled,
-    );
-    finished
-        .widget()
-        .insert_before(&block_list_rc, Some(active_rc.borrow().widget()));
-
-    let was_user_scrolled = scroll_debouncer.user_scrolled_up.get();
-
-    // If the user is reading history (scrolled up), this
-    // freshly-finished block is "unread": bump the FAB badge
-    // so they can see work completed below and jump to it.
-    if was_user_scrolled {
-        unread_count_rc.set(unread_count_rc.get().saturating_add(1));
-        set_jump_fab_label(&jump_fab, unread_count_rc.get());
-        jump_fab.set_visible(true);
-    }
-
-    let finished_clone = finished.clone();
-    let finished_widget = finished_clone.widget().clone();
-
-    finished_clone.connect_actions(
-        &active_vte,
-        &pty_for_init,
-        &pty_synced_rc,
-        &bracketed_paste_rc,
-        &typed_cmd_rc,
-        &armed_agent_execution_rc,
-        &bstate_rc,
-        &active_rc,
-    );
-    finished_clone.connect_scroll_forwarding(&block_scroll_rc);
-
-    finished_blocks_for_cb.borrow_mut().push(finished);
-
-    if !is_background {
-        let output_sample = sample_output_for_event(&output_plain);
-        let agent_execution = active_agent_execution_rc.take();
-        for cb in block_finished_cbs.borrow().iter() {
-            cb(
-                cmd.clone(),
-                exit_code,
-                output_sample.clone(),
-                agent_execution,
-                duration_ms,
-            );
+        // If the user is reading history (scrolled up), this
+        // freshly-finished block is "unread": bump the FAB badge
+        // so they can see work completed below and jump to it.
+        if was_user_scrolled {
+            self.unread_count_rc
+                .set(self.unread_count_rc.get().saturating_add(1));
+            set_jump_fab_label(&self.jump_fab, self.unread_count_rc.get());
+            self.jump_fab.set_visible(true);
         }
-        // Attach this block's output to the shell's own
-        // journal record. Only jsh sends an execution id,
-        // and only it writes the record this completes —
-        // without the id there is nothing to correlate,
-        // which is why the capture used to stay stranded
-        // in this window.
-        if let Some(id) = execution_id_rc.borrow_mut().take() {
-            // The journal gets the line-capped text this
-            // pane kept, with `truncated` set from the same
-            // cap. `total_bytes` is measured against the
-            // trimmed full capture, so a record that merely
-            // lost surrounding blank lines is not reported
-            // as truncated. (What this layer cannot see is
-            // the live buffer's byte cap dropping the *head*
-            // of a very long stream — a gap, not a claim.)
-            let total_bytes = output_plain.trim().len();
-            let submitted = jterm_core::execution_journal::CompletedExecution {
-                id,
-                output: output_trimmed.clone(),
-                output_available: true,
-                truncated: output_trimmed.len() != total_bytes,
-                total_bytes,
-            };
-            if let Err(error) = jterm_core::execution_journal::submit(submitted) {
-                log::warn!("jsh execution journal rejected a block's output: {error:?}");
-            }
-        }
-    }
 
-    {
-        let cfg = config_for_cb.borrow();
-        if !is_background && cfg.notify_long_blocks {
-            if let Some(ms) = duration_ms {
-                if ms >= cfg.notify_long_block_threshold_ms {
-                    crate::notify::long_block_finished(&cmd, exit_code_for_i32_api(exit_code), ms);
+        let finished_clone = finished.clone();
+        let finished_widget = finished_clone.widget().clone();
+
+        finished_clone.connect_actions(
+            &self.active_vte,
+            &self.pty_for_init,
+            &self.pty_synced_rc,
+            &self.bracketed_paste_rc,
+            &self.typed_cmd_rc,
+            &self.armed_agent_execution_rc,
+            &self.bstate_rc,
+            &self.active_rc,
+        );
+        finished_clone.connect_scroll_forwarding(&self.block_scroll_rc);
+
+        self.finished_blocks_for_cb.borrow_mut().push(finished);
+
+        {
+            let cfg = self.config_for_cb.borrow();
+            if !is_background && cfg.notify_long_blocks {
+                if let Some(ms) = duration_ms {
+                    if ms >= cfg.notify_long_block_threshold_ms {
+                        crate::notify::long_block_finished(
+                            &cmd,
+                            exit_code_for_i32_api(exit_code),
+                            ms,
+                        );
+                    }
                 }
             }
         }
-    }
 
-    // Right-click context menu.
-    install_finished_block_context_menu(FinishedBlockMenuCtx {
-        finished_blocks_for_cb: finished_blocks_for_cb.clone(),
-        block_list_rc: block_list_rc.clone(),
-        active_vte: active_vte.clone(),
-        pty_for_init: pty_for_init.clone(),
-        pty_synced_rc: pty_synced_rc.clone(),
-        bracketed_paste_rc: bracketed_paste_rc.clone(),
-        typed_cmd_rc: typed_cmd_rc.clone(),
-        armed_agent_execution_rc: armed_agent_execution_rc.clone(),
-        bstate_rc: bstate_rc.clone(),
-        active_rc: active_rc.clone(),
-        selected_block_ids_rc: selected_block_ids_rc.clone(),
-        selected_block_id_rc: selected_block_id_rc.clone(),
-        selection_anchor_id_rc: selection_anchor_id_rc.clone(),
-        bookmarks_rc: bookmarks_rc.clone(),
-        block_scroll_rc: block_scroll_rc.clone(),
-        visible_indices_rc: visible_indices_rc.clone(),
-        widget_pool_for_cb: widget_pool_for_cb.clone(),
-        ask_ai_about_block_cbs: ask_ai_about_block_cbs.clone(),
-        failure_marker_redraw: failure_marker_redraw.clone(),
-        unread_count_rc: unread_count_rc.clone(),
-        jump_fab: jump_fab.clone(),
-        finished_widget,
-        finished_menu_clone: finished_clone.clone(),
-        block_data_for_export: block_data_for_cb.clone(),
-        block_id: finished_clone.id,
-    });
+        // Right-click context menu.
+        self.install_finished_block_context_menu(
+            finished_widget,
+            finished_clone.clone(),
+            finished_clone.id,
+        );
 
-    install_finished_block_selection(
-        &finished_clone,
-        &active_rc,
-        &finished_blocks_for_cb,
-        &selected_block_ids_rc,
-        &selected_block_id_rc,
-        &selection_anchor_id_rc,
-    );
+        install_finished_block_selection(
+            &finished_clone,
+            &self.active_rc,
+            &self.finished_blocks_for_cb,
+            &self.selected_block_ids_rc,
+            &self.selected_block_id_rc,
+            &self.selection_anchor_id_rc,
+        );
 
-    // Recheck with the widget's actual retained
-    // estimate. Normally this matches the pre-build
-    // plan; the second pass closes any estimator
-    // drift without ever evicting the newest card.
-    let retention_plan = {
-        let finished = finished_blocks_for_cb.borrow();
-        plan_completed_block_retention_with_restored(&[], &finished, max_blocks)
-    };
-    log_completed_block_retention("finalizing live block", retention_plan);
-    if retention_plan.evict_prefix > 0 {
-        clear_find_handles(&finished_blocks_for_cb, &active_vte, &find_state_rc);
-    }
-    evict_finished_block_prefix(
-        retention_plan.evict_prefix,
-        &finished_blocks_for_cb,
-        &block_data_for_cb,
-        &block_list_rc,
-        &widget_pool_for_cb,
-        BlockRemovalRefs {
-            selected_ids: &selected_block_ids_rc,
-            selected: &selected_block_id_rc,
-            anchor: &selection_anchor_id_rc,
-            bookmarks: &bookmarks_rc,
-            visible_indices: &visible_indices_rc,
-            failure_marker_redraw: failure_marker_redraw.as_ref(),
-            unread_count: &unread_count_rc,
-            jump_fab: &jump_fab,
-        },
-    );
-
-    // Keep a small JSONL command index separate from
-    // optional full-output block history. This powers
-    // History, palette search, and opt-in AI context
-    // without persisting terminal output by default.
-    let (history_path, history_limit) = {
-        let cfg = config_for_cb.borrow();
-        (
-            cfg.command_history_enabled
-                .then(|| cfg.command_history_path.clone())
-                .flatten(),
-            cfg.command_history_max_entries as usize,
-        )
-    };
-    if let Some(path) = history_path {
-        if let Err(err) = crate::command_history::enqueue(
-            std::path::Path::new(&path),
-            history_limit,
-            &cmd,
-            block_cwd.as_deref(),
-            exit_code_for_i32_api(exit_code),
-            end_time_ms,
-        ) {
-            log::warn!("command history: {err}");
+        // Recheck with the widget's actual retained
+        // estimate. Normally this matches the pre-build
+        // plan; the second pass closes any estimator
+        // drift without ever evicting the newest card.
+        let retention_plan = {
+            let finished = self.finished_blocks_for_cb.borrow();
+            plan_completed_block_retention_with_restored(&[], &finished, max_blocks)
+        };
+        log_completed_block_retention("finalizing live block", retention_plan);
+        if retention_plan.evict_prefix > 0 {
+            clear_find_handles(
+                &self.finished_blocks_for_cb,
+                &self.active_vte,
+                &self.find_state_rc,
+            );
         }
-    }
+        evict_finished_block_prefix(
+            retention_plan.evict_prefix,
+            &self.finished_blocks_for_cb,
+            &self.block_data_for_cb,
+            &self.block_list_rc,
+            &self.widget_pool_for_cb,
+            BlockRemovalRefs {
+                selected_ids: &self.selected_block_ids_rc,
+                selected: &self.selected_block_id_rc,
+                anchor: &self.selection_anchor_id_rc,
+                bookmarks: &self.bookmarks_rc,
+                visible_indices: &self.visible_indices_rc,
+                failure_marker_redraw: self.failure_marker_redraw.as_ref(),
+                unread_count: &self.unread_count_rc,
+                jump_fab: &self.jump_fab,
+            },
+        );
 
-    let preserve = config_for_cb.borrow().preserve_live_scrollback;
-    active_rc.borrow().reset_active(preserve);
-    // Drop any half-uploaded kitty chunks so they
-    // can't leak into the next command (the drain
-    // above already moved every completed image onto
-    // the finished block).
-    kitty_assembler_rc.borrow_mut().reset();
-    kitty_pending_images_rc.borrow_mut().clear();
-    kitty_pending_bytes_rc.set(0);
-    if !was_user_scrolled {
-        scroll_debouncer.reset_scroll_lock();
-        scroll_debouncer.pin_to_bottom_deferred(&block_scroll_rc);
+        // Keep a small JSONL command index separate from
+        // optional full-output block history. This powers
+        // History, palette search, and opt-in AI context
+        // without persisting terminal output by default.
+        let (history_path, history_limit) = {
+            let cfg = self.config_for_cb.borrow();
+            (
+                cfg.command_history_enabled
+                    .then(|| cfg.command_history_path.clone())
+                    .flatten(),
+                cfg.command_history_max_entries as usize,
+            )
+        };
+        if let Some(path) = history_path {
+            if let Err(err) = crate::command_history::enqueue(
+                std::path::Path::new(&path),
+                history_limit,
+                &cmd,
+                block_cwd.as_deref(),
+                exit_code_for_i32_api(exit_code),
+                end_time_ms,
+            ) {
+                log::warn!("command history: {err}");
+            }
+        }
+
+        let preserve = self.config_for_cb.borrow().preserve_live_scrollback;
+        self.active_rc.borrow().reset_active(preserve);
+        // Drop any half-uploaded kitty chunks so they
+        // can't leak into the next command (the drain
+        // above already moved every completed image onto
+        // the finished block). The parked admission, had
+        // the engine skipped its admit, dies with them.
+        self.kitty_assembler.borrow_mut().reset();
+        self.kitty_pending_images.borrow_mut().clear();
+        self.kitty_pending_bytes.set(0);
+        self.kitty_pending_admission.borrow_mut().take();
+        if !was_user_scrolled {
+            self.scroll_debouncer.reset_scroll_lock();
+            self.scroll_debouncer
+                .pin_to_bottom_deferred(&self.block_scroll_rc);
+        }
     }
 }
 
 impl ReaderCtx {
-    fn install(self, pty: &Rc<OwnedPty>) -> std::io::Result<()> {
+    /// `live_vte` is passed in rather than read back off the backend:
+    /// `ReaderCtx` itself no longer names widget types, and the selection
+    /// hold's VTE hooks are wiring, not lifecycle dispatch.
+    fn install(self, pty: &Rc<OwnedPty>, live_vte: &Terminal) -> std::io::Result<()> {
         let shell_token = pty
             .shell_integration_token()
             .unwrap_or_default()
             .to_string();
         let mut capability_observer = ShellCapabilityObserver::default();
-        self.selection_feed_hold.install_vte_hooks(&self.active_vte);
+        self.selection_feed_hold.install_vte_hooks(live_vte);
 
         let ctx = Rc::new(self);
 
@@ -5001,7 +5143,14 @@ impl TermView {
         // Active block: a single persistent live VTE pinned at the bottom of the
         // block list. Prompt + typing + output all render here natively (anvil
         // model); finished commands snapshot into styled blocks above it.
-        let active = Rc::new(RefCell::new(ActiveBlock::new(config)));
+        // Bounded raw-output ring for the running command. Engine-owned: the
+        // reader appends/clears/snapshots it, and `ActiveBlock` holds this same
+        // cell only so live-find can read the running capture.
+        let live_raw_output: Rc<RefCell<VecDeque<u8>>> = Rc::new(RefCell::new(VecDeque::new()));
+        let active = Rc::new(RefCell::new(ActiveBlock::new(
+            config,
+            live_raw_output.clone(),
+        )));
         let active_vte = active.borrow().active_vte.clone();
         let focus_requested = Rc::new(Cell::new(false));
         {
@@ -5688,9 +5837,42 @@ impl TermView {
 
             let event_buf: Rc<RefCell<Vec<ParserEvent>>> =
                 Rc::new(RefCell::new(Vec::with_capacity(32)));
-            ReaderCtx {
+            let backend: Rc<dyn RenderBackend> = Rc::new(BlockBackend {
                 active_rc,
                 active_vte: active_vte_rc,
+                block_list_rc,
+                block_scroll_rc,
+                jump_fab: jump_fab.clone(),
+                scroll_debouncer,
+                failure_marker_redraw: failure_marker_redraw.clone(),
+                finished_blocks_for_cb,
+                widget_pool_for_cb,
+                find_state_rc: find_state.clone(),
+                visible_indices_rc,
+                fullscreen_rc,
+                selected_block_ids_rc: selected_block_ids.clone(),
+                selected_block_id_rc: selected_block_id.clone(),
+                selection_anchor_id_rc: selection_anchor_id.clone(),
+                bookmarks_rc: block_bookmarks.clone(),
+                block_data_for_cb,
+                unread_count_rc: unread_count.clone(),
+                layout_active_surface: layout_active_surface.clone(),
+                config_for_cb: config_for_cb.clone(),
+                dynamic_colors_rc: dynamic_colors_rc.clone(),
+                pty_for_init: pty_for_init.clone(),
+                ask_ai_about_block_cbs: ask_ai_about_block_callbacks.clone(),
+                bstate_rc: bstate_rc.clone(),
+                typed_cmd_rc: typed_cmd_rc.clone(),
+                armed_agent_execution_rc: armed_agent_execution.clone(),
+                bracketed_paste_rc: bracketed_paste_rc.clone(),
+                pty_synced_rc: pty_synced_rc.clone(),
+                kitty_assembler: RefCell::new(kitty_graphics::Assembler::new()),
+                kitty_pending_images: RefCell::new(Vec::new()),
+                kitty_pending_bytes: Cell::new(0),
+                kitty_pending_admission: RefCell::new(None),
+            });
+            ReaderCtx {
+                backend,
                 bstate_rc,
                 engine: RefCell::new(EngineState {
                     prev_state: BlockState::Idle,
@@ -5711,12 +5893,11 @@ impl TermView {
                     command_cwd: None,
                     active_alt_screen_mode: None,
                 }),
+                live_raw_output_rc: live_raw_output.clone(),
                 typed_cmd_rc,
                 idle_input_dirty_rc: idle_input_dirty.clone(),
                 prompt_end_pos_rc,
                 prompt_anchor_ready_rc: prompt_anchor_ready.clone(),
-                block_list_rc,
-                block_scroll_rc,
                 remote_session_cbs: remote_session_callbacks.clone(),
                 exited_cbs,
                 activity_cbs,
@@ -5728,15 +5909,8 @@ impl TermView {
                 dynamic_colors_rc,
                 config_for_cb,
                 parser,
-                block_data_for_cb,
                 reserved_history_block_ids: reserved_history_block_ids.clone(),
-                failure_marker_redraw: failure_marker_redraw.clone(),
-                finished_blocks_for_cb,
-                scroll_debouncer,
-                widget_pool_for_cb,
                 pty_synced_rc,
-                visible_indices_rc,
-                fullscreen_rc,
                 ftcs_seen_rc,
                 init_cmds_queue_for_cb,
                 pty_for_init,
@@ -5744,13 +5918,6 @@ impl TermView {
                 execution_id_rc: execution_id.clone(),
                 current_cwd_for_cb,
                 event_buf,
-                unread_count_rc: unread_count.clone(),
-                jump_fab: jump_fab.clone(),
-                selected_block_ids_rc: selected_block_ids.clone(),
-                selected_block_id_rc: selected_block_id.clone(),
-                selection_anchor_id_rc: selection_anchor_id.clone(),
-                bookmarks_rc: block_bookmarks.clone(),
-                find_state_rc: find_state.clone(),
                 cmd_running_rc: cmd_running.clone(),
                 running_cmd_rc: running_cmd.clone(),
                 armed_agent_execution_rc: armed_agent_execution.clone(),
@@ -5758,15 +5925,10 @@ impl TermView {
                 active_agent_execution_rc: active_agent_execution.clone(),
                 agent_execution_supported_rc: agent_execution_supported.clone(),
                 verified_submission: verified_submission.clone(),
-                layout_active_surface: layout_active_surface.clone(),
                 block_finished_cbs: block_finished_callbacks.clone(),
-                ask_ai_about_block_cbs: ask_ai_about_block_callbacks.clone(),
                 selection_feed_hold: selection_feed_hold.clone(),
-                kitty_assembler_rc: Rc::new(RefCell::new(kitty_graphics::Assembler::new())),
-                kitty_pending_images_rc: Rc::new(RefCell::new(Vec::new())),
-                kitty_pending_bytes_rc: Rc::new(Cell::new(0)),
             }
-            .install(&pty)?;
+            .install(&pty, &active_vte)?;
 
             // Shells without OSC 133 never emit PromptEnd, so the normal
             // integration-driven replay path above would leave startup/session
