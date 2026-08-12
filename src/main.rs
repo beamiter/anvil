@@ -38,6 +38,7 @@ mod keybindings;
 mod navigation_ui;
 mod notebook;
 mod organism;
+mod organism_attention;
 mod organism_memory;
 mod organism_ui;
 mod palette;
@@ -121,6 +122,38 @@ fn widget_is_within(mut current: gtk::Widget, ancestor: &gtk::Widget) -> bool {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrganismFocusDecision {
+    ClaimCurrentPane,
+    Revoke,
+}
+
+/// Relm's last observed activation and GTK's current toplevel state must both
+/// agree before a pane may own the spatial organism. Checking both closes the
+/// gap where a pane-focus message was queued just before the window lost focus.
+fn organism_focus_decision(
+    observed_window_active: bool,
+    current_window_active: bool,
+) -> OrganismFocusDecision {
+    if observed_window_active && current_window_active {
+        OrganismFocusDecision::ClaimCurrentPane
+    } else {
+        OrganismFocusDecision::Revoke
+    }
+}
+
+/// A workspace mutation needs an explicit two-phase organism handoff whenever
+/// it changes pane identity or temporarily hides/reparents the current pane.
+/// The latter matters for moves where the same stable pane id remains selected
+/// but its old tab/container disappears underneath it.
+fn organism_focus_transfer_required(
+    previous_pane: Option<u64>,
+    next_pane: Option<u64>,
+    hides_previous: bool,
+) -> bool {
+    hides_previous || previous_pane != next_pane
+}
+
 // `file_tree_store: gtk::TreeStore` uses the GTK4 TreeStore family deprecated in
 // 4.10; it stays functional and a ColumnView rewrite is out of scope.
 #[allow(deprecated)]
@@ -129,6 +162,9 @@ struct AppModel {
     /// Shared native-organism state; Relm4 remains responsible for resolving
     /// which Block component owns focus and for attaching new panes.
     organism_hub: Rc<organism_ui::OrganismHub>,
+    /// Last activation state delivered through the Relm4 update loop. GTK's
+    /// live state is checked alongside it before any presence claim.
+    window_active: bool,
     config_revision: RefCell<Option<config_store::ConfigRevision>>,
     themes: Rc<Vec<Theme>>,
     kbmap: Rc<RefCell<KeybindingMap>>,
@@ -373,6 +409,44 @@ impl AppModel {
             .get(self.active)
             .and_then(|t| t.panes.get(t.active_pane))
             .map(|p| &p.terminal)
+    }
+
+    fn active_pane_id(&self) -> Option<u64> {
+        self.tabs
+            .get(self.active)
+            .and_then(|tab| tab.panes.get(tab.active_pane))
+            .map(|pane| pane.id)
+    }
+
+    /// Phase one of a workspace focus handoff. Revocation happens before GTK
+    /// hides/reparents a tab or before the model changes `active_pane`, so a
+    /// dormant timeout can never keep drawing into the old hidden surface.
+    fn begin_organism_focus_transfer(&self, next_pane: Option<u64>, hides_previous: bool) -> bool {
+        let transfer =
+            organism_focus_transfer_required(self.active_pane_id(), next_pane, hides_previous);
+        if transfer {
+            self.organism_hub.revoke_organism_presence();
+        }
+        transfer
+    }
+
+    /// Phase two resolves from the final model state and the live window gate.
+    /// It never relies on an asynchronous `GrabFocus`/`Focused` round trip;
+    /// launch-error pages naturally resolve to no `TermView` and stay revoked.
+    fn finish_organism_focus_transfer(&self, transfer: bool) {
+        if transfer {
+            self.sync_organism_focus();
+        }
+    }
+
+    fn sync_organism_focus(&self) {
+        match organism_focus_decision(self.window_active, self.window.is_active()) {
+            OrganismFocusDecision::ClaimCurrentPane => {
+                let focused = self.active_terminal().and_then(TermCtl::term_view);
+                self.organism_hub.focus_view(focused.as_ref());
+            }
+            OrganismFocusDecision::Revoke => self.organism_hub.revoke_organism_presence(),
+        }
     }
 
     /// Local working directory of the active pane, if it reports one. External
@@ -872,6 +946,7 @@ impl SimpleComponent for AppModel {
         let mut model = AppModel {
             config,
             organism_hub,
+            window_active: root.is_active(),
             config_revision: RefCell::new(config_revision),
             themes: Rc::new(themes),
             kbmap,
@@ -1012,11 +1087,18 @@ impl SimpleComponent for AppModel {
             });
         }
         {
+            let window_sender = sender.clone();
             let organism_hub = model.organism_hub.clone();
             root.connect_is_active_notify(move |window| {
-                if !window.is_active() {
+                let active = window.is_active();
+                // Revocation is a visibility safety boundary, so perform it
+                // synchronously in GTK's notification. The Relm message still
+                // records activation order and reclaims the current pane on
+                // the active edge; delayed focus events remain gated there.
+                if !active {
                     organism_hub.revoke_organism_presence();
                 }
+                window_sender.input(AppMsg::WindowActive(active));
             });
         }
 
@@ -1265,6 +1347,10 @@ impl SimpleComponent for AppModel {
                 self.top_bar
                     .emit(top_bar::TopBarMsg::SetMaximized(maximized));
             }
+            AppMsg::WindowActive(active) => {
+                self.window_active = active;
+                self.sync_organism_focus();
+            }
             AppMsg::Quit => {
                 self.request_quit(&sender);
             }
@@ -1289,6 +1375,12 @@ impl SimpleComponent for AppModel {
                         }
                     }
                 }
+                // A successful backend is enough to resolve organism
+                // ownership; an error page or backend that never emits a
+                // focus-enter must not be required for the handoff.
+                if self.active_pane_id() == Some(pane_id) {
+                    self.sync_organism_focus();
+                }
             }
             AppMsg::PaneLaunchFailed(pane_id, message) => {
                 if let Some((source_tab_id, source_pane_id)) =
@@ -1311,7 +1403,14 @@ impl SimpleComponent for AppModel {
                             "{message} The failed split could not be rolled back safely."
                         ));
                     }
-                } else if let Some((idx, _)) = self.find_pane(pane_id) {
+                } else if let Some((idx, pane_index)) = self.find_pane(pane_id) {
+                    let active_failure =
+                        idx == self.active && self.tabs[idx].active_pane == pane_index;
+                    let focus_transfer = if active_failure {
+                        self.begin_organism_focus_transfer(None, false)
+                    } else {
+                        false
+                    };
                     if let Some(connection) = self.tabs[idx]
                         .remote
                         .as_mut()
@@ -1321,6 +1420,7 @@ impl SimpleComponent for AppModel {
                     }
                     self.sync_tab_strip();
                     self.show_toast(message);
+                    self.finish_organism_focus_transfer(focus_transfer);
                 } else {
                     // A synchronously rejected Block split drops its prepared
                     // component before commit and reports its own toast. Ignore
@@ -1413,9 +1513,24 @@ impl SimpleComponent for AppModel {
                             terminal.emit(VteInput::SearchClear);
                         }
                     }
+                    let next_owner = if ti == self.active {
+                        Some(pane_id)
+                    } else {
+                        self.active_pane_id()
+                    };
+                    let focus_transfer = self.begin_organism_focus_transfer(next_owner, false);
                     self.tabs[ti].active_pane = pi;
-                    let focused = self.tabs[ti].panes[pi].terminal.term_view();
-                    self.organism_hub.focus_view(focused.as_ref());
+                    // Resolve from the selected tab/pane instead of trusting
+                    // this possibly delayed event's pane. The activation gate
+                    // also prevents focus queued before deactivation from
+                    // reclaiming a live body while the window is inactive.
+                    self.finish_organism_focus_transfer(focus_transfer);
+                    if !focus_transfer {
+                        // Even a same-pane notification must re-evaluate the
+                        // activation gate: it may have been queued before the
+                        // window changed state.
+                        self.sync_organism_focus();
+                    }
                     self.refresh_pane_headers(ti);
                     // The tab shows its selected pane, so the label follows
                     // focus across a split.
@@ -2060,6 +2175,45 @@ fn init_input_method_env() {
     }
     if is_unset("XMODIFIERS") {
         unsafe { std::env::set_var("XMODIFIERS", "@im=fcitx") };
+    }
+}
+
+#[cfg(test)]
+mod organism_focus_tests {
+    use super::*;
+
+    #[test]
+    fn organism_focus_requires_observed_and_current_window_activation() {
+        assert_eq!(
+            organism_focus_decision(true, true),
+            OrganismFocusDecision::ClaimCurrentPane
+        );
+        assert_eq!(
+            organism_focus_decision(true, false),
+            OrganismFocusDecision::Revoke,
+            "a pane-focus event queued before deactivation cannot reclaim presence"
+        );
+        assert_eq!(
+            organism_focus_decision(false, true),
+            OrganismFocusDecision::Revoke,
+            "reactivation waits for its Relm4 activation message"
+        );
+        assert_eq!(
+            organism_focus_decision(false, false),
+            OrganismFocusDecision::Revoke
+        );
+    }
+
+    #[test]
+    fn workspace_focus_handoffs_cover_hidden_and_missing_destinations() {
+        assert!(!organism_focus_transfer_required(Some(7), Some(7), false));
+        assert!(organism_focus_transfer_required(Some(7), Some(8), false));
+        assert!(organism_focus_transfer_required(Some(7), None, false));
+        assert!(
+            organism_focus_transfer_required(Some(7), Some(7), true),
+            "reparenting the same pane still hides its old surface"
+        );
+        assert!(!organism_focus_transfer_required(None, None, false));
     }
 }
 

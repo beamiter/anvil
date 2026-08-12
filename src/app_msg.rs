@@ -19,6 +19,9 @@ pub(crate) enum AppMsg {
     MinimizeWindow,
     ToggleMaximizedWindow,
     WindowMaximized(bool),
+    /// GTK toplevel activation changed. The app loop owns organism presence so
+    /// delayed pane-focus messages cannot reclaim a body after deactivation.
+    WindowActive(bool),
     Quit,
     ForceQuit,
     Toast(String),

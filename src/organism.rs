@@ -4,6 +4,8 @@
 //! command lifecycle events; the UI renders the returned [`Reaction`]. It does
 //! not inspect output contents, execute commands, or perform network I/O.
 
+use std::borrow::Cow;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommandKind {
     BuildOrTest,
@@ -116,7 +118,7 @@ pub(crate) enum Behavior {
     /// that the loop is stubborn without escalating speech or stimulus.
     GuardStuck,
     /// A recovered build has not been pushed yet. Between real events the cat
-    /// stays beside that finished work instead of anviltting it at settle.
+    /// stays beside that finished work instead of forgetting it at settle.
     GuardRecovery,
     /// Repeated same-day failure/success flips make the recovery worth checking
     /// again before push; this is caution, not a claim that a test is flaky.
@@ -135,6 +137,15 @@ const GAIT_FRAMES: [&str; 2] = [" /\\_/\\\n( o.o )\n >/ \\<", " /\\_/\\\n( o.o )
 const GAIT_TENSE_FRAMES: [&str; 2] = [" =\\_/=\n( o.o )\n >/ \\<", " =\\_/=\n( o.o )\n >\\ /<"];
 const WATCH_FRAMES: [&str; 2] = [" /\\_/\\\n( o.o )\n > ^ <", " /\\_/\\\n( o.o )\n >~^ <"];
 const WATCH_TENSE_FRAMES: [&str; 2] = [" =\\_/=\n( o.o )\n > ^ <", " =\\_/=\n( o.o )\n >~^ <"];
+const WATCH_BUSY_FRAMES: [&str; 2] = [" /\\_/\\\n( o.> )\n > ^ <", " /\\_/\\\n( <.o )\n >~^ <"];
+const WATCH_BUSY_TENSE_FRAMES: [&str; 2] = [" =\\_/=\n( o.> )\n > ^ <", " =\\_/=\n( <.o )\n >~^ <"];
+const WATCH_WAITING_FRAMES: [&str; 2] =
+    [" /\\_/\\\n( -.- )\n (___) ", " /\\_/\\\n( -.o )\n (___) "];
+const WATCH_WAITING_TENSE_FRAMES: [&str; 2] =
+    [" =\\_/=\n( -.- )\n (___) ", " =\\_/=\n( -.o )\n (___) "];
+const WATCH_RESUMED_FRAMES: [&str; 2] = [" /\\_/\\\n( O.O )\n > ^ <", " /\\_/\\\n( o.o )\n >~^ <"];
+const WATCH_RESUMED_TENSE_FRAMES: [&str; 2] =
+    [" =\\_/=\n( O.O )\n > ^ <", " =\\_/=\n( o.o )\n >~^ <"];
 const INSPECT_FRAME: &str = " /\\_/\\  ->\n( o_o )\n /|_|\\";
 const SIT_FRAMES: [&str; 2] = [
     " /\\_/\\\n( ._. )  !\n /|_|\\",
@@ -164,8 +175,20 @@ const SLEEP_FRAMES: [&str; 2] = [
 const EXPLORE_FRAMES: [&str; 2] = [" /\\_/\\\n( o.o)?\n > ^ <", " /\\_/\\\n?(o.o )\n > ^ <"];
 const APPROACH_FRAMES: [&str; 2] = [" /\\_/\\\n( ^.^ )\n > ^ <", " /\\_/\\\n( ^.^ )\n >~^ <"];
 const WATCH_AGENT_FRAMES: [&str; 2] = [" /\\_/\\\n( -.o )\n (___) ", " /\\_/\\\n( o.- )\n (___) "];
+const WATCH_AGENT_BUSY_FRAMES: [&str; 2] =
+    [" /\\_/\\\n( -.> )\n (___) ", " /\\_/\\\n( <.- )\n (___) "];
+const WATCH_AGENT_WAITING_FRAMES: [&str; 2] =
+    [" /\\_/\\\n( -.- )\n (___) ", " /\\_/\\\n( -.o )\n (___) "];
+const WATCH_AGENT_RESUMED_FRAMES: [&str; 2] =
+    [" /\\_/\\\n( o.o )\n (___) ", " /\\_/\\\n( -.o )\n (___) "];
 const WATCH_SETTLED_FRAMES: [&str; 2] =
     [" /\\_/\\\n( -.- )\n (___) ", " /\\_/\\\n( -.o )\n (___) "];
+const WATCH_SETTLED_BUSY_FRAMES: [&str; 2] =
+    [" /\\_/\\\n( -.> )\n (___) ", " /\\_/\\\n( <.- )\n (___) "];
+const WATCH_SETTLED_WAITING_FRAMES: [&str; 2] =
+    [" /\\_/\\\n( ._. )\n (___) ", " /\\_/\\\n( -.- )\n (___) "];
+const WATCH_SETTLED_RESUMED_FRAMES: [&str; 2] =
+    [" /\\_/\\\n( o.o )\n (___) ", " /\\_/\\\n( -.o )\n (___) "];
 const GUARD_FAILURE_FRAMES: [&str; 2] = [
     " /\\_/\\\n( o_o ) [!]\n /|_|\\",
     " /\\_/\\\n( o.o ) [!]\n /|_|\\",
@@ -181,6 +204,95 @@ const GUARD_RECOVERY_FRAMES: [&str; 2] = [
 const GUARD_CAUTIOUS_FRAMES: [&str; 2] = [
     " /\\_/\\\n( ?.? ) [?]\n /|_|\\",
     " /\\_/\\\n( ?.o ) [?]\n /|_|\\",
+];
+
+// Semantic pose changes are short, one-shot arcs rather than new reducer
+// states. Every frame in one arc has the same three-line bounding box. The UI
+// can therefore render the intermediate frames in Full motion, while Calm and
+// Static can keep using the canonical destination pose.
+const INSPECT_TO_GUARD_FAILURE_FRAMES: [&str; 4] = [
+    " /\\_/\\  -->\n( o_o )\n /|_|\\",
+    " /\\_/\\  <- \n( o_o ) [!]\n /|_|\\",
+    " /\\_/\\     \n( ._. ) [!]\n /|_|\\",
+    " /\\_/\\     \n( o_o ) [!]\n /|_|\\",
+];
+const SIT_TO_GUARD_STUCK_FRAMES: [&str; 4] = [
+    " =\\_/=      \n( ._. )  !!\n /|_|\\",
+    " =\\_/=      \n( -.- ) [!!]\n /|_|\\",
+    " =\\_/=      \n( ._. ) [!!]\n /|_|\\",
+    " =\\_/=      \n( -.- ) [!!]\n /|_|\\",
+];
+const FAILURE_TO_RECOVERY_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n( o_o ) [! ]\n /|_|\\",
+    " /\\_/\\      \n( ._. ) [~ ]\n /|_|\\",
+    " /\\_/\\      \n( -.o ) [ok]\n /|_|\\",
+    " /\\_/\\      \n( -.- ) [ok]\n /|_|\\",
+];
+const FAILURE_TO_CAUTIOUS_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n( o_o ) [! ]\n /|_|\\",
+    " /\\_/\\      \n( ._. ) [~ ]\n /|_|\\",
+    " /\\_/\\      \n( ?.o ) [? ]\n /|_|\\",
+    " /\\_/\\      \n( ?.? ) [? ]\n /|_|\\",
+];
+const STUCK_TO_RECOVERY_FRAMES: [&str; 4] = [
+    " =\\_/=      \n( ._. ) [!!]\n /|_|\\",
+    " =\\_/=      \n( -.- ) [~ ]\n /|_|\\",
+    " /\\_/\\      \n( -.o ) [ok]\n /|_|\\",
+    " /\\_/\\      \n( -.- ) [ok]\n /|_|\\",
+];
+const STUCK_TO_CAUTIOUS_FRAMES: [&str; 4] = [
+    " =\\_/=      \n( ._. ) [!!]\n /|_|\\",
+    " =\\_/=      \n( -.- ) [~ ]\n /|_|\\",
+    " /\\_/\\      \n( ?.o ) [? ]\n /|_|\\",
+    " /\\_/\\      \n( ?.? ) [? ]\n /|_|\\",
+];
+const SETTLED_TO_CELEBRATE_FRAMES: [&str; 4] = [
+    " /\\_/\\\n ( -.- ) \n  (___)  ",
+    " /\\_/\\\n ( o.o ) \n  > ^ <  ",
+    " /\\_/\\\n<( ^.^ )>\n  > ^ <  ",
+    " /\\_/\\\n<( ^o^ )>\n  > ^ <  ",
+];
+const SETTLED_TO_CELEBRATE_BIG_FRAMES: [&str; 4] = [
+    "  /\\_/\\  \n ( -.- ) \n  (___)  ",
+    "  /\\_/\\  \n<( o.o )>\n  > ^ <  ",
+    "* /\\_/\\ *\n<( ^.^ )>\n* > ^ < *",
+    "* /\\_/\\ *\n<( ^o^ )>\n* > ^ < *",
+];
+const CELEBRATE_TO_RECOVERY_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n<( ^.^ )>   \n  > ^ <     ",
+    " /\\_/\\      \n ( ^.^ )    \n  > ^ <     ",
+    " /\\_/\\      \n( -.o ) [~ ]\n /|_|\\",
+    " /\\_/\\      \n( -.- ) [ok]\n /|_|\\",
+];
+const CELEBRATE_TO_CAUTIOUS_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n<( ^.^ )>   \n  > ^ <     ",
+    " /\\_/\\      \n ( ^.^ )    \n  > ^ <     ",
+    " /\\_/\\      \n( ?.o ) [~ ]\n /|_|\\",
+    " /\\_/\\      \n( ?.? ) [? ]\n /|_|\\",
+];
+const CELEBRATE_BIG_TO_RECOVERY_FRAMES: [&str; 4] = [
+    "* /\\_/\\ *   \n<( ^o^ )>   \n* > ^ < *   ",
+    "  /\\_/\\     \n<( ^.^ )>   \n  > ^ <     ",
+    " /\\_/\\      \n( -.o ) [~ ]\n /|_|\\",
+    " /\\_/\\      \n( -.- ) [ok]\n /|_|\\",
+];
+const CELEBRATE_BIG_TO_CAUTIOUS_FRAMES: [&str; 4] = [
+    "* /\\_/\\ *   \n<( ^o^ )>   \n* > ^ < *   ",
+    "  /\\_/\\     \n<( ^.^ )>   \n  > ^ <     ",
+    " /\\_/\\      \n( ?.o ) [~ ]\n /|_|\\",
+    " /\\_/\\      \n( ?.? ) [? ]\n /|_|\\",
+];
+const RECOVERY_TO_REST_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n( -.- ) [ok]\n /|_|\\",
+    " /\\_/\\      \n( -.o ) [ok]\n /|_|\\",
+    " /\\_/\\      \n( ^.^ ) [ok]\n > ^ <",
+    " /\\_/\\      \n( ^.^ ) [ok]\n >~^ <",
+];
+const CAUTIOUS_TO_REST_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n( ?.? ) [? ]\n /|_|\\",
+    " /\\_/\\      \n( ?.o ) [~ ]\n /|_|\\",
+    " /\\_/\\      \n( ^.^ ) [ok]\n > ^ <",
+    " /\\_/\\      \n( ^.^ ) [ok]\n >~^ <",
 ];
 
 impl Behavior {
@@ -267,6 +379,216 @@ impl BodyLanguage {
     }
 }
 
+/// Coarse lifetime appearance supplied by the memory/UI boundary. This lives
+/// in the renderer rather than importing memory's `GrowthStage`, which keeps
+/// the no-LLM reducer independent and avoids a module cycle.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum VisualGrowthStage {
+    Juvenile,
+    #[default]
+    Adult,
+    Seasoned,
+}
+
+/// Content-free rhythm of a running command. It describes only the cadence of
+/// output activity, never bytes, lines, commands, or terminal contents.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum WatchRhythm {
+    #[default]
+    Steady,
+    Busy,
+    Waiting,
+    Resumed,
+}
+
+/// A short visual bridge between semantically adjacent canonical behaviors.
+/// Reducer state remains authoritative: these variants carry no data and are
+/// selected only after the UI has already observed both endpoint behaviors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VisualTransition {
+    InspectErrorToGuardFailure,
+    SitNearErrorToGuardStuck,
+    GuardFailureToGuardRecovery,
+    GuardFailureToGuardCautious,
+    GuardStuckToGuardRecovery,
+    GuardStuckToGuardCautious,
+    WatchSettledToCelebrate,
+    WatchSettledToCelebrateBig,
+    CelebrateToGuardRecovery,
+    CelebrateToGuardCautious,
+    CelebrateBigToGuardRecovery,
+    CelebrateBigToGuardCautious,
+    GuardRecoveryToRestAfterPush,
+    GuardCautiousToRestAfterPush,
+}
+
+impl VisualTransition {
+    /// Recognize only intentional arcs. Unrelated behavior changes snap to the
+    /// new canonical pose instead of inventing a misleading transition.
+    pub(crate) const fn between(from: Behavior, to: Behavior) -> Option<Self> {
+        match (from, to) {
+            (Behavior::InspectError, Behavior::GuardFailure) => {
+                Some(Self::InspectErrorToGuardFailure)
+            }
+            (Behavior::SitNearError, Behavior::GuardStuck) => Some(Self::SitNearErrorToGuardStuck),
+            (Behavior::GuardFailure, Behavior::GuardRecovery) => {
+                Some(Self::GuardFailureToGuardRecovery)
+            }
+            (Behavior::GuardFailure, Behavior::GuardCautious) => {
+                Some(Self::GuardFailureToGuardCautious)
+            }
+            (Behavior::GuardStuck, Behavior::GuardRecovery) => {
+                Some(Self::GuardStuckToGuardRecovery)
+            }
+            (Behavior::GuardStuck, Behavior::GuardCautious) => {
+                Some(Self::GuardStuckToGuardCautious)
+            }
+            (Behavior::WatchSettled, Behavior::Celebrate) => Some(Self::WatchSettledToCelebrate),
+            (Behavior::WatchSettled, Behavior::CelebrateBig) => {
+                Some(Self::WatchSettledToCelebrateBig)
+            }
+            (Behavior::Celebrate, Behavior::GuardRecovery) => Some(Self::CelebrateToGuardRecovery),
+            (Behavior::Celebrate, Behavior::GuardCautious) => Some(Self::CelebrateToGuardCautious),
+            (Behavior::CelebrateBig, Behavior::GuardRecovery) => {
+                Some(Self::CelebrateBigToGuardRecovery)
+            }
+            (Behavior::CelebrateBig, Behavior::GuardCautious) => {
+                Some(Self::CelebrateBigToGuardCautious)
+            }
+            (Behavior::GuardRecovery, Behavior::RestAfterPush) => {
+                Some(Self::GuardRecoveryToRestAfterPush)
+            }
+            (Behavior::GuardCautious, Behavior::RestAfterPush) => {
+                Some(Self::GuardCautiousToRestAfterPush)
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn source(self) -> Behavior {
+        match self {
+            Self::InspectErrorToGuardFailure => Behavior::InspectError,
+            Self::SitNearErrorToGuardStuck => Behavior::SitNearError,
+            Self::GuardFailureToGuardRecovery | Self::GuardFailureToGuardCautious => {
+                Behavior::GuardFailure
+            }
+            Self::GuardStuckToGuardRecovery | Self::GuardStuckToGuardCautious => {
+                Behavior::GuardStuck
+            }
+            Self::WatchSettledToCelebrate | Self::WatchSettledToCelebrateBig => {
+                Behavior::WatchSettled
+            }
+            Self::CelebrateToGuardRecovery | Self::CelebrateToGuardCautious => Behavior::Celebrate,
+            Self::CelebrateBigToGuardRecovery | Self::CelebrateBigToGuardCautious => {
+                Behavior::CelebrateBig
+            }
+            Self::GuardRecoveryToRestAfterPush => Behavior::GuardRecovery,
+            Self::GuardCautiousToRestAfterPush => Behavior::GuardCautious,
+        }
+    }
+
+    pub(crate) const fn target(self) -> Behavior {
+        match self {
+            Self::InspectErrorToGuardFailure => Behavior::GuardFailure,
+            Self::SitNearErrorToGuardStuck => Behavior::GuardStuck,
+            Self::GuardFailureToGuardRecovery | Self::GuardStuckToGuardRecovery => {
+                Behavior::GuardRecovery
+            }
+            Self::GuardFailureToGuardCautious | Self::GuardStuckToGuardCautious => {
+                Behavior::GuardCautious
+            }
+            Self::WatchSettledToCelebrate => Behavior::Celebrate,
+            Self::WatchSettledToCelebrateBig => Behavior::CelebrateBig,
+            Self::CelebrateToGuardRecovery | Self::CelebrateBigToGuardRecovery => {
+                Behavior::GuardRecovery
+            }
+            Self::CelebrateToGuardCautious | Self::CelebrateBigToGuardCautious => {
+                Behavior::GuardCautious
+            }
+            Self::GuardRecoveryToRestAfterPush | Self::GuardCautiousToRestAfterPush => {
+                Behavior::RestAfterPush
+            }
+        }
+    }
+
+    pub(crate) const fn frame_count(self) -> u64 {
+        4
+    }
+
+    /// `frame` is relative to the start of the arc. Holding beyond the fourth
+    /// frame is safe and keeps the last bridge pose until the UI clears it.
+    pub(crate) const fn sprite_frame(self, frame: u64) -> &'static str {
+        let index = if frame >= self.frame_count() {
+            self.frame_count() as usize - 1
+        } else {
+            frame as usize
+        };
+        match self {
+            Self::InspectErrorToGuardFailure => INSPECT_TO_GUARD_FAILURE_FRAMES[index],
+            Self::SitNearErrorToGuardStuck => SIT_TO_GUARD_STUCK_FRAMES[index],
+            Self::GuardFailureToGuardRecovery => FAILURE_TO_RECOVERY_FRAMES[index],
+            Self::GuardFailureToGuardCautious => FAILURE_TO_CAUTIOUS_FRAMES[index],
+            Self::GuardStuckToGuardRecovery => STUCK_TO_RECOVERY_FRAMES[index],
+            Self::GuardStuckToGuardCautious => STUCK_TO_CAUTIOUS_FRAMES[index],
+            Self::WatchSettledToCelebrate => SETTLED_TO_CELEBRATE_FRAMES[index],
+            Self::WatchSettledToCelebrateBig => SETTLED_TO_CELEBRATE_BIG_FRAMES[index],
+            Self::CelebrateToGuardRecovery => CELEBRATE_TO_RECOVERY_FRAMES[index],
+            Self::CelebrateToGuardCautious => CELEBRATE_TO_CAUTIOUS_FRAMES[index],
+            Self::CelebrateBigToGuardRecovery => CELEBRATE_BIG_TO_RECOVERY_FRAMES[index],
+            Self::CelebrateBigToGuardCautious => CELEBRATE_BIG_TO_CAUTIOUS_FRAMES[index],
+            Self::GuardRecoveryToRestAfterPush => RECOVERY_TO_REST_FRAMES[index],
+            Self::GuardCautiousToRestAfterPush => CAUTIOUS_TO_REST_FRAMES[index],
+        }
+    }
+}
+
+/// All orthogonal visual inputs for one render. Event semantics stay in
+/// `behavior`; body language, lifetime appearance, output rhythm, and an
+/// optional one-shot bridge merely choose how that state is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RenderContext {
+    pub(crate) behavior: Behavior,
+    pub(crate) body_language: BodyLanguage,
+    pub(crate) walking: bool,
+    pub(crate) growth_stage: VisualGrowthStage,
+    pub(crate) watch_rhythm: WatchRhythm,
+    pub(crate) transition: Option<VisualTransition>,
+}
+
+impl RenderContext {
+    /// Backwards-compatible visual defaults: adult, steady cadence, and no
+    /// semantic bridge.
+    pub(crate) const fn new(
+        behavior: Behavior,
+        body_language: BodyLanguage,
+        walking: bool,
+    ) -> Self {
+        Self {
+            behavior,
+            body_language,
+            walking,
+            growth_stage: VisualGrowthStage::Adult,
+            watch_rhythm: WatchRhythm::Steady,
+            transition: None,
+        }
+    }
+
+    pub(crate) const fn with_growth_stage(mut self, growth_stage: VisualGrowthStage) -> Self {
+        self.growth_stage = growth_stage;
+        self
+    }
+
+    pub(crate) const fn with_watch_rhythm(mut self, watch_rhythm: WatchRhythm) -> Self {
+        self.watch_rhythm = watch_rhythm;
+        self
+    }
+
+    pub(crate) const fn with_transition(mut self, transition: Option<VisualTransition>) -> Self {
+        self.transition = transition;
+        self
+    }
+}
+
 /// Pick the live-body sprite for this animation frame, on the same
 /// half-second beat the sticky header uses; rare flourishes (tail flick,
 /// yawn) sit on their own longer cadences. Output-activity pulses advance
@@ -277,7 +599,54 @@ pub(crate) fn sprite_frame(
     walking: bool,
     frame: u64,
 ) -> &'static str {
-    let beat = frame / 5;
+    base_sprite_frame(behavior, language, walking, WatchRhythm::Steady, frame / 5)
+}
+
+/// Render all composable appearance inputs. The returned `Cow` stays borrowed
+/// for the adult stage and allocates only when the five-character maturity
+/// grammar needs to be overlaid on a canonical frame.
+pub(crate) fn sprite_frame_with_context(context: RenderContext, frame: u64) -> Cow<'static, str> {
+    let sprite = if let Some(transition) = context.transition {
+        transition.sprite_frame(frame)
+    } else {
+        let cadence = render_cadence(context);
+        base_sprite_frame(
+            context.behavior,
+            context.body_language,
+            context.walking,
+            context.watch_rhythm,
+            frame / cadence,
+        )
+    };
+    apply_sprite_growth(sprite, context.growth_stage)
+}
+
+fn render_cadence(context: RenderContext) -> u64 {
+    let base = match context.growth_stage {
+        VisualGrowthStage::Juvenile => 4,
+        VisualGrowthStage::Adult => 5,
+        VisualGrowthStage::Seasoned => 8,
+    };
+    if !matches!(
+        context.behavior,
+        Behavior::WatchCommand | Behavior::WatchAgent | Behavior::WatchSettled
+    ) {
+        return base;
+    }
+    match context.watch_rhythm {
+        WatchRhythm::Steady => base,
+        WatchRhythm::Busy | WatchRhythm::Resumed => (base / 2).max(1),
+        WatchRhythm::Waiting => base * 2,
+    }
+}
+
+fn base_sprite_frame(
+    behavior: Behavior,
+    language: BodyLanguage,
+    walking: bool,
+    watch_rhythm: WatchRhythm,
+    beat: u64,
+) -> &'static str {
     let alt = usize::from(beat % 2 == 1);
     match behavior {
         Behavior::Idle if language.drowsy => DOZE_FRAMES[alt],
@@ -286,8 +655,16 @@ pub(crate) fn sprite_frame(
         Behavior::Idle if language.listless && beat % 12 == 11 => YAWN_FRAME,
         Behavior::Idle if language.tense => IDLE_TENSE,
         Behavior::Idle => IDLE_FRAMES[usize::from(beat % 8 == 7)],
-        Behavior::WatchCommand if language.tense => WATCH_TENSE_FRAMES[alt],
-        Behavior::WatchCommand => WATCH_FRAMES[alt],
+        Behavior::WatchCommand => match (watch_rhythm, language.tense) {
+            (WatchRhythm::Busy, true) => WATCH_BUSY_TENSE_FRAMES[alt],
+            (WatchRhythm::Busy, false) => WATCH_BUSY_FRAMES[alt],
+            (WatchRhythm::Waiting, true) => WATCH_WAITING_TENSE_FRAMES[alt],
+            (WatchRhythm::Waiting, false) => WATCH_WAITING_FRAMES[alt],
+            (WatchRhythm::Resumed, true) => WATCH_RESUMED_TENSE_FRAMES[alt],
+            (WatchRhythm::Resumed, false) => WATCH_RESUMED_FRAMES[alt],
+            (WatchRhythm::Steady, true) => WATCH_TENSE_FRAMES[alt],
+            (WatchRhythm::Steady, false) => WATCH_FRAMES[alt],
+        },
         Behavior::SitNearError => SIT_FRAMES[alt],
         Behavior::Celebrate => CELE_FRAMES[alt],
         Behavior::CelebrateBig => BIG_FRAMES[alt],
@@ -298,13 +675,59 @@ pub(crate) fn sprite_frame(
         Behavior::Explore if walking => GAIT_FRAMES[alt],
         Behavior::Explore => EXPLORE_FRAMES[alt],
         Behavior::Approach => APPROACH_FRAMES[alt],
-        Behavior::WatchAgent => WATCH_AGENT_FRAMES[alt],
-        Behavior::WatchSettled => WATCH_SETTLED_FRAMES[alt],
+        Behavior::WatchAgent => match watch_rhythm {
+            WatchRhythm::Steady => WATCH_AGENT_FRAMES[alt],
+            WatchRhythm::Busy => WATCH_AGENT_BUSY_FRAMES[alt],
+            WatchRhythm::Waiting => WATCH_AGENT_WAITING_FRAMES[alt],
+            WatchRhythm::Resumed => WATCH_AGENT_RESUMED_FRAMES[alt],
+        },
+        Behavior::WatchSettled => match watch_rhythm {
+            WatchRhythm::Steady => WATCH_SETTLED_FRAMES[alt],
+            WatchRhythm::Busy => WATCH_SETTLED_BUSY_FRAMES[alt],
+            WatchRhythm::Waiting => WATCH_SETTLED_WAITING_FRAMES[alt],
+            WatchRhythm::Resumed => WATCH_SETTLED_RESUMED_FRAMES[alt],
+        },
         Behavior::GuardFailure => GUARD_FAILURE_FRAMES[alt],
         Behavior::GuardStuck => GUARD_STUCK_FRAMES[alt],
         Behavior::GuardRecovery => GUARD_RECOVERY_FRAMES[alt],
         Behavior::GuardCautious => GUARD_CAUTIOUS_FRAMES[alt],
         Behavior::InspectError | Behavior::UnknownOutcome => behavior.sprite(),
+    }
+}
+
+fn apply_sprite_growth(sprite: &'static str, growth_stage: VisualGrowthStage) -> Cow<'static, str> {
+    match growth_stage {
+        VisualGrowthStage::Adult => Cow::Borrowed(sprite),
+        VisualGrowthStage::Juvenile => {
+            // Rounded ears, larger open eyes, and a short tail. Replacements
+            // are ASCII and exactly width-preserving.
+            let mut evolved = sprite
+                .replace("/\\_/\\", "(\\_/)")
+                .replace("=\\_/=", "(\\_/)");
+            for (from, to) in [
+                (" o.o ", " O.O "),
+                (" o_o ", " O_O "),
+                (" -.o ", " -.O "),
+                (" o.- ", " O.- "),
+                (" ?.o ", " ?.O "),
+                (" ^o^ ", " ^O^ "),
+                (" >o< ", " >O< "),
+                (">~^ <", "> ^ <"),
+            ] {
+                evolved = evolved.replace(from, to);
+            }
+            Cow::Owned(evolved)
+        }
+        VisualGrowthStage::Seasoned => {
+            // The right ear has a small notch and neutral open eyes settle to
+            // a half-lidded gaze. Its animation cadence is slowed separately.
+            let evolved = sprite
+                .replace("/\\_/\\", "/\\_/|")
+                .replace("=\\_/=", "=\\_/|")
+                .replace(" o.o ", " -.o ")
+                .replace(" O.O ", " -.O ");
+            Cow::Owned(evolved)
+        }
     }
 }
 
@@ -514,17 +937,78 @@ impl AmbientMind {
 /// in twelve so a quiet header stays quiet. A drowsy mind dozes in the header
 /// too.
 pub(crate) fn sticky_glyph(behavior: Behavior, language: BodyLanguage, frame: u64) -> &'static str {
-    let beat = frame / 5;
+    base_sticky_glyph(behavior, language, WatchRhythm::Steady, frame / 5)
+}
+
+/// Context-aware sticky form. Semantic transitions intentionally remain a
+/// property of the one spatial body; the scrollback header keeps the target
+/// behavior legible while sharing growth and output rhythm.
+pub(crate) fn sticky_glyph_with_context(context: RenderContext, frame: u64) -> Cow<'static, str> {
+    let beat = frame / render_cadence(context);
+    let glyph = base_sticky_glyph(
+        context.behavior,
+        context.body_language,
+        context.watch_rhythm,
+        beat,
+    );
+    apply_glyph_growth(glyph, context.growth_stage)
+}
+
+fn base_sticky_glyph(
+    behavior: Behavior,
+    language: BodyLanguage,
+    watch_rhythm: WatchRhythm,
+    beat: u64,
+) -> &'static str {
     // Flat-eared doze, distinct from RestAfterPush's perked-ear rest glyph.
     if behavior == Behavior::Idle && language.drowsy {
         return if beat % 2 == 1 { "=\\_/=" } else { "=\\z/=" };
     }
-    let frames = behavior.sticky_frames();
+    let frames = match (behavior, watch_rhythm) {
+        (
+            Behavior::WatchCommand | Behavior::WatchAgent | Behavior::WatchSettled,
+            WatchRhythm::Busy,
+        ) => ["/\\>/\\", "/\\</\\"],
+        (Behavior::WatchCommand | Behavior::WatchAgent, WatchRhythm::Waiting) => {
+            ["/\\-/\\", "/\\_/\\"]
+        }
+        (Behavior::WatchSettled, WatchRhythm::Waiting) => ["=\\-/=", "=\\_/="],
+        (
+            Behavior::WatchCommand | Behavior::WatchAgent | Behavior::WatchSettled,
+            WatchRhythm::Resumed,
+        ) => ["/\\O/\\", "/\\o/\\"],
+        _ => behavior.sticky_frames(),
+    };
     let alternate = match behavior {
         Behavior::Idle => beat % 12 == 11,
         _ => beat % 2 == 1,
     };
     frames[usize::from(alternate)]
+}
+
+fn apply_glyph_growth(glyph: &'static str, growth_stage: VisualGrowthStage) -> Cow<'static, str> {
+    if growth_stage == VisualGrowthStage::Adult {
+        return Cow::Borrowed(glyph);
+    }
+    debug_assert!(glyph.is_ascii());
+    debug_assert_eq!(glyph.len(), 5);
+    let mut evolved = glyph.as_bytes().to_vec();
+    match growth_stage {
+        VisualGrowthStage::Juvenile => {
+            // Rounded outer ears preserve the center behavior mark.
+            evolved[0] = b'(';
+            evolved[4] = b')';
+            if evolved[2] == b'o' {
+                evolved[2] = b'O';
+            }
+        }
+        VisualGrowthStage::Seasoned => {
+            // A clipped right ear leaves the behavior mark untouched.
+            evolved[4] = b'|';
+        }
+        VisualGrowthStage::Adult => unreachable!("adult glyph returned borrowed above"),
+    }
+    Cow::Owned(String::from_utf8(evolved).expect("sticky glyphs are fixed ASCII"))
 }
 
 /// Coarse, content-free phases of the Shell Agent lifecycle. Only the phase
@@ -1180,7 +1664,7 @@ impl NativeOrganism {
                 if failures > 0 {
                     self.failure_success_flips = self.failure_success_flips.saturating_add(1);
                 }
-                // A later clean build must not anvilt an earlier recovery that
+                // A later clean build must not forget an earlier recovery that
                 // is still waiting for push. Memory preserves this flag until
                 // a new build failure or a successful push; mirror it here.
                 self.recovered_build |= failures > 0;
@@ -2130,6 +2614,291 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn adult_steady_render_context_is_byte_for_byte_backwards_compatible() {
+        let languages = [
+            BodyLanguage::default(),
+            BodyLanguage {
+                drowsy: true,
+                tense: true,
+                listless: true,
+            },
+        ];
+        for behavior in [
+            Behavior::Idle,
+            Behavior::WatchCommand,
+            Behavior::InspectError,
+            Behavior::SitNearError,
+            Behavior::Celebrate,
+            Behavior::CelebrateBig,
+            Behavior::RestAfterPush,
+            Behavior::UnknownOutcome,
+            Behavior::GlanceAside,
+            Behavior::Sleep,
+            Behavior::Explore,
+            Behavior::Approach,
+            Behavior::WatchAgent,
+            Behavior::WatchSettled,
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardRecovery,
+            Behavior::GuardCautious,
+        ] {
+            for language in languages {
+                for walking in [false, true] {
+                    let context = RenderContext::new(behavior, language, walking);
+                    for frame in 0..130 {
+                        assert_eq!(
+                            sprite_frame_with_context(context, frame).as_ref(),
+                            sprite_frame(behavior, language, walking, frame)
+                        );
+                        assert_eq!(
+                            sticky_glyph_with_context(context, frame).as_ref(),
+                            sticky_glyph(behavior, language, frame)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn growth_is_visible_width_preserving_and_keeps_behavior_marks() {
+        let adult = RenderContext::new(Behavior::WatchCommand, BodyLanguage::default(), false);
+        let juvenile = adult.with_growth_stage(VisualGrowthStage::Juvenile);
+        let seasoned = adult.with_growth_stage(VisualGrowthStage::Seasoned);
+        let adult_sprite = sprite_frame_with_context(adult, 0);
+        let juvenile_sprite = sprite_frame_with_context(juvenile, 0);
+        let seasoned_sprite = sprite_frame_with_context(seasoned, 0);
+
+        assert_ne!(juvenile_sprite, adult_sprite);
+        assert_ne!(seasoned_sprite, adult_sprite);
+        assert!(juvenile_sprite.contains("(\\_/)") && juvenile_sprite.contains("O.O"));
+        assert!(seasoned_sprite.contains("/\\_/|") && seasoned_sprite.contains("-.o"));
+        assert_eq!(
+            bounding_box_of(&juvenile_sprite),
+            bounding_box_of(&adult_sprite)
+        );
+        assert_eq!(
+            bounding_box_of(&seasoned_sprite),
+            bounding_box_of(&adult_sprite)
+        );
+
+        let juvenile_glyph = sticky_glyph_with_context(juvenile, 0);
+        let adult_glyph = sticky_glyph_with_context(adult, 0);
+        let seasoned_glyph = sticky_glyph_with_context(seasoned, 0);
+        assert_eq!(juvenile_glyph.chars().count(), 5);
+        assert_eq!(seasoned_glyph.chars().count(), 5);
+        assert_ne!(juvenile_glyph, adult_glyph);
+        assert_ne!(seasoned_glyph, adult_glyph);
+
+        // Maturity never erases an event marker in the compact form.
+        for stage in [
+            VisualGrowthStage::Juvenile,
+            VisualGrowthStage::Adult,
+            VisualGrowthStage::Seasoned,
+        ] {
+            let glyph = sticky_glyph_with_context(
+                RenderContext::new(Behavior::GuardFailure, BodyLanguage::default(), false)
+                    .with_growth_stage(stage),
+                0,
+            );
+            assert_eq!(glyph.as_bytes()[2], b'!');
+        }
+
+        // Seasoned motion holds the first tail pose longer; juvenile motion
+        // reaches the alternate pose sooner. Adult remains the old cadence.
+        let juvenile_agent =
+            RenderContext::new(Behavior::WatchAgent, BodyLanguage::default(), false)
+                .with_growth_stage(VisualGrowthStage::Juvenile);
+        assert_ne!(
+            sprite_frame_with_context(juvenile_agent, 0),
+            sprite_frame_with_context(juvenile_agent, 4)
+        );
+        assert_ne!(
+            sprite_frame_with_context(adult, 0),
+            sprite_frame_with_context(adult, 5)
+        );
+        assert_eq!(
+            sprite_frame_with_context(seasoned, 0),
+            sprite_frame_with_context(seasoned, 5)
+        );
+    }
+
+    #[test]
+    fn every_growth_layer_preserves_every_pose_family_envelope() {
+        let behaviors = [
+            Behavior::Idle,
+            Behavior::WatchCommand,
+            Behavior::InspectError,
+            Behavior::SitNearError,
+            Behavior::Celebrate,
+            Behavior::CelebrateBig,
+            Behavior::RestAfterPush,
+            Behavior::UnknownOutcome,
+            Behavior::GlanceAside,
+            Behavior::Sleep,
+            Behavior::Explore,
+            Behavior::Approach,
+            Behavior::WatchAgent,
+            Behavior::WatchSettled,
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardRecovery,
+            Behavior::GuardCautious,
+        ];
+        let languages = [
+            BodyLanguage::default(),
+            BodyLanguage {
+                drowsy: true,
+                tense: true,
+                listless: true,
+            },
+        ];
+        for behavior in behaviors {
+            for language in languages {
+                for walking in [false, true] {
+                    for rhythm in [
+                        WatchRhythm::Steady,
+                        WatchRhythm::Busy,
+                        WatchRhythm::Waiting,
+                        WatchRhythm::Resumed,
+                    ] {
+                        for frame in 0..130 {
+                            let adult = RenderContext::new(behavior, language, walking)
+                                .with_watch_rhythm(rhythm);
+                            let reference =
+                                bounding_box_of(&sprite_frame_with_context(adult, frame));
+                            for stage in [
+                                VisualGrowthStage::Juvenile,
+                                VisualGrowthStage::Adult,
+                                VisualGrowthStage::Seasoned,
+                            ] {
+                                let context = adult.with_growth_stage(stage);
+                                assert_eq!(
+                                    bounding_box_of(&sprite_frame_with_context(context, frame)),
+                                    reference,
+                                    "{behavior:?} {language:?} walking={walking} {rhythm:?} {stage:?} frame={frame}"
+                                );
+                                assert_eq!(
+                                    sticky_glyph_with_context(context, frame).chars().count(),
+                                    5
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn watch_rhythms_are_content_free_distinct_and_box_stable() {
+        for behavior in [
+            Behavior::WatchCommand,
+            Behavior::WatchAgent,
+            Behavior::WatchSettled,
+        ] {
+            let reference = bounding_box_of(behavior.sprite());
+            let mut sprites = Vec::new();
+            let mut glyphs = Vec::new();
+            for rhythm in [
+                WatchRhythm::Steady,
+                WatchRhythm::Busy,
+                WatchRhythm::Waiting,
+                WatchRhythm::Resumed,
+            ] {
+                let context = RenderContext::new(behavior, BodyLanguage::default(), false)
+                    .with_watch_rhythm(rhythm);
+                let sprite = sprite_frame_with_context(context, 0);
+                assert_eq!(
+                    bounding_box_of(&sprite),
+                    reference,
+                    "{behavior:?} {rhythm:?}"
+                );
+                let glyph = sticky_glyph_with_context(context, 0);
+                assert_eq!(glyph.chars().count(), 5);
+                assert!(glyph.is_ascii());
+                sprites.push(sprite.into_owned());
+                glyphs.push(glyph.into_owned());
+            }
+            sprites.sort();
+            sprites.dedup();
+            glyphs.sort();
+            glyphs.dedup();
+            assert_eq!(sprites.len(), 4, "{behavior:?} live rhythms collapsed");
+            assert_eq!(glyphs.len(), 4, "{behavior:?} sticky rhythms collapsed");
+        }
+
+        // A rhythm is ignored outside a watching behavior.
+        let idle = RenderContext::new(Behavior::Idle, BodyLanguage::default(), false);
+        assert_eq!(
+            sprite_frame_with_context(idle, 20),
+            sprite_frame_with_context(idle.with_watch_rhythm(WatchRhythm::Busy), 20)
+        );
+    }
+
+    #[test]
+    fn semantic_transitions_are_bounded_one_shot_arcs() {
+        let transitions = [
+            VisualTransition::InspectErrorToGuardFailure,
+            VisualTransition::SitNearErrorToGuardStuck,
+            VisualTransition::GuardFailureToGuardRecovery,
+            VisualTransition::GuardFailureToGuardCautious,
+            VisualTransition::GuardStuckToGuardRecovery,
+            VisualTransition::GuardStuckToGuardCautious,
+            VisualTransition::WatchSettledToCelebrate,
+            VisualTransition::WatchSettledToCelebrateBig,
+            VisualTransition::CelebrateToGuardRecovery,
+            VisualTransition::CelebrateToGuardCautious,
+            VisualTransition::CelebrateBigToGuardRecovery,
+            VisualTransition::CelebrateBigToGuardCautious,
+            VisualTransition::GuardRecoveryToRestAfterPush,
+            VisualTransition::GuardCautiousToRestAfterPush,
+        ];
+        for transition in transitions {
+            assert_eq!(
+                VisualTransition::between(transition.source(), transition.target()),
+                Some(transition)
+            );
+            assert_eq!(transition.frame_count(), 4);
+            let reference = bounding_box_of(transition.sprite_frame(0));
+            for frame in 0..transition.frame_count() {
+                assert_eq!(
+                    bounding_box_of(transition.sprite_frame(frame)),
+                    reference,
+                    "{transition:?} frame {frame}"
+                );
+            }
+            assert_eq!(
+                transition.sprite_frame(u64::MAX),
+                transition.sprite_frame(transition.frame_count() - 1)
+            );
+
+            for stage in [
+                VisualGrowthStage::Juvenile,
+                VisualGrowthStage::Adult,
+                VisualGrowthStage::Seasoned,
+            ] {
+                let context =
+                    RenderContext::new(transition.target(), BodyLanguage::default(), false)
+                        .with_growth_stage(stage)
+                        .with_transition(Some(transition));
+                for frame in 0..transition.frame_count() {
+                    assert_eq!(
+                        bounding_box_of(&sprite_frame_with_context(context, frame)),
+                        reference,
+                        "{transition:?} {stage:?} frame {frame}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            VisualTransition::between(Behavior::Idle, Behavior::Celebrate),
+            None
+        );
     }
 
     #[test]

@@ -1796,6 +1796,13 @@ pub(crate) enum HumanInputKind {
     StickyStop,
 }
 
+/// Content-free ownership change for the terminal's alternate screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AltScreenTransition {
+    Entered,
+    Left,
+}
+
 /// Authoritative foreground-command lifecycle event emitted at OSC 133 `C`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommandStartedEvent {
@@ -1843,6 +1850,7 @@ type AgentExecutionLostCallbacks =
 type CommandStartedCallbacks = Rc<RefCell<Vec<Box<dyn Fn(CommandStartedEvent)>>>>;
 type CommandFinishedCallbacks = Rc<RefCell<Vec<Box<dyn Fn(CommandFinishedEvent)>>>>;
 type HumanInputCallbacks = Rc<RefCell<Vec<Box<dyn Fn(HumanInputKind)>>>>;
+type AltScreenCallbacks = Rc<RefCell<Vec<Box<dyn Fn(AltScreenTransition)>>>>;
 
 fn emit_command_started(callbacks: &CommandStartedCallbacks, event: CommandStartedEvent) {
     for callback in callbacks.borrow().iter() {
@@ -1859,6 +1867,12 @@ fn emit_command_finished(callbacks: &CommandFinishedCallbacks, event: CommandFin
 fn emit_human_input(callbacks: &HumanInputCallbacks, kind: HumanInputKind) {
     for callback in callbacks.borrow().iter() {
         callback(kind);
+    }
+}
+
+fn emit_alt_screen_transition(callbacks: &AltScreenCallbacks, transition: AltScreenTransition) {
+    for callback in callbacks.borrow().iter() {
+        callback(transition);
     }
 }
 pub(crate) type DebugInfo = Vec<(&'static str, Vec<(String, String)>)>;
@@ -2270,6 +2284,7 @@ pub struct TermView {
     title_callbacks: StrCallbacks,
     activity_callbacks: VoidCallbacks,
     human_input_callbacks: HumanInputCallbacks,
+    alt_screen_callbacks: AltScreenCallbacks,
     command_started_callbacks: CommandStartedCallbacks,
     command_finished_callbacks: CommandFinishedCallbacks,
     block_finished_callbacks: BlockFinishedCallbacks,
@@ -2407,6 +2422,7 @@ struct ReaderCtx {
     remote_session_cbs: StrCallbacks,
     exited_cbs: IntCallbacks,
     activity_cbs: VoidCallbacks,
+    alt_screen_cbs: AltScreenCallbacks,
     command_started_cbs: CommandStartedCallbacks,
     command_finished_cbs: CommandFinishedCallbacks,
     mouse_reporting_rc: Rc<Cell<MouseReportingMode>>,
@@ -2602,6 +2618,7 @@ impl ReaderCtx {
             remote_session_cbs,
             exited_cbs,
             activity_cbs,
+            alt_screen_cbs,
             command_started_cbs,
             command_finished_cbs,
             mouse_reporting_rc,
@@ -4000,6 +4017,10 @@ impl ReaderCtx {
                                     &fullscreen_rc,
                                 );
                                 active_rc.borrow().set_live_organism_alt_screen(false);
+                                emit_alt_screen_transition(
+                                    &alt_screen_cbs,
+                                    AltScreenTransition::Left,
+                                );
                                 layout_active_surface();
                             }
                             // `None` stays `None`: a shell that reported no status
@@ -4055,6 +4076,10 @@ impl ReaderCtx {
                                 active.set_live_organism_visible(false);
                                 active.set_live_organism_alt_screen(true);
                             }
+                            emit_alt_screen_transition(
+                                &alt_screen_cbs,
+                                AltScreenTransition::Entered,
+                            );
                             // Hand the viewport to the alt-screen app: hide finished
                             // blocks so the live VTE fills the scroll area.
                             enter_fullscreen(
@@ -4083,6 +4108,7 @@ impl ReaderCtx {
                             // just the command name + exit code.
                             active_alt_screen_mode_rc.set(None);
                             active_rc.borrow().set_live_organism_alt_screen(false);
+                            emit_alt_screen_transition(&alt_screen_cbs, AltScreenTransition::Left);
                             let leave = format!("\x1b[?{mode}l");
                             active_vte.feed(leave.as_bytes());
                             exit_fullscreen(
@@ -5310,6 +5336,7 @@ impl TermView {
         let title_callbacks: StrCallbacks = Rc::new(RefCell::new(vec![]));
         let activity_callbacks: VoidCallbacks = Rc::new(RefCell::new(vec![]));
         let human_input_callbacks: HumanInputCallbacks = Rc::new(RefCell::new(vec![]));
+        let alt_screen_callbacks: AltScreenCallbacks = Rc::new(RefCell::new(vec![]));
         let command_started_callbacks: CommandStartedCallbacks = Rc::new(RefCell::new(vec![]));
         let command_finished_callbacks: CommandFinishedCallbacks = Rc::new(RefCell::new(vec![]));
         let block_finished_callbacks: BlockFinishedCallbacks = Rc::new(RefCell::new(vec![]));
@@ -5494,6 +5521,7 @@ impl TermView {
             let block_scroll_rc = block_scroll.clone();
             let exited_cbs = exited_callbacks.clone();
             let activity_cbs = activity_callbacks.clone();
+            let alt_screen_cbs = alt_screen_callbacks.clone();
             let mouse_reporting_rc = mouse_reporting_mode.clone();
             let bracketed_paste_rc = bracketed_paste.clone();
             let dynamic_colors_rc = dynamic_colors.clone();
@@ -5541,6 +5569,7 @@ impl TermView {
                 remote_session_cbs: remote_session_callbacks.clone(),
                 exited_cbs,
                 activity_cbs,
+                alt_screen_cbs,
                 command_started_cbs: command_started_callbacks.clone(),
                 command_finished_cbs: command_finished_callbacks.clone(),
                 mouse_reporting_rc,
@@ -6302,6 +6331,7 @@ impl TermView {
             title_callbacks,
             activity_callbacks,
             human_input_callbacks,
+            alt_screen_callbacks,
             command_started_callbacks,
             command_finished_callbacks,
             block_finished_callbacks,
@@ -7008,6 +7038,14 @@ impl TermView {
     /// Observe accepted direct-human PTY input without exposing its contents.
     pub(crate) fn connect_human_input<F: Fn(HumanInputKind) + 'static>(&self, f: F) {
         self.human_input_callbacks.borrow_mut().push(Box::new(f));
+    }
+
+    /// Observe alternate-screen ownership without exposing terminal bytes.
+    pub(crate) fn connect_alt_screen_transition<F>(&self, f: F)
+    where
+        F: Fn(AltScreenTransition) + 'static,
+    {
+        self.alt_screen_callbacks.borrow_mut().push(Box::new(f));
     }
 
     pub(crate) fn connect_command_started<F>(&self, f: F)
@@ -7759,21 +7797,22 @@ mod tests {
         build_clipboard_paste, build_color_query_reply, build_command_recall,
         build_keyboard_query_reply, claim_next_unused_block_id, classify_command_prompt_status,
         clear_dynamic_colors, coalesce_bytes_events, command_end_matches_started_id,
-        command_id_uses_shell_token, decide_agent_command_end, failed_block_marker_fractions,
-        finished_block_config, finished_command, finished_layout_key, is_post_command_metadata,
-        mutate_block_data_and_redraw, normalize_captured_command, notification_permitted,
-        parse_color_spec, pop_typed_command_shadow, process_block_id_namespace,
-        record_external_input, resolve_command_text,
-        reviewed_pre_command_bytes_are_identity_neutral, reviewed_submission_matches,
-        selected_blocks_markdown, selected_command_text, selected_id_range,
-        shell_argv_supports_agent_ids, stable_visible_indices, step_marked_indices,
-        stranded_focus_key_recovers, strip_ansi, strip_ansi_with_clear_detect,
+        command_id_uses_shell_token, decide_agent_command_end, emit_alt_screen_transition,
+        failed_block_marker_fractions, finished_block_config, finished_command,
+        finished_layout_key, is_post_command_metadata, mutate_block_data_and_redraw,
+        normalize_captured_command, notification_permitted, parse_color_spec,
+        pop_typed_command_shadow, process_block_id_namespace, record_external_input,
+        resolve_command_text, reviewed_pre_command_bytes_are_identity_neutral,
+        reviewed_submission_matches, selected_blocks_markdown, selected_command_text,
+        selected_id_range, shell_argv_supports_agent_ids, stable_visible_indices,
+        step_marked_indices, stranded_focus_key_recovers, strip_ansi, strip_ansi_with_clear_detect,
         take_armed_agent_execution, take_background_output, unread_after_index_removal,
         unread_after_prefix_eviction, viewport_page_size_changed, viewport_state_for_scroll,
-        visible_indices_for_viewport, AgentCommandEndDecision, ArmedAgentExecution, BlockData,
-        BlockState, CommandPromptStatus, CommandTextSource, DynamicColors, DynamicColorsRc,
-        ShellCapabilityObserver, BLOCK_ID_SEQUENCE_LIMIT, MAX_RECALLED_COMMAND_BYTES,
-        MAX_TYPED_COMMAND_SHADOW_BYTES, NOTIFICATION_MIN_INTERVAL, TRUNCATED_COMMAND_PLACEHOLDER,
+        visible_indices_for_viewport, AgentCommandEndDecision, AltScreenCallbacks,
+        AltScreenTransition, ArmedAgentExecution, BlockData, BlockState, CommandPromptStatus,
+        CommandTextSource, DynamicColors, DynamicColorsRc, ShellCapabilityObserver,
+        BLOCK_ID_SEQUENCE_LIMIT, MAX_RECALLED_COMMAND_BYTES, MAX_TYPED_COMMAND_SHADOW_BYTES,
+        NOTIFICATION_MIN_INTERVAL, TRUNCATED_COMMAND_PLACEHOLDER,
     };
     use crate::agent::{AgentExecutionRef, AgentSession};
     use crate::config::Config;
@@ -7782,6 +7821,24 @@ mod tests {
     use std::collections::{HashSet, VecDeque};
     use std::rc::Rc;
     use std::time::{Instant, SystemTime};
+
+    #[test]
+    fn alt_screen_boundaries_are_typed_content_free_and_not_coalesced() {
+        let callbacks: AltScreenCallbacks = Rc::new(RefCell::new(Vec::new()));
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let seen_for_callback = seen.clone();
+        callbacks.borrow_mut().push(Box::new(move |transition| {
+            seen_for_callback.borrow_mut().push(transition)
+        }));
+
+        emit_alt_screen_transition(&callbacks, AltScreenTransition::Entered);
+        emit_alt_screen_transition(&callbacks, AltScreenTransition::Left);
+
+        assert_eq!(
+            seen.borrow().as_slice(),
+            &[AltScreenTransition::Entered, AltScreenTransition::Left]
+        );
+    }
 
     #[test]
     fn block_id_allocator_skips_reserved_history_without_retaining_live_ids() {

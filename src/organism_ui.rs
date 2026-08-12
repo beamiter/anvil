@@ -7,13 +7,17 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use crate::block_view::TermView;
+use crate::block_view::{AltScreenTransition, TermView};
 use crate::config::OrganismMotion;
+#[cfg(test)]
+use crate::organism::sprite_frame;
 use crate::organism::{
-    classify_command, sprite_frame, sticky_glyph, AgentPulse, AmbientBehavior, AmbientMind,
-    Behavior, BodyLanguage, CircadianPhase, CommandKind, LifeState, NativeOrganism, Reaction,
-    RepoArrival, RepoVigil, RepoWorkState, Tone,
+    classify_command, sprite_frame_with_context, sticky_glyph_with_context, AgentPulse,
+    AmbientBehavior, AmbientMind, Behavior, BodyLanguage, CircadianPhase, CommandKind, LifeState,
+    NativeOrganism, Reaction, RenderContext, RepoArrival, RepoVigil, RepoWorkState, Tone,
+    VisualGrowthStage, VisualTransition, WatchRhythm,
 };
+use crate::organism_attention::{AttentionArbiter, AttentionCue};
 use crate::organism_memory::{
     local_circadian_time_at_ms, unix_ms, CircadianProfile, GrowthProgress, GrowthStage,
     LocalCircadianTime, MemoryEvent, MemoryInsight, RepoContext,
@@ -34,6 +38,11 @@ const SURFACE_MARGIN: i32 = 8;
 const SETTLED_WATCH_ONSET: Duration = Duration::from_secs(60);
 /// Elapsed time only appears on the card once a command stops being quick.
 const ACCOMPANY_LABEL_ONSET: Duration = Duration::from_secs(10);
+/// A newly encountered checkout gets one short, silent look around after the
+/// command that introduced it has settled. The cue is live-only and never
+/// delays a command reaction or enters repository memory.
+const TERRITORY_INTRO_HOLD: Duration = Duration::from_secs(4);
+const MAX_TERRITORY_HASH_BYTES: usize = 2 * 1024;
 /// Widest canonical inline pose (`CelebrateBig`); reserving the slot keeps the
 /// title/status column still when reactions change silhouette.
 const INLINE_SPRITE_SLOT_CHARS: i32 = 12;
@@ -188,6 +197,230 @@ enum WanderTempo {
     Drowsy,
     Calm,
     Restless,
+}
+
+/// A spatial habit derived in the UI from a canonical repository identity.
+/// The identity itself never crosses into the reducer and this value is never
+/// persisted: it merely gives a familiar checkout a stable nest and route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TerritoryHabit {
+    familiarity: RepoArrival,
+    nest_right: bool,
+    route_offset: u16,
+}
+
+impl TerritoryHabit {
+    fn for_repo(repo: &str, familiarity_days: u32) -> Self {
+        let hash = stable_repo_hash(repo.as_bytes());
+        Self {
+            familiarity: RepoArrival::from_familiarity(familiarity_days),
+            nest_right: hash & 1 != 0,
+            route_offset: ((hash >> 1) % 800) as u16,
+        }
+    }
+
+    const fn is_unfamiliar(self) -> bool {
+        matches!(self.familiarity, RepoArrival::Unfamiliar)
+    }
+
+    const fn is_home(self) -> bool {
+        matches!(self.familiarity, RepoArrival::Home)
+    }
+
+    fn route_frame(self, frame: u64) -> u64 {
+        frame.wrapping_add(u64::from(self.route_offset))
+    }
+
+    const fn nest_x(self, min_x: i32, max_x: i32) -> i32 {
+        if self.is_home() && self.nest_right {
+            max_x
+        } else {
+            min_x
+        }
+    }
+}
+
+/// Stable FNV-1a rather than `DefaultHasher`, whose seed/algorithm is not a UI
+/// contract. Only the resulting few bits survive; no path is displayed or
+/// stored by the territory layer.
+fn stable_repo_hash(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes.iter().copied().take(MAX_TERRITORY_HASH_BYTES) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct OutputRhythmTracker {
+    command_started: Option<Instant>,
+    third_recent_output: Option<Instant>,
+    second_recent_output: Option<Instant>,
+    last_output: Option<Instant>,
+    resumed_until: Option<Instant>,
+    rhythm: WatchRhythm,
+}
+
+impl OutputRhythmTracker {
+    const BUSY_WINDOW: Duration = Duration::from_millis(1_200);
+    const WAITING_AFTER: Duration = Duration::from_secs(3);
+    const RESUMED_HOLD: Duration = Duration::from_millis(900);
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn start(&mut self, now: Instant) {
+        self.reset();
+        self.command_started = Some(now);
+    }
+
+    fn note_output(&mut self, now: Instant) {
+        let quiet_since = self.last_output.or(self.command_started);
+        let was_waiting = quiet_since
+            .is_some_and(|last| now.saturating_duration_since(last) >= Self::WAITING_AFTER);
+        self.third_recent_output = self.second_recent_output;
+        self.second_recent_output = self.last_output;
+        self.last_output = Some(now);
+        if was_waiting {
+            self.rhythm = WatchRhythm::Resumed;
+            self.resumed_until = Some(now + Self::RESUMED_HOLD);
+        } else if self.resumed_until.is_some_and(|until| now < until) {
+            self.rhythm = WatchRhythm::Resumed;
+        } else if self
+            .third_recent_output
+            .is_some_and(|oldest| now.saturating_duration_since(oldest) <= Self::BUSY_WINDOW)
+        {
+            self.rhythm = WatchRhythm::Busy;
+            self.resumed_until = None;
+        } else {
+            self.rhythm = WatchRhythm::Steady;
+        }
+    }
+
+    fn sample(&mut self, now: Instant, command_running: bool) -> WatchRhythm {
+        if !command_running {
+            self.reset();
+            return WatchRhythm::Steady;
+        }
+        if self.resumed_until.is_some_and(|until| now < until) {
+            return WatchRhythm::Resumed;
+        }
+        self.resumed_until = None;
+        if self
+            .last_output
+            .or(self.command_started)
+            .is_some_and(|last| now.saturating_duration_since(last) >= Self::WAITING_AFTER)
+        {
+            self.rhythm = WatchRhythm::Waiting;
+        } else if self
+            .third_recent_output
+            .is_some_and(|oldest| now.saturating_duration_since(oldest) <= Self::BUSY_WINDOW)
+        {
+            self.rhythm = WatchRhythm::Busy;
+        } else {
+            self.rhythm = WatchRhythm::Steady;
+        }
+        self.rhythm
+    }
+}
+
+fn reset_output_rhythm_at_boundary(
+    tracker: &mut OutputRhythmTracker,
+    command_running: bool,
+    now: Instant,
+) {
+    if command_running {
+        tracker.start(now);
+    } else {
+        tracker.reset();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WatchRhythmPlan {
+    visible: WatchRhythm,
+    offered: WatchRhythm,
+    attention_offer: Option<WatchRhythm>,
+}
+
+/// Consume each non-steady sensing edge exactly once. The neutral fallback is
+/// installed before attention/presentation checks, so a rejected or invisible
+/// edge cannot remain on screen or be replayed on a later heartbeat.
+fn watch_rhythm_plan(
+    desired: WatchRhythm,
+    visible: WatchRhythm,
+    offered: WatchRhythm,
+) -> WatchRhythmPlan {
+    if desired == WatchRhythm::Steady {
+        WatchRhythmPlan {
+            visible: WatchRhythm::Steady,
+            offered: WatchRhythm::Steady,
+            attention_offer: None,
+        }
+    } else if desired != offered {
+        WatchRhythmPlan {
+            visible: WatchRhythm::Steady,
+            offered: desired,
+            attention_offer: Some(desired),
+        }
+    } else {
+        WatchRhythmPlan {
+            visible,
+            offered,
+            attention_offer: None,
+        }
+    }
+}
+
+fn watch_rhythm_context_presentable(
+    owner: bool,
+    motion: OrganismMotion,
+    mode: SurfaceMode,
+    alt_screen: bool,
+) -> bool {
+    owner && motion != OrganismMotion::Static && mode == SurfaceMode::Watching && !alt_screen
+}
+
+fn watch_rhythm_surface_presentable(context_presentable: bool, visual_mapped: bool) -> bool {
+    context_presentable && visual_mapped
+}
+
+fn should_begin_territory_intro(
+    pending: bool,
+    territory: Option<TerritoryHabit>,
+    vigil: RepoVigil,
+) -> bool {
+    // `pending` is the arrival-time eligibility bit. The command that first
+    // introduced this checkout creates today's memory record before settling,
+    // so the current habit may already have advanced Unfamiliar -> Known.
+    pending && territory.is_some() && !vigil.is_active()
+}
+
+/// Fold a newly synchronized durable repo intention into the volatile
+/// first-look state. Any vigil cancels both a pending introduction and one
+/// already on screen; a clean sync leaves the arrival-time eligibility intact.
+fn territory_intro_after_repo_sync<T>(
+    pending: bool,
+    active_until: Option<T>,
+    vigil: RepoVigil,
+) -> (bool, Option<T>) {
+    if vigil.is_active() {
+        (false, None)
+    } else {
+        (pending, active_until)
+    }
+}
+
+/// Typing, alternate-screen ownership, focus loss, and fail-closed geometry are
+/// terminal boundaries for a one-shot first look. Returning to a presentable
+/// surface must not replay either a pending or partially shown introduction.
+fn territory_intro_after_interruption<T>(
+    _pending: bool,
+    _active_until: Option<T>,
+) -> (bool, Option<T>) {
+    (false, None)
 }
 
 fn wander_tempo(language: BodyLanguage) -> WanderTempo {
@@ -352,6 +585,38 @@ fn presence_signal_for_exit(exit_code: Option<i32>) -> Option<PresenceSignal> {
     exit_code
         .is_some_and(|code| code != 0)
         .then_some(PresenceSignal::BackgroundCommandFailed)
+}
+
+fn completion_attention_cue(
+    kind: CommandKind,
+    exit_code: Option<i32>,
+    recovered_failures: u32,
+    agent_driven: bool,
+) -> Option<AttentionCue> {
+    match (kind, exit_code) {
+        (_, Some(code)) if code != 0 => Some(AttentionCue::FailureVigil),
+        (_, Some(0)) if agent_driven => None,
+        (CommandKind::GitPush, Some(0)) => Some(AttentionCue::Push),
+        (CommandKind::BuildOrTest, Some(0)) if recovered_failures > 0 => {
+            Some(AttentionCue::Recovery)
+        }
+        (CommandKind::BuildOrTest | CommandKind::Other, Some(0)) => Some(AttentionCue::Closure),
+        _ => None,
+    }
+}
+
+fn remembered_insight_attention(has_optional_speech: bool) -> Option<AttentionCue> {
+    has_optional_speech.then_some(AttentionCue::Insight)
+}
+
+fn visual_transition_for_motion(
+    motion: OrganismMotion,
+    from: Behavior,
+    to: Behavior,
+) -> Option<VisualTransition> {
+    (motion == OrganismMotion::Full)
+        .then(|| VisualTransition::between(from, to))
+        .flatten()
 }
 
 /// Which watching pose fits: the Agent's commands get the crouch-apart pose,
@@ -564,7 +829,7 @@ fn apply_growth_voice(
     stage: GrowthStage,
     recovered_failures: u32,
     agent_driven: bool,
-) {
+) -> bool {
     // Age changes expression, never stimulus strength. An organism seasoned
     // by months and many debugging episodes keeps the same full recovery pose
     // and state transition, but no longer needs the exuberant sentence.
@@ -574,6 +839,9 @@ fn apply_growth_voice(
         && reaction.behavior == Behavior::CelebrateBig
     {
         reaction.speech = Some("嗯。");
+        true
+    } else {
+        false
     }
 }
 
@@ -593,6 +861,14 @@ fn growth_badge(stage: GrowthStage, memory: MemoryBadgeState) -> &'static str {
         (GrowthStage::Juvenile, MemoryBadgeState::SaveFailed) => "juvenile · save failed · no LLM",
         (GrowthStage::Adult, MemoryBadgeState::SaveFailed) => "adult · save failed · no LLM",
         (GrowthStage::Seasoned, MemoryBadgeState::SaveFailed) => "seasoned · save failed · no LLM",
+    }
+}
+
+const fn visual_growth_stage(stage: GrowthStage) -> VisualGrowthStage {
+    match stage {
+        GrowthStage::Juvenile => VisualGrowthStage::Juvenile,
+        GrowthStage::Adult => VisualGrowthStage::Adult,
+        GrowthStage::Seasoned => VisualGrowthStage::Seasoned,
     }
 }
 
@@ -643,6 +919,19 @@ fn surface_point_for_vigil(
     ambient: AmbientBehavior,
     vigil: RepoVigil,
     frame: u64,
+) -> Option<SurfacePoint> {
+    surface_point_for_territory(surface, mode, tempo, ambient, vigil, frame, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn surface_point_for_territory(
+    surface: SurfaceBox,
+    mode: SurfaceMode,
+    tempo: WanderTempo,
+    ambient: AmbientBehavior,
+    vigil: RepoVigil,
+    frame: u64,
+    territory: Option<TerritoryHabit>,
 ) -> Option<SurfacePoint> {
     let cell_width = surface.cell_width.max(1);
     let cell_height = surface.cell_height.max(1);
@@ -712,8 +1001,13 @@ fn surface_point_for_vigil(
                 }
             } else {
                 match ambient {
-                    // Curl up in the bottom-left corner, unmoved by the frame.
-                    AmbientBehavior::Sleep => (min_x, max_y),
+                    // Familiar repositories acquire one stable nest side. An
+                    // unknown/merely-known checkout retains the quiet original
+                    // bottom-left curl so a path cannot create visual noise.
+                    AmbientBehavior::Sleep => (
+                        territory.map_or(min_x, |habit| habit.nest_x(min_x, max_x)),
+                        max_y,
+                    ),
                     // Sit by the prompt edge, where the human works.
                     AmbientBehavior::Approach => (max_x, max_y),
                     // Unresolved work stays at the completed output edge. If no
@@ -729,7 +1023,13 @@ fn surface_point_for_vigil(
                     }
                     // Pace the restless cycle regardless of the idle tempo.
                     AmbientBehavior::Explore => (
-                        wander_x(wander_phase(frame, WanderTempo::Restless).0),
+                        wander_x(
+                            wander_phase(
+                                territory.map_or(frame, |habit| habit.route_frame(frame)),
+                                WanderTempo::Restless,
+                            )
+                            .0,
+                        ),
                         max_y,
                     ),
                     // Mostly sit at an edge, occasionally walk between them — the
@@ -737,7 +1037,16 @@ fn surface_point_for_vigil(
                     // paces while a drowsy one lies still. It feels alive without
                     // turning ordinary terminal work into a perpetual desktop-pet
                     // animation.
-                    AmbientBehavior::Idle => (wander_x(wander_phase(frame, tempo).0), max_y),
+                    AmbientBehavior::Idle => (
+                        wander_x(
+                            wander_phase(
+                                territory.map_or(frame, |habit| habit.route_frame(frame)),
+                                tempo,
+                            )
+                            .0,
+                        ),
+                        max_y,
+                    ),
                 }
             }
         }
@@ -867,6 +1176,8 @@ const REST_ONSET: Duration = Duration::from_secs(60);
 /// tick clock so several pane bodies never multiply the homeostasis rates of
 /// their one shared mind.
 pub(crate) struct OrganismActivity {
+    session_started: Instant,
+    attention: RefCell<AttentionArbiter>,
     input_at: Cell<Option<Instant>>,
     commands_running: Cell<u32>,
     active_at: Cell<Option<Instant>>,
@@ -893,6 +1204,8 @@ impl OrganismActivity {
         // A fresh window counts as activity: rest only begins after a real
         // quiet stretch, never at attach time.
         Rc::new(Self {
+            session_started: Instant::now(),
+            attention: RefCell::new(AttentionArbiter::default()),
             input_at: Cell::new(None),
             commands_running: Cell::new(0),
             active_at: Cell::new(Some(Instant::now())),
@@ -909,6 +1222,14 @@ impl OrganismActivity {
 
     fn set_growth(&self, growth: GrowthProgress) {
         self.growth.set(growth);
+    }
+
+    /// Spend this window/session's attention immediately. Suppressed cues are
+    /// deliberately forgotten; there is no deferred speech or animation queue.
+    fn offer_attention(&self, cue: AttentionCue, now: Instant) -> bool {
+        self.attention
+            .borrow_mut()
+            .offer(cue, now.saturating_duration_since(self.session_started))
     }
 
     fn growth(&self) -> GrowthProgress {
@@ -1343,6 +1664,11 @@ struct OrganismRuntime {
     /// mixed root/cwd context key.
     last_repo_root: RefCell<Option<String>>,
     last_repo_cwd: RefCell<Option<String>>,
+    /// UI-only spatial habit derived from the canonical repo identity. The
+    /// path never enters the reducer or persistence through this field.
+    territory: Cell<Option<TerritoryHabit>>,
+    territory_intro_pending: Cell<bool>,
+    territory_intro_until: Cell<Option<Instant>>,
     last_local_day: Cell<Option<i64>>,
     generation: Cell<u64>,
     settle_timer: RefCell<Option<gtk::glib::SourceId>>,
@@ -1350,6 +1676,14 @@ struct OrganismRuntime {
     surface_last_frame: Cell<Option<Instant>>,
     surface_frame: Cell<u64>,
     surface_behavior_frame_origin: Cell<u64>,
+    visual_transition: Cell<Option<VisualTransition>>,
+    /// One-shot bridges advance exactly once per Full-motion heartbeat. They
+    /// deliberately do not share `surface_frame`, which output pulses may
+    /// accelerate for ordinary watch animation.
+    visual_transition_frame: Cell<u64>,
+    last_live_behavior: Cell<Behavior>,
+    transition_source_override: Cell<Option<Behavior>>,
+    command_origin_behavior: Cell<Option<Behavior>>,
     /// Where the body currently stands on the live surface; `None` while
     /// hidden, so every reappearance snaps into place and the cat only ever
     /// walks where it can be seen.
@@ -1373,6 +1707,12 @@ struct OrganismRuntime {
     agent_watching: Cell<bool>,
     last_human_input: Cell<Option<Instant>>,
     output_activity: Cell<bool>,
+    output_rhythm: RefCell<OutputRhythmTracker>,
+    visible_watch_rhythm: Cell<WatchRhythm>,
+    /// The last rhythm boundary offered to attention. A rejected boundary is
+    /// remembered until the sensed rhythm changes, so it is dropped rather
+    /// than retried as a delayed animation on every heartbeat.
+    offered_watch_rhythm: Cell<WatchRhythm>,
     card: gtk::Widget,
     sprite: Label,
     live_body: Label,
@@ -1501,6 +1841,9 @@ impl OrganismRuntime {
             active_repo_context: RefCell::new(None),
             last_repo_root: RefCell::new(None),
             last_repo_cwd: RefCell::new(None),
+            territory: Cell::new(None),
+            territory_intro_pending: Cell::new(false),
+            territory_intro_until: Cell::new(None),
             last_local_day: Cell::new(None),
             generation: Cell::new(0),
             settle_timer: RefCell::new(None),
@@ -1508,6 +1851,11 @@ impl OrganismRuntime {
             surface_last_frame: Cell::new(None),
             surface_frame: Cell::new(0),
             surface_behavior_frame_origin: Cell::new(0),
+            visual_transition: Cell::new(None),
+            visual_transition_frame: Cell::new(0),
+            last_live_behavior: Cell::new(Behavior::Idle),
+            transition_source_override: Cell::new(None),
+            command_origin_behavior: Cell::new(None),
             body_position: Cell::new(None),
             body_in_transit: Cell::new(false),
             surface_signature: Cell::new((0, 0, 0, 0, 0, 0, 0)),
@@ -1519,6 +1867,9 @@ impl OrganismRuntime {
             agent_watching: Cell::new(false),
             last_human_input: Cell::new(None),
             output_activity: Cell::new(false),
+            output_rhythm: RefCell::new(OutputRhythmTracker::default()),
+            visible_watch_rhythm: Cell::new(WatchRhythm::Steady),
+            offered_watch_rhythm: Cell::new(WatchRhythm::Steady),
             card: outer.upcast(),
             sprite,
             live_body,
@@ -1652,8 +2003,17 @@ impl OrganismRuntime {
         // A durable work intention always outranks a live-only glance that
         // may have begun a few milliseconds before this sync arrived.
         runtime.clear_presence_cue();
+        let vigil = runtime.organism.borrow().repo_vigil();
+        let (territory_intro_pending, territory_intro_until) = territory_intro_after_repo_sync(
+            runtime.territory_intro_pending.get(),
+            runtime.territory_intro_until.get(),
+            vigil,
+        );
+        runtime.territory_intro_pending.set(territory_intro_pending);
+        runtime.territory_intro_until.set(territory_intro_until);
         // Revocation must be immediate even when an active command/reaction
-        // makes the visual update wait. Such modes never own a sleep claim.
+        // makes the visual update wait. Such modes never own a sleep claim, and
+        // the vigil above has already cancelled any queued/live first-look.
         runtime.set_sleeping(false);
         if runtime.command_running.get() {
             return;
@@ -1665,7 +2025,6 @@ impl OrganismRuntime {
 
         // Derive from the reducer after its defensive normalization instead
         // of trusting a future internal caller to construct the snapshot.
-        let vigil = runtime.organism.borrow().repo_vigil();
         let ambient = if vigil.is_active() {
             runtime.ambient.borrow_mut().step(
                 runtime.shared_life.get(),
@@ -1685,8 +2044,31 @@ impl OrganismRuntime {
         view.insert_inline_notice(&runtime.card);
     }
 
+    fn cancel_territory_intro(&self) {
+        let (pending, active_until) = territory_intro_after_interruption(
+            self.territory_intro_pending.get(),
+            self.territory_intro_until.get(),
+        );
+        self.territory_intro_pending.set(pending);
+        self.territory_intro_until.set(active_until);
+    }
+
+    fn reset_watch_rhythm_at_boundary(&self, now: Instant) {
+        reset_output_rhythm_at_boundary(
+            &mut self.output_rhythm.borrow_mut(),
+            self.command_running.get(),
+            now,
+        );
+        self.output_activity.set(false);
+        self.visible_watch_rhythm.set(WatchRhythm::Steady);
+        self.offered_watch_rhythm.set(WatchRhythm::Steady);
+    }
+
     fn hide_live_body(&self, view: &TermView) {
+        self.reset_watch_rhythm_at_boundary(Instant::now());
         self.clear_presence_cue();
+        self.visual_transition.set(None);
+        self.cancel_territory_intro();
         self.set_sleeping(false);
         self.body_position.set(None);
         self.body_in_transit.set(false);
@@ -1694,7 +2076,25 @@ impl OrganismRuntime {
     }
 
     fn bump_generation(&self) -> u64 {
+        self.advance_generation(false)
+    }
+
+    /// A normal command finish is the sole generation boundary across which an
+    /// arrival-time first-look may travel to its settle callback. A new command,
+    /// lost execution, or any other superseding generation uses
+    /// [`Self::bump_generation`] and drops it immediately instead of queueing it.
+    fn bump_generation_for_command_finish(&self) -> u64 {
+        self.advance_generation(true)
+    }
+
+    fn advance_generation(&self, preserve_territory_intro: bool) -> u64 {
+        let territory_intro_pending =
+            preserve_territory_intro && self.territory_intro_pending.get();
         self.clear_presence_cue();
+        self.visual_transition.set(None);
+        self.transition_source_override.set(None);
+        self.territory_intro_pending.set(territory_intro_pending);
+        self.territory_intro_until.set(None);
         if let Some(source) = self.settle_timer.borrow_mut().take() {
             source.remove();
         }
@@ -1704,10 +2104,18 @@ impl OrganismRuntime {
     }
 
     fn render(&self, reaction: &Reaction) {
-        self.sprite.set_text(reaction.behavior.sprite());
+        let transition_from = self
+            .transition_source_override
+            .take()
+            .unwrap_or_else(|| self.last_live_behavior.get());
+        let transition =
+            visual_transition_for_motion(self.motion, transition_from, reaction.behavior);
+        self.visual_transition.set(transition);
+        self.visual_transition_frame.set(0);
         self.surface_behavior_frame_origin
             .set(self.surface_frame.get());
         self.surface_behavior.set(reaction.behavior);
+        self.refresh_inline_sprite();
         self.refresh_growth_badge();
         let status = match reaction.speech {
             Some(speech) => format!("{speech}  {}", reaction.description),
@@ -1755,6 +2163,17 @@ impl OrganismRuntime {
             }
         };
         self.badge.set_tooltip_text(Some(&tooltip));
+    }
+
+    fn refresh_inline_sprite(&self) {
+        let sprite = sprite_frame_with_context(
+            RenderContext::new(self.surface_behavior.get(), BodyLanguage::default(), false)
+                .with_growth_stage(visual_growth_stage(self.activity.growth().stage())),
+            0,
+        );
+        if self.sprite.text().as_str() != sprite.as_ref() {
+            self.sprite.set_text(sprite.as_ref());
+        }
     }
 
     fn refresh_state(&self, state: LifeState) {
@@ -1818,6 +2237,9 @@ impl OrganismRuntime {
         *self.last_repo_root.borrow_mut() = None;
         *self.last_repo_cwd.borrow_mut() = None;
         *self.active_context_key.borrow_mut() = None;
+        self.territory.set(None);
+        self.territory_intro_pending.set(false);
+        self.territory_intro_until.set(None);
         if released_vigil {
             self.ambient.borrow_mut().interrupt();
             self.ambient_display.set(AmbientBehavior::Idle);
@@ -1842,9 +2264,12 @@ impl OrganismRuntime {
         // their badge on the low-frequency heartbeat after another pane ages
         // the organism into its next stage.
         self.refresh_growth_badge();
+        self.refresh_inline_sprite();
         if self.motion == OrganismMotion::Static {
             // The inline card is the whole visual surface; the live body and
-            // sticky avatar were never attached.
+            // sticky avatar were never attached. Consume a first-look rather
+            // than carrying it behind an unavailable surface.
+            self.cancel_territory_intro();
             return;
         }
         let behavior = self.surface_behavior.get();
@@ -1857,7 +2282,19 @@ impl OrganismRuntime {
             log::trace!("ASCII organism live-surface mode: {mode:?}");
             self.last_surface_mode.set(Some(mode));
         }
-        let ambient = self.ambient_display.get();
+        let mut ambient = self.ambient_display.get();
+        if self
+            .territory_intro_until
+            .get()
+            .is_some_and(|until| now >= until)
+        {
+            self.territory_intro_until.set(None);
+        }
+        if mode == SurfaceMode::Idle && self.territory_intro_until.get().is_some() {
+            // One silent, post-settle look around in a never-seen checkout. A
+            // command/input/geometry boundary still preempts it normally.
+            ambient = AmbientBehavior::Explore;
+        }
         // A body still under way to its next pose walks there openly instead
         // of sliding in a seated (or curled) form.
         let in_transit = self.body_in_transit.get();
@@ -1907,17 +2344,46 @@ impl OrganismRuntime {
             | AmbientBehavior::GuardCautious => false,
         };
         let walking = mode == SurfaceMode::Idle && (in_transit || wander_walking);
-        let sprite = sprite_frame(display_behavior, language, walking, live_frame);
-        if self.live_body.text().as_str() != sprite {
-            self.live_body.set_text(sprite);
+        let growth = visual_growth_stage(self.activity.growth().stage());
+        let rhythm = if mode == SurfaceMode::Watching {
+            self.visible_watch_rhythm.get()
+        } else {
+            WatchRhythm::Steady
+        };
+        let mut transition = self.visual_transition.get();
+        let transition_frame = self.visual_transition_frame.get();
+        if transition.is_some_and(|arc| transition_frame >= arc.frame_count()) {
+            self.visual_transition.set(None);
+            transition = None;
         }
+        let sprite_frame = if transition.is_some() {
+            transition_frame
+        } else {
+            live_frame
+        };
+        let sprite = sprite_frame_with_context(
+            RenderContext::new(display_behavior, language, walking)
+                .with_growth_stage(growth)
+                .with_watch_rhythm(rhythm)
+                .with_transition(transition),
+            sprite_frame,
+        );
+        if self.live_body.text().as_str() != sprite.as_ref() {
+            self.live_body.set_text(sprite.as_ref());
+        }
+        self.last_live_behavior.set(display_behavior);
         // The sticky one-line form mirrors the same displayed behavior with a
         // fixed-width micro-pose, so scrollback readers see the mood too.
         // Cross-pane cues belong only to the one spatial body. The focused
         // pane's sticky and inline forms retain their own local semantics.
-        let glyph = sticky_glyph(baseline_behavior, language, baseline_frame);
-        if self.sticky_avatar.text().as_str() != glyph {
-            self.sticky_avatar.set_text(glyph);
+        let glyph = sticky_glyph_with_context(
+            RenderContext::new(baseline_behavior, language, false)
+                .with_growth_stage(growth)
+                .with_watch_rhythm(rhythm),
+            baseline_frame,
+        );
+        if self.sticky_avatar.text().as_str() != glyph.as_ref() {
+            self.sticky_avatar.set_text(glyph.as_ref());
         }
 
         if !self.presence.is_owner(self.presence_token) {
@@ -1930,7 +2396,7 @@ impl OrganismRuntime {
 
         if suppress_live_body_for_focus(mode) {
             // Accepted human input owns the prompt completely. Hiding also
-            // anvilts the old position, so the body returns by snapping after
+            // forgets the old position, so the body returns by snapping after
             // the retreat window instead of visibly running back into view.
             self.hide_live_body(view);
             self.sticky_avatar.set_visible(false);
@@ -1941,7 +2407,7 @@ impl OrganismRuntime {
         if metrics.alt_screen {
             // ActiveBlock owns the override and cleared desired visibility on
             // smcup. Keep it cleared through rmcup; a later heartbeat must
-            // remeasure the primary screen before showing anything. Anvilt the
+            // remeasure the primary screen before showing anything. Forget the
             // standing spot so that safe return snaps rather than walking
             // across a surface the body was never seen leaving.
             self.hide_live_body(view);
@@ -1973,7 +2439,15 @@ impl OrganismRuntime {
             self.body_in_transit.set(false);
         }
         let vigil = self.organism.borrow().repo_vigil();
-        let point = surface_point_for_vigil(surface, mode, tempo, ambient, vigil, geometry_frame);
+        let point = surface_point_for_territory(
+            surface,
+            mode,
+            tempo,
+            ambient,
+            vigil,
+            geometry_frame,
+            self.territory.get(),
+        );
 
         if let Some(target) = point {
             let previous = self.body_position.get();
@@ -2127,11 +2601,69 @@ impl OrganismRuntime {
                 runtime.ambient.borrow_mut().interrupt();
                 runtime.ambient_display.set(AmbientBehavior::Idle);
             }
+            let desired_rhythm = runtime
+                .output_rhythm
+                .borrow_mut()
+                .sample(now, runtime.command_running.get());
+            let rhythm_plan = watch_rhythm_plan(
+                desired_rhythm,
+                runtime.visible_watch_rhythm.get(),
+                runtime.offered_watch_rhythm.get(),
+            );
+            let rhythm_context_presentable = watch_rhythm_context_presentable(
+                runtime.presence.is_owner(runtime.presence_token),
+                runtime.motion,
+                mode,
+                alt_screen,
+            );
+            // Record the sensing edge before any presentation/arbitration test.
+            // An invisible or rejected edge is consumed, never held for later.
+            runtime.offered_watch_rhythm.set(rhythm_plan.offered);
+            runtime
+                .visible_watch_rhythm
+                .set(if rhythm_context_presentable {
+                    rhythm_plan.visible
+                } else {
+                    WatchRhythm::Steady
+                });
+            if runtime.visual_transition.get().is_some() {
+                runtime
+                    .visual_transition_frame
+                    .set(runtime.visual_transition_frame.get().saturating_add(1));
+            }
             let pulse = u64::from(runtime.output_activity.replace(false));
             runtime
                 .surface_frame
                 .set(runtime.surface_frame.get().wrapping_add(1 + pulse));
             runtime.refresh_surface(&view, now);
+
+            // Geometry and GTK mapping are known only after the neutral frame
+            // has performed its fail-closed placement. Spend shared attention
+            // only if either the safe live body or its sticky form can actually
+            // be presented now. A successful edge gets one immediate repaint;
+            // all rhythm families retain the same bounding box.
+            let rhythm_surface_presentable = || {
+                watch_rhythm_surface_presentable(
+                    rhythm_context_presentable,
+                    runtime.live_body.is_mapped() || runtime.sticky_avatar.is_mapped(),
+                )
+            };
+            if !rhythm_surface_presentable() {
+                runtime.visible_watch_rhythm.set(WatchRhythm::Steady);
+            } else if let Some(offered) = rhythm_plan.attention_offer {
+                if runtime
+                    .activity
+                    .offer_attention(AttentionCue::LongCommandChange, now)
+                {
+                    runtime.visible_watch_rhythm.set(offered);
+                    runtime.refresh_surface(&view, now);
+                    if !rhythm_surface_presentable() {
+                        // A concurrent fail-closed placement cannot make the
+                        // admitted edge pending; consume it at neutral instead.
+                        runtime.visible_watch_rhythm.set(WatchRhythm::Steady);
+                    }
+                }
+            }
             runtime.reconcile_sleeping_claim(&view, now);
             // Accompaniment: a long-running command's card counts the time
             // spent watching together. Text only — no pose escalation, no
@@ -2206,6 +2738,15 @@ impl OrganismRuntime {
                 vigil,
             );
             runtime.ambient_display.set(ambient);
+            if should_begin_territory_intro(
+                runtime.territory_intro_pending.replace(false),
+                runtime.territory.get(),
+                vigil,
+            ) {
+                runtime
+                    .territory_intro_until
+                    .set(Some(Instant::now() + TERRITORY_INTRO_HOLD));
+            }
             runtime.render(&idle);
             if let Some(view) = view {
                 let now = Instant::now();
@@ -2422,7 +2963,10 @@ impl OrganismHub {
                     .is_none_or(|age| age >= HUMAN_INPUT_RETREAT);
                 runtime.last_human_input.set(Some(now));
                 runtime.activity.note_input(now);
+                runtime.reset_watch_rhythm_at_boundary(now);
                 runtime.clear_presence_cue();
+                runtime.visual_transition.set(None);
+                runtime.cancel_territory_intro();
                 runtime.set_sleeping(false);
                 if entering_retreat {
                     // Keep the accepted-input hot path O(1): hide once, then
@@ -2445,17 +2989,62 @@ impl OrganismHub {
         {
             let runtime = runtime.clone();
             let view_weak = Rc::downgrade(view);
-            view.connect_activity(move || {
-                runtime.output_activity.set(true);
-                runtime.activity.note_output(Instant::now());
+            view.connect_alt_screen_transition(move |transition| {
+                let now = Instant::now();
+                runtime.reset_watch_rhythm_at_boundary(now);
                 runtime.clear_presence_cue();
+                runtime.visual_transition.set(None);
+                if transition == AltScreenTransition::Entered {
+                    runtime.cancel_territory_intro();
+                }
+                runtime.set_sleeping(false);
+                runtime.body_position.set(None);
+                runtime.body_in_transit.set(false);
+                if let Some(view) = view_weak.upgrade() {
+                    view.set_live_organism_visible(false);
+                }
+            });
+        }
+
+        {
+            let runtime = runtime.clone();
+            let view_weak = Rc::downgrade(view);
+            view.connect_activity(move || {
+                let now = Instant::now();
+                let view = view_weak.upgrade();
+                let rhythm_presentable_at_origin = view.as_ref().is_some_and(|view| {
+                    watch_rhythm_context_presentable(
+                        runtime.presence.is_owner(runtime.presence_token),
+                        runtime.motion,
+                        surface_mode(
+                            runtime.surface_behavior.get(),
+                            runtime.command_running.get(),
+                            runtime.human_input_age(now),
+                        ),
+                        view.live_organism_surface_metrics().alt_screen,
+                    )
+                });
+                if rhythm_presentable_at_origin {
+                    runtime.output_activity.set(true);
+                    runtime.output_rhythm.borrow_mut().note_output(now);
+                } else {
+                    runtime.reset_watch_rhythm_at_boundary(now);
+                }
+                runtime.activity.note_output(now);
+                runtime.clear_presence_cue();
+                // Preserve arrival eligibility while its introducing command
+                // emits ordinary output, but output that interrupts an already
+                // visible first-look consumes that one-shot cue immediately.
+                if runtime.territory_intro_until.get().is_some() {
+                    runtime.cancel_territory_intro();
+                }
                 runtime.set_sleeping(false);
                 // Output is reported just before the bytes update terminal
                 // geometry. Hide in O(1) now; the coalesced frame remeasures
                 // and restores the body below the new cursor edge.
                 runtime.body_position.set(None);
                 runtime.body_in_transit.set(false);
-                if let Some(view) = view_weak.upgrade() {
+                if let Some(view) = view {
                     view.set_live_organism_visible(false);
                 }
             });
@@ -2491,14 +3080,23 @@ impl OrganismHub {
             let correction = self.organism_correction.clone();
             let pane = pane_token(view);
             view.connect_command_started(move |event| {
+                let now = Instant::now();
+                let command_origin = runtime.surface_behavior.get();
                 runtime.bump_generation();
                 runtime.set_sleeping(false);
+                runtime
+                    .command_origin_behavior
+                    .set(command_origin.is_repo_vigil().then_some(command_origin));
+                runtime.output_rhythm.borrow_mut().start(now);
+                runtime.visible_watch_rhythm.set(WatchRhythm::Steady);
+                runtime.offered_watch_rhythm.set(WatchRhythm::Steady);
+                runtime.output_activity.set(false);
                 // Transition-guarded so a repeated start can never over-count
                 // the shared running total.
                 if !runtime.command_running.replace(true) {
-                    runtime.activity.command_started(Instant::now());
+                    runtime.activity.command_started(now);
                 }
-                runtime.command_started_at.set(Some(Instant::now()));
+                runtime.command_started_at.set(Some(now));
                 // Identity-verified at CommandStart: content-free fact only.
                 let agent_driven = view_weak
                     .upgrade()
@@ -2592,10 +3190,20 @@ impl OrganismHub {
                             context.successes_today,
                             context.failures_today,
                         );
+                        // Recompute the UI-only habit on every authoritative
+                        // context refresh. A checkout that crosses the
+                        // familiarity threshold while this pane stays in it
+                        // should gain its home nest without requiring a leave
+                        // and re-entry.
+                        let territory =
+                            TerritoryHabit::for_repo(&context.repo, context.familiarity_days);
+                        runtime.territory.set(Some(territory));
                         if entered_new_repo {
-                            organism.note_repo_arrival(RepoArrival::from_familiarity(
-                                context.familiarity_days,
-                            ));
+                            let arrival = RepoArrival::from_familiarity(context.familiarity_days);
+                            organism.note_repo_arrival(arrival);
+                            runtime
+                                .territory_intro_pending
+                                .set(territory.is_unfamiliar());
                         }
                         *runtime.last_repo_root.borrow_mut() = Some(context.repo.clone());
                         *runtime.last_repo_cwd.borrow_mut() = event.cwd.clone();
@@ -2608,6 +3216,9 @@ impl OrganismHub {
                         organism.clear_repo_arrival();
                         *runtime.last_repo_root.borrow_mut() = None;
                         *runtime.last_repo_cwd.borrow_mut() = None;
+                        runtime.territory.set(None);
+                        runtime.territory_intro_pending.set(false);
+                        runtime.territory_intro_until.set(None);
                     }
                     if !has_repo_context && semantic {
                         // A non-Git or temporarily memory-less build still
@@ -2615,6 +3226,7 @@ impl OrganismHub {
                         // the exact raw cwd so `cd` can release it immediately.
                         *runtime.last_repo_root.borrow_mut() = None;
                         *runtime.last_repo_cwd.borrow_mut() = event.cwd.clone();
+                        runtime.territory.set(None);
                     }
                     if correction.take_recent_accept(pane, Instant::now()) {
                         organism.note_assisted_command();
@@ -2624,8 +3236,17 @@ impl OrganismHub {
                     shared_life.set(organism.state());
                     reaction
                 };
-                if morning {
-                    mark_circadian_greeting(&mut reaction, local.bucket);
+                let greeting_candidate = morning || reaction.speech.is_some();
+                if greeting_candidate
+                    && runtime
+                        .activity
+                        .offer_attention(AttentionCue::Greeting, Instant::now())
+                {
+                    if morning {
+                        mark_circadian_greeting(&mut reaction, local.bucket);
+                    }
+                } else if greeting_candidate {
+                    reaction.speech = None;
                 }
                 runtime.render(&reaction);
                 if let Some(view) = view_weak.upgrade() {
@@ -2641,11 +3262,15 @@ impl OrganismHub {
             let memory = self.organism_memory.clone();
             let shared_life = self.organism_life.clone();
             view.connect_command_finished(move |event| {
-                let generation = runtime.bump_generation();
+                let generation = runtime.bump_generation_for_command_finish();
                 if runtime.command_running.replace(false) {
                     runtime.activity.command_finished(Instant::now());
                 }
                 runtime.command_started_at.set(None);
+                runtime.output_rhythm.borrow_mut().reset();
+                runtime.visible_watch_rhythm.set(WatchRhythm::Steady);
+                runtime.offered_watch_rhythm.set(WatchRhythm::Steady);
+                runtime.output_activity.set(false);
                 let agent_driven = runtime.agent_watching.replace(false);
                 // Show the authoritative result for the complete hold window.
                 // Any genuinely new prompt input will immediately replace this
@@ -2658,6 +3283,8 @@ impl OrganismHub {
                     runtime.active_memory_kind.take();
                     classified
                 };
+                let mut completion_attention =
+                    completion_attention_cue(kind, event.exit_code, 0, agent_driven);
                 let repo = runtime
                     .active_repo_context
                     .borrow_mut()
@@ -2725,11 +3352,16 @@ impl OrganismHub {
                 let work_day = memory_event.day();
                 debug_assert_eq!(work_day, finished_local.day);
                 let mut work_sync = None;
+                let mut refreshed_territory = None;
                 if let Some(memory) = memory.borrow_mut().as_mut() {
                     let (insight, persist_result, retained) =
                         memory.apply_and_enqueue(memory_event);
-                    if let Some(repo) = work_repo {
-                        work_sync = Some((repo, work_day, insight.current_work, retained));
+                    if let Some(repo) = work_repo.as_deref() {
+                        let context = memory.context_for_repo_day(repo, work_day);
+                        refreshed_territory =
+                            Some(TerritoryHabit::for_repo(repo, context.familiarity_days));
+                        work_sync =
+                            Some((repo.to_owned(), work_day, insight.current_work, retained));
                     }
                     runtime.activity.set_growth(memory.growth_progress());
                     runtime.activity.set_circadian_profile(
@@ -2748,12 +3380,21 @@ impl OrganismHub {
                         &insight,
                         agent_driven,
                     );
+                    completion_attention = completion_attention_cue(
+                        kind,
+                        event.exit_code,
+                        insight.recovered_failures,
+                        agent_driven,
+                    );
                     if kind == CommandKind::BuildOrTest
                         && event.exit_code == Some(0)
                         && insight.event_order_exact
                         && insight.likely_flaky
                     {
                         mark_likely_flaky(&mut reaction, agent_driven);
+                        if let Some(cue) = remembered_insight_attention(reaction.speech.is_some()) {
+                            completion_attention = Some(cue);
+                        }
                     }
                     // A successful build measured against this repo's own
                     // baseline: one quiet sentence, no pose change.
@@ -2768,6 +3409,7 @@ impl OrganismHub {
                     if insight.faster_than_yesterday && !agent_driven {
                         reaction.speech = Some("这次比昨天快。");
                         reaction.description.push_str(" · remembered this repo");
+                        completion_attention = remembered_insight_attention(true);
                     } else if insight.push_after_recovery
                         && reaction.speech.is_none()
                         && !agent_driven
@@ -2775,13 +3417,16 @@ impl OrganismHub {
                         // The build may have recovered before this window was
                         // restarted; repo memory still closes the loop.
                         reaction.speech = Some("收好了。");
+                        completion_attention = Some(AttentionCue::Push);
                     }
-                    apply_growth_voice(
+                    if apply_growth_voice(
                         &mut reaction,
                         runtime.activity.growth().stage(),
                         insight.recovered_failures,
                         agent_driven,
-                    );
+                    ) {
+                        completion_attention = Some(AttentionCue::Recovery);
+                    }
                     // Run last: no later voice decorator may resurrect a
                     // closure claim that the final ordered work disproves.
                     normalize_replayed_closure(&mut reaction, kind, event.exit_code, &insight);
@@ -2789,6 +3434,9 @@ impl OrganismHub {
                         log::error!("could not queue ASCII organism memory: {error}");
                         runtime.mark_volatile();
                     }
+                }
+                if let Some(territory) = refreshed_territory {
+                    runtime.territory.set(Some(territory));
                 }
                 if let Some((repo, day, work, retained)) = work_sync {
                     // The pane-local reducer handled completion in arrival
@@ -2815,6 +3463,19 @@ impl OrganismHub {
                         .organism
                         .borrow_mut()
                         .sync_repo_work_state(RepoWorkState::default());
+                }
+                // The arbiter spends attention only for an expression it can
+                // actually suppress. Durable behavior/status facts render
+                // regardless, and a speechless completion consumes no focus.
+                if reaction.speech.is_some()
+                    && completion_attention
+                        .is_some_and(|cue| !runtime.activity.offer_attention(cue, Instant::now()))
+                {
+                    reaction.speech = None;
+                }
+                let command_origin = runtime.command_origin_behavior.take();
+                if kind == CommandKind::GitPush && event.exit_code == Some(0) {
+                    runtime.transition_source_override.set(command_origin);
                 }
                 runtime.render(&reaction);
                 if let Some(view) = view_weak.upgrade() {
@@ -2880,6 +3541,11 @@ impl OrganismHub {
                     }
                     runtime.command_started_at.set(None);
                     runtime.agent_watching.set(false);
+                    runtime.output_rhythm.borrow_mut().reset();
+                    runtime.visible_watch_rhythm.set(WatchRhythm::Steady);
+                    runtime.offered_watch_rhythm.set(WatchRhythm::Steady);
+                    runtime.output_activity.set(false);
+                    runtime.command_origin_behavior.set(None);
                     let generation = runtime.bump_generation();
                     let reaction = {
                         let mut organism = runtime.organism.borrow_mut();
@@ -2923,6 +3589,317 @@ impl OrganismHub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_rhythm_uses_only_pulse_count_and_monotonic_quiet_time() {
+        let start = Instant::now();
+        let mut rhythm = OutputRhythmTracker::default();
+        rhythm.start(start);
+        rhythm.note_output(start);
+        rhythm.note_output(start + Duration::from_millis(300));
+        rhythm.note_output(start + Duration::from_millis(600));
+        assert_eq!(
+            rhythm.sample(start + Duration::from_millis(600), true),
+            WatchRhythm::Busy
+        );
+        assert_eq!(
+            rhythm.sample(start + Duration::from_secs(2), true),
+            WatchRhythm::Steady
+        );
+        assert_eq!(
+            rhythm.sample(start + Duration::from_millis(3_600), true),
+            WatchRhythm::Waiting
+        );
+
+        rhythm.note_output(start + Duration::from_millis(3_700));
+        assert_eq!(
+            rhythm.sample(start + Duration::from_millis(4_000), true),
+            WatchRhythm::Resumed
+        );
+        assert_eq!(
+            rhythm.sample(start + Duration::from_millis(4_700), true),
+            WatchRhythm::Steady
+        );
+        assert_eq!(
+            rhythm.sample(start + Duration::from_secs(5), false),
+            WatchRhythm::Steady
+        );
+        assert_eq!(rhythm.last_output, None);
+        assert_eq!(rhythm.command_started, None);
+    }
+
+    #[test]
+    fn output_rhythm_handles_silent_commands_and_a_true_sliding_window() {
+        let start = Instant::now();
+        let mut silent = OutputRhythmTracker::default();
+        silent.start(start);
+        assert_eq!(
+            silent.sample(start + Duration::from_millis(2_999), true),
+            WatchRhythm::Steady
+        );
+        assert_eq!(
+            silent.sample(start + Duration::from_secs(3), true),
+            WatchRhythm::Waiting
+        );
+        silent.note_output(start + Duration::from_millis(3_100));
+        assert_eq!(
+            silent.sample(start + Duration::from_millis(3_100), true),
+            WatchRhythm::Resumed
+        );
+
+        let mut sliding = OutputRhythmTracker::default();
+        sliding.start(start);
+        sliding.note_output(start);
+        sliding.note_output(start + Duration::from_millis(1_100));
+        sliding.note_output(start + Duration::from_millis(1_210));
+        assert_eq!(
+            sliding.sample(start + Duration::from_millis(1_210), true),
+            WatchRhythm::Steady
+        );
+        sliding.note_output(start + Duration::from_millis(1_220));
+        assert_eq!(
+            sliding.sample(start + Duration::from_millis(1_220), true),
+            WatchRhythm::Busy,
+            "the most recent three pulses, not a tumbling first-pulse window, define busy"
+        );
+    }
+
+    #[test]
+    fn presentation_boundary_consumes_rhythm_and_restarts_visible_quiet_time() {
+        let start = Instant::now();
+        let boundary = start + Duration::from_secs(4);
+        let mut rhythm = OutputRhythmTracker::default();
+        rhythm.start(start);
+        rhythm.note_output(start);
+        rhythm.note_output(start + Duration::from_millis(100));
+        rhythm.note_output(start + Duration::from_millis(200));
+        assert_eq!(
+            rhythm.sample(start + Duration::from_millis(200), true),
+            WatchRhythm::Busy
+        );
+
+        reset_output_rhythm_at_boundary(&mut rhythm, true, boundary);
+        assert_eq!(rhythm.sample(boundary, true), WatchRhythm::Steady);
+        assert_eq!(
+            rhythm.sample(boundary + Duration::from_millis(2_999), true),
+            WatchRhythm::Steady,
+            "hidden busy/waiting edges must not replay after presentation resumes"
+        );
+        assert_eq!(
+            rhythm.sample(boundary + Duration::from_secs(3), true),
+            WatchRhythm::Waiting,
+            "a new visible quiet interval may create a fresh edge"
+        );
+    }
+
+    #[test]
+    fn rejected_or_invisible_watch_rhythm_edges_are_not_reoffered() {
+        let first = watch_rhythm_plan(WatchRhythm::Waiting, WatchRhythm::Busy, WatchRhythm::Steady);
+        assert_eq!(
+            first,
+            WatchRhythmPlan {
+                visible: WatchRhythm::Steady,
+                offered: WatchRhythm::Waiting,
+                attention_offer: Some(WatchRhythm::Waiting),
+            },
+            "a new edge first clears any older expression"
+        );
+        let dropped = watch_rhythm_plan(WatchRhythm::Waiting, WatchRhythm::Steady, first.offered);
+        assert_eq!(dropped.attention_offer, None);
+        assert_eq!(dropped.visible, WatchRhythm::Steady);
+
+        let neutral = watch_rhythm_plan(WatchRhythm::Steady, dropped.visible, dropped.offered);
+        assert_eq!(neutral.offered, WatchRhythm::Steady);
+        assert_eq!(
+            watch_rhythm_plan(WatchRhythm::Waiting, neutral.visible, neutral.offered)
+                .attention_offer,
+            Some(WatchRhythm::Waiting),
+            "a genuinely new boundary may be offered later"
+        );
+    }
+
+    #[test]
+    fn watch_rhythm_attention_requires_a_mapped_owner_watching_surface() {
+        assert!(watch_rhythm_context_presentable(
+            true,
+            OrganismMotion::Full,
+            SurfaceMode::Watching,
+            false,
+        ));
+        assert!(watch_rhythm_context_presentable(
+            true,
+            OrganismMotion::Calm,
+            SurfaceMode::Watching,
+            false,
+        ));
+        for (owner, motion, mode, alt_screen) in [
+            (false, OrganismMotion::Full, SurfaceMode::Watching, false),
+            (true, OrganismMotion::Full, SurfaceMode::Typing, false),
+            (true, OrganismMotion::Full, SurfaceMode::Watching, true),
+            (true, OrganismMotion::Static, SurfaceMode::Watching, false),
+        ] {
+            assert!(!watch_rhythm_context_presentable(
+                owner, motion, mode, alt_screen,
+            ));
+        }
+        assert!(watch_rhythm_surface_presentable(true, true));
+        assert!(!watch_rhythm_surface_presentable(true, false));
+        assert!(!watch_rhythm_surface_presentable(false, true));
+    }
+
+    #[test]
+    fn territory_hash_is_bounded_and_home_nests_are_stable() {
+        let prefix = "r".repeat(MAX_TERRITORY_HASH_BYTES);
+        assert_eq!(
+            stable_repo_hash(format!("{prefix}/one").as_bytes()),
+            stable_repo_hash(format!("{prefix}/two").as_bytes()),
+            "identity hashing must remain bounded"
+        );
+
+        let home = TerritoryHabit::for_repo("/work/anvil", 7);
+        assert!(home.is_home());
+        assert_eq!(home, TerritoryHabit::for_repo("/work/anvil", 99));
+        assert_eq!(home.nest_x(8, 240), if home.nest_right { 240 } else { 8 });
+        assert!(home.route_offset < 800);
+        assert_eq!(home.route_frame(0), u64::from(home.route_offset));
+        let known = TerritoryHabit::for_repo("/work/known", 2);
+        assert_eq!(known.nest_x(8, 240), 8);
+        let unfamiliar_at_arrival = TerritoryHabit::for_repo("/work/new", 0);
+        assert!(unfamiliar_at_arrival.is_unfamiliar());
+        assert!(should_begin_territory_intro(
+            true,
+            Some(unfamiliar_at_arrival),
+            RepoVigil::None,
+        ));
+        let known_after_first_finish = TerritoryHabit::for_repo("/work/new", 1);
+        assert!(!known_after_first_finish.is_unfamiliar());
+        assert!(
+            should_begin_territory_intro(true, Some(known_after_first_finish), RepoVigil::None),
+            "arrival-time eligibility must survive the first event's Unfamiliar -> Known refresh"
+        );
+        assert!(!should_begin_territory_intro(
+            true,
+            Some(known_after_first_finish),
+            RepoVigil::Failure,
+        ));
+        assert!(!should_begin_territory_intro(
+            false,
+            Some(known),
+            RepoVigil::None,
+        ));
+        assert!(!should_begin_territory_intro(true, None, RepoVigil::None));
+        let mut pending = true;
+        assert!(!should_begin_territory_intro(
+            std::mem::replace(&mut pending, false),
+            Some(known_after_first_finish),
+            RepoVigil::Failure,
+        ));
+        assert!(
+            !pending,
+            "a conflicting first-look is consumed, never queued"
+        );
+        assert!(!should_begin_territory_intro(
+            std::mem::replace(&mut pending, false),
+            Some(known_after_first_finish),
+            RepoVigil::None,
+        ));
+
+        for vigil in [
+            RepoVigil::Failure,
+            RepoVigil::Stuck,
+            RepoVigil::Recovery,
+            RepoVigil::CautiousRecovery,
+        ] {
+            assert_eq!(
+                territory_intro_after_repo_sync(true, Some(7_u8), vigil),
+                (false, None),
+                "{vigil:?} must cancel pending and already-active exploration"
+            );
+        }
+        assert_eq!(
+            territory_intro_after_repo_sync(true, Some(7_u8), RepoVigil::None),
+            (true, Some(7)),
+            "a clean cross-pane sync must not consume arrival eligibility"
+        );
+        assert_eq!(
+            territory_intro_after_interruption(true, None::<u8>),
+            (false, None),
+            "typing/alt/focus loss consumes a pending first-look"
+        );
+        assert_eq!(
+            territory_intro_after_interruption(false, Some(7_u8)),
+            (false, None),
+            "an already-visible first-look cannot resume after interruption"
+        );
+    }
+
+    #[test]
+    fn attention_classes_keep_failures_and_human_closures_above_chatter() {
+        assert_eq!(
+            completion_attention_cue(CommandKind::BuildOrTest, Some(1), 0, false),
+            Some(AttentionCue::FailureVigil)
+        );
+        assert_eq!(
+            completion_attention_cue(CommandKind::BuildOrTest, Some(0), 2, false),
+            Some(AttentionCue::Recovery)
+        );
+        assert_eq!(
+            completion_attention_cue(CommandKind::GitPush, Some(0), 0, false),
+            Some(AttentionCue::Push)
+        );
+        assert_eq!(
+            completion_attention_cue(CommandKind::BuildOrTest, Some(0), 0, true),
+            None,
+            "agent success must not spend the human greeting budget"
+        );
+        assert_eq!(
+            completion_attention_cue(CommandKind::Other, Some(0), 0, false),
+            Some(AttentionCue::Closure)
+        );
+        assert_eq!(
+            completion_attention_cue(CommandKind::Other, None, 0, false),
+            None
+        );
+        assert_eq!(
+            remembered_insight_attention(true),
+            Some(AttentionCue::Insight)
+        );
+        assert_eq!(remembered_insight_attention(false), None);
+    }
+
+    #[test]
+    fn semantic_bridges_run_only_in_full_motion() {
+        assert_eq!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::Celebrate,
+                Behavior::GuardRecovery,
+            ),
+            VisualTransition::between(Behavior::Celebrate, Behavior::GuardRecovery)
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::Celebrate, Behavior::GuardRecovery,),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn memory_growth_maps_to_the_visual_phenotype_without_new_state() {
+        assert_eq!(
+            visual_growth_stage(GrowthStage::Juvenile),
+            VisualGrowthStage::Juvenile
+        );
+        assert_eq!(
+            visual_growth_stage(GrowthStage::Adult),
+            VisualGrowthStage::Adult
+        );
+        assert_eq!(
+            visual_growth_stage(GrowthStage::Seasoned),
+            VisualGrowthStage::Seasoned
+        );
+    }
 
     #[test]
     fn compact_state_summary_reports_all_eight_bounded_dimensions() {

@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-10
+Updated: 2026-08-12
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,16 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- ASCII organism frontend parity now includes the five-part embodiment pass:
+  visible juvenile/adult/seasoned phenotypes through a composable render
+  context; content-free busy/waiting/resumed output rhythm; four-frame semantic
+  bridges in Full motion; process-local repo territory habits; and a
+  window/session attention arbiter with shared focus, cue-local cooldowns, and
+  no replay queue. The implementation keeps Anvil's Relm4 ownership model while
+  matching Forge's reducer and visible semantics. No memory schema or
+  content-bearing perception was added; typing, alternate screen, and geometry
+  failure still preempt every live expression.
 
 - Workflow discovery is a startup-prewarmed, single-flight cache refresh; the
   Palette presents immediately and accepts only the matching asynchronous

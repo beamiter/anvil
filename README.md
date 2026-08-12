@@ -673,6 +673,32 @@ Settings exposes the same four choices as Forge: Automatic, Full, Calm, and
 Static. Changes apply to newly created Block panes; existing pane-local life
 continues without being replaced mid-command.
 
+Lifetime growth is now visible as well as named in the badge: juvenile bodies
+use rounder ears, larger eyes, and quicker micro-motion; adult keeps the
+canonical silhouette; seasoned gains a notched ear and a slower cadence. These
+layers preserve every pose family's exact bounding box and never change the
+semantic strength of a failure, recovery, or push reaction.
+
+While a command runs, only output-activity timestamps—not bytes, lines, ANSI,
+or command text—shape its watch rhythm. The most recent three pulses inside
+roughly 1.2 seconds read as busy; roughly three quiet seconds, including a
+command with no output yet, read as waiting; returning output gets a brief
+0.9-second acknowledgement. These volatile rhythms never infer a result or
+enter memory. Full motion also connects selected semantic pose boundaries with
+four fixed-envelope frames; Calm snaps to the target and Static remains
+card-only. Typing, alternate-screen entry, and fail-closed sizing always
+preempt the bridge.
+
+A familiar canonical repository acquires a process-local preferred nest side
+and walking-route offset. An unfamiliar checkout may receive one short
+post-settle exploration when no higher-priority vigil conflicts; otherwise it
+is dropped rather than replayed. No path is displayed, sent to the reducer, or
+persisted. A window/session attention arbiter similarly admits optional
+failure/vigil expression before closure/recovery/push, then command-rhythm
+changes, then greetings and remembered insights. Admitted expressions own a
+shared focus window and cue-local cooldown; suppressed ones are dropped without
+a pending queue, while durable `[!]`, `[!!]`, `[ok]`, and `[?]` facts remain.
+
 ### Notebooks
 
 Activating a `.jtnb.md` file in the sidebar opens the notebook viewer. Markdown

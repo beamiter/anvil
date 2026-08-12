@@ -1387,6 +1387,11 @@ impl AppModel {
             return;
         };
         // Swap the dead pane widget for a fresh remote pane.
+        let focus_transfer = if self.active == idx {
+            self.begin_organism_focus_transfer(None, true)
+        } else {
+            false
+        };
         let old_widget = self.tabs[idx].panes[0].widget();
         self.tabs[idx].holder.remove(&old_widget);
         let new_pane_id = self.next_pane_id;
@@ -1424,6 +1429,7 @@ impl AppModel {
             c.attempt = attempt;
             c.spawn_at = std::time::Instant::now();
         }
+        self.finish_organism_focus_transfer(focus_transfer);
         if self.active == idx {
             self.tabs[idx].panes[0].terminal.emit(VteInput::GrabFocus);
         }
@@ -1488,6 +1494,8 @@ impl AppModel {
             .panes
             .get(self.tabs[idx].active_pane)
             .map(|pane| pane.id);
+        let hides_previous = self.tabs.get(self.active).map(|tab| tab.id) != Some(id);
+        let focus_transfer = self.begin_organism_focus_transfer(next_pane_id, hides_previous);
         let active_pane_changed = search::active_pane_changed(previous_pane_id, next_pane_id);
         if active_pane_changed {
             // Search regexes and highlights live inside a terminal backend.
@@ -1505,6 +1513,16 @@ impl AppModel {
             tab.bell = false;
             tab.activity = false;
         }
+        // Model selection and Stack visibility are now authoritative. Resolve
+        // the organism directly; GrabFocus below is only keyboard focus, not
+        // the ownership commit signal.
+        self.finish_organism_focus_transfer(focus_transfer);
+        if !focus_transfer {
+            // Callers such as active-tab removal may already have revoked the
+            // old owner before indices shifted and made the destination look
+            // identity-stable here.
+            self.sync_organism_focus();
+        }
         let tab = &self.tabs[idx];
         if let Some(pane) = tab.panes.get(tab.active_pane) {
             pane.terminal.emit(VteInput::GrabFocus);
@@ -1520,6 +1538,9 @@ impl AppModel {
 
     pub(crate) fn close_tab(&mut self, id: u64, sender: &ComponentSender<AppModel>) {
         let Some(idx) = self.index_of(id) else { return };
+        if idx == self.active {
+            self.begin_organism_focus_transfer(None, true);
+        }
         let pane_ids = self.tabs[idx]
             .panes
             .iter()
@@ -1655,10 +1676,17 @@ impl AppModel {
         }
         let dragged_widget = self.tabs[ti].panes[di].widget();
         let target_widget = self.tabs[ti].panes[tj_index].widget();
+        let focus_transfer = if ti == self.active {
+            self.begin_organism_focus_transfer(Some(dragged), true)
+        } else {
+            false
+        };
         if !crate::pane_header::swap_pane_widgets(&dragged_widget, &target_widget) {
+            self.finish_organism_focus_transfer(focus_transfer);
             return;
         }
         self.tabs[ti].active_pane = di;
+        self.finish_organism_focus_transfer(focus_transfer);
         self.tabs[ti].panes[di].terminal.emit(VteInput::GrabFocus);
         self.refresh_pane_headers(ti);
     }
@@ -1721,6 +1749,10 @@ impl AppModel {
             return;
         };
 
+        // The source tab may currently own the body, and the target becomes
+        // selected at the end. End old ownership before either widget tree is
+        // detached; `select_tab` performs the final gated reclaim.
+        self.begin_organism_focus_transfer(Some(plan.moved_pane_id), true);
         clear_root_focus_before_reparent(&source_widget);
         let mut source_tab = self.tabs.remove(source_index);
         self.stack.remove(&source_tab.holder);
@@ -1936,6 +1968,13 @@ impl AppModel {
             return;
         }
         let selected: std::collections::HashSet<u64> = ids.into_iter().collect();
+        if self
+            .tabs
+            .get(self.active)
+            .is_some_and(|tab| selected.contains(&tab.id))
+        {
+            self.begin_organism_focus_transfer(None, true);
+        }
         let pane_ids = self
             .tabs
             .iter()
@@ -2070,21 +2109,25 @@ impl AppModel {
                 } else {
                     pane_header::PaneDropEdge::Bottom
                 };
+                let focus_transfer = self.begin_organism_focus_transfer(Some(pane_id), true);
                 slot.replace_with_split(&cur_widget, &new_widget, edge);
 
-                let tab = &mut self.tabs[ti];
-                tab.panes.push(new_pane);
-                tab.active_pane = tab.panes.len() - 1;
-                // libvte reports spawn completion asynchronously. Until its
-                // success event arrives, this stable id can roll back exactly
-                // the new leaf without guessing from a shifted pane index.
-                if matches!(mode, TerminalMode::Vte) {
-                    self.pending_split_spawns
-                        .insert(pane_id, (tab_id, source_pane_id));
-                } else if let Some(root) = tab.holder.first_child() {
-                    schedule_pane_rebalance(root);
+                {
+                    let tab = &mut self.tabs[ti];
+                    tab.panes.push(new_pane);
+                    tab.active_pane = tab.panes.len() - 1;
+                    // libvte reports spawn completion asynchronously. Until its
+                    // success event arrives, this stable id can roll back exactly
+                    // the new leaf without guessing from a shifted pane index.
+                    if matches!(mode, TerminalMode::Vte) {
+                        self.pending_split_spawns
+                            .insert(pane_id, (tab_id, source_pane_id));
+                    } else if let Some(root) = tab.holder.first_child() {
+                        schedule_pane_rebalance(root);
+                    }
                 }
-                tab.panes[tab.active_pane]
+                self.finish_organism_focus_transfer(focus_transfer);
+                self.tabs[ti].panes[self.tabs[ti].active_pane]
                     .terminal
                     .emit(VteInput::GrabFocus);
                 // The tab just became split, so every pane's header appears now.
@@ -2119,7 +2162,13 @@ impl AppModel {
         }
         let was_active_tab = self.active == tab_index;
         let failed_was_active = self.tabs[tab_index].active_pane == pane_index;
+        let focus_transfer = if was_active_tab && failed_was_active {
+            self.begin_organism_focus_transfer(Some(source_pane_id), true)
+        } else {
+            false
+        };
         let Some(removed) = self.detach_pane_from_tab(tab_index, pane_index) else {
+            self.finish_organism_focus_transfer(focus_transfer);
             return false;
         };
         drop(removed);
@@ -2133,17 +2182,19 @@ impl AppModel {
                 "Split rollback removed pane {pane_id}, but source pane {source_pane_id} disappeared"
             );
             self.refresh_pane_headers(tab_index);
+            self.finish_organism_focus_transfer(focus_transfer);
             return true;
         };
         if failed_was_active {
             self.tabs[tab_index].active_pane = source_index;
-            if was_active_tab {
-                self.tabs[tab_index].panes[source_index]
-                    .terminal
-                    .emit(VteInput::GrabFocus);
-            }
         }
         self.refresh_pane_headers(tab_index);
+        self.finish_organism_focus_transfer(focus_transfer);
+        if was_active_tab && failed_was_active {
+            self.tabs[tab_index].panes[source_index]
+                .terminal
+                .emit(VteInput::GrabFocus);
+        }
         true
     }
 
@@ -2192,6 +2243,11 @@ impl AppModel {
         if closes_agent {
             self.agent_close();
         }
+        let focus_transfer = if ti == self.active {
+            self.begin_organism_focus_transfer(None, true)
+        } else {
+            false
+        };
         if self.tabs[ti].zoom.is_some() {
             self.toggle_pane_zoom_for(ti);
         }
@@ -2206,21 +2262,27 @@ impl AppModel {
             .is_some_and(|conn| conn.pane_id == pane_id);
         let Some(removed) = self.detach_pane_from_tab(ti, pi) else {
             log::error!("Failed to detach pane {pane_id} from tab widget tree");
+            self.finish_organism_focus_transfer(focus_transfer);
             return;
         };
-        let tab = &mut self.tabs[ti];
-        if was_remote {
-            tab.remote = None;
+        {
+            let tab = &mut self.tabs[ti];
+            if was_remote {
+                tab.remote = None;
+            }
         }
-        let ap = tab.active_pane;
-        tab.panes[ap].terminal.emit(VteInput::GrabFocus);
         drop(removed);
         // Numbering shifted, and dropping back to one pane hides the headers.
         self.refresh_pane_headers(ti);
+        self.finish_organism_focus_transfer(focus_transfer);
+        if ti == self.active {
+            let ap = self.tabs[ti].active_pane;
+            self.tabs[ti].panes[ap].terminal.emit(VteInput::GrabFocus);
+        }
     }
 
     pub(crate) fn cycle_pane_focus(&mut self, delta: i32) {
-        let Some(tab) = self.tabs.get_mut(self.active) else {
+        let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
         let n = tab.panes.len() as i32;
@@ -2229,8 +2291,12 @@ impl AppModel {
         }
         let cur = tab.active_pane as i32;
         let next = ((cur + delta) % n + n) % n;
-        tab.active_pane = next as usize;
-        tab.panes[tab.active_pane]
+        let next = next as usize;
+        let next_pane_id = tab.panes[next].id;
+        let focus_transfer = self.begin_organism_focus_transfer(Some(next_pane_id), false);
+        self.tabs[self.active].active_pane = next;
+        self.finish_organism_focus_transfer(focus_transfer);
+        self.tabs[self.active].panes[next]
             .terminal
             .emit(VteInput::GrabFocus);
         self.refresh_active_pane_headers();
@@ -2284,9 +2350,13 @@ impl AppModel {
         }
 
         if let Some((_, i)) = best {
-            let tab = &mut self.tabs[self.active];
-            tab.active_pane = i;
-            tab.panes[i].terminal.emit(VteInput::GrabFocus);
+            let next_pane_id = self.tabs[self.active].panes[i].id;
+            let focus_transfer = self.begin_organism_focus_transfer(Some(next_pane_id), false);
+            self.tabs[self.active].active_pane = i;
+            self.finish_organism_focus_transfer(focus_transfer);
+            self.tabs[self.active].panes[i]
+                .terminal
+                .emit(VteInput::GrabFocus);
         }
     }
 
@@ -2309,7 +2379,21 @@ impl AppModel {
     }
 
     pub(crate) fn toggle_pane_zoom(&mut self) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        if tab
+            .panes
+            .iter()
+            .any(|pane| self.pending_split_spawns.contains_key(&pane.id))
+            || (tab.zoom.is_none() && tab.panes.len() <= 1)
+        {
+            return;
+        }
+        let next_pane = self.active_pane_id();
+        let focus_transfer = self.begin_organism_focus_transfer(next_pane, true);
         self.toggle_pane_zoom_for(self.active);
+        self.finish_organism_focus_transfer(focus_transfer);
     }
 
     pub(crate) fn toggle_pane_zoom_for(&mut self, ti: usize) {
@@ -2412,8 +2496,10 @@ impl AppModel {
         {
             return;
         }
+        let focus_transfer = self.begin_organism_focus_transfer(Some(plan.pane_id), true);
         let Some(moved) = self.detach_pane_from_tab(source_index, pane_index) else {
             log::error!("Failed to detach pane {pane_id} into a new tab");
+            self.finish_organism_focus_transfer(focus_transfer);
             return;
         };
 
