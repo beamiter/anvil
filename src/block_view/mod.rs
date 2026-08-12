@@ -13,7 +13,9 @@ use vte4::Terminal;
 use vte4::TerminalExt;
 
 use crate::config::Config;
-use crate::parser::{ColorKind, KeyboardProtocolQuery, Parser, ParserConfig, ParserEvent};
+use crate::parser::{
+    ColorKind, CommandMeta, KeyboardProtocolQuery, Parser, ParserConfig, ParserEvent,
+};
 use crate::pty::OwnedPty;
 use crate::pty_input;
 use crate::terminal::kitty_graphics;
@@ -2963,6 +2965,864 @@ struct ReaderCtx {
     block_finished_cbs: BlockFinishedCallbacks,
     ask_ai_about_block_cbs: BlockContextCallbacks,
     selection_feed_hold: Rc<SelectionFeedHold>,
+    active_alt_screen_mode_rc: Rc<Cell<Option<u32>>>,
+    /// Kitty graphics (APC G) — multi-chunk uploads assemble here; completed
+    /// textures wait against the running command until its block finishes.
+    /// The byte counter enforces the shared per-block budget so a runaway
+    /// shell cannot balloon RSS between prompts.
+    kitty_assembler_rc: Rc<RefCell<kitty_graphics::Assembler>>,
+    kitty_pending_images_rc: Rc<RefCell<Vec<gtk::gdk::Texture>>>,
+    kitty_pending_bytes_rc: Rc<Cell<usize>>,
+}
+
+/// Per-event handlers for the PTY reader pipeline: one method per
+/// `ParserEvent` arm, dispatched by [`ReaderCtx::handle_event`] in the
+/// order the events arrive. Bodies moved verbatim from the former
+/// `process_chunk` match closure (arm-level `continue` became `return`).
+impl ReaderCtx {
+    fn handle_event(&self, event: &ParserEvent) {
+        let state = self.bstate_rc.get();
+        match event {
+            ParserEvent::RemoteSessionId(id) => self.on_remote_session_id(id),
+            ParserEvent::DecsetMode { mode, set } => self.on_decset_mode(*mode, *set),
+            ParserEvent::Bytes(bytes) => self.on_bytes(bytes, state),
+            ParserEvent::PromptStart => self.on_prompt_start(),
+            ParserEvent::PromptEnd => self.on_prompt_end(),
+            ParserEvent::CommandStart(meta) => self.on_command_start(meta),
+            ParserEvent::CommandEnd { exit, meta } => self.on_command_end(*exit, meta),
+            ParserEvent::AltScreenEnter(mode) => self.on_alt_screen_enter(*mode),
+            ParserEvent::AltScreenLeave(mode) => self.on_alt_screen_leave(*mode),
+            ParserEvent::ClipboardSet(text) => self.on_clipboard_set(text),
+            ParserEvent::ClipboardQuery => self.on_clipboard_query(),
+            ParserEvent::ColorQuery(kind) => self.on_color_query(*kind),
+            ParserEvent::ColorSet { kind, spec } => self.on_color_set(*kind, spec),
+            ParserEvent::ColorReset(kind) => self.on_color_reset(*kind),
+            ParserEvent::KeyboardProtocolQuery(query) => self.on_keyboard_protocol_query(*query),
+            ParserEvent::ApcSequence(payload) => self.on_apc_sequence(payload),
+            ParserEvent::Notification { title, body } => self.on_notification(title, body),
+        }
+    }
+
+    fn on_remote_session_id(&self, id: &str) {
+        for cb in self.remote_session_cbs.borrow().iter() {
+            cb(id);
+        }
+    }
+
+    fn on_decset_mode(&self, mode: u32, set: bool) {
+        if mode == 2004 {
+            self.bracketed_paste_rc.set(set);
+        }
+        // VTE handles paste/cursor/etc. natively from its
+        // own bytes; block_view only needs mouse-reporting
+        // state for wheel suppression in alt-screen apps.
+        let new_mode = match (mode, set) {
+            (1000, true) => Some(MouseReportingMode::Click),
+            (1002, true) => Some(MouseReportingMode::Button),
+            (1003, true) => Some(MouseReportingMode::Motion),
+            (1006, true) => Some(MouseReportingMode::Sgr),
+            (1000 | 1002 | 1003 | 1006, false) => Some(MouseReportingMode::None),
+            _ => None,
+        };
+        if let Some(m) = new_mode {
+            self.mouse_reporting_rc.set(m);
+        }
+    }
+
+    fn on_bytes(&self, bytes: &[u8], state: BlockState) {
+        if state == BlockState::AwaitingCommand {
+            if let Some(submission) = self.verified_submission.submission.borrow_mut().as_mut() {
+                if submission.phase == ReviewedSubmissionPhase::Submitted
+                    && !reviewed_pre_command_bytes_are_identity_neutral(bytes)
+                {
+                    submission.identity_feed_tainted = true;
+                }
+            }
+        }
+        // No shell integration seen yet: once real output flows,
+        // stream everything into the live VTE (raw fallback).
+        if state == BlockState::Idle {
+            self.bstate_rc.set(BlockState::RawFallback);
+        }
+
+        let feed_active_vte = match self.bstate_rc.get() {
+            BlockState::CollectingPrompt => {
+                let text = String::from_utf8_lossy(bytes);
+                append_bounded_text_tail(
+                    &mut self.prompt_buf_rc.borrow_mut(),
+                    &text,
+                    MAX_PROMPT_CAPTURE_BYTES,
+                );
+                self.scroll_debouncer.mark_dirty(&self.block_scroll_rc);
+                true
+            }
+            BlockState::AwaitingCommand => {
+                // Warp separates asynchronous output only when it
+                // arrives before the user begins editing. Once input
+                // is dirty, PTY echo/completion is indistinguishable
+                // from a background process and remains inline.
+                if !self.idle_input_dirty_rc.get() {
+                    let mut pending = self.background_output_rc.borrow_mut();
+                    append_bounded_output(&mut pending, bytes, MAX_RAW_OUTPUT_BYTES);
+                }
+                self.scroll_debouncer.mark_dirty(&self.block_scroll_rc);
+                true
+            }
+            BlockState::CollectingOutput | BlockState::PostCommand => {
+                if self.bstate_rc.get() != BlockState::PostCommand
+                    || !is_post_command_metadata(bytes)
+                {
+                    self.active_rc.borrow().accumulate_output(bytes);
+                }
+                for cb in self.activity_cbs.borrow().iter() {
+                    cb();
+                }
+                true
+            }
+            BlockState::AltScreen => {
+                // Alt-screen bytes go to the live VTE only — they
+                // are not captured into block output (ephemeral).
+                true
+            }
+            _ => true,
+        };
+
+        if feed_active_vte {
+            self.active_vte.feed(bytes);
+        }
+    }
+
+    fn on_prompt_start(&self) {
+        self.ftcs_seen_rc.set(true);
+        let state = self.bstate_rc.get();
+        if state == BlockState::CollectingOutput || state == BlockState::AltScreen {
+            return;
+        }
+        if state == BlockState::PostCommand
+            && !agent_prompt_boundary_is_trusted(
+                self.active_agent_execution_rc.get(),
+                self.pty_for_init.shell_is_foreground(),
+            )
+        {
+            // A foreground child can print a guessed/known
+            // C/D/A sequence. Its D may have moved us to
+            // PostCommand, but it cannot return foreground
+            // ownership to the shell. Resume capture and
+            // wait for the shell's real D + prompt instead.
+            log::warn!("Ignoring an Agent prompt marker while a child process still owns the PTY");
+            self.pending_exit_code_rc.set(None);
+            self.cmd_running_rc.set(true);
+            self.bstate_rc.set(BlockState::CollectingOutput);
+            return;
+        }
+        if state == BlockState::PostCommand && !self.agent_completion_trusted_rc.get() {
+            if let Some(execution) = self.active_agent_execution_rc.take() {
+                emit_agent_execution_lost(
+                    &self.verified_submission.agent_execution_lost_callbacks,
+                    execution,
+                    "the shell prompt arrived without a trusted matching command end",
+                );
+            }
+        }
+        let background_output = if state == BlockState::AwaitingCommand {
+            take_background_output(&self.background_output_rc)
+        } else {
+            None
+        };
+        let is_background = background_output.is_some();
+        // Finalize the previous command (deferred from CommandEnd),
+        // or turn commandless async output into a first-class block.
+        if state == BlockState::PostCommand || is_background {
+            // The VTE-text capture taken at CommandStart is
+            // authoritative — it reflects what was on screen
+            // when the user pressed Enter. Fall back to the
+            // keystroke shadow only if the VTE read came back
+            // empty (which would indicate the prompt-end
+            // anchor never captured a valid cursor position).
+            let cmd = if is_background {
+                String::new()
+            } else {
+                finished_command(&self.vte_typed_cmd_rc.borrow(), &self.typed_cmd_rc.borrow())
+            };
+
+            if cmd.is_empty() && !is_background {
+                // Nothing meaningful to record; just reset.
+                let preserve = self.config_for_cb.borrow().preserve_live_scrollback;
+                self.active_rc.borrow().reset_active(preserve);
+                // No block is created here, so half-uploaded
+                // kitty chunks and undisplayed images have
+                // nowhere to land: drop them with the rest of
+                // the active state instead of leaking into
+                // the next command.
+                self.kitty_assembler_rc.borrow_mut().reset();
+                self.kitty_pending_images_rc.borrow_mut().clear();
+                self.kitty_pending_bytes_rc.set(0);
+                self.bstate_rc.set(BlockState::CollectingPrompt);
+                self.prompt_buf_rc.borrow_mut().clear();
+                self.scroll_debouncer.mark_dirty(&self.block_scroll_rc);
+                return;
+            }
+
+            let prompt = if is_background {
+                String::new()
+            } else {
+                self.prompt_display_rc.borrow().clone()
+            };
+
+            // The raw bytes already carry CRLF — the PTY's
+            // ONLCR turns `\n` into `\r\n` on the master side
+            // before we ever see them — and the finished VTE
+            // handles in-line CR overwrites natively, just
+            // like the live VTE did while the command ran. So
+            // we feed the captured bytes verbatim, with no
+            // reconstruction pass.
+            let output_with_ansi =
+                background_output.unwrap_or_else(|| self.active_rc.borrow().output_text());
+
+            let output_plain = strip_ansi(&output_with_ansi).to_string();
+
+            let truncation_limit = self.config_for_cb.borrow().truncation_threshold_lines as usize;
+            let output_trimmed = {
+                let trimmed = output_plain.trim();
+                let lines: Vec<&str> = trimmed.lines().collect();
+                if lines.len() > truncation_limit {
+                    let kept: String = lines[..truncation_limit].join("\n");
+                    format!(
+                        "{}\n\n[... truncated: {} lines total, showing first {}]",
+                        kept,
+                        lines.len(),
+                        truncation_limit
+                    )
+                } else {
+                    trimmed.to_string()
+                }
+            };
+
+            let line_count = output_trimmed.lines().count();
+
+            let start_time = if is_background {
+                None
+            } else {
+                self.block_start_time_for_cb.get()
+            };
+            let now = SystemTime::now();
+            let end_time_ms = now
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_millis() as u64);
+            let start_time_ms = start_time.and_then(|st| {
+                st.duration_since(SystemTime::UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_millis() as u64)
+            });
+            // Commandless background output has no shell-reported
+            // figure of its own, so it keeps the local timer only.
+            let shell_duration_ms = if is_background {
+                None
+            } else {
+                self.shell_duration_ms_rc.take()
+            };
+            let duration_ms = block_duration_ms(shell_duration_ms, start_time, now);
+
+            let block_cwd = {
+                // The cwd the shell said the command ran in wins
+                // over the pane's tracked cwd: after `cd`, the
+                // OSC 7 that updated the pane already names the
+                // directory the *next* command will run in.
+                let reported = if is_background {
+                    None
+                } else {
+                    self.command_cwd_rc.borrow_mut().take()
+                };
+                reported.or_else(|| {
+                    let cwd_str = self.current_cwd_for_cb.borrow().clone();
+                    if cwd_str.is_empty() {
+                        None
+                    } else {
+                        Some(cwd_str)
+                    }
+                })
+            };
+
+            // `None` means the shell never reported a status.
+            // Background output was never a command, so it has no
+            // status to report either — both render neutrally
+            // rather than as a success.
+            let exit_code = if is_background {
+                None
+            } else {
+                self.pending_exit_code_rc.get()
+            };
+
+            // Single id shared by the serializable BlockData and
+            // the GTK FinishedBlock so id-keyed lookups (export,
+            // delete) resolve in both lists.
+            let block_id = next_block_id(&self.reserved_history_block_ids);
+            // Capture cols now (live VTE is allocated by the time
+            // a command finishes) and store it on BlockData so
+            // session restore can recreate the finished VTE at
+            // the same width — preserving column-formatted output
+            // (ls, git log, etc.) instead of reflowing it.
+            let cols = bounded_finished_vte_columns(self.active_rc.borrow().grid_cols() as i64);
+            let estimated_height = estimated_finished_block_height_for_text(
+                &self.config_for_cb.borrow(),
+                &output_plain,
+                cols,
+            );
+            let block_data = BlockData {
+                id: block_id,
+                prompt: prompt.clone(),
+                cmd: cmd.clone(),
+                cmd_markup: None,
+                output: output_plain.trim().to_string(),
+                exit_code,
+                estimated_height,
+                line_count,
+                start_time_ms,
+                end_time_ms,
+                duration_ms,
+                cwd: block_cwd.clone(),
+                cols: cols as u16,
+            };
+
+            render_finalized_block(
+                FinalizeRenderCtx {
+                    active_rc: self.active_rc.clone(),
+                    active_vte: self.active_vte.clone(),
+                    bstate_rc: self.bstate_rc.clone(),
+                    typed_cmd_rc: self.typed_cmd_rc.clone(),
+                    bracketed_paste_rc: self.bracketed_paste_rc.clone(),
+                    armed_agent_execution_rc: self.armed_agent_execution_rc.clone(),
+                    active_agent_execution_rc: self.active_agent_execution_rc.clone(),
+                    execution_id_rc: self.execution_id_rc.clone(),
+                    config_for_cb: self.config_for_cb.clone(),
+                    dynamic_colors_rc: self.dynamic_colors_rc.clone(),
+                    block_data_for_cb: self.block_data_for_cb.clone(),
+                    failure_marker_redraw: self.failure_marker_redraw.clone(),
+                    finished_blocks_for_cb: self.finished_blocks_for_cb.clone(),
+                    find_state_rc: self.find_state_rc.clone(),
+                    scroll_debouncer: self.scroll_debouncer.clone(),
+                    widget_pool_for_cb: self.widget_pool_for_cb.clone(),
+                    pty_synced_rc: self.pty_synced_rc.clone(),
+                    visible_indices_rc: self.visible_indices_rc.clone(),
+                    pty_for_init: self.pty_for_init.clone(),
+                    unread_count_rc: self.unread_count_rc.clone(),
+                    jump_fab: self.jump_fab.clone(),
+                    selected_block_ids_rc: self.selected_block_ids_rc.clone(),
+                    selected_block_id_rc: self.selected_block_id_rc.clone(),
+                    selection_anchor_id_rc: self.selection_anchor_id_rc.clone(),
+                    bookmarks_rc: self.bookmarks_rc.clone(),
+                    block_list_rc: self.block_list_rc.clone(),
+                    block_scroll_rc: self.block_scroll_rc.clone(),
+                    block_finished_cbs: self.block_finished_cbs.clone(),
+                    ask_ai_about_block_cbs: self.ask_ai_about_block_cbs.clone(),
+                    kitty_assembler_rc: self.kitty_assembler_rc.clone(),
+                    kitty_pending_images_rc: self.kitty_pending_images_rc.clone(),
+                    kitty_pending_bytes_rc: self.kitty_pending_bytes_rc.clone(),
+                },
+                block_data,
+                FinalizedBlockArgs {
+                    block_id,
+                    prompt,
+                    cmd,
+                    output_with_ansi,
+                    output_plain,
+                    output_trimmed,
+                    block_cwd,
+                    cols,
+                    exit_code,
+                    duration_ms,
+                    end_time_ms,
+                    is_background,
+                },
+            );
+        }
+        self.bstate_rc.set(BlockState::CollectingPrompt);
+        self.prompt_buf_rc.borrow_mut().clear();
+        // Live VTE collapses back to the compact input cell
+        // now that no command is running. Sync the PTY size
+        // so the shell sees the new winsize before it reads
+        // anything past the prompt.
+        sync_active_to_pty(
+            &self.layout_active_surface,
+            &self.active_vte,
+            &self.block_scroll_rc,
+            &self.pty_for_init,
+        );
+        self.scroll_debouncer.mark_dirty(&self.block_scroll_rc);
+    }
+
+    fn on_prompt_end(&self) {
+        if self.bstate_rc.get() != BlockState::CollectingPrompt {
+            return;
+        }
+        self.verified_submission.cancel_if_pending(
+            "a new prompt arrived before the reviewed command start was verified",
+        );
+        // Capture the rendered prompt (last non-empty line) for the
+        // finished block / export.
+        let prompt_line = {
+            let pb = self.prompt_buf_rc.borrow();
+            strip_ansi(&pb)
+                .lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        };
+        *self.prompt_display_rc.borrow_mut() = prompt_line;
+        self.prompt_buf_rc.borrow_mut().clear();
+        self.typed_cmd_rc.borrow_mut().clear();
+        self.vte_typed_cmd_rc.borrow_mut().clear();
+        self.background_output_rc.borrow_mut().clear();
+        self.idle_input_dirty_rc.set(false);
+        let prompt_generation = self.agent_prompt_generation_rc.get().wrapping_add(1);
+        self.agent_prompt_generation_rc.set(prompt_generation);
+        // An armed write belongs to exactly one prompt. A
+        // redraw/new prompt before CommandStart invalidates
+        // it instead of letting same text match later.
+        self.armed_agent_execution_rc.borrow_mut().take();
+        self.active_agent_execution_rc.set(None);
+        self.agent_completion_trusted_rc.set(false);
+        self.execution_id_trusted_rc.set(false);
+        // Snapshot the live VTE cursor at the moment the
+        // prompt finishes drawing — this is where the user's
+        // command starts. CommandStart will read text from
+        // here to the cursor's then-position to recover the
+        // command as it really appeared on screen.
+        let (col, row) = self.active_vte.cursor_position();
+        self.prompt_end_pos_rc.set((col, row));
+        self.prompt_anchor_ready_rc.set(false);
+        self.pty_synced_rc.set(false);
+        self.bstate_rc.set(BlockState::AwaitingCommand);
+        // VTE applies feed asynchronously. Keep the cursor
+        // captured at the authenticated PromptEnd boundary
+        // immutable, then expose it after a short fence only
+        // if no input or new prompt raced it. Moving this
+        // anchor to the later live cursor could absorb text
+        // printed after PromptEnd (for example a line-editor
+        // prefill) into trusted prompt furniture.
+        {
+            let state = self.bstate_rc.clone();
+            let dirty = self.idle_input_dirty_rc.clone();
+            let synced = self.pty_synced_rc.clone();
+            let generation = self.agent_prompt_generation_rc.clone();
+            let ready = self.prompt_anchor_ready_rc.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(32), move || {
+                if state.get() == BlockState::AwaitingCommand
+                    && generation.get() == prompt_generation
+                    && !dirty.get()
+                    && !synced.get()
+                {
+                    ready.set(true);
+                }
+            });
+        }
+        (self.layout_active_surface)();
+        if self.active_vte.has_focus() {
+            let active_for_focus = self.active_rc.clone();
+            glib::idle_add_local_once(move || {
+                active_for_focus.borrow().grab_focus();
+            });
+        }
+
+        // Feed next initial command if any.
+        if let Some(cmd) = self.init_cmds_queue_for_cb.borrow_mut().pop_front() {
+            let text = format!("{}\r", cmd);
+            self.idle_input_dirty_rc.set(true);
+            self.pty_synced_rc.set(true);
+            self.pty_for_init.write_bytes(text.as_bytes());
+        }
+
+        self.scroll_debouncer.reset_scroll_lock();
+        self.scroll_debouncer.mark_dirty(&self.block_scroll_rc);
+    }
+
+    fn on_command_start(&self, meta: &CommandMeta) {
+        self.ftcs_seen_rc.set(true);
+        let state = self.bstate_rc.get();
+        if state == BlockState::CollectingOutput || state == BlockState::AltScreen {
+            self.osc133_depth_rc
+                .set(self.osc133_depth_rc.get().saturating_add(1));
+            return;
+        }
+        if state != BlockState::AwaitingCommand {
+            return;
+        }
+        self.osc133_depth_rc.set(0);
+        // A command start without an intervening PromptStart is
+        // an ambiguous shell-integration edge. Keep those bytes
+        // visible in the live VTE but do not merge them into the
+        // command's output block.
+        self.background_output_rc.borrow_mut().clear();
+        self.active_rc.borrow().reset_output_buffer();
+        self.block_start_time_for_cb.set(Some(SystemTime::now()));
+        // The shell may attach its own measurement to either
+        // mark; jsh puts it on D. Reset it here so the previous
+        // command's figure cannot be reused for this one.
+        self.shell_duration_ms_rc.set(meta.duration_ms);
+        // jsh's execution id: the key its journal is written
+        // under, so the output captured below can be attached
+        // to the record instead of living only in this window.
+        *self.execution_id_rc.borrow_mut() = meta.id.clone();
+        let trusted_execution_id = meta.id.as_deref().is_some_and(|id| {
+            self.pty_for_init
+                .shell_integration_token()
+                .is_some_and(|token| command_id_uses_shell_token(id, token))
+        });
+        self.execution_id_trusted_rc.set(trusted_execution_id);
+        self.agent_completion_trusted_rc.set(false);
+        // The cwd the command runs *in*. The pane's tracked cwd
+        // comes from an OSC 7 the shell emits with its next
+        // prompt, which for `cd`/`pushd` is already the new
+        // directory by the time this block is finalized.
+        *self.command_cwd_rc.borrow_mut() = meta.cwd.clone();
+        // Scrape the command off the live VTE as the fallback
+        // for shells that send bare marks: the range from the
+        // cursor captured at PromptEnd to the cursor now (right
+        // before the shell echoes a newline) is what the user
+        // saw, including history recalls and jsh autosuggestion
+        // accepts.
+        let (cmd_end_col, cmd_end_row) = self.active_vte.cursor_position();
+        let (start_col, start_row) = self.prompt_end_pos_rc.get();
+        let captured = self
+            .active_vte
+            .text_range_format(
+                vte4::Format::Text,
+                start_row,
+                start_col,
+                cmd_end_row,
+                cmd_end_col,
+            )
+            .0
+            .map(|gs| gs.to_string())
+            .unwrap_or_default();
+        let scraped = normalize_captured_command(&captured, &self.prompt_display_rc.borrow());
+        let (command, source) =
+            resolve_command_text(meta.command.as_deref(), meta.command_truncated, &scraped);
+        if source == CommandTextSource::ScreenAfterTruncation {
+            log::debug!(
+                "Shell dropped an oversized command line; falling back to the screen capture ({} bytes)",
+                command.len()
+            );
+        }
+        let matching_execution = self.verified_submission.command_start_observed(
+            meta.command.as_deref(),
+            &captured,
+            trusted_execution_id,
+        );
+        self.active_agent_execution_rc.set(matching_execution);
+        *self.vte_typed_cmd_rc.borrow_mut() = command.clone();
+        emit_command_started(
+            &self.command_started_cbs,
+            CommandStartedEvent {
+                command: command.clone(),
+                cwd: self.command_cwd_rc.borrow().clone(),
+            },
+        );
+        *self.running_cmd_rc.borrow_mut() = command;
+        self.cmd_running_rc.set(true);
+        self.bstate_rc.set(BlockState::CollectingOutput);
+        // Do not clear the input shadow here. VTE `feed()` is
+        // asynchronous, so the text-range capture above can
+        // occasionally be empty even for a real command. It
+        // remains the finalize fallback until PromptEnd
+        // clears both command buffers for the next prompt.
+        // Match anvil's block-mode runtime model: keep the
+        // active VTE as the live surface while the command
+        // runs, then snapshot it into a finished block on the
+        // next prompt. Interactive CLIs such as Codex rely on
+        // VTE applying cursor positioning/redraws directly.
+        sync_active_to_pty(
+            &self.layout_active_surface,
+            &self.active_vte,
+            &self.block_scroll_rc,
+            &self.pty_for_init,
+        );
+        self.scroll_debouncer.mark_dirty(&self.block_scroll_rc);
+    }
+
+    fn on_command_end(&self, exit: Option<i32>, meta: &CommandMeta) {
+        let state = self.bstate_rc.get();
+        if state != BlockState::CollectingOutput && state != BlockState::AltScreen {
+            return;
+        }
+        let matches_started_id = command_end_matches_started_id(
+            self.execution_id_rc.borrow().as_deref(),
+            meta.id.as_deref(),
+        );
+        if self.osc133_depth_rc.get() > 0 && !matches_started_id {
+            self.osc133_depth_rc.set(self.osc133_depth_rc.get() - 1);
+            return;
+        }
+        if matches_started_id {
+            // A command can print an unmatched nested C
+            // marker. The shell's private outer C/D id still
+            // identifies its real completion, so do not let
+            // hostile output wedge this pane indefinitely.
+            self.osc133_depth_rc.set(0);
+        }
+        let active_agent_execution = self.active_agent_execution_rc.get();
+        let shell_is_foreground = self.pty_for_init.shell_is_foreground();
+        let trusted_match = self.execution_id_trusted_rc.get()
+            && command_end_matches_started_id(
+                self.execution_id_rc.borrow().as_deref(),
+                meta.id.as_deref(),
+            );
+        match decide_agent_command_end(
+            active_agent_execution.is_some(),
+            shell_is_foreground,
+            trusted_match,
+        ) {
+            AgentCommandEndDecision::IgnoreUntilShellOwnsForeground => {
+                // A foreground job can emit arbitrary OSC.
+                // Wait until the interactive shell actually
+                // regains ownership before accepting its D.
+                log::warn!(
+                    "Ignoring an Agent command-end marker while a child process owns the PTY"
+                );
+                return;
+            }
+            AgentCommandEndDecision::Accept => {
+                if active_agent_execution.is_some() {
+                    self.agent_completion_trusted_rc.set(true);
+                }
+            }
+            AgentCommandEndDecision::AcceptWithoutAgentCorrelation => {
+                let execution =
+                    active_agent_execution.expect("decision requires an active Agent execution");
+                self.active_agent_execution_rc.set(None);
+                self.agent_completion_trusted_rc.set(false);
+                emit_agent_execution_lost(
+                    &self.verified_submission.agent_execution_lost_callbacks,
+                    execution,
+                    "the shell command end lacked a trusted matching id or foreground owner",
+                );
+            }
+        }
+        // Safety net (Warp parity): if the alt-screen app
+        // crashed or exited without rmcup, force the UI back
+        // to the block list so the next prompt is usable.
+        if state == BlockState::AltScreen {
+            let mode = self.active_alt_screen_mode_rc.replace(None).unwrap_or(1049);
+            let leave = format!("\x1b[?{mode}l");
+            self.active_vte.feed(leave.as_bytes());
+            exit_fullscreen(
+                &self.finished_blocks_for_cb,
+                &self.visible_indices_rc,
+                &self.fullscreen_rc,
+            );
+            self.active_rc.borrow().set_live_organism_alt_screen(false);
+            emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Left);
+            (self.layout_active_surface)();
+        }
+        // `None` stays `None`: a shell that reported no status
+        // is not a shell that reported success, and this used
+        // to collapse to a green `exit 0`.
+        self.pending_exit_code_rc.set(exit);
+        // jsh measures the command itself; only fall back to
+        // this process's timer when the shell said nothing.
+        if meta.duration_ms.is_some() {
+            self.shell_duration_ms_rc.set(meta.duration_ms);
+        }
+        // The D packet repeats the execution id, so a shell
+        // that only tags the finish still correlates.
+        if meta.id.is_some() {
+            *self.execution_id_rc.borrow_mut() = meta.id.clone();
+        }
+        let duration_ms = self.shell_duration_ms_rc.get().or_else(|| {
+            self.block_start_time_for_cb.get().and_then(|started| {
+                SystemTime::now()
+                    .duration_since(started)
+                    .ok()
+                    .map(|elapsed| elapsed.as_millis().min(u64::MAX as u128) as u64)
+            })
+        });
+        emit_command_finished(
+            &self.command_finished_cbs,
+            CommandFinishedEvent {
+                command: self.running_cmd_rc.borrow().clone(),
+                cwd: self.command_cwd_rc.borrow().clone(),
+                exit_code: exit,
+                duration_ms,
+            },
+        );
+        self.cmd_running_rc.set(false);
+        self.bstate_rc.set(BlockState::PostCommand);
+        self.scroll_debouncer.mark_dirty(&self.block_scroll_rc);
+    }
+
+    fn on_alt_screen_enter(&self, mode: u32) {
+        let from_state = self.bstate_rc.get();
+        if from_state != BlockState::CollectingOutput && from_state != BlockState::AwaitingCommand {
+            return;
+        }
+        self.prev_state_rc.set(from_state);
+        self.bstate_rc.set(BlockState::AltScreen);
+        self.active_alt_screen_mode_rc.set(Some(mode));
+        {
+            let active = self.active_rc.borrow();
+            active.set_live_organism_visible(false);
+            active.set_live_organism_alt_screen(true);
+        }
+        emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Entered);
+        // Hand the viewport to the alt-screen app: hide finished
+        // blocks so the live VTE fills the scroll area.
+        enter_fullscreen(
+            &self.finished_blocks_for_cb,
+            &self.visible_indices_rc,
+            &self.fullscreen_rc,
+        );
+        // Grow the live VTE to the full viewport before the
+        // app draws (see sync_active_to_pty doc).
+        sync_active_to_pty(
+            &self.layout_active_surface,
+            &self.active_vte,
+            &self.block_scroll_rc,
+            &self.pty_for_init,
+        );
+        let enter = format!("\x1b[?{mode}h");
+        self.active_vte.feed(enter.as_bytes());
+    }
+
+    fn on_alt_screen_leave(&self, mode: u32) {
+        if self.bstate_rc.get() != BlockState::AltScreen {
+            return;
+        }
+        // Warp parity: alt-screen content is ephemeral and is
+        // NOT merged into the block. The active block keeps
+        // just the command name + exit code.
+        self.active_alt_screen_mode_rc.set(None);
+        self.active_rc.borrow().set_live_organism_alt_screen(false);
+        emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Left);
+        let leave = format!("\x1b[?{mode}l");
+        self.active_vte.feed(leave.as_bytes());
+        exit_fullscreen(
+            &self.finished_blocks_for_cb,
+            &self.visible_indices_rc,
+            &self.fullscreen_rc,
+        );
+        self.osc133_depth_rc.set(0);
+        self.bstate_rc.set(self.prev_state_rc.get());
+        // Collapse the live VTE back to the compact input cell
+        // now that the alt app has released the viewport.
+        sync_active_to_pty(
+            &self.layout_active_surface,
+            &self.active_vte,
+            &self.block_scroll_rc,
+            &self.pty_for_init,
+        );
+        if self.active_vte.has_focus() {
+            let active_for_idle = self.active_rc.clone();
+            glib::idle_add_local_once(move || {
+                active_for_idle.borrow().grab_focus();
+            });
+        }
+    }
+
+    fn on_clipboard_set(&self, text: &str) {
+        if self.config_for_cb.borrow().allow_remote_clipboard_write {
+            if let Some(display) = gtk::gdk::Display::default() {
+                let clipboard = display.clipboard();
+                clipboard.set_text(text);
+            }
+        }
+    }
+
+    fn on_clipboard_query(&self) {
+        self.pty_for_init.write_bytes(b"\x1b]52;c;\x1b\\");
+    }
+
+    fn on_color_query(&self, kind: ColorKind) {
+        let reply = build_color_query_reply(
+            &self.config_for_cb.borrow(),
+            self.dynamic_colors_rc.get(),
+            kind,
+        );
+        self.pty_for_init.write_bytes(reply.as_bytes());
+    }
+
+    // The original OSC bytes already passed through to the
+    // live VTE (which recolors natively); only the tracked
+    // values change here so queries and new finished blocks
+    // see the dynamic color.
+    fn on_color_set(&self, kind: ColorKind, spec: &str) {
+        let mut colors = self.dynamic_colors_rc.get();
+        colors.set(kind, spec);
+        self.dynamic_colors_rc.set(colors);
+    }
+
+    fn on_color_reset(&self, kind: ColorKind) {
+        let mut colors = self.dynamic_colors_rc.get();
+        colors.reset(kind);
+        self.dynamic_colors_rc.set(colors);
+    }
+
+    fn on_keyboard_protocol_query(&self, query: KeyboardProtocolQuery) {
+        let (col, row) = self.active_vte.cursor_position();
+        let reply = build_keyboard_query_reply(query, col, row);
+        self.pty_for_init.write_bytes(reply.as_bytes());
+    }
+
+    fn on_apc_sequence(&self, payload: &[u8]) {
+        // APC G — Kitty graphics. libvte has no APC graphics
+        // handler, so re-wrapping these bytes and feeding
+        // them to the live VTE (the previous behaviour)
+        // silently dropped every inline image. Decode them
+        // here instead, regardless of block state — tools
+        // like `kitten icat` emit them at the shell prompt
+        // (main screen), not only inside alt-screen apps.
+        // Completed textures accumulate against the running
+        // command and are mounted on its finished block.
+        // Non-G APC payloads keep today's behaviour: consumed
+        // silently, since libvte would ignore them anyway.
+        if jterm_core::kitty_graphics::is_graphics_payload(payload) {
+            let outcome = self.kitty_assembler_rc.borrow_mut().feed(payload);
+            // Answer before consuming the outcome: clients
+            // like `kitten icat` block on the `i=`-keyed
+            // OK/error reply.
+            if let Some(reply) = kitty_graphics::response_for(payload, &outcome) {
+                self.pty_for_init.write_bytes(&reply);
+            }
+            if let kitty_graphics::Outcome::Complete(texture) = outcome {
+                // Rough memory bound: width*height*4 (bytes
+                // per RGBA pixel). Once the shared per-block
+                // budget is exhausted, further images drop —
+                // the transmission was still acknowledged
+                // above, only the display is skipped.
+                let approx = (texture.width() as usize)
+                    .saturating_mul(texture.height() as usize)
+                    .saturating_mul(4);
+                let used = self.kitty_pending_bytes_rc.get();
+                if used + approx <= kitty_graphics::MAX_PENDING_BYTES_PER_BLOCK {
+                    self.kitty_pending_bytes_rc.set(used + approx);
+                    self.kitty_pending_images_rc.borrow_mut().push(texture);
+                } else {
+                    log::warn!(
+                        "kitty graphics: per-block image budget exhausted ({} + {} > {}), dropping",
+                        used,
+                        approx,
+                        kitty_graphics::MAX_PENDING_BYTES_PER_BLOCK
+                    );
+                }
+            }
+        }
+    }
+
+    fn on_notification(&self, title: &Option<String>, body: &str) {
+        // Desktop notification requested via OSC 9 / OSC
+        // 777. The parser already control-stripped and
+        // capped the text; here only launch pacing is
+        // enforced, then extras drop silently.
+        let now = Instant::now();
+        LAST_NOTIFICATION_AT.with(|last| {
+            if notification_permitted(last.get(), now) {
+                last.set(Some(now));
+                crate::notify::app_notification(title.as_deref(), body);
+            }
+        });
+    }
 }
 
 /// Fold every run of consecutive `ParserEvent::Bytes(_)` entries in `events`
@@ -3467,99 +4327,25 @@ fn render_finalized_block(ctx: FinalizeRenderCtx, block_data: BlockData, args: F
 
 impl ReaderCtx {
     fn install(self, pty: &Rc<OwnedPty>) -> std::io::Result<()> {
-        let ReaderCtx {
-            active_rc,
-            active_vte,
-            bstate_rc,
-            prev_state_rc,
-            osc133_depth_rc,
-            prompt_buf_rc,
-            typed_cmd_rc,
-            background_output_rc,
-            idle_input_dirty_rc,
-            vte_typed_cmd_rc,
-            prompt_end_pos_rc,
-            prompt_anchor_ready_rc,
-            prompt_display_rc,
-            block_list_rc,
-            block_scroll_rc,
-            remote_session_cbs,
-            exited_cbs,
-            activity_cbs,
-            alt_screen_cbs,
-            command_started_cbs,
-            command_finished_cbs,
-            mouse_reporting_rc,
-            bracketed_paste_rc,
-            dynamic_colors_rc,
-            config_for_cb,
-            parser,
-            block_data_for_cb,
-            reserved_history_block_ids,
-            failure_marker_redraw,
-            finished_blocks_for_cb,
-            scroll_debouncer,
-            widget_pool_for_cb,
-            pty_synced_rc,
-            visible_indices_rc,
-            fullscreen_rc,
-            ftcs_seen_rc,
-            init_cmds_queue_for_cb,
-            pty_for_init,
-            block_start_time_for_cb,
-            pending_exit_code_rc,
-            shell_duration_ms_rc,
-            execution_id_rc,
-            execution_id_trusted_rc,
-            agent_completion_trusted_rc,
-            command_cwd_rc,
-            current_cwd_for_cb,
-            event_buf,
-            unread_count_rc,
-            jump_fab,
-            selected_block_ids_rc,
-            selected_block_id_rc,
-            selection_anchor_id_rc,
-            bookmarks_rc,
-            find_state_rc,
-            cmd_running_rc,
-            running_cmd_rc,
-            armed_agent_execution_rc,
-            agent_prompt_generation_rc,
-            active_agent_execution_rc,
-            agent_execution_supported_rc,
-            verified_submission,
-            layout_active_surface,
-            block_finished_cbs,
-            ask_ai_about_block_cbs,
-            selection_feed_hold,
-        } = self;
-        let active_alt_screen_mode_rc: Rc<Cell<Option<u32>>> = Rc::new(Cell::new(None));
-        // Kitty graphics (APC G) — multi-chunk uploads assemble here; completed
-        // textures wait against the running command until its block finishes.
-        // The byte counter enforces the shared per-block budget so a runaway
-        // shell cannot balloon RSS between prompts.
-        let kitty_assembler_rc: Rc<RefCell<kitty_graphics::Assembler>> =
-            Rc::new(RefCell::new(kitty_graphics::Assembler::new()));
-        let kitty_pending_images_rc: Rc<RefCell<Vec<gtk::gdk::Texture>>> =
-            Rc::new(RefCell::new(Vec::new()));
-        let kitty_pending_bytes_rc: Rc<Cell<usize>> = Rc::new(Cell::new(0));
         let shell_token = pty
             .shell_integration_token()
             .unwrap_or_default()
             .to_string();
         let mut capability_observer = ShellCapabilityObserver::default();
-        selection_feed_hold.install_vte_hooks(&active_vte);
+        self.selection_feed_hold.install_vte_hooks(&self.active_vte);
+
+        let ctx = Rc::new(self);
 
         // Keep the complete security-observer → parser → Block state machine
         // behind one replayable closure. A selection hold intercepts raw chunks
         // before this boundary and flushes them back through this exact path.
-        let process_chunk: Rc<RefCell<dyn FnMut(Vec<u8>)>> = Rc::new(RefCell::new(
+        let process_chunk: Rc<RefCell<dyn FnMut(Vec<u8>)>> = Rc::new(RefCell::new({
+            let ctx = ctx.clone();
             move |data: Vec<u8>| {
-                capability_observer.feed(&data, &shell_token, &agent_execution_supported_rc);
-                let mut events = event_buf.borrow_mut();
+                capability_observer.feed(&data, &shell_token, &ctx.agent_execution_supported_rc);
+                let mut events = ctx.event_buf.borrow_mut();
                 events.clear();
-                parser.borrow_mut().feed(&data, &mut events);
+                ctx.parser.borrow_mut().feed(&data, &mut events);
                 // Fold runs of consecutive `Bytes` events into one so the live
                 // VTE feed, autoscroll mark-dirty, and accumulate_output happen
                 // once per stretch instead of once per parser chunk. Boundary
@@ -3568,872 +4354,15 @@ impl ReaderCtx {
                 // the scroll-invariant from [[scroll_synchronous_autoscroll]].
                 coalesce_bytes_events(&mut events);
 
+                // `events` keeps `event_buf` mutably borrowed across the whole
+                // dispatch: no `on_*` handler may touch `self.event_buf`.
                 for event in events.iter() {
-                    let state = bstate_rc.get();
-                    match event {
-                        ParserEvent::RemoteSessionId(id) => {
-                            for cb in remote_session_cbs.borrow().iter() {
-                                cb(id);
-                            }
-                        }
-                        ParserEvent::DecsetMode { mode, set } => {
-                            if *mode == 2004 {
-                                bracketed_paste_rc.set(*set);
-                            }
-                            // VTE handles paste/cursor/etc. natively from its
-                            // own bytes; block_view only needs mouse-reporting
-                            // state for wheel suppression in alt-screen apps.
-                            let new_mode = match (*mode, *set) {
-                                (1000, true) => Some(MouseReportingMode::Click),
-                                (1002, true) => Some(MouseReportingMode::Button),
-                                (1003, true) => Some(MouseReportingMode::Motion),
-                                (1006, true) => Some(MouseReportingMode::Sgr),
-                                (1000 | 1002 | 1003 | 1006, false) => {
-                                    Some(MouseReportingMode::None)
-                                }
-                                _ => None,
-                            };
-                            if let Some(m) = new_mode {
-                                mouse_reporting_rc.set(m);
-                            }
-                        }
-                        ParserEvent::Bytes(bytes) => {
-                            if state == BlockState::AwaitingCommand {
-                                if let Some(submission) =
-                                    verified_submission.submission.borrow_mut().as_mut()
-                                {
-                                    if submission.phase == ReviewedSubmissionPhase::Submitted
-                                        && !reviewed_pre_command_bytes_are_identity_neutral(bytes)
-                                    {
-                                        submission.identity_feed_tainted = true;
-                                    }
-                                }
-                            }
-                            // No shell integration seen yet: once real output flows,
-                            // stream everything into the live VTE (raw fallback).
-                            if state == BlockState::Idle {
-                                bstate_rc.set(BlockState::RawFallback);
-                            }
-
-                            let feed_active_vte = match bstate_rc.get() {
-                                BlockState::CollectingPrompt => {
-                                    let text = String::from_utf8_lossy(bytes);
-                                    append_bounded_text_tail(
-                                        &mut prompt_buf_rc.borrow_mut(),
-                                        &text,
-                                        MAX_PROMPT_CAPTURE_BYTES,
-                                    );
-                                    scroll_debouncer.mark_dirty(&block_scroll_rc);
-                                    true
-                                }
-                                BlockState::AwaitingCommand => {
-                                    // Warp separates asynchronous output only when it
-                                    // arrives before the user begins editing. Once input
-                                    // is dirty, PTY echo/completion is indistinguishable
-                                    // from a background process and remains inline.
-                                    if !idle_input_dirty_rc.get() {
-                                        let mut pending = background_output_rc.borrow_mut();
-                                        append_bounded_output(
-                                            &mut pending,
-                                            bytes,
-                                            MAX_RAW_OUTPUT_BYTES,
-                                        );
-                                    }
-                                    scroll_debouncer.mark_dirty(&block_scroll_rc);
-                                    true
-                                }
-                                BlockState::CollectingOutput | BlockState::PostCommand => {
-                                    if bstate_rc.get() != BlockState::PostCommand
-                                        || !is_post_command_metadata(bytes)
-                                    {
-                                        active_rc.borrow().accumulate_output(bytes);
-                                    }
-                                    for cb in activity_cbs.borrow().iter() {
-                                        cb();
-                                    }
-                                    true
-                                }
-                                BlockState::AltScreen => {
-                                    // Alt-screen bytes go to the live VTE only — they
-                                    // are not captured into block output (ephemeral).
-                                    true
-                                }
-                                _ => true,
-                            };
-
-                            if feed_active_vte {
-                                active_vte.feed(bytes);
-                            }
-                        }
-
-                        ParserEvent::PromptStart => {
-                            ftcs_seen_rc.set(true);
-                            let state = bstate_rc.get();
-                            if state == BlockState::CollectingOutput
-                                || state == BlockState::AltScreen
-                            {
-                                continue;
-                            }
-                            if state == BlockState::PostCommand
-                                && !agent_prompt_boundary_is_trusted(
-                                    active_agent_execution_rc.get(),
-                                    pty_for_init.shell_is_foreground(),
-                                )
-                            {
-                                // A foreground child can print a guessed/known
-                                // C/D/A sequence. Its D may have moved us to
-                                // PostCommand, but it cannot return foreground
-                                // ownership to the shell. Resume capture and
-                                // wait for the shell's real D + prompt instead.
-                                log::warn!(
-                                    "Ignoring an Agent prompt marker while a child process still owns the PTY"
-                                );
-                                pending_exit_code_rc.set(None);
-                                cmd_running_rc.set(true);
-                                bstate_rc.set(BlockState::CollectingOutput);
-                                continue;
-                            }
-                            if state == BlockState::PostCommand
-                                && !agent_completion_trusted_rc.get()
-                            {
-                                if let Some(execution) = active_agent_execution_rc.take() {
-                                    emit_agent_execution_lost(
-                                        &verified_submission.agent_execution_lost_callbacks,
-                                        execution,
-                                        "the shell prompt arrived without a trusted matching command end",
-                                    );
-                                }
-                            }
-                            let background_output = if state == BlockState::AwaitingCommand {
-                                take_background_output(&background_output_rc)
-                            } else {
-                                None
-                            };
-                            let is_background = background_output.is_some();
-                            // Finalize the previous command (deferred from CommandEnd),
-                            // or turn commandless async output into a first-class block.
-                            if state == BlockState::PostCommand || is_background {
-                                // The VTE-text capture taken at CommandStart is
-                                // authoritative — it reflects what was on screen
-                                // when the user pressed Enter. Fall back to the
-                                // keystroke shadow only if the VTE read came back
-                                // empty (which would indicate the prompt-end
-                                // anchor never captured a valid cursor position).
-                                let cmd = if is_background {
-                                    String::new()
-                                } else {
-                                    finished_command(
-                                        &vte_typed_cmd_rc.borrow(),
-                                        &typed_cmd_rc.borrow(),
-                                    )
-                                };
-
-                                if cmd.is_empty() && !is_background {
-                                    // Nothing meaningful to record; just reset.
-                                    let preserve = config_for_cb.borrow().preserve_live_scrollback;
-                                    active_rc.borrow().reset_active(preserve);
-                                    // No block is created here, so half-uploaded
-                                    // kitty chunks and undisplayed images have
-                                    // nowhere to land: drop them with the rest of
-                                    // the active state instead of leaking into
-                                    // the next command.
-                                    kitty_assembler_rc.borrow_mut().reset();
-                                    kitty_pending_images_rc.borrow_mut().clear();
-                                    kitty_pending_bytes_rc.set(0);
-                                    bstate_rc.set(BlockState::CollectingPrompt);
-                                    prompt_buf_rc.borrow_mut().clear();
-                                    scroll_debouncer.mark_dirty(&block_scroll_rc);
-                                    continue;
-                                }
-
-                                let prompt = if is_background {
-                                    String::new()
-                                } else {
-                                    prompt_display_rc.borrow().clone()
-                                };
-
-                                // The raw bytes already carry CRLF — the PTY's
-                                // ONLCR turns `\n` into `\r\n` on the master side
-                                // before we ever see them — and the finished VTE
-                                // handles in-line CR overwrites natively, just
-                                // like the live VTE did while the command ran. So
-                                // we feed the captured bytes verbatim, with no
-                                // reconstruction pass.
-                                let output_with_ansi = background_output
-                                    .unwrap_or_else(|| active_rc.borrow().output_text());
-
-                                let output_plain = strip_ansi(&output_with_ansi).to_string();
-
-                                let truncation_limit =
-                                    config_for_cb.borrow().truncation_threshold_lines as usize;
-                                let output_trimmed = {
-                                    let trimmed = output_plain.trim();
-                                    let lines: Vec<&str> = trimmed.lines().collect();
-                                    if lines.len() > truncation_limit {
-                                        let kept: String = lines[..truncation_limit].join("\n");
-                                        format!("{}\n\n[... truncated: {} lines total, showing first {}]", kept, lines.len(), truncation_limit)
-                                    } else {
-                                        trimmed.to_string()
-                                    }
-                                };
-
-                                let line_count = output_trimmed.lines().count();
-
-                                let start_time = if is_background {
-                                    None
-                                } else {
-                                    block_start_time_for_cb.get()
-                                };
-                                let now = SystemTime::now();
-                                let end_time_ms = now
-                                    .duration_since(SystemTime::UNIX_EPOCH)
-                                    .ok()
-                                    .map(|d| d.as_millis() as u64);
-                                let start_time_ms = start_time.and_then(|st| {
-                                    st.duration_since(SystemTime::UNIX_EPOCH)
-                                        .ok()
-                                        .map(|d| d.as_millis() as u64)
-                                });
-                                // Commandless background output has no shell-reported
-                                // figure of its own, so it keeps the local timer only.
-                                let shell_duration_ms = if is_background {
-                                    None
-                                } else {
-                                    shell_duration_ms_rc.take()
-                                };
-                                let duration_ms =
-                                    block_duration_ms(shell_duration_ms, start_time, now);
-
-                                let block_cwd = {
-                                    // The cwd the shell said the command ran in wins
-                                    // over the pane's tracked cwd: after `cd`, the
-                                    // OSC 7 that updated the pane already names the
-                                    // directory the *next* command will run in.
-                                    let reported = if is_background {
-                                        None
-                                    } else {
-                                        command_cwd_rc.borrow_mut().take()
-                                    };
-                                    reported.or_else(|| {
-                                        let cwd_str = current_cwd_for_cb.borrow().clone();
-                                        if cwd_str.is_empty() {
-                                            None
-                                        } else {
-                                            Some(cwd_str)
-                                        }
-                                    })
-                                };
-
-                                // `None` means the shell never reported a status.
-                                // Background output was never a command, so it has no
-                                // status to report either — both render neutrally
-                                // rather than as a success.
-                                let exit_code = if is_background {
-                                    None
-                                } else {
-                                    pending_exit_code_rc.get()
-                                };
-
-                                // Single id shared by the serializable BlockData and
-                                // the GTK FinishedBlock so id-keyed lookups (export,
-                                // delete) resolve in both lists.
-                                let block_id = next_block_id(&reserved_history_block_ids);
-                                // Capture cols now (live VTE is allocated by the time
-                                // a command finishes) and store it on BlockData so
-                                // session restore can recreate the finished VTE at
-                                // the same width — preserving column-formatted output
-                                // (ls, git log, etc.) instead of reflowing it.
-                                let cols = bounded_finished_vte_columns(
-                                    active_rc.borrow().grid_cols() as i64,
-                                );
-                                let estimated_height = estimated_finished_block_height_for_text(
-                                    &config_for_cb.borrow(),
-                                    &output_plain,
-                                    cols,
-                                );
-                                let block_data = BlockData {
-                                    id: block_id,
-                                    prompt: prompt.clone(),
-                                    cmd: cmd.clone(),
-                                    cmd_markup: None,
-                                    output: output_plain.trim().to_string(),
-                                    exit_code,
-                                    estimated_height,
-                                    line_count,
-                                    start_time_ms,
-                                    end_time_ms,
-                                    duration_ms,
-                                    cwd: block_cwd.clone(),
-                                    cols: cols as u16,
-                                };
-
-                                render_finalized_block(
-                                    FinalizeRenderCtx {
-                                        active_rc: active_rc.clone(),
-                                        active_vte: active_vte.clone(),
-                                        bstate_rc: bstate_rc.clone(),
-                                        typed_cmd_rc: typed_cmd_rc.clone(),
-                                        bracketed_paste_rc: bracketed_paste_rc.clone(),
-                                        armed_agent_execution_rc: armed_agent_execution_rc.clone(),
-                                        active_agent_execution_rc: active_agent_execution_rc
-                                            .clone(),
-                                        execution_id_rc: execution_id_rc.clone(),
-                                        config_for_cb: config_for_cb.clone(),
-                                        dynamic_colors_rc: dynamic_colors_rc.clone(),
-                                        block_data_for_cb: block_data_for_cb.clone(),
-                                        failure_marker_redraw: failure_marker_redraw.clone(),
-                                        finished_blocks_for_cb: finished_blocks_for_cb.clone(),
-                                        find_state_rc: find_state_rc.clone(),
-                                        scroll_debouncer: scroll_debouncer.clone(),
-                                        widget_pool_for_cb: widget_pool_for_cb.clone(),
-                                        pty_synced_rc: pty_synced_rc.clone(),
-                                        visible_indices_rc: visible_indices_rc.clone(),
-                                        pty_for_init: pty_for_init.clone(),
-                                        unread_count_rc: unread_count_rc.clone(),
-                                        jump_fab: jump_fab.clone(),
-                                        selected_block_ids_rc: selected_block_ids_rc.clone(),
-                                        selected_block_id_rc: selected_block_id_rc.clone(),
-                                        selection_anchor_id_rc: selection_anchor_id_rc.clone(),
-                                        bookmarks_rc: bookmarks_rc.clone(),
-                                        block_list_rc: block_list_rc.clone(),
-                                        block_scroll_rc: block_scroll_rc.clone(),
-                                        block_finished_cbs: block_finished_cbs.clone(),
-                                        ask_ai_about_block_cbs: ask_ai_about_block_cbs.clone(),
-                                        kitty_assembler_rc: kitty_assembler_rc.clone(),
-                                        kitty_pending_images_rc: kitty_pending_images_rc.clone(),
-                                        kitty_pending_bytes_rc: kitty_pending_bytes_rc.clone(),
-                                    },
-                                    block_data,
-                                    FinalizedBlockArgs {
-                                        block_id,
-                                        prompt,
-                                        cmd,
-                                        output_with_ansi,
-                                        output_plain,
-                                        output_trimmed,
-                                        block_cwd,
-                                        cols,
-                                        exit_code,
-                                        duration_ms,
-                                        end_time_ms,
-                                        is_background,
-                                    },
-                                );
-                            }
-                            bstate_rc.set(BlockState::CollectingPrompt);
-                            prompt_buf_rc.borrow_mut().clear();
-                            // Live VTE collapses back to the compact input cell
-                            // now that no command is running. Sync the PTY size
-                            // so the shell sees the new winsize before it reads
-                            // anything past the prompt.
-                            sync_active_to_pty(
-                                &layout_active_surface,
-                                &active_vte,
-                                &block_scroll_rc,
-                                &pty_for_init,
-                            );
-                            scroll_debouncer.mark_dirty(&block_scroll_rc);
-                        }
-
-                        ParserEvent::PromptEnd => {
-                            if bstate_rc.get() != BlockState::CollectingPrompt {
-                                continue;
-                            }
-                            verified_submission.cancel_if_pending(
-                                "a new prompt arrived before the reviewed command start was verified",
-                            );
-                            // Capture the rendered prompt (last non-empty line) for the
-                            // finished block / export.
-                            let prompt_line = {
-                                let pb = prompt_buf_rc.borrow();
-                                strip_ansi(&pb)
-                                    .lines()
-                                    .rev()
-                                    .find(|l| !l.trim().is_empty())
-                                    .unwrap_or("")
-                                    .trim()
-                                    .to_string()
-                            };
-                            *prompt_display_rc.borrow_mut() = prompt_line;
-                            prompt_buf_rc.borrow_mut().clear();
-                            typed_cmd_rc.borrow_mut().clear();
-                            vte_typed_cmd_rc.borrow_mut().clear();
-                            background_output_rc.borrow_mut().clear();
-                            idle_input_dirty_rc.set(false);
-                            let prompt_generation =
-                                agent_prompt_generation_rc.get().wrapping_add(1);
-                            agent_prompt_generation_rc.set(prompt_generation);
-                            // An armed write belongs to exactly one prompt. A
-                            // redraw/new prompt before CommandStart invalidates
-                            // it instead of letting same text match later.
-                            armed_agent_execution_rc.borrow_mut().take();
-                            active_agent_execution_rc.set(None);
-                            agent_completion_trusted_rc.set(false);
-                            execution_id_trusted_rc.set(false);
-                            // Snapshot the live VTE cursor at the moment the
-                            // prompt finishes drawing — this is where the user's
-                            // command starts. CommandStart will read text from
-                            // here to the cursor's then-position to recover the
-                            // command as it really appeared on screen.
-                            let (col, row) = active_vte.cursor_position();
-                            prompt_end_pos_rc.set((col, row));
-                            prompt_anchor_ready_rc.set(false);
-                            pty_synced_rc.set(false);
-                            bstate_rc.set(BlockState::AwaitingCommand);
-                            // VTE applies feed asynchronously. Keep the cursor
-                            // captured at the authenticated PromptEnd boundary
-                            // immutable, then expose it after a short fence only
-                            // if no input or new prompt raced it. Moving this
-                            // anchor to the later live cursor could absorb text
-                            // printed after PromptEnd (for example a line-editor
-                            // prefill) into trusted prompt furniture.
-                            {
-                                let state = bstate_rc.clone();
-                                let dirty = idle_input_dirty_rc.clone();
-                                let synced = pty_synced_rc.clone();
-                                let generation = agent_prompt_generation_rc.clone();
-                                let ready = prompt_anchor_ready_rc.clone();
-                                glib::timeout_add_local_once(
-                                    std::time::Duration::from_millis(32),
-                                    move || {
-                                        if state.get() == BlockState::AwaitingCommand
-                                            && generation.get() == prompt_generation
-                                            && !dirty.get()
-                                            && !synced.get()
-                                        {
-                                            ready.set(true);
-                                        }
-                                    },
-                                );
-                            }
-                            layout_active_surface();
-                            if active_vte.has_focus() {
-                                let active_for_focus = active_rc.clone();
-                                glib::idle_add_local_once(move || {
-                                    active_for_focus.borrow().grab_focus();
-                                });
-                            }
-
-                            // Feed next initial command if any.
-                            if let Some(cmd) = init_cmds_queue_for_cb.borrow_mut().pop_front() {
-                                let text = format!("{}\r", cmd);
-                                idle_input_dirty_rc.set(true);
-                                pty_synced_rc.set(true);
-                                pty_for_init.write_bytes(text.as_bytes());
-                            }
-
-                            scroll_debouncer.reset_scroll_lock();
-                            scroll_debouncer.mark_dirty(&block_scroll_rc);
-                        }
-
-                        ParserEvent::CommandStart(meta) => {
-                            ftcs_seen_rc.set(true);
-                            let state = bstate_rc.get();
-                            if state == BlockState::CollectingOutput
-                                || state == BlockState::AltScreen
-                            {
-                                osc133_depth_rc.set(osc133_depth_rc.get().saturating_add(1));
-                                continue;
-                            }
-                            if state != BlockState::AwaitingCommand {
-                                continue;
-                            }
-                            osc133_depth_rc.set(0);
-                            // A command start without an intervening PromptStart is
-                            // an ambiguous shell-integration edge. Keep those bytes
-                            // visible in the live VTE but do not merge them into the
-                            // command's output block.
-                            background_output_rc.borrow_mut().clear();
-                            active_rc.borrow().reset_output_buffer();
-                            block_start_time_for_cb.set(Some(SystemTime::now()));
-                            // The shell may attach its own measurement to either
-                            // mark; jsh puts it on D. Reset it here so the previous
-                            // command's figure cannot be reused for this one.
-                            shell_duration_ms_rc.set(meta.duration_ms);
-                            // jsh's execution id: the key its journal is written
-                            // under, so the output captured below can be attached
-                            // to the record instead of living only in this window.
-                            *execution_id_rc.borrow_mut() = meta.id.clone();
-                            let trusted_execution_id = meta.id.as_deref().is_some_and(|id| {
-                                pty_for_init
-                                    .shell_integration_token()
-                                    .is_some_and(|token| command_id_uses_shell_token(id, token))
-                            });
-                            execution_id_trusted_rc.set(trusted_execution_id);
-                            agent_completion_trusted_rc.set(false);
-                            // The cwd the command runs *in*. The pane's tracked cwd
-                            // comes from an OSC 7 the shell emits with its next
-                            // prompt, which for `cd`/`pushd` is already the new
-                            // directory by the time this block is finalized.
-                            *command_cwd_rc.borrow_mut() = meta.cwd.clone();
-                            // Scrape the command off the live VTE as the fallback
-                            // for shells that send bare marks: the range from the
-                            // cursor captured at PromptEnd to the cursor now (right
-                            // before the shell echoes a newline) is what the user
-                            // saw, including history recalls and jsh autosuggestion
-                            // accepts.
-                            let (cmd_end_col, cmd_end_row) = active_vte.cursor_position();
-                            let (start_col, start_row) = prompt_end_pos_rc.get();
-                            let captured = active_vte
-                                .text_range_format(
-                                    vte4::Format::Text,
-                                    start_row,
-                                    start_col,
-                                    cmd_end_row,
-                                    cmd_end_col,
-                                )
-                                .0
-                                .map(|gs| gs.to_string())
-                                .unwrap_or_default();
-                            let scraped =
-                                normalize_captured_command(&captured, &prompt_display_rc.borrow());
-                            let (command, source) = resolve_command_text(
-                                meta.command.as_deref(),
-                                meta.command_truncated,
-                                &scraped,
-                            );
-                            if source == CommandTextSource::ScreenAfterTruncation {
-                                log::debug!(
-                                    "Shell dropped an oversized command line; falling back to the screen capture ({} bytes)",
-                                    command.len()
-                                );
-                            }
-                            let matching_execution = verified_submission.command_start_observed(
-                                meta.command.as_deref(),
-                                &captured,
-                                trusted_execution_id,
-                            );
-                            active_agent_execution_rc.set(matching_execution);
-                            *vte_typed_cmd_rc.borrow_mut() = command.clone();
-                            emit_command_started(
-                                &command_started_cbs,
-                                CommandStartedEvent {
-                                    command: command.clone(),
-                                    cwd: command_cwd_rc.borrow().clone(),
-                                },
-                            );
-                            *running_cmd_rc.borrow_mut() = command;
-                            cmd_running_rc.set(true);
-                            bstate_rc.set(BlockState::CollectingOutput);
-                            // Do not clear the input shadow here. VTE `feed()` is
-                            // asynchronous, so the text-range capture above can
-                            // occasionally be empty even for a real command. It
-                            // remains the finalize fallback until PromptEnd
-                            // clears both command buffers for the next prompt.
-                            // Match anvil's block-mode runtime model: keep the
-                            // active VTE as the live surface while the command
-                            // runs, then snapshot it into a finished block on the
-                            // next prompt. Interactive CLIs such as Codex rely on
-                            // VTE applying cursor positioning/redraws directly.
-                            sync_active_to_pty(
-                                &layout_active_surface,
-                                &active_vte,
-                                &block_scroll_rc,
-                                &pty_for_init,
-                            );
-                            scroll_debouncer.mark_dirty(&block_scroll_rc);
-                        }
-
-                        ParserEvent::CommandEnd { exit, meta } => {
-                            let state = bstate_rc.get();
-                            if state != BlockState::CollectingOutput
-                                && state != BlockState::AltScreen
-                            {
-                                continue;
-                            }
-                            let matches_started_id = command_end_matches_started_id(
-                                execution_id_rc.borrow().as_deref(),
-                                meta.id.as_deref(),
-                            );
-                            if osc133_depth_rc.get() > 0 && !matches_started_id {
-                                osc133_depth_rc.set(osc133_depth_rc.get() - 1);
-                                continue;
-                            }
-                            if matches_started_id {
-                                // A command can print an unmatched nested C
-                                // marker. The shell's private outer C/D id still
-                                // identifies its real completion, so do not let
-                                // hostile output wedge this pane indefinitely.
-                                osc133_depth_rc.set(0);
-                            }
-                            let active_agent_execution = active_agent_execution_rc.get();
-                            let shell_is_foreground = pty_for_init.shell_is_foreground();
-                            let trusted_match = execution_id_trusted_rc.get()
-                                && command_end_matches_started_id(
-                                    execution_id_rc.borrow().as_deref(),
-                                    meta.id.as_deref(),
-                                );
-                            match decide_agent_command_end(
-                                active_agent_execution.is_some(),
-                                shell_is_foreground,
-                                trusted_match,
-                            ) {
-                                AgentCommandEndDecision::IgnoreUntilShellOwnsForeground => {
-                                    // A foreground job can emit arbitrary OSC.
-                                    // Wait until the interactive shell actually
-                                    // regains ownership before accepting its D.
-                                    log::warn!(
-                                        "Ignoring an Agent command-end marker while a child process owns the PTY"
-                                    );
-                                    continue;
-                                }
-                                AgentCommandEndDecision::Accept => {
-                                    if active_agent_execution.is_some() {
-                                        agent_completion_trusted_rc.set(true);
-                                    }
-                                }
-                                AgentCommandEndDecision::AcceptWithoutAgentCorrelation => {
-                                    let execution = active_agent_execution
-                                        .expect("decision requires an active Agent execution");
-                                    active_agent_execution_rc.set(None);
-                                    agent_completion_trusted_rc.set(false);
-                                    emit_agent_execution_lost(
-                                        &verified_submission.agent_execution_lost_callbacks,
-                                        execution,
-                                        "the shell command end lacked a trusted matching id or foreground owner",
-                                    );
-                                }
-                            }
-                            // Safety net (Warp parity): if the alt-screen app
-                            // crashed or exited without rmcup, force the UI back
-                            // to the block list so the next prompt is usable.
-                            if state == BlockState::AltScreen {
-                                let mode = active_alt_screen_mode_rc.replace(None).unwrap_or(1049);
-                                let leave = format!("\x1b[?{mode}l");
-                                active_vte.feed(leave.as_bytes());
-                                exit_fullscreen(
-                                    &finished_blocks_for_cb,
-                                    &visible_indices_rc,
-                                    &fullscreen_rc,
-                                );
-                                active_rc.borrow().set_live_organism_alt_screen(false);
-                                emit_alt_screen_transition(
-                                    &alt_screen_cbs,
-                                    AltScreenTransition::Left,
-                                );
-                                layout_active_surface();
-                            }
-                            // `None` stays `None`: a shell that reported no status
-                            // is not a shell that reported success, and this used
-                            // to collapse to a green `exit 0`.
-                            pending_exit_code_rc.set(*exit);
-                            // jsh measures the command itself; only fall back to
-                            // this process's timer when the shell said nothing.
-                            if meta.duration_ms.is_some() {
-                                shell_duration_ms_rc.set(meta.duration_ms);
-                            }
-                            // The D packet repeats the execution id, so a shell
-                            // that only tags the finish still correlates.
-                            if meta.id.is_some() {
-                                *execution_id_rc.borrow_mut() = meta.id.clone();
-                            }
-                            let duration_ms = shell_duration_ms_rc.get().or_else(|| {
-                                block_start_time_for_cb.get().and_then(|started| {
-                                    SystemTime::now()
-                                        .duration_since(started)
-                                        .ok()
-                                        .map(|elapsed| {
-                                            elapsed.as_millis().min(u64::MAX as u128) as u64
-                                        })
-                                })
-                            });
-                            emit_command_finished(
-                                &command_finished_cbs,
-                                CommandFinishedEvent {
-                                    command: running_cmd_rc.borrow().clone(),
-                                    cwd: command_cwd_rc.borrow().clone(),
-                                    exit_code: *exit,
-                                    duration_ms,
-                                },
-                            );
-                            cmd_running_rc.set(false);
-                            bstate_rc.set(BlockState::PostCommand);
-                            scroll_debouncer.mark_dirty(&block_scroll_rc);
-                        }
-
-                        ParserEvent::AltScreenEnter(mode) => {
-                            let from_state = bstate_rc.get();
-                            if from_state != BlockState::CollectingOutput
-                                && from_state != BlockState::AwaitingCommand
-                            {
-                                continue;
-                            }
-                            prev_state_rc.set(from_state);
-                            bstate_rc.set(BlockState::AltScreen);
-                            active_alt_screen_mode_rc.set(Some(*mode));
-                            {
-                                let active = active_rc.borrow();
-                                active.set_live_organism_visible(false);
-                                active.set_live_organism_alt_screen(true);
-                            }
-                            emit_alt_screen_transition(
-                                &alt_screen_cbs,
-                                AltScreenTransition::Entered,
-                            );
-                            // Hand the viewport to the alt-screen app: hide finished
-                            // blocks so the live VTE fills the scroll area.
-                            enter_fullscreen(
-                                &finished_blocks_for_cb,
-                                &visible_indices_rc,
-                                &fullscreen_rc,
-                            );
-                            // Grow the live VTE to the full viewport before the
-                            // app draws (see sync_active_to_pty doc).
-                            sync_active_to_pty(
-                                &layout_active_surface,
-                                &active_vte,
-                                &block_scroll_rc,
-                                &pty_for_init,
-                            );
-                            let enter = format!("\x1b[?{mode}h");
-                            active_vte.feed(enter.as_bytes());
-                        }
-
-                        ParserEvent::AltScreenLeave(mode) => {
-                            if bstate_rc.get() != BlockState::AltScreen {
-                                continue;
-                            }
-                            // Warp parity: alt-screen content is ephemeral and is
-                            // NOT merged into the block. The active block keeps
-                            // just the command name + exit code.
-                            active_alt_screen_mode_rc.set(None);
-                            active_rc.borrow().set_live_organism_alt_screen(false);
-                            emit_alt_screen_transition(&alt_screen_cbs, AltScreenTransition::Left);
-                            let leave = format!("\x1b[?{mode}l");
-                            active_vte.feed(leave.as_bytes());
-                            exit_fullscreen(
-                                &finished_blocks_for_cb,
-                                &visible_indices_rc,
-                                &fullscreen_rc,
-                            );
-                            osc133_depth_rc.set(0);
-                            bstate_rc.set(prev_state_rc.get());
-                            // Collapse the live VTE back to the compact input cell
-                            // now that the alt app has released the viewport.
-                            sync_active_to_pty(
-                                &layout_active_surface,
-                                &active_vte,
-                                &block_scroll_rc,
-                                &pty_for_init,
-                            );
-                            if active_vte.has_focus() {
-                                let active_for_idle = active_rc.clone();
-                                glib::idle_add_local_once(move || {
-                                    active_for_idle.borrow().grab_focus();
-                                });
-                            }
-                        }
-
-                        ParserEvent::ClipboardSet(text) => {
-                            if config_for_cb.borrow().allow_remote_clipboard_write {
-                                if let Some(display) = gtk::gdk::Display::default() {
-                                    let clipboard = display.clipboard();
-                                    clipboard.set_text(text);
-                                }
-                            }
-                        }
-
-                        ParserEvent::ClipboardQuery => {
-                            pty_for_init.write_bytes(b"\x1b]52;c;\x1b\\");
-                        }
-
-                        ParserEvent::ColorQuery(kind) => {
-                            let reply = build_color_query_reply(
-                                &config_for_cb.borrow(),
-                                dynamic_colors_rc.get(),
-                                *kind,
-                            );
-                            pty_for_init.write_bytes(reply.as_bytes());
-                        }
-
-                        // The original OSC bytes already passed through to the
-                        // live VTE (which recolors natively); only the tracked
-                        // values change here so queries and new finished blocks
-                        // see the dynamic color.
-                        ParserEvent::ColorSet { kind, spec } => {
-                            let mut colors = dynamic_colors_rc.get();
-                            colors.set(*kind, spec);
-                            dynamic_colors_rc.set(colors);
-                        }
-
-                        ParserEvent::ColorReset(kind) => {
-                            let mut colors = dynamic_colors_rc.get();
-                            colors.reset(*kind);
-                            dynamic_colors_rc.set(colors);
-                        }
-
-                        ParserEvent::KeyboardProtocolQuery(query) => {
-                            let (col, row) = active_vte.cursor_position();
-                            let reply = build_keyboard_query_reply(*query, col, row);
-                            pty_for_init.write_bytes(reply.as_bytes());
-                        }
-
-                        ParserEvent::ApcSequence(payload) => {
-                            // APC G — Kitty graphics. libvte has no APC graphics
-                            // handler, so re-wrapping these bytes and feeding
-                            // them to the live VTE (the previous behaviour)
-                            // silently dropped every inline image. Decode them
-                            // here instead, regardless of block state — tools
-                            // like `kitten icat` emit them at the shell prompt
-                            // (main screen), not only inside alt-screen apps.
-                            // Completed textures accumulate against the running
-                            // command and are mounted on its finished block.
-                            // Non-G APC payloads keep today's behaviour: consumed
-                            // silently, since libvte would ignore them anyway.
-                            if jterm_core::kitty_graphics::is_graphics_payload(payload) {
-                                let outcome = kitty_assembler_rc.borrow_mut().feed(payload);
-                                // Answer before consuming the outcome: clients
-                                // like `kitten icat` block on the `i=`-keyed
-                                // OK/error reply.
-                                if let Some(reply) = kitty_graphics::response_for(payload, &outcome)
-                                {
-                                    pty_for_init.write_bytes(&reply);
-                                }
-                                if let kitty_graphics::Outcome::Complete(texture) = outcome {
-                                    // Rough memory bound: width*height*4 (bytes
-                                    // per RGBA pixel). Once the shared per-block
-                                    // budget is exhausted, further images drop —
-                                    // the transmission was still acknowledged
-                                    // above, only the display is skipped.
-                                    let approx = (texture.width() as usize)
-                                        .saturating_mul(texture.height() as usize)
-                                        .saturating_mul(4);
-                                    let used = kitty_pending_bytes_rc.get();
-                                    if used + approx <= kitty_graphics::MAX_PENDING_BYTES_PER_BLOCK
-                                    {
-                                        kitty_pending_bytes_rc.set(used + approx);
-                                        kitty_pending_images_rc.borrow_mut().push(texture);
-                                    } else {
-                                        log::warn!(
-                                            "kitty graphics: per-block image budget exhausted ({} + {} > {}), dropping",
-                                            used,
-                                            approx,
-                                            kitty_graphics::MAX_PENDING_BYTES_PER_BLOCK
-                                        );
-                                    }
-                                }
-                            }
-                        }
-
-                        ParserEvent::Notification { title, body } => {
-                            // Desktop notification requested via OSC 9 / OSC
-                            // 777. The parser already control-stripped and
-                            // capped the text; here only launch pacing is
-                            // enforced, then extras drop silently.
-                            let now = Instant::now();
-                            LAST_NOTIFICATION_AT.with(|last| {
-                                if notification_permitted(last.get(), now) {
-                                    last.set(Some(now));
-                                    crate::notify::app_notification(title.as_deref(), body);
-                                }
-                            });
-                        }
-                    }
+                    ctx.handle_event(event);
                 }
-            },
-        ));
+            }
+        }));
 
-        selection_feed_hold.set_flush({
+        ctx.selection_feed_hold.set_flush({
             let process_chunk = Rc::downgrade(&process_chunk);
             move |bytes| {
                 if let Some(process_chunk) = process_chunk.upgrade() {
@@ -4442,8 +4371,9 @@ impl ReaderCtx {
             }
         });
 
-        let hold_for_reader = selection_feed_hold.clone();
-        let hold_for_exit = selection_feed_hold.clone();
+        let hold_for_reader = ctx.selection_feed_hold.clone();
+        let hold_for_exit = ctx.selection_feed_hold.clone();
+        let exited_cbs = ctx.exited_cbs.clone();
         pty.start_reader(
             move |data: Vec<u8>| {
                 if hold_for_reader.try_buffer(&data) {
@@ -5806,6 +5736,10 @@ impl TermView {
                 block_finished_cbs: block_finished_callbacks.clone(),
                 ask_ai_about_block_cbs: ask_ai_about_block_callbacks.clone(),
                 selection_feed_hold: selection_feed_hold.clone(),
+                active_alt_screen_mode_rc: Rc::new(Cell::new(None)),
+                kitty_assembler_rc: Rc::new(RefCell::new(kitty_graphics::Assembler::new())),
+                kitty_pending_images_rc: Rc::new(RefCell::new(Vec::new())),
+                kitty_pending_bytes_rc: Rc::new(Cell::new(0)),
             }
             .install(&pty)?;
 
