@@ -2717,7 +2717,6 @@ pub struct TermView {
     active_vte: Terminal,
     active: Rc<RefCell<ActiveBlock>>,
     bstate: Rc<Cell<BlockState>>,
-    prompt_buf: Rc<RefCell<String>>,
     /// Keystroke shadow used only to size the idle input cell (line count). The
     /// authoritative finished-command text is read off the live VTE at
     /// CommandStart, so this never has to round-trip to display.
@@ -2731,7 +2730,6 @@ pub struct TermView {
     /// It follows only the next command at the same prompt generation; the
     /// Agent session performs the secondary command-text check at completion.
     armed_agent_execution: Rc<RefCell<Option<ArmedAgentExecution>>>,
-    agent_prompt_generation: Rc<Cell<u64>>,
     /// True only after a token-aware integration announces the exact private
     /// token inside the current prompt boundary.
     agent_execution_supported: Rc<Cell<bool>>,
@@ -6432,12 +6430,10 @@ impl TermView {
             active_vte,
             active,
             bstate,
-            prompt_buf,
             typed_cmd,
             prompt_end_pos,
             prompt_anchor_ready,
             armed_agent_execution,
-            agent_prompt_generation,
             agent_execution_supported,
             verified_submission,
             active_agent_execution,
