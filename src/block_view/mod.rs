@@ -2865,6 +2865,41 @@ impl Drop for TermView {
     }
 }
 
+/// Reader-pipeline state private to this pane's PTY event dispatch: nothing
+/// outside [`ReaderCtx`] reads or writes these, so they live as plain values
+/// behind one `RefCell`. Borrows must stay statement- or tight-block-scoped —
+/// never held across the finalize path, a callback fan-out, a layout/PTY-sync
+/// call, or a VTE feed.
+struct EngineState {
+    /// State to restore when an alt-screen app exits (anvil model).
+    prev_state: BlockState,
+    osc133_depth: u32,
+    prompt_buf: String,
+    /// Bytes emitted asynchronously after PromptEnd and before the next PromptStart.
+    /// Empty-command blocks are inferred from this separate buffer, so no history
+    /// schema change is needed.
+    background_output: VecDeque<u8>,
+    /// Command text read from the live VTE at CommandStart; primary source
+    /// for the finished block.
+    vte_typed_cmd: String,
+    /// Rendered prompt (last non-empty line) captured at PromptEnd, used by the
+    /// finalize path since prompt_buf is cleared once the prompt ends.
+    prompt_display: String,
+    /// Status from the shell's OSC 133 `D` packet. `None` means the shell did
+    /// not report one — not that the command succeeded.
+    pending_exit_code: Option<i32>,
+    /// Duration the shell measured for the running command, when it sends one.
+    /// Beats `block_start_time_for_cb`, which starts when this process noticed
+    /// the mark.
+    shell_duration_ms: Option<u64>,
+    execution_id_trusted: bool,
+    agent_completion_trusted: bool,
+    /// cwd the running command was started in, as the shell reported it at
+    /// CommandStart. The pane's tracked cwd has already moved on after a `cd`.
+    command_cwd: Option<String>,
+    active_alt_screen_mode: Option<u32>,
+}
+
 /// Captures the shared handles the PTY reader/exit callbacks need, so
 /// `TermView::new` does not carry the reader closure inline.
 struct ReaderCtx {
@@ -2872,30 +2907,17 @@ struct ReaderCtx {
     /// The live VTE — every byte is fed here; alt-screen toggles feed it 1049h/l.
     active_vte: Terminal,
     bstate_rc: Rc<Cell<BlockState>>,
-    /// State to restore when an alt-screen app exits (anvil model).
-    prev_state_rc: Rc<Cell<BlockState>>,
-    osc133_depth_rc: Rc<Cell<u32>>,
-    prompt_buf_rc: Rc<RefCell<String>>,
+    engine: RefCell<EngineState>,
     /// Keystroke-shadow input line, used only as a fallback if the VTE-text
     /// capture at CommandStart returns empty.
     typed_cmd_rc: Rc<RefCell<String>>,
-    /// Bytes emitted asynchronously after PromptEnd and before the next PromptStart.
-    /// Empty-command blocks are inferred from this separate buffer, so no history
-    /// schema change is needed.
-    background_output_rc: Rc<RefCell<VecDeque<u8>>>,
     /// Once the user starts editing at an idle prompt, output is intentionally left
     /// inline: shell echo/completion and true background output are ambiguous then.
     idle_input_dirty_rc: Rc<Cell<bool>>,
-    /// Command text read from the live VTE at CommandStart; primary source
-    /// for the finished block.
-    vte_typed_cmd_rc: Rc<RefCell<String>>,
     /// VTE cursor position (col, row) captured at PromptEnd; the start anchor
-    /// for the text-range read that produces `vte_typed_cmd_rc`.
+    /// for the text-range read that produces `EngineState::vte_typed_cmd`.
     prompt_end_pos_rc: Rc<Cell<(i64, i64)>>,
     prompt_anchor_ready_rc: Rc<Cell<bool>>,
-    /// Rendered prompt (last non-empty line) captured at PromptEnd, used by the
-    /// finalize path since prompt_buf is cleared once the prompt ends.
-    prompt_display_rc: Rc<RefCell<String>>,
     block_list_rc: gtk::Box,
     block_scroll_rc: ScrolledWindow,
     remote_session_cbs: StrCallbacks,
@@ -2926,21 +2948,10 @@ struct ReaderCtx {
     init_cmds_queue_for_cb: Rc<RefCell<std::collections::VecDeque<String>>>,
     pty_for_init: Rc<OwnedPty>,
     block_start_time_for_cb: Rc<Cell<Option<SystemTime>>>,
-    /// Status from the shell's OSC 133 `D` packet. `None` means the shell did
-    /// not report one — not that the command succeeded.
-    pending_exit_code_rc: Rc<Cell<Option<i32>>>,
-    /// Duration the shell measured for the running command, when it sends one.
-    /// Beats `block_start_time_for_cb`, which starts when this process noticed
-    /// the mark.
-    shell_duration_ms_rc: Rc<Cell<Option<u64>>>,
     /// The shell's execution id for the running command (jsh only): the key its
-    /// execution journal keeps the record under.
+    /// execution journal keeps the record under. Still shared because the
+    /// finalize path consumes it.
     execution_id_rc: Rc<RefCell<Option<String>>>,
-    execution_id_trusted_rc: Rc<Cell<bool>>,
-    agent_completion_trusted_rc: Rc<Cell<bool>>,
-    /// cwd the running command was started in, as the shell reported it at
-    /// CommandStart. The pane's tracked cwd has already moved on after a `cd`.
-    command_cwd_rc: Rc<RefCell<Option<String>>>,
     current_cwd_for_cb: Rc<RefCell<String>>,
     event_buf: Rc<RefCell<Vec<ParserEvent>>>,
     unread_count_rc: Rc<Cell<u32>>,
@@ -2963,7 +2974,6 @@ struct ReaderCtx {
     block_finished_cbs: BlockFinishedCallbacks,
     ask_ai_about_block_cbs: BlockContextCallbacks,
     selection_feed_hold: Rc<SelectionFeedHold>,
-    active_alt_screen_mode_rc: Rc<Cell<Option<u32>>>,
     /// Kitty graphics (APC G) — multi-chunk uploads assemble here; completed
     /// textures wait against the running command until its block finishes.
     /// The byte counter enforces the shared per-block budget so a runaway
@@ -3047,7 +3057,7 @@ impl ReaderCtx {
             BlockState::CollectingPrompt => {
                 let text = String::from_utf8_lossy(bytes);
                 append_bounded_text_tail(
-                    &mut self.prompt_buf_rc.borrow_mut(),
+                    &mut self.engine.borrow_mut().prompt_buf,
                     &text,
                     MAX_PROMPT_CAPTURE_BYTES,
                 );
@@ -3060,8 +3070,12 @@ impl ReaderCtx {
                 // is dirty, PTY echo/completion is indistinguishable
                 // from a background process and remains inline.
                 if !self.idle_input_dirty_rc.get() {
-                    let mut pending = self.background_output_rc.borrow_mut();
-                    append_bounded_output(&mut pending, bytes, MAX_RAW_OUTPUT_BYTES);
+                    let mut engine = self.engine.borrow_mut();
+                    append_bounded_output(
+                        &mut engine.background_output,
+                        bytes,
+                        MAX_RAW_OUTPUT_BYTES,
+                    );
                 }
                 self.scroll_debouncer.mark_dirty(&self.block_scroll_rc);
                 true
@@ -3108,12 +3122,15 @@ impl ReaderCtx {
             // ownership to the shell. Resume capture and
             // wait for the shell's real D + prompt instead.
             log::warn!("Ignoring an Agent prompt marker while a child process still owns the PTY");
-            self.pending_exit_code_rc.set(None);
+            self.engine.borrow_mut().pending_exit_code = None;
             self.cmd_running_rc.set(true);
             self.bstate_rc.set(BlockState::CollectingOutput);
             return;
         }
-        if state == BlockState::PostCommand && !self.agent_completion_trusted_rc.get() {
+        // Read out of the engine cell first: an `if` condition's temporary
+        // `Ref` would otherwise stay alive across the fan-out in the body.
+        let agent_completion_trusted = self.engine.borrow().agent_completion_trusted;
+        if state == BlockState::PostCommand && !agent_completion_trusted {
             if let Some(execution) = self.active_agent_execution_rc.take() {
                 emit_agent_execution_lost(
                     &self.verified_submission.agent_execution_lost_callbacks,
@@ -3123,7 +3140,7 @@ impl ReaderCtx {
             }
         }
         let background_output = if state == BlockState::AwaitingCommand {
-            take_background_output(&self.background_output_rc)
+            take_background_output(&mut self.engine.borrow_mut().background_output)
         } else {
             None
         };
@@ -3140,7 +3157,10 @@ impl ReaderCtx {
             let cmd = if is_background {
                 String::new()
             } else {
-                finished_command(&self.vte_typed_cmd_rc.borrow(), &self.typed_cmd_rc.borrow())
+                finished_command(
+                    &self.engine.borrow().vte_typed_cmd,
+                    &self.typed_cmd_rc.borrow(),
+                )
             };
 
             if cmd.is_empty() && !is_background {
@@ -3156,7 +3176,7 @@ impl ReaderCtx {
                 self.kitty_pending_images_rc.borrow_mut().clear();
                 self.kitty_pending_bytes_rc.set(0);
                 self.bstate_rc.set(BlockState::CollectingPrompt);
-                self.prompt_buf_rc.borrow_mut().clear();
+                self.engine.borrow_mut().prompt_buf.clear();
                 self.scroll_debouncer.mark_dirty(&self.block_scroll_rc);
                 return;
             }
@@ -3164,7 +3184,7 @@ impl ReaderCtx {
             let prompt = if is_background {
                 String::new()
             } else {
-                self.prompt_display_rc.borrow().clone()
+                self.engine.borrow().prompt_display.clone()
             };
 
             // The raw bytes already carry CRLF — the PTY's
@@ -3218,7 +3238,7 @@ impl ReaderCtx {
             let shell_duration_ms = if is_background {
                 None
             } else {
-                self.shell_duration_ms_rc.take()
+                self.engine.borrow_mut().shell_duration_ms.take()
             };
             let duration_ms = block_duration_ms(shell_duration_ms, start_time, now);
 
@@ -3230,7 +3250,7 @@ impl ReaderCtx {
                 let reported = if is_background {
                     None
                 } else {
-                    self.command_cwd_rc.borrow_mut().take()
+                    self.engine.borrow_mut().command_cwd.take()
                 };
                 reported.or_else(|| {
                     let cwd_str = self.current_cwd_for_cb.borrow().clone();
@@ -3249,7 +3269,7 @@ impl ReaderCtx {
             let exit_code = if is_background {
                 None
             } else {
-                self.pending_exit_code_rc.get()
+                self.engine.borrow().pending_exit_code
             };
 
             // Single id shared by the serializable BlockData and
@@ -3336,7 +3356,7 @@ impl ReaderCtx {
             );
         }
         self.bstate_rc.set(BlockState::CollectingPrompt);
-        self.prompt_buf_rc.borrow_mut().clear();
+        self.engine.borrow_mut().prompt_buf.clear();
         // Live VTE collapses back to the compact input cell
         // now that no command is running. Sync the PTY size
         // so the shell sees the new winsize before it reads
@@ -3359,21 +3379,21 @@ impl ReaderCtx {
         );
         // Capture the rendered prompt (last non-empty line) for the
         // finished block / export.
-        let prompt_line = {
-            let pb = self.prompt_buf_rc.borrow();
-            strip_ansi(&pb)
+        {
+            let mut engine = self.engine.borrow_mut();
+            let prompt_line = strip_ansi(&engine.prompt_buf)
                 .lines()
                 .rev()
                 .find(|l| !l.trim().is_empty())
                 .unwrap_or("")
                 .trim()
-                .to_string()
-        };
-        *self.prompt_display_rc.borrow_mut() = prompt_line;
-        self.prompt_buf_rc.borrow_mut().clear();
+                .to_string();
+            engine.prompt_display = prompt_line;
+            engine.prompt_buf.clear();
+        }
         self.typed_cmd_rc.borrow_mut().clear();
-        self.vte_typed_cmd_rc.borrow_mut().clear();
-        self.background_output_rc.borrow_mut().clear();
+        self.engine.borrow_mut().vte_typed_cmd.clear();
+        self.engine.borrow_mut().background_output.clear();
         self.idle_input_dirty_rc.set(false);
         let prompt_generation = self.agent_prompt_generation_rc.get().wrapping_add(1);
         self.agent_prompt_generation_rc.set(prompt_generation);
@@ -3382,8 +3402,8 @@ impl ReaderCtx {
         // it instead of letting same text match later.
         self.armed_agent_execution_rc.borrow_mut().take();
         self.active_agent_execution_rc.set(None);
-        self.agent_completion_trusted_rc.set(false);
-        self.execution_id_trusted_rc.set(false);
+        self.engine.borrow_mut().agent_completion_trusted = false;
+        self.engine.borrow_mut().execution_id_trusted = false;
         // Snapshot the live VTE cursor at the moment the
         // prompt finishes drawing — this is where the user's
         // command starts. CommandStart will read text from
@@ -3441,25 +3461,25 @@ impl ReaderCtx {
         self.ftcs_seen_rc.set(true);
         let state = self.bstate_rc.get();
         if state == BlockState::CollectingOutput || state == BlockState::AltScreen {
-            self.osc133_depth_rc
-                .set(self.osc133_depth_rc.get().saturating_add(1));
+            let mut engine = self.engine.borrow_mut();
+            engine.osc133_depth = engine.osc133_depth.saturating_add(1);
             return;
         }
         if state != BlockState::AwaitingCommand {
             return;
         }
-        self.osc133_depth_rc.set(0);
+        self.engine.borrow_mut().osc133_depth = 0;
         // A command start without an intervening PromptStart is
         // an ambiguous shell-integration edge. Keep those bytes
         // visible in the live VTE but do not merge them into the
         // command's output block.
-        self.background_output_rc.borrow_mut().clear();
+        self.engine.borrow_mut().background_output.clear();
         self.active_rc.borrow().reset_output_buffer();
         self.block_start_time_for_cb.set(Some(SystemTime::now()));
         // The shell may attach its own measurement to either
         // mark; jsh puts it on D. Reset it here so the previous
         // command's figure cannot be reused for this one.
-        self.shell_duration_ms_rc.set(meta.duration_ms);
+        self.engine.borrow_mut().shell_duration_ms = meta.duration_ms;
         // jsh's execution id: the key its journal is written
         // under, so the output captured below can be attached
         // to the record instead of living only in this window.
@@ -3469,13 +3489,13 @@ impl ReaderCtx {
                 .shell_integration_token()
                 .is_some_and(|token| command_id_uses_shell_token(id, token))
         });
-        self.execution_id_trusted_rc.set(trusted_execution_id);
-        self.agent_completion_trusted_rc.set(false);
+        self.engine.borrow_mut().execution_id_trusted = trusted_execution_id;
+        self.engine.borrow_mut().agent_completion_trusted = false;
         // The cwd the command runs *in*. The pane's tracked cwd
         // comes from an OSC 7 the shell emits with its next
         // prompt, which for `cd`/`pushd` is already the new
         // directory by the time this block is finalized.
-        *self.command_cwd_rc.borrow_mut() = meta.cwd.clone();
+        self.engine.borrow_mut().command_cwd = meta.cwd.clone();
         // Scrape the command off the live VTE as the fallback
         // for shells that send bare marks: the range from the
         // cursor captured at PromptEnd to the cursor now (right
@@ -3496,7 +3516,7 @@ impl ReaderCtx {
             .0
             .map(|gs| gs.to_string())
             .unwrap_or_default();
-        let scraped = normalize_captured_command(&captured, &self.prompt_display_rc.borrow());
+        let scraped = normalize_captured_command(&captured, &self.engine.borrow().prompt_display);
         let (command, source) =
             resolve_command_text(meta.command.as_deref(), meta.command_truncated, &scraped);
         if source == CommandTextSource::ScreenAfterTruncation {
@@ -3511,12 +3531,15 @@ impl ReaderCtx {
             trusted_execution_id,
         );
         self.active_agent_execution_rc.set(matching_execution);
-        *self.vte_typed_cmd_rc.borrow_mut() = command.clone();
+        self.engine.borrow_mut().vte_typed_cmd = command.clone();
+        // `cwd` is read out of the engine cell before the fan-out: the
+        // callbacks must not run under an engine borrow.
+        let started_cwd = self.engine.borrow().command_cwd.clone();
         emit_command_started(
             &self.command_started_cbs,
             CommandStartedEvent {
                 command: command.clone(),
-                cwd: self.command_cwd_rc.borrow().clone(),
+                cwd: started_cwd,
             },
         );
         *self.running_cmd_rc.borrow_mut() = command;
@@ -3550,8 +3573,9 @@ impl ReaderCtx {
             self.execution_id_rc.borrow().as_deref(),
             meta.id.as_deref(),
         );
-        if self.osc133_depth_rc.get() > 0 && !matches_started_id {
-            self.osc133_depth_rc.set(self.osc133_depth_rc.get() - 1);
+        let osc133_depth = self.engine.borrow().osc133_depth;
+        if osc133_depth > 0 && !matches_started_id {
+            self.engine.borrow_mut().osc133_depth = osc133_depth - 1;
             return;
         }
         if matches_started_id {
@@ -3559,11 +3583,12 @@ impl ReaderCtx {
             // marker. The shell's private outer C/D id still
             // identifies its real completion, so do not let
             // hostile output wedge this pane indefinitely.
-            self.osc133_depth_rc.set(0);
+            self.engine.borrow_mut().osc133_depth = 0;
         }
         let active_agent_execution = self.active_agent_execution_rc.get();
         let shell_is_foreground = self.pty_for_init.shell_is_foreground();
-        let trusted_match = self.execution_id_trusted_rc.get()
+        let execution_id_trusted = self.engine.borrow().execution_id_trusted;
+        let trusted_match = execution_id_trusted
             && command_end_matches_started_id(
                 self.execution_id_rc.borrow().as_deref(),
                 meta.id.as_deref(),
@@ -3584,14 +3609,14 @@ impl ReaderCtx {
             }
             AgentCommandEndDecision::Accept => {
                 if active_agent_execution.is_some() {
-                    self.agent_completion_trusted_rc.set(true);
+                    self.engine.borrow_mut().agent_completion_trusted = true;
                 }
             }
             AgentCommandEndDecision::AcceptWithoutAgentCorrelation => {
                 let execution =
                     active_agent_execution.expect("decision requires an active Agent execution");
                 self.active_agent_execution_rc.set(None);
-                self.agent_completion_trusted_rc.set(false);
+                self.engine.borrow_mut().agent_completion_trusted = false;
                 emit_agent_execution_lost(
                     &self.verified_submission.agent_execution_lost_callbacks,
                     execution,
@@ -3603,7 +3628,8 @@ impl ReaderCtx {
         // crashed or exited without rmcup, force the UI back
         // to the block list so the next prompt is usable.
         if state == BlockState::AltScreen {
-            let mode = self.active_alt_screen_mode_rc.replace(None).unwrap_or(1049);
+            let mode = self.engine.borrow_mut().active_alt_screen_mode.take();
+            let mode = mode.unwrap_or(1049);
             let leave = format!("\x1b[?{mode}l");
             self.active_vte.feed(leave.as_bytes());
             exit_fullscreen(
@@ -3618,18 +3644,19 @@ impl ReaderCtx {
         // `None` stays `None`: a shell that reported no status
         // is not a shell that reported success, and this used
         // to collapse to a green `exit 0`.
-        self.pending_exit_code_rc.set(exit);
+        self.engine.borrow_mut().pending_exit_code = exit;
         // jsh measures the command itself; only fall back to
         // this process's timer when the shell said nothing.
         if meta.duration_ms.is_some() {
-            self.shell_duration_ms_rc.set(meta.duration_ms);
+            self.engine.borrow_mut().shell_duration_ms = meta.duration_ms;
         }
         // The D packet repeats the execution id, so a shell
         // that only tags the finish still correlates.
         if meta.id.is_some() {
             *self.execution_id_rc.borrow_mut() = meta.id.clone();
         }
-        let duration_ms = self.shell_duration_ms_rc.get().or_else(|| {
+        let shell_duration_ms = self.engine.borrow().shell_duration_ms;
+        let duration_ms = shell_duration_ms.or_else(|| {
             self.block_start_time_for_cb.get().and_then(|started| {
                 SystemTime::now()
                     .duration_since(started)
@@ -3637,11 +3664,13 @@ impl ReaderCtx {
                     .map(|elapsed| elapsed.as_millis().min(u64::MAX as u128) as u64)
             })
         });
+        // `cwd` leaves the engine cell before the fan-out below.
+        let finished_cwd = self.engine.borrow().command_cwd.clone();
         emit_command_finished(
             &self.command_finished_cbs,
             CommandFinishedEvent {
                 command: self.running_cmd_rc.borrow().clone(),
-                cwd: self.command_cwd_rc.borrow().clone(),
+                cwd: finished_cwd,
                 exit_code: exit,
                 duration_ms,
             },
@@ -3656,9 +3685,9 @@ impl ReaderCtx {
         if from_state != BlockState::CollectingOutput && from_state != BlockState::AwaitingCommand {
             return;
         }
-        self.prev_state_rc.set(from_state);
+        self.engine.borrow_mut().prev_state = from_state;
         self.bstate_rc.set(BlockState::AltScreen);
-        self.active_alt_screen_mode_rc.set(Some(mode));
+        self.engine.borrow_mut().active_alt_screen_mode = Some(mode);
         {
             let active = self.active_rc.borrow();
             active.set_live_organism_visible(false);
@@ -3691,7 +3720,7 @@ impl ReaderCtx {
         // Warp parity: alt-screen content is ephemeral and is
         // NOT merged into the block. The active block keeps
         // just the command name + exit code.
-        self.active_alt_screen_mode_rc.set(None);
+        self.engine.borrow_mut().active_alt_screen_mode = None;
         self.active_rc.borrow().set_live_organism_alt_screen(false);
         emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Left);
         let leave = format!("\x1b[?{mode}l");
@@ -3701,8 +3730,9 @@ impl ReaderCtx {
             &self.visible_indices_rc,
             &self.fullscreen_rc,
         );
-        self.osc133_depth_rc.set(0);
-        self.bstate_rc.set(self.prev_state_rc.get());
+        self.engine.borrow_mut().osc133_depth = 0;
+        let prev_state = self.engine.borrow().prev_state;
+        self.bstate_rc.set(prev_state);
         // Collapse the live VTE back to the compact input cell
         // now that the alt app has released the viewport.
         sync_active_to_pty(
@@ -3907,8 +3937,7 @@ fn background_output_has_visible_text(bytes: &[u8]) -> bool {
         .any(|ch| !ch.is_whitespace() && !ch.is_control())
 }
 
-fn take_background_output(pending: &RefCell<VecDeque<u8>>) -> Option<String> {
-    let mut pending = pending.borrow_mut();
+fn take_background_output(pending: &mut VecDeque<u8>) -> Option<String> {
     if pending.is_empty() {
         return None;
     }
@@ -5165,12 +5194,7 @@ impl TermView {
         // VTE at CommandStart, so this shadow is no longer load-bearing — it
         // does not need to match the rendered line in edge cases.
         let typed_cmd: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
-        let background_output: Rc<RefCell<VecDeque<u8>>> = Rc::new(RefCell::new(VecDeque::new()));
         let idle_input_dirty: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        // Command text snapshot taken at CommandStart from the VTE itself,
-        // between `prompt_end_pos` and the current cursor. This is what
-        // finalize uses to record the run.
-        let vte_typed_cmd: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         // VTE cursor position (col, row) right after the prompt finished
         // drawing — anchor for the text-range read at CommandStart.
         let prompt_end_pos: Rc<Cell<(i64, i64)>> = Rc::new(Cell::new((0, 0)));
@@ -5432,13 +5456,6 @@ impl TermView {
             });
         }
 
-        // State to restore when an alt-screen app exits (anvil model).
-        let prev_state: Rc<Cell<BlockState>> = Rc::new(Cell::new(BlockState::Idle));
-        let osc133_depth: Rc<Cell<u32>> = Rc::new(Cell::new(0));
-        let prompt_buf: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
-        // Rendered prompt captured at PromptEnd (prompt_buf is cleared once the
-        // prompt ends, so the finalize path reads this instead).
-        let prompt_display: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         // True while an alt-screen app owns the viewport (finished blocks hidden).
         let fullscreen: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let cwd_callbacks: CwdCallbacks = Rc::new(RefCell::new(vec![]));
@@ -5513,16 +5530,7 @@ impl TermView {
             });
         }
 
-        // Set from the shell's OSC 133 `D` packet. `None` — the initial value and
-        // the value for a shell that omits the status — means "not reported",
-        // which the block header renders as neutral rather than as `exit 0`.
-        let pending_exit_code: Rc<Cell<Option<i32>>> = Rc::new(Cell::new(None));
-        // Metadata jsh attaches to the same marks (see ParserEvent::CommandStart).
-        let shell_duration_ms: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
         let execution_id: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-        let execution_id_trusted: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        let agent_completion_trusted: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        let command_cwd: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
 
         let widget_pool: Rc<RefCell<WidgetPool>> = Rc::new(RefCell::new(WidgetPool::new()));
         let pty_synced: Rc<Cell<bool>> = Rc::new(Cell::new(false));
@@ -5646,13 +5654,8 @@ impl TermView {
             let active_rc = active.clone();
             let active_vte_rc = active_vte.clone();
             let bstate_rc = bstate.clone();
-            let prev_state_rc = prev_state.clone();
-            let osc133_depth_rc = osc133_depth.clone();
-            let prompt_buf_rc = prompt_buf.clone();
             let typed_cmd_rc = typed_cmd.clone();
-            let vte_typed_cmd_rc = vte_typed_cmd.clone();
             let prompt_end_pos_rc = prompt_end_pos.clone();
-            let prompt_display_rc = prompt_display.clone();
             let block_list_rc = block_list.clone();
             let block_scroll_rc = block_scroll.clone();
             let exited_cbs = exited_callbacks.clone();
@@ -5681,7 +5684,6 @@ impl TermView {
             let init_cmds_queue_for_cb = Rc::clone(&init_cmds_queue);
             let pty_for_init = Rc::clone(&pty);
             let block_start_time_for_cb = block_start_time.clone();
-            let pending_exit_code_rc = pending_exit_code.clone();
             let current_cwd_for_cb = current_cwd.clone();
 
             let event_buf: Rc<RefCell<Vec<ParserEvent>>> =
@@ -5690,16 +5692,29 @@ impl TermView {
                 active_rc,
                 active_vte: active_vte_rc,
                 bstate_rc,
-                prev_state_rc,
-                osc133_depth_rc,
-                prompt_buf_rc,
+                engine: RefCell::new(EngineState {
+                    prev_state: BlockState::Idle,
+                    osc133_depth: 0,
+                    prompt_buf: String::new(),
+                    background_output: VecDeque::new(),
+                    vte_typed_cmd: String::new(),
+                    prompt_display: String::new(),
+                    // `None` — the initial value and the value for a shell that
+                    // omits the status — means "not reported", which the block
+                    // header renders as neutral rather than as `exit 0`.
+                    pending_exit_code: None,
+                    // Metadata jsh attaches to the same marks (see
+                    // ParserEvent::CommandStart).
+                    shell_duration_ms: None,
+                    execution_id_trusted: false,
+                    agent_completion_trusted: false,
+                    command_cwd: None,
+                    active_alt_screen_mode: None,
+                }),
                 typed_cmd_rc,
-                background_output_rc: background_output.clone(),
                 idle_input_dirty_rc: idle_input_dirty.clone(),
-                vte_typed_cmd_rc,
                 prompt_end_pos_rc,
                 prompt_anchor_ready_rc: prompt_anchor_ready.clone(),
-                prompt_display_rc,
                 block_list_rc,
                 block_scroll_rc,
                 remote_session_cbs: remote_session_callbacks.clone(),
@@ -5726,12 +5741,7 @@ impl TermView {
                 init_cmds_queue_for_cb,
                 pty_for_init,
                 block_start_time_for_cb,
-                pending_exit_code_rc,
-                shell_duration_ms_rc: shell_duration_ms.clone(),
                 execution_id_rc: execution_id.clone(),
-                execution_id_trusted_rc: execution_id_trusted.clone(),
-                agent_completion_trusted_rc: agent_completion_trusted.clone(),
-                command_cwd_rc: command_cwd.clone(),
                 current_cwd_for_cb,
                 event_buf,
                 unread_count_rc: unread_count.clone(),
@@ -5752,7 +5762,6 @@ impl TermView {
                 block_finished_cbs: block_finished_callbacks.clone(),
                 ask_ai_about_block_cbs: ask_ai_about_block_callbacks.clone(),
                 selection_feed_hold: selection_feed_hold.clone(),
-                active_alt_screen_mode_rc: Rc::new(Cell::new(None)),
                 kitty_assembler_rc: Rc::new(RefCell::new(kitty_graphics::Assembler::new())),
                 kitty_pending_images_rc: Rc::new(RefCell::new(Vec::new())),
                 kitty_pending_bytes_rc: Rc::new(Cell::new(0)),
@@ -8453,13 +8462,13 @@ mod tests {
 
     #[test]
     fn taking_background_output_drains_the_pending_buffer() {
-        let pending = RefCell::new(VecDeque::from(b"async line\r\n".to_vec()));
+        let mut pending = VecDeque::from(b"async line\r\n".to_vec());
         assert_eq!(
-            take_background_output(&pending).as_deref(),
+            take_background_output(&mut pending).as_deref(),
             Some("async line\r\n")
         );
-        assert!(pending.borrow().is_empty());
-        assert!(take_background_output(&pending).is_none());
+        assert!(pending.is_empty());
+        assert!(take_background_output(&mut pending).is_none());
     }
 
     #[test]
