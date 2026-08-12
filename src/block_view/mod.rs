@@ -4922,9 +4922,14 @@ impl KeyCtx {
 
 #[allow(dead_code)]
 impl TermView {
-    /// Replace the runtime configuration shared by parser and rendering
+    /// Replace the runtime configuration shared by the reader/finalize
     /// callbacks. Visual setters are dispatched separately; this updates
-    /// behavioral options without requiring Block panes to be recreated.
+    /// behavioral options (scrollback preservation, output truncation, block
+    /// retention, long-block notifications, command-history capture, the OSC
+    /// color-reply palette, remote clipboard policy) without requiring Block
+    /// panes to be recreated. Parser flags (mouse/focus reporting) are
+    /// snapshotted into `ParserConfig` at pane construction and are NOT
+    /// affected.
     pub(crate) fn reload_config(&self, config: &Config) {
         *self.config.borrow_mut() = config.clone();
     }
@@ -5623,6 +5628,19 @@ impl TermView {
             });
         }
 
+        // One shared cell for the runtime Config: TermView.config and the
+        // reader/finalize path must alias, or reload_config / set_font /
+        // set_font_scale would update a copy the reader callbacks never see.
+        // The three borrow_mut sites (reload_config, set_font, set_font_scale)
+        // are statement-scoped and run from UI actions outside reader dispatch.
+        // Reader-path borrows may span calls only into code that cannot reach a
+        // borrow_mut of this cell (height estimation, finished_block_config,
+        // FinishedBlock::new_with_pool, the OSC color-reply builder,
+        // notify::long_block_finished and command_history::enqueue are all
+        // non-reentrant). Parser flags (mouse/focus reporting) are NOT covered:
+        // ParserConfig below snapshots them at construction.
+        let config_shared: Rc<RefCell<Config>> = Rc::new(RefCell::new(config.clone()));
+
         // ── Wire PTY → parser → block events ─────────────────────────────
         {
             let active_rc = active.clone();
@@ -5643,7 +5661,7 @@ impl TermView {
             let mouse_reporting_rc = mouse_reporting_mode.clone();
             let bracketed_paste_rc = bracketed_paste.clone();
             let dynamic_colors_rc = dynamic_colors.clone();
-            let config_for_cb = Rc::new(RefCell::new(config.clone()));
+            let config_for_cb = config_shared.clone();
             let parser = Rc::new(RefCell::new(Parser::with_config(ParserConfig {
                 mouse_reporting: config.mouse_reporting_enabled,
                 focus_reporting: config.focus_reporting_enabled,
@@ -6459,7 +6477,7 @@ impl TermView {
             mouse_reporting_mode,
             bracketed_paste,
             dynamic_colors,
-            config: Rc::new(RefCell::new(config.clone())),
+            config: config_shared,
             block_data: block_data_rc,
             reserved_history_block_ids,
             failure_marker_redraw,
