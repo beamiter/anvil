@@ -47,6 +47,320 @@ pub(crate) fn skip_escape_sequence(bytes: &[u8], i: usize) -> usize {
     }
 }
 
+/// Independent bounds for the visibility replay state. A row/column bound
+/// alone is insufficient: sparse cursor writes could otherwise retain the
+/// product of both limits. The aggregate high-water budget also accounts for
+/// `Vec` capacity retained after an erase/refill cycle.
+const MAX_VISIBILITY_GRID_ROWS: usize = 100_000;
+const MAX_VISIBILITY_GRID_COLS: usize = 10_000;
+const MAX_VISIBILITY_GRID_CELLS: usize = 1024 * 1024;
+const MAX_VISIBILITY_CSI_PARAM_BYTES: usize = 256;
+
+struct VisibilityGrid {
+    rows: Vec<Vec<char>>,
+    row_cell_high_water: Vec<usize>,
+    cells: usize,
+    retained_cells: usize,
+}
+
+impl VisibilityGrid {
+    fn new() -> Self {
+        Self {
+            rows: vec![Vec::new()],
+            row_cell_high_water: vec![0],
+            cells: 0,
+            retained_cells: 0,
+        }
+    }
+
+    fn ensure_row(&mut self, row: usize) -> bool {
+        if row >= MAX_VISIBILITY_GRID_ROWS {
+            return false;
+        }
+        if self.rows.len() <= row {
+            self.rows.resize_with(row + 1, Vec::new);
+            self.row_cell_high_water.resize(row + 1, 0);
+        }
+        true
+    }
+
+    fn ensure_len(&mut self, row: usize, len: usize) -> bool {
+        if row >= MAX_VISIBILITY_GRID_ROWS || len > MAX_VISIBILITY_GRID_COLS {
+            return false;
+        }
+        let old_len = self.rows.get(row).map_or(0, Vec::len);
+        let old_high_water = self.row_cell_high_water.get(row).copied().unwrap_or(0);
+        let additional = len.saturating_sub(old_len);
+        let retained_additional = len.saturating_sub(old_high_water);
+        if additional > MAX_VISIBILITY_GRID_CELLS.saturating_sub(self.cells)
+            || retained_additional > MAX_VISIBILITY_GRID_CELLS.saturating_sub(self.retained_cells)
+        {
+            return false;
+        }
+        if !self.ensure_row(row) {
+            return false;
+        }
+        if additional > 0 {
+            if self.rows[row].capacity() < len
+                && self.rows[row].try_reserve_exact(additional).is_err()
+            {
+                return false;
+            }
+            self.rows[row].resize(len, ' ');
+            self.cells += additional;
+        }
+        if retained_additional > 0 {
+            self.row_cell_high_water[row] = len;
+            self.retained_cells += retained_additional;
+        }
+        true
+    }
+
+    fn set_cell(&mut self, row: usize, col: usize, value: char) -> bool {
+        let Some(len) = col.checked_add(1) else {
+            return false;
+        };
+        if !self.ensure_len(row, len) {
+            return false;
+        }
+        self.rows[row][col] = value;
+        true
+    }
+
+    fn clear(&mut self) {
+        self.rows.clear();
+        self.rows.push(Vec::new());
+        self.row_cell_high_water.clear();
+        self.row_cell_high_water.push(0);
+        self.cells = 0;
+        self.retained_cells = 0;
+    }
+
+    fn clear_row(&mut self, row: usize) {
+        let Some(cells) = self.rows.get_mut(row) else {
+            return;
+        };
+        self.cells = self.cells.saturating_sub(cells.len());
+        cells.clear();
+    }
+
+    fn clear_rows_before(&mut self, end: usize) {
+        for cells in self.rows.iter_mut().take(end) {
+            self.cells = self.cells.saturating_sub(cells.len());
+            cells.clear();
+        }
+    }
+
+    fn truncate_row(&mut self, row: usize, len: usize) {
+        let Some(cells) = self.rows.get_mut(row) else {
+            return;
+        };
+        if cells.len() > len {
+            self.cells -= cells.len() - len;
+            cells.truncate(len);
+        }
+    }
+
+    fn truncate_rows(&mut self, len: usize) {
+        if self.rows.len() <= len {
+            return;
+        }
+        let removed = self.rows[len..].iter().map(Vec::len).sum::<usize>();
+        let removed_retained = self.row_cell_high_water[len..].iter().sum::<usize>();
+        self.cells = self.cells.saturating_sub(removed);
+        self.retained_cells = self.retained_cells.saturating_sub(removed_retained);
+        self.rows.truncate(len);
+        self.row_cell_high_water.truncate(len);
+    }
+
+    fn has_visible_text(&self) -> bool {
+        self.rows
+            .iter()
+            .flatten()
+            .any(|ch| !ch.is_whitespace() && !ch.is_control())
+    }
+}
+
+/// Decode one UTF-8 scalar with `String::from_utf8_lossy`-equivalent invalid
+/// sequence boundaries, without allocating a replacement string.
+fn next_lossy_char(bytes: &[u8], index: usize) -> (char, usize) {
+    let first = bytes[index];
+    if first.is_ascii() {
+        return (char::from(first), 1);
+    }
+    let width = match first {
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => return ('\u{FFFD}', 1),
+    };
+    let remaining = &bytes[index..];
+    let candidate_len = width.min(remaining.len());
+    match std::str::from_utf8(&remaining[..candidate_len]) {
+        Ok(text) if candidate_len == width => (
+            text.chars().next().expect("one complete UTF-8 scalar"),
+            width,
+        ),
+        Err(error) => (
+            '\u{FFFD}',
+            error.error_len().unwrap_or(remaining.len()).max(1),
+        ),
+        Ok(_) => ('\u{FFFD}', remaining.len().max(1)),
+    }
+}
+
+fn replay_visibility(bytes: &[u8]) -> VisibilityGrid {
+    let mut grid = VisibilityGrid::new();
+    let mut row = 0usize;
+    let mut col = 0usize;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() {
+            match bytes[i + 1] {
+                b'[' => {
+                    i += 2;
+                    let params_start = i;
+                    while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                        i += 1;
+                    }
+                    if i >= bytes.len() {
+                        break;
+                    }
+                    let final_byte = bytes[i];
+                    let params = &bytes[params_start..i];
+                    i += 1;
+                    if params.len() > MAX_VISIBILITY_CSI_PARAM_BYTES
+                        || matches!(params.first(), Some(0x3c..=0x3f))
+                    {
+                        continue;
+                    }
+
+                    match final_byte {
+                        b'H' | b'f' => {
+                            row = parse_param_nth(params, 0, 1)
+                                .saturating_sub(1)
+                                .min(MAX_VISIBILITY_GRID_ROWS);
+                            col = parse_param_nth(params, 1, 1)
+                                .saturating_sub(1)
+                                .min(MAX_VISIBILITY_GRID_COLS);
+                        }
+                        b'A' => row = row.saturating_sub(parse_param_first(params, 1)),
+                        b'B' | b'e' => {
+                            row = row
+                                .saturating_add(parse_param_first(params, 1))
+                                .min(MAX_VISIBILITY_GRID_ROWS);
+                        }
+                        b'E' => {
+                            row = row
+                                .saturating_add(parse_param_first(params, 1))
+                                .min(MAX_VISIBILITY_GRID_ROWS);
+                            col = 0;
+                        }
+                        b'F' => {
+                            row = row.saturating_sub(parse_param_first(params, 1));
+                            col = 0;
+                        }
+                        b'd' => {
+                            row = parse_param_first(params, 1)
+                                .saturating_sub(1)
+                                .min(MAX_VISIBILITY_GRID_ROWS);
+                        }
+                        b'C' | b'a' => {
+                            col = col
+                                .saturating_add(parse_param_first(params, 1))
+                                .min(MAX_VISIBILITY_GRID_COLS);
+                        }
+                        b'D' => col = col.saturating_sub(parse_param_first(params, 1)),
+                        b'G' | b'`' => {
+                            col = parse_param_first(params, 1)
+                                .saturating_sub(1)
+                                .min(MAX_VISIBILITY_GRID_COLS);
+                        }
+                        b'J' => match params {
+                            b"" | b"0" => {
+                                grid.truncate_row(row, col);
+                                grid.truncate_rows(row.saturating_add(1));
+                            }
+                            b"1" => {
+                                grid.clear_rows_before(row);
+                                if let Some(cells) = grid.rows.get_mut(row) {
+                                    let upto = col.min(cells.len());
+                                    for cell in cells.iter_mut().take(upto) {
+                                        *cell = ' ';
+                                    }
+                                }
+                            }
+                            b"2" | b"3" => {
+                                grid.clear();
+                                row = 0;
+                                col = 0;
+                            }
+                            _ => {}
+                        },
+                        b'K' => match params {
+                            b"" | b"0" => grid.truncate_row(row, col),
+                            b"1" => {
+                                if let Some(cells) = grid.rows.get_mut(row) {
+                                    let upto = col.min(cells.len());
+                                    for cell in cells.iter_mut().take(upto) {
+                                        *cell = ' ';
+                                    }
+                                }
+                            }
+                            b"2" => grid.clear_row(row),
+                            _ => {}
+                        },
+                        _ => {}
+                    }
+                }
+                b']' => i = skip_osc_sequence(bytes, i),
+                _ => i = skip_escape_sequence(bytes, i),
+            }
+        } else if bytes[i] == b'\n' {
+            row = row.saturating_add(1).min(MAX_VISIBILITY_GRID_ROWS);
+            col = 0;
+            if !grid.ensure_row(row) {
+                break;
+            }
+            i += 1;
+        } else if bytes[i] == b'\r' {
+            col = 0;
+            i += 1;
+        } else if bytes[i] == b'\x08' {
+            col = col.saturating_sub(1);
+            i += 1;
+        } else {
+            let (ch, consumed) = next_lossy_char(bytes, i);
+            i += consumed;
+            if col >= MAX_VISIBILITY_GRID_COLS || !grid.set_cell(row, col, ch) {
+                break;
+            }
+            col = col.saturating_add(1);
+        }
+    }
+    grid
+}
+
+/// Whether replaying `bytes` leaves a visible, non-whitespace cell. The common
+/// no-cursor-control path decodes directly from the byte slice, including
+/// invalid UTF-8 replacement semantics; cursor motion and erases use the
+/// bounded grid above. Neither path allocates a lossy serialized copy.
+pub(crate) fn ansi_has_visible_text(bytes: &[u8]) -> bool {
+    if memchr::memchr3(0x1b, b'\r', b'\x08', bytes).is_none() {
+        let mut i = 0;
+        while i < bytes.len() {
+            let (ch, consumed) = next_lossy_char(bytes, i);
+            if !ch.is_whitespace() && !ch.is_control() {
+                return true;
+            }
+            i += consumed;
+        }
+        return false;
+    }
+    replay_visibility(bytes).has_visible_text()
+}
+
 pub(crate) fn strip_ansi_with_clear_detect(input: &str) -> (String, bool) {
     let bytes = input.as_bytes();
     let mut lines: Vec<Vec<char>> = vec![Vec::new()];
@@ -196,14 +510,22 @@ pub(crate) fn contains_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool 
 }
 
 pub(crate) fn parse_param_first(buf: &[u8], default: usize) -> usize {
-    let end = buf.iter().position(|&b| b == b';').unwrap_or(buf.len());
-    if end == 0 {
+    parse_param_nth(buf, 0, default)
+}
+
+/// Parse one semicolon-separated numeric parameter, saturating rather than
+/// overflowing on adversarially long digit runs.
+pub(crate) fn parse_param_nth(buf: &[u8], n: usize, default: usize) -> usize {
+    let Some(field) = buf.split(|&b| b == b';').nth(n) else {
+        return default;
+    };
+    if field.is_empty() {
         return default;
     }
     let mut val = 0usize;
-    for &b in &buf[..end] {
+    for &b in field {
         if b.is_ascii_digit() {
-            val = val * 10 + (b - b'0') as usize;
+            val = val.saturating_mul(10).saturating_add((b - b'0') as usize);
         } else {
             return default;
         }
@@ -221,7 +543,7 @@ pub(crate) fn strip_ansi(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::contains_case_insensitive as cci;
+    use super::{ansi_has_visible_text, contains_case_insensitive as cci};
 
     #[test]
     fn matches_regardless_of_case() {
@@ -255,5 +577,24 @@ mod tests {
         assert!(cci("ÉCHEC: déjà vu".as_bytes(), "échec".as_bytes()));
         assert!(cci("ПРИВЕТ мир".as_bytes(), "привет".as_bytes()));
         assert!(!cci("你好世界".as_bytes(), "再见".as_bytes()));
+    }
+
+    #[test]
+    fn visibility_replays_cursor_overwrite_and_erases_without_plain_copy() {
+        assert!(!ansi_has_visible_text(b"\r\n\x1b[0m"));
+        assert!(ansi_has_visible_text(b"\x1b[36mworker finished\x1b[0m\r\n"));
+        assert!(ansi_has_visible_text(b"visible\rhidden"));
+        assert!(!ansi_has_visible_text(b"visible\r\x1b[2K"));
+        assert!(!ansi_has_visible_text(
+            b"\x1b]8;;https://example.invalid\x1b\\\x1b]8;;\x1b\\"
+        ));
+        assert!(!ansi_has_visible_text(b"first\nsecond\x1b[2J"));
+    }
+
+    #[test]
+    fn visibility_scans_large_invalid_utf8_without_a_lossy_copy() {
+        let invalid = vec![0xff; 4 * 1024 * 1024];
+        assert!(ansi_has_visible_text(&invalid));
+        assert!(!ansi_has_visible_text(b" \n\t"));
     }
 }

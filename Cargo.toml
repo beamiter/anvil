@@ -25,6 +25,7 @@ rkyv = { version = "0.8", features = ["bytecheck"] }
 bytecheck = { version = "0.8", default-features = false }
 zstd = "0.13"
 regex = "1"
+regex-syntax = "0.8"
 fuzzy-matcher = "0.3"
 unicode-width = "0.2"
 unicode-bidi = "0.3"

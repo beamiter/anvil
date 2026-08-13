@@ -351,6 +351,10 @@ impl InitialCommands {
 
 pub struct VteInit {
     pub config: Rc<RefCell<Config>>,
+    /// Backend requested by the pane creator. Conventional VTE ignores this;
+    /// the shared Block component passes it through to `TermView` so Unified
+    /// is never accidentally re-derived from mutable global configuration.
+    pub mode: crate::config::TerminalMode,
     pub shell_argv: Rc<Vec<String>>,
     pub working_directory: Option<String>,
     pub working_directory_external: bool,

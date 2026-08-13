@@ -7,7 +7,7 @@ Register-ArgumentCompleter -Native -CommandName anvil -ScriptBlock {
     $previous = if ($words.Count -ge 2) { $words[-2] } else { '' }
 
     $values = switch ($previous) {
-        '--mode' { @('block', 'vte'); break }
+        '--mode' { @('block', 'vte', 'unified'); break }
         '--shell-integration' { @('bash', 'zsh', 'fish', 'pwsh'); break }
         '--generate-completion' { @('bash', 'zsh', 'fish', 'pwsh'); break }
         '--completion' { @('bash', 'zsh', 'fish', 'pwsh'); break }

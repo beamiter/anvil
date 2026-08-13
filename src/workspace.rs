@@ -23,7 +23,7 @@ impl TermCtl {
     pub(crate) fn mode(&self) -> TerminalMode {
         match self {
             Self::Vte(_) => TerminalMode::Vte,
-            Self::Block(_) => TerminalMode::Block,
+            Self::Block(controller) => controller.model().mode(),
         }
     }
 
@@ -108,6 +108,13 @@ impl TermCtl {
         match self {
             Self::Vte(_) => false,
             Self::Block(controller) => controller.model().insert_inline_notice(widget),
+        }
+    }
+
+    pub(crate) fn supports_inline_notices(&self) -> bool {
+        match self {
+            Self::Vte(_) => false,
+            Self::Block(controller) => controller.model().supports_inline_notices(),
         }
     }
 

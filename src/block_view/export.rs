@@ -1,9 +1,9 @@
 //! export — extracted from block_view (mechanical split, no logic changes)
 //!
-//! Serializes finished blocks to JSON / Markdown for the user-facing export
-//! actions, plus a clipboard-copy helper for the per-block right-click menu.
-//! Reads only the in-memory `block_data` and `finished_blocks` snapshots; no
-//! VTE state mutation.
+//! Serializes completed backend records to JSON / Markdown for the user-facing
+//! export actions, plus a clipboard-copy helper for Block's right-click menu.
+//! Block records include snapshotted output; Unified exports metadata with
+//! `output_available: false` because its output remains on one live VTE.
 
 use gtk::prelude::*;
 use relm4::gtk;
@@ -11,7 +11,94 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use super::{strip_ansi, BlockData, TermView};
+use super::{strip_ansi, BackendRecordRef, BackendRecords, CompletedCommandRecord, TermView};
+
+#[derive(serde::Serialize)]
+struct MetadataRecordExport<'a> {
+    id: u64,
+    cmd: &'a str,
+    exit_code: Option<i32>,
+    start_time_ms: Option<u64>,
+    end_time_ms: Option<u64>,
+    duration_ms: Option<u64>,
+    cwd: Option<&'a str>,
+    is_background: bool,
+    /// Unified output remains on one persistent terminal surface and is not a
+    /// per-command snapshot. Never serialize a misleading empty output field.
+    output_available: bool,
+}
+
+impl<'a> From<&'a CompletedCommandRecord> for MetadataRecordExport<'a> {
+    fn from(record: &'a CompletedCommandRecord) -> Self {
+        Self {
+            id: record.id,
+            cmd: &record.cmd,
+            exit_code: record.exit_code,
+            start_time_ms: record.start_time_ms,
+            end_time_ms: record.end_time_ms,
+            duration_ms: record.duration_ms,
+            cwd: record.cwd.as_deref(),
+            is_background: record.is_background,
+            output_available: false,
+        }
+    }
+}
+
+fn metadata_record_markdown(record: &CompletedCommandRecord) -> String {
+    let mut markdown = if record.is_background {
+        "## Background Output\n\n".to_string()
+    } else {
+        format!(
+            "## Command Record\n\n**Command:**\n```bash\n{}\n```\n\n",
+            record.cmd
+        )
+    };
+    markdown.push_str(
+        "**Output:** unavailable (retained on the live Unified terminal surface only)\n\n",
+    );
+    if !record.is_background {
+        match record.exit_code {
+            Some(code) => markdown.push_str(&format!("**Exit Code:** {code}\n\n")),
+            None => markdown.push_str("**Exit Code:** unknown (the shell reported none)\n\n"),
+        }
+    }
+    if let Some(duration_ms) = record.duration_ms {
+        markdown.push_str(&format!(
+            "**Duration:** {:.3}s\n\n",
+            duration_ms as f64 / 1_000.0
+        ));
+    }
+    markdown
+}
+
+fn record_json(record: BackendRecordRef<'_>) -> String {
+    match record {
+        BackendRecordRef::Block(record) => record.to_json(),
+        BackendRecordRef::Metadata(record) => {
+            serde_json::to_string_pretty(&MetadataRecordExport::from(record))
+                .unwrap_or_else(|_| "{}".to_string())
+        }
+    }
+}
+
+fn record_markdown(record: BackendRecordRef<'_>) -> String {
+    match record {
+        BackendRecordRef::Block(record) => record.to_markdown(),
+        BackendRecordRef::Metadata(record) => metadata_record_markdown(record),
+    }
+}
+
+fn records_json(records: &BackendRecords<'_>) -> String {
+    match records {
+        BackendRecords::Blocks(records) => {
+            serde_json::to_string_pretty(&**records).unwrap_or_else(|_| "[]".to_string())
+        }
+        BackendRecords::Metadata(records) => {
+            let exports: Vec<_> = records.iter().map(MetadataRecordExport::from).collect();
+            serde_json::to_string_pretty(&exports).unwrap_or_else(|_| "[]".to_string())
+        }
+    }
+}
 
 /// On-disk formats for whole-session export.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,17 +132,16 @@ impl TermView {
         writer: &mut impl Write,
         format: SessionExportFormat,
     ) -> io::Result<()> {
-        let blocks = self.block_data.borrow();
+        let records = self.render_backend.records();
         match format {
-            SessionExportFormat::Json => serde_json::to_writer_pretty(writer, &*blocks)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error)),
+            SessionExportFormat::Json => writer.write_all(records_json(&records).as_bytes()),
             SessionExportFormat::Markdown => {
                 writeln!(writer, "# Terminal Session Export\n")?;
-                writeln!(writer, "Total blocks: {}\n", blocks.len())?;
+                writeln!(writer, "Total blocks: {}\n", records.len())?;
                 writeln!(writer, "---\n")?;
-                for (index, block) in blocks.iter().enumerate() {
+                for (index, record) in records.iter().enumerate() {
                     writeln!(writer, "## Block #{}\n", index + 1)?;
-                    writer.write_all(block.to_markdown().as_bytes())?;
+                    writer.write_all(record_markdown(record).as_bytes())?;
                     writeln!(writer, "\n---\n")?;
                 }
                 Ok(())
@@ -65,41 +151,40 @@ impl TermView {
 
     /// Export a block by ID to JSON format
     pub fn export_block_json(&self, block_id: u64) -> Option<String> {
-        let blocks = self.block_data.borrow();
-        blocks
+        let records = self.render_backend.records();
+        records
             .iter()
-            .find(|b| b.id == block_id)
-            .map(|b| b.to_json())
+            .find(|record| record.id() == block_id)
+            .map(record_json)
     }
 
     /// Export a block by ID to Markdown format
     pub fn export_block_markdown(&self, block_id: u64) -> Option<String> {
-        let blocks = self.block_data.borrow();
-        blocks
+        let records = self.render_backend.records();
+        records
             .iter()
-            .find(|b| b.id == block_id)
-            .map(|b| b.to_markdown())
+            .find(|record| record.id() == block_id)
+            .map(record_markdown)
     }
 
     /// Export all blocks in the session as JSON
     pub fn export_session_json(&self) -> String {
-        let blocks = self.block_data.borrow();
-        let blocks_vec: Vec<&BlockData> = blocks.iter().collect();
-        serde_json::to_string_pretty(&blocks_vec).unwrap_or_else(|_| "[]".to_string())
+        let records = self.render_backend.records();
+        records_json(&records)
     }
 
     /// Export all blocks in the session as Markdown
     pub fn export_session_markdown(&self) -> String {
-        let blocks = self.block_data.borrow();
+        let records = self.render_backend.records();
         let mut md = String::new();
 
         md.push_str("# Terminal Session Export\n\n");
-        md.push_str(&format!("Total blocks: {}\n\n", blocks.len()));
+        md.push_str(&format!("Total blocks: {}\n\n", records.len()));
         md.push_str("---\n\n");
 
-        for (index, block) in blocks.iter().enumerate() {
+        for (index, record) in records.iter().enumerate() {
             md.push_str(&format!("## Block #{}\n\n", index + 1));
-            md.push_str(&block.to_markdown());
+            md.push_str(&record_markdown(record));
             md.push_str("\n---\n\n");
         }
 
@@ -170,7 +255,10 @@ impl TermView {
 
 #[cfg(test)]
 mod tests {
-    use super::{export_file_name, SessionExportFormat};
+    use super::{
+        export_file_name, metadata_record_markdown, MetadataRecordExport, SessionExportFormat,
+    };
+    use crate::block_view::CompletedCommandRecord;
 
     #[test]
     fn export_file_names_disambiguate_same_second_collisions() {
@@ -186,5 +274,27 @@ mod tests {
             export_file_name("20260725-101112", SessionExportFormat::Json.extension(), 2),
             "session-20260725-101112-2.json"
         );
+    }
+
+    #[test]
+    fn unified_metadata_export_marks_output_unavailable_instead_of_empty() {
+        let record = CompletedCommandRecord {
+            id: 7,
+            cmd: "cargo test".to_string(),
+            exit_code: Some(1),
+            start_time_ms: Some(10),
+            end_time_ms: Some(25),
+            duration_ms: Some(15),
+            cwd: Some("/work".to_string()),
+            is_background: false,
+        };
+        let json = serde_json::to_value(MetadataRecordExport::from(&record)).unwrap();
+        assert_eq!(json["output_available"], false);
+        assert!(json.get("output").is_none());
+        assert_eq!(json["cmd"], "cargo test");
+
+        let markdown = metadata_record_markdown(&record);
+        assert!(markdown.contains("retained on the live Unified terminal surface only"));
+        assert!(markdown.contains("**Exit Code:** 1"));
     }
 }

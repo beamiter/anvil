@@ -3576,7 +3576,7 @@ impl OrganismHub {
             let runtime = runtime.clone();
             let view_weak = Rc::downgrade(view);
             view.connect_block_finished(
-                move |_command, _exit_code, _output, _agent_generation, _duration_ms| {
+                move |_command, _exit_code, _agent_generation, _duration_ms| {
                     if let Some(view) = view_weak.upgrade() {
                         view.insert_inline_notice(&runtime.card);
                     }

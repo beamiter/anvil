@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use gtk::gdk::RGBA;
 
 use crate::cli::ReportFormat;
-use crate::config::{self, Config, TerminalMode};
+use crate::config::{self, Config};
 use crate::keybindings::Action;
 use jterm_core::keybindings::{is_unbind_token, parse, Chord};
 
@@ -793,13 +793,7 @@ fn apply_config_to_table(config: &Config, table: &mut toml::Table) {
     );
     table.insert(
         "terminal_mode".into(),
-        toml::Value::String(
-            match config.terminal_mode {
-                TerminalMode::Block => "block",
-                TerminalMode::Vte => "vte",
-            }
-            .to_string(),
-        ),
+        toml::Value::String(config.terminal_mode.as_str().to_string()),
     );
     table.insert(
         "tab_placement".into(),
@@ -1719,7 +1713,12 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
             "nord",
         ],
     );
-    check_enum(&mut report, table, "terminal_mode", &["block", "vte"]);
+    check_enum(
+        &mut report,
+        table,
+        "terminal_mode",
+        &["block", "vte", "unified"],
+    );
     check_enum(
         &mut report,
         table,
@@ -1943,6 +1942,15 @@ pub(crate) fn run_check_path(path: &Path, format: ReportFormat) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validator_accepts_unified_terminal_mode() {
+        let table = "terminal_mode = 'unified'\n"
+            .parse::<toml::Table>()
+            .unwrap();
+        let report = validate_table(Path::new("config.toml"), &table);
+        assert!(report.healthy(), "unexpected issues: {:?}", report.issues);
+    }
 
     fn temporary_directory(label: &str) -> PathBuf {
         #[cfg(unix)]

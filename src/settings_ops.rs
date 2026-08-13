@@ -93,10 +93,10 @@ impl AppModel {
             self.show_toast("Terminal mode is fixed to VTE in safe mode.");
             return;
         }
-        self.config.borrow_mut().terminal_mode = if mode == 0 {
-            TerminalMode::Block
-        } else {
-            TerminalMode::Vte
+        self.config.borrow_mut().terminal_mode = match mode {
+            0 => TerminalMode::Block,
+            2 => TerminalMode::Unified,
+            _ => TerminalMode::Vte,
         };
         self.persist_config();
         self.show_toast("Terminal backend will apply to new and restored local panes.");

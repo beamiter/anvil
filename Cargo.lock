@@ -81,6 +81,7 @@ dependencies = [
  "nix",
  "pcre2-sys",
  "regex",
+ "regex-syntax",
  "relm4",
  "rkyv",
  "serde",

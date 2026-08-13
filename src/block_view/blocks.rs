@@ -2810,6 +2810,9 @@ pub(crate) struct ActiveBlock {
     /// remains the overlay's measured child, so the organism never changes
     /// the terminal grid or steals input.
     pub(crate) live_organism_surface: gtk::Fixed,
+    /// Pass-through, non-measuring chrome overlay used only by Unified mode.
+    /// It exists (hidden) in Block mode so the widget tree stays mode-neutral.
+    pub(crate) unified_chrome_surface: gtk::DrawingArea,
     /// Overlay scrollbar for a still-running command. It is painted above the
     /// organism surface and therefore remains reachable at every pane width.
     pub(crate) live_scrollbar: gtk::Scrollbar,
@@ -2889,6 +2892,18 @@ impl ActiveBlock {
         vte_overlay.set_measure_overlay(&live_organism_surface, false);
         vte_overlay.set_clip_overlay(&live_organism_surface, true);
 
+        let unified_chrome_surface = gtk::DrawingArea::new();
+        unified_chrome_surface.set_hexpand(true);
+        unified_chrome_surface.set_vexpand(true);
+        unified_chrome_surface.set_halign(gtk::Align::Fill);
+        unified_chrome_surface.set_valign(gtk::Align::Fill);
+        unified_chrome_surface.set_can_target(false);
+        unified_chrome_surface.set_focusable(false);
+        unified_chrome_surface.set_visible(false);
+        vte_overlay.add_overlay(&unified_chrome_surface);
+        vte_overlay.set_measure_overlay(&unified_chrome_surface, false);
+        vte_overlay.set_clip_overlay(&unified_chrome_surface, true);
+
         let live_scrollbar =
             gtk::Scrollbar::new(Orientation::Vertical, active_vte.vadjustment().as_ref());
         live_scrollbar.add_css_class("block-output-scrollbar");
@@ -2916,6 +2931,7 @@ impl ActiveBlock {
             widget,
             active_vte,
             live_organism_surface,
+            unified_chrome_surface,
             live_scrollbar,
             live_organism_visible: Cell::new(false),
             live_organism_alt_screen: Cell::new(false),
@@ -2927,6 +2943,21 @@ impl ActiveBlock {
     /// same ring through `super::live_output_text` at finalize.
     pub(crate) fn output_text(&self) -> String {
         super::live_output_text(&self.raw_output)
+    }
+
+    /// Return at most `max_bytes` from the live capture for bounded find.
+    /// Lossy conversion remains safe when the byte ceiling splits UTF-8.
+    pub(crate) fn output_text_prefix(&self, max_bytes: usize) -> (String, bool) {
+        let mut raw = self.raw_output.borrow_mut();
+        if raw.is_empty() {
+            return (String::new(), false);
+        }
+        let bytes = raw.make_contiguous();
+        let end = bytes.len().min(max_bytes);
+        (
+            String::from_utf8_lossy(&bytes[..end]).into_owned(),
+            end < bytes.len(),
+        )
     }
 
     /// The column count the live VTE is wrapping at — the single source of truth

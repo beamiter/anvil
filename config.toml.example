@@ -19,7 +19,9 @@ opacity = 0.95
 scrollback = 5000
 
 # Backend and layout.
-terminal_mode = "block"     # "block" or "vte"; applies to new/restored local panes
+# "block": structured command blocks; "vte": compatibility terminal;
+# "unified": experimental continuous OSC 133 surface without block chrome.
+terminal_mode = "block"     # applies to new/restored local panes
 tab_placement = "sidebar"   # "sidebar" or "top"
 sidebar_view = "tabs"       # "tabs" or "files"
 sidebar_visible = true

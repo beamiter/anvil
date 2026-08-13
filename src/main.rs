@@ -291,6 +291,7 @@ fn create_pane(
     let cwd_token = terminal::new_cwd_token();
     let init = VteInit {
         config: config.clone(),
+        mode,
         shell_argv: shell_argv.clone(),
         working_directory: working_directory.clone(),
         working_directory_external: cwd_external,
@@ -339,7 +340,7 @@ fn create_pane(
         VteOutput::AskAiAboutBlock(context) => AppMsg::AskAiAboutBlock(context),
     };
     let terminal = match mode {
-        TerminalMode::Block => {
+        TerminalMode::Block | TerminalMode::Unified => {
             let controller = BlockTerminal::builder()
                 .launch(init)
                 .forward(sender.input_sender(), forward);
@@ -533,6 +534,7 @@ impl SimpleComponent for AppModel {
                 config.terminal_mode = match mode {
                     cli::Mode::Block => TerminalMode::Block,
                     cli::Mode::Vte => TerminalMode::Vte,
+                    cli::Mode::Unified => TerminalMode::Unified,
                 };
             }
         }
@@ -725,6 +727,7 @@ impl SimpleComponent for AppModel {
                     terminal_mode: match config.borrow().terminal_mode {
                         TerminalMode::Block => 0,
                         TerminalMode::Vte => 1,
+                        TerminalMode::Unified => 2,
                     },
                     block_compact: config.borrow().block_compact,
                     command_history: config.borrow().command_history_enabled,

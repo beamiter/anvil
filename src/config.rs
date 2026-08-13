@@ -16,10 +16,42 @@ const DEFAULT_FONT_DESC: &str = "Monospace 14";
 // Terminal Mode
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TerminalMode {
     Block,
     Vte,
+    /// One long-lived full-size VTE driven by the same OSC 133 lifecycle as
+    /// Block, but without per-command block widgets. Experimental.
+    Unified,
+}
+
+impl TerminalMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::Vte => "vte",
+            Self::Unified => "unified",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "block" => Some(Self::Block),
+            "vte" => Some(Self::Vte),
+            "unified" => Some(Self::Unified),
+            _ => None,
+        }
+    }
+
+    /// Block and Unified share the OSC 133 `TermView`; only their render
+    /// backends differ. Conventional VTE panes use the other component.
+    pub(crate) fn uses_term_view(self) -> bool {
+        matches!(self, Self::Block | Self::Unified)
+    }
+
+    pub(crate) fn is_unified(self) -> bool {
+        matches!(self, Self::Unified)
+    }
 }
 
 /// Where the tab strip lives: down the left sidebar (vertical) or along the top
@@ -1512,10 +1544,10 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     let terminal_mode_str = env_string("ANVIL_MODE")
         .or(fc.terminal_mode)
         .unwrap_or_else(|| "block".to_string());
-    let terminal_mode = match terminal_mode_str.to_lowercase().as_str() {
-        "vte" => TerminalMode::Vte,
-        _ => TerminalMode::Block,
-    };
+    let terminal_mode = TerminalMode::parse(&terminal_mode_str).unwrap_or_else(|| {
+        log::warn!("Unknown terminal_mode '{terminal_mode_str}', using block");
+        TerminalMode::Block
+    });
 
     let tab_placement = TabPlacement::parse(
         &env_string("ANVIL_TAB_PLACEMENT")
@@ -1747,6 +1779,24 @@ pub(crate) fn choose_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_mode_parses_and_round_trips_every_backend() {
+        for (text, mode) in [
+            ("block", TerminalMode::Block),
+            ("vte", TerminalMode::Vte),
+            ("unified", TerminalMode::Unified),
+        ] {
+            assert_eq!(TerminalMode::parse(text), Some(mode));
+            assert_eq!(TerminalMode::parse(&text.to_uppercase()), Some(mode));
+            assert_eq!(mode.as_str(), text);
+            assert_eq!(TerminalMode::parse(mode.as_str()), Some(mode));
+        }
+        assert_eq!(TerminalMode::parse("warp"), None);
+        assert!(TerminalMode::Unified.uses_term_view());
+        assert!(TerminalMode::Block.uses_term_view());
+        assert!(!TerminalMode::Vte.uses_term_view());
+    }
 
     #[test]
     fn portable_font_default_matches_the_example_config() {

@@ -964,6 +964,7 @@ impl AppModel {
                         match p.mode {
                             TerminalMode::Vte => "vte",
                             TerminalMode::Block => "block",
+                            TerminalMode::Unified => "unified",
                         }
                         .to_string(),
                         p.cwd.clone(),
@@ -1175,6 +1176,7 @@ impl AppModel {
                 match cfg.terminal_mode {
                     TerminalMode::Vte => "vte",
                     TerminalMode::Block => "block",
+                    TerminalMode::Unified => "unified",
                 }
                 .to_string(),
             ),
@@ -3148,6 +3150,10 @@ mod pane_tree_tests {
                 restored_leaf_mode(TerminalMode::Vte, false),
                 TerminalMode::Vte
             ));
+            assert!(matches!(
+                restored_leaf_mode(TerminalMode::Unified, false),
+                TerminalMode::Unified
+            ));
         }
     }
 
@@ -3159,6 +3165,10 @@ mod pane_tree_tests {
         assert!(!crate::process::command_uses_external_cwd(&nix));
         assert!(matches!(
             restored_leaf_mode(TerminalMode::Vte, true),
+            TerminalMode::Block
+        ));
+        assert!(matches!(
+            restored_leaf_mode(TerminalMode::Unified, true),
             TerminalMode::Block
         ));
     }

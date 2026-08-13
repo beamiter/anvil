@@ -3,7 +3,7 @@ use gtk::pango::FontDescription;
 use gtk::prelude::*;
 use gtk::{glib, Orientation, ScrolledWindow};
 use relm4::gtk;
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, Ref, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,6 +32,7 @@ mod history;
 mod palette;
 mod scroll;
 mod selection_hold;
+mod unified_chrome;
 pub(crate) use alt_screen::*;
 pub(crate) use ansi::*;
 pub(crate) use blocks::*;
@@ -164,6 +165,180 @@ fn next_block_id(reserved: &RefCell<HashSet<u64>>) -> u64 {
             .unwrap_or_else(|_| panic!("completed-block id sequence exhausted"));
         process_block_id_namespace() | sequence
     })
+}
+
+const ZONE_MARKER_CLOSE: &[u8] = b"\x1b]8;;\x1b\\";
+
+/// Per-pane OSC 8 marker framing for Unified's persistent VTE.
+///
+/// The nonce comes from Linux `getrandom(2)` only. If strong randomness is
+/// unavailable, marker injection stays disabled: a predictable fallback would
+/// let guest output forge this pane's record boundaries and is worse than
+/// temporarily exposing no record-specific marker at all.
+///
+/// RIS/reset invalidation deliberately remains outside this increment. It has
+/// to evict marker authority and retained record ranges together.
+#[derive(Debug)]
+struct ZoneMarkerInjector {
+    nonce: Option<[u8; 16]>,
+    open: Option<OpenZoneMarker>,
+}
+
+#[derive(Debug)]
+struct OpenZoneMarker {
+    id: u64,
+    bytes: Rc<[u8]>,
+}
+
+impl ZoneMarkerInjector {
+    fn from_system_entropy() -> Self {
+        let nonce = secure_zone_marker_nonce();
+        if nonce.is_none() {
+            log::warn!("unified zone markers disabled: strong per-pane randomness is unavailable");
+        }
+        Self { nonce, open: None }
+    }
+
+    #[cfg(test)]
+    fn with_nonce(nonce: [u8; 16]) -> Self {
+        Self {
+            nonce: Some(nonce),
+            open: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn disabled() -> Self {
+        Self {
+            nonce: None,
+            open: None,
+        }
+    }
+
+    fn begin_zone(&mut self, zone_id: u64) {
+        if self.open.as_ref().is_some_and(|open| open.id == zone_id) {
+            return;
+        }
+        let Some(nonce) = self.nonce else {
+            self.open = None;
+            return;
+        };
+        let mut nonce_hex = String::with_capacity(32);
+        for byte in nonce {
+            use std::fmt::Write as _;
+            let _ = write!(nonce_hex, "{byte:02x}");
+        }
+        self.open = Some(OpenZoneMarker {
+            id: zone_id,
+            bytes: format!("\x1b]8;;block://{nonce_hex}/{zone_id}\x1b\\")
+                .into_bytes()
+                .into(),
+        });
+    }
+
+    fn close_zone(&mut self, zone_id: Option<u64>) {
+        match (self.open.take(), zone_id) {
+            (Some(open), Some(zone_id)) if open.id == zone_id => {}
+            (Some(_), None) => {}
+            (Some(open), Some(zone_id)) => {
+                log::debug!(
+                    "unified zone marker close mismatch: requested={zone_id} open={}",
+                    open.id
+                );
+            }
+            (None, _) => {}
+        }
+    }
+
+    fn open_bytes(&self) -> Option<Rc<[u8]>> {
+        self.open.as_ref().map(|open| open.bytes.clone())
+    }
+
+    fn nonce(&self) -> Option<[u8; 16]> {
+        self.nonce
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingZone {
+    Prompt(u64),
+    Command(u64),
+}
+
+impl PendingZone {
+    fn id(self) -> u64 {
+        match self {
+            Self::Prompt(id) | Self::Command(id) => id,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PromptZonePlan {
+    completed_record_id: Option<u64>,
+    prompt_id: u64,
+}
+
+/// Select the id owned by an accepted OSC 133 `A`. Repeated idle-prompt
+/// redraws reuse their id; a completed foreground/background record consumes
+/// the prior id and the following prompt receives a fresh global id.
+fn plan_prompt_zone(
+    pending: Option<PendingZone>,
+    completes_record: bool,
+    mut next_id: impl FnMut() -> u64,
+) -> PromptZonePlan {
+    if completes_record {
+        PromptZonePlan {
+            completed_record_id: Some(pending.map(PendingZone::id).unwrap_or_else(&mut next_id)),
+            prompt_id: next_id(),
+        }
+    } else {
+        PromptZonePlan {
+            completed_record_id: None,
+            prompt_id: pending.map(PendingZone::id).unwrap_or_else(next_id),
+        }
+    }
+}
+
+fn prompt_zone_to_reopen_after_alt(
+    restored_state: BlockState,
+    pending: Option<PendingZone>,
+) -> Option<u64> {
+    match (restored_state, pending) {
+        (BlockState::AwaitingCommand, Some(PendingZone::Prompt(id))) => Some(id),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn secure_zone_marker_nonce() -> Option<[u8; 16]> {
+    let mut nonce = [0_u8; 16];
+    let mut filled = 0;
+    while filled < nonce.len() {
+        // SAFETY: the suffix beginning at `filled` is writable for exactly
+        // the length passed to the kernel and remains alive for the call.
+        let read = unsafe {
+            nix::libc::getrandom(
+                nonce[filled..].as_mut_ptr().cast(),
+                nonce.len() - filled,
+                nix::libc::GRND_NONBLOCK,
+            )
+        };
+        if read > 0 {
+            filled += read as usize;
+            continue;
+        }
+        if read < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return None;
+    }
+    Some(nonce)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn secure_zone_marker_nonce() -> Option<[u8; 16]> {
+    None
 }
 
 /// Approximate the vertical positions of failed finished blocks within the
@@ -438,6 +613,7 @@ fn shell_argv_supports_agent_ids(argv: &[String]) -> bool {
 }
 
 const MAX_CAPABILITY_OSC_BYTES: usize = 128;
+const MAX_LOCAL_APC_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Default)]
 struct ShellCapabilityObserver {
@@ -589,6 +765,7 @@ fn reviewed_pre_command_bytes_are_identity_neutral(mut bytes: &[u8]) -> bool {
 /// too. Recorded as the block's command so its output is still filed as a
 /// command block instead of as commandless background output.
 pub(crate) const TRUNCATED_COMMAND_PLACEHOLDER: &str = "[command too long to report]";
+const UNAVAILABLE_COMMAND_PLACEHOLDER: &str = "(command capture unavailable)";
 
 /// Where a finished block's command text came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1332,6 +1509,24 @@ fn step_marked_indices(marked: &[usize], cur: Option<usize>, direction: i32) -> 
     }
 }
 
+/// Resolve stable marked ids through current document order before applying
+/// the existing previous/next wrapping behavior.
+fn step_marked_record_ids(
+    record_ids: &[u64],
+    marked_ids: &[u64],
+    current_id: Option<u64>,
+    direction: i32,
+) -> Option<u64> {
+    let marked_ids: HashSet<u64> = marked_ids.iter().copied().collect();
+    let marked_indices: Vec<usize> = record_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(index, id)| marked_ids.contains(id).then_some(index))
+        .collect();
+    let current = current_id.and_then(|id| record_ids.iter().position(|record| *record == id));
+    step_marked_indices(&marked_indices, current, direction).map(|index| record_ids[index])
+}
+
 fn select_finished_block_range(
     finished: &[FinishedBlock],
     selected_block_ids: &SelectedBlockIds,
@@ -1449,18 +1644,11 @@ fn log_completed_block_retention(context: &str, plan: CompletedBlockRetentionPla
 }
 
 fn clear_find_handles(
-    finished_blocks: &Rc<RefCell<Vec<FinishedBlock>>>,
+    _finished_blocks: &Rc<RefCell<Vec<FinishedBlock>>>,
     active_vte: &Terminal,
     find_state: &Rc<RefCell<FindState>>,
 ) {
-    for block in finished_blocks.borrow().iter() {
-        block.command_vte.search_set_regex(None::<&vte4::Regex>, 0);
-        block.output_vte.search_set_regex(None::<&vte4::Regex>, 0);
-    }
-    active_vte.search_set_regex(None::<&vte4::Regex>, 0);
-    let mut state = find_state.borrow_mut();
-    state.matches.clear();
-    state.current = 0;
+    find::clear_find_state(find_state.as_ref(), active_vte);
 }
 
 /// Remove an oldest prefix and every piece of state indexed by those blocks.
@@ -2262,24 +2450,45 @@ pub(crate) struct CommandFinishedEvent {
 /// viewport, and is forced to the full viewport only for alt-screen apps.
 const MIN_INPUT_ROWS: i32 = 6;
 
-/// `(command, exit status, output sample, Agent execution, duration ms)`. The
-/// status is `None` when the shell reported none, so a consumer that styles
-/// failures can tell "failed" apart from "outcome unknown".
-type BlockFinishedCallbacks = Rc<
-    RefCell<
-        Vec<
-            Box<
-                dyn Fn(
-                    String,
-                    Option<i32>,
-                    String,
-                    Option<crate::agent::AgentExecutionRef>,
-                    Option<u64>,
-                ),
-            >,
-        >,
-    >,
->;
+/// The identity and outcome of one completed command. Rendering-only values
+/// are deliberately absent: Unified retains this metadata without ever
+/// building a Block card payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CompletedCommandRecord {
+    id: u64,
+    /// Empty only for asynchronous output observed at an idle prompt.
+    cmd: String,
+    exit_code: Option<i32>,
+    start_time_ms: Option<u64>,
+    end_time_ms: Option<u64>,
+    duration_ms: Option<u64>,
+    cwd: Option<String>,
+    is_background: bool,
+}
+
+/// Completed-command observers are metadata-only unless their predicate says
+/// this exact completion needs a bounded output sample. The predicate is what
+/// lets Anvil's permanent Relm4 bridge request output for a correlated Agent
+/// completion without materializing every ordinary Unified command.
+type MetadataBlockFinishedCallback =
+    dyn Fn(String, Option<i32>, Option<crate::agent::AgentExecutionRef>, Option<u64>);
+type OutputBlockFinishedCallback = dyn Fn(
+    String,
+    Option<i32>,
+    Option<String>,
+    Option<crate::agent::AgentExecutionRef>,
+    Option<u64>,
+);
+
+enum BlockFinishedCallback {
+    Metadata(Box<MetadataBlockFinishedCallback>),
+    ConditionalOutput {
+        needs_output: Box<dyn Fn(Option<crate::agent::AgentExecutionRef>) -> bool>,
+        callback: Box<OutputBlockFinishedCallback>,
+    },
+}
+
+type BlockFinishedCallbacks = Rc<RefCell<Vec<BlockFinishedCallback>>>;
 type BlockContextCallbacks = Rc<RefCell<Vec<Box<dyn Fn(crate::ai::BlockContext)>>>>;
 type CwdCallbacks = Rc<RefCell<Vec<Box<dyn Fn(&str, bool)>>>>;
 type AgentExecutionLostCallbacks =
@@ -2363,6 +2572,54 @@ fn command_capture_range_is_bounded(start_row: i64, end_row: i64, columns: i64) 
         .is_some_and(|cells| cells <= MAX_RECALLED_COMMAND_BYTES)
 }
 
+/// Convert VTE's ring row into the screen-relative row required by DSR 6.
+/// Unified never clears its ring, so reporting the raw row would grow without
+/// bound over the lifetime of the pane.
+fn screen_relative_cpr_row(row: i64, top_row: i64, rows: i64) -> i64 {
+    if rows <= 0 {
+        return row.max(0);
+    }
+    (row - top_row).clamp(0, rows - 1)
+}
+
+/// Rebase a prompt anchor when the live surface changes grid height between
+/// PromptEnd and CommandStart. Block's compact/full `set_size` transition
+/// moves the relevant row by this delta; Unified keeps one stable full-size
+/// surface and therefore uses the identity policy.
+fn rebase_prompt_anchor(anchor: (i64, i64), recorded_rows: i64, current_rows: i64) -> (i64, i64) {
+    if recorded_rows <= 0 || current_rows <= 0 {
+        return anchor;
+    }
+    let (col, row) = anchor;
+    (col, row.saturating_add(current_rows - recorded_rows).max(0))
+}
+
+/// Construction-time anchor policy derived from the same switch that selects
+/// the render backend. This value is copied into both the lifecycle backend
+/// and the query-only submission surface, so no prompt consumer can drift.
+fn prompt_anchor_rebases_on_row_delta(unified: bool) -> bool {
+    !unified
+}
+
+/// Return the PromptEnd anchor as it exists on this pane's live surface now.
+///
+/// Command capture, reviewed-submission admission and polling, prompt status,
+/// and click-to-place-cursor all route through this helper. The policy bit is
+/// selected beside the render backend, so those security-relevant readers
+/// cannot disagree about the beginning of the editable line.
+fn prompt_anchor_for_surface(
+    rebase_on_row_delta: bool,
+    provisional: (i64, i64),
+    recorded_rows: i64,
+    current_rows: i64,
+) -> (i64, i64) {
+    if rebase_on_row_delta {
+        rebase_prompt_anchor(provisional, recorded_rows, current_rows)
+    } else {
+        provisional
+    }
+}
+
 fn visible_editor_text(vte: &Terminal, anchor: (i64, i64)) -> Option<String> {
     let (end_col, end_row) = vte.cursor_position();
     let (start_col, start_row) = anchor;
@@ -2375,6 +2632,50 @@ fn visible_editor_text(vte: &Terminal, anchor: (i64, i64)) -> Option<String> {
     vte.text_range_format(vte4::Format::Text, start_row, start_col, end_row, end_col)
         .0
         .map(|text| text.to_string())
+}
+
+/// Query-only live-surface seam used by the reviewed submission boundary and
+/// prompt consumers that must share the render backend's anchor policy.
+trait SubmissionSurface {
+    fn cursor_position(&self) -> (i64, i64);
+    fn row_count(&self) -> i64;
+    fn prompt_anchor(&self, provisional: (i64, i64), recorded_rows: i64) -> (i64, i64);
+    fn visible_editor_text(&self, anchor: (i64, i64)) -> Option<String>;
+    fn suffix_is_empty(&self) -> Option<bool>;
+}
+
+struct VteSubmissionSurface {
+    vte: Terminal,
+    /// Selected beside the render backend: Block rebases across compact/full
+    /// grid changes, while Unified keeps one stable viewport-sized grid.
+    rebase_on_row_delta: bool,
+}
+
+impl SubmissionSurface for VteSubmissionSurface {
+    fn cursor_position(&self) -> (i64, i64) {
+        self.vte.cursor_position()
+    }
+
+    fn row_count(&self) -> i64 {
+        self.vte.row_count()
+    }
+
+    fn prompt_anchor(&self, provisional: (i64, i64), recorded_rows: i64) -> (i64, i64) {
+        prompt_anchor_for_surface(
+            self.rebase_on_row_delta,
+            provisional,
+            recorded_rows,
+            self.vte.row_count(),
+        )
+    }
+
+    fn visible_editor_text(&self, anchor: (i64, i64)) -> Option<String> {
+        visible_editor_text(&self.vte, anchor)
+    }
+
+    fn suffix_is_empty(&self) -> Option<bool> {
+        crate::terminal::click_cursor::verified_suffix_is_empty(&self.vte)
+    }
 }
 
 fn approved_command_submission_payload(command: &str) -> Result<Vec<u8>, String> {
@@ -2395,13 +2696,14 @@ fn approved_command_submission_payload(command: &str) -> Result<Vec<u8>, String>
 /// Agent identity rather than binding a later block to the approval.
 #[derive(Clone)]
 struct VerifiedSubmissionCtx {
-    active_vte: Terminal,
+    surface: Rc<dyn SubmissionSurface>,
     bstate: Rc<Cell<BlockState>>,
     pty: Rc<OwnedPty>,
     typed_cmd: Rc<RefCell<String>>,
     idle_input_dirty: Rc<Cell<bool>>,
     pty_synced: Rc<Cell<bool>>,
     prompt_end_pos: Rc<Cell<(i64, i64)>>,
+    prompt_anchor_rows: Rc<Cell<i64>>,
     prompt_anchor_ready: Rc<Cell<bool>>,
     prompt_generation: Rc<Cell<u64>>,
     contents_generation: Rc<Cell<u64>>,
@@ -2413,6 +2715,11 @@ struct VerifiedSubmissionCtx {
 }
 
 impl VerifiedSubmissionCtx {
+    fn current_anchor(&self) -> (i64, i64) {
+        self.surface
+            .prompt_anchor(self.prompt_end_pos.get(), self.prompt_anchor_rows.get())
+    }
+
     fn fail(&self, reason: &'static str) {
         let pending = self.submission.borrow_mut().take();
         self.armed_agent_execution.borrow_mut().take();
@@ -2472,11 +2779,10 @@ impl VerifiedSubmissionCtx {
         {
             return Err("the shell prompt is no longer verified empty".to_string());
         }
-        let anchor = self.prompt_end_pos.get();
-        if self.active_vte.cursor_position() != anchor
-            || crate::terminal::click_cursor::verified_suffix_is_empty(&self.active_vte)
-                != Some(true)
-        {
+        let anchor = self.current_anchor();
+        let cursor = self.surface.cursor_position();
+        let suffix_is_empty = self.surface.suffix_is_empty();
+        if cursor != anchor || suffix_is_empty != Some(true) {
             return Err("the shell prompt visibly contains input".to_string());
         }
 
@@ -2526,7 +2832,7 @@ impl VerifiedSubmissionCtx {
             if contents == contents_before {
                 return glib::ControlFlow::Continue;
             }
-            let (col, row) = ctx.active_vte.cursor_position();
+            let (col, row) = ctx.surface.cursor_position();
             let observed = (contents, col, row);
             if last_observed.get() == Some(observed) {
                 stable_polls.set(stable_polls.get().saturating_add(1));
@@ -2539,9 +2845,8 @@ impl VerifiedSubmissionCtx {
                 return glib::ControlFlow::Continue;
             }
 
-            let rendered = visible_editor_text(&ctx.active_vte, ctx.prompt_end_pos.get());
-            let suffix_empty =
-                crate::terminal::click_cursor::verified_suffix_is_empty(&ctx.active_vte);
+            let rendered = ctx.surface.visible_editor_text(ctx.current_anchor());
+            let suffix_empty = ctx.surface.suffix_is_empty();
             if rendered.as_deref() != Some(command.as_str()) || suffix_empty != Some(true) {
                 ctx.source_id.borrow_mut().take();
                 ctx.fail(VERIFIED_SUBMISSION_LOST);
@@ -2679,6 +2984,9 @@ pub struct TermView {
     typed_cmd: Rc<RefCell<String>>,
     /// Immutable PromptEnd cursor anchor used for empty-editor verification.
     prompt_end_pos: Rc<Cell<(i64, i64)>>,
+    /// Grid height observed beside `prompt_end_pos`; every consumer passes the
+    /// pair through the selected surface's anchor policy.
+    prompt_anchor_rows: Rc<Cell<i64>>,
     /// VTE feed is asynchronous; approval remains unavailable until a short
     /// post-PromptEnd fence confirms that no input raced the captured anchor.
     prompt_anchor_ready: Rc<Cell<bool>>,
@@ -2788,6 +3096,9 @@ pub struct TermView {
     /// metrics change. Keeping the closure here makes programmatic font updates
     /// follow the same refit path as GTK allocation signals.
     layout_active_surface: Rc<dyn Fn()>,
+    /// The same backend instance driven by `ReaderCtx`; all completed-record
+    /// consumers query this instead of inferring a mode from empty Block lists.
+    render_backend: Rc<dyn RenderBackend>,
 }
 
 impl Drop for TermView {
@@ -2853,7 +3164,275 @@ struct EngineState {
     /// cwd the running command was started in, as the shell reported it at
     /// CommandStart. The pane's tracked cwd has already moved on after a `cd`.
     command_cwd: Option<String>,
+    /// The id opened at A and carried through C until the completed record is
+    /// finalized at the following A. Opening a marker alone never creates a
+    /// record.
+    pending_zone: Option<PendingZone>,
     active_alt_screen_mode: Option<u32>,
+}
+
+/// The VTE/widget pair that presents one field of a completed record.
+struct RecordSearchTarget {
+    terminal: Terminal,
+    widget: gtk::Widget,
+    /// Unified deliberately cannot return a record-specific target until
+    /// marker ranges exist. Kept explicit for Block's ordinary card targets.
+    uses_live_surface: bool,
+}
+
+/// One bounded window inside a native VTE search domain. Windows are ordered
+/// exactly as a freshly reset native cursor visits them. Unified presents the
+/// viewport-to-tail window first and the wrapped oldest-history prefix second.
+struct BackendSearchWindow {
+    text: String,
+    /// Counting this window does not prove the domain's total match count.
+    incomplete: bool,
+    /// The native step entering this window must wrap around once.
+    initial_wrap: bool,
+}
+
+/// One native VTE search domain and bounded plain-text windows used to count
+/// its matches. Unified returns exactly one domain for its persistent surface.
+struct BackendSearchSurface {
+    block_id: u64,
+    block_index: usize,
+    is_output: bool,
+    is_live: bool,
+    windows: Vec<BackendSearchWindow>,
+    /// Hard-budget charge for extracting every window.
+    scanned_bytes: usize,
+    /// Clear the native selection/search anchor before entering the selected
+    /// window. Unified shares one persistent cursor across successive queries.
+    reset_cursor: bool,
+    terminal: Terminal,
+}
+
+/// Last-resort native search for a persistent surface whose absolute ring
+/// rows are not currently trustworthy. It can prove one selected result but
+/// cannot claim a total or navigate beyond that representative result.
+struct BackendNativeSearchFallback {
+    block_id: u64,
+    block_index: usize,
+    is_output: bool,
+    is_live: bool,
+    terminal: Terminal,
+}
+
+/// One bounded backend snapshot. `incomplete` also covers a deadline reached
+/// between surfaces (including before the first), where no individual surface
+/// exists on which to carry the partial-state bit.
+struct BackendSearchBatch {
+    surfaces: Vec<BackendSearchSurface>,
+    incomplete: bool,
+    native_fallback: Option<BackendNativeSearchFallback>,
+}
+
+/// Materialize one surface only while the caller's deadline remains live. A
+/// post-check keeps the just-created surface usable while preventing another
+/// potentially allocating read after the deadline.
+fn push_search_surface_before_deadline<T>(
+    surfaces: &mut Vec<T>,
+    deadline_exhausted: &mut dyn FnMut() -> bool,
+    materialize: impl FnOnce() -> T,
+) -> bool {
+    if deadline_exhausted() {
+        return false;
+    }
+    surfaces.push(materialize());
+    !deadline_exhausted()
+}
+
+/// Borrowed completed-record storage. Block owns serializable `BlockData`;
+/// Unified owns only command identity/outcome metadata.
+enum BackendRecords<'a> {
+    Blocks(Ref<'a, VecDeque<BlockData>>),
+    Metadata(Ref<'a, VecDeque<CompletedCommandRecord>>),
+}
+
+#[derive(Clone, Copy)]
+enum BackendRecordRef<'a> {
+    Block(&'a BlockData),
+    Metadata(&'a CompletedCommandRecord),
+}
+
+enum BackendRecordIter<'a> {
+    Blocks(std::collections::vec_deque::Iter<'a, BlockData>),
+    Metadata(std::collections::vec_deque::Iter<'a, CompletedCommandRecord>),
+}
+
+impl<'a> Iterator for BackendRecordIter<'a> {
+    type Item = BackendRecordRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Blocks(records) => records.next().map(BackendRecordRef::Block),
+            Self::Metadata(records) => records.next().map(BackendRecordRef::Metadata),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Blocks(records) => records.size_hint(),
+            Self::Metadata(records) => records.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for BackendRecordIter<'_> {}
+
+impl DoubleEndedIterator for BackendRecordIter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Blocks(records) => records.next_back().map(BackendRecordRef::Block),
+            Self::Metadata(records) => records.next_back().map(BackendRecordRef::Metadata),
+        }
+    }
+}
+
+impl BackendRecords<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Blocks(records) => records.len(),
+            Self::Metadata(records) => records.len(),
+        }
+    }
+
+    fn iter(&self) -> BackendRecordIter<'_> {
+        match self {
+            Self::Blocks(records) => BackendRecordIter::Blocks(records.iter()),
+            Self::Metadata(records) => BackendRecordIter::Metadata(records.iter()),
+        }
+    }
+
+    fn block_data(&self) -> Option<&VecDeque<BlockData>> {
+        match self {
+            Self::Blocks(records) => Some(records),
+            Self::Metadata(_) => None,
+        }
+    }
+}
+
+impl<'a> BackendRecordRef<'a> {
+    fn id(self) -> u64 {
+        match self {
+            Self::Block(record) => record.id,
+            Self::Metadata(record) => record.id,
+        }
+    }
+
+    fn command(self) -> &'a str {
+        match self {
+            Self::Block(record) => &record.cmd,
+            Self::Metadata(record) => &record.cmd,
+        }
+    }
+
+    fn prompt(self) -> Option<&'a str> {
+        match self {
+            Self::Block(record) => Some(&record.prompt),
+            Self::Metadata(_) => None,
+        }
+    }
+
+    fn output(self) -> Option<&'a str> {
+        match self {
+            Self::Block(record) => Some(&record.output),
+            Self::Metadata(_) => None,
+        }
+    }
+
+    fn exit_code(self) -> Option<i32> {
+        match self {
+            Self::Block(record) => record.exit_code,
+            Self::Metadata(record) => record.exit_code,
+        }
+    }
+
+    fn duration_ms(self) -> Option<u64> {
+        match self {
+            Self::Block(record) => record.duration_ms,
+            Self::Metadata(record) => record.duration_ms,
+        }
+    }
+}
+
+/// Output stays in its existing capture owner until a backend or explicit
+/// consumer requests the render payload.
+enum CapturedFinalizeOutput {
+    Foreground(Rc<RefCell<VecDeque<u8>>>),
+    Background(VecDeque<u8>),
+}
+
+struct BlockRenderPayload {
+    prompt: String,
+    output_with_ansi: String,
+    output_plain: String,
+}
+
+trait BlockRenderPayloadAccessor {
+    fn materialize(&self) -> &BlockRenderPayload;
+
+    #[cfg(test)]
+    fn materialization_counter(&self) -> Rc<Cell<usize>>;
+}
+
+struct LazyBlockRenderPayload {
+    value: OnceCell<BlockRenderPayload>,
+    prompt: RefCell<Option<String>>,
+    output: RefCell<Option<CapturedFinalizeOutput>>,
+    materializations: Rc<Cell<usize>>,
+}
+
+impl LazyBlockRenderPayload {
+    fn new(prompt: String, output: CapturedFinalizeOutput) -> Self {
+        Self {
+            value: OnceCell::new(),
+            prompt: RefCell::new(Some(prompt)),
+            output: RefCell::new(Some(output)),
+            materializations: Rc::new(Cell::new(0)),
+        }
+    }
+
+    #[cfg(test)]
+    fn materialization_count(&self) -> usize {
+        self.materializations.get()
+    }
+}
+
+impl BlockRenderPayloadAccessor for LazyBlockRenderPayload {
+    fn materialize(&self) -> &BlockRenderPayload {
+        self.value.get_or_init(|| {
+            self.materializations
+                .set(self.materializations.get().saturating_add(1));
+            let prompt = self
+                .prompt
+                .borrow_mut()
+                .take()
+                .expect("a finalize payload is materialized at most once");
+            let output_with_ansi = match self
+                .output
+                .borrow_mut()
+                .take()
+                .expect("a finalize payload is materialized at most once")
+            {
+                CapturedFinalizeOutput::Foreground(output) => live_output_text(&output),
+                CapturedFinalizeOutput::Background(mut output) => {
+                    String::from_utf8_lossy(output.make_contiguous()).into_owned()
+                }
+            };
+            let output_plain = strip_ansi(&output_with_ansi).to_string();
+            BlockRenderPayload {
+                prompt,
+                output_with_ansi,
+                output_plain,
+            }
+        })
+    }
+
+    #[cfg(test)]
+    fn materialization_counter(&self) -> Rc<Cell<usize>> {
+        self.materializations.clone()
+    }
 }
 
 /// Rendering seam for the OSC 133 block lifecycle. Every statement in the
@@ -2871,6 +3450,16 @@ trait RenderBackend {
     /// Feed bytes to the live terminal surface (including re-synthesized
     /// `\x1b[?..h/l` alt-screen toggles).
     fn feed_live(&self, bytes: &[u8]);
+    /// Open or reassert the prompt zone chosen by the engine at OSC 133 `A`.
+    /// Block has no persistent marker surface, so this is a no-op by default.
+    fn begin_prompt_zone(&self, _zone_id: u64) {}
+    /// Close the A→C prompt marker before command output begins. Backends
+    /// without marker-based ranges leave the default no-op in place.
+    fn close_prompt_zone(&self, _zone_id: Option<u64>) {}
+    /// Invalidate row-address authority immediately before ED3 reaches VTE.
+    fn erase_scrollback(&self) {}
+    /// Invalidate persistent-surface authority before RIS reaches VTE.
+    fn hard_reset(&self) {}
     /// Reset the live surface for the next prompt. `preserve_scrollback` is
     /// Block-surface mechanics (the engine passes the config knob through; a
     /// backend without a persistent live scrollback may ignore it). Does NOT
@@ -2886,13 +3475,42 @@ trait RenderBackend {
     fn sync_geometry_to_pty(&self);
     /// Re-run only the live-surface layout (compact vs full-screen).
     fn layout_active_surface(&self);
+    // ── completed-record document ──
+    fn records(&self) -> BackendRecords<'_>;
+    /// Resolve the exact visible surface for one record field. Unified returns
+    /// `None` until command markers provide a truthful per-record range.
+    fn record_search_target(&self, block_id: u64, is_output: bool) -> Option<RecordSearchTarget>;
+    /// Snapshot completed text into native search-cursor domains under one
+    /// aggregate byte/work ceiling.
+    fn completed_search_surfaces(
+        &self,
+        max_bytes: usize,
+        deadline_exhausted: &mut dyn FnMut() -> bool,
+    ) -> BackendSearchBatch;
+    fn persists_block_history(&self) -> bool {
+        true
+    }
+    fn supports_inline_notices(&self) -> bool {
+        true
+    }
+    fn supports_block_mutation(&self) -> bool {
+        true
+    }
+    fn scroll_surface_lines(&self, _lines: i32) -> bool {
+        false
+    }
+    fn debug_name(&self) -> &'static str;
     // ── autoscroll ──
     fn mark_scroll_dirty(&self);
     fn reset_scroll_lock(&self);
     // ── finished blocks ──
     /// Mount a finished command as a history block and reset the live
     /// surface; subsumes the whole ordered finalize sub-step chain.
-    fn finalize_block(&self, block_data: BlockData, args: FinalizedBlockArgs);
+    fn finalize_block(
+        &self,
+        record: &CompletedCommandRecord,
+        payload: &dyn BlockRenderPayloadAccessor,
+    );
     // ── alt-screen chrome ──
     fn enter_alt_screen_chrome(&self);
     fn exit_alt_screen_chrome(&self);
@@ -2917,11 +3535,16 @@ trait RenderBackend {
     // ── system ──
     fn set_system_clipboard(&self, text: &str);
     fn desktop_notify(&self, title: Option<&str>, body: &str);
+    // ── prompt-anchor settling ──
+    /// Schedule the surface-coupled delay that publishes a PromptEnd anchor.
+    /// Keeping this behind the backend makes the lifecycle independently
+    /// driveable in tests without changing the production settling policy.
+    fn schedule_anchor_settle(&self, args: AnchorSettleArgs);
     // ── queries ──
-    /// Current cursor position `(col, row)`. Rows are text-buffer (ring) rows
-    /// — monotonic as scrollback grows — NOT screen rows; prompt anchors and
-    /// capture ranges live in this coordinate space.
-    fn cursor_position(&self) -> (i64, i64);
+    /// Current cursor position `(col, row)` and live-grid height, sampled
+    /// together so the PromptEnd pair describes one surface frame. Rows are
+    /// text-buffer (ring) rows, not screen-relative rows.
+    fn cursor_and_rows(&self) -> ((i64, i64), i64);
     /// Cursor position `(col, row)` for the DSR 6 cursor-position report
     /// (`ESC[{row+1};{col+1}R`). Block reports the text-buffer row here
     /// (pre-existing quirk kept for compatibility); a correct implementation
@@ -2930,20 +3553,18 @@ trait RenderBackend {
     /// Rebase the prompt anchor captured at PromptEnd (`provisional`) onto the
     /// surface as it stands at CommandStart. Anchor cells are in the backend's
     /// surface coordinates and each backend owns its rebase policy. Block's
-    /// policy is the identity because that is what the pre-split path did, not
-    /// because the grid holds still: `layout_active_surface` shrinks the live
-    /// VTE to `compact_rows()` between the two marks. VTE's cursor rows are
-    /// ring-absolute, so the resize does not move them; a backend whose rows
-    /// are screen-relative must shift the anchor here (cf. forge's
-    /// `rebase_prompt_anchor`, which corrects a row-count delta).
+    /// Block rebases by the row-count delta because `layout_active_surface`
+    /// changes the live VTE between compact and full grids. Unified keeps one
+    /// full-size surface and therefore returns the provisional anchor unchanged.
     ///
-    /// Engine-side command-capture path only. The reviewed-submission guard,
-    /// its verification poll, `command_prompt_status` and `click_cursor` read
-    /// `prompt_end_pos` raw; a non-identity implementation must rebase there
-    /// too or those readers desynchronize.
-    fn command_capture_anchor(&self, provisional: (i64, i64)) -> (i64, i64);
+    /// The same policy is exposed by [`SubmissionSurface::prompt_anchor`] for
+    /// reviewed submission, status and click-to-place-cursor reads.
+    fn command_capture_anchor(&self, provisional: (i64, i64), recorded_rows: i64) -> (i64, i64);
     /// The column count finished blocks pre-wrap at (live grid, floored).
     fn grid_cols(&self) -> i64;
+    /// The live surface's actual column count. Command-capture bounds use this
+    /// rather than the independently floored finished-block width.
+    fn live_column_count(&self) -> i64;
     /// Plain text between two grid positions, `None` when the surface has
     /// nothing there. Bounding/normalizing the result stays engine-side.
     fn capture_text_range(
@@ -2953,6 +3574,30 @@ trait RenderBackend {
         end_row: i64,
         end_col: i64,
     ) -> Option<String>;
+}
+
+/// Everything the production PromptEnd settling delay needs. Values and cells
+/// are captured engine-side before scheduling; a recording backend may publish
+/// `ready` synchronously while the GTK backends retain the real delay.
+struct AnchorSettleArgs {
+    prompt_generation: u64,
+    state: Rc<Cell<BlockState>>,
+    dirty: Rc<Cell<bool>>,
+    synced: Rc<Cell<bool>>,
+    generation: Rc<Cell<u64>>,
+    ready: Rc<Cell<bool>>,
+}
+
+fn schedule_prompt_anchor_settle(args: AnchorSettleArgs) {
+    glib::timeout_add_local_once(std::time::Duration::from_millis(32), move || {
+        if args.state.get() == BlockState::AwaitingCommand
+            && args.generation.get() == args.prompt_generation
+            && !args.dirty.get()
+            && !args.synced.get()
+        {
+            args.ready.set(true);
+        }
+    });
 }
 
 /// The GTK/VTE implementation of [`RenderBackend`] for Block mode: owns the
@@ -2965,6 +3610,9 @@ struct BlockBackend {
     active_rc: Rc<RefCell<ActiveBlock>>,
     /// The live VTE — every byte is fed here; alt-screen toggles feed it 1049h/l.
     active_vte: Terminal,
+    /// Shared construction-time anchor policy; the submission surface receives
+    /// this same value so no prompt reader can bypass the backend decision.
+    rebase_prompt_anchor_on_row_delta: bool,
     block_list_rc: gtk::Box,
     block_scroll_rc: ScrolledWindow,
     jump_fab: gtk::Button,
@@ -3020,6 +3668,327 @@ struct BlockBackend {
     kitty_pending_admission: RefCell<Option<gtk::gdk::Texture>>,
 }
 
+fn record_unified_zone(
+    zones: &mut VecDeque<CompletedCommandRecord>,
+    record: CompletedCommandRecord,
+    max_zones: usize,
+) -> Vec<u64> {
+    zones.push_back(record);
+    let max_zones = max_zones.max(1);
+    if zones.len() > max_zones {
+        return zones
+            .drain(..zones.len() - max_zones)
+            .map(|record| record.id)
+            .collect();
+    }
+    Vec::new()
+}
+
+/// The sole Unified live-feed wrapper. Marker bytes are separate terminal
+/// feeds, so guest bytes are not copied and injected bytes cannot enter the
+/// engine-owned prompt/output buffers.
+fn feed_vte_with_zone_marker(
+    vte: &Terminal,
+    zone_marker: &RefCell<ZoneMarkerInjector>,
+    bytes: &[u8],
+) {
+    feed_with_zone_marker(zone_marker, bytes, |part| vte.feed(part));
+}
+
+fn feed_with_zone_marker(
+    zone_marker: &RefCell<ZoneMarkerInjector>,
+    bytes: &[u8],
+    mut feed: impl FnMut(&[u8]),
+) {
+    let open = zone_marker.borrow().open_bytes();
+    if let Some(open) = open {
+        feed(&open);
+    }
+    feed(bytes);
+}
+
+/// End marker authority and close any guest-open OSC 8 hyperlink on every
+/// accepted C, even when entropy failure disabled our own marker.
+fn close_zone_marker(
+    zone_marker: &RefCell<ZoneMarkerInjector>,
+    zone_id: Option<u64>,
+    mut feed: impl FnMut(&[u8]),
+) {
+    zone_marker.borrow_mut().close_zone(zone_id);
+    feed(ZONE_MARKER_CLOSE);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalResetKind {
+    EraseScrollback,
+    HardReset,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ResetAwareParserPart {
+    Bytes(Vec<u8>),
+    /// ANSI control string whose framing is unsafe in pinned core. Feed it to
+    /// capture/VTE without letting payload CSI/OSC become lifecycle events.
+    OpaqueBytes(Vec<u8>),
+    /// A fully framed APC payload parsed locally because pinned core treats
+    /// BEL and ESC non-ST as terminators. This preserves Kitty semantics
+    /// without exposing payload controls to the shared parser.
+    ApcSequence(Vec<u8>),
+    Reset {
+        kind: TerminalResetKind,
+        bytes: Vec<u8>,
+    },
+}
+
+#[derive(Debug, Default)]
+enum ResetAwareParserState {
+    #[default]
+    Ground,
+    Escape,
+    Csi(Vec<u8>),
+    ControlString {
+        bel_terminates: bool,
+        after_escape: bool,
+        bypass_parser: bool,
+        capture_apc: bool,
+        apc_payload: Vec<u8>,
+        apc_overflow: bool,
+    },
+}
+
+#[derive(Debug, Default)]
+struct ResetAwareParserSplitter {
+    state: ResetAwareParserState,
+}
+
+fn csi_parameter_is_ed3(params: &[u8]) -> bool {
+    !params.is_empty()
+        && params.iter().all(u8::is_ascii_digit)
+        && params.iter().fold(0_u32, |value, digit| {
+            value
+                .saturating_mul(10)
+                .saturating_add(u32::from(*digit - b'0'))
+        }) == 3
+}
+
+fn flush_reset_passthrough(parts: &mut Vec<ResetAwareParserPart>, passthrough: &mut Vec<u8>) {
+    if !passthrough.is_empty() {
+        parts.push(ResetAwareParserPart::Bytes(std::mem::take(passthrough)));
+    }
+}
+
+fn flush_opaque_passthrough(parts: &mut Vec<ResetAwareParserPart>, opaque: &mut Vec<u8>) {
+    if !opaque.is_empty() {
+        parts.push(ResetAwareParserPart::OpaqueBytes(std::mem::take(opaque)));
+    }
+}
+
+/// Split the raw PTY stream before pinned jterm_core parses it.
+///
+/// Only an unresolved ESC or CSI is retained across chunks (bounded by core's
+/// own 4096-byte malformed-CSI ceiling). Every ordinary/control-string byte is
+/// forwarded exactly once while a small framing state prevents reset-looking
+/// text inside OSC/DCS/APC/PM/SOS from becoming a lifecycle side effect.
+impl ResetAwareParserSplitter {
+    fn feed(&mut self, bytes: &[u8]) -> Vec<ResetAwareParserPart> {
+        let mut parts = Vec::new();
+        let mut passthrough = Vec::with_capacity(bytes.len());
+        let mut opaque = Vec::new();
+        let mut index = 0;
+        while index < bytes.len() {
+            match std::mem::take(&mut self.state) {
+                ResetAwareParserState::Ground => match memchr::memchr(0x1b, &bytes[index..]) {
+                    Some(offset) => {
+                        flush_opaque_passthrough(&mut parts, &mut opaque);
+                        passthrough.extend_from_slice(&bytes[index..index + offset]);
+                        index += offset + 1;
+                        self.state = ResetAwareParserState::Escape;
+                    }
+                    None => {
+                        flush_opaque_passthrough(&mut parts, &mut opaque);
+                        passthrough.extend_from_slice(&bytes[index..]);
+                        index = bytes.len();
+                        self.state = ResetAwareParserState::Ground;
+                    }
+                },
+                ResetAwareParserState::Escape => {
+                    let Some(&introducer) = bytes.get(index) else {
+                        self.state = ResetAwareParserState::Escape;
+                        break;
+                    };
+                    index += 1;
+                    match introducer {
+                        b'c' => {
+                            flush_reset_passthrough(&mut parts, &mut passthrough);
+                            parts.push(ResetAwareParserPart::Reset {
+                                kind: TerminalResetKind::HardReset,
+                                bytes: b"\x1bc".to_vec(),
+                            });
+                            self.state = ResetAwareParserState::Ground;
+                        }
+                        b'[' => {
+                            self.state = ResetAwareParserState::Csi(b"\x1b[".to_vec());
+                        }
+                        b']' | b'P' | b'_' | b'^' | b'X' => {
+                            // Pinned core does not keep DCS/APC/PM opaque across
+                            // BEL and ESC non-ST recovery. SOS is unsupported.
+                            // Only OSC remains parser-owned because Anvil needs
+                            // its real OSC 133/52/notification events.
+                            let bypass_parser = introducer != b']';
+                            let capture_apc = introducer == b'_';
+                            if bypass_parser && !capture_apc {
+                                flush_reset_passthrough(&mut parts, &mut passthrough);
+                                opaque.extend_from_slice(&[0x1b, introducer]);
+                            } else if !capture_apc {
+                                passthrough.extend_from_slice(&[0x1b, introducer]);
+                            }
+                            self.state = ResetAwareParserState::ControlString {
+                                bel_terminates: introducer == b']',
+                                after_escape: false,
+                                bypass_parser,
+                                capture_apc,
+                                apc_payload: Vec::new(),
+                                apc_overflow: false,
+                            };
+                        }
+                        _ => {
+                            passthrough.extend_from_slice(&[0x1b, introducer]);
+                            self.state = ResetAwareParserState::Ground;
+                        }
+                    }
+                }
+                ResetAwareParserState::Csi(mut sequence) => {
+                    let byte = bytes[index];
+                    index += 1;
+                    sequence.push(byte);
+                    if (0x40..=0x7e).contains(&byte) {
+                        let kind = (byte == b'J'
+                            && csi_parameter_is_ed3(&sequence[2..sequence.len() - 1]))
+                        .then_some(TerminalResetKind::EraseScrollback);
+                        if let Some(kind) = kind {
+                            flush_reset_passthrough(&mut parts, &mut passthrough);
+                            parts.push(ResetAwareParserPart::Reset {
+                                kind,
+                                bytes: sequence,
+                            });
+                        } else {
+                            passthrough.extend_from_slice(&sequence);
+                        }
+                        self.state = ResetAwareParserState::Ground;
+                    } else if sequence.len() > 4098 {
+                        // Match pinned core: after more than 4096 parameter /
+                        // intermediary bytes, recover to Ground and pass the
+                        // malformed CSI without treating later text as params.
+                        passthrough.extend_from_slice(&sequence);
+                        self.state = ResetAwareParserState::Ground;
+                    } else {
+                        self.state = ResetAwareParserState::Csi(sequence);
+                    }
+                }
+                ResetAwareParserState::ControlString {
+                    bel_terminates,
+                    mut after_escape,
+                    bypass_parser,
+                    capture_apc,
+                    mut apc_payload,
+                    mut apc_overflow,
+                } => {
+                    let byte = bytes[index];
+                    if after_escape && byte != b'\\' {
+                        // A non-ST escape aborts the old control string. Keep
+                        // the ESC pending and reinterpret this byte as its
+                        // introducer, so RIS/CSI after malformed strings keep
+                        // their real stream order without duplicating bytes.
+                        flush_opaque_passthrough(&mut parts, &mut opaque);
+                        flush_reset_passthrough(&mut parts, &mut passthrough);
+                        self.state = ResetAwareParserState::Escape;
+                        continue;
+                    }
+                    index += 1;
+                    if after_escape {
+                        if capture_apc {
+                            if !apc_overflow {
+                                parts.push(ResetAwareParserPart::ApcSequence(apc_payload));
+                            }
+                        } else if bypass_parser {
+                            opaque.extend_from_slice(b"\x1b\\");
+                        } else {
+                            passthrough.extend_from_slice(b"\x1b\\");
+                        }
+                        self.state = ResetAwareParserState::Ground;
+                    } else if bel_terminates && byte == 0x07 {
+                        if bypass_parser {
+                            opaque.push(byte);
+                        } else {
+                            passthrough.push(byte);
+                        }
+                        self.state = ResetAwareParserState::Ground;
+                    } else if byte == 0x1b {
+                        // Hold one ambiguous ESC across chunks until ST vs an
+                        // aborting new escape sequence is known.
+                        after_escape = true;
+                        self.state = ResetAwareParserState::ControlString {
+                            bel_terminates,
+                            after_escape,
+                            bypass_parser,
+                            capture_apc,
+                            apc_payload,
+                            apc_overflow,
+                        };
+                    } else {
+                        if capture_apc {
+                            if apc_payload.len() < MAX_LOCAL_APC_PAYLOAD_BYTES {
+                                apc_payload.push(byte);
+                            } else {
+                                apc_payload.clear();
+                                apc_overflow = true;
+                            }
+                        } else if bypass_parser {
+                            opaque.push(byte);
+                        } else {
+                            passthrough.push(byte);
+                        }
+                        self.state = ResetAwareParserState::ControlString {
+                            bel_terminates,
+                            after_escape: false,
+                            bypass_parser,
+                            capture_apc,
+                            apc_payload,
+                            apc_overflow,
+                        };
+                    }
+                }
+            }
+        }
+        flush_opaque_passthrough(&mut parts, &mut opaque);
+        flush_reset_passthrough(&mut parts, &mut passthrough);
+        parts
+    }
+}
+
+/// One long-lived full-size VTE driven by the normal OSC 133 lifecycle, with
+/// no finished-block widgets or other block chrome.
+struct UnifiedBackend {
+    vte: Terminal,
+    /// Same construction-time policy bit as the SubmissionSurface. Unified's
+    /// stable full-size grid selects `false`.
+    rebase_prompt_anchor_on_row_delta: bool,
+    active_rc: Rc<RefCell<ActiveBlock>>,
+    block_scroll_rc: ScrolledWindow,
+    layout_active_surface: Rc<dyn Fn()>,
+    config_for_cb: Rc<RefCell<Config>>,
+    pty_for_init: Rc<OwnedPty>,
+    zones: Rc<RefCell<VecDeque<CompletedCommandRecord>>>,
+    find_state_for_cb: Rc<RefCell<FindState>>,
+    /// Per-pane fail-closed marker state. Marker bytes are fed only inside the
+    /// backend, never through the parser or any engine capture buffer.
+    zone_marker: Rc<RefCell<ZoneMarkerInjector>>,
+    /// Probe/paint half of Unified zone chrome. Marker authority is separate
+    /// from completed records so eviction cannot delete history metadata.
+    chrome: unified_chrome::UnifiedChrome,
+    kitty_assembler: RefCell<kitty_graphics::Assembler>,
+}
+
 /// Captures the shared handles the PTY reader/exit callbacks need, so
 /// `TermView::new` does not carry the reader closure inline. Widget-owning
 /// handles live behind [`ReaderCtx::backend`]; the fields here are the parse
@@ -3045,6 +4014,7 @@ struct ReaderCtx {
     /// Live-surface cursor position (col, row) captured at PromptEnd; the start
     /// anchor for the text-range read that produces `EngineState::vte_typed_cmd`.
     prompt_end_pos_rc: Rc<Cell<(i64, i64)>>,
+    prompt_anchor_rows_rc: Rc<Cell<i64>>,
     prompt_anchor_ready_rc: Rc<Cell<bool>>,
     remote_session_cbs: StrCallbacks,
     exited_cbs: IntCallbacks,
@@ -3061,6 +4031,13 @@ struct ReaderCtx {
     dynamic_colors_rc: DynamicColorsRc,
     config_for_cb: Rc<RefCell<Config>>,
     parser: Rc<RefCell<Parser>>,
+    /// Raw OSC capability observer. It advances in reset-splitter order so a
+    /// RIS can invalidate pre-reset trust before same-chunk suffix bytes.
+    capability_observer: RefCell<ShellCapabilityObserver>,
+    shell_capability_token: String,
+    /// ANSI-aware raw framing in front of pinned jterm_core. Only unresolved
+    /// reset candidates are retained across PTY chunks.
+    reset_splitter: RefCell<ResetAwareParserSplitter>,
     reserved_history_block_ids: Rc<RefCell<HashSet<u64>>>,
     pty_synced_rc: Rc<Cell<bool>>,
     ftcs_seen_rc: Rc<Cell<bool>>,
@@ -3129,6 +4106,7 @@ impl ReaderCtx {
     fn on_decset_mode(&self, mode: u32, set: bool) {
         if mode == 2004 {
             self.bracketed_paste_rc.set(set);
+            self.pty_for_init.set_shell_bracketed_paste(set);
         }
         // VTE handles paste/cursor/etc. natively from its
         // own bytes; block_view only needs mouse-reporting
@@ -3144,6 +4122,156 @@ impl ReaderCtx {
         if let Some(m) = new_mode {
             self.mouse_reporting_rc.set(m);
         }
+    }
+
+    fn on_hard_reset(&self) {
+        // RIS invalidates saved screens and every row address. Completed
+        // metadata remains in the backend document, but an old marker must
+        // never become authoritative again after reset.
+        let (was_alt_screen, restored_state) = {
+            let mut engine = self.engine.borrow_mut();
+            engine.pending_zone = None;
+            engine.osc133_depth = 0;
+            engine.prompt_buf.clear();
+            engine.background_output.clear();
+            engine.vte_typed_cmd.clear();
+            engine.prompt_display.clear();
+            engine.pending_exit_code = None;
+            engine.shell_duration_ms = None;
+            engine.execution_id_trusted = false;
+            engine.agent_completion_trusted = false;
+            engine.command_cwd = None;
+            (
+                self.bstate_rc.get() == BlockState::AltScreen,
+                engine.prev_state,
+            )
+        };
+
+        // No pending settle/submission may publish trust derived from the
+        // pre-RIS surface. The generation bump invalidates an already queued
+        // settle callback even though Anvil does not retain its source id.
+        self.prompt_anchor_ready_rc.set(false);
+        self.agent_prompt_generation_rc
+            .set(self.agent_prompt_generation_rc.get().wrapping_add(1));
+        self.prompt_end_pos_rc.set((-1, -1));
+        self.prompt_anchor_rows_rc.set(0);
+        self.typed_cmd_rc.borrow_mut().clear();
+        self.idle_input_dirty_rc.set(false);
+        self.pty_synced_rc.set(false);
+        self.live_raw_output_rc.borrow_mut().clear();
+        self.block_start_time_for_cb.set(None);
+        self.execution_id_rc.borrow_mut().take();
+        self.cmd_running_rc.set(false);
+        self.running_cmd_rc.borrow_mut().clear();
+
+        if let Some(source) = self.verified_submission.source_id.borrow_mut().take() {
+            source.remove();
+        }
+        let pending_execution = self
+            .verified_submission
+            .submission
+            .borrow_mut()
+            .take()
+            .and_then(|submission| submission.execution);
+        self.armed_agent_execution_rc.borrow_mut().take();
+        let active_execution = self
+            .active_agent_execution_rc
+            .take()
+            .filter(|execution| Some(*execution) != pending_execution);
+        for execution in [pending_execution, active_execution].into_iter().flatten() {
+            emit_agent_execution_lost(
+                &self.verified_submission.agent_execution_lost_callbacks,
+                execution,
+                "a terminal reset invalidated the Agent command correlation",
+            );
+        }
+        self.agent_execution_supported_rc.set(false);
+        *self.capability_observer.borrow_mut() = ShellCapabilityObserver::default();
+
+        // This runs before the exact RIS bytes are fed. Unified clears both
+        // injector and row authority here, so its normal feed wrapper cannot
+        // prepend a retired OSC 8 marker to the reset itself.
+        self.backend.hard_reset();
+
+        if was_alt_screen {
+            // RIS already returns VTE to the primary screen. Do not emit rmcup
+            // after it; only unwind the frontend ownership/chrome state.
+            self.backend.exit_fullscreen();
+            self.backend.exit_alt_screen_chrome();
+            emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Left);
+            self.backend.layout_active_surface();
+            self.bstate_rc.set(restored_state);
+        }
+        self.engine.borrow_mut().active_alt_screen_mode = None;
+        self.backend.reset_kitty_pipeline();
+        self.bracketed_paste_rc.set(false);
+        self.pty_for_init.set_shell_bracketed_paste(false);
+        self.mouse_reporting_rc.set(MouseReportingMode::None);
+        self.dynamic_colors_rc.set(DynamicColors::default());
+        let config = self.config_for_cb.borrow();
+        *self.parser.borrow_mut() = Parser::with_config(ParserConfig {
+            mouse_reporting: config.mouse_reporting_enabled,
+            focus_reporting: config.focus_reporting_enabled,
+        });
+    }
+
+    fn parse_and_dispatch(&self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let mut events = self.event_buf.borrow_mut();
+        events.clear();
+        self.parser.borrow_mut().feed(bytes, &mut events);
+        coalesce_bytes_events(&mut events);
+        // `events` remains borrowed across dispatch exactly as in the former
+        // process_chunk body; handlers never touch this staging buffer.
+        for event in events.iter() {
+            self.handle_event(event);
+        }
+    }
+
+    fn process_parser_input(&self, bytes: &[u8]) {
+        let parts = self.reset_splitter.borrow_mut().feed(bytes);
+        for part in parts {
+            match part {
+                ResetAwareParserPart::Bytes(bytes) => {
+                    self.observe_capability_bytes(&bytes);
+                    self.parse_and_dispatch(&bytes);
+                }
+                ResetAwareParserPart::OpaqueBytes(bytes) => {
+                    // Capability packets nested in an opaque control string
+                    // are data, not shell-integration authority.
+                    self.on_bytes(&bytes, self.bstate_rc.get());
+                }
+                ResetAwareParserPart::ApcSequence(payload) => self.on_apc_sequence(&payload),
+                ResetAwareParserPart::Reset { kind, bytes } => {
+                    // Prefix parser events have already completed. Invalidate
+                    // before the exact sequence is handed to core/VTE, then
+                    // let the parser emit its ordinary Bytes event from a
+                    // freshly reset state for RIS.
+                    match kind {
+                        TerminalResetKind::EraseScrollback => {
+                            self.observe_capability_bytes(&bytes);
+                            self.backend.erase_scrollback();
+                        }
+                        TerminalResetKind::HardReset => self.on_hard_reset(),
+                    }
+                    if kind == TerminalResetKind::HardReset {
+                        self.observe_capability_bytes(&bytes);
+                    }
+                    self.parse_and_dispatch(&bytes);
+                }
+            }
+        }
+    }
+
+    fn observe_capability_bytes(&self, bytes: &[u8]) {
+        let expected = self.shell_capability_token.as_str();
+        self.capability_observer.borrow_mut().feed(
+            bytes,
+            expected,
+            &self.agent_execution_supported_rc,
+        );
     }
 
     fn on_bytes(&self, bytes: &[u8], state: BlockState) {
@@ -3258,16 +4386,23 @@ impl ReaderCtx {
             None
         };
         let is_background = background_output.is_some();
+        let completes_record = state == BlockState::PostCommand || is_background;
+        let zone_plan =
+            plan_prompt_zone(self.engine.borrow().pending_zone, completes_record, || {
+                next_block_id(&self.reserved_history_block_ids)
+            });
+        self.engine.borrow_mut().pending_zone = Some(PendingZone::Prompt(zone_plan.prompt_id));
+        self.backend.begin_prompt_zone(zone_plan.prompt_id);
         // Finalize the previous command (deferred from CommandEnd),
         // or turn commandless async output into a first-class block.
-        if state == BlockState::PostCommand || is_background {
+        if completes_record {
             // The VTE-text capture taken at CommandStart is
             // authoritative — it reflects what was on screen
             // when the user pressed Enter. Fall back to the
             // keystroke shadow only if the VTE read came back
             // empty (which would indicate the prompt-end
             // anchor never captured a valid cursor position).
-            let cmd = if is_background {
+            let mut cmd = if is_background {
                 String::new()
             } else {
                 finished_command(
@@ -3277,61 +4412,55 @@ impl ReaderCtx {
             };
 
             if cmd.is_empty() && !is_background {
-                // Nothing meaningful to record; just reset.
-                let preserve = self.config_for_cb.borrow().preserve_live_scrollback;
-                self.backend.reset_active_surface(preserve);
-                // The surface reset no longer drops the capture
-                // (the ring is engine-owned now); clear it here
-                // for parity with the pre-split `reset_active`.
-                self.live_raw_output_rc.borrow_mut().clear();
-                // No block is created here, so half-uploaded
-                // kitty chunks and undisplayed images have
-                // nowhere to land: drop them with the rest of
-                // the active state instead of leaking into
-                // the next command.
-                self.backend.reset_kitty_pipeline();
-                self.bstate_rc.set(BlockState::CollectingPrompt);
-                self.engine.borrow_mut().prompt_buf.clear();
-                self.backend.mark_scroll_dirty();
-                return;
+                // Never silently discard a command lifecycle merely because
+                // the asynchronous VTE range read and input shadow both raced.
+                // A synchronized input write or visible output proves that a
+                // command ran, and the bounded visibility replay avoids
+                // materializing the lazy render payload to make that decision.
+                let output_visible = {
+                    let mut output = self.live_raw_output_rc.borrow_mut();
+                    background_output_has_visible_text(output.make_contiguous())
+                };
+                if self.pty_synced_rc.get() || output_visible {
+                    log::warn!(
+                        "finished command text was unavailable; preserving record with placeholder"
+                    );
+                    cmd = UNAVAILABLE_COMMAND_PLACEHOLDER.to_string();
+                } else {
+                    // A genuinely empty submission with no output is not useful
+                    // history; reset for the prompt without creating a record.
+                    let preserve = self.config_for_cb.borrow().preserve_live_scrollback;
+                    self.backend.reset_active_surface(preserve);
+                    // The surface reset no longer drops the capture
+                    // (the ring is engine-owned now); clear it here
+                    // for parity with the pre-split `reset_active`.
+                    self.live_raw_output_rc.borrow_mut().clear();
+                    // No block is created here, so half-uploaded
+                    // kitty chunks and undisplayed images have
+                    // nowhere to land: drop them with the rest of
+                    // the active state instead of leaking into
+                    // the next command.
+                    self.backend.reset_kitty_pipeline();
+                    self.bstate_rc.set(BlockState::CollectingPrompt);
+                    self.engine.borrow_mut().prompt_buf.clear();
+                    self.backend.mark_scroll_dirty();
+                    return;
+                }
             }
 
             let prompt = if is_background {
                 String::new()
             } else {
-                self.engine.borrow().prompt_display.clone()
+                std::mem::take(&mut self.engine.borrow_mut().prompt_display)
             };
 
-            // The raw bytes already carry CRLF — the PTY's
-            // ONLCR turns `\n` into `\r\n` on the master side
-            // before we ever see them — and the finished VTE
-            // handles in-line CR overwrites natively, just
-            // like the live VTE did while the command ran. So
-            // we feed the captured bytes verbatim, with no
-            // reconstruction pass.
-            let output_with_ansi =
-                background_output.unwrap_or_else(|| live_output_text(&self.live_raw_output_rc));
-
-            let output_plain = strip_ansi(&output_with_ansi).to_string();
-
-            let truncation_limit = self.config_for_cb.borrow().truncation_threshold_lines as usize;
-            let output_trimmed = {
-                let trimmed = output_plain.trim();
-                let lines: Vec<&str> = trimmed.lines().collect();
-                if lines.len() > truncation_limit {
-                    let kept: String = lines[..truncation_limit].join("\n");
-                    format!(
-                        "{}\n\n[... truncated: {} lines total, showing first {}]",
-                        kept,
-                        lines.len(),
-                        truncation_limit
-                    )
-                } else {
-                    trimmed.to_string()
-                }
+            // Keep bytes in their existing capture owner until an actual
+            // output consumer asks. Unified finalization therefore allocates
+            // neither raw/plain strings nor a BlockData value by default.
+            let captured_output = match background_output {
+                Some(output) => CapturedFinalizeOutput::Background(output),
+                None => CapturedFinalizeOutput::Foreground(self.live_raw_output_rc.clone()),
             };
-
-            let line_count = output_trimmed.lines().count();
 
             let start_time = if is_background {
                 None
@@ -3387,68 +4516,69 @@ impl ReaderCtx {
                 self.engine.borrow().pending_exit_code
             };
 
-            // Single id shared by the serializable BlockData and
-            // the GTK FinishedBlock so id-keyed lookups (export,
-            // delete) resolve in both lists.
-            let block_id = next_block_id(&self.reserved_history_block_ids);
-            // Capture cols now (live VTE is allocated by the time
-            // a command finishes) and store it on BlockData so
-            // session restore can recreate the finished VTE at
-            // the same width — preserving column-formatted output
-            // (ls, git log, etc.) instead of reflowing it.
-            let cols = bounded_finished_vte_columns(self.backend.grid_cols());
-            let estimated_height = estimated_finished_block_height_for_text(
-                &self.config_for_cb.borrow(),
-                &output_plain,
-                cols,
-            );
-            let block_data = BlockData {
+            // The accepted A that opened this command's prompt preallocated
+            // the identity. The following A consumes exactly that id here and
+            // opens a fresh prompt id; finalization must never mint another.
+            let block_id = zone_plan
+                .completed_record_id
+                .expect("a completing prompt transition owns a record id");
+            let record = CompletedCommandRecord {
                 id: block_id,
-                prompt: prompt.clone(),
                 cmd: cmd.clone(),
-                cmd_markup: None,
-                output: output_plain.trim().to_string(),
                 exit_code,
-                estimated_height,
-                line_count,
                 start_time_ms,
                 end_time_ms,
                 duration_ms,
-                cwd: block_cwd.clone(),
-                cols: cols as u16,
+                cwd: block_cwd,
+                is_background,
             };
+            let payload = LazyBlockRenderPayload::new(prompt, captured_output);
 
-            // Sampled before `output_plain` moves out of scope; the
-            // block-finished fan-out below runs after the backend returns.
-            let output_sample = if is_background {
-                String::new()
-            } else {
-                sample_output_for_event(&output_plain)
+            // jsh owns the command lifecycle record. A trusted correlation id
+            // and an enabled output consumer must both exist before touching
+            // the lazy payload; jterm_core::submit repeats the same capability
+            // check at its queue boundary.
+            let journal_execution_id = (!is_background)
+                .then(|| self.execution_id_rc.borrow_mut().take())
+                .flatten();
+            let truncation_limit = self.config_for_cb.borrow().truncation_threshold_lines as usize;
+            if let Some(submitted) = build_journal_completion(
+                journal_execution_id,
+                execution_journal_output_capture_enabled(),
+                &payload,
+                truncation_limit,
+            ) {
+                if let Err(error) = jterm_core::execution_journal::submit(submitted) {
+                    log::warn!("jsh execution journal rejected a block's output: {error:?}");
+                }
+            }
+
+            self.backend.finalize_block(&record, &payload);
+
+            // Command-only history is a metadata consumer shared by both
+            // backends. Keeping it engine-side prevents Unified from missing
+            // palette/history entries without forcing output materialization.
+            let (history_path, history_limit) = {
+                let cfg = self.config_for_cb.borrow();
+                (
+                    cfg.command_history_enabled
+                        .then(|| cfg.command_history_path.clone())
+                        .flatten(),
+                    cfg.command_history_max_entries as usize,
+                )
             };
-            // The journal reports bytes against the trimmed full capture, so
-            // the same measurement has to be taken before the args are built.
-            let total_bytes = output_plain.trim().len();
-            let plain_output_bytes = output_plain.len();
-            self.backend.finalize_block(
-                block_data,
-                FinalizedBlockArgs {
-                    block_id,
-                    prompt,
-                    cmd: cmd.clone(),
-                    output_with_ansi,
-                    plain_output_bytes,
-                    block_cwd,
-                    cols,
-                    exit_code,
-                    duration_ms,
-                    end_time_ms,
-                    is_background,
-                },
-            );
-            // The backend's live-surface reset no longer clears output state;
-            // the engine-owned ring is cleared here instead (pre-split parity:
-            // the clear rode inside finalize's tail reset_active).
-            self.live_raw_output_rc.borrow_mut().clear();
+            if let Some(path) = history_path {
+                if let Err(err) = crate::command_history::enqueue(
+                    std::path::Path::new(&path),
+                    history_limit,
+                    &record.cmd,
+                    record.cwd.as_deref(),
+                    exit_code_for_i32_api(record.exit_code),
+                    record.end_time_ms,
+                ) {
+                    log::warn!("command history: {err}");
+                }
+            }
             // DECISION: the block-finished fan-out — and the jsh journal
             // submission bundled with it — is engine policy and now runs AFTER
             // the whole backend finalize. Pre-split it ran mid-finalize: after
@@ -3473,42 +4603,40 @@ impl ReaderCtx {
             // from a widget callback finalize installs or runs.
             if !is_background {
                 let agent_execution = self.active_agent_execution_rc.take();
+                let output_sample = OnceCell::new();
                 for cb in self.block_finished_cbs.borrow().iter() {
-                    cb(
-                        cmd.clone(),
-                        exit_code,
-                        output_sample.clone(),
-                        agent_execution,
-                        duration_ms,
-                    );
-                }
-                // Attach this block's output to the shell's own
-                // journal record. Only jsh sends an execution id,
-                // and only it writes the record this completes —
-                // without the id there is nothing to correlate,
-                // which is why the capture used to stay stranded
-                // in this window.
-                if let Some(id) = self.execution_id_rc.borrow_mut().take() {
-                    // The journal gets the line-capped text this
-                    // pane kept, with `truncated` set from the same
-                    // cap. `total_bytes` is measured against the
-                    // trimmed full capture, so a record that merely
-                    // lost surrounding blank lines is not reported
-                    // as truncated. (What this layer cannot see is
-                    // the live buffer's byte cap dropping the *head*
-                    // of a very long stream — a gap, not a claim.)
-                    let submitted = jterm_core::execution_journal::CompletedExecution {
-                        id,
-                        output: output_trimmed.clone(),
-                        output_available: true,
-                        truncated: output_trimmed.len() != total_bytes,
-                        total_bytes,
-                    };
-                    if let Err(error) = jterm_core::execution_journal::submit(submitted) {
-                        log::warn!("jsh execution journal rejected a block's output: {error:?}");
+                    match cb {
+                        BlockFinishedCallback::Metadata(callback) => callback(
+                            record.cmd.clone(),
+                            record.exit_code,
+                            agent_execution,
+                            record.duration_ms,
+                        ),
+                        BlockFinishedCallback::ConditionalOutput {
+                            needs_output,
+                            callback,
+                        } => {
+                            let sample = needs_output(agent_execution).then(|| {
+                                output_sample
+                                    .get_or_init(|| {
+                                        sample_output_for_event(&payload.materialize().output_plain)
+                                    })
+                                    .clone()
+                            });
+                            callback(
+                                record.cmd.clone(),
+                                record.exit_code,
+                                sample,
+                                agent_execution,
+                                record.duration_ms,
+                            );
+                        }
                     }
                 }
             }
+            // Keep the engine-owned ring alive through backend finalization and
+            // every conditional output observer; clear it only after fan-out.
+            self.live_raw_output_rc.borrow_mut().clear();
         }
         self.bstate_rc.set(BlockState::CollectingPrompt);
         self.engine.borrow_mut().prompt_buf.clear();
@@ -3559,8 +4687,9 @@ impl ReaderCtx {
         // command starts. CommandStart will read text from
         // here to the cursor's then-position to recover the
         // command as it really appeared on screen.
-        let (col, row) = self.backend.cursor_position();
+        let ((col, row), surface_rows) = self.backend.cursor_and_rows();
         self.prompt_end_pos_rc.set((col, row));
+        self.prompt_anchor_rows_rc.set(surface_rows);
         self.prompt_anchor_ready_rc.set(false);
         self.pty_synced_rc.set(false);
         self.bstate_rc.set(BlockState::AwaitingCommand);
@@ -3571,22 +4700,14 @@ impl ReaderCtx {
         // anchor to the later live cursor could absorb text
         // printed after PromptEnd (for example a line-editor
         // prefill) into trusted prompt furniture.
-        {
-            let state = self.bstate_rc.clone();
-            let dirty = self.idle_input_dirty_rc.clone();
-            let synced = self.pty_synced_rc.clone();
-            let generation = self.agent_prompt_generation_rc.clone();
-            let ready = self.prompt_anchor_ready_rc.clone();
-            glib::timeout_add_local_once(std::time::Duration::from_millis(32), move || {
-                if state.get() == BlockState::AwaitingCommand
-                    && generation.get() == prompt_generation
-                    && !dirty.get()
-                    && !synced.get()
-                {
-                    ready.set(true);
-                }
-            });
-        }
+        self.backend.schedule_anchor_settle(AnchorSettleArgs {
+            prompt_generation,
+            state: self.bstate_rc.clone(),
+            dirty: self.idle_input_dirty_rc.clone(),
+            synced: self.pty_synced_rc.clone(),
+            generation: self.agent_prompt_generation_rc.clone(),
+            ready: self.prompt_anchor_ready_rc.clone(),
+        });
         self.backend.layout_active_surface();
         self.backend.focus_live_deferred();
 
@@ -3649,17 +4770,47 @@ impl ReaderCtx {
         // before the shell echoes a newline) is what the user
         // saw, including history recalls and jsh autosuggestion
         // accepts.
-        let (cmd_end_col, cmd_end_row) = self.backend.cursor_position();
-        let (start_col, start_row) = self
-            .backend
-            .command_capture_anchor(self.prompt_end_pos_rc.get());
-        let captured = self
-            .backend
-            .capture_text_range(start_row, start_col, cmd_end_row, cmd_end_col)
-            .unwrap_or_default();
+        let ((cmd_end_col, cmd_end_row), current_rows) = self.backend.cursor_and_rows();
+        let (start_col, start_row) = self.backend.command_capture_anchor(
+            self.prompt_end_pos_rc.get(),
+            self.prompt_anchor_rows_rc.get(),
+        );
+        self.prompt_end_pos_rc.set((start_col, start_row));
+        self.prompt_anchor_rows_rc.set(current_rows);
+        let captured = if !self.prompt_anchor_ready_rc.get() {
+            String::new()
+        } else if command_capture_range_is_bounded(
+            start_row,
+            cmd_end_row,
+            self.backend.live_column_count(),
+        ) {
+            self.backend
+                .capture_text_range(start_row, start_col, cmd_end_row, cmd_end_col)
+                .unwrap_or_default()
+        } else {
+            TRUNCATED_COMMAND_PLACEHOLDER.to_string()
+        };
         let scraped = normalize_captured_command(&captured, &self.engine.borrow().prompt_display);
         let (command, source) =
             resolve_command_text(meta.command.as_deref(), meta.command_truncated, &scraped);
+        // Command capture (and every preceding parser feed in this chunk) has
+        // completed while the prompt zone is still open. C now converts that
+        // exact zone to Command and closes it before any command output can be
+        // admitted. Nested/unaccepted C returned above and cannot reach this.
+        let command_zone_id = {
+            let mut engine = self.engine.borrow_mut();
+            match engine.pending_zone {
+                Some(PendingZone::Prompt(id)) => {
+                    engine.pending_zone = Some(PendingZone::Command(id));
+                    Some(id)
+                }
+                other => {
+                    log::debug!("command start without a prompt zone: {other:?}");
+                    None
+                }
+            }
+        };
+        self.backend.close_prompt_zone(command_zone_id);
         if source == CommandTextSource::ScreenAfterTruncation {
             log::debug!(
                 "Shell dropped an oversized command line; falling back to the screen capture ({} bytes)",
@@ -3676,16 +4827,16 @@ impl ReaderCtx {
         // `cwd` is read out of the engine cell before the fan-out: the
         // callbacks must not run under an engine borrow.
         let started_cwd = self.engine.borrow().command_cwd.clone();
+        *self.running_cmd_rc.borrow_mut() = command.clone();
+        self.cmd_running_rc.set(true);
+        self.bstate_rc.set(BlockState::CollectingOutput);
         emit_command_started(
             &self.command_started_cbs,
             CommandStartedEvent {
-                command: command.clone(),
+                command,
                 cwd: started_cwd,
             },
         );
-        *self.running_cmd_rc.borrow_mut() = command;
-        self.cmd_running_rc.set(true);
-        self.bstate_rc.set(BlockState::CollectingOutput);
         // Do not clear the input shadow here. VTE `feed()` is
         // asynchronous, so the text-range capture above can
         // occasionally be empty even for a real command. It
@@ -3768,6 +4919,15 @@ impl ReaderCtx {
             let mode = mode.unwrap_or(1049);
             let leave = format!("\x1b[?{mode}l");
             self.backend.feed_live(leave.as_bytes());
+            let prompt_zone = {
+                let engine = self.engine.borrow();
+                prompt_zone_to_reopen_after_alt(engine.prev_state, engine.pending_zone)
+            };
+            if let Some(zone_id) = prompt_zone {
+                // `rmcup` above restores the main screen after its marker
+                // prefix was interpreted on the alternate screen.
+                self.backend.begin_prompt_zone(zone_id);
+            }
             self.backend.exit_fullscreen();
             self.backend.exit_alt_screen_chrome();
             emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Left);
@@ -3844,10 +5004,17 @@ impl ReaderCtx {
         emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Left);
         let leave = format!("\x1b[?{mode}l");
         self.backend.feed_live(leave.as_bytes());
-        self.backend.exit_fullscreen();
         self.engine.borrow_mut().osc133_depth = 0;
         let prev_state = self.engine.borrow().prev_state;
         self.bstate_rc.set(prev_state);
+        let prompt_zone =
+            prompt_zone_to_reopen_after_alt(prev_state, self.engine.borrow().pending_zone);
+        if let Some(zone_id) = prompt_zone {
+            // The feed above executes `rmcup` first; only then reassert the
+            // prompt marker on the restored main-screen document.
+            self.backend.begin_prompt_zone(zone_id);
+        }
+        self.backend.exit_fullscreen();
         // Collapse the live VTE back to the compact input cell
         // now that the alt app has released the viewport.
         self.backend.sync_geometry_to_pty();
@@ -4017,10 +5184,7 @@ fn is_post_command_metadata(bytes: &[u8]) -> bool {
 /// at least one visible character. Prompt redraw control sequences and blank CR/LF
 /// bursts should not create empty history cards.
 fn background_output_has_visible_text(bytes: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(bytes);
-    strip_ansi(text.as_ref())
-        .chars()
-        .any(|ch| !ch.is_whitespace() && !ch.is_control())
+    ansi::ansi_has_visible_text(bytes)
 }
 
 /// Snapshot the engine-owned raw-output ring as lossy UTF-8. Raw PTY bytes may
@@ -4034,17 +5198,65 @@ pub(super) fn live_output_text(ring: &RefCell<VecDeque<u8>>) -> String {
     String::from_utf8_lossy(raw.make_contiguous()).into_owned()
 }
 
-fn take_background_output(pending: &mut VecDeque<u8>) -> Option<String> {
-    if pending.is_empty() {
-        return None;
+fn take_background_output(pending: &mut VecDeque<u8>) -> Option<VecDeque<u8>> {
+    if background_output_has_visible_text(pending.make_contiguous()) {
+        Some(std::mem::take(pending))
+    } else {
+        pending.clear();
+        None
     }
-    let output = {
-        let bytes = pending.make_contiguous();
-        background_output_has_visible_text(bytes)
-            .then(|| String::from_utf8_lossy(bytes).into_owned())
-    };
-    pending.clear();
-    output
+}
+
+/// Exact mirror of pinned jterm_core's private journal capability predicate.
+/// `std::env::var(...).ok()` means a missing or non-Unicode value defaults to
+/// enabled; only these five normalized spellings disable capture.
+fn execution_journal_output_capture_enabled_for(value: Option<&str>) -> bool {
+    value.is_none_or(|value| {
+        !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no" | "off"
+        )
+    })
+}
+
+fn execution_journal_output_capture_enabled() -> bool {
+    let value = std::env::var("JSH_EXECUTION_JOURNAL").ok();
+    execution_journal_output_capture_enabled_for(value.as_deref())
+}
+
+fn truncate_output_for_journal(output_plain: &str, line_limit: usize) -> String {
+    let trimmed = output_plain.trim();
+    let lines: Vec<&str> = trimmed.lines().collect();
+    if lines.len() > line_limit {
+        let kept = lines[..line_limit].join("\n");
+        format!(
+            "{}\n\n[... truncated: {} lines total, showing first {}]",
+            kept,
+            lines.len(),
+            line_limit
+        )
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn build_journal_completion(
+    id: Option<String>,
+    enabled: bool,
+    payload: &dyn BlockRenderPayloadAccessor,
+    line_limit: usize,
+) -> Option<jterm_core::execution_journal::CompletedExecution> {
+    let id = id.filter(|_| enabled)?;
+    let output_plain = &payload.materialize().output_plain;
+    let total_bytes = output_plain.trim().len();
+    let output = truncate_output_for_journal(output_plain, line_limit);
+    Some(jterm_core::execution_journal::CompletedExecution {
+        id,
+        truncated: output.len() != total_bytes,
+        total_bytes,
+        output,
+        output_available: true,
+    })
 }
 
 /// Pick the command text recorded for a finished block.  The live VTE is the
@@ -4058,27 +5270,6 @@ fn finished_command(vte_capture: &str, input_shadow: &str) -> String {
     } else {
         captured.to_string()
     }
-}
-
-/// Per-block lifecycle values the reader engine computes before the render
-/// path runs; their computation stays engine-side. The string fields are the
-/// pre-trim originals the finished widgets are built from, and `cols` is the
-/// already-bounded live-grid width.
-struct FinalizedBlockArgs {
-    block_id: u64,
-    prompt: String,
-    cmd: String,
-    output_with_ansi: String,
-    /// Pre-trim plain length: the finished widgets charge both plain-text
-    /// owners against the larger figure, and the text itself never leaves the
-    /// engine (the jsh journal and the block-finished sample read it there).
-    plain_output_bytes: usize,
-    block_cwd: Option<String>,
-    cols: i64,
-    exit_code: Option<i32>,
-    duration_ms: Option<u64>,
-    end_time_ms: Option<u64>,
-    is_background: bool,
 }
 
 /// The GTK/VTE rendering seam. Bodies moved verbatim from the former
@@ -4115,6 +5306,153 @@ impl RenderBackend for BlockBackend {
 
     fn layout_active_surface(&self) {
         (self.layout_active_surface)();
+    }
+
+    fn records(&self) -> BackendRecords<'_> {
+        BackendRecords::Blocks(self.block_data_for_cb.borrow())
+    }
+
+    fn record_search_target(&self, block_id: u64, is_output: bool) -> Option<RecordSearchTarget> {
+        let finished = self.finished_blocks_for_cb.borrow();
+        let block = finished.iter().find(|block| block.id == block_id)?;
+        let terminal = if is_output {
+            block.output_vte.clone()
+        } else {
+            block.command_vte.clone()
+        };
+        Some(RecordSearchTarget {
+            terminal,
+            widget: block.widget().clone().upcast(),
+            uses_live_surface: false,
+        })
+    }
+
+    fn completed_search_surfaces(
+        &self,
+        max_bytes: usize,
+        deadline_exhausted: &mut dyn FnMut() -> bool,
+    ) -> BackendSearchBatch {
+        let finished = self.finished_blocks_for_cb.borrow();
+        let mut remaining = max_bytes;
+        let mut surfaces = Vec::new();
+        for (block_index, block) in finished.iter().enumerate() {
+            if remaining == 0 {
+                return BackendSearchBatch {
+                    surfaces,
+                    incomplete: true,
+                    native_fallback: None,
+                };
+            }
+            let mut command_incomplete = false;
+            if !push_search_surface_before_deadline(&mut surfaces, deadline_exhausted, || {
+                let command_prefix = utf8_prefix_bounded(&block.cmd_text, remaining);
+                command_incomplete = command_prefix.len() < block.cmd_text.len();
+                remaining = remaining.saturating_sub(command_prefix.len());
+                BackendSearchSurface {
+                    block_id: block.id,
+                    block_index,
+                    is_output: false,
+                    is_live: false,
+                    windows: vec![BackendSearchWindow {
+                        text: command_prefix.to_string(),
+                        incomplete: command_incomplete,
+                        initial_wrap: false,
+                    }],
+                    scanned_bytes: command_prefix.len(),
+                    reset_cursor: false,
+                    terminal: block.command_vte.clone(),
+                }
+            }) {
+                return BackendSearchBatch {
+                    surfaces,
+                    incomplete: true,
+                    native_fallback: None,
+                };
+            }
+            if command_incomplete {
+                return BackendSearchBatch {
+                    surfaces,
+                    incomplete: true,
+                    native_fallback: None,
+                };
+            }
+            if remaining == 0 {
+                let has_more =
+                    !block.full_output.borrow().is_empty() || block_index + 1 < finished.len();
+                surfaces
+                    .last_mut()
+                    .expect("the command surface was just appended")
+                    .windows
+                    .last_mut()
+                    .expect("a command search window exists")
+                    .incomplete = has_more;
+                return BackendSearchBatch {
+                    surfaces,
+                    incomplete: has_more,
+                    native_fallback: None,
+                };
+            }
+
+            // Bound the decorated prefix before ANSI stripping so both the
+            // copied input and retained UTF-8 stay under the aggregate budget.
+            let mut output_incomplete = false;
+            if !push_search_surface_before_deadline(&mut surfaces, deadline_exhausted, || {
+                let raw_output = block.full_output.borrow();
+                let raw_prefix = utf8_prefix_bounded(&raw_output, remaining);
+                output_incomplete = raw_prefix.len() < raw_output.len();
+                remaining = remaining.saturating_sub(raw_prefix.len());
+                BackendSearchSurface {
+                    block_id: block.id,
+                    block_index,
+                    is_output: true,
+                    is_live: false,
+                    windows: vec![BackendSearchWindow {
+                        text: strip_ansi(raw_prefix),
+                        incomplete: output_incomplete,
+                        initial_wrap: false,
+                    }],
+                    scanned_bytes: raw_prefix.len(),
+                    reset_cursor: false,
+                    terminal: block.output_vte.clone(),
+                }
+            }) {
+                return BackendSearchBatch {
+                    surfaces,
+                    incomplete: true,
+                    native_fallback: None,
+                };
+            }
+            if output_incomplete {
+                return BackendSearchBatch {
+                    surfaces,
+                    incomplete: true,
+                    native_fallback: None,
+                };
+            }
+            if remaining == 0 && block_index + 1 < finished.len() {
+                surfaces
+                    .last_mut()
+                    .expect("the output surface was just appended")
+                    .windows
+                    .last_mut()
+                    .expect("an output search window exists")
+                    .incomplete = true;
+                return BackendSearchBatch {
+                    surfaces,
+                    incomplete: true,
+                    native_fallback: None,
+                };
+            }
+        }
+        BackendSearchBatch {
+            surfaces,
+            incomplete: false,
+            native_fallback: None,
+        }
+    }
+
+    fn debug_name(&self) -> &'static str {
+        "block"
     }
 
     fn mark_scroll_dirty(&self) {
@@ -4210,8 +5548,15 @@ impl RenderBackend for BlockBackend {
         crate::notify::app_notification(title, body);
     }
 
-    fn cursor_position(&self) -> (i64, i64) {
-        self.active_vte.cursor_position()
+    fn schedule_anchor_settle(&self, args: AnchorSettleArgs) {
+        schedule_prompt_anchor_settle(args);
+    }
+
+    fn cursor_and_rows(&self) -> ((i64, i64), i64) {
+        (
+            self.active_vte.cursor_position(),
+            self.active_vte.row_count(),
+        )
     }
 
     fn cursor_position_report(&self) -> (i64, i64) {
@@ -4223,16 +5568,24 @@ impl RenderBackend for BlockBackend {
         self.active_vte.cursor_position()
     }
 
-    fn command_capture_anchor(&self, provisional: (i64, i64)) -> (i64, i64) {
-        // Verbatim pre-split behaviour: Block mode captures the command from
-        // the PromptEnd anchor exactly as recorded. The grid does resize
-        // between the marks (compact prompt layout), but VTE cursor rows are
-        // ring-absolute, so nothing needs correcting.
-        provisional
+    fn command_capture_anchor(&self, provisional: (i64, i64), recorded_rows: i64) -> (i64, i64) {
+        // Block changes the VTE from compact prompt height to full command
+        // height between B and C. Rebase the saved anchor by that row delta;
+        // the query-only submission surface carries the exact same policy bit.
+        prompt_anchor_for_surface(
+            self.rebase_prompt_anchor_on_row_delta,
+            provisional,
+            recorded_rows,
+            self.active_vte.row_count(),
+        )
     }
 
     fn grid_cols(&self) -> i64 {
         self.active_rc.borrow().grid_cols() as i64
+    }
+
+    fn live_column_count(&self) -> i64 {
+        self.active_vte.column_count()
     }
 
     fn capture_text_range(
@@ -4256,31 +5609,56 @@ impl RenderBackend for BlockBackend {
     /// jsh journal submission are engine policy and run after this returns (see
     /// `on_prompt_start`); the raw-output ring clear that used to ride on the
     /// tail `reset_active` is likewise the engine's now.
-    fn finalize_block(&self, block_data: BlockData, args: FinalizedBlockArgs) {
-        let FinalizedBlockArgs {
-            block_id,
-            prompt,
-            cmd,
-            output_with_ansi,
-            plain_output_bytes,
-            block_cwd,
+    fn finalize_block(
+        &self,
+        record: &CompletedCommandRecord,
+        payload: &dyn BlockRenderPayloadAccessor,
+    ) {
+        // Block is the sole production backend that always asks for render
+        // data. Every widget/persistence derivative stays on this side.
+        let payload = payload.materialize();
+        let block_id = record.id;
+        let prompt = payload.prompt.as_str();
+        let cmd = record.cmd.as_str();
+        let output_with_ansi = payload.output_with_ansi.as_str();
+        let output_plain = payload.output_plain.as_str();
+        let plain_output_bytes = output_plain.len();
+        let block_cwd = record.cwd.as_deref();
+        let cols = bounded_finished_vte_columns(self.grid_cols());
+        let truncation_limit = self.config_for_cb.borrow().truncation_threshold_lines as usize;
+        let output_trimmed = truncate_output_for_journal(output_plain, truncation_limit);
+        let line_count = output_trimmed.lines().count();
+        let estimated_height = estimated_finished_block_height_for_text(
+            &self.config_for_cb.borrow(),
+            output_plain,
             cols,
-            exit_code,
-            duration_ms,
-            end_time_ms,
-            is_background,
-        } = args;
+        );
+        let block_data = BlockData {
+            id: block_id,
+            prompt: prompt.to_owned(),
+            cmd: cmd.to_owned(),
+            cmd_markup: None,
+            output: output_plain.trim().to_owned(),
+            exit_code: record.exit_code,
+            estimated_height,
+            line_count,
+            start_time_ms: record.start_time_ms,
+            end_time_ms: record.end_time_ms,
+            duration_ms: record.duration_ms,
+            cwd: record.cwd.clone(),
+            cols: cols as u16,
+        };
 
         let max_blocks = self.config_for_cb.borrow().max_visible_blocks as usize;
         let newest_estimated_bytes = {
             let images = self.kitty_pending_images.borrow();
             estimated_live_finished_block_retained_bytes(
-                &prompt,
-                &cmd,
+                prompt,
+                cmd,
                 None,
-                &output_with_ansi,
+                output_with_ansi,
                 plain_output_bytes,
-                block_cwd.as_deref(),
+                block_cwd,
                 cols,
                 &images,
             )
@@ -4345,15 +5723,15 @@ impl RenderBackend for BlockBackend {
             finished_block_config(&self.dynamic_colors_rc, &self.config_for_cb.borrow());
         let finished = FinishedBlock::new_with_pool(
             block_id,
-            &prompt,
-            &cmd,
+            prompt,
+            cmd,
             None,
-            &output_with_ansi,
-            exit_code,
+            output_with_ansi,
+            record.exit_code,
             &block_config,
-            duration_ms,
-            end_time_ms,
-            block_cwd.as_deref(),
+            record.duration_ms,
+            record.end_time_ms,
+            block_cwd,
             cols,
             &kitty_images,
             plain_output_bytes,
@@ -4394,12 +5772,12 @@ impl RenderBackend for BlockBackend {
 
         {
             let cfg = self.config_for_cb.borrow();
-            if !is_background && cfg.notify_long_blocks {
-                if let Some(ms) = duration_ms {
+            if !record.is_background && cfg.notify_long_blocks {
+                if let Some(ms) = record.duration_ms {
                     if ms >= cfg.notify_long_block_threshold_ms {
                         crate::notify::long_block_finished(
-                            &cmd,
-                            exit_code_for_i32_api(exit_code),
+                            cmd,
+                            exit_code_for_i32_api(record.exit_code),
                             ms,
                         );
                     }
@@ -4457,32 +5835,6 @@ impl RenderBackend for BlockBackend {
             },
         );
 
-        // Keep a small JSONL command index separate from
-        // optional full-output block history. This powers
-        // History, palette search, and opt-in AI context
-        // without persisting terminal output by default.
-        let (history_path, history_limit) = {
-            let cfg = self.config_for_cb.borrow();
-            (
-                cfg.command_history_enabled
-                    .then(|| cfg.command_history_path.clone())
-                    .flatten(),
-                cfg.command_history_max_entries as usize,
-            )
-        };
-        if let Some(path) = history_path {
-            if let Err(err) = crate::command_history::enqueue(
-                std::path::Path::new(&path),
-                history_limit,
-                &cmd,
-                block_cwd.as_deref(),
-                exit_code_for_i32_api(exit_code),
-                end_time_ms,
-            ) {
-                log::warn!("command history: {err}");
-            }
-        }
-
         let preserve = self.config_for_cb.borrow().preserve_live_scrollback;
         self.active_rc.borrow().reset_active(preserve);
         // Drop any half-uploaded kitty chunks so they
@@ -4502,16 +5854,524 @@ impl RenderBackend for BlockBackend {
     }
 }
 
+fn utf8_prefix_bounded(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+fn capture_vte_text_range(
+    vte: &Terminal,
+    start_row: i64,
+    start_col: i64,
+    end_row: i64,
+    end_col: i64,
+) -> Option<String> {
+    vte.text_range_format(vte4::Format::Text, start_row, start_col, end_row, end_col)
+        .0
+        .map(|text| text.to_string())
+}
+
+const VTE_SEARCH_CAPTURE_TIME_LIMIT: std::time::Duration = std::time::Duration::from_millis(10);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VteCaptureSpan {
+    start_row: i64,
+    end_row: i64,
+    end_col: i64,
+    work_cells: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct BoundedVteCapture {
+    text: String,
+    incomplete: bool,
+    /// Grid-cell work charged against the caller's shared ceiling. Blank rows
+    /// still cost native extraction work even when they return no text.
+    work_cells: usize,
+}
+
+/// Extract terminal rows oldest-first without ever asking VTE to copy its
+/// whole scrollback. Both requested grid work and retained UTF-8 are bounded
+/// by `max_bytes`; each native call spans exactly one row. Despite calling it
+/// the "last column", VTE treats `end_col` as the exclusive edge, so a request
+/// from column zero through `end_col = N` costs N cells. A multi-row range
+/// cannot be honestly charged from only its final `end_col`: every
+/// intermediate row is copied at full width. The time predicate lets the UI
+/// stop between calls, so a large blank ring is bounded too.
+fn capture_vte_rows_bounded(
+    start_row: i64,
+    end_row: i64,
+    columns: i64,
+    max_bytes: usize,
+    mut time_exhausted: impl FnMut() -> bool,
+    mut capture: impl FnMut(VteCaptureSpan) -> Option<String>,
+) -> BoundedVteCapture {
+    if start_row > end_row {
+        return BoundedVteCapture {
+            text: String::new(),
+            incomplete: false,
+            work_cells: 0,
+        };
+    }
+    if max_bytes == 0 {
+        return BoundedVteCapture {
+            text: String::new(),
+            incomplete: true,
+            work_cells: 0,
+        };
+    }
+
+    let mut text = String::with_capacity(max_bytes.min(64 * 1024));
+    let mut work_remaining = max_bytes;
+    let mut row = start_row;
+    let columns = usize::try_from(columns.max(1)).unwrap_or(usize::MAX);
+    while row <= end_row && work_remaining > 0 && text.len() < max_bytes {
+        if time_exhausted() {
+            return BoundedVteCapture {
+                text,
+                incomplete: true,
+                work_cells: max_bytes.saturating_sub(work_remaining),
+            };
+        }
+        let work_cells = columns.min(work_remaining);
+        // `work_cells` is non-zero by the loop condition and cannot exceed
+        // the original positive i64 column count, so the exclusive edge is
+        // representable by VTE's signed coordinate type.
+        let end_col = i64::try_from(work_cells).unwrap_or(i64::MAX);
+        let span = VteCaptureSpan {
+            start_row: row,
+            end_row: row,
+            end_col,
+            work_cells,
+        };
+        let raw = capture(span).unwrap_or_default();
+        let remaining_bytes = max_bytes.saturating_sub(text.len());
+        let prefix = utf8_prefix_bounded(&raw, remaining_bytes);
+        text.push_str(prefix);
+        work_remaining = work_remaining.saturating_sub(work_cells);
+
+        let width_incomplete = work_cells < columns;
+        let bytes_incomplete = prefix.len() < raw.len();
+        row = row.saturating_add(1);
+        if width_incomplete || bytes_incomplete {
+            return BoundedVteCapture {
+                text,
+                incomplete: true,
+                work_cells: max_bytes.saturating_sub(work_remaining),
+            };
+        }
+    }
+
+    BoundedVteCapture {
+        incomplete: row <= end_row,
+        text,
+        work_cells: max_bytes.saturating_sub(work_remaining),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct BoundedVteSearchWindows {
+    /// Native forward-search order after clearing selection begins at VTE's
+    /// current viewport top, not at the oldest retained row.
+    viewport_to_tail: BoundedVteCapture,
+    /// Present only when the first window completed. Entering it corresponds
+    /// to enabling one-shot native wrap-around.
+    oldest_history: Option<BoundedVteCapture>,
+}
+
+/// Extract one persistent VTE domain in native forward-cursor order. The
+/// second window is never requested after a partial first window, because an
+/// unseen tail hit would precede every counted history hit.
+fn capture_vte_search_windows_bounded(
+    retained_start: i64,
+    retained_end_exclusive: i64,
+    viewport_top: i64,
+    columns: i64,
+    max_bytes: usize,
+    mut time_exhausted: impl FnMut() -> bool,
+    mut capture: impl FnMut(VteCaptureSpan) -> Option<String>,
+) -> BoundedVteSearchWindows {
+    let viewport_top = viewport_top.clamp(retained_start, retained_end_exclusive);
+    let viewport_to_tail = capture_vte_rows_bounded(
+        viewport_top,
+        retained_end_exclusive.saturating_sub(1),
+        columns,
+        max_bytes,
+        &mut time_exhausted,
+        &mut capture,
+    );
+    let remaining = max_bytes
+        .saturating_sub(viewport_to_tail.work_cells)
+        .min(max_bytes.saturating_sub(viewport_to_tail.text.len()));
+    let oldest_history = if !viewport_to_tail.incomplete
+        && retained_start < viewport_top
+        && remaining > 0
+        && !time_exhausted()
+    {
+        Some(capture_vte_rows_bounded(
+            retained_start,
+            viewport_top.saturating_sub(1),
+            columns,
+            remaining,
+            &mut time_exhausted,
+            &mut capture,
+        ))
+    } else {
+        None
+    };
+    BoundedVteSearchWindows {
+        viewport_to_tail,
+        oldest_history,
+    }
+}
+
+impl RenderBackend for UnifiedBackend {
+    fn feed_live(&self, bytes: &[u8]) {
+        feed_vte_with_zone_marker(&self.vte, &self.zone_marker, bytes);
+    }
+
+    fn begin_prompt_zone(&self, zone_id: u64) {
+        self.chrome.begin_zone(zone_id, &self.vte);
+        self.chrome
+            .enforce_limit(self.config_for_cb.borrow().max_visible_blocks as usize);
+        let open = {
+            let mut marker = self.zone_marker.borrow_mut();
+            marker.begin_zone(zone_id);
+            marker.open_bytes()
+        };
+        if let Some(open) = open {
+            self.vte.feed(&open);
+        }
+    }
+
+    fn close_prompt_zone(&self, zone_id: Option<u64>) {
+        close_zone_marker(&self.zone_marker, zone_id, |bytes| self.vte.feed(bytes));
+    }
+
+    fn erase_scrollback(&self) {
+        self.chrome.erase_scrollback(&self.vte);
+    }
+
+    fn hard_reset(&self) {
+        self.zone_marker.borrow_mut().close_zone(None);
+        self.chrome.clear_authority();
+        find::clear_find_state(self.find_state_for_cb.as_ref(), &self.vte);
+        self.kitty_assembler.borrow_mut().reset();
+    }
+
+    /// Preserve the continuous surface between prompts. A bare SGR reset keeps
+    /// an interrupted command's attributes from tinting the next prompt.
+    fn reset_active_surface(&self, _preserve_scrollback: bool) {
+        self.feed_live(b"\x1b[0m");
+    }
+
+    fn focus_live_deferred(&self) {
+        // Preserve Anvil's pane-focus invariant: a background pane receiving a
+        // prompt must never steal focus merely because its backend is Unified.
+        if !self.vte.has_focus() {
+            return;
+        }
+        let vte = self.vte.downgrade();
+        glib::idle_add_local_once(move || {
+            if let Some(vte) = vte.upgrade() {
+                vte.grab_focus();
+            }
+        });
+    }
+
+    fn sync_geometry_to_pty(&self) {
+        sync_active_to_pty(
+            &self.layout_active_surface,
+            &self.vte,
+            &self.block_scroll_rc,
+            &self.pty_for_init,
+        );
+    }
+
+    fn layout_active_surface(&self) {
+        (self.layout_active_surface)();
+    }
+
+    fn records(&self) -> BackendRecords<'_> {
+        BackendRecords::Metadata(self.zones.borrow())
+    }
+
+    fn record_search_target(&self, _block_id: u64, _is_output: bool) -> Option<RecordSearchTarget> {
+        // A shared VTE is not an exact per-record jump target. Marker ranges
+        // land in a later increment; fail closed until then.
+        None
+    }
+
+    fn completed_search_surfaces(
+        &self,
+        max_bytes: usize,
+        deadline_exhausted: &mut dyn FnMut() -> bool,
+    ) -> BackendSearchBatch {
+        let native_fallback = || BackendNativeSearchFallback {
+            block_id: 0,
+            block_index: 0,
+            is_output: true,
+            is_live: true,
+            terminal: self.vte.clone(),
+        };
+        if max_bytes == 0 || deadline_exhausted() {
+            return BackendSearchBatch {
+                surfaces: Vec::new(),
+                incomplete: true,
+                native_fallback: Some(native_fallback()),
+            };
+        }
+        let Some(bounds) = self.chrome.trusted_ring_bounds(&self.vte) else {
+            return BackendSearchBatch {
+                surfaces: Vec::new(),
+                incomplete: true,
+                native_fallback: Some(native_fallback()),
+            };
+        };
+        let (cursor_col, _cursor_row) = self.vte.cursor_position();
+        let columns = self.vte.column_count().max(cursor_col).max(1);
+        let started = std::time::Instant::now();
+        let captured_windows = {
+            let capture_deadline_exhausted =
+                || deadline_exhausted() || started.elapsed() >= VTE_SEARCH_CAPTURE_TIME_LIMIT;
+            capture_vte_search_windows_bounded(
+                bounds.retained_start,
+                bounds.retained_end_exclusive,
+                bounds.viewport_top,
+                columns,
+                max_bytes,
+                capture_deadline_exhausted,
+                |span| {
+                    capture_vte_text_range(&self.vte, span.start_row, 0, span.end_row, span.end_col)
+                },
+            )
+        };
+        let deadline_limited =
+            deadline_exhausted() || started.elapsed() >= VTE_SEARCH_CAPTURE_TIME_LIMIT;
+        let has_older_history = bounds.retained_start < bounds.viewport_top;
+        let history_complete = !has_older_history
+            || captured_windows
+                .oldest_history
+                .as_ref()
+                .is_some_and(|capture| !capture.incomplete);
+        let incomplete =
+            deadline_limited || captured_windows.viewport_to_tail.incomplete || !history_complete;
+        let scanned_work = captured_windows.viewport_to_tail.work_cells
+            + captured_windows
+                .oldest_history
+                .as_ref()
+                .map_or(0, |capture| capture.work_cells);
+        let retained_bytes = captured_windows.viewport_to_tail.text.len()
+            + captured_windows
+                .oldest_history
+                .as_ref()
+                .map_or(0, |capture| capture.text.len());
+        let scanned_bytes = scanned_work.max(retained_bytes);
+        let mut windows = vec![BackendSearchWindow {
+            text: captured_windows.viewport_to_tail.text,
+            incomplete: incomplete
+                && (deadline_limited
+                    || captured_windows.viewport_to_tail.incomplete
+                    || has_older_history),
+            initial_wrap: false,
+        }];
+        if let Some(history) = captured_windows.oldest_history {
+            windows.push(BackendSearchWindow {
+                text: history.text,
+                incomplete: incomplete && (deadline_limited || history.incomplete),
+                initial_wrap: true,
+            });
+        }
+        BackendSearchBatch {
+            surfaces: vec![BackendSearchSurface {
+                block_id: 0,
+                block_index: 0,
+                is_output: true,
+                is_live: true,
+                windows,
+                scanned_bytes,
+                reset_cursor: true,
+                terminal: self.vte.clone(),
+            }],
+            incomplete,
+            native_fallback: incomplete.then(native_fallback),
+        }
+    }
+
+    fn persists_block_history(&self) -> bool {
+        false
+    }
+
+    fn supports_inline_notices(&self) -> bool {
+        false
+    }
+
+    fn supports_block_mutation(&self) -> bool {
+        false
+    }
+
+    fn scroll_surface_lines(&self, lines: i32) -> bool {
+        let Some(adj) = gtk::prelude::ScrollableExt::vadjustment(&self.vte) else {
+            return true;
+        };
+        let step = adj.step_increment().max(1.0);
+        let max_value = (adj.upper() - adj.page_size()).max(adj.lower());
+        adj.set_value((adj.value() + step * f64::from(lines)).clamp(adj.lower(), max_value));
+        true
+    }
+
+    fn debug_name(&self) -> &'static str {
+        "unified"
+    }
+
+    // The VTE's own adjustment is authoritative. The outer scroller contains
+    // only this viewport-sized surface and has no history to follow.
+    fn mark_scroll_dirty(&self) {}
+
+    fn reset_scroll_lock(&self) {}
+
+    fn finalize_block(
+        &self,
+        record: &CompletedCommandRecord,
+        _payload: &dyn BlockRenderPayloadAccessor,
+    ) {
+        find::clear_find_state(self.find_state_for_cb.as_ref(), &self.vte);
+        let max_zones = self.config_for_cb.borrow().max_visible_blocks as usize;
+        let retired_record_ids =
+            record_unified_zone(&mut self.zones.borrow_mut(), record.clone(), max_zones);
+        self.chrome.retire_ids(&retired_record_ids);
+        self.chrome.enforce_limit(max_zones);
+        self.chrome
+            .record_completed(unified_chrome::ZoneChromeRecord {
+                id: record.id,
+                exit_code: record.exit_code,
+                duration_ms: record.duration_ms,
+                is_background: record.is_background,
+            });
+        log::debug!(
+            "unified zone {} recorded: exit={:?} duration_ms={:?} background={} zones={}",
+            record.id,
+            record.exit_code,
+            record.duration_ms,
+            record.is_background,
+            self.zones.borrow().len(),
+        );
+        self.kitty_assembler.borrow_mut().reset();
+    }
+
+    // The block chrome is permanently absent. The organism overlay still has
+    // to be suppressed while an alternate-screen application owns the VTE.
+    fn enter_alt_screen_chrome(&self) {
+        self.chrome.set_alt_screen(true);
+        let active = self.active_rc.borrow();
+        active.set_live_organism_visible(false);
+        active.set_live_organism_alt_screen(true);
+    }
+
+    fn exit_alt_screen_chrome(&self) {
+        self.chrome.set_alt_screen(false);
+        self.active_rc.borrow().set_live_organism_alt_screen(false);
+    }
+
+    fn enter_fullscreen(&self) {}
+
+    fn exit_fullscreen(&self) {}
+
+    /// Consume complete Kitty transfers but refuse every display-capable
+    /// result: this backend has nowhere to mount the decoded texture yet.
+    fn kitty_feed(&self, payload: &[u8]) -> kitty_graphics::FeedStatus {
+        let outcome = self.kitty_assembler.borrow_mut().feed(payload);
+        let status = outcome.status();
+        drop(outcome);
+        match status {
+            kitty_graphics::FeedStatus::Pending => kitty_graphics::FeedStatus::Pending,
+            kitty_graphics::FeedStatus::Invalid => kitty_graphics::FeedStatus::Invalid,
+            _ => {
+                log::debug!("unified: refusing Kitty graphics because no image surface exists");
+                kitty_graphics::FeedStatus::Skipped
+            }
+        }
+    }
+
+    fn kitty_admit_pending(&self) {}
+
+    fn reset_kitty_pipeline(&self) {
+        self.kitty_assembler.borrow_mut().reset();
+    }
+
+    fn set_system_clipboard(&self, text: &str) {
+        if let Some(display) = gtk::gdk::Display::default() {
+            display.clipboard().set_text(text);
+        }
+    }
+
+    fn desktop_notify(&self, title: Option<&str>, body: &str) {
+        crate::notify::app_notification(title, body);
+    }
+
+    fn schedule_anchor_settle(&self, args: AnchorSettleArgs) {
+        schedule_prompt_anchor_settle(args);
+    }
+
+    fn cursor_and_rows(&self) -> ((i64, i64), i64) {
+        (self.vte.cursor_position(), self.vte.row_count())
+    }
+
+    fn cursor_position_report(&self) -> (i64, i64) {
+        let (col, row) = self.vte.cursor_position();
+        let top_row = gtk::prelude::ScrollableExt::vadjustment(&self.vte)
+            .map(|adjustment| adjustment.value() as i64)
+            .unwrap_or(0);
+        (
+            col,
+            screen_relative_cpr_row(row, top_row, self.vte.row_count()),
+        )
+    }
+
+    /// Unified does no compact/full grid churn, so ring-coordinate anchors are
+    /// stable even when the viewport gains or loses rows.
+    fn command_capture_anchor(&self, provisional: (i64, i64), recorded_rows: i64) -> (i64, i64) {
+        prompt_anchor_for_surface(
+            self.rebase_prompt_anchor_on_row_delta,
+            provisional,
+            recorded_rows,
+            self.vte.row_count(),
+        )
+    }
+
+    fn grid_cols(&self) -> i64 {
+        self.vte.column_count().max(20)
+    }
+
+    fn live_column_count(&self) -> i64 {
+        self.vte.column_count()
+    }
+
+    fn capture_text_range(
+        &self,
+        start_row: i64,
+        start_col: i64,
+        end_row: i64,
+        end_col: i64,
+    ) -> Option<String> {
+        self.vte
+            .text_range_format(vte4::Format::Text, start_row, start_col, end_row, end_col)
+            .0
+            .map(|text| text.to_string())
+    }
+}
+
 impl ReaderCtx {
     /// `live_vte` is passed in rather than read back off the backend:
     /// `ReaderCtx` itself no longer names widget types, and the selection
     /// hold's VTE hooks are wiring, not lifecycle dispatch.
     fn install(self, pty: &Rc<OwnedPty>, live_vte: &Terminal) -> std::io::Result<()> {
-        let shell_token = pty
-            .shell_integration_token()
-            .unwrap_or_default()
-            .to_string();
-        let mut capability_observer = ShellCapabilityObserver::default();
         self.selection_feed_hold.install_vte_hooks(live_vte);
 
         let ctx = Rc::new(self);
@@ -4522,23 +6382,7 @@ impl ReaderCtx {
         let process_chunk: Rc<RefCell<dyn FnMut(Vec<u8>)>> = Rc::new(RefCell::new({
             let ctx = ctx.clone();
             move |data: Vec<u8>| {
-                capability_observer.feed(&data, &shell_token, &ctx.agent_execution_supported_rc);
-                let mut events = ctx.event_buf.borrow_mut();
-                events.clear();
-                ctx.parser.borrow_mut().feed(&data, &mut events);
-                // Fold runs of consecutive `Bytes` events into one so the live
-                // VTE feed, autoscroll mark-dirty, and accumulate_output happen
-                // once per stretch instead of once per parser chunk. Boundary
-                // events (PromptStart/End, AltScreen*, CommandStart/End) still
-                // run their synchronous mark_dirty between stretches, keeping
-                // the scroll-invariant from [[scroll_synchronous_autoscroll]].
-                coalesce_bytes_events(&mut events);
-
-                // `events` keeps `event_buf` mutably borrowed across the whole
-                // dispatch: no `on_*` handler may touch `self.event_buf`.
-                for event in events.iter() {
-                    ctx.handle_event(event);
-                }
+                ctx.process_parser_input(&data);
             }
         }));
 
@@ -5116,8 +6960,10 @@ impl TermView {
         *self.config.borrow_mut() = config.clone();
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: &Config,
+        mode: &crate::config::TerminalMode,
         shell_argv: &[String],
         cwd: Option<&str>,
         cwd_external: bool,
@@ -5163,6 +7009,16 @@ impl TermView {
             live_raw_output.clone(),
         )));
         let active_vte = active.borrow().active_vte.clone();
+        // The caller owns the mode decision. Managed remote panes deliberately
+        // pass Block even when the shared config defaults to Unified.
+        let unified = mode.is_unified();
+        let unified_zones: Rc<RefCell<VecDeque<CompletedCommandRecord>>> =
+            Rc::new(RefCell::new(VecDeque::new()));
+        if unified {
+            let holder = active.borrow().widget().clone();
+            holder.remove_css_class("block-compact");
+            holder.add_css_class("block-fullscreen");
+        }
         let focus_requested = Rc::new(Cell::new(false));
         {
             let focus_requested = focus_requested.clone();
@@ -5358,7 +7214,13 @@ impl TermView {
         // VTE cursor position (col, row) right after the prompt finished
         // drawing — anchor for the text-range read at CommandStart.
         let prompt_end_pos: Rc<Cell<(i64, i64)>> = Rc::new(Cell::new((0, 0)));
+        let prompt_anchor_rows: Rc<Cell<i64>> = Rc::new(Cell::new(0));
         let prompt_anchor_ready: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+
+        // Derived from the same switch that selects the render backend and
+        // copied into its SubmissionSurface: Block's compact/full transition
+        // rebases; Unified's one stable full-size grid does not.
+        let rebase_prompt_anchor_on_row_delta = prompt_anchor_rebases_on_row_delta(unified);
 
         // Scroll-lock flags shared across the contents_changed pin, value_changed
         // detector, FAB, and ScrollDebouncer. `user_scrolled_up` suppresses the
@@ -5445,7 +7307,7 @@ impl TermView {
         // (vim/less/TUIs) which need real terminal rows. During a running command
         // the height is frozen at the idle value (no per-chunk resize / SIGWINCH
         // thrash); the full output is snapshotted into a finished block when done.
-        let layout_active_surface: Rc<dyn Fn()> = {
+        let block_layout_active_surface: Rc<dyn Fn()> = {
             // This callback is retained by adjustment/VTE signals as well as
             // TermView.  Keep every widget edge weak so closing a pane cannot
             // form signal -> callback -> ancestor/terminal reference cycles.
@@ -5563,6 +7425,38 @@ impl TermView {
                 fit_finished_outputs();
             })
         };
+        // Unified has one layout state: a viewport-sized VTE for prompts,
+        // commands and alternate-screen applications alike.
+        let unified_layout_active_surface: Rc<dyn Fn()> = {
+            let holder = active.borrow().widget().downgrade();
+            let vte = active_vte.downgrade();
+            let scroll = block_scroll.downgrade();
+            let last_size_target: Rc<Cell<(i64, i64)>> = Rc::new(Cell::new((0, 0)));
+            Rc::new(move || {
+                let (Some(holder), Some(vte), Some(scroll)) =
+                    (holder.upgrade(), vte.upgrade(), scroll.upgrade())
+                else {
+                    return;
+                };
+                let cell_h = (vte.char_height() as i32).max(1);
+                let Some(viewport_rows) = viewport_rows_for(&vte, &scroll) else {
+                    return;
+                };
+                let target = (vte.column_count().max(1), viewport_rows);
+                holder.set_visible(true);
+                if last_size_target.get() != target {
+                    vte.set_size(target.0, target.1);
+                    last_size_target.set(target);
+                }
+                holder.set_height_request((viewport_rows as i32) * cell_h);
+            })
+        };
+        let layout_active_surface: Rc<dyn Fn()> = if unified {
+            unified_layout_active_surface
+        } else {
+            block_layout_active_surface
+        };
+
         // Coalesces follow-bottom pins so a burst of contents-changed signals
         // schedules at most one deferred scroll.
         let pin_pending: Rc<Cell<bool>> = Rc::new(Cell::new(false));
@@ -5719,13 +7613,17 @@ impl TermView {
         let verified_submission_source_id: Rc<RefCell<Option<glib::SourceId>>> =
             Rc::new(RefCell::new(None));
         let verified_submission = VerifiedSubmissionCtx {
-            active_vte: active_vte.clone(),
+            surface: Rc::new(VteSubmissionSurface {
+                vte: active_vte.clone(),
+                rebase_on_row_delta: rebase_prompt_anchor_on_row_delta,
+            }),
             bstate: bstate.clone(),
             pty: pty.clone(),
             typed_cmd: typed_cmd.clone(),
             idle_input_dirty: idle_input_dirty.clone(),
             pty_synced: pty_synced.clone(),
             prompt_end_pos: prompt_end_pos.clone(),
+            prompt_anchor_rows: prompt_anchor_rows.clone(),
             prompt_anchor_ready: prompt_anchor_ready.clone(),
             prompt_generation: agent_prompt_generation.clone(),
             contents_generation: contents_generation.clone(),
@@ -5810,12 +7708,15 @@ impl TermView {
         let config_shared: Rc<RefCell<Config>> = Rc::new(RefCell::new(config.clone()));
 
         // ── Wire PTY → parser → block events ─────────────────────────────
+        let render_backend_slot: Rc<RefCell<Option<Rc<dyn RenderBackend>>>> =
+            Rc::new(RefCell::new(None));
         {
             let active_rc = active.clone();
             let active_vte_rc = active_vte.clone();
             let bstate_rc = bstate.clone();
             let typed_cmd_rc = typed_cmd.clone();
             let prompt_end_pos_rc = prompt_end_pos.clone();
+            let prompt_anchor_rows_rc = prompt_anchor_rows.clone();
             let block_list_rc = block_list.clone();
             let block_scroll_rc = block_scroll.clone();
             let exited_cbs = exited_callbacks.clone();
@@ -5848,40 +7749,74 @@ impl TermView {
 
             let event_buf: Rc<RefCell<Vec<ParserEvent>>> =
                 Rc::new(RefCell::new(Vec::with_capacity(32)));
-            let backend: Rc<dyn RenderBackend> = Rc::new(BlockBackend {
-                active_rc,
-                active_vte: active_vte_rc,
-                block_list_rc,
-                block_scroll_rc,
-                jump_fab: jump_fab.clone(),
-                scroll_debouncer,
-                failure_marker_redraw: failure_marker_redraw.clone(),
-                finished_blocks_for_cb,
-                widget_pool_for_cb,
-                find_state_rc: find_state.clone(),
-                visible_indices_rc,
-                fullscreen_rc,
-                selected_block_ids_rc: selected_block_ids.clone(),
-                selected_block_id_rc: selected_block_id.clone(),
-                selection_anchor_id_rc: selection_anchor_id.clone(),
-                bookmarks_rc: block_bookmarks.clone(),
-                block_data_for_cb,
-                unread_count_rc: unread_count.clone(),
-                layout_active_surface: layout_active_surface.clone(),
-                config_for_cb: config_for_cb.clone(),
-                dynamic_colors_rc: dynamic_colors_rc.clone(),
-                pty_for_init: pty_for_init.clone(),
-                ask_ai_about_block_cbs: ask_ai_about_block_callbacks.clone(),
-                bstate_rc: bstate_rc.clone(),
-                typed_cmd_rc: typed_cmd_rc.clone(),
-                armed_agent_execution_rc: armed_agent_execution.clone(),
-                bracketed_paste_rc: bracketed_paste_rc.clone(),
-                pty_synced_rc: pty_synced_rc.clone(),
-                kitty_assembler: RefCell::new(kitty_graphics::Assembler::new()),
-                kitty_pending_images: RefCell::new(Vec::new()),
-                kitty_pending_bytes: Cell::new(0),
-                kitty_pending_admission: RefCell::new(None),
-            });
+            // This is the only reader-path mode switch. The PTY, parser,
+            // lifecycle engine and all state above and below it are shared.
+            let backend: Rc<dyn RenderBackend> = if unified {
+                let zone_marker = Rc::new(RefCell::new(ZoneMarkerInjector::from_system_entropy()));
+                let chrome_authority = Rc::new(RefCell::new(
+                    unified_chrome::ZoneChromeAuthority::new(zone_marker.borrow().nonce()),
+                ));
+                let chrome = unified_chrome::UnifiedChrome::new(
+                    &active_vte_rc,
+                    &active_rc.borrow().unified_chrome_surface,
+                    chrome_authority,
+                    config_for_cb.clone(),
+                );
+                active_rc.borrow().unified_chrome_surface.set_visible(true);
+                Rc::new(UnifiedBackend {
+                    vte: active_vte_rc,
+                    rebase_prompt_anchor_on_row_delta,
+                    active_rc,
+                    block_scroll_rc,
+                    layout_active_surface: layout_active_surface.clone(),
+                    config_for_cb: config_for_cb.clone(),
+                    pty_for_init: pty_for_init.clone(),
+                    zones: unified_zones.clone(),
+                    find_state_for_cb: find_state.clone(),
+                    zone_marker,
+                    chrome,
+                    kitty_assembler: RefCell::new(kitty_graphics::Assembler::new()),
+                })
+            } else {
+                Rc::new(BlockBackend {
+                    active_rc,
+                    active_vte: active_vte_rc,
+                    // Same construction-time policy passed to the submission
+                    // surface above, so every prompt-anchor reader agrees.
+                    rebase_prompt_anchor_on_row_delta,
+                    block_list_rc,
+                    block_scroll_rc,
+                    jump_fab: jump_fab.clone(),
+                    scroll_debouncer,
+                    failure_marker_redraw: failure_marker_redraw.clone(),
+                    finished_blocks_for_cb,
+                    widget_pool_for_cb,
+                    find_state_rc: find_state.clone(),
+                    visible_indices_rc,
+                    fullscreen_rc,
+                    selected_block_ids_rc: selected_block_ids.clone(),
+                    selected_block_id_rc: selected_block_id.clone(),
+                    selection_anchor_id_rc: selection_anchor_id.clone(),
+                    bookmarks_rc: block_bookmarks.clone(),
+                    block_data_for_cb,
+                    unread_count_rc: unread_count.clone(),
+                    layout_active_surface: layout_active_surface.clone(),
+                    config_for_cb: config_for_cb.clone(),
+                    dynamic_colors_rc: dynamic_colors_rc.clone(),
+                    pty_for_init: pty_for_init.clone(),
+                    ask_ai_about_block_cbs: ask_ai_about_block_callbacks.clone(),
+                    bstate_rc: bstate_rc.clone(),
+                    typed_cmd_rc: typed_cmd_rc.clone(),
+                    armed_agent_execution_rc: armed_agent_execution.clone(),
+                    bracketed_paste_rc: bracketed_paste_rc.clone(),
+                    pty_synced_rc: pty_synced_rc.clone(),
+                    kitty_assembler: RefCell::new(kitty_graphics::Assembler::new()),
+                    kitty_pending_images: RefCell::new(Vec::new()),
+                    kitty_pending_bytes: Cell::new(0),
+                    kitty_pending_admission: RefCell::new(None),
+                })
+            };
+            *render_backend_slot.borrow_mut() = Some(backend.clone());
             ReaderCtx {
                 backend,
                 bstate_rc,
@@ -5902,12 +7837,14 @@ impl TermView {
                     execution_id_trusted: false,
                     agent_completion_trusted: false,
                     command_cwd: None,
+                    pending_zone: None,
                     active_alt_screen_mode: None,
                 }),
                 live_raw_output_rc: live_raw_output.clone(),
                 typed_cmd_rc,
                 idle_input_dirty_rc: idle_input_dirty.clone(),
                 prompt_end_pos_rc,
+                prompt_anchor_rows_rc,
                 prompt_anchor_ready_rc: prompt_anchor_ready.clone(),
                 remote_session_cbs: remote_session_callbacks.clone(),
                 exited_cbs,
@@ -5920,6 +7857,12 @@ impl TermView {
                 dynamic_colors_rc,
                 config_for_cb,
                 parser,
+                capability_observer: RefCell::new(ShellCapabilityObserver::default()),
+                shell_capability_token: pty_for_init
+                    .shell_integration_token()
+                    .unwrap_or_default()
+                    .to_string(),
+                reset_splitter: RefCell::new(ResetAwareParserSplitter::default()),
                 reserved_history_block_ids: reserved_history_block_ids.clone(),
                 pty_synced_rc,
                 ftcs_seen_rc,
@@ -6488,7 +8431,14 @@ impl TermView {
             crate::terminal::click_cursor::ClickCursorCtx {
                 enabled: config.click_moves_cursor,
                 pty: Rc::clone(&pty),
-                prompt_end_pos: prompt_end_pos.clone(),
+                prompt_anchor: {
+                    let surface = verified_submission.surface.clone();
+                    let prompt_end_pos = prompt_end_pos.clone();
+                    let prompt_anchor_rows = prompt_anchor_rows.clone();
+                    Rc::new(move || {
+                        surface.prompt_anchor(prompt_end_pos.get(), prompt_anchor_rows.get())
+                    })
+                },
                 bstate: bstate.clone(),
                 mouse_mode: mouse_reporting_mode.clone(),
                 fullscreen: fullscreen.clone(),
@@ -6534,13 +8484,15 @@ impl TermView {
             let bstate_for_scroll = bstate.clone();
             let vte_for_scroll = active_vte.downgrade();
             let outer_for_scroll = block_scroll.downgrade();
+            let unified_for_scroll = unified;
             let scroll_ctrl = gtk::EventControllerScroll::new(
                 gtk::EventControllerScrollFlags::VERTICAL
                     | gtk::EventControllerScrollFlags::HORIZONTAL,
             );
             scroll_ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
             scroll_ctrl.connect_scroll(move |_, _dx, dy| {
-                let in_mouse_app = fullscreen_for_scroll.get()
+                let in_mouse_app = (fullscreen_for_scroll.get()
+                    || bstate_for_scroll.get() == BlockState::AltScreen)
                     && mouse_mode_for_scroll.get() != MouseReportingMode::None;
                 if in_mouse_app {
                     if !scroll_enabled {
@@ -6553,6 +8505,11 @@ impl TermView {
                         pty_for_scroll.write_bytes(&bytes);
                     }
                     return glib::Propagation::Stop;
+                }
+                // Unified's VTE owns all scrollback, including at the idle
+                // prompt. Let its native wheel handler move that adjustment.
+                if unified_for_scroll {
+                    return glib::Propagation::Proceed;
                 }
                 // Alt-screen programs without mouse reporting use VTE's native
                 // wheel-to-arrow fallback.
@@ -6632,6 +8589,7 @@ impl TermView {
             bstate,
             typed_cmd,
             prompt_end_pos,
+            prompt_anchor_rows,
             prompt_anchor_ready,
             armed_agent_execution,
             agent_execution_supported,
@@ -6687,6 +8645,10 @@ impl TermView {
             cross_selection,
             selection_feed_hold,
             layout_active_surface,
+            render_backend: render_backend_slot
+                .borrow_mut()
+                .take()
+                .expect("reader backend installed before TermView construction"),
         };
 
         // Load history if configured
@@ -6952,13 +8914,29 @@ impl TermView {
         true
     }
 
+    /// Whether this pane uses the continuous Unified backend rather than the
+    /// finished-block renderer.
+    pub(crate) fn is_unified(&self) -> bool {
+        matches!(self.render_backend.records(), BackendRecords::Metadata(_))
+    }
+
+    /// Inline cards live in the block document. A Unified pane has no
+    /// scrollable block document and therefore cannot mount one visibly.
+    pub(crate) fn supports_inline_notices(&self) -> bool {
+        self.render_backend.supports_inline_notices()
+    }
+
     /// Insert a transient card directly above the live prompt. Agent UI is
     /// deliberately not a finished block, so it stays out of history,
     /// selection, virtualization, and persistence metadata.
     ///
     /// Calling this for an already-inserted widget re-pins it below any newly
     /// completed command block.
-    pub fn insert_inline_notice(&self, widget: &gtk::Widget) {
+    pub fn insert_inline_notice(&self, widget: &gtk::Widget) -> bool {
+        if !self.supports_inline_notices() {
+            log::debug!("unified mode: refusing an unreachable inline notice card");
+            return false;
+        }
         let active_widget = self.active.borrow().widget().clone();
         let already_inserted = widget
             .parent()
@@ -6977,6 +8955,7 @@ impl TermView {
             self.programmatic_scroll.clone(),
         )
         .pin_to_bottom_deferred(&self.block_scroll);
+        true
     }
 
     /// Remove a transient inline card. Safe when the widget was already
@@ -7019,6 +8998,15 @@ impl TermView {
         self.pty.write_bytes(data);
     }
 
+    /// Resolve the saved PromptEnd anchor through this pane's surface policy.
+    /// Reviewed submission and click-to-place-cursor use the same method on the
+    /// same surface object.
+    fn current_prompt_anchor(&self) -> (i64, i64) {
+        self.verified_submission
+            .surface
+            .prompt_anchor(self.prompt_end_pos.get(), self.prompt_anchor_rows.get())
+    }
+
     /// Review-gated commands may only target a clean, idle shell editor. The
     /// diagnostic status is shared by the inline Agent card and execution
     /// boundary so the UI never advertises a weaker condition than the write.
@@ -7040,9 +9028,9 @@ impl TermView {
             Some(false) => CommandPromptStatus::Running,
             None => CommandPromptStatus::ShellIntegrationUnavailable,
             Some(true) => {
-                if self.active_vte.cursor_position() == self.prompt_end_pos.get()
-                    && crate::terminal::click_cursor::verified_suffix_is_empty(&self.active_vte)
-                        == Some(true)
+                if self.verified_submission.surface.cursor_position()
+                    == self.current_prompt_anchor()
+                    && self.verified_submission.surface.suffix_is_empty() == Some(true)
                 {
                     CommandPromptStatus::Ready
                 } else {
@@ -7404,10 +9392,33 @@ impl TermView {
 
     pub fn connect_block_finished<F>(&self, f: F)
     where
-        F: Fn(String, Option<i32>, String, Option<crate::agent::AgentExecutionRef>, Option<u64>)
-            + 'static,
+        F: Fn(String, Option<i32>, Option<crate::agent::AgentExecutionRef>, Option<u64>) + 'static,
     {
-        self.block_finished_callbacks.borrow_mut().push(Box::new(f));
+        self.block_finished_callbacks
+            .borrow_mut()
+            .push(BlockFinishedCallback::Metadata(Box::new(f)));
+    }
+
+    /// Register Anvil's Relm4 bridge with a per-completion output capability.
+    /// The callback always receives metadata; `None` means its predicate chose
+    /// not to materialize the terminal payload for this event.
+    pub(crate) fn connect_block_finished_with_output_if<P, F>(&self, needs_output: P, f: F)
+    where
+        P: Fn(Option<crate::agent::AgentExecutionRef>) -> bool + 'static,
+        F: Fn(
+                String,
+                Option<i32>,
+                Option<String>,
+                Option<crate::agent::AgentExecutionRef>,
+                Option<u64>,
+            ) + 'static,
+    {
+        self.block_finished_callbacks
+            .borrow_mut()
+            .push(BlockFinishedCallback::ConditionalOutput {
+                needs_output: Box::new(needs_output),
+                callback: Box::new(f),
+            });
     }
 
     pub fn connect_ask_ai_about_block<F>(&self, f: F)
@@ -7420,6 +9431,9 @@ impl TermView {
     }
 
     pub fn scroll_lines(&self, lines: i32) {
+        if self.render_backend.scroll_surface_lines(lines) {
+            return;
+        }
         // Ctrl+Up enters Warp-style block selection at the newest block; once a
         // block is selected Ctrl+Up/Down continue moving the selection. Ctrl+Down
         // with no selection retains the ordinary small scroll behavior.
@@ -7511,6 +9525,10 @@ impl TermView {
     /// Remove every finished block. Returns how many blocks were cleared; the
     /// removed data is stashed so `undo_clear_blocks` can rebuild it.
     pub fn clear_blocks(&self) -> usize {
+        if !self.render_backend.supports_block_mutation() {
+            log::debug!("render backend has no Block document to mutate");
+            return 0;
+        }
         // Bind deletion authority before mutating UI state. A failed save keeps
         // this exact resolved target armed across config path/codec changes,
         // and Undo or Drop retries it with the pane's then-current state.
@@ -7717,16 +9735,18 @@ impl TermView {
         restored_count
     }
 
-    pub fn apply_failed_filter(&self) {
-        if let Some(idx) = self.get_failed_blocks().first().copied() {
-            self.scroll_to_block(idx);
-        }
+    pub(crate) fn apply_failed_filter(&self) -> RecordNavigationResult {
+        let Some(record_id) = self.get_failed_blocks().first().copied() else {
+            return RecordNavigationResult::NoMatchingRecord;
+        };
+        self.navigate_to_record_id(record_id, false)
     }
 
-    pub fn apply_slow_filter(&self) {
-        if let Some(idx) = self.get_slow_blocks(1000).first().copied() {
-            self.scroll_to_block(idx);
-        }
+    pub(crate) fn apply_slow_filter(&self) -> RecordNavigationResult {
+        let Some(record_id) = self.get_slow_blocks(1000).first().copied() else {
+            return RecordNavigationResult::NoMatchingRecord;
+        };
+        self.navigate_to_record_id(record_id, false)
     }
 
     pub fn apply_pinned_filter(&self) {
@@ -7763,9 +9783,25 @@ impl TermView {
 
     /// Jump to the previous / next failed (non-zero exit) block, wrapping to
     /// the far end when there is no match in the requested direction.
-    pub fn jump_to_failed(&self, direction: i32) {
+    pub(crate) fn jump_to_failed(&self, direction: i32) -> RecordNavigationResult {
         let failed = self.get_failed_blocks();
-        self.jump_to_marked_index(&failed, direction);
+        if failed.is_empty() {
+            return RecordNavigationResult::NoMatchingRecord;
+        }
+        let record_ids = {
+            let records = self.render_backend.records();
+            records.iter().map(|record| record.id()).collect::<Vec<_>>()
+        };
+        let target = step_marked_record_ids(
+            &record_ids,
+            &failed,
+            self.selected_block_id.get(),
+            direction,
+        );
+        let Some(record_id) = target else {
+            return RecordNavigationResult::NoMatchingRecord;
+        };
+        self.navigate_to_record_id(record_id, false)
     }
 
     /// Shared stepping for pinned/failed navigation: `marked` is an ascending
@@ -7925,7 +9961,8 @@ impl TermView {
                     ),
                     (
                         "Alt screen visible".to_string(),
-                        self.fullscreen.get().to_string(),
+                        (self.fullscreen.get() || self.bstate.get() == BlockState::AltScreen)
+                            .to_string(),
                     ),
                 ],
             ),
@@ -7943,6 +9980,14 @@ impl TermView {
             (
                 "Blocks",
                 vec![
+                    (
+                        "Render backend".to_string(),
+                        format!(
+                            "{} ({} records)",
+                            self.render_backend.debug_name(),
+                            self.render_backend.records().len()
+                        ),
+                    ),
                     ("Finished blocks".to_string(), finished_len.to_string()),
                     ("Block data entries".to_string(), block_data_len.to_string()),
                     ("Failed blocks".to_string(), failed.to_string()),
@@ -8066,11 +10111,11 @@ impl TermView {
     /// Used to populate the Ctrl+Shift+H history palette. The first entry is
     /// the most recent unique command; whitespace-only commands are dropped.
     pub fn command_history(&self) -> Vec<String> {
-        let finished = self.finished_blocks.borrow();
+        let records = self.render_backend.records();
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        let mut out: Vec<String> = Vec::new();
-        for block in finished.iter().rev() {
-            let cmd = block.cmd_text.trim();
+        let mut out = Vec::with_capacity(MAX_COMMAND_HISTORY_ENTRIES.min(records.len()));
+        for record in records.iter().rev() {
+            let cmd = record.command().trim();
             if cmd.is_empty() || !recalled_command_is_safe(cmd) {
                 continue;
             }
@@ -8116,31 +10161,2753 @@ mod tests {
         background_output_has_visible_text, block_clipboard_text, block_duration_ms,
         build_clipboard_paste, build_color_query_reply, build_command_recall,
         build_keyboard_query_reply, claim_next_unused_block_id, classify_command_prompt_status,
-        clear_dynamic_colors, coalesce_bytes_events, command_end_matches_started_id,
+        clear_dynamic_colors, close_zone_marker, coalesce_bytes_events,
+        command_capture_range_is_bounded, command_end_matches_started_id,
         command_id_uses_shell_token, decide_agent_command_end, emit_alt_screen_transition,
-        failed_block_marker_fractions, finished_block_config, finished_command,
-        finished_layout_key, is_post_command_metadata, mutate_block_data_and_redraw,
-        normalize_captured_command, notification_permitted, parse_color_spec,
-        pop_typed_command_shadow, process_block_id_namespace, record_external_input,
-        resolve_command_text, reviewed_pre_command_bytes_are_identity_neutral,
-        reviewed_submission_matches, selected_blocks_markdown, selected_command_text,
+        estimated_finished_block_height_for_text, failed_block_marker_fractions,
+        feed_with_zone_marker, finished_block_config, finished_command, finished_layout_key,
+        is_post_command_metadata, live_output_text, mutate_block_data_and_redraw,
+        normalize_captured_command, notification_permitted, parse_color_spec, plan_prompt_zone,
+        pop_typed_command_shadow, process_block_id_namespace, prompt_anchor_for_surface,
+        prompt_anchor_rebases_on_row_delta, prompt_zone_to_reopen_after_alt, rebase_prompt_anchor,
+        record_external_input, record_unified_zone, resolve_command_text,
+        reviewed_pre_command_bytes_are_identity_neutral, reviewed_submission_matches,
+        screen_relative_cpr_row, selected_blocks_markdown, selected_command_text,
         selected_id_range, shell_argv_supports_agent_ids, stable_visible_indices,
-        step_marked_indices, stranded_focus_key_recovers, strip_ansi, strip_ansi_with_clear_detect,
-        take_armed_agent_execution, take_background_output, unread_after_index_removal,
-        unread_after_prefix_eviction, viewport_page_size_changed, viewport_state_for_scroll,
-        visible_indices_for_viewport, AgentCommandEndDecision, AltScreenCallbacks,
-        AltScreenTransition, ArmedAgentExecution, BlockData, BlockState, CommandPromptStatus,
-        CommandTextSource, DynamicColors, DynamicColorsRc, ShellCapabilityObserver,
-        BLOCK_ID_SEQUENCE_LIMIT, MAX_RECALLED_COMMAND_BYTES, MAX_TYPED_COMMAND_SHADOW_BYTES,
-        NOTIFICATION_MIN_INTERVAL, TRUNCATED_COMMAND_PLACEHOLDER,
+        step_marked_indices, step_marked_record_ids, stranded_focus_key_recovers, strip_ansi,
+        strip_ansi_with_clear_detect, take_armed_agent_execution, take_background_output,
+        unread_after_index_removal, unread_after_prefix_eviction, viewport_page_size_changed,
+        viewport_state_for_scroll, visible_indices_for_viewport, AgentCommandEndDecision,
+        AgentExecutionLostCallbacks, AltScreenCallbacks, AltScreenTransition, AnchorSettleArgs,
+        ArmedAgentExecution, BackendRecords, BlockData, BlockFinishedCallback,
+        BlockFinishedCallbacks, BlockRenderPayloadAccessor, BlockState, CommandFinishedCallbacks,
+        CommandFinishedEvent, CommandPromptStatus, CommandStartedCallbacks, CommandStartedEvent,
+        CommandTextSource, CompletedCommandRecord, DynamicColors, DynamicColorsRc, EngineState,
+        PendingZone, ReaderCtx, RenderBackend, ResetAwareParserPart, ResetAwareParserSplitter,
+        ReviewedSubmission, ReviewedSubmissionPhase, SelectionFeedHold, ShellCapabilityObserver,
+        SubmissionSurface, TerminalResetKind, VerifiedSubmissionCtx, ZoneMarkerInjector,
+        BLOCK_ID_SEQUENCE_LIMIT, LAST_NOTIFICATION_AT, MAX_RECALLED_COMMAND_BYTES,
+        MAX_TYPED_COMMAND_SHADOW_BYTES, NOTIFICATION_MIN_INTERVAL, TRUNCATED_COMMAND_PLACEHOLDER,
+        UNAVAILABLE_COMMAND_PLACEHOLDER, ZONE_MARKER_CLOSE,
     };
     use crate::agent::{AgentExecutionRef, AgentSession};
     use crate::config::Config;
     use crate::parser::{ColorKind, CommandMeta, KeyboardProtocolQuery, ParserEvent};
+    use relm4::gtk::gdk::RGBA;
     use std::cell::{Cell, RefCell};
     use std::collections::{HashSet, VecDeque};
     use std::rc::Rc;
     use std::time::{Instant, SystemTime};
+
+    #[test]
+    fn prompt_anchor_policy_is_shared_by_every_surface_reader() {
+        assert_eq!(prompt_anchor_for_surface(false, (11, 6), 7, 5), (11, 6));
+        assert_eq!(prompt_anchor_for_surface(false, (3, 2), 5, 8), (3, 2));
+        assert_eq!(prompt_anchor_for_surface(true, (11, 6), 7, 5), (11, 4));
+        assert_eq!(
+            prompt_anchor_for_surface(true, (3, 2), 5, 8),
+            rebase_prompt_anchor((3, 2), 5, 8)
+        );
+    }
+
+    #[test]
+    fn backend_switch_selects_block_rebase_and_unified_identity() {
+        assert!(prompt_anchor_rebases_on_row_delta(false));
+        assert!(!prompt_anchor_rebases_on_row_delta(true));
+
+        let provisional = (7, 3);
+        assert_eq!(
+            prompt_anchor_for_surface(
+                prompt_anchor_rebases_on_row_delta(false),
+                provisional,
+                24,
+                26,
+            ),
+            (7, 5),
+            "Block rebases across compact/full row-count changes",
+        );
+        assert_eq!(
+            prompt_anchor_for_surface(
+                prompt_anchor_rebases_on_row_delta(true),
+                provisional,
+                24,
+                26,
+            ),
+            provisional,
+            "Unified keeps its stable full-size surface anchor",
+        );
+    }
+
+    #[test]
+    fn unified_zones_retain_identity_and_drop_the_oldest_past_the_cap() {
+        let finalized = |id, command: &str| CompletedCommandRecord {
+            id,
+            cmd: command.to_string(),
+            exit_code: Some(id as i32),
+            start_time_ms: Some(id),
+            end_time_ms: Some(id * 100),
+            duration_ms: Some(id * 10),
+            cwd: Some("/work".to_string()),
+            is_background: false,
+        };
+        let mut zones = VecDeque::new();
+        let _ = record_unified_zone(&mut zones, finalized(1, "first"), 2);
+        let _ = record_unified_zone(&mut zones, finalized(2, "second"), 2);
+        let _ = record_unified_zone(&mut zones, finalized(3, "third"), 2);
+        assert_eq!(zones.len(), 2);
+        assert_eq!(zones[0].id, 2);
+        assert_eq!(
+            zones[1],
+            CompletedCommandRecord {
+                id: 3,
+                cmd: "third".to_string(),
+                exit_code: Some(3),
+                start_time_ms: Some(3),
+                end_time_ms: Some(300),
+                duration_ms: Some(30),
+                cwd: Some("/work".to_string()),
+                is_background: false,
+            }
+        );
+
+        let _ = record_unified_zone(&mut zones, finalized(4, "fourth"), 0);
+        assert_eq!(zones.len(), 1, "a zero configuration still stays bounded");
+        assert_eq!(zones[0].id, 4);
+    }
+
+    #[test]
+    fn unified_cursor_position_report_row_stays_screen_relative() {
+        assert_eq!(screen_relative_cpr_row(805, 800, 24), 5);
+        assert_eq!(screen_relative_cpr_row(799, 800, 24), 0);
+        assert_eq!(screen_relative_cpr_row(900, 800, 24), 23);
+        assert_eq!(screen_relative_cpr_row(-3, 0, 0), 0);
+    }
+
+    #[test]
+    fn zone_marker_injector_uses_canonical_lower_hex_and_reasserts_each_feed() {
+        let marker = RefCell::new(ZoneMarkerInjector::with_nonce([
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
+        ]));
+        marker.borrow_mut().begin_zone(42);
+        let open = b"\x1b]8;;block://000102030405060708090a0b0c0d0e0f/42\x1b\\".to_vec();
+        let mut fed = Vec::new();
+        feed_with_zone_marker(&marker, b"prompt", |part| fed.push(part.to_vec()));
+        feed_with_zone_marker(
+            &marker,
+            b"\x1b]8;;https://guest.invalid\x1b\\guest\x1b8tail",
+            |part| fed.push(part.to_vec()),
+        );
+        assert_eq!(
+            fed,
+            vec![
+                open.clone(),
+                b"prompt".to_vec(),
+                open,
+                b"\x1b]8;;https://guest.invalid\x1b\\guest\x1b8tail".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn marker_close_fails_closed_and_always_ends_guest_hyperlinks() {
+        let marker = RefCell::new(ZoneMarkerInjector::with_nonce([0xab; 16]));
+        marker.borrow_mut().begin_zone(7);
+        let mut fed = Vec::new();
+        close_zone_marker(&marker, Some(8), |part| fed.push(part.to_vec()));
+        feed_with_zone_marker(&marker, b"command output", |part| fed.push(part.to_vec()));
+        assert_eq!(
+            fed,
+            vec![ZONE_MARKER_CLOSE.to_vec(), b"command output".to_vec()],
+            "a mismatched close drops stale authority before later feeds"
+        );
+
+        let disabled = RefCell::new(ZoneMarkerInjector::disabled());
+        disabled.borrow_mut().begin_zone(9);
+        let mut fed = Vec::new();
+        close_zone_marker(&disabled, Some(9), |part| fed.push(part.to_vec()));
+        feed_with_zone_marker(&disabled, b"raw", |part| fed.push(part.to_vec()));
+        assert_eq!(
+            fed,
+            vec![ZONE_MARKER_CLOSE.to_vec(), b"raw".to_vec()],
+            "accepted C closes a guest hyperlink even when marker entropy failed"
+        );
+    }
+
+    fn split_resets(bytes: &[u8]) -> Vec<ResetAwareParserPart> {
+        ResetAwareParserSplitter::default().feed(bytes)
+    }
+
+    fn reset_kinds(parts: &[ResetAwareParserPart]) -> Vec<TerminalResetKind> {
+        parts
+            .iter()
+            .filter_map(|part| match part {
+                ResetAwareParserPart::Reset { kind, .. } => Some(*kind),
+                ResetAwareParserPart::Bytes(_)
+                | ResetAwareParserPart::OpaqueBytes(_)
+                | ResetAwareParserPart::ApcSequence(_) => None,
+            })
+            .collect()
+    }
+
+    fn split_bytes(parts: &[ResetAwareParserPart]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for part in parts {
+            match part {
+                ResetAwareParserPart::Bytes(part)
+                | ResetAwareParserPart::OpaqueBytes(part)
+                | ResetAwareParserPart::Reset { bytes: part, .. } => bytes.extend_from_slice(part),
+                ResetAwareParserPart::ApcSequence(payload) => {
+                    bytes.extend_from_slice(b"\x1b_");
+                    bytes.extend_from_slice(payload);
+                    bytes.extend_from_slice(b"\x1b\\");
+                }
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn local_reset_splitter_accepts_only_exact_ed3_and_ris() {
+        for sequence in [b"\x1b[3J".as_slice(), b"\x1b[03J", b"\x1b[0003J", b"\x1bc"] {
+            let parts = split_resets(sequence);
+            assert_eq!(reset_kinds(&parts).len(), 1, "{sequence:?}");
+            assert_eq!(split_bytes(&parts), sequence);
+        }
+        for lookalike in [
+            b"\x1b[2J".as_slice(),
+            b"\x1b[?3J",
+            b"\x1b[3;0J",
+            b"\x1b[3:0J",
+            b"\x1b[3 J",
+            b"\x1b[3K",
+            b"\x1b[42949672963J",
+            b"\x1bcx\x1b[",
+        ] {
+            let expected = usize::from(lookalike.starts_with(b"\x1bc"));
+            assert_eq!(
+                reset_kinds(&split_resets(lookalike)).len(),
+                expected,
+                "{lookalike:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_reset_splitter_keeps_bel_and_plain_lookalikes_inside_control_strings() {
+        let bytes = b"\x1b]0;osc [3J and c\x07\
+            \x1bP1;2|dcs \x07 [3J and c\x1b\\\
+            \x1b_apc \x07 [3J and c\x1b\\\
+            \x1b^pm \x07 [3J and c\x1b\\\
+            \x1bXsos \x07 [3J and c\x1b\\tail";
+        let parts = split_resets(bytes);
+        assert!(reset_kinds(&parts).is_empty());
+        assert_eq!(split_bytes(&parts), bytes);
+    }
+
+    #[test]
+    fn local_reset_splitter_remembers_split_sos_until_its_st() {
+        let mut splitter = ResetAwareParserSplitter::default();
+        let mut parts = splitter.feed(b"\x1bXsos prefix");
+        parts.extend(splitter.feed(b"fake \x07 [3J and c"));
+        parts.extend(splitter.feed(b"\x1b\\tail\x1b[3J"));
+        assert_eq!(reset_kinds(&parts), [TerminalResetKind::EraseScrollback]);
+        assert_eq!(
+            split_bytes(&parts),
+            b"\x1bXsos prefixfake \x07 [3J and c\x1b\\tail\x1b[3J"
+        );
+    }
+
+    #[test]
+    fn malformed_control_string_escape_aborts_then_replays_reset_candidate() {
+        for introducer in [b'P', b'_', b'^', b'X'] {
+            let mut splitter = ResetAwareParserSplitter::default();
+            let mut prefix = vec![0x1b, introducer];
+            prefix.extend_from_slice(b"payload\x07\x1b");
+            let mut parts = splitter.feed(&prefix);
+            parts.extend(splitter.feed(b"c\x1b[?2004h"));
+            assert_eq!(reset_kinds(&parts), [TerminalResetKind::HardReset]);
+        }
+    }
+
+    #[test]
+    fn raw_reset_splitter_survives_every_byte_boundary_without_loss() {
+        let input = b"before\x1b]0;inside [3J\x07middle\x1b[03Jafter\x1bcend";
+        let mut splitter = ResetAwareParserSplitter::default();
+        let mut parts = Vec::new();
+        for byte in input {
+            parts.extend(splitter.feed(std::slice::from_ref(byte)));
+        }
+        assert_eq!(
+            reset_kinds(&parts),
+            [
+                TerminalResetKind::EraseScrollback,
+                TerminalResetKind::HardReset
+            ]
+        );
+        assert_eq!(split_bytes(&parts), input);
+    }
+
+    #[test]
+    fn prompt_zone_plan_reuses_idle_ids_and_aligns_completed_records() {
+        let mut next = 10_u64;
+        let mut allocate = || {
+            next += 1;
+            next
+        };
+        let first = plan_prompt_zone(None, false, &mut allocate);
+        let repeated = plan_prompt_zone(
+            Some(PendingZone::Prompt(first.prompt_id)),
+            false,
+            &mut allocate,
+        );
+        assert_eq!(repeated.prompt_id, first.prompt_id);
+        assert_eq!(repeated.completed_record_id, None);
+        let foreground = plan_prompt_zone(
+            Some(PendingZone::Command(first.prompt_id)),
+            true,
+            &mut allocate,
+        );
+        assert_eq!(foreground.completed_record_id, Some(first.prompt_id));
+        assert_ne!(foreground.prompt_id, first.prompt_id);
+        let background = plan_prompt_zone(
+            Some(PendingZone::Prompt(foreground.prompt_id)),
+            true,
+            &mut allocate,
+        );
+        assert_eq!(background.completed_record_id, Some(foreground.prompt_id));
+        assert_ne!(background.prompt_id, foreground.prompt_id);
+    }
+
+    #[test]
+    fn only_pre_command_alt_restore_reopens_the_prompt_zone() {
+        assert_eq!(
+            prompt_zone_to_reopen_after_alt(
+                BlockState::AwaitingCommand,
+                Some(PendingZone::Prompt(17)),
+            ),
+            Some(17)
+        );
+        assert_eq!(
+            prompt_zone_to_reopen_after_alt(
+                BlockState::CollectingOutput,
+                Some(PendingZone::Command(17)),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn linux_zone_nonce_uses_full_128_bit_entropy() {
+        #[cfg(target_os = "linux")]
+        {
+            let first = super::secure_zone_marker_nonce().expect("Linux getrandom is available");
+            let second = super::secure_zone_marker_nonce().expect("Linux getrandom is available");
+            assert_ne!(first, second);
+            assert_eq!(first.len(), 16);
+        }
+    }
+
+    // ── OSC 133 reader dispatch ──────────────────────────────────────────
+    // The recording implementations model a terminal surface instead of
+    // echoing the lifecycle's arguments back to it. The column queries differ
+    // and Block's anchor performs a real row-delta rebase, making mutations in
+    // coordinate choice and effect ordering observable without GTK.
+    //
+    // Deliberate architecture gaps versus Forge's final harness:
+    // - Anvil has no `post_prompt_bytes` fence/ring in `ReaderCtx`, so Forge's
+    //   park/overflow/drop trio has no production state to drive here.
+    // - Agent correlation uses `AgentExecutionRef` plus private tokenized
+    //   command ids rather than Forge's generation-only handoff. Its foreign-
+    //   foreground decisions remain covered by the existing
+    //   `agent_command_end_requires_shell_foreground_and_a_trusted_pair` and
+    //   prompt-boundary tests instead of manufacturing incompatible state.
+    // - Swapping in this backend necessarily cannot execute `BlockBackend`'s
+    //   GTK finalize body; these tests pin everything the engine hands it and
+    //   the surrounding fan-out order, not the widget assembly internals.
+    const HARNESS_CWD: &str = "/harness/cwd";
+    const SHELL_REPORTED_CWD: &str = "/shell/reported/cwd";
+    const PTY_REPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum DispatchQuery {
+        CursorAndRows,
+        CursorPositionReport,
+        CommandCaptureAnchor {
+            provisional: (i64, i64),
+            recorded_rows: i64,
+        },
+        CaptureTextRange {
+            start: (i64, i64),
+            end: (i64, i64),
+        },
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct FinalizeRecord {
+        prompt: String,
+        command: String,
+        output_with_ansi: String,
+        output_plain: String,
+        plain_output_bytes: usize,
+        cwd: Option<String>,
+        cols: i64,
+        estimated_height: i32,
+        exit_code: Option<i32>,
+        has_duration: bool,
+        has_end_time: bool,
+        is_background: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum DispatchCall {
+        Feed(Vec<u8>),
+        EraseScrollback,
+        HardReset,
+        ResetActiveSurface { preserve_scrollback: bool },
+        Focus,
+        SyncGeometry,
+        Layout,
+        MarkDirty,
+        ResetLock,
+        Finalize(FinalizeRecord),
+        EnterChrome,
+        EnterFullscreen,
+        ExitChrome,
+        ExitFullscreen,
+        KittyFeed(Vec<u8>),
+        KittyAdmitPending,
+        ResetKittyPipeline,
+        SetSystemClipboard(String),
+        DesktopNotify { title: Option<String>, body: String },
+        ScheduleAnchorSettle { prompt_generation: u64 },
+        Query(DispatchQuery),
+        PtyReply(Vec<u8>),
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum MarkerTrace {
+        Feed(Vec<u8>),
+        Begin(u64),
+        Close(Option<u64>),
+        Finalize(u64),
+        HardReset,
+    }
+
+    struct SurfaceGrid {
+        rows: Vec<String>,
+        cursor: (i64, i64),
+        grid_cols: i64,
+        live_cols: i64,
+    }
+
+    struct RecordingBackend {
+        calls: RefCell<Vec<DispatchCall>>,
+        marker_trace: RefCell<Vec<MarkerTrace>>,
+        grid: RefCell<SurfaceGrid>,
+        finalized_ids: RefCell<Vec<u64>>,
+        config: Rc<RefCell<Config>>,
+        block_records: RefCell<VecDeque<BlockData>>,
+        metadata_records: RefCell<VecDeque<CompletedCommandRecord>>,
+        metadata_only: Cell<bool>,
+        payload_counters: RefCell<Vec<Rc<Cell<usize>>>>,
+        kitty_status: Cell<crate::terminal::kitty_graphics::FeedStatus>,
+        settle_anchor_now: Cell<bool>,
+        admit_probe: RefCell<Option<Box<dyn Fn()>>>,
+    }
+
+    impl RecordingBackend {
+        fn new(config: Rc<RefCell<Config>>) -> Rc<Self> {
+            Rc::new(Self {
+                calls: RefCell::new(Vec::new()),
+                marker_trace: RefCell::new(Vec::new()),
+                grid: RefCell::new(SurfaceGrid {
+                    rows: vec![String::new(); 24],
+                    cursor: (0, 0),
+                    grid_cols: 80,
+                    live_cols: 80,
+                }),
+                finalized_ids: RefCell::new(Vec::new()),
+                config,
+                block_records: RefCell::new(VecDeque::new()),
+                metadata_records: RefCell::new(VecDeque::new()),
+                metadata_only: Cell::new(false),
+                payload_counters: RefCell::new(Vec::new()),
+                kitty_status: Cell::new(crate::terminal::kitty_graphics::FeedStatus::Pending),
+                settle_anchor_now: Cell::new(true),
+                admit_probe: RefCell::new(None),
+            })
+        }
+
+        fn set_metadata_only(&self, metadata_only: bool) {
+            self.metadata_only.set(metadata_only);
+        }
+
+        fn record(&self, call: DispatchCall) {
+            self.calls.borrow_mut().push(call);
+        }
+
+        fn calls(&self) -> Vec<DispatchCall> {
+            self.calls.borrow().clone()
+        }
+
+        fn take_calls(&self) -> Vec<DispatchCall> {
+            std::mem::take(&mut *self.calls.borrow_mut())
+        }
+
+        fn finalized(&self) -> Vec<DispatchCall> {
+            self.calls
+                .borrow()
+                .iter()
+                .filter(|call| matches!(call, DispatchCall::Finalize(_)))
+                .cloned()
+                .collect()
+        }
+
+        fn geometry_pushes(&self) -> usize {
+            self.calls
+                .borrow()
+                .iter()
+                .filter(|call| matches!(call, DispatchCall::SyncGeometry))
+                .count()
+        }
+
+        fn render_row(&self, row: i64, text: &str) {
+            let index = usize::try_from(row).expect("a non-negative grid row");
+            let mut grid = self.grid.borrow_mut();
+            if grid.rows.len() <= index {
+                grid.rows.resize(index + 1, String::new());
+            }
+            grid.rows[index] = text.to_string();
+            grid.cursor = (text.chars().count() as i64, row);
+        }
+
+        fn set_columns(&self, grid_cols: i64, live_cols: i64) {
+            let mut grid = self.grid.borrow_mut();
+            grid.grid_cols = grid_cols;
+            grid.live_cols = live_cols;
+        }
+
+        fn set_row_count(&self, rows: i64) {
+            let rows = usize::try_from(rows).expect("a non-negative row count");
+            self.grid.borrow_mut().rows.resize(rows, String::new());
+        }
+
+        fn set_admit_probe(&self, probe: impl Fn() + 'static) {
+            *self.admit_probe.borrow_mut() = Some(Box::new(probe));
+        }
+    }
+
+    impl RenderBackend for RecordingBackend {
+        fn feed_live(&self, bytes: &[u8]) {
+            self.marker_trace
+                .borrow_mut()
+                .push(MarkerTrace::Feed(bytes.to_vec()));
+            self.record(DispatchCall::Feed(bytes.to_vec()));
+        }
+
+        fn begin_prompt_zone(&self, zone_id: u64) {
+            self.marker_trace
+                .borrow_mut()
+                .push(MarkerTrace::Begin(zone_id));
+        }
+
+        fn close_prompt_zone(&self, zone_id: Option<u64>) {
+            self.marker_trace
+                .borrow_mut()
+                .push(MarkerTrace::Close(zone_id));
+        }
+
+        fn erase_scrollback(&self) {
+            self.record(DispatchCall::EraseScrollback);
+        }
+
+        fn hard_reset(&self) {
+            self.marker_trace.borrow_mut().push(MarkerTrace::HardReset);
+            self.record(DispatchCall::HardReset);
+        }
+
+        fn reset_active_surface(&self, preserve_scrollback: bool) {
+            self.record(DispatchCall::ResetActiveSurface {
+                preserve_scrollback,
+            });
+        }
+
+        fn focus_live_deferred(&self) {
+            self.record(DispatchCall::Focus);
+        }
+
+        fn sync_geometry_to_pty(&self) {
+            self.record(DispatchCall::SyncGeometry);
+        }
+
+        fn layout_active_surface(&self) {
+            self.record(DispatchCall::Layout);
+        }
+
+        fn records(&self) -> BackendRecords<'_> {
+            if self.metadata_only.get() {
+                BackendRecords::Metadata(self.metadata_records.borrow())
+            } else {
+                BackendRecords::Blocks(self.block_records.borrow())
+            }
+        }
+
+        fn record_search_target(
+            &self,
+            _block_id: u64,
+            _is_output: bool,
+        ) -> Option<super::RecordSearchTarget> {
+            None
+        }
+
+        fn completed_search_surfaces(
+            &self,
+            _max_bytes: usize,
+            _deadline_exhausted: &mut dyn FnMut() -> bool,
+        ) -> super::BackendSearchBatch {
+            super::BackendSearchBatch {
+                surfaces: Vec::new(),
+                incomplete: false,
+                native_fallback: None,
+            }
+        }
+
+        fn debug_name(&self) -> &'static str {
+            "recording"
+        }
+
+        fn mark_scroll_dirty(&self) {
+            self.record(DispatchCall::MarkDirty);
+        }
+
+        fn reset_scroll_lock(&self) {
+            self.record(DispatchCall::ResetLock);
+        }
+
+        fn finalize_block(
+            &self,
+            record: &CompletedCommandRecord,
+            payload: &dyn BlockRenderPayloadAccessor,
+        ) {
+            self.finalized_ids.borrow_mut().push(record.id);
+            self.marker_trace
+                .borrow_mut()
+                .push(MarkerTrace::Finalize(record.id));
+            self.payload_counters
+                .borrow_mut()
+                .push(payload.materialization_counter());
+            if self.metadata_only.get() {
+                self.metadata_records.borrow_mut().push_back(record.clone());
+                return;
+            }
+
+            let payload = payload.materialize();
+            let cols = super::bounded_finished_vte_columns(self.grid.borrow().grid_cols);
+            let truncation_limit = self.config.borrow().truncation_threshold_lines as usize;
+            let output_trimmed =
+                super::truncate_output_for_journal(&payload.output_plain, truncation_limit);
+            let estimated_height = estimated_finished_block_height_for_text(
+                &self.config.borrow(),
+                &payload.output_plain,
+                cols,
+            );
+            let block_data = BlockData {
+                id: record.id,
+                prompt: payload.prompt.clone(),
+                cmd: record.cmd.clone(),
+                cmd_markup: None,
+                output: payload.output_plain.trim().to_string(),
+                exit_code: record.exit_code,
+                estimated_height,
+                line_count: output_trimmed.lines().count(),
+                start_time_ms: record.start_time_ms,
+                end_time_ms: record.end_time_ms,
+                duration_ms: record.duration_ms,
+                cwd: record.cwd.clone(),
+                cols: cols as u16,
+            };
+            self.block_records
+                .borrow_mut()
+                .push_back(block_data.clone());
+            self.record(DispatchCall::Finalize(FinalizeRecord {
+                prompt: payload.prompt.clone(),
+                command: record.cmd.clone(),
+                output_with_ansi: payload.output_with_ansi.clone(),
+                output_plain: block_data.output,
+                plain_output_bytes: payload.output_plain.len(),
+                cwd: record.cwd.clone(),
+                cols,
+                estimated_height: block_data.estimated_height,
+                exit_code: record.exit_code,
+                has_duration: record.duration_ms.is_some(),
+                has_end_time: record.end_time_ms.is_some(),
+                is_background: record.is_background,
+            }));
+        }
+
+        fn enter_alt_screen_chrome(&self) {
+            self.record(DispatchCall::EnterChrome);
+        }
+
+        fn exit_alt_screen_chrome(&self) {
+            self.record(DispatchCall::ExitChrome);
+        }
+
+        fn enter_fullscreen(&self) {
+            self.record(DispatchCall::EnterFullscreen);
+        }
+
+        fn exit_fullscreen(&self) {
+            self.record(DispatchCall::ExitFullscreen);
+        }
+
+        fn kitty_feed(&self, payload: &[u8]) -> crate::terminal::kitty_graphics::FeedStatus {
+            self.record(DispatchCall::KittyFeed(payload.to_vec()));
+            self.kitty_status.get()
+        }
+
+        fn kitty_admit_pending(&self) {
+            if let Some(probe) = self.admit_probe.borrow().as_ref() {
+                probe();
+            }
+            self.record(DispatchCall::KittyAdmitPending);
+        }
+
+        fn reset_kitty_pipeline(&self) {
+            self.record(DispatchCall::ResetKittyPipeline);
+        }
+
+        fn set_system_clipboard(&self, text: &str) {
+            self.record(DispatchCall::SetSystemClipboard(text.to_string()));
+        }
+
+        fn desktop_notify(&self, title: Option<&str>, body: &str) {
+            self.record(DispatchCall::DesktopNotify {
+                title: title.map(str::to_string),
+                body: body.to_string(),
+            });
+        }
+
+        fn schedule_anchor_settle(&self, args: AnchorSettleArgs) {
+            self.record(DispatchCall::ScheduleAnchorSettle {
+                prompt_generation: args.prompt_generation,
+            });
+            if self.settle_anchor_now.get() {
+                args.ready.set(true);
+            }
+        }
+
+        fn cursor_and_rows(&self) -> ((i64, i64), i64) {
+            self.record(DispatchCall::Query(DispatchQuery::CursorAndRows));
+            let grid = self.grid.borrow();
+            (grid.cursor, grid.rows.len() as i64)
+        }
+
+        fn cursor_position_report(&self) -> (i64, i64) {
+            self.record(DispatchCall::Query(DispatchQuery::CursorPositionReport));
+            self.grid.borrow().cursor
+        }
+
+        fn command_capture_anchor(
+            &self,
+            provisional: (i64, i64),
+            recorded_rows: i64,
+        ) -> (i64, i64) {
+            self.record(DispatchCall::Query(DispatchQuery::CommandCaptureAnchor {
+                provisional,
+                recorded_rows,
+            }));
+            rebase_prompt_anchor(
+                provisional,
+                recorded_rows,
+                self.grid.borrow().rows.len() as i64,
+            )
+        }
+
+        fn grid_cols(&self) -> i64 {
+            self.grid.borrow().grid_cols
+        }
+
+        fn live_column_count(&self) -> i64 {
+            self.grid.borrow().live_cols
+        }
+
+        fn capture_text_range(
+            &self,
+            start_row: i64,
+            start_col: i64,
+            end_row: i64,
+            end_col: i64,
+        ) -> Option<String> {
+            self.record(DispatchCall::Query(DispatchQuery::CaptureTextRange {
+                start: (start_row, start_col),
+                end: (end_row, end_col),
+            }));
+            let grid = self.grid.borrow();
+            let row_index = |row: i64| {
+                usize::try_from(row)
+                    .ok()
+                    .filter(|index| *index < grid.rows.len())
+            };
+            let (first, last) = (row_index(start_row)?, row_index(end_row)?);
+            if (end_row, end_col) <= (start_row, start_col) {
+                return Some(String::new());
+            }
+            let mut text = String::new();
+            for index in first..=last {
+                let row: Vec<char> = grid.rows[index].chars().collect();
+                if index > first {
+                    text.push('\n');
+                }
+                let from = if index == first {
+                    usize::try_from(start_col).unwrap_or(0).min(row.len())
+                } else {
+                    0
+                };
+                let to = if index == last {
+                    usize::try_from(end_col).unwrap_or(0).clamp(from, row.len())
+                } else {
+                    row.len()
+                };
+                text.extend(&row[from..to]);
+            }
+            Some(text)
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SurfaceRead {
+        CursorPosition,
+        RowCount,
+        PromptAnchor {
+            provisional: (i64, i64),
+            recorded_rows: i64,
+        },
+        VisibleEditorText {
+            anchor: (i64, i64),
+        },
+        SuffixIsEmpty,
+    }
+
+    struct RecordingSurface {
+        reads: RefCell<Vec<SurfaceRead>>,
+        cursor: Cell<(i64, i64)>,
+        rows: Cell<i64>,
+        suffix_is_empty: Cell<Option<bool>>,
+    }
+
+    impl RecordingSurface {
+        fn new() -> Rc<Self> {
+            Rc::new(Self {
+                reads: RefCell::new(Vec::new()),
+                cursor: Cell::new((0, 0)),
+                rows: Cell::new(24),
+                suffix_is_empty: Cell::new(None),
+            })
+        }
+
+        fn reads(&self) -> Vec<SurfaceRead> {
+            self.reads.borrow().clone()
+        }
+    }
+
+    impl SubmissionSurface for RecordingSurface {
+        fn cursor_position(&self) -> (i64, i64) {
+            self.reads.borrow_mut().push(SurfaceRead::CursorPosition);
+            self.cursor.get()
+        }
+
+        fn row_count(&self) -> i64 {
+            self.reads.borrow_mut().push(SurfaceRead::RowCount);
+            self.rows.get()
+        }
+
+        fn prompt_anchor(&self, provisional: (i64, i64), recorded_rows: i64) -> (i64, i64) {
+            self.reads.borrow_mut().push(SurfaceRead::PromptAnchor {
+                provisional,
+                recorded_rows,
+            });
+            prompt_anchor_for_surface(true, provisional, recorded_rows, self.rows.get())
+        }
+
+        fn visible_editor_text(&self, anchor: (i64, i64)) -> Option<String> {
+            self.reads
+                .borrow_mut()
+                .push(SurfaceRead::VisibleEditorText { anchor });
+            // The polling half of verified submission needs a GLib main loop
+            // and is deliberately outside this headless pre-check seam.
+            None
+        }
+
+        fn suffix_is_empty(&self) -> Option<bool> {
+            self.reads.borrow_mut().push(SurfaceRead::SuffixIsEmpty);
+            self.suffix_is_empty.get()
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct FinishedFanOut {
+        command: String,
+        exit_code: Option<i32>,
+        output_sample: String,
+        agent_execution: Option<AgentExecutionRef>,
+        blocks_finalized_before: usize,
+        state_at_fan_out: BlockState,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct StartedFanOut {
+        event: CommandStartedEvent,
+        cmd_running: bool,
+        state_at_fan_out: BlockState,
+        geometry_pushes_before: usize,
+    }
+
+    struct ReaderHarness {
+        ctx: ReaderCtx,
+        backend: Rc<RecordingBackend>,
+        surface: Rc<RecordingSurface>,
+        pty: Rc<crate::pty::OwnedPty>,
+        config: Rc<RefCell<Config>>,
+        bstate: Rc<Cell<BlockState>>,
+        live_raw_output: Rc<RefCell<VecDeque<u8>>>,
+        prompt_end: Rc<Cell<(i64, i64)>>,
+        prompt_rows: Rc<Cell<i64>>,
+        prompt_ready: Rc<Cell<bool>>,
+        blocks_finished: Rc<RefCell<Vec<FinishedFanOut>>>,
+        commands_started: Rc<RefCell<Vec<StartedFanOut>>>,
+        commands_finished: Rc<RefCell<Vec<CommandFinishedEvent>>>,
+        alt_screen: Rc<RefCell<Vec<AltScreenTransition>>>,
+        agent_lost: Rc<RefCell<Vec<(AgentExecutionRef, &'static str)>>>,
+    }
+
+    type HarnessPreconditionMutation = (&'static str, fn(&ReaderHarness));
+
+    impl ReaderHarness {
+        fn new() -> Self {
+            Self::with_foreground(true)
+        }
+
+        fn with_foreground(foreground: bool) -> Self {
+            let surface = RecordingSurface::new();
+            let bstate = Rc::new(Cell::new(BlockState::Idle));
+            let cmd_running = Rc::new(Cell::new(false));
+            let live_raw_output = Rc::new(RefCell::new(VecDeque::new()));
+            let config = {
+                // Safe defaults read neither the developer's config file nor
+                // ANVIL_* environment overrides. Pin every path input used by
+                // this harness beside its assertions.
+                let mut config = crate::config::load_safe_config().0;
+                config.preserve_live_scrollback = false;
+                config.truncation_threshold_lines = 50_000;
+                config.finished_block_viewport_rows = 24;
+                config.finished_block_max_expanded_rows = 5_000;
+                config.font_desc = "Monospace 14".to_string();
+                config.default_font_scale = 1.0;
+                config.allow_remote_clipboard_write = false;
+                config.notify_long_blocks = false;
+                config.notify_long_block_threshold_ms = 10_000;
+                config.max_visible_blocks = 200;
+                config.command_history_enabled = false;
+                config.command_history_path = None;
+                Rc::new(RefCell::new(config))
+            };
+            let backend = RecordingBackend::new(config.clone());
+            let pty = Rc::new(
+                crate::pty::OwnedPty::from_openpty(Some(foreground)).expect("open a test PTY"),
+            );
+            let prompt_end = Rc::new(Cell::new((0, 0)));
+            let prompt_rows = Rc::new(Cell::new(24));
+            let prompt_ready = Rc::new(Cell::new(false));
+            let typed_cmd = Rc::new(RefCell::new(String::new()));
+            let idle_dirty = Rc::new(Cell::new(false));
+            let pty_synced = Rc::new(Cell::new(false));
+            let agent_prompt_generation = Rc::new(Cell::new(0));
+            let agent_execution_supported = Rc::new(Cell::new(false));
+            let armed_agent_execution = Rc::new(RefCell::new(None));
+
+            let agent_lost = Rc::new(RefCell::new(Vec::new()));
+            let agent_lost_callbacks: AgentExecutionLostCallbacks =
+                Rc::new(RefCell::new(Vec::new()));
+            {
+                let seen = agent_lost.clone();
+                agent_lost_callbacks
+                    .borrow_mut()
+                    .push(Box::new(move |execution, reason| {
+                        seen.borrow_mut().push((execution, reason));
+                    }));
+            }
+
+            let blocks_finished = Rc::new(RefCell::new(Vec::new()));
+            let block_finished_cbs: BlockFinishedCallbacks = Rc::new(RefCell::new(Vec::new()));
+            {
+                let seen = blocks_finished.clone();
+                let backend_at_fan_out = backend.clone();
+                let bstate_at_fan_out = bstate.clone();
+                block_finished_cbs
+                    .borrow_mut()
+                    .push(BlockFinishedCallback::ConditionalOutput {
+                        needs_output: Box::new(|_| true),
+                        callback: Box::new(
+                            move |command, exit_code, output_sample, agent_execution, _duration| {
+                                seen.borrow_mut().push(FinishedFanOut {
+                                    command,
+                                    exit_code,
+                                    output_sample: output_sample
+                                        .expect("the recording harness requests output"),
+                                    agent_execution,
+                                    blocks_finalized_before: backend_at_fan_out.finalized().len(),
+                                    state_at_fan_out: bstate_at_fan_out.get(),
+                                });
+                            },
+                        ),
+                    });
+            }
+
+            let commands_started = Rc::new(RefCell::new(Vec::new()));
+            let command_started_cbs: CommandStartedCallbacks = Rc::new(RefCell::new(Vec::new()));
+            {
+                let seen = commands_started.clone();
+                let backend_at_fan_out = backend.clone();
+                let bstate_at_fan_out = bstate.clone();
+                let running_at_fan_out = cmd_running.clone();
+                command_started_cbs
+                    .borrow_mut()
+                    .push(Box::new(move |event| {
+                        seen.borrow_mut().push(StartedFanOut {
+                            event,
+                            cmd_running: running_at_fan_out.get(),
+                            state_at_fan_out: bstate_at_fan_out.get(),
+                            geometry_pushes_before: backend_at_fan_out.geometry_pushes(),
+                        });
+                    }));
+            }
+
+            let commands_finished = Rc::new(RefCell::new(Vec::new()));
+            let command_finished_cbs: CommandFinishedCallbacks = Rc::new(RefCell::new(Vec::new()));
+            {
+                let seen = commands_finished.clone();
+                command_finished_cbs
+                    .borrow_mut()
+                    .push(Box::new(move |event| seen.borrow_mut().push(event)));
+            }
+
+            let alt_screen = Rc::new(RefCell::new(Vec::new()));
+            let alt_screen_cbs: AltScreenCallbacks = Rc::new(RefCell::new(Vec::new()));
+            {
+                let seen = alt_screen.clone();
+                alt_screen_cbs
+                    .borrow_mut()
+                    .push(Box::new(move |transition| {
+                        seen.borrow_mut().push(transition);
+                    }));
+            }
+
+            let verified_submission = VerifiedSubmissionCtx {
+                surface: surface.clone(),
+                bstate: bstate.clone(),
+                pty: pty.clone(),
+                typed_cmd: typed_cmd.clone(),
+                idle_input_dirty: idle_dirty.clone(),
+                pty_synced: pty_synced.clone(),
+                prompt_end_pos: prompt_end.clone(),
+                prompt_anchor_rows: prompt_rows.clone(),
+                prompt_anchor_ready: prompt_ready.clone(),
+                prompt_generation: agent_prompt_generation.clone(),
+                contents_generation: Rc::new(Cell::new(0)),
+                submission: Rc::new(RefCell::new(None::<ReviewedSubmission>)),
+                source_id: Rc::new(RefCell::new(None)),
+                armed_agent_execution: armed_agent_execution.clone(),
+                agent_execution_supported: agent_execution_supported.clone(),
+                agent_execution_lost_callbacks: agent_lost_callbacks.clone(),
+            };
+
+            let ctx = ReaderCtx {
+                backend: backend.clone(),
+                bstate_rc: bstate.clone(),
+                engine: RefCell::new(EngineState {
+                    prev_state: BlockState::Idle,
+                    osc133_depth: 0,
+                    prompt_buf: String::new(),
+                    background_output: VecDeque::new(),
+                    vte_typed_cmd: String::new(),
+                    prompt_display: String::new(),
+                    pending_exit_code: None,
+                    shell_duration_ms: None,
+                    execution_id_trusted: false,
+                    agent_completion_trusted: false,
+                    command_cwd: None,
+                    pending_zone: None,
+                    active_alt_screen_mode: None,
+                }),
+                live_raw_output_rc: live_raw_output.clone(),
+                typed_cmd_rc: typed_cmd,
+                idle_input_dirty_rc: idle_dirty,
+                prompt_end_pos_rc: prompt_end.clone(),
+                prompt_anchor_rows_rc: prompt_rows.clone(),
+                prompt_anchor_ready_rc: prompt_ready.clone(),
+                remote_session_cbs: Rc::new(RefCell::new(Vec::new())),
+                exited_cbs: Rc::new(RefCell::new(Vec::new())),
+                activity_cbs: Rc::new(RefCell::new(Vec::new())),
+                alt_screen_cbs,
+                command_started_cbs,
+                command_finished_cbs,
+                mouse_reporting_rc: Rc::new(Cell::new(super::MouseReportingMode::None)),
+                bracketed_paste_rc: Rc::new(Cell::new(false)),
+                dynamic_colors_rc: Rc::new(Cell::new(DynamicColors::default())),
+                config_for_cb: config.clone(),
+                parser: Rc::new(RefCell::new(crate::parser::Parser::new())),
+                capability_observer: RefCell::new(ShellCapabilityObserver::default()),
+                shell_capability_token: "0123456789abcdef0123456789abcdef".to_string(),
+                reset_splitter: RefCell::new(ResetAwareParserSplitter::default()),
+                reserved_history_block_ids: Rc::new(RefCell::new(HashSet::new())),
+                pty_synced_rc: pty_synced,
+                ftcs_seen_rc: Rc::new(Cell::new(false)),
+                init_cmds_queue_for_cb: Rc::new(RefCell::new(VecDeque::new())),
+                pty_for_init: pty.clone(),
+                block_start_time_for_cb: Rc::new(Cell::new(None)),
+                execution_id_rc: Rc::new(RefCell::new(None)),
+                current_cwd_for_cb: Rc::new(RefCell::new(HARNESS_CWD.to_string())),
+                event_buf: Rc::new(RefCell::new(Vec::new())),
+                cmd_running_rc: cmd_running,
+                running_cmd_rc: Rc::new(RefCell::new(String::new())),
+                armed_agent_execution_rc: armed_agent_execution,
+                agent_prompt_generation_rc: agent_prompt_generation,
+                active_agent_execution_rc: Rc::new(Cell::new(None)),
+                agent_execution_supported_rc: agent_execution_supported,
+                verified_submission,
+                block_finished_cbs,
+                selection_feed_hold: SelectionFeedHold::new(),
+            };
+            Self {
+                ctx,
+                backend,
+                surface,
+                pty,
+                config,
+                bstate,
+                live_raw_output,
+                prompt_end,
+                prompt_rows,
+                prompt_ready,
+                blocks_finished,
+                commands_started,
+                commands_finished,
+                alt_screen,
+                agent_lost,
+            }
+        }
+
+        fn feed(&self, event: ParserEvent) {
+            self.ctx.handle_event(&event);
+        }
+
+        fn feed_all(&self, events: impl IntoIterator<Item = ParserEvent>) {
+            for event in events {
+                self.feed(event);
+            }
+        }
+
+        fn feed_raw(&self, bytes: &[u8]) {
+            self.ctx.process_parser_input(bytes);
+        }
+
+        fn live_output(&self) -> String {
+            live_output_text(&self.live_raw_output)
+        }
+
+        fn arm_verified_prompt(&self) -> (i64, i64) {
+            self.backend.render_row(3, "user@host $ ");
+            self.feed_all([
+                ParserEvent::PromptStart,
+                dispatch_bytes("user@host $ "),
+                ParserEvent::PromptEnd,
+            ]);
+            assert_eq!(self.bstate.get(), BlockState::AwaitingCommand);
+            assert!(self.prompt_ready.get());
+            let anchor = self.prompt_end.get();
+            self.surface.rows.set(self.prompt_rows.get());
+            self.surface.cursor.set(anchor);
+            self.surface.suffix_is_empty.set(Some(true));
+            self.surface.reads.borrow_mut().clear();
+            self.backend.take_calls();
+            anchor
+        }
+    }
+
+    fn dispatch_command_start(command: Option<&str>) -> ParserEvent {
+        ParserEvent::CommandStart(CommandMeta {
+            command: command.map(str::to_string),
+            ..CommandMeta::default()
+        })
+    }
+
+    fn dispatch_command_start_in(command: Option<&str>, cwd: &str) -> ParserEvent {
+        ParserEvent::CommandStart(CommandMeta {
+            command: command.map(str::to_string),
+            cwd: Some(cwd.to_string()),
+            ..CommandMeta::default()
+        })
+    }
+
+    fn dispatch_command_end(exit: Option<i32>) -> ParserEvent {
+        ParserEvent::CommandEnd {
+            exit,
+            meta: CommandMeta::default(),
+        }
+    }
+
+    fn dispatch_bytes(text: &str) -> ParserEvent {
+        ParserEvent::Bytes(text.as_bytes().to_vec())
+    }
+
+    fn drive_simple_command(
+        harness: &ReaderHarness,
+        command: &str,
+        output: &str,
+        agent: Option<AgentExecutionRef>,
+    ) {
+        harness.backend.render_row(3, "$ ");
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            dispatch_bytes("$ "),
+            ParserEvent::PromptEnd,
+        ]);
+        harness.backend.render_row(3, &format!("$ {command}"));
+        harness.feed(dispatch_command_start(Some(command)));
+        harness.feed(dispatch_bytes(output));
+        harness.feed(dispatch_command_end(Some(0)));
+        if agent.is_some() {
+            // This helper's synthetic marks do not carry a shell-authenticated
+            // execution id.  Install the already-resolved correlation after D
+            // so this test can isolate the block-finished fan-out; the command
+            // end trust policy has its own focused coverage below.
+            harness.ctx.active_agent_execution_rc.set(agent);
+            harness.ctx.engine.borrow_mut().agent_completion_trusted = true;
+            assert_eq!(harness.ctx.active_agent_execution_rc.get(), agent);
+            assert_eq!(harness.ctx.pty_for_init.shell_is_foreground(), Some(true));
+        }
+        harness.feed(ParserEvent::PromptStart);
+    }
+
+    #[test]
+    fn marker_trace_orders_a_prompt_b_c_output_and_finalize_on_one_id() {
+        let harness = ReaderHarness::new();
+        harness.backend.render_row(3, "$ ");
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            dispatch_bytes("$ "),
+            ParserEvent::PromptEnd,
+        ]);
+        let zone_id = harness
+            .ctx
+            .engine
+            .borrow()
+            .pending_zone
+            .expect("A opens a prompt zone")
+            .id();
+        assert_eq!(
+            harness.backend.marker_trace.borrow().as_slice(),
+            &[
+                MarkerTrace::Begin(zone_id),
+                MarkerTrace::Feed(b"$ ".to_vec()),
+            ],
+            "B leaves the prompt marker open"
+        );
+
+        harness.backend.render_row(3, "$ printf ok");
+        harness.feed(dispatch_command_start(Some("printf ok")));
+        assert_eq!(
+            harness.ctx.engine.borrow().pending_zone,
+            Some(PendingZone::Command(zone_id))
+        );
+        harness.feed(dispatch_bytes("ok\r\n"));
+        harness.feed(dispatch_command_end(Some(0)));
+        harness.feed(ParserEvent::PromptStart);
+        let next_id = harness
+            .ctx
+            .engine
+            .borrow()
+            .pending_zone
+            .expect("the following A opens a fresh prompt zone")
+            .id();
+        assert_ne!(next_id, zone_id);
+        assert_eq!(
+            harness.backend.marker_trace.borrow().as_slice(),
+            &[
+                MarkerTrace::Begin(zone_id),
+                MarkerTrace::Feed(b"$ ".to_vec()),
+                MarkerTrace::Close(Some(zone_id)),
+                MarkerTrace::Feed(b"ok\r\n".to_vec()),
+                MarkerTrace::Begin(next_id),
+                MarkerTrace::Finalize(zone_id),
+            ]
+        );
+        assert_eq!(
+            harness.backend.finalized_ids.borrow().as_slice(),
+            &[zone_id],
+            "finalize consumes the id allocated at A"
+        );
+        let finalized = harness.backend.finalized();
+        let DispatchCall::Finalize(record) = &finalized[0] else {
+            unreachable!();
+        };
+        assert_eq!(record.prompt, "$");
+        assert_eq!(record.output_plain, "ok");
+        assert!(!record.prompt.contains("block://"));
+        assert!(!record.output_with_ansi.contains("block://"));
+    }
+
+    #[test]
+    fn reset_splitter_preserves_capture_once_and_orders_hooks_before_exact_bytes() {
+        let harness = ReaderHarness::new();
+        harness.bstate.set(BlockState::CollectingOutput);
+        harness.backend.take_calls();
+        harness.backend.marker_trace.borrow_mut().clear();
+        let bytes = b"before\x1b[3Jmiddle\x1bcafter";
+
+        harness.feed_raw(bytes);
+
+        assert_eq!(harness.live_output(), "\x1bcafter");
+        assert_eq!(
+            harness.backend.take_calls(),
+            vec![
+                DispatchCall::Feed(b"before".to_vec()),
+                DispatchCall::EraseScrollback,
+                DispatchCall::Feed(b"\x1b[3J".to_vec()),
+                DispatchCall::Feed(b"middle".to_vec()),
+                DispatchCall::HardReset,
+                DispatchCall::ResetKittyPipeline,
+                DispatchCall::Feed(b"\x1bc".to_vec()),
+                DispatchCall::Feed(b"after".to_vec()),
+            ]
+        );
+        assert_eq!(harness.ctx.engine.borrow().pending_zone, None);
+    }
+
+    #[test]
+    fn ris_resets_parser_modes_before_same_chunk_suffix_is_dispatched() {
+        let harness = ReaderHarness::new();
+        harness.bstate.set(BlockState::CollectingOutput);
+        harness.backend.take_calls();
+
+        harness.feed_raw(b"\x1b[?2004h\x1bc\x1b[?2004h");
+
+        assert!(
+            harness.pty.shell_bracketed_paste(),
+            "the post-RIS DECSET must run on the fresh parser after reset"
+        );
+        assert_eq!(
+            harness.backend.take_calls(),
+            vec![
+                DispatchCall::Feed(b"\x1b[?2004h".to_vec()),
+                DispatchCall::HardReset,
+                DispatchCall::ResetKittyPipeline,
+                DispatchCall::Feed(b"\x1bc".to_vec()),
+                DispatchCall::Feed(b"\x1b[?2004h".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn capability_observation_is_interleaved_with_same_chunk_ris() {
+        let harness = ReaderHarness::new();
+        let capability =
+            b"\x1b]133;A\x07\x1b]7771;0123456789abcdef0123456789abcdef\x07\x1b]133;B\x07";
+
+        let mut before = capability.to_vec();
+        before.extend_from_slice(b"\x1bc");
+        harness.feed_raw(&before);
+        assert!(!harness.ctx.agent_execution_supported_rc.get());
+
+        let mut after = b"\x1bc".to_vec();
+        after.extend_from_slice(capability);
+        harness.feed_raw(&after);
+        assert!(harness.ctx.agent_execution_supported_rc.get());
+    }
+
+    #[test]
+    fn ris_invalidates_unsettled_prompt_review_and_running_capture() {
+        let harness = ReaderHarness::new();
+        let execution = AgentExecutionRef {
+            epoch: AgentSession::new(1, 2, 1).epoch(),
+            generation: 19,
+        };
+        harness.bstate.set(BlockState::CollectingOutput);
+        harness.prompt_ready.set(true);
+        harness.ctx.agent_prompt_generation_rc.set(41);
+        harness.ctx.agent_execution_supported_rc.set(true);
+        harness.ctx.typed_cmd_rc.borrow_mut().push_str("typed");
+        harness.ctx.idle_input_dirty_rc.set(true);
+        harness.ctx.pty_synced_rc.set(true);
+        harness.live_raw_output.borrow_mut().extend(b"live output");
+        harness.ctx.running_cmd_rc.borrow_mut().push_str("running");
+        harness.ctx.cmd_running_rc.set(true);
+        harness
+            .ctx
+            .execution_id_rc
+            .borrow_mut()
+            .replace("exec".into());
+        harness.ctx.active_agent_execution_rc.set(Some(execution));
+        harness
+            .ctx
+            .armed_agent_execution_rc
+            .borrow_mut()
+            .replace(ArmedAgentExecution {
+                execution,
+                prompt_generation: 41,
+            });
+        harness
+            .ctx
+            .verified_submission
+            .submission
+            .borrow_mut()
+            .replace(ReviewedSubmission {
+                command: "reviewed".into(),
+                execution: Some(execution),
+                prompt_generation: 41,
+                phase: ReviewedSubmissionPhase::Inserting,
+                identity_feed_tainted: false,
+            });
+        {
+            let mut engine = harness.ctx.engine.borrow_mut();
+            engine.prompt_buf.push_str("prompt");
+            engine.prompt_display.push_str("display");
+            engine.vte_typed_cmd.push_str("vte command");
+            engine.background_output.extend(b"background");
+            engine.execution_id_trusted = true;
+            engine.agent_completion_trusted = true;
+        }
+
+        harness.feed_raw(b"\x1bc");
+
+        let engine = harness.ctx.engine.borrow();
+        assert!(engine.prompt_buf.is_empty());
+        assert!(engine.prompt_display.is_empty());
+        assert!(engine.vte_typed_cmd.is_empty());
+        assert!(engine.background_output.is_empty());
+        assert!(!engine.execution_id_trusted);
+        assert!(!engine.agent_completion_trusted);
+        drop(engine);
+        assert!(!harness.prompt_ready.get());
+        assert_eq!(harness.ctx.agent_prompt_generation_rc.get(), 42);
+        assert!(harness.ctx.typed_cmd_rc.borrow().is_empty());
+        assert_eq!(harness.live_output(), "\x1bc");
+        assert!(!harness.ctx.idle_input_dirty_rc.get());
+        assert!(!harness.ctx.pty_synced_rc.get());
+        assert!(!harness.ctx.cmd_running_rc.get());
+        assert!(harness.ctx.running_cmd_rc.borrow().is_empty());
+        assert!(harness.ctx.execution_id_rc.borrow().is_none());
+        assert!(harness.ctx.active_agent_execution_rc.get().is_none());
+        assert!(harness.ctx.armed_agent_execution_rc.borrow().is_none());
+        assert!(harness
+            .ctx
+            .verified_submission
+            .submission
+            .borrow()
+            .is_none());
+        assert!(!harness.ctx.agent_execution_supported_rc.get());
+    }
+
+    #[test]
+    fn unsupported_sos_payload_is_opaque_to_pinned_core_but_reaches_vte_once() {
+        let harness = ReaderHarness::new();
+        harness.bstate.set(BlockState::CollectingOutput);
+        harness.backend.take_calls();
+        let bytes = b"\x1bXsos \x07 [ ?2004h [6n [3J c\x1b\\";
+
+        harness.feed_raw(bytes);
+
+        assert!(!harness.pty.shell_bracketed_paste());
+        assert!(harness.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty());
+        assert_eq!(
+            harness.backend.take_calls(),
+            [DispatchCall::Feed(bytes.to_vec())]
+        );
+        assert_eq!(harness.live_output().as_bytes(), bytes);
+    }
+
+    #[test]
+    fn ris_precedes_same_chunk_query_and_alt_screen_events() {
+        let harness = ReaderHarness::new();
+        harness.bstate.set(BlockState::CollectingOutput);
+        harness.backend.take_calls();
+
+        harness.feed_raw(b"\x1bc\x1b[6n\x1b[?1049h");
+
+        assert_eq!(harness.pty.drain_test_slave(PTY_REPLY_WAIT), b"\x1b[1;1R");
+        assert_eq!(harness.bstate.get(), BlockState::AltScreen);
+        assert_eq!(
+            harness.backend.take_calls(),
+            vec![
+                DispatchCall::HardReset,
+                DispatchCall::ResetKittyPipeline,
+                DispatchCall::Feed(b"\x1bc".to_vec()),
+                DispatchCall::Query(DispatchQuery::CursorPositionReport),
+                DispatchCall::Feed(b"\x1b[6n".to_vec()),
+                DispatchCall::EnterChrome,
+                DispatchCall::EnterFullscreen,
+                DispatchCall::SyncGeometry,
+                DispatchCall::Feed(b"\x1b[?1049h".to_vec()),
+            ],
+            "reset hook must run before query replies and alt-screen side effects"
+        );
+    }
+
+    #[test]
+    fn ris_retires_open_zone_before_feed_and_keeps_completed_metadata() {
+        let harness = ReaderHarness::new();
+        harness.backend.set_metadata_only(true);
+        drive_simple_command(&harness, "printf kept", "kept\r\n", None);
+        assert_eq!(harness.backend.metadata_records.borrow().len(), 1);
+        assert!(harness.ctx.engine.borrow().pending_zone.is_some());
+        harness.backend.take_calls();
+        harness.backend.marker_trace.borrow_mut().clear();
+
+        harness.feed_raw(b"\x1bc");
+
+        assert_eq!(harness.ctx.engine.borrow().pending_zone, None);
+        assert_eq!(harness.backend.metadata_records.borrow().len(), 1);
+        assert_eq!(
+            harness.backend.marker_trace.borrow().as_slice(),
+            &[MarkerTrace::HardReset, MarkerTrace::Feed(b"\x1bc".to_vec())],
+        );
+    }
+
+    #[test]
+    fn repeated_idle_a_reuses_its_zone_and_completed_a_rotates_once() {
+        let harness = ReaderHarness::new();
+        harness.feed(ParserEvent::PromptStart);
+        let first_id = harness.ctx.engine.borrow().pending_zone.unwrap().id();
+        harness.feed(ParserEvent::PromptEnd);
+        harness.feed(ParserEvent::PromptStart);
+        assert_eq!(
+            harness.ctx.engine.borrow().pending_zone.unwrap().id(),
+            first_id,
+            "an idle prompt redraw reuses its globally allocated id"
+        );
+
+        harness.feed(ParserEvent::PromptEnd);
+        harness.backend.render_row(0, "echo ok");
+        harness.feed(dispatch_command_start(Some("echo ok")));
+        harness.feed(dispatch_command_end(Some(0)));
+        harness.feed(ParserEvent::PromptStart);
+        assert_eq!(
+            harness.backend.finalized_ids.borrow().as_slice(),
+            &[first_id]
+        );
+        assert_ne!(
+            harness.ctx.engine.borrow().pending_zone.unwrap().id(),
+            first_id
+        );
+    }
+
+    #[test]
+    fn empty_nested_and_out_of_state_marks_do_not_mint_or_close_extra_zones() {
+        let harness = ReaderHarness::new();
+        harness.feed(dispatch_command_start(Some("untrusted-before-a")));
+        assert!(harness.ctx.engine.borrow().pending_zone.is_none());
+        assert!(harness.backend.marker_trace.borrow().is_empty());
+
+        harness.feed_all([ParserEvent::PromptStart, ParserEvent::PromptEnd]);
+        let zone_id = harness.ctx.engine.borrow().pending_zone.unwrap().id();
+        harness.feed(dispatch_command_start(None));
+        harness.feed(dispatch_command_start(Some("nested")));
+        harness.feed(ParserEvent::PromptStart);
+        harness.feed(dispatch_command_end(Some(9)));
+        harness.feed(dispatch_command_end(Some(0)));
+        harness.feed(ParserEvent::PromptStart);
+
+        assert!(harness.backend.finalized_ids.borrow().is_empty());
+        assert_ne!(
+            harness.ctx.engine.borrow().pending_zone.unwrap().id(),
+            zone_id,
+            "the empty lifecycle consumes its A identity without fabricating a record"
+        );
+        let trace = harness.backend.marker_trace.borrow();
+        assert_eq!(
+            trace
+                .iter()
+                .filter(|event| **event == MarkerTrace::Close(Some(zone_id)))
+                .count(),
+            1,
+            "only the accepted outer C closes the zone"
+        );
+        assert!(!trace
+            .iter()
+            .any(|event| matches!(event, MarkerTrace::Finalize(_))));
+    }
+
+    #[test]
+    fn background_record_consumes_the_open_idle_prompt_zone() {
+        let harness = ReaderHarness::new();
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            dispatch_bytes("$ "),
+            ParserEvent::PromptEnd,
+        ]);
+        let prompt_id = harness.ctx.engine.borrow().pending_zone.unwrap().id();
+        harness.feed(dispatch_bytes("background\r\n"));
+        harness.feed(ParserEvent::PromptStart);
+        assert_eq!(
+            harness.backend.finalized_ids.borrow().as_slice(),
+            &[prompt_id]
+        );
+        let finalized = harness.backend.finalized();
+        let DispatchCall::Finalize(record) = &finalized[0] else {
+            unreachable!();
+        };
+        assert!(record.is_background);
+        assert_eq!(record.output_plain, "background");
+    }
+
+    #[test]
+    fn alt_leave_reopens_only_the_pre_c_prompt_zone_after_rmcup() {
+        let harness = ReaderHarness::new();
+        harness.feed_all([ParserEvent::PromptStart, ParserEvent::PromptEnd]);
+        let zone_id = harness.ctx.engine.borrow().pending_zone.unwrap().id();
+        harness.backend.marker_trace.borrow_mut().clear();
+        harness.feed_all([
+            ParserEvent::AltScreenEnter(1049),
+            ParserEvent::AltScreenLeave(1049),
+        ]);
+        assert_eq!(
+            harness.backend.marker_trace.borrow().as_slice(),
+            &[
+                MarkerTrace::Feed(b"\x1b[?1049h".to_vec()),
+                MarkerTrace::Feed(b"\x1b[?1049l".to_vec()),
+                MarkerTrace::Begin(zone_id),
+            ]
+        );
+
+        harness.feed(dispatch_command_start(None));
+        harness.backend.marker_trace.borrow_mut().clear();
+        harness.feed_all([
+            ParserEvent::AltScreenEnter(1049),
+            ParserEvent::AltScreenLeave(1049),
+        ]);
+        assert!(!harness
+            .backend
+            .marker_trace
+            .borrow()
+            .iter()
+            .any(|event| matches!(event, MarkerTrace::Begin(_))));
+    }
+
+    #[test]
+    fn selection_hold_replay_uses_the_same_marker_feed_wrapper() {
+        let marker = Rc::new(RefCell::new(ZoneMarkerInjector::with_nonce([0x11; 16])));
+        marker.borrow_mut().begin_zone(5);
+        let fed = Rc::new(RefCell::new(Vec::new()));
+        let hold = SelectionFeedHold::new();
+        hold.set_flush({
+            let marker = marker.clone();
+            let fed = fed.clone();
+            move |bytes| {
+                feed_with_zone_marker(&marker, &bytes, |part| fed.borrow_mut().push(part.to_vec()));
+            }
+        });
+        hold.begin_drag();
+        assert!(hold.try_buffer(b"parked shell bytes"));
+        hold.flush_now();
+        let open = marker.borrow().open_bytes().unwrap().to_vec();
+        assert_eq!(
+            fed.borrow().as_slice(),
+            &[open, b"parked shell bytes".to_vec()]
+        );
+    }
+
+    #[test]
+    fn metadata_finalize_and_metadata_observers_never_materialize_output() {
+        let harness = ReaderHarness::new();
+        harness.backend.set_metadata_only(true);
+        harness.ctx.block_finished_cbs.borrow_mut().clear();
+        let observed = Rc::new(RefCell::new(Vec::new()));
+        {
+            let observed = observed.clone();
+            harness
+                .ctx
+                .block_finished_cbs
+                .borrow_mut()
+                .push(BlockFinishedCallback::Metadata(Box::new(
+                    move |command, exit_code, agent, duration| {
+                        observed
+                            .borrow_mut()
+                            .push((command, exit_code, agent, duration));
+                    },
+                )));
+        }
+
+        drive_simple_command(&harness, "printf hi", "\x1b[32mhi\x1b[0m\r\n", None);
+
+        assert_eq!(harness.backend.payload_counters.borrow().len(), 1);
+        assert_eq!(harness.backend.payload_counters.borrow()[0].get(), 0);
+        assert_eq!(observed.borrow().len(), 1);
+        let records = harness.backend.records();
+        let BackendRecords::Metadata(records) = records else {
+            panic!("metadata backend must not manufacture BlockData");
+        };
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].cmd, "printf hi");
+        assert!(harness.live_output().is_empty());
+    }
+
+    #[test]
+    fn metadata_bridge_materializes_only_a_correlated_agent_completion() {
+        let harness = ReaderHarness::new();
+        harness.backend.set_metadata_only(true);
+        harness.ctx.block_finished_cbs.borrow_mut().clear();
+        let samples = Rc::new(RefCell::new(Vec::new()));
+        {
+            let samples = samples.clone();
+            harness.ctx.block_finished_cbs.borrow_mut().push(
+                BlockFinishedCallback::ConditionalOutput {
+                    needs_output: Box::new(|agent| agent.is_some()),
+                    callback: Box::new(move |_, _, sample, _, _| {
+                        samples.borrow_mut().push(sample);
+                    }),
+                },
+            );
+        }
+
+        drive_simple_command(&harness, "printf ordinary", "ordinary output\r\n", None);
+        assert_eq!(harness.backend.payload_counters.borrow()[0].get(), 0);
+        assert_eq!(samples.borrow().as_slice(), &[None]);
+
+        let execution = AgentExecutionRef {
+            epoch: AgentSession::new(1, 2, 1).epoch(),
+            generation: 7,
+        };
+        drive_simple_command(
+            &harness,
+            "printf agent",
+            "agent output\r\n",
+            Some(execution),
+        );
+        assert_eq!(harness.backend.payload_counters.borrow()[1].get(), 1);
+        assert_eq!(
+            samples.borrow()[1].as_deref(),
+            Some("agent output\n"),
+            "the Agent bridge gets the bounded plain sample"
+        );
+    }
+
+    #[test]
+    fn metadata_background_finalize_skips_command_output_observers() {
+        let harness = ReaderHarness::new();
+        harness.backend.set_metadata_only(true);
+        harness.ctx.block_finished_cbs.borrow_mut().clear();
+        let observer_calls = Rc::new(Cell::new(0usize));
+        {
+            let observer_calls = observer_calls.clone();
+            harness.ctx.block_finished_cbs.borrow_mut().push(
+                BlockFinishedCallback::ConditionalOutput {
+                    needs_output: Box::new(|_| true),
+                    callback: Box::new(move |_, _, _, _, _| {
+                        observer_calls.set(observer_calls.get() + 1);
+                    }),
+                },
+            );
+        }
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            dispatch_bytes("$ "),
+            ParserEvent::PromptEnd,
+            dispatch_bytes("async metadata only\r\n"),
+            ParserEvent::PromptStart,
+        ]);
+
+        assert_eq!(observer_calls.get(), 0);
+        assert_eq!(harness.backend.payload_counters.borrow().len(), 1);
+        assert_eq!(harness.backend.payload_counters.borrow()[0].get(), 0);
+        let records = harness.backend.records();
+        let BackendRecords::Metadata(records) = records else {
+            panic!("metadata backend must not manufacture a BlockData");
+        };
+        assert_eq!(records.len(), 1);
+        assert!(records[0].is_background);
+    }
+
+    #[test]
+    fn journal_capability_matches_pinned_jterm_core_enabled_semantics() {
+        use super::execution_journal_output_capture_enabled_for as enabled;
+
+        for disabled in ["", "0", "false", "no", "off", " FALSE ", "No"] {
+            assert!(!enabled(Some(disabled)), "{disabled:?}");
+        }
+        for enabled_value in ["1", "true", "yes", "on", "anything"] {
+            assert!(enabled(Some(enabled_value)), "{enabled_value:?}");
+        }
+        assert!(enabled(None), "missing/non-Unicode values default enabled");
+    }
+
+    #[test]
+    fn journal_id_and_capability_gate_lazy_output_materialization() {
+        let disabled = super::LazyBlockRenderPayload::new(
+            "$ ".to_string(),
+            super::CapturedFinalizeOutput::Background(b"disabled\r\n".iter().copied().collect()),
+        );
+        assert!(super::build_journal_completion(
+            Some("execution-disabled".to_string()),
+            false,
+            &disabled,
+            100,
+        )
+        .is_none());
+        assert_eq!(disabled.materialization_count(), 0);
+
+        let missing_id = super::LazyBlockRenderPayload::new(
+            "$ ".to_string(),
+            super::CapturedFinalizeOutput::Background(b"missing id\r\n".iter().copied().collect()),
+        );
+        assert!(super::build_journal_completion(None, true, &missing_id, 100).is_none());
+        assert_eq!(missing_id.materialization_count(), 0);
+
+        let enabled = super::LazyBlockRenderPayload::new(
+            "$ ".to_string(),
+            super::CapturedFinalizeOutput::Background(b"enabled\r\n".iter().copied().collect()),
+        );
+        let completion = super::build_journal_completion(
+            Some("execution-enabled".to_string()),
+            true,
+            &enabled,
+            100,
+        )
+        .expect("enabled correlated output is consumed");
+        assert_eq!(enabled.materialization_count(), 1);
+        assert_eq!(completion.output, "enabled");
+    }
+
+    #[test]
+    fn bounded_vte_capture_limits_each_call_and_total_work() {
+        let spans = Rc::new(RefCell::new(Vec::new()));
+        let seen = spans.clone();
+        let captured = super::capture_vte_rows_bounded(
+            -10_000,
+            10_000,
+            80,
+            73,
+            || false,
+            move |span| {
+                seen.borrow_mut().push(span);
+                Some("雪".repeat(span.work_cells))
+            },
+        );
+
+        assert!(captured.incomplete);
+        assert!(captured.text.len() <= 73);
+        let spans = spans.borrow();
+        assert!(spans.iter().all(|span| span.start_row == span.end_row));
+        assert!(spans
+            .iter()
+            .all(|span| usize::try_from(span.end_col).ok() == Some(span.work_cells)));
+        assert!(spans.iter().map(|span| span.work_cells).sum::<usize>() <= 73);
+        assert!(spans.len() < 20_001, "the whole ring was not requested");
+
+        let calls = Cell::new(0usize);
+        let timed_out = super::capture_vte_rows_bounded(
+            0,
+            999,
+            80,
+            4 * 1024 * 1024,
+            || true,
+            |_| {
+                calls.set(calls.get() + 1);
+                Some(String::new())
+            },
+        );
+        assert!(timed_out.incomplete);
+        assert!(timed_out.text.is_empty());
+        assert_eq!(calls.get(), 0, "deadline is checked before a VTE call");
+    }
+
+    #[test]
+    fn unified_search_extracts_viewport_before_huge_old_history() {
+        let mut requested_rows = Vec::new();
+        let captured = super::capture_vte_search_windows_bounded(
+            -100_000,
+            4,
+            0,
+            80,
+            400,
+            || false,
+            |span| {
+                requested_rows.push(span.start_row);
+                Some(String::new())
+            },
+        );
+
+        assert_eq!(requested_rows[..4], [0, 1, 2, 3]);
+        assert_eq!(requested_rows[4], -100_000);
+        assert!(!captured.viewport_to_tail.incomplete);
+        assert_eq!(captured.viewport_to_tail.work_cells, 320);
+        let history = captured.oldest_history.expect("remaining bounded history");
+        assert!(history.incomplete);
+        assert_eq!(history.work_cells, 80);
+        assert_eq!(
+            captured.viewport_to_tail.work_cells + history.work_cells,
+            400,
+            "both windows share one hard extraction budget"
+        );
+    }
+
+    #[test]
+    fn bounded_vte_capture_charges_each_half_open_row_exactly() {
+        let spans = Rc::new(RefCell::new(Vec::new()));
+        let seen = spans.clone();
+        let captured = super::capture_vte_rows_bounded(
+            5,
+            99,
+            10,
+            25,
+            || false,
+            move |span| {
+                seen.borrow_mut().push(span);
+                Some(String::new())
+            },
+        );
+        assert_eq!(
+            spans.borrow().as_slice(),
+            &[
+                super::VteCaptureSpan {
+                    start_row: 5,
+                    end_row: 5,
+                    end_col: 10,
+                    work_cells: 10,
+                },
+                super::VteCaptureSpan {
+                    start_row: 6,
+                    end_row: 6,
+                    end_col: 10,
+                    work_cells: 10,
+                },
+                super::VteCaptureSpan {
+                    start_row: 7,
+                    end_row: 7,
+                    end_col: 5,
+                    work_cells: 5,
+                },
+            ]
+        );
+        assert!(captured.incomplete);
+    }
+
+    #[test]
+    fn completed_surface_materialization_checks_deadline_on_both_sides() {
+        let materialized = Cell::new(0usize);
+        let mut surfaces = Vec::new();
+        let mut already_expired = || true;
+        assert!(!super::push_search_surface_before_deadline(
+            &mut surfaces,
+            &mut already_expired,
+            || {
+                materialized.set(materialized.get() + 1);
+                1usize
+            },
+        ));
+        assert!(surfaces.is_empty());
+        assert_eq!(materialized.get(), 0);
+
+        let checks = Cell::new(0usize);
+        let mut expires_after_surface = || {
+            checks.set(checks.get() + 1);
+            checks.get() >= 2
+        };
+        assert!(!super::push_search_surface_before_deadline(
+            &mut surfaces,
+            &mut expires_after_surface,
+            || {
+                materialized.set(materialized.get() + 1);
+                2usize
+            },
+        ));
+        assert_eq!(surfaces, vec![2]);
+        assert_eq!(materialized.get(), 1);
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn bounded_vte_capture_real_vte_uses_half_open_column_boundary() {
+        use relm4::gtk;
+        use relm4::gtk::prelude::*;
+        use std::time::Duration;
+        use vte4::TerminalExt;
+
+        gtk::init().expect("gtk init");
+        let terminal = vte4::Terminal::new();
+        terminal.set_size(5, 2);
+        let window = gtk::Window::new();
+        window.set_child(Some(&terminal));
+        window.present();
+        terminal.feed(b"ABCDE");
+        let context = gtk::glib::MainContext::default();
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_millis(100) {
+            while context.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        let spans = Rc::new(RefCell::new(Vec::new()));
+        let seen = spans.clone();
+        let captured = super::capture_vte_rows_bounded(
+            0,
+            0,
+            5,
+            4,
+            || false,
+            move |span| {
+                seen.borrow_mut().push(span);
+                super::capture_vte_text_range(
+                    &terminal,
+                    span.start_row,
+                    0,
+                    span.end_row,
+                    span.end_col,
+                )
+            },
+        );
+        assert_eq!(spans.borrow().len(), 1);
+        assert_eq!(spans.borrow()[0].end_col, 4);
+        assert_eq!(spans.borrow()[0].work_cells, 4);
+        assert_eq!(captured.text, "ABCD");
+        assert!(captured.incomplete);
+        window.close();
+        while context.iteration(false) {}
+    }
+
+    #[test]
+    fn reader_dispatch_full_cycle_finalizes_content_and_orders_fan_outs() {
+        let harness = ReaderHarness::new();
+        harness.backend.set_columns(100, 120);
+        harness.backend.render_row(3, "user@host $ ");
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            dispatch_bytes("top-line\r\nuser@host $ "),
+            ParserEvent::PromptEnd,
+        ]);
+        assert_eq!(harness.prompt_end.get(), (12, 3));
+        assert_eq!(harness.prompt_rows.get(), 24);
+
+        harness.backend.render_row(3, "user@host $ echo hi");
+        harness.backend.take_calls();
+        harness.feed(dispatch_command_start_in(None, SHELL_REPORTED_CWD));
+
+        assert_eq!(harness.bstate.get(), BlockState::CollectingOutput);
+        assert_eq!(
+            harness.backend.take_calls(),
+            vec![
+                DispatchCall::Query(DispatchQuery::CursorAndRows),
+                DispatchCall::Query(DispatchQuery::CommandCaptureAnchor {
+                    provisional: (12, 3),
+                    recorded_rows: 24,
+                }),
+                DispatchCall::Query(DispatchQuery::CaptureTextRange {
+                    start: (3, 12),
+                    end: (3, 19),
+                }),
+                DispatchCall::SyncGeometry,
+                DispatchCall::MarkDirty,
+            ]
+        );
+        assert_eq!(
+            harness.commands_started.borrow().as_slice(),
+            &[StartedFanOut {
+                event: CommandStartedEvent {
+                    command: "echo hi".to_string(),
+                    cwd: Some(SHELL_REPORTED_CWD.to_string()),
+                },
+                cmd_running: true,
+                state_at_fan_out: BlockState::CollectingOutput,
+                geometry_pushes_before: 0,
+            }]
+        );
+
+        let wide_line = "w".repeat(110);
+        let raw_output = format!("\x1b[32mhi\x1b[0m\r\n{wide_line}\r\n");
+        let plain_output = format!("hi\n{wide_line}\n");
+        harness.feed(dispatch_bytes(&raw_output));
+        assert_eq!(harness.live_output(), raw_output);
+        harness.feed(dispatch_command_end(Some(0)));
+        assert_eq!(harness.bstate.get(), BlockState::PostCommand);
+
+        let before_finalize = harness.backend.take_calls();
+        assert!(before_finalize.contains(&DispatchCall::Feed(raw_output.as_bytes().to_vec())));
+        assert!(!before_finalize
+            .iter()
+            .any(|call| matches!(call, DispatchCall::Finalize(_))));
+
+        let expected_height =
+            estimated_finished_block_height_for_text(&harness.config.borrow(), &plain_output, 100);
+        let wrong_height =
+            estimated_finished_block_height_for_text(&harness.config.borrow(), &plain_output, 120);
+        assert_ne!(expected_height, wrong_height);
+
+        harness.feed(ParserEvent::PromptStart);
+        assert_eq!(
+            harness.backend.calls(),
+            vec![
+                DispatchCall::Finalize(FinalizeRecord {
+                    prompt: "user@host $".to_string(),
+                    command: "echo hi".to_string(),
+                    output_with_ansi: raw_output,
+                    output_plain: plain_output.trim().to_string(),
+                    plain_output_bytes: plain_output.len(),
+                    cwd: Some(SHELL_REPORTED_CWD.to_string()),
+                    cols: 100,
+                    estimated_height: expected_height,
+                    exit_code: Some(0),
+                    has_duration: true,
+                    has_end_time: true,
+                    is_background: false,
+                }),
+                DispatchCall::SyncGeometry,
+                DispatchCall::MarkDirty,
+            ]
+        );
+        assert_eq!(harness.backend.finalized_ids.borrow().len(), 1);
+        assert_eq!(harness.backend.payload_counters.borrow()[0].get(), 1);
+        assert!(harness.live_output().is_empty());
+        assert_eq!(harness.bstate.get(), BlockState::CollectingPrompt);
+        assert_eq!(
+            harness.blocks_finished.borrow().as_slice(),
+            &[FinishedFanOut {
+                command: "echo hi".to_string(),
+                exit_code: Some(0),
+                output_sample: plain_output,
+                agent_execution: None,
+                blocks_finalized_before: 1,
+                state_at_fan_out: BlockState::PostCommand,
+            }]
+        );
+        assert_eq!(harness.commands_finished.borrow().len(), 1);
+    }
+
+    #[test]
+    fn reader_dispatch_second_cycle_keeps_its_unreported_status() {
+        let harness = ReaderHarness::new();
+        harness.backend.render_row(3, "$ ");
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            dispatch_bytes("$ "),
+            ParserEvent::PromptEnd,
+        ]);
+        harness.backend.render_row(3, "$ first");
+        harness.feed(dispatch_command_start(None));
+        harness.feed(dispatch_bytes("one\r\n"));
+        harness.feed(dispatch_command_end(Some(0)));
+        harness.feed(ParserEvent::PromptStart);
+
+        harness.backend.render_row(3, "$ ");
+        harness.feed_all([dispatch_bytes("$ "), ParserEvent::PromptEnd]);
+        harness.backend.render_row(3, "$ second");
+        harness.feed(dispatch_command_start(None));
+        harness.feed(dispatch_bytes("two\r\n"));
+        harness.feed(dispatch_command_end(None));
+        harness.feed(ParserEvent::PromptStart);
+
+        let finalized = harness.backend.finalized();
+        assert_eq!(finalized.len(), 2);
+        let DispatchCall::Finalize(second) = &finalized[1] else {
+            panic!("the second record must be a finalize: {finalized:?}");
+        };
+        assert_eq!(second.command, "second");
+        assert_eq!(second.output_plain, "two");
+        assert_eq!(second.exit_code, None);
+        assert!(second.has_duration);
+        assert_eq!(
+            harness
+                .commands_finished
+                .borrow()
+                .iter()
+                .map(|event| event.exit_code)
+                .collect::<Vec<_>>(),
+            vec![Some(0), None]
+        );
+    }
+
+    #[test]
+    fn reader_dispatch_capture_uses_live_columns_for_the_size_guard() {
+        assert!(command_capture_range_is_bounded(0, 2499, 100));
+        assert!(!command_capture_range_is_bounded(0, 2499, 120));
+        let harness = ReaderHarness::new();
+        harness.backend.set_row_count(2600);
+        harness.backend.set_columns(100, 120);
+        harness.backend.render_row(0, "");
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            dispatch_bytes("$ "),
+            ParserEvent::PromptEnd,
+        ]);
+        harness.backend.render_row(2499, "wrapped-tail");
+        harness.backend.take_calls();
+
+        harness.feed(dispatch_command_start(None));
+        assert!(!harness.backend.take_calls().iter().any(|call| matches!(
+            call,
+            DispatchCall::Query(DispatchQuery::CaptureTextRange { .. })
+        )));
+        assert_eq!(
+            harness.commands_started.borrow()[0].event.command,
+            TRUNCATED_COMMAND_PLACEHOLDER
+        );
+    }
+
+    #[test]
+    fn reader_dispatch_rebases_the_saved_anchor_before_capture() {
+        let harness = ReaderHarness::new();
+        harness.backend.render_row(3, "$ ");
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            dispatch_bytes("$ "),
+            ParserEvent::PromptEnd,
+        ]);
+        harness.backend.set_row_count(28);
+        harness.backend.render_row(7, "$ echo hi");
+        harness.backend.take_calls();
+
+        harness.feed(dispatch_command_start(None));
+        assert_eq!(
+            harness.backend.take_calls(),
+            vec![
+                DispatchCall::Query(DispatchQuery::CursorAndRows),
+                DispatchCall::Query(DispatchQuery::CommandCaptureAnchor {
+                    provisional: (2, 3),
+                    recorded_rows: 24,
+                }),
+                DispatchCall::Query(DispatchQuery::CaptureTextRange {
+                    start: (7, 2),
+                    end: (7, 9),
+                }),
+                DispatchCall::SyncGeometry,
+                DispatchCall::MarkDirty,
+            ]
+        );
+        assert_eq!(
+            harness.commands_started.borrow()[0].event.command,
+            "echo hi"
+        );
+        assert_eq!(harness.prompt_end.get(), (2, 7));
+        assert_eq!(harness.prompt_rows.get(), 28);
+    }
+
+    #[test]
+    fn reader_dispatch_unsettled_anchor_is_never_read_for_command_text() {
+        let harness = ReaderHarness::new();
+        harness.backend.settle_anchor_now.set(false);
+        harness.backend.render_row(3, "user@host $ ");
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            dispatch_bytes("user@host $ "),
+            ParserEvent::PromptEnd,
+        ]);
+        assert!(!harness.prompt_ready.get());
+        harness.backend.render_row(3, "user@host $ echo hi");
+        harness.backend.take_calls();
+        harness.feed(dispatch_command_start(None));
+
+        let calls = harness.backend.take_calls();
+        assert!(calls.contains(&DispatchCall::Query(DispatchQuery::CursorAndRows)));
+        assert!(calls.iter().any(|call| matches!(
+            call,
+            DispatchCall::Query(DispatchQuery::CommandCaptureAnchor { .. })
+        )));
+        assert!(!calls.iter().any(|call| matches!(
+            call,
+            DispatchCall::Query(DispatchQuery::CaptureTextRange { .. })
+        )));
+        assert_eq!(harness.commands_started.borrow()[0].event.command, "");
+    }
+
+    #[test]
+    fn reader_dispatch_empty_command_resets_without_finalize_or_geometry() {
+        let harness = ReaderHarness::new();
+        harness.config.borrow_mut().preserve_live_scrollback = true;
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            dispatch_bytes("user@host $ "),
+            ParserEvent::PromptEnd,
+            dispatch_command_start(None),
+            dispatch_command_end(Some(0)),
+        ]);
+        harness.backend.take_calls();
+
+        harness.feed(ParserEvent::PromptStart);
+        assert_eq!(
+            harness.backend.take_calls(),
+            vec![
+                DispatchCall::ResetActiveSurface {
+                    preserve_scrollback: true,
+                },
+                DispatchCall::ResetKittyPipeline,
+                DispatchCall::MarkDirty,
+            ]
+        );
+        assert!(harness.blocks_finished.borrow().is_empty());
+        assert_eq!(harness.bstate.get(), BlockState::CollectingPrompt);
+    }
+
+    #[test]
+    fn missing_command_with_visible_output_preserves_metadata_without_materializing() {
+        let harness = ReaderHarness::new();
+        harness.backend.set_metadata_only(true);
+        harness.ctx.block_finished_cbs.borrow_mut().clear();
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            dispatch_bytes("user@host $ "),
+            ParserEvent::PromptEnd,
+            dispatch_command_start(None),
+            dispatch_bytes("the command really ran\r\n"),
+            dispatch_command_end(Some(0)),
+            ParserEvent::PromptStart,
+        ]);
+
+        assert_eq!(harness.backend.payload_counters.borrow().len(), 1);
+        assert_eq!(harness.backend.payload_counters.borrow()[0].get(), 0);
+        let records = harness.backend.records();
+        let BackendRecords::Metadata(records) = records else {
+            panic!("metadata backend must not manufacture a BlockData");
+        };
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].cmd, UNAVAILABLE_COMMAND_PLACEHOLDER);
+        assert_eq!(records[0].exit_code, Some(0));
+        assert!(harness.live_output().is_empty());
+    }
+
+    #[test]
+    fn reader_dispatch_background_output_becomes_a_commandless_block() {
+        let harness = ReaderHarness::new();
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            dispatch_bytes("user@host $ "),
+            ParserEvent::PromptEnd,
+        ]);
+        harness.backend.take_calls();
+        harness.feed(dispatch_bytes("cron: backup done\r\n"));
+        assert_eq!(
+            harness.backend.take_calls(),
+            vec![
+                DispatchCall::MarkDirty,
+                DispatchCall::Feed(b"cron: backup done\r\n".to_vec()),
+            ]
+        );
+
+        harness.feed(ParserEvent::PromptStart);
+        let expected_height = estimated_finished_block_height_for_text(
+            &harness.config.borrow(),
+            "cron: backup done\n",
+            80,
+        );
+        assert_eq!(
+            harness.backend.calls(),
+            vec![
+                DispatchCall::Finalize(FinalizeRecord {
+                    prompt: String::new(),
+                    command: String::new(),
+                    output_with_ansi: "cron: backup done\r\n".to_string(),
+                    output_plain: "cron: backup done".to_string(),
+                    plain_output_bytes: 18,
+                    cwd: Some(HARNESS_CWD.to_string()),
+                    cols: 80,
+                    estimated_height: expected_height,
+                    exit_code: None,
+                    has_duration: false,
+                    has_end_time: true,
+                    is_background: true,
+                }),
+                DispatchCall::SyncGeometry,
+                DispatchCall::MarkDirty,
+            ]
+        );
+        assert!(harness.blocks_finished.borrow().is_empty());
+        assert!(harness.commands_started.borrow().is_empty());
+    }
+
+    #[test]
+    fn reader_dispatch_dirty_prompt_output_stays_inline() {
+        let harness = ReaderHarness::new();
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            dispatch_bytes("user@host $ "),
+            ParserEvent::PromptEnd,
+        ]);
+        harness.ctx.idle_input_dirty_rc.set(true);
+        harness.backend.take_calls();
+        harness.feed(dispatch_bytes("ec\r\n"));
+        assert_eq!(
+            harness.backend.take_calls(),
+            vec![
+                DispatchCall::MarkDirty,
+                DispatchCall::Feed(b"ec\r\n".to_vec()),
+            ]
+        );
+        assert!(harness.ctx.engine.borrow().background_output.is_empty());
+        harness.feed(ParserEvent::PromptStart);
+        assert!(harness.backend.finalized().is_empty());
+    }
+
+    #[test]
+    fn reader_dispatch_command_start_drops_buffered_background_output() {
+        let harness = ReaderHarness::new();
+        harness.backend.render_row(3, "user@host $ ");
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            dispatch_bytes("user@host $ "),
+            ParserEvent::PromptEnd,
+        ]);
+        harness.feed(dispatch_bytes("cron: backup done\r\n"));
+        assert!(!harness.ctx.engine.borrow().background_output.is_empty());
+        harness.backend.render_row(3, "user@host $ echo hi");
+        harness.feed(dispatch_command_start(None));
+        assert!(harness.ctx.engine.borrow().background_output.is_empty());
+        harness.feed(dispatch_bytes("hi\r\n"));
+        harness.feed(dispatch_command_end(Some(0)));
+        harness.feed(ParserEvent::PromptStart);
+        let finalized = harness.backend.finalized();
+        assert_eq!(finalized.len(), 1);
+        let DispatchCall::Finalize(block) = &finalized[0] else {
+            unreachable!();
+        };
+        assert_eq!(block.command, "echo hi");
+        assert_eq!(block.output_plain, "hi");
+        assert!(!block.is_background);
+    }
+
+    #[test]
+    fn reader_dispatch_alt_screen_preserves_both_entry_states() {
+        let harness = ReaderHarness::new();
+        harness.backend.render_row(3, "user@host $ ");
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            dispatch_bytes("user@host $ "),
+            ParserEvent::PromptEnd,
+        ]);
+        harness.backend.take_calls();
+
+        harness.feed(ParserEvent::AltScreenEnter(1049));
+        assert_eq!(
+            harness.backend.take_calls(),
+            vec![
+                DispatchCall::EnterChrome,
+                DispatchCall::EnterFullscreen,
+                DispatchCall::SyncGeometry,
+                DispatchCall::Feed(b"\x1b[?1049h".to_vec()),
+            ]
+        );
+        assert_eq!(harness.bstate.get(), BlockState::AltScreen);
+        harness.feed(ParserEvent::AltScreenLeave(1049));
+        assert_eq!(
+            harness.backend.take_calls(),
+            vec![
+                DispatchCall::ExitChrome,
+                DispatchCall::Feed(b"\x1b[?1049l".to_vec()),
+                DispatchCall::ExitFullscreen,
+                DispatchCall::SyncGeometry,
+                DispatchCall::Focus,
+            ]
+        );
+        assert_eq!(harness.bstate.get(), BlockState::AwaitingCommand);
+
+        harness.backend.render_row(3, "user@host $ git log");
+        harness.feed(dispatch_command_start(None));
+        harness.backend.take_calls();
+        harness.feed(ParserEvent::AltScreenEnter(1049));
+        assert_eq!(harness.bstate.get(), BlockState::AltScreen);
+        harness.feed(ParserEvent::AltScreenLeave(1049));
+        assert_eq!(harness.bstate.get(), BlockState::CollectingOutput);
+        harness.feed(dispatch_bytes("after-pager\r\n"));
+        assert_eq!(harness.live_output(), "after-pager\r\n");
+        harness.feed(dispatch_command_end(Some(0)));
+        harness.feed(ParserEvent::PromptStart);
+        let finalized = harness.backend.finalized();
+        assert_eq!(finalized.len(), 1);
+        let DispatchCall::Finalize(block) = &finalized[0] else {
+            unreachable!();
+        };
+        assert_eq!(block.command, "git log");
+        assert_eq!(block.output_plain, "after-pager");
+        assert_eq!(
+            harness.alt_screen.borrow().as_slice(),
+            &[
+                AltScreenTransition::Entered,
+                AltScreenTransition::Left,
+                AltScreenTransition::Entered,
+                AltScreenTransition::Left,
+            ]
+        );
+    }
+
+    #[test]
+    fn reader_dispatch_nested_command_marks_mint_only_the_outer_block() {
+        let harness = ReaderHarness::new();
+        harness.backend.render_row(3, "user@host $ ");
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            dispatch_bytes("user@host $ "),
+            ParserEvent::PromptEnd,
+        ]);
+        harness.backend.render_row(3, "user@host $ run-nested");
+        harness.feed(dispatch_command_start(None));
+        harness.feed(dispatch_command_start(Some("inner")));
+        assert_eq!(harness.bstate.get(), BlockState::CollectingOutput);
+        harness.feed(dispatch_command_end(Some(7)));
+        assert_eq!(harness.bstate.get(), BlockState::CollectingOutput);
+        assert!(harness.commands_finished.borrow().is_empty());
+        harness.feed(dispatch_command_end(Some(0)));
+        harness.feed(ParserEvent::PromptStart);
+
+        let finalized = harness.backend.finalized();
+        assert_eq!(finalized.len(), 1);
+        let DispatchCall::Finalize(block) = &finalized[0] else {
+            unreachable!();
+        };
+        assert_eq!(block.command, "run-nested");
+        assert_eq!(block.exit_code, Some(0));
+        assert_eq!(harness.commands_started.borrow().len(), 1);
+        assert_eq!(harness.commands_finished.borrow().len(), 1);
+        assert_eq!(harness.blocks_finished.borrow().len(), 1);
+    }
+
+    #[test]
+    fn reader_dispatch_kitty_reply_precedes_image_admission() {
+        let harness = ReaderHarness::new();
+        harness
+            .backend
+            .kitty_status
+            .set(crate::terminal::kitty_graphics::FeedStatus::Complete);
+        {
+            let probe_backend = harness.backend.clone();
+            let probe_pty = harness.pty.clone();
+            harness.backend.set_admit_probe(move || {
+                probe_backend.record(DispatchCall::PtyReply(
+                    probe_pty.drain_test_slave(PTY_REPLY_WAIT),
+                ));
+            });
+        }
+        harness.feed(ParserEvent::ApcSequence(b"Gi=31,a=T;AAAA".to_vec()));
+        assert_eq!(
+            harness.backend.take_calls(),
+            vec![
+                DispatchCall::KittyFeed(b"Gi=31,a=T;AAAA".to_vec()),
+                DispatchCall::PtyReply(b"\x1b_Gi=31;OK\x1b\\".to_vec()),
+                DispatchCall::KittyAdmitPending,
+            ]
+        );
+    }
+
+    #[test]
+    fn reader_dispatch_cpr_uses_the_dedicated_row_then_column_query() {
+        let harness = ReaderHarness::new();
+        harness.backend.render_row(3, "user@host $ ");
+        harness.feed(ParserEvent::KeyboardProtocolQuery(
+            KeyboardProtocolQuery::CursorPosition,
+        ));
+        assert_eq!(harness.pty.drain_test_slave(PTY_REPLY_WAIT), b"\x1b[4;13R");
+        assert_eq!(
+            harness.backend.take_calls(),
+            vec![DispatchCall::Query(DispatchQuery::CursorPositionReport)]
+        );
+    }
+
+    #[test]
+    fn reader_dispatch_clipboard_query_discloses_nothing() {
+        let harness = ReaderHarness::new();
+        harness.config.borrow_mut().allow_remote_clipboard_write = true;
+        harness.feed(ParserEvent::ClipboardQuery);
+        assert_eq!(
+            harness.pty.drain_test_slave(PTY_REPLY_WAIT),
+            b"\x1b]52;c;\x1b\\"
+        );
+        assert!(harness.backend.take_calls().is_empty());
+    }
+
+    #[test]
+    fn reader_dispatch_color_queries_track_set_and_reset() {
+        let harness = ReaderHarness::new();
+        harness.config.borrow_mut().cursor = RGBA::new(0.0, 0.0, 1.0, 1.0);
+        harness.feed(ParserEvent::ColorQuery(ColorKind::Cursor));
+        assert_eq!(
+            harness.pty.drain_test_slave(PTY_REPLY_WAIT),
+            b"\x1b]12;rgb:0000/0000/ffff\x1b\\"
+        );
+
+        harness.config.borrow_mut().background = RGBA::new(1.0, 0.0, 0.0, 1.0);
+        harness.feed(ParserEvent::ColorQuery(ColorKind::Background));
+        assert_eq!(
+            harness.pty.drain_test_slave(PTY_REPLY_WAIT),
+            b"\x1b]11;rgb:ffff/0000/0000\x1b\\"
+        );
+        harness.feed(ParserEvent::ColorSet {
+            kind: ColorKind::Background,
+            spec: "rgb:0000/ffff/0000".to_string(),
+        });
+        harness.feed(ParserEvent::ColorQuery(ColorKind::Background));
+        assert_eq!(
+            harness.pty.drain_test_slave(PTY_REPLY_WAIT),
+            b"\x1b]11;rgb:0000/ffff/0000\x1b\\"
+        );
+        harness.feed(ParserEvent::ColorReset(ColorKind::Background));
+        harness.feed(ParserEvent::ColorQuery(ColorKind::Background));
+        assert_eq!(
+            harness.pty.drain_test_slave(PTY_REPLY_WAIT),
+            b"\x1b]11;rgb:ffff/0000/0000\x1b\\"
+        );
+        assert!(harness.backend.take_calls().is_empty());
+    }
+
+    #[test]
+    fn reader_dispatch_clipboard_write_is_gated_and_notification_keeps_title() {
+        let harness = ReaderHarness::new();
+        LAST_NOTIFICATION_AT.with(|last| last.set(None));
+        harness.feed(ParserEvent::ClipboardSet("secret".to_string()));
+        assert!(harness.backend.take_calls().is_empty());
+
+        harness.config.borrow_mut().allow_remote_clipboard_write = true;
+        harness.feed(ParserEvent::ClipboardSet("secret".to_string()));
+        harness.feed(ParserEvent::Notification {
+            title: Some("build".to_string()),
+            body: "finished".to_string(),
+        });
+        assert_eq!(
+            harness.backend.take_calls(),
+            vec![
+                DispatchCall::SetSystemClipboard("secret".to_string()),
+                DispatchCall::DesktopNotify {
+                    title: Some("build".to_string()),
+                    body: "finished".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn verified_submission_rebases_against_the_surface_row_count() {
+        let harness = ReaderHarness::new();
+        harness.backend.set_row_count(20);
+        harness.backend.render_row(10, "$ 123");
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            dispatch_bytes("$ 123"),
+            ParserEvent::PromptEnd,
+        ]);
+        assert_eq!(harness.prompt_end.get(), (5, 10));
+        assert_eq!(harness.prompt_rows.get(), 20);
+        harness.surface.rows.set(24);
+        // Correct rebase is row 14; row 6 is where an inverted delta lands.
+        harness.surface.cursor.set((5, 6));
+        harness.surface.suffix_is_empty.set(Some(true));
+        harness.surface.reads.borrow_mut().clear();
+
+        assert_eq!(
+            harness.ctx.verified_submission.begin("echo hi", None),
+            Err("the shell prompt visibly contains input".to_string())
+        );
+        assert_eq!(
+            harness.surface.reads(),
+            vec![
+                SurfaceRead::PromptAnchor {
+                    provisional: (5, 10),
+                    recorded_rows: 20,
+                },
+                SurfaceRead::CursorPosition,
+                SurfaceRead::SuffixIsEmpty,
+            ]
+        );
+    }
+
+    #[test]
+    fn verified_submission_refuses_a_cursor_past_the_anchor() {
+        let harness = ReaderHarness::new();
+        let anchor = harness.arm_verified_prompt();
+        harness.surface.cursor.set((anchor.0 + 1, anchor.1));
+        assert_eq!(
+            harness.ctx.verified_submission.begin("echo hi", None),
+            Err("the shell prompt visibly contains input".to_string())
+        );
+        assert!(harness
+            .surface
+            .reads()
+            .contains(&SurfaceRead::CursorPosition));
+    }
+
+    #[test]
+    fn verified_submission_refuses_every_unproven_suffix() {
+        for suffix in [None, Some(false)] {
+            let harness = ReaderHarness::new();
+            harness.arm_verified_prompt();
+            harness.surface.suffix_is_empty.set(suffix);
+            assert_eq!(
+                harness.ctx.verified_submission.begin("echo hi", None),
+                Err("the shell prompt visibly contains input".to_string()),
+                "suffix answer {suffix:?} must fail closed"
+            );
+            assert!(harness
+                .surface
+                .reads()
+                .contains(&SurfaceRead::SuffixIsEmpty));
+        }
+    }
+
+    #[test]
+    fn verified_submission_preconditions_fail_before_surface_reads() {
+        let cases: [HarnessPreconditionMutation; 4] = [
+            ("state", |harness| {
+                harness.bstate.set(BlockState::CollectingPrompt)
+            }),
+            ("anchor readiness", |harness| {
+                harness.prompt_ready.set(false)
+            }),
+            ("dirty input", |harness| {
+                harness.ctx.idle_input_dirty_rc.set(true)
+            }),
+            ("prior PTY write", |harness| {
+                harness.ctx.pty_synced_rc.set(true)
+            }),
+        ];
+        for (name, mutate) in cases {
+            let harness = ReaderHarness::new();
+            harness.arm_verified_prompt();
+            mutate(&harness);
+            harness.surface.reads.borrow_mut().clear();
+            assert_eq!(
+                harness.ctx.verified_submission.begin("echo hi", None),
+                Err("the shell prompt is no longer verified empty".to_string()),
+                "{name} must refuse"
+            );
+            assert!(harness.surface.reads().is_empty());
+        }
+
+        let foreign = ReaderHarness::with_foreground(false);
+        foreign.arm_verified_prompt();
+        foreign.surface.reads.borrow_mut().clear();
+        assert_eq!(
+            foreign.ctx.verified_submission.begin("echo hi", None),
+            Err("the shell prompt is no longer verified empty".to_string())
+        );
+        assert!(foreign.surface.reads().is_empty());
+    }
+
+    #[test]
+    fn verified_agent_submission_requires_token_aware_integration() {
+        let harness = ReaderHarness::new();
+        harness.arm_verified_prompt();
+        let execution = AgentExecutionRef {
+            epoch: AgentSession::new(1, 2, 1).epoch(),
+            generation: 9,
+        };
+        assert_eq!(
+            harness
+                .ctx
+                .verified_submission
+                .begin("echo hi", Some(execution)),
+            Err(
+                "Shell Agent execution requires the bundled token-aware bash/zsh integration"
+                    .to_string()
+            )
+        );
+        assert!(harness.surface.reads().is_empty());
+        assert!(harness.agent_lost.borrow().is_empty());
+    }
 
     #[test]
     fn alt_screen_boundaries_are_typed_content_free_and_not_coalesced() {
@@ -8631,15 +13398,33 @@ mod tests {
         assert!(background_output_has_visible_text(
             b"\x1b[36mworker finished\x1b[0m\r\n"
         ));
+        assert!(background_output_has_visible_text(b"visible\rhidden"));
+        assert!(!background_output_has_visible_text(b"visible\r\x1b[2K"));
+        assert!(!background_output_has_visible_text(
+            b"\x1b]8;;https://example.invalid\x1b\\\x1b]8;;\x1b\\"
+        ));
+    }
+
+    #[test]
+    fn invalid_utf8_visibility_does_not_materialize_the_lazy_payload() {
+        let invalid = vec![0xff; 4 * 1024 * 1024];
+        let payload = super::LazyBlockRenderPayload::new(
+            "$ ".to_string(),
+            super::CapturedFinalizeOutput::Background(invalid.iter().copied().collect()),
+        );
+        assert!(background_output_has_visible_text(&invalid));
+        assert_eq!(
+            payload.materialization_count(),
+            0,
+            "visibility must inspect raw bytes without constructing render strings"
+        );
     }
 
     #[test]
     fn taking_background_output_drains_the_pending_buffer() {
         let mut pending = VecDeque::from(b"async line\r\n".to_vec());
-        assert_eq!(
-            take_background_output(&mut pending).as_deref(),
-            Some("async line\r\n")
-        );
+        let mut taken = take_background_output(&mut pending).expect("visible output");
+        assert_eq!(taken.make_contiguous(), b"async line\r\n");
         assert!(pending.is_empty());
         assert!(take_background_output(&mut pending).is_none());
     }
@@ -9074,6 +13859,24 @@ mod tests {
         assert_eq!(step_marked_indices(&marked, Some(2), -1), Some(9));
         // Nothing marked -> nowhere to go.
         assert_eq!(step_marked_indices(&[], Some(3), 1), None);
+    }
+
+    #[test]
+    fn marked_record_stepping_uses_document_order_not_numeric_identity() {
+        let records = [900, 3, 450, 17];
+        let marked = [450, 900];
+        assert_eq!(
+            step_marked_record_ids(&records, &marked, Some(900), 1),
+            Some(450)
+        );
+        assert_eq!(
+            step_marked_record_ids(&records, &marked, Some(450), -1),
+            Some(900)
+        );
+        assert_eq!(
+            step_marked_record_ids(&records, &marked, Some(3), 1),
+            Some(450)
+        );
     }
 
     #[test]

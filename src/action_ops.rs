@@ -56,7 +56,7 @@ impl AppModel {
             .get(self.active)
             .and_then(|tab| tab.panes.get(tab.active_pane));
         match pane {
-            Some(pane) if matches!(pane.mode, TerminalMode::Block) => {
+            Some(pane) if pane.mode.uses_term_view() => {
                 pane.terminal.emit(input);
             }
             Some(_) => {
@@ -240,6 +240,7 @@ impl AppModel {
                         terminal_mode: match config.terminal_mode {
                             TerminalMode::Block => 0,
                             TerminalMode::Vte => 1,
+                            TerminalMode::Unified => 2,
                         },
                         block_compact: config.block_compact,
                         command_history: config.command_history_enabled,

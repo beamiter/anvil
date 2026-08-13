@@ -10,7 +10,7 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use crate::cli::ReportFormat;
-use crate::config::{choose_shell_argv, config_file_path, load_config, TerminalMode};
+use crate::config::{choose_shell_argv, config_file_path, load_config};
 use crate::config_store::{self, ConfigLockStatus};
 
 const OPTIONAL_RUNTIME_TOOLS: [(&str, &str); 4] = [
@@ -481,10 +481,7 @@ fn collect() -> DiagnosticReport {
     report.push(
         "terminal mode",
         CheckStatus::Ok,
-        match config.terminal_mode {
-            TerminalMode::Block => "block",
-            TerminalMode::Vte => "vte",
-        },
+        config.terminal_mode.as_str(),
     );
 
     let (ready_snapshots, active_snapshots) = crate::session::session_snapshot_counts();

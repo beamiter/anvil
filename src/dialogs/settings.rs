@@ -350,7 +350,11 @@ impl Component for SettingsModel {
                     adw::ComboRow {
                         set_title: "Terminal Backend",
                         set_subtitle: "Applies to new and restored local panes",
-                        set_model: Some(&gtk::StringList::new(&["Block", "VTE compatibility"])),
+                        set_model: Some(&gtk::StringList::new(&[
+                            "Block",
+                            "VTE compatibility",
+                            "Unified (experimental)",
+                        ])),
                         set_selected: model.values.terminal_mode,
                         set_sensitive: !model.values.safe_mode,
                         connect_selected_notify[sender] => move |row| {

@@ -1202,6 +1202,11 @@ impl TermView {
 
     /// Save block history without risking truncation of the last good snapshot.
     pub fn save_history(&self) -> io::Result<()> {
+        // Metadata-only backends do not own the persisted Block-card format;
+        // an empty save would destroy a valid snapshot from Block mode.
+        if !self.render_backend.persists_block_history() {
+            return Ok(());
+        }
         let configured = {
             let config = self.config.borrow();
             configured_history_target(
@@ -1217,7 +1222,11 @@ impl TermView {
             return Ok(());
         }
 
-        let blocks = self.block_data.borrow().iter().cloned().collect::<Vec<_>>();
+        let records = self.render_backend.records();
+        let Some(block_data) = records.block_data() else {
+            return Ok(());
+        };
+        let blocks = block_data.iter().cloned().collect::<Vec<_>>();
         execute_history_saves(
             &self.history_baselines,
             &self.history_explicit_replace_pending,
@@ -1228,6 +1237,10 @@ impl TermView {
 
     /// Load only the configured number of most-recent history records.
     pub fn load_history(&self) -> io::Result<()> {
+        // Backends which do not own Block persistence cannot restore cards.
+        if !self.render_backend.persists_block_history() {
+            return Ok(());
+        }
         let (target, load_limit) = {
             let config = self.config.borrow();
             (

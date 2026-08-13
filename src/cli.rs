@@ -9,6 +9,7 @@ use std::path::PathBuf;
 pub(crate) enum Mode {
     Block,
     Vte,
+    Unified,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,8 +68,9 @@ fn parse_mode(value: &str) -> Result<Mode, String> {
     match value.to_ascii_lowercase().as_str() {
         "block" => Ok(Mode::Block),
         "vte" => Ok(Mode::Vte),
+        "unified" => Ok(Mode::Unified),
         _ => Err(format!(
-            "invalid terminal mode '{value}' (use block or vte)"
+            "invalid terminal mode '{value}' (use block, vte or unified)"
         )),
     }
 }
@@ -168,7 +170,7 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<ParsedAr
                 let mode = args
                     .get(index)
                     .and_then(|value| value.to_str())
-                    .ok_or_else(|| "--mode requires 'block' or 'vte'".to_string())?;
+                    .ok_or_else(|| "--mode requires 'block', 'vte' or 'unified'".to_string())?;
                 launch.mode = Some(parse_mode(mode)?);
             }
             "-e" | "--execute" | "--" => {
@@ -306,7 +308,8 @@ Global options:
 Launch options:
   -d, --working-directory DIR  Start in DIR
   -e, --execute COMMAND ...    Run a command instead of the configured shell
-      --mode block|vte         Override the terminal backend for this window
+      --mode block|vte|unified
+                               Override the terminal backend for this window
       --no-restore             Start a fresh workspace
       --safe-mode              Use isolated VTE defaults without restore or persistence
 
@@ -367,6 +370,14 @@ mod tests {
                 mode: Some(Mode::Block),
             })
         );
+    }
+
+    #[test]
+    fn parses_unified_backend_override() {
+        let Command::Run(options) = parse_command(&["--mode", "unified"]).unwrap() else {
+            panic!("expected run")
+        };
+        assert_eq!(options.mode, Some(Mode::Unified));
     }
 
     #[test]

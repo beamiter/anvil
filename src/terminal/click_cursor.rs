@@ -32,9 +32,10 @@ use crate::pty::OwnedPty;
 pub(crate) struct ClickCursorCtx {
     pub(crate) enabled: bool,
     pub(crate) pty: Rc<OwnedPty>,
-    /// VTE cursor position captured at OSC 133 `B`, i.e. where the user's
-    /// command starts. It bounds how far left a click may walk.
-    pub(crate) prompt_end_pos: Rc<Cell<(i64, i64)>>,
+    /// Current OSC 133 `B` prompt anchor under the pane's render-surface
+    /// policy. It bounds how far left a click may walk without bypassing the
+    /// same rebase decision used by reviewed submission and prompt status.
+    pub(crate) prompt_anchor: Rc<dyn Fn() -> (i64, i64)>,
     pub(crate) bstate: Rc<Cell<BlockState>>,
     pub(crate) mouse_mode: Rc<Cell<MouseReportingMode>>,
     pub(crate) fullscreen: Rc<Cell<bool>>,
@@ -336,7 +337,7 @@ fn move_for_click(vte: &Terminal, ctx: &ClickCursorCtx, click: core_click::Cell)
     };
 
     // How far left the input reaches: back to where the prompt handed over.
-    let (start_col, start_row) = ctx.prompt_end_pos.get();
+    let (start_col, start_row) = (ctx.prompt_anchor)();
     let max_left = chars_between(vte, core_click::Cell::new(start_row, start_col), cursor);
 
     // How far right it reaches: to the end of what the buffer really holds —

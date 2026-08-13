@@ -53,6 +53,14 @@ pub struct OwnedPty {
     /// environment, and the bundled integration closes the descriptor before
     /// any user command can inherit it.
     shell_integration_token: Option<String>,
+    /// Slave end of the bare PTY pair used by dispatch tests. Holding it open
+    /// keeps protocol replies writable and gives tests a drain point.
+    #[cfg(test)]
+    test_slave: Option<OwnedFd>,
+    /// Recorded foreground answer for a bare test PTY, which has no session to
+    /// answer the real `tcgetpgrp` probe.
+    #[cfg(test)]
+    test_foreground: Option<bool>,
 }
 
 #[cfg(target_os = "linux")]
@@ -862,6 +870,10 @@ impl OwnedPty {
                     input_guard: std::sync::Mutex::new(pty_input::InputGuard::new()),
                     shell_bracketed_paste: Arc::new(AtomicBool::new(false)),
                     shell_integration_token,
+                    #[cfg(test)]
+                    test_slave: None,
+                    #[cfg(test)]
+                    test_foreground: None,
                 })
             }
             Err(e) => Err(io::Error::other(e)),
@@ -889,6 +901,10 @@ impl OwnedPty {
     /// Whether the PTY child/shell owns the foreground process group. `None`
     /// means the comparison is unavailable (notably Flatpak host bridging).
     pub(crate) fn shell_is_foreground(&self) -> Option<bool> {
+        #[cfg(test)]
+        if self.test_slave.is_some() {
+            return self.test_foreground;
+        }
         if !self.foreground_identity_available {
             return None;
         }
@@ -899,6 +915,18 @@ impl OwnedPty {
         let foreground = unsafe { libc::tcgetpgrp(fd) };
         let shell_group = unsafe { libc::getpgid(self.child_lifecycle.pid()) };
         (foreground > 0 && shell_group > 0).then_some(foreground == shell_group)
+    }
+
+    /// Keep the outgoing paste boundary in sync with parser-observed resets.
+    /// The reader thread normally owns this bit; RIS is a semantic reset that
+    /// must clear it before any later paste is encoded.
+    pub(crate) fn set_shell_bracketed_paste(&self, enabled: bool) {
+        self.shell_bracketed_paste.store(enabled, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shell_bracketed_paste(&self) -> bool {
+        self.shell_bracketed_paste.load(Ordering::Relaxed)
     }
 
     /// Filter one outgoing chunk and queue it.
@@ -1317,6 +1345,108 @@ fn signal_eventfd(eventfd: RawFd) -> io::Result<()> {
             return Ok(());
         }
         return Err(error);
+    }
+}
+
+/// Bare, display-independent PTY plumbing for reader-dispatch tests.
+#[cfg(test)]
+impl OwnedPty {
+    pub(crate) fn from_openpty(foreground: Option<bool>) -> io::Result<Self> {
+        let OpenptyResult { master, slave } = openpty(None, None).map_err(io::Error::other)?;
+        prepare_test_slave(&slave);
+        // SAFETY: the child uses only async-signal-safe syscalls after fork.
+        let child = match unsafe { unistd::fork() }.map_err(io::Error::other)? {
+            ForkResult::Child => unsafe {
+                libc::setpgid(0, 0);
+                libc::_exit(0);
+            },
+            ForkResult::Parent { child } => child,
+        };
+        let child_lifecycle = match ChildLifecycle::new(child.as_raw(), ReapOwner::Ours) {
+            Ok(lifecycle) => lifecycle,
+            Err(error) => {
+                kill_and_reap_unreferenced_child(child);
+                return Err(error);
+            }
+        };
+        let writer_fd = match master.try_clone() {
+            Ok(fd) => fd,
+            Err(error) => {
+                child_lifecycle.force_kill_and_reap();
+                return Err(error);
+            }
+        };
+        let input_tx = match spawn_fd_writer(writer_fd, "anvil-test-pty-writer") {
+            Ok(tx) => tx,
+            Err(error) => {
+                child_lifecycle.force_kill_and_reap();
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            master: Arc::new(Mutex::new(Some(master))),
+            input_tx,
+            child_lifecycle,
+            foreground_identity_available: true,
+            reader_cancelled: Arc::new(AtomicBool::new(false)),
+            reader_cancel_eventfd: create_reader_cancel_eventfd(),
+            input_guard: Mutex::new(pty_input::InputGuard::new()),
+            shell_bracketed_paste: Arc::new(AtomicBool::new(false)),
+            shell_integration_token: None,
+            test_slave: Some(slave),
+            test_foreground: foreground,
+        })
+    }
+
+    pub(crate) fn drain_test_slave(&self, wait: std::time::Duration) -> Vec<u8> {
+        let Some(slave) = self.test_slave.as_ref() else {
+            return Vec::new();
+        };
+        let fd = slave.as_raw_fd();
+        let deadline = std::time::Instant::now() + wait;
+        let mut drained = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            // SAFETY: `buffer` is writable and `fd` is owned by this object.
+            let read = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+            if read > 0 {
+                drained.extend_from_slice(&buffer[..read as usize]);
+                continue;
+            }
+            if read == 0 {
+                break;
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if error.kind() == io::ErrorKind::WouldBlock
+                && drained.is_empty()
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
+            break;
+        }
+        drained
+    }
+}
+
+#[cfg(test)]
+fn prepare_test_slave(slave: &OwnedFd) {
+    let fd = slave.as_raw_fd();
+    // SAFETY: `fd` and the local termios value are valid for these syscalls.
+    unsafe {
+        let mut attrs: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut attrs) == 0 {
+            libc::cfmakeraw(&mut attrs);
+            let _ = libc::tcsetattr(fd, libc::TCSANOW, &attrs);
+        }
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            let _ = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
     }
 }
 

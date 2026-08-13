@@ -14,7 +14,9 @@ use std::rc::Rc;
 use std::time::Duration;
 use vte4::prelude::TerminalExt;
 
-use crate::block_view::TermView;
+use crate::block_view::{
+    FindNavigationResult, FindProgress, FindSearchResult, RecordNavigationResult, TermView,
+};
 use crate::search::SearchStatus;
 
 use super::cross_block_search;
@@ -39,8 +41,27 @@ fn export_notice(result: std::io::Result<std::path::PathBuf>) -> String {
     }
 }
 
+fn record_navigation_notice(result: RecordNavigationResult) -> Option<&'static str> {
+    match result {
+        RecordNavigationResult::LocationUnavailable => Some(
+            "Unified mode can identify matching records, but exact record locations aren't available yet.",
+        ),
+        RecordNavigationResult::Navigated | RecordNavigationResult::NoMatchingRecord => None,
+    }
+}
+
+fn report_record_navigation(
+    sender: &ComponentSender<BlockTerminal>,
+    result: RecordNavigationResult,
+) {
+    if let Some(message) = record_navigation_notice(result) {
+        let _ = sender.output(VteOutput::Notice(message.to_string()));
+    }
+}
+
 pub struct BlockTerminal {
     view: Option<Rc<TermView>>,
+    mode: crate::config::TerminalMode,
     /// Block PTY construction runs synchronously inside Relm4 component init.
     /// Split preparation can inspect this after `launch()` and avoid committing
     /// an error page into the pane tree.
@@ -64,36 +85,43 @@ fn validate_block_search_pattern(pattern: &str) -> Result<(), String> {
     .map_err(crate::search::invalid_regex_message)
 }
 
-fn block_result_status(current: usize, total: usize, use_regex: bool) -> SearchStatus {
-    if use_regex {
+fn progress_status(progress: FindProgress, use_regex: bool) -> SearchStatus {
+    if use_regex || progress.capped || progress.scan_limited {
         // Match enumeration uses Rust regex while painting/cursor movement is
         // native PCRE2. Even when both compile their semantics can differ, so
         // never present a regex total as exact.
-        SearchStatus::partial_results(current, total)
+        SearchStatus::partial_results(progress.current, progress.total)
     } else {
-        SearchStatus::results(current, total)
+        SearchStatus::results(progress.current, progress.total)
+    }
+}
+
+fn block_result_status(result: FindSearchResult, use_regex: bool) -> SearchStatus {
+    match result {
+        FindSearchResult::NoMatches => SearchStatus::results(0, 0),
+        FindSearchResult::InvalidRegex => SearchStatus::Error("Invalid regex".to_string()),
+        FindSearchResult::ScanLimit => SearchStatus::partial_results(0, 0),
+        FindSearchResult::Matches(progress) => progress_status(progress, use_regex),
     }
 }
 
 fn block_navigation_status(
     previous: &SearchStatus,
-    result: Option<(usize, usize)>,
+    result: FindNavigationResult,
+    use_regex: bool,
 ) -> SearchStatus {
-    match (previous, result) {
-        (
-            SearchStatus::Results {
-                truncated: true, ..
-            },
-            Some((current, total)),
-        ) => SearchStatus::partial_results(current, total),
-        (SearchStatus::Results { .. }, Some((current, total))) => {
-            SearchStatus::results(current, total)
-        }
-        _ => previous.clone(),
+    match result {
+        FindNavigationResult::Progress(progress) => progress_status(progress, use_regex),
+        FindNavigationResult::Invalidated => SearchStatus::results(0, 0),
+        FindNavigationResult::Inactive => previous.clone(),
     }
 }
 
 impl BlockTerminal {
+    pub(crate) fn mode(&self) -> crate::config::TerminalMode {
+        self.mode
+    }
+
     pub(crate) fn term_view(&self) -> Option<Rc<TermView>> {
         self.view.clone()
     }
@@ -143,8 +171,13 @@ impl BlockTerminal {
         let Some(view) = self.view.as_ref() else {
             return false;
         };
-        view.insert_inline_notice(widget);
-        true
+        view.insert_inline_notice(widget)
+    }
+
+    pub(crate) fn supports_inline_notices(&self) -> bool {
+        self.view
+            .as_ref()
+            .is_some_and(|view| view.supports_inline_notices())
     }
 
     pub(crate) fn remove_inline_notice(&self, widget: &gtk::Widget) {
@@ -299,20 +332,24 @@ fn connect_view_outputs(
             let _ = sender.output(VteOutput::AgentExecutionStartFailed { execution });
         }
     });
-    view.connect_block_finished({
-        let sender = sender.clone();
-        move |command, exit_code, output_sample, agent_execution, duration_ms| {
-            let _ = sender.output(command_finished_output(exit_code));
-            let _ = sender.output(VteOutput::BlockFinished {
-                command,
-                // The agent transcript this feeds still speaks one i32.
-                exit_code: crate::block_view::exit_code_for_i32_api(exit_code),
-                output_sample,
-                agent_execution,
-                duration_ms,
-            });
-        }
-    });
+    let supports_correction_output = view.supports_inline_notices();
+    view.connect_block_finished_with_output_if(
+        move |agent_execution| supports_correction_output || agent_execution.is_some(),
+        {
+            let sender = sender.clone();
+            move |command, exit_code, output_sample, agent_execution, duration_ms| {
+                let _ = sender.output(command_finished_output(exit_code));
+                let _ = sender.output(VteOutput::BlockFinished {
+                    command,
+                    // The agent transcript this feeds still speaks one i32.
+                    exit_code: crate::block_view::exit_code_for_i32_api(exit_code),
+                    output_sample: output_sample.unwrap_or_default(),
+                    agent_execution,
+                    duration_ms,
+                });
+            }
+        },
+    );
     view.connect_ask_ai_about_block({
         let sender = sender.clone();
         move |context| {
@@ -345,6 +382,7 @@ impl Component for BlockTerminal {
             let config = config.borrow();
             TermView::new(
                 &config,
+                &init.mode,
                 init.shell_argv.as_ref().as_slice(),
                 init.working_directory.as_deref(),
                 init.working_directory_external,
@@ -388,6 +426,7 @@ impl Component for BlockTerminal {
 
         let model = BlockTerminal {
             view,
+            mode: init.mode,
             launch_error,
             terminal_done,
             config,
@@ -446,8 +485,12 @@ impl Component for BlockTerminal {
             VteInput::ApplyTheme => view.apply_theme(),
             VteInput::SyncConfig => view.reload_config(&self.config.borrow()),
             VteInput::Kill => self.terminate_once(),
-            VteInput::FilterFailedBlocks => view.apply_failed_filter(),
-            VteInput::FilterSlowBlocks => view.apply_slow_filter(),
+            VteInput::FilterFailedBlocks => {
+                report_record_navigation(&sender, view.apply_failed_filter())
+            }
+            VteInput::FilterSlowBlocks => {
+                report_record_navigation(&sender, view.apply_slow_filter())
+            }
             VteInput::FilterPinnedBlocks => view.apply_pinned_filter(),
             VteInput::ClearBlockFilter => view.clear_block_filter(),
             VteInput::SelectAllBlocks => view.select_all_blocks(),
@@ -458,6 +501,11 @@ impl Component for BlockTerminal {
                     let _ = sender.output(VteOutput::Notice(format!(
                         "Cleared {cleared} block{plural} — \"Undo clear blocks\" restores them."
                     )));
+                } else if view.is_unified() {
+                    let _ = sender.output(VteOutput::Notice(
+                        "Unified mode keeps no blocks to clear — use the shell's own clear."
+                            .to_string(),
+                    ));
                 }
             }
             VteInput::UndoClearBlocks => {
@@ -473,8 +521,10 @@ impl Component for BlockTerminal {
             VteInput::ReinputSelectedCommands => view.reinput_selected_commands(),
             VteInput::JumpToPrevPinned => view.jump_to_pinned(-1),
             VteInput::JumpToNextPinned => view.jump_to_pinned(1),
-            VteInput::JumpToPrevFailed => view.jump_to_failed(-1),
-            VteInput::JumpToNextFailed => view.jump_to_failed(1),
+            VteInput::JumpToPrevFailed => {
+                report_record_navigation(&sender, view.jump_to_failed(-1))
+            }
+            VteInput::JumpToNextFailed => report_record_navigation(&sender, view.jump_to_failed(1)),
             VteInput::ExportSessionMarkdown => {
                 let message = export_notice(
                     view.export_session_to_file(crate::block_view::SessionExportFormat::Markdown),
@@ -490,10 +540,7 @@ impl Component for BlockTerminal {
             VteInput::SearchSet(query, use_regex) => {
                 let pattern = super::vte::search_pattern(&query, use_regex);
                 self.search_status = match validate_block_search_pattern(&pattern) {
-                    Ok(_) => {
-                        let (current, total) = view.find_in_blocks(&query, use_regex);
-                        block_result_status(current, total, use_regex)
-                    }
+                    Ok(_) => block_result_status(view.find_in_blocks(&query, use_regex), use_regex),
                     Err(error) => {
                         view.clear_find();
                         SearchStatus::Error(error)
@@ -502,21 +549,43 @@ impl Component for BlockTerminal {
                 let _ = sender.output(VteOutput::SearchStatus(self.search_status.clone()));
             }
             VteInput::SearchNext => {
-                let result = matches!(
+                let active = matches!(
                     self.search_status,
                     SearchStatus::Results { total, .. } if total > 0
-                )
-                .then(|| view.find_next());
-                self.search_status = block_navigation_status(&self.search_status, result);
+                );
+                let partial = matches!(
+                    self.search_status,
+                    SearchStatus::Results {
+                        truncated: true,
+                        ..
+                    }
+                );
+                let result = if active {
+                    view.find_next()
+                } else {
+                    FindNavigationResult::Inactive
+                };
+                self.search_status = block_navigation_status(&self.search_status, result, partial);
                 let _ = sender.output(VteOutput::SearchStatus(self.search_status.clone()));
             }
             VteInput::SearchPrev => {
-                let result = matches!(
+                let active = matches!(
                     self.search_status,
                     SearchStatus::Results { total, .. } if total > 0
-                )
-                .then(|| view.find_prev());
-                self.search_status = block_navigation_status(&self.search_status, result);
+                );
+                let partial = matches!(
+                    self.search_status,
+                    SearchStatus::Results {
+                        truncated: true,
+                        ..
+                    }
+                );
+                let result = if active {
+                    view.find_prev()
+                } else {
+                    FindNavigationResult::Inactive
+                };
+                self.search_status = block_navigation_status(&self.search_status, result, partial);
                 let _ = sender.output(VteOutput::SearchStatus(self.search_status.clone()));
             }
             VteInput::SearchClear => {
@@ -544,7 +613,8 @@ impl Component for BlockTerminal {
 mod tests {
     use super::{
         block_navigation_status, block_result_status, command_finished_output,
-        validate_block_search_pattern, VteOutput,
+        record_navigation_notice, validate_block_search_pattern, FindNavigationResult,
+        FindProgress, FindSearchResult, RecordNavigationResult, VteOutput,
     };
     use crate::search::SearchStatus;
 
@@ -573,22 +643,57 @@ mod tests {
     #[test]
     fn invalid_search_stays_an_error_when_navigation_is_requested() {
         let error = SearchStatus::Error("Invalid regex: missing closing parenthesis".into());
-        assert_eq!(block_navigation_status(&error, Some((0, 0))), error);
+        assert_eq!(
+            block_navigation_status(&error, FindNavigationResult::Inactive, false),
+            error
+        );
+    }
+
+    #[test]
+    fn unavailable_unified_record_location_has_explicit_feedback() {
+        assert!(
+            record_navigation_notice(RecordNavigationResult::LocationUnavailable)
+                .is_some_and(|message| message.contains("exact record locations"))
+        );
+        assert_eq!(
+            record_navigation_notice(RecordNavigationResult::Navigated),
+            None
+        );
+        assert_eq!(
+            record_navigation_notice(RecordNavigationResult::NoMatchingRecord),
+            None
+        );
     }
 
     #[test]
     fn block_regex_counts_remain_explicitly_approximate_while_literals_are_exact() {
         assert_eq!(
-            block_result_status(1, 3, true),
+            block_result_status(
+                FindSearchResult::Matches(FindProgress {
+                    current: 1,
+                    total: 3,
+                    capped: false,
+                    scan_limited: false,
+                }),
+                true,
+            ),
             SearchStatus::partial_results(1, 3)
         );
         assert_eq!(
-            block_result_status(1, 3, false),
+            block_result_status(
+                FindSearchResult::Matches(FindProgress {
+                    current: 1,
+                    total: 3,
+                    capped: false,
+                    scan_limited: false,
+                }),
+                false,
+            ),
             SearchStatus::results(1, 3)
         );
         assert_eq!(
-            block_result_status(0, 0, true),
-            SearchStatus::partial_results(0, 0)
+            block_result_status(FindSearchResult::NoMatches, true),
+            SearchStatus::results(0, 0)
         );
     }
 

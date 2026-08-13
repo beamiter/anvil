@@ -1098,14 +1098,18 @@ impl AppModel {
             return;
         }
         drop(config);
-        let output = sample_output(&output);
-        let Some(kind) = classify_failure(&command, exit_code, &output) else {
-            return;
-        };
         let Some((tab_index, pane_index)) = self.find_pane(pane_id) else {
             return;
         };
         let pane = &self.tabs[tab_index].panes[pane_index];
+        if !pane.terminal.supports_inline_notices() {
+            log::debug!("unified pane: command correction has no inline card surface");
+            return;
+        }
+        let output = sample_output(&output);
+        let Some(kind) = classify_failure(&command, exit_code, &output) else {
+            return;
+        };
         let remote = pane.cwd_external;
         let local_target = !remote;
         let cwd = pane.cwd.clone().unwrap_or_else(|| ".".to_string());
@@ -1402,8 +1406,12 @@ impl AppModel {
             .is_some_and(|terminal| terminal.command_prompt_status().is_ready());
         session.review = Some(review);
         drop(sessions);
-        if let Some(terminal) = self.correction_terminal(pane_id) {
-            terminal.insert_inline_notice(&card);
+        let inserted = self
+            .correction_terminal(pane_id)
+            .is_some_and(|terminal| terminal.insert_inline_notice(&card));
+        if !inserted {
+            self.close_command_correction_generation(pane_id, generation);
+            return;
         }
         if focus_review {
             if let Some(review) = self
