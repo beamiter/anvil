@@ -548,8 +548,10 @@ struct VisibleZoneLine {
     is_head: bool,
 }
 
-/// A single O(viewport rows) scan. There is exactly one probe per input row;
-/// no history-sized fallback or retry is permitted on the drawing path.
+/// A single O(viewport rows) scan: exactly one column-0 probe per input row,
+/// plus at most one bounded widening query per zone whose first row starts
+/// past column 0. No history-sized fallback or retry is permitted on the
+/// drawing path.
 fn scan_visible_rows<'a>(
     layout: ScanLayoutKey,
     top_absolute_row: i64,
@@ -557,14 +559,41 @@ fn scan_visible_rows<'a>(
     authority: &mut ZoneChromeAuthority,
     cache: &mut KnownHeadCache,
 ) -> Vec<VisibleZoneLine> {
+    scan_visible_rows_with(
+        layout,
+        top_absolute_row,
+        probe_uris,
+        authority,
+        cache,
+        &mut |_, _| false,
+    )
+}
+
+/// `row_carries_zone(visible_row, zone_id)` answers whether that row carries
+/// this zone's canonical marker somewhere past column 0. It is consulted only
+/// for the row immediately above an observed transition, and only when that
+/// row's own column-0 probe found nothing — at most one extra query per new
+/// zone in steady state.
+fn scan_visible_rows_with<'a>(
+    layout: ScanLayoutKey,
+    top_absolute_row: i64,
+    probe_uris: impl IntoIterator<Item = Option<&'a str>>,
+    authority: &mut ZoneChromeAuthority,
+    cache: &mut KnownHeadCache,
+    row_carries_zone: &mut dyn FnMut(usize, u64) -> bool,
+) -> Vec<VisibleZoneLine> {
     cache.prepare(layout, authority);
     let Some(expected_nonce) = authority.nonce else {
         return Vec::new();
     };
 
-    let mut result = Vec::new();
+    let mut result: Vec<VisibleZoneLine> = Vec::new();
     let mut current_id = authority.zone_containing_row(layout.row_epoch, top_absolute_row);
     let mut highest_order = current_id.and_then(|id| authority.order(id));
+    // Whether the row pushed last failed its own column-0 parse, and whether
+    // this scan has already spent its one widening query.
+    let mut previous_row_unowned = false;
+    let mut widened = false;
     for (visible_row, uri) in probe_uris.into_iter().enumerate() {
         let absolute_row = top_absolute_row.saturating_add(visible_row as i64);
         let cached = cache
@@ -603,9 +632,46 @@ fn scan_visible_rows<'a>(
         // seen below row zero, remember its absolute row for future scrolls.
         let indexed_head = authority.head_matches(id, layout.row_epoch, absolute_row);
         let observed_transition = parsed == Some(id) && current_id != Some(id) && !indexed_head;
-        if observed_transition {
+        // A zone's first row begins wherever the shell resumed writing. When
+        // that is not column 0 — output with no trailing newline, or the tty's
+        // own `^C` echo — column 0 of that row was written while the marker was
+        // closed, so its probe finds nothing and propagation hands the row to
+        // the previous zone. The separator and badge then sit one row low.
+        //
+        // Widen by exactly one row, and only when every one of these holds: the
+        // row is the immediately preceding scanned row, its own column-0 parse
+        // failed this scan, it is not already some zone's validated head (a
+        // validated head survives a guest OSC 8 at column 0 and must never be
+        // stolen — displacing it would delete its span outright), and the ring
+        // proves it carries this zone's canonical marker past column 0.
+        let mut widened_head = false;
+        if observed_transition && !widened {
+            let widen_onto = result.last().filter(|previous| {
+                previous_row_unowned
+                    && !previous.is_head
+                    && previous.visible_row + 1 == visible_row
+                    && previous.absolute_row + 1 == absolute_row
+            });
+            if let Some((prev_visible, prev_absolute)) =
+                widen_onto.map(|previous| (previous.visible_row, previous.absolute_row))
+            {
+                if row_carries_zone(prev_visible, id) {
+                    widened = true;
+                    widened_head = true;
+                    authority.observe_head(id, layout.row_epoch, prev_absolute);
+                    cache.heads.insert(prev_absolute, id);
+                    if let Some(previous) = result.last_mut() {
+                        previous.zone_id = id;
+                        previous.is_head = true;
+                    }
+                }
+            }
+        }
+        if observed_transition && !widened_head {
             authority.observe_head(id, layout.row_epoch, absolute_row);
             cache.heads.insert(absolute_row, id);
+        }
+        if observed_transition {
             while cache.heads.len() > MAX_CACHED_HEADS {
                 let Some(oldest) = cache.heads.first_key_value().map(|(row, _)| *row) else {
                     break;
@@ -613,9 +679,11 @@ fn scan_visible_rows<'a>(
                 cache.heads.remove(&oldest);
             }
         }
+        previous_row_unowned = parsed.is_none();
         // A canonical marker at row zero is an observed head, not an inferred
-        // mid-zone continuation, and therefore earns its real separator.
-        let is_head = cached == Some(id) || indexed_head || observed_transition;
+        // mid-zone continuation, and therefore earns its real separator. A row
+        // whose head moved up one is a continuation of that head, not a second.
+        let is_head = (cached == Some(id) || indexed_head || observed_transition) && !widened_head;
         result.push(VisibleZoneLine {
             visible_row,
             absolute_row,
@@ -888,12 +956,28 @@ impl UnifiedChrome {
                 ring_lower: projection.ring_lower,
                 row_epoch: projection.row_epoch,
             };
-            let lines = scan_visible_rows(
+            // The widening probe walks a row rightwards looking for this
+            // pane's canonical marker past column 0. `check_hyperlink_at`
+            // takes widget coordinates, the same convention as the column-0
+            // pass above.
+            let pane_nonce = authority.nonce;
+            let mut row_carries_zone = |visible_row: usize, zone_id: u64| {
+                let y = content_y + (visible_row as f64 + 0.5) * cell_height;
+                (1..columns).any(|column| {
+                    terminal_for_draw
+                        .check_hyperlink_at(content_x + (column as f64 + 0.5) * cell_width, y)
+                        .as_deref()
+                        .and_then(parse_canonical_zone_uri)
+                        .is_some_and(|(nonce, id)| Some(nonce) == pane_nonce && id == zone_id)
+                })
+            };
+            let lines = scan_visible_rows_with(
                 layout,
                 top_ring_row,
                 probe_uris.iter().map(Option::as_deref),
                 &mut authority,
                 &mut cache_for_draw.borrow_mut(),
+                &mut row_carries_zone,
             );
             if lines.is_empty() {
                 return;
@@ -2154,6 +2238,182 @@ mod tests {
         );
         assert_eq!(probes, 73);
         assert_eq!(lines.len(), 73);
+    }
+
+    /// The widening query is the only work permitted beyond one probe per row.
+    /// It is asked at most once per scan, only where a transition follows a row
+    /// that failed its own column-0 parse, and a `false` answer changes nothing.
+    #[test]
+    fn the_widening_query_is_bounded_and_a_refusal_changes_nothing() {
+        let mut authority = make_authority(&[1, 2, 3]);
+        let (one, two, three) = (uri(1), uri(2), uri(3));
+        // Two transitions, each preceded by an unowned output row.
+        let inputs = vec![
+            Some(one.as_str()),
+            None,
+            Some(two.as_str()),
+            None,
+            Some(three.as_str()),
+        ];
+        let mut widening_queries = 0;
+        let lines = scan_visible_rows_with(
+            layout(120, 0),
+            1000,
+            inputs,
+            &mut authority,
+            &mut KnownHeadCache::default(),
+            &mut |_, _| {
+                widening_queries += 1;
+                false
+            },
+        );
+        assert_eq!(
+            widening_queries, 2,
+            "one query per transition that follows an unowned row, never per row"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.is_head)
+                .map(|line| (line.zone_id, line.absolute_row))
+                .collect::<Vec<_>>(),
+            vec![(1, 1000), (2, 1002), (3, 1004)],
+            "a refused widening leaves every head exactly where column 0 proved it"
+        );
+    }
+
+    /// The loop skips rows whose marker order regresses, and the unowned flag
+    /// is only updated on rows it actually pushes. Widening must therefore
+    /// check that the last pushed row really is the row above this one, or a
+    /// stale predecessor gets stolen across the gap.
+    #[test]
+    fn widening_refuses_a_predecessor_that_is_not_the_row_directly_above() {
+        let mut authority = make_authority(&[1, 2, 3]);
+        let (one, two, three) = (uri(1), uri(2), uri(3));
+        let inputs = vec![
+            // 1000: zone 2 opens.
+            Some(two.as_str()),
+            // 1001: zone 2 output, unowned column 0.
+            None,
+            // 1002: an older zone's marker — an order regression, skipped
+            // entirely, so it never updates the unowned flag.
+            Some(one.as_str()),
+            // 1003: zone 3 opens. Its predecessor in `result` is 1001.
+            Some(three.as_str()),
+        ];
+        let lines = scan_visible_rows_with(
+            layout(120, 0),
+            1000,
+            inputs,
+            &mut authority,
+            &mut KnownHeadCache::default(),
+            &mut |_, _| true,
+        );
+        assert!(
+            authority.head_matches(3, 0, 1003),
+            "zone 3 keeps the row its own marker proved"
+        );
+        assert!(
+            authority.head_matches(2, 0, 1000),
+            "zone 2 keeps its head and its continuation row"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .find(|line| line.absolute_row == 1001)
+                .map(|line| line.zone_id),
+            Some(2)
+        );
+    }
+
+    /// A transition whose predecessor owns its own column 0 has nothing
+    /// unowned to widen onto, so no query is spent at all.
+    #[test]
+    fn an_adjacent_pair_of_column_zero_zones_spends_no_widening_query() {
+        let mut authority = make_authority(&[1, 2]);
+        let (one, two) = (uri(1), uri(2));
+        let inputs = vec![Some(one.as_str()), Some(two.as_str())];
+        let mut widening_queries = 0;
+        let lines = scan_visible_rows_with(
+            layout(120, 0),
+            1000,
+            inputs,
+            &mut authority,
+            &mut KnownHeadCache::default(),
+            &mut |_, _| {
+                widening_queries += 1;
+                true
+            },
+        );
+        assert_eq!(widening_queries, 0);
+        assert_eq!(lines.iter().filter(|line| line.is_head).count(), 2);
+    }
+
+    /// A zone whose first row starts past column 0 has no canonical marker
+    /// there, so the column-0 pass hands that row to the previous zone. The
+    /// widening query moves the head back up exactly one row.
+    #[test]
+    fn a_head_widens_onto_the_unowned_row_the_zone_really_starts_on() {
+        let mut authority = make_authority(&[1, 2]);
+        let (one, two) = (uri(1), uri(2));
+        // Row 0: zone 1. Row 1: zone 2's real first row, written past column 0
+        // so its own probe finds nothing. Row 2: zone 2's marker at column 0.
+        let inputs = vec![Some(one.as_str()), None, Some(two.as_str())];
+        let lines = scan_visible_rows_with(
+            layout(120, 0),
+            1000,
+            inputs,
+            &mut authority,
+            &mut KnownHeadCache::default(),
+            &mut |visible_row, zone_id| visible_row == 1 && zone_id == 2,
+        );
+        assert_eq!(lines.len(), 3);
+        assert_eq!((lines[1].zone_id, lines[1].is_head), (2, true));
+        assert_eq!(
+            (lines[2].zone_id, lines[2].is_head),
+            (2, false),
+            "the row whose head moved up is a continuation, not a second head"
+        );
+        assert!(authority.head_matches(2, 0, 1001));
+    }
+
+    /// A validated head survives a guest OSC 8 overwriting its column 0, so
+    /// its own probe fails too. Widening onto it would displace it and delete
+    /// its span outright — no separator, no badge for a zone that has both.
+    #[test]
+    fn widening_never_steals_a_row_that_is_already_a_validated_head() {
+        let mut authority = make_authority(&[1, 2]);
+        let two = uri(2);
+        // Zone 1's head is validated at row 1001 and cached, but its column 0
+        // now parses as nothing (a guest marker overwrote it).
+        authority.observe_head(1, 0, 1001);
+        let mut cache = KnownHeadCache::default();
+        cache.prepare(layout(120, 0), &authority);
+        cache.heads.insert(1001, 1);
+        let inputs = vec![None, None, Some(two.as_str())];
+        let lines = scan_visible_rows_with(
+            layout(120, 0),
+            1000,
+            inputs,
+            &mut authority,
+            &mut cache,
+            &mut |_, _| true,
+        );
+        assert!(
+            authority.head_matches(1, 0, 1001),
+            "zone 1 keeps the head it had already proved"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .find(|line| line.absolute_row == 1001)
+                .map(|line| (line.zone_id, line.is_head)),
+            Some((1, true))
+        );
+        assert!(
+            authority.head_matches(2, 0, 1002),
+            "zone 2 keeps its own row"
+        );
     }
 
     #[test]
