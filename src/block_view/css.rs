@@ -273,6 +273,10 @@ pub(crate) fn install_block_css(config: &Config) {
         .block-list {{
             background-color: {bg_hex};
         }}
+        .notice-dock {{
+            background-color: {bg_hex};
+            border-top: 1px solid rgba({fg_r},{fg_g},{fg_b},0.14);
+        }}
         .block-finished {{
             border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.08);
             border-left: 3px solid transparent;

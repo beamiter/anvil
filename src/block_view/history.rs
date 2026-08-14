@@ -3,6 +3,7 @@
 //! The in-memory deque is already bounded and seeded from this file, so saves
 //! replace the file rather than append duplicate records.
 
+use super::zone_history;
 use super::{mutate_block_data_and_redraw, BlockData, TermView};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1200,12 +1201,79 @@ impl TermView {
         enqueue_pending_clear(&self.history_explicit_replace_pending, target);
     }
 
+    /// Where this pane's bounded zone document lives: a sibling of the Block
+    /// history file, distinct by stem so a pane that changes mode between runs
+    /// can never decode one as the other.
+    fn zone_history_path(&self) -> Option<PathBuf> {
+        let configured = self.config.borrow().block_history_path.as_ref().cloned()?;
+        let base = history_path(&configured);
+        let stem = base
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "blocks".to_string());
+        let name = match base.extension() {
+            Some(ext) => format!("{stem}-zones.{}", ext.to_string_lossy()),
+            None => format!("{stem}-zones"),
+        };
+        Some(base.with_file_name(name))
+    }
+
+    /// Persist the backend's bounded zone document. Encoding is small and
+    /// bounded by construction, so it stays on this thread rather than joining
+    /// the Block history's revision/baseline protocol, which guards a format
+    /// this document deliberately does not share.
+    fn save_zone_history(&self) -> io::Result<()> {
+        let Some(zones) = self.render_backend.zone_replay_snapshot(
+            zone_history::MAX_RESTORED_ZONES,
+            zone_history::MAX_RESTORED_SNAPSHOT_BYTES,
+        ) else {
+            return Ok(());
+        };
+        let Some(path) = self.zone_history_path() else {
+            return Ok(());
+        };
+        if zones.is_empty() {
+            // An empty session must not leave a stale document behind for the
+            // next run to replay.
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            return Ok(());
+        }
+        let encoded = zone_history::encode_session(zones)?;
+        atomic_write(&path, |file| file.write_all(&encoded))
+    }
+
+    /// Replay this pane's persisted zones onto the surface before any PTY byte
+    /// reaches it. A failed or unreadable document is logged and skipped: a
+    /// restart with no history is a working pane, and refusing to start is not.
+    fn restore_zone_history(&self) {
+        let Some(path) = self.zone_history_path() else {
+            return;
+        };
+        let zones = match zone_history::read_session(&path) {
+            Ok(zones) => zones,
+            Err(error) => {
+                log::warn!("zone history not restored from {}: {error}", path.display());
+                return;
+            }
+        };
+        if zones.is_empty() {
+            return;
+        }
+        let restored = self.render_backend.replay_zone_snapshot(zones);
+        log::debug!("restored {restored} zones from {}", path.display());
+    }
+
     /// Save block history without risking truncation of the last good snapshot.
     pub fn save_history(&self) -> io::Result<()> {
-        // Metadata-only backends do not own the persisted Block-card format;
-        // an empty save would destroy a valid snapshot from Block mode.
+        // A backend that does not own the Block card document persists its own
+        // bounded zone document instead, on a sibling path, so neither
+        // representation can overwrite the other.
         if !self.render_backend.persists_block_history() {
-            return Ok(());
+            return self.save_zone_history();
         }
         let configured = {
             let config = self.config.borrow();
@@ -1237,8 +1305,12 @@ impl TermView {
 
     /// Load only the configured number of most-recent history records.
     pub fn load_history(&self) -> io::Result<()> {
-        // Backends which do not own Block persistence cannot restore cards.
+        // A backend without the Block card document restores its own bounded
+        // zone document instead. That replay is synchronous on purpose: it
+        // must reach the surface before the shell's first prompt, or restored
+        // rows would land under output they precede.
         if !self.render_backend.persists_block_history() {
+            self.restore_zone_history();
             return Ok(());
         }
         let (target, load_limit) = {

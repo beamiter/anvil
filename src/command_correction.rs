@@ -1103,7 +1103,7 @@ impl AppModel {
         };
         let pane = &self.tabs[tab_index].panes[pane_index];
         if !pane.terminal.supports_inline_notices() {
-            log::debug!("unified pane: command correction has no inline card surface");
+            log::debug!("pane has no inline card surface: skipping command correction");
             return;
         }
         let output = sample_output(&output);

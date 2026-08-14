@@ -33,6 +33,7 @@ mod palette;
 mod scroll;
 mod selection_hold;
 mod unified_chrome;
+mod zone_history;
 pub(crate) use alt_screen::*;
 pub(crate) use ansi::*;
 pub(crate) use blocks::*;
@@ -2973,6 +2974,9 @@ pub struct TermView {
     root: gtk::Box,
     block_scroll: ScrolledWindow,
     block_list: gtk::Box,
+    /// Space-occupying card region below the surface. Used by a backend whose
+    /// document cannot scroll to a mounted card; empty and hidden otherwise.
+    notice_dock: gtk::Box,
     /// The single persistent live VTE (anvil model): prompt + typing + output all
     /// render here natively; finished commands snapshot into styled blocks above.
     active_vte: Terminal,
@@ -3582,11 +3586,35 @@ trait RenderBackend {
         max_bytes: usize,
         deadline_exhausted: &mut dyn FnMut() -> bool,
     ) -> BackendSearchBatch;
+    /// Whether this backend owns the persisted Block-card format. A backend
+    /// answering `false` must implement the bounded zone-replay pair below, or
+    /// it retains nothing across a restart.
     fn persists_block_history(&self) -> bool {
         true
     }
+    /// Bounded, replayable form of this backend's completed zones, newest
+    /// last. `None` from a backend whose history is the Block card document.
+    fn zone_replay_snapshot(
+        &self,
+        _max_zones: usize,
+        _max_bytes: usize,
+    ) -> Option<Vec<zone_history::PersistedZone>> {
+        None
+    }
+    /// Replay a restored session onto the surface and adopt its records,
+    /// returning how many zones landed. Ids are issued from this process's
+    /// counter: a persisted id must never re-enter marker authority.
+    fn replay_zone_snapshot(&self, _zones: Vec<zone_history::PersistedZone>) -> usize {
+        0
+    }
     fn supports_inline_notices(&self) -> bool {
         true
+    }
+    /// Whether cards belong in the space-occupying bottom dock instead of the
+    /// scrollable document. True for a surface that owns the whole viewport,
+    /// where a card in the document exists at a position nothing can reach.
+    fn docks_inline_notices(&self) -> bool {
+        false
     }
     fn supports_block_mutation(&self) -> bool {
         true
@@ -4270,6 +4298,9 @@ struct UnifiedBackend {
     /// Probe/paint half of Unified zone chrome. Marker authority is separate
     /// from completed records so eviction cannot delete history metadata.
     chrome: unified_chrome::UnifiedChrome,
+    /// Shared with the engine so a replayed zone draws from the same id
+    /// sequence a live one does; a persisted id is never reused.
+    reserved_history_block_ids: Rc<RefCell<HashSet<u64>>>,
     kitty_assembler: RefCell<kitty_graphics::Assembler>,
 }
 
@@ -6577,8 +6608,77 @@ impl RenderBackend for UnifiedBackend {
         false
     }
 
+    fn zone_replay_snapshot(
+        &self,
+        max_zones: usize,
+        max_bytes: usize,
+    ) -> Option<Vec<zone_history::PersistedZone>> {
+        let zones = self.zones.borrow();
+        let persisted = zones
+            .records
+            .iter()
+            .map(|record| zone_history::PersistedZone::from_live(record, zones.snapshot(record.id)))
+            .collect();
+        Some(zone_history::bound_persisted_zones(
+            persisted, max_zones, max_bytes,
+        ))
+    }
+
+    fn replay_zone_snapshot(&self, zones: Vec<zone_history::PersistedZone>) -> usize {
+        if zones.is_empty() {
+            return 0;
+        }
+        // Replay is display-only: the bytes go straight to VTE, never through
+        // the parser, so a restored zone cannot be mistaken for a command this
+        // session ran. Marker frames come from this pane's own injector under
+        // freshly issued ids, so chrome addresses restored rows exactly as it
+        // addresses live ones.
+        self.vte.feed(&zone_history::replay_banner(zones.len()));
+        let max_zones = self.config_for_cb.borrow().max_visible_blocks as usize;
+        let mut restored = 0;
+        for zone in zones {
+            let id = next_block_id(&self.reserved_history_block_ids);
+            let (record, snapshot) = zone.into_live(id);
+            self.chrome.begin_zone(id, &self.vte);
+            self.zone_marker.borrow_mut().begin_zone(id);
+            let bytes = zone_history::replay_bytes(
+                &record,
+                snapshot.as_ref().map(|snapshot| snapshot.plain.as_str()),
+                snapshot.as_ref().is_some_and(|snapshot| snapshot.truncated),
+            );
+            feed_vte_with_zone_marker(&self.vte, &self.zone_marker, &bytes);
+            close_zone_marker(&self.zone_marker, Some(id), |part| self.vte.feed(part));
+            self.chrome
+                .record_completed(unified_chrome::ZoneChromeRecord {
+                    id: record.id,
+                    exit_code: record.exit_code,
+                    duration_ms: record.duration_ms,
+                    is_background: record.is_background,
+                });
+            let retired = {
+                let mut store = self.zones.borrow_mut();
+                let retired = record_unified_zone(&mut store, record, max_zones);
+                if let Some(snapshot) = snapshot {
+                    store.insert_snapshot(id, snapshot);
+                }
+                store.enforce_snapshot_budget(MAX_TOTAL_SNAPSHOT_BYTES);
+                retired
+            };
+            self.chrome.retire_ids(&retired);
+            restored += 1;
+        }
+        self.chrome.enforce_limit(max_zones);
+        restored
+    }
+
+    /// Cards are mounted, but in the dock: this surface owns the viewport, so
+    /// a card in the scrolling document would sit where nothing can scroll.
     fn supports_inline_notices(&self) -> bool {
-        false
+        true
+    }
+
+    fn docks_inline_notices(&self) -> bool {
+        true
     }
 
     fn supports_block_mutation(&self) -> bool {
@@ -7541,6 +7641,15 @@ impl TermView {
         }
         root.append(&scroll_overlay);
 
+        // Cards dock BELOW the surface as a sibling that takes space, not as
+        // an overlay: the row an overlay would cover is the prompt the user is
+        // typing at. Occupying space costs one grid resize per toggle, which
+        // the layout closure turns into a single SIGWINCH.
+        let notice_dock = gtk::Box::new(Orientation::Vertical, 0);
+        notice_dock.add_css_class("notice-dock");
+        notice_dock.set_visible(false);
+        root.append(&notice_dock);
+
         let unread_count: Rc<Cell<u32>> = Rc::new(Cell::new(0));
 
         // ── PTY ───────────────────────────────────────────────────────────
@@ -8156,6 +8265,7 @@ impl TermView {
                     find_state_for_cb: find_state.clone(),
                     zone_marker,
                     chrome,
+                    reserved_history_block_ids: reserved_history_block_ids.clone(),
                     kitty_assembler: RefCell::new(kitty_graphics::Assembler::new()),
                 })
             } else {
@@ -8364,6 +8474,43 @@ impl TermView {
                         }
                     });
                 });
+        }
+
+        // ── Unified scroll-position detector ──────────────────────────────
+        // The outer scroller holds one full-viewport surface, so its
+        // adjustment never moves and the detector above never fires. Reading
+        // history here means scrolling the VTE's own adjustment, which is what
+        // must drive the same flag: the sticky running header and the jump FAB
+        // both key off it, and both were unreachable in this mode without it.
+        if unified {
+            let user_scrolled = user_scrolled_up.clone();
+            let fab = jump_fab.downgrade();
+            let unread = unread_count.clone();
+            let fullscreen = fullscreen.clone();
+            if let Some(adjustment) = gtk::prelude::ScrollableExt::vadjustment(&active_vte) {
+                adjustment.connect_value_changed(move |adj| {
+                    let Some(fab) = fab.upgrade() else {
+                        return;
+                    };
+                    if fullscreen.get() {
+                        user_scrolled.set(false);
+                        unread.set(0);
+                        fab.set_visible(false);
+                        return;
+                    }
+                    // One row of slack: a partially scrolled last row still
+                    // counts as following the bottom.
+                    let at_bottom = adj.value() >= adj.upper() - adj.page_size() - 1.0;
+                    user_scrolled.set(!at_bottom);
+                    if at_bottom {
+                        unread.set(0);
+                        fab.set_visible(false);
+                    } else {
+                        set_jump_fab_label(&fab, unread.get());
+                        fab.set_visible(true);
+                    }
+                });
+            }
         }
 
         // ── Re-clamp input height on viewport resize ──────────────────────
@@ -8967,6 +9114,7 @@ impl TermView {
             root,
             block_scroll,
             block_list,
+            notice_dock,
             active_vte,
             active,
             bstate,
@@ -9304,8 +9452,9 @@ impl TermView {
         matches!(self.render_backend.records(), BackendRecords::Metadata(_))
     }
 
-    /// Inline cards live in the block document. A Unified pane has no
-    /// scrollable block document and therefore cannot mount one visibly.
+    /// Whether a card can be mounted anywhere the user can reach. A backend
+    /// whose document cannot scroll to one answers through the bottom dock
+    /// instead of refusing.
     pub(crate) fn supports_inline_notices(&self) -> bool {
         self.render_backend.supports_inline_notices()
     }
@@ -9317,8 +9466,11 @@ impl TermView {
     /// Calling this for an already-inserted widget re-pins it below any newly
     /// completed command block.
     pub fn insert_inline_notice(&self, widget: &gtk::Widget) -> bool {
+        if self.render_backend.docks_inline_notices() {
+            return self.dock_inline_notice(widget);
+        }
         if !self.supports_inline_notices() {
-            log::debug!("unified mode: refusing an unreachable inline notice card");
+            log::debug!("refusing an inline notice card no document can reach");
             return false;
         }
         let active_widget = self.active.borrow().widget().clone();
@@ -9342,9 +9494,52 @@ impl TermView {
         true
     }
 
+    /// Mount a card in the bottom dock, newest last, and give the surface its
+    /// new height. Re-mounting a card already docked leaves it where it is:
+    /// re-pinning exists to keep a card next to the prompt in a scrolling
+    /// document, and the dock is always next to the prompt.
+    fn dock_inline_notice(&self, widget: &gtk::Widget) -> bool {
+        let already_docked = widget
+            .parent()
+            .is_some_and(|parent| parent == *self.notice_dock.upcast_ref::<gtk::Widget>());
+        if !already_docked {
+            if widget.parent().is_some() {
+                // A card built for the scrolling document must not be parented
+                // twice; GTK would warn and leave it in neither place.
+                return false;
+            }
+            self.notice_dock.append(widget);
+        }
+        self.notice_dock.set_visible(true);
+        self.relayout_after_dock_change();
+        true
+    }
+
+    /// Give the surface back the rows the dock no longer needs. Hiding the
+    /// empty dock is what returns them: an empty visible box still asks for
+    /// padding, and the child would keep the smaller grid.
+    fn relayout_after_dock_change(&self) {
+        if self.notice_dock.first_child().is_none() {
+            self.notice_dock.set_visible(false);
+        }
+        self.notice_dock.queue_allocate();
+        // The grid follows the viewport the dock just resized. One pass here
+        // is one SIGWINCH for the child, not one per card.
+        (self.layout_active_surface)();
+        self.render_backend.sync_geometry_to_pty();
+    }
+
     /// Remove a transient inline card. Safe when the widget was already
     /// detached as part of pane teardown.
     pub fn remove_inline_notice(&self, widget: &gtk::Widget) {
+        if widget
+            .parent()
+            .is_some_and(|parent| parent == *self.notice_dock.upcast_ref::<gtk::Widget>())
+        {
+            self.notice_dock.remove(widget);
+            self.relayout_after_dock_change();
+            return;
+        }
         if widget
             .parent()
             .is_some_and(|parent| parent == *self.block_list.upcast_ref::<gtk::Widget>())
