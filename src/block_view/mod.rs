@@ -3870,6 +3870,28 @@ impl UnifiedZoneStore {
     }
 }
 
+/// What mounting a card in the bottom dock must do, given where the widget is
+/// parented right now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DockMount {
+    /// Unparented: the dock takes it.
+    Append,
+    /// Already docked. Re-pinning exists to keep a card beside the prompt in a
+    /// scrolling document; the dock is always beside the prompt, so leave it.
+    Keep,
+    /// Parented elsewhere. Appending would reparent a widget the other region
+    /// still owns, so refuse and let the caller fall back.
+    Refuse,
+}
+
+fn dock_mount_decision(parent: Option<&gtk::Widget>, dock: &gtk::Widget) -> DockMount {
+    match parent {
+        None => DockMount::Append,
+        Some(parent) if parent == dock => DockMount::Keep,
+        Some(_) => DockMount::Refuse,
+    }
+}
+
 /// Append a completed record to the Unified zone table, dropping the oldest
 /// entries past `max_zones`. A drained record takes its snapshot with it.
 fn record_unified_zone(
@@ -9499,20 +9521,21 @@ impl TermView {
     /// re-pinning exists to keep a card next to the prompt in a scrolling
     /// document, and the dock is always next to the prompt.
     fn dock_inline_notice(&self, widget: &gtk::Widget) -> bool {
-        let already_docked = widget
-            .parent()
-            .is_some_and(|parent| parent == *self.notice_dock.upcast_ref::<gtk::Widget>());
-        if !already_docked {
-            if widget.parent().is_some() {
-                // A card built for the scrolling document must not be parented
-                // twice; GTK would warn and leave it in neither place.
-                return false;
+        let dock_widget: &gtk::Widget = self.notice_dock.upcast_ref();
+        match dock_mount_decision(widget.parent().as_ref(), dock_widget) {
+            DockMount::Refuse => false,
+            DockMount::Keep => {
+                self.notice_dock.set_visible(true);
+                self.relayout_after_dock_change();
+                true
             }
-            self.notice_dock.append(widget);
+            DockMount::Append => {
+                self.notice_dock.append(widget);
+                self.notice_dock.set_visible(true);
+                self.relayout_after_dock_change();
+                true
+            }
         }
-        self.notice_dock.set_visible(true);
-        self.relayout_after_dock_change();
-        true
     }
 
     /// Give the surface back the rows the dock no longer needs. Hiding the
@@ -13168,6 +13191,43 @@ mod tests {
         ));
         assert_eq!(surfaces, vec![2]);
         assert_eq!(materialized.get(), 1);
+    }
+
+    /// The dock must never reparent a widget another region still owns: GTK
+    /// would warn and the card would end up in neither place.
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn dock_mount_refuses_a_widget_another_region_owns() {
+        use relm4::gtk;
+        use relm4::gtk::prelude::*;
+
+        gtk::init().expect("gtk init");
+        let dock = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let elsewhere = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let dock_widget: &gtk::Widget = dock.upcast_ref();
+
+        let card = gtk::Label::new(Some("card"));
+        let card_widget: gtk::Widget = card.clone().upcast();
+        assert_eq!(
+            super::dock_mount_decision(card_widget.parent().as_ref(), dock_widget),
+            super::DockMount::Append,
+            "an unparented card is taken by the dock"
+        );
+
+        dock.append(&card);
+        assert_eq!(
+            super::dock_mount_decision(card_widget.parent().as_ref(), dock_widget),
+            super::DockMount::Keep,
+            "a docked card stays where it is; the dock is already beside the prompt"
+        );
+
+        dock.remove(&card);
+        elsewhere.append(&card);
+        assert_eq!(
+            super::dock_mount_decision(card_widget.parent().as_ref(), dock_widget),
+            super::DockMount::Refuse,
+            "a card the scrolling document owns is refused, not stolen"
+        );
     }
 
     #[test]
