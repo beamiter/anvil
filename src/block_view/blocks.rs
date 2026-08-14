@@ -222,7 +222,10 @@ pub(crate) struct BlockData {
     pub(crate) cols: u16,
 }
 
-fn markdown_fence(text: &str) -> String {
+/// Fence long enough to contain `text`: untrusted output may itself hold a run
+/// of backticks, and a shorter fence would end the block there. Shared with the
+/// metadata record export so both record kinds fence the same way.
+pub(super) fn markdown_fence(text: &str) -> String {
     let mut longest = 0usize;
     let mut current = 0usize;
     for ch in text.chars() {
@@ -1128,10 +1131,15 @@ mod tests {
         const LIMIT: usize = 8 * 1024 * 1024;
         const CHUNKS: usize = 3_200; // 100 MiB total
         let mut output = VecDeque::new();
+        let mut dropped = false;
         for index in 0..CHUNKS {
-            append_bounded_output(&mut output, &vec![(index % 251) as u8; CHUNK], LIMIT);
+            dropped |= append_bounded_output(&mut output, &vec![(index % 251) as u8; CHUNK], LIMIT);
         }
         assert_eq!(output.len(), LIMIT);
+        assert!(
+            dropped,
+            "100 MiB through an 8 MiB bound lost bytes off the front"
+        );
         let retained_chunks = LIMIT / CHUNK;
         let contiguous = output.make_contiguous();
         for offset in 0..retained_chunks {
@@ -1141,9 +1149,35 @@ mod tests {
                 .all(|byte| *byte == expected));
         }
 
-        append_bounded_output(&mut output, &vec![0x5a; LIMIT + CHUNK], LIMIT);
+        assert!(append_bounded_output(
+            &mut output,
+            &vec![0x5a; LIMIT + CHUNK],
+            LIMIT
+        ));
         assert_eq!(output.len(), LIMIT);
         assert!(output.iter().all(|byte| *byte == 0x5a));
+    }
+
+    /// The drop marker reports the stream, not the buffer: an append that fits
+    /// entirely loses nothing, and an exactly-limit-sized append into an empty
+    /// buffer is complete even though it replaces the whole retention window.
+    #[test]
+    fn bounded_output_reports_only_appends_that_lose_bytes() {
+        let mut output = VecDeque::new();
+        assert!(!append_bounded_output(&mut output, b"abc", 5));
+        assert!(append_bounded_output(&mut output, b"def", 5));
+        assert_eq!(output.make_contiguous(), b"bcdef");
+
+        let mut exact = VecDeque::new();
+        assert!(!append_bounded_output(&mut exact, b"12345", 5));
+        assert!(append_bounded_output(&mut exact, b"67890", 5));
+
+        let mut over = VecDeque::new();
+        assert!(append_bounded_output(&mut over, b"123456", 5));
+
+        let mut zero_limit = VecDeque::new();
+        assert!(append_bounded_output(&mut zero_limit, b"x", 0));
+        assert!(!append_bounded_output(&mut zero_limit, b"", 0));
     }
 
     #[test]
@@ -2831,15 +2865,22 @@ pub(crate) struct ActiveBlock {
 /// retained buffer. A `VecDeque` makes long-running output proportional to the
 /// new bytes discarded instead of copying the full multi-megabyte tail for
 /// every PTY chunk.
-pub(super) fn append_bounded_output(buffer: &mut VecDeque<u8>, bytes: &[u8], limit: usize) {
+///
+/// Returns whether any byte of the stream failed to survive this append. The
+/// retained tail cannot reveal that on its own, so a consumer that snapshots
+/// the tail must accumulate this to report the stream truthfully.
+#[must_use]
+pub(super) fn append_bounded_output(buffer: &mut VecDeque<u8>, bytes: &[u8], limit: usize) -> bool {
     if limit == 0 {
+        let dropped = !buffer.is_empty() || !bytes.is_empty();
         buffer.clear();
-        return;
+        return dropped;
     }
     if bytes.len() >= limit {
+        let dropped = !buffer.is_empty() || bytes.len() > limit;
         buffer.clear();
         buffer.extend(bytes[bytes.len() - limit..].iter().copied());
-        return;
+        return dropped;
     }
     let overflow = buffer
         .len()
@@ -2849,6 +2890,7 @@ pub(super) fn append_bounded_output(buffer: &mut VecDeque<u8>, bytes: &[u8], lim
         buffer.drain(..overflow);
     }
     buffer.extend(bytes.iter().copied());
+    overflow > 0
 }
 
 impl ActiveBlock {

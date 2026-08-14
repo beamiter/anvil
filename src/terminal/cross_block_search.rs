@@ -10,9 +10,40 @@ use relm4::gtk;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::block_view::{CrossBlockHit, TermView};
+use crate::block_view::{CrossBlockHit, RecordNavigationResult, TermView};
 
-pub(super) fn toggle(view: Rc<TermView>, dialog_slot: Rc<RefCell<Option<adw::Dialog>>>) {
+use super::record_snapshot;
+
+/// What the palette does with one activated hit. Every arm of
+/// [`RecordNavigationResult`] resolves to exactly one of these: a record the
+/// view could reach, or could only show a snapshot of, always closes the
+/// palette; only a record it can do neither for keeps it open with a status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JumpOutcome {
+    Close,
+    ShowSnapshot(u64),
+    KeepOpen,
+}
+
+fn jump_outcome(result: RecordNavigationResult) -> JumpOutcome {
+    match result {
+        RecordNavigationResult::Navigated => JumpOutcome::Close,
+        RecordNavigationResult::SnapshotView { record_id } => JumpOutcome::ShowSnapshot(record_id),
+        RecordNavigationResult::LocationUnavailable | RecordNavigationResult::NoMatchingRecord => {
+            JumpOutcome::KeepOpen
+        }
+    }
+}
+
+fn jump_unavailable_status() -> &'static str {
+    "This result is searchable, but it has no terminal location and no retained output."
+}
+
+pub(super) fn toggle(
+    view: Rc<TermView>,
+    dialog_slot: Rc<RefCell<Option<adw::Dialog>>>,
+    snapshot_slot: Rc<RefCell<Option<adw::Dialog>>>,
+) {
     let open_dialog = { dialog_slot.borrow_mut().take() };
     if let Some(dialog) = open_dialog {
         dialog.force_close();
@@ -102,8 +133,15 @@ pub(super) fn toggle(view: Rc<TermView>, dialog_slot: Rc<RefCell<Option<adw::Dia
                     }
                     for hit in &results {
                         let surface = if hit.is_output { "out" } else { "cmd" };
+                        // A hit whose record has no location and no retained
+                        // output says so before the user activates it.
+                        let unreachable = if view.can_jump_to_record(hit.block_id, hit.is_output) {
+                            ""
+                        } else {
+                            " — location unavailable"
+                        };
                         let subtitle = format!(
-                            "{surface} L{}: {}",
+                            "{surface} L{}: {}{unreachable}",
                             hit.line_no,
                             gtk::glib::markup_escape_text(&hit.line_text)
                         );
@@ -140,24 +178,52 @@ pub(super) fn toggle(view: Rc<TermView>, dialog_slot: Rc<RefCell<Option<adw::Dia
         let hits = hits.clone();
         let filter_entry = filter_entry.clone();
         let regex_toggle = regex_toggle.clone();
-        Rc::new(move |index: usize| {
+        let status_label = status_label.clone();
+        Rc::new(move |index: usize| -> JumpOutcome {
             let Some(hit) = hits.borrow().get(index).cloned() else {
-                return;
+                return JumpOutcome::KeepOpen;
             };
             let pattern = filter_entry.text().to_string();
             let is_regex = regex_toggle.is_active();
-            if view.scroll_to_block_id(hit.block_id) {
-                view.focus_match_in_block(hit.block_id, &pattern, is_regex, hit.is_output);
+            let outcome = jump_outcome(view.navigate_to_record_id(hit.block_id, hit.is_output));
+            match outcome {
+                JumpOutcome::Close => {
+                    // The surface has already scrolled and taken focus. A
+                    // highlight that cannot be set is not a reason to strand
+                    // this modal over it.
+                    view.focus_match_in_block(hit.block_id, &pattern, is_regex, hit.is_output);
+                }
+                JumpOutcome::KeepOpen => status_label.set_text(jump_unavailable_status()),
+                JumpOutcome::ShowSnapshot(_) => {}
             }
+            outcome
+        })
+    };
+
+    let apply_jump_outcome = {
+        let view = view.clone();
+        let dialog = dialog.clone();
+        let status_label = status_label.clone();
+        Rc::new(move |outcome: JumpOutcome| match outcome {
+            JumpOutcome::Close => dialog.force_close(),
+            // The budget can evict a snapshot between the search that found it
+            // and this activation, so the palette closes only once the view is
+            // actually up; otherwise it stays open to say what happened.
+            JumpOutcome::ShowSnapshot(record_id) => {
+                match record_snapshot::present(&view, &snapshot_slot, record_id) {
+                    Some(notice) => status_label.set_text(notice),
+                    None => dialog.force_close(),
+                }
+            }
+            JumpOutcome::KeepOpen => {}
         })
     };
 
     {
         let jump = jump.clone();
-        let dialog = dialog.clone();
+        let apply_jump_outcome = apply_jump_outcome.clone();
         list_box.connect_row_activated(move |_, row| {
-            jump(row.index() as usize);
-            dialog.force_close();
+            apply_jump_outcome(jump(row.index() as usize));
         });
     }
 
@@ -167,6 +233,7 @@ pub(super) fn toggle(view: Rc<TermView>, dialog_slot: Rc<RefCell<Option<adw::Dia
         let dialog = dialog.clone();
         let list_box = list_box.clone();
         let jump = jump.clone();
+        let apply_jump_outcome = apply_jump_outcome.clone();
         key_controller.connect_key_pressed(move |_, key, _, state| {
             use gtk::gdk::{Key, ModifierType};
             if key == Key::Escape
@@ -178,8 +245,7 @@ pub(super) fn toggle(view: Rc<TermView>, dialog_slot: Rc<RefCell<Option<adw::Dia
             }
             if matches!(key, Key::Return | Key::KP_Enter) {
                 if let Some(row) = list_box.selected_row() {
-                    jump(row.index() as usize);
-                    dialog.force_close();
+                    apply_jump_outcome(jump(row.index() as usize));
                 }
                 return gtk::glib::Propagation::Stop;
             }
@@ -209,4 +275,33 @@ pub(super) fn toggle(view: Rc<TermView>, dialog_slot: Rc<RefCell<Option<adw::Dia
     let parent = view.widget();
     dialog.present(Some(&parent));
     filter_entry.grab_focus();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{jump_outcome, JumpOutcome, RecordNavigationResult};
+
+    /// The palette dispatches on the whole navigation ladder, not on "did it
+    /// scroll": a record whose retained snapshot produced the hit is
+    /// reachable, and only a record with neither location nor snapshot keeps
+    /// the palette open with the unavailable status.
+    #[test]
+    fn jump_dispatches_every_navigation_outcome() {
+        assert_eq!(
+            jump_outcome(RecordNavigationResult::Navigated),
+            JumpOutcome::Close
+        );
+        assert_eq!(
+            jump_outcome(RecordNavigationResult::SnapshotView { record_id: 42 }),
+            JumpOutcome::ShowSnapshot(42)
+        );
+        assert_eq!(
+            jump_outcome(RecordNavigationResult::LocationUnavailable),
+            JumpOutcome::KeepOpen
+        );
+        assert_eq!(
+            jump_outcome(RecordNavigationResult::NoMatchingRecord),
+            JumpOutcome::KeepOpen
+        );
+    }
 }

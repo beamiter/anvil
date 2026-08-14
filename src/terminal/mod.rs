@@ -5,6 +5,7 @@ pub mod click_cursor;
 mod cross_block_search;
 pub mod grid;
 pub mod kitty_graphics;
+mod record_snapshot;
 pub mod select;
 pub mod url;
 pub mod vte;

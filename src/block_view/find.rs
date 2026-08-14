@@ -12,7 +12,10 @@ use relm4::gtk;
 use std::time::{Duration, Instant};
 use vte4::TerminalExt;
 
-use super::{contains_case_insensitive, replace_finished_block_selection, BlockFilters, TermView};
+use super::{
+    contains_case_insensitive, replace_finished_block_selection, BackendRecordRef, BlockFilters,
+    TermView, MAX_ZONE_SNAPSHOT_BYTES,
+};
 
 fn outcome_matches_filters(
     resolved_command: &str,
@@ -139,13 +142,66 @@ pub(crate) enum FindNavigationResult {
 }
 
 /// Result of an action that targets one completed record by stable identity.
-/// Unified can filter metadata now, but reports `LocationUnavailable` until a
-/// marker-backed row target exists for that exact record.
+/// A Unified record jump is exact only when chrome proves the zone's row;
+/// otherwise the retained snapshot is offered read-only, and only a record
+/// with neither proof nor snapshot reports `LocationUnavailable`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RecordNavigationResult {
     Navigated,
     NoMatchingRecord,
+    /// The record exists and retains a bounded output snapshot; the UI
+    /// presents it as a read-only view instead of scrolling anywhere.
+    SnapshotView {
+        record_id: u64,
+    },
     LocationUnavailable,
+}
+
+/// Everything the read-only snapshot dialog presents for one metadata record.
+/// Command identity and outcome come from the parser-fed record — never
+/// re-read from any terminal surface — and the output text is the bounded
+/// finalize-time snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RecordSnapshotView {
+    pub(crate) cmd: String,
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) duration_ms: Option<u64>,
+    pub(crate) is_background: bool,
+    pub(crate) output: String,
+    pub(crate) truncated: bool,
+}
+
+impl RecordSnapshotView {
+    /// One-line outcome header for the snapshot view. Unknown outcomes stay
+    /// explicit and background output names itself; nothing here is inferred
+    /// from a terminal surface.
+    pub(crate) fn status_line(&self) -> String {
+        let mut status = if self.is_background {
+            "Background output".to_string()
+        } else {
+            match self.exit_code {
+                Some(code) => format!("Exit code {code}"),
+                None => "Exit code unknown (the shell reported none)".to_string(),
+            }
+        };
+        if let Some(duration_ms) = self.duration_ms {
+            status.push_str(&format!(
+                " · {}",
+                super::unified_chrome::format_block_duration(duration_ms)
+            ));
+        }
+        status
+    }
+
+    /// User-facing truncation note; `None` when the snapshot is complete.
+    pub(crate) fn truncation_note(&self) -> Option<String> {
+        self.truncated.then(|| {
+            format!(
+                "Output truncated to the last {} KiB.",
+                MAX_ZONE_SNAPSHOT_BYTES / 1024
+            )
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -535,10 +591,18 @@ fn unresolved_record_target_result<'a>(
     records: impl IntoIterator<Item = super::BackendRecordRef<'a>>,
     block_id: u64,
 ) -> RecordNavigationResult {
-    if records.into_iter().any(|record| record.id() == block_id) {
-        RecordNavigationResult::LocationUnavailable
+    let Some(record) = records.into_iter().find(|record| record.id() == block_id) else {
+        return RecordNavigationResult::NoMatchingRecord;
+    };
+    // Only a metadata record falls back to its snapshot: a Block record whose
+    // widget target vanished mid-operation was concurrently removed, not
+    // retained without a surface.
+    if record.is_metadata_only() && record.output().is_some() {
+        RecordNavigationResult::SnapshotView {
+            record_id: block_id,
+        }
     } else {
-        RecordNavigationResult::NoMatchingRecord
+        RecordNavigationResult::LocationUnavailable
     }
 }
 
@@ -1009,6 +1073,27 @@ impl TermView {
         Ok(hits)
     }
 
+    /// Whether activating this hit would show the user anything: a per-record
+    /// surface, an exact proven scroll, or the record's retained snapshot.
+    /// Every rung `navigate_to_record_id` can reach is one here — a hit
+    /// labelled reachable must lead somewhere, and a hit labelled unavailable
+    /// must have nothing left to offer.
+    pub fn can_jump_to_record(&self, block_id: u64, is_output: bool) -> bool {
+        if self
+            .render_backend
+            .record_search_target(block_id, is_output)
+            .is_some()
+            || self.render_backend.can_scroll_to_record(block_id)
+        {
+            return true;
+        }
+        let records = self.render_backend.records();
+        matches!(
+            unresolved_record_target_result(records.iter(), block_id),
+            RecordNavigationResult::SnapshotView { .. }
+        )
+    }
+
     pub(crate) fn navigate_to_record_id(
         &self,
         block_id: u64,
@@ -1018,8 +1103,23 @@ impl TermView {
             .render_backend
             .record_search_target(block_id, is_output)
         else {
-            let records = self.render_backend.records();
-            return unresolved_record_target_result(records.iter(), block_id);
+            // No per-record surface: an exact proven scroll is still allowed,
+            // then the retained snapshot, then the honest notice.
+            let result = if self.render_backend.scroll_to_record(block_id) {
+                RecordNavigationResult::Navigated
+            } else {
+                let records = self.render_backend.records();
+                unresolved_record_target_result(records.iter(), block_id)
+            };
+            // A backend with no per-record widget never writes
+            // `selected_block_id`, so stepping has no other cursor to read:
+            // record wherever the user was last sent, including a record that
+            // could only be reported, or next/previous re-open one record
+            // forever.
+            if result != RecordNavigationResult::NoMatchingRecord {
+                self.navigated_record_id.set(Some(block_id));
+            }
+            return result;
         };
         if target.uses_live_surface {
             target.terminal.grab_focus();
@@ -1039,22 +1139,35 @@ impl TermView {
                 Some(block_id),
             );
         }
+        // The selection this just wrote is the stepping cursor for a backend
+        // that mounts widgets; the fallback must not shadow it.
+        self.navigated_record_id.set(None);
         target.widget.grab_focus();
-        let adj = self.block_scroll.vadjustment();
-        if let Some(value) = target
-            .widget
-            .compute_point(&self.block_scroll, &gtk::graphene::Point::new(0.0, 0.0))
-        {
-            let max_value = (adj.upper() - adj.page_size()).max(adj.lower());
-            let target_value = adj.value() + value.y() as f64;
-            adj.set_value(target_value.clamp(adj.lower(), max_value));
-        }
+        scroll_widget_to_block_scroller_top(&target.widget, &self.block_scroll);
         RecordNavigationResult::Navigated
     }
 
-    /// Scroll the named block output into view by stable id.
-    pub fn scroll_to_block_id(&self, block_id: u64) -> bool {
-        self.navigate_to_record_id(block_id, true) == RecordNavigationResult::Navigated
+    /// Snapshot-view payload for one metadata record, `None` when the record
+    /// is gone, is not metadata-only, or no longer retains a snapshot (the
+    /// budget may have evicted it between navigation and presentation).
+    pub(crate) fn record_snapshot_view(&self, record_id: u64) -> Option<RecordSnapshotView> {
+        let records = self.render_backend.records();
+        let record = records.iter().find(|record| record.id() == record_id)?;
+        let BackendRecordRef::Metadata {
+            record,
+            snapshot: Some(snapshot),
+        } = record
+        else {
+            return None;
+        };
+        Some(RecordSnapshotView {
+            cmd: record.cmd.clone(),
+            exit_code: record.exit_code,
+            duration_ms: record.duration_ms,
+            is_background: record.is_background,
+            output: snapshot.plain.clone(),
+            truncated: snapshot.truncated,
+        })
     }
 
     /// Light up the chosen block's command/output VTE with a PCRE2 search
@@ -1142,6 +1255,21 @@ impl TermView {
     }
 }
 
+/// Scroll the outer Block scroller so `widget`'s top edge lands at the
+/// viewport top (clamped to the scroll range). Shared by record navigation and
+/// the Block backend's `scroll_to_record` seam so both jumps land the same way.
+pub(super) fn scroll_widget_to_block_scroller_top(
+    widget: &gtk::Widget,
+    block_scroll: &gtk::ScrolledWindow,
+) {
+    let adj = block_scroll.vadjustment();
+    if let Some(value) = widget.compute_point(block_scroll, &gtk::graphene::Point::new(0.0, 0.0)) {
+        let max_value = (adj.upper() - adj.page_size()).max(adj.lower());
+        let target_value = adj.value() + value.y() as f64;
+        adj.set_value(target_value.clamp(adj.lower(), max_value));
+    }
+}
+
 /// Reset a pane's search before its finished-block structure changes. Resolve
 /// the highlighted terminals while the block list is borrowed, then release
 /// that borrow before calling into GTK so a synchronous signal cannot re-enter
@@ -1169,10 +1297,11 @@ mod tests {
         matching_record_ids, native_cursor_action, outcome_matches_filters, plan_matching_windows,
         regex_consumption, snippet, step_compressed_cursor, unresolved_record_target_result,
         utf8_prefix, FindCursor, FindDirection, FindScanBudget, FindSurface, NativeCursorAction,
-        RecordNavigationResult, RegexConsumption, VTE_SEARCH_FLAGS,
+        RecordNavigationResult, RecordSnapshotView, RegexConsumption, VTE_SEARCH_FLAGS,
     };
     use crate::block_view::{
         BackendRecordRef, BackendSearchWindow, BlockFilters, CompletedCommandRecord,
+        ZoneOutputSnapshot,
     };
     use std::time::Instant;
 
@@ -1705,6 +1834,12 @@ mod tests {
                 is_background: false,
             },
         ];
+        let records = || {
+            metadata.iter().map(|record| BackendRecordRef::Metadata {
+                record,
+                snapshot: None,
+            })
+        };
         let failed = BlockFilters {
             failed_only: true,
             ..Default::default()
@@ -1715,21 +1850,121 @@ mod tests {
             ..Default::default()
         };
 
+        assert_eq!(matching_record_ids(records(), "", &failed), [91]);
+        assert_eq!(matching_record_ids(records(), "", &slow), [7]);
         assert_eq!(
-            matching_record_ids(metadata.iter().map(BackendRecordRef::Metadata), "", &failed),
-            [91]
-        );
-        assert_eq!(
-            matching_record_ids(metadata.iter().map(BackendRecordRef::Metadata), "", &slow),
-            [7]
-        );
-        assert_eq!(
-            unresolved_record_target_result(metadata.iter().map(BackendRecordRef::Metadata), 91),
+            unresolved_record_target_result(records(), 91),
             RecordNavigationResult::LocationUnavailable
         );
         assert_eq!(
-            unresolved_record_target_result(metadata.iter().map(BackendRecordRef::Metadata), 999),
+            unresolved_record_target_result(records(), 999),
             RecordNavigationResult::NoMatchingRecord
+        );
+    }
+
+    /// A retained snapshot makes a metadata record searchable by its output;
+    /// budget eviction demotes the same record to command-only matching, and
+    /// navigation falls back from the snapshot view to the honest notice.
+    #[test]
+    fn metadata_records_match_by_snapshot_output_until_it_is_evicted() {
+        let record = |id: u64, cmd: &str| CompletedCommandRecord {
+            id,
+            cmd: cmd.to_string(),
+            exit_code: Some(0),
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: None,
+            cwd: None,
+            is_background: false,
+        };
+        let with_snapshot = record(1, "cargo test");
+        let evicted = record(2, "rg needle src");
+        let snapshot = ZoneOutputSnapshot {
+            plain: "error: found needle in haystack".to_string(),
+            truncated: false,
+        };
+        let records = || {
+            [
+                BackendRecordRef::Metadata {
+                    record: &with_snapshot,
+                    snapshot: Some(&snapshot),
+                },
+                BackendRecordRef::Metadata {
+                    record: &evicted,
+                    snapshot: None,
+                },
+            ]
+            .into_iter()
+        };
+
+        assert_eq!(
+            matching_record_ids(records(), "needle", &BlockFilters::default()),
+            [1, 2],
+            "id 1 matches by snapshot output, id 2 by command only"
+        );
+        assert_eq!(
+            matching_record_ids(records(), "haystack", &BlockFilters::default()),
+            [1],
+            "the evicted record no longer matches by output content"
+        );
+
+        assert_eq!(
+            unresolved_record_target_result(records(), 1),
+            RecordNavigationResult::SnapshotView { record_id: 1 }
+        );
+        assert_eq!(
+            unresolved_record_target_result(records(), 2),
+            RecordNavigationResult::LocationUnavailable
+        );
+    }
+
+    #[test]
+    fn snapshot_view_truncation_note_states_the_per_zone_bound() {
+        let view = RecordSnapshotView {
+            cmd: "cat big.log".to_string(),
+            exit_code: Some(0),
+            duration_ms: None,
+            is_background: false,
+            output: "tail".to_string(),
+            truncated: true,
+        };
+        assert_eq!(
+            view.truncation_note().as_deref(),
+            Some("Output truncated to the last 64 KiB.")
+        );
+        assert_eq!(
+            RecordSnapshotView {
+                truncated: false,
+                ..view
+            }
+            .truncation_note(),
+            None
+        );
+    }
+
+    /// The snapshot view's header states the record's own outcome; an
+    /// unreported status must never read as a success.
+    #[test]
+    fn snapshot_view_status_line_states_the_recorded_outcome() {
+        let view = |exit_code, duration_ms, is_background| RecordSnapshotView {
+            cmd: "cargo test".to_string(),
+            exit_code,
+            duration_ms,
+            is_background,
+            output: "ok".to_string(),
+            truncated: false,
+        };
+        assert_eq!(
+            view(Some(0), Some(1_500), false).status_line(),
+            "Exit code 0 · 1.5s"
+        );
+        assert_eq!(
+            view(None, None, false).status_line(),
+            "Exit code unknown (the shell reported none)"
+        );
+        assert_eq!(
+            view(None, Some(250), true).status_line(),
+            "Background output · 250ms"
         );
     }
 

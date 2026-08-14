@@ -19,7 +19,7 @@ use crate::block_view::{
 };
 use crate::search::SearchStatus;
 
-use super::cross_block_search;
+use super::{cross_block_search, record_snapshot};
 
 pub use super::vte::{VteInit, VteInput, VteOutput};
 
@@ -43,18 +43,29 @@ fn export_notice(result: std::io::Result<std::path::PathBuf>) -> String {
 
 fn record_navigation_notice(result: RecordNavigationResult) -> Option<&'static str> {
     match result {
-        RecordNavigationResult::LocationUnavailable => Some(
-            "Unified mode can identify matching records, but exact record locations aren't available yet.",
-        ),
-        RecordNavigationResult::Navigated | RecordNavigationResult::NoMatchingRecord => None,
+        RecordNavigationResult::LocationUnavailable => {
+            Some("This record has no exact terminal location and no retained output snapshot.")
+        }
+        // SnapshotView opens the read-only view instead of reporting anything.
+        RecordNavigationResult::Navigated
+        | RecordNavigationResult::NoMatchingRecord
+        | RecordNavigationResult::SnapshotView { .. } => None,
     }
 }
 
 fn report_record_navigation(
     sender: &ComponentSender<BlockTerminal>,
+    view: &Rc<TermView>,
+    dialog_slot: &Rc<RefCell<Option<relm4::adw::Dialog>>>,
     result: RecordNavigationResult,
 ) {
-    if let Some(message) = record_navigation_notice(result) {
+    let notice = match result {
+        RecordNavigationResult::SnapshotView { record_id } => {
+            record_snapshot::present(view, dialog_slot, record_id)
+        }
+        result => record_navigation_notice(result),
+    };
+    if let Some(message) = notice {
         let _ = sender.output(VteOutput::Notice(message.to_string()));
     }
 }
@@ -69,6 +80,9 @@ pub struct BlockTerminal {
     terminal_done: Rc<Cell<bool>>,
     config: Rc<RefCell<crate::config::Config>>,
     cross_block_search_dialog: Rc<RefCell<Option<relm4::adw::Dialog>>>,
+    /// The read-only snapshot view opened by record navigation. One slot per
+    /// pane, so a second navigation replaces the open view instead of stacking.
+    record_snapshot_dialog: Rc<RefCell<Option<relm4::adw::Dialog>>>,
     /// Last result belongs to the regex currently installed in this pane.
     /// Keeping it backend-side prevents navigation after a compile error from
     /// turning that diagnostic into a misleading `(0, 0)` result.
@@ -431,6 +445,7 @@ impl Component for BlockTerminal {
             terminal_done,
             config,
             cross_block_search_dialog: Rc::new(RefCell::new(None)),
+            record_snapshot_dialog: Rc::new(RefCell::new(None)),
             search_status: SearchStatus::Idle,
         };
         ComponentParts { model, widgets: () }
@@ -460,6 +475,7 @@ impl Component for BlockTerminal {
             }
             return;
         }
+        let snapshot_dialog = self.record_snapshot_dialog.clone();
         let Some(view) = self.view.as_ref() else {
             return;
         };
@@ -485,11 +501,14 @@ impl Component for BlockTerminal {
             VteInput::ApplyTheme => view.apply_theme(),
             VteInput::SyncConfig => view.reload_config(&self.config.borrow()),
             VteInput::Kill => self.terminate_once(),
-            VteInput::FilterFailedBlocks => {
-                report_record_navigation(&sender, view.apply_failed_filter())
-            }
+            VteInput::FilterFailedBlocks => report_record_navigation(
+                &sender,
+                view,
+                &snapshot_dialog,
+                view.apply_failed_filter(),
+            ),
             VteInput::FilterSlowBlocks => {
-                report_record_navigation(&sender, view.apply_slow_filter())
+                report_record_navigation(&sender, view, &snapshot_dialog, view.apply_slow_filter())
             }
             VteInput::FilterPinnedBlocks => view.apply_pinned_filter(),
             VteInput::ClearBlockFilter => view.clear_block_filter(),
@@ -522,9 +541,11 @@ impl Component for BlockTerminal {
             VteInput::JumpToPrevPinned => view.jump_to_pinned(-1),
             VteInput::JumpToNextPinned => view.jump_to_pinned(1),
             VteInput::JumpToPrevFailed => {
-                report_record_navigation(&sender, view.jump_to_failed(-1))
+                report_record_navigation(&sender, view, &snapshot_dialog, view.jump_to_failed(-1))
             }
-            VteInput::JumpToNextFailed => report_record_navigation(&sender, view.jump_to_failed(1)),
+            VteInput::JumpToNextFailed => {
+                report_record_navigation(&sender, view, &snapshot_dialog, view.jump_to_failed(1))
+            }
             VteInput::ExportSessionMarkdown => {
                 let message = export_notice(
                     view.export_session_to_file(crate::block_view::SessionExportFormat::Markdown),
@@ -593,9 +614,11 @@ impl Component for BlockTerminal {
                 self.search_status = SearchStatus::Idle;
                 let _ = sender.output(VteOutput::SearchStatus(self.search_status.clone()));
             }
-            VteInput::CrossBlockSearch => {
-                cross_block_search::toggle(view.clone(), self.cross_block_search_dialog.clone())
-            }
+            VteInput::CrossBlockSearch => cross_block_search::toggle(
+                view.clone(),
+                self.cross_block_search_dialog.clone(),
+                snapshot_dialog,
+            ),
             VteInput::AskAiAboutSelectedBlock => {
                 if let Some(context) = view.selected_block_context(80) {
                     let _ = sender.output(VteOutput::AskAiAboutBlock(context));
@@ -653,7 +676,7 @@ mod tests {
     fn unavailable_unified_record_location_has_explicit_feedback() {
         assert!(
             record_navigation_notice(RecordNavigationResult::LocationUnavailable)
-                .is_some_and(|message| message.contains("exact record locations"))
+                .is_some_and(|message| message.contains("no retained output snapshot"))
         );
         assert_eq!(
             record_navigation_notice(RecordNavigationResult::Navigated),
@@ -662,6 +685,11 @@ mod tests {
         assert_eq!(
             record_navigation_notice(RecordNavigationResult::NoMatchingRecord),
             None
+        );
+        assert_eq!(
+            record_navigation_notice(RecordNavigationResult::SnapshotView { record_id: 7 }),
+            None,
+            "the snapshot view, not a notice, answers this result"
         );
     }
 

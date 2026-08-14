@@ -65,7 +65,7 @@ impl ZoneChromeRecord {
     }
 }
 
-fn format_block_duration(dur_ms: u64) -> String {
+pub(super) fn format_block_duration(dur_ms: u64) -> String {
     if dur_ms < 1000 {
         format!("{dur_ms}ms")
     } else if dur_ms < 60_000 {
@@ -396,6 +396,15 @@ impl ZoneChromeAuthority {
     fn order(&self, id: u64) -> Option<usize> {
         self.order_by_id.get(&id).copied()
     }
+
+    /// The zone's trusted head span, only while the id itself still holds
+    /// marker authority. Retirement — including the quarantine reconciliation
+    /// that refuses an unproven completed id — removes both together, so a
+    /// stale span can never answer for a retired id.
+    fn trusted_span(&self, id: u64) -> Option<ZoneRowSpan> {
+        self.order_by_id.contains_key(&id).then_some(())?;
+        self.row_spans.get(&id).copied()
+    }
 }
 
 /// Parse only the one canonical spelling emitted by `ZoneMarkerInjector`.
@@ -682,6 +691,36 @@ fn trusted_ring_bounds_from(
             viewport_top,
         },
     )
+}
+
+/// Pure gate behind [`UnifiedChrome::proven_zone_scroll_value`]. Every input
+/// must independently prove itself at `current_epoch` — the projection, the
+/// ring bounds derived from it, and the zone's recorded head — and the head
+/// must lie inside the retained ring. Any doubt is `None`: a record jump is
+/// exact or it does not happen.
+fn proven_zone_scroll_value_from(
+    projection: ViewportProjection,
+    current_epoch: u64,
+    span: Option<ZoneRowSpan>,
+    lower: f64,
+    upper: f64,
+    value: f64,
+    page_size: f64,
+) -> Option<f64> {
+    (projection.row_epoch == current_epoch).then_some(())?;
+    let bounds = trusted_ring_bounds_from(projection, lower, upper, value)?;
+    let span = span?;
+    (span.row_epoch == current_epoch).then_some(())?;
+    (bounds.retained_start <= span.head && span.head < bounds.retained_end_exclusive)
+        .then_some(())?;
+    if !page_size.is_finite() || page_size < 0.0 {
+        return None;
+    }
+    let adjustment_row = span.head.checked_sub(projection.row_offset)?;
+    // A retained head near the ring tail cannot be scrolled to the viewport
+    // top; clamping to the scroll range still shows the row.
+    let max_value = (upper - page_size).max(lower);
+    Some((adjustment_row as f64).clamp(lower, max_value))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1223,6 +1262,29 @@ impl UnifiedChrome {
         )
     }
 
+    /// Adjustment value that provably shows the zone's head row, or `None`
+    /// when any link in the proof chain (projection epoch, ring bounds, the
+    /// zone's recorded span, retention of the head row) is missing. The caller
+    /// must treat `None` as "no exact location", never guess one.
+    pub(super) fn proven_zone_scroll_value(
+        &self,
+        terminal: &Terminal,
+        zone_id: u64,
+    ) -> Option<f64> {
+        let projection = self.projection.get()?;
+        let adjustment = terminal.vadjustment()?;
+        let span = self.authority.borrow().trusted_span(zone_id);
+        proven_zone_scroll_value_from(
+            projection,
+            self.row_epoch.get(),
+            span,
+            adjustment.lower(),
+            adjustment.upper(),
+            adjustment.value(),
+            adjustment.page_size(),
+        )
+    }
+
     pub(super) fn set_alt_screen(&self, alt_screen: bool) {
         self.surface.set_visible(!alt_screen);
         if alt_screen {
@@ -1411,7 +1473,7 @@ mod tests {
 
     #[test]
     fn config_100_keeps_100_records_but_99_completed_markers_plus_pending() {
-        let mut records = VecDeque::new();
+        let mut records = super::super::UnifiedZoneStore::new();
         let mut authority = ZoneChromeAuthority::new(Some(NONCE));
         for id in 0..100 {
             authority.begin_zone(id);
@@ -1435,9 +1497,9 @@ mod tests {
         authority.begin_zone(100);
         authority.enforce_limit(100);
 
-        assert_eq!(records.len(), 100);
+        assert_eq!(records.records.len(), 100);
         assert_eq!(authority.active.len(), 100);
-        assert_eq!(records.front().map(|record| record.id), Some(0));
+        assert_eq!(records.records.front().map(|record| record.id), Some(0));
         assert!(authority.record(0).is_none());
         assert_eq!(authority.active.back().map(|record| record.id), Some(100));
         assert!(!authority.is_completed(100));
@@ -1691,6 +1753,124 @@ mod tests {
             })
         );
         assert_eq!(trusted_ring_bounds_from(projection, 6.0, 105.0, 81.0), None);
+    }
+
+    #[test]
+    fn proven_zone_scroll_maps_a_current_epoch_head_into_the_scroll_range() {
+        let projection = ViewportProjection {
+            row_offset: 35,
+            ring_lower: 40,
+            row_epoch: 3,
+        };
+        let span = |row_epoch, head| {
+            Some(ZoneRowSpan {
+                row_epoch,
+                head,
+                end_exclusive: None,
+            })
+        };
+
+        assert_eq!(
+            proven_zone_scroll_value_from(projection, 3, span(3, 90), 5.0, 105.0, 81.0, 24.0),
+            Some(55.0)
+        );
+        // The retained floor is inclusive: the oldest row the ring still holds
+        // is a provable target, not a rejected one.
+        assert_eq!(
+            proven_zone_scroll_value_from(projection, 3, span(3, 40), 5.0, 105.0, 81.0, 24.0),
+            Some(5.0)
+        );
+        // A head near the ring tail clamps to the maximum scroll position.
+        assert_eq!(
+            proven_zone_scroll_value_from(projection, 3, span(3, 139), 5.0, 105.0, 81.0, 24.0),
+            Some(81.0)
+        );
+    }
+
+    /// Every broken link in the proof chain must refuse the jump: no scroll
+    /// target is ever guessed from a stale epoch, a missing span, or a head
+    /// outside the retained ring.
+    #[test]
+    fn proven_zone_scroll_fails_closed_on_every_unproven_input() {
+        let projection = ViewportProjection {
+            row_offset: 35,
+            ring_lower: 40,
+            row_epoch: 3,
+        };
+        let span = |row_epoch, head| {
+            Some(ZoneRowSpan {
+                row_epoch,
+                head,
+                end_exclusive: None,
+            })
+        };
+
+        for (current_epoch, span, lower, page_size) in [
+            // Projection from a retired epoch. The span is recorded at the
+            // current epoch, so only the projection's own epoch check can
+            // refuse this row.
+            (4, span(4, 90), 5.0, 24.0),
+            // No recorded span for the zone.
+            (3, None, 5.0, 24.0),
+            // Span recorded at a stale epoch.
+            (3, span(2, 90), 5.0, 24.0),
+            // Head below the retained floor / at the exclusive end.
+            (3, span(3, 39), 5.0, 24.0),
+            (3, span(3, 140), 5.0, 24.0),
+            // Ring floor moved since the projection was proven.
+            (3, span(3, 90), 6.0, 24.0),
+            // Unusable page size.
+            (3, span(3, 90), 5.0, f64::NAN),
+        ] {
+            assert_eq!(
+                proven_zone_scroll_value_from(
+                    projection,
+                    current_epoch,
+                    span,
+                    lower,
+                    105.0,
+                    81.0,
+                    page_size
+                ),
+                None
+            );
+        }
+    }
+
+    /// The span index answers only for an id that still holds authority, so a
+    /// retired zone cannot be scrolled to through a span left behind.
+    #[test]
+    fn trusted_span_follows_marker_authority_not_the_span_table() {
+        let mut authority = make_authority(&[7]);
+        authority.row_spans.insert(
+            7,
+            ZoneRowSpan {
+                row_epoch: 3,
+                head: 90,
+                end_exclusive: None,
+            },
+        );
+        assert_eq!(
+            authority.trusted_span(7).map(|span| span.head),
+            Some(90),
+            "an id with authority answers with its recorded head"
+        );
+        assert_eq!(authority.trusted_span(8), None, "unknown id");
+
+        // A span whose id never held (or no longer holds) marker authority is
+        // not a scroll target, whichever side of the pair went missing.
+        authority.row_spans.insert(
+            9,
+            ZoneRowSpan {
+                row_epoch: 3,
+                head: 120,
+                end_exclusive: None,
+            },
+        );
+        assert_eq!(authority.trusted_span(9), None);
+
+        authority.retire_ids(&[7]);
+        assert_eq!(authority.trusted_span(7), None);
     }
 
     #[test]
