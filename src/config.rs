@@ -7,7 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::keybindings::KeybindingMap;
-use jterm_core::host::find_executable_in_path;
+use jterm_core::host::{find_executable_in_path, is_executable_file};
 use jterm_core::process::shell_single_quote;
 
 const DEFAULT_FONT_DESC: &str = "Monospace 14";
@@ -219,8 +219,28 @@ fn wrap_exec_in_login_bash(command: &str) -> String {
     )
 }
 
+/// The interactive-bash wrapper runs the *user's* rc, so it needs the system's
+/// interactive bash — not whichever bash the PATH we inherited happens to name
+/// first. A `nix develop`/`nix-shell` puts stdenv's bash ahead of the system
+/// one, and that build has no programmable completion: no `complete` builtin,
+/// and `progcomp`/`hostcomplete` are not shopt names. A stock `~/.bashrc`
+/// sources `/usr/share/bash-completion/bash_completion`, so every one of its
+/// directives fails and ~65 error lines land on the pane before the shell's
+/// first prompt — where a continuous surface never clears them away.
+fn interactive_bash_path() -> Option<std::path::PathBuf> {
+    [
+        "/usr/bin/bash",
+        "/bin/bash",
+        "/run/current-system/sw/bin/bash",
+    ]
+    .into_iter()
+    .map(std::path::PathBuf::from)
+    .find(|candidate| is_executable_file(candidate))
+    .or_else(|| find_executable_in_path("bash"))
+}
+
 fn wrap_jsh_argv_in_interactive_bash(jsh_path: &str) -> Option<Vec<String>> {
-    let bash_path = find_executable_in_path("bash")?;
+    let bash_path = interactive_bash_path()?;
     Some(vec![
         bash_path.to_string_lossy().to_string(),
         "-ic".to_string(),
@@ -1767,8 +1787,10 @@ pub(crate) fn choose_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
         return vec![jsh_path.to_string_lossy().to_string()];
     }
 
-    // Fallback: bash
-    if let Some(bash_path) = find_executable_in_path("bash") {
+    // Fallback: bash. This one *is* the pane's shell rather than a wrapper
+    // that execs itself away, so resolving it off the inherited PATH would
+    // leave the user in a bash their rc was not written for.
+    if let Some(bash_path) = interactive_bash_path() {
         return vec![bash_path.to_string_lossy().to_string(), "-l".to_string()];
     }
 
@@ -2053,6 +2075,12 @@ mod tests {
     fn jsh_wrapper_uses_interactive_bash() {
         let argv = wrap_jsh_argv_in_interactive_bash("/home/tester/.local/bin/jsh")
             .expect("bash should be available in the test environment");
+        // The wrapper sources the user's rc, so it must be the system's
+        // interactive bash whenever one exists — never whichever bash the
+        // inherited PATH names first.
+        if is_executable_file(std::path::Path::new("/usr/bin/bash")) {
+            assert_eq!(argv[0], "/usr/bin/bash");
+        }
         assert_eq!(argv[1], "-ic");
         assert_eq!(
             &argv[2..],
