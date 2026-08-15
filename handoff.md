@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-15
+Updated: 2026-08-15 (config_store fixture fix)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,13 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **config_store test fixtures are umask-proof (2026-08-15, second half)**:
+  the 11 tests that wrote `config.toml` fixtures with plain `fs::write` now go
+  through a `write_fixture` helper that chmods `0600` after writing, so the
+  full suite passes under the default `umask 002` as well as `077`. Test-only
+  change; mode-matrix and permission-rejection tests that set explicit modes
+  were deliberately left untouched.
 
 - **Architecture unification round (2026-08-15)**: the last local duplicates
   of core modules are gone, and `jterm_core` is repinned to
@@ -29,9 +36,7 @@ captured, queued, written, and restored.
   the round also caught the reader-join hang and a stale comment claiming
   `\u{ffa0}` was anvil-only (core already covers it). Still local by design:
   `src/notebook.rs`'s long-lived terminal children keep their own wait logic
-  (`SupervisedChild` scopes itself to short-lived helpers), and
-  `config_store::tests` remain umask-sensitive (they pass under `umask 077`)
-  — a pre-existing fixture gap, not from this round.
+  (`SupervisedChild` scopes itself to short-lived helpers).
 
 - ASCII organism frontend parity now includes the five-part embodiment pass:
   visible juvenile/adult/seasoned phenotypes through a composable render

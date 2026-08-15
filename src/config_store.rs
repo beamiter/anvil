@@ -1967,6 +1967,17 @@ mod tests {
         path
     }
 
+    /// Fixture files must stay owner-only even under a permissive umask: the
+    /// production reader rejects group/other-writable configs.
+    fn write_fixture(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) {
+        fs::write(&path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
     #[test]
     fn explicit_missing_config_is_an_error_but_default_discovery_is_a_warning() {
         let path = temporary_directory("missing-check").join("absent.toml");
@@ -2016,9 +2027,9 @@ mod tests {
     fn revisions_detect_external_changes() {
         let directory = temporary_directory("revision");
         let path = directory.join("config.toml");
-        fs::write(&path, "opacity = 0.5\n").unwrap();
+        write_fixture(&path, "opacity = 0.5\n");
         let first = revision_at(&path).unwrap();
-        fs::write(&path, "opacity = 0.6\n").unwrap();
+        write_fixture(&path, "opacity = 0.6\n");
         let second = revision_at(&path).unwrap();
         assert_ne!(first, second);
         fs::remove_dir_all(directory).unwrap();
@@ -2037,7 +2048,7 @@ mod tests {
         let hard = directory.join("hard.toml");
         let fifo = directory.join("fifo.toml");
         let oversized = directory.join("oversized.toml");
-        fs::write(&victim, b"opacity = 0.5\n").unwrap();
+        write_fixture(&victim, b"opacity = 0.5\n");
         assert!(read_config_bytes(&victim).unwrap().is_some());
 
         symlink(&victim, &symbolic).unwrap();
@@ -2133,9 +2144,9 @@ mod tests {
     fn stale_writer_is_rejected_without_touching_disk() {
         let directory = temporary_directory("conflict");
         let path = directory.join("config.toml");
-        fs::write(&path, "opacity = 0.5\n").unwrap();
+        write_fixture(&path, "opacity = 0.5\n");
         let expected = revision_at(&path).unwrap();
-        fs::write(&path, "opacity = 0.6\n").unwrap();
+        write_fixture(&path, "opacity = 0.6\n");
         let config = config::load_config().0;
         let error = save_config_to_path(&path, &config, Some(&expected)).unwrap_err();
         assert!(error.is_conflict());
@@ -2268,7 +2279,7 @@ mod tests {
     fn saving_writes_remote_hosts_into_a_file_that_lacked_the_key() {
         let directory = temporary_directory("remote-save");
         let path = directory.join("config.toml");
-        fs::write(&path, "opacity = 0.5\n").unwrap();
+        write_fixture(&path, "opacity = 0.5\n");
         let expected = revision_at(&path).unwrap();
         let mut config = config::load_safe_config().0;
         config.remote_hosts = vec![ssh_host(), docker_host()];
@@ -2295,11 +2306,10 @@ mod tests {
     fn emptying_the_remote_host_list_persists_an_empty_array() {
         let directory = temporary_directory("remote-empty");
         let path = directory.join("config.toml");
-        fs::write(
+        write_fixture(
             &path,
             "[[remote_hosts]]\nname = 'staging'\nhost = 'server.example.com'\n",
-        )
-        .unwrap();
+        );
         let expected = revision_at(&path).unwrap();
         let config = config::load_safe_config().0;
         assert!(config.remote_hosts.is_empty());
@@ -2335,7 +2345,7 @@ mod tests {
     fn validation_knows_the_container_host_keys() {
         let directory = temporary_directory("remote-container");
         let path = directory.join("config.toml");
-        fs::write(
+        write_fixture(
             &path,
             concat!(
                 "[[remote_hosts]]\n",
@@ -2345,19 +2355,17 @@ mod tests {
                 "deploy_artifact = '/opt/jsh/jsh'\n",
                 "deploy = 'persist'\n",
             ),
-        )
-        .unwrap();
+        );
         let report = validate_path(&path);
         assert_eq!(report.errors(), 0);
         assert_eq!(report.warnings(), 0);
 
         // The parser rejects a relative artifact path; the validator has to
         // say so instead of skipping the host silently.
-        fs::write(
+        write_fixture(
             &path,
             "[[remote_hosts]]\nhost = 'dev-env'\ndeploy_artifact = 'jsh'\n",
-        )
-        .unwrap();
+        );
         let report = validate_path(&path);
         assert_eq!(report.errors(), 1);
         fs::remove_dir_all(directory).unwrap();
@@ -2368,7 +2376,7 @@ mod tests {
         let directory = temporary_directory("render-budget");
         let path = directory.join("config.toml");
         let original = b"opacity = 0.5\n";
-        fs::write(&path, original).unwrap();
+        write_fixture(&path, original);
         let expected = revision_at(&path).unwrap();
         let mut config = config::load_safe_config().0;
         config.ai_model = "x".repeat(MAX_CONFIG_BYTES as usize);
@@ -2399,11 +2407,10 @@ mod tests {
     fn validation_reports_unknown_and_invalid_keys_without_values() {
         let directory = temporary_directory("validation");
         let path = directory.join("config.toml");
-        fs::write(
+        write_fixture(
             &path,
             "opacity = 'secret-value'\nunknown_setting = 'also-secret'\n",
-        )
-        .unwrap();
+        );
         let report = validate_path(&path);
         assert_eq!(report.errors(), 1);
         assert_eq!(report.warnings(), 1);
@@ -2417,7 +2424,7 @@ mod tests {
     fn validation_rejects_unsafe_remote_fields_without_echoing_them() {
         let directory = temporary_directory("remote-validation");
         let path = directory.join("config.toml");
-        fs::write(
+        write_fixture(
             &path,
             concat!(
                 "[[remote_hosts]]\n",
@@ -2428,8 +2435,7 @@ mod tests {
                 "session = \"prod\\tsecret\"\n",
                 "ssh_args = [\"-p\", \"22\\tProxyCommand=secret\"]\n",
             ),
-        )
-        .unwrap();
+        );
         let report = validate_path(&path);
         let json = serde_json::to_string(&report).unwrap();
         for key in [
@@ -2722,9 +2728,9 @@ mod tests {
     fn restore_uses_secondary_when_primary_is_invalid() {
         let directory = temporary_directory("restore");
         let path = directory.join("config.toml");
-        fs::write(&path, "not valid toml = [\n").unwrap();
-        fs::write(backup_path_for(&path), "also invalid = [\n").unwrap();
-        fs::write(secondary_backup_path_for(&path), "opacity = 0.7\n").unwrap();
+        write_fixture(&path, "not valid toml = [\n");
+        write_fixture(backup_path_for(&path), "also invalid = [\n");
+        write_fixture(secondary_backup_path_for(&path), "opacity = 0.7\n");
         let (source, _) = restore_backup_to_path(&path).unwrap();
         assert_eq!(source, secondary_backup_path_for(&path));
         assert_eq!(fs::read_to_string(&path).unwrap(), "opacity = 0.7\n");
@@ -2788,7 +2794,7 @@ mod tests {
 
         let directory = temporary_directory("restore-unreadable-primary");
         let path = directory.join("config.toml");
-        fs::write(&path, "not valid toml = [\n").unwrap();
+        write_fixture(&path, "not valid toml = [\n");
         let primary = backup_path_for(&path);
         let primary_name = CString::new(primary.as_os_str().as_bytes()).unwrap();
         // SAFETY: primary_name is a live NUL-terminated pathname for this call.
@@ -2796,7 +2802,7 @@ mod tests {
             unsafe { nix::libc::mkfifo(primary_name.as_ptr(), 0o600) },
             0
         );
-        fs::write(secondary_backup_path_for(&path), "opacity = 0.7\n").unwrap();
+        write_fixture(secondary_backup_path_for(&path), "opacity = 0.7\n");
 
         let (source, _) = restore_backup_to_path(&path).unwrap();
         assert_eq!(source, secondary_backup_path_for(&path));
