@@ -12,6 +12,25 @@ captured, queued, written, and restored.
 
 ## Completed since the previous handoff
 
+- **Inherited-environment freeze (2026-08-15, fourth round)**: anvil already
+  consumed `jterm_core::child_env` but never wired the freeze; now
+  `capture_inherited_environment()` is the first statement of `main` (every
+  `set_var` — `ANVIL_CONFIG`, the input-method writes — runs strictly after;
+  capture failure is fatal). The PTY spawn builds children from
+  `envp_from_captured`, and executable resolution now reads `PATH` out of the
+  frozen block instead of the live process environment, so resolution cannot
+  diverge from the PATH the child will actually run with. The VTE spawn pairs
+  `vte_envv_from_captured` with `VTE_SPAWN_NO_PARENT_ENVV_BITS` (OR'd in
+  numerically — gtk-rs predates the named flag), stopping libvte from merging
+  the live GTK-mutated environment back in; its failure path reports a launch
+  failure in the terminal like the existing async errors. Adversarial review
+  verified capture ordering on every path, the frozen-PATH semantics against
+  `execvpe`, and the flag's bit value against the system libvte headers; it
+  found only comment nits (fixed). Accepted test weakness, same as forge's:
+  the spawn tests tolerate an `AlreadyExists` capture race, so the test
+  binary's snapshot can contain another test's env mutation (no assertion
+  depends on it).
+
 - **Repin round (2026-08-15, third)**: `jterm_core` repinned to
   `04f63283090591d9ad88500224e848dbb69b1f61` (picks up `helper.rs`,
   `link.rs`, `bounded_json.rs`, `command_history::prepare_path`, and the

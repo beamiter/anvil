@@ -244,14 +244,36 @@ pub(crate) fn spawn_shell(
         crate::host::wrap_argv(&argv_vec, effective_working_directory, &host_environment);
     let argv: Vec<&str> = argv_vec.iter().map(|s| s.as_str()).collect();
 
-    // libvte injects its own TERM/VTE_VERSION and adds `envv` on top, so this is
-    // identity only: a LESS or a LANG asserted here would override whatever the
-    // user configured, which `child_env::vte_envv` documents and refuses to do.
-    // The cwd-authentication token rides along as the per-call extra.
-    let envv_owned: Vec<String> =
-        child_env::vte_envv(&child_env::ChildEnv::from_identity(), &host_environment);
+    // `vte_envv_from_captured` is the child's complete environment, built from
+    // the launch-time snapshot `main` froze; the cwd-authentication token rides
+    // along as the per-call extra. VTE_SPAWN_NO_PARENT_ENVV below stops libvte
+    // from merging the live, GTK-mutated process environment back in, which
+    // would reintroduce the frontend-private writes the freeze exists to
+    // exclude (ANVIL_CONFIG and anvil's own input-method overrides; values the
+    // user launched with stay frozen and intact). libvte's own TERM/VTE_VERSION
+    // injection loses to explicit envv entries.
+    let envv_owned: Vec<String> = match child_env::vte_envv_from_captured(
+        &child_env::ChildEnv::from_identity(),
+        &host_environment,
+    ) {
+        Ok(envv) => envv,
+        Err(error) => {
+            let message = launch_failure_message(&error);
+            log::error!("{message}");
+            terminal.feed(format!("\r\nanvil: {message}\r\n").as_bytes());
+            let _ = sender.output(VteOutput::LaunchFailed(message));
+            return;
+        }
+    };
     let envv: Vec<&str> = envv_owned.iter().map(String::as_str).collect();
-    let spawn_flags = SpawnFlags::SEARCH_PATH;
+    // gtk-rs predates VTE 0.60's VTE_SPAWN_NO_PARENT_ENVV, so OR the numeric
+    // flag jterm_core pins into the ordinary GLib spawn flags. SEARCH_PATH
+    // resolves argv[0] against the parent's live PATH while the child receives
+    // the frozen one; the two cannot diverge today because nothing mutates
+    // PATH after the capture.
+    let spawn_flags = SpawnFlags::from_bits_retain(
+        SpawnFlags::SEARCH_PATH.bits() | child_env::VTE_SPAWN_NO_PARENT_ENVV_BITS,
+    );
     let cancellable: Option<&Cancellable> = None;
     let spawn_working_directory = if crate::host::is_flatpak() {
         None

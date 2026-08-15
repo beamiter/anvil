@@ -1965,6 +1965,16 @@ impl SimpleComponent for AppModel {
 }
 
 fn main() {
+    // Freeze the inherited environment before anything can mutate it: CLI
+    // parsing writes ANVIL_CONFIG below, input-method setup writes
+    // GTK_PATH/GTK_IM_MODULE/XMODIFIERS, and GTK itself starts threads. Every
+    // spawn path builds the child environment from this snapshot, so a capture
+    // after any of those would leak frontend-private variables to the shell.
+    // A failure here is an initialization-ordering bug, not a runtime error.
+    if let Err(error) = child_env::capture_inherited_environment() {
+        eprintln!("anvil: {error}");
+        std::process::exit(1);
+    }
     jterm_core::identity::init(jterm_core::identity::AppIdentity {
         app_name: host::APP_NAME,
         app_id: host::APP_ID,
@@ -1983,8 +1993,9 @@ fn main() {
     };
 
     if let Some(path) = parsed.config_path {
-        // SAFETY: CLI parsing is the first operation in main; no GTK runtime,
-        // worker thread, or configuration read exists yet.
+        // SAFETY: no GTK runtime, worker thread, or configuration read exists
+        // yet. The inherited-environment freeze already ran above, so this
+        // process-only variable stays out of every spawned child.
         unsafe { std::env::set_var("ANVIL_CONFIG", path) };
     }
 

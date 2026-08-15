@@ -12,7 +12,7 @@ use nix::pty::{openpty, OpenptyResult};
 use nix::unistd::{self, ForkResult, Pid};
 use relm4::gtk;
 use std::collections::VecDeque;
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
 use std::io::{self, Read as _, Write as _};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
@@ -687,7 +687,10 @@ impl OwnedPty {
         // `flatpak-spawn --env=` arguments for the host child, so passing it here
         // as well would set it in the sandbox process too.
         let bridged_extra: &[(&str, &str)] = if host_bridge { &[] } else { &sanitized_extra };
-        let mut c_environment = child_env::envp(&child_environment_options(), bridged_extra)?;
+        // Strict frozen variant: the block comes from the launch-time snapshot
+        // `main` captured, never from the live GTK-mutated process environment.
+        let mut c_environment =
+            child_env::envp_from_captured(&child_environment_options(), bridged_extra)?;
         let token_channel = if host_bridge || !enable_shell_token {
             None
         } else {
@@ -711,12 +714,17 @@ impl OwnedPty {
                 .expect("numeric shell integration descriptor contains no NUL"),
             );
         }
-        // Resolve against the PATH the *child* will run with, which the overlay
-        // above never rewrites, so this cannot silently search a different PATH
-        // than the one the shell inherits.
-        let child_path = std::env::var_os("PATH");
+        // Resolve against the PATH the *child* will run with: read it out of
+        // the frozen block just built, not the live process environment, which
+        // frontend setup may have changed since the capture.
+        let child_path = c_environment.iter().find_map(|entry| {
+            entry
+                .to_bytes()
+                .strip_prefix(b"PATH=")
+                .map(OsStr::from_bytes)
+        });
         let executable_path =
-            crate::host::resolve_executable(&executable_argv[0], child_path.as_deref(), child_cwd)?;
+            crate::host::resolve_executable(&executable_argv[0], child_path, child_cwd)?;
         let c_executable = CString::new(executable_path.as_os_str().as_bytes()).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1467,6 +1475,17 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
+    /// The strict spawn path reads the frozen launch environment, but a test
+    /// binary has no `main` to capture it. The capture is process-global and
+    /// one-shot while tests run on parallel threads, so a racing call that
+    /// loses with `AlreadyExists` is fine: either way the snapshot exists by
+    /// the time this returns.
+    fn ensure_inherited_environment_captured() {
+        if !child_env::inherited_environment_is_captured() {
+            let _ = child_env::capture_inherited_environment();
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn eventfd_wakeup_is_coalesced_until_consumer_rearms() {
@@ -1596,6 +1615,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn bundled_bash_consumes_fd_announces_token_and_scrubs_environment() {
+        ensure_inherited_environment_captured();
         let integration = format!(
             "{}/scripts/shell-integration/anvil.bash",
             env!("CARGO_MANIFEST_DIR")
@@ -1746,6 +1766,43 @@ mod tests {
         assert_eq!(value("JSH_SESSION_ID").as_deref(), Some("7"));
     }
 
+    /// The spawn block comes from the frozen launch snapshot, not the live
+    /// process environment: a variable written after the capture must not reach
+    /// the child, and the identity entries appear exactly once.
+    #[test]
+    fn the_frozen_spawn_environment_excludes_post_capture_mutations() {
+        ensure_inherited_environment_captured();
+        // SAFETY: the marker name is unique to this test and the capture above
+        // strictly precedes this write, so the frozen snapshot cannot contain
+        // it regardless of how the test threads are interleaved.
+        unsafe { std::env::set_var("ANVIL_POST_CAPTURE_MARKER", "1") };
+
+        let block =
+            child_env::envp_from_captured(&child_environment_options(), &[("JSH_SESSION_ID", "7")])
+                .expect("the captured environment builds the spawn block");
+        let entries: Vec<&str> = block
+            .iter()
+            .filter_map(|entry| entry.to_str().ok())
+            .collect();
+
+        assert!(
+            entries
+                .iter()
+                .all(|entry| !entry.starts_with("ANVIL_POST_CAPTURE_MARKER=")),
+            "a post-capture mutation leaked into the frozen spawn environment"
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.starts_with("TERM="))
+                .count(),
+            1
+        );
+        assert!(entries.contains(&"TERM=xterm-256color"));
+        assert!(entries.contains(&"COLORTERM=truecolor"));
+        assert!(entries.contains(&"JSH_SESSION_ID=7"));
+    }
+
     /// Replaces `executable_resolution_is_absolute_and_rejects_missing_commands`,
     /// which pinned the local `resolve_executable` this file donated to
     /// `jterm_core::host` (whose own tests cover the lookup rules, including the
@@ -1754,6 +1811,9 @@ mod tests {
     /// the pane that asked gets the error instead of a child that exits 127.
     #[test]
     fn spawn_reports_an_unresolvable_command_before_forking() {
+        // Without a capture the strict spawn path itself fails with NotFound,
+        // which would make this test pass without exercising resolution.
+        ensure_inherited_environment_captured();
         let error = OwnedPty::spawn(&["anvil-command-that-does-not-exist"], None, &[])
             .err()
             .expect("an unresolvable command must fail the spawn");
