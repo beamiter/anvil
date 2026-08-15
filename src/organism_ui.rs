@@ -5063,7 +5063,7 @@ mod tests {
     fn checkout_identity_requires_the_raw_cwd_not_its_bounded_display_copy() {
         let root = format!("/repo/{}", "r".repeat(5_000));
         let raw_cwd = format!("{root}/nested");
-        let display_cwd = crate::text_safety::bounded_display_text(&raw_cwd, 4 * 1_024, false);
+        let display_cwd = crate::review_input::safe_inline_display(&raw_cwd, 4 * 1_024);
 
         assert_ne!(display_cwd, raw_cwd);
         assert!(!same_checkout(Some(&root), Some(&root), Some(&display_cwd)));

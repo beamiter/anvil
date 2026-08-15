@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-15 (config_store fixture fix)
+Updated: 2026-08-15 (text_safety removal)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,19 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **text_safety removed (2026-08-15, fifth round)**: `jterm_core` repinned to
+  `592d6632b7f51239c0d7ece7dc1796e708fab400`, whose `review_input` spoof table
+  now covers `\u{fff0}..=\u{fff8}` and the full `\u{e0000}..=\u{e0fff}` tag
+  plane — exactly anvil's old local superset — and which adds the bounded
+  `safe_inline_display`/`safe_multiline_display` sanitizers. All
+  `bounded_display_text` call sites moved to the core helpers (the one
+  variable-multiline site in `agent.rs` branches locally), and
+  `src/text_safety.rs` is deleted. Accepted cosmetic change: the truncation
+  suffix is now a bare `…` (appended when `max_bytes >= 3`) instead of
+  `… [truncated]`. `read_history_checked` stays for one policy difference
+  (unsafe cwd kept and sanitized at display time); its spoof check now rides
+  on the identical core table.
 
 - **Inherited-environment freeze (2026-08-15, fourth round)**: anvil already
   consumed `jterm_core::child_env` but never wired the freeze; now

@@ -132,11 +132,11 @@ pub(crate) fn read_history(path: &Path, max: usize) -> Vec<command_history::Comm
 }
 
 /// Read the bounded JSONL tail through a no-follow, nonblocking descriptor.
-/// The core's reader applies the same inode checks and the same 4 MiB tail /
-/// 1 MiB record / 256 KiB command budgets now; this local copy remains for
-/// two deliberate policy differences: `palette_command_is_safe` rides on
-/// `text_safety`'s wider spoof set, and records with an unsafe cwd are kept
-/// and sanitized at display time instead of being dropped during the read.
+/// The core's reader applies the same inode checks, the same 4 MiB tail /
+/// 1 MiB record / 256 KiB command budgets, and the same spoof table now;
+/// this local copy remains for one deliberate policy difference: records
+/// with an unsafe cwd are kept and sanitized at display time instead of
+/// being dropped during the read.
 fn read_history_checked(
     path: &Path,
     max: usize,
@@ -228,7 +228,7 @@ fn palette_command_is_safe(command: &str) -> bool {
     !command.trim().is_empty()
         && command.len() <= MAX_PALETTE_COMMAND_BYTES
         && !command.chars().any(char::is_control)
-        && !crate::text_safety::contains_visual_spoof(command)
+        && !crate::review_input::contains_visual_spoofing(command)
 }
 
 /// Load one newest-first history snapshot for a palette opening, preferring
@@ -346,10 +346,9 @@ pub(crate) fn gather(
                 Accept::TypeCommand(String::new()),
             )
         } else {
-            let display_query = crate::text_safety::bounded_display_text(
+            let display_query = crate::review_input::safe_inline_display(
                 &query.text,
                 MAX_PALETTE_METADATA_DISPLAY_BYTES,
-                false,
             );
             (
                 format!("Ask AI: {display_query}"),
@@ -383,10 +382,9 @@ pub(crate) fn gather(
             let entry = Entry {
                 tier: 2,
                 score: recency,
-                label: crate::text_safety::bounded_display_text(
+                label: crate::review_input::safe_inline_display(
                     &item.command,
                     MAX_PALETTE_METADATA_DISPLAY_BYTES,
-                    false,
                 ),
                 sublabel: Some(history_sublabel(item)),
                 right: None,
@@ -434,7 +432,7 @@ fn history_sublabel(item: &command_history::CommandHistoryRecord) -> String {
     } else {
         cwd
     };
-    crate::text_safety::bounded_display_text(&text, MAX_PALETTE_METADATA_DISPLAY_BYTES, false)
+    crate::review_input::safe_inline_display(&text, MAX_PALETTE_METADATA_DISPLAY_BYTES)
 }
 
 fn shorten_path(p: &str) -> String {

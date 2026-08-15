@@ -269,7 +269,7 @@ pub(crate) fn append_entries(
             continue;
         };
         let display_name =
-            crate::text_safety::bounded_display_text(&name, MAX_FILE_NAME_DISPLAY_BYTES, false);
+            crate::review_input::safe_inline_display(&name, MAX_FILE_NAME_DISPLAY_BYTES);
         let tooltip = display_full_path(&path);
         let iter = store.insert_with_values(
             parent,
@@ -397,14 +397,13 @@ pub(crate) fn display_path(path: &Path) -> String {
     } else {
         display_os_str(path.as_os_str())
     };
-    crate::text_safety::bounded_display_text(&display, MAX_FILE_PATH_DISPLAY_BYTES, false)
+    crate::review_input::safe_inline_display(&display, MAX_FILE_PATH_DISPLAY_BYTES)
 }
 
 pub(crate) fn display_full_path(path: &Path) -> String {
-    crate::text_safety::bounded_display_text(
+    crate::review_input::safe_inline_display(
         &display_os_str(path.as_os_str()),
         MAX_FILE_PATH_DISPLAY_BYTES,
-        false,
     )
 }
 

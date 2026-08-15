@@ -23,7 +23,9 @@ pub fn is_url(text: &str) -> bool {
     !text.is_empty()
         && text.len() <= MAX_URI_BYTES
         && !text.chars().any(|ch| {
-            ch.is_whitespace() || ch.is_control() || crate::text_safety::is_visual_spoof(ch)
+            ch.is_whitespace()
+                || ch.is_control()
+                || crate::review_input::is_visual_spoofing_character(ch)
         })
         && SCHEMES.iter().any(|scheme| text.starts_with(scheme))
 }
@@ -45,7 +47,7 @@ pub fn open_uri(uri: &str) {
     if let Err(err) = gio::AppInfo::launch_default_for_uri(uri, None::<&gio::AppLaunchContext>) {
         log::warn!(
             "Failed to open a validated URI: {}",
-            crate::text_safety::bounded_display_text(&err.to_string(), 1024, false)
+            crate::review_input::safe_inline_display(&err.to_string(), 1024)
         );
     }
 }

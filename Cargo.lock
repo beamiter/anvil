@@ -847,7 +847,7 @@ dependencies = [
 [[package]]
 name = "jterm_core"
 version = "0.2.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=04f63283090591d9ad88500224e848dbb69b1f61#04f63283090591d9ad88500224e848dbb69b1f61"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=592d6632b7f51239c0d7ece7dc1796e708fab400#592d6632b7f51239c0d7ece7dc1796e708fab400"
 dependencies = [
  "crossbeam-channel",
  "dirs",

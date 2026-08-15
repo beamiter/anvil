@@ -847,9 +847,7 @@ const MAX_COMMAND_HISTORY_ENTRIES: usize = 2_000;
 
 fn recalled_command_is_safe(command: &str) -> bool {
     command.len() <= MAX_RECALLED_COMMAND_BYTES
-        && !command
-            .chars()
-            .any(|ch| !ch.is_control() && crate::text_safety::is_visual_spoof(ch))
+        && !crate::review_input::contains_noncontrol_visual_spoofing(command)
 }
 
 fn agent_command_is_safe(command: &str) -> bool {
@@ -8692,8 +8690,7 @@ impl TermView {
                             .is_some_and(|child| child.is_visible()),
                     );
                     let cmd = running_cmd.borrow();
-                    let cmd_disp =
-                        crate::text_safety::bounded_display_text(cmd.trim(), 1024, false);
+                    let cmd_disp = crate::review_input::safe_inline_display(cmd.trim(), 1024);
                     let elapsed = block_start_time
                         .get()
                         .and_then(|st| SystemTime::now().duration_since(st).ok())
@@ -8725,8 +8722,7 @@ impl TermView {
                     let card_bottom = card.y() + card.height();
                     if header_bottom <= 0.0 && card_bottom > sticky_height + 4.0 {
                         let command = block.cmd_text.lines().next().unwrap_or("").trim();
-                        let command =
-                            crate::text_safety::bounded_display_text(command, 1024, false);
+                        let command = crate::review_input::safe_inline_display(command, 1024);
                         Some((block.id, command, block.long_output))
                     } else {
                         None

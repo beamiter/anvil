@@ -1045,7 +1045,7 @@ impl AppModel {
         ) else {
             return;
         };
-        let message = crate::text_safety::bounded_display_text(&message, 1024, false);
+        let message = crate::review_input::safe_inline_display(&message, 1024);
         self.show_toast(message);
     }
 
@@ -2623,16 +2623,14 @@ fn persistence_failure_notice(
         [] => None,
         [failure] => Some(format!(
             "Background save failed — {}: {}. Recent state may not be saved.",
-            crate::text_safety::bounded_display_text(&failure.operation, 160, false),
-            crate::text_safety::bounded_display_text(&failure.error, 512, false)
+            crate::review_input::safe_inline_display(&failure.operation, 160),
+            crate::review_input::safe_inline_display(&failure.error, 512)
         )),
         failures => {
             let operations = failures
                 .iter()
                 .take(4)
-                .map(|failure| {
-                    crate::text_safety::bounded_display_text(&failure.operation, 96, false)
-                })
+                .map(|failure| crate::review_input::safe_inline_display(&failure.operation, 96))
                 .collect::<Vec<_>>()
                 .join(", ");
             let remainder = failures.len().saturating_sub(4);

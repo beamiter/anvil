@@ -555,8 +555,7 @@ impl Component for AiPanelModel {
                         }
                     }
                     Err(error) => {
-                        let error =
-                            crate::text_safety::bounded_display_text(&error, 2 * 1024, false);
+                        let error = crate::review_input::safe_inline_display(&error, 2 * 1024);
                         let _ = self
                             .store
                             .complete_error(token, format!("AI error: {error}"));
@@ -649,11 +648,8 @@ impl Component for AiPanelModel {
                 Err(_) => {}
             },
             AiPanelMsg::Delete => {
-                let title = crate::text_safety::bounded_display_text(
-                    self.store.active_title(),
-                    1_024,
-                    false,
-                );
+                let title =
+                    crate::review_input::safe_inline_display(self.store.active_title(), 1_024);
                 let dialog = adw::AlertDialog::new(
                     Some("Delete this chat?"),
                     Some(&format!(
@@ -791,7 +787,7 @@ impl AiPanelModel {
             return false;
         };
         payload.user_text = payload.user_text.trim().to_string();
-        let provider = crate::text_safety::bounded_display_text(&client.display_name(), 256, false);
+        let provider = crate::review_input::safe_inline_display(&client.display_name(), 256);
         let start = match self.store.begin_turn(
             payload.user_text.clone(),
             payload.context.clone(),
@@ -961,7 +957,7 @@ impl AiPanelModel {
             .and_then(|payload| payload.context.as_ref())
             .or_else(|| self.store.active_context());
         if let Some(context) = context {
-            let command = crate::text_safety::bounded_display_text(&context.cmd, 4 * 1024, false);
+            let command = crate::review_input::safe_inline_display(&context.cmd, 4 * 1024);
             widgets
                 .context_label
                 .set_label(&format!("Block: {command} (exit {})", context.exit_code));

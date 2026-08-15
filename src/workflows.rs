@@ -185,7 +185,7 @@ fn validate_workflow(workflow: &Workflow) -> Result<(), String> {
     }
     crate::review_input::validate(&workflow.command)
         .map_err(|error| format!("command is unsafe for review-only insertion: {error}"))?;
-    if crate::text_safety::contains_visual_spoof(&workflow.command) {
+    if crate::review_input::contains_visual_spoofing(&workflow.command) {
         return Err("workflow command contains an invisible or bidirectional character".into());
     }
     if workflow.tags.len() > MAX_WORKFLOW_TAGS {
@@ -228,7 +228,7 @@ fn validate_workflow(workflow: &Workflow) -> Result<(), String> {
             }
             if default
                 .chars()
-                .any(|ch| ch.is_control() || crate::text_safety::is_visual_spoof(ch))
+                .any(|ch| ch.is_control() || crate::review_input::is_visual_spoofing_character(ch))
             {
                 return Err(format!(
                     "default for '{}' is unsafe for command insertion",
@@ -254,7 +254,7 @@ fn validate_display_field(
     }
     if value
         .chars()
-        .any(|ch| ch.is_control() || crate::text_safety::is_visual_spoof(ch))
+        .any(|ch| ch.is_control() || crate::review_input::is_visual_spoofing_character(ch))
     {
         return Err(format!(
             "workflow {label} contains a control, invisible, or bidirectional character"
@@ -449,7 +449,7 @@ pub(crate) fn render(
         }
         if value
             .chars()
-            .any(|ch| ch.is_control() || crate::text_safety::is_visual_spoof(ch))
+            .any(|ch| ch.is_control() || crate::review_input::is_visual_spoofing_character(ch))
         {
             return Err(format!(
                 "value for '{name}' is unsafe for review-only insertion"

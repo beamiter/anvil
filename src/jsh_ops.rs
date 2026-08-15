@@ -39,8 +39,7 @@ impl AppModel {
         match jsh_install::install_argv() {
             Ok(argv) => self.add_command_tab("Install jsh", argv, sender),
             Err(error) => {
-                let error =
-                    crate::text_safety::bounded_display_text(&error.to_string(), 2 * 1024, false);
+                let error = crate::review_input::safe_inline_display(&error.to_string(), 2 * 1024);
                 log::warn!("cannot stage the jsh installer: {error}");
                 self.show_toast(format!("Could not write the installer script: {error}"));
             }
@@ -91,27 +90,27 @@ impl AppModel {
     /// that cannot work.
     pub(crate) fn offer_jsh_update(&self, status: &Status, sender: &ComponentSender<AppModel>) {
         if let Some(error) = &status.error {
-            let error = crate::text_safety::bounded_display_text(error, 2 * 1024, false);
+            let error = crate::review_input::safe_inline_display(error, 2 * 1024);
             log::info!("jsh update check unavailable: {error}");
         }
         if let Some(other) = &status.shadowed_by {
             // Some other binary named jsh, earlier on PATH. Installing does not
             // fix PATH order, so the installer explains it in the tab; here it
             // is only worth a log line.
-            let other = crate::text_safety::bounded_display_text(other, 2 * 1024, false);
+            let other = crate::review_input::safe_inline_display(other, 2 * 1024);
             log::warn!("PATH resolves jsh to {other}, which anvil does not manage");
         }
 
         let Some(prompt) = jsh_install::prompt_for(status) else {
             return;
         };
-        let title = crate::text_safety::bounded_display_text(&prompt.banner_title(), 1024, false);
+        let title = crate::review_input::safe_inline_display(&prompt.banner_title(), 1024);
         let title = if title.is_empty() {
             "jsh update available".to_string()
         } else {
             title
         };
-        let button = crate::text_safety::bounded_display_text(prompt.button_label(), 128, false);
+        let button = crate::review_input::safe_inline_display(prompt.button_label(), 128);
         log::info!("jsh notice: {title}");
 
         let toast = adw::Toast::new(&title);

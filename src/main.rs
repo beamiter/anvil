@@ -54,7 +54,6 @@ mod sidebar_toggle;
 mod startup_ui;
 mod tab_strip;
 mod terminal;
-mod text_safety;
 mod top_bar;
 mod vte_pty;
 mod workflow_ops;

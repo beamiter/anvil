@@ -47,7 +47,7 @@ impl AppModel {
             });
         if let Err(error) = spawn {
             self.workflow_refresh.finish();
-            let error = crate::text_safety::bounded_display_text(&error.to_string(), 1024, false);
+            let error = crate::review_input::safe_inline_display(&error.to_string(), 1024);
             log::warn!("could not start workflow refresh worker: {error}");
             self.show_toast(format!(
                 "Workflows could not refresh because the background worker could not start: {error}"

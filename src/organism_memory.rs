@@ -919,7 +919,7 @@ fn valid_repo_id(repo: &str) -> bool {
         && repo.len() <= MAX_REPO_BYTES
         && Path::new(repo).is_absolute()
         && !repo.chars().any(char::is_control)
-        && !crate::text_safety::contains_visual_spoof(repo)
+        && !crate::review_input::contains_visual_spoofing(repo)
 }
 
 fn valid_event_id(id: &str) -> bool {
@@ -2222,7 +2222,7 @@ pub(crate) fn git_repo_root_for(cwd: &str) -> Option<String> {
     if cwd.is_empty()
         || cwd.len() > 16 * 1024
         || cwd.chars().any(char::is_control)
-        || crate::text_safety::contains_visual_spoof(cwd)
+        || crate::review_input::contains_visual_spoofing(cwd)
     {
         return None;
     }

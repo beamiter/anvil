@@ -140,7 +140,7 @@ pub(crate) fn show_command_palette(
             let mut keep = Vec::with_capacity(scored.len());
             for (_, c) in scored {
                 let display =
-                    crate::text_safety::bounded_display_text(c, MAX_PALETTE_DISPLAY_BYTES, false);
+                    crate::review_input::safe_inline_display(c, MAX_PALETTE_DISPLAY_BYTES);
                 let row_label = gtk::Label::new(Some(&display));
                 row_label.set_halign(gtk::Align::Start);
                 row_label.set_ellipsize(gtk::pango::EllipsizeMode::End);

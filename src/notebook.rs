@@ -108,7 +108,8 @@ fn notebook_cell_issue(source: &str) -> Option<&'static str> {
         return Some("cell exceeds the execution size limit");
     }
     if source.chars().any(|ch| {
-        !matches!(ch, '\n' | '\t') && (ch.is_control() || crate::text_safety::is_visual_spoof(ch))
+        !matches!(ch, '\n' | '\t')
+            && (ch.is_control() || crate::review_input::is_visual_spoofing_character(ch))
     }) {
         return Some("cell contains a hidden, bidirectional, or unsafe control character");
     }
@@ -116,7 +117,7 @@ fn notebook_cell_issue(source: &str) -> Option<&'static str> {
 }
 
 fn bounded_notebook_display(source: &str, max_bytes: usize) -> String {
-    crate::text_safety::bounded_display_text(source, max_bytes, true)
+    crate::review_input::safe_multiline_display(source, max_bytes)
 }
 
 #[derive(Debug, Clone)]
@@ -1316,7 +1317,7 @@ mod tests {
         let display = bounded_notebook_display("safe\u{200b}\u{1b}text", 1024);
         assert_eq!(display, "safe��text");
         let truncated = bounded_notebook_display(&"界".repeat(100), 16);
-        assert!(truncated.ends_with("… [truncated]"));
+        assert!(truncated.ends_with('…'));
         assert!(truncated.is_char_boundary(truncated.len()));
     }
 

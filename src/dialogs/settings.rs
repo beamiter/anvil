@@ -975,7 +975,7 @@ impl Component for SettingsModel {
             SettingsMsg::RemoteHostRemove(index) => {
                 if let Some(host) = self.values.remote_hosts.get(index) {
                     let name = host.name.clone();
-                    let display = crate::text_safety::bounded_display_text(&name, 1_024, false);
+                    let display = crate::review_input::safe_inline_display(&name, 1_024);
                     let dialog = adw::AlertDialog::new(
                         Some("Remove this host?"),
                         Some(&format!(
@@ -1116,7 +1116,7 @@ impl SettingsModel {
         content.append(&list);
         if let Some((_, existing)) = existing.as_ref() {
             if let Some(note) = advanced_fields_note(existing) {
-                let note = crate::text_safety::bounded_display_text(&note, 4 * 1024, false);
+                let note = crate::review_input::safe_inline_display(&note, 4 * 1024);
                 let label = gtk::Label::new(Some(&note));
                 label.add_css_class("dim-label");
                 label.set_wrap(true);
@@ -1218,9 +1218,7 @@ impl SettingsModel {
             } else {
                 &host.name
             };
-            row.set_title(&crate::text_safety::bounded_display_text(
-                title, 1_024, false,
-            ));
+            row.set_title(&crate::review_input::safe_inline_display(title, 1_024));
             let target = match &host.user {
                 Some(user) => format!("{user}@{}", host.host),
                 None => host.host.clone(),
@@ -1232,10 +1230,9 @@ impl SettingsModel {
             if !host.ssh_args.is_empty() {
                 subtitle.push_str(&format!(" · ssh_args {}", host.ssh_args.join(" ")));
             }
-            row.set_subtitle(&crate::text_safety::bounded_display_text(
+            row.set_subtitle(&crate::review_input::safe_inline_display(
                 &subtitle,
                 4 * 1024,
-                false,
             ));
             let edit = gtk::Button::from_icon_name("document-edit-symbolic");
             edit.set_valign(gtk::Align::Center);

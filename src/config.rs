@@ -820,7 +820,7 @@ fn setting_text_is_safe(value: &str, max_bytes: usize) -> bool {
     !value.trim().is_empty()
         && value.len() <= max_bytes
         && !value.chars().any(char::is_control)
-        && !crate::text_safety::contains_visual_spoof(value)
+        && !crate::review_input::contains_visual_spoofing(value)
 }
 
 pub(crate) fn configured_path_is_safe(value: &str, require_absolute_or_home: bool) -> bool {

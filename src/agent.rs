@@ -59,7 +59,11 @@ const MAX_AGENT_INPUT_BYTES: usize = 16 * 1024;
 const MAX_AGENT_MODEL_REPLY_BYTES: usize = 128 * 1024;
 
 fn agent_display_text(text: &str, preserve_multiline: bool) -> String {
-    crate::text_safety::bounded_display_text(text, MAX_AGENT_DISPLAY_BYTES, preserve_multiline)
+    if preserve_multiline {
+        crate::review_input::safe_multiline_display(text, MAX_AGENT_DISPLAY_BYTES)
+    } else {
+        crate::review_input::safe_inline_display(text, MAX_AGENT_DISPLAY_BYTES)
+    }
 }
 
 pub(crate) fn local_agent_command_issue(command: &str) -> Option<&'static str> {
@@ -72,7 +76,7 @@ pub(crate) fn local_agent_command_issue(command: &str) -> Option<&'static str> {
     if command.chars().any(char::is_control) {
         return Some("command contains a control character");
     }
-    if crate::text_safety::contains_visual_spoof(command) {
+    if crate::review_input::contains_visual_spoofing(command) {
         return Some("command contains an invisible or bidirectional formatting character");
     }
     None

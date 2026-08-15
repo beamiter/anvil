@@ -15,11 +15,11 @@ const MAX_REVIEW_DESCRIPTION_BYTES: usize = 16 * 1024;
 const MAX_REVIEW_FEEDBACK_BYTES: usize = 16 * 1024;
 
 fn safe_inline_display(text: &str, max_bytes: usize) -> String {
-    crate::text_safety::bounded_display_text(text, max_bytes, false)
+    crate::review_input::safe_inline_display(text, max_bytes)
 }
 
 fn safe_multiline_display(text: &str, max_bytes: usize) -> String {
-    crate::text_safety::bounded_display_text(text, max_bytes, true)
+    crate::review_input::safe_multiline_display(text, max_bytes)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

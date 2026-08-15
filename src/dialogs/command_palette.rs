@@ -468,7 +468,7 @@ impl PaletteModel {
         let generation = request.generation;
         if let Err(error) = spawn_history_snapshot_load(sender.clone(), request) {
             self.history_load.spawn_failed(generation);
-            let error = crate::text_safety::bounded_display_text(&error.to_string(), 1024, false);
+            let error = crate::review_input::safe_inline_display(&error.to_string(), 1024);
             log::warn!("could not start palette history worker: {error}");
             if self.opening.accepts(generation) {
                 widgets.history_status.set_label(&format!(

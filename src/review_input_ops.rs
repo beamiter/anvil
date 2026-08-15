@@ -8,7 +8,7 @@ fn local_review_issue(text: &str) -> Option<&'static str> {
     if text.len() > MAX_LOCAL_REVIEW_INPUT_BYTES {
         return Some("the command exceeds the 262144-byte review limit");
     }
-    if crate::text_safety::contains_visual_spoof(text) {
+    if crate::review_input::contains_visual_spoofing(text) {
         return Some("the command contains an invisible or bidirectional formatting character");
     }
     None

@@ -1141,7 +1141,7 @@ impl AppModel {
         let title = gtk::Label::new(Some("Approval-gated shell assistant"));
         title.set_xalign(0.0);
         title.add_css_class("title-3");
-        let safe_cwd = crate::text_safety::bounded_display_text(&cwd, 4 * 1024, false);
+        let safe_cwd = crate::review_input::safe_inline_display(&cwd, 4 * 1024);
         let target = gtk::Label::new(Some(&format!("Bound to Block pane · {safe_cwd}")));
         target.set_xalign(0.0);
         target.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
@@ -1168,7 +1168,7 @@ impl AppModel {
         .into_iter()
         .enumerate()
         {
-            let text = crate::text_safety::bounded_display_text(&text, 1024, false);
+            let text = crate::review_input::safe_inline_display(&text, 1024);
             let chip = gtk::Label::new(Some(&text));
             chip.add_css_class("agent-chip");
             if index == 2 {

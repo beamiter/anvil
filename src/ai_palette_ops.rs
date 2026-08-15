@@ -24,7 +24,7 @@ pub(crate) struct CommandSuggestionSession {
 }
 
 fn compact_one_line(text: &str, max_chars: usize) -> String {
-    let safe = crate::text_safety::bounded_display_text(text, 16 * 1024, false);
+    let safe = crate::review_input::safe_inline_display(text, 16 * 1024);
     let collapsed = safe.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut chars = collapsed.chars();
     let preview: String = chars.by_ref().take(max_chars).collect();
@@ -63,10 +63,9 @@ fn set_suggestion_status(
 ) {
     session
         .status
-        .set_text(&crate::text_safety::bounded_display_text(
+        .set_text(&crate::review_input::safe_inline_display(
             message,
             16 * 1024,
-            false,
         ));
     if error {
         session.status.add_css_class("error");
@@ -162,7 +161,7 @@ impl AppModel {
         title.set_xalign(0.0);
         title.set_ellipsize(gtk::pango::EllipsizeMode::End);
         header.append(&title);
-        let cwd_display = crate::text_safety::bounded_display_text(&cwd, 4 * 1024, false);
+        let cwd_display = crate::review_input::safe_inline_display(&cwd, 4 * 1024);
         let binding = gtk::Label::new(Some(&format!("{cwd_display} · review only")));
         binding.add_css_class("assistant-card-badge");
         binding.set_hexpand(true);
