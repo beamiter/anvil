@@ -12,6 +12,18 @@ captured, queued, written, and restored.
 
 ## Completed since the previous handoff
 
+- **Repin round (2026-08-15, third)**: `jterm_core` repinned to
+  `04f63283090591d9ad88500224e848dbb69b1f61` (picks up `helper.rs`,
+  `link.rs`, `bounded_json.rs`, `command_history::prepare_path`, and the
+  upstreamed `read_recent_with_status`). The palette's stale
+  "pinned core predates these inode checks" comment was corrected — twice:
+  the first replacement cited the 256 KiB command cap, which core's reader
+  actually enforces identically; the local `read_history_checked` in fact
+  remains for `text_safety`'s wider spoof set and for keeping records with an
+  unsafe cwd (sanitized at display time instead of dropped during the read).
+  Deleting it in favor of core's `read_recent` plus a post-filter is viable
+  but would change those two policies; deferred deliberately.
+
 - **config_store test fixtures are umask-proof (2026-08-15, second half)**:
   the 11 tests that wrote `config.toml` fixtures with plain `fs::write` now go
   through a `write_fixture` helper that chmods `0600` after writing, so the

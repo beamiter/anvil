@@ -132,9 +132,11 @@ pub(crate) fn read_history(path: &Path, max: usize) -> Vec<command_history::Comm
 }
 
 /// Read the bounded JSONL tail through a no-follow, nonblocking descriptor.
-/// The currently pinned core predates these inode checks, and calling its
-/// pathname-based reader directly from GTK would let a replaced FIFO freeze
-/// the main thread while opening a palette.
+/// The core's reader applies the same inode checks and the same 4 MiB tail /
+/// 1 MiB record / 256 KiB command budgets now; this local copy remains for
+/// two deliberate policy differences: `palette_command_is_safe` rides on
+/// `text_safety`'s wider spoof set, and records with an unsafe cwd are kept
+/// and sanitized at display time instead of being dropped during the read.
 fn read_history_checked(
     path: &Path,
     max: usize,
