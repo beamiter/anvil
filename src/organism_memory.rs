@@ -1611,7 +1611,7 @@ fn faster_than_previous_day(memory: &DiskMemory, day: i64, repo: &str) -> bool {
 }
 
 fn read_memory(path: &Path) -> io::Result<DiskMemory> {
-    let json = match crate::snapshot_file::read_bounded_private(path, MAX_MEMORY_BYTES) {
+    let json = match jterm_core::snapshot_file::read_bounded_private(path, MAX_MEMORY_BYTES) {
         Ok(json) => json,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(DiskMemory::default()),
         Err(error) => return Err(error),
@@ -1947,7 +1947,7 @@ fn transact_batch(path: &Path, events: &[MemoryEvent]) -> io::Result<()> {
             "ASCII organism memory path has no parent",
         )
     })?;
-    crate::snapshot_file::ensure_private_directory(parent)?;
+    jterm_core::snapshot_file::ensure_private_directory(parent)?;
     let _lock = MemoryTransactionLock::acquire(path, LOCK_TIMEOUT)?;
     let mut memory = read_memory(path)?;
     for event in events {
@@ -1959,7 +1959,7 @@ fn transact_batch(path: &Path, events: &[MemoryEvent]) -> io::Result<()> {
     if bytes.len() as u64 > MAX_MEMORY_BYTES {
         return Err(invalid("ASCII organism memory exceeds its 512 KiB limit"));
     }
-    crate::snapshot_file::write_atomic_private(path, &bytes)
+    jterm_core::snapshot_file::write_atomic_private(path, &bytes)
 }
 
 struct MemoryTransactionLock {
@@ -2792,8 +2792,8 @@ mod tests {
         strip_current_organism_families(&mut legacy);
         let mut bytes = serde_json::to_vec_pretty(&legacy).unwrap();
         bytes.push(b'\n');
-        crate::snapshot_file::ensure_private_directory(path.parent().unwrap()).unwrap();
-        crate::snapshot_file::write_atomic_private(&path, &bytes).unwrap();
+        jterm_core::snapshot_file::ensure_private_directory(path.parent().unwrap()).unwrap();
+        jterm_core::snapshot_file::write_atomic_private(&path, &bytes).unwrap();
 
         let migrated = read_memory(&path).unwrap();
         assert_eq!(
@@ -2831,8 +2831,8 @@ mod tests {
         day_value.insert("build_failures".to_string(), serde_json::json!(2));
         let mut bytes = serde_json::to_vec_pretty(&legacy).unwrap();
         bytes.push(b'\n');
-        crate::snapshot_file::ensure_private_directory(path.parent().unwrap()).unwrap();
-        crate::snapshot_file::write_atomic_private(&path, &bytes).unwrap();
+        jterm_core::snapshot_file::ensure_private_directory(path.parent().unwrap()).unwrap();
+        jterm_core::snapshot_file::write_atomic_private(&path, &bytes).unwrap();
 
         let error = read_memory(&path).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
@@ -2871,7 +2871,7 @@ mod tests {
             let path = root.0.join(format!("partial-{remove_baseline}.json"));
             let mut bytes = serde_json::to_vec_pretty(&partial).unwrap();
             bytes.push(b'\n');
-            crate::snapshot_file::write_atomic_private(&path, &bytes).unwrap();
+            jterm_core::snapshot_file::write_atomic_private(&path, &bytes).unwrap();
             let error = read_memory(&path).unwrap_err();
             assert!(error.to_string().contains("incomplete"));
         }
@@ -2905,8 +2905,8 @@ mod tests {
             .remove("failure_success_flips");
         let mut bytes = serde_json::to_vec_pretty(&mixed).unwrap();
         bytes.push(b'\n');
-        crate::snapshot_file::ensure_private_directory(path.parent().unwrap()).unwrap();
-        crate::snapshot_file::write_atomic_private(&path, &bytes).unwrap();
+        jterm_core::snapshot_file::ensure_private_directory(path.parent().unwrap()).unwrap();
+        jterm_core::snapshot_file::write_atomic_private(&path, &bytes).unwrap();
 
         let error = read_memory(&path).unwrap_err();
         assert!(error.to_string().contains("mixes failure-success"));
@@ -2941,8 +2941,8 @@ mod tests {
         let path = root.memory_path();
         let encoded = serde_json::to_string_pretty(&DiskMemory::default()).unwrap();
         let duplicate = encoded.replacen('{', "{\n  \"version\": 1,", 1);
-        crate::snapshot_file::ensure_private_directory(path.parent().unwrap()).unwrap();
-        crate::snapshot_file::write_atomic_private(&path, duplicate.as_bytes()).unwrap();
+        jterm_core::snapshot_file::ensure_private_directory(path.parent().unwrap()).unwrap();
+        jterm_core::snapshot_file::write_atomic_private(&path, duplicate.as_bytes()).unwrap();
 
         let error = read_memory(&path).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
@@ -2952,7 +2952,7 @@ mod tests {
     #[test]
     fn nested_schema_fields_reject_duplicates_before_the_presence_scan() {
         let root = TestDir::new("nested-duplicate-fields");
-        crate::snapshot_file::ensure_private_directory(&root.0).unwrap();
+        jterm_core::snapshot_file::ensure_private_directory(&root.0).unwrap();
 
         let mut memory = DiskMemory::default();
         let mut stats = DailyStats::new(60_000, "/work/nested-duplicates".to_string());
@@ -2995,7 +2995,7 @@ mod tests {
             );
             let duplicate = encoded.replacen(needle, replacement, 1);
             let path = root.0.join(format!("{label}.json"));
-            crate::snapshot_file::write_atomic_private(&path, duplicate.as_bytes()).unwrap();
+            jterm_core::snapshot_file::write_atomic_private(&path, duplicate.as_bytes()).unwrap();
 
             let error = read_memory(&path).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
@@ -3108,7 +3108,7 @@ mod tests {
             let path = root.0.join(format!("partial-{missing}.json"));
             let mut bytes = serde_json::to_vec_pretty(&partial).unwrap();
             bytes.push(b'\n');
-            crate::snapshot_file::write_atomic_private(&path, &bytes).unwrap();
+            jterm_core::snapshot_file::write_atomic_private(&path, &bytes).unwrap();
             assert!(read_memory(&path)
                 .unwrap_err()
                 .to_string()
@@ -3121,7 +3121,7 @@ mod tests {
         let path = root.0.join("legacy.json");
         let mut bytes = serde_json::to_vec_pretty(&legacy).unwrap();
         bytes.push(b'\n');
-        crate::snapshot_file::write_atomic_private(&path, &bytes).unwrap();
+        jterm_core::snapshot_file::write_atomic_private(&path, &bytes).unwrap();
         let migrated = read_memory(&path).unwrap();
         assert_eq!(migrated.days[0].build_duration_sum_ms, 0);
         assert_eq!(migrated.days[0].build_duration_count, 0);
@@ -3175,7 +3175,7 @@ mod tests {
             let path = root.0.join(format!("missing-{missing_family}.json"));
             let mut bytes = serde_json::to_vec_pretty(&tampered).unwrap();
             bytes.push(b'\n');
-            crate::snapshot_file::write_atomic_private(&path, &bytes).unwrap();
+            jterm_core::snapshot_file::write_atomic_private(&path, &bytes).unwrap();
             assert!(read_memory(&path)
                 .unwrap_err()
                 .to_string()
@@ -3189,7 +3189,7 @@ mod tests {
         let head_path = root.0.join("released-head.json");
         let mut bytes = serde_json::to_vec_pretty(&released_head).unwrap();
         bytes.push(b'\n');
-        crate::snapshot_file::write_atomic_private(&head_path, &bytes).unwrap();
+        jterm_core::snapshot_file::write_atomic_private(&head_path, &bytes).unwrap();
         read_memory(&head_path).unwrap().validate().unwrap();
 
         // Older seed/development files may predate the duration pair too.
@@ -3197,7 +3197,7 @@ mod tests {
         let seed_path = root.0.join("pre-duration-seed.json");
         let mut bytes = serde_json::to_vec_pretty(&released_head).unwrap();
         bytes.push(b'\n');
-        crate::snapshot_file::write_atomic_private(&seed_path, &bytes).unwrap();
+        jterm_core::snapshot_file::write_atomic_private(&seed_path, &bytes).unwrap();
         read_memory(&seed_path).unwrap().validate().unwrap();
     }
 
@@ -3826,8 +3826,8 @@ mod tests {
         assert_eq!(memory.growth_days.value.compacted_through, None);
         let mut bytes = serde_json::to_vec_pretty(&memory).unwrap();
         bytes.push(b'\n');
-        crate::snapshot_file::ensure_private_directory(path.parent().unwrap()).unwrap();
-        crate::snapshot_file::write_atomic_private(&path, &bytes).unwrap();
+        jterm_core::snapshot_file::ensure_private_directory(path.parent().unwrap()).unwrap();
+        jterm_core::snapshot_file::write_atomic_private(&path, &bytes).unwrap();
 
         let late = MemoryEvent::fixed(
             10_000,
@@ -3861,8 +3861,9 @@ mod tests {
         strip_current_organism_families(&mut legacy);
         let mut bytes = serde_json::to_vec_pretty(&legacy).unwrap();
         bytes.push(b'\n');
-        crate::snapshot_file::ensure_private_directory(migrated_path.parent().unwrap()).unwrap();
-        crate::snapshot_file::write_atomic_private(&migrated_path, &bytes).unwrap();
+        jterm_core::snapshot_file::ensure_private_directory(migrated_path.parent().unwrap())
+            .unwrap();
+        jterm_core::snapshot_file::write_atomic_private(&migrated_path, &bytes).unwrap();
 
         let late = MemoryEvent::fixed(
             20_001,
@@ -4291,8 +4292,8 @@ mod tests {
         strip_current_organism_families(&mut legacy);
         let mut bytes = serde_json::to_vec_pretty(&legacy).unwrap();
         bytes.push(b'\n');
-        crate::snapshot_file::ensure_private_directory(path.parent().unwrap()).unwrap();
-        crate::snapshot_file::write_atomic_private(&path, &bytes).unwrap();
+        jterm_core::snapshot_file::ensure_private_directory(path.parent().unwrap()).unwrap();
+        jterm_core::snapshot_file::write_atomic_private(&path, &bytes).unwrap();
 
         let migrated = read_memory(&path).unwrap();
         // The failed push day was visible only through the new activity
@@ -4313,7 +4314,7 @@ mod tests {
             let partial_path = root.0.join(format!("partial-{missing}.json"));
             let mut bytes = serde_json::to_vec_pretty(&partial).unwrap();
             bytes.push(b'\n');
-            crate::snapshot_file::write_atomic_private(&partial_path, &bytes).unwrap();
+            jterm_core::snapshot_file::write_atomic_private(&partial_path, &bytes).unwrap();
             assert!(read_memory(&partial_path)
                 .unwrap_err()
                 .to_string()
@@ -4390,8 +4391,8 @@ mod tests {
         strip_current_organism_families(&mut legacy);
         let mut bytes = serde_json::to_vec_pretty(&legacy).unwrap();
         bytes.push(b'\n');
-        crate::snapshot_file::ensure_private_directory(path.parent().unwrap()).unwrap();
-        crate::snapshot_file::write_atomic_private(&path, &bytes).unwrap();
+        jterm_core::snapshot_file::ensure_private_directory(path.parent().unwrap()).unwrap();
+        jterm_core::snapshot_file::write_atomic_private(&path, &bytes).unwrap();
         let migrated = read_memory(&path).unwrap();
         assert_eq!(
             migrated.stats(12_000, repo).unwrap().activity_buckets,
@@ -4407,7 +4408,7 @@ mod tests {
         let mixed_path = root.0.join("mixed.json");
         let mut bytes = serde_json::to_vec_pretty(&mixed).unwrap();
         bytes.push(b'\n');
-        crate::snapshot_file::write_atomic_private(&mixed_path, &bytes).unwrap();
+        jterm_core::snapshot_file::write_atomic_private(&mixed_path, &bytes).unwrap();
         assert!(read_memory(&mixed_path)
             .unwrap_err()
             .to_string()
@@ -4503,9 +4504,9 @@ mod tests {
     fn corrupt_or_future_memory_is_never_replaced_by_a_transaction() {
         let root = TestDir::new("fail-closed");
         let path = root.memory_path();
-        crate::snapshot_file::ensure_private_directory(path.parent().unwrap()).unwrap();
+        jterm_core::snapshot_file::ensure_private_directory(path.parent().unwrap()).unwrap();
         let corrupt = b"{\"version\":99,\"life\":{},\"life_updated_at_ms\":0,\"days\":[]}";
-        crate::snapshot_file::write_atomic_private(&path, corrupt).unwrap();
+        jterm_core::snapshot_file::write_atomic_private(&path, corrupt).unwrap();
         let repo = root.0.join("repo");
         let result = transact(
             &path,
@@ -4993,8 +4994,8 @@ mod tests {
         let path = root.memory_path();
         let mut bytes = serde_json::to_vec_pretty(&reordered).unwrap();
         bytes.push(b'\n');
-        crate::snapshot_file::ensure_private_directory(path.parent().unwrap()).unwrap();
-        crate::snapshot_file::write_atomic_private(&path, &bytes).unwrap();
+        jterm_core::snapshot_file::ensure_private_directory(path.parent().unwrap()).unwrap();
+        jterm_core::snapshot_file::write_atomic_private(&path, &bytes).unwrap();
         let mut reordered = read_memory(&path).unwrap();
         assert_eq!(
             reordered.stats(200, &repos[0]).unwrap().observations[0].at_ms,

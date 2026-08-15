@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-12
+Updated: 2026-08-15
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,27 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **Architecture unification round (2026-08-15)**: the last local duplicates
+  of core modules are gone, and `jterm_core` is repinned to
+  `1b7598de5530b7b8ca39582a77610b22987f66bc`. `src/snapshot_file.rs` and `src/atomic_file.rs`
+  were deleted — organism memory now reads through the new
+  `jterm_core::snapshot_file::read_bounded_private` (any owner-only mode
+  accepted, group/other bits rejected on the open descriptor) and all atomic
+  writes use `jterm_core::atomic_file`. `src/command_correction.rs`'s
+  hand-rolled `waitid(WNOWAIT)`/group-signal probe was replaced by the newly
+  public `jterm_core::supervised::SupervisedChild`; on probe/reap failure
+  paths the worker detaches its output reader instead of joining it, because
+  a disarmed (unsignalled) group can hold the pipe open forever.
+  `src/text_safety.rs` stays: its spoof table deliberately extends core's
+  with `\u{fff0}..=\u{fff8}` and the full `\u{e0000}..=\u{e0fff}` tag plane,
+  and `bounded_display_text` has no core equivalent. Adversarial review of
+  the round also caught the reader-join hang and a stale comment claiming
+  `\u{ffa0}` was anvil-only (core already covers it). Still local by design:
+  `src/notebook.rs`'s long-lived terminal children keep their own wait logic
+  (`SupervisedChild` scopes itself to short-lived helpers), and
+  `config_store::tests` remain umask-sensitive (they pass under `umask 077`)
+  — a pre-existing fixture gap, not from this round.
 
 - ASCII organism frontend parity now includes the five-part embodiment pass:
   visible juvenile/adult/seasoned phenotypes through a composable render

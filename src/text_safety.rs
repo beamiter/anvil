@@ -2,8 +2,12 @@
 //! boundary while anvil still exact-pins the previous jterm_core release.
 
 /// Characters that can make the visible order or apparent contents differ
-/// from the string acted upon. Keep this in lockstep with jterm_core's review
-/// input policy until the staged core release is pinned.
+/// from the string acted upon. This table is a deliberate superset of
+/// jterm_core `review_input::is_visual_spoofing_character`: anvil also treats
+/// `\u{fff0}..=\u{fff8}` and the full `\u{e0000}..=\u{e0fff}` tag
+/// plane as spoofing, so the file cannot be replaced by the core predicate
+/// until the core table catches up. `bounded_display_text` below has no core
+/// equivalent at all.
 pub(crate) fn is_visual_spoof(ch: char) -> bool {
     (ch.is_whitespace() && ch != ' ')
         || matches!(

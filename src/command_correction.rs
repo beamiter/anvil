@@ -15,9 +15,8 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const MAX_CORRECTION_COMMAND_BYTES: usize = 16 * 1024;
@@ -767,26 +766,17 @@ fn run_capture(
         return None;
     }
     let mut command = correction_helper_command(program)?;
-    command.process_group(0);
-    let mut child = command
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let process_group = match i32::try_from(child.id()) {
-        Ok(process_group) => process_group,
-        Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
-    };
-    let Some(mut stdout) = child.stdout.take() else {
-        terminate_probe_group(&mut child, process_group);
-        return None;
-    };
+        .stderr(Stdio::null());
+    // A probe must not be able to leave background work behind. SupervisedChild
+    // places the child in a fresh process group before exec, keeps the root a
+    // zombie until the group is signalled (so the group id cannot be recycled
+    // onto an unrelated process), and reaps synchronously on drop.
+    let mut child = jterm_core::supervised::SupervisedChild::spawn(&mut command).ok()?;
+    let mut stdout = child.take_stdout()?;
     let reader = std::thread::Builder::new()
         .name("anvil-correction-probe-output".to_string())
         .spawn(move || {
@@ -807,28 +797,46 @@ fn run_capture(
     let reader = match reader {
         Ok(reader) => reader,
         Err(_) => {
-            terminate_probe_group(&mut child, process_group);
+            // Dropping the supervised child signals the group and reaps the
+            // root — unless the pre-signal ownership probe fails (ECHILD from
+            // a foreign reaper, or a SIGCHLD disposition flipped after
+            // spawn), in which case it disarms WITHOUT signalling.
             return None;
         }
     };
     loop {
         if cancellation.is_cancelled() || Instant::now() >= deadline {
-            terminate_probe_group(&mut child, process_group);
-            let _ = reader.join();
+            // The reap signals the group and reaps the root, which also
+            // releases a reader blocked on the probe's pipe — unless the
+            // pre-signal ownership probe fails, in which case it disarms
+            // without signalling and a descendant may keep the pipe open.
+            // Joining the reader then could block forever, so only join when
+            // the group was actually signalled and detach otherwise: a
+            // detached reader is better than a hang.
+            if child.reap_after_group_kill().is_ok() {
+                let _ = reader.join();
+            }
             return None;
         }
-        match probe_root_has_exited(process_group) {
+        match child.root_has_exited() {
             Ok(true) => break,
             Ok(false) => std::thread::sleep(Duration::from_millis(20)),
             Err(_) => {
-                terminate_probe_group(&mut child, process_group);
-                let _ = reader.join();
+                // The wait-ownership probe already failed, so dropping the
+                // child disarms it WITHOUT signalling the group; a surviving
+                // descendant can hold the stdout pipe open indefinitely.
+                // Returning here drops the reader's JoinHandle, detaching the
+                // thread instead of joining it — a detached reader is better
+                // than a hang.
                 return None;
             }
         }
     }
-    signal_probe_group(process_group);
-    let status = child.wait().ok()?;
+    // The root may exit successfully while a background descendant keeps
+    // stdout open. The reap signals the dedicated group before joining the
+    // reader, so neither that process nor an indefinitely blocked reader can
+    // outlive the correction request.
+    let status = child.reap_after_group_kill().ok()?;
     let output = match reader.join() {
         Ok(Ok(output)) => output,
         Ok(Err(_)) | Err(_) => return None,
@@ -836,32 +844,6 @@ fn run_capture(
     status
         .success()
         .then(|| String::from_utf8_lossy(&output).into_owned())
-}
-
-fn probe_root_has_exited(pid: i32) -> std::io::Result<bool> {
-    use nix::sys::wait::{waitid, Id, WaitPidFlag, WaitStatus};
-    use nix::unistd::Pid;
-
-    let flags = WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT;
-    match waitid(Id::Pid(Pid::from_raw(pid)), flags).map_err(std::io::Error::from)? {
-        WaitStatus::Exited(_, _) | WaitStatus::Signaled(_, _, _) => Ok(true),
-        WaitStatus::StillAlive => Ok(false),
-        _ => Ok(false),
-    }
-}
-
-fn signal_probe_group(process_group: i32) {
-    if process_group > 1 && process_group != unsafe { nix::libc::getpgrp() } {
-        unsafe {
-            nix::libc::kill(-process_group, nix::libc::SIGKILL);
-        }
-    }
-}
-
-fn terminate_probe_group(child: &mut Child, process_group: i32) {
-    signal_probe_group(process_group);
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 fn resolve_path_command(
