@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-15 (text_safety removal)
+Updated: 2026-08-16 (agent-validation hardening repin)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,40 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **Agent-validation hardening repin (2026-08-16, seventh round)**:
+  `jterm_core` repinned to `cf0dd2c9cd369c1d8113eadde0ec6254d3fb81b1`.
+  Core's pre-restore validation now enforces the stricter audit rules forge
+  used to keep local (pending-must-be-final-turn,
+  approved-requires-observation-or-note, turn-counter arithmetic,
+  final-turn/state matching — verified against every reachable jagent live
+  shape, including the AwaitingObservation normalization round-trip), and
+  claimed Agent snapshots are read with `read_bounded_private`, so a
+  group-readable snapshot quarantines as tampering. Also adds a block-view
+  integration test pinning that a reset aborting a parser-owned OSC fires
+  its barrier exactly once, and a comment documenting the capability
+  observer's deliberate ESC-leniency divergence from the parser.
+
+- **Strict-ST parser repin (2026-08-15, sixth round)**: `jterm_core` repinned
+  to `73c1411f23ea41626187013133f1e2c27620ae94`, which adds the
+  `AgentIntegrationReady`/`EraseScrollback`/`HardReset` ParserEvent barriers
+  and unifies the parser on strict ST-only termination for APC/DCS/PM/SOS with
+  abort-and-reprocess on ESC + non-ST (OSC keeps the BEL convention).
+  `handle_event` gained the three arms: `EraseScrollback` →
+  `backend.erase_scrollback()`, `HardReset` → `on_hard_reset()`,
+  `AgentIntegrationReady` ignored (the raw `ShellCapabilityObserver` remains
+  the trust authority because it advances in reset-splitter order ahead of
+  dispatch). The splitter's `Reset` part no longer invokes those handlers
+  itself — core emits each barrier exactly once when the part's exact bytes
+  are fed, so the old direct call would have doubled every reset; the part
+  survives purely as the ordering barrier that interleaves capability
+  observation with the reset wipe. Behavioral change to note: an aborted OSC
+  no longer fires its payload, so a malformed OSC 133 can no longer produce
+  bogus PromptStart/CommandStart marks (fail-closed). Core also consumes OSC
+  7771 now (never forwarded to the VTE); the observer still sees the raw
+  bytes pre-parse, so capability trust is unchanged. Stale "pinned core
+  predates / does not frame" comments were corrected; the APC capture path
+  stays local pending a dedicated equivalence check.
 
 - **text_safety removed (2026-08-15, fifth round)**: `jterm_core` repinned to
   `592d6632b7f51239c0d7ece7dc1796e708fab400`, whose `review_input` spoof table

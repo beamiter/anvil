@@ -635,9 +635,10 @@ enum CapabilityOscState {
 
 impl ShellCapabilityObserver {
     /// Observe the raw stream without replacing the shared terminal parser.
-    /// This exact-pinned jterm_core predates OSC 7771, so Anvil consumes only
-    /// this hidden capability packet locally while the normal parser continues
-    /// to own every display/lifecycle event.
+    /// Core now recognizes OSC 7771 itself (`AgentIntegrationReady`, never
+    /// forwarded to the VTE); this observer remains the trust authority
+    /// because it advances in reset-splitter order, so a same-chunk RIS
+    /// invalidates pre-reset trust before the suffix bytes are observed.
     fn feed(&mut self, bytes: &[u8], expected: &str, ready: &Cell<bool>) {
         for &byte in bytes {
             let state = std::mem::take(&mut self.state);
@@ -671,6 +672,15 @@ impl ShellCapabilityObserver {
                         self.finish_osc(&payload, expected, ready);
                         CapabilityOscState::Ground
                     }
+                    // Deliberately more lenient than the core parser this
+                    // observer shadows: core aborts the string on ESC +
+                    // non-ST and drops the payload, while a repeated ESC
+                    // here keeps the payload alive so
+                    // `\x1b]7771;<tok>\x1b\x1b\\` still finishes. Harmless:
+                    // core's AgentIntegrationReady arm is ignored (this
+                    // observer is the trust authority), and the token is a
+                    // secret only the real shell can complete, so the extra
+                    // leniency cannot be exploited to forge readiness.
                     0x1b => CapabilityOscState::OscEscape(payload),
                     _ => CapabilityOscState::Discard,
                 },
@@ -4055,13 +4065,18 @@ enum TerminalResetKind {
 #[derive(Debug, PartialEq, Eq)]
 enum ResetAwareParserPart {
     Bytes(Vec<u8>),
-    /// ANSI control string whose framing is unsafe in pinned core. Feed it to
-    /// capture/VTE without letting payload CSI/OSC become lifecycle events.
+    /// ANSI control string kept away from the shared parser. Feed it to
+    /// capture/VTE without letting payload CSI/OSC become lifecycle events
+    /// or shell-capability observations.
     OpaqueBytes(Vec<u8>),
-    /// A fully framed APC payload parsed locally because pinned core treats
-    /// BEL and ESC non-ST as terminators. This preserves Kitty semantics
-    /// without exposing payload controls to the shared parser.
+    /// A fully framed APC payload captured locally. Core now frames APC on
+    /// strict ST as well; the local capture is retained (pending a dedicated
+    /// equivalence check) so payload bytes never reach the shared parser.
     ApcSequence(Vec<u8>),
+    /// Byte-exact ED3/RIS barrier. The sequence is fed to core in its own
+    /// part so the reset's invalidation is ordered between the capability
+    /// observations of the prefix and suffix parts; core emits the matching
+    /// ParserEvent barrier when the bytes are parsed.
     Reset {
         kind: TerminalResetKind,
         bytes: Vec<u8>,
@@ -4158,10 +4173,13 @@ impl ResetAwareParserSplitter {
                             self.state = ResetAwareParserState::Csi(b"\x1b[".to_vec());
                         }
                         b']' | b'P' | b'_' | b'^' | b'X' => {
-                            // Pinned core does not keep DCS/APC/PM opaque across
-                            // BEL and ESC non-ST recovery. SOS is unsupported.
-                            // Only OSC remains parser-owned because Anvil needs
-                            // its real OSC 133/52/notification events.
+                            // Core now frames DCS/APC/PM/SOS on strict ST with
+                            // abort-and-reprocess recovery, but the bypass
+                            // stays: bytes routed around the parser can emit
+                            // no parser events and cannot register as
+                            // shell-capability authority. Only OSC remains
+                            // parser-owned because Anvil needs its real
+                            // OSC 133/52/notification events.
                             let bypass_parser = introducer != b']';
                             let capture_apc = introducer == b'_';
                             if bypass_parser && !capture_apc {
@@ -4445,6 +4463,17 @@ impl ReaderCtx {
             ParserEvent::KeyboardProtocolQuery(query) => self.on_keyboard_protocol_query(*query),
             ParserEvent::ApcSequence(payload) => self.on_apc_sequence(payload),
             ParserEvent::Notification { title, body } => self.on_notification(title, body),
+            // OSC 7771 readiness: Anvil's trust authority is the raw
+            // ShellCapabilityObserver, which advances in reset-splitter order
+            // ahead of dispatch. Core's copy of the token needs no handling.
+            ParserEvent::AgentIntegrationReady(_) => {}
+            // Core barrier events: emitted immediately before the exact
+            // ED3/RIS bytes are passed through as Bytes, so the invalidation
+            // runs once per sequence, ahead of the VTE feed. The splitter
+            // keeps the part boundary (observation ordering) but no longer
+            // synthesizes these calls itself.
+            ParserEvent::EraseScrollback => self.backend.erase_scrollback(),
+            ParserEvent::HardReset => self.on_hard_reset(),
         }
     }
 
@@ -4596,21 +4625,15 @@ impl ReaderCtx {
                     self.on_bytes(&bytes, self.bstate_rc.get());
                 }
                 ResetAwareParserPart::ApcSequence(payload) => self.on_apc_sequence(&payload),
-                ResetAwareParserPart::Reset { kind, bytes } => {
-                    // Prefix parser events have already completed. Invalidate
-                    // before the exact sequence is handed to core/VTE, then
-                    // let the parser emit its ordinary Bytes event from a
-                    // freshly reset state for RIS.
-                    match kind {
-                        TerminalResetKind::EraseScrollback => {
-                            self.observe_capability_bytes(&bytes);
-                            self.backend.erase_scrollback();
-                        }
-                        TerminalResetKind::HardReset => self.on_hard_reset(),
-                    }
-                    if kind == TerminalResetKind::HardReset {
-                        self.observe_capability_bytes(&bytes);
-                    }
+                ResetAwareParserPart::Reset { bytes, .. } => {
+                    // Pure ordering barrier: the splitter carved these exact
+                    // bytes into their own part so prefix parts were observed
+                    // and parsed before the reset and suffix parts after it.
+                    // Core emits the EraseScrollback/HardReset barrier event
+                    // when the bytes are fed, and handle_event performs the
+                    // invalidation exactly once from there — the splitter no
+                    // longer calls the handlers itself.
+                    self.observe_capability_bytes(&bytes);
                     self.parse_and_dispatch(&bytes);
                 }
             }
@@ -12435,6 +12458,45 @@ mod tests {
     }
 
     #[test]
+    fn reset_aborts_a_parser_owned_osc_and_fires_its_barrier_exactly_once() {
+        // OSC stays parser-owned (Anvil needs core's real OSC events), so a
+        // reset arriving mid-payload must be recovered by core's Osc/OscEsc
+        // reprocess path: it emits the barrier event exactly once, ahead of
+        // the exact reset bytes, and drops the aborted payload. The exact
+        // call vectors below pin both halves — a double-fire or a dropped
+        // reset would change them, and no Feed carries the aborted OSC's
+        // title bytes to the terminal.
+        for (bytes, expected_calls, expected_live) in [
+            (
+                b"\x1b]0;t\x1bc".as_slice(),
+                vec![
+                    DispatchCall::HardReset,
+                    DispatchCall::ResetKittyPipeline,
+                    DispatchCall::Feed(b"\x1bc".to_vec()),
+                ],
+                "\x1bc",
+            ),
+            (
+                b"\x1b]0;t\x1b[3J".as_slice(),
+                vec![
+                    DispatchCall::EraseScrollback,
+                    DispatchCall::Feed(b"\x1b[3J".to_vec()),
+                ],
+                "\x1b[3J",
+            ),
+        ] {
+            let harness = ReaderHarness::new();
+            harness.bstate.set(BlockState::CollectingOutput);
+            harness.backend.take_calls();
+
+            harness.feed_raw(bytes);
+
+            assert_eq!(harness.backend.take_calls(), expected_calls, "{bytes:?}");
+            assert_eq!(harness.live_output(), expected_live, "{bytes:?}");
+        }
+    }
+
+    #[test]
     fn ris_resets_parser_modes_before_same_chunk_suffix_is_dispatched() {
         let harness = ReaderHarness::new();
         harness.bstate.set(BlockState::CollectingOutput);
@@ -12559,7 +12621,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_sos_payload_is_opaque_to_pinned_core_but_reaches_vte_once() {
+    fn bypassed_sos_payload_is_opaque_to_core_but_reaches_vte_once() {
         let harness = ReaderHarness::new();
         harness.bstate.set(BlockState::CollectingOutput);
         harness.backend.take_calls();
