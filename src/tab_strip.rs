@@ -119,11 +119,13 @@ pub(crate) struct TabRowInit {
     pub(crate) id: u64,
     pub(crate) target_index: usize,
     pub(crate) title: String,
+    pub(crate) real_title: String,
     pub(crate) active: bool,
     pub(crate) bell: bool,
     pub(crate) activity: bool,
     pub(crate) marked: bool,
     pub(crate) pinned: bool,
+    pub(crate) private_title: bool,
     pub(crate) connection: Option<ConnectionState>,
     pub(crate) remote_hosts: Vec<(u8, String)>,
     pub(crate) tab_width: u32,
@@ -133,7 +135,7 @@ pub(crate) struct TabRowInit {
 
 #[derive(Debug)]
 pub(crate) enum TabRowMsg {
-    SetTitle(String),
+    SetTitles { title: String, real_title: String },
     Sync(TabRowInit),
 }
 
@@ -176,17 +178,20 @@ pub(crate) enum TabAction {
     Duplicate,
     ToggleMarked,
     TogglePinned,
+    TogglePrivateTitle,
 }
 
 pub(crate) struct TabRow {
     pub(crate) id: u64,
     target_index: usize,
     title: String,
+    real_title: String,
     active: bool,
     bell: bool,
     activity: bool,
     marked: bool,
     pinned: bool,
+    private_title: bool,
     connection: Option<ConnectionState>,
     remote_hosts: Vec<(u8, String)>,
     tab_width: u32,
@@ -198,9 +203,10 @@ pub(crate) struct TabRow {
 #[derive(Debug, Clone)]
 struct TabRowActionState {
     target_index: usize,
-    title: String,
+    real_title: String,
     marked: bool,
     pinned: bool,
+    private_title: bool,
     remote_hosts: Vec<(u8, String)>,
     tab_width: u32,
     sidebar: bool,
@@ -210,9 +216,10 @@ impl TabRowActionState {
     fn from_init(init: &TabRowInit) -> Self {
         Self {
             target_index: init.target_index,
-            title: init.title.clone(),
+            real_title: init.real_title.clone(),
             marked: init.marked,
             pinned: init.pinned,
+            private_title: init.private_title,
             remote_hosts: init.remote_hosts.clone(),
             tab_width: init.tab_width,
             sidebar: init.sidebar,
@@ -345,7 +352,7 @@ impl FactoryComponent for TabRow {
                     ] =>
                         move |_, presses, _, _| {
                             if presses == 2 {
-                                let title = action_state.borrow().title.clone();
+                                let title = action_state.borrow().real_title.clone();
                                 show_rename(&select_button, id, &title, sender.clone());
                             }
                         },
@@ -366,9 +373,10 @@ impl FactoryComponent for TabRow {
                             x,
                             y,
                             id,
-                            &state.title,
+                            &state.real_title,
                             state.marked,
                             state.pinned,
+                            state.private_title,
                             &state.remote_hosts,
                             sender.clone(),
                         );
@@ -562,8 +570,8 @@ impl FactoryComponent for TabRow {
 
     fn update(&mut self, msg: Self::Input, _sender: FactorySender<Self>) {
         match msg {
-            TabRowMsg::SetTitle(title) => {
-                self.action_state.borrow_mut().title = title.clone();
+            TabRowMsg::SetTitles { title, real_title } => {
+                self.action_state.borrow_mut().real_title = real_title;
                 self.title = title;
             }
             TabRowMsg::Sync(init) => self.sync_from(init),
@@ -609,11 +617,13 @@ impl TabRow {
             id: init.id,
             target_index: init.target_index,
             title: init.title,
+            real_title: init.real_title,
             active: init.active,
             bell: init.bell,
             activity: init.activity,
             marked: init.marked,
             pinned: init.pinned,
+            private_title: init.private_title,
             connection: init.connection,
             remote_hosts: init.remote_hosts,
             tab_width: init.tab_width,
@@ -627,11 +637,13 @@ impl TabRow {
         self.id == init.id
             && self.target_index == init.target_index
             && self.title == init.title
+            && self.real_title == init.real_title
             && self.active == init.active
             && self.bell == init.bell
             && self.activity == init.activity
             && self.marked == init.marked
             && self.pinned == init.pinned
+            && self.private_title == init.private_title
             && self.connection == init.connection
             && self.remote_hosts == init.remote_hosts
             && self.tab_width == init.tab_width
@@ -644,11 +656,13 @@ impl TabRow {
         *self.action_state.borrow_mut() = TabRowActionState::from_init(&init);
         self.target_index = init.target_index;
         self.title = init.title;
+        self.real_title = init.real_title;
         self.active = init.active;
         self.bell = init.bell;
         self.activity = init.activity;
         self.marked = init.marked;
         self.pinned = init.pinned;
+        self.private_title = init.private_title;
         self.connection = init.connection;
         self.remote_hosts = init.remote_hosts;
         self.tab_width = init.tab_width;
@@ -729,6 +743,7 @@ fn show_context_menu(
     title: &str,
     marked: bool,
     pinned: bool,
+    private_title: bool,
     remote_hosts: &[(u8, String)],
     sender: FactorySender<TabRow>,
 ) {
@@ -762,6 +777,17 @@ fn show_context_menu(
         &popover,
         sender.clone(),
         move |sender| sender.output(TabRowOutput::Action(id, TabAction::TogglePinned)),
+    );
+    add_menu_item(
+        &menu,
+        if private_title {
+            "Show Title Details"
+        } else {
+            "Hide Title Details"
+        },
+        &popover,
+        sender.clone(),
+        move |sender| sender.output(TabRowOutput::Action(id, TabAction::TogglePrivateTitle)),
     );
 
     let rename_button = menu_button("Rename");
@@ -837,11 +863,13 @@ mod tests {
             id: 7,
             target_index: 2,
             title: "shell".to_string(),
+            real_title: "shell".to_string(),
             active: false,
             bell: false,
             activity: false,
             marked: false,
             pinned: false,
+            private_title: false,
             connection: Some(ConnectionState::Connecting),
             remote_hosts: vec![(0, "host-a".to_string())],
             tab_width: 180,
@@ -857,6 +885,7 @@ mod tests {
         updated.drag_coordinator = row.drag_coordinator.clone();
         updated.target_index = 4;
         updated.title = "remote".to_string();
+        updated.real_title = "remote".to_string();
         updated.active = true;
         updated.bell = true;
         updated.marked = true;
@@ -870,7 +899,7 @@ mod tests {
         assert!(row.matches_init(&updated));
         let actions = row.action_state.borrow();
         assert_eq!(actions.target_index, 4);
-        assert_eq!(actions.title, "remote");
+        assert_eq!(actions.real_title, "remote");
         assert!(actions.marked);
         assert_eq!(actions.remote_hosts.len(), 2);
         assert_eq!(actions.tab_width, 240);

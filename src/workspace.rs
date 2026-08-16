@@ -248,7 +248,18 @@ pub(crate) struct Tab {
     pub(crate) activity: bool,
     pub(crate) marked: bool,
     pub(crate) pinned: bool,
+    pub(crate) private_title: bool,
     pub(crate) id: u64,
     pub(crate) zoom: Option<ZoomState>,
     pub(crate) remote: Option<RemoteConn>,
+}
+
+impl Tab {
+    pub(crate) fn display_title(&self) -> &str {
+        if self.private_title {
+            "Private"
+        } else {
+            &self.title
+        }
+    }
 }

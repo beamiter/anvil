@@ -145,17 +145,27 @@ impl AppModel {
     /// frame destroys the button between pointer press and release, so GTK
     /// never emits `clicked`. Keeping the existing widget alive also avoids a
     /// surprising amount of layout and session-persistence work.
-    pub(crate) fn update_tab_title_widget(&self, id: u64, title: &str) -> bool {
+    pub(crate) fn update_tab_title_widget(&self, id: u64) -> bool {
+        let Some(tab) = self.tabs.iter().find(|tab| tab.id == id) else {
+            return false;
+        };
+        let title = tab.display_title().to_string();
+        let real_title = tab.title.clone();
         let Some(index) = self.tab_rows.iter().position(|row| row.id == id) else {
             return false;
         };
-        self.tab_rows
-            .send(index, tab_strip::TabRowMsg::SetTitle(title.to_string()));
+        self.tab_rows.send(
+            index,
+            tab_strip::TabRowMsg::SetTitles {
+                title: title.clone(),
+                real_title: real_title.clone(),
+            },
+        );
         // The mirror filters identically, so the index matches; look it up
         // anyway rather than assume the two lists never drift.
         if let Some(index) = self.sidebar_tab_rows.iter().position(|row| row.id == id) {
             self.sidebar_tab_rows
-                .send(index, tab_strip::TabRowMsg::SetTitle(title.to_string()));
+                .send(index, tab_strip::TabRowMsg::SetTitles { title, real_title });
         }
         true
     }
@@ -202,16 +212,20 @@ impl AppModel {
             .tabs
             .iter()
             .enumerate()
-            .filter(|(_, tab)| filter.is_empty() || tab.title.to_lowercase().contains(&filter))
+            .filter(|(_, tab)| {
+                filter.is_empty() || tab.display_title().to_lowercase().contains(&filter)
+            })
             .map(|(index, tab)| tab_strip::TabRowInit {
                 id: tab.id,
                 target_index: index,
-                title: tab.title.clone(),
+                title: tab.display_title().to_string(),
+                real_title: tab.title.clone(),
                 active: index == self.active,
                 bell: tab.bell,
                 activity: tab.activity,
                 marked: tab.marked,
                 pinned: tab.pinned,
+                private_title: tab.private_title,
                 connection: tab.remote.as_ref().map(|remote| match remote.status {
                     ConnStatus::Connecting => tab_strip::ConnectionState::Connecting,
                     ConnStatus::Connected => tab_strip::ConnectionState::Connected,

@@ -542,9 +542,9 @@ fn running_process_summary_for_tabs<'a>(tabs: impl IntoIterator<Item = &'a Tab>)
         for (pane_index, pane) in tab.panes.iter().enumerate() {
             if let Some(process) = pane.foreground_process() {
                 let location = if tab.panes.len() > 1 {
-                    format!("{} (pane {})", tab.title, pane_index + 1)
+                    format!("{} (pane {})", tab.display_title(), pane_index + 1)
                 } else {
-                    tab.title.clone()
+                    tab.display_title().to_string()
                 };
                 running.push(format!("{location} — {process}"));
             }
@@ -688,6 +688,7 @@ impl AppModel {
             activity: false,
             marked: false,
             pinned: false,
+            private_title: false,
             id,
             zoom: None,
             remote: None,
@@ -732,6 +733,7 @@ impl AppModel {
             activity: false,
             marked: false,
             pinned: saved.pinned,
+            private_title: saved.private_title,
             id,
             zoom: None,
             remote: restored_remote,
@@ -1010,6 +1012,7 @@ impl AppModel {
                     t.title.clone(),
                     t.custom_title,
                     t.pinned,
+                    t.private_title,
                     self.serialize_layout(t),
                 )
             })
@@ -1153,7 +1156,9 @@ impl AppModel {
             ("Total panes".to_string(), total_panes.to_string()),
             (
                 "Active tab".to_string(),
-                active_tab.map(|t| t.title.clone()).unwrap_or_default(),
+                active_tab
+                    .map(|t| t.display_title().to_string())
+                    .unwrap_or_default(),
             ),
             (
                 "Panes in active tab".to_string(),
@@ -1263,6 +1268,7 @@ impl AppModel {
             activity: false,
             marked: false,
             pinned: false,
+            private_title: false,
             id,
             zoom: None,
             remote: Some(RemoteConn {
@@ -1611,8 +1617,12 @@ impl AppModel {
         // A filter is matched against the label, so a changed label can move
         // the row in or out of the filtered set; that needs a full rebuild.
         let filter = self.tab_filter.to_lowercase();
-        let visible = filter.is_empty() || self.tabs[ti].title.to_lowercase().contains(&filter);
-        if !visible || !self.update_tab_title_widget(id, &self.tabs[ti].title) {
+        let visible = filter.is_empty()
+            || self.tabs[ti]
+                .display_title()
+                .to_lowercase()
+                .contains(&filter);
+        if !visible || !self.update_tab_title_widget(id) {
             self.rebuild_tab_strip(sender);
         }
     }
@@ -1892,6 +1902,7 @@ impl AppModel {
             .map(str::to_string);
         let title = src.title.clone();
         let custom_title = src.custom_title;
+        let private_title = src.private_title;
 
         let id = self.next_id;
         self.next_id += 1;
@@ -1926,6 +1937,7 @@ impl AppModel {
             activity: false,
             marked: false,
             pinned: false,
+            private_title,
             id,
             zoom: None,
             remote: None,
@@ -2491,6 +2503,7 @@ impl AppModel {
         if self.tabs[source_index].id != plan.source_tab_id {
             return;
         }
+        let private_title = self.tabs[source_index].private_title;
         if self.tabs[source_index]
             .panes
             .iter()
@@ -2532,6 +2545,7 @@ impl AppModel {
             activity: false,
             marked: false,
             pinned: false,
+            private_title,
             id: new_id,
             zoom: None,
             remote,

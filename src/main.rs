@@ -1639,16 +1639,21 @@ impl SimpleComponent for AppModel {
                     if is_selected_pane && !self.tabs[idx].custom_title && !title.is_empty() {
                         let filter = self.tab_filter.to_lowercase();
                         let was_visible = filter.is_empty()
-                            || self.tabs[idx].title.to_lowercase().contains(&filter);
-                        let is_visible =
-                            filter.is_empty() || title.to_lowercase().contains(&filter);
+                            || self.tabs[idx]
+                                .display_title()
+                                .to_lowercase()
+                                .contains(&filter);
                         self.tabs[idx].title = title;
+                        let is_visible = filter.is_empty()
+                            || self.tabs[idx]
+                                .display_title()
+                                .to_lowercase()
+                                .contains(&filter);
                         // A filter membership change really does alter the row
                         // set. Otherwise update only the label: OSC-title
                         // spinners can arrive many times per second.
                         if was_visible != is_visible
-                            || (is_visible
-                                && !self.update_tab_title_widget(id, &self.tabs[idx].title))
+                            || (is_visible && !self.update_tab_title_widget(id))
                         {
                             self.rebuild_tab_strip(&sender);
                         }
@@ -1772,11 +1777,27 @@ impl SimpleComponent for AppModel {
             }
             AppMsg::ReorderTab(src_id, to_idx) => self.reorder_tab(src_id, to_idx, &sender),
             AppMsg::TabRowAction(id, action) => {
+                // Privacy is a chrome-only action. Do not activate an inactive
+                // tab just to hide its title: that would reveal the very
+                // terminal content the user is trying to keep in the background.
+                if matches!(action, tab_strip::TabAction::TogglePrivateTitle) {
+                    if let Some(idx) = self.index_of(id) {
+                        self.tabs[idx].private_title = !self.tabs[idx].private_title;
+                        self.show_toast(if self.tabs[idx].private_title {
+                            "Tab title details hidden"
+                        } else {
+                            "Tab title details visible"
+                        });
+                        self.rebuild_tab_strip(&sender);
+                    }
+                    return;
+                }
                 self.select_tab(id, &sender);
                 let action = match action {
                     tab_strip::TabAction::Duplicate => Action::DuplicateTab,
                     tab_strip::TabAction::ToggleMarked => Action::ToggleTabMarked,
                     tab_strip::TabAction::TogglePinned => Action::ToggleTabPinned,
+                    tab_strip::TabAction::TogglePrivateTitle => unreachable!(),
                 };
                 self.execute_action(action, &sender);
             }

@@ -199,6 +199,8 @@ pub(crate) struct SavedTab {
     /// field and therefore restore as unpinned.
     #[serde(default)]
     pub pinned: bool,
+    #[serde(default)]
+    pub private_title: bool,
     pub layout: PaneLayout,
 }
 
@@ -207,12 +209,14 @@ impl SavedTab {
         title: String,
         custom_title: bool,
         pinned: bool,
+        private_title: bool,
         layout: PaneLayout,
     ) -> Self {
         Self {
             title: truncate_string_to_bytes(title, MAX_RESTORED_TITLE_BYTES),
             custom_title,
             pinned,
+            private_title,
             layout,
         }
     }
@@ -1128,6 +1132,7 @@ impl<'de> serde::de::Visitor<'de> for SavedTabSeed<'_> {
         let mut title = None;
         let mut custom_title = None;
         let mut pinned = None;
+        let mut private_title = None;
         let mut layout = None;
         let mut tab_panes = MAX_RESTORED_PANES_PER_TAB;
         while let Some(key) = map.next_key::<String>()? {
@@ -1140,6 +1145,7 @@ impl<'de> serde::de::Visitor<'de> for SavedTabSeed<'_> {
                 }
                 "custom_title" => custom_title = Some(map.next_value::<bool>()?),
                 "pinned" => pinned = Some(map.next_value::<bool>()?),
+                "private_title" => private_title = Some(map.next_value::<bool>()?),
                 "layout" => {
                     layout = Some(map.next_value_seed(PaneLayoutSeed {
                         budget: &mut *budget,
@@ -1156,6 +1162,7 @@ impl<'de> serde::de::Visitor<'de> for SavedTabSeed<'_> {
             title: title.ok_or_else(|| A::Error::missing_field("title"))?,
             custom_title: custom_title.ok_or_else(|| A::Error::missing_field("custom_title"))?,
             pinned: pinned.unwrap_or_default(),
+            private_title: private_title.unwrap_or_default(),
             layout: layout.ok_or_else(|| A::Error::missing_field("layout"))?,
         })
     }
@@ -2874,6 +2881,7 @@ mod tests {
                 title: title.to_string(),
                 custom_title: true,
                 pinned: false,
+                private_title: false,
                 layout: PaneLayout::Leaf {
                     mode: "block".to_string(),
                     cwd: None,
@@ -3210,7 +3218,7 @@ mod tests {
         assert!(matches!(oversized_sid, PaneLayout::Leaf { sid: None, .. }));
 
         let title = "界".repeat(MAX_RESTORED_TITLE_BYTES / "界".len() + 2);
-        let tab = SavedTab::captured(title, true, false, layout);
+        let tab = SavedTab::captured(title, true, false, false, layout);
         assert!(tab.title.len() <= MAX_RESTORED_TITLE_BYTES);
         assert!(tab.title.is_char_boundary(tab.title.len()));
         let mut captured = SavedSession::captured(0, vec![tab], Some("not a chat snapshot".into()));
@@ -3579,6 +3587,7 @@ mod tests {
                 title: format!("command-{index}"),
                 custom_title: false,
                 pinned: false,
+                private_title: false,
                 layout: PaneLayout::Leaf {
                     mode: "block".to_string(),
                     cwd: None,
@@ -3721,12 +3730,14 @@ mod tests {
     }
 
     #[test]
-    fn pinned_round_trips_and_legacy_snapshots_default_to_unpinned() {
+    fn tab_flags_round_trip_and_legacy_snapshots_default_off() {
         let mut current = saved_session("pinned");
         current.tabs[0].pinned = true;
+        current.tabs[0].private_title = true;
         let encoded = serde_json::to_string(&current).expect("serialize pinned session");
         let decoded = decode_saved_session(&encoded).expect("deserialize pinned session");
         assert!(decoded.tabs[0].pinned);
+        assert!(decoded.tabs[0].private_title);
 
         let legacy = r#"{
             "active": 0,
@@ -3738,6 +3749,7 @@ mod tests {
         }"#;
         let decoded = decode_saved_session(legacy).expect("deserialize legacy session");
         assert!(!decoded.tabs[0].pinned);
+        assert!(!decoded.tabs[0].private_title);
     }
 
     #[test]
