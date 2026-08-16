@@ -3,13 +3,14 @@
 //! VTE clears a selection when the cells beneath it are repainted. Interactive
 //! commands, progress displays, and other live output can repaint many times a
 //! second, so selection over the running surface needs to defer the PTY feed.
-//! Parked bytes are replayed through the same parser/state-machine pipeline in
-//! arrival order; display is delayed, never discarded or reordered.
+//! The hold lasts as long as the selection itself; copy, input, clearing, or
+//! the bounded safety cap resumes it. Parked bytes are replayed through the
+//! same parser/state-machine pipeline in arrival order; display is delayed,
+//! never discarded or reordered.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use relm4::gtk::glib;
 use vte4::TerminalExt;
 
 use super::{BlockState, MouseReportingMode};
@@ -20,9 +21,6 @@ type StateFn = Box<dyn Fn(bool)>;
 /// A firehose must not let selection parking grow memory without bound or
 /// stall the Block state machine indefinitely.
 const MAX_PARKED_BYTES: usize = 2 * 1024 * 1024;
-
-/// Keep a completed selection alive briefly so the copy shortcut can read it.
-const RELEASE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Only streaming states can destroy a live selection. When mouse reporting
 /// is active the child owns the drag, unless Shift forces VTE local selection.
@@ -47,7 +45,6 @@ pub(crate) struct SelectionFeedHold {
     /// treat that mid-drag selection-changed signal as an instruction to flush.
     dragging: Cell<bool>,
     parked: RefCell<Vec<u8>>,
-    grace_timer: RefCell<Option<glib::SourceId>>,
     flush_cb: RefCell<Option<FlushFn>>,
     /// The indicator changes only once bytes are really parked, so a click
     /// without output never flashes a false paused state.
@@ -60,7 +57,6 @@ impl SelectionFeedHold {
             holding: Cell::new(false),
             dragging: Cell::new(false),
             parked: RefCell::new(Vec::new()),
-            grace_timer: RefCell::new(None),
             flush_cb: RefCell::new(None),
             state_cb: RefCell::new(None),
         })
@@ -101,7 +97,6 @@ impl SelectionFeedHold {
     }
 
     pub(crate) fn begin_drag(&self) {
-        self.cancel_grace();
         self.dragging.set(true);
         self.holding.set(true);
     }
@@ -110,9 +105,7 @@ impl SelectionFeedHold {
         if !self.dragging.replace(false) || !self.holding.get() {
             return;
         }
-        if selection_alive {
-            self.schedule_grace();
-        } else {
+        if !selection_alive {
             self.flush_now();
         }
     }
@@ -148,7 +141,6 @@ impl SelectionFeedHold {
     }
 
     pub(crate) fn flush_now(&self) {
-        self.cancel_grace();
         if !self.holding.replace(false) {
             return;
         }
@@ -168,24 +160,6 @@ impl SelectionFeedHold {
     pub(crate) fn flush_then(&self, action: impl FnOnce()) {
         self.flush_now();
         action();
-    }
-
-    fn schedule_grace(self: &Rc<Self>) {
-        self.cancel_grace();
-        let weak = Rc::downgrade(self);
-        let id = glib::timeout_add_local_once(RELEASE_GRACE, move || {
-            if let Some(hold) = weak.upgrade() {
-                hold.grace_timer.borrow_mut().take();
-                hold.flush_now();
-            }
-        });
-        *self.grace_timer.borrow_mut() = Some(id);
-    }
-
-    fn cancel_grace(&self) {
-        if let Some(id) = self.grace_timer.borrow_mut().take() {
-            id.remove();
-        }
     }
 }
 
@@ -269,6 +243,21 @@ mod tests {
         hold.end_drag(false);
         assert_eq!(log.borrow().as_slice(), [b"one two".to_vec()]);
         assert!(!hold.try_buffer(b"after"));
+    }
+
+    #[test]
+    fn surviving_selection_keeps_feed_parked_until_copy_or_input() {
+        let (hold, log) = hold_with_log();
+        hold.begin_drag();
+        assert!(hold.try_buffer(b"codex redraw"));
+        hold.end_drag(true);
+        assert!(hold.try_buffer(b" stays parked"));
+        assert!(log.borrow().is_empty());
+        hold.flush_now();
+        assert_eq!(
+            log.borrow().as_slice(),
+            [b"codex redraw stays parked".to_vec()]
+        );
     }
 
     #[test]

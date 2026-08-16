@@ -43,6 +43,12 @@ pub(crate) enum AppMsg {
     RemoteReconnectTick(u64, u64),
     RemoteReconnectNow(u64, u32),
     PaneFocused(u64, u64),
+    /// Local files dropped on one concrete pane. The model validates that all
+    /// are supported images before inserting their quoted paths without Enter.
+    ImageFilesDropped {
+        pane_id: u64,
+        paths: Vec<std::path::PathBuf>,
+    },
     /// A pane header was dropped onto another pane: exchange their positions
     /// in the split tree.
     SwapPanes {

@@ -19,6 +19,7 @@ mod dialogs;
 mod file_tree;
 mod file_tree_ops;
 mod git_meta_ui;
+mod image_drop;
 use jterm_core::{child_env, command_history, notify, parser, pty_input, review_input};
 
 mod host {
@@ -381,6 +382,29 @@ fn create_pane(
                 true
             }
         });
+    }
+    {
+        let target = gtk::DropTarget::new(
+            gtk::gdk::FileList::static_type(),
+            gtk::gdk::DragAction::COPY,
+        );
+        let sender = sender.clone();
+        target.connect_drop(move |_, value, _x, _y| {
+            let Ok(files) = value.get::<gtk::gdk::FileList>() else {
+                return false;
+            };
+            let paths = files
+                .files()
+                .into_iter()
+                .filter_map(|file| file.path())
+                .collect::<Vec<_>>();
+            if paths.is_empty() {
+                return false;
+            }
+            sender.input(AppMsg::ImageFilesDropped { pane_id, paths });
+            true
+        });
+        frame.widget().add_controller(target);
     }
     Pane {
         terminal,
@@ -1356,6 +1380,22 @@ impl SimpleComponent for AppModel {
             }
             AppMsg::ForceQuit => self.force_quit(),
             AppMsg::Toast(message) => self.show_toast(message),
+            AppMsg::ImageFilesDropped { pane_id, paths } => {
+                match image_drop::prompt_payload(&paths) {
+                    Ok(payload) => {
+                        if let Some((tab_index, pane_index)) = self.find_pane(pane_id) {
+                            let terminal = &self.tabs[tab_index].panes[pane_index].terminal;
+                            terminal.emit(VteInput::GrabFocus);
+                            terminal.emit(VteInput::WriteInput(payload.into_bytes()));
+                        } else {
+                            self.show_toast("Image drop rejected: the target terminal closed.");
+                        }
+                    }
+                    Err(error) => {
+                        self.show_toast(format!("Image drop rejected: {error}"));
+                    }
+                }
+            }
             AppMsg::JshUpdateChecked(status) => self.offer_jsh_update(&status, &sender),
             AppMsg::WorkflowRefreshFinished(result) => self.finish_workflow_refresh(result),
             AppMsg::CopyOutputOnly => {

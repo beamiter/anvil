@@ -201,7 +201,20 @@ impl CrossSelection {
     }
 
     fn end_active_feed_hold(&self) {
-        self.feed_hold.end_drag(self.active_vte.has_selection());
+        // Our capture-phase gesture ends before VTE's child gesture has
+        // finalized its native selection. Reading `has_selection()` here can
+        // therefore report false and replay Codex's next repaint immediately,
+        // erasing the range the user just drew. Let the event finish, then
+        // decide from VTE's settled state on the next main-loop turn.
+        let hold = self.feed_hold.clone();
+        let terminal = self.active_vte.downgrade();
+        gtk::glib::idle_add_local_once(move || {
+            hold.end_drag(
+                terminal
+                    .upgrade()
+                    .is_some_and(|terminal| terminal.has_selection()),
+            );
+        });
     }
 
     fn clear_block_selection(&self) {
