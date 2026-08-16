@@ -316,6 +316,13 @@ fn rebase_offset(cursor_row: i64, adjustment_upper: i64) -> i64 {
     (cursor_row + 1 - adjustment_upper).max(0)
 }
 
+/// Whether a click can belong to the live editor rather than session history.
+/// The upper edge stays open because a cursor parked mid-buffer can have a
+/// genuine soft-wrapped suffix below it.
+fn click_may_target_live_input(click: core_click::Cell, input_start_row: i64) -> bool {
+    click.row >= input_start_row
+}
+
 /// Bytes that walk the line editor from the cursor to `click`, or nothing when
 /// the click must not move it.
 fn move_for_click(vte: &Terminal, ctx: &ClickCursorCtx, click: core_click::Cell) -> Vec<u8> {
@@ -330,6 +337,15 @@ fn move_for_click(vte: &Terminal, ctx: &ClickCursorCtx, click: core_click::Cell)
         return Vec::new();
     }
 
+    // The active VTE also paints completed blocks. A click above the current
+    // prompt belongs to history (selection, links, or block focus), not to the
+    // shell line editor. Previously its distance was clamped to `max_left`,
+    // which turned any such click into an accidental Home operation.
+    let (start_col, start_row) = (ctx.prompt_anchor)();
+    if !click_may_target_live_input(click, start_row) {
+        return Vec::new();
+    }
+
     let steps = if (click.row, click.col) < (cursor.row, cursor.col) {
         -chars_between(vte, click, cursor)
     } else {
@@ -337,7 +353,6 @@ fn move_for_click(vte: &Terminal, ctx: &ClickCursorCtx, click: core_click::Cell)
     };
 
     // How far left the input reaches: back to where the prompt handed over.
-    let (start_col, start_row) = (ctx.prompt_anchor)();
     let max_left = chars_between(vte, core_click::Cell::new(start_row, start_col), cursor);
 
     // How far right it reaches: to the end of what the buffer really holds —
@@ -541,6 +556,23 @@ mod tests {
         assert_eq!(rebase_offset(5, 6), 0);
         // A cursor parked mid-screen must never shift clicks upward.
         assert_eq!(rebase_offset(0, 6), 0);
+    }
+
+    #[test]
+    fn completed_block_rows_precede_the_live_input_anchor() {
+        let input_start_row = 18;
+        assert!(!click_may_target_live_input(
+            core_click::Cell::new(12, 40),
+            input_start_row
+        ));
+        assert!(click_may_target_live_input(
+            core_click::Cell::new(18, 0),
+            input_start_row
+        ));
+        assert!(click_may_target_live_input(
+            core_click::Cell::new(19, 0),
+            input_start_row
+        ));
     }
 
     #[test]
