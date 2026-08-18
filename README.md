@@ -596,10 +596,20 @@ honored) or `docker exec` and run a small POSIX sh probe on the far side whose
 arguments are single-quote-escaped or passed as raw argv, so paths with spaces
 or shell metacharacters survive the trip. Right-clicking a row offers New
 File, New Folder, Rename, Delete (with confirmation), Copy, Cut, Paste, and
-Refresh; the same menu works locally. Paste is confined to the location the
-entry was copied or cut from, names are validated before any dialog is
-accepted, `/` can never be a delete target, and a stale host removed from the
-config drops the tree back to `Local`.
+Refresh; the same menu works locally, and a successful operation refreshes
+only the directories it touched, so unrelated expanded rows never collapse.
+
+Paste also works across locations. Copying or cutting on a host and pasting
+locally downloads (labeled "Paste (download)"); the reverse uploads; pasting
+between two different hosts relays through a staging file under the system
+temp dir. Files stream through the probe (`cat`/`put` — the upload is written
+to a temp name and moved into place atomically on the far side), directories
+stream as tar archives, and payloads are capped at 512 MiB with a 15-minute
+overall timeout. A destination that already holds the name is refused before
+any bytes move, a cut across locations deletes the source only after the copy
+landed, and partial transfers clean up after themselves. Names are validated
+before any dialog is accepted, `/` can never be a delete target, and a stale
+host removed from the config drops the tree back to `Local`.
 
 ### AI
 

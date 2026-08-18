@@ -299,12 +299,28 @@ fn show_file_tree_context_menu(
 
     let loc = location.borrow().clone();
     let clip = clipboard.borrow().clone();
-    let (paste_sensitive, paste_tooltip) = match &clip {
-        Some(clip) if clip.loc == loc => (true, ""),
-        // Cross-location paste is out of scope for v1: the two filesystems
-        // share no transport, so the item stays visible but insensitive.
-        Some(_) => (false, "Paste stays within one browsing location"),
-        None => (false, "Copy or cut an item first"),
+    // Cross-location paste streams between the two filesystems; the label
+    // says which direction the bytes will flow.
+    let (paste_sensitive, paste_label, paste_tooltip) = match &clip {
+        None => (
+            false,
+            "Paste".to_string(),
+            Some("Copy or cut an item first"),
+        ),
+        Some(clip) if clip.loc == loc => (true, "Paste".to_string(), None),
+        Some(clip) => match (&clip.loc, &loc) {
+            (remote_fs::FsLocation::Remote(_), remote_fs::FsLocation::Local) => {
+                (true, "Paste (download)".to_string(), None)
+            }
+            (remote_fs::FsLocation::Local, remote_fs::FsLocation::Remote(_)) => {
+                (true, "Paste (upload)".to_string(), None)
+            }
+            _ => (
+                true,
+                "Paste (via local relay)".to_string(),
+                Some("Downloaded to a local staging file, then uploaded"),
+            ),
+        },
     };
 
     let popover = gtk::Popover::new();
@@ -369,10 +385,10 @@ fn show_file_tree_context_menu(
         );
     }
     {
-        let button = file_menu_button("Paste");
+        let button = file_menu_button(&paste_label);
         button.set_sensitive(paste_sensitive);
-        if !paste_tooltip.is_empty() {
-            button.set_tooltip_text(Some(paste_tooltip));
+        if let Some(tooltip) = paste_tooltip {
+            button.set_tooltip_text(Some(tooltip));
         }
         let popover = popover.clone();
         let sender = sender.clone();

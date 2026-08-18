@@ -166,6 +166,9 @@ pub(crate) enum AppMsg {
         dir: Option<std::path::PathBuf>,
     },
     FileTreeRefresh,
+    /// A background op or transfer finished; refresh these directories in
+    /// place, preserving all other expansion.
+    FileTreeOpSucceeded(Vec<std::path::PathBuf>),
     /// Dialog results, names already validated against `remote_fs` rules.
     FileTreeCreateNamed {
         dir: std::path::PathBuf,

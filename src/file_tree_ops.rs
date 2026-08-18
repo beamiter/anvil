@@ -338,6 +338,7 @@ impl AppModel {
         let hosts = self.config.borrow().remote_hosts.clone();
         self.run_file_tree_op(
             None,
+            vec![dir],
             move || {
                 if is_dir {
                     remote_fs::create_dir(&loc, &hosts, &path)
@@ -363,6 +364,7 @@ impl AppModel {
             self.show_toast("The filesystem root cannot be renamed.");
             return;
         };
+        let refresh = vec![parent.to_path_buf()];
         let dst = parent.join(&name);
         if dst == src {
             return;
@@ -372,6 +374,7 @@ impl AppModel {
         // A renamed clipboard source would dangle; forget it on success.
         self.run_file_tree_op(
             Some(src.clone()),
+            refresh,
             move || remote_fs::rename(&loc, &hosts, &src, &dst),
             sender,
         );
@@ -384,16 +387,24 @@ impl AppModel {
     ) {
         let loc = self.file_tree_location.borrow().clone();
         let hosts = self.config.borrow().remote_hosts.clone();
+        let refresh = path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .into_iter()
+            .collect();
         // A deleted clipboard source would dangle; forget it on success.
         self.run_file_tree_op(
             Some(path.clone()),
+            refresh,
             move || remote_fs::delete(&loc, &hosts, &path),
             sender,
         );
     }
 
-    /// Paste the clipboard into `dir` (the root when None): cut becomes a
-    /// rename, copy a recursive copy. Cross-location paste is refused.
+    /// Paste the clipboard into `dir` (the root when None). Same location:
+    /// cut becomes a rename, copy a recursive copy. Different locations: a
+    /// streaming transfer (download, upload, or a local relay between two
+    /// remote hosts), where cut copies first and then deletes the source.
     pub(crate) fn file_tree_paste(
         &self,
         dir: Option<std::path::PathBuf>,
@@ -403,34 +414,72 @@ impl AppModel {
             return;
         };
         let loc = self.file_tree_location.borrow().clone();
-        if clip.loc != loc {
-            // The menu keeps Paste insensitive in this state; this catches a
-            // clipboard or location that changed while the menu was open.
-            self.show_toast("Paste stays within one browsing location.");
-            return;
-        }
         let dir = dir.unwrap_or_else(|| self.file_tree_root.borrow().clone());
         if dir.as_os_str().is_empty() {
-            return;
-        }
-        let dst = remote_fs::paste_destination(&dir, &clip.path);
-        if dst == clip.path {
-            self.show_toast("Copy and cut need a different target directory.");
             return;
         }
         let hosts = self.config.borrow().remote_hosts.clone();
         let src = clip.path.clone();
         let cut = clip.cut;
-        // A successful cut-paste consumes the clipboard.
-        self.run_file_tree_op(
-            cut.then_some(src.clone()),
-            move || {
-                if cut {
-                    remote_fs::rename(&loc, &hosts, &src, &dst)
-                } else {
-                    remote_fs::copy(&loc, &hosts, &src, &dst)
+        if clip.loc == loc {
+            let dst = remote_fs::paste_destination(&dir, &clip.path);
+            if dst == clip.path {
+                self.show_toast("Copy and cut need a different target directory.");
+                return;
+            }
+            // A successful cut-paste consumes the clipboard.
+            let refresh = if cut {
+                let mut dirs = vec![dir.clone()];
+                if let Some(parent) = src.parent() {
+                    dirs.push(parent.to_path_buf());
                 }
-            },
+                dirs
+            } else {
+                vec![dir.clone()]
+            };
+            self.run_file_tree_op(
+                cut.then_some(src.clone()),
+                refresh,
+                move || {
+                    if cut {
+                        remote_fs::rename(&loc, &hosts, &src, &dst)
+                    } else {
+                        remote_fs::copy(&loc, &hosts, &src, &dst)
+                    }
+                },
+                sender,
+            );
+            return;
+        }
+
+        // Cross-location: stream through the probe (or the local relay).
+        let src_loc = clip.loc.clone();
+        let is_dir = clip.is_dir;
+        let name = src.file_name().map(file_tree::display_os_str);
+        let name = name.unwrap_or_else(|| src.display().to_string());
+        let name = review_input::safe_inline_display(&name, 256);
+        let (verb, from_to) = match (&src_loc, &loc) {
+            (remote_fs::FsLocation::Remote(_), remote_fs::FsLocation::Local) => {
+                ("Downloading", format!("from {}", src_loc.label(&hosts)))
+            }
+            (remote_fs::FsLocation::Local, remote_fs::FsLocation::Remote(_)) => {
+                ("Uploading", format!("to {}", loc.label(&hosts)))
+            }
+            _ => (
+                "Relaying",
+                format!("from {} to {}", src_loc.label(&hosts), loc.label(&hosts)),
+            ),
+        };
+        let busy = format!("{verb} {name} {from_to}…");
+        let done = format!("{name}: transfer complete");
+        let cut_source = cut.then_some((src_loc.clone(), src.clone()));
+        let dst_loc = loc.clone();
+        self.run_file_tree_transfer(
+            busy,
+            done,
+            vec![dir.clone()],
+            cut_source,
+            move || remote_fs::transfer(&hosts, &src_loc, &src, &dst_loc, &dir, is_dir).map(drop),
             sender,
         );
     }
@@ -474,12 +523,14 @@ impl AppModel {
         dialog.present(Some(&self.window));
     }
 
-    /// Run one blocking op on a worker thread, then reload the tree on the
-    /// GTK thread. `forget_clipboard` names a clipboard source that a
-    /// successful rename/delete/cut-paste consumes or makes dangle.
+    /// Run one blocking op on a worker thread, then refresh only the affected
+    /// directories in place on the GTK thread. `forget_clipboard` names a
+    /// clipboard source that a successful rename/delete/cut-paste consumes or
+    /// makes dangle.
     fn run_file_tree_op(
         &self,
         forget_clipboard: Option<std::path::PathBuf>,
+        refresh: Vec<std::path::PathBuf>,
         op: impl FnOnce() -> std::io::Result<()> + Send + 'static,
         sender: &ComponentSender<AppModel>,
     ) {
@@ -497,7 +548,7 @@ impl AppModel {
                         *clipboard.borrow_mut() = None;
                     }
                 }
-                sender.input(AppMsg::FileTreeRefresh);
+                sender.input(AppMsg::FileTreeOpSucceeded(refresh));
             }
             Err(error) => {
                 let message = review_input::safe_inline_display(&error.to_string(), 512);
@@ -507,6 +558,174 @@ impl AppModel {
             }
         }) {
             self.show_toast(format!("Could not start the file operation: {error}"));
+        }
+    }
+
+    /// Run one cross-location transfer on a worker thread with a held busy
+    /// toast. On success a cut's source is deleted through the regular delete
+    /// op; a failed source delete is reported as partial success.
+    fn run_file_tree_transfer(
+        &self,
+        busy_label: String,
+        done_label: String,
+        refresh: Vec<std::path::PathBuf>,
+        cut_source: Option<(remote_fs::FsLocation, std::path::PathBuf)>,
+        transfer: impl FnOnce() -> std::io::Result<()> + Send + 'static,
+        sender: &ComponentSender<AppModel>,
+    ) {
+        let busy_toast = self.file_tree_transfer_begin(&busy_label);
+        let transfer_toast = self.file_tree_transfer_toast.clone();
+        let toast_overlay = self.toast_overlay.clone();
+        let clipboard = self.file_tree_clipboard.clone();
+        let config = self.config.clone();
+        let sender = sender.clone();
+        if let Err(error) = file_tree::request_fs_op(transfer, move |result| {
+            busy_toast.dismiss();
+            // Free the shared slot only if it still holds this transfer's
+            // toast; a newer transfer's busy toast must survive.
+            {
+                let mut slot = transfer_toast.borrow_mut();
+                if slot.as_ref() == Some(&busy_toast) {
+                    slot.take();
+                }
+            }
+            match result {
+                Ok(()) => {
+                    toast_overlay.add_toast(adw::Toast::new(&done_label));
+                    sender.input(AppMsg::FileTreeOpSucceeded(refresh));
+                    let Some((loc, path)) = cut_source else {
+                        return;
+                    };
+                    // The copy half of the cut is done: the clipboard is
+                    // spent either way, and the source delete is best-effort.
+                    let dangling = clipboard
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|clip| clip.path == path);
+                    if dangling {
+                        *clipboard.borrow_mut() = None;
+                    }
+                    let hosts = config.borrow().remote_hosts.clone();
+                    let toast_overlay = toast_overlay.clone();
+                    if let Err(error) = file_tree::request_fs_op(
+                        move || remote_fs::delete(&loc, &hosts, &path),
+                        move |result| {
+                            if let Err(error) = result {
+                                let message =
+                                    review_input::safe_inline_display(&error.to_string(), 512);
+                                toast_overlay.add_toast(adw::Toast::new(&format!(
+                                    "Copied, but deleting the source failed: {message}"
+                                )));
+                            }
+                        },
+                    ) {
+                        log::warn!("failed to start cut-paste source delete: {error}");
+                    }
+                }
+                Err(error) => {
+                    let message = review_input::safe_inline_display(&error.to_string(), 512);
+                    toast_overlay
+                        .add_toast(adw::Toast::new(&format!("Transfer failed: {message}")));
+                }
+            }
+        }) {
+            if let Some(toast) = self.file_tree_transfer_toast.borrow_mut().take() {
+                toast.dismiss();
+            }
+            self.show_toast(format!("Could not start the transfer: {error}"));
+        }
+    }
+
+    /// One held toast per transfer, dismissed when it finishes — the busy
+    /// indication for payloads that can outlive a normal toast. Returns the
+    /// toast so the completing transfer dismisses its own, not a newer one.
+    fn file_tree_transfer_begin(&self, label: &str) -> adw::Toast {
+        if let Some(old) = self.file_tree_transfer_toast.borrow_mut().take() {
+            old.dismiss();
+        }
+        let toast = adw::Toast::new(label);
+        toast.set_timeout(0);
+        self.toast_overlay.add_toast(toast.clone());
+        *self.file_tree_transfer_toast.borrow_mut() = Some(toast.clone());
+        toast
+    }
+
+    /// Refresh only the affected directories in place: locate each row by its
+    /// path identity, merge a fresh scan into its children, and leave every
+    /// other row — and all expansion — untouched. Directories that are not
+    /// materialized in the model (collapsed, or outside the root) need no
+    /// work: their lazy scan sees the fresh state on expansion.
+    #[allow(deprecated)]
+    pub(crate) fn refresh_tree_dirs(&self, dirs: Vec<std::path::PathBuf>) {
+        let loc = self.file_tree_location.borrow().clone();
+        let hosts = self.config.borrow().remote_hosts.clone();
+        let root = self.file_tree_root.borrow().clone();
+        let mut seen = std::collections::HashSet::new();
+        for dir in dirs {
+            if dir.as_os_str().is_empty() || !seen.insert(dir.clone()) {
+                continue;
+            }
+            let parent_ref = if dir == root {
+                None // the root merges at the model's top level
+            } else {
+                let Some(identity) = file_tree::encode_path_identity(&dir) else {
+                    continue;
+                };
+                let Some(iter) = file_tree::find_row_by_identity(&self.file_tree_store, &identity)
+                else {
+                    continue;
+                };
+                // A placeholder child marks a never-expanded directory: its
+                // lazy scan shows the fresh state anyway. An expanded-but-
+                // empty directory has no children at all and still wants the
+                // refresh.
+                if let Some(first) = self.file_tree_store.iter_children(Some(&iter)) {
+                    let placeholder: String = self
+                        .file_tree_store
+                        .get_value(&first, file_tree::COL_PATH as i32)
+                        .get()
+                        .unwrap_or_default();
+                    if placeholder.is_empty() {
+                        continue;
+                    }
+                }
+                let Some(row_ref) = gtk::TreeRowReference::new(
+                    &self.file_tree_store,
+                    &self.file_tree_store.path(&iter),
+                ) else {
+                    continue;
+                };
+                Some(row_ref)
+            };
+
+            let store = self.file_tree_store.clone();
+            let active_generation = self.file_tree_scan_generation.clone();
+            let generation = active_generation.get();
+            let active_location = self.file_tree_location.clone();
+            let expected_loc = loc.clone();
+            let active_root = self.file_tree_root.clone();
+            let expected_root = root.clone();
+            if let Err(error) =
+                file_tree::request_dir_scan(loc.clone(), hosts.clone(), dir, move |result| {
+                    if active_generation.get() != generation
+                        || *active_location.borrow() != expected_loc
+                        || *active_root.borrow() != expected_root
+                    {
+                        return;
+                    }
+                    let parent = parent_ref
+                        .and_then(|row_ref| row_ref.path())
+                        .and_then(|path| store.iter(&path));
+                    match result {
+                        Ok(entries) => {
+                            file_tree::merge_refresh_children(&store, parent.as_ref(), entries)
+                        }
+                        Err(error) => log::warn!("failed to refresh directory rows: {error}"),
+                    }
+                })
+            {
+                log::warn!("failed to start directory refresh: {error}");
+            }
         }
     }
 }

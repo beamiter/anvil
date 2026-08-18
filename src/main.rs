@@ -221,6 +221,9 @@ struct AppModel {
     file_tree_location: Rc<RefCell<remote_fs::FsLocation>>,
     /// Copy/Cut row awaiting a Paste; usable only in its source location.
     file_tree_clipboard: Rc<RefCell<Option<remote_fs::FsClipboard>>>,
+    /// The live busy toast of an in-flight cross-location transfer, held so
+    /// long transfers are not left without any indication.
+    file_tree_transfer_toast: Rc<RefCell<Option<adw::Toast>>>,
     tab_strip_scroll: gtk::ScrolledWindow,
     sidebar_tab_scroll: gtk::ScrolledWindow,
     top_tab_scroll: gtk::ScrolledWindow,
@@ -1022,6 +1025,7 @@ impl SimpleComponent for AppModel {
             file_tree_scan_generation,
             file_tree_location,
             file_tree_clipboard,
+            file_tree_transfer_toast: Rc::new(RefCell::new(None)),
             tab_strip_scroll: tab_strip_scroll.clone(),
             sidebar_tab_scroll: sidebar_tab_scroll.clone(),
             top_tab_scroll: top_tab_scroll.clone(),
@@ -2048,6 +2052,7 @@ impl SimpleComponent for AppModel {
             }
             AppMsg::FileTreePaste { dir } => self.file_tree_paste(dir, &sender),
             AppMsg::FileTreeRefresh => self.file_tree_refresh(),
+            AppMsg::FileTreeOpSucceeded(dirs) => self.refresh_tree_dirs(dirs),
             AppMsg::FileTreeCreateNamed { dir, name, is_dir } => {
                 self.file_tree_create_named(dir, name, is_dir, &sender)
             }

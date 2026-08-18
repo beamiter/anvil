@@ -89,12 +89,16 @@ impl FileEntry {
     }
 }
 
+/// Directories first, then case-insensitive name order — the one comparator
+/// behind scans, inserts, and merge refreshes.
+fn entry_cmp(a: &FileEntry, b: &FileEntry) -> std::cmp::Ordering {
+    b.is_dir
+        .cmp(&a.is_dir)
+        .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+}
+
 pub(crate) fn sort_entries(entries: &mut [FileEntry]) {
-    entries.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
+    entries.sort_by(entry_cmp);
 }
 
 pub(crate) fn scan_dir(dir: &Path) -> io::Result<Vec<FileEntry>> {
@@ -293,54 +297,191 @@ pub(crate) fn new_view(store: &TreeStore) -> TreeView {
     view
 }
 
+/// Insert one entry row under `parent` at `position` (None = append), with
+/// the lazy-expansion placeholder child for directories.
+fn insert_entry_row(
+    store: &TreeStore,
+    parent: Option<&TreeIter>,
+    position: Option<u32>,
+    entry: &FileEntry,
+) {
+    let FileEntry { name, path, is_dir } = entry;
+    let icon = if *is_dir {
+        "folder-symbolic"
+    } else {
+        "text-x-generic-symbolic"
+    };
+    let Some(path_identity) = encode_path_identity(path) else {
+        log::warn!(
+            "file-tree path exceeds the {}-byte identity limit: {}",
+            MAX_FILE_PATH_IDENTITY_BYTES,
+            display_full_path(path)
+        );
+        return;
+    };
+    let display_name = crate::review_input::safe_inline_display(name, MAX_FILE_NAME_DISPLAY_BYTES);
+    let tooltip = display_full_path(path);
+    let iter = store.insert_with_values(
+        parent,
+        position,
+        &[
+            (COL_NAME, &display_name),
+            (COL_PATH, &path_identity),
+            (COL_IS_DIR, is_dir),
+            (COL_ICON, &icon),
+            (COL_TOOLTIP, &tooltip),
+        ],
+    );
+    if *is_dir {
+        // Placeholder child (empty path) → expander shows, loaded lazily.
+        store.insert_with_values(
+            Some(&iter),
+            None,
+            &[
+                (COL_NAME, &""),
+                (COL_PATH, &""),
+                (COL_IS_DIR, &false),
+                (COL_ICON, &""),
+                (COL_TOOLTIP, &""),
+            ],
+        );
+    }
+}
+
 /// Insert one row per pre-scanned directory entry under `parent`.
 pub(crate) fn append_entries(
     store: &TreeStore,
     parent: Option<&TreeIter>,
     entries: Vec<FileEntry>,
 ) {
-    for FileEntry { name, path, is_dir } in entries {
-        let icon = if is_dir {
-            "folder-symbolic"
-        } else {
-            "text-x-generic-symbolic"
-        };
-        let Some(path_identity) = encode_path_identity(&path) else {
-            log::warn!(
-                "file-tree path exceeds the {}-byte identity limit: {}",
-                MAX_FILE_PATH_IDENTITY_BYTES,
-                display_full_path(&path)
-            );
-            continue;
-        };
-        let display_name =
-            crate::review_input::safe_inline_display(&name, MAX_FILE_NAME_DISPLAY_BYTES);
-        let tooltip = display_full_path(&path);
-        let iter = store.insert_with_values(
-            parent,
-            None,
-            &[
-                (COL_NAME, &display_name),
-                (COL_PATH, &path_identity),
-                (COL_IS_DIR, &is_dir),
-                (COL_ICON, &icon),
-                (COL_TOOLTIP, &tooltip),
-            ],
-        );
-        if is_dir {
-            // Placeholder child (empty path) → expander shows, loaded lazily.
-            store.insert_with_values(
-                Some(&iter),
-                None,
-                &[
-                    (COL_NAME, &""),
-                    (COL_PATH, &""),
-                    (COL_IS_DIR, &false),
-                    (COL_ICON, &""),
-                    (COL_TOOLTIP, &""),
-                ],
-            );
+    for entry in &entries {
+        insert_entry_row(store, parent, None, entry);
+    }
+}
+
+/// Find the first row whose COL_PATH identity matches, walking the whole
+/// model. Used to target an in-place refresh at one materialized directory.
+pub(crate) fn find_row_by_identity(store: &TreeStore, identity: &str) -> Option<TreeIter> {
+    fn walk(store: &TreeStore, parent: Option<&TreeIter>, identity: &str) -> Option<TreeIter> {
+        let mut index = 0;
+        while let Some(iter) = store.iter_nth_child(parent, index) {
+            let value: String = store
+                .get_value(&iter, COL_PATH as i32)
+                .get()
+                .unwrap_or_default();
+            if value == identity {
+                return Some(iter);
+            }
+            if let Some(found) = walk(store, Some(&iter), identity) {
+                return Some(found);
+            }
+            index += 1;
         }
+        None
+    }
+    walk(store, None, identity)
+}
+
+/// Attach identities to a fresh scan, dropping paths too long to encode.
+fn identified(entries: Vec<FileEntry>) -> Vec<(String, FileEntry)> {
+    entries
+        .into_iter()
+        .filter_map(|entry| {
+            let identity = encode_path_identity(&entry.path)?;
+            Some((identity, entry))
+        })
+        .collect()
+}
+
+/// The edits that reconcile one directory's rows with a fresh scan.
+struct MergeEdit<'a> {
+    /// Indexes of current children to remove, ascending.
+    removals: Vec<usize>,
+    /// (position, entry) inserts in ascending order; positions apply to the
+    /// post-removal model as the inserts land one by one.
+    inserts: Vec<(u32, &'a FileEntry)>,
+}
+
+/// Pure merge computation behind [`merge_refresh_children`]: rows whose path
+/// vanished are removed, new entries are inserted in sort order, survivors
+/// keep their place (and with it their children and expansion). Returns None
+/// when a placeholder child marks a never-expanded directory — its lazy scan
+/// sees the fresh state on expansion, so the row stays untouched.
+fn plan_merge_refresh<'a>(
+    current: &[String],
+    fresh: &'a [(String, FileEntry)],
+) -> Option<MergeEdit<'a>> {
+    if current.iter().any(String::is_empty) {
+        return None;
+    }
+    let fresh_ids: std::collections::HashSet<&str> =
+        fresh.iter().map(|(id, _)| id.as_str()).collect();
+    let fresh_by_id: std::collections::HashMap<&str, &FileEntry> = fresh
+        .iter()
+        .map(|(id, entry)| (id.as_str(), entry))
+        .collect();
+
+    let mut removals = Vec::new();
+    let mut survivors: Vec<&str> = Vec::new();
+    for (index, identity) in current.iter().enumerate() {
+        if fresh_ids.contains(identity.as_str()) {
+            survivors.push(identity.as_str());
+        } else {
+            removals.push(index);
+        }
+    }
+
+    let mut inserts = Vec::new();
+    let mut insert_at = 0u32;
+    let mut survivor_index = 0;
+    for (identity, entry) in fresh {
+        if survivors.contains(&identity.as_str()) {
+            continue;
+        }
+        while survivor_index < survivors.len() {
+            let survivor = fresh_by_id[survivors[survivor_index]];
+            if entry_cmp(entry, survivor) == std::cmp::Ordering::Less {
+                break;
+            }
+            survivor_index += 1;
+            insert_at += 1;
+        }
+        inserts.push((insert_at, entry));
+        insert_at += 1;
+    }
+    Some(MergeEdit { removals, inserts })
+}
+
+/// Reconcile one directory's rows with a fresh scan, preserving surviving
+/// rows (and their expansion). `parent: None` merges at the top level.
+pub(crate) fn merge_refresh_children(
+    store: &TreeStore,
+    parent: Option<&TreeIter>,
+    fresh: Vec<FileEntry>,
+) {
+    let fresh = identified(fresh);
+    let mut current = Vec::new();
+    let mut index = 0;
+    while let Some(iter) = store.iter_nth_child(parent, index) {
+        current.push(
+            store
+                .get_value(&iter, COL_PATH as i32)
+                .get::<String>()
+                .unwrap_or_default(),
+        );
+        index += 1;
+    }
+    let Some(edit) = plan_merge_refresh(&current, &fresh) else {
+        return;
+    };
+    // Descending removal keeps the still-valid lower indexes intact.
+    for index in edit.removals.iter().rev() {
+        if let Some(iter) = store.iter_nth_child(parent, *index as i32) {
+            store.remove(&iter);
+        }
+    }
+    for (position, entry) in edit.inserts {
+        insert_entry_row(store, parent, Some(position), entry);
     }
 }
 
@@ -524,5 +665,101 @@ mod tests {
             MAX_FILE_PATH_IDENTITY_BYTES + 1
         ]));
         assert_eq!(encode_path_identity(&oversized), None);
+    }
+
+    // -- merge refresh (in-place directory update) ----------------------------
+
+    fn entry(path: &str, is_dir: bool) -> FileEntry {
+        let name = path.rsplit('/').next().unwrap_or(path).to_string();
+        FileEntry::new(name, PathBuf::from(path), is_dir)
+    }
+
+    fn identity_of(path: &str) -> String {
+        encode_path_identity(Path::new(path)).expect("short paths encode")
+    }
+
+    /// Simulate the model after applying an edit: stale rows removed, inserts
+    /// at their planned positions, survivors untouched.
+    fn apply_plan(current: &[String], edit: &MergeEdit) -> Vec<String> {
+        let mut model: Vec<String> = current.to_vec();
+        for index in edit.removals.iter().rev() {
+            model.remove(*index);
+        }
+        for (position, entry) in &edit.inserts {
+            model.insert(
+                *position as usize,
+                encode_path_identity(&entry.path).expect("short paths encode"),
+            );
+        }
+        model
+            .iter()
+            .map(|identity| {
+                decode_path_identity(identity)
+                    .expect("rows carry valid identities")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn merge_plan_removes_stale_inserts_sorted_and_keeps_survivors() {
+        let current: Vec<String> = ["/r/aaa", "/r/bbb", "/r/file1", "/r/file2"]
+            .into_iter()
+            .map(identity_of)
+            .collect();
+        let mut fresh_entries = vec![
+            entry("/r/aaa", true),    // survives
+            entry("/r/ccc", true),    // new dir
+            entry("/r/file0", false), // new file
+            entry("/r/file1", false), // survives
+        ];
+        sort_entries(&mut fresh_entries);
+        let fresh = identified(fresh_entries);
+
+        let edit = plan_merge_refresh(&current, &fresh).expect("no placeholder");
+        assert_eq!(edit.removals, [1, 3], "bbb and file2 are removed");
+        let insert_paths: Vec<(u32, String)> = edit
+            .inserts
+            .iter()
+            .map(|(position, entry)| (*position, entry.path.to_string_lossy().into_owned()))
+            .collect();
+        assert_eq!(
+            insert_paths,
+            [(1, "/r/ccc".to_string()), (2, "/r/file0".to_string())],
+            "ccc and file0 land at their sorted positions"
+        );
+        assert_eq!(
+            apply_plan(&current, &edit),
+            ["/r/aaa", "/r/ccc", "/r/file0", "/r/file1"]
+        );
+    }
+
+    #[test]
+    fn merge_plan_skips_placeholder_rows() {
+        // A never-expanded directory has one placeholder child (empty path).
+        let current = vec![String::new()];
+        let fresh = identified(vec![entry("/r/aaa/new", false)]);
+        assert!(plan_merge_refresh(&current, &fresh).is_none());
+    }
+
+    #[test]
+    fn merge_plan_handles_rename_shape_and_empty_results() {
+        let current: Vec<String> = ["/r/alpha.txt", "/r/zeta.txt"]
+            .into_iter()
+            .map(identity_of)
+            .collect();
+        let mut fresh_entries = vec![entry("/r/alpha.txt", false), entry("/r/mid.txt", false)];
+        sort_entries(&mut fresh_entries);
+        let fresh = identified(fresh_entries);
+        let edit = plan_merge_refresh(&current, &fresh).expect("no placeholder");
+        assert_eq!(edit.removals, [1]);
+        assert_eq!(apply_plan(&current, &edit), ["/r/alpha.txt", "/r/mid.txt"]);
+
+        // Everything vanished: the children are all removed.
+        let edit = plan_merge_refresh(&current, &[]).expect("no placeholder");
+        assert_eq!(edit.removals, [0, 1]);
+        assert!(edit.inserts.is_empty());
+        assert!(apply_plan(&current, &edit).is_empty());
     }
 }
