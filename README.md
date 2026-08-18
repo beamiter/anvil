@@ -585,6 +585,22 @@ and `/usr/bin/bash` as untrusted helpers when euid is 0 — Git completion, the
 Git prompt, and the `.bashrc` import all disappear inside the container while
 working locally. Pair container tabs with a jsh that carries that fix.
 
+#### Browsing remote filesystems
+
+The sidebar file tree browses any configured host natively — no sshfs, nothing
+to install on the far side. The location selector in the tree's header lists
+`Local` plus every `[[remote_hosts]]` entry as `ssh: name` or `docker: name`;
+switching re-roots the tree at that account's home directory. Listing and file
+operations spawn the system `ssh` (BatchMode, 10 s connect timeout, `ssh_args`
+honored) or `docker exec` and run a small POSIX sh probe on the far side whose
+arguments are single-quote-escaped or passed as raw argv, so paths with spaces
+or shell metacharacters survive the trip. Right-clicking a row offers New
+File, New Folder, Rename, Delete (with confirmation), Copy, Cut, Paste, and
+Refresh; the same menu works locally. Paste is confined to the location the
+entry was copied or cut from, names are validated before any dialog is
+accepted, `/` can never be a delete target, and a stale host removed from the
+config drops the tree back to `Local`.
+
 ### AI
 
 AI surfaces are optional and can be hidden with `ai_enabled = false`. Provider

@@ -125,7 +125,12 @@ pub(crate) struct FileTreeUi {
 }
 
 #[allow(deprecated)]
-pub(crate) fn build_file_tree(sender: &ComponentSender<AppModel>) -> FileTreeUi {
+pub(crate) fn build_file_tree(
+    sender: &ComponentSender<AppModel>,
+    config: &Rc<RefCell<Config>>,
+    location: &Rc<RefCell<remote_fs::FsLocation>>,
+    clipboard: &Rc<RefCell<Option<remote_fs::FsClipboard>>>,
+) -> FileTreeUi {
     let store = file_tree::new_store();
     let view = file_tree::new_view(&store);
     let scan_generation = Rc::new(std::cell::Cell::new(0));
@@ -134,8 +139,11 @@ pub(crate) fn build_file_tree(sender: &ComponentSender<AppModel>) -> FileTreeUi 
     {
         let store = store.clone();
         let scan_generation = scan_generation.clone();
+        let config = config.clone();
+        let location = location.clone();
         view.connect_row_expanded(move |_view, iter, _path| {
-            file_tree::on_expand(&store, iter, &scan_generation);
+            let hosts = config.borrow().remote_hosts.clone();
+            file_tree::on_expand(&store, iter, &scan_generation, &location, hosts);
         });
     }
     {
@@ -174,17 +182,45 @@ pub(crate) fn build_file_tree(sender: &ComponentSender<AppModel>) -> FileTreeUi 
             }
         });
     }
+    {
+        // Right-click context menu: file operations for the row under the
+        // pointer, or for the tree root when the pointer is over empty space.
+        let gesture = gtk::GestureClick::new();
+        gesture.set_button(3);
+        let view_for_gesture = view.clone();
+        let store_for_gesture = store.clone();
+        let location = location.clone();
+        let clipboard = clipboard.clone();
+        let sender = sender.clone();
+        gesture.connect_pressed(move |gesture, _n_press, x, y| {
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            show_file_tree_context_menu(
+                &view_for_gesture,
+                &store_for_gesture,
+                x,
+                y,
+                &location,
+                &clipboard,
+                &sender,
+            );
+        });
+        view.add_controller(gesture);
+    }
 
     let scroll = gtk::ScrolledWindow::new();
     scroll.set_vexpand(true);
     scroll.set_child(Some(&view));
-    let header =
-        sidebar::FileHeaderModel::builder()
-            .launch(())
-            .forward(sender.input_sender(), |output| match output {
-                sidebar::FileHeaderOutput::Up => AppMsg::FileTreeGoUp,
-                sidebar::FileHeaderOutput::CurrentDirectory => AppMsg::FileTreeGotoCwd,
-            });
+    let labels = remote_fs::location_labels(&config.borrow().remote_hosts);
+    let header = sidebar::FileHeaderModel::builder().launch(labels).forward(
+        sender.input_sender(),
+        |output| match output {
+            sidebar::FileHeaderOutput::Up => AppMsg::FileTreeGoUp,
+            sidebar::FileHeaderOutput::CurrentDirectory => AppMsg::FileTreeGotoCwd,
+            sidebar::FileHeaderOutput::SelectLocation(index) => {
+                AppMsg::FileTreeSelectLocation(index)
+            }
+        },
+    );
 
     FileTreeUi {
         store,
@@ -192,6 +228,167 @@ pub(crate) fn build_file_tree(sender: &ComponentSender<AppModel>) -> FileTreeUi 
         header,
         scan_generation,
     }
+}
+
+/// One menu row, styled like the tab strip's context-menu buttons.
+fn file_menu_button(label: &str) -> gtk::Button {
+    let button = gtk::Button::with_label(label);
+    button.set_has_frame(false);
+    button.add_css_class("flat");
+    if let Some(child) = button.child() {
+        child.set_halign(gtk::Align::Start);
+    }
+    button
+}
+
+fn add_file_menu_item(
+    menu: &gtk::Box,
+    label: &str,
+    popover: &gtk::Popover,
+    sender: &ComponentSender<AppModel>,
+    msg: AppMsg,
+) {
+    let button = file_menu_button(label);
+    let popover = popover.clone();
+    let sender = sender.clone();
+    button.connect_clicked(move |_| {
+        popover.popdown();
+        sender.input(msg.clone());
+    });
+    menu.append(&button);
+}
+
+#[allow(deprecated)]
+fn show_file_tree_context_menu(
+    view: &gtk::TreeView,
+    store: &gtk::TreeStore,
+    x: f64,
+    y: f64,
+    location: &Rc<RefCell<remote_fs::FsLocation>>,
+    clipboard: &Rc<RefCell<Option<remote_fs::FsClipboard>>>,
+    sender: &ComponentSender<AppModel>,
+) {
+    // Resolve the row under the pointer to (path, is_dir); rows without a
+    // valid identity (placeholders) behave like empty space.
+    let row = view
+        .path_at_pos(x as i32, y as i32)
+        .and_then(|(path, _column, _x, _y)| path)
+        .and_then(|path| store.iter(&path))
+        .and_then(|iter| {
+            let identity: String = store
+                .get_value(&iter, file_tree::COL_PATH as i32)
+                .get()
+                .unwrap_or_default();
+            if identity.is_empty() {
+                return None;
+            }
+            let path = file_tree::decode_path_identity(&identity)?;
+            let is_dir: bool = store
+                .get_value(&iter, file_tree::COL_IS_DIR as i32)
+                .get()
+                .unwrap_or(false);
+            Some((path, is_dir))
+        });
+    // New entries and pastes land in the clicked directory, next to the
+    // clicked file, or at the current root (handled message-side via None).
+    let target_dir = match &row {
+        Some((path, true)) => Some(path.clone()),
+        Some((path, false)) => path.parent().map(std::path::Path::to_path_buf),
+        None => None,
+    };
+
+    let loc = location.borrow().clone();
+    let clip = clipboard.borrow().clone();
+    let (paste_sensitive, paste_tooltip) = match &clip {
+        Some(clip) if clip.loc == loc => (true, ""),
+        // Cross-location paste is out of scope for v1: the two filesystems
+        // share no transport, so the item stays visible but insensitive.
+        Some(_) => (false, "Paste stays within one browsing location"),
+        None => (false, "Copy or cut an item first"),
+    };
+
+    let popover = gtk::Popover::new();
+    popover.set_parent(view);
+    popover.set_has_arrow(false);
+    popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+    let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    menu.add_css_class("menu");
+
+    add_file_menu_item(
+        &menu,
+        "New File",
+        &popover,
+        sender,
+        AppMsg::FileTreeNewFile {
+            dir: target_dir.clone(),
+        },
+    );
+    add_file_menu_item(
+        &menu,
+        "New Folder",
+        &popover,
+        sender,
+        AppMsg::FileTreeNewFolder {
+            dir: target_dir.clone(),
+        },
+    );
+    if let Some((path, is_dir)) = &row {
+        add_file_menu_item(
+            &menu,
+            "Rename",
+            &popover,
+            sender,
+            AppMsg::FileTreeRename { path: path.clone() },
+        );
+        add_file_menu_item(
+            &menu,
+            "Delete",
+            &popover,
+            sender,
+            AppMsg::FileTreeDelete { path: path.clone() },
+        );
+        add_file_menu_item(
+            &menu,
+            "Copy",
+            &popover,
+            sender,
+            AppMsg::FileTreeCopy {
+                path: path.clone(),
+                is_dir: *is_dir,
+            },
+        );
+        add_file_menu_item(
+            &menu,
+            "Cut",
+            &popover,
+            sender,
+            AppMsg::FileTreeCut {
+                path: path.clone(),
+                is_dir: *is_dir,
+            },
+        );
+    }
+    {
+        let button = file_menu_button("Paste");
+        button.set_sensitive(paste_sensitive);
+        if !paste_tooltip.is_empty() {
+            button.set_tooltip_text(Some(paste_tooltip));
+        }
+        let popover = popover.clone();
+        let sender = sender.clone();
+        button.connect_clicked(move |_| {
+            popover.popdown();
+            sender.input(AppMsg::FileTreePaste {
+                dir: target_dir.clone(),
+            });
+        });
+        menu.append(&button);
+    }
+    add_file_menu_item(&menu, "Refresh", &popover, sender, AppMsg::FileTreeRefresh);
+
+    popover.set_child(Some(&menu));
+    popover.connect_closed(|popover| popover.unparent());
+    popover.popup();
 }
 
 pub(crate) fn build_tab_scrolls() -> (gtk::ScrolledWindow, gtk::ScrolledWindow) {

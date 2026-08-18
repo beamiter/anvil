@@ -16,7 +16,7 @@ use gtk::{
     CellRendererPixbuf, CellRendererText, TreeIter, TreeRowReference, TreeStore, TreeView,
     TreeViewColumn,
 };
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -33,7 +33,7 @@ pub(crate) const COL_IS_DIR: u32 = 2;
 pub(crate) const COL_ICON: u32 = 3;
 pub(crate) const COL_TOOLTIP: u32 = 4;
 const SCAN_POLL_INTERVAL: Duration = Duration::from_millis(16);
-const MAX_DIRECTORY_ENTRIES: usize = 4_096;
+pub(crate) const MAX_DIRECTORY_ENTRIES: usize = 4_096;
 const MAX_FILE_NAME_DISPLAY_BYTES: usize = 512;
 const MAX_FILE_PATH_DISPLAY_BYTES: usize = 4 * 1024;
 const MAX_FILE_PATH_IDENTITY_BYTES: usize = 64 * 1024;
@@ -67,7 +67,29 @@ pub(crate) struct FileEntry {
     is_dir: bool,
 }
 
-fn sort_entries(entries: &mut [FileEntry]) {
+impl FileEntry {
+    /// `remote_fs` builds entries from probe output; the fields stay private
+    /// so every entry is constructed through one place.
+    pub(crate) fn new(name: String, path: PathBuf, is_dir: bool) -> Self {
+        Self { name, path, is_dir }
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn is_dir(&self) -> bool {
+        self.is_dir
+    }
+}
+
+pub(crate) fn sort_entries(entries: &mut [FileEntry]) {
     entries.sort_by(|a, b| {
         b.is_dir
             .cmp(&a.is_dir)
@@ -75,7 +97,7 @@ fn sort_entries(entries: &mut [FileEntry]) {
     });
 }
 
-fn scan_dir(dir: &Path) -> io::Result<Vec<FileEntry>> {
+pub(crate) fn scan_dir(dir: &Path) -> io::Result<Vec<FileEntry>> {
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(dir)?
         .take(MAX_DIRECTORY_ENTRIES)
@@ -187,9 +209,32 @@ pub(crate) fn is_notebook_path(path: &Path) -> bool {
     path.as_os_str().as_bytes().ends_with(b".jtnb.md")
 }
 
-pub(crate) fn request_dir_scan<F>(dir: PathBuf, apply: F) -> io::Result<()>
+/// Scan `dir` on a worker thread under the shared permit, then hand the
+/// result to `apply` on the GTK thread via the glib poll. `loc` + `hosts`
+/// snapshot the backend at request time; `remote_fs::list_dir` does the work.
+pub(crate) fn request_dir_scan<F>(
+    loc: crate::remote_fs::FsLocation,
+    hosts: Vec<crate::config::RemoteHost>,
+    dir: PathBuf,
+    apply: F,
+) -> io::Result<()>
 where
     F: FnOnce(io::Result<Vec<FileEntry>>) + 'static,
+{
+    request_fs_op(
+        move || crate::remote_fs::list_dir(&loc, &hosts, &dir),
+        apply,
+    )
+}
+
+/// Run one blocking filesystem op on a worker thread with the same permit /
+/// glib-poll skeleton as directory scans, so mutations and listings share the
+/// concurrency budget.
+pub(crate) fn request_fs_op<T, O, F>(op: O, apply: F) -> io::Result<()>
+where
+    O: FnOnce() -> io::Result<T> + Send + 'static,
+    T: Send + 'static,
+    F: FnOnce(io::Result<T>) + 'static,
 {
     let permit = ScanPermit::acquire()?;
     let (tx, rx) = mpsc::sync_channel(1);
@@ -197,7 +242,7 @@ where
         .name("anvil-file-tree-scan".to_string())
         .spawn(move || {
             let _permit = permit;
-            let _ = tx.send(scan_dir(&dir));
+            let _ = tx.send(op());
         })?;
 
     let mut apply = Some(apply);
@@ -299,8 +344,16 @@ pub(crate) fn append_entries(
     }
 }
 
-/// Lazily fill a directory row's real children on first expansion.
-pub(crate) fn on_expand(store: &TreeStore, iter: &TreeIter, scan_generation: &Rc<Cell<u64>>) {
+/// Lazily fill a directory row's real children on first expansion. `location`
+/// decides the backend (local disk or one remote host); a location switch
+/// mid-scan drops the stale result before it touches the store.
+pub(crate) fn on_expand(
+    store: &TreeStore,
+    iter: &TreeIter,
+    scan_generation: &Rc<Cell<u64>>,
+    location: &Rc<RefCell<crate::remote_fs::FsLocation>>,
+    hosts: Vec<crate::config::RemoteHost>,
+) {
     // A not-yet-loaded directory has a single placeholder child (empty path).
     let Some(first_child) = store.iter_children(Some(iter)) else {
         return;
@@ -340,8 +393,11 @@ pub(crate) fn on_expand(store: &TreeStore, iter: &TreeIter, scan_generation: &Rc
     let generation = active_generation.get();
     let expected_identity = dir_identity.clone();
     let expected_display = display_full_path(&dir_path);
-    if let Err(error) = request_dir_scan(dir_path, move |result| {
-        if active_generation.get() != generation {
+    let loc = location.borrow().clone();
+    let active_location = location.clone();
+    let expected_loc = loc.clone();
+    if let Err(error) = request_dir_scan(loc, hosts, dir_path, move |result| {
+        if active_generation.get() != generation || *active_location.borrow() != expected_loc {
             return;
         }
         let Some(row_path) = row_ref.path() else {

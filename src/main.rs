@@ -46,6 +46,7 @@ mod pane_header;
 mod persistence;
 mod process;
 mod pty;
+mod remote_fs;
 mod review_input_ops;
 mod search;
 mod session;
@@ -216,6 +217,10 @@ struct AppModel {
     file_header: Controller<sidebar::FileHeaderModel>,
     file_tree_root: Rc<RefCell<std::path::PathBuf>>,
     file_tree_scan_generation: Rc<std::cell::Cell<u64>>,
+    /// Which filesystem the tree browses; drives both scans and file ops.
+    file_tree_location: Rc<RefCell<remote_fs::FsLocation>>,
+    /// Copy/Cut row awaiting a Paste; usable only in its source location.
+    file_tree_clipboard: Rc<RefCell<Option<remote_fs::FsClipboard>>>,
     tab_strip_scroll: gtk::ScrolledWindow,
     sidebar_tab_scroll: gtk::ScrolledWindow,
     top_tab_scroll: gtk::ScrolledWindow,
@@ -611,12 +616,19 @@ impl SimpleComponent for AppModel {
             },
         );
 
+        let file_tree_location = Rc::new(RefCell::new(remote_fs::FsLocation::Local));
+        let file_tree_clipboard = Rc::new(RefCell::new(None));
         let startup_ui::FileTreeUi {
             store: file_tree_store,
             scroll: file_tree_scroll,
             header: file_header,
             scan_generation: file_tree_scan_generation,
-        } = startup_ui::build_file_tree(&sender);
+        } = startup_ui::build_file_tree(
+            &sender,
+            &config,
+            &file_tree_location,
+            &file_tree_clipboard,
+        );
 
         let sidebar_width = config.borrow().sidebar_width as i32;
         let tab_placement = config.borrow().tab_placement;
@@ -1008,6 +1020,8 @@ impl SimpleComponent for AppModel {
             file_header,
             file_tree_root: Rc::new(RefCell::new(std::path::PathBuf::new())),
             file_tree_scan_generation,
+            file_tree_location,
+            file_tree_clipboard,
             tab_strip_scroll: tab_strip_scroll.clone(),
             sidebar_tab_scroll: sidebar_tab_scroll.clone(),
             top_tab_scroll: top_tab_scroll.clone(),
@@ -2018,6 +2032,29 @@ impl SimpleComponent for AppModel {
             }
             AppMsg::FileTreeGotoCwd => self.file_tree_goto_current_cwd(),
             AppMsg::FileTreeGoUp => self.file_tree_go_up(),
+            AppMsg::FileTreeSelectLocation(index) => self.file_tree_select_location(index, &sender),
+            AppMsg::FileTreeLocationResolved { loc, start } => {
+                self.file_tree_location_resolved(loc, start)
+            }
+            AppMsg::FileTreeNewFile { dir } => self.file_tree_prompt_new(dir, false, &sender),
+            AppMsg::FileTreeNewFolder { dir } => self.file_tree_prompt_new(dir, true, &sender),
+            AppMsg::FileTreeRename { path } => self.file_tree_prompt_rename(path, &sender),
+            AppMsg::FileTreeDelete { path } => self.file_tree_confirm_delete(path, &sender),
+            AppMsg::FileTreeCopy { path, is_dir } => {
+                self.file_tree_clipboard_set(path, is_dir, false)
+            }
+            AppMsg::FileTreeCut { path, is_dir } => {
+                self.file_tree_clipboard_set(path, is_dir, true)
+            }
+            AppMsg::FileTreePaste { dir } => self.file_tree_paste(dir, &sender),
+            AppMsg::FileTreeRefresh => self.file_tree_refresh(),
+            AppMsg::FileTreeCreateNamed { dir, name, is_dir } => {
+                self.file_tree_create_named(dir, name, is_dir, &sender)
+            }
+            AppMsg::FileTreeRenameNamed { src, name } => {
+                self.file_tree_rename_named(src, name, &sender)
+            }
+            AppMsg::FileTreeDeleteConfirmed(path) => self.file_tree_delete_confirmed(path, &sender),
             AppMsg::SetSidebarView(view) => self.apply_sidebar_view(view, true),
             AppMsg::Ignore => {}
         }

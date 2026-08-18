@@ -347,6 +347,19 @@ impl AppModel {
             return;
         }
         self.config.borrow_mut().remote_hosts = hosts;
+        // A removed host must not keep driving the tree: fall back to Local.
+        let stale = match &*self.file_tree_location.borrow() {
+            remote_fs::FsLocation::Local => false,
+            remote_fs::FsLocation::Remote(index) => {
+                *index >= self.config.borrow().remote_hosts.len()
+            }
+        };
+        if stale {
+            *self.file_tree_location.borrow_mut() = remote_fs::FsLocation::Local;
+            let root = file_tree::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
+            self.set_file_tree_root(root);
+        }
+        self.sync_file_header_locations();
         self.persist_config();
     }
 

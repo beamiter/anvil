@@ -133,6 +133,50 @@ pub(crate) enum AppMsg {
     TabRowAction(u64, crate::tab_strip::TabAction),
     SetTabFilter(String),
     FileTreeActivateFile(std::path::PathBuf),
+    /// Header location selector moved: 0 is Local, i > 0 is
+    /// `config.remote_hosts[i - 1]`.
+    FileTreeSelectLocation(usize),
+    /// The background `start_dir` probe for a location switch answered.
+    FileTreeLocationResolved {
+        loc: crate::remote_fs::FsLocation,
+        start: Result<std::path::PathBuf, String>,
+    },
+    /// Context-menu requests; `dir: None` targets the current tree root.
+    FileTreeNewFile {
+        dir: Option<std::path::PathBuf>,
+    },
+    FileTreeNewFolder {
+        dir: Option<std::path::PathBuf>,
+    },
+    FileTreeRename {
+        path: std::path::PathBuf,
+    },
+    FileTreeDelete {
+        path: std::path::PathBuf,
+    },
+    FileTreeCopy {
+        path: std::path::PathBuf,
+        is_dir: bool,
+    },
+    FileTreeCut {
+        path: std::path::PathBuf,
+        is_dir: bool,
+    },
+    FileTreePaste {
+        dir: Option<std::path::PathBuf>,
+    },
+    FileTreeRefresh,
+    /// Dialog results, names already validated against `remote_fs` rules.
+    FileTreeCreateNamed {
+        dir: std::path::PathBuf,
+        name: String,
+        is_dir: bool,
+    },
+    FileTreeRenameNamed {
+        src: std::path::PathBuf,
+        name: String,
+    },
+    FileTreeDeleteConfirmed(std::path::PathBuf),
     OpenNotebook(std::path::PathBuf),
     OpenAgent,
     OpenAgentSettings,
