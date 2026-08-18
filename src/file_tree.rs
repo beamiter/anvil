@@ -231,6 +231,70 @@ where
     )
 }
 
+/// One event from a streaming filesystem op: throttled byte progress, then
+/// exactly one terminal result.
+pub(crate) enum FsOpOutcome<T> {
+    Progress(u64),
+    Done(io::Result<T>),
+}
+
+/// Run one blocking op on a worker thread under the shared permit, streaming
+/// throttled progress events and the terminal result to `apply` on the GTK
+/// thread via the glib poll. The worker's progress callback is non-blocking:
+/// a stalled UI must never back-pressure a transfer.
+pub(crate) fn request_fs_op_streaming<T, O, F>(op: O, apply: F) -> io::Result<()>
+where
+    O: FnOnce(&dyn Fn(u64)) -> io::Result<T> + Send + 'static,
+    T: Send + 'static,
+    F: FnMut(FsOpOutcome<T>) + 'static,
+{
+    let permit = ScanPermit::acquire()?;
+    let (tx, rx) = mpsc::sync_channel::<FsOpOutcome<T>>(64);
+    std::thread::Builder::new()
+        .name("anvil-file-tree-op".to_string())
+        .spawn(move || {
+            let _permit = permit;
+            let progress = |bytes: u64| {
+                let _ = tx.try_send(FsOpOutcome::Progress(bytes));
+            };
+            let result = op(&progress);
+            let _ = tx.send(FsOpOutcome::Done(result));
+        })?;
+
+    let mut apply = Some(apply);
+    glib::timeout_add_local(SCAN_POLL_INTERVAL, move || {
+        let mut flow = glib::ControlFlow::Continue;
+        loop {
+            match rx.try_recv() {
+                Ok(FsOpOutcome::Progress(bytes)) => {
+                    if let Some(apply) = apply.as_mut() {
+                        apply(FsOpOutcome::Progress(bytes));
+                    }
+                }
+                Ok(FsOpOutcome::Done(result)) => {
+                    if let Some(mut apply) = apply.take() {
+                        apply(FsOpOutcome::Done(result));
+                    }
+                    flow = glib::ControlFlow::Break;
+                    break;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if let Some(mut apply) = apply.take() {
+                        apply(FsOpOutcome::Done(Err(io::Error::other(
+                            "file-tree op worker disconnected",
+                        ))));
+                    }
+                    flow = glib::ControlFlow::Break;
+                    break;
+                }
+            }
+        }
+        flow
+    });
+    Ok(())
+}
+
 /// Run one blocking filesystem op on a worker thread with the same permit /
 /// glib-poll skeleton as directory scans, so mutations and listings share the
 /// concurrency budget.
@@ -604,6 +668,13 @@ pub(crate) fn display_full_path(path: &Path) -> String {
     )
 }
 
+/// The Copy Path payload: the row's full path text, display-escaped so a
+/// non-UTF-8 name stays unambiguous. Remote rows intentionally get the plain
+/// path with no prefix — that is what users paste into the remote shell.
+pub(crate) fn copy_path_payload(path: &Path) -> String {
+    display_full_path(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,6 +736,17 @@ mod tests {
             MAX_FILE_PATH_IDENTITY_BYTES + 1
         ]));
         assert_eq!(encode_path_identity(&oversized), None);
+    }
+
+    #[test]
+    fn copy_path_payload_is_the_plain_display_path() {
+        assert_eq!(
+            copy_path_payload(Path::new("/etc/hostname")),
+            "/etc/hostname"
+        );
+        // Non-UTF-8 names keep the unambiguous escaped display form.
+        let weird = PathBuf::from(OsString::from_vec(b"/tmp/a\xffb".to_vec()));
+        assert_eq!(copy_path_payload(&weird), r"/tmp/a\xffb");
     }
 
     // -- merge refresh (in-place directory update) ----------------------------

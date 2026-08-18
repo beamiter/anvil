@@ -605,11 +605,17 @@ between two different hosts relays through a staging file under the system
 temp dir. Files stream through the probe (`cat`/`put` — the upload is written
 to a temp name and moved into place atomically on the far side), directories
 stream as tar archives, and payloads are capped at 512 MiB with a 15-minute
-overall timeout. A destination that already holds the name is refused before
+overall timeout. While a transfer runs, a held toast reports throttled
+progress ("Downloading name… 12.4 MiB", or "X / Y MiB" for single-file
+uploads) and offers a Cancel action that kills the stream, removes the
+partial temp file, and reports a neutral cancelled status rather than an
+error. A destination that already holds the name is refused before
 any bytes move, a cut across locations deletes the source only after the copy
 landed, and partial transfers clean up after themselves. Names are validated
 before any dialog is accepted, `/` can never be a delete target, and a stale
-host removed from the config drops the tree back to `Local`.
+host removed from the config drops the tree back to `Local`. The context menu
+also has Copy Path, which puts the row's full path — for remote rows the
+plain remote path, ready to paste into the remote shell — on the clipboard.
 
 ### AI
 

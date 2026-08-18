@@ -836,51 +836,122 @@ fn wait_child(child: &Arc<Mutex<Child>>) -> io::Result<std::process::ExitStatus>
     }
 }
 
-/// Kill-on-timeout for transfers: after `timeout`, flag and kill every child
-/// (TRANSFER_TIMEOUT, 15 minutes overall per transfer). `Drop` cancels and
-/// joins the watchdog thread.
-struct TransferWatchdog {
-    timed_out: Arc<AtomicBool>,
-    cancel: mpsc::Sender<()>,
-    handle: Option<JoinHandle<()>>,
+/// Shared per-transfer state: cancellation from the UI, the overall timeout
+/// from the guard thread, and the children either one kills. One control is
+/// created per transfer before spawning; clones go to the worker, the cancel
+/// button, and (for relays) each leg.
+#[derive(Clone)]
+pub(crate) struct TransferControl {
+    inner: Arc<TransferControlInner>,
 }
 
-impl TransferWatchdog {
-    fn start(children: Vec<Arc<Mutex<Child>>>, timeout: Duration) -> io::Result<Self> {
-        let timed_out = Arc::new(AtomicBool::new(false));
+struct TransferControlInner {
+    cancelled: AtomicBool,
+    timed_out: AtomicBool,
+    children: Mutex<Vec<Arc<Mutex<Child>>>>,
+}
+
+impl TransferControl {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Arc::new(TransferControlInner {
+                cancelled: AtomicBool::new(false),
+                timed_out: AtomicBool::new(false),
+                children: Mutex::new(Vec::new()),
+            }),
+        }
+    }
+
+    /// Register a child so cancel/timeout can kill it mid-stream. A cancel
+    /// that already fired applies to late registrations immediately.
+    fn register(&self, child: &Arc<Mutex<Child>>) {
+        if let Ok(mut children) = self.inner.children.lock() {
+            children.push(child.clone());
+        }
+        if self.is_cancelled() {
+            Self::kill_child(child);
+        }
+    }
+
+    fn kill_child(child: &Arc<Mutex<Child>>) {
+        if let Ok(mut child) = child.lock() {
+            let _ = child.kill();
+        }
+    }
+
+    fn kill_all(&self) {
+        if let Ok(children) = self.inner.children.lock() {
+            for child in children.iter() {
+                Self::kill_child(child);
+            }
+        }
+    }
+
+    /// UI cancel: flag, then kill every registered child exactly like the
+    /// timeout does. Idempotent; safe to race a completed transfer (killing
+    /// an exited child is a no-op).
+    pub(crate) fn cancel(&self) {
+        self.inner.cancelled.store(true, Ordering::SeqCst);
+        self.kill_all();
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.inner.cancelled.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn is_timed_out(&self) -> bool {
+        self.inner.timed_out.load(Ordering::SeqCst)
+    }
+
+    /// The error a worker returns when it notices the cancel.
+    pub(crate) fn check(&self) -> io::Result<()> {
+        if self.is_cancelled() {
+            Err(cancelled_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Start the overall timeout: after `timeout`, flag and kill everything
+    /// registered so far or later. The returned guard stops the timer on
+    /// drop.
+    fn arm_timeout(&self, timeout: Duration) -> io::Result<TransferTimeoutGuard> {
         let (cancel, rx) = mpsc::channel::<()>();
-        let flag = timed_out.clone();
+        let control = self.clone();
         let handle = std::thread::Builder::new()
             .name("anvil-fs-transfer-watchdog".to_string())
             .spawn(move || {
                 if rx.recv_timeout(timeout).is_err() {
-                    flag.store(true, Ordering::SeqCst);
-                    for child in &children {
-                        if let Ok(mut child) = child.lock() {
-                            let _ = child.kill();
-                        }
-                    }
+                    control.inner.timed_out.store(true, Ordering::SeqCst);
+                    control.kill_all();
                 }
             })?;
-        Ok(Self {
-            timed_out,
+        Ok(TransferTimeoutGuard {
             cancel,
             handle: Some(handle),
         })
     }
-
-    fn timed_out(&self) -> bool {
-        self.timed_out.load(Ordering::SeqCst)
-    }
 }
 
-impl Drop for TransferWatchdog {
+/// Stops the transfer timeout thread on drop.
+struct TransferTimeoutGuard {
+    cancel: mpsc::Sender<()>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Drop for TransferTimeoutGuard {
     fn drop(&mut self) {
         let _ = self.cancel.send(());
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
     }
+}
+
+/// Cancellation is not a failure: Interrupted is the neutral signal the UI
+/// maps to a plain "cancelled" notice instead of an error toast.
+pub(crate) fn cancelled_error() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "transfer cancelled")
 }
 
 fn transfer_timed_out_error() -> io::Error {
@@ -945,35 +1016,108 @@ fn spawn_probe_streaming(
     spawn_probe_argv(&argv, mode)
 }
 
-/// Pump `from` into `to` in 64 KiB chunks, enforcing `max`; on overflow the
-/// children are killed so no partial payload keeps moving. A broken pipe
-/// means the far side exited early — its exit code tells the real story, so
-/// the pump stops quietly and lets the caller read it.
+/// Progress is reported at most ~4 times per second and only once at least
+/// 256 KiB have moved since the last emission; the final total is always
+/// emitted by the pump at clean EOF.
+const PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(250);
+const PROGRESS_MIN_DELTA_BYTES: u64 = 256 * 1024;
+
+/// Time- and size-throttled progress accumulator behind `stream_to`.
+struct ProgressThrottle {
+    last_emit: std::time::Instant,
+    last_bytes: u64,
+    total: u64,
+}
+
+impl ProgressThrottle {
+    fn new() -> Self {
+        Self {
+            last_emit: std::time::Instant::now(),
+            last_bytes: 0,
+            total: 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn aged(age: Duration) -> Self {
+        Self {
+            last_emit: std::time::Instant::now() - age,
+            last_bytes: 0,
+            total: 0,
+        }
+    }
+
+    /// Account for `delta` more bytes; Some(total) when an emission is due.
+    fn update(&mut self, delta: u64) -> Option<u64> {
+        self.total += delta;
+        if self.total - self.last_bytes >= PROGRESS_MIN_DELTA_BYTES
+            && self.last_emit.elapsed() >= PROGRESS_MIN_INTERVAL
+        {
+            self.last_emit = std::time::Instant::now();
+            self.last_bytes = self.total;
+            Some(self.total)
+        } else {
+            None
+        }
+    }
+
+    fn total(&self) -> u64 {
+        self.total
+    }
+}
+
+/// 12.4 MiB-style formatting for transfer progress: binary units, one
+/// decimal below 10, whole numbers at or above.
+pub(crate) fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else if value < 10.0 {
+        format!("{value:.1} {}", UNITS[unit])
+    } else {
+        format!("{value:.0} {}", UNITS[unit])
+    }
+}
+
+/// Pump `from` into `to` in 64 KiB chunks, enforcing `max` and reporting
+/// throttled progress. On overflow every registered child is killed so no
+/// partial payload keeps moving. A broken pipe means the far side exited
+/// early — its exit code tells the real story, so the pump stops quietly and
+/// lets the caller read it.
 fn stream_to<R: Read, W: Write>(
     mut from: R,
     mut to: W,
     max: u64,
-    killers: &[Arc<Mutex<Child>>],
+    control: &TransferControl,
+    on_progress: &dyn Fn(u64),
 ) -> io::Result<u64> {
     let mut buf = [0u8; STREAM_BUF_SIZE];
-    let mut total = 0u64;
+    let mut throttle = ProgressThrottle::new();
     loop {
         let read = from.read(&mut buf)?;
         if read == 0 {
+            let total = throttle.total();
+            on_progress(total);
             return Ok(total);
         }
-        total += read as u64;
-        if total > max {
-            for child in killers {
-                if let Ok(mut child) = child.lock() {
-                    let _ = child.kill();
-                }
-            }
+        if let Some(total) = throttle.update(read as u64) {
+            on_progress(total);
+        }
+        if throttle.total() > max {
+            control.kill_all();
             return Err(too_large_error(max));
         }
         match to.write_all(&buf[..read]) {
             Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => return Ok(total),
+            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                return Ok(throttle.total());
+            }
             Err(error) => return Err(error),
         }
     }
@@ -1066,7 +1210,9 @@ fn remote_name_exists(host: &RemoteHost, dir: &Path, name: &OsStr) -> io::Result
 /// (Local→Remote), or a local staging relay between two remote hosts.
 /// Returns the destination path. Same-name collisions fail BEFORE streaming
 /// (local metadata / remote list); file uploads are additionally enforced
-/// atomically by the probe's `put`.
+/// atomically by the probe's `put`. `control` carries cancel/timeout kill
+/// semantics; `progress` receives throttled byte totals.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn transfer(
     hosts: &[RemoteHost],
     src_loc: &FsLocation,
@@ -1074,17 +1220,32 @@ pub(crate) fn transfer(
     dst_loc: &FsLocation,
     dst_dir: &Path,
     is_dir: bool,
+    control: &TransferControl,
+    progress: &dyn Fn(u64),
 ) -> io::Result<PathBuf> {
+    control.check()?;
     match (src_loc, dst_loc) {
-        (FsLocation::Remote(_), FsLocation::Local) => {
-            download(remote_host(src_loc, hosts)?, src_path, dst_dir, is_dir)
-        }
-        (FsLocation::Local, FsLocation::Remote(_)) => {
-            upload(remote_host(dst_loc, hosts)?, src_path, dst_dir, is_dir)
-        }
+        (FsLocation::Remote(_), FsLocation::Local) => download(
+            remote_host(src_loc, hosts)?,
+            src_path,
+            dst_dir,
+            is_dir,
+            control,
+            progress,
+        ),
+        (FsLocation::Local, FsLocation::Remote(_)) => upload(
+            remote_host(dst_loc, hosts)?,
+            src_path,
+            dst_dir,
+            is_dir,
+            control,
+            progress,
+        ),
         (FsLocation::Remote(_), FsLocation::Remote(_)) => {
             // No host-to-host channel exists, so relay through a unique local
-            // staging dir that is always cleaned up.
+            // staging dir that is always cleaned up. Progress stays monotonic
+            // across both legs: the upload leg offsets by the download's
+            // final count.
             let src_host = remote_host(src_loc, hosts)?;
             let dst_host = remote_host(dst_loc, hosts)?;
             let name = src_path.file_name().ok_or_else(|| {
@@ -1094,8 +1255,24 @@ pub(crate) fn transfer(
                 return Err(already_exists_error(name));
             }
             let staging = StagingDir::new()?;
-            let staged = download(src_host, src_path, staging.path(), is_dir)?;
-            upload(dst_host, &staged, dst_dir, is_dir)
+            let leg1_total = Arc::new(AtomicUsize::new(0));
+            let leg1_seen = leg1_total.clone();
+            let leg1_progress = move |bytes: u64| {
+                leg1_seen.store(bytes as usize, Ordering::Relaxed);
+                progress(bytes);
+            };
+            let staged = download(
+                src_host,
+                src_path,
+                staging.path(),
+                is_dir,
+                control,
+                &leg1_progress,
+            )?;
+            control.check()?;
+            let base = leg1_total.load(Ordering::Relaxed) as u64;
+            let leg2_progress = move |bytes: u64| progress(base + bytes);
+            upload(dst_host, &staged, dst_dir, is_dir, control, &leg2_progress)
         }
         (FsLocation::Local, FsLocation::Local) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1119,6 +1296,8 @@ fn download(
     remote_path: &Path,
     dir: &Path,
     is_dir: bool,
+    control: &TransferControl,
+    progress: &dyn Fn(u64),
 ) -> io::Result<PathBuf> {
     require_absolute(remote_path)?;
     let name = remote_path.file_name().ok_or_else(|| {
@@ -1137,6 +1316,8 @@ fn download(
             name,
             dir,
             MAX_TRANSFER_BYTES,
+            control,
+            progress,
         )
     } else {
         download_file_with(
@@ -1151,6 +1332,8 @@ fn download(
             name,
             dir,
             MAX_TRANSFER_BYTES,
+            control,
+            progress,
         )
     }
 }
@@ -1160,6 +1343,8 @@ fn upload(
     local_path: &Path,
     remote_dir: &Path,
     is_dir: bool,
+    control: &TransferControl,
+    progress: &dyn Fn(u64),
 ) -> io::Result<PathBuf> {
     require_absolute(remote_dir)?;
     let name = local_path.file_name().ok_or_else(|| {
@@ -1175,15 +1360,83 @@ fn upload(
             || spawn_probe_streaming(host, "untar", &[dst.as_os_str()], ScriptDelivery::Argv),
             local_path,
             MAX_TRANSFER_BYTES,
+            control,
+            progress,
         )?;
     } else {
-        upload_file_with(
+        let result = upload_file_with(
             || spawn_probe_streaming(host, "put", &[dst.as_os_str()], ScriptDelivery::Argv),
             local_path,
             MAX_TRANSFER_BYTES,
-        )?;
+            control,
+            progress,
+        );
+        if let Err(error) = &result {
+            // A kill (cancel/timeout) is the only way the probe's `.fspart`
+            // temp survives — the script cleans up after its own failures.
+            if error.kind() == io::ErrorKind::Interrupted || error.kind() == io::ErrorKind::TimedOut
+            {
+                cleanup_remote_part(host, &dst);
+            }
+        }
+        result?;
     }
     Ok(dst)
+}
+
+/// The probe's `put` temp name is `"$p.fspart.$$"` with the remote shell's
+/// pid unknown to us, so cancel cleanup globs the fixed suffix. The path is
+/// single-quote-escaped before the suffix is appended, so nothing here is
+/// shell-reinterpreted. Best-effort: errors are logged, never propagated.
+fn cleanup_remote_part(host: &RemoteHost, dst: &Path) {
+    let command = part_cleanup_command(dst);
+    let argv = host_command_argv(host, &command);
+    if let Err(error) = run_capture(&argv, &[], PROBE_OP_TIMEOUT, MAX_CAPTURE_BYTES) {
+        log::warn!("remote .fspart cleanup failed to run: {error}");
+    }
+}
+
+/// `rm -f '<dst>'.fspart.*` — a glob no-match is a harmless literal `rm -f`.
+/// A non-UTF-8 destination lossy-mangles into a pattern that matches nothing,
+/// which under best-effort semantics is a safe no-op, never a wrong delete.
+fn part_cleanup_command(dst: &Path) -> String {
+    format!("rm -f {}.fspart.*", sq(&dst.as_os_str().to_string_lossy()))
+}
+
+/// Run one small far-side shell command outside the probe protocol (ssh:
+/// one re-parsed command element; docker: `sh -c`). Used only for the
+/// best-effort cancel cleanup.
+fn host_command_argv(host: &RemoteHost, command: &str) -> Vec<OsString> {
+    if host.docker {
+        let mut argv = vec![
+            OsString::from("docker"),
+            OsString::from("exec"),
+            OsString::from("-i"),
+        ];
+        if let Some(user) = &host.user {
+            argv.push(OsString::from("-u"));
+            argv.push(OsString::from(user));
+        }
+        argv.push(OsString::from(&host.host));
+        argv.push(OsString::from("sh"));
+        argv.push(OsString::from("-c"));
+        argv.push(OsString::from(command));
+        argv
+    } else {
+        let dest = match &host.user {
+            Some(user) => format!("{user}@{}", host.host),
+            None => host.host.clone(),
+        };
+        let mut argv: Vec<OsString> = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        argv.extend(host.ssh_args.iter().map(OsString::from));
+        argv.push(OsString::from("--"));
+        argv.push(OsString::from(dest));
+        argv.push(OsString::from(command));
+        argv
+    }
 }
 
 /// Stream one remote regular file into `dir`. Takes the probe spawn as a
@@ -1194,26 +1447,32 @@ fn download_file_with(
     name: &OsStr,
     dir: &Path,
     max: u64,
+    control: &TransferControl,
+    progress: &dyn Fn(u64),
 ) -> io::Result<PathBuf> {
     let dst = dir.join(name);
     require_missing(&dst)?;
+    control.check()?;
     let probe = spawn()?;
     let probe_handle = probe.handle();
+    control.register(&probe_handle);
     let mut stdout = probe
         .stdout
         .ok_or_else(|| io::Error::other("probe has no stdout"))?;
-    let watchdog = TransferWatchdog::start(vec![probe_handle.clone()], TRANSFER_TIMEOUT)?;
+    let _timeout = control.arm_timeout(TRANSFER_TIMEOUT)?;
     let temp = part_path(dir, name);
     let _guard = PartFile(temp.clone());
     let mut file = std::fs::File::create(&temp)?;
-    let killers = [probe_handle.clone()];
-    let streamed = stream_to(&mut stdout, &mut file, max, &killers);
+    let streamed = stream_to(&mut stdout, &mut file, max, control, progress);
     drop(stdout);
     let status = wait_child(&probe_handle)?;
     let stderr = join_reader(probe.stderr)?;
-    if watchdog.timed_out() {
+    if control.is_timed_out() {
         return Err(transfer_timed_out_error());
     }
+    // A cancel wins over stream/probe errors: it is the user's intent, and
+    // the killed far side has no meaningful exit code of its own.
+    control.check()?;
     streamed?;
     probe_result(
         "cat",
@@ -1238,6 +1497,8 @@ fn upload_file_with(
     spawn: impl FnOnce() -> io::Result<ProbeChild>,
     local_path: &Path,
     max: u64,
+    control: &TransferControl,
+    progress: &dyn Fn(u64),
 ) -> io::Result<()> {
     let metadata = std::fs::metadata(local_path)?;
     if !metadata.is_file() {
@@ -1252,8 +1513,10 @@ fn upload_file_with(
     if metadata.len() > max {
         return Err(too_large_error(max));
     }
+    control.check()?;
     let probe = spawn()?;
     let probe_handle = probe.handle();
+    control.register(&probe_handle);
     let stdin = probe
         .stdin
         .ok_or_else(|| io::Error::other("probe has no stdin"))?;
@@ -1261,18 +1524,18 @@ fn upload_file_with(
     let stdout_drain = probe
         .stdout
         .map(|pipe| spawn_bounded_reader(pipe, MAX_TRANSFER_STDERR_BYTES));
-    let watchdog = TransferWatchdog::start(vec![probe_handle.clone()], TRANSFER_TIMEOUT)?;
+    let _timeout = control.arm_timeout(TRANSFER_TIMEOUT)?;
     let file = std::fs::File::open(local_path)?;
-    let killers = [probe_handle.clone()];
-    let streamed = stream_to(file, stdin, max, &killers);
+    let streamed = stream_to(file, stdin, max, control, progress);
     // stream_to owns and drops stdin here, so the far side sees the payload
     // EOF before it finishes `put`.
     let status = wait_child(&probe_handle)?;
     let stderr = join_reader(probe.stderr)?;
     let _ = join_reader(stdout_drain);
-    if watchdog.timed_out() {
+    if control.is_timed_out() {
         return Err(transfer_timed_out_error());
     }
+    control.check()?;
     streamed?;
     probe_result(
         "put",
@@ -1290,8 +1553,11 @@ fn upload_dir_with(
     spawn: impl FnOnce() -> io::Result<ProbeChild>,
     local_path: &Path,
     max: u64,
+    control: &TransferControl,
+    progress: &dyn Fn(u64),
 ) -> io::Result<()> {
     require_local_tar()?;
+    control.check()?;
     let metadata = std::fs::symlink_metadata(local_path)?;
     if !metadata.is_dir() {
         return Err(io::Error::new(
@@ -1325,16 +1591,16 @@ fn upload_dir_with(
     let tar = Arc::new(Mutex::new(tar));
     let probe = spawn()?;
     let probe_handle = probe.handle();
+    control.register(&probe_handle);
+    control.register(&tar);
     let stdin = probe
         .stdin
         .ok_or_else(|| io::Error::other("probe has no stdin"))?;
     let stdout_drain = probe
         .stdout
         .map(|pipe| spawn_bounded_reader(pipe, MAX_TRANSFER_STDERR_BYTES));
-    let watchdog =
-        TransferWatchdog::start(vec![probe_handle.clone(), tar.clone()], TRANSFER_TIMEOUT)?;
-    let killers = [probe_handle.clone(), tar.clone()];
-    let streamed = stream_to(tar_stdout, stdin, max, &killers);
+    let _timeout = control.arm_timeout(TRANSFER_TIMEOUT)?;
+    let streamed = stream_to(tar_stdout, stdin, max, control, progress);
     if streamed.is_err() {
         // After an overflow the tar can still be blocked writing; make sure
         // it is gone before reaping.
@@ -1347,9 +1613,10 @@ fn upload_dir_with(
     let status = wait_child(&probe_handle)?;
     let stderr = join_reader(probe.stderr)?;
     let _ = join_reader(stdout_drain);
-    if watchdog.timed_out() {
+    if control.is_timed_out() {
         return Err(transfer_timed_out_error());
     }
+    control.check()?;
     streamed?;
     if !tar_status.success() {
         let detail = bounded_stderr_text(&tar_stderr);
@@ -1379,10 +1646,13 @@ fn download_dir_with(
     name: &OsStr,
     dir: &Path,
     max: u64,
+    control: &TransferControl,
+    progress: &dyn Fn(u64),
 ) -> io::Result<PathBuf> {
     let dst = dir.join(name);
     require_missing(&dst)?;
     require_local_tar()?;
+    control.check()?;
     let probe = spawn()?;
     let probe_handle = probe.handle();
     let stdout = probe
@@ -1404,10 +1674,10 @@ fn download_dir_with(
         .take()
         .map(|pipe| spawn_bounded_reader(pipe, MAX_TRANSFER_STDERR_BYTES));
     let tar = Arc::new(Mutex::new(tar));
-    let watchdog =
-        TransferWatchdog::start(vec![probe_handle.clone(), tar.clone()], TRANSFER_TIMEOUT)?;
-    let killers = [probe_handle.clone(), tar.clone()];
-    let streamed = stream_to(stdout, tar_stdin, max, &killers);
+    control.register(&probe_handle);
+    control.register(&tar);
+    let _timeout = control.arm_timeout(TRANSFER_TIMEOUT)?;
+    let streamed = stream_to(stdout, tar_stdin, max, control, progress);
     if streamed.is_err() {
         if let Ok(mut child) = tar.lock() {
             let _ = child.kill();
@@ -1417,9 +1687,14 @@ fn download_dir_with(
     let tar_stderr = join_reader(tar_stderr)?;
     let status = wait_child(&probe_handle)?;
     let stderr = join_reader(probe.stderr)?;
-    if watchdog.timed_out() {
+    if control.is_timed_out() {
         let _ = std::fs::remove_dir_all(&dst);
         return Err(transfer_timed_out_error());
+    }
+    if let Err(error) = control.check() {
+        // tar streams straight into the destination: drop the partial tree.
+        let _ = std::fs::remove_dir_all(&dst);
+        return Err(error);
     }
     let outcome = streamed
         .and_then(|_| {
@@ -2189,6 +2464,8 @@ mod tests {
             OsStr::new("file.bin"),
             local.path(),
             1 << 20,
+            &TransferControl::new(),
+            &|_| {},
         )
         .unwrap();
         assert_eq!(dst, local.path().join("file.bin"));
@@ -2204,6 +2481,8 @@ mod tests {
             OsStr::new("file.bin"),
             local.path(),
             1 << 20,
+            &TransferControl::new(),
+            &|_| {},
         )
         .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
@@ -2222,6 +2501,8 @@ mod tests {
             OsStr::new("big.bin"),
             local.path(),
             16,
+            &TransferControl::new(),
+            &|_| {},
         )
         .unwrap_err();
         assert!(err.to_string().contains("limit"));
@@ -2242,6 +2523,8 @@ mod tests {
             OsStr::new("missing"),
             local.path(),
             1 << 20,
+            &TransferControl::new(),
+            &|_| {},
         )
         .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
@@ -2261,6 +2544,8 @@ mod tests {
             || spawn_local(&["put", &dst_str], ScriptDelivery::Argv),
             &src,
             1 << 20,
+            &TransferControl::new(),
+            &|_| {},
         )
         .unwrap();
         assert_eq!(std::fs::read(&dst).unwrap(), content);
@@ -2269,6 +2554,8 @@ mod tests {
             || spawn_local(&["put", &dst_str], ScriptDelivery::Argv),
             &src,
             1 << 20,
+            &TransferControl::new(),
+            &|_| {},
         )
         .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
@@ -2286,6 +2573,8 @@ mod tests {
             || spawn_local(&["put", &dst_str], ScriptDelivery::Argv),
             &src,
             16,
+            &TransferControl::new(),
+            &|_| {},
         )
         .unwrap_err();
         assert!(err.to_string().contains("limit"));
@@ -2309,6 +2598,8 @@ mod tests {
             || spawn_local(&["untar", &relay_str], ScriptDelivery::Argv),
             &src,
             1 << 24,
+            &TransferControl::new(),
+            &|_| {},
         )
         .unwrap();
         assert_eq!(
@@ -2324,6 +2615,8 @@ mod tests {
             OsStr::new("tree"),
             local_dst.path(),
             1 << 24,
+            &TransferControl::new(),
+            &|_| {},
         )
         .unwrap();
         assert_eq!(
@@ -2353,8 +2646,223 @@ mod tests {
             &FsLocation::Local,
             Path::new("/b"),
             false,
+            &TransferControl::new(),
+            &|_| {},
         )
         .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    // -- progress, cancellation, cleanup --------------------------------------
+
+    #[test]
+    fn human_bytes_formats_binary_units() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1023), "1023 B");
+        assert_eq!(human_bytes(1024), "1.0 KiB");
+        assert_eq!(human_bytes(1536), "1.5 KiB");
+        assert_eq!(human_bytes(9 * 1024), "9.0 KiB");
+        assert_eq!(human_bytes(10 * 1024), "10 KiB");
+        assert_eq!(human_bytes(13_000_000), "12 MiB");
+        assert_eq!(human_bytes(1 << 30), "1.0 GiB");
+        assert_eq!(human_bytes(5 << 30), "5.0 GiB");
+    }
+
+    #[test]
+    fn progress_throttle_gates_on_size_and_time() {
+        // Below the 256 KiB delta: no emission even with time elapsed.
+        let mut throttle = ProgressThrottle::aged(Duration::from_secs(1));
+        assert_eq!(throttle.update(100 * 1024), None);
+        // Crossing 256 KiB with the interval satisfied: emit the total.
+        assert_eq!(throttle.update(200 * 1024), Some(300 * 1024));
+        // Right after an emission the time gate blocks the next one.
+        assert_eq!(throttle.update(512 * 1024), None);
+        assert_eq!(throttle.total(), 812 * 1024);
+
+        // A fresh throttle is inside the 250 ms interval: even a large first
+        // chunk waits for the interval, keeping emissions at ~4 per second.
+        let mut fresh = ProgressThrottle::new();
+        assert_eq!(fresh.update(4 * 1024 * 1024), None);
+    }
+
+    #[test]
+    fn progress_throttle_emits_after_the_interval() {
+        let mut throttle = ProgressThrottle::new();
+        assert_eq!(throttle.update(PROGRESS_MIN_DELTA_BYTES), None);
+        std::thread::sleep(PROGRESS_MIN_INTERVAL + Duration::from_millis(60));
+        assert_eq!(
+            throttle.update(PROGRESS_MIN_DELTA_BYTES),
+            Some(2 * PROGRESS_MIN_DELTA_BYTES)
+        );
+    }
+
+    #[test]
+    fn transfer_progress_reaches_the_exact_file_size() {
+        let local = TestDir::new("progress-src");
+        let remote = TestDir::new("progress-dst");
+        let content = binary_content(2, 30_000);
+        let src = local.path().join("up.bin");
+        std::fs::write(&src, &content).unwrap();
+        let dst = remote.path().join("up.bin");
+        let dst_str = dst.to_str().unwrap().to_string();
+
+        let events = std::sync::Mutex::new(Vec::new());
+        upload_file_with(
+            || spawn_local(&["put", &dst_str], ScriptDelivery::Argv),
+            &src,
+            1 << 20,
+            &TransferControl::new(),
+            &|bytes| events.lock().unwrap().push(bytes),
+        )
+        .unwrap();
+        let events = events.into_inner().unwrap();
+        assert!(
+            !events.is_empty(),
+            "the pump emits at least the final total"
+        );
+        assert_eq!(
+            events.last().copied(),
+            Some(content.len() as u64),
+            "the final progress value is the exact payload size"
+        );
+        assert!(
+            events.windows(2).all(|pair| pair[0] <= pair[1]),
+            "progress is monotonic"
+        );
+    }
+
+    #[test]
+    fn cancel_kills_registered_children_and_flags_interrupted() {
+        let control = TransferControl::new();
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let child = Arc::new(Mutex::new(child));
+        control.register(&child);
+        assert!(!control.is_cancelled());
+        control.cancel();
+        assert!(control.is_cancelled());
+        assert_eq!(
+            control.check().unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        let status = wait_child(&child).unwrap();
+        assert!(!status.success(), "the child was killed, not exited");
+        // Racing a finished transfer: a second cancel is a harmless no-op.
+        control.cancel();
+        assert_eq!(
+            control.check().unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+    }
+
+    #[test]
+    fn cancel_before_start_prevents_the_spawn() {
+        let local = TestDir::new("cancel-early");
+        let control = TransferControl::new();
+        control.cancel();
+        let spawned = std::sync::atomic::AtomicBool::new(false);
+        let err = download_file_with(
+            || {
+                spawned.store(true, Ordering::Relaxed);
+                spawn_local(&["cat", "/dev/null"], ScriptDelivery::Stdin)
+            },
+            OsStr::new("null.bin"),
+            local.path(),
+            1 << 20,
+            &control,
+            &|_| {},
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+        assert!(!spawned.load(Ordering::Relaxed), "no spawn after a cancel");
+        assert_eq!(std::fs::read_dir(local.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn cancel_during_download_cleans_up_and_is_not_an_error() {
+        let local = TestDir::new("cancel-dl");
+        let local_path = local.path().to_path_buf();
+        let control = TransferControl::new();
+        let worker_control = control.clone();
+        let handle = std::thread::spawn(move || {
+            // `yes` streams forever: the transfer is definitely in flight
+            // when the cancel lands.
+            download_file_with(
+                || spawn_local_shell("yes transfer-payload"),
+                OsStr::new("yes.bin"),
+                &local_path,
+                1 << 30,
+                &worker_control,
+                &|_| {},
+            )
+        });
+        std::thread::sleep(Duration::from_millis(150));
+        control.cancel();
+        let err = handle.join().expect("worker finished").unwrap_err();
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::Interrupted,
+            "a cancel reports Interrupted, not a transfer failure"
+        );
+        assert_eq!(
+            std::fs::read_dir(local.path()).unwrap().count(),
+            0,
+            "the partial temp file is cleaned up"
+        );
+    }
+
+    /// Spawn any local shell command as a "remote" for cancel tests.
+    fn spawn_local_shell(command: &str) -> io::Result<ProbeChild> {
+        let argv = vec![
+            OsString::from("sh"),
+            OsString::from("-c"),
+            OsString::from(command),
+        ];
+        spawn_probe_argv(&argv, ScriptDelivery::Argv)
+    }
+
+    #[test]
+    fn part_cleanup_command_globs_only_the_fixed_suffix() {
+        assert_eq!(
+            part_cleanup_command(Path::new("/dst/dir name")),
+            "rm -f '/dst/dir name'.fspart.*"
+        );
+        assert_eq!(
+            part_cleanup_command(Path::new("/dst/don't")),
+            "rm -f '/dst/don'\\''t'.fspart.*"
+        );
+    }
+
+    #[test]
+    fn part_cleanup_command_executes_against_local_sh() {
+        let tmp = TestDir::new("part-cleanup");
+        let dst = tmp.path().join("up.bin");
+        std::fs::write(tmp.path().join("up.bin.fspart.111"), b"partial").unwrap();
+        std::fs::write(tmp.path().join("up.bin.fspart.222"), b"partial").unwrap();
+        std::fs::write(tmp.path().join("up.bin"), b"done").unwrap();
+        std::fs::write(tmp.path().join("other.txt"), b"keep").unwrap();
+
+        let command = part_cleanup_command(&dst);
+        let argv = vec![
+            OsString::from("sh"),
+            OsString::from("-c"),
+            OsString::from(command),
+        ];
+        let capture = run_capture(&argv, &[], Duration::from_secs(10), MAX_CAPTURE_BYTES).unwrap();
+        assert_eq!(capture.code, Some(0));
+        assert!(dst.is_file(), "the destination itself survives");
+        assert!(tmp.path().join("other.txt").is_file());
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().contains("fspart"))
+            .collect();
+        assert!(leftovers.is_empty(), "the .fspart temps are gone");
     }
 }

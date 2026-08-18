@@ -383,6 +383,22 @@ fn show_file_tree_context_menu(
                 is_dir: *is_dir,
             },
         );
+        {
+            // Remote rows copy the plain remote path (no prefix): that is
+            // what users paste into the remote shell.
+            let button = file_menu_button("Copy Path");
+            let popover = popover.clone();
+            let sender = sender.clone();
+            let payload = file_tree::copy_path_payload(path);
+            button.connect_clicked(move |_| {
+                popover.popdown();
+                if let Some(display) = gtk::gdk::Display::default() {
+                    display.clipboard().set_text(&payload);
+                    sender.input(AppMsg::Toast("Path copied to clipboard.".to_string()));
+                }
+            });
+            menu.append(&button);
+        }
     }
     {
         let button = file_menu_button(&paste_label);

@@ -470,16 +470,53 @@ impl AppModel {
                 format!("from {} to {}", src_loc.label(&hosts), loc.label(&hosts)),
             ),
         };
+        // Uploads of one file can show "X / Y" from the local metadata;
+        // downloads and relays have no trustworthy total.
+        let total = if clip.loc == remote_fs::FsLocation::Local && !is_dir {
+            std::fs::metadata(&src).ok().map(|metadata| metadata.len())
+        } else {
+            None
+        };
+        let progress_label = {
+            let verb = verb.to_string();
+            let name = name.clone();
+            move |bytes: u64| match total {
+                Some(total) => format!(
+                    "{verb} {name}… {} / {}",
+                    remote_fs::human_bytes(bytes),
+                    remote_fs::human_bytes(total)
+                ),
+                None => format!("{verb} {name}… {}", remote_fs::human_bytes(bytes)),
+            }
+        };
         let busy = format!("{verb} {name} {from_to}…");
         let done = format!("{name}: transfer complete");
+        let cancelled = format!("{name}: transfer cancelled");
         let cut_source = cut.then_some((src_loc.clone(), src.clone()));
         let dst_loc = loc.clone();
+        let control = remote_fs::TransferControl::new();
+        let worker_control = control.clone();
         self.run_file_tree_transfer(
             busy,
             done,
+            cancelled,
             vec![dir.clone()],
             cut_source,
-            move || remote_fs::transfer(&hosts, &src_loc, &src, &dst_loc, &dir, is_dir).map(drop),
+            control,
+            move |progress: &dyn Fn(u64)| {
+                remote_fs::transfer(
+                    &hosts,
+                    &src_loc,
+                    &src,
+                    &dst_loc,
+                    &dir,
+                    is_dir,
+                    &worker_control,
+                    progress,
+                )
+                .map(drop)
+            },
+            progress_label,
             sender,
         );
     }
@@ -562,76 +599,119 @@ impl AppModel {
     }
 
     /// Run one cross-location transfer on a worker thread with a held busy
-    /// toast. On success a cut's source is deleted through the regular delete
-    /// op; a failed source delete is reported as partial success.
+    /// toast that reports throttled progress and carries a Cancel action.
+    /// Cancellation kills the transfer's children through the shared control
+    /// and reports a neutral "cancelled" — not an error. On success a cut's
+    /// source is deleted through the regular delete op; a failed source
+    /// delete is reported as partial success.
+    #[allow(clippy::too_many_arguments)]
     fn run_file_tree_transfer(
         &self,
         busy_label: String,
         done_label: String,
+        cancelled_label: String,
         refresh: Vec<std::path::PathBuf>,
         cut_source: Option<(remote_fs::FsLocation, std::path::PathBuf)>,
-        transfer: impl FnOnce() -> std::io::Result<()> + Send + 'static,
+        control: remote_fs::TransferControl,
+        transfer: impl FnOnce(&dyn Fn(u64)) -> std::io::Result<()> + Send + 'static,
+        progress_label: impl Fn(u64) -> String + 'static,
         sender: &ComponentSender<AppModel>,
     ) {
         let busy_toast = self.file_tree_transfer_begin(&busy_label);
+        // The Cancel action races the transfer's own completion harmlessly:
+        // cancelling an already-finished control only kills exited children.
+        busy_toast.set_button_label(Some("Cancel"));
+        {
+            let control = control.clone();
+            busy_toast.connect_button_clicked(move |_| {
+                control.cancel();
+            });
+        }
         let transfer_toast = self.file_tree_transfer_toast.clone();
         let toast_overlay = self.toast_overlay.clone();
         let clipboard = self.file_tree_clipboard.clone();
         let config = self.config.clone();
         let sender = sender.clone();
-        if let Err(error) = file_tree::request_fs_op(transfer, move |result| {
-            busy_toast.dismiss();
-            // Free the shared slot only if it still holds this transfer's
-            // toast; a newer transfer's busy toast must survive.
-            {
-                let mut slot = transfer_toast.borrow_mut();
-                if slot.as_ref() == Some(&busy_toast) {
-                    slot.take();
+        let mut refresh = Some(refresh);
+        let mut cut_source = cut_source;
+        let busy_toast_for_error = busy_toast.clone();
+        if let Err(error) =
+            file_tree::request_fs_op_streaming(transfer, move |outcome| match outcome {
+                file_tree::FsOpOutcome::Progress(bytes) => {
+                    busy_toast.set_title(&progress_label(bytes));
                 }
-            }
-            match result {
-                Ok(()) => {
-                    toast_overlay.add_toast(adw::Toast::new(&done_label));
-                    sender.input(AppMsg::FileTreeOpSucceeded(refresh));
-                    let Some((loc, path)) = cut_source else {
-                        return;
-                    };
-                    // The copy half of the cut is done: the clipboard is
-                    // spent either way, and the source delete is best-effort.
-                    let dangling = clipboard
-                        .borrow()
-                        .as_ref()
-                        .is_some_and(|clip| clip.path == path);
-                    if dangling {
-                        *clipboard.borrow_mut() = None;
+                file_tree::FsOpOutcome::Done(result) => {
+                    busy_toast.dismiss();
+                    // Free the shared slot only if it still holds this
+                    // transfer's toast; a newer one must survive.
+                    {
+                        let mut slot = transfer_toast.borrow_mut();
+                        if slot.as_ref() == Some(&busy_toast) {
+                            slot.take();
+                        }
                     }
-                    let hosts = config.borrow().remote_hosts.clone();
-                    let toast_overlay = toast_overlay.clone();
-                    if let Err(error) = file_tree::request_fs_op(
-                        move || remote_fs::delete(&loc, &hosts, &path),
-                        move |result| {
-                            if let Err(error) = result {
-                                let message =
-                                    review_input::safe_inline_display(&error.to_string(), 512);
-                                toast_overlay.add_toast(adw::Toast::new(&format!(
-                                    "Copied, but deleting the source failed: {message}"
-                                )));
+                    match result {
+                        Ok(()) => {
+                            toast_overlay.add_toast(adw::Toast::new(&done_label));
+                            sender.input(AppMsg::FileTreeOpSucceeded(
+                                refresh.take().unwrap_or_default(),
+                            ));
+                            let Some((loc, path)) = cut_source.take() else {
+                                return;
+                            };
+                            // The copy half of the cut is done: the clipboard
+                            // is spent either way, and the source delete is
+                            // best-effort.
+                            let dangling = clipboard
+                                .borrow()
+                                .as_ref()
+                                .is_some_and(|clip| clip.path == path);
+                            if dangling {
+                                *clipboard.borrow_mut() = None;
                             }
-                        },
-                    ) {
-                        log::warn!("failed to start cut-paste source delete: {error}");
+                            let hosts = config.borrow().remote_hosts.clone();
+                            let toast_overlay = toast_overlay.clone();
+                            if let Err(error) = file_tree::request_fs_op(
+                                move || remote_fs::delete(&loc, &hosts, &path),
+                                move |result| {
+                                    if let Err(error) = result {
+                                        let message = review_input::safe_inline_display(
+                                            &error.to_string(),
+                                            512,
+                                        );
+                                        toast_overlay.add_toast(adw::Toast::new(&format!(
+                                            "Copied, but deleting the source failed: {message}"
+                                        )));
+                                    }
+                                },
+                            ) {
+                                log::warn!("failed to start cut-paste source delete: {error}");
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                            // Cancellation is a neutral outcome, not an error;
+                            // refresh so any partial state shows truthfully.
+                            toast_overlay.add_toast(adw::Toast::new(&cancelled_label));
+                            sender.input(AppMsg::FileTreeOpSucceeded(
+                                refresh.take().unwrap_or_default(),
+                            ));
+                        }
+                        Err(error) => {
+                            let message =
+                                review_input::safe_inline_display(&error.to_string(), 512);
+                            toast_overlay
+                                .add_toast(adw::Toast::new(&format!("Transfer failed: {message}")));
+                        }
                     }
                 }
-                Err(error) => {
-                    let message = review_input::safe_inline_display(&error.to_string(), 512);
-                    toast_overlay
-                        .add_toast(adw::Toast::new(&format!("Transfer failed: {message}")));
-                }
+            })
+        {
+            busy_toast_for_error.dismiss();
+            let mut slot = self.file_tree_transfer_toast.borrow_mut();
+            if slot.as_ref() == Some(&busy_toast_for_error) {
+                slot.take();
             }
-        }) {
-            if let Some(toast) = self.file_tree_transfer_toast.borrow_mut().take() {
-                toast.dismiss();
-            }
+            drop(slot);
             self.show_toast(format!("Could not start the transfer: {error}"));
         }
     }
