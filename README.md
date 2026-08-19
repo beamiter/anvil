@@ -629,6 +629,20 @@ total (estimated with a bounded, symlink-free size walk), and per-item
 failures — an existing name, an unreadable file — are summarized in the
 completion toast without aborting the rest.
 
+The tree multi-selects: Ctrl+click toggles rows, Shift+click extends a range.
+A right-click inside the selection aims the menu at all of it (Delete reads
+"Delete N items" and the confirmation names up to five); a right-click
+outside collapses the selection to that row first. Copy, Cut, and Delete run
+as one background batch that continues past per-item failures and reports a
+summary, and a batch cut-paste deletes each source only after that item
+landed. Rename, New File, and New Folder stay single-row operations and are
+insensitive while multiple rows are selected; Copy Path with a selection
+copies one full path per line. The magnifier in the header opens an inline
+filter over the already-loaded rows — case-insensitive name matching that
+keeps matches and their ancestors (auto-expanded), restores the previous
+expansion when it clears, works identically over local and remote listings,
+and never triggers a scan.
+
 ### AI
 
 AI surfaces are optional and can be hidden with `ai_enabled = false`. Provider

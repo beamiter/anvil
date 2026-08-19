@@ -9,8 +9,11 @@ use super::*;
 
 impl AppModel {
     /// Rebuild the file tree with `root` at the top of the current location.
+    /// An open filter is closed: the fresh rows would otherwise be invisible
+    /// until the query is retyped.
     #[allow(deprecated)]
     pub(crate) fn set_file_tree_root(&self, root: std::path::PathBuf) {
+        self.file_header.emit(sidebar::FileHeaderMsg::CloseFilter);
         let generation = self.file_tree_scan_generation.get().wrapping_add(1);
         self.file_tree_scan_generation.set(generation);
         self.file_tree_store.clear();
@@ -140,6 +143,19 @@ impl AppModel {
         } else {
             self.set_file_tree_root(root);
         }
+    }
+
+    /// Apply the header filter entry's query to the loaded tree rows.
+    #[allow(deprecated)]
+    pub(crate) fn file_tree_apply_filter(&self, query: &str) {
+        let mut state = self.file_tree_filter.borrow_mut();
+        file_tree::apply_tree_filter(
+            &self.file_tree_store,
+            &self.file_tree_view,
+            &self.file_tree_filter_model,
+            &mut state,
+            query,
+        );
     }
 
     /// Selector moved: resolve the new location's start directory off-thread,
@@ -281,16 +297,33 @@ impl AppModel {
         );
     }
 
-    /// Destructive ops name their target and wait for an explicit confirm.
+    /// Destructive ops name their target and wait for an explicit confirm;
+    /// a batch delete lists the count and up to five names.
     pub(crate) fn file_tree_confirm_delete(
         &self,
-        path: std::path::PathBuf,
+        paths: Vec<std::path::PathBuf>,
         sender: &ComponentSender<AppModel>,
     ) {
-        let body = format!(
-            "Delete {} permanently?\n\nThis cannot be undone.",
-            file_tree::display_full_path(&path)
-        );
+        if paths.is_empty() {
+            return;
+        }
+        let body = if paths.len() == 1 {
+            format!(
+                "Delete {} permanently?\n\nThis cannot be undone.",
+                file_tree::display_full_path(&paths[0])
+            )
+        } else {
+            let mut body = format!("Delete {} items permanently?\n\n", paths.len());
+            for path in paths.iter().take(5) {
+                body.push_str(&file_tree::display_full_path(path));
+                body.push('\n');
+            }
+            if paths.len() > 5 {
+                body.push_str(&format!("…and {} more\n", paths.len() - 5));
+            }
+            body.push_str("\nThis cannot be undone.");
+            body
+        };
         let dialog = adw::AlertDialog::new(Some("Delete"), Some(&body));
         dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Delete")]);
         dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
@@ -300,24 +333,28 @@ impl AppModel {
             let sender = sender.clone();
             dialog.connect_response(None, move |_, response| {
                 if response == "delete" {
-                    sender.input(AppMsg::FileTreeDeleteConfirmed(path.clone()));
+                    sender.input(AppMsg::FileTreeDeleteConfirmed(paths.clone()));
                 }
             });
         }
         dialog.present(Some(&self.window));
     }
 
-    /// Remember one Copy/Cut row, tagged with the location it came from.
+    /// Remember Copy/Cut rows, tagged with the location they came from.
     pub(crate) fn file_tree_clipboard_set(
         &self,
-        path: std::path::PathBuf,
-        is_dir: bool,
+        items: Vec<(std::path::PathBuf, bool)>,
         cut: bool,
     ) {
+        if items.is_empty() {
+            return;
+        }
         *self.file_tree_clipboard.borrow_mut() = Some(remote_fs::FsClipboard {
             loc: self.file_tree_location.borrow().clone(),
-            path,
-            is_dir,
+            items: items
+                .into_iter()
+                .map(|(path, is_dir)| remote_fs::FsClipboardItem { path, is_dir })
+                .collect(),
             cut,
         });
     }
@@ -337,7 +374,7 @@ impl AppModel {
         let loc = self.file_tree_location.borrow().clone();
         let hosts = self.config.borrow().remote_hosts.clone();
         self.run_file_tree_op(
-            None,
+            Vec::new(),
             vec![dir],
             move || {
                 if is_dir {
@@ -346,6 +383,7 @@ impl AppModel {
                     remote_fs::create_file(&loc, &hosts, &path)
                 }
             },
+            |_| {},
             sender,
         );
     }
@@ -373,38 +411,50 @@ impl AppModel {
         let hosts = self.config.borrow().remote_hosts.clone();
         // A renamed clipboard source would dangle; forget it on success.
         self.run_file_tree_op(
-            Some(src.clone()),
+            vec![src.clone()],
             refresh,
             move || remote_fs::rename(&loc, &hosts, &src, &dst),
+            |_| {},
             sender,
         );
     }
 
     pub(crate) fn file_tree_delete_confirmed(
         &self,
-        path: std::path::PathBuf,
+        paths: Vec<std::path::PathBuf>,
         sender: &ComponentSender<AppModel>,
     ) {
+        if paths.is_empty() {
+            return;
+        }
         let loc = self.file_tree_location.borrow().clone();
         let hosts = self.config.borrow().remote_hosts.clone();
-        let refresh = path
-            .parent()
-            .map(std::path::Path::to_path_buf)
-            .into_iter()
-            .collect();
-        // A deleted clipboard source would dangle; forget it on success.
+        let mut refresh: Vec<std::path::PathBuf> = Vec::new();
+        for path in &paths {
+            if let Some(parent) = path.parent() {
+                refresh.push(parent.to_path_buf());
+            }
+        }
+        // Deleted clipboard sources would dangle; forget them on success.
+        let toast_overlay = self.toast_overlay.clone();
         self.run_file_tree_op(
-            Some(path.clone()),
+            paths.clone(),
             refresh,
-            move || remote_fs::delete(&loc, &hosts, &path),
+            move || Ok(remote_fs::delete_all(&loc, &hosts, &paths)),
+            move |outcome| {
+                if !outcome.failed.is_empty() {
+                    toast_overlay.add_toast(adw::Toast::new(&batch_summary(&outcome, "deleted")));
+                }
+            },
             sender,
         );
     }
 
     /// Paste the clipboard into `dir` (the root when None). Same location:
-    /// cut becomes a rename, copy a recursive copy. Different locations: a
-    /// streaming transfer (download, upload, or a local relay between two
-    /// remote hosts), where cut copies first and then deletes the source.
+    /// cut becomes a rename, copy a recursive copy — per item for batches.
+    /// Different locations: a streaming transfer (download, upload, or a
+    /// local relay between two remote hosts), where cut copies first and
+    /// then deletes the source per item.
     pub(crate) fn file_tree_paste(
         &self,
         dir: Option<std::path::PathBuf>,
@@ -419,32 +469,81 @@ impl AppModel {
             return;
         }
         let hosts = self.config.borrow().remote_hosts.clone();
-        let src = clip.path.clone();
         let cut = clip.cut;
+        let count = clip.items.len();
+
         if clip.loc == loc {
-            let dst = remote_fs::paste_destination(&dir, &clip.path);
-            if dst == clip.path {
-                self.show_toast("Copy and cut need a different target directory.");
+            if count == 1 {
+                // Single-item fast path with the plain rename/copy semantics.
+                let src = clip.items[0].path.clone();
+                let dst = remote_fs::paste_destination(&dir, &src);
+                if dst == src {
+                    self.show_toast("Copy and cut need a different target directory.");
+                    return;
+                }
+                // A successful cut-paste consumes the clipboard.
+                let refresh = if cut {
+                    let mut dirs = vec![dir.clone()];
+                    if let Some(parent) = src.parent() {
+                        dirs.push(parent.to_path_buf());
+                    }
+                    dirs
+                } else {
+                    vec![dir.clone()]
+                };
+                let forget = if cut { vec![src.clone()] } else { Vec::new() };
+                self.run_file_tree_op(
+                    forget,
+                    refresh,
+                    move || {
+                        if cut {
+                            remote_fs::rename(&loc, &hosts, &src, &dst)
+                        } else {
+                            remote_fs::copy(&loc, &hosts, &src, &dst)
+                        }
+                    },
+                    |_| {},
+                    sender,
+                );
                 return;
             }
-            // A successful cut-paste consumes the clipboard.
-            let refresh = if cut {
-                let mut dirs = vec![dir.clone()];
-                if let Some(parent) = src.parent() {
-                    dirs.push(parent.to_path_buf());
-                }
-                dirs
+            // Same-location batch: one worker job, per-item failures
+            // collected into a summary toast.
+            let items = clip.items.clone();
+            let forget: Vec<std::path::PathBuf> = if cut {
+                items.iter().map(|item| item.path.clone()).collect()
             } else {
-                vec![dir.clone()]
+                Vec::new()
             };
+            let mut refresh = vec![dir.clone()];
+            if cut {
+                for item in &items {
+                    if let Some(parent) = item.path.parent() {
+                        refresh.push(parent.to_path_buf());
+                    }
+                }
+            }
+            let clip_loc = clip.loc.clone();
+            let toast_overlay = self.toast_overlay.clone();
             self.run_file_tree_op(
-                cut.then_some(src.clone()),
+                forget,
                 refresh,
                 move || {
-                    if cut {
-                        remote_fs::rename(&loc, &hosts, &src, &dst)
-                    } else {
-                        remote_fs::copy(&loc, &hosts, &src, &dst)
+                    remote_fs::paste_all(
+                        &hosts,
+                        &clip_loc,
+                        &items,
+                        &loc,
+                        &dir,
+                        cut,
+                        &remote_fs::TransferControl::new(),
+                        &|_| {},
+                    )
+                },
+                move |outcome| {
+                    if !outcome.failed.is_empty() {
+                        toast_overlay
+                            .add_toast(adw::Toast::new(&batch_summary(&outcome, "pasted")));
                     }
                 },
                 sender,
@@ -454,10 +553,6 @@ impl AppModel {
 
         // Cross-location: stream through the probe (or the local relay).
         let src_loc = clip.loc.clone();
-        let is_dir = clip.is_dir;
-        let name = src.file_name().map(file_tree::display_os_str);
-        let name = name.unwrap_or_else(|| src.display().to_string());
-        let name = review_input::safe_inline_display(&name, 256);
         let (verb, from_to) = match (&src_loc, &loc) {
             (remote_fs::FsLocation::Remote(_), remote_fs::FsLocation::Local) => {
                 ("Downloading", format!("from {}", src_loc.label(&hosts)))
@@ -470,52 +565,101 @@ impl AppModel {
                 format!("from {} to {}", src_loc.label(&hosts), loc.label(&hosts)),
             ),
         };
-        // Uploads of one file can show "X / Y" from the local metadata;
-        // downloads and relays have no trustworthy total.
-        let total = if clip.loc == remote_fs::FsLocation::Local && !is_dir {
-            std::fs::metadata(&src).ok().map(|metadata| metadata.len())
-        } else {
-            None
-        };
-        let progress_label = {
-            let verb = verb.to_string();
-            let name = name.clone();
-            move |bytes: u64| match total {
-                Some(total) => format!(
-                    "{verb} {name}… {} / {}",
-                    remote_fs::human_bytes(bytes),
-                    remote_fs::human_bytes(total)
-                ),
-                None => format!("{verb} {name}… {}", remote_fs::human_bytes(bytes)),
-            }
-        };
-        let busy = format!("{verb} {name} {from_to}…");
-        let done = format!("{name}: transfer complete");
-        let cancelled = format!("{name}: transfer cancelled");
-        let cut_source = cut.then_some((src_loc.clone(), src.clone()));
         let dst_loc = loc.clone();
         let control = remote_fs::TransferControl::new();
         let worker_control = control.clone();
+
+        if count == 1 {
+            // Single item: keep the byte-progress transfer toast.
+            let item = clip.items[0].clone();
+            let src = item.path.clone();
+            let is_dir = item.is_dir;
+            let name = src.file_name().map(file_tree::display_os_str);
+            let name = name.unwrap_or_else(|| src.display().to_string());
+            let name = review_input::safe_inline_display(&name, 256);
+            // Uploads of one file can show "X / Y" from the local metadata;
+            // downloads and relays have no trustworthy total.
+            let total = if src_loc == remote_fs::FsLocation::Local && !is_dir {
+                std::fs::metadata(&src).ok().map(|metadata| metadata.len())
+            } else {
+                None
+            };
+            let progress_label = {
+                let verb = verb.to_string();
+                let name = name.clone();
+                move |bytes: u64| match total {
+                    Some(total) => format!(
+                        "{verb} {name}… {} / {}",
+                        remote_fs::human_bytes(bytes),
+                        remote_fs::human_bytes(total)
+                    ),
+                    None => format!("{verb} {name}… {}", remote_fs::human_bytes(bytes)),
+                }
+            };
+            let busy = format!("{verb} {name} {from_to}…");
+            let done = format!("{name}: transfer complete");
+            let cancelled = format!("{name}: transfer cancelled");
+            let cut_source = cut.then_some((src_loc.clone(), src.clone()));
+            self.run_file_tree_transfer(
+                busy,
+                cancelled,
+                vec![dir.clone()],
+                control,
+                move |progress: &dyn Fn(u64)| {
+                    remote_fs::transfer(
+                        &hosts,
+                        &src_loc,
+                        &src,
+                        &dst_loc,
+                        &dir,
+                        is_dir,
+                        &worker_control,
+                        progress,
+                    )
+                    .map(drop)
+                },
+                progress_label,
+                move |()| (done, cut_source),
+                sender,
+            );
+            return;
+        }
+
+        // Cross-location batch: one transfer job over all items; progress
+        // reports completed items (remote sizes are unknown ahead of time).
+        let items = clip.items.clone();
+        let busy = format!("{verb} {count} items {from_to}…");
+        let progress_label = {
+            let busy = busy.clone();
+            move |done: u64| format!("{busy} {done}/{count}")
+        };
+        let clipboard = self.file_tree_clipboard.clone();
         self.run_file_tree_transfer(
             busy,
-            cancelled,
+            "Paste cancelled".to_string(),
             vec![dir.clone()],
             control,
             move |progress: &dyn Fn(u64)| {
-                remote_fs::transfer(
+                remote_fs::paste_all(
                     &hosts,
                     &src_loc,
-                    &src,
+                    &items,
                     &dst_loc,
                     &dir,
-                    is_dir,
+                    cut,
                     &worker_control,
                     progress,
                 )
-                .map(drop)
             },
             progress_label,
-            move |()| (done, cut_source),
+            move |outcome| {
+                // A cut batch is spent once it ran; sources of failed items
+                // remain in place and are named in the summary.
+                if cut {
+                    *clipboard.borrow_mut() = None;
+                }
+                (batch_summary(&outcome, "pasted"), None)
+            },
             sender,
         );
     }
@@ -571,7 +715,7 @@ impl AppModel {
                 remote_fs::run_drop(&plan, &loc, &hosts, &dir, &worker_control, progress)
             },
             progress_label,
-            move |outcome| (drop_summary(&outcome), None),
+            move |outcome| (batch_summary(&outcome, "imported"), None),
             sender,
         );
     }
@@ -616,31 +760,34 @@ impl AppModel {
     }
 
     /// Run one blocking op on a worker thread, then refresh only the affected
-    /// directories in place on the GTK thread. `forget_clipboard` names a
-    /// clipboard source that a successful rename/delete/cut-paste consumes or
-    /// makes dangle.
-    fn run_file_tree_op(
+    /// directories in place on the GTK thread. `forget_clipboard` names
+    /// clipboard sources that a successful op consumes or makes dangle;
+    /// `on_success` turns the worker payload into any summary toast.
+    fn run_file_tree_op<T: Send + 'static>(
         &self,
-        forget_clipboard: Option<std::path::PathBuf>,
+        forget_clipboard: Vec<std::path::PathBuf>,
         refresh: Vec<std::path::PathBuf>,
-        op: impl FnOnce() -> std::io::Result<()> + Send + 'static,
+        op: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+        on_success: impl FnOnce(T) + 'static,
         sender: &ComponentSender<AppModel>,
     ) {
         let toast_overlay = self.toast_overlay.clone();
         let clipboard = self.file_tree_clipboard.clone();
         let sender = sender.clone();
         if let Err(error) = file_tree::request_fs_op(op, move |result| match result {
-            Ok(()) => {
-                if let Some(path) = &forget_clipboard {
-                    let dangling = clipboard
-                        .borrow()
-                        .as_ref()
-                        .is_some_and(|clip| &clip.path == path);
+            Ok(payload) => {
+                if !forget_clipboard.is_empty() {
+                    let dangling = clipboard.borrow().as_ref().is_some_and(|clip| {
+                        clip.items
+                            .iter()
+                            .any(|item| forget_clipboard.contains(&item.path))
+                    });
                     if dangling {
                         *clipboard.borrow_mut() = None;
                     }
                 }
                 sender.input(AppMsg::FileTreeOpSucceeded(refresh));
+                on_success(payload);
             }
             Err(error) => {
                 let message = review_input::safe_inline_display(&error.to_string(), 512);
@@ -720,10 +867,9 @@ impl AppModel {
                             // The copy half of the cut is done: the clipboard
                             // is spent either way, and the source delete is
                             // best-effort.
-                            let dangling = clipboard
-                                .borrow()
-                                .as_ref()
-                                .is_some_and(|clip| clip.path == path);
+                            let dangling = clipboard.borrow().as_ref().is_some_and(|clip| {
+                                clip.items.iter().any(|item| item.path == path)
+                            });
                             if dangling {
                                 *clipboard.borrow_mut() = None;
                             }
@@ -897,17 +1043,17 @@ fn drop_rejection_message(
     }
 }
 
-/// Completion toast for a drop batch: counts, plus the first failure's
-/// reason so a partial batch is never silent.
-fn drop_summary(outcome: &remote_fs::DropOutcome) -> String {
+/// Summary toast text for a multi-item batch: counts, plus the first
+/// failure's reason so a partial batch is never silent.
+fn batch_summary(outcome: &remote_fs::BatchOutcome, verb: &str) -> String {
     if outcome.failed.is_empty() {
-        return format!("{} item(s) imported.", outcome.done);
+        return format!("{} item(s) {verb}.", outcome.done);
     }
     let (name, error) = &outcome.failed[0];
     format!(
-        "{} item(s) imported, {} failed ({}: {})",
-        outcome.done,
+        "{} of {} failed ({}: {})",
         outcome.failed.len(),
+        outcome.done + outcome.failed.len(),
         name,
         error
     )

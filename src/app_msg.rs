@@ -152,15 +152,13 @@ pub(crate) enum AppMsg {
         path: std::path::PathBuf,
     },
     FileTreeDelete {
-        path: std::path::PathBuf,
+        paths: Vec<std::path::PathBuf>,
     },
     FileTreeCopy {
-        path: std::path::PathBuf,
-        is_dir: bool,
+        items: Vec<(std::path::PathBuf, bool)>,
     },
     FileTreeCut {
-        path: std::path::PathBuf,
-        is_dir: bool,
+        items: Vec<(std::path::PathBuf, bool)>,
     },
     FileTreePaste {
         dir: Option<std::path::PathBuf>,
@@ -171,6 +169,8 @@ pub(crate) enum AppMsg {
         dir: Option<std::path::PathBuf>,
     },
     FileTreeRefresh,
+    /// The header filter entry's text changed ("" = filter cleared).
+    FileTreeFilterChanged(String),
     /// A background op or transfer finished; refresh these directories in
     /// place, preserving all other expansion.
     FileTreeOpSucceeded(Vec<std::path::PathBuf>),
@@ -184,7 +184,7 @@ pub(crate) enum AppMsg {
         src: std::path::PathBuf,
         name: String,
     },
-    FileTreeDeleteConfirmed(std::path::PathBuf),
+    FileTreeDeleteConfirmed(Vec<std::path::PathBuf>),
     OpenNotebook(std::path::PathBuf),
     OpenAgent,
     OpenAgentSettings,

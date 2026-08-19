@@ -196,12 +196,19 @@ pub(crate) fn location_labels(hosts: &[RemoteHost]) -> Vec<String> {
     labels
 }
 
-/// One remembered Copy/Cut row. Paste stays within `loc` in v1.
+/// One remembered Copy/Cut entry: a path and whether it is a directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FsClipboardItem {
+    pub(crate) path: PathBuf,
+    pub(crate) is_dir: bool,
+}
+
+/// The remembered Copy/Cut rows. Paste iterates `items`; cross-location
+/// items stream, same-location items rename (cut) or copy.
 #[derive(Clone, Debug)]
 pub(crate) struct FsClipboard {
     pub(crate) loc: FsLocation,
-    pub(crate) path: PathBuf,
-    pub(crate) is_dir: bool,
+    pub(crate) items: Vec<FsClipboardItem>,
     pub(crate) cut: bool,
 }
 
@@ -1913,13 +1920,128 @@ fn plan_drop_with_limit(
     Ok(DropPlan { items, total_bytes })
 }
 
-/// Per-item result of a multi-item import.
+/// Per-item result of a multi-item batch (drop import, batch delete, batch
+/// paste): how many succeeded, and (display name, error) per failed item.
+/// Batches continue past ordinary failures and only abort on cancellation.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DropOutcome {
+pub(crate) struct BatchOutcome {
     pub(crate) done: usize,
-    /// (display name, error) per failed item; the batch continues past
-    /// ordinary failures and only aborts on cancellation.
     pub(crate) failed: Vec<(String, String)>,
+}
+
+/// Format one failed batch item's error for the summary toast.
+fn batch_failure(outcome: &mut BatchOutcome, display: String, error: &io::Error) {
+    let message =
+        jterm_core::review_input::safe_inline_display(&error.to_string(), MAX_ERROR_DISPLAY_BYTES);
+    outcome.failed.push((display, message));
+}
+
+/// Display name of a batch item path (escaped, unambiguous).
+fn batch_display_name(path: &Path) -> String {
+    match path.file_name() {
+        Some(name) => crate::file_tree::display_os_str(name),
+        None => crate::file_tree::display_full_path(path),
+    }
+}
+
+/// Paste every clipboard item into `dst_dir`: same-location items rename
+/// (cut) or recursive-copy, cross-location items stream via `transfer` with
+/// cancel/timeout intact. Cut sources are deleted only after their own
+/// transfer succeeded. `progress` receives the running completed-item count.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn paste_all(
+    hosts: &[RemoteHost],
+    clip_loc: &FsLocation,
+    items: &[FsClipboardItem],
+    dst_loc: &FsLocation,
+    dst_dir: &Path,
+    cut: bool,
+    control: &TransferControl,
+    progress: &dyn Fn(u64),
+) -> io::Result<BatchOutcome> {
+    let same_location = clip_loc == dst_loc;
+    let mut outcome = BatchOutcome {
+        done: 0,
+        failed: Vec::new(),
+    };
+    let mut moved = 0u64;
+    for item in items {
+        control.check()?;
+        let display = batch_display_name(&item.path);
+        let dst = paste_destination(dst_dir, &item.path);
+        let result = if same_location {
+            if dst == item.path {
+                Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "source and destination are the same",
+                ))
+            } else if cut {
+                rename(clip_loc, hosts, &item.path, &dst)
+            } else {
+                copy(clip_loc, hosts, &item.path, &dst)
+            }
+        } else {
+            transfer(
+                hosts,
+                clip_loc,
+                &item.path,
+                dst_loc,
+                dst_dir,
+                item.is_dir,
+                control,
+                &|_| {},
+            )
+            .map(drop)
+        };
+        match result {
+            Ok(()) => {
+                outcome.done += 1;
+                if cut && !same_location {
+                    // The copy half of the cut landed; deleting the source is
+                    // best-effort and reported per item.
+                    if let Err(error) = delete(clip_loc, hosts, &item.path) {
+                        let message = jterm_core::review_input::safe_inline_display(
+                            &error.to_string(),
+                            MAX_ERROR_DISPLAY_BYTES,
+                        );
+                        outcome.failed.push((
+                            display,
+                            format!("copied, but deleting the source failed: {message}"),
+                        ));
+                    }
+                }
+            }
+            Err(error) => {
+                if error.kind() == io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+                batch_failure(&mut outcome, display, &error);
+            }
+        }
+        moved += 1;
+        progress(moved);
+    }
+    Ok(outcome)
+}
+
+/// Delete every path, continuing past failures. `/` is refused per item by
+/// the delete op itself.
+pub(crate) fn delete_all(
+    loc: &FsLocation,
+    hosts: &[RemoteHost],
+    paths: &[PathBuf],
+) -> BatchOutcome {
+    let mut outcome = BatchOutcome {
+        done: 0,
+        failed: Vec::new(),
+    };
+    for path in paths {
+        match delete(loc, hosts, path) {
+            Ok(()) => outcome.done += 1,
+            Err(error) => batch_failure(&mut outcome, batch_display_name(path), &error),
+        }
+    }
+    outcome
 }
 
 /// Execute a drop plan item by item: copies via the local recursive copier,
@@ -1933,8 +2055,8 @@ pub(crate) fn run_drop(
     dst_dir: &Path,
     control: &TransferControl,
     progress: &dyn Fn(u64),
-) -> io::Result<DropOutcome> {
-    let mut outcome = DropOutcome {
+) -> io::Result<BatchOutcome> {
+    let mut outcome = BatchOutcome {
         done: 0,
         failed: Vec::new(),
     };
@@ -3399,5 +3521,122 @@ mod tests {
             0,
             "a cancelled batch copies nothing"
         );
+    }
+
+    // -- batch clipboard operations -------------------------------------------
+
+    fn clip_item(path: &Path, is_dir: bool) -> FsClipboardItem {
+        FsClipboardItem {
+            path: path.to_path_buf(),
+            is_dir,
+        }
+    }
+
+    #[test]
+    fn paste_all_copy_continues_past_collisions() {
+        let tmp = TestDir::new("paste-copy");
+        let a = tmp.path().join("a.txt");
+        let b = tmp.path().join("b.txt");
+        std::fs::write(&a, b"aaa").unwrap();
+        std::fs::write(&b, b"bbb").unwrap();
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir(&dst).unwrap();
+        std::fs::write(dst.join("a.txt"), b"old").unwrap();
+
+        let items = vec![clip_item(&a, false), clip_item(&b, false)];
+        let outcome = paste_all(
+            &[],
+            &FsLocation::Local,
+            &items,
+            &FsLocation::Local,
+            &dst,
+            false,
+            &TransferControl::new(),
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(outcome.done, 1, "b.txt copied");
+        assert_eq!(outcome.failed.len(), 1, "a.txt collided");
+        assert!(outcome.failed[0].0.contains("a.txt"));
+        assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"old");
+        assert_eq!(std::fs::read(dst.join("b.txt")).unwrap(), b"bbb");
+    }
+
+    #[test]
+    fn paste_all_cut_removes_only_successful_sources() {
+        let tmp = TestDir::new("paste-cut");
+        let ok = tmp.path().join("ok.txt");
+        let blocked = tmp.path().join("blocked.txt");
+        std::fs::write(&ok, b"ok").unwrap();
+        std::fs::write(&blocked, b"blocked").unwrap();
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir(&dst).unwrap();
+        std::fs::write(dst.join("blocked.txt"), b"existing").unwrap();
+
+        let items = vec![clip_item(&ok, false), clip_item(&blocked, false)];
+        let outcome = paste_all(
+            &[],
+            &FsLocation::Local,
+            &items,
+            &FsLocation::Local,
+            &dst,
+            true,
+            &TransferControl::new(),
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(outcome.done, 1);
+        assert_eq!(outcome.failed.len(), 1);
+        assert!(!ok.exists(), "the moved source is gone");
+        assert!(blocked.exists(), "the colliding source stays put");
+        assert_eq!(std::fs::read(dst.join("ok.txt")).unwrap(), b"ok");
+    }
+
+    #[test]
+    fn paste_all_refuses_same_directory_self_paste_per_item() {
+        let tmp = TestDir::new("paste-self");
+        let a = tmp.path().join("a.txt");
+        std::fs::write(&a, b"aaa").unwrap();
+        let items = vec![clip_item(&a, false)];
+        let outcome = paste_all(
+            &[],
+            &FsLocation::Local,
+            &items,
+            &FsLocation::Local,
+            tmp.path(),
+            false,
+            &TransferControl::new(),
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(outcome.done, 0);
+        assert_eq!(outcome.failed.len(), 1);
+        assert!(a.exists());
+    }
+
+    #[test]
+    fn delete_all_continues_past_failures_and_counts() {
+        let tmp = TestDir::new("delete-all");
+        let a = tmp.path().join("a.txt");
+        let b = tmp.path().join("b.txt");
+        std::fs::write(&a, b"1").unwrap();
+        std::fs::write(&b, b"2").unwrap();
+        let missing = tmp.path().join("missing.txt");
+
+        let outcome = delete_all(&FsLocation::Local, &[], &[a.clone(), missing, b.clone()]);
+        assert_eq!(outcome.done, 2);
+        assert_eq!(outcome.failed.len(), 1);
+        assert!(outcome.failed[0].0.contains("missing.txt"));
+        assert!(!a.exists() && !b.exists());
+
+        // The filesystem root survives a batch delete.
+        let outcome = delete_all(
+            &FsLocation::Local,
+            &[],
+            std::slice::from_ref(&PathBuf::from("/")),
+        );
+        assert_eq!(outcome.done, 0);
+        assert_eq!(outcome.failed.len(), 1);
+        assert!(Path::new("/").is_dir());
     }
 }

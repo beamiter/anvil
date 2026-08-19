@@ -13,8 +13,8 @@ use relm4::gtk;
 use gtk::glib;
 use gtk::prelude::*;
 use gtk::{
-    CellRendererPixbuf, CellRendererText, TreeIter, TreeRowReference, TreeStore, TreeView,
-    TreeViewColumn,
+    CellRendererPixbuf, CellRendererText, TreeIter, TreeModelFilter, TreeRowReference, TreeStore,
+    TreeView, TreeViewColumn,
 };
 use std::cell::{Cell, RefCell};
 use std::ffi::{OsStr, OsString};
@@ -343,12 +343,36 @@ pub(crate) fn new_store() -> TreeStore {
     ])
 }
 
-/// Build the headerless `TreeView` (icon + name in one column), no signals wired.
-pub(crate) fn new_view(store: &TreeStore) -> TreeView {
-    let view = TreeView::with_model(store);
+/// Build the headerless `TreeView` (icon + name in one column) over a
+/// `TreeModelFilter` driven by `filter`, with multi-selection enabled. No
+/// signals wired. Returns the filter model and the view; every path/iter the
+/// view hands out (signals, path_at_pos, selection) is in FILTER-model
+/// coordinates and must be converted before indexing `store`.
+pub(crate) fn new_view(
+    store: &TreeStore,
+    filter: &Rc<RefCell<TreeFilter>>,
+) -> (TreeModelFilter, TreeView) {
+    let filter_model = TreeModelFilter::new(store, None::<&gtk::TreePath>);
+    {
+        let filter = filter.clone();
+        filter_model.set_visible_func(move |model, iter| {
+            let state = filter.borrow();
+            if !state.is_active() {
+                return true;
+            }
+            let identity: String = model
+                .get_value(iter, COL_PATH as i32)
+                .get()
+                .unwrap_or_default();
+            // Placeholders (empty identity) never count as matches.
+            !identity.is_empty() && state.is_visible(&identity)
+        });
+    }
+    let view = TreeView::with_model(&filter_model);
     view.set_headers_visible(false);
     view.set_vexpand(true);
     view.set_tooltip_column(COL_TOOLTIP as i32);
+    view.selection().set_mode(gtk::SelectionMode::Multiple);
 
     let column = TreeViewColumn::new();
     let icon = CellRendererPixbuf::new();
@@ -358,7 +382,7 @@ pub(crate) fn new_view(store: &TreeStore) -> TreeView {
     column.pack_start(&text, true);
     column.add_attribute(&text, "text", COL_NAME as i32);
     view.append_column(&column);
-    view
+    (filter_model, view)
 }
 
 /// Insert one entry row under `parent` at `position` (None = append), with
@@ -675,6 +699,208 @@ pub(crate) fn copy_path_payload(path: &Path) -> String {
     display_full_path(path)
 }
 
+/// Right-click target resolution: a click inside the current selection aims
+/// the menu at the whole selection; a click outside collapses the selection
+/// to the clicked row first (the bool tells the caller to reselect).
+pub(crate) fn menu_targets(selected: &[PathBuf], clicked: &Path) -> (Vec<PathBuf>, bool) {
+    if selected.iter().any(|path| path == clicked) {
+        (selected.to_vec(), false)
+    } else {
+        (vec![clicked.to_path_buf()], true)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Client-side filter of the loaded tree
+// ---------------------------------------------------------------------------
+
+/// Live filter state for the sidebar tree. While active, `visible` holds the
+/// identities shown (matches plus ancestors); clearing restores the expansion
+/// snapshot taken when filtering began.
+pub(crate) struct TreeFilter {
+    query: String,
+    visible: std::collections::HashSet<String>,
+    saved_expansion: Option<std::collections::HashSet<String>>,
+}
+
+impl TreeFilter {
+    pub(crate) fn new() -> Self {
+        Self {
+            query: String::new(),
+            visible: std::collections::HashSet::new(),
+            saved_expansion: None,
+        }
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        !self.query.is_empty()
+    }
+
+    fn is_visible(&self, identity: &str) -> bool {
+        !self.is_active() || self.visible.contains(identity)
+    }
+}
+
+/// One loaded row for filter planning: path identity, display name, parent
+/// (index into the same list, depth-first order).
+pub(crate) struct FilterRow {
+    pub(crate) identity: String,
+    pub(crate) name: String,
+    pub(crate) parent: Option<usize>,
+}
+
+/// Rows whose name contains `query` (case-insensitive) plus every ancestor
+/// of a match. An empty query keeps everything.
+pub(crate) fn filter_visible(rows: &[FilterRow], query: &str) -> Vec<bool> {
+    let query = query.to_lowercase();
+    if query.is_empty() {
+        return vec![true; rows.len()];
+    }
+    let mut visible = vec![false; rows.len()];
+    for (index, row) in rows.iter().enumerate() {
+        if row.name.to_lowercase().contains(&query) {
+            visible[index] = true;
+            let mut parent = row.parent;
+            while let Some(index) = parent {
+                if visible[index] {
+                    break;
+                }
+                visible[index] = true;
+                parent = rows[index].parent;
+            }
+        }
+    }
+    visible
+}
+
+/// All loaded rows in depth-first order with their store paths.
+fn collect_filter_rows(store: &TreeStore) -> (Vec<FilterRow>, Vec<gtk::TreePath>) {
+    fn walk(
+        store: &TreeStore,
+        parent: Option<&TreeIter>,
+        parent_index: Option<usize>,
+        rows: &mut Vec<FilterRow>,
+        paths: &mut Vec<gtk::TreePath>,
+    ) {
+        let mut index = 0;
+        while let Some(iter) = store.iter_nth_child(parent, index) {
+            let identity: String = store
+                .get_value(&iter, COL_PATH as i32)
+                .get()
+                .unwrap_or_default();
+            if identity.is_empty() {
+                index += 1;
+                continue; // placeholders are not filterable rows
+            }
+            let name: String = store
+                .get_value(&iter, COL_NAME as i32)
+                .get()
+                .unwrap_or_default();
+            let row_index = rows.len();
+            rows.push(FilterRow {
+                identity,
+                name,
+                parent: parent_index,
+            });
+            paths.push(store.path(&iter));
+            walk(store, Some(&iter), Some(row_index), rows, paths);
+            index += 1;
+        }
+    }
+    let mut rows = Vec::new();
+    let mut paths = Vec::new();
+    walk(store, None, None, &mut rows, &mut paths);
+    (rows, paths)
+}
+
+/// Apply or update the filter: recompute visibility over the loaded rows,
+/// refilter, and auto-expand ancestors of matches. On clear, restore the
+/// expansion snapshot from when filtering began. Pure lookup — never scans.
+pub(crate) fn apply_tree_filter(
+    store: &TreeStore,
+    view: &TreeView,
+    filter_model: &TreeModelFilter,
+    state: &mut TreeFilter,
+    query: &str,
+) {
+    let was_active = state.is_active();
+    if !was_active && !query.is_empty() {
+        state.saved_expansion = Some(collect_expanded_identities(store, view, filter_model));
+    }
+    state.query.clear();
+    state.query.push_str(query);
+    if state.is_active() {
+        let (rows, _) = collect_filter_rows(store);
+        let visible = filter_visible(&rows, query);
+        state.visible = rows
+            .iter()
+            .zip(visible.iter())
+            .filter(|(_, visible)| **visible)
+            .map(|(row, _)| row.identity.clone())
+            .collect();
+    } else {
+        state.visible.clear();
+    }
+    filter_model.refilter();
+    if state.is_active() {
+        // Expand every ancestor of a visible row. Those rows are all fully
+        // loaded (a loaded descendant implies a loaded chain), so this never
+        // triggers a scan.
+        let (rows, paths) = collect_filter_rows(store);
+        let mut expand = vec![false; rows.len()];
+        for index in 0..rows.len() {
+            if !state.visible.contains(&rows[index].identity) {
+                continue;
+            }
+            let mut parent = rows[index].parent;
+            while let Some(p) = parent {
+                expand[p] = true;
+                parent = rows[p].parent;
+            }
+        }
+        for (index, _) in rows.iter().enumerate() {
+            if !expand[index] {
+                continue;
+            }
+            if let Some(filter_path) = filter_model.convert_child_path_to_path(&paths[index]) {
+                view.expand_row(&filter_path, false);
+            }
+        }
+    } else if was_active {
+        view.collapse_all();
+        if let Some(saved) = state.saved_expansion.take() {
+            let (rows, paths) = collect_filter_rows(store);
+            for (index, row) in rows.iter().enumerate() {
+                if !saved.contains(&row.identity) {
+                    continue;
+                }
+                if let Some(filter_path) = filter_model.convert_child_path_to_path(&paths[index]) {
+                    view.expand_row(&filter_path, false);
+                }
+            }
+        }
+    }
+}
+
+/// Identities of every currently expanded row, for the clear-time restore.
+fn collect_expanded_identities(
+    store: &TreeStore,
+    view: &TreeView,
+    filter_model: &TreeModelFilter,
+) -> std::collections::HashSet<String> {
+    let (rows, paths) = collect_filter_rows(store);
+    let mut expanded = std::collections::HashSet::new();
+    for (index, row) in rows.iter().enumerate() {
+        let expanded_now = filter_model
+            .convert_child_path_to_path(&paths[index])
+            .is_some_and(|filter_path| view.row_expanded(&filter_path));
+        if expanded_now {
+            expanded.insert(row.identity.clone());
+        }
+    }
+    expanded
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -747,6 +973,74 @@ mod tests {
         // Non-UTF-8 names keep the unambiguous escaped display form.
         let weird = PathBuf::from(OsString::from_vec(b"/tmp/a\xffb".to_vec()));
         assert_eq!(copy_path_payload(&weird), r"/tmp/a\xffb");
+    }
+
+    #[test]
+    fn menu_targets_selection_inside_vs_outside() {
+        let selected = vec![PathBuf::from("/a/one"), PathBuf::from("/a/two")];
+
+        // A click inside the selection targets the whole selection and keeps it.
+        let (targets, collapse) = menu_targets(&selected, Path::new("/a/two"));
+        assert_eq!(targets, selected);
+        assert!(!collapse);
+
+        // A click outside targets that row alone and collapses the selection.
+        let (targets, collapse) = menu_targets(&selected, Path::new("/a/other"));
+        assert_eq!(targets, [PathBuf::from("/a/other")]);
+        assert!(collapse);
+
+        // No selection at all behaves like a plain single-row click.
+        let (targets, collapse) = menu_targets(&[], Path::new("/a/one"));
+        assert_eq!(targets, [PathBuf::from("/a/one")]);
+        assert!(collapse);
+    }
+
+    // -- tree filter (loaded rows only) ---------------------------------------
+
+    /// rows: (identity, name, parent index)
+    fn filter_rows(spec: &[(&str, &str, Option<usize>)]) -> Vec<FilterRow> {
+        spec.iter()
+            .map(|(identity, name, parent)| FilterRow {
+                identity: (*identity).to_string(),
+                name: (*name).to_string(),
+                parent: *parent,
+            })
+            .collect()
+    }
+
+    fn visible_names<'a>(rows: &'a [FilterRow], query: &str) -> Vec<&'a str> {
+        rows.iter()
+            .zip(filter_visible(rows, query))
+            .filter(|(_, visible)| *visible)
+            .map(|(row, _)| row.name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn filter_visible_matches_and_keeps_ancestors() {
+        let rows = filter_rows(&[
+            ("/r", "r", None),                         // 0
+            ("/r/docs", "docs", Some(0)),              // 1
+            ("/r/docs/notes.md", "notes.md", Some(1)), // 2
+            ("/r/src", "src", Some(0)),                // 3
+            ("/r/src/main.rs", "main.rs", Some(3)),    // 4
+            ("/r/README.md", "README.md", Some(0)),    // 5
+        ]);
+
+        // Nested match keeps the whole ancestor chain, hides siblings.
+        assert_eq!(visible_names(&rows, "notes"), ["r", "docs", "notes.md"]);
+        // Case-insensitive.
+        assert_eq!(visible_names(&rows, "README"), ["r", "README.md"]);
+        // Multiple matches keep each ancestor chain once.
+        assert_eq!(
+            visible_names(&rows, "md"),
+            ["r", "docs", "notes.md", "README.md"]
+        );
+        // No match → nothing visible.
+        assert!(visible_names(&rows, "zzz").is_empty());
+        // Empty query is the identity.
+        assert_eq!(filter_visible(&rows, ""), vec![true; rows.len()]);
+        assert_eq!(filter_visible(&rows, "  "), vec![false; 6]); // "  " matches nothing
     }
 
     // -- merge refresh (in-place directory update) ----------------------------

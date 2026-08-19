@@ -69,6 +69,12 @@ pub(crate) enum FileHeaderMsg {
     /// The user moved the selector; internal, keeps programmatic rebuilds from
     /// echoing back as location switches.
     LocationActivated(usize),
+    /// The magnifier toggle moved; opens/closes the inline filter entry.
+    ToggleFilter,
+    /// The filter entry's text changed (also fired when closing clears it).
+    FilterEdited(String),
+    /// Esc in the entry or a programmatic close (e.g. a root change).
+    CloseFilter,
 }
 
 #[derive(Debug)]
@@ -77,6 +83,8 @@ pub(crate) enum FileHeaderOutput {
     CurrentDirectory,
     /// Dropdown index: 0 is Local, i > 0 is `config.remote_hosts[i - 1]`.
     SelectLocation(usize),
+    /// Current filter query; "" when the filter is closed or cleared.
+    FilterChanged(String),
 }
 
 pub(crate) struct FileHeaderModel {
@@ -84,6 +92,7 @@ pub(crate) struct FileHeaderModel {
     tooltip: String,
     selected: usize,
     suppress_location_signal: bool,
+    filter_open: bool,
 }
 
 #[relm4::component(pub(crate))]
@@ -96,45 +105,68 @@ impl Component for FileHeaderModel {
 
     view! {
         root = gtk::Box {
-            set_orientation: gtk::Orientation::Horizontal,
+            set_orientation: gtk::Orientation::Vertical,
             set_spacing: 2,
 
-            #[name(location_dropdown)]
-            gtk::DropDown {
-                set_tooltip_text: Some("Choose which filesystem the tree browses"),
-                connect_selected_notify[sender] => move |dropdown| {
-                    sender.input(FileHeaderMsg::LocationActivated(dropdown.selected() as usize));
+            gtk::Box {
+                set_orientation: gtk::Orientation::Horizontal,
+                set_spacing: 2,
+
+                #[name(location_dropdown)]
+                gtk::DropDown {
+                    set_tooltip_text: Some("Choose which filesystem the tree browses"),
+                    connect_selected_notify[sender] => move |dropdown| {
+                        sender.input(FileHeaderMsg::LocationActivated(dropdown.selected() as usize));
+                    },
+                },
+
+                gtk::Button {
+                    set_icon_name: "go-up-symbolic",
+                    set_tooltip_text: Some("Parent directory"),
+                    update_property: &[
+                        gtk::accessible::Property::Label(PARENT_DIRECTORY_LABEL),
+                    ],
+                    connect_clicked[sender] => move |_| {
+                        let _ = sender.output(FileHeaderOutput::Up);
+                    },
+                },
+
+                gtk::Button {
+                    set_icon_name: "go-home-symbolic",
+                    set_tooltip_text: Some("Go to current directory"),
+                    update_property: &[
+                        gtk::accessible::Property::Label(CURRENT_DIRECTORY_LABEL),
+                    ],
+                    connect_clicked[sender] => move |_| {
+                        let _ = sender.output(FileHeaderOutput::CurrentDirectory);
+                    },
+                },
+
+                #[name(root_label)]
+                gtk::Label {
+                    set_label: "~",
+                    set_xalign: 0.0,
+                    set_hexpand: true,
+                    set_ellipsize: gtk::pango::EllipsizeMode::Start,
+                },
+
+                #[name(filter_button)]
+                gtk::ToggleButton {
+                    set_icon_name: "edit-find-symbolic",
+                    set_tooltip_text: Some("Filter the loaded rows"),
+                    connect_toggled[sender] => move |_| {
+                        sender.input(FileHeaderMsg::ToggleFilter);
+                    },
                 },
             },
 
-            gtk::Button {
-                set_icon_name: "go-up-symbolic",
-                set_tooltip_text: Some("Parent directory"),
-                update_property: &[
-                    gtk::accessible::Property::Label(PARENT_DIRECTORY_LABEL),
-                ],
-                connect_clicked[sender] => move |_| {
-                    let _ = sender.output(FileHeaderOutput::Up);
+            #[name(filter_entry)]
+            gtk::Entry {
+                set_placeholder_text: Some("Filter loaded rows…"),
+                set_visible: false,
+                connect_changed[sender] => move |entry| {
+                    sender.input(FileHeaderMsg::FilterEdited(entry.text().to_string()));
                 },
-            },
-
-            gtk::Button {
-                set_icon_name: "go-home-symbolic",
-                set_tooltip_text: Some("Go to current directory"),
-                update_property: &[
-                    gtk::accessible::Property::Label(CURRENT_DIRECTORY_LABEL),
-                ],
-                connect_clicked[sender] => move |_| {
-                    let _ = sender.output(FileHeaderOutput::CurrentDirectory);
-                },
-            },
-
-            #[name(root_label)]
-            gtk::Label {
-                set_label: "~",
-                set_xalign: 0.0,
-                set_hexpand: true,
-                set_ellipsize: gtk::pango::EllipsizeMode::Start,
             },
         }
     }
@@ -149,12 +181,25 @@ impl Component for FileHeaderModel {
             tooltip: String::new(),
             selected: 0,
             suppress_location_signal: false,
+            filter_open: false,
         };
         let widgets = view_output!();
         let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
         widgets
             .location_dropdown
             .set_model(Some(&gtk::StringList::new(&refs)));
+        // Esc inside the entry closes the filter.
+        let key_controller = gtk::EventControllerKey::new();
+        {
+            let sender = sender.clone();
+            key_controller.connect_key_pressed(move |_, key, _, _| {
+                if key == gtk::gdk::Key::Escape {
+                    sender.input(FileHeaderMsg::CloseFilter);
+                }
+                gtk::glib::Propagation::Proceed
+            });
+        }
+        widgets.filter_entry.add_controller(key_controller);
         ComponentParts { model, widgets }
     }
 
@@ -189,6 +234,25 @@ impl Component for FileHeaderModel {
                 if !self.suppress_location_signal && index != self.selected {
                     self.selected = index;
                     let _ = sender.output(FileHeaderOutput::SelectLocation(index));
+                }
+            }
+            FileHeaderMsg::ToggleFilter => {
+                self.filter_open = widgets.filter_button.is_active();
+                widgets.filter_entry.set_visible(self.filter_open);
+                if self.filter_open {
+                    widgets.filter_entry.grab_focus();
+                } else {
+                    // Clearing the text fires FilterEdited(""), which resets
+                    // the tree filter through the output channel.
+                    widgets.filter_entry.set_text("");
+                }
+            }
+            FileHeaderMsg::FilterEdited(text) => {
+                let _ = sender.output(FileHeaderOutput::FilterChanged(text));
+            }
+            FileHeaderMsg::CloseFilter => {
+                if self.filter_open {
+                    widgets.filter_button.set_active(false);
                 }
             }
         }

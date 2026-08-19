@@ -217,6 +217,11 @@ struct AppModel {
     file_header: Controller<sidebar::FileHeaderModel>,
     file_tree_root: Rc<RefCell<std::path::PathBuf>>,
     file_tree_scan_generation: Rc<std::cell::Cell<u64>>,
+    /// The tree view, its filter model, and the live filter state behind the
+    /// header's filter entry.
+    file_tree_view: gtk::TreeView,
+    file_tree_filter_model: gtk::TreeModelFilter,
+    file_tree_filter: Rc<RefCell<file_tree::TreeFilter>>,
     /// Which filesystem the tree browses; drives both scans and file ops.
     file_tree_location: Rc<RefCell<remote_fs::FsLocation>>,
     /// Copy/Cut row awaiting a Paste; usable only in its source location.
@@ -623,6 +628,9 @@ impl SimpleComponent for AppModel {
         let file_tree_clipboard = Rc::new(RefCell::new(None));
         let startup_ui::FileTreeUi {
             store: file_tree_store,
+            filter_model: file_tree_filter_model,
+            view: file_tree_view,
+            filter: file_tree_filter,
             scroll: file_tree_scroll,
             header: file_header,
             scan_generation: file_tree_scan_generation,
@@ -1023,6 +1031,9 @@ impl SimpleComponent for AppModel {
             file_header,
             file_tree_root: Rc::new(RefCell::new(std::path::PathBuf::new())),
             file_tree_scan_generation,
+            file_tree_view,
+            file_tree_filter_model,
+            file_tree_filter,
             file_tree_location,
             file_tree_clipboard,
             file_tree_transfer_toast: Rc::new(RefCell::new(None)),
@@ -2043,18 +2054,15 @@ impl SimpleComponent for AppModel {
             AppMsg::FileTreeNewFile { dir } => self.file_tree_prompt_new(dir, false, &sender),
             AppMsg::FileTreeNewFolder { dir } => self.file_tree_prompt_new(dir, true, &sender),
             AppMsg::FileTreeRename { path } => self.file_tree_prompt_rename(path, &sender),
-            AppMsg::FileTreeDelete { path } => self.file_tree_confirm_delete(path, &sender),
-            AppMsg::FileTreeCopy { path, is_dir } => {
-                self.file_tree_clipboard_set(path, is_dir, false)
-            }
-            AppMsg::FileTreeCut { path, is_dir } => {
-                self.file_tree_clipboard_set(path, is_dir, true)
-            }
+            AppMsg::FileTreeDelete { paths } => self.file_tree_confirm_delete(paths, &sender),
+            AppMsg::FileTreeCopy { items } => self.file_tree_clipboard_set(items, false),
+            AppMsg::FileTreeCut { items } => self.file_tree_clipboard_set(items, true),
             AppMsg::FileTreePaste { dir } => self.file_tree_paste(dir, &sender),
             AppMsg::FileTreeImportPaths { paths, dir } => {
                 self.file_tree_import_paths(paths, dir, &sender)
             }
             AppMsg::FileTreeRefresh => self.file_tree_refresh(),
+            AppMsg::FileTreeFilterChanged(query) => self.file_tree_apply_filter(&query),
             AppMsg::FileTreeOpSucceeded(dirs) => self.refresh_tree_dirs(dirs),
             AppMsg::FileTreeCreateNamed { dir, name, is_dir } => {
                 self.file_tree_create_named(dir, name, is_dir, &sender)
@@ -2062,7 +2070,9 @@ impl SimpleComponent for AppModel {
             AppMsg::FileTreeRenameNamed { src, name } => {
                 self.file_tree_rename_named(src, name, &sender)
             }
-            AppMsg::FileTreeDeleteConfirmed(path) => self.file_tree_delete_confirmed(path, &sender),
+            AppMsg::FileTreeDeleteConfirmed(paths) => {
+                self.file_tree_delete_confirmed(paths, &sender)
+            }
             AppMsg::SetSidebarView(view) => self.apply_sidebar_view(view, true),
             AppMsg::Ignore => {}
         }

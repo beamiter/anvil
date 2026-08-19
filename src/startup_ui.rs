@@ -119,6 +119,9 @@ pub(crate) fn install_dynamic_css_provider() -> gtk::CssProvider {
 #[allow(deprecated)]
 pub(crate) struct FileTreeUi {
     pub(crate) store: gtk::TreeStore,
+    pub(crate) filter_model: gtk::TreeModelFilter,
+    pub(crate) view: gtk::TreeView,
+    pub(crate) filter: Rc<RefCell<file_tree::TreeFilter>>,
     pub(crate) scroll: gtk::ScrolledWindow,
     pub(crate) header: Controller<sidebar::FileHeaderModel>,
     pub(crate) scan_generation: Rc<std::cell::Cell<u64>>,
@@ -132,25 +135,36 @@ pub(crate) fn build_file_tree(
     clipboard: &Rc<RefCell<Option<remote_fs::FsClipboard>>>,
 ) -> FileTreeUi {
     let store = file_tree::new_store();
-    let view = file_tree::new_view(&store);
+    let filter = Rc::new(RefCell::new(file_tree::TreeFilter::new()));
+    let (filter_model, view) = file_tree::new_view(&store, &filter);
     let scan_generation = Rc::new(std::cell::Cell::new(0));
     view.add_css_class("file-tree");
 
     {
         let store = store.clone();
+        let filter_model = filter_model.clone();
         let scan_generation = scan_generation.clone();
         let config = config.clone();
         let location = location.clone();
         view.connect_row_expanded(move |_view, iter, _path| {
+            // The view's rows are filter-model coordinates; the store works
+            // in child coordinates.
+            let iter = filter_model.convert_iter_to_child_iter(iter);
             let hosts = config.borrow().remote_hosts.clone();
-            file_tree::on_expand(&store, iter, &scan_generation, &location, hosts);
+            file_tree::on_expand(&store, &iter, &scan_generation, &location, hosts);
         });
     }
     {
         let store = store.clone();
+        let filter_model = filter_model.clone();
         let sender = sender.clone();
         view.connect_row_activated(move |view, path, _column| {
-            let Some(iter) = store.iter(path) else { return };
+            let Some(child_path) = filter_model.convert_path_to_child_path(path) else {
+                return;
+            };
+            let Some(iter) = store.iter(&child_path) else {
+                return;
+            };
             let is_dir: bool = store
                 .get_value(&iter, file_tree::COL_IS_DIR as i32)
                 .get()
@@ -184,11 +198,13 @@ pub(crate) fn build_file_tree(
     }
     {
         // Right-click context menu: file operations for the row under the
-        // pointer, or for the tree root when the pointer is over empty space.
+        // pointer (or the whole selection when it contains that row), or for
+        // the tree root when the pointer is over empty space.
         let gesture = gtk::GestureClick::new();
         gesture.set_button(3);
         let view_for_gesture = view.clone();
         let store_for_gesture = store.clone();
+        let filter_model_for_gesture = filter_model.clone();
         let location = location.clone();
         let clipboard = clipboard.clone();
         let sender = sender.clone();
@@ -197,6 +213,7 @@ pub(crate) fn build_file_tree(
             show_file_tree_context_menu(
                 &view_for_gesture,
                 &store_for_gesture,
+                &filter_model_for_gesture,
                 x,
                 y,
                 &location,
@@ -216,8 +233,9 @@ pub(crate) fn build_file_tree(
         {
             let view = view.clone();
             let store = store.clone();
+            let filter_model = filter_model.clone();
             drop_target.connect_motion(move |_, x, y| {
-                match row_at_pos(&view, &store, x, y) {
+                match row_at_pos(&view, &store, &filter_model, x, y) {
                     Some((_, true, tree_path)) => {
                         view.set_drag_dest_row(
                             Some(&tree_path),
@@ -245,6 +263,7 @@ pub(crate) fn build_file_tree(
         {
             let view = view.clone();
             let store = store.clone();
+            let filter_model = filter_model.clone();
             let sender = sender.clone();
             drop_target.connect_drop(move |_, value, x, y| {
                 view.set_drag_dest_row(None, gtk::TreeViewDropPosition::After);
@@ -259,7 +278,7 @@ pub(crate) fn build_file_tree(
                 if paths.is_empty() {
                     return false;
                 }
-                let target_dir = match row_at_pos(&view, &store, x, y) {
+                let target_dir = match row_at_pos(&view, &store, &filter_model, x, y) {
                     Some((path, true, _)) => Some(path),
                     Some((path, false, _)) => path.parent().map(std::path::Path::to_path_buf),
                     None => None,
@@ -286,29 +305,37 @@ pub(crate) fn build_file_tree(
             sidebar::FileHeaderOutput::SelectLocation(index) => {
                 AppMsg::FileTreeSelectLocation(index)
             }
+            sidebar::FileHeaderOutput::FilterChanged(query) => AppMsg::FileTreeFilterChanged(query),
         },
     );
 
     FileTreeUi {
         store,
+        filter_model,
+        view,
+        filter,
         scroll,
         header,
         scan_generation,
     }
 }
 
-/// The tree row at view coordinates: (filesystem path, is_dir, tree path).
-/// Rows without a valid identity (placeholders) resolve to nothing.
+/// The tree row at view coordinates: (filesystem path, is_dir, view path).
+/// Rows without a valid identity (placeholders) resolve to nothing. The
+/// returned TreePath stays in VIEW coordinates (for drag highlight and
+/// selection), the path is decoded from the child store.
 #[allow(deprecated)]
 fn row_at_pos(
     view: &gtk::TreeView,
     store: &gtk::TreeStore,
+    filter_model: &gtk::TreeModelFilter,
     x: f64,
     y: f64,
 ) -> Option<(std::path::PathBuf, bool, gtk::TreePath)> {
-    let (tree_path, _column, _x, _y) = view.path_at_pos(x as i32, y as i32)?;
-    let tree_path = tree_path?;
-    let iter = store.iter(&tree_path)?;
+    let (view_path, _column, _x, _y) = view.path_at_pos(x as i32, y as i32)?;
+    let view_path = view_path?;
+    let child_path = filter_model.convert_path_to_child_path(&view_path)?;
+    let iter = store.iter(&child_path)?;
     let identity: String = store
         .get_value(&iter, file_tree::COL_PATH as i32)
         .get()
@@ -321,7 +348,7 @@ fn row_at_pos(
         .get_value(&iter, file_tree::COL_IS_DIR as i32)
         .get()
         .unwrap_or(false);
-    Some((path, is_dir, tree_path))
+    Some((path, is_dir, view_path))
 }
 
 /// One menu row, styled like the tab strip's context-menu buttons.
@@ -353,41 +380,77 @@ fn add_file_menu_item(
 }
 
 #[allow(deprecated)]
+#[allow(clippy::too_many_arguments)]
 fn show_file_tree_context_menu(
     view: &gtk::TreeView,
     store: &gtk::TreeStore,
+    filter_model: &gtk::TreeModelFilter,
     x: f64,
     y: f64,
     location: &Rc<RefCell<remote_fs::FsLocation>>,
     clipboard: &Rc<RefCell<Option<remote_fs::FsClipboard>>>,
     sender: &ComponentSender<AppModel>,
 ) {
-    // Resolve the row under the pointer to (path, is_dir); rows without a
-    // valid identity (placeholders) behave like empty space.
-    let row = view
-        .path_at_pos(x as i32, y as i32)
-        .and_then(|(path, _column, _x, _y)| path)
-        .and_then(|path| store.iter(&path))
-        .and_then(|iter| {
+    // Resolve the row under the pointer and the current selection. A click
+    // inside the selection aims the menu at the whole selection; a click
+    // outside collapses the selection to that row first.
+    let clicked = row_at_pos(view, store, filter_model, x, y);
+    let selection = view.selection();
+    let mut targets: Vec<(std::path::PathBuf, bool)> = Vec::new();
+    if let Some((path, is_dir, view_path)) = &clicked {
+        let (selected_view_paths, _model) = selection.selected_rows();
+        let mut selected: Vec<(std::path::PathBuf, bool)> = Vec::new();
+        for selected_view_path in &selected_view_paths {
+            let Some(child_path) = filter_model.convert_path_to_child_path(selected_view_path)
+            else {
+                continue;
+            };
+            let Some(iter) = store.iter(&child_path) else {
+                continue;
+            };
             let identity: String = store
                 .get_value(&iter, file_tree::COL_PATH as i32)
                 .get()
                 .unwrap_or_default();
             if identity.is_empty() {
-                return None;
+                continue;
             }
-            let path = file_tree::decode_path_identity(&identity)?;
-            let is_dir: bool = store
+            let Some(selected_path) = file_tree::decode_path_identity(&identity) else {
+                continue;
+            };
+            let selected_is_dir: bool = store
                 .get_value(&iter, file_tree::COL_IS_DIR as i32)
                 .get()
                 .unwrap_or(false);
-            Some((path, is_dir))
-        });
+            selected.push((selected_path, selected_is_dir));
+        }
+        let selected_paths: Vec<std::path::PathBuf> =
+            selected.iter().map(|(path, _)| path.clone()).collect();
+        let (target_paths, collapse) = file_tree::menu_targets(&selected_paths, path);
+        if collapse {
+            selection.unselect_all();
+            selection.select_path(view_path);
+            targets.push((path.clone(), *is_dir));
+        } else {
+            targets = target_paths
+                .iter()
+                .map(|target| {
+                    let target_is_dir = selected
+                        .iter()
+                        .find(|(selected_path, _)| selected_path == target)
+                        .map(|(_, is_dir)| *is_dir)
+                        .unwrap_or(*is_dir);
+                    (target.clone(), target_is_dir)
+                })
+                .collect();
+        }
+    }
+    let multi = targets.len() > 1;
     // New entries and pastes land in the clicked directory, next to the
     // clicked file, or at the current root (handled message-side via None).
-    let target_dir = match &row {
-        Some((path, true)) => Some(path.clone()),
-        Some((path, false)) => path.parent().map(std::path::Path::to_path_buf),
+    let target_dir = match &clicked {
+        Some((path, true, _)) => Some(path.clone()),
+        Some((path, false, _)) => path.parent().map(std::path::Path::to_path_buf),
         None => None,
     };
 
@@ -424,47 +487,67 @@ fn show_file_tree_context_menu(
     let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
     menu.add_css_class("menu");
 
-    add_file_menu_item(
-        &menu,
-        "New File",
-        &popover,
-        sender,
-        AppMsg::FileTreeNewFile {
-            dir: target_dir.clone(),
-        },
-    );
-    add_file_menu_item(
-        &menu,
-        "New Folder",
-        &popover,
-        sender,
-        AppMsg::FileTreeNewFolder {
-            dir: target_dir.clone(),
-        },
-    );
-    if let Some((path, is_dir)) = &row {
+    // Creating and renaming are single-target operations; insensitive under
+    // a multi-selection.
+    let new_file = file_menu_button("New File");
+    new_file.set_sensitive(!multi);
+    {
+        let popover = popover.clone();
+        let sender = sender.clone();
+        let dir = target_dir.clone();
+        new_file.connect_clicked(move |_| {
+            popover.popdown();
+            sender.input(AppMsg::FileTreeNewFile { dir: dir.clone() });
+        });
+    }
+    menu.append(&new_file);
+    let new_folder = file_menu_button("New Folder");
+    new_folder.set_sensitive(!multi);
+    {
+        let popover = popover.clone();
+        let sender = sender.clone();
+        let dir = target_dir.clone();
+        new_folder.connect_clicked(move |_| {
+            popover.popdown();
+            sender.input(AppMsg::FileTreeNewFolder { dir: dir.clone() });
+        });
+    }
+    menu.append(&new_folder);
+    if let Some((path, _is_dir, _)) = &clicked {
+        let rename = file_menu_button("Rename");
+        rename.set_sensitive(!multi);
+        {
+            let popover = popover.clone();
+            let sender = sender.clone();
+            let path = path.clone();
+            rename.connect_clicked(move |_| {
+                popover.popdown();
+                sender.input(AppMsg::FileTreeRename { path: path.clone() });
+            });
+        }
+        menu.append(&rename);
+
+        let paths: Vec<std::path::PathBuf> = targets.iter().map(|(path, _)| path.clone()).collect();
+        let delete_label = if multi {
+            format!("Delete {} items", targets.len())
+        } else {
+            "Delete".to_string()
+        };
         add_file_menu_item(
             &menu,
-            "Rename",
+            &delete_label,
             &popover,
             sender,
-            AppMsg::FileTreeRename { path: path.clone() },
+            AppMsg::FileTreeDelete { paths },
         );
-        add_file_menu_item(
-            &menu,
-            "Delete",
-            &popover,
-            sender,
-            AppMsg::FileTreeDelete { path: path.clone() },
-        );
+        let items: Vec<(std::path::PathBuf, bool)> = targets.clone();
         add_file_menu_item(
             &menu,
             "Copy",
             &popover,
             sender,
             AppMsg::FileTreeCopy {
-                path: path.clone(),
-                is_dir: *is_dir,
+                items: items.clone(),
             },
         );
         add_file_menu_item(
@@ -472,18 +555,20 @@ fn show_file_tree_context_menu(
             "Cut",
             &popover,
             sender,
-            AppMsg::FileTreeCut {
-                path: path.clone(),
-                is_dir: *is_dir,
-            },
+            AppMsg::FileTreeCut { items },
         );
         {
             // Remote rows copy the plain remote path (no prefix): that is
-            // what users paste into the remote shell.
+            // what users paste into the remote shell. A multi-selection
+            // copies one full path per line.
             let button = file_menu_button("Copy Path");
             let popover = popover.clone();
             let sender = sender.clone();
-            let payload = file_tree::copy_path_payload(path);
+            let payload = targets
+                .iter()
+                .map(|(path, _)| file_tree::copy_path_payload(path))
+                .collect::<Vec<_>>()
+                .join("\n");
             button.connect_clicked(move |_| {
                 popover.popdown();
                 if let Some(display) = gtk::gdk::Display::default() {
