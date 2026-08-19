@@ -6986,6 +6986,67 @@ fn viewport_rows_for(vte: &Terminal, scroll: &ScrolledWindow) -> Option<i64> {
     Some(((usable / cell_h).max(1)) as i64)
 }
 
+/// Rows the live card shows while a command is running.
+///
+/// The grid underneath stays a full viewport — that is the winsize the child
+/// was given — but the card is only as tall as the output produced so far. Same
+/// rule ember and frost apply to their live block: the greater of the idle
+/// prompt's height and the content extent, capped by the viewport. Feeding it a
+/// high-water extent keeps a repaint that parks the cursor back at the top from
+/// shrinking the card mid-command.
+fn live_visible_rows(extent: i64, viewport_rows: i64) -> i64 {
+    let floor = (MIN_INPUT_ROWS as i64).min(viewport_rows);
+    extent.clamp(floor, viewport_rows.max(floor))
+}
+
+/// How many rows of the live grid this command has reached: the top of the
+/// screen down to the cursor.
+///
+/// Screen-relative on purpose. VTE row numbers are absolute ring coordinates
+/// that climb for the whole session (and `[H[2J` does not reset them), so
+/// `cursor_position` alone measures the session, not the block. `upper -
+/// page_size` is the first row of the screen — the row the in-stream clear at
+/// the previous `reset_active` homed the cursor to — and unlike the
+/// adjustment's `value` it does not move when the user scrolls the live
+/// terminal back.
+fn live_content_extent(vte: &Terminal) -> Option<i64> {
+    let adjustment = gtk::prelude::ScrollableExt::vadjustment(vte)?;
+    live_content_extent_for(
+        adjustment.lower(),
+        adjustment.upper(),
+        adjustment.page_size(),
+        vte.cursor_position().1,
+    )
+}
+
+/// The arithmetic behind [`live_content_extent`], separated so it can be tested
+/// without a display.
+///
+/// `None` means the extent is not measurable right now, and the caller must
+/// fall back to a full-viewport card. That happens when the running command
+/// emits `ESC[3J` (what `clear` sends to drop the scrollback): measured, VTE
+/// renumbers the adjustment down to the screen but leaves `cursor_position` in
+/// the old ring coordinates, so the two stop describing the same buffer and any
+/// difference between them is meaningless. `cursor_row > upper` is the tell —
+/// the cursor is always inside the buffer the adjustment describes, except that
+/// a cursor resting one row past the last written row is normal, so the test
+/// has to be strict. The next prompt's `reset_active` re-bases both.
+fn live_content_extent_for(lower: f64, upper: f64, page_size: f64, cursor_row: i64) -> Option<i64> {
+    if !lower.is_finite() || !upper.is_finite() || !page_size.is_finite() {
+        return None;
+    }
+    if cursor_row > upper as i64 {
+        return None;
+    }
+    let screen_top = (upper - page_size).max(lower) as i64;
+    Some(
+        cursor_row
+            .saturating_sub(screen_top)
+            .saturating_add(1)
+            .max(1),
+    )
+}
+
 type FinishedLayoutKey = (i32, i32, i32);
 
 /// Change detector for the finished-block re-fit.
@@ -7833,13 +7894,20 @@ impl TermView {
             });
         }
 
-        // ── Warp-style input-cell sizing ──────────────────────────────────
-        // The live VTE holder hugs its content (prompt + typed command) with a
-        // guaranteed minimum height while idle, so finished blocks remain visible
-        // above it. It is forced to the full viewport only for alt-screen apps
-        // (vim/less/TUIs) which need real terminal rows. During a running command
-        // the height is frozen at the idle value (no per-chunk resize / SIGWINCH
-        // thrash); the full output is snapshotted into a finished block when done.
+        // ── Warp-style live-card sizing ───────────────────────────────────
+        // The live card hugs its content — prompt plus typed command while idle,
+        // and the output produced so far while a command runs — with a
+        // guaranteed minimum height, so finished blocks stay on screen and the
+        // history pans up a row at a time instead of being shoved off by a
+        // page-tall reservation. The card is the full viewport only for
+        // alt-screen apps (vim/less/TUIs) and the no-integration fallback.
+        //
+        // Two heights, not one. `vte.set_size` still gives the terminal the
+        // whole viewport for the entire command — that is the winsize the child
+        // was told about, and absolute cursor addressing needs those rows to
+        // exist — while the card's own height comes from the clip built in
+        // `ActiveBlock::new`. The PTY never sees either number: `pty_grid_size`
+        // reports the viewport in every state.
         let block_layout_active_surface: Rc<dyn Fn()> = {
             // This callback is retained by adjustment/VTE signals as well as
             // TermView.  Keep every widget edge weak so closing a pane cannot
@@ -7854,10 +7922,19 @@ impl TermView {
             let failure_marker_redraw_for_layout = failure_marker_redraw.clone();
             let last_size_target: Rc<Cell<(i64, i64)>> = Rc::new(Cell::new((0, 0)));
             let last_output_layout: Rc<Cell<FinishedLayoutKey>> = Rc::new(Cell::new((-1, -1, -1)));
+            // High-water content extent of the command running now. Owned by
+            // ActiveBlock so that `reset_active` — the one funnel every reset
+            // path goes through — clears it for the next command.
+            let live_rows_high_water = active.borrow().live_extent_rows();
+            // Weak: ActiveBlock owns the VTE that retains this callback.
+            let active_for_layout = Rc::downgrade(&active);
             Rc::new(move || {
                 let (Some(holder), Some(vte), Some(scroll)) =
                     (holder.upgrade(), vte.upgrade(), scroll.upgrade())
                 else {
+                    return;
+                };
+                let Some(active_block) = active_for_layout.upgrade() else {
                     return;
                 };
                 let cell_h = (vte.char_height() as i32).max(1);
@@ -7904,21 +7981,55 @@ impl TermView {
                 };
                 let cols = vte.column_count().max(1);
                 let state = bstate.get();
+                holder.set_visible(true);
                 if matches!(
                     state,
                     BlockState::CollectingOutput | BlockState::PostCommand
                 ) {
+                    // The grid stays a full viewport: `pty_grid_size` told the
+                    // child that is its winsize, and an application that repaints
+                    // by absolute row without taking the alternate screen (`top`,
+                    // `watch`, a plain `clear`) needs every one of those rows to
+                    // draw into.
                     let target = (cols, viewport_rows);
                     if last_size_target.get() != target {
                         vte.set_size(cols, viewport_rows);
                         last_size_target.set(target);
                     }
-                    holder.set_visible(true);
-                    holder.set_height_request((viewport_rows as i32) * cell_h);
+                    // The card, though, is only as tall as the output so far, so
+                    // the blocks above stay on screen and the history pans up a
+                    // row at a time instead of being shoved off by a page-tall
+                    // reservation the command may never fill.
+                    let visible_rows = match live_content_extent(&vte) {
+                        Some(measured) => {
+                            let extent = live_rows_high_water.get().max(measured);
+                            live_rows_high_water.set(extent);
+                            live_visible_rows(extent, viewport_rows)
+                        }
+                        // Unmeasurable (the command cleared the scrollback):
+                        // fall back to the page-tall card rather than risk one
+                        // that hides output, and latch it so a later pass that
+                        // does measure cannot shrink the card back mid-command.
+                        None => {
+                            live_rows_high_water.set(viewport_rows);
+                            viewport_rows
+                        }
+                    };
+                    holder.set_height_request((visible_rows as i32) * cell_h);
+                    if let Ok(active_block) = active_block.try_borrow() {
+                        active_block.set_live_geometry(cell_h, viewport_rows, visible_rows);
+                    }
                     fit_finished_outputs();
                     return;
                 }
-                holder.set_visible(true);
+                // Not running. The next command starts from the prompt's height
+                // again — except on the way out of a screen application, where
+                // the restored primary screen is already full of content the
+                // card has to keep showing.
+                live_rows_high_water.set(match state {
+                    BlockState::AltScreen | BlockState::RawFallback => viewport_rows,
+                    _ => 0,
+                });
                 let compact_rows = || {
                     let input_lines =
                         1 + typed_cmd.borrow().bytes().filter(|&b| b == b'\n').count() as i64;
@@ -7955,6 +8066,12 @@ impl TermView {
                     last_size_target.set(target);
                 }
                 holder.set_height_request((target_rows as i32) * cell_h);
+                // Nothing to clip outside a running command: the card and the
+                // grid are the same height at the prompt, on the alternate
+                // screen and in the no-integration fallback.
+                if let Ok(live) = active_block.try_borrow() {
+                    live.set_live_geometry(cell_h, target_rows, target_rows);
+                }
                 fit_finished_outputs();
             })
         };
@@ -7965,10 +8082,14 @@ impl TermView {
             let vte = active_vte.downgrade();
             let scroll = block_scroll.downgrade();
             let last_size_target: Rc<Cell<(i64, i64)>> = Rc::new(Cell::new((0, 0)));
+            let active_for_layout = Rc::downgrade(&active);
             Rc::new(move || {
                 let (Some(holder), Some(vte), Some(scroll)) =
                     (holder.upgrade(), vte.upgrade(), scroll.upgrade())
                 else {
+                    return;
+                };
+                let Some(active_block) = active_for_layout.upgrade() else {
                     return;
                 };
                 let cell_h = (vte.char_height() as i32).max(1);
@@ -7982,6 +8103,12 @@ impl TermView {
                     last_size_target.set(target);
                 }
                 holder.set_height_request((viewport_rows as i32) * cell_h);
+                // Unified has one surface and one height; the clip is a no-op
+                // here, but the terminal still needs its size request or the
+                // Fixed would allocate it its bare minimum.
+                if let Ok(live) = active_block.try_borrow() {
+                    live.set_live_geometry(cell_h, viewport_rows, viewport_rows);
+                };
             })
         };
         let layout_active_surface: Rc<dyn Fn()> = if unified {
@@ -9403,8 +9530,26 @@ impl TermView {
     fn install_resize_tick(&self) {
         let pty_for_resize = self.pty.clone();
         let scroll_for_resize = self.block_scroll.clone();
+        let layout_for_resize = self.layout_active_surface.clone();
+        let clip_for_resize = self.active.borrow().live_clip().downgrade();
         let last: Rc<Cell<(u16, u16)>> = Rc::new(Cell::new((0, 0)));
+        let last_pane: Rc<Cell<(i32, i32)>> = Rc::new(Cell::new((0, 0)));
         let tick_id = self.active_vte.add_tick_callback(move |vte, _clock| {
+            // The live terminal is sized by an explicit pixel request (it lives
+            // in a `gtk::Fixed` and cannot expand into the pane on its own), and
+            // a resized pane at an idle prompt produces no `contents-changed`
+            // to re-run the layout. Watch the pane from the frame clock so the
+            // grid — and therefore the winsize read below — follows the window.
+            if let Some(clip) = clip_for_resize.upgrade() {
+                let pane = (
+                    clip.width(),
+                    scroll_for_resize.vadjustment().page_size() as i32,
+                );
+                if pane != last_pane.get() && pane.0 > 0 {
+                    last_pane.set(pane);
+                    layout_for_resize();
+                }
+            }
             let (cols, rows) = pty_grid_size(vte, &scroll_for_resize);
             if cols > 0 && rows > 0 && (cols, rows) != last.get() {
                 last.set((cols, rows));
@@ -9455,11 +9600,17 @@ impl TermView {
 
     pub(crate) fn live_organism_surface_metrics(&self) -> LiveOrganismSurfaceMetrics {
         let active = self.active.borrow();
+        let visible_height = active
+            .live_visible_height_px()
+            .min(active.active_vte.height().max(0));
         LiveOrganismSurfaceMetrics {
             // The hidden surface may not be allocated yet. The always-mapped
             // VTE is its measured child and shares the same clipped space.
             width: active.active_vte.width().max(0),
-            height: active.active_vte.height().max(0),
+            // The VTE keeps the whole viewport grid while a command runs; only
+            // the card's own height is on screen. Placing the body by the grid
+            // would drop it into the clipped rows.
+            height: visible_height,
             cell_width: (active.active_vte.char_width() as i32).max(1),
             cell_height: (active.active_vte.char_height() as i32).max(1),
             right_gutter: LIVE_ORGANISM_RIGHT_GUTTER,
@@ -9469,7 +9620,9 @@ impl TermView {
                 let top_row = gtk::prelude::ScrollableExt::vadjustment(&active.active_vte)
                     .map(|adjustment| adjustment.value().floor() as i64)
                     .unwrap_or(0);
-                let visible_rows = active.active_vte.row_count().max(1);
+                let cell_height = active.active_vte.char_height().max(1);
+                let visible_rows = ((visible_height as i64) / cell_height)
+                    .clamp(1, active.active_vte.row_count().max(1));
                 cursor_row
                     .saturating_sub(top_row)
                     .clamp(0, visible_rows.saturating_sub(1)) as i32
@@ -10789,18 +10942,19 @@ mod tests {
         command_id_uses_shell_token, decide_agent_command_end, emit_alt_screen_transition,
         estimated_finished_block_height_for_text, failed_block_marker_fractions,
         feed_with_zone_marker, finished_block_config, finished_command, finished_layout_key,
-        is_post_command_metadata, live_output_text, mutate_block_data_and_redraw,
-        normalize_captured_command, notification_permitted, parse_color_spec, plan_prompt_zone,
-        pop_typed_command_shadow, process_block_id_namespace, prompt_anchor_for_surface,
-        prompt_anchor_rebases_on_row_delta, prompt_zone_to_reopen_after_alt, rebase_prompt_anchor,
-        record_external_input, record_unified_zone, resolve_command_text,
-        reviewed_pre_command_bytes_are_identity_neutral, reviewed_submission_matches,
-        screen_relative_cpr_row, selected_blocks_markdown, selected_command_text,
-        selected_id_range, shell_argv_supports_agent_ids, stable_visible_indices,
-        step_marked_indices, step_marked_record_ids, stranded_focus_key_recovers, strip_ansi,
-        strip_ansi_with_clear_detect, take_armed_agent_execution, take_background_output,
-        unread_after_index_removal, unread_after_prefix_eviction, viewport_page_size_changed,
-        viewport_state_for_scroll, visible_indices_for_viewport, zone_output_snapshot_from_plain,
+        is_post_command_metadata, live_content_extent_for, live_output_text, live_visible_rows,
+        mutate_block_data_and_redraw, normalize_captured_command, notification_permitted,
+        parse_color_spec, plan_prompt_zone, pop_typed_command_shadow, process_block_id_namespace,
+        prompt_anchor_for_surface, prompt_anchor_rebases_on_row_delta,
+        prompt_zone_to_reopen_after_alt, rebase_prompt_anchor, record_external_input,
+        record_unified_zone, resolve_command_text, reviewed_pre_command_bytes_are_identity_neutral,
+        reviewed_submission_matches, screen_relative_cpr_row, selected_blocks_markdown,
+        selected_command_text, selected_id_range, shell_argv_supports_agent_ids,
+        stable_visible_indices, step_marked_indices, step_marked_record_ids,
+        stranded_focus_key_recovers, strip_ansi, strip_ansi_with_clear_detect,
+        take_armed_agent_execution, take_background_output, unread_after_index_removal,
+        unread_after_prefix_eviction, viewport_page_size_changed, viewport_state_for_scroll,
+        visible_indices_for_viewport, zone_output_snapshot_from_plain,
         zone_output_snapshot_from_ring, AgentCommandEndDecision, AgentExecutionLostCallbacks,
         AltScreenCallbacks, AltScreenTransition, AnchorSettleArgs, ArmedAgentExecution,
         BackendRecords, BlockData, BlockFinishedCallback, BlockFinishedCallbacks,
@@ -10823,6 +10977,49 @@ mod tests {
     use std::collections::{HashSet, VecDeque};
     use std::rc::Rc;
     use std::time::{Instant, SystemTime};
+
+    #[test]
+    fn live_card_grows_with_output_but_never_past_the_viewport() {
+        // Idle prompt and a command that has printed nothing yet both sit on
+        // the floor, so pressing Enter changes no height at all.
+        assert_eq!(live_visible_rows(1, 40), 6);
+        assert_eq!(live_visible_rows(6, 40), 6);
+        // Then one row per row of output ...
+        assert_eq!(live_visible_rows(7, 40), 7);
+        assert_eq!(live_visible_rows(39, 40), 39);
+        // ... up to the viewport, which is where the old code started.
+        assert_eq!(live_visible_rows(40, 40), 40);
+        assert_eq!(live_visible_rows(4000, 40), 40);
+        // A pane too short for the floor still gets a card, never zero rows.
+        assert_eq!(live_visible_rows(1, 3), 3);
+        assert_eq!(live_visible_rows(9, 3), 3);
+    }
+
+    #[test]
+    fn live_content_extent_is_screen_relative_not_an_absolute_ring_row() {
+        // VTE row numbers are absolute and climb for the whole session, so the
+        // extent is measured from the top of the *screen* (`upper - page`).
+        // A full 36-row screen whose cursor sits on its last row:
+        assert_eq!(live_content_extent_for(0.0, 63.0, 36.0, 62), Some(36));
+        // The same terminal after `[H[2J`: the ring kept climbing (upper 99),
+        // the cursor is six rows into the current screen.
+        assert_eq!(live_content_extent_for(0.0, 99.0, 36.0, 68), Some(6));
+        // A fresh block: cursor at the top of the screen is one row, not zero.
+        assert_eq!(live_content_extent_for(0.0, 36.0, 36.0, 0), Some(1));
+        // Scrolled-back views must not inflate it: `value` moves, `upper -
+        // page` does not, and the cursor stays on the live screen.
+        assert_eq!(live_content_extent_for(0.0, 200.0, 36.0, 170), Some(7));
+        // The cursor resting one row past the last written row is normal.
+        assert_eq!(live_content_extent_for(0.0, 54.0, 20.0, 54), Some(21));
+        // `ESC[3J` renumbers the adjustment but not the cursor: measured, a
+        // 20-row screen reported upper=20 with the cursor still at ring row 55.
+        // Unmeasurable, so the card must fall back to the full viewport.
+        assert_eq!(live_content_extent_for(0.0, 20.0, 20.0, 55), None);
+        assert_eq!(live_content_extent_for(0.0, 20.0, 20.0, 113), None);
+        // Degenerate adjustments never produce a card that hides output.
+        assert_eq!(live_content_extent_for(0.0, 0.0, 0.0, 0), Some(1));
+        assert_eq!(live_content_extent_for(f64::NAN, 99.0, 36.0, 68), None);
+    }
 
     #[test]
     fn prompt_anchor_policy_is_shared_by_every_surface_reader() {

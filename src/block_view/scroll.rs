@@ -48,11 +48,16 @@ fn request_bottom_pin(user_scrolled: bool, active: &Cell<bool>, generation: &Cel
 /// from inside the PTY-reader's event handling, *before* GTK lays out any block
 /// that was just appended. At that instant `upper` still reflects the previous
 /// layout, so `upper - page` lands the view at the *top* of the freshly-finished
-/// block rather than at the bottom of the page-tall live holder. Because nothing
-/// re-scrolls after layout settles, the last finished block stays visible with
-/// the prompt directly below it. Deferring this to a timer (or re-running it from
-/// the adjustment's `changed` signal) reads the settled, larger `upper` and parks
-/// the view at the bottom of the blank holder, hiding all history.
+/// block instead of below it. Because nothing re-scrolls after layout settles,
+/// the last finished block stays visible with the prompt directly below it.
+/// Deferring this to a timer (or re-running it from the adjustment's `changed`
+/// signal) reads the settled, larger `upper` and parks the view past the block.
+///
+/// This used to matter far more: the live holder was a full page tall during a
+/// command, so a settled read hid every finished block behind blank rows. The
+/// live card now grows with its output, which makes the stale-`upper` read a
+/// smaller correction — but still the one that keeps the finished block's first
+/// row on screen, and `pin_to_bottom_deferred` completes it.
 #[derive(Clone)]
 pub(crate) struct ScrollDebouncer {
     pub(crate) user_scrolled_up: Rc<Cell<bool>>,

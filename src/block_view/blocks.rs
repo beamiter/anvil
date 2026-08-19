@@ -2840,6 +2840,23 @@ impl FinishedBlock {
 pub(crate) struct ActiveBlock {
     pub(crate) widget: gtk::Box,
     pub(crate) active_vte: Terminal,
+    /// The measured wrapper around the live VTE. It carries the terminal's
+    /// requested pixel size — see [`ActiveBlock::set_live_geometry`], which
+    /// keeps the grid at the full viewport while the card shows less.
+    vte_overlay: gtk::Overlay,
+    /// Sole measured child of the clip: its height IS the live card's height.
+    live_spacer: gtk::Box,
+    /// The clip itself; its allocated width is the space the terminal may use.
+    live_clip: gtk::Overlay,
+    /// Last applied `(width_px, grid_px, visible_px)`, so a layout pass that
+    /// changes nothing does not queue a resize.
+    live_geometry: Cell<(i32, i32, i32)>,
+    /// High-water row extent of the command in flight. Monotone within one
+    /// command so a `\r` progress bar, an `ESC[1A` redraw or a mid-command
+    /// `clear` can never make the card shrink under the output already on
+    /// screen. `reset_active` — the single funnel every reset path uses —
+    /// clears it for the next command.
+    live_extent_rows: Rc<Cell<i64>>,
     /// Pass-through, non-measuring surface for small live widgets. The VTE
     /// remains the overlay's measured child, so the organism never changes
     /// the terminal grid or steals input.
@@ -2953,8 +2970,48 @@ impl ActiveBlock {
         live_scrollbar.set_halign(gtk::Align::End);
         live_scrollbar.set_visible(false);
         // Added last so it paints above the pass-through organism surface.
-        vte_overlay.add_overlay(&live_scrollbar);
-        widget.append(&vte_overlay);
+
+        // ── Live card clip ────────────────────────────────────────────────
+        // The card is only as tall as the running command's output so far, but
+        // the terminal underneath keeps the FULL viewport grid: that is the
+        // winsize the child was told about (`pty_grid_size`), and anything that
+        // addresses rows absolutely — `top`, `watch`, any repaint that clears
+        // the screen without switching to the alternate one — would otherwise
+        // be drawing into a grid too short to hold it.
+        //
+        // GTK derives the grid from the VTE's *allocation*: `set_size` cannot
+        // hold a taller grid than the space the parent hands out (measured — an
+        // explicit `set_size(200, 50)` reverted on the next reallocation), and
+        // neither a ScrolledWindow/Viewport nor a plain non-FILL overlay child
+        // keeps them apart (both squeeze the terminal to the visible height).
+        // `gtk::Fixed` does: it allocates each child the size the child asked
+        // for, whatever height the Fixed itself has. Riding it as a non-measured
+        // overlay above a spacer means the card measures the spacer alone while
+        // the terminal keeps every row, and `Overflow::Hidden` clips the rows
+        // below the card — for input as well as for paint. Both dimensions of
+        // the child's size request are required: inside a Fixed a `-1` collapses
+        // the child to its minimum (the same recipe the organism surface uses).
+        let live_spacer = gtk::Box::new(Orientation::Vertical, 0);
+        live_spacer.set_hexpand(true);
+        live_spacer.set_vexpand(false);
+        let live_surface = gtk::Fixed::new();
+        live_surface.set_overflow(gtk::Overflow::Hidden);
+        live_surface.set_halign(gtk::Align::Fill);
+        live_surface.set_valign(gtk::Align::Fill);
+        live_surface.put(&vte_overlay, 0.0, 0.0);
+        let live_clip = gtk::Overlay::new();
+        live_clip.set_hexpand(true);
+        live_clip.set_vexpand(false);
+        live_clip.set_overflow(gtk::Overflow::Hidden);
+        live_clip.set_child(Some(&live_spacer));
+        live_clip.add_overlay(&live_surface);
+        live_clip.set_measure_overlay(&live_surface, false);
+        live_clip.set_clip_overlay(&live_surface, true);
+        // The scrollbar rides the CLIP, not the terminal: `vte_overlay` is now
+        // allocated the whole grid, so a scrollbar inside it would be sized
+        // against rows the card is not showing and cut off halfway.
+        live_clip.add_overlay(&live_scrollbar);
+        widget.append(&live_clip);
         if let Some(adjustment) = active_vte.vadjustment() {
             let scrollbar = live_scrollbar.downgrade();
             let sync_visibility = move |adjustment: &gtk::Adjustment| {
@@ -2972,6 +3029,11 @@ impl ActiveBlock {
         ActiveBlock {
             widget,
             active_vte,
+            vte_overlay,
+            live_spacer,
+            live_clip,
+            live_geometry: Cell::new((0, 0, 0)),
+            live_extent_rows: Rc::new(Cell::new(0)),
             live_organism_surface,
             unified_chrome_surface,
             live_scrollbar,
@@ -3008,6 +3070,71 @@ impl ActiveBlock {
         (self.active_vte.column_count().max(20)) as usize
     }
 
+    /// Give the live terminal a `grid_px`-tall grid and show `visible_px` of it.
+    ///
+    /// The two are equal everywhere except while a command is running, where the
+    /// card grows with the output and the grid stays a full viewport (see the
+    /// clip construction in [`ActiveBlock::new`]). Returns whether anything
+    /// changed, so callers can skip follow-up work on a no-op layout pass.
+    ///
+    /// The width comes from the clip's own allocation — inside a `gtk::Fixed`
+    /// the terminal is allocated exactly what it requests, so it cannot pick up
+    /// the pane width by expanding. Before the first allocation there is no
+    /// width to hand out and the request is left alone; the next layout pass
+    /// (contents, adjustment or resize tick) applies it.
+    pub(crate) fn set_live_geometry(&self, cell_h: i32, grid_rows: i64, visible_rows: i64) -> bool {
+        let cell_h = cell_h.max(1);
+        let grid_rows = grid_rows.max(1);
+        let visible_rows = visible_rows.clamp(1, grid_rows);
+        let width_px = self.live_clip.width();
+        if width_px <= 0 {
+            // Before the first allocation there is no width to hand out, but
+            // the card height does not depend on one and the caller has already
+            // moved the holder's request: leave the two in step.
+            self.live_spacer
+                .set_height_request((visible_rows as i32).saturating_mul(cell_h));
+            return false;
+        }
+        // Ask for a sliver more than the grid needs. The terminal takes its row
+        // count from the allocation, and a container that hands back a pixel or
+        // two less than requested would cost a whole row; anything under one
+        // cell cannot add one.
+        let grid_px = (grid_rows as i32).saturating_mul(cell_h) + cell_h - 1;
+        let visible_px = (visible_rows as i32).saturating_mul(cell_h);
+        let geometry = (width_px, grid_px, visible_px);
+        if self.live_geometry.get() == geometry {
+            return false;
+        }
+        self.live_geometry.set(geometry);
+        self.vte_overlay.set_size_request(width_px, grid_px);
+        self.live_spacer.set_height_request(visible_px);
+        true
+    }
+
+    /// The measured live card. The frame-clock resize tick watches its width:
+    /// the terminal is sized by an explicit request now and cannot follow the
+    /// pane on its own.
+    pub(crate) fn live_clip(&self) -> gtk::Overlay {
+        self.live_clip.clone()
+    }
+
+    /// Shared high-water extent, cloned into `block_layout_active_surface`.
+    pub(crate) fn live_extent_rows(&self) -> Rc<Cell<i64>> {
+        self.live_extent_rows.clone()
+    }
+
+    /// Height of the live card in pixels — the part of the grid the user can
+    /// see. Live widgets positioned over the terminal (the organism) must stay
+    /// inside it or they are clipped away.
+    pub(crate) fn live_visible_height_px(&self) -> i32 {
+        let (_, _, visible) = self.live_geometry.get();
+        if visible > 0 {
+            visible
+        } else {
+            self.active_vte.height().max(0)
+        }
+    }
+
     /// Reset the live VTE for the next prompt (anvil block.rs:1028-1044). `reset`
     /// acts immediately, but already-queued feed() bytes are processed async, so the
     /// in-stream clear (fed after them) wipes stale output in the correct order.
@@ -3022,6 +3149,8 @@ impl ActiveBlock {
     /// state, cleared explicitly by the reader engine around this reset (see
     /// `RenderBackend::reset_active_surface`).
     pub(crate) fn reset_active(&self, preserve_scrollback: bool) {
+        // A new command starts a new card: forget how far the last one grew.
+        self.live_extent_rows.set(0);
         if preserve_scrollback {
             self.active_vte.feed(b"\x1b[0m");
         } else {

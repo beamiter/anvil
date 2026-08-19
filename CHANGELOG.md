@@ -261,6 +261,34 @@ versioning for tagged releases while it remains experimental.
 
 ### Fixed
 
+- Block mode no longer flashes a full-screen block on every command. The live
+  cell was sized by state, not by content: at `CommandStart` it jumped from the
+  ~6-row prompt to the whole viewport and stayed there until the next prompt, so
+  the follow-bottom pin pushed every finished block off the top, and the card
+  that finally replaced it was only as tall as its output — a page-tall blank
+  cell appearing and collapsing around each command, however little that command
+  printed. The live card now grows with the output it has actually produced
+  (`max(MIN_INPUT_ROWS, rows written)`, capped by the viewport), which is the
+  rule ember and frost already use, so history stays on screen and pans up a row
+  at a time as output streams in.
+
+  The terminal underneath is untouched: `vte.set_size` still hands a running
+  command the full viewport grid — the winsize `pty_grid_size` reports to the
+  child, and the rows anything that addresses the screen absolutely (`top`,
+  `watch`, a bare `clear`) needs to draw into. Only the *card* is short, via a
+  clip: a `gtk::Fixed` inside a non-measured, `Overflow::Hidden` overlay hands
+  the terminal its full requested height while the card measures a spacer. GTK
+  derives a VTE's grid from its allocation, so nothing else in the widget tree
+  can keep the two apart — a ScrolledWindow/Viewport and a plain non-FILL
+  overlay child were both measured squeezing the grid to the visible height.
+
+  The row extent is read from the live terminal (top of the screen down to the
+  cursor) and latched to a per-command high-water mark, so a `\r` progress bar
+  or an `ESC[1A` redraw can never shrink the card under output already on
+  screen. A command that clears the scrollback (`ESC[3J`) leaves VTE's
+  adjustment and cursor in different coordinate spaces; that is detected and
+  falls back to the old page-tall card rather than risk one that hides output.
+  With `preserve_live_scrollback = true` the extent saturates the same way.
 - Block mode no longer clears and repaints the whole history on every command.
   A finished block's output cap was derived from the space left over *above the
   live input cell*, and that cell grows to the full viewport while a command
