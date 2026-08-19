@@ -165,6 +165,11 @@ pub(crate) enum AppMsg {
     FileTreePaste {
         dir: Option<std::path::PathBuf>,
     },
+    /// OS file-manager drop onto the tree; `dir: None` targets the root.
+    FileTreeImportPaths {
+        paths: Vec<std::path::PathBuf>,
+        dir: Option<std::path::PathBuf>,
+    },
     FileTreeRefresh,
     /// A background op or transfer finished; refresh these directories in
     /// place, preserving all other expansion.

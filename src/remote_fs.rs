@@ -26,10 +26,12 @@ use crate::file_tree::FileEntry;
 /// therefore run as `sh -c '<script>' -- <op> [args...]` instead: a shell's
 /// read-ahead on `sh -s` may legally swallow payload bytes into its own
 /// buffer. Keep the exit-code contract in sync with `probe_result`.
-pub(crate) const PROBE_SCRIPT: &str = r#"# remote-fs probe v2 — runs under `sh -s -- <op> [args...]`.
+pub(crate) const PROBE_SCRIPT: &str = r#"# remote-fs probe v3 — runs under `sh -s -- <op> [args...]`.
 # `list` stdout: NUL-separated pairs "<t>\0<name>\0", t in {d,f,l}, names relative.
 # `cat` streams a file to stdout; `put` stores stdin as a new file;
-# `tar`/`untar` move directories as tar streams on stdout/stdin.
+# `tar` streams a directory to stdout; `untar <dir> <name>` extracts stdin into
+# <dir>, refusing an existing <dir>/<name> before anything is extracted;
+# `stat` prints "<t> <size>" (size 0 for d/l).
 # Exit codes: 0 ok, 2 usage/bad path, 3 cannot enter dir, 4 op failed, 17 target exists.
 set -u
 op=${1:-}
@@ -111,11 +113,26 @@ case "$op" in
     tar cf - -C "$d" "${p##*/}" || exit 4
     ;;
   untar)
-    d=${2:-}
+    d=${2:-}; n=${3:-}
     case "$d" in /*) ;; *) exit 2 ;; esac
     [ -d "$d" ] || exit 3
+    case "$n" in ""|.|..|*/*) exit 2 ;; esac
+    if [ -e "$d/$n" ] || [ -L "$d/$n" ]; then exit 17; fi
     command -v tar >/dev/null 2>&1 || { echo "remote-fs probe: tar is not installed" >&2; exit 4; }
     tar xf - -C "$d" || exit 4
+    ;;
+  stat)
+    p=${2:-}
+    case "$p" in /*) ;; *) exit 2 ;; esac
+    if [ -d "$p" ]; then t=d; s=0
+    elif [ -L "$p" ]; then t=l; s=0
+    elif [ -f "$p" ]; then
+      t=f
+      s=$(wc -c < "$p") || exit 4
+    else
+      exit 3
+    fi
+    printf '%s %s\n' "$t" "$s"
     ;;
   *) exit 2 ;;
 esac
@@ -1193,25 +1210,57 @@ fn require_local_tar() -> io::Result<()> {
     }
 }
 
-/// Byte-exact "does this name already exist there" check over `list`, so an
-/// upload can fail BEFORE streaming instead of merging into a remote dir.
-fn remote_name_exists(host: &RemoteHost, dir: &Path, name: &OsStr) -> io::Result<bool> {
-    let stdout = run_probe(host, "list", &[dir.as_os_str()], PROBE_LIST_TIMEOUT)?;
-    let mut fields = stdout.split(|&byte| byte == 0);
-    while let (Some(_kind), Some(entry)) = (fields.next(), fields.next()) {
-        if entry == name.as_bytes() {
-            return Ok(true);
-        }
+/// Parsed `stat` output: entry type (dirs first-class) and size in bytes
+/// (always 0 for directories and symlinks).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RemoteStat {
+    pub(crate) is_dir: bool,
+    pub(crate) size: u64,
+}
+
+/// `stat` one remote path; Ok(None) means it does not exist (probe exit 3).
+fn remote_stat(host: &RemoteHost, path: &Path) -> io::Result<Option<RemoteStat>> {
+    require_absolute(path)?;
+    match run_probe(host, "stat", &[path.as_os_str()], PROBE_LIST_TIMEOUT) {
+        Ok(stdout) => parse_stat_output(&stdout).map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
     }
-    Ok(false)
+}
+
+/// Parse one `<t> <size>` line; split_whitespace absorbs any `wc` padding.
+fn parse_stat_output(bytes: &[u8]) -> io::Result<RemoteStat> {
+    let line = bytes
+        .split(|&byte| byte == b'\n')
+        .next()
+        .unwrap_or_default();
+    let text = std::str::from_utf8(line)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "stat probe returned non-UTF-8"))?;
+    let mut fields = text.split_whitespace();
+    let kind = fields.next().unwrap_or_default();
+    let size = fields
+        .next()
+        .and_then(|field| field.parse::<u64>().ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "stat probe returned no size"))?;
+    let is_dir = match kind {
+        "d" => true,
+        "f" | "l" => false,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stat probe returned an unknown entry type",
+            ))
+        }
+    };
+    Ok(RemoteStat { is_dir, size })
 }
 
 /// Transfer `src_path` between locations: download (Remote→Local), upload
 /// (Local→Remote), or a local staging relay between two remote hosts.
 /// Returns the destination path. Same-name collisions fail BEFORE streaming
-/// (local metadata / remote list); file uploads are additionally enforced
-/// atomically by the probe's `put`. `control` carries cancel/timeout kill
-/// semantics; `progress` receives throttled byte totals.
+/// via the probe's `stat`; file uploads and directory untars are additionally
+/// enforced atomically by `put`/v3 `untar` exit 17. `control` carries
+/// cancel/timeout kill semantics; `progress` receives throttled byte totals.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn transfer(
     hosts: &[RemoteHost],
@@ -1251,7 +1300,7 @@ pub(crate) fn transfer(
             let name = src_path.file_name().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "remote path has no file name")
             })?;
-            if remote_name_exists(dst_host, dst_dir, name)? {
+            if remote_stat(dst_host, &dst_dir.join(name))?.is_some() {
                 return Err(already_exists_error(name));
             }
             let staging = StagingDir::new()?;
@@ -1350,14 +1399,23 @@ fn upload(
     let name = local_path.file_name().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "local path has no file name")
     })?;
-    // Fail before streaming: the remote list sees an existing destination.
-    if remote_name_exists(host, remote_dir, name)? {
+    let dst = remote_dir.join(name);
+    // Fail before streaming: one `stat` answers the existence question.
+    if remote_stat(host, &dst)?.is_some() {
         return Err(already_exists_error(name));
     }
-    let dst = remote_dir.join(name);
     if is_dir {
+        // v3 untar takes <dir> <name> and refuses an existing destination
+        // before extracting anything; the tar stream carries the name.
         upload_dir_with(
-            || spawn_probe_streaming(host, "untar", &[dst.as_os_str()], ScriptDelivery::Argv),
+            || {
+                spawn_probe_streaming(
+                    host,
+                    "untar",
+                    &[remote_dir.as_os_str(), name],
+                    ScriptDelivery::Argv,
+                )
+            },
             local_path,
             MAX_TRANSFER_BYTES,
             control,
@@ -1731,6 +1789,216 @@ fn download_dir_with(
         return Err(error);
     }
     Ok(dst)
+}
+
+// ---------------------------------------------------------------------------
+// Drag-and-drop import
+// ---------------------------------------------------------------------------
+
+/// A file-manager drop is refused wholesale past 256 items.
+pub(crate) const MAX_DROP_ITEMS: usize = 256;
+/// Size-walk depth bound for dropped directories; deeper payloads are not
+/// counted (the per-item stream cap still applies at transfer time).
+const MAX_DROP_WALK_DEPTH: usize = 64;
+
+/// One dropped item's fate: local recursive copy, or upload via `transfer`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DropAction {
+    Copy,
+    Upload,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DropItem {
+    pub(crate) path: PathBuf,
+    pub(crate) is_dir: bool,
+    /// Walked payload estimate, used for progress and the total cap.
+    pub(crate) size: u64,
+    pub(crate) action: DropAction,
+    /// Local destinations are collision-checked at plan time; remote ones
+    /// fail per item at transfer time via the probe's existence checks.
+    pub(crate) collides: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DropPlan {
+    pub(crate) items: Vec<DropItem>,
+    pub(crate) total_bytes: u64,
+}
+
+/// Why a drop is refused wholesale.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DropRejection {
+    Empty,
+    NotAbsolute(PathBuf),
+    Unreadable(PathBuf),
+    TooManyItems(usize),
+    TooLarge(u64),
+}
+
+/// Total payload estimate of one dropped item: directories are walked without
+/// ever following symlinks, bounded to depth 64.
+fn drop_item_size(path: &Path, depth: usize) -> io::Result<u64> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.is_dir() {
+        if depth >= MAX_DROP_WALK_DEPTH {
+            return Ok(0);
+        }
+        let mut total = 0u64;
+        for entry in std::fs::read_dir(path)? {
+            total = total.saturating_add(drop_item_size(&entry?.path(), depth + 1)?);
+        }
+        Ok(total)
+    } else if metadata.file_type().is_symlink() {
+        // Never followed: a linked directory is neither walked nor sized.
+        Ok(0)
+    } else {
+        Ok(metadata.len())
+    }
+}
+
+/// Plan a file-manager drop onto `dst_dir` in `dst_loc`: per-item action,
+/// walked size, and local collision flag — or a wholesale refusal with the
+/// reason. Production entry point uses MAX_TRANSFER_BYTES; tests pass a
+/// smaller cap.
+pub(crate) fn plan_drop(
+    paths: &[PathBuf],
+    dst_loc: &FsLocation,
+    dst_dir: &Path,
+) -> Result<DropPlan, DropRejection> {
+    plan_drop_with_limit(paths, dst_loc, dst_dir, MAX_TRANSFER_BYTES)
+}
+
+fn plan_drop_with_limit(
+    paths: &[PathBuf],
+    dst_loc: &FsLocation,
+    dst_dir: &Path,
+    max_bytes: u64,
+) -> Result<DropPlan, DropRejection> {
+    if paths.is_empty() {
+        return Err(DropRejection::Empty);
+    }
+    if paths.len() > MAX_DROP_ITEMS {
+        return Err(DropRejection::TooManyItems(paths.len()));
+    }
+    let action = match dst_loc {
+        FsLocation::Local => DropAction::Copy,
+        FsLocation::Remote(_) => DropAction::Upload,
+    };
+    let mut items = Vec::with_capacity(paths.len());
+    let mut total_bytes = 0u64;
+    for path in paths {
+        if !path.is_absolute() {
+            return Err(DropRejection::NotAbsolute(path.clone()));
+        }
+        let metadata =
+            std::fs::symlink_metadata(path).map_err(|_| DropRejection::Unreadable(path.clone()))?;
+        let size = drop_item_size(path, 0).map_err(|_| DropRejection::Unreadable(path.clone()))?;
+        total_bytes = total_bytes.saturating_add(size);
+        if total_bytes > max_bytes {
+            return Err(DropRejection::TooLarge(total_bytes));
+        }
+        let collides = action == DropAction::Copy
+            && path
+                .file_name()
+                .is_some_and(|name| std::fs::symlink_metadata(dst_dir.join(name)).is_ok());
+        items.push(DropItem {
+            path: path.clone(),
+            is_dir: metadata.is_dir(),
+            size,
+            action,
+            collides,
+        });
+    }
+    Ok(DropPlan { items, total_bytes })
+}
+
+/// Per-item result of a multi-item import.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DropOutcome {
+    pub(crate) done: usize,
+    /// (display name, error) per failed item; the batch continues past
+    /// ordinary failures and only aborts on cancellation.
+    pub(crate) failed: Vec<(String, String)>,
+}
+
+/// Execute a drop plan item by item: copies via the local recursive copier,
+/// uploads through `transfer` (so progress/cancel/atomicity apply). Progress
+/// is cumulative across items and never dips. A cancel aborts the batch with
+/// the neutral Interrupted error.
+pub(crate) fn run_drop(
+    plan: &DropPlan,
+    dst_loc: &FsLocation,
+    hosts: &[RemoteHost],
+    dst_dir: &Path,
+    control: &TransferControl,
+    progress: &dyn Fn(u64),
+) -> io::Result<DropOutcome> {
+    let mut outcome = DropOutcome {
+        done: 0,
+        failed: Vec::new(),
+    };
+    let mut moved = 0u64;
+    let high_water = std::cell::Cell::new(0u64);
+    let report = |bytes: u64| {
+        if bytes > high_water.get() {
+            high_water.set(bytes);
+            progress(bytes);
+        }
+    };
+    for item in &plan.items {
+        control.check()?;
+        let Some(name) = item.path.file_name() else {
+            outcome.failed.push((
+                crate::file_tree::display_full_path(&item.path),
+                "the path has no file name".to_string(),
+            ));
+            continue;
+        };
+        let display = crate::file_tree::display_os_str(name);
+        if item.collides {
+            outcome
+                .failed
+                .push((display, "already exists at the destination".to_string()));
+            moved = moved.saturating_add(item.size);
+            continue;
+        }
+        let dst = dst_dir.join(name);
+        let result = match item.action {
+            DropAction::Copy => copy(&FsLocation::Local, &[], &item.path, &dst),
+            DropAction::Upload => {
+                let base = moved;
+                let item_progress = |bytes: u64| report(base + bytes);
+                transfer(
+                    hosts,
+                    &FsLocation::Local,
+                    &item.path,
+                    dst_loc,
+                    dst_dir,
+                    item.is_dir,
+                    control,
+                    &item_progress,
+                )
+                .map(drop)
+            }
+        };
+        match result {
+            Ok(()) => outcome.done += 1,
+            Err(error) => {
+                if error.kind() == io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+                let message = jterm_core::review_input::safe_inline_display(
+                    &error.to_string(),
+                    MAX_ERROR_DISPLAY_BYTES,
+                );
+                outcome.failed.push((display, message));
+            }
+        }
+        moved = moved.saturating_add(item.size);
+        report(moved);
+    }
+    Ok(outcome)
 }
 
 #[cfg(test)]
@@ -2381,7 +2649,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_v2_tar_untar_round_trip() {
+    fn probe_v3_tar_untar_round_trip() {
         let tmp = TestDir::new("probe-tar");
         let src = tmp.path().join("srcdir");
         std::fs::create_dir_all(src.join("nested")).unwrap();
@@ -2395,7 +2663,8 @@ mod tests {
 
         let out = tmp.path().join("out");
         std::fs::create_dir(&out).unwrap();
-        let capture = local_probe_payload(&["untar", out.to_str().unwrap()], &tarred.stdout);
+        let capture =
+            local_probe_payload(&["untar", out.to_str().unwrap(), "srcdir"], &tarred.stdout);
         assert_eq!(capture.code, Some(0));
         assert_eq!(
             std::fs::read(out.join("srcdir").join("nested").join("data.bin")).unwrap(),
@@ -2413,12 +2682,97 @@ mod tests {
         );
         assert_eq!(
             local_probe_payload(
-                &["untar", tmp.path().join("missing").to_str().unwrap()],
+                &[
+                    "untar",
+                    tmp.path().join("missing").to_str().unwrap(),
+                    "srcdir"
+                ],
                 b"x"
             )
             .code,
             Some(3)
         );
+        // Bad names are usage errors, not operations.
+        for bad in ["", ".", "..", "a/b"] {
+            assert_eq!(
+                local_probe_payload(&["untar", out.to_str().unwrap(), bad], b"x").code,
+                Some(2),
+                "name {bad:?} is rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_v3_untar_refuses_existing_name_before_extracting() {
+        let tmp = TestDir::new("probe-untar-17");
+        let src = tmp.path().join("srcdir");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("new.txt"), b"new").unwrap();
+        let tarred = local_probe(&["tar", src.to_str().unwrap()]);
+        assert_eq!(tarred.code, Some(0));
+
+        // The destination already holds a `srcdir` with a marker file.
+        let out = tmp.path().join("out");
+        std::fs::create_dir_all(out.join("srcdir")).unwrap();
+        std::fs::write(out.join("srcdir").join("marker.txt"), b"keep").unwrap();
+
+        let capture =
+            local_probe_payload(&["untar", out.to_str().unwrap(), "srcdir"], &tarred.stdout);
+        assert_eq!(capture.code, Some(17));
+        assert_eq!(
+            std::fs::read(out.join("srcdir").join("marker.txt")).unwrap(),
+            b"keep",
+            "the existing tree is untouched"
+        );
+        assert!(
+            !out.join("srcdir").join("new.txt").exists(),
+            "nothing was extracted before the refusal"
+        );
+    }
+
+    #[test]
+    fn probe_v3_stat_reports_type_and_size() {
+        let tmp = TestDir::new("probe-stat");
+        let content = binary_content(4, 7_654);
+        let file = tmp.path().join("data.bin");
+        std::fs::write(&file, &content).unwrap();
+        std::fs::create_dir(tmp.path().join("dir")).unwrap();
+        std::os::unix::fs::symlink("data.bin", tmp.path().join("link")).unwrap();
+
+        let capture = local_probe(&["stat", file.to_str().unwrap()]);
+        assert_eq!(capture.code, Some(0));
+        assert_eq!(capture.stdout, format!("f {}\n", content.len()).as_bytes());
+
+        let capture = local_probe(&["stat", tmp.path().join("dir").to_str().unwrap()]);
+        assert_eq!(capture.stdout, b"d 0\n");
+        let capture = local_probe(&["stat", tmp.path().join("link").to_str().unwrap()]);
+        assert_eq!(capture.stdout, b"l 0\n");
+        assert_eq!(
+            local_probe(&["stat", tmp.path().join("missing").to_str().unwrap()]).code,
+            Some(3)
+        );
+
+        // The Rust parser agrees with the wire format.
+        let stat = parse_stat_output(format!("f {}\n", content.len()).as_bytes()).unwrap();
+        assert_eq!(
+            stat,
+            RemoteStat {
+                is_dir: false,
+                size: content.len() as u64
+            }
+        );
+        assert_eq!(
+            parse_stat_output(b"d 0\n").unwrap(),
+            RemoteStat {
+                is_dir: true,
+                size: 0
+            }
+        );
+        // wc padding on some platforms is absorbed.
+        assert_eq!(parse_stat_output(b"f   42\n").unwrap().size, 42);
+        assert!(parse_stat_output(b"x 1\n").is_err());
+        assert!(parse_stat_output(b"f\n").is_err());
+        assert!(parse_stat_output(b"").is_err());
     }
 
     #[test]
@@ -2433,19 +2787,24 @@ mod tests {
         );
         let command = argv.last().expect("command element").to_string_lossy();
         assert!(command.starts_with("sh -c '"));
-        assert!(command.contains("remote-fs probe v2"));
+        assert!(command.contains("remote-fs probe v3"));
         assert!(command.ends_with(" -- 'put' '/dst/a b'\\''c'"));
 
         // docker: script as one raw argv element, no quoting anywhere.
         let host = docker_host();
-        let argv = docker_probe_argv(&host, "untar", &[OsStr::new("/dst")], ScriptDelivery::Argv);
+        let argv = docker_probe_argv(
+            &host,
+            "untar",
+            &[OsStr::new("/dst"), OsStr::new("tree")],
+            ScriptDelivery::Argv,
+        );
         let text: Vec<_> = argv
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         let pos = text.iter().position(|a| a == "-c").expect("-c present");
         assert_eq!(text[pos + 1], PROBE_SCRIPT);
-        assert_eq!(text[pos + 2..], ["--", "untar", "/dst"]);
+        assert_eq!(text[pos + 2..], ["--", "untar", "/dst", "tree"]);
     }
 
     // -- streaming transfer mechanics ----------------------------------------
@@ -2595,7 +2954,7 @@ mod tests {
         // "upload": local tar → the untar probe writing into the relay dir.
         let relay_str = relay.path().to_str().unwrap().to_string();
         upload_dir_with(
-            || spawn_local(&["untar", &relay_str], ScriptDelivery::Argv),
+            || spawn_local(&["untar", &relay_str, "tree"], ScriptDelivery::Argv),
             &src,
             1 << 24,
             &TransferControl::new(),
@@ -2864,5 +3223,181 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().contains("fspart"))
             .collect();
         assert!(leftovers.is_empty(), "the .fspart temps are gone");
+    }
+
+    // -- drag-and-drop import planning ----------------------------------------
+
+    #[test]
+    fn plan_drop_dispatches_copy_local_and_upload_remote() {
+        let tmp = TestDir::new("plan-drop");
+        let file = tmp.path().join("file.txt");
+        std::fs::write(&file, b"data").unwrap();
+        let dir = tmp.path().join("dir");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("inner.bin"), b"123456").unwrap();
+
+        // Local destination: Copy actions, collision flags from the dst dir.
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir(&dst).unwrap();
+        std::fs::write(dst.join("file.txt"), b"old").unwrap();
+        let plan = plan_drop(&[file.clone(), dir.clone()], &FsLocation::Local, &dst).unwrap();
+        assert_eq!(plan.items.len(), 2);
+        assert!(plan
+            .items
+            .iter()
+            .all(|item| item.action == DropAction::Copy));
+        assert!(plan.items[0].collides, "file.txt exists in dst");
+        assert!(!plan.items[1].collides);
+        assert!(plan.items[1].is_dir);
+        assert_eq!(plan.total_bytes, 4 + 6);
+
+        // Remote destination: Upload actions, collisions deferred to the probe.
+        let plan = plan_drop(
+            std::slice::from_ref(&file),
+            &FsLocation::Remote(0),
+            Path::new("/remote/dst"),
+        )
+        .unwrap();
+        assert_eq!(plan.items[0].action, DropAction::Upload);
+        assert!(!plan.items[0].collides);
+    }
+
+    #[test]
+    fn plan_drop_refusals_are_wholesale_and_ordered() {
+        let tmp = TestDir::new("plan-drop-refuse");
+        let file = tmp.path().join("f");
+        std::fs::write(&file, b"x").unwrap();
+
+        assert_eq!(
+            plan_drop(&[], &FsLocation::Local, tmp.path()),
+            Err(DropRejection::Empty)
+        );
+        // Item-count cap fires before any filesystem reads.
+        let many: Vec<PathBuf> = (0..=MAX_DROP_ITEMS)
+            .map(|i| tmp.path().join(format!("nope-{i}")))
+            .collect();
+        assert_eq!(
+            plan_drop(&many, &FsLocation::Local, tmp.path()),
+            Err(DropRejection::TooManyItems(MAX_DROP_ITEMS + 1))
+        );
+        assert_eq!(
+            plan_drop(
+                &[PathBuf::from("relative/path")],
+                &FsLocation::Local,
+                tmp.path()
+            ),
+            Err(DropRejection::NotAbsolute(PathBuf::from("relative/path")))
+        );
+        assert_eq!(
+            plan_drop(
+                &[tmp.path().join("missing")],
+                &FsLocation::Local,
+                tmp.path()
+            ),
+            Err(DropRejection::Unreadable(tmp.path().join("missing")))
+        );
+        // Total-cap enforcement against a tiny test limit.
+        let big = tmp.path().join("big");
+        std::fs::write(&big, vec![b'x'; 100]).unwrap();
+        assert!(matches!(
+            plan_drop_with_limit(&[file, big], &FsLocation::Local, tmp.path(), 50),
+            Err(DropRejection::TooLarge(101))
+        ));
+    }
+
+    #[test]
+    fn drop_size_walk_bounds_depth_and_never_follows_symlinks() {
+        let tmp = TestDir::new("plan-drop-walk");
+        // A 70-deep chain with a file at the bottom: beyond depth 64 it
+        // contributes nothing.
+        let mut deep = tmp.path().to_path_buf();
+        for level in 0..70 {
+            deep = deep.join(format!("d{level}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("bottom.txt"), b"deep").unwrap();
+
+        let shallow = tmp.path().join("shallow");
+        std::fs::create_dir(&shallow).unwrap();
+        std::fs::write(shallow.join("a.txt"), b"1234").unwrap();
+
+        // Symlinks are never followed: the linked dir's file counts nothing.
+        std::os::unix::fs::symlink(&shallow, tmp.path().join("dirlink")).unwrap();
+        std::os::unix::fs::symlink(shallow.join("a.txt"), tmp.path().join("filelink")).unwrap();
+
+        let top = plan_drop(&[tmp.path().to_path_buf()], &FsLocation::Local, tmp.path())
+            .unwrap()
+            .total_bytes;
+        assert_eq!(top, 4, "only the shallow real file counts");
+
+        assert_eq!(drop_item_size(&tmp.path().join("dirlink"), 0).unwrap(), 0);
+        assert_eq!(drop_item_size(&tmp.path().join("filelink"), 0).unwrap(), 0);
+        assert_eq!(
+            drop_item_size(&tmp.path().join("shallow"), 0).unwrap(),
+            4,
+            "a directly named directory is still walked"
+        );
+    }
+
+    #[test]
+    fn run_drop_copies_items_and_collects_failures() {
+        let tmp = TestDir::new("run-drop");
+        let src_file = tmp.path().join("note.txt");
+        std::fs::write(&src_file, b"hello").unwrap();
+        let src_dir = tmp.path().join("tree");
+        std::fs::create_dir(&src_dir).unwrap();
+        std::fs::write(src_dir.join("inner"), b"42").unwrap();
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir(&dst).unwrap();
+        std::fs::write(dst.join("note.txt"), b"old").unwrap();
+
+        let plan = plan_drop(&[src_file, src_dir], &FsLocation::Local, &dst).unwrap();
+        let events = std::sync::Mutex::new(Vec::new());
+        let outcome = run_drop(
+            &plan,
+            &FsLocation::Local,
+            &[],
+            &dst,
+            &TransferControl::new(),
+            &|bytes| events.lock().unwrap().push(bytes),
+        )
+        .unwrap();
+        assert_eq!(outcome.done, 1, "the directory copied");
+        assert_eq!(outcome.failed.len(), 1, "the colliding file failed");
+        assert!(outcome.failed[0].1.contains("already exists"));
+        assert_eq!(
+            std::fs::read(dst.join("tree").join("inner")).unwrap(),
+            b"42"
+        );
+        assert_eq!(
+            std::fs::read(dst.join("note.txt")).unwrap(),
+            b"old",
+            "no overwrite"
+        );
+        let events = events.into_inner().unwrap();
+        assert!(
+            events.windows(2).all(|pair| pair[0] <= pair[1]),
+            "progress never dips"
+        );
+    }
+
+    #[test]
+    fn run_drop_honors_a_pre_cancelled_control() {
+        let tmp = TestDir::new("run-drop-cancel");
+        let src = tmp.path().join("f.txt");
+        std::fs::write(&src, b"data").unwrap();
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir(&dst).unwrap();
+        let plan = plan_drop(&[src], &FsLocation::Local, &dst).unwrap();
+
+        let control = TransferControl::new();
+        control.cancel();
+        let err = run_drop(&plan, &FsLocation::Local, &[], &dst, &control, &|_| {}).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(
+            std::fs::read_dir(&dst).unwrap().count(),
+            0,
+            "a cancelled batch copies nothing"
+        );
     }
 }

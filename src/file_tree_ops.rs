@@ -498,10 +498,8 @@ impl AppModel {
         let worker_control = control.clone();
         self.run_file_tree_transfer(
             busy,
-            done,
             cancelled,
             vec![dir.clone()],
-            cut_source,
             control,
             move |progress: &dyn Fn(u64)| {
                 remote_fs::transfer(
@@ -517,6 +515,63 @@ impl AppModel {
                 .map(drop)
             },
             progress_label,
+            move |()| (done, cut_source),
+            sender,
+        );
+    }
+
+    /// Import OS file-manager drops onto the tree: plan per-item copy/upload
+    /// with the guardrail caps, then run the batch as one cancellable
+    /// transfer with progress. The batch finishes with a summary toast and an
+    /// in-place refresh of the target directory.
+    pub(crate) fn file_tree_import_paths(
+        &self,
+        paths: Vec<std::path::PathBuf>,
+        dir: Option<std::path::PathBuf>,
+        sender: &ComponentSender<AppModel>,
+    ) {
+        let loc = self.file_tree_location.borrow().clone();
+        let dir = dir.unwrap_or_else(|| self.file_tree_root.borrow().clone());
+        if dir.as_os_str().is_empty() {
+            return;
+        }
+        let hosts = self.config.borrow().remote_hosts.clone();
+        let plan = match remote_fs::plan_drop(&paths, &loc, &dir) {
+            Ok(plan) => plan,
+            Err(rejection) => {
+                self.show_toast(drop_rejection_message(&rejection, &loc, &hosts));
+                return;
+            }
+        };
+        let count = plan.items.len();
+        let total = plan.total_bytes;
+        let action = match &loc {
+            remote_fs::FsLocation::Local => "Copying".to_string(),
+            remote_fs::FsLocation::Remote(_) => format!("Uploading to {}", loc.label(&hosts)),
+        };
+        let busy = format!("{action}: {count} item(s)…");
+        let progress_label = {
+            let action = action.clone();
+            move |bytes: u64| {
+                format!(
+                    "{action}: {count} item(s)… {} / {}",
+                    remote_fs::human_bytes(bytes),
+                    remote_fs::human_bytes(total)
+                )
+            }
+        };
+        let control = remote_fs::TransferControl::new();
+        let worker_control = control.clone();
+        self.run_file_tree_transfer(
+            busy,
+            "Import cancelled".to_string(),
+            vec![dir.clone()],
+            control,
+            move |progress: &dyn Fn(u64)| {
+                remote_fs::run_drop(&plan, &loc, &hosts, &dir, &worker_control, progress)
+            },
+            progress_label,
+            move |outcome| (drop_summary(&outcome), None),
             sender,
         );
     }
@@ -601,20 +656,21 @@ impl AppModel {
     /// Run one cross-location transfer on a worker thread with a held busy
     /// toast that reports throttled progress and carries a Cancel action.
     /// Cancellation kills the transfer's children through the shared control
-    /// and reports a neutral "cancelled" — not an error. On success a cut's
-    /// source is deleted through the regular delete op; a failed source
-    /// delete is reported as partial success.
+    /// and reports a neutral "cancelled" — not an error. On success, `finish`
+    /// turns the worker's payload into the completion toast and an optional
+    /// cut source, which is then deleted through the regular delete op; a
+    /// failed source delete is reported as partial success.
     #[allow(clippy::too_many_arguments)]
-    fn run_file_tree_transfer(
+    fn run_file_tree_transfer<T: Send + 'static>(
         &self,
         busy_label: String,
-        done_label: String,
         cancelled_label: String,
         refresh: Vec<std::path::PathBuf>,
-        cut_source: Option<(remote_fs::FsLocation, std::path::PathBuf)>,
         control: remote_fs::TransferControl,
-        transfer: impl FnOnce(&dyn Fn(u64)) -> std::io::Result<()> + Send + 'static,
+        transfer: impl FnOnce(&dyn Fn(u64)) -> std::io::Result<T> + Send + 'static,
         progress_label: impl Fn(u64) -> String + 'static,
+        finish: impl FnOnce(T) -> (String, Option<(remote_fs::FsLocation, std::path::PathBuf)>)
+            + 'static,
         sender: &ComponentSender<AppModel>,
     ) {
         let busy_toast = self.file_tree_transfer_begin(&busy_label);
@@ -633,7 +689,7 @@ impl AppModel {
         let config = self.config.clone();
         let sender = sender.clone();
         let mut refresh = Some(refresh);
-        let mut cut_source = cut_source;
+        let mut finish = Some(finish);
         let busy_toast_for_error = busy_toast.clone();
         if let Err(error) =
             file_tree::request_fs_op_streaming(transfer, move |outcome| match outcome {
@@ -651,12 +707,14 @@ impl AppModel {
                         }
                     }
                     match result {
-                        Ok(()) => {
+                        Ok(payload) => {
+                            let Some(finish) = finish.take() else { return };
+                            let (done_label, cut_source) = finish(payload);
                             toast_overlay.add_toast(adw::Toast::new(&done_label));
                             sender.input(AppMsg::FileTreeOpSucceeded(
                                 refresh.take().unwrap_or_default(),
                             ));
-                            let Some((loc, path)) = cut_source.take() else {
+                            let Some((loc, path)) = cut_source else {
                                 return;
                             };
                             // The copy half of the cut is done: the clipboard
@@ -808,4 +866,49 @@ impl AppModel {
             }
         }
     }
+}
+
+/// Toast text for a wholesale-refused drop.
+fn drop_rejection_message(
+    rejection: &remote_fs::DropRejection,
+    loc: &remote_fs::FsLocation,
+    hosts: &[config::RemoteHost],
+) -> String {
+    let target = loc.label(hosts);
+    match rejection {
+        remote_fs::DropRejection::Empty => "Nothing to import.".to_string(),
+        remote_fs::DropRejection::NotAbsolute(path) => format!(
+            "Cannot import {}: not an absolute local path.",
+            file_tree::display_full_path(path)
+        ),
+        remote_fs::DropRejection::Unreadable(path) => format!(
+            "Cannot import {}: not readable.",
+            file_tree::display_full_path(path)
+        ),
+        remote_fs::DropRejection::TooManyItems(count) => format!(
+            "Refusing to import {count} items to {target}: the limit is {}.",
+            remote_fs::MAX_DROP_ITEMS
+        ),
+        remote_fs::DropRejection::TooLarge(bytes) => format!(
+            "Refusing to import to {target}: {} exceeds the {} transfer limit.",
+            remote_fs::human_bytes(*bytes),
+            remote_fs::human_bytes(remote_fs::MAX_TRANSFER_BYTES),
+        ),
+    }
+}
+
+/// Completion toast for a drop batch: counts, plus the first failure's
+/// reason so a partial batch is never silent.
+fn drop_summary(outcome: &remote_fs::DropOutcome) -> String {
+    if outcome.failed.is_empty() {
+        return format!("{} item(s) imported.", outcome.done);
+    }
+    let (name, error) = &outcome.failed[0];
+    format!(
+        "{} item(s) imported, {} failed ({}: {})",
+        outcome.done,
+        outcome.failed.len(),
+        name,
+        error
+    )
 }

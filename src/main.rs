@@ -2051,6 +2051,9 @@ impl SimpleComponent for AppModel {
                 self.file_tree_clipboard_set(path, is_dir, true)
             }
             AppMsg::FileTreePaste { dir } => self.file_tree_paste(dir, &sender),
+            AppMsg::FileTreeImportPaths { paths, dir } => {
+                self.file_tree_import_paths(paths, dir, &sender)
+            }
             AppMsg::FileTreeRefresh => self.file_tree_refresh(),
             AppMsg::FileTreeOpSucceeded(dirs) => self.refresh_tree_dirs(dirs),
             AppMsg::FileTreeCreateNamed { dir, name, is_dir } => {

@@ -610,12 +610,24 @@ progress ("Downloading name… 12.4 MiB", or "X / Y MiB" for single-file
 uploads) and offers a Cancel action that kills the stream, removes the
 partial temp file, and reports a neutral cancelled status rather than an
 error. A destination that already holds the name is refused before
-any bytes move, a cut across locations deletes the source only after the copy
+any bytes move — for directory uploads the v3 probe checks the collision
+itself before extracting, so the refusal is atomic on the far side — a cut
+across locations deletes the source only after the copy
 landed, and partial transfers clean up after themselves. Names are validated
 before any dialog is accepted, `/` can never be a delete target, and a stale
 host removed from the config drops the tree back to `Local`. The context menu
 also has Copy Path, which puts the row's full path — for remote rows the
 plain remote path, ready to paste into the remote shell — on the clipboard.
+
+Files and folders can also be dropped straight from the OS file manager onto
+the tree: the row under the pointer (a directory, a file's parent, or the
+tree root over empty space) is highlighted while hovering, and the drop
+imports into it — copied recursively when the tree shows Local, uploaded
+through the transfer machinery otherwise, with the same progress toast and
+Cancel action. A drop is refused wholesale past 256 items or the 512 MiB
+total (estimated with a bounded, symlink-free size walk), and per-item
+failures — an existing name, an unreadable file — are summarized in the
+completion toast without aborting the rest.
 
 ### AI
 

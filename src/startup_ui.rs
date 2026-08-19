@@ -206,6 +206,73 @@ pub(crate) fn build_file_tree(
         });
         view.add_controller(gesture);
     }
+    {
+        // Drag-and-drop import from the OS file manager: local files only
+        // (Gdk::FileList), target row highlighted during hover.
+        let drop_target = gtk::DropTarget::new(
+            gtk::gdk::FileList::static_type(),
+            gtk::gdk::DragAction::COPY,
+        );
+        {
+            let view = view.clone();
+            let store = store.clone();
+            drop_target.connect_motion(move |_, x, y| {
+                match row_at_pos(&view, &store, x, y) {
+                    Some((_, true, tree_path)) => {
+                        view.set_drag_dest_row(
+                            Some(&tree_path),
+                            gtk::TreeViewDropPosition::IntoOrAfter,
+                        );
+                    }
+                    Some((_, false, tree_path)) => {
+                        // Files import into the row's parent directory.
+                        view.set_drag_dest_row(Some(&tree_path), gtk::TreeViewDropPosition::After);
+                    }
+                    None => {
+                        // Empty area: the root is the target.
+                        view.set_drag_dest_row(None, gtk::TreeViewDropPosition::After);
+                    }
+                }
+                gtk::gdk::DragAction::COPY
+            });
+        }
+        {
+            let view = view.clone();
+            drop_target.connect_leave(move |_| {
+                view.set_drag_dest_row(None, gtk::TreeViewDropPosition::After);
+            });
+        }
+        {
+            let view = view.clone();
+            let store = store.clone();
+            let sender = sender.clone();
+            drop_target.connect_drop(move |_, value, x, y| {
+                view.set_drag_dest_row(None, gtk::TreeViewDropPosition::After);
+                let Ok(file_list) = value.get::<gtk::gdk::FileList>() else {
+                    return false;
+                };
+                let paths: Vec<std::path::PathBuf> = file_list
+                    .files()
+                    .iter()
+                    .filter_map(|file| file.path())
+                    .collect();
+                if paths.is_empty() {
+                    return false;
+                }
+                let target_dir = match row_at_pos(&view, &store, x, y) {
+                    Some((path, true, _)) => Some(path),
+                    Some((path, false, _)) => path.parent().map(std::path::Path::to_path_buf),
+                    None => None,
+                };
+                sender.input(AppMsg::FileTreeImportPaths {
+                    paths,
+                    dir: target_dir,
+                });
+                true
+            });
+        }
+        view.add_controller(drop_target);
+    }
 
     let scroll = gtk::ScrolledWindow::new();
     scroll.set_vexpand(true);
@@ -228,6 +295,33 @@ pub(crate) fn build_file_tree(
         header,
         scan_generation,
     }
+}
+
+/// The tree row at view coordinates: (filesystem path, is_dir, tree path).
+/// Rows without a valid identity (placeholders) resolve to nothing.
+#[allow(deprecated)]
+fn row_at_pos(
+    view: &gtk::TreeView,
+    store: &gtk::TreeStore,
+    x: f64,
+    y: f64,
+) -> Option<(std::path::PathBuf, bool, gtk::TreePath)> {
+    let (tree_path, _column, _x, _y) = view.path_at_pos(x as i32, y as i32)?;
+    let tree_path = tree_path?;
+    let iter = store.iter(&tree_path)?;
+    let identity: String = store
+        .get_value(&iter, file_tree::COL_PATH as i32)
+        .get()
+        .unwrap_or_default();
+    if identity.is_empty() {
+        return None;
+    }
+    let path = file_tree::decode_path_identity(&identity)?;
+    let is_dir = store
+        .get_value(&iter, file_tree::COL_IS_DIR as i32)
+        .get()
+        .unwrap_or(false);
+    Some((path, is_dir, tree_path))
 }
 
 /// One menu row, styled like the tab strip's context-menu buttons.
