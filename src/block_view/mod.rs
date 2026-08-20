@@ -347,7 +347,44 @@ fn secure_zone_marker_nonce() -> Option<[u8; 16]> {
 /// for very long sessions while preserving the newest failures, which are
 /// usually the most useful navigation hints. Computing positions still scans
 /// the retained block metadata once.
+fn failed_block_marker_fractions_from_entries(
+    entries: impl IntoIterator<Item = (u64, bool)>,
+) -> Vec<f64> {
+    const MAX_FAILURE_MARKERS: usize = 1024;
+
+    let mut top = 0_u64;
+    let mut markers = VecDeque::new();
+    for (height, failed) in entries {
+        if failed {
+            if markers.len() == MAX_FAILURE_MARKERS {
+                markers.pop_front();
+            }
+            markers.push_back(top);
+        }
+        top = top.saturating_add(height.max(1));
+    }
+    if top == 0 {
+        return Vec::new();
+    }
+
+    markers
+        .into_iter()
+        .map(|marker_top| (marker_top as f64 / top as f64).clamp(0.0, 1.0))
+        .collect()
+}
+
 fn failed_block_marker_fractions(blocks: &VecDeque<BlockData>) -> Vec<f64> {
+    failed_block_marker_fractions_from_entries(blocks.iter().map(|block| {
+        (
+            block.estimated_height.max(1) as u64,
+            jterm_core::block_contract::classify_completed(Some(&block.cmd), block.exit_code)
+                .is_failed(),
+        )
+    }))
+}
+
+#[cfg(test)]
+fn failed_block_marker_fractions_legacy(blocks: &VecDeque<BlockData>) -> Vec<f64> {
     const MAX_FAILURE_MARKERS: usize = 1024;
 
     let total_height = blocks.iter().fold(0_u64, |total, block| {
@@ -616,13 +653,13 @@ fn shell_argv_supports_agent_ids(argv: &[String]) -> bool {
 const MAX_CAPABILITY_OSC_BYTES: usize = 128;
 const MAX_LOCAL_APC_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 
-#[derive(Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 struct ShellCapabilityObserver {
     state: CapabilityOscState,
     collecting_prompt: bool,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 enum CapabilityOscState {
     #[default]
     Ground,
@@ -640,16 +677,28 @@ impl ShellCapabilityObserver {
     /// because it advances in reset-splitter order, so a same-chunk RIS
     /// invalidates pre-reset trust before the suffix bytes are observed.
     fn feed(&mut self, bytes: &[u8], expected: &str, ready: &Cell<bool>) {
-        for &byte in bytes {
+        let mut index = 0usize;
+        while index < bytes.len() {
+            // ESC is the only byte that leaves Ground. Bulk-skip ordinary output
+            // instead of taking/replacing the enum once per byte; long compiler
+            // logs otherwise make this trust observer more expensive than the
+            // parser and raw capture it accompanies.
+            if matches!(&self.state, CapabilityOscState::Ground) {
+                match memchr::memchr(0x1b, &bytes[index..]) {
+                    Some(offset) => {
+                        index += offset + 1;
+                        self.state = CapabilityOscState::Escape;
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+
+            let byte = bytes[index];
+            index += 1;
             let state = std::mem::take(&mut self.state);
             self.state = match state {
-                CapabilityOscState::Ground => {
-                    if byte == 0x1b {
-                        CapabilityOscState::Escape
-                    } else {
-                        CapabilityOscState::Ground
-                    }
-                }
+                CapabilityOscState::Ground => unreachable!("Ground is handled by the fast path"),
                 CapabilityOscState::Escape => match byte {
                     b']' => CapabilityOscState::Osc(Vec::new()),
                     0x1b => CapabilityOscState::Escape,
@@ -3248,6 +3297,25 @@ struct BackendSearchBatch {
     native_fallback: Option<BackendNativeSearchFallback>,
 }
 
+/// Intersect mounted record ids with one page of search candidates. Walking
+/// the document once avoids the former per-hit `record_search_target` lookup,
+/// which rescanned the mounted block vector for every rendered result row.
+fn mounted_jumpable_records(
+    mounted_ids: impl IntoIterator<Item = u64>,
+    candidates: &HashSet<(u64, bool)>,
+) -> HashSet<(u64, bool)> {
+    let mut jumpable = HashSet::with_capacity(candidates.len());
+    for block_id in mounted_ids {
+        for is_output in [false, true] {
+            let candidate = (block_id, is_output);
+            if candidates.contains(&candidate) {
+                jumpable.insert(candidate);
+            }
+        }
+    }
+    jumpable
+}
+
 /// Materialize one surface only while the caller's deadline remains live. A
 /// post-check keeps the just-created surface usable while preventing another
 /// potentially allocating read after the deadline.
@@ -3419,6 +3487,23 @@ struct BlockRenderPayload {
     output_plain: String,
 }
 
+#[inline]
+fn into_payload_plain_output(stripped: String) -> String {
+    stripped
+}
+
+fn materialize_plain_output(output_with_ansi: &str) -> String {
+    // `strip_ansi` already returns an owned String. Returning it directly
+    // transfers that allocation into the payload; calling `to_string()` on it
+    // would allocate and copy the complete (up to 8 MiB) output a second time.
+    into_payload_plain_output(strip_ansi(output_with_ansi))
+}
+
+#[cfg(test)]
+fn materialize_plain_output_legacy(output_with_ansi: &str) -> String {
+    strip_ansi(output_with_ansi).to_string()
+}
+
 /// Object-safe, memoized accessor handed to every backend. Block calls
 /// `materialize`; Unified calls only the bounded `output_snapshot`, which
 /// never builds or memoizes the full card payload.
@@ -3487,7 +3572,7 @@ impl BlockRenderPayloadAccessor for LazyBlockRenderPayload {
                     String::from_utf8_lossy(output.make_contiguous()).into_owned()
                 }
             };
-            let output_plain = strip_ansi(&output_with_ansi).to_string();
+            let output_plain = materialize_plain_output(&output_with_ansi);
             BlockRenderPayload {
                 prompt,
                 output_with_ansi,
@@ -3586,6 +3671,19 @@ trait RenderBackend {
     /// no scroll, no focus, no selection.
     fn can_scroll_to_record(&self, _block_id: u64) -> bool {
         false
+    }
+    /// Resolve one result page without moving focus or scroll state. The
+    /// default retains backend-specific lookup/proof semantics; mounted-card
+    /// backends override it to avoid one document scan per candidate.
+    fn jumpable_records(&self, candidates: &HashSet<(u64, bool)>) -> HashSet<(u64, bool)> {
+        candidates
+            .iter()
+            .copied()
+            .filter(|(block_id, is_output)| {
+                self.record_search_target(*block_id, *is_output).is_some()
+                    || self.can_scroll_to_record(*block_id)
+            })
+            .collect()
     }
     /// Snapshot completed text into native search-cursor domains under one
     /// aggregate byte/work ceiling.
@@ -4133,6 +4231,15 @@ fn flush_opaque_passthrough(parts: &mut Vec<ResetAwareParserPart>, opaque: &mut 
 /// forwarded exactly once while a small framing state prevents reset-looking
 /// text inside OSC/DCS/APC/PM/SOS from becoming a lifecycle side effect.
 impl ResetAwareParserSplitter {
+    /// Ordinary ground-state text needs no framing: every sequence this shim
+    /// recognizes starts with ESC. Let the caller borrow that chunk directly
+    /// instead of allocating a one-element parts vector and copying all bytes
+    /// into a passthrough buffer before the shared parser copies them again.
+    fn can_forward_borrowed(&self, bytes: &[u8]) -> bool {
+        matches!(&self.state, ResetAwareParserState::Ground)
+            && memchr::memchr(0x1b, bytes).is_none()
+    }
+
     fn feed(&mut self, bytes: &[u8]) -> Vec<ResetAwareParserPart> {
         let mut parts = Vec::new();
         let mut passthrough = Vec::with_capacity(bytes.len());
@@ -4627,6 +4734,16 @@ impl ReaderCtx {
     }
 
     fn process_parser_input(&self, bytes: &[u8]) {
+        // The local splitter only interposes on ESC-led reset/control strings.
+        // Its Ground + no-ESC path would produce exactly one `Bytes` part, so
+        // retain the original slice and avoid an otherwise redundant full-chunk
+        // allocation/copy. A pending ESC/CSI/control string always takes the
+        // stateful path even when this continuation chunk contains no ESC.
+        if self.reset_splitter.borrow().can_forward_borrowed(bytes) {
+            self.observe_capability_bytes(bytes);
+            self.parse_and_dispatch(bytes);
+            return;
+        }
         let parts = self.reset_splitter.borrow_mut().feed(bytes);
         for part in parts {
             match part {
@@ -5764,6 +5881,11 @@ impl RenderBackend for BlockBackend {
             .borrow()
             .iter()
             .any(|block| block.id == block_id)
+    }
+
+    fn jumpable_records(&self, candidates: &HashSet<(u64, bool)>) -> HashSet<(u64, bool)> {
+        let finished = self.finished_blocks_for_cb.borrow();
+        mounted_jumpable_records(finished.iter().map(|block| block.id), candidates)
     }
 
     fn completed_search_surfaces(
@@ -7163,6 +7285,27 @@ fn compute_viewport_state(
     }
 }
 
+fn viewport_bounds_for_scroll(
+    scroll_top: f64,
+    viewport_height: f64,
+    margin_pages: u32,
+) -> Option<(i32, i32)> {
+    if !scroll_top.is_finite() || !viewport_height.is_finite() || viewport_height < 1.0 {
+        return None;
+    }
+    let scroll_top = scroll_top.max(0.0) as i32;
+    let viewport_height = viewport_height as i32;
+    if viewport_height <= 0 {
+        return None;
+    }
+    let margin = viewport_height.saturating_mul(i32::try_from(margin_pages).unwrap_or(i32::MAX));
+    let visible_top = scroll_top.saturating_sub(margin).max(0);
+    let visible_bottom = scroll_top
+        .saturating_add(viewport_height)
+        .saturating_add(margin);
+    (visible_bottom > visible_top).then_some((visible_top, visible_bottom))
+}
+
 /// Convert mapped GTK scroll geometry into a block range. Notebook/tab
 /// transitions temporarily expose zero-sized adjustments; retaining the last
 /// valid set avoids virtualizing every card during that transient frame.
@@ -7172,22 +7315,70 @@ fn viewport_state_for_scroll(
     viewport_height: f64,
     margin_pages: u32,
 ) -> Option<ViewportState> {
-    if !scroll_top.is_finite() || !viewport_height.is_finite() || viewport_height < 1.0 {
-        return None;
+    let (visible_top, visible_bottom) =
+        viewport_bounds_for_scroll(scroll_top, viewport_height, margin_pages)?;
+    Some(compute_viewport_state(
+        block_data,
+        visible_top,
+        visible_bottom,
+    ))
+}
+
+/// Compute strict and one-page-looser virtualization ranges in one history
+/// walk. Scroll signals used to call `viewport_state_for_scroll` twice; near
+/// the bottom of a long session that scanned the same old block prefix twice
+/// on the GTK main thread.
+fn viewport_states_for_scroll(
+    block_data: &VecDeque<BlockData>,
+    scroll_top: f64,
+    viewport_height: f64,
+    margin_pages: u32,
+) -> Option<(ViewportState, ViewportState)> {
+    let strict_bounds = viewport_bounds_for_scroll(scroll_top, viewport_height, margin_pages)?;
+    let loose_bounds =
+        viewport_bounds_for_scroll(scroll_top, viewport_height, margin_pages.saturating_add(1))?;
+
+    let mut y = 0_i32;
+    let mut strict_first = None;
+    let mut strict_last = 0;
+    let mut loose_first = None;
+    let mut loose_last = 0;
+    for (index, block) in block_data.iter().enumerate() {
+        let block_top = y;
+        let block_bottom = y.saturating_add(block.estimated_height.max(1));
+
+        if strict_first.is_none() && block_bottom > strict_bounds.0 {
+            strict_first = Some(index);
+        }
+        if block_top < strict_bounds.1 {
+            strict_last = index;
+        }
+        if loose_first.is_none() && block_bottom > loose_bounds.0 {
+            loose_first = Some(index);
+        }
+        if block_top < loose_bounds.1 {
+            loose_last = index;
+        }
+        y = block_bottom;
+
+        if strict_first.is_some()
+            && loose_first.is_some()
+            && y >= strict_bounds.1.max(loose_bounds.1)
+        {
+            break;
+        }
     }
-    let scroll_top = scroll_top.max(0.0) as i32;
-    let viewport_height = viewport_height as i32;
-    if viewport_height <= 0 {
-        return None;
-    }
-    let margin_pages = i32::try_from(margin_pages).unwrap_or(i32::MAX);
-    let margin = viewport_height.saturating_mul(margin_pages);
-    let visible_top = scroll_top.saturating_sub(margin).max(0);
-    let visible_bottom = scroll_top
-        .saturating_add(viewport_height)
-        .saturating_add(margin);
-    (visible_bottom > visible_top)
-        .then(|| compute_viewport_state(block_data, visible_top, visible_bottom))
+
+    Some((
+        ViewportState {
+            first_visible: strict_first.unwrap_or(0),
+            last_visible: strict_last,
+        },
+        ViewportState {
+            first_visible: loose_first.unwrap_or(0),
+            last_visible: loose_last,
+        },
+    ))
 }
 
 /// `changed` also fires when hiding a card changes only `upper`. Recompute on
@@ -9541,7 +9732,7 @@ impl TermView {
                     let adjustment = scroll.vadjustment();
                     let margin = config.borrow().virtual_scroll_margin;
                     let block_data_ref = block_data.borrow();
-                    let Some(strict) = viewport_state_for_scroll(
+                    let Some((strict, loose)) = viewport_states_for_scroll(
                         &block_data_ref,
                         adjustment.value(),
                         adjustment.page_size(),
@@ -9549,16 +9740,10 @@ impl TermView {
                     ) else {
                         return;
                     };
-                    let loose = viewport_state_for_scroll(
-                        &block_data_ref,
-                        adjustment.value(),
-                        adjustment.page_size(),
-                        margin.saturating_add(1),
-                    );
                     drop(block_data_ref);
 
                     let new_visible =
-                        stable_visible_indices(&strict, loose.as_ref(), &visible.borrow());
+                        stable_visible_indices(&strict, Some(&loose), &visible.borrow());
                     *viewport.borrow_mut() = strict;
 
                     let finished_ref = finished.borrow();
@@ -10735,7 +10920,7 @@ impl TermView {
         let adjustment = self.block_scroll.vadjustment();
         let margin = self.config.borrow().virtual_scroll_margin;
         let block_data = self.block_data.borrow();
-        let Some(strict) = viewport_state_for_scroll(
+        let Some((strict, loose)) = viewport_states_for_scroll(
             &block_data,
             adjustment.value(),
             adjustment.page_size(),
@@ -10743,15 +10928,9 @@ impl TermView {
         ) else {
             return;
         };
-        let loose = viewport_state_for_scroll(
-            &block_data,
-            adjustment.value(),
-            adjustment.page_size(),
-            margin.saturating_add(1),
-        );
         drop(block_data);
         let new_visible =
-            stable_visible_indices(&strict, loose.as_ref(), &self.visible_indices.borrow());
+            stable_visible_indices(&strict, Some(&loose), &self.visible_indices.borrow());
         *self.viewport.borrow_mut() = strict;
         let finished = self.finished_blocks.borrow();
         let mut block_data = self.block_data.borrow_mut();
@@ -11015,27 +11194,29 @@ mod tests {
         command_capture_range_is_bounded, command_end_matches_started_id,
         command_id_uses_shell_token, decide_agent_command_end, emit_alt_screen_transition,
         estimated_finished_block_height_for_text, failed_block_marker_fractions,
+        failed_block_marker_fractions_from_entries, failed_block_marker_fractions_legacy,
         feed_with_zone_marker, finished_block_config, finished_command, finished_layout_key,
-        is_post_command_metadata, live_content_extent_for, live_output_text, live_visible_rows,
-        mutate_block_data_and_redraw, normalize_captured_command, notification_permitted,
-        parse_color_spec, plan_prompt_zone, pop_typed_command_shadow, process_block_id_namespace,
-        prompt_anchor_for_surface, prompt_anchor_rebases_on_row_delta,
-        prompt_zone_to_reopen_after_alt, rebase_prompt_anchor, record_external_input,
-        record_unified_zone, resolve_command_text, reviewed_pre_command_bytes_are_identity_neutral,
-        reviewed_submission_matches, screen_relative_cpr_row, selected_blocks_markdown,
-        selected_command_text, selected_id_range, shell_argv_supports_agent_ids,
-        stable_visible_indices, step_marked_indices, step_marked_record_ids,
-        stranded_focus_key_recovers, strip_ansi, strip_ansi_with_clear_detect,
-        take_armed_agent_execution, take_background_output, unread_after_index_removal,
-        unread_after_prefix_eviction, viewport_page_size_changed, viewport_state_for_scroll,
-        visible_indices_for_viewport, zone_output_snapshot_from_plain,
-        zone_output_snapshot_from_ring, AgentCommandEndDecision, AgentExecutionLostCallbacks,
-        AltScreenCallbacks, AltScreenTransition, AnchorSettleArgs, ArmedAgentExecution,
-        BackendRecords, BlockData, BlockFinishedCallback, BlockFinishedCallbacks,
-        BlockRenderPayloadAccessor, BlockState, CommandFinishedCallbacks, CommandFinishedEvent,
-        CommandPromptStatus, CommandStartedCallbacks, CommandStartedEvent, CommandTextSource,
-        CompletedCommandRecord, DynamicColors, DynamicColorsRc, EngineState, PendingZone,
-        ReaderCtx, RenderBackend, ResetAwareParserPart, ResetAwareParserSplitter,
+        into_payload_plain_output, is_post_command_metadata, live_content_extent_for,
+        live_output_text, live_visible_rows, materialize_plain_output,
+        materialize_plain_output_legacy, mounted_jumpable_records, mutate_block_data_and_redraw,
+        normalize_captured_command, notification_permitted, parse_color_spec, plan_prompt_zone,
+        pop_typed_command_shadow, process_block_id_namespace, prompt_anchor_for_surface,
+        prompt_anchor_rebases_on_row_delta, prompt_zone_to_reopen_after_alt, rebase_prompt_anchor,
+        record_external_input, record_unified_zone, resolve_command_text,
+        reviewed_pre_command_bytes_are_identity_neutral, reviewed_submission_matches,
+        screen_relative_cpr_row, selected_blocks_markdown, selected_command_text,
+        selected_id_range, shell_argv_supports_agent_ids, stable_visible_indices,
+        step_marked_indices, step_marked_record_ids, stranded_focus_key_recovers, strip_ansi,
+        strip_ansi_with_clear_detect, take_armed_agent_execution, take_background_output,
+        unread_after_index_removal, unread_after_prefix_eviction, viewport_page_size_changed,
+        viewport_state_for_scroll, viewport_states_for_scroll, visible_indices_for_viewport,
+        zone_output_snapshot_from_plain, zone_output_snapshot_from_ring, AgentCommandEndDecision,
+        AgentExecutionLostCallbacks, AltScreenCallbacks, AltScreenTransition, AnchorSettleArgs,
+        ArmedAgentExecution, BackendRecords, BlockData, BlockFinishedCallback,
+        BlockFinishedCallbacks, BlockRenderPayloadAccessor, BlockState, CommandFinishedCallbacks,
+        CommandFinishedEvent, CommandPromptStatus, CommandStartedCallbacks, CommandStartedEvent,
+        CommandTextSource, CompletedCommandRecord, DynamicColors, DynamicColorsRc, EngineState,
+        PendingZone, ReaderCtx, RenderBackend, ResetAwareParserPart, ResetAwareParserSplitter,
         ReviewedSubmission, ReviewedSubmissionPhase, SelectionFeedHold, ShellCapabilityObserver,
         SubmissionSurface, TerminalResetKind, UnifiedZoneStore, VerifiedSubmissionCtx,
         ZoneMarkerInjector, ZoneOutputSnapshot, BLOCK_ID_SEQUENCE_LIMIT, LAST_NOTIFICATION_AT,
@@ -11533,6 +11714,47 @@ mod tests {
     }
 
     #[test]
+    fn payload_plain_output_transfers_the_stripped_allocation() {
+        let stripped = "plain output".repeat(128);
+        let pointer = stripped.as_ptr();
+        let capacity = stripped.capacity();
+
+        let transferred = into_payload_plain_output(stripped);
+
+        assert_eq!(transferred.as_ptr(), pointer);
+        assert_eq!(transferred.capacity(), capacity);
+        assert_eq!(
+            materialize_plain_output("\x1b[32mok\x1b[0m"),
+            materialize_plain_output_legacy("\x1b[32mok\x1b[0m")
+        );
+    }
+
+    #[test]
+    #[ignore = "micro-benchmark; run explicitly with --ignored --nocapture"]
+    fn payload_plain_output_clone_micro_benchmark() {
+        const BYTES: usize = 8 * 1024 * 1024;
+        const REPETITIONS: usize = 16;
+        let input = "x".repeat(BYTES);
+
+        let legacy_started = Instant::now();
+        for _ in 0..REPETITIONS {
+            std::hint::black_box(materialize_plain_output_legacy(&input));
+        }
+        let legacy = legacy_started.elapsed();
+
+        let direct_started = Instant::now();
+        for _ in 0..REPETITIONS {
+            std::hint::black_box(materialize_plain_output(&input));
+        }
+        let direct = direct_started.elapsed();
+
+        eprintln!(
+            "8 MiB payload plain output ({REPETITIONS}x): legacy={legacy:?} (2 allocations), direct={direct:?} (1 allocation), speedup={:.2}x",
+            legacy.as_secs_f64() / direct.as_secs_f64()
+        );
+    }
+
+    #[test]
     fn unified_cursor_position_report_row_stays_screen_relative() {
         assert_eq!(screen_relative_cpr_row(805, 800, 24), 5);
         assert_eq!(screen_relative_cpr_row(799, 800, 24), 0);
@@ -11622,6 +11844,82 @@ mod tests {
             }
         }
         bytes
+    }
+
+    fn split_resets_with_borrowed_fast_path(
+        splitter: &mut ResetAwareParserSplitter,
+        bytes: &[u8],
+    ) -> Vec<ResetAwareParserPart> {
+        if splitter.can_forward_borrowed(bytes) {
+            vec![ResetAwareParserPart::Bytes(bytes.to_vec())]
+        } else {
+            splitter.feed(bytes)
+        }
+    }
+
+    #[test]
+    fn borrowed_plain_fast_path_matches_splitter_across_control_boundaries() {
+        // Include a direct plain chunk and continuations with no ESC while the
+        // splitter is inside ESC, CSI, OSC, DCS, APC, plus both reset kinds.
+        // The Ground check is what keeps those continuation chunks stateful.
+        let chunks: &[&[u8]] = &[
+            b"plain-before",
+            b"\x1b",
+            b"[3",
+            b"Jplain-after-ed3",
+            b"\x1b]0;ti",
+            b"tle",
+            b"\x07plain-after-osc",
+            b"\x1bP1;2|dcs",
+            b"-payload\x1b",
+            b"\\plain-after-dcs",
+            b"\x1b_Ga=T;AAAA",
+            b"BBBB\x1b",
+            b"\\plain-after-apc",
+            b"\x1b",
+            b"cplain-after-ris",
+        ];
+        let mut legacy = ResetAwareParserSplitter::default();
+        let mut optimized = ResetAwareParserSplitter::default();
+
+        for (index, chunk) in chunks.iter().enumerate() {
+            let expected = legacy.feed(chunk);
+            let actual = split_resets_with_borrowed_fast_path(&mut optimized, chunk);
+            assert_eq!(actual, expected, "chunk #{index}: {chunk:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "micro-benchmark; run explicitly with --ignored --nocapture"]
+    fn reset_splitter_plain_borrowed_micro_benchmark() {
+        use std::hint::black_box;
+
+        const CHUNK_BYTES: usize = 32 * 1024;
+        const ITERATIONS: usize = 16_384;
+        let chunk = vec![b'x'; CHUNK_BYTES];
+
+        let mut legacy = ResetAwareParserSplitter::default();
+        let started = Instant::now();
+        for _ in 0..ITERATIONS {
+            black_box(legacy.feed(black_box(&chunk)));
+        }
+        let copied = started.elapsed();
+
+        let optimized = ResetAwareParserSplitter::default();
+        let started = Instant::now();
+        for _ in 0..ITERATIONS {
+            let bytes = black_box(chunk.as_slice());
+            if optimized.can_forward_borrowed(bytes) {
+                black_box(bytes);
+            }
+        }
+        let borrowed = started.elapsed();
+
+        let mib = (CHUNK_BYTES * ITERATIONS) as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "{mib:.0} MiB plain chunks: copied-splitter={copied:?}, borrowed-fast-path={borrowed:?}, speedup={:.2}x",
+            copied.as_secs_f64() / borrowed.as_secs_f64()
+        );
     }
 
     #[test]
@@ -12840,6 +13138,52 @@ mod tests {
                 DispatchCall::Feed(b"\x1b[?2004h".to_vec()),
             ]
         );
+    }
+
+    #[test]
+    fn split_decset_and_decrst_update_owned_pty_through_parser_events() {
+        let harness = ReaderHarness::new();
+        harness.bstate.set(BlockState::CollectingOutput);
+
+        harness.feed_raw(b"\x1b[?20");
+        assert!(!harness.pty.shell_bracketed_paste());
+        // This continuation contains no ESC, but the reset splitter is inside
+        // CSI and must not take the borrowed Ground-state path.
+        harness.feed_raw(b"04h");
+        assert!(harness.pty.shell_bracketed_paste());
+
+        harness.feed_raw(b"plain output without escapes");
+        assert!(harness.pty.shell_bracketed_paste());
+
+        harness.feed_raw(b"\x1b[?2004");
+        assert!(harness.pty.shell_bracketed_paste());
+        harness.feed_raw(b"l");
+        assert!(!harness.pty.shell_bracketed_paste());
+    }
+
+    #[test]
+    fn borrowed_splitter_path_still_advances_a_divergent_core_parser_state() {
+        let harness = ReaderHarness::new();
+        harness.bstate.set(BlockState::CollectingOutput);
+        harness.backend.take_calls();
+
+        // The local splitter aborts this malformed OSC on the repeated ESC and
+        // returns to Ground. Core has consumed the same `ESC ESC` according to
+        // its own recovery rule and is still in its Esc state, however.
+        harness.feed_raw(b"\x1b]0;discarded-title\x1b");
+        harness.feed_raw(b"\x1b");
+        assert!(harness.backend.take_calls().is_empty());
+
+        // This chunk has no ESC, so it takes the borrowed splitter fast path.
+        // It must still pass through core: the pending Esc is emitted with the
+        // backslash, followed by the plain suffix. Calling `on_bytes` directly
+        // here would lose that ESC and strand core in the wrong state.
+        harness.feed_raw(b"\\plain");
+        assert_eq!(
+            harness.backend.take_calls(),
+            [DispatchCall::Feed(b"\x1b\\plain".to_vec())]
+        );
+        assert_eq!(harness.live_output(), "\x1b\\plain");
     }
 
     #[test]
@@ -14517,6 +14861,165 @@ mod tests {
         ])));
     }
 
+    fn legacy_capability_observer_feed(
+        observer: &mut ShellCapabilityObserver,
+        bytes: &[u8],
+        expected: &str,
+        ready: &Cell<bool>,
+    ) {
+        use super::CapabilityOscState;
+
+        for &byte in bytes {
+            let state = std::mem::take(&mut observer.state);
+            observer.state = match state {
+                CapabilityOscState::Ground => {
+                    if byte == 0x1b {
+                        CapabilityOscState::Escape
+                    } else {
+                        CapabilityOscState::Ground
+                    }
+                }
+                CapabilityOscState::Escape => match byte {
+                    b']' => CapabilityOscState::Osc(Vec::new()),
+                    0x1b => CapabilityOscState::Escape,
+                    _ => CapabilityOscState::Ground,
+                },
+                CapabilityOscState::Osc(mut payload) => match byte {
+                    0x07 => {
+                        observer.finish_osc(&payload, expected, ready);
+                        CapabilityOscState::Ground
+                    }
+                    0x1b => CapabilityOscState::OscEscape(payload),
+                    _ if payload.len() < super::MAX_CAPABILITY_OSC_BYTES => {
+                        payload.push(byte);
+                        CapabilityOscState::Osc(payload)
+                    }
+                    _ => CapabilityOscState::Discard,
+                },
+                CapabilityOscState::OscEscape(payload) => match byte {
+                    b'\\' => {
+                        observer.finish_osc(&payload, expected, ready);
+                        CapabilityOscState::Ground
+                    }
+                    0x1b => CapabilityOscState::OscEscape(payload),
+                    _ => CapabilityOscState::Discard,
+                },
+                CapabilityOscState::Discard => {
+                    if byte == 0x1b {
+                        CapabilityOscState::DiscardEscape
+                    } else if byte == 0x07 {
+                        CapabilityOscState::Ground
+                    } else {
+                        CapabilityOscState::Discard
+                    }
+                }
+                CapabilityOscState::DiscardEscape => match byte {
+                    b'\\' => CapabilityOscState::Ground,
+                    0x1b => CapabilityOscState::DiscardEscape,
+                    _ => CapabilityOscState::Discard,
+                },
+            };
+        }
+    }
+
+    #[test]
+    fn capability_observer_ground_fast_path_matches_legacy_at_every_split() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let mut oversized_bel = b"\x1b]".to_vec();
+        oversized_bel.extend(std::iter::repeat_n(
+            b'x',
+            super::MAX_CAPABILITY_OSC_BYTES + 17,
+        ));
+        oversized_bel.extend_from_slice(b"\x07tail");
+        let corpora: Vec<Vec<u8>> = vec![
+            b"plain compiler output without escapes".to_vec(),
+            format!("\x1b]133;A\x07plain\x1b]7771;{token}\x07\x1b]133;B\x07tail").into_bytes(),
+            b"\x1b]0;ordinary title\x07tail".to_vec(),
+            b"\x1b]0;st title\x1b\\tail".to_vec(),
+            b"\x1b]0;lenient-repeat\x1b\x1b\\tail".to_vec(),
+            b"\x1b]0;discard-on-malformed\x1bcpast-reset".to_vec(),
+            b"\x1bP1;2|dcs payload\x1b\\tail".to_vec(),
+            b"\x1b_apc payload\x1b\\tail".to_vec(),
+            b"\x1b[3Jplain\x1bcplain".to_vec(),
+            oversized_bel,
+        ];
+
+        for bytes in corpora {
+            for split in 0..=bytes.len() {
+                let mut legacy = ShellCapabilityObserver::default();
+                let mut optimized = ShellCapabilityObserver::default();
+                let legacy_ready = Cell::new(false);
+                let optimized_ready = Cell::new(false);
+                for chunk in [&bytes[..split], &bytes[split..]] {
+                    legacy_capability_observer_feed(&mut legacy, chunk, token, &legacy_ready);
+                    optimized.feed(chunk, token, &optimized_ready);
+                }
+                assert_eq!(optimized, legacy, "split {split} of {bytes:?}");
+                assert_eq!(
+                    optimized_ready.get(),
+                    legacy_ready.get(),
+                    "readiness at split {split} of {bytes:?}"
+                );
+            }
+
+            let mut legacy = ShellCapabilityObserver::default();
+            let mut optimized = ShellCapabilityObserver::default();
+            let legacy_ready = Cell::new(false);
+            let optimized_ready = Cell::new(false);
+            for byte in &bytes {
+                legacy_capability_observer_feed(
+                    &mut legacy,
+                    std::slice::from_ref(byte),
+                    token,
+                    &legacy_ready,
+                );
+                optimized.feed(std::slice::from_ref(byte), token, &optimized_ready);
+            }
+            assert_eq!(optimized, legacy, "bytewise {bytes:?}");
+            assert_eq!(optimized_ready.get(), legacy_ready.get());
+        }
+    }
+
+    #[test]
+    #[ignore = "micro-benchmark; run explicitly with --ignored --nocapture"]
+    fn capability_observer_ground_fast_path_micro_benchmark() {
+        use std::hint::black_box;
+
+        const CHUNK_BYTES: usize = 32 * 1024;
+        const ITERATIONS: usize = 16_384;
+        let bytes = vec![b'x'; CHUNK_BYTES];
+        let token = "0123456789abcdef0123456789abcdef";
+
+        let legacy_ready = Cell::new(false);
+        let mut legacy_observer = ShellCapabilityObserver::default();
+        let started = Instant::now();
+        for _ in 0..ITERATIONS {
+            legacy_capability_observer_feed(
+                &mut legacy_observer,
+                black_box(&bytes),
+                token,
+                &legacy_ready,
+            );
+        }
+        black_box((&legacy_observer, legacy_ready.get()));
+        let legacy = started.elapsed();
+
+        let optimized_ready = Cell::new(false);
+        let mut optimized_observer = ShellCapabilityObserver::default();
+        let started = Instant::now();
+        for _ in 0..ITERATIONS {
+            optimized_observer.feed(black_box(&bytes), token, &optimized_ready);
+        }
+        black_box((&optimized_observer, optimized_ready.get()));
+        let optimized = started.elapsed();
+
+        let mib = (CHUNK_BYTES * ITERATIONS) as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "{mib:.0} MiB plain chunks: legacy-capability-observer={legacy:?}, ground-memchr={optimized:?}, speedup={:.2}x",
+            legacy.as_secs_f64() / optimized.as_secs_f64()
+        );
+    }
+
     #[test]
     fn capability_observer_is_strict_hidden_streaming_and_prompt_scoped() {
         let token = "0123456789abcdef0123456789abcdef";
@@ -15307,6 +15810,212 @@ mod tests {
         assert_eq!(
             stable_visible_indices(&strict, Some(&loose), &HashSet::new()),
             HashSet::from_iter(4..=9)
+        );
+    }
+
+    #[test]
+    fn combined_viewport_scan_matches_two_independent_scans_at_boundaries() {
+        let blocks: VecDeque<BlockData> = (0..257)
+            .map(|index| block_with_height(1 + index % 37))
+            .collect();
+        for scroll_top in [-50.0, 0.0, 1.0, 777.0, 4_800.0, f64::from(i32::MAX)] {
+            for viewport_height in [1.0, 40.0, 800.0, f64::from(i32::MAX)] {
+                for margin in [0, 1, 3, u32::MAX] {
+                    let expected =
+                        viewport_state_for_scroll(&blocks, scroll_top, viewport_height, margin)
+                            .zip(viewport_state_for_scroll(
+                                &blocks,
+                                scroll_top,
+                                viewport_height,
+                                margin.saturating_add(1),
+                            ));
+                    let actual =
+                        viewport_states_for_scroll(&blocks, scroll_top, viewport_height, margin);
+                    match (actual, expected) {
+                        (Some((actual_strict, actual_loose)), Some((strict, loose))) => {
+                            assert_eq!(
+                                (actual_strict.first_visible, actual_strict.last_visible),
+                                (strict.first_visible, strict.last_visible)
+                            );
+                            assert_eq!(
+                                (actual_loose.first_visible, actual_loose.last_visible),
+                                (loose.first_visible, loose.last_visible)
+                            );
+                        }
+                        (None, None) => {}
+                        _ => panic!(
+                            "combined/independent validity differed for top={scroll_top}, height={viewport_height}, margin={margin}"
+                        ),
+                    }
+                }
+            }
+        }
+
+        assert!(viewport_states_for_scroll(&blocks, f64::NAN, 40.0, 1).is_none());
+        assert!(viewport_states_for_scroll(&blocks, 0.0, 0.5, 1).is_none());
+        let empty = VecDeque::new();
+        let (strict, loose) = viewport_states_for_scroll(&empty, 0.0, 40.0, 1).unwrap();
+        assert_eq!((strict.first_visible, strict.last_visible), (0, 0));
+        assert_eq!((loose.first_visible, loose.last_visible), (0, 0));
+    }
+
+    #[test]
+    #[ignore = "micro-benchmark; run explicitly with --ignored --nocapture"]
+    fn viewport_pair_scan_micro_benchmark() {
+        let blocks: VecDeque<BlockData> = std::iter::repeat_n(20, 100_000)
+            .map(block_with_height)
+            .collect();
+        let legacy_started = std::time::Instant::now();
+        for _ in 0..256 {
+            std::hint::black_box((
+                viewport_state_for_scroll(&blocks, 1_999_000.0, 800.0, 1).unwrap(),
+                viewport_state_for_scroll(&blocks, 1_999_000.0, 800.0, 2).unwrap(),
+            ));
+        }
+        let legacy_elapsed = legacy_started.elapsed();
+
+        let combined_started = std::time::Instant::now();
+        for _ in 0..256 {
+            std::hint::black_box(
+                viewport_states_for_scroll(&blocks, 1_999_000.0, 800.0, 1).unwrap(),
+            );
+        }
+        eprintln!(
+            "viewport pair scan: legacy={legacy_elapsed:?}, combined={:?}",
+            combined_started.elapsed()
+        );
+    }
+
+    #[test]
+    fn mounted_jumpability_intersects_both_surfaces_in_one_document_pass() {
+        let candidates = HashSet::from([(2, false), (2, true), (3, true), (9, false)]);
+        let visited = Cell::new(0);
+        let jumpable = mounted_jumpable_records(
+            [1, 2, 3, 4]
+                .into_iter()
+                .inspect(|_| visited.set(visited.get() + 1)),
+            &candidates,
+        );
+
+        assert_eq!(jumpable, HashSet::from([(2, false), (2, true), (3, true)]));
+        assert_eq!(visited.get(), 4, "each mounted block is visited once");
+    }
+
+    #[test]
+    #[ignore = "micro-benchmark; run explicitly with --ignored --nocapture"]
+    fn cross_block_jumpability_micro_benchmark() {
+        const MOUNTED: u64 = 1_000;
+        const MATCHING_RECORDS: u64 = 250;
+        const REPETITIONS: usize = 250;
+
+        let mounted: Vec<u64> = (0..MOUNTED).collect();
+        let candidates: HashSet<(u64, bool)> = (MOUNTED - MATCHING_RECORDS..MOUNTED)
+            .flat_map(|id| [(id, false), (id, true)])
+            .collect();
+
+        let legacy_started = Instant::now();
+        for _ in 0..REPETITIONS {
+            let found: HashSet<_> = candidates
+                .iter()
+                .copied()
+                .filter(|(id, _)| mounted.iter().any(|mounted_id| mounted_id == id))
+                .collect();
+            std::hint::black_box(found);
+        }
+        let legacy = legacy_started.elapsed();
+
+        let batched_started = Instant::now();
+        for _ in 0..REPETITIONS {
+            std::hint::black_box(mounted_jumpable_records(
+                mounted.iter().copied(),
+                &candidates,
+            ));
+        }
+        let batched = batched_started.elapsed();
+
+        eprintln!(
+            "cross-block jumpability: legacy={legacy:?}, batched={batched:?}, speedup={:.1}x",
+            legacy.as_secs_f64() / batched.as_secs_f64()
+        );
+    }
+
+    #[test]
+    fn one_pass_failure_markers_match_legacy_order_and_fraction_semantics() {
+        let mut blocks = VecDeque::new();
+        for id in 0..5_000_u64 {
+            let failed = id % 7 == 0;
+            let mut block = test_block(
+                id,
+                if failed { "false" } else { "true" },
+                Some(if failed { 1 } else { 0 }),
+            );
+            block.estimated_height = match id % 5 {
+                0 => -7,
+                1 => 0,
+                2 => 1,
+                3 => 37,
+                _ => i32::MAX,
+            };
+            blocks.push_back(block);
+        }
+
+        assert_eq!(
+            failed_block_marker_fractions(&blocks),
+            failed_block_marker_fractions_legacy(&blocks)
+        );
+        assert_eq!(
+            failed_block_marker_fractions(&VecDeque::new()),
+            failed_block_marker_fractions_legacy(&VecDeque::new())
+        );
+    }
+
+    #[test]
+    fn one_pass_failure_markers_keep_saturating_positions_and_newest_tail() {
+        let saturated =
+            failed_block_marker_fractions_from_entries([(u64::MAX, false), (1, true), (1, true)]);
+        assert_eq!(saturated, [1.0, 1.0]);
+
+        let newest = failed_block_marker_fractions_from_entries((0..1_025).map(|_| (1, true)));
+        assert_eq!(newest.len(), 1_024);
+        assert!((newest[0] - 1.0 / 1_025.0).abs() < f64::EPSILON);
+        assert!((newest[1_023] - 1_024.0 / 1_025.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    #[ignore = "micro-benchmark; run explicitly with --ignored --nocapture"]
+    fn failure_marker_single_pass_micro_benchmark() {
+        const BLOCKS: u64 = 100_000;
+        const REPETITIONS: usize = 64;
+        let mut blocks: VecDeque<BlockData> = (0..BLOCKS)
+            .map(|id| {
+                let failed = id % 10 == 0;
+                let mut block = test_block(
+                    id,
+                    if failed { "false" } else { "true" },
+                    Some(if failed { 1 } else { 0 }),
+                );
+                block.estimated_height = 1 + (id % 97) as i32;
+                block
+            })
+            .collect();
+        // Exercise the height clamp without changing the retained population.
+        blocks[0].estimated_height = i32::MIN;
+
+        let legacy_started = Instant::now();
+        for _ in 0..REPETITIONS {
+            std::hint::black_box(failed_block_marker_fractions_legacy(&blocks));
+        }
+        let legacy = legacy_started.elapsed();
+
+        let single_started = Instant::now();
+        for _ in 0..REPETITIONS {
+            std::hint::black_box(failed_block_marker_fractions(&blocks));
+        }
+        let single = single_started.elapsed();
+
+        eprintln!(
+            "failure markers ({BLOCKS} blocks, {REPETITIONS}x): legacy={legacy:?}, single={single:?}, speedup={:.2}x",
+            legacy.as_secs_f64() / single.as_secs_f64()
         );
     }
 

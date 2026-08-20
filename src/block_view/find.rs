@@ -9,6 +9,7 @@
 use gtk::glib;
 use gtk::prelude::*;
 use relm4::gtk;
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 use vte4::TerminalExt;
 
@@ -606,6 +607,24 @@ fn unresolved_record_target_result<'a>(
     }
 }
 
+fn add_snapshot_jump_fallbacks<'a>(
+    records: impl IntoIterator<Item = BackendRecordRef<'a>>,
+    candidates: &HashSet<(u64, bool)>,
+    jumpable: &mut HashSet<(u64, bool)>,
+) {
+    for record in records {
+        if !record.is_metadata_only() || record.output().is_none() {
+            continue;
+        }
+        for is_output in [false, true] {
+            let candidate = (record.id(), is_output);
+            if candidates.contains(&candidate) {
+                jumpable.insert(candidate);
+            }
+        }
+    }
+}
+
 #[allow(dead_code)]
 impl TermView {
     /// Search records for a query string, returning stable record ids.
@@ -1094,6 +1113,31 @@ impl TermView {
         )
     }
 
+    /// Resolve reachability for one rendered result page at once. Block mode
+    /// intersects candidate ids with mounted cards in one document pass;
+    /// metadata-only records then gain the same retained-snapshot fallback as
+    /// [`Self::can_jump_to_record`]. Unified's backend default still asks the
+    /// exact proven-scroll predicate for every candidate, preserving its row-
+    /// authority semantics.
+    pub(crate) fn jumpable_search_hits(&self, hits: &[CrossBlockHit]) -> HashSet<(u64, bool)> {
+        let candidates: HashSet<_> = hits
+            .iter()
+            .map(|hit| (hit.block_id, hit.is_output))
+            .collect();
+        if candidates.is_empty() {
+            return HashSet::new();
+        }
+
+        let mut jumpable = self.render_backend.jumpable_records(&candidates);
+        if jumpable.len() == candidates.len() {
+            return jumpable;
+        }
+
+        let records = self.render_backend.records();
+        add_snapshot_jump_fallbacks(records.iter(), &candidates, &mut jumpable);
+        jumpable
+    }
+
     pub(crate) fn navigate_to_record_id(
         &self,
         block_id: u64,
@@ -1293,16 +1337,18 @@ pub(super) fn clear_find_state(
 #[cfg(test)]
 mod tests {
     use super::{
-        bounded_match_count, command_preview, duration_matches, focus_one_native_forward_match,
-        matching_record_ids, native_cursor_action, outcome_matches_filters, plan_matching_windows,
-        regex_consumption, snippet, step_compressed_cursor, unresolved_record_target_result,
-        utf8_prefix, FindCursor, FindDirection, FindScanBudget, FindSurface, NativeCursorAction,
-        RecordNavigationResult, RecordSnapshotView, RegexConsumption, VTE_SEARCH_FLAGS,
+        add_snapshot_jump_fallbacks, bounded_match_count, command_preview, duration_matches,
+        focus_one_native_forward_match, matching_record_ids, native_cursor_action,
+        outcome_matches_filters, plan_matching_windows, regex_consumption, snippet,
+        step_compressed_cursor, unresolved_record_target_result, utf8_prefix, FindCursor,
+        FindDirection, FindScanBudget, FindSurface, NativeCursorAction, RecordNavigationResult,
+        RecordSnapshotView, RegexConsumption, VTE_SEARCH_FLAGS,
     };
     use crate::block_view::{
         BackendRecordRef, BackendSearchWindow, BlockFilters, CompletedCommandRecord,
         ZoneOutputSnapshot,
     };
+    use std::collections::HashSet;
     use std::time::Instant;
 
     fn surface(count: usize, complete: bool) -> FindSurface {
@@ -1916,6 +1962,45 @@ mod tests {
             unresolved_record_target_result(records(), 2),
             RecordNavigationResult::LocationUnavailable
         );
+    }
+
+    #[test]
+    fn batched_jumpability_preserves_only_retained_snapshot_fallbacks() {
+        let with_snapshot = CompletedCommandRecord {
+            id: 1,
+            cmd: "cargo test".to_string(),
+            exit_code: Some(0),
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: None,
+            cwd: None,
+            is_background: false,
+        };
+        let evicted = CompletedCommandRecord {
+            id: 2,
+            cmd: "rg needle src".to_string(),
+            ..with_snapshot.clone()
+        };
+        let snapshot = ZoneOutputSnapshot {
+            plain: "retained output".to_string(),
+            truncated: false,
+        };
+        let records = [
+            BackendRecordRef::Metadata {
+                record: &with_snapshot,
+                snapshot: Some(&snapshot),
+            },
+            BackendRecordRef::Metadata {
+                record: &evicted,
+                snapshot: None,
+            },
+        ];
+        let candidates = HashSet::from([(1, false), (1, true), (2, true), (9, false)]);
+        let mut jumpable = HashSet::new();
+
+        add_snapshot_jump_fallbacks(records, &candidates, &mut jumpable);
+
+        assert_eq!(jumpable, HashSet::from([(1, false), (1, true)]));
     }
 
     #[test]

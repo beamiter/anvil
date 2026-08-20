@@ -315,6 +315,11 @@ const MAX_MESSAGES_PER_DISPATCH: usize = 1;
 /// runaway producer. An unbounded channel can otherwise grow indefinitely while
 /// GTK consumes output more slowly than the child writes it.
 const PTY_QUEUE_CAPACITY: usize = 8;
+/// Maximum bytes delivered in one main-thread callback. Reserving the complete
+/// bound once avoids geometric reallocations when a repaint arrives in several
+/// immediately-readable writes (and avoids the old 36 KiB over-allocation when
+/// the first read already filled the 32 KiB buffer).
+const PTY_READ_CHUNK_BYTES: usize = 32 * 1024;
 /// Pace main-thread terminal feeding. A readiness source immediately becomes
 /// ready again while a producer is chatty, so priority alone does not provide a
 /// frame boundary. At 8 ms and 32 KiB chunks the cap is about 4 MiB/s per PTY,
@@ -323,9 +328,6 @@ const PTY_DISPATCH_INTERVAL: std::time::Duration = std::time::Duration::from_mil
 const FD_WRITER_MAX_QUEUED_BYTES: usize = 4 * 1024 * 1024;
 const FD_WRITER_MAX_MESSAGES: usize = 256;
 const FD_WRITER_MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
-
-const BRACKETED_PASTE_ENABLE: &[u8] = b"\x1b[?2004h";
-const BRACKETED_PASTE_DISABLE: &[u8] = b"\x1b[?2004l";
 
 /// Write a complete byte slice to a blocking fd, retrying interrupted and
 /// partial writes. This must run only on a background writer thread: a full
@@ -495,39 +497,6 @@ pub(crate) fn spawn_fd_writer(fd: OwnedFd, thread_name: &'static str) -> io::Res
             }
         })?;
     Ok(FdWriter { shared })
-}
-
-/// Observe DECSET/DECRST 2004 in a stream that may split an escape sequence
-/// across read chunks. `tail` retains only the bytes needed to bridge the next
-/// boundary; the returned bool is the mode after processing `data`.
-fn observe_bracketed_paste_mode(current: bool, tail: &mut Vec<u8>, data: &[u8]) -> bool {
-    let mut combined = Vec::with_capacity(tail.len() + data.len());
-    combined.extend_from_slice(tail);
-    combined.extend_from_slice(data);
-
-    let mut enabled = current;
-    let mut index = 0usize;
-    while index < combined.len() {
-        let rest = &combined[index..];
-        if rest.starts_with(BRACKETED_PASTE_ENABLE) {
-            enabled = true;
-            index += BRACKETED_PASTE_ENABLE.len();
-        } else if rest.starts_with(BRACKETED_PASTE_DISABLE) {
-            enabled = false;
-            index += BRACKETED_PASTE_DISABLE.len();
-        } else {
-            index += 1;
-        }
-    }
-
-    let bridge_len = BRACKETED_PASTE_ENABLE
-        .len()
-        .max(BRACKETED_PASTE_DISABLE.len())
-        .saturating_sub(1);
-    let keep_from = combined.len().saturating_sub(bridge_len);
-    tail.clear();
-    tail.extend_from_slice(&combined[keep_from..]);
-    enabled
 }
 
 /// anvil's child-environment policy for a directly exec'd shell.
@@ -1023,7 +992,6 @@ impl OwnedPty {
         let child_lifecycle = Arc::clone(&self.child_lifecycle);
         let reader_cancelled = Arc::clone(&self.reader_cancelled);
         let (tx, rx) = mpsc::sync_channel::<PtyMsg>(PTY_QUEUE_CAPACITY);
-        let shell_bracketed_paste = Arc::clone(&self.shell_bracketed_paste);
 
         self.start_reader_timed(
             reader_fd,
@@ -1033,7 +1001,6 @@ impl OwnedPty {
             rx,
             callback,
             on_exit,
-            shell_bracketed_paste,
         )
     }
 
@@ -1050,7 +1017,6 @@ impl OwnedPty {
         rx: mpsc::Receiver<PtyMsg>,
         mut callback: F,
         on_exit: E,
-        shell_bracketed_paste: Arc<AtomicBool>,
     ) -> io::Result<()>
     where
         F: FnMut(Vec<u8>) + 'static,
@@ -1085,9 +1051,7 @@ impl OwnedPty {
                 // original descriptor number.
                 let mut file = std::fs::File::from(reader_fd);
                 let fd = file.as_raw_fd();
-                let mut buf = [0u8; 32 * 1024];
-                let mut mode_tail =
-                    Vec::with_capacity(BRACKETED_PASTE_ENABLE.len().saturating_sub(1));
+                let mut buf = [0u8; PTY_READ_CHUNK_BYTES];
                 loop {
                     if reader_cancelled.load(Ordering::Acquire) {
                         break;
@@ -1118,15 +1082,9 @@ impl OwnedPty {
                             break;
                         }
                         Ok(n) => {
-                            let mut combined = Vec::with_capacity(n + 4096);
+                            let mut combined = Vec::with_capacity(PTY_READ_CHUNK_BYTES);
                             combined.extend_from_slice(&buf[..n]);
                             coalesce_pending(fd, &mut file, &mut buf, &mut combined);
-                            let mode = observe_bracketed_paste_mode(
-                                shell_bracketed_paste.load(Ordering::Relaxed),
-                                &mut mode_tail,
-                                &combined,
-                            );
-                            shell_bracketed_paste.store(mode, Ordering::Relaxed);
                             if tx.send(PtyMsg::Data(combined)).is_err() {
                                 break;
                             }
@@ -1270,10 +1228,9 @@ fn reap_child(child_lifecycle: &Arc<ChildLifecycle>, tx: &mpsc::SyncSender<PtyMs
 /// fraction of a 60Hz frame budget but enough to merge clear+repaint pairs
 /// that one program emitted in a single render.
 fn coalesce_pending(fd: RawFd, file: &mut std::fs::File, buf: &mut [u8], combined: &mut Vec<u8>) {
-    const MAX_BYTES: usize = 32 * 1024;
     const MAX_FOLLOWUP_READS: u32 = 8;
     let mut follow_ups = 0u32;
-    while combined.len() < MAX_BYTES && follow_ups < MAX_FOLLOWUP_READS {
+    while combined.len() < PTY_READ_CHUNK_BYTES && follow_ups < MAX_FOLLOWUP_READS {
         let mut pfd = libc::pollfd {
             fd,
             events: libc::POLLIN,
@@ -1283,7 +1240,7 @@ fn coalesce_pending(fd: RawFd, file: &mut std::fs::File, buf: &mut [u8], combine
         if r <= 0 || (pfd.revents & libc::POLLIN) == 0 {
             break;
         }
-        let remaining = MAX_BYTES - combined.len();
+        let remaining = PTY_READ_CHUNK_BYTES - combined.len();
         let read_len = remaining.min(buf.len());
         match file.read(&mut buf[..read_len]) {
             Ok(0) | Err(_) => break,
@@ -1474,6 +1431,39 @@ impl Drop for OwnedPty {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    /// Production used to run this raw scan before dispatching the same bytes
+    /// through the stateful terminal parser. Keep the old implementation only
+    /// as the baseline for the ignored micro-benchmark below.
+    fn legacy_observe_bracketed_paste_mode(current: bool, tail: &mut Vec<u8>, data: &[u8]) -> bool {
+        const ENABLE: &[u8] = b"\x1b[?2004h";
+        const DISABLE: &[u8] = b"\x1b[?2004l";
+
+        let mut combined = Vec::with_capacity(tail.len() + data.len());
+        combined.extend_from_slice(tail);
+        combined.extend_from_slice(data);
+
+        let mut enabled = current;
+        let mut index = 0usize;
+        while index < combined.len() {
+            let rest = &combined[index..];
+            if rest.starts_with(ENABLE) {
+                enabled = true;
+                index += ENABLE.len();
+            } else if rest.starts_with(DISABLE) {
+                enabled = false;
+                index += DISABLE.len();
+            } else {
+                index += 1;
+            }
+        }
+
+        let bridge_len = ENABLE.len().max(DISABLE.len()).saturating_sub(1);
+        let keep_from = combined.len().saturating_sub(bridge_len);
+        tail.clear();
+        tail.extend_from_slice(&combined[keep_from..]);
+        enabled
+    }
 
     /// The strict spawn path reads the frozen launch environment, but a test
     /// binary has no `main` to capture it. The capture is process-global and
@@ -1968,14 +1958,81 @@ mod tests {
     }
 
     #[test]
-    fn observes_split_bracketed_paste_mode_sequences() {
-        let mut tail = Vec::new();
-        let enabled = observe_bracketed_paste_mode(false, &mut tail, b"prompt\x1b[?20");
-        assert!(!enabled);
-        let enabled = observe_bracketed_paste_mode(enabled, &mut tail, b"04h");
-        assert!(enabled);
+    #[ignore = "micro-benchmark; run explicitly with --ignored --nocapture"]
+    fn bracketed_paste_raw_observer_micro_benchmark() {
+        use crate::parser::Parser;
+        use std::hint::black_box;
 
-        let enabled = observe_bracketed_paste_mode(enabled, &mut tail, b"\x1b[?2004l");
-        assert!(!enabled);
+        const CHUNK_BYTES: usize = 32 * 1024;
+        const ITERATIONS: usize = 4_096;
+        let chunk = vec![b'x'; CHUNK_BYTES];
+
+        let run = |legacy_scan: bool| {
+            let mut parser = Parser::new();
+            let mut events = Vec::new();
+            let mut tail = Vec::new();
+            let mut mode = false;
+            let started = Instant::now();
+            for _ in 0..ITERATIONS {
+                let bytes = black_box(chunk.as_slice());
+                if legacy_scan {
+                    mode = legacy_observe_bracketed_paste_mode(mode, &mut tail, bytes);
+                }
+                events.clear();
+                parser.feed(bytes, &mut events);
+                black_box(&events);
+            }
+            black_box((mode, tail));
+            started.elapsed()
+        };
+
+        let parser_only = run(false);
+        let legacy_plus_parser = run(true);
+        let mib = (CHUNK_BYTES * ITERATIONS) as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "{mib:.0} MiB: parser-only={parser_only:?}, legacy-observer+parser={legacy_plus_parser:?}, overhead={:.2}x",
+            legacy_plus_parser.as_secs_f64() / parser_only.as_secs_f64()
+        );
+    }
+
+    #[test]
+    #[ignore = "micro-benchmark; run explicitly with --ignored --nocapture"]
+    fn reader_chunk_capacity_micro_benchmark() {
+        use std::hint::black_box;
+
+        const INITIAL_BYTES: usize = 128;
+        const FOLLOWUP_BYTES: usize = (PTY_READ_CHUNK_BYTES - INITIAL_BYTES) / 8;
+        const ITERATIONS: usize = 16_384;
+        let initial = vec![b'x'; INITIAL_BYTES];
+        let followup = vec![b'y'; FOLLOWUP_BYTES];
+
+        let run = |fixed_capacity: bool| {
+            let started = Instant::now();
+            let mut final_capacity = 0;
+            for _ in 0..ITERATIONS {
+                let capacity = if fixed_capacity {
+                    PTY_READ_CHUNK_BYTES
+                } else {
+                    initial.len() + 4_096
+                };
+                let mut combined = Vec::with_capacity(capacity);
+                combined.extend_from_slice(black_box(&initial));
+                for _ in 0..8 {
+                    let remaining = PTY_READ_CHUNK_BYTES - combined.len();
+                    combined
+                        .extend_from_slice(&black_box(&followup)[..remaining.min(followup.len())]);
+                }
+                final_capacity = combined.capacity();
+                black_box(combined);
+            }
+            (started.elapsed(), final_capacity)
+        };
+
+        let (legacy, legacy_capacity) = run(false);
+        let (fixed, fixed_capacity) = run(true);
+        eprintln!(
+            "fragmented 32 KiB chunks ({ITERATIONS}x): legacy={legacy:?} (capacity {legacy_capacity}), fixed={fixed:?} (capacity {fixed_capacity}), speedup={:.2}x",
+            legacy.as_secs_f64() / fixed.as_secs_f64()
+        );
     }
 }

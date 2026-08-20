@@ -7,12 +7,15 @@
 use relm4::adw;
 use relm4::adw::prelude::*;
 use relm4::gtk;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::time::Duration;
 
 use crate::block_view::{CrossBlockHit, RecordNavigationResult, TermView};
 
 use super::record_snapshot;
+
+const CROSS_BLOCK_SEARCH_DEBOUNCE: Duration = Duration::from_millis(150);
 
 /// What the palette does with one activated hit. Every arm of
 /// [`RecordNavigationResult`] resolves to exactly one of these: a record the
@@ -101,6 +104,8 @@ pub(super) fn toggle(
     dialog.set_child(Some(&toolbar_view));
 
     let hits: Rc<RefCell<Vec<CrossBlockHit>>> = Rc::new(RefCell::new(Vec::new()));
+    let pending_rebuild: Rc<RefCell<Option<gtk::glib::SourceId>>> = Rc::new(RefCell::new(None));
+    let search_generation = Rc::new(Cell::new(0_u64));
     let rebuild = {
         let view = view.clone();
         let list_box = list_box.clone();
@@ -131,11 +136,12 @@ pub(super) fn toggle(
                     if total > 0 && total < 500 {
                         status_label.set_text(&format!("{total} matches"));
                     }
+                    let jumpable = view.jumpable_search_hits(&results);
                     for hit in &results {
                         let surface = if hit.is_output { "out" } else { "cmd" };
                         // A hit whose record has no location and no retained
                         // output says so before the user activates it.
-                        let unreachable = if view.can_jump_to_record(hit.block_id, hit.is_output) {
+                        let unreachable = if jumpable.contains(&(hit.block_id, hit.is_output)) {
                             ""
                         } else {
                             " — location unavailable"
@@ -164,13 +170,54 @@ pub(super) fn toggle(
         })
     };
 
-    {
+    let schedule_rebuild = {
+        let pending_rebuild = pending_rebuild.clone();
+        let search_generation = search_generation.clone();
         let rebuild = rebuild.clone();
-        filter_entry.connect_search_changed(move |_| rebuild());
+        let hits = hits.clone();
+        let list_box = list_box.clone();
+        let status_label = status_label.clone();
+        let filter_entry = filter_entry.clone();
+        Rc::new(move || {
+            let generation = search_generation.get().wrapping_add(1);
+            search_generation.set(generation);
+            if let Some(source) = pending_rebuild.borrow_mut().take() {
+                source.remove();
+            }
+
+            while let Some(child) = list_box.first_child() {
+                list_box.remove(&child);
+            }
+            hits.borrow_mut().clear();
+            if filter_entry.text().is_empty() {
+                status_label.set_text("Type to search across blocks.");
+                return;
+            }
+            status_label.set_text("Searching blocks…");
+
+            let pending_slot = pending_rebuild.clone();
+            let pending_clear = pending_rebuild.clone();
+            let search_generation = search_generation.clone();
+            let rebuild = rebuild.clone();
+            let source = gtk::glib::timeout_add_local(CROSS_BLOCK_SEARCH_DEBOUNCE, move || {
+                if search_generation.get() == generation {
+                    rebuild();
+                    // A stale callback must never clear a newer timeout.
+                    pending_clear.borrow_mut().take();
+                }
+                gtk::glib::ControlFlow::Break
+            });
+            *pending_slot.borrow_mut() = Some(source);
+        })
+    };
+
+    {
+        let schedule_rebuild = schedule_rebuild.clone();
+        filter_entry.connect_search_changed(move |_| schedule_rebuild());
     }
     {
-        let rebuild = rebuild.clone();
-        regex_toggle.connect_toggled(move |_| rebuild());
+        let schedule_rebuild = schedule_rebuild.clone();
+        regex_toggle.connect_toggled(move |_| schedule_rebuild());
     }
 
     let jump = {
@@ -266,7 +313,11 @@ pub(super) fn toggle(
 
     {
         let dialog_slot = dialog_slot.clone();
+        let pending_rebuild = pending_rebuild.clone();
         dialog.connect_closed(move |_| {
+            if let Some(source) = pending_rebuild.borrow_mut().take() {
+                source.remove();
+            }
             *dialog_slot.borrow_mut() = None;
         });
     }
@@ -279,7 +330,7 @@ pub(super) fn toggle(
 
 #[cfg(test)]
 mod tests {
-    use super::{jump_outcome, JumpOutcome, RecordNavigationResult};
+    use super::{jump_outcome, JumpOutcome, RecordNavigationResult, CROSS_BLOCK_SEARCH_DEBOUNCE};
 
     /// The palette dispatches on the whole navigation ladder, not on "did it
     /// scroll": a record whose retained snapshot produced the hit is
@@ -302,6 +353,14 @@ mod tests {
         assert_eq!(
             jump_outcome(RecordNavigationResult::NoMatchingRecord),
             JumpOutcome::KeepOpen
+        );
+    }
+
+    #[test]
+    fn cross_block_search_waits_for_a_quiet_input_window() {
+        assert_eq!(
+            CROSS_BLOCK_SEARCH_DEBOUNCE,
+            std::time::Duration::from_millis(150)
         );
     }
 }

@@ -362,6 +362,18 @@ pub(crate) fn ansi_has_visible_text(bytes: &[u8]) -> bool {
 }
 
 pub(crate) fn strip_ansi_with_clear_detect(input: &str) -> (String, bool) {
+    // Plain command output is overwhelmingly the common case. LF does not
+    // alter replay semantics: the slow path splits rows and serializes the
+    // same separators again. Only ESC, CR, and BS can change or erase already
+    // emitted cells, so avoid the per-character grid and row allocations when
+    // none of those bytes are present.
+    if memchr::memchr3(0x1b, b'\r', b'\x08', input.as_bytes()).is_none() {
+        return (input.to_owned(), false);
+    }
+    strip_ansi_with_clear_detect_replay(input)
+}
+
+fn strip_ansi_with_clear_detect_replay(input: &str) -> (String, bool) {
     let bytes = input.as_bytes();
     let mut lines: Vec<Vec<char>> = vec![Vec::new()];
     let mut cursor = 0usize;
@@ -543,7 +555,55 @@ pub(crate) fn strip_ansi(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ansi_has_visible_text, contains_case_insensitive as cci};
+    use super::{
+        ansi_has_visible_text, contains_case_insensitive as cci, strip_ansi_with_clear_detect,
+        strip_ansi_with_clear_detect_replay,
+    };
+
+    #[test]
+    fn plain_fast_path_matches_replay_semantics() {
+        let cases = [
+            "",
+            "one line",
+            "first\nsecond\n",
+            "\nleading and trailing\n",
+            "tabs\tand\0controls\u{7f}",
+            "Unicode: 界 🙂 e\u{301}\nПривет\n",
+        ];
+        for input in cases {
+            assert!(memchr::memchr3(0x1b, b'\r', b'\x08', input.as_bytes()).is_none());
+            assert_eq!(
+                strip_ansi_with_clear_detect(input),
+                strip_ansi_with_clear_detect_replay(input),
+                "plain fast path diverged for {input:?}"
+            );
+            assert_eq!(
+                strip_ansi_with_clear_detect(input),
+                (input.to_owned(), false)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "micro-benchmark; run explicitly with --ignored --nocapture"]
+    fn plain_strip_ansi_micro_benchmark() {
+        for bytes in [1 << 20, 8 << 20] {
+            let mut input = "ordinary build output\n".repeat(bytes / 22 + 1);
+            input.truncate(bytes);
+
+            let replay_started = std::time::Instant::now();
+            std::hint::black_box(strip_ansi_with_clear_detect_replay(&input));
+            let replay_elapsed = replay_started.elapsed();
+
+            let fast_started = std::time::Instant::now();
+            std::hint::black_box(strip_ansi_with_clear_detect(&input));
+            eprintln!(
+                "plain strip {} MiB: replay={replay_elapsed:?}, fast={:?}",
+                bytes >> 20,
+                fast_started.elapsed()
+            );
+        }
+    }
 
     #[test]
     fn matches_regardless_of_case() {

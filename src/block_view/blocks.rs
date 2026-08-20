@@ -32,6 +32,7 @@ const PLAIN_OUTPUT_RETAINED_OWNERS: usize = 2;
 const VTE_RETAINED_BYTES_PER_MATERIALIZED_BYTE: usize = 32;
 // GDK may retain decoded pixels and encoded/source backing simultaneously.
 const IMAGE_RETAINED_OWNERS: usize = 2;
+const FINISHED_OUTPUT_FILTER_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CompletedBlockRetentionPlan {
@@ -484,6 +485,10 @@ pub(crate) struct FinishedBlock {
     /// Render geometry plus filtered-text generation. A remap at the same
     /// geometry must not re-feed and transiently reset the card height.
     render_stamp: Rc<Cell<(i64, i64, bool, u64)>>,
+    /// Cost cache for deriving wrapped rows from the displayed transcript.
+    /// This is deliberately separate from `render_stamp`: equal row counts do
+    /// not prove that VTE already contains the right bytes or geometry.
+    visual_rows_cache: Rc<Cell<Option<OutputVisualRowsCacheEntry>>>,
     displayed_generation: Rc<Cell<u64>>,
     command_bytes: Rc<Vec<u8>>,
     command_render_cols: Rc<Cell<i64>>,
@@ -530,6 +535,7 @@ impl Clone for FinishedBlock {
             viewport_cap: self.viewport_cap,
             dynamic_viewport_rows: self.dynamic_viewport_rows.clone(),
             render_stamp: self.render_stamp.clone(),
+            visual_rows_cache: self.visual_rows_cache.clone(),
             displayed_generation: self.displayed_generation.clone(),
             command_bytes: self.command_bytes.clone(),
             command_render_cols: self.command_render_cols.clone(),
@@ -641,7 +647,9 @@ pub(crate) fn highlight_command_to_ansi(cmd: &str) -> String {
 
 /// Filter raw output (ANSI preserved) to the lines matching `query`, honoring
 /// regex / case / invert and `context` lines of surroundings (Warp's
-/// BlockFilterQuery). Empty query, or an invalid regex, returns `full` verbatim.
+/// BlockFilterQuery). `None` means the caller should borrow `full` directly;
+/// this covers an empty query, an invalid regex, and a result identical to the
+/// original transcript without cloning it into a temporary display override.
 fn filter_output_lines(
     full: &str,
     query: &str,
@@ -649,9 +657,9 @@ fn filter_output_lines(
     case_sensitive: bool,
     invert: bool,
     context: usize,
-) -> String {
+) -> Option<String> {
     if query.is_empty() {
-        return full.to_string();
+        return None;
     }
     let re = if use_regex {
         match regex::RegexBuilder::new(query)
@@ -659,7 +667,7 @@ fn filter_output_lines(
             .build()
         {
             Ok(re) => Some(re),
-            Err(_) => return full.to_string(),
+            Err(_) => return None,
         }
     } else {
         None
@@ -679,18 +687,41 @@ fn filter_output_lines(
     for (i, line) in lines.iter().enumerate() {
         if matches_line(line) {
             let lo = i.saturating_sub(context);
-            let hi = (i + context + 1).min(lines.len());
+            let hi = i.saturating_add(context).saturating_add(1).min(lines.len());
             for slot in keep.iter_mut().take(hi).skip(lo) {
                 *slot = true;
             }
         }
     }
-    lines
+
+    // `str::lines().join("\n")` (the legacy result) normalizes CRLF and
+    // removes a final LF. Only borrow `full` when joining every retained line
+    // would be byte-identical; otherwise preserve those exact old semantics.
+    if keep.iter().all(|kept| *kept) && !full.ends_with('\n') && !full.contains("\r\n") {
+        return None;
+    }
+
+    let (kept_lines, kept_bytes) = lines
         .iter()
-        .zip(keep.iter())
-        .filter_map(|(l, k)| if *k { Some(*l) } else { None })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .zip(&keep)
+        .filter(|(_, kept)| **kept)
+        .fold((0usize, 0usize), |(count, bytes), (line, _)| {
+            (count.saturating_add(1), bytes.saturating_add(line.len()))
+        });
+    let mut filtered =
+        String::with_capacity(kept_bytes.saturating_add(kept_lines.saturating_sub(1)));
+    let mut wrote_line = false;
+    for (line, kept) in lines.iter().zip(&keep) {
+        if !kept {
+            continue;
+        }
+        if wrote_line {
+            filtered.push('\n');
+        }
+        filtered.push_str(line);
+        wrote_line = true;
+    }
+    Some(filtered)
 }
 
 fn output_row_count(text: &str) -> i64 {
@@ -709,10 +740,26 @@ fn output_row_count(text: &str) -> i64 {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static OUTPUT_VISUAL_ROW_COUNT_CALLS: Cell<usize> = const { Cell::new(0) };
+    static OUTPUT_VISUAL_ROWS_CACHE_HITS: Cell<usize> = const { Cell::new(0) };
+    static OUTPUT_VISUAL_ROWS_CACHE_MISSES: Cell<usize> = const { Cell::new(0) };
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OutputVisualRowsCacheEntry {
+    effective_cols: i64,
+    displayed_generation: u64,
+    rows: i64,
+}
+
 /// Rows occupied after VTE wraps the snapshot at `cols`. Finished cards need
 /// this rather than the logical line count, otherwise a stack trace containing
 /// very long type names is still pushed into the VTE's private scrollback.
 pub(crate) fn output_visual_row_count(text: &str, cols: i64) -> i64 {
+    #[cfg(test)]
+    OUTPUT_VISUAL_ROW_COUNT_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
     use unicode_width::UnicodeWidthChar;
 
     let cols = cols.max(1) as usize;
@@ -725,8 +772,19 @@ pub(crate) fn output_visual_row_count(text: &str, cols: i64) -> i64 {
     // `strip_ansi` applies the horizontal cursor/erase semantics as well as
     // removing escape sequences, which makes this estimate match the VTE
     // snapshot closely enough for the short/long decision.
-    let rendered = strip_ansi(text);
-    let text = output_display_text(&rendered);
+    // `strip_ansi` must replay cursor motion and erases, but for ordinary text
+    // its result is byte-for-byte identical. Borrow the common case directly
+    // so a cache miss scans once without first allocating an equally large
+    // String. ESC, CR, and BS are exactly the slow-path identity boundary used
+    // by `strip_ansi_with_clear_detect`.
+    let rendered;
+    let text = if memchr::memchr3(0x1b, b'\r', b'\x08', text.as_bytes()).is_none() {
+        text
+    } else {
+        rendered = strip_ansi(text);
+        rendered.as_str()
+    };
+    let text = output_display_text(text);
     if text.is_empty() {
         return 1;
     }
@@ -744,6 +802,44 @@ pub(crate) fn output_visual_row_count(text: &str, cols: i64) -> i64 {
         })
         .sum::<i64>()
         .max(1)
+}
+
+fn cached_output_visual_row_count(
+    cache: &Cell<Option<OutputVisualRowsCacheEntry>>,
+    text: &str,
+    effective_cols: i64,
+    displayed_generation: u64,
+) -> i64 {
+    if let Some(entry) = cache.get().filter(|entry| {
+        entry.effective_cols == effective_cols && entry.displayed_generation == displayed_generation
+    }) {
+        #[cfg(test)]
+        OUTPUT_VISUAL_ROWS_CACHE_HITS.with(|hits| hits.set(hits.get().saturating_add(1)));
+        return entry.rows;
+    }
+
+    #[cfg(test)]
+    OUTPUT_VISUAL_ROWS_CACHE_MISSES.with(|misses| misses.set(misses.get().saturating_add(1)));
+    let rows = output_visual_row_count(text, effective_cols);
+    cache.set(Some(OutputVisualRowsCacheEntry {
+        effective_cols,
+        displayed_generation,
+        rows,
+    }));
+    rows
+}
+
+/// Start a new displayed-text generation and invalidate its derived row count.
+/// Clear before wrapping so `u64::MAX -> 0` can never alias a stale generation
+/// zero entry, even if a future caller advances without immediately measuring.
+fn advance_displayed_generation(
+    generation: &Cell<u64>,
+    visual_rows_cache: &Cell<Option<OutputVisualRowsCacheEntry>>,
+) -> u64 {
+    visual_rows_cache.set(None);
+    let next = generation.get().wrapping_add(1);
+    generation.set(next);
+    next
 }
 
 /// Finished VTEs follow their pixel allocation once a split becomes narrower
@@ -934,6 +1030,265 @@ fn scroll_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn legacy_filter_output_lines(
+        full: &str,
+        query: &str,
+        use_regex: bool,
+        case_sensitive: bool,
+        invert: bool,
+        context: usize,
+    ) -> String {
+        if query.is_empty() {
+            return full.to_string();
+        }
+        let re = if use_regex {
+            match regex::RegexBuilder::new(query)
+                .case_insensitive(!case_sensitive)
+                .build()
+            {
+                Ok(re) => Some(re),
+                Err(_) => return full.to_string(),
+            }
+        } else {
+            None
+        };
+        let lines: Vec<&str> = full.lines().collect();
+        let matches_line = |line: &str| -> bool {
+            let hit = if let Some(ref re) = re {
+                re.is_match(line)
+            } else if case_sensitive {
+                line.contains(query)
+            } else {
+                contains_case_insensitive(line.as_bytes(), query.as_bytes())
+            };
+            hit ^ invert
+        };
+        let mut keep = vec![false; lines.len()];
+        for (i, line) in lines.iter().enumerate() {
+            if matches_line(line) {
+                let lo = i.saturating_sub(context);
+                let hi = (i + context + 1).min(lines.len());
+                for slot in keep.iter_mut().take(hi).skip(lo) {
+                    *slot = true;
+                }
+            }
+        }
+        lines
+            .iter()
+            .zip(keep.iter())
+            .filter_map(|(line, kept)| kept.then_some(*line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn reset_visual_row_cache_counters() {
+        OUTPUT_VISUAL_ROWS_CACHE_HITS.with(|hits| hits.set(0));
+        OUTPUT_VISUAL_ROWS_CACHE_MISSES.with(|misses| misses.set(0));
+    }
+
+    fn visual_row_cache_counters() -> (usize, usize) {
+        let hits = OUTPUT_VISUAL_ROWS_CACHE_HITS.with(Cell::get);
+        let misses = OUTPUT_VISUAL_ROWS_CACHE_MISSES.with(Cell::get);
+        (hits, misses)
+    }
+
+    fn spin_main_context_until(condition: impl Fn() -> bool) {
+        let context = glib::MainContext::default();
+        let started = std::time::Instant::now();
+        while !condition() && started.elapsed() < std::time::Duration::from_secs(2) {
+            while context.iteration(false) {}
+        }
+        assert!(
+            condition(),
+            "GTK condition did not settle before the deadline"
+        );
+    }
+
+    fn spin_main_context_for(duration: std::time::Duration) {
+        let done = Rc::new(Cell::new(false));
+        let done_for_timeout = done.clone();
+        glib::timeout_add_local_once(duration, move || done_for_timeout.set(true));
+        spin_main_context_until(|| done.get());
+    }
+
+    fn find_search_entry(widget: &gtk::Widget) -> Option<gtk::SearchEntry> {
+        if let Ok(entry) = widget.clone().downcast::<gtk::SearchEntry>() {
+            return Some(entry);
+        }
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            if let Some(entry) = find_search_entry(&current) {
+                return Some(entry);
+            }
+            child = current.next_sibling();
+        }
+        None
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn unmapped_refit_skips_output_row_scan() {
+        gtk::init().expect("gtk init");
+        let block = FinishedBlock::new(
+            1,
+            "$ ",
+            "cat huge.log",
+            None,
+            &"wide 界 output\n".repeat(100_000),
+            Some(0),
+            &Config::safe_defaults(),
+            None,
+            None,
+            None,
+            80,
+        );
+        assert!(!block.output_vte.is_mapped());
+        OUTPUT_VISUAL_ROW_COUNT_CALLS.with(|calls| calls.set(0));
+
+        assert_eq!(block.refit_output_to_viewport(), None);
+        OUTPUT_VISUAL_ROW_COUNT_CALLS.with(|calls| {
+            assert_eq!(
+                calls.get(),
+                0,
+                "an off-screen refit must return before scanning its transcript"
+            )
+        });
+
+        // The skipped cap is not lost: the card's map handler performs the
+        // deferred measurement against its actual ScrolledWindow ancestor.
+        let scrolled = gtk::ScrolledWindow::builder()
+            .min_content_width(640)
+            .min_content_height(320)
+            .child(block.widget())
+            .build();
+        let window = gtk::Window::builder().child(&scrolled).build();
+        reset_visual_row_cache_counters();
+        window.present();
+        spin_main_context_until(|| block.output_vte.is_mapped());
+        let (hits, misses) = visual_row_cache_counters();
+        assert_eq!(hits + misses, 1, "map resolves output rows exactly once");
+        assert!(block.dynamic_viewport_rows.get() > 0);
+        window.close();
+        while glib::MainContext::default().iteration(false) {}
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn visual_row_cache_covers_filter_remap_expand_and_resize_refit() {
+        gtk::init().expect("gtk init");
+        let mut config = Config::safe_defaults();
+        config.finished_block_viewport_rows = 12;
+        config.finished_block_max_expanded_rows = 200;
+        let output = (0..2_000)
+            .map(|index| {
+                if index % 2 == 0 {
+                    format!("keep {index:04} wide 界 transcript payload")
+                } else {
+                    format!("drop {index:04} ordinary transcript payload")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let block = FinishedBlock::new(
+            2,
+            "$ ",
+            "cat mixed.log",
+            None,
+            &output,
+            Some(0),
+            &config,
+            None,
+            None,
+            None,
+            100,
+        );
+        let scrolled = gtk::ScrolledWindow::builder().child(block.widget()).build();
+        let window = gtk::Window::builder()
+            .default_width(900)
+            .default_height(420)
+            .child(&scrolled)
+            .build();
+        window.present();
+        spin_main_context_until(|| block.output_vte.is_mapped());
+
+        (block.toggle_filter)();
+        let root = block.widget().clone().upcast::<gtk::Widget>();
+        let filter_entry = find_search_entry(&root).expect("finished block filter entry");
+        let generation_before_query = block.displayed_generation.get();
+        reset_visual_row_cache_counters();
+        filter_entry.set_text("drop");
+        filter_entry.set_text("keep");
+        spin_main_context_until(|| block.displayed_generation.get() != generation_before_query);
+        let filtered_generation = block.displayed_generation.get();
+        spin_main_context_for(
+            FINISHED_OUTPUT_FILTER_DEBOUNCE + std::time::Duration::from_millis(50),
+        );
+        assert_eq!(
+            block.displayed_generation.get(),
+            filtered_generation,
+            "a cancelled query timeout must not publish after the quiet winner",
+        );
+        let displayed = block.displayed_output.borrow();
+        let filtered_text = displayed.as_deref().expect("filter display override");
+        assert!(filtered_text.lines().all(|line| line.contains("keep")));
+        drop(displayed);
+        let filtered_entry = block.visual_rows_cache.get().expect("filtered rows cached");
+        assert_eq!(filtered_entry.displayed_generation, filtered_generation);
+        assert!(visual_row_cache_counters().1 >= 1, "filter text must miss");
+
+        reset_visual_row_cache_counters();
+        block.set_virtualized(true);
+        spin_main_context_until(|| !block.output_vte.is_mapped());
+        block.set_virtualized(false);
+        spin_main_context_until(|| block.output_vte.is_mapped());
+        assert_eq!(
+            visual_row_cache_counters(),
+            (1, 0),
+            "same-width filtered remap must reuse cached rows",
+        );
+
+        reset_visual_row_cache_counters();
+        block.expand_btn.emit_clicked();
+        while glib::MainContext::default().iteration(false) {}
+        assert_eq!(
+            visual_row_cache_counters(),
+            (1, 0),
+            "expand must reuse the current displayed rows",
+        );
+
+        let old_cols = effective_render_cols(&block.output_vte, block.cols);
+        window.set_default_size(320, 420);
+        window.queue_resize();
+        spin_main_context_until(|| effective_render_cols(&block.output_vte, block.cols) < old_cols);
+        let new_cols = effective_render_cols(&block.output_vte, block.cols);
+        reset_visual_row_cache_counters();
+        assert!(block.refit_output_to_viewport().is_some());
+        assert_eq!(
+            visual_row_cache_counters(),
+            (0, 1),
+            "a real column change must refresh wrapped rows",
+        );
+        assert_eq!(
+            block
+                .visual_rows_cache
+                .get()
+                .expect("resized rows cached")
+                .effective_cols,
+            new_cols,
+        );
+
+        reset_visual_row_cache_counters();
+        let _ = block.refit_output_to_viewport();
+        assert_eq!(
+            visual_row_cache_counters(),
+            (1, 0),
+            "same-width refit must reuse cached rows",
+        );
+
+        window.close();
+        while glib::MainContext::default().iteration(false) {}
+    }
 
     fn finished_block(exit_code: Option<i32>) -> BlockData {
         BlockData {
@@ -1254,6 +1609,127 @@ mod tests {
     }
 
     #[test]
+    fn plain_visual_row_fast_path_matches_control_replay() {
+        for text in [
+            "plain output\nsecond line\n",
+            "tabs\tand wide 界🙂 glyphs\n",
+            "combining e\u{301} and nul \0 stay byte-identical\n",
+        ] {
+            assert!(memchr::memchr3(0x1b, b'\r', b'\x08', text.as_bytes()).is_none());
+            let forced_replay = format!("\x1b[0m{text}");
+            for cols in [4, 31, 80] {
+                assert_eq!(
+                    output_visual_row_count(text, cols),
+                    output_visual_row_count(&forced_replay, cols),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn visual_row_cache_hits_same_key_and_refreshes_generation_or_columns() {
+        let text = "123456789\n界界界";
+        let cache = Cell::new(Some(OutputVisualRowsCacheEntry {
+            effective_cols: 4,
+            displayed_generation: 7,
+            rows: 6,
+        }));
+        OUTPUT_VISUAL_ROW_COUNT_CALLS.with(|calls| calls.set(0));
+
+        assert_eq!(cached_output_visual_row_count(&cache, text, 4, 7), 6);
+        OUTPUT_VISUAL_ROW_COUNT_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+
+        let generation_rows = cached_output_visual_row_count(&cache, text, 4, 8);
+        assert_eq!(generation_rows, output_visual_row_count(text, 4));
+        OUTPUT_VISUAL_ROW_COUNT_CALLS.with(|calls| calls.set(0));
+        assert_eq!(
+            cached_output_visual_row_count(&cache, "ignored on a cache hit", 4, 8),
+            generation_rows,
+        );
+        OUTPUT_VISUAL_ROW_COUNT_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+
+        let narrower_rows = cached_output_visual_row_count(&cache, text, 2, 8);
+        assert!(narrower_rows > generation_rows);
+        OUTPUT_VISUAL_ROW_COUNT_CALLS.with(|calls| assert_eq!(calls.get(), 1));
+    }
+
+    #[test]
+    fn displayed_generation_wrap_invalidates_generation_zero_cache_entry() {
+        let generation = Cell::new(u64::MAX);
+        let cache = Cell::new(Some(OutputVisualRowsCacheEntry {
+            effective_cols: 2,
+            displayed_generation: 0,
+            rows: 999,
+        }));
+
+        let wrapped = advance_displayed_generation(&generation, &cache);
+        assert_eq!(wrapped, 0);
+        assert_eq!(cache.get(), None);
+        assert_eq!(
+            cached_output_visual_row_count(&cache, "abcd", 2, wrapped),
+            2
+        );
+    }
+
+    /// Run with:
+    /// `cargo test --release finished_output_visual_rows_cache_microbenchmark -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual microbenchmark"]
+    fn finished_output_visual_rows_cache_microbenchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const REMAPS: usize = 100;
+        const PATTERN: &str = "plain terminal output with wide 界 glyphs and tabs\t0123456789\n";
+
+        for target_bytes in [1usize << 20, 8usize << 20] {
+            let text = PATTERN.repeat(target_bytes.div_ceil(PATTERN.len()));
+            let generation = 19;
+            let cols = 80;
+            let initial_rows = output_visual_row_count(&text, cols);
+            let cache = Cell::new(None);
+
+            reset_visual_row_cache_counters();
+            let misses_started = Instant::now();
+            for _ in 0..REMAPS {
+                cache.set(None);
+                black_box(cached_output_visual_row_count(
+                    black_box(&cache),
+                    black_box(&text),
+                    black_box(cols),
+                    black_box(generation),
+                ));
+            }
+            let misses = misses_started.elapsed();
+            assert_eq!(visual_row_cache_counters(), (0, REMAPS));
+
+            cache.set(Some(OutputVisualRowsCacheEntry {
+                effective_cols: cols,
+                displayed_generation: generation,
+                rows: initial_rows,
+            }));
+            reset_visual_row_cache_counters();
+            let hits_started = Instant::now();
+            for _ in 0..REMAPS {
+                black_box(cached_output_visual_row_count(
+                    black_box(&cache),
+                    black_box(&text),
+                    black_box(cols),
+                    black_box(generation),
+                ));
+            }
+            let hits = hits_started.elapsed();
+            assert_eq!(visual_row_cache_counters(), (REMAPS, 0));
+
+            eprintln!(
+                "finished-output remap {} MiB x {REMAPS}: first-miss={misses:?}, repeated-hit={hits:?}, speedup={:.1}x",
+                target_bytes >> 20,
+                misses.as_secs_f64() / hits.as_secs_f64(),
+            );
+        }
+    }
+
+    #[test]
     fn every_snapshot_feed_carries_its_own_reset() {
         // The reset must ride in the byte stream, not be a separate reset() call:
         // VTE parses feeds asynchronously, so an immediate reset cannot drop an
@@ -1355,9 +1831,150 @@ mod tests {
     #[test]
     fn filter_output_lines_matches_case_insensitively_without_regex() {
         assert_eq!(
-            filter_output_lines("alpha\nBeta\ngamma", "BETA", false, false, false, 0),
-            "Beta"
+            filter_output_lines("alpha\nBeta\ngamma", "BETA", false, false, false, 0).as_deref(),
+            Some("Beta")
         );
+    }
+
+    #[test]
+    fn filter_output_override_matches_legacy_line_and_newline_semantics() {
+        let transcripts = [
+            "",
+            "alpha",
+            "alpha\n",
+            "\n",
+            "alpha\nBeta\ngamma",
+            "alpha\n\nBeta\n",
+            "alpha\r\nBeta\r\ngamma\r\n",
+            "bare\rcarriage\nwide 界\nALPHA",
+        ];
+        let cases = [
+            ("", false, false, false, 0),
+            ("alpha", false, true, false, 0),
+            ("ALPHA", false, false, false, 0),
+            ("nomatch", false, false, false, 0),
+            ("a", false, false, true, 1),
+            ("^.*$", true, true, false, 0),
+            ("Beta", true, true, false, 9),
+            ("[", true, false, false, 0),
+        ];
+
+        for full in transcripts {
+            for (query, use_regex, case_sensitive, invert, context) in cases {
+                let legacy = legacy_filter_output_lines(
+                    full,
+                    query,
+                    use_regex,
+                    case_sensitive,
+                    invert,
+                    context,
+                );
+                let filtered =
+                    filter_output_lines(full, query, use_regex, case_sensitive, invert, context);
+                assert_eq!(
+                    filtered.as_deref().unwrap_or(full),
+                    legacy,
+                    "full={full:?}, query={query:?}, regex={use_regex}, case={case_sensitive}, invert={invert}, context={context}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn filter_output_borrows_full_when_override_is_unnecessary() {
+        let full = "alpha\nBeta\ngamma";
+        assert_eq!(filter_output_lines(full, "", false, false, false, 0), None);
+        assert_eq!(filter_output_lines(full, "[", true, false, false, 0), None);
+        assert_eq!(filter_output_lines(full, ".*", true, true, false, 9), None,);
+        // Legacy `lines().join("\n")` removes the final LF and normalizes
+        // CRLF, so these still require an override even when every line is kept.
+        assert_eq!(
+            filter_output_lines("alpha\n", ".*", true, true, false, 9).as_deref(),
+            Some("alpha"),
+        );
+        assert_eq!(
+            filter_output_lines("alpha\r\nBeta", ".*", true, true, false, 9).as_deref(),
+            Some("alpha\nBeta"),
+        );
+    }
+
+    /// Run with:
+    /// `cargo test --release finished_output_filter_microbenchmark -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual microbenchmark"]
+    fn finished_output_filter_microbenchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const BYPASS_RUNS: usize = 100;
+        const FILTER_RUNS: usize = 20;
+        const PATTERN: &str = "keep alpha wide 界 payload\ndrop beta ordinary payload\ndrop gamma context payload\ndrop delta payload\n";
+
+        for target_bytes in [1usize << 20, 8usize << 20] {
+            let full = PATTERN.repeat(target_bytes.div_ceil(PATTERN.len()));
+
+            let legacy_bypass_started = Instant::now();
+            for _ in 0..BYPASS_RUNS {
+                black_box(legacy_filter_output_lines(
+                    black_box(&full),
+                    "",
+                    false,
+                    false,
+                    false,
+                    0,
+                ));
+            }
+            let legacy_bypass = legacy_bypass_started.elapsed();
+            let borrowed_bypass_started = Instant::now();
+            for _ in 0..BYPASS_RUNS {
+                black_box(filter_output_lines(
+                    black_box(&full),
+                    "",
+                    false,
+                    false,
+                    false,
+                    0,
+                ));
+            }
+            let borrowed_bypass = borrowed_bypass_started.elapsed();
+
+            let expected = legacy_filter_output_lines(&full, "keep", false, true, false, 1);
+            assert_eq!(
+                filter_output_lines(&full, "keep", false, true, false, 1).as_deref(),
+                Some(expected.as_str()),
+            );
+            let legacy_filter_started = Instant::now();
+            for _ in 0..FILTER_RUNS {
+                black_box(legacy_filter_output_lines(
+                    black_box(&full),
+                    "keep",
+                    false,
+                    true,
+                    false,
+                    1,
+                ));
+            }
+            let legacy_filter = legacy_filter_started.elapsed();
+            let single_build_started = Instant::now();
+            for _ in 0..FILTER_RUNS {
+                black_box(filter_output_lines(
+                    black_box(&full),
+                    "keep",
+                    false,
+                    true,
+                    false,
+                    1,
+                ));
+            }
+            let single_build = single_build_started.elapsed();
+
+            eprintln!(
+                "finished-filter {} MiB: bypass x{BYPASS_RUNS} clone={legacy_bypass:?} borrow={borrowed_bypass:?} ({:.1}x); active x{FILTER_RUNS} legacy={legacy_filter:?} single-build={single_build:?} ({:.2}x)",
+                target_bytes >> 20,
+                legacy_bypass.as_secs_f64() / borrowed_bypass.as_secs_f64(),
+                legacy_filter.as_secs_f64() / single_build.as_secs_f64(),
+            );
+        }
     }
 
     #[test]
@@ -1653,6 +2270,12 @@ impl FinishedBlock {
         // snapshots. GTK cannot allocate an arbitrarily tall single widget, so
         // long blocks retain VTE's private scrollback inside this viewport.
         let output_rows = output_visual_row_count(output, cols);
+        let estimated_visible_rows = bounded_finished_viewport_rows(
+            cols,
+            output_rows
+                .min(config.finished_block_viewport_rows as i64)
+                .max(1),
+        );
         let (_, viewport_cap, _) = bounded_finished_vte_geometry(
             cols,
             (config.finished_block_viewport_rows as i64).max(1),
@@ -1976,6 +2599,14 @@ impl FinishedBlock {
         let expanded: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let render_stamp: Rc<Cell<(i64, i64, bool, u64)>> = Rc::new(Cell::new((0, 0, false, 0)));
         let displayed_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+        // Construction already paid for the initial transcript scan. Seed the
+        // cache so a first map at the recorded width, and every same-width
+        // virtualization remap after it, can reuse those rows.
+        let visual_rows_cache = Rc::new(Cell::new(Some(OutputVisualRowsCacheEntry {
+            effective_cols: cols,
+            displayed_generation: 0,
+            rows: output_rows,
+        })));
         {
             let cols_for_map = cols.max(1);
             let cap_for_map = dynamic_viewport_rows.clone();
@@ -1986,6 +2617,7 @@ impl FinishedBlock {
             let expanded_for_map = expanded.clone();
             let render_stamp_for_map = render_stamp.clone();
             let displayed_generation_for_map = displayed_generation.clone();
+            let visual_rows_cache_for_map = visual_rows_cache.clone();
             let expand_btn_for_map = expand_btn.downgrade();
             let jump_btn_for_map = jump_bottom_btn.downgrade();
             output_vte.connect_map(move |w| {
@@ -1993,7 +2625,12 @@ impl FinishedBlock {
                 let displayed = displayed_for_map.borrow();
                 let text = displayed.as_deref().unwrap_or(full.as_str());
                 let effective_cols = effective_render_cols(w, cols_for_map);
-                let rows = output_visual_row_count(text, effective_cols);
+                let rows = cached_output_visual_row_count(
+                    &visual_rows_cache_for_map,
+                    text,
+                    effective_cols,
+                    displayed_generation_for_map.get(),
+                );
                 // Fit against the pane this card just entered. The global
                 // layout pass now runs only on a real geometry change, so a
                 // freshly appended (or re-virtualized) card has to establish
@@ -2067,6 +2704,7 @@ impl FinishedBlock {
             let cols_for_btn = cols.max(1);
             let render_stamp_for_btn = render_stamp.clone();
             let displayed_generation_for_btn = displayed_generation.clone();
+            let visual_rows_cache_for_btn = visual_rows_cache.clone();
             expand_btn.connect_clicked(move |btn| {
                 let now_expanded = !expand_for_btn.get();
                 expand_for_btn.set(now_expanded);
@@ -2080,7 +2718,12 @@ impl FinishedBlock {
                     viewport_for_btn.get()
                 };
                 let cap = bounded_finished_viewport_rows(effective_cols, requested_cap);
-                let rows = output_visual_row_count(text, effective_cols);
+                let rows = cached_output_visual_row_count(
+                    &visual_rows_cache_for_btn,
+                    text,
+                    effective_cols,
+                    displayed_generation_for_btn.get(),
+                );
                 let visible_rows = snapshot_visible_rows(rows, cap);
                 render_stamp_for_btn.set(output_render_stamp(
                     effective_cols,
@@ -2345,6 +2988,7 @@ impl FinishedBlock {
                 let filter_enabled = filter_enabled.clone();
                 let render_stamp = render_stamp.clone();
                 let displayed_generation = displayed_generation.clone();
+                let visual_rows_cache = visual_rows_cache.clone();
                 move || {
                     let (
                         Some(output_vte),
@@ -2374,10 +3018,7 @@ impl FinishedBlock {
                     };
                     let q = filter_entry.text().to_string();
                     let full = full_output.borrow();
-                    let full_rows = output_row_count(&full);
-                    let shown = if !filter_enabled.get() || q.is_empty() {
-                        full.to_string()
-                    } else {
+                    let next_display = if filter_enabled.get() {
                         filter_output_lines(
                             full.as_str(),
                             &q,
@@ -2386,37 +3027,57 @@ impl FinishedBlock {
                             invert_tg.is_active(),
                             ctx_spin.value() as usize,
                         )
+                    } else {
+                        None
                     };
-                    let shown_rows = output_row_count(&shown);
+                    let shown = next_display.as_deref().unwrap_or(full.as_str());
+                    let shown_rows = output_row_count(shown);
+                    let full_rows = if next_display.is_none() {
+                        shown_rows
+                    } else {
+                        output_row_count(&full)
+                    };
                     let effective_cols = effective_render_cols(&output_vte, cols);
-                    let shown_visual_rows = output_visual_row_count(&shown, effective_cols);
+                    let display_changed =
+                        displayed_output.borrow().as_deref() != next_display.as_deref();
+                    let generation = if display_changed {
+                        advance_displayed_generation(&displayed_generation, &visual_rows_cache)
+                    } else {
+                        displayed_generation.get()
+                    };
+                    let shown_visual_rows = cached_output_visual_row_count(
+                        &visual_rows_cache,
+                        shown,
+                        effective_cols,
+                        generation,
+                    );
                     let requested_cap = if expanded.get() {
                         max_expanded_cap
                     } else {
                         dynamic_viewport_rows.get()
                     };
                     let active_cap = bounded_finished_viewport_rows(effective_cols, requested_cap);
-                    let generation = displayed_generation.get().wrapping_add(1);
-                    displayed_generation.set(generation);
-                    render_stamp.set(output_render_stamp(
+                    let stamp = output_render_stamp(
                         effective_cols,
                         shown_visual_rows,
                         active_cap,
                         generation,
-                    ));
-                    render_bytes_into_finished_vte(
-                        &output_vte,
-                        &shown,
-                        effective_cols,
-                        shown_visual_rows,
-                        active_cap,
-                        capture_rows,
-                        shown_visual_rows <= active_cap,
                     );
-                    let ch = output_vte.char_height() as i32;
-                    if ch > 0 {
-                        let probe_rows = shown_visual_rows.min(active_cap).clamp(1, 32);
-                        output_vte.set_height_request(finished_vte_height_px(probe_rows, ch));
+                    if render_stamp.replace(stamp) != stamp {
+                        render_bytes_into_finished_vte(
+                            &output_vte,
+                            shown,
+                            effective_cols,
+                            shown_visual_rows,
+                            active_cap,
+                            capture_rows,
+                            shown_visual_rows <= active_cap,
+                        );
+                        let ch = output_vte.char_height() as i32;
+                        if ch > 0 {
+                            let probe_rows = shown_visual_rows.min(active_cap).clamp(1, 32);
+                            output_vte.set_height_request(finished_vte_height_px(probe_rows, ch));
+                        }
                     }
                     let has_query = filter_enabled.get() && !q.trim().is_empty();
                     if has_query {
@@ -2440,31 +3101,83 @@ impl FinishedBlock {
                     expand_btn.set_visible(shown_visual_rows > dynamic_viewport_rows.get());
                     output_scrollbar.set_visible(shown_visual_rows > active_cap);
                     collapsed_summary.set_label(&collapsed_output_summary(shown_rows));
-                    let display_override = if shown == full.as_str() {
-                        None
-                    } else {
-                        Some(shown)
-                    };
-                    *displayed_output.borrow_mut() = display_override;
+                    if display_changed {
+                        *displayed_output.borrow_mut() = next_display;
+                    }
                 }
             };
             let apply = Rc::new(apply);
+            let pending_apply: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+            let apply_generation = Rc::new(Cell::new(0_u64));
+            // Option/context/filter-row changes are explicit actions and apply
+            // immediately. They also invalidate a pending keystroke timeout so
+            // an older query can never render over the newer state.
+            let apply_now = {
+                let pending_apply = pending_apply.clone();
+                let apply_generation = apply_generation.clone();
+                let apply = apply.clone();
+                Rc::new(move || {
+                    apply_generation.set(apply_generation.get().wrapping_add(1));
+                    if let Some(source) = pending_apply.borrow_mut().take() {
+                        source.remove();
+                    }
+                    apply();
+                })
+            };
+            let schedule_apply = {
+                let pending_apply = pending_apply.clone();
+                let apply_generation = apply_generation.clone();
+                let apply = apply.clone();
+                Rc::new(move || {
+                    let generation = apply_generation.get().wrapping_add(1);
+                    apply_generation.set(generation);
+                    if let Some(source) = pending_apply.borrow_mut().take() {
+                        source.remove();
+                    }
+
+                    let pending_slot = pending_apply.clone();
+                    let pending_clear = pending_apply.clone();
+                    let apply_generation = apply_generation.clone();
+                    let apply = apply.clone();
+                    let source =
+                        glib::timeout_add_local(FINISHED_OUTPUT_FILTER_DEBOUNCE, move || {
+                            if apply_generation.get() == generation {
+                                // A stale callback must not clear a newer
+                                // timeout stored in the shared slot.
+                                pending_clear.borrow_mut().take();
+                                apply();
+                            }
+                            glib::ControlFlow::Break
+                        });
+                    *pending_slot.borrow_mut() = Some(source);
+                })
+            };
             {
-                let a = apply.clone();
-                filter_entry.connect_search_changed(move |_| a());
+                let schedule_apply = schedule_apply.clone();
+                filter_entry.connect_search_changed(move |_| schedule_apply());
             }
             for tg in [&regex_tg, &case_tg, &invert_tg] {
-                let a = apply.clone();
-                tg.connect_toggled(move |_| a());
+                let apply_now = apply_now.clone();
+                tg.connect_toggled(move |_| apply_now());
             }
             {
-                let a = apply.clone();
-                ctx_spin.connect_value_changed(move |_| a());
+                let apply_now = apply_now.clone();
+                ctx_spin.connect_value_changed(move |_| apply_now());
+            }
+            {
+                let pending_apply = pending_apply.clone();
+                let apply_generation = apply_generation.clone();
+                filter_entry.connect_destroy(move |_| {
+                    apply_generation.set(apply_generation.get().wrapping_add(1));
+                    if let Some(source) = pending_apply.borrow_mut().take() {
+                        source.remove();
+                    }
+                });
             }
 
             let filter_row_for_toggle = filter_row.downgrade();
             let entry_for_toggle = filter_entry.downgrade();
-            let apply_for_toggle = apply.clone();
+            let apply_for_toggle = apply_now.clone();
             let filter_btn_for_toggle = filter_btn.downgrade();
             let filter_enabled_for_toggle = filter_enabled.clone();
             let toggle: Rc<dyn Fn()> = Rc::new(move || {
@@ -2501,8 +3214,9 @@ impl FinishedBlock {
             is_background,
             widget: outer,
             content,
-            virtualized_height: Rc::new(Cell::new(estimated_finished_block_height_for_text(
-                config, output, cols,
+            virtualized_height: Rc::new(Cell::new(estimated_finished_block_height(
+                config,
+                estimated_visible_rows,
             ))),
             virtualized: Rc::new(Cell::new(false)),
             prompt_text: prompt.to_string(),
@@ -2526,6 +3240,7 @@ impl FinishedBlock {
             viewport_cap,
             dynamic_viewport_rows,
             render_stamp,
+            visual_rows_cache,
             displayed_generation,
             command_bytes: cmd_bytes,
             command_render_cols,
@@ -2620,21 +3335,29 @@ impl FinishedBlock {
     /// [`fitted_output_rows_for_viewport`]. Virtualized (unmapped) cards are
     /// left alone; their own `connect_map` handler fits them on the way back in.
     pub(crate) fn refit_output_to_viewport(&self) -> Option<i32> {
+        // This method is called for every retained block on a pane resize.
+        // Reject parked cards before borrowing their output or counting visual
+        // rows: `connect_map` recomputes the cap when a card becomes visible,
+        // while scanning an off-screen transcript cannot affect this frame.
+        if !self.output_vte.is_mapped() {
+            return None;
+        }
         let cell_height = (self.output_vte.char_height() as i32).max(1);
         let effective_cols = effective_render_cols(&self.output_vte, self.cols);
         let full = self.full_output.borrow();
         let displayed = self.displayed_output.borrow();
         let text = displayed.as_deref().unwrap_or(full.as_str());
-        let output_rows = output_visual_row_count(text, effective_cols);
+        let output_rows = cached_output_visual_row_count(
+            &self.visual_rows_cache,
+            text,
+            effective_cols,
+            self.displayed_generation.get(),
+        );
         let fitted_rows = bounded_finished_viewport_rows(
             effective_cols,
             fitted_output_rows_for_widget(&self.output_vte, self.viewport_cap, output_rows),
         );
         let generation = self.displayed_generation.get();
-        if !self.output_vte.is_mapped() {
-            self.dynamic_viewport_rows.set(fitted_rows);
-            return None;
-        }
         let (last_cols, ..) = self.render_stamp.get();
         let geometry_changed =
             last_cols != effective_cols || self.dynamic_viewport_rows.get() != fitted_rows;
