@@ -4364,6 +4364,10 @@ struct ReaderCtx {
     /// longer than what survives; cleared with the ring by
     /// [`ReaderCtx::clear_live_raw_output`].
     live_raw_output_dropped_rc: Rc<Cell<bool>>,
+    /// Command-scoped proof that ED3 or RIS invalidated VTE's row mapping.
+    /// Unlike raw-output presence, this is set before the reset bytes are fed
+    /// and remains authoritative while VTE applies them asynchronously.
+    live_extent_force_full_rc: Rc<Cell<bool>>,
     /// Keystroke-shadow input line, used only as a fallback if the VTE-text
     /// capture at CommandStart returns empty.
     typed_cmd_rc: Rc<RefCell<String>>,
@@ -4472,7 +4476,7 @@ impl ReaderCtx {
             // runs once per sequence, ahead of the VTE feed. The splitter
             // keeps the part boundary (observation ordering) but no longer
             // synthesizes these calls itself.
-            ParserEvent::EraseScrollback => self.backend.erase_scrollback(),
+            ParserEvent::EraseScrollback => self.on_erase_scrollback(),
             ParserEvent::HardReset => self.on_hard_reset(),
         }
     }
@@ -4481,6 +4485,14 @@ impl ReaderCtx {
         for cb in self.remote_session_cbs.borrow().iter() {
             cb(id);
         }
+    }
+
+    fn on_erase_scrollback(&self) {
+        // The parser emits this barrier before the exact ED3 bytes reach VTE.
+        // Remember the semantic reset instead of inferring it from an
+        // adjustment/cursor pair that settles asynchronously.
+        self.live_extent_force_full_rc.set(true);
+        self.backend.erase_scrollback();
     }
 
     fn on_decset_mode(&self, mode: u32, set: bool) {
@@ -4505,6 +4517,9 @@ impl ReaderCtx {
     }
 
     fn on_hard_reset(&self) {
+        // RIS invalidates the same row mapping as ED3. Record that before any
+        // reset cleanup or bytes can trigger a live-surface layout.
+        self.live_extent_force_full_rc.set(true);
         // RIS invalidates saved screens and every row address. Completed
         // metadata remains in the backend document, but an old marker must
         // never become authoritative again after reset.
@@ -4759,6 +4774,10 @@ impl ReaderCtx {
                 );
             }
         }
+        // All rejection/recovery guards above have passed: this PromptStart
+        // really ends the prior lifecycle. Clear an ED3/RIS full-card latch
+        // before backend finalization resets VTE and can synchronously relayout.
+        self.live_extent_force_full_rc.set(false);
         let background_output = if state == BlockState::AwaitingCommand {
             let mut engine = self.engine.borrow_mut();
             // The marker describes exactly the bytes taken (or discarded)
@@ -5141,6 +5160,7 @@ impl ReaderCtx {
         // Engine-owned ring: the previous command's capture is dropped here,
         // exactly where `ActiveBlock::reset_output_buffer` used to do it.
         self.clear_live_raw_output();
+        self.live_extent_force_full_rc.set(false);
         self.block_start_time_for_cb.set(Some(SystemTime::now()));
         // The shell may attach its own measurement to either
         // mark; jsh puts it on D. Reset it here so the previous
@@ -6999,6 +7019,54 @@ fn live_visible_rows(extent: i64, viewport_rows: i64) -> i64 {
     extent.clamp(floor, viewport_rows.max(floor))
 }
 
+/// Resolve one live-card measurement without trusting VTE's asynchronous
+/// command-start transition before this command has emitted output.
+///
+/// `CommandStart` switches the block state and synchronously lays out the live
+/// surface before VTE has necessarily applied the prompt/command bytes already
+/// queued through `feed()`. During that short window [`live_content_extent`]
+/// can expose either an unmeasurable extent or a coherent-looking stale extent
+/// from the previous grid generation. Growing from either sample pushes
+/// finished history off screen before the command has drawn anything. Until
+/// the engine-owned output capture proves that this command has produced bytes,
+/// keep the compact input height recorded in `high_water` and ignore the VTE
+/// sample entirely. Once output exists, a coherent measurement may grow the
+/// card, while an ordinary `None` remains provisional because the raw bytes are
+/// captured before VTE finishes applying them. Only an explicit ED3/RIS parser
+/// barrier sets `force_full` and exposes the whole viewport.
+///
+/// Returns `(visible_rows, next_high_water)`; the latter is monotone for the
+/// lifetime of one command.
+fn live_visible_rows_for_measurement(
+    measured: Option<i64>,
+    output_started: bool,
+    force_full: bool,
+    high_water: i64,
+    viewport_rows: i64,
+) -> (i64, i64) {
+    if force_full {
+        let next_high_water = high_water.max(viewport_rows);
+        return (viewport_rows, next_high_water);
+    }
+    if !output_started {
+        return (live_visible_rows(high_water, viewport_rows), high_water);
+    }
+    match measured {
+        Some(measured) => {
+            let next_high_water = high_water.max(measured);
+            (
+                live_visible_rows(next_high_water, viewport_rows),
+                next_high_water,
+            )
+        }
+        // The raw bytes enter the capture before VTE applies feed(). An
+        // ordinary first output chunk can therefore still leave the extent
+        // temporarily unreadable; retain the last proven height until a
+        // contents-changed pass publishes a coherent measurement.
+        None => (live_visible_rows(high_water, viewport_rows), high_water),
+    }
+}
+
 /// How many rows of the live grid this command has reached: the top of the
 /// screen down to the cursor.
 ///
@@ -7022,15 +7090,19 @@ fn live_content_extent(vte: &Terminal) -> Option<i64> {
 /// The arithmetic behind [`live_content_extent`], separated so it can be tested
 /// without a display.
 ///
-/// `None` means the extent is not measurable right now, and the caller must
-/// fall back to a full-viewport card. That happens when the running command
-/// emits `ESC[3J` (what `clear` sends to drop the scrollback): measured, VTE
-/// renumbers the adjustment down to the screen but leaves `cursor_position` in
-/// the old ring coordinates, so the two stop describing the same buffer and any
-/// difference between them is meaningless. `cursor_row > upper` is the tell —
-/// the cursor is always inside the buffer the adjustment describes, except that
-/// a cursor resting one row past the last written row is normal, so the test
-/// has to be strict. The next prompt's `reset_active` re-bases both.
+/// `None` means the extent is not measurable right now. Every such sample is
+/// provisional because cursor and adjustment may describe different grid
+/// generations (see [`live_visible_rows_for_measurement`]). A running command
+/// that emits `ESC[3J` (what `clear` sends to drop the scrollback) is handled by
+/// the parser's explicit ED3 barrier instead of being inferred from `None`:
+/// while VTE applies the bytes, it can renumber the adjustment down to the
+/// screen but leave `cursor_position` in the old ring coordinates, so the two
+/// stop describing the same buffer and any difference between them is
+/// meaningless.
+/// `cursor_row > upper` is the tell — the cursor is always inside the buffer the
+/// adjustment describes, except that a cursor resting one row past the last
+/// written row is normal, so the test has to be strict. The next prompt's
+/// `reset_active` re-bases both.
 fn live_content_extent_for(lower: f64, upper: f64, page_size: f64, cursor_row: i64) -> Option<i64> {
     if !lower.is_finite() || !upper.is_finite() || !page_size.is_finite() {
         return None;
@@ -7589,6 +7661,7 @@ impl TermView {
         // cell only so live-find can read the running capture.
         let live_raw_output: Rc<RefCell<VecDeque<u8>>> = Rc::new(RefCell::new(VecDeque::new()));
         let live_raw_output_dropped: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let live_extent_force_full: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let active = Rc::new(RefCell::new(ActiveBlock::new(
             config,
             live_raw_output.clone(),
@@ -7926,6 +7999,11 @@ impl TermView {
             // ActiveBlock so that `reset_active` — the one funnel every reset
             // path goes through — clears it for the next command.
             let live_rows_high_water = active.borrow().live_extent_rows();
+            // The engine-owned capture gates coherent growth after
+            // CommandStart. Empty means every VTE sample is still provisional;
+            // only the separate parser-barrier flag authorizes a full card.
+            let live_output_for_layout = live_raw_output.clone();
+            let live_force_full_for_layout = live_extent_force_full.clone();
             // Weak: ActiveBlock owns the VTE that retains this callback.
             let active_for_layout = Rc::downgrade(&active);
             Rc::new(move || {
@@ -8000,21 +8078,15 @@ impl TermView {
                     // the blocks above stay on screen and the history pans up a
                     // row at a time instead of being shoved off by a page-tall
                     // reservation the command may never fill.
-                    let visible_rows = match live_content_extent(&vte) {
-                        Some(measured) => {
-                            let extent = live_rows_high_water.get().max(measured);
-                            live_rows_high_water.set(extent);
-                            live_visible_rows(extent, viewport_rows)
-                        }
-                        // Unmeasurable (the command cleared the scrollback):
-                        // fall back to the page-tall card rather than risk one
-                        // that hides output, and latch it so a later pass that
-                        // does measure cannot shrink the card back mid-command.
-                        None => {
-                            live_rows_high_water.set(viewport_rows);
-                            viewport_rows
-                        }
-                    };
+                    let output_started = !live_output_for_layout.borrow().is_empty();
+                    let (visible_rows, next_high_water) = live_visible_rows_for_measurement(
+                        live_content_extent(&vte),
+                        output_started,
+                        live_force_full_for_layout.get(),
+                        live_rows_high_water.get(),
+                        viewport_rows,
+                    );
+                    live_rows_high_water.set(next_high_water);
                     holder.set_height_request((visible_rows as i32) * cell_h);
                     if let Ok(active_block) = active_block.try_borrow() {
                         active_block.set_live_geometry(cell_h, viewport_rows, visible_rows);
@@ -8026,10 +8098,6 @@ impl TermView {
                 // again — except on the way out of a screen application, where
                 // the restored primary screen is already full of content the
                 // card has to keep showing.
-                live_rows_high_water.set(match state {
-                    BlockState::AltScreen | BlockState::RawFallback => viewport_rows,
-                    _ => 0,
-                });
                 let compact_rows = || {
                     let input_lines =
                         1 + typed_cmd.borrow().bytes().filter(|&b| b == b'\n').count() as i64;
@@ -8054,6 +8122,11 @@ impl TermView {
                     | BlockState::AwaitingCommand => compact_rows(),
                     BlockState::CollectingOutput | BlockState::PostCommand => viewport_rows,
                 };
+                // Preserve the compact input height across CommandStart. VTE's
+                // cursor/adjustment pair may still describe different grid
+                // generations until the first real output arrives, so the
+                // running branch needs a trustworthy baseline of its own.
+                live_rows_high_water.set(target_rows);
                 // Drive the VTE grid directly. `set_height_request` only sets a
                 // *minimum*, so it cannot shrink a VTE whose natural height
                 // (row_count * char_height) is larger — the cell would stay
@@ -8504,6 +8577,7 @@ impl TermView {
                 }),
                 live_raw_output_rc: live_raw_output.clone(),
                 live_raw_output_dropped_rc: live_raw_output_dropped.clone(),
+                live_extent_force_full_rc: live_extent_force_full.clone(),
                 typed_cmd_rc,
                 idle_input_dirty_rc: idle_input_dirty.clone(),
                 prompt_end_pos_rc,
@@ -10996,6 +11070,53 @@ mod tests {
     }
 
     #[test]
+    fn command_start_measurements_before_output_are_provisional() {
+        // CommandStart lays out synchronously while VTE applies feed() bytes
+        // asynchronously. A failed measurement in that gap must leave the
+        // fresh live card at its floor and, critically, must not latch a
+        // viewport-sized high-water mark.
+        assert_eq!(
+            super::live_visible_rows_for_measurement(None, false, false, 6, 40),
+            (6, 6)
+        );
+        // A coherent-looking sample can be stale too: a grid resize and VTE's
+        // adjustment update do not settle atomically. Ignore it until output.
+        assert_eq!(
+            super::live_visible_rows_for_measurement(Some(38), false, false, 6, 40),
+            (6, 6)
+        );
+        // A multiline input baseline remains visible instead of shrinking to
+        // the default floor while its command waits to produce output.
+        assert_eq!(
+            super::live_visible_rows_for_measurement(Some(2), false, false, 9, 40),
+            (9, 9)
+        );
+
+        // Raw bytes reach the capture before VTE has settled its cursor and
+        // adjustment. The first chunk's transient None therefore preserves the
+        // last proven height too.
+        assert_eq!(
+            super::live_visible_rows_for_measurement(None, true, false, 6, 40),
+            (6, 6)
+        );
+        assert_eq!(
+            super::live_visible_rows_for_measurement(Some(8), true, false, 6, 40),
+            (8, 8)
+        );
+
+        // ED3/RIS is known from the parser barrier before its bytes reach VTE,
+        // so it can safely expose and latch the full viewport.
+        assert_eq!(
+            super::live_visible_rows_for_measurement(None, true, true, 6, 40),
+            (40, 40)
+        );
+        assert_eq!(
+            super::live_visible_rows_for_measurement(Some(2), true, false, 40, 40),
+            (40, 40)
+        );
+    }
+
+    #[test]
     fn live_content_extent_is_screen_relative_not_an_absolute_ring_row() {
         // VTE row numbers are absolute and climb for the whole session, so the
         // extent is measured from the top of the *screen* (`upper - page`).
@@ -12237,6 +12358,7 @@ mod tests {
         config: Rc<RefCell<Config>>,
         bstate: Rc<Cell<BlockState>>,
         live_raw_output: Rc<RefCell<VecDeque<u8>>>,
+        live_extent_force_full: Rc<Cell<bool>>,
         prompt_end: Rc<Cell<(i64, i64)>>,
         prompt_rows: Rc<Cell<i64>>,
         prompt_ready: Rc<Cell<bool>>,
@@ -12260,6 +12382,7 @@ mod tests {
             let cmd_running = Rc::new(Cell::new(false));
             let live_raw_output = Rc::new(RefCell::new(VecDeque::new()));
             let live_raw_output_dropped = Rc::new(Cell::new(false));
+            let live_extent_force_full = Rc::new(Cell::new(false));
             let config = {
                 // Safe defaults read neither the developer's config file nor
                 // ANVIL_* environment overrides. Pin every path input used by
@@ -12410,6 +12533,7 @@ mod tests {
                 }),
                 live_raw_output_rc: live_raw_output.clone(),
                 live_raw_output_dropped_rc: live_raw_output_dropped.clone(),
+                live_extent_force_full_rc: live_extent_force_full.clone(),
                 typed_cmd_rc: typed_cmd,
                 idle_input_dirty_rc: idle_dirty,
                 prompt_end_pos_rc: prompt_end.clone(),
@@ -12456,6 +12580,7 @@ mod tests {
                 config,
                 bstate,
                 live_raw_output,
+                live_extent_force_full,
                 prompt_end,
                 prompt_rows,
                 prompt_ready,
@@ -12815,6 +12940,31 @@ mod tests {
             .borrow()
             .is_none());
         assert!(!harness.ctx.agent_execution_supported_rc.get());
+    }
+
+    #[test]
+    fn explicit_reset_extent_latch_is_scoped_to_one_command() {
+        let harness = ReaderHarness::new();
+        harness.arm_verified_prompt();
+
+        harness.feed(ParserEvent::EraseScrollback);
+        assert!(harness.live_extent_force_full.get());
+
+        // An accepted C starts a new command generation, so an ED3 observed
+        // while the shell was idle cannot poison its live-card height.
+        harness.feed(dispatch_command_start(Some("sleep 1")));
+        assert!(!harness.live_extent_force_full.get());
+
+        // A reset during this command is authoritative until the lifecycle's
+        // accepted next prompt, including through finalization/reset_active.
+        harness.feed(ParserEvent::EraseScrollback);
+        assert!(harness.live_extent_force_full.get());
+        harness.feed(dispatch_command_end(Some(0)));
+        harness.feed(ParserEvent::PromptStart);
+        assert!(!harness.live_extent_force_full.get());
+
+        harness.feed(ParserEvent::HardReset);
+        assert!(harness.live_extent_force_full.get());
     }
 
     #[test]
