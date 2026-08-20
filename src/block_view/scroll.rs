@@ -180,6 +180,25 @@ impl ScrollDebouncer {
         });
     }
 
+    /// Record whether a wheel notch left the history away from its bottom.
+    ///
+    /// Call this straight after writing the outer adjustment. The other writer
+    /// of `user_scrolled_up` is a deferred probe that compares the live card's
+    /// top edge against the viewport, so it only flips once the view has moved
+    /// by a whole card height — and while a command streams, the card is a full
+    /// viewport. One notch moves a tenth of a page and the follow-bottom pin
+    /// puts it back on the next frame, so the displacement could never
+    /// accumulate to what that probe needs: wheeling up into the finished
+    /// blocks kicked once per notch and went nowhere until the command ended.
+    /// Reading the adjustment we just wrote settles it in one step, and a notch
+    /// that lands back at the bottom clears the flag again.
+    pub(crate) fn record_wheel_intent(&self, scroll: &ScrolledWindow) {
+        let adjustment = scroll.vadjustment();
+        let bottom = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
+        self.user_scrolled_up
+            .set(scroll_value_changed(adjustment.value(), bottom));
+    }
+
     pub(crate) fn reset_scroll_lock(&self) {
         self.user_scrolled_up.set(false);
     }
@@ -331,7 +350,10 @@ mod tests {
         );
         let output_vte = block.output_vte.downgrade();
         let outer = block.widget().clone();
-        block.connect_scroll_forwarding(&gtk::ScrolledWindow::new());
+        block.connect_scroll_forwarding(
+            &gtk::ScrolledWindow::new(),
+            &ScrollDebouncer::with_scroll_lock(Rc::new(Cell::new(false)), Rc::new(Cell::new(false))),
+        );
         drop(block);
         pool.release(outer);
         assert!(output_vte.upgrade().is_none());

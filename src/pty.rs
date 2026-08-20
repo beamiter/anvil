@@ -320,10 +320,9 @@ const PTY_QUEUE_CAPACITY: usize = 8;
 /// immediately-readable writes (and avoids the old 36 KiB over-allocation when
 /// the first read already filled the 32 KiB buffer).
 const PTY_READ_CHUNK_BYTES: usize = 32 * 1024;
-/// Pace main-thread terminal feeding. A readiness source immediately becomes
-/// ready again while a producer is chatty, so priority alone does not provide a
-/// frame boundary. At 8 ms and 32 KiB chunks the cap is about 4 MiB/s per PTY,
-/// while pointer and keyboard handling get a scheduling opportunity each tick.
+/// Pace the fallback timer transport, which has no readiness signal of its own
+/// and would otherwise spin. The eventfd transport re-arms itself at idle
+/// priority instead — see `rearm_dispatch`.
 const PTY_DISPATCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(8);
 const FD_WRITER_MAX_QUEUED_BYTES: usize = 4 * 1024 * 1024;
 const FD_WRITER_MAX_MESSAGES: usize = 256;
@@ -1140,13 +1139,26 @@ impl OwnedPty {
                 match message {
                     PtyMsg::Data(data) => {
                         callback(data);
-                        let eventfd = Arc::clone(&eventfd);
-                        let wake_pending = Arc::clone(&wake_pending);
-                        glib::timeout_add_local_once(PTY_DISPATCH_INTERVAL, move || {
-                            if signal_eventfd(eventfd.as_raw_fd()).is_err() {
-                                wake_pending.store(false, Ordering::Release);
-                            }
-                        });
+                        // Re-arm at idle priority rather than after a fixed
+                        // sleep. This watch is itself a DEFAULT_IDLE source, so
+                        // GTK's input handling (DEFAULT) and its frame clock
+                        // (HIGH_IDLE + 20) both preempt the loop: the frame
+                        // boundary comes from the priority that is already
+                        // there instead of from a constant that has to guess
+                        // one. The former fixed 8 ms re-arm handed the renderer
+                        // at most one 32 KiB chunk per tick — a ~4 MiB/s
+                        // ceiling that spent ~98% of each interval asleep, and
+                        // it showed: measured over `seq 1 200000` in a 1600x1000
+                        // pane, the screen only reached a new frame every 6th
+                        // capture frame (~200 ms of visibly frozen output at a
+                        // time), and the run took 2478 ms from Enter to the
+                        // last repaint. Idle re-arm: no gap above one capture
+                        // frame, 1830 ms end to end. Responsiveness under a
+                        // 20 MiB stream is unchanged — Ctrl+Shift+P still
+                        // raised the palette within 200 ms in both — and peak
+                        // RSS over a 40 MiB runaway grew by 15 MiB, bounded by
+                        // the same output ring and scrollback caps as before.
+                        rearm_dispatch(&eventfd, &wake_pending);
                         true
                     }
                     PtyMsg::Exit(code) => {
@@ -1251,6 +1263,24 @@ fn coalesce_pending(fd: RawFd, file: &mut std::fs::File, buf: &mut [u8], combine
 }
 
 #[cfg(target_os = "linux")]
+/// Ask the dispatch watch to look at the queue again once GTK has run
+/// everything more urgent.
+///
+/// `wake_pending` stays set across this hop, so the reader thread does not also
+/// signal and the eventfd counter cannot run away. If the signal fails the flag
+/// is cleared, which hands the next wakeup back to the reader thread rather
+/// than leaving the queue armed with nobody scheduled to drain it.
+#[cfg(target_os = "linux")]
+fn rearm_dispatch(eventfd: &Arc<OwnedFd>, wake_pending: &Arc<AtomicBool>) {
+    let eventfd = Arc::clone(eventfd);
+    let wake_pending = Arc::clone(wake_pending);
+    glib::idle_add_local_once(move || {
+        if signal_eventfd(eventfd.as_raw_fd()).is_err() {
+            wake_pending.store(false, Ordering::Release);
+        }
+    });
+}
+
 fn notify_eventfd_once(eventfd: &OwnedFd, wake_pending: &AtomicBool) {
     if !wake_pending.swap(true, Ordering::AcqRel) && signal_eventfd(eventfd.as_raw_fd()).is_err() {
         // Do not leave the queue permanently armed without a kernel wakeup.

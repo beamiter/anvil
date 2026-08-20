@@ -3138,6 +3138,11 @@ pub struct TermView {
     /// all of the visible block-history state atomically.
     unread_count: Rc<Cell<u32>>,
     jump_fab: gtk::Button,
+    /// The pane's one follow-bottom controller, shared with the PTY reader.
+    /// Rebuilding it per call site produced independent 16 ms settling timers
+    /// that could not coalesce, so a notice card landing next to a finishing
+    /// block drove the viewport from two loops at once.
+    scroll_debouncer: ScrollDebouncer,
     /// Compact organism representation inside the sticky running header.
     sticky_organism_slot: gtk::Box,
     /// Find-within-blocks state: every match across the finished blocks plus a
@@ -3732,6 +3737,10 @@ trait RenderBackend {
     // ── autoscroll ──
     fn mark_scroll_dirty(&self);
     fn reset_scroll_lock(&self);
+    /// Whether the user has scrolled away from the live prompt. Read before
+    /// clearing the lock so a prompt boundary cannot overrule a reading
+    /// position the command-end path just decided to keep.
+    fn user_scrolled_up(&self) -> bool;
     // ── finished blocks ──
     /// Mount a finished command as a history block and reset the live
     /// surface; subsumes the whole ordered finalize sub-step chain.
@@ -5249,8 +5258,17 @@ impl ReaderCtx {
             self.pty_for_init.write_bytes(text.as_bytes());
         }
 
-        self.backend.reset_scroll_lock();
-        self.backend.mark_scroll_dirty();
+        // Only when the user is already at the live prompt. `finalize_block`
+        // ran moments ago: it reads the same flag, raises the unread-count FAB
+        // when the user is up in the history, and resets the lock only when
+        // they were not. The shell prints its next prompt milliseconds later,
+        // so clearing the lock unconditionally here threw that decision away —
+        // the viewport was yanked to the bottom and the FAB raised for exactly
+        // this case was invalidated in the same instant.
+        if !self.backend.user_scrolled_up() {
+            self.backend.reset_scroll_lock();
+            self.backend.mark_scroll_dirty();
+        }
     }
 
     fn on_command_start(&self, meta: &CommandMeta) {
@@ -5650,15 +5668,29 @@ impl ReaderCtx {
 /// build` spew, and any sustained byte-only output. Safe because boundary
 /// events (PromptStart/End, AltScreen*, CommandStart/End) are NOT merged and
 /// keep their own synchronous mark_dirty.
+///
+/// A shell's post-command metadata — OSC 7 (cwd) and OSC 0/1/2 (title) — is
+/// also excluded, because it is *classified by payload* downstream:
+/// [`is_post_command_metadata`] tests the head of a payload, and `on_bytes`
+/// skips the whole payload it matches so a title update does not become an
+/// empty history card. The parser emits each of those OSCs as its own Bytes
+/// event, so merging one with the output next to it made that test drop real
+/// output from the block capture — output the user had already watched appear
+/// in the live card, gone the moment the block finalized.
 fn coalesce_bytes_events(events: &mut Vec<ParserEvent>) {
     if events.len() < 2 {
         return;
+    }
+    /// Payloads whose classification depends on their own first bytes must
+    /// stay whole, both as the head of a run and as its terminator.
+    fn mergeable(event: &ParserEvent) -> bool {
+        matches!(event, ParserEvent::Bytes(bytes) if !is_post_command_metadata(bytes))
     }
     let mut write = 0usize;
     let mut i = 0usize;
     let n = events.len();
     while i < n {
-        if matches!(events[i], ParserEvent::Bytes(_)) {
+        if mergeable(&events[i]) {
             // Move the first Bytes payload out so we can extend it in place.
             let placeholder = ParserEvent::Bytes(Vec::new());
             let first = std::mem::replace(&mut events[i], placeholder);
@@ -5667,13 +5699,11 @@ fn coalesce_bytes_events(events: &mut Vec<ParserEvent>) {
                 _ => unreachable!(),
             };
             i += 1;
-            while i < n {
+            while i < n && mergeable(&events[i]) {
                 if let ParserEvent::Bytes(b) = &events[i] {
                     merged.extend_from_slice(b);
-                    i += 1;
-                } else {
-                    break;
                 }
+                i += 1;
             }
             events[write] = ParserEvent::Bytes(merged);
             write += 1;
@@ -6024,6 +6054,10 @@ impl RenderBackend for BlockBackend {
         self.scroll_debouncer.reset_scroll_lock();
     }
 
+    fn user_scrolled_up(&self) -> bool {
+        self.scroll_debouncer.user_scrolled_up.get()
+    }
+
     fn enter_alt_screen_chrome(&self) {
         let active = self.active_rc.borrow();
         active.set_live_organism_visible(false);
@@ -6327,7 +6361,7 @@ impl RenderBackend for BlockBackend {
             &self.bstate_rc,
             &self.active_rc,
         );
-        finished_clone.connect_scroll_forwarding(&self.block_scroll_rc);
+        finished_clone.connect_scroll_forwarding(&self.block_scroll_rc, &self.scroll_debouncer);
 
         self.finished_blocks_for_cb.borrow_mut().push(finished);
 
@@ -6890,6 +6924,10 @@ impl RenderBackend for UnifiedBackend {
 
     fn reset_scroll_lock(&self) {}
 
+    fn user_scrolled_up(&self) -> bool {
+        false
+    }
+
     fn finalize_block(
         &self,
         record: &CompletedCommandRecord,
@@ -7115,9 +7153,13 @@ fn viewport_rows_for(vte: &Terminal, scroll: &ScrolledWindow) -> Option<i64> {
     }
     // .block-active wraps the VTE with margin+border+padding; subtract the
     // chrome for the active density so the holder total fits exactly.
+    // The card's Box — the widget that carries `.block-compact` — is several
+    // levels up: the VTE's own parent is the `gtk::Overlay` that holds its grid
+    // size request. Probing `parent()` for a Box never matched, so compact
+    // density silently measured itself against the normal chrome and came out
+    // a row short.
     let compact = vte
-        .parent()
-        .and_then(|parent| parent.downcast::<gtk::Box>().ok())
+        .ancestor(gtk::Box::static_type())
         .is_some_and(|holder| holder.has_css_class("block-compact"));
     let chrome = if compact {
         css::BLOCK_ACTIVE_COMPACT_VCHROME_PX
@@ -7189,56 +7231,69 @@ fn live_visible_rows_for_measurement(
     }
 }
 
-/// How many rows of the live grid this command has reached: the top of the
-/// screen down to the cursor.
+/// How many rows of the live grid this command has reached: the distance the
+/// cursor has travelled since the command's output began, capped by the grid.
 ///
-/// Screen-relative on purpose. VTE row numbers are absolute ring coordinates
-/// that climb for the whole session (and `[H[2J` does not reset them), so
-/// `cursor_position` alone measures the session, not the block. `upper -
-/// page_size` is the first row of the screen — the row the in-stream clear at
-/// the previous `reset_active` homed the cursor to — and unlike the
-/// adjustment's `value` it does not move when the user scrolls the live
-/// terminal back.
-fn live_content_extent(vte: &Terminal) -> Option<i64> {
-    let adjustment = gtk::prelude::ScrollableExt::vadjustment(vte)?;
-    live_content_extent_for(
-        adjustment.lower(),
-        adjustment.upper(),
-        adjustment.page_size(),
-        vte.cursor_position().1,
-    )
+/// Both readings come from `cursor_position()`, so they are in the same
+/// coordinate system by construction. The origin is re-sampled on every layout
+/// pass that runs before this command has produced output, which is the row its
+/// first output line will land on.
+///
+/// This used to subtract the *adjustment's* screen top (`upper - page_size`)
+/// from the cursor row and treat `cursor_row > upper` as "not measurable".
+/// Measured on VTE 0.82, those two APIs are not coherent for a live grid that
+/// gets resized at CommandStart: `upper` then trails `cursor_position().1` by a
+/// fixed offset for the rest of the command, and once the output passes the
+/// live scrollback limit `upper` stops moving altogether while the cursor keeps
+/// climbing (`seq 1 200000` on a 36-row grid reported a pinned `upper = 5000`
+/// against `cursor = 196103`). The coherence guard therefore latched `None` on
+/// every sample of every streaming command, the high-water never grew, and the
+/// card stayed at the compact prompt height — a six-row peephole showing rows
+/// thirty behind the cursor, with the rest of the pane blank — until the block
+/// finished.
+fn live_content_extent(
+    vte: &Terminal,
+    origin: &Cell<Option<i64>>,
+    output_started: bool,
+) -> Option<i64> {
+    let cursor_row = vte.cursor_position().1;
+    if !output_started {
+        // Still showing the prompt. Keep the origin pinned to the live cursor
+        // so the first output sample measures a true distance; fixing it only
+        // once output exists would put the origin several thousand rows into a
+        // fast stream and hold the card at its floor.
+        origin.set(Some(cursor_row));
+        return None;
+    }
+    let Some(origin_row) = origin.get() else {
+        // Output beat every layout pass, so there is no origin to measure
+        // against yet. Adopt this cursor and report the sample as provisional,
+        // exactly as the caller's `None` contract expects. CommandStart lays
+        // the surface out before the first chunk can arrive, so this is a
+        // fallback rather than the normal entry point.
+        origin.set(Some(cursor_row));
+        return None;
+    };
+    Some(live_content_extent_for(
+        origin_row,
+        cursor_row,
+        vte.row_count(),
+    ))
 }
 
 /// The arithmetic behind [`live_content_extent`], separated so it can be tested
 /// without a display.
 ///
-/// `None` means the extent is not measurable right now. Every such sample is
-/// provisional because cursor and adjustment may describe different grid
-/// generations (see [`live_visible_rows_for_measurement`]). A running command
-/// that emits `ESC[3J` (what `clear` sends to drop the scrollback) is handled by
-/// the parser's explicit ED3 barrier instead of being inferred from `None`:
-/// while VTE applies the bytes, it can renumber the adjustment down to the
-/// screen but leave `cursor_position` in the old ring coordinates, so the two
-/// stop describing the same buffer and any difference between them is
-/// meaningless.
-/// `cursor_row > upper` is the tell — the cursor is always inside the buffer the
-/// adjustment describes, except that a cursor resting one row past the last
-/// written row is normal, so the test has to be strict. The next prompt's
-/// `reset_active` re-bases both.
-fn live_content_extent_for(lower: f64, upper: f64, page_size: f64, cursor_row: i64) -> Option<i64> {
-    if !lower.is_finite() || !upper.is_finite() || !page_size.is_finite() {
-        return None;
-    }
-    if cursor_row > upper as i64 {
-        return None;
-    }
-    let screen_top = (upper - page_size).max(lower) as i64;
-    Some(
-        cursor_row
-            .saturating_sub(screen_top)
-            .saturating_add(1)
-            .max(1),
-    )
+/// A cursor that moved backwards — a full-screen repaint homing to `[H`, or an
+/// origin sampled a row late — measures as a single row rather than a negative
+/// one; the caller's monotone high-water keeps the card from shrinking under
+/// it, and ED3/RIS still exposes the full viewport through the parser barrier
+/// rather than through this sample.
+fn live_content_extent_for(origin_row: i64, cursor_row: i64, grid_rows: i64) -> i64 {
+    cursor_row
+        .saturating_sub(origin_row)
+        .saturating_add(1)
+        .clamp(1, grid_rows.max(1))
 }
 
 type FinishedLayoutKey = (i32, i32, i32);
@@ -8190,11 +8245,15 @@ impl TermView {
             // ActiveBlock so that `reset_active` — the one funnel every reset
             // path goes through — clears it for the next command.
             let live_rows_high_water = active.borrow().live_extent_rows();
+            // Origin for the extent measurement, re-based by the same
+            // `reset_active` funnel that clears the high-water.
+            let live_cursor_origin = active.borrow().live_cursor_origin();
             // The engine-owned capture gates coherent growth after
             // CommandStart. Empty means every VTE sample is still provisional;
             // only the separate parser-barrier flag authorizes a full card.
             let live_output_for_layout = live_raw_output.clone();
             let live_force_full_for_layout = live_extent_force_full.clone();
+            let live_origin_for_layout = live_cursor_origin.clone();
             // Weak: ActiveBlock owns the VTE that retains this callback.
             let active_for_layout = Rc::downgrade(&active);
             Rc::new(move || {
@@ -8271,7 +8330,7 @@ impl TermView {
                     // reservation the command may never fill.
                     let output_started = !live_output_for_layout.borrow().is_empty();
                     let (visible_rows, next_high_water) = live_visible_rows_for_measurement(
-                        live_content_extent(&vte),
+                        live_content_extent(&vte, &live_origin_for_layout, output_started),
                         output_started,
                         live_force_full_for_layout.get(),
                         live_rows_high_water.get(),
@@ -8381,56 +8440,40 @@ impl TermView {
             block_layout_active_surface
         };
 
-        // Coalesces follow-bottom pins so a burst of contents-changed signals
-        // schedules at most one deferred scroll.
-        let pin_pending: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let contents_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
         {
             // Drive sizing from the data path (contents changed: prompt printed,
             // user typing, output streaming, alt-screen toggle), and follow the
             // bottom from here too — NOT from the vadjustment `changed` signal.
             //
-            // Why a deferred idle and not `changed`: pinning inside `changed`
-            // reacts to virtualization's own `upper` changes (off-screen blocks
-            // collapse to 0 height when hidden), so pin → hide top block → upper
-            // shrinks → `changed` → pin → block reappears → upper grows → `changed`
-            // → … an infinite two-state oscillation. A low-priority idle runs once
-            // per content burst, AFTER layout settles (so `upper` is final), and is
-            // never re-triggered by the visibility side-effects of its own scroll.
+            // Why not `changed`: pinning inside it reacts to virtualization's own
+            // `upper` changes, so pin → hide top block → upper shrinks → `changed`
+            // → pin → block reappears → upper grows → `changed` → … an infinite
+            // two-state oscillation.
+            //
+            // This used to schedule its own idle and compute `upper - page_size`
+            // inside it. The sizing above only *queues* resizes
+            // (`set_height_request` on the holder and on the live spacer), and a
+            // DEFAULT_IDLE source runs before the frame clock has allocated them,
+            // so that idle read a pre-layout `upper` and pinned one growth step
+            // short of the true bottom. `pin_to_bottom_deferred` is the shared
+            // frame-spaced controller built for exactly this: it re-reads the
+            // target once per frame until it stops moving, coalesces overlapping
+            // requests into one timer, and is the same loop the command-finished
+            // and refocus paths use — so a burst of output and a finishing block
+            // no longer drive the viewport from two settling loops at once.
             let f = layout_active_surface.clone();
             let scroll = block_scroll.downgrade();
-            let user_scrolled = user_scrolled_up.clone();
-            let programmatic = programmatic_scroll.clone();
-            let pin_pending = pin_pending.clone();
+            let debouncer = scroll_debouncer.clone();
             let contents_generation_for_signal = contents_generation.clone();
             active_vte.connect_contents_changed(move |_| {
                 contents_generation_for_signal
                     .set(contents_generation_for_signal.get().wrapping_add(1));
                 f();
-                if user_scrolled.get() || pin_pending.get() {
+                let Some(scroll) = scroll.upgrade() else {
                     return;
-                }
-                pin_pending.set(true);
-                let scroll = scroll.clone();
-                let user_scrolled = user_scrolled.clone();
-                let programmatic = programmatic.clone();
-                let pin_pending = pin_pending.clone();
-                glib::idle_add_local_once(move || {
-                    pin_pending.set(false);
-                    if user_scrolled.get() {
-                        return;
-                    }
-                    let Some(scroll) = scroll.upgrade() else {
-                        return;
-                    };
-                    let adj = scroll.vadjustment();
-                    let target = (adj.upper() - adj.page_size()).max(adj.lower());
-                    if (adj.value() - target).abs() > 1.0 {
-                        programmatic.set(true);
-                        adj.set_value(target);
-                        programmatic.set(false);
-                    }
-                });
+                };
+                debouncer.pin_to_bottom_deferred(&scroll);
             });
         }
 
@@ -8991,12 +9034,12 @@ impl TermView {
             let unread = unread_count.clone();
             let fab = jump_fab.clone();
             let live_vte = active_vte.downgrade();
+            let debouncer = scroll_debouncer.clone();
             jump_fab.connect_clicked(move |_| {
                 // Returning to the live prompt is not a single set_value: blocks
-                // below the viewport are virtualized to 0 height, so `upper` only
-                // grows as they scroll into view. One jump lands partway; we have
-                // to re-apply `upper - page` across idle passes until `upper` stops
-                // growing (true bottom reached) or we hit a small iteration cap.
+                // below the viewport are virtualized, so `upper` only grows as
+                // they scroll into view. One jump lands partway; the target has
+                // to be re-applied until `upper` stops growing.
                 user_scrolled.set(false);
                 unread.set(0);
                 fab.set_visible(false);
@@ -9013,30 +9056,16 @@ impl TermView {
                 adj.set_value((adj.upper() - adj.page_size()).max(adj.lower()));
                 programmatic.set(false);
 
-                let scroll = scroll.clone();
-                let programmatic = programmatic.clone();
-                let tries = Rc::new(Cell::new(0u8));
-                glib::idle_add_local(move || {
-                    // Runs for a handful of frames (cap below), too fast for the
-                    // user to interrupt — so we don't watch user_scrolled here; the
-                    // value_changed geometry check settles the FAB state afterward.
-                    if tries.get() >= 12 {
-                        return glib::ControlFlow::Break;
-                    }
-                    tries.set(tries.get() + 1);
-                    let adj = scroll.vadjustment();
-                    let before = adj.value();
-                    let target = (adj.upper() - adj.page_size()).max(adj.lower());
-                    programmatic.set(true);
-                    adj.set_value(target);
-                    programmatic.set(false);
-                    // Stable once another pass no longer advances the position.
-                    if (adj.value() - before).abs() < 1.0 {
-                        glib::ControlFlow::Break
-                    } else {
-                        glib::ControlFlow::Continue
-                    }
-                });
+                // Settle on the frame clock, not on an idle. An idle source
+                // that returns Continue re-runs inside the same main-loop turn,
+                // so all twelve retries used to observe the same pre-layout
+                // `upper` — and the early break compared the position against
+                // the value from before its own write, which usually stopped
+                // after two. Both left the click landing short of the live
+                // prompt on a long virtualized history. This is the pane's one
+                // settling loop, so a click during streaming output coalesces
+                // with the pin the output is already driving.
+                debouncer.pin_to_bottom_deferred(&scroll);
             });
         }
 
@@ -9447,6 +9476,7 @@ impl TermView {
             let bstate_for_scroll = bstate.clone();
             let vte_for_scroll = active_vte.downgrade();
             let outer_for_scroll = block_scroll.downgrade();
+            let debouncer_for_scroll = scroll_debouncer.clone();
             let unified_for_scroll = unified;
             let scroll_ctrl = gtk::EventControllerScroll::new(
                 gtk::EventControllerScrollFlags::VERTICAL
@@ -9501,6 +9531,7 @@ impl TermView {
                     return glib::Propagation::Proceed;
                 };
                 forward_outer_scroll(&outer, dy);
+                debouncer_for_scroll.record_wheel_intent(&outer);
                 glib::Propagation::Stop
             });
             active_vte.add_controller(scroll_ctrl);
@@ -9513,6 +9544,7 @@ impl TermView {
             scrollbar_scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
             let vte_for_scrollbar = active_vte.downgrade();
             let outer_for_scrollbar = block_scroll.downgrade();
+            let debouncer_for_scrollbar = scroll_debouncer.clone();
             scrollbar_scroll.connect_scroll(move |_, _dx, dy| {
                 if let Some(adjustment) = vte_for_scrollbar
                     .upgrade()
@@ -9526,6 +9558,7 @@ impl TermView {
                     return glib::Propagation::Proceed;
                 };
                 forward_outer_scroll(&outer, dy);
+                debouncer_for_scrollbar.record_wheel_intent(&outer);
                 glib::Propagation::Stop
             });
             live_scrollbar.add_controller(scrollbar_scroll);
@@ -9602,6 +9635,7 @@ impl TermView {
             history_explicit_replace_pending: RefCell::new(VecDeque::new()),
             unread_count,
             jump_fab,
+            scroll_debouncer: scroll_debouncer.clone(),
             sticky_organism_slot,
             find_state,
             current_cwd: current_cwd.clone(),
@@ -9670,7 +9704,7 @@ impl TermView {
                             &term_view.bstate,
                             &term_view.active,
                         );
-                        finished.connect_scroll_forwarding(&term_view.block_scroll);
+                        finished.connect_scroll_forwarding(&term_view.block_scroll, &term_view.scroll_debouncer);
                         install_finished_block_selection(
                             &finished,
                             &term_view.active,
@@ -9939,11 +9973,8 @@ impl TermView {
             widget.insert_before(&self.block_list, Some(&active_widget));
         }
         self.block_list.queue_allocate();
-        ScrollDebouncer::with_scroll_lock(
-            self.user_scrolled_up.clone(),
-            self.programmatic_scroll.clone(),
-        )
-        .pin_to_bottom_deferred(&self.block_scroll);
+        self.scroll_debouncer
+            .pin_to_bottom_deferred(&self.block_scroll);
         true
     }
 
@@ -10727,7 +10758,7 @@ impl TermView {
                     &self.bstate,
                     &self.active,
                 );
-                finished.connect_scroll_forwarding(&self.block_scroll);
+                finished.connect_scroll_forwarding(&self.block_scroll, &self.scroll_debouncer);
                 install_finished_block_selection(
                     &finished,
                     &self.active,
@@ -11298,29 +11329,26 @@ mod tests {
     }
 
     #[test]
-    fn live_content_extent_is_screen_relative_not_an_absolute_ring_row() {
-        // VTE row numbers are absolute and climb for the whole session, so the
-        // extent is measured from the top of the *screen* (`upper - page`).
-        // A full 36-row screen whose cursor sits on its last row:
-        assert_eq!(live_content_extent_for(0.0, 63.0, 36.0, 62), Some(36));
-        // The same terminal after `[H[2J`: the ring kept climbing (upper 99),
-        // the cursor is six rows into the current screen.
-        assert_eq!(live_content_extent_for(0.0, 99.0, 36.0, 68), Some(6));
-        // A fresh block: cursor at the top of the screen is one row, not zero.
-        assert_eq!(live_content_extent_for(0.0, 36.0, 36.0, 0), Some(1));
-        // Scrolled-back views must not inflate it: `value` moves, `upper -
-        // page` does not, and the cursor stays on the live screen.
-        assert_eq!(live_content_extent_for(0.0, 200.0, 36.0, 170), Some(7));
-        // The cursor resting one row past the last written row is normal.
-        assert_eq!(live_content_extent_for(0.0, 54.0, 20.0, 54), Some(21));
-        // `ESC[3J` renumbers the adjustment but not the cursor: measured, a
-        // 20-row screen reported upper=20 with the cursor still at ring row 55.
-        // Unmeasurable, so the card must fall back to the full viewport.
-        assert_eq!(live_content_extent_for(0.0, 20.0, 20.0, 55), None);
-        assert_eq!(live_content_extent_for(0.0, 20.0, 20.0, 113), None);
-        // Degenerate adjustments never produce a card that hides output.
-        assert_eq!(live_content_extent_for(0.0, 0.0, 0.0, 0), Some(1));
-        assert_eq!(live_content_extent_for(f64::NAN, 99.0, 36.0, 68), None);
+    fn live_content_extent_measures_cursor_travel_not_adjustment_geometry() {
+        // A command that has printed nothing yet still occupies its first row.
+        assert_eq!(live_content_extent_for(120, 120, 36), 1);
+        // Six rows in, the card is six rows tall.
+        assert_eq!(live_content_extent_for(120, 125, 36), 6);
+        // Output past the grid caps at the grid: the screen is full and the
+        // card is a full viewport, however far the ring has since climbed.
+        assert_eq!(live_content_extent_for(120, 155, 36), 36);
+        assert_eq!(live_content_extent_for(120, 199_999, 36), 36);
+        // The measurement this replaced could not survive a live grid whose
+        // adjustment stops tracking the cursor. Measured during
+        // `seq 1 200000` on a 36-row grid: adjustment pinned at upper = 5000,
+        // cursor at ring row 196_103. Travel is unaffected by either number.
+        assert_eq!(live_content_extent_for(2, 196_103, 36), 36);
+        // A full-screen repaint homes the cursor above the origin. One row,
+        // never a negative one — the caller's high-water holds the card.
+        assert_eq!(live_content_extent_for(500, 12, 36), 1);
+        // Degenerate grids never produce a card that hides output.
+        assert_eq!(live_content_extent_for(0, 0, 0), 1);
+        assert_eq!(live_content_extent_for(i64::MIN, i64::MAX, 36), 36);
     }
 
     #[test]
@@ -12174,6 +12202,9 @@ mod tests {
         kitty_status: Cell<crate::terminal::kitty_graphics::FeedStatus>,
         settle_anchor_now: Cell<bool>,
         admit_probe: RefCell<Option<Box<dyn Fn()>>>,
+        /// Stands in for the pane's scroll lock so a test can assert that a
+        /// prompt boundary does not overrule a user reading history.
+        user_scrolled_up: Cell<bool>,
     }
 
     impl RecordingBackend {
@@ -12197,6 +12228,7 @@ mod tests {
                 payload_counters: RefCell::new(Vec::new()),
                 kitty_status: Cell::new(crate::terminal::kitty_graphics::FeedStatus::Pending),
                 settle_anchor_now: Cell::new(true),
+                user_scrolled_up: Cell::new(false),
                 admit_probe: RefCell::new(None),
             })
         }
@@ -12359,6 +12391,10 @@ mod tests {
 
         fn reset_scroll_lock(&self) {
             self.record(DispatchCall::ResetLock);
+        }
+
+        fn user_scrolled_up(&self) -> bool {
+            self.user_scrolled_up.get()
         }
 
         fn finalize_block(
@@ -12980,6 +13016,43 @@ mod tests {
             assert_eq!(harness.ctx.pty_for_init.shell_is_foreground(), Some(true));
         }
         harness.feed(ParserEvent::PromptStart);
+    }
+
+    #[test]
+    fn a_prompt_boundary_does_not_overrule_a_user_reading_history() {
+        // PromptEnd follows CommandEnd by milliseconds. `finalize_block` reads
+        // the scroll lock there, raises the unread-count FAB when the user is
+        // up in the history, and resets the lock only when they were not — so
+        // PromptEnd clearing it unconditionally threw that decision away and
+        // yanked the viewport back to the live prompt.
+        let harness = ReaderHarness::new();
+        harness.backend.user_scrolled_up.set(true);
+        harness.backend.render_row(3, "$ ");
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            dispatch_bytes("$ "),
+            ParserEvent::PromptEnd,
+        ]);
+        let calls = harness.backend.calls.borrow();
+        assert!(
+            !calls.contains(&DispatchCall::ResetLock),
+            "PromptEnd must leave a scrolled-up reader where they are: {calls:?}"
+        );
+        drop(calls);
+
+        // Back at the prompt, following the bottom resumes.
+        harness.backend.calls.borrow_mut().clear();
+        harness.backend.user_scrolled_up.set(false);
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            dispatch_bytes("$ "),
+            ParserEvent::PromptEnd,
+        ]);
+        let calls = harness.backend.calls.borrow();
+        assert!(
+            calls.contains(&DispatchCall::ResetLock) && calls.contains(&DispatchCall::MarkDirty),
+            "PromptEnd at the bottom must still follow it: {calls:?}"
+        );
     }
 
     #[test]
@@ -15478,6 +15551,37 @@ mod tests {
         ];
         coalesce_bytes_events(&mut events);
         assert_eq!(ev_summary(&events), vec!["B(hello world!)"]);
+    }
+
+    #[test]
+    fn coalesce_keeps_post_command_metadata_out_of_an_output_run() {
+        // `on_bytes` skips a PostCommand payload whose head is a metadata OSC,
+        // so merging one into the output beside it dropped that output from the
+        // block capture entirely.
+        let mut events = vec![
+            ParserEvent::Bytes(b"before".to_vec()),
+            ParserEvent::Bytes(b"\x1b]7;file://host/tmp\x1b\\".to_vec()),
+            ParserEvent::Bytes(b"after".to_vec()),
+            ParserEvent::Bytes(b" more".to_vec()),
+        ];
+        coalesce_bytes_events(&mut events);
+        assert_eq!(
+            ev_summary(&events),
+            vec![
+                "B(before)",
+                "B(\x1b]7;file://host/tmp\x1b\\)",
+                "B(after more)"
+            ]
+        );
+
+        // A title update between two output runs keeps both runs whole and
+        // separate, and never starts a run itself.
+        let mut events = vec![
+            ParserEvent::Bytes(b"\x1b]0;title\x07".to_vec()),
+            ParserEvent::Bytes(b"out".to_vec()),
+        ];
+        coalesce_bytes_events(&mut events);
+        assert_eq!(ev_summary(&events), vec!["B(\x1b]0;title\x07)", "B(out)"]);
     }
 
     #[test]

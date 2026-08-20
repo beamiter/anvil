@@ -3444,7 +3444,13 @@ impl FinishedBlock {
     /// Give a long block first refusal on wheel events while the pointer is over
     /// either its output or its scrollbar. Only hand off to the outer history
     /// canvas after the inner adjustment reaches the requested boundary.
-    pub(crate) fn connect_scroll_forwarding(&self, outer: &gtk::ScrolledWindow) {
+    /// `debouncer` records the user's scroll intent for wheel motion this card
+    /// hands on to the history — see [`ScrollDebouncer::record_wheel_intent`].
+    pub(crate) fn connect_scroll_forwarding(
+        &self,
+        outer: &gtk::ScrolledWindow,
+        debouncer: &ScrollDebouncer,
+    ) {
         // The button belongs to this FinishedBlock. Capturing `self.clone()`
         // here forms button -> signal closure -> FinishedBlock -> button/VTE;
         // weak widget handles keep eviction and pane teardown reclaimable.
@@ -3471,6 +3477,7 @@ impl FinishedBlock {
             scroll_ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
             let vte = self.output_vte.downgrade();
             let outer_for_vte = outer.downgrade();
+            let debouncer = debouncer.clone();
             scroll_ctrl.connect_scroll(move |_, _dx, dy| {
                 let (Some(vte), Some(outer_for_vte)) = (vte.upgrade(), outer_for_vte.upgrade())
                 else {
@@ -3482,6 +3489,7 @@ impl FinishedBlock {
                     }
                 }
                 forward_outer_scroll(&outer_for_vte, dy);
+                debouncer.record_wheel_intent(&outer_for_vte);
                 glib::Propagation::Stop
             });
             target.add_controller(scroll_ctrl);
@@ -3580,6 +3588,9 @@ pub(crate) struct ActiveBlock {
     /// screen. `reset_active` — the single funnel every reset path uses —
     /// clears it for the next command.
     live_extent_rows: Rc<Cell<i64>>,
+    /// Cursor row this command's output started from. Paired with
+    /// `live_extent_rows` so both are re-based by the same reset funnel.
+    live_cursor_origin: Rc<Cell<Option<i64>>>,
     /// Pass-through, non-measuring surface for small live widgets. The VTE
     /// remains the overlay's measured child, so the organism never changes
     /// the terminal grid or steals input.
@@ -3757,6 +3768,7 @@ impl ActiveBlock {
             live_clip,
             live_geometry: Cell::new((0, 0, 0)),
             live_extent_rows: Rc::new(Cell::new(0)),
+            live_cursor_origin: Rc::new(Cell::new(None)),
             live_organism_surface,
             unified_chrome_surface,
             live_scrollbar,
@@ -3846,6 +3858,11 @@ impl ActiveBlock {
         self.live_extent_rows.clone()
     }
 
+    /// Shared measurement origin, cloned into `block_layout_active_surface`.
+    pub(crate) fn live_cursor_origin(&self) -> Rc<Cell<Option<i64>>> {
+        self.live_cursor_origin.clone()
+    }
+
     /// Height of the live card in pixels — the part of the grid the user can
     /// see. Live widgets positioned over the terminal (the organism) must stay
     /// inside it or they are clipped away.
@@ -3872,8 +3889,10 @@ impl ActiveBlock {
     /// state, cleared explicitly by the reader engine around this reset (see
     /// `RenderBackend::reset_active_surface`).
     pub(crate) fn reset_active(&self, preserve_scrollback: bool) {
-        // A new command starts a new card: forget how far the last one grew.
+        // A new command starts a new card: forget how far the last one grew,
+        // and the row its predecessor grew from.
         self.live_extent_rows.set(0);
+        self.live_cursor_origin.set(None);
         if preserve_scrollback {
             self.active_vte.feed(b"\x1b[0m");
         } else {
