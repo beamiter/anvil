@@ -6058,14 +6058,23 @@ impl RenderBackend for BlockBackend {
         self.scroll_debouncer.user_scrolled_up.get()
     }
 
+    /// Strip the card's chrome so a full-screen app fills the pane.
+    ///
+    /// A live card is inset, rounded, accent-bordered and shadowed. That frames
+    /// a *command's* output, but an alternate-screen app owns the whole pane —
+    /// and `viewport_rows_for` subtracts the same chrome from the winsize, so
+    /// leaving it on also cost `top`, `htop`, `vim` and `less` a terminal row.
     fn enter_alt_screen_chrome(&self) {
         let active = self.active_rc.borrow();
+        active.widget().add_css_class("block-fullscreen");
         active.set_live_organism_visible(false);
         active.set_live_organism_alt_screen(true);
     }
 
     fn exit_alt_screen_chrome(&self) {
-        self.active_rc.borrow().set_live_organism_alt_screen(false);
+        let active = self.active_rc.borrow();
+        active.widget().remove_css_class("block-fullscreen");
+        active.set_live_organism_alt_screen(false);
     }
 
     fn enter_fullscreen(&self) {
@@ -7145,6 +7154,23 @@ fn pty_grid_size(vte: &Terminal, scroll: &ScrolledWindow) -> (u16, u16) {
     (cols, rows)
 }
 
+/// Vertical chrome the live card spends on margin, border and padding, which
+/// `viewport_rows_for` must subtract before dividing the pane into rows.
+///
+/// Three tiers, one per CSS rule on `.block-active`. Alt-screen removes the
+/// chrome entirely: a full-screen app owns the pane, so framing it in a card
+/// both looks wrong and costs it a terminal row, because this number also
+/// reaches the child through `pty_grid_size`.
+fn active_card_vchrome_px(fullscreen: bool, compact: bool) -> i32 {
+    if fullscreen {
+        0
+    } else if compact {
+        css::BLOCK_ACTIVE_COMPACT_VCHROME_PX
+    } else {
+        css::BLOCK_ACTIVE_VCHROME_PX
+    }
+}
+
 fn viewport_rows_for(vte: &Terminal, scroll: &ScrolledWindow) -> Option<i64> {
     let cell_h = (vte.char_height() as i32).max(1);
     let page = scroll.vadjustment().page_size() as i32;
@@ -7158,14 +7184,9 @@ fn viewport_rows_for(vte: &Terminal, scroll: &ScrolledWindow) -> Option<i64> {
     // size request. Probing `parent()` for a Box never matched, so compact
     // density silently measured itself against the normal chrome and came out
     // a row short.
-    let compact = vte
-        .ancestor(gtk::Box::static_type())
-        .is_some_and(|holder| holder.has_css_class("block-compact"));
-    let chrome = if compact {
-        css::BLOCK_ACTIVE_COMPACT_VCHROME_PX
-    } else {
-        css::BLOCK_ACTIVE_VCHROME_PX
-    };
+    let holder = vte.ancestor(gtk::Box::static_type());
+    let has = |class| holder.as_ref().is_some_and(|h| h.has_css_class(class));
+    let chrome = active_card_vchrome_px(has("block-fullscreen"), has("block-compact"));
     let usable = (page - chrome).max(cell_h);
     Some(((usable / cell_h).max(1)) as i64)
 }
@@ -11326,6 +11347,25 @@ mod tests {
             super::live_visible_rows_for_measurement(Some(2), true, false, 40, 40),
             (40, 40)
         );
+    }
+
+    #[test]
+    fn a_full_screen_app_is_charged_no_card_chrome() {
+        // The card frames a command's output; an alternate-screen app owns the
+        // pane. Charging it the card's chrome cost `top`/`vim`/`less` a row,
+        // because this figure also reaches the child through `pty_grid_size`.
+        assert_eq!(super::active_card_vchrome_px(true, false), 0);
+        assert_eq!(super::active_card_vchrome_px(true, true), 0);
+        // Otherwise the density decides, and compact really is cheaper.
+        assert_eq!(
+            super::active_card_vchrome_px(false, true),
+            super::css::BLOCK_ACTIVE_COMPACT_VCHROME_PX
+        );
+        assert_eq!(
+            super::active_card_vchrome_px(false, false),
+            super::css::BLOCK_ACTIVE_VCHROME_PX
+        );
+        assert!(super::css::BLOCK_ACTIVE_COMPACT_VCHROME_PX < super::css::BLOCK_ACTIVE_VCHROME_PX);
     }
 
     #[test]

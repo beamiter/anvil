@@ -616,6 +616,13 @@ pub(crate) fn install_block_css(config: &Config) {
             padding: 0;
             box-shadow: none;
         }}
+        .block-active.block-fullscreen {{
+            border: none;
+            border-radius: 0;
+            margin: 0;
+            padding: 0;
+            box-shadow: none;
+        }}
         .block-output-scrollbar {{
             min-width: 10px;
             margin: 1px 3px 1px 1px;
