@@ -320,6 +320,10 @@ const PTY_QUEUE_CAPACITY: usize = 8;
 /// immediately-readable writes (and avoids the old 36 KiB over-allocation when
 /// the first read already filled the 32 KiB buffer).
 const PTY_READ_CHUNK_BYTES: usize = 32 * 1024;
+/// Wall-clock a reader thread may spend merging follow-up reads into one
+/// delivered chunk. Bounds reader dwell for a producer that never stops being
+/// readable; the byte cap above is what ends the loop for everything else.
+const PTY_COALESCE_BUDGET: std::time::Duration = std::time::Duration::from_millis(2);
 /// Pace the fallback timer transport, which has no readiness signal of its own
 /// and would otherwise spin. The eventfd transport re-arms itself at idle
 /// priority instead — see `rearm_dispatch`.
@@ -1235,14 +1239,29 @@ fn reap_child(child_lifecycle: &Arc<ChildLifecycle>, tx: &mpsc::SyncSender<PtyMs
 }
 
 /// Briefly poll the PTY master for more bytes already on the wire and append
-/// them onto `combined`. Caps each delivered chunk at 32 KiB so even a steady
-/// firehose cannot create a single long-running GTK callback; the 1ms timeout is a tiny
-/// fraction of a 60Hz frame budget but enough to merge clear+repaint pairs
-/// that one program emitted in a single render.
+/// them onto `combined`.
+///
+/// The bound that matters is `PTY_READ_CHUNK_BYTES` — one delivered chunk, one
+/// main-thread callback — plus a small wall-clock budget so a firehose cannot
+/// park the reader here. It used to be a count of follow-up reads instead, and
+/// that count, not the byte cap, is what every chunk actually hit: a line-
+/// buffered writer such as `seq` emits one small write per line, so nine reads
+/// delivered ~700 bytes and the 32 KiB the comment promised was never reached.
+/// Every per-chunk fixed cost in the pipeline — the GLib idle round trip and
+/// the source churn it causes, the chunk `Vec`, the parse pass, the activity
+/// fan-out, the `vte_terminal_feed` call — was therefore paid about twelve
+/// times more often than the design intended.
+///
+/// Every poll still waits a millisecond, exactly as before — that is what
+/// merges the writes of a producer the reader can outrun, which is most of
+/// them: a paced writer leaves the tty buffer momentarily empty between writes,
+/// and a zero-timeout follow-up poll would stop coalescing at the first such
+/// gap and deliver SMALLER chunks than the old loop did. The budget, not the
+/// poll timeout, is what bounds the dwell, and at 2 ms it is a quarter of the
+/// 8 ms the old nine-poll loop could spend.
 fn coalesce_pending(fd: RawFd, file: &mut std::fs::File, buf: &mut [u8], combined: &mut Vec<u8>) {
-    const MAX_FOLLOWUP_READS: u32 = 8;
-    let mut follow_ups = 0u32;
-    while combined.len() < PTY_READ_CHUNK_BYTES && follow_ups < MAX_FOLLOWUP_READS {
+    let started = std::time::Instant::now();
+    while combined.len() < PTY_READ_CHUNK_BYTES && started.elapsed() < PTY_COALESCE_BUDGET {
         let mut pfd = libc::pollfd {
             fd,
             events: libc::POLLIN,
@@ -1258,7 +1277,6 @@ fn coalesce_pending(fd: RawFd, file: &mut std::fs::File, buf: &mut [u8], combine
             Ok(0) | Err(_) => break,
             Ok(m) => combined.extend_from_slice(&buf[..m]),
         }
-        follow_ups += 1;
     }
 }
 

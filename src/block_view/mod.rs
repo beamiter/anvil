@@ -581,17 +581,17 @@ fn sample_output_for_event(output: &str) -> String {
         return output.to_string();
     }
     let half = MAX_CHARS / 2;
-    let head_end = output
-        .char_indices()
-        .map(|(i, _)| i)
-        .take_while(|&i| i <= half)
-        .last()
-        .unwrap_or(0);
-    let tail_start = output
-        .char_indices()
-        .map(|(i, _)| i)
-        .find(|&i| i >= output.len().saturating_sub(half))
-        .unwrap_or(output.len());
+    // Both bounds are the nearest char boundary to a byte offset. Walking
+    // `char_indices` to find the tail one decoded the entire transcript — up to
+    // 8 MiB of UTF-8 — to answer a question about its last 16 KiB.
+    let mut head_end = half.min(output.len());
+    while head_end > 0 && !output.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = output.len().saturating_sub(half);
+    while tail_start < output.len() && !output.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
     format!(
         "{}\n... [{} bytes elided] ...\n{}",
         &output[..head_end],
@@ -5843,6 +5843,26 @@ fn truncate_output_for_journal(output_plain: &str, line_limit: usize) -> String 
     }
 }
 
+/// Lines [`truncate_output_for_journal`] would produce, without building the
+/// string it would have to allocate to produce them.
+///
+/// `finalize_block` only ever consumed the count. Materializing the truncated
+/// transcript to call `.lines().count()` on it cost a `Vec<&str>` over every
+/// line plus a full second copy of the output, on the main thread, per command.
+fn truncated_journal_line_count(total_lines: usize, line_limit: usize) -> usize {
+    if total_lines <= line_limit {
+        return total_lines;
+    }
+    // The truncated form is `kept + "\n\n" + banner`: the kept lines, one
+    // blank line, then the banner. A zero limit joins nothing, which still
+    // leaves an empty first line ahead of that blank.
+    if line_limit == 0 {
+        3
+    } else {
+        line_limit + 2
+    }
+}
+
 fn build_journal_completion(
     id: Option<String>,
     enabled: bool,
@@ -6281,11 +6301,24 @@ impl RenderBackend for BlockBackend {
         let block_cwd = record.cwd.as_deref();
         let cols = bounded_finished_vte_columns(self.grid_cols());
         let truncation_limit = self.config_for_cb.borrow().truncation_threshold_lines as usize;
-        let output_trimmed = truncate_output_for_journal(output_plain, truncation_limit);
-        let line_count = output_trimmed.lines().count();
-        let estimated_height = estimated_finished_block_height_for_text(
+        // The journal's own string is built where the journal consumes it. All
+        // this side ever wanted was the line count, and reaching it through
+        // `truncate_output_for_journal` meant a `Vec<&str>` over every line of
+        // the transcript plus a second full copy of it.
+        let line_count =
+            truncated_journal_line_count(output_plain.trim().lines().count(), truncation_limit);
+        // One unicode-width walk for the whole finalize, and it must be over the
+        // SAME string the card constructor measures — `output_with_ansi`.
+        // Counting `output_plain` instead would be cheaper (the strip replay is
+        // already paid) but `strip_ansi` is not idempotent: a capture ending in
+        // a lone ESC after cursor motion replays that ESC as a literal cell, and
+        // a second strip then consumes it as the head of an escape sequence,
+        // swallowing the byte after it. The card would be sized from a row count
+        // the render never produces.
+        let output_rows = output_visual_row_count(output_with_ansi, cols);
+        let estimated_height = estimated_finished_block_height_for_rows(
             &self.config_for_cb.borrow(),
-            output_plain,
+            output_rows,
             cols,
         );
         let block_data = BlockData {
@@ -6391,6 +6424,10 @@ impl RenderBackend for BlockBackend {
             &kitty_images,
             plain_output_bytes,
             recycled,
+            FinishedBlockPrecomputed {
+                output_rows: Some(output_rows),
+                retained_bytes: Some(newest_estimated_bytes),
+            },
         );
         finished
             .widget()
@@ -13942,6 +13979,86 @@ mod tests {
         };
         assert_eq!(store.records.len(), 1);
         assert!(store.records[0].is_background);
+    }
+
+    #[test]
+    fn journal_line_count_matches_the_string_it_no_longer_builds() {
+        // `finalize_block` derives the count arithmetically now. Pin it against
+        // the function whose output it is predicting, including the truncation
+        // banner's own two lines and the degenerate zero-limit join.
+        let corpora = [
+            "",
+            "one",
+            "one\ntwo",
+            "one\ntwo\nthree\n",
+            "  leading and trailing  \n\n",
+            "a\r\nb\r\nc",
+        ];
+        for text in corpora {
+            for limit in [0usize, 1, 2, 3, 5, 100] {
+                let built = super::truncate_output_for_journal(text, limit);
+                let expected = built.lines().count();
+                let total = text.trim().lines().count();
+                assert_eq!(
+                    super::truncated_journal_line_count(total, limit),
+                    expected,
+                    "text={text:?} limit={limit}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn finalize_measures_the_same_string_the_card_constructor_does() {
+        // finalize counts rows ONCE and hands the result to
+        // `FinishedBlock::new_with_pool`, which used to count them itself on
+        // `output_with_ansi`. The two must agree exactly, or the card is sized
+        // from a number its own render never produces.
+        //
+        // They agree only because both measure `output_with_ansi`. Measuring
+        // the already-stripped `output_plain` instead would be cheaper and is
+        // WRONG: `strip_ansi` is not idempotent. This corpus is the
+        // counter-example — a capture ending in a lone ESC after a carriage
+        // return replays the ESC as a literal cell, and stripping that a second
+        // time consumes it together with the byte after it.
+        let not_idempotent = format!("{}\r\x1b", "a".repeat(82));
+        let plain = super::materialize_plain_output(&not_idempotent);
+        assert_ne!(
+            super::output_visual_row_count(&plain, 80),
+            super::output_visual_row_count(&not_idempotent, 80),
+            "if this ever becomes equal, strip_ansi was made idempotent and \
+             finalize may measure output_plain again"
+        );
+
+        // And the ordinary shapes: nothing here should count zero rows or panic
+        // on a width of one column.
+        for with_ansi in [
+            "plain line\nsecond line",
+            "\x1b[31mred\x1b[0m and \x1b[1mbold\x1b[0m\nnext",
+            "progress\rprogress done\nafter",
+            "wide 中文字符 line\ntab\tseparated",
+            not_idempotent.as_str(),
+            "",
+        ] {
+            for cols in [1i64, 20, 80] {
+                assert!(super::output_visual_row_count(with_ansi, cols) >= 1);
+            }
+        }
+    }
+
+    #[test]
+    fn sample_output_cuts_on_char_boundaries_around_multibyte_text() {
+        // The bounds moved off a full `char_indices` decode of the whole
+        // transcript. Same cut, including when a multi-byte char straddles it.
+        let sample = super::sample_output_for_event(&"中".repeat(40 * 1024));
+        assert!(sample.contains("bytes elided"));
+        assert!(std::str::from_utf8(sample.as_bytes()).is_ok());
+        let short = "short output";
+        assert_eq!(super::sample_output_for_event(short), short);
+        // A 3-byte char straddling both bounds must not be split.
+        let straddling = format!("{}{}", "a".repeat(16 * 1024 - 1), "中".repeat(16 * 1024));
+        let cut = super::sample_output_for_event(&straddling);
+        assert!(!cut.contains('\u{fffd}'));
     }
 
     #[test]

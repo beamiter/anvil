@@ -65,12 +65,7 @@ pub(crate) fn create_terminal(config: &Config) -> Terminal {
     let font_desc = FontDescription::from_string(&config.font_desc);
     terminal.set_font(Some(&font_desc));
 
-    if let Ok(regex_pattern) = vte4::Regex::for_match(
-        r"[a-z]+://[[:graph:]]+",
-        pcre2_sys::PCRE2_CASELESS | pcre2_sys::PCRE2_MULTILINE,
-    ) {
-        terminal.match_add_regex(&regex_pattern, 0);
-    }
+    crate::block_view::add_url_match_regex(&terminal);
 
     terminal
 }

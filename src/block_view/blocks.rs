@@ -484,7 +484,7 @@ pub(crate) struct FinishedBlock {
     dynamic_viewport_rows: Rc<Cell<i64>>,
     /// Render geometry plus filtered-text generation. A remap at the same
     /// geometry must not re-feed and transiently reset the card height.
-    render_stamp: Rc<Cell<(i64, i64, bool, u64)>>,
+    render_stamp: Rc<Cell<RenderStamp>>,
     /// Cost cache for deriving wrapped rows from the displayed transcript.
     /// This is deliberately separate from `render_stamp`: equal row counts do
     /// not prove that VTE already contains the right bytes or geometry.
@@ -1765,6 +1765,34 @@ mod tests {
     }
 
     #[test]
+    fn only_a_content_change_earns_a_re_feed() {
+        let base = output_render_stamp(137, 40, 24, 0);
+        // Cap moved: for a long block this changes the stamp (the visible rows
+        // ARE the cap), but the ring already holds the right bytes.
+        assert!(!stamp_change_needs_refeed(
+            base,
+            output_render_stamp(137, 40, 12, 0)
+        ));
+        // Expanded past the content: still only a window change.
+        assert!(!stamp_change_needs_refeed(
+            base,
+            output_render_stamp(137, 40, 200, 0)
+        ));
+        // Different wrap width: the ring's line breaks are wrong.
+        assert!(stamp_change_needs_refeed(
+            base,
+            output_render_stamp(135, 40, 24, 0)
+        ));
+        // Different displayed text (a filter was applied).
+        assert!(stamp_change_needs_refeed(
+            base,
+            output_render_stamp(137, 40, 24, 1)
+        ));
+        // The construction-time zero stamp always feeds.
+        assert!(stamp_change_needs_refeed((0, 0, false, 0), base));
+    }
+
+    #[test]
     fn snapshot_rows_stay_within_the_cap_the_layout_gave_the_block() {
         assert_eq!(snapshot_visible_rows(3, 24), 3);
         assert_eq!(snapshot_visible_rows(40, 24), 24);
@@ -2030,6 +2058,21 @@ pub(crate) fn estimated_finished_block_height(config: &Config, output_rows: i64)
         .saturating_add(34)
 }
 
+/// Values `finalize_block` already derived from the very bytes it is about to
+/// hand to [`FinishedBlock::new_with_pool`].
+///
+/// Both of these are pure functions of `(output, cols)` and both are expensive:
+/// the row count is a unicode-width walk (plus a `strip_ansi` replay when the
+/// text still has escapes in it) and the retention estimate folds every byte.
+/// Recomputing them inside the constructor walked a 1.3 MB transcript a second
+/// and third time for numbers the caller was already holding. `None` keeps the
+/// old self-sufficient behavior for restore paths and tests.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct FinishedBlockPrecomputed {
+    pub(crate) output_rows: Option<i64>,
+    pub(crate) retained_bytes: Option<usize>,
+}
+
 /// Height metadata used by block virtualization must use visual terminal rows,
 /// not logical newlines. A stack trace can contain one type-name line that wraps
 /// thousands of times; underestimating it makes the virtualizer hide the block
@@ -2039,7 +2082,22 @@ pub(crate) fn estimated_finished_block_height_for_text(
     output: &str,
     cols: i64,
 ) -> i32 {
-    let requested_rows = output_visual_row_count(output, cols)
+    estimated_finished_block_height_for_rows(config, output_visual_row_count(output, cols), cols)
+}
+
+/// The same estimate from a row count the caller already holds.
+///
+/// `output_visual_row_count` is a per-character unicode-width walk over the
+/// whole transcript, preceded by a full `strip_ansi` whenever the text still
+/// carries escapes. `finalize_block` needs that count anyway to build the card,
+/// so it derives it once and threads it through here instead of paying for a
+/// second identical walk on the way to the same number.
+pub(crate) fn estimated_finished_block_height_for_rows(
+    config: &Config,
+    output_rows: i64,
+    cols: i64,
+) -> i32 {
+    let requested_rows = output_rows
         .min(config.finished_block_viewport_rows as i64)
         .max(1);
     let visible_rows = bounded_finished_viewport_rows(cols, requested_rows);
@@ -2101,12 +2159,16 @@ fn snapshot_visible_rows(content_rows: i64, viewport_cap: i64) -> i64 {
 /// instead of the rows it yields is what made every new block render twice — a
 /// short block's height is its content either way, but the cap it was measured
 /// against changes from the map-time default to the layout's fitted value.
+/// `(effective_cols, visible_rows, fits, generation)` — see
+/// [`stamp_change_needs_refeed`] for which half is content and which geometry.
+type RenderStamp = (i64, i64, bool, u64);
+
 fn output_render_stamp(
     cols: i64,
     content_rows: i64,
     viewport_cap: i64,
     generation: u64,
-) -> (i64, i64, bool, u64) {
+) -> RenderStamp {
     (
         cols,
         snapshot_visible_rows(content_rows, viewport_cap),
@@ -2136,7 +2198,7 @@ pub(crate) fn render_bytes_into_finished_vte(
     // preserves those unused rows as a large blank tail. Overflow is retained
     // in scrollback and `settle_finished_terminal_after_feed` expands the widget
     // to the exact buffer span after VTE has processed the bytes.
-    let requested_visible_rows = output_rows.min(viewport_cap).clamp(1, 32);
+    let requested_visible_rows = settle_probe_rows(output_rows.min(viewport_cap));
     let overflow_rows = output_rows
         .saturating_sub(requested_visible_rows)
         .saturating_add(64);
@@ -2154,6 +2216,67 @@ pub(crate) fn render_bytes_into_finished_vte(
     feed_snapshot_bytes(vte, display_text.as_bytes());
     if expand_to_buffer {
         settle_finished_terminal_after_feed(vte, visible_rows, viewport_cap.max(visible_rows));
+    }
+    if let Some(adj) = vte.vadjustment() {
+        adj.set_value(adj.lower());
+    }
+    settle_vte_to_top(vte);
+}
+
+/// The small measuring grid a settle starts from.
+///
+/// `fit_finished_terminal_to_content` clamps what it measures up to the floor it
+/// is given, so the floor has to be small enough that an over-counted snapshot
+/// can still shrink to the rows VTE really drew. Both the feed path and the
+/// re-window path go through here so the two cannot drift apart.
+fn settle_probe_rows(rows: i64) -> i64 {
+    rows.clamp(1, 32)
+}
+
+/// Whether a render-stamp change means the bytes in VTE are wrong, or only the
+/// window onto them.
+///
+/// The stamp is `(effective_cols, visible_rows, fits, generation)`. Columns
+/// decide how the transcript wraps and the generation identifies which text is
+/// displayed; those two are the content. The other two are geometry, and
+/// geometry alone never invalidates a parsed ring.
+fn stamp_change_needs_refeed(previous: RenderStamp, next: RenderStamp) -> bool {
+    previous.0 != next.0 || previous.3 != next.3
+}
+
+/// Re-window a finished VTE that already holds the right bytes.
+///
+/// How many rows a card SHOWS is not a property of what was fed into it: the
+/// transcript is already parsed and sitting in VTE's ring, and the visible grid
+/// is a window onto that ring. `render_bytes_into_finished_vte` was being used
+/// for this anyway, which reset the terminal and re-parsed the whole snapshot —
+/// up to a 1.3 MB re-parse per card. The re-fit sweep that asks for it is
+/// driven from the frame clock, so dragging a window edge re-parsed every
+/// mapped long block on every frame of the drag.
+///
+/// The scrollback dance mirrors `render_bytes_into_finished_vte`: arm a
+/// generous limit first so no `set_size` in either direction can trim the ring,
+/// then settle on the real one, which keeps screen + scrollback at exactly the
+/// same total the feed path left behind.
+fn rewindow_finished_vte(
+    vte: &vte4::Terminal,
+    cols: i64,
+    visible_rows: i64,
+    requested_scrollback: i64,
+    settle_cap: Option<i64>,
+) {
+    let (cols, visible_rows, scrollback) =
+        bounded_finished_vte_geometry(cols, visible_rows.max(1), requested_scrollback.max(64));
+    vte.set_scrollback_lines(bounded_finished_vte_max_rows(cols));
+    vte.set_size(cols.max(1), visible_rows);
+    vte.set_scrollback_lines(scrollback);
+    if let Some(cap) = settle_cap {
+        // Same probe floor the feed path hands the settle. `fit_finished_terminal_to_content`
+        // clamps its measurement UP to this floor, so passing the full row estimate would
+        // stop an over-counted snapshot from ever shrinking to what VTE actually rendered —
+        // `strip_ansi` replays horizontal motion only, so CUU/EL progress output counts far
+        // more rows than it draws.
+        settle_finished_terminal_after_feed(vte, settle_probe_rows(visible_rows), cap.max(visible_rows));
     }
     if let Some(adj) = vte.vadjustment() {
         adj.set_value(adj.lower());
@@ -2230,6 +2353,7 @@ impl FinishedBlock {
             &[],
             output.len(),
             None,
+            FinishedBlockPrecomputed::default(),
         )
     }
 
@@ -2252,24 +2376,29 @@ impl FinishedBlock {
         images: &[gtk::gdk::Texture],
         plain_output_bytes: usize,
         recycled: Option<gtk::Box>,
+        precomputed: FinishedBlockPrecomputed,
     ) -> Self {
         let is_background = cmd.trim().is_empty();
         let cols = cols.clamp(1, MAX_FINISHED_VTE_COLUMNS);
-        let estimated_retained_bytes = estimated_live_finished_block_retained_bytes(
-            prompt,
-            cmd,
-            cmd_ansi,
-            output,
-            plain_output_bytes,
-            cwd,
-            cols,
-            images,
-        );
+        let estimated_retained_bytes = precomputed.retained_bytes.unwrap_or_else(|| {
+            estimated_live_finished_block_retained_bytes(
+                prompt,
+                cmd,
+                cmd_ansi,
+                output,
+                plain_output_bytes,
+                cwd,
+                cols,
+                images,
+            )
+        });
 
         // Keep ordinary output on the outer continuous canvas, but cap very long
         // snapshots. GTK cannot allocate an arbitrarily tall single widget, so
         // long blocks retain VTE's private scrollback inside this viewport.
-        let output_rows = output_visual_row_count(output, cols);
+        let output_rows = precomputed
+            .output_rows
+            .unwrap_or_else(|| output_visual_row_count(output, cols));
         let estimated_visible_rows = bounded_finished_viewport_rows(
             cols,
             output_rows
@@ -3382,16 +3511,31 @@ impl FinishedBlock {
         // first fitted pass over a short block always does this) leaves the
         // snapshot as it is: re-feeding it in the same main-loop iteration as the
         // map-time render is what made block output appear twice.
-        if self.render_stamp.replace(stamp) != stamp {
-            render_bytes_into_finished_vte(
-                &self.output_vte,
-                text,
-                effective_cols,
-                output_rows,
-                fitted_rows,
-                self.capture_rows,
-                output_rows <= fitted_rows,
-            );
+        let previous_stamp = self.render_stamp.replace(stamp);
+        if previous_stamp != stamp {
+            // Same columns and same displayed generation means VTE already
+            // holds exactly these bytes wrapped exactly this way; only the
+            // number of rows on screen moved. Re-window it instead of resetting
+            // and re-parsing the transcript.
+            if !stamp_change_needs_refeed(previous_stamp, stamp) {
+                rewindow_finished_vte(
+                    &self.output_vte,
+                    effective_cols,
+                    visible_rows,
+                    self.capture_rows.max(output_rows),
+                    (output_rows <= fitted_rows).then_some(fitted_rows),
+                );
+            } else {
+                render_bytes_into_finished_vte(
+                    &self.output_vte,
+                    text,
+                    effective_cols,
+                    output_rows,
+                    fitted_rows,
+                    self.capture_rows,
+                    output_rows <= fitted_rows,
+                );
+            }
         }
         self.output_vte
             .set_height_request(finished_vte_height_px(visible_rows, cell_height));

@@ -38,13 +38,19 @@ pub(crate) fn bounded_finished_vte_columns(cols: i64) -> i64 {
     cols.clamp(1, MAX_FINISHED_VTE_COLUMNS)
 }
 
+/// Total rows a finished VTE may hold at `cols` — screen plus scrollback.
+pub(crate) fn bounded_finished_vte_max_rows(cols: i64) -> i64 {
+    let cols = bounded_finished_vte_columns(cols);
+    (MAX_FINISHED_VTE_GRID_CELLS / cols as usize).max(1) as i64
+}
+
 pub(crate) fn bounded_finished_vte_geometry(
     cols: i64,
     visible_rows: i64,
     requested_scrollback_rows: i64,
 ) -> (i64, i64, i64) {
     let cols = bounded_finished_vte_columns(cols);
-    let max_rows = (MAX_FINISHED_VTE_GRID_CELLS / cols as usize).max(1) as i64;
+    let max_rows = bounded_finished_vte_max_rows(cols);
     let visible_rows = visible_rows.clamp(1, max_rows);
     let scrollback_rows = requested_scrollback_rows
         .max(0)
@@ -362,6 +368,26 @@ mod tests {
 /// Apply colors + font + font scale from `config` onto an existing Terminal.
 /// Single source of truth for VTE theming so the live VTE and read-only
 /// finished-block VTEs stay visually identical.
+/// One Pango parse per distinct font string, shared by every VTE.
+///
+/// `FontDescription::from_string` re-parses the same configured string for the
+/// live surface and for both read-only VTEs of every finished card. The value
+/// changes only when the config does, so a one-entry cache is enough.
+fn with_font_description<R>(desc: &str, f: impl FnOnce(&FontDescription) -> R) -> R {
+    thread_local! {
+        static CACHED: std::cell::RefCell<Option<(String, FontDescription)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    CACHED.with(|cached| {
+        let mut cached = cached.borrow_mut();
+        if cached.as_ref().map(|(key, _)| key.as_str()) != Some(desc) {
+            *cached = Some((desc.to_owned(), FontDescription::from_string(desc)));
+        }
+        let (_, parsed) = cached.as_ref().expect("populated above");
+        f(parsed)
+    })
+}
+
 pub(crate) fn apply_theme_to_vte(terminal: &Terminal, config: &Config) {
     let palette_refs: Vec<&RGBA> = config.palette.iter().collect();
     terminal.set_colors(
@@ -372,9 +398,39 @@ pub(crate) fn apply_theme_to_vte(terminal: &Terminal, config: &Config) {
     terminal.set_color_bold(None);
     terminal.set_color_cursor(Some(&config.cursor));
     terminal.set_color_cursor_foreground(Some(&config.cursor_foreground));
-    let font_desc = FontDescription::from_string(&config.font_desc);
-    terminal.set_font(Some(&font_desc));
+    with_font_description(&config.font_desc, |font_desc| {
+        terminal.set_font(Some(font_desc));
+    });
     terminal.set_font_scale(config.default_font_scale);
+}
+
+/// One PCRE2 compile of the URL pattern for the whole thread.
+///
+/// `vte4::Regex::for_match` compiles and JIT-studies the pattern; every live
+/// VTE and every finished card's TWO read-only VTEs used to do that
+/// independently, so a session with 200 blocks paid ~400 identical compiles.
+/// `match_add_regex` takes its own reference, so one handle can be shared by
+/// every terminal.
+fn with_url_match_regex(f: impl FnOnce(&vte4::Regex)) {
+    thread_local! {
+        static URL_REGEX: Option<vte4::Regex> = vte4::Regex::for_match(
+            r"[a-z]+://[[:graph:]]+",
+            pcre2_sys::PCRE2_CASELESS | pcre2_sys::PCRE2_MULTILINE,
+        )
+        .ok();
+    }
+    URL_REGEX.with(|regex| {
+        if let Some(regex) = regex.as_ref() {
+            f(regex);
+        }
+    });
+}
+
+/// Register the shared URL pattern on `terminal` so hyperlink hovering works.
+pub(crate) fn add_url_match_regex(terminal: &Terminal) {
+    with_url_match_regex(|regex| {
+        terminal.match_add_regex(regex, 0);
+    });
 }
 
 /// The single persistent live VTE for block mode. It keeps `input_enabled(true)`
@@ -391,6 +447,12 @@ pub(crate) fn create_active_terminal(config: &Config) -> Terminal {
         .bold_is_bright(true)
         .input_enabled(true)
         .scrollback_lines(config.terminal_scrollback_lines)
+        // Reading the running command's scrollback must survive streaming:
+        // VTE's default yanks the view to the bottom on every output chunk, so
+        // a reader who scrolled up lost their place tens of times a second. A
+        // view that is already at the bottom still follows output natively.
+        // Matches forge's live surface (forge alt_screen.rs).
+        .scroll_on_output(false)
         .cursor_blink_mode(CursorBlinkMode::System)
         .cursor_shape(CursorShape::Block)
         .font_scale(config.default_font_scale)
@@ -405,12 +467,7 @@ pub(crate) fn create_active_terminal(config: &Config) -> Terminal {
     // which readline-style line editors (incl. jsh) ignore — making Backspace dead.
     terminal.set_backspace_binding(vte4::EraseBinding::AsciiDelete);
     apply_theme_to_vte(&terminal, config);
-    if let Ok(regex) = vte4::Regex::for_match(
-        r"[a-z]+://[[:graph:]]+",
-        pcre2_sys::PCRE2_CASELESS | pcre2_sys::PCRE2_MULTILINE,
-    ) {
-        terminal.match_add_regex(&regex, 0);
-    }
+    add_url_match_regex(&terminal);
     terminal
 }
 
@@ -508,12 +565,7 @@ pub(crate) fn create_finished_terminal(
         terminal.add_controller(scroll);
     }
 
-    // URL detection — mirror the live-VTE pattern at src/terminal.rs:52-56.
-    if let Ok(regex) = vte4::Regex::for_match(
-        r"[a-z]+://[[:graph:]]+",
-        pcre2_sys::PCRE2_CASELESS | pcre2_sys::PCRE2_MULTILINE,
-    ) {
-        terminal.match_add_regex(&regex, 0);
-    }
+    // URL detection — the same shared pattern the live VTE registers.
+    add_url_match_regex(&terminal);
     terminal
 }

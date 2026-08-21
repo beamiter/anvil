@@ -10,14 +10,16 @@ const MAX_GIT_POINTER_BYTES: u64 = 16 * 1024;
 const MAX_BRANCH_DISPLAY_CHARS: usize = 256;
 
 /// Vertical chrome the `.block-active` holder adds around the live VTE:
-/// 4px top margin + 4px bottom margin + 1px top border + 1px bottom border +
-/// 2px top padding + 2px bottom padding = 14px.
+/// 4px top margin + 4px bottom margin + 3px top padding + 3px bottom padding
+/// = 14px. The top/bottom borders became `outline`, which does not take part in
+/// layout, and the 1px each used to contribute moved into the padding.
 ///
 /// Used by the live-surface layout to subtract chrome from the visible page
 /// before computing how many VTE rows fit. Keep both values in sync with the
 /// normal and `.block-active.block-compact` rules below.
 pub(crate) const BLOCK_ACTIVE_VCHROME_PX: i32 = 14;
-/// Compact mode: 1px top/bottom margin + 1px top/bottom border, no padding.
+/// Compact mode: 1px top/bottom margin + 1px top/bottom padding (the border
+/// that used to supply those pixels is now a layout-free `outline`).
 pub(crate) const BLOCK_ACTIVE_COMPACT_VCHROME_PX: i32 = 4;
 
 pub(crate) fn rgba_to_hex(c: &RGBA) -> String {
@@ -277,13 +279,36 @@ pub(crate) fn install_block_css(config: &Config) {
             background-color: {bg_hex};
             border-top: 1px solid rgba({fg_r},{fg_g},{fg_b},0.14);
         }}
+        /* The status stripe and the hairline ring are deliberately drawn by two
+           DIFFERENT CSS boxes. GTK's cairo renderer falls back to one
+           `cairo_pattern_create_mesh` per rounded corner as soon as a rounded
+           border has two different colours on adjacent sides (gtkrenderborder.c
+           `render_frame_fill` only takes its single-fill path when all four
+           colours are equal). A card with a 1px neutral border plus a 3px
+           coloured left border hit that path on every repaint, and with the
+           whole viewport repainting per frame while a command streams it cost
+           roughly half of the streaming wall clock (measured: `seq 1 200000`
+           drain 200ms -> 99ms, converged 366ms -> 166ms).
+
+           So the border keeps ONE colour and only the left side has width — the
+           stripe — and the ring moves to `outline`, which is its own
+           single-colour rounded ring. `outline` does not take part in layout,
+           so the 1px the other three border sides used to reserve comes back as
+           padding. */
         .block-finished {{
-            border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.08);
-            border-left: 3px solid transparent;
+            border-style: solid;
+            border-width: 0 0 0 3px;
+            border-color: transparent;
+            outline-style: solid;
+            outline-width: 1px;
+            outline-color: rgba({fg_r},{fg_g},{fg_b},0.08);
+            outline-offset: -1px;
+            padding: 1px 1px 1px 0;
             border-radius: 10px;
             background-color: {block_bg_hex};
             min-height: 40px;
-            transition: background-color 140ms ease, border-color 140ms ease, box-shadow 140ms ease;
+            transition: background-color 140ms ease, border-color 140ms ease,
+                        outline-color 140ms ease, box-shadow 140ms ease;
         }}
         .block-finished.block-compact {{
             border-radius: 6px;
@@ -291,44 +316,44 @@ pub(crate) fn install_block_css(config: &Config) {
             box-shadow: none;
         }}
         .block-success {{
-            border-left-color: {ok_stripe};
+            border-color: {ok_stripe};
         }}
         .block-failed {{
-            border-left-color: {err_stripe};
+            border-color: {err_stripe};
             background-color: rgba({err_r},{err_g},{err_b},0.11);
             box-shadow: inset 2px 0 0 0 {err_stripe};
         }}
         .block-background {{
-            border-left-color: {async_stripe};
+            border-color: {async_stripe};
             background-color: rgba({async_r},{async_g},{async_b},0.07);
             box-shadow: inset 2px 0 0 0 {async_stripe};
         }}
         .block-correction, .command-suggestion, .command-review-standalone {{
-            border-left-color: rgba({acc_r},{acc_g},{acc_b},0.85);
+            border-color: rgba({acc_r},{acc_g},{acc_b},0.85);
             background-color: rgba({acc_r},{acc_g},{acc_b},0.05);
         }}
         .block-agent {{
-            border-left-color: rgba({agent_r},{agent_g},{agent_b},0.85);
+            border-color: rgba({agent_r},{agent_g},{agent_b},0.85);
             background-color: rgba({agent_r},{agent_g},{agent_b},0.05);
         }}
         .block-organism {{
-            border-left-color: rgba({agent_r},{agent_g},{agent_b},0.70);
+            border-color: rgba({agent_r},{agent_g},{agent_b},0.70);
             background-color: rgba({agent_r},{agent_g},{agent_b},0.035);
         }}
         .block-organism.organism-active {{
-            border-left-color: rgba({acc_r},{acc_g},{acc_b},0.90);
+            border-color: rgba({acc_r},{acc_g},{acc_b},0.90);
             background-color: rgba({acc_r},{acc_g},{acc_b},0.07);
         }}
         .block-organism.organism-success {{
-            border-left-color: {ok_stripe};
+            border-color: {ok_stripe};
             background-color: rgba({ok_r},{ok_g},{ok_b},0.08);
         }}
         .block-organism.organism-error {{
-            border-left-color: {err_stripe};
+            border-color: {err_stripe};
             background-color: rgba({err_r},{err_g},{err_b},0.10);
         }}
         .block-organism.organism-warning {{
-            border-left-color: {warn_stripe};
+            border-color: {warn_stripe};
             background-color: rgba({warn_r},{warn_g},{warn_b},0.07);
         }}
         .organism-sprite {{
@@ -582,42 +607,58 @@ pub(crate) fn install_block_css(config: &Config) {
         /* The shell reported no status. Deliberately not tinted like a failure
            and not striped like a success: nothing is known about the outcome. */
         .block-unknown {{
-            border-left-color: rgba({fg_r},{fg_g},{fg_b},0.35);
+            border-color: rgba({fg_r},{fg_g},{fg_b},0.35);
         }}
         .block-hovered {{
             background-color: rgba({fg_r},{fg_g},{fg_b},0.05);
-            border-top-color: rgba({fg_r},{fg_g},{fg_b},0.16);
-            border-right-color: rgba({fg_r},{fg_g},{fg_b},0.16);
-            border-bottom-color: rgba({fg_r},{fg_g},{fg_b},0.16);
+            /* The ring, not the stripe: recolouring three of four border sides
+               is exactly the mixed-colour case the mesh fallback exists for. */
+            outline-color: rgba({fg_r},{fg_g},{fg_b},0.16);
             box-shadow: 0 4px 14px rgba(0,0,0,0.22);
         }}
+        /* The inset rings are anchored to the PADDING box, which moved one pixel
+           outward when the top/right/bottom border became a layout-free
+           `outline`. Widen each by that pixel so a selected card keeps the same
+           2px band, and the active end its 3px one. */
         .block-selected {{
             background-color: rgba({acc_r},{acc_g},{acc_b},0.08);
             border-color: rgba({acc_r},{acc_g},{acc_b},0.48);
-            box-shadow: inset 0 0 0 1px rgba({acc_r},{acc_g},{acc_b},0.65);
+            outline-color: rgba({acc_r},{acc_g},{acc_b},0.48);
+            box-shadow: inset 0 0 0 2px rgba({acc_r},{acc_g},{acc_b},0.65);
         }}
         .block-selected.block-selection-active {{
             background-color: rgba({acc_r},{acc_g},{acc_b},0.14);
             border-color: rgba({acc_r},{acc_g},{acc_b},0.92);
-            box-shadow: inset 0 0 0 2px {accent}, 0 0 0 1px rgba({acc_r},{acc_g},{acc_b},0.55);
+            outline-color: rgba({acc_r},{acc_g},{acc_b},0.92);
+            box-shadow: inset 0 0 0 3px {accent}, 0 0 0 1px rgba({acc_r},{acc_g},{acc_b},0.55);
         }}
+        /* Same split as `.block-finished`: one border colour so GTK never builds
+           a corner mesh, ring on `outline`, and the layout the removed border
+           sides used to contribute given back as padding. This is the card that
+           repaints on every frame of a stream, so it is the one that pays. */
         .block-active {{
-            border: 1px solid rgba({acc_r},{acc_g},{acc_b},0.32);
-            border-left: 3px solid rgba({acc_r},{acc_g},{acc_b},0.85);
+            border-style: solid;
+            border-width: 0 0 0 3px;
+            border-color: rgba({acc_r},{acc_g},{acc_b},0.85);
+            outline-style: solid;
+            outline-width: 1px;
+            outline-color: rgba({acc_r},{acc_g},{acc_b},0.32);
+            outline-offset: -1px;
             border-radius: 10px;
             margin: 4px 8px;
-            padding: 2px 0;
+            padding: 3px 1px 3px 0;
             background-color: {bg_hex};
             box-shadow: 0 2px 8px rgba(0,0,0,0.18);
         }}
         .block-active.block-compact {{
             border-radius: 6px;
             margin: 1px 4px;
-            padding: 0;
+            padding: 1px 1px 1px 0;
             box-shadow: none;
         }}
         .block-active.block-fullscreen {{
             border: none;
+            outline-style: none;
             border-radius: 0;
             margin: 0;
             padding: 0;
