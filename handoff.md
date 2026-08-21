@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-16 (agent-validation hardening repin)
+Updated: 2026-08-21 (exactly-once command lifecycle closure)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,18 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **Exactly-once command lifecycle closure (2026-08-21)**: Block and Unified
+  now share one observer-side `C -> finish` latch. An accepted `D` consumes it
+  with `shell_reported` evidence; if `D` is lost, only a foreground-shell `A`
+  consumes it with `boundary_inferred`/`degraded` evidence and `None` for exit
+  status and duration. The inferred fan-out runs before that same `A` finalizes
+  the backend record, preserving the normal `D -> A` ordering. Repeated `A`,
+  background output, prompt-owned alternate screens, and RIS cannot mint a
+  finish without an accepted `C`; RIS remains invalidation, not completion.
+  The running-command display copy, engine-owned command identity, and Agent
+  correlation remain available for prompt-trust rollback and later
+  Block/Unified finalization.
 
 - **Agent-validation hardening repin (2026-08-16, seventh round)**:
   `jterm_core` repinned to `cf0dd2c9cd369c1d8113eadde0ec6254d3fb81b1`.

@@ -2642,7 +2642,9 @@ pub(crate) struct CommandStartedEvent {
     pub(crate) cwd: Option<String>,
 }
 
-/// Authoritative foreground-command lifecycle event emitted at OSC 133 `D`.
+/// Exactly-once foreground-command lifecycle event paired with an accepted
+/// [`CommandStartedEvent`]. It is emitted at an accepted OSC 133 `D`, or at a
+/// trusted foreground-shell prompt boundary when `D` was lost.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommandFinishedEvent {
     pub(crate) command: String,
@@ -3442,6 +3444,11 @@ struct EngineState {
     /// Completion authority for the current command; reset at C and promoted
     /// only by an accepted D or a foreground-shell A recovery.
     pending_completion_provenance: CompletionProvenance,
+    /// Exactly-once observer half of an accepted C lifecycle. Armed only by C,
+    /// consumed by the first accepted D or trusted-A recovery, and cleared by
+    /// RIS. This is deliberately separate from `cmd_running_rc`: prompt-trust
+    /// recovery may resume capture without creating a second lifecycle.
+    command_finished_event_pending: bool,
     /// Duration the shell measured for the running command, when it sends one.
     /// Beats `block_start_time_for_cb`, which starts when this process noticed
     /// the mark.
@@ -4818,6 +4825,34 @@ impl ReaderCtx {
         self.live_output_bytes_rc.set(0);
     }
 
+    /// Close the observer-facing half of one accepted `C` lifecycle exactly
+    /// once. The engine-owned latch is shared by the ordinary `D` path and the
+    /// trusted-`A` recovery path; renderer mode cannot change this contract,
+    /// and a prompt-owned alt screen without a command start cannot manufacture
+    /// a finish event.
+    fn take_command_finished_event(
+        &self,
+        cwd: Option<String>,
+        exit_code: Option<i32>,
+        duration_ms: Option<u64>,
+        completion_provenance: CompletionProvenance,
+    ) -> Option<CommandFinishedEvent> {
+        if !std::mem::take(&mut self.engine.borrow_mut().command_finished_event_pending) {
+            return None;
+        }
+        Some(CommandFinishedEvent {
+            // Keep the display copy intact: a provisional post-D prompt can
+            // lose foreground trust and resume CollectingOutput before the
+            // real prompt arrives.
+            command: self.running_cmd_rc.borrow().clone(),
+            cwd,
+            exit_code,
+            duration_ms,
+            completion_provenance,
+            lifecycle_health: assess_lifecycle(true, completion_provenance),
+        })
+    }
+
     fn handle_event(&self, event: &ParserEvent) {
         let state = self.bstate_rc.get();
         match event {
@@ -4916,6 +4951,7 @@ impl ReaderCtx {
             engine.prompt_display.clear();
             engine.pending_exit_code = None;
             engine.pending_completion_provenance = CompletionProvenance::Unknown;
+            engine.command_finished_event_pending = false;
             engine.shell_duration_ms = None;
             engine.execution_id_trusted = false;
             engine.agent_completion_trusted = false;
@@ -5172,16 +5208,29 @@ impl ReaderCtx {
                 emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Left);
                 self.backend.layout_active_surface();
             }
-            {
+            let command_cwd = {
                 let mut engine = self.engine.borrow_mut();
                 engine.osc133_depth = 0;
                 engine.pending_exit_code = None;
                 engine.pending_completion_provenance = CompletionProvenance::BoundaryInferred;
                 engine.agent_completion_trusted = false;
-            }
+                engine.command_cwd.clone()
+            };
+            let inferred_finish = self.take_command_finished_event(
+                command_cwd,
+                None,
+                None,
+                CompletionProvenance::BoundaryInferred,
+            );
             self.cmd_running_rc.set(false);
             self.bstate_rc.set(BlockState::PostCommand);
             state = BlockState::PostCommand;
+            if let Some(event) = inferred_finish {
+                // The trusted A is both the recovery proof and the next
+                // prompt's start. Close observers before finalizing the block,
+                // preserving the ordinary D -> A callback order.
+                emit_command_finished(&self.command_finished_cbs, event);
+            }
         }
         if state == BlockState::PostCommand
             && !agent_prompt_boundary_is_trusted(
@@ -5629,6 +5678,7 @@ impl ReaderCtx {
             let mut engine = self.engine.borrow_mut();
             engine.osc133_depth = 0;
             engine.pending_completion_provenance = CompletionProvenance::Unknown;
+            engine.command_finished_event_pending = true;
         }
         let reset_idle_kitty =
             std::mem::take(&mut self.engine.borrow_mut().idle_kitty_pipeline_dirty);
@@ -5882,19 +5932,17 @@ impl ReaderCtx {
         });
         // `cwd` leaves the engine cell before the fan-out below.
         let finished_cwd = self.engine.borrow().command_cwd.clone();
-        emit_command_finished(
-            &self.command_finished_cbs,
-            CommandFinishedEvent {
-                command: self.running_cmd_rc.borrow().clone(),
-                cwd: finished_cwd,
-                exit_code: exit,
-                duration_ms,
-                completion_provenance: CompletionProvenance::ShellReported,
-                lifecycle_health: assess_lifecycle(true, CompletionProvenance::ShellReported),
-            },
+        let command_finished = self.take_command_finished_event(
+            finished_cwd,
+            exit,
+            duration_ms,
+            CompletionProvenance::ShellReported,
         );
         self.cmd_running_rc.set(false);
         self.bstate_rc.set(BlockState::PostCommand);
+        if let Some(event) = command_finished {
+            emit_command_finished(&self.command_finished_cbs, event);
+        }
         self.backend.mark_scroll_dirty();
     }
 
@@ -9495,6 +9543,7 @@ impl TermView {
                     // header renders as neutral rather than as `exit 0`.
                     pending_exit_code: None,
                     pending_completion_provenance: CompletionProvenance::Unknown,
+                    command_finished_event_pending: false,
                     // Metadata jsh attaches to the same marks (see
                     // ParserEvent::CommandStart).
                     shell_duration_ms: None,
@@ -13710,6 +13759,7 @@ mod tests {
                     prompt_display: String::new(),
                     pending_exit_code: None,
                     pending_completion_provenance: super::CompletionProvenance::Unknown,
+                    command_finished_event_pending: false,
                     shell_duration_ms: None,
                     execution_id_trusted: false,
                     agent_completion_trusted: false,
@@ -14399,6 +14449,28 @@ mod tests {
     }
 
     #[test]
+    fn ris_after_command_start_emits_no_finish_and_next_a_mints_no_phantom() {
+        let harness = ReaderHarness::new();
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            dispatch_bytes("$ "),
+            ParserEvent::PromptEnd,
+            dispatch_command_start(Some("reset-interrupted")),
+            dispatch_bytes("partial"),
+            ParserEvent::HardReset,
+            ParserEvent::PromptStart,
+        ]);
+
+        assert_eq!(harness.commands_started.borrow().len(), 1);
+        assert!(
+            harness.commands_finished.borrow().is_empty(),
+            "RIS invalidates a running lifecycle instead of reporting a completion"
+        );
+        assert!(harness.backend.finalized_ids.borrow().is_empty());
+        assert_eq!(harness.bstate.get(), BlockState::CollectingPrompt);
+    }
+
+    #[test]
     fn repeated_idle_a_reuses_its_zone_and_completed_a_rotates_once() {
         let harness = ReaderHarness::new();
         harness.feed(ParserEvent::PromptStart);
@@ -14409,6 +14481,10 @@ mod tests {
             harness.ctx.engine.borrow().pending_zone.unwrap().id(),
             first_id,
             "an idle prompt redraw reuses its globally allocated id"
+        );
+        assert!(
+            harness.commands_finished.borrow().is_empty(),
+            "A without an accepted C cannot manufacture a finish"
         );
 
         harness.feed(ParserEvent::PromptEnd);
@@ -14483,6 +14559,10 @@ mod tests {
         };
         assert!(record.is_background);
         assert_eq!(record.output_plain, "background");
+        assert!(
+            harness.commands_finished.borrow().is_empty(),
+            "background output has no accepted C to pair with a finish"
+        );
     }
 
     #[test]
@@ -14588,6 +14668,18 @@ mod tests {
     fn missing_d_at_a_records_degraded_provenance_without_fabricated_timing() {
         let harness = ReaderHarness::new();
         harness.backend.set_metadata_only(true);
+        let finalized_before_finish = Rc::new(RefCell::new(Vec::new()));
+        {
+            let seen = finalized_before_finish.clone();
+            let backend = harness.backend.clone();
+            harness
+                .ctx
+                .command_finished_cbs
+                .borrow_mut()
+                .push(Box::new(move |_| {
+                    seen.borrow_mut().push(backend.finalized_ids.borrow().len());
+                }));
+        }
         harness.feed_all([
             ParserEvent::PromptStart,
             dispatch_bytes("$ "),
@@ -14615,6 +14707,106 @@ mod tests {
         assert_eq!(record.end_time_ms, None);
         assert_eq!(record.duration_ms, None);
         assert_eq!(super::command_history_exit_code(record.exit_code), None);
+        drop(store);
+
+        assert_eq!(
+            harness.commands_finished.borrow().as_slice(),
+            &[CommandFinishedEvent {
+                command: "printf partial".to_string(),
+                cwd: None,
+                exit_code: None,
+                duration_ms: None,
+                completion_provenance: super::CompletionProvenance::BoundaryInferred,
+                lifecycle_health: super::BlockLifecycleHealth::Degraded,
+            }],
+            "trusted A closes the observer lifecycle with the same degraded evidence as the record"
+        );
+        harness.feed(ParserEvent::PromptStart);
+        assert_eq!(
+            harness.commands_finished.borrow().len(),
+            1,
+            "the A that recovered D is the only finish boundary"
+        );
+        assert_eq!(
+            finalized_before_finish.borrow().as_slice(),
+            &[0],
+            "Unified observers close before the same A finalizes metadata"
+        );
+    }
+
+    #[test]
+    fn alt_screen_missing_d_closes_once_for_block_and_unified_backends() {
+        for metadata_only in [false, true] {
+            let harness = ReaderHarness::new();
+            harness.backend.set_metadata_only(metadata_only);
+            harness.feed_all([
+                ParserEvent::PromptStart,
+                dispatch_bytes("$ "),
+                ParserEvent::PromptEnd,
+                dispatch_command_start(Some("fullscreen-command")),
+                ParserEvent::AltScreenEnter(1049),
+                ParserEvent::PromptStart,
+                ParserEvent::PromptStart,
+            ]);
+
+            let finished = harness.commands_finished.borrow();
+            assert_eq!(finished.len(), 1, "metadata_only={metadata_only}");
+            assert_eq!(
+                finished[0].completion_provenance,
+                super::CompletionProvenance::BoundaryInferred
+            );
+            assert_eq!(finished[0].exit_code, None);
+            assert_eq!(finished[0].duration_ms, None);
+            assert_eq!(
+                harness.alt_screen.borrow().as_slice(),
+                &[AltScreenTransition::Entered, AltScreenTransition::Left]
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_owned_alt_screen_cannot_manufacture_a_command_finish() {
+        for metadata_only in [false, true] {
+            let harness = ReaderHarness::new();
+            harness.backend.set_metadata_only(metadata_only);
+            harness.feed_all([
+                ParserEvent::PromptStart,
+                ParserEvent::PromptEnd,
+                ParserEvent::AltScreenEnter(1049),
+                dispatch_command_end(Some(0)),
+                ParserEvent::PromptStart,
+            ]);
+
+            assert!(
+                harness.commands_finished.borrow().is_empty(),
+                "metadata_only={metadata_only}: no accepted C armed the finish latch"
+            );
+        }
+    }
+
+    #[test]
+    fn ui_capture_rollback_cannot_rearm_the_command_finished_event() {
+        let harness = ReaderHarness::new();
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            ParserEvent::PromptEnd,
+            dispatch_command_start(Some("rollback-safe")),
+            dispatch_command_end(Some(0)),
+        ]);
+        assert_eq!(harness.commands_finished.borrow().len(), 1);
+        assert!(!harness.ctx.engine.borrow().command_finished_event_pending);
+
+        // These are the exact state writes made when an Agent's post-D A
+        // loses foreground trust and capture resumes. Neither may rearm the
+        // observer lifecycle.
+        harness.ctx.cmd_running_rc.set(true);
+        harness.bstate.set(BlockState::CollectingOutput);
+        harness.feed(dispatch_command_end(Some(0)));
+        assert_eq!(harness.commands_finished.borrow().len(), 1);
+        assert_eq!(
+            harness.ctx.running_cmd_rc.borrow().as_str(),
+            "rollback-safe"
+        );
     }
 
     #[test]
@@ -15216,6 +15408,18 @@ mod tests {
     #[test]
     fn reader_dispatch_full_cycle_finalizes_content_and_orders_fan_outs() {
         let harness = ReaderHarness::new();
+        let finalized_before_finish = Rc::new(RefCell::new(Vec::new()));
+        {
+            let seen = finalized_before_finish.clone();
+            let backend = harness.backend.clone();
+            harness
+                .ctx
+                .command_finished_cbs
+                .borrow_mut()
+                .push(Box::new(move |_| {
+                    seen.borrow_mut().push(backend.finalized_ids.borrow().len());
+                }));
+        }
         harness.backend.set_columns(100, 120);
         harness.backend.render_row(3, "user@host $ ");
         harness.feed_all([
@@ -15267,6 +15471,11 @@ mod tests {
         assert_eq!(harness.live_output(), raw_output);
         harness.feed(dispatch_command_end(Some(0)));
         assert_eq!(harness.bstate.get(), BlockState::PostCommand);
+        assert_eq!(
+            harness.ctx.running_cmd_rc.borrow().as_str(),
+            "echo hi",
+            "observer delivery must not consume renderer/rollback command identity"
+        );
 
         let before_finalize = harness.backend.take_calls();
         assert!(before_finalize.contains(&DispatchCall::Feed(raw_output.as_bytes().to_vec())));
@@ -15318,6 +15527,15 @@ mod tests {
             }]
         );
         assert_eq!(harness.commands_finished.borrow().len(), 1);
+        assert_eq!(
+            harness.commands_finished.borrow()[0].completion_provenance,
+            super::CompletionProvenance::ShellReported
+        );
+        assert_eq!(
+            finalized_before_finish.borrow().as_slice(),
+            &[0],
+            "Block observers close at D before the following A finalizes widgets"
+        );
     }
 
     #[test]

@@ -791,7 +791,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 [[package]]
 name = "jagent"
 version = "0.7.0"
-source = "git+https://github.com/beamiter/jagent.git?rev=d52002e4a18735e8cfec718da5fea8f0a5cfaaf8#d52002e4a18735e8cfec718da5fea8f0a5cfaaf8"
+source = "git+https://github.com/beamiter/jagent.git?rev=6aa3136c939807ec1d4fae55e7e4d956b616af05#6aa3136c939807ec1d4fae55e7e4d956b616af05"
 dependencies = [
  "regex",
  "serde",
@@ -847,7 +847,7 @@ dependencies = [
 [[package]]
 name = "jterm_core"
 version = "0.2.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=3e09b161a36e2ec30f730eee8f8d6702b2bacc35#3e09b161a36e2ec30f730eee8f8d6702b2bacc35"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=fd6098a3d46ab6ae435cf8dccd5668d6cee50b40#fd6098a3d46ab6ae435cf8dccd5668d6cee50b40"
 dependencies = [
  "crossbeam-channel",
  "dirs",

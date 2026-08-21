@@ -18,6 +18,11 @@ versioning for tagged releases while it remains experimental.
   the PTY foreground; inferred records are visibly degraded and never receive
   fabricated end times or durations. Legacy/restored weak records do not gain
   trust, and RIS clears active Agent/command correlation before the next prompt.
+  Every accepted `C` now also closes its observer lifecycle exactly once: a
+  trusted prompt recovery emits an unknown/degraded finish before Block or
+  Unified finalization, while a later `A`, background output, and RIS cannot
+  replay or manufacture that finish. This keeps the organism and shared
+  activity counters from remaining permanently busy after a lost `D`.
 - A persistent Relm4-native **AI Chats** side panel with a searchable retained
   chat library, per-chat drafts and selected-Block context, automatic titles,
   rename/archive/delete, concurrent owner-bound streaming requests, Stop/Retry,
