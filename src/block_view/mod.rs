@@ -1374,6 +1374,25 @@ fn build_color_query_reply(config: &Config, dynamic: DynamicColors, kind: ColorK
     }
 }
 
+/// The queries libvte answers on its own once the bytes reach it.
+///
+/// Measured against libvte 0.82 by sending each sequence into a live pane and
+/// counting the replies that came back on the shell's input: these six arrived
+/// twice — once from `build_keyboard_query_reply`, once from VTE — while
+/// `CSI ? u` and `CSI ? 4 m` arrived only from the synthesized path, because
+/// libvte implements neither the kitty keyboard protocol nor modifyOtherKeys.
+fn vte_answers_query_natively(query: KeyboardProtocolQuery) -> bool {
+    matches!(
+        query,
+        KeyboardProtocolQuery::CursorPosition
+            | KeyboardProtocolQuery::DeviceStatus
+            | KeyboardProtocolQuery::PrimaryDeviceAttributes
+            | KeyboardProtocolQuery::SecondaryDeviceAttributes
+            | KeyboardProtocolQuery::TertiaryDeviceAttributes
+            | KeyboardProtocolQuery::XtVersion
+    )
+}
+
 fn build_keyboard_query_reply(
     query: KeyboardProtocolQuery,
     cursor_col: i64,
@@ -3784,10 +3803,22 @@ trait RenderBackend {
     /// text-buffer (ring) rows, not screen-relative rows.
     fn cursor_and_rows(&self) -> ((i64, i64), i64);
     /// Cursor position `(col, row)` for the DSR 6 cursor-position report
-    /// (`ESC[{row+1};{col+1}R`). Block reports the text-buffer row here
-    /// (pre-existing quirk kept for compatibility); a correct implementation
-    /// reports screen-relative coordinates as the CPR protocol expects.
+    /// (`ESC[{row+1};{col+1}R`). The row is screen-relative, which is what the
+    /// CPR protocol specifies: clients read it to place their own viewport
+    /// inside the visible grid, so a text-buffer row means nothing to them the
+    /// moment the surface has scrolled at all.
     fn cursor_position_report(&self) -> (i64, i64);
+    /// Whether the live surface already answers `query` by itself.
+    ///
+    /// Both live backends pass a query's bytes straight through to their VTE,
+    /// which replies natively through the commit splice. Synthesizing a second
+    /// reply puts two answers on the shell's input for one question: the
+    /// client reads the first and the leftover shifts every reply after it by
+    /// one. Backends with no VTE behind them (recording, headless tests) still
+    /// need the synthesized reply, which is what the default reports.
+    fn live_surface_answers_query(&self, _query: KeyboardProtocolQuery) -> bool {
+        false
+    }
     /// Rebase the prompt anchor captured at PromptEnd (`provisional`) onto the
     /// surface as it stands at CommandStart. Anchor cells are in the backend's
     /// surface coordinates and each backend owns its rebase policy. Block's
@@ -5612,6 +5643,13 @@ impl ReaderCtx {
     }
 
     fn on_keyboard_protocol_query(&self, query: KeyboardProtocolQuery) {
+        // The parser reports the query *and* passes its bytes through to the
+        // live surface. Where that surface answers for itself, this reply
+        // would be the second answer to one question, and the client's next
+        // read returns the leftover instead of the reply it is waiting for.
+        if self.backend.live_surface_answers_query(query) {
+            return;
+        }
         let (col, row) = self.backend.cursor_position_report();
         let reply = build_keyboard_query_reply(query, col, row);
         self.pty_for_init.write_bytes(reply.as_bytes());
@@ -6164,12 +6202,25 @@ impl RenderBackend for BlockBackend {
     }
 
     fn cursor_position_report(&self) -> (i64, i64) {
-        // Bug-compatible on purpose: VTE's `cursor_position()` row is a
-        // text-buffer (ring) row, and the pre-split code fed exactly this
-        // value into the `ESC[{row+1};{col+1}R` reply. Kept so the reply
-        // bytes do not change under the trait split; see the CPR note on
-        // `RenderBackend::cursor_position_report`.
-        self.active_vte.cursor_position()
+        // `cursor_position()` is a text-buffer (ring) row that climbs for the
+        // whole life of the live VTE, so reporting it raw only agrees with the
+        // screen while the ring is still shorter than one grid. Past that it
+        // reports rows far outside the grid the client believes it has -- an
+        // inline-viewport TUI (codex, and anything else on ratatui/crossterm)
+        // anchors its frame on this reply, so it lands off screen and the card
+        // renders blank. Rebase onto the visible grid, exactly as Unified does.
+        let (col, row) = self.active_vte.cursor_position();
+        let top_row = gtk::prelude::ScrollableExt::vadjustment(&self.active_vte)
+            .map(|adjustment| adjustment.value() as i64)
+            .unwrap_or(0);
+        (
+            col,
+            screen_relative_cpr_row(row, top_row, self.active_vte.row_count()),
+        )
+    }
+
+    fn live_surface_answers_query(&self, query: KeyboardProtocolQuery) -> bool {
+        vte_answers_query_natively(query)
     }
 
     fn command_capture_anchor(&self, provisional: (i64, i64), recorded_rows: i64) -> (i64, i64) {
@@ -7044,6 +7095,10 @@ impl RenderBackend for UnifiedBackend {
             col,
             screen_relative_cpr_row(row, top_row, self.vte.row_count()),
         )
+    }
+
+    fn live_surface_answers_query(&self, query: KeyboardProtocolQuery) -> bool {
+        vte_answers_query_natively(query)
     }
 
     /// Unified does no compact/full grid churn, so ring-coordinate anchors are
@@ -11262,13 +11317,14 @@ mod tests {
         strip_ansi_with_clear_detect, take_armed_agent_execution, take_background_output,
         unread_after_index_removal, unread_after_prefix_eviction, viewport_page_size_changed,
         viewport_state_for_scroll, viewport_states_for_scroll, visible_indices_for_viewport,
-        zone_output_snapshot_from_plain, zone_output_snapshot_from_ring, AgentCommandEndDecision,
-        AgentExecutionLostCallbacks, AltScreenCallbacks, AltScreenTransition, AnchorSettleArgs,
-        ArmedAgentExecution, BackendRecords, BlockData, BlockFinishedCallback,
-        BlockFinishedCallbacks, BlockRenderPayloadAccessor, BlockState, CommandFinishedCallbacks,
-        CommandFinishedEvent, CommandPromptStatus, CommandStartedCallbacks, CommandStartedEvent,
-        CommandTextSource, CompletedCommandRecord, DynamicColors, DynamicColorsRc, EngineState,
-        PendingZone, ReaderCtx, RenderBackend, ResetAwareParserPart, ResetAwareParserSplitter,
+        vte_answers_query_natively, zone_output_snapshot_from_plain,
+        zone_output_snapshot_from_ring, AgentCommandEndDecision, AgentExecutionLostCallbacks,
+        AltScreenCallbacks, AltScreenTransition, AnchorSettleArgs, ArmedAgentExecution,
+        BackendRecords, BlockData, BlockFinishedCallback, BlockFinishedCallbacks,
+        BlockRenderPayloadAccessor, BlockState, CommandFinishedCallbacks, CommandFinishedEvent,
+        CommandPromptStatus, CommandStartedCallbacks, CommandStartedEvent, CommandTextSource,
+        CompletedCommandRecord, DynamicColors, DynamicColorsRc, EngineState, PendingZone,
+        ReaderCtx, RenderBackend, ResetAwareParserPart, ResetAwareParserSplitter,
         ReviewedSubmission, ReviewedSubmissionPhase, SelectionFeedHold, ShellCapabilityObserver,
         SubmissionSurface, TerminalResetKind, UnifiedZoneStore, VerifiedSubmissionCtx,
         ZoneMarkerInjector, ZoneOutputSnapshot, BLOCK_ID_SEQUENCE_LIMIT, LAST_NOTIFICATION_AT,
@@ -11823,11 +11879,37 @@ mod tests {
     }
 
     #[test]
-    fn unified_cursor_position_report_row_stays_screen_relative() {
+    fn cursor_position_report_row_stays_screen_relative() {
+        // Both live backends run their ring row through this. A pane that has
+        // scrolled 800 rows must still report row 5 of a 24-row grid, not 805:
+        // an inline-viewport TUI anchors its frame on the reply and draws off
+        // screen if it is handed a text-buffer row.
         assert_eq!(screen_relative_cpr_row(805, 800, 24), 5);
         assert_eq!(screen_relative_cpr_row(799, 800, 24), 0);
         assert_eq!(screen_relative_cpr_row(900, 800, 24), 23);
         assert_eq!(screen_relative_cpr_row(-3, 0, 0), 0);
+    }
+
+    #[test]
+    fn only_the_queries_libvte_implements_are_left_to_the_live_surface() {
+        for query in [
+            KeyboardProtocolQuery::CursorPosition,
+            KeyboardProtocolQuery::DeviceStatus,
+            KeyboardProtocolQuery::PrimaryDeviceAttributes,
+            KeyboardProtocolQuery::SecondaryDeviceAttributes,
+            KeyboardProtocolQuery::TertiaryDeviceAttributes,
+            KeyboardProtocolQuery::XtVersion,
+        ] {
+            assert!(vte_answers_query_natively(query), "{query:?}");
+        }
+        // libvte implements neither the kitty keyboard protocol nor
+        // modifyOtherKeys, so dropping these would answer nothing at all.
+        assert!(!vte_answers_query_natively(
+            KeyboardProtocolQuery::KittyQuery
+        ));
+        assert!(!vte_answers_query_natively(
+            KeyboardProtocolQuery::ModifyOtherKeysQuery
+        ));
     }
 
     #[test]
@@ -12245,6 +12327,8 @@ mod tests {
         /// Stands in for the pane's scroll lock so a test can assert that a
         /// prompt boundary does not overrule a user reading history.
         user_scrolled_up: Cell<bool>,
+        /// Stands in for a VTE behind the backend that answers queries itself.
+        answers_queries_natively: Cell<bool>,
     }
 
     impl RecordingBackend {
@@ -12270,6 +12354,7 @@ mod tests {
                 settle_anchor_now: Cell::new(true),
                 user_scrolled_up: Cell::new(false),
                 admit_probe: RefCell::new(None),
+                answers_queries_natively: Cell::new(false),
             })
         }
 
@@ -12567,6 +12652,10 @@ mod tests {
         fn cursor_position_report(&self) -> (i64, i64) {
             self.record(DispatchCall::Query(DispatchQuery::CursorPositionReport));
             self.grid.borrow().cursor
+        }
+
+        fn live_surface_answers_query(&self, query: KeyboardProtocolQuery) -> bool {
+            self.answers_queries_natively.get() && vte_answers_query_natively(query)
         }
 
         fn command_capture_anchor(
@@ -14674,6 +14763,40 @@ mod tests {
             harness.backend.take_calls(),
             vec![DispatchCall::Query(DispatchQuery::CursorPositionReport)]
         );
+    }
+
+    #[test]
+    fn reader_dispatch_leaves_vte_answered_queries_to_the_live_surface() {
+        // The parser hands the query's bytes to the live surface as well as
+        // reporting it, so answering here too would put two replies on the
+        // shell's input for one question and shift every later reply by one.
+        let harness = ReaderHarness::new();
+        harness.backend.answers_queries_natively.set(true);
+        harness.backend.render_row(3, "user@host $ ");
+        for query in [
+            KeyboardProtocolQuery::CursorPosition,
+            KeyboardProtocolQuery::DeviceStatus,
+            KeyboardProtocolQuery::PrimaryDeviceAttributes,
+            KeyboardProtocolQuery::SecondaryDeviceAttributes,
+            KeyboardProtocolQuery::TertiaryDeviceAttributes,
+            KeyboardProtocolQuery::XtVersion,
+        ] {
+            harness.feed(ParserEvent::KeyboardProtocolQuery(query));
+        }
+        assert!(harness.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty());
+        assert!(harness.backend.take_calls().is_empty());
+
+        // The two libvte does not implement still need an answer from here.
+        for (query, reply) in [
+            (KeyboardProtocolQuery::KittyQuery, &b"\x1b[?0u"[..]),
+            (
+                KeyboardProtocolQuery::ModifyOtherKeysQuery,
+                &b"\x1b[>4;0m"[..],
+            ),
+        ] {
+            harness.feed(ParserEvent::KeyboardProtocolQuery(query));
+            assert_eq!(harness.pty.drain_test_slave(PTY_REPLY_WAIT), reply);
+        }
     }
 
     #[test]
