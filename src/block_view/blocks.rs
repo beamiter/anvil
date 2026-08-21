@@ -3062,276 +3062,313 @@ impl FinishedBlock {
         // reopening it reapplies the same filter, matching Warp's toggle behavior.
         let filter_enabled = Rc::new(Cell::new(false));
         let toggle_filter: Rc<dyn Fn()> = {
-            let filter_row = gtk::Box::new(Orientation::Horizontal, 4);
-            filter_row.add_css_class("block-filter-row");
-            filter_row.set_visible(false);
-            filter_row.set_margin_start(12);
-            filter_row.set_margin_end(8);
-            filter_row.set_margin_top(2);
-            filter_row.set_margin_bottom(2);
-
-            let filter_entry = gtk::SearchEntry::new();
-            filter_entry.set_placeholder_text(Some("Filter output…"));
-            filter_entry.set_hexpand(true);
-            let regex_tg = gtk::ToggleButton::with_label(".*");
-            regex_tg.set_tooltip_text(Some("Regular expression"));
-            let case_tg = gtk::ToggleButton::with_label("Aa");
-            case_tg.set_tooltip_text(Some("Case sensitive"));
-            let invert_tg = gtk::ToggleButton::with_label("!");
-            invert_tg.set_tooltip_text(Some("Invert match (hide matching lines)"));
-            let ctx_spin = gtk::SpinButton::with_range(0.0, 9.0, 1.0);
-            ctx_spin.set_tooltip_text(Some("Lines of context around each match"));
-            ctx_spin.set_value(0.0);
-            let filter_status = gtk::Label::new(None);
-            filter_status.add_css_class("block-filter-status");
-            filter_status.set_halign(gtk::Align::Start);
-            for w in [&regex_tg, &case_tg, &invert_tg] {
-                w.add_css_class("flat");
-                w.add_css_class("block-filter-toggle");
-            }
-            filter_row.append(&filter_entry);
-            filter_row.append(&regex_tg);
-            filter_row.append(&case_tg);
-            filter_row.append(&invert_tg);
-            filter_row.append(&ctx_spin);
-            filter_row.append(&filter_status);
-
-            content.append(&filter_row);
-            content.reorder_child_after(&filter_row, Some(&cmd_row));
-
-            let apply = {
-                let output_vte = output_vte.downgrade();
+            // The filter editor is built on the FIRST toggle, not at card
+            // construction. A search entry, three toggles, a spin button and a
+            // status label are ~15-20 GtkWidgets per card — a third of the
+            // whole history's widget population at the default block cap —
+            // and they existed solely so a keystroke could make them visible.
+            // Everything the builder needs is captured weakly (widgets) or by
+            // Rc (state), exactly as the eager version captured it, so the
+            // toggle closure the filter button owns still cannot keep the card
+            // alive after eviction.
+            type FilterRowHandles = (
+                glib::WeakRef<gtk::Box>,
+                glib::WeakRef<gtk::SearchEntry>,
+                Rc<dyn Fn()>,
+            );
+            let output_vte = output_vte.downgrade();
+            let expand_btn = expand_btn.downgrade();
+            let output_scrollbar = output_scrollbar.downgrade();
+            let collapsed_summary = collapsed_summary.downgrade();
+            let build_filter_row: Rc<dyn Fn(&gtk::Box, &gtk::Box) -> Option<FilterRowHandles>> = {
                 let full_output = full_output.clone();
                 let displayed_output = displayed_output.clone();
-                let filter_entry = filter_entry.downgrade();
-                let regex_tg = regex_tg.downgrade();
-                let case_tg = case_tg.downgrade();
-                let invert_tg = invert_tg.downgrade();
-                let ctx_spin = ctx_spin.downgrade();
-                let filter_status = filter_status.downgrade();
-                let expand_btn = expand_btn.downgrade();
-                let output_scrollbar = output_scrollbar.downgrade();
                 let expanded = expanded.clone();
                 let dynamic_viewport_rows = dynamic_viewport_rows.clone();
-                let collapsed_summary = collapsed_summary.downgrade();
                 let filter_enabled = filter_enabled.clone();
                 let render_stamp = render_stamp.clone();
                 let displayed_generation = displayed_generation.clone();
                 let visual_rows_cache = visual_rows_cache.clone();
-                move || {
-                    let (
-                        Some(output_vte),
-                        Some(filter_entry),
-                        Some(regex_tg),
-                        Some(case_tg),
-                        Some(invert_tg),
-                        Some(ctx_spin),
-                        Some(filter_status),
-                        Some(expand_btn),
-                        Some(output_scrollbar),
-                        Some(collapsed_summary),
-                    ) = (
-                        output_vte.upgrade(),
-                        filter_entry.upgrade(),
-                        regex_tg.upgrade(),
-                        case_tg.upgrade(),
-                        invert_tg.upgrade(),
-                        ctx_spin.upgrade(),
-                        filter_status.upgrade(),
-                        expand_btn.upgrade(),
-                        output_scrollbar.upgrade(),
-                        collapsed_summary.upgrade(),
-                    )
-                    else {
-                        return;
-                    };
-                    let q = filter_entry.text().to_string();
-                    let full = full_output.borrow();
-                    let next_display = if filter_enabled.get() {
-                        filter_output_lines(
-                            full.as_str(),
-                            &q,
-                            regex_tg.is_active(),
-                            case_tg.is_active(),
-                            invert_tg.is_active(),
-                            ctx_spin.value() as usize,
+                Rc::new(move |content: &gtk::Box, cmd_row: &gtk::Box| {
+                let filter_row = gtk::Box::new(Orientation::Horizontal, 4);
+                filter_row.add_css_class("block-filter-row");
+                filter_row.set_visible(false);
+                filter_row.set_margin_start(12);
+                filter_row.set_margin_end(8);
+                filter_row.set_margin_top(2);
+                filter_row.set_margin_bottom(2);
+
+                let filter_entry = gtk::SearchEntry::new();
+                filter_entry.set_placeholder_text(Some("Filter output…"));
+                filter_entry.set_hexpand(true);
+                let regex_tg = gtk::ToggleButton::with_label(".*");
+                regex_tg.set_tooltip_text(Some("Regular expression"));
+                let case_tg = gtk::ToggleButton::with_label("Aa");
+                case_tg.set_tooltip_text(Some("Case sensitive"));
+                let invert_tg = gtk::ToggleButton::with_label("!");
+                invert_tg.set_tooltip_text(Some("Invert match (hide matching lines)"));
+                let ctx_spin = gtk::SpinButton::with_range(0.0, 9.0, 1.0);
+                ctx_spin.set_tooltip_text(Some("Lines of context around each match"));
+                ctx_spin.set_value(0.0);
+                let filter_status = gtk::Label::new(None);
+                filter_status.add_css_class("block-filter-status");
+                filter_status.set_halign(gtk::Align::Start);
+                for w in [&regex_tg, &case_tg, &invert_tg] {
+                    w.add_css_class("flat");
+                    w.add_css_class("block-filter-toggle");
+                }
+                filter_row.append(&filter_entry);
+                filter_row.append(&regex_tg);
+                filter_row.append(&case_tg);
+                filter_row.append(&invert_tg);
+                filter_row.append(&ctx_spin);
+                filter_row.append(&filter_status);
+
+                content.append(&filter_row);
+                content.reorder_child_after(&filter_row, Some(cmd_row));
+
+                let apply = {
+                    let output_vte = output_vte.clone();
+                    let full_output = full_output.clone();
+                    let displayed_output = displayed_output.clone();
+                    let filter_entry = filter_entry.downgrade();
+                    let regex_tg = regex_tg.downgrade();
+                    let case_tg = case_tg.downgrade();
+                    let invert_tg = invert_tg.downgrade();
+                    let ctx_spin = ctx_spin.downgrade();
+                    let filter_status = filter_status.downgrade();
+                    let expand_btn = expand_btn.clone();
+                    let output_scrollbar = output_scrollbar.clone();
+                    let expanded = expanded.clone();
+                    let dynamic_viewport_rows = dynamic_viewport_rows.clone();
+                    let collapsed_summary = collapsed_summary.clone();
+                    let filter_enabled = filter_enabled.clone();
+                    let render_stamp = render_stamp.clone();
+                    let displayed_generation = displayed_generation.clone();
+                    let visual_rows_cache = visual_rows_cache.clone();
+                    move || {
+                        let (
+                            Some(output_vte),
+                            Some(filter_entry),
+                            Some(regex_tg),
+                            Some(case_tg),
+                            Some(invert_tg),
+                            Some(ctx_spin),
+                            Some(filter_status),
+                            Some(expand_btn),
+                            Some(output_scrollbar),
+                            Some(collapsed_summary),
+                        ) = (
+                            output_vte.upgrade(),
+                            filter_entry.upgrade(),
+                            regex_tg.upgrade(),
+                            case_tg.upgrade(),
+                            invert_tg.upgrade(),
+                            ctx_spin.upgrade(),
+                            filter_status.upgrade(),
+                            expand_btn.upgrade(),
+                            output_scrollbar.upgrade(),
+                            collapsed_summary.upgrade(),
                         )
-                    } else {
-                        None
-                    };
-                    let shown = next_display.as_deref().unwrap_or(full.as_str());
-                    let shown_rows = output_row_count(shown);
-                    let full_rows = if next_display.is_none() {
-                        shown_rows
-                    } else {
-                        output_row_count(&full)
-                    };
-                    let effective_cols = effective_render_cols(&output_vte, cols);
-                    let display_changed =
-                        displayed_output.borrow().as_deref() != next_display.as_deref();
-                    let generation = if display_changed {
-                        advance_displayed_generation(&displayed_generation, &visual_rows_cache)
-                    } else {
-                        displayed_generation.get()
-                    };
-                    let shown_visual_rows = cached_output_visual_row_count(
-                        &visual_rows_cache,
-                        shown,
-                        effective_cols,
-                        generation,
-                    );
-                    let requested_cap = if expanded.get() {
-                        max_expanded_cap
-                    } else {
-                        dynamic_viewport_rows.get()
-                    };
-                    let active_cap = bounded_finished_viewport_rows(effective_cols, requested_cap);
-                    let stamp = output_render_stamp(
-                        effective_cols,
-                        shown_visual_rows,
-                        active_cap,
-                        generation,
-                    );
-                    if render_stamp.replace(stamp) != stamp {
-                        render_bytes_into_finished_vte(
-                            &output_vte,
+                        else {
+                            return;
+                        };
+                        let q = filter_entry.text().to_string();
+                        let full = full_output.borrow();
+                        let next_display = if filter_enabled.get() {
+                            filter_output_lines(
+                                full.as_str(),
+                                &q,
+                                regex_tg.is_active(),
+                                case_tg.is_active(),
+                                invert_tg.is_active(),
+                                ctx_spin.value() as usize,
+                            )
+                        } else {
+                            None
+                        };
+                        let shown = next_display.as_deref().unwrap_or(full.as_str());
+                        let shown_rows = output_row_count(shown);
+                        let full_rows = if next_display.is_none() {
+                            shown_rows
+                        } else {
+                            output_row_count(&full)
+                        };
+                        let effective_cols = effective_render_cols(&output_vte, cols);
+                        let display_changed =
+                            displayed_output.borrow().as_deref() != next_display.as_deref();
+                        let generation = if display_changed {
+                            advance_displayed_generation(&displayed_generation, &visual_rows_cache)
+                        } else {
+                            displayed_generation.get()
+                        };
+                        let shown_visual_rows = cached_output_visual_row_count(
+                            &visual_rows_cache,
                             shown,
+                            effective_cols,
+                            generation,
+                        );
+                        let requested_cap = if expanded.get() {
+                            max_expanded_cap
+                        } else {
+                            dynamic_viewport_rows.get()
+                        };
+                        let active_cap = bounded_finished_viewport_rows(effective_cols, requested_cap);
+                        let stamp = output_render_stamp(
                             effective_cols,
                             shown_visual_rows,
                             active_cap,
-                            capture_rows,
-                            shown_visual_rows <= active_cap,
+                            generation,
                         );
-                        let ch = output_vte.char_height() as i32;
-                        if ch > 0 {
-                            let probe_rows = shown_visual_rows.min(active_cap).clamp(1, 32);
-                            output_vte.set_height_request(finished_vte_height_px(probe_rows, ch));
+                        if render_stamp.replace(stamp) != stamp {
+                            render_bytes_into_finished_vte(
+                                &output_vte,
+                                shown,
+                                effective_cols,
+                                shown_visual_rows,
+                                active_cap,
+                                capture_rows,
+                                shown_visual_rows <= active_cap,
+                            );
+                            let ch = output_vte.char_height() as i32;
+                            if ch > 0 {
+                                let probe_rows = shown_visual_rows.min(active_cap).clamp(1, 32);
+                                output_vte.set_height_request(finished_vte_height_px(probe_rows, ch));
+                            }
                         }
-                    }
-                    let has_query = filter_enabled.get() && !q.trim().is_empty();
-                    if has_query {
-                        filter_status.set_visible(true);
-                        let hidden = full_rows.saturating_sub(shown_rows);
-                        if shown.trim().is_empty() {
-                            filter_status.set_text("No matches");
-                            filter_status.add_css_class("block-filter-empty");
+                        let has_query = filter_enabled.get() && !q.trim().is_empty();
+                        if has_query {
+                            filter_status.set_visible(true);
+                            let hidden = full_rows.saturating_sub(shown_rows);
+                            if shown.trim().is_empty() {
+                                filter_status.set_text("No matches");
+                                filter_status.add_css_class("block-filter-empty");
+                            } else {
+                                filter_status.remove_css_class("block-filter-empty");
+                                filter_status.set_text(&format!(
+                                    "{} shown, {} hidden",
+                                    line_count_text(shown_rows),
+                                    hidden
+                                ));
+                            }
                         } else {
                             filter_status.remove_css_class("block-filter-empty");
-                            filter_status.set_text(&format!(
-                                "{} shown, {} hidden",
-                                line_count_text(shown_rows),
-                                hidden
-                            ));
+                            filter_status.set_visible(false);
                         }
-                    } else {
-                        filter_status.remove_css_class("block-filter-empty");
-                        filter_status.set_visible(false);
+                        expand_btn.set_visible(shown_visual_rows > dynamic_viewport_rows.get());
+                        output_scrollbar.set_visible(shown_visual_rows > active_cap);
+                        collapsed_summary.set_label(&collapsed_output_summary(shown_rows));
+                        if display_changed {
+                            *displayed_output.borrow_mut() = next_display;
+                        }
                     }
-                    expand_btn.set_visible(shown_visual_rows > dynamic_viewport_rows.get());
-                    output_scrollbar.set_visible(shown_visual_rows > active_cap);
-                    collapsed_summary.set_label(&collapsed_output_summary(shown_rows));
-                    if display_changed {
-                        *displayed_output.borrow_mut() = next_display;
-                    }
-                }
-            };
-            let apply = Rc::new(apply);
-            let pending_apply: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
-            let apply_generation = Rc::new(Cell::new(0_u64));
-            // Option/context/filter-row changes are explicit actions and apply
-            // immediately. They also invalidate a pending keystroke timeout so
-            // an older query can never render over the newer state.
-            let apply_now = {
-                let pending_apply = pending_apply.clone();
-                let apply_generation = apply_generation.clone();
-                let apply = apply.clone();
-                Rc::new(move || {
-                    apply_generation.set(apply_generation.get().wrapping_add(1));
-                    if let Some(source) = pending_apply.borrow_mut().take() {
-                        source.remove();
-                    }
-                    apply();
-                })
-            };
-            let schedule_apply = {
-                let pending_apply = pending_apply.clone();
-                let apply_generation = apply_generation.clone();
-                let apply = apply.clone();
-                Rc::new(move || {
-                    let generation = apply_generation.get().wrapping_add(1);
-                    apply_generation.set(generation);
-                    if let Some(source) = pending_apply.borrow_mut().take() {
-                        source.remove();
-                    }
-
-                    let pending_slot = pending_apply.clone();
-                    let pending_clear = pending_apply.clone();
+                };
+                let apply = Rc::new(apply);
+                let pending_apply: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+                let apply_generation = Rc::new(Cell::new(0_u64));
+                // Option/context/filter-row changes are explicit actions and apply
+                // immediately. They also invalidate a pending keystroke timeout so
+                // an older query can never render over the newer state.
+                let apply_now = {
+                    let pending_apply = pending_apply.clone();
                     let apply_generation = apply_generation.clone();
                     let apply = apply.clone();
-                    let source =
-                        glib::timeout_add_local(FINISHED_OUTPUT_FILTER_DEBOUNCE, move || {
-                            if apply_generation.get() == generation {
-                                // A stale callback must not clear a newer
-                                // timeout stored in the shared slot.
-                                pending_clear.borrow_mut().take();
-                                apply();
-                            }
-                            glib::ControlFlow::Break
-                        });
-                    *pending_slot.borrow_mut() = Some(source);
-                })
-            };
-            {
-                let schedule_apply = schedule_apply.clone();
-                filter_entry.connect_search_changed(move |_| schedule_apply());
-            }
-            for tg in [&regex_tg, &case_tg, &invert_tg] {
-                let apply_now = apply_now.clone();
-                tg.connect_toggled(move |_| apply_now());
-            }
-            {
-                let apply_now = apply_now.clone();
-                ctx_spin.connect_value_changed(move |_| apply_now());
-            }
-            {
-                let pending_apply = pending_apply.clone();
-                let apply_generation = apply_generation.clone();
-                filter_entry.connect_destroy(move |_| {
-                    apply_generation.set(apply_generation.get().wrapping_add(1));
-                    if let Some(source) = pending_apply.borrow_mut().take() {
-                        source.remove();
-                    }
-                });
-            }
+                    Rc::new(move || {
+                        apply_generation.set(apply_generation.get().wrapping_add(1));
+                        if let Some(source) = pending_apply.borrow_mut().take() {
+                            source.remove();
+                        }
+                        apply();
+                    })
+                };
+                let schedule_apply = {
+                    let pending_apply = pending_apply.clone();
+                    let apply_generation = apply_generation.clone();
+                    let apply = apply.clone();
+                    Rc::new(move || {
+                        let generation = apply_generation.get().wrapping_add(1);
+                        apply_generation.set(generation);
+                        if let Some(source) = pending_apply.borrow_mut().take() {
+                            source.remove();
+                        }
 
-            let filter_row_for_toggle = filter_row.downgrade();
-            let entry_for_toggle = filter_entry.downgrade();
-            let apply_for_toggle = apply_now.clone();
+                        let pending_slot = pending_apply.clone();
+                        let pending_clear = pending_apply.clone();
+                        let apply_generation = apply_generation.clone();
+                        let apply = apply.clone();
+                        let source =
+                            glib::timeout_add_local(FINISHED_OUTPUT_FILTER_DEBOUNCE, move || {
+                                if apply_generation.get() == generation {
+                                    // A stale callback must not clear a newer
+                                    // timeout stored in the shared slot.
+                                    pending_clear.borrow_mut().take();
+                                    apply();
+                                }
+                                glib::ControlFlow::Break
+                            });
+                        *pending_slot.borrow_mut() = Some(source);
+                    })
+                };
+                {
+                    let schedule_apply = schedule_apply.clone();
+                    filter_entry.connect_search_changed(move |_| schedule_apply());
+                }
+                for tg in [&regex_tg, &case_tg, &invert_tg] {
+                    let apply_now = apply_now.clone();
+                    tg.connect_toggled(move |_| apply_now());
+                }
+                {
+                    let apply_now = apply_now.clone();
+                    ctx_spin.connect_value_changed(move |_| apply_now());
+                }
+                {
+                    let pending_apply = pending_apply.clone();
+                    let apply_generation = apply_generation.clone();
+                    filter_entry.connect_destroy(move |_| {
+                        apply_generation.set(apply_generation.get().wrapping_add(1));
+                        if let Some(source) = pending_apply.borrow_mut().take() {
+                            source.remove();
+                        }
+                    });
+                }
+
+                Some((filter_row.downgrade(), filter_entry.downgrade(), apply_now))
+            })
+            };
+            let built: Rc<RefCell<Option<FilterRowHandles>>> = Rc::new(RefCell::new(None));
+            let content_for_toggle = content.downgrade();
+            let cmd_row_for_toggle = cmd_row.downgrade();
             let filter_btn_for_toggle = filter_btn.downgrade();
             let filter_enabled_for_toggle = filter_enabled.clone();
             let toggle: Rc<dyn Fn()> = Rc::new(move || {
-                let (
-                    Some(filter_row_for_toggle),
-                    Some(entry_for_toggle),
-                    Some(filter_btn_for_toggle),
-                ) = (
-                    filter_row_for_toggle.upgrade(),
-                    entry_for_toggle.upgrade(),
+                let (Some(content), Some(cmd_row), Some(filter_btn)) = (
+                    content_for_toggle.upgrade(),
+                    cmd_row_for_toggle.upgrade(),
                     filter_btn_for_toggle.upgrade(),
-                )
-                else {
+                ) else {
                     return;
                 };
-                let show = !filter_row_for_toggle.is_visible();
-                filter_row_for_toggle.set_visible(show);
+                if built.borrow().is_none() {
+                    let handles = build_filter_row(&content, &cmd_row);
+                    *built.borrow_mut() = handles;
+                }
+                let built = built.borrow();
+                let Some((row, entry, apply_now)) = built.as_ref() else {
+                    return;
+                };
+                let (Some(row), Some(entry)) = (row.upgrade(), entry.upgrade()) else {
+                    return;
+                };
+                let show = !row.is_visible();
+                row.set_visible(show);
                 filter_enabled_for_toggle.set(show);
                 if show {
-                    filter_btn_for_toggle.add_css_class("block-action-active");
-                    entry_for_toggle.grab_focus();
+                    filter_btn.add_css_class("block-action-active");
+                    entry.grab_focus();
                 } else {
-                    filter_btn_for_toggle.remove_css_class("block-action-active");
+                    filter_btn.remove_css_class("block-action-active");
                 }
-                apply_for_toggle();
+                apply_now();
             });
             let toggle_for_button = toggle.clone();
             filter_btn.connect_clicked(move |_| toggle_for_button());
@@ -3734,7 +3771,14 @@ pub(crate) struct ActiveBlock {
     live_extent_rows: Rc<Cell<i64>>,
     /// Cursor row this command's output started from. Paired with
     /// `live_extent_rows` so both are re-based by the same reset funnel.
+    /// Lowest ring row the prompt drew on, and the highest the cursor has
+    /// reached since. Both are `cursor_position()` readings, so they are in
+    /// one coordinate system by construction — which the live adjustment is
+    /// not, and neither is a literal zero: `vte.reset()` does not rewind
+    /// VTE's absolute row counter (`Ring::reset` returns `m_end` unchanged),
+    /// so rows keep climbing for the life of the pane.
     live_cursor_origin: Rc<Cell<Option<i64>>>,
+    live_cursor_high: Rc<Cell<i64>>,
     /// Pass-through, non-measuring surface for small live widgets. The VTE
     /// remains the overlay's measured child, so the organism never changes
     /// the terminal grid or steals input.
@@ -3913,6 +3957,7 @@ impl ActiveBlock {
             live_geometry: Cell::new((0, 0, 0)),
             live_extent_rows: Rc::new(Cell::new(0)),
             live_cursor_origin: Rc::new(Cell::new(None)),
+            live_cursor_high: Rc::new(Cell::new(0)),
             live_organism_surface,
             unified_chrome_surface,
             live_scrollbar,
@@ -4007,6 +4052,10 @@ impl ActiveBlock {
         self.live_cursor_origin.clone()
     }
 
+    pub(crate) fn live_cursor_high(&self) -> Rc<Cell<i64>> {
+        self.live_cursor_high.clone()
+    }
+
     /// Height of the live card in pixels — the part of the grid the user can
     /// see. Live widgets positioned over the terminal (the organism) must stay
     /// inside it or they are clipped away.
@@ -4036,7 +4085,12 @@ impl ActiveBlock {
         // A new command starts a new card: forget how far the last one grew,
         // and the row its predecessor grew from.
         self.live_extent_rows.set(0);
+        // Forget where the last card began. The next one re-latches its origin
+        // from the prompt's own cursor samples; nothing here can name a row in
+        // that coordinate system yet, because the bytes below are applied
+        // asynchronously.
         self.live_cursor_origin.set(None);
+        self.live_cursor_high.set(0);
         if preserve_scrollback {
             self.active_vte.feed(b"\x1b[0m");
         } else {

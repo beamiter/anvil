@@ -1280,23 +1280,30 @@ fn coalesce_pending(fd: RawFd, file: &mut std::fs::File, buf: &mut [u8], combine
     }
 }
 
-#[cfg(target_os = "linux")]
 /// Ask the dispatch watch to look at the queue again once GTK has run
 /// everything more urgent.
 ///
-/// `wake_pending` stays set across this hop, so the reader thread does not also
-/// signal and the eventfd counter cannot run away. If the signal fails the flag
-/// is cleared, which hands the next wakeup back to the reader thread rather
-/// than leaving the queue armed with nobody scheduled to drain it.
+/// Signalling the eventfd from inside its own callback is enough: the watch is
+/// level-triggered on readability, so GLib sees it ready on the very next poll,
+/// and because the watch sits at `DEFAULT_IDLE` the main loop still dispatches
+/// every ready input event (`DEFAULT`) and frame-clock tick (`HIGH_IDLE + 20`)
+/// ahead of it — GLib only dispatches the highest-priority band that is ready.
+/// This used to hop through a throwaway `idle_add_local_once` at the same
+/// priority, which bought nothing the priority does not already guarantee and
+/// cost one GSource create + dispatch + destroy and one extra main-loop
+/// iteration per delivered chunk. With ~2000 chunks in a 1.3 MB stream, that
+/// churn was the largest userspace cost left after the paint fixes
+/// (`g_source_ref` / `g_source_iter_next` / `g_source_unref_internal`).
+///
+/// `wake_pending` stays set, so the reader thread does not also signal and
+/// the eventfd counter cannot run away. If the signal fails the flag is
+/// cleared, which hands the next wakeup back to the reader thread rather than
+/// leaving the queue armed with nobody scheduled to drain it.
 #[cfg(target_os = "linux")]
 fn rearm_dispatch(eventfd: &Arc<OwnedFd>, wake_pending: &Arc<AtomicBool>) {
-    let eventfd = Arc::clone(eventfd);
-    let wake_pending = Arc::clone(wake_pending);
-    glib::idle_add_local_once(move || {
-        if signal_eventfd(eventfd.as_raw_fd()).is_err() {
-            wake_pending.store(false, Ordering::Release);
-        }
-    });
+    if signal_eventfd(eventfd.as_raw_fd()).is_err() {
+        wake_pending.store(false, Ordering::Release);
+    }
 }
 
 fn notify_eventfd_once(eventfd: &OwnedFd, wake_pending: &AtomicBool) {
