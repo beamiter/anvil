@@ -519,12 +519,74 @@ fn decode_record(data: &[u8], compressed: bool, max_decoded_bytes: usize) -> io:
     Ok(decoded)
 }
 
+/// Exact BlockData archive used before completion provenance/start evidence
+/// was added. rkyv validates field layout, so serde defaults cannot recover
+/// these frames; an explicit fallback is required to preserve recent history.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+struct LegacyBlockDataV2 {
+    id: u64,
+    prompt: String,
+    cmd: String,
+    cmd_markup: Option<String>,
+    output: String,
+    exit_code: Option<i32>,
+    estimated_height: i32,
+    line_count: usize,
+    start_time_ms: Option<u64>,
+    end_time_ms: Option<u64>,
+    duration_ms: Option<u64>,
+    cwd: Option<String>,
+    cols: u16,
+}
+
+impl From<LegacyBlockDataV2> for BlockData {
+    fn from(legacy: LegacyBlockDataV2) -> Self {
+        let is_background = legacy.cmd.trim().is_empty();
+        let trusted_completion = !is_background && legacy.exit_code.is_some();
+        Self {
+            id: legacy.id,
+            prompt: legacy.prompt,
+            cmd: legacy.cmd,
+            cmd_markup: legacy.cmd_markup,
+            output: legacy.output,
+            exit_code: (!is_background).then_some(legacy.exit_code).flatten(),
+            lifecycle_schema: super::blocks::BLOCK_LIFECYCLE_SCHEMA,
+            completion_provenance: if trusted_completion {
+                super::CompletionProvenance::JournalRecovered
+            } else {
+                super::CompletionProvenance::Unknown
+            },
+            start_mark_seen: trusted_completion,
+            estimated_height: legacy.estimated_height,
+            line_count: legacy.line_count,
+            start_time_ms: trusted_completion.then_some(legacy.start_time_ms).flatten(),
+            end_time_ms: trusted_completion.then_some(legacy.end_time_ms).flatten(),
+            duration_ms: trusted_completion.then_some(legacy.duration_ms).flatten(),
+            cwd: legacy.cwd,
+            cols: legacy.cols,
+        }
+    }
+}
+
 fn decode_block_record(data: &[u8], prefer_compressed: bool) -> io::Result<(BlockData, usize)> {
     let decode_as = |compressed| -> io::Result<(BlockData, usize)> {
         let decoded = decode_record(data, compressed, MAX_DECODED_RECORD_BYTES)?;
         let decoded_len = decoded.len();
         let block = rkyv::from_bytes::<BlockData, rkyv::rancor::Error>(&decoded)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+            .ok()
+            .filter(|block| block.lifecycle_schema == super::blocks::BLOCK_LIFECYCLE_SCHEMA)
+            .or_else(|| {
+                rkyv::from_bytes::<LegacyBlockDataV2, rkyv::rancor::Error>(&decoded)
+                    .ok()
+                    .map(BlockData::from)
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid Block-history rkyv record",
+                )
+            })?;
+        let block = normalize_block_lifecycle(block);
         Ok((block, decoded_len))
     };
 
@@ -536,6 +598,20 @@ fn decode_block_record(data: &[u8], prefer_compressed: bool) -> io::Result<(Bloc
                 "block-history frame is neither a valid raw nor bounded zstd BlockData record",
             )
         })
+}
+
+fn normalize_block_lifecycle(mut block: BlockData) -> BlockData {
+    if block.is_background() {
+        block.exit_code = None;
+        block.completion_provenance = super::CompletionProvenance::Unknown;
+        block.start_mark_seen = false;
+    }
+    if block.is_background() || !block.timing_is_authoritative() {
+        block.start_time_ms = None;
+        block.end_time_ms = None;
+        block.duration_ms = None;
+    }
+    block
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1453,6 +1529,9 @@ mod tests {
             cmd_markup: None,
             output: format!("output for {cmd}\n"),
             exit_code: Some(0),
+            lifecycle_schema: super::super::blocks::BLOCK_LIFECYCLE_SCHEMA,
+            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            start_mark_seen: true,
             estimated_height: 2,
             line_count: 1,
             start_time_ms: Some(1_000_u64.saturating_add(id)),
@@ -1907,6 +1986,65 @@ mod tests {
         let compressed = zstd::encode_all(&b"0123456789abcdef"[..], 1).unwrap();
         let error = decode_record(&compressed, true, 8).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn decoder_accepts_pre_lifecycle_option_status_frames() {
+        let legacy = super::LegacyBlockDataV2 {
+            id: 2,
+            prompt: "$ ".into(),
+            cmd: "maybe".into(),
+            cmd_markup: None,
+            output: "output".into(),
+            exit_code: None,
+            estimated_height: 2,
+            line_count: 1,
+            start_time_ms: Some(1),
+            end_time_ms: Some(2),
+            duration_ms: Some(1),
+            cwd: Some("/tmp".into()),
+            cols: 80,
+        };
+        let encoded = rkyv::to_bytes::<rkyv::rancor::Error>(&legacy).unwrap();
+        let (decoded, _) = decode_block_record(encoded.as_slice(), false).unwrap();
+        assert_eq!(decoded.cmd, "maybe");
+        assert_eq!(decoded.exit_code, None);
+        assert_eq!(
+            decoded.completion_provenance,
+            super::super::CompletionProvenance::Unknown
+        );
+        assert!(!decoded.start_mark_seen);
+    }
+
+    #[test]
+    fn pre_lifecycle_background_fields_are_normalized() {
+        let legacy = super::LegacyBlockDataV2 {
+            id: 6,
+            prompt: "forged prompt".into(),
+            cmd: String::new(),
+            cmd_markup: None,
+            output: "background".into(),
+            exit_code: Some(9),
+            estimated_height: 1,
+            line_count: 1,
+            start_time_ms: Some(1),
+            end_time_ms: Some(2),
+            duration_ms: Some(1),
+            cwd: None,
+            cols: 80,
+        };
+        let encoded = rkyv::to_bytes::<rkyv::rancor::Error>(&legacy).unwrap();
+        let (decoded, _) = decode_block_record(encoded.as_slice(), false).unwrap();
+        assert!(decoded.is_background());
+        assert_eq!(decoded.exit_code, None);
+        assert_eq!(decoded.start_time_ms, None);
+        assert_eq!(decoded.end_time_ms, None);
+        assert_eq!(decoded.duration_ms, None);
+        assert_eq!(
+            decoded.completion_provenance,
+            super::super::CompletionProvenance::Unknown
+        );
+        assert!(!decoded.start_mark_seen);
     }
 
     #[test]

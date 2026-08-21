@@ -227,6 +227,28 @@ reported status are therefore not presented as failures.
 terminal_mode = "block"
 ```
 
+Unified mode keeps one continuous VTE scrollback while retaining authenticated
+command zones, status chrome, bounded per-zone output snapshots, search/export,
+and session replay. Kitty `a=T` images use nonce-scoped row probes and remain
+aligned while scrolling and rewrapping; placements outside the live grid are
+rejected rather than silently resized:
+
+```toml
+terminal_mode = "unified"
+```
+
+The supported Kitty subset is direct, static `a=T` display (`i`, `c/r/C`,
+PNG/RGB/RGBA) plus `a=q`; transmit-only storage, `I`, crop/z/relative placement,
+delete and replacement return `ENOTSUP`. Unified honors cell placement. Block
+mode retains its established finished-card attachment profile, so it does not
+promise in-grid `c/r` placement or replacement semantics.
+
+If a shell omits OSC 133 `D`, a new prompt recovers the record only after the
+shell is confirmed as PTY foreground owner. Such a record is explicitly
+`boundary_inferred` / degraded and carries no fabricated exit status, end time,
+or duration. Replayed and unknown records remain distinguishable in Unified
+exports and chrome.
+
 Use the conventional VTE backend when compatibility with terminal applications
 matters more than command blocks:
 

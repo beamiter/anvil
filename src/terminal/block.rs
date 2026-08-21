@@ -353,10 +353,18 @@ fn connect_view_outputs(
             let sender = sender.clone();
             move |command, exit_code, output_sample, agent_execution, duration_ms| {
                 let _ = sender.output(command_finished_output(exit_code));
+                let (exit_code, unknown_note) =
+                    crate::block_view::exit_code_for_shared_surface(exit_code);
+                let output_sample = match (unknown_note, output_sample) {
+                    (Some(note), Some(output)) => Some(format!("{note}\n{output}")),
+                    (Some(note), None) => Some(note.to_string()),
+                    (None, output) => output,
+                };
                 let _ = sender.output(VteOutput::BlockFinished {
                     command,
-                    // The agent transcript this feeds still speaks one i32.
-                    exit_code: crate::block_view::exit_code_for_i32_api(exit_code),
+                    // The agent transcript still speaks one i32; -1 plus the
+                    // note above is explicitly unknown, never fabricated 0.
+                    exit_code,
                     output_sample: output_sample.unwrap_or_default(),
                     agent_execution,
                     duration_ms,

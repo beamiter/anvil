@@ -18,9 +18,11 @@ use crate::parser::{
     ParserEvent,
 };
 use crate::pty::OwnedPty;
-use jterm_core::kitty_keyboard::{self, KittyKey, KittyKeyboardStacks, Modifiers as KittyModifiers};
 use crate::pty_input;
 use crate::terminal::kitty_graphics;
+use jterm_core::kitty_keyboard::{
+    self, KittyKey, KittyKeyboardStacks, Modifiers as KittyModifiers,
+};
 
 mod alt_screen;
 mod ansi;
@@ -35,6 +37,7 @@ mod palette;
 mod scroll;
 mod selection_hold;
 mod unified_chrome;
+mod unified_images;
 mod zone_history;
 pub(crate) use alt_screen::*;
 pub(crate) use ansi::*;
@@ -867,19 +870,29 @@ fn resolve_command_text(
     (scraped.to_string(), CommandTextSource::Screen)
 }
 
-/// Lower a possibly-unreported status to the single `i32` that shared APIs still
-/// require: `jterm_core::command_history`, `jterm_core::notify`, and jagent's
-/// block context and observation turns.
-///
-/// `0` is the least-bad stand-in for all four, because every one of them treats
-/// non-zero as "this command failed" — a desktop notification marked critical, a
-/// palette entry in the failure filter, an agent told to fix something. Claiming
-/// a failure nobody observed is worse than claiming an outcome. The distinction
-/// survives wherever this app owns the presentation (the block header, the
-/// markdown export, the inactive-tab styling); widening those APIs to
-/// `Option<i32>` is the follow-up this function exists to make greppable.
-pub(crate) fn exit_code_for_i32_api(exit_code: Option<i32>) -> i32 {
-    exit_code.unwrap_or(0)
+pub(crate) const UNKNOWN_EXIT_SENTINEL: i32 = -1;
+pub(crate) const UNKNOWN_EXIT_NOTE: &str =
+    "[terminal] the shell reported no exit status for this command";
+const AGENT_EXIT_STATUS_UNREPORTED: &str =
+    "the shell reported command completion without an exit status";
+
+pub(crate) fn exit_code_for_shared_surface(exit_code: Option<i32>) -> (i32, Option<&'static str>) {
+    match exit_code {
+        Some(code) => (code, None),
+        None => (UNKNOWN_EXIT_SENTINEL, Some(UNKNOWN_EXIT_NOTE)),
+    }
+}
+
+pub(crate) fn exit_code_from_shared_surface(exit_code: i32) -> Option<i32> {
+    (exit_code != UNKNOWN_EXIT_SENTINEL).then_some(exit_code)
+}
+
+fn shared_block_context_output(output: String, exit_code: Option<i32>) -> (String, i32) {
+    let (exit_code, unknown_note) = exit_code_for_shared_surface(exit_code);
+    let output = unknown_note
+        .map(|note| format!("{note}\n{output}"))
+        .unwrap_or(output);
+    (output, exit_code)
 }
 
 /// Duration recorded for a finished block.
@@ -2203,11 +2216,15 @@ impl BlockBackend {
                     let record = data.iter().find(|block| block.id == block_id);
                     let truncated =
                         output.contains("lines elided") || output.contains("bytes elided");
+                    let (output, exit_code) = shared_block_context_output(
+                        output,
+                        record.and_then(|block| block.exit_code),
+                    );
                     let context = crate::ai::BlockContext {
                         cmd: finished_for_ai.cmd_text.clone(),
                         output,
                         cwd: record.and_then(|block| block.cwd.clone()),
-                        exit_code: exit_code_for_i32_api(record.and_then(|block| block.exit_code)),
+                        exit_code,
                         truncated,
                     };
                     for callback in callbacks_for_ai.borrow().iter() {
@@ -2555,6 +2572,76 @@ pub(crate) enum AltScreenTransition {
     Left,
 }
 
+/// Local mirror of the next `jterm_core::block_contract` lifecycle contract.
+/// The current dependency pin predates it; names and truth table intentionally
+/// match so moving to the shared type is mechanical.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CompletionProvenance {
+    ShellReported,
+    JournalRecovered,
+    BoundaryInferred,
+    #[default]
+    Unknown,
+}
+
+impl CompletionProvenance {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ShellReported => "shell_reported",
+            Self::JournalRecovered => "journal_recovered",
+            Self::BoundaryInferred => "boundary_inferred",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum BlockLifecycleHealth {
+    Healthy,
+    Recovered,
+    Degraded,
+    Incomplete,
+}
+
+impl BlockLifecycleHealth {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Recovered => "recovered",
+            Self::Degraded => "degraded",
+            Self::Incomplete => "incomplete",
+        }
+    }
+}
+
+const fn assess_lifecycle(
+    start_mark_seen: bool,
+    provenance: CompletionProvenance,
+) -> BlockLifecycleHealth {
+    match provenance {
+        CompletionProvenance::ShellReported if start_mark_seen => BlockLifecycleHealth::Healthy,
+        CompletionProvenance::JournalRecovered => BlockLifecycleHealth::Recovered,
+        CompletionProvenance::ShellReported | CompletionProvenance::BoundaryInferred => {
+            BlockLifecycleHealth::Degraded
+        }
+        CompletionProvenance::Unknown => BlockLifecycleHealth::Incomplete,
+    }
+}
+
 /// Authoritative foreground-command lifecycle event emitted at OSC 133 `C`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommandStartedEvent {
@@ -2569,6 +2656,8 @@ pub(crate) struct CommandFinishedEvent {
     pub(crate) cwd: Option<String>,
     pub(crate) exit_code: Option<i32>,
     pub(crate) duration_ms: Option<u64>,
+    pub(crate) completion_provenance: CompletionProvenance,
+    pub(crate) lifecycle_health: BlockLifecycleHealth,
 }
 
 /// Minimum rows the live input cell is guaranteed when idle (warp-style compact
@@ -2591,6 +2680,44 @@ struct CompletedCommandRecord {
     duration_ms: Option<u64>,
     cwd: Option<String>,
     is_background: bool,
+    completion_provenance: CompletionProvenance,
+    start_mark_seen: bool,
+}
+
+impl CompletedCommandRecord {
+    fn lifecycle_health(&self) -> BlockLifecycleHealth {
+        assess_lifecycle(self.start_mark_seen, self.completion_provenance)
+    }
+
+    fn timing_is_authoritative(&self) -> bool {
+        self.is_background
+            || self.completion_provenance == CompletionProvenance::JournalRecovered
+            || (self.completion_provenance == CompletionProvenance::ShellReported
+                && self.start_mark_seen)
+    }
+
+    fn lifecycle_notice(&self) -> Option<String> {
+        if self.is_background {
+            return None;
+        }
+        match self.lifecycle_health() {
+            BlockLifecycleHealth::Healthy => None,
+            BlockLifecycleHealth::Recovered => Some(
+                "Recovered command record — terminal rows were reconstructed from session history"
+                    .to_string(),
+            ),
+            BlockLifecycleHealth::Degraded => Some(match self.completion_provenance {
+                CompletionProvenance::BoundaryInferred =>
+                    "Command completion inferred from a trusted prompt boundary; exit status and timing are unavailable".to_string(),
+                CompletionProvenance::ShellReported =>
+                    "The shell reported an end marker without a matching command-start marker".to_string(),
+                _ => "Command lifecycle provenance is degraded".to_string(),
+            }),
+            BlockLifecycleHealth::Incomplete => Some(
+                "Command lifecycle is incomplete; no trusted completion source was retained".to_string(),
+            ),
+        }
+    }
 }
 
 /// Completed-command observers are metadata-only unless their predicate says
@@ -3096,6 +3223,26 @@ fn agent_prompt_boundary_is_trusted(
     active_execution.is_none() || shell_is_foreground == Some(true)
 }
 
+fn prompt_boundary_infers_command_end(
+    state: BlockState,
+    shell_is_foreground: Option<bool>,
+) -> bool {
+    matches!(state, BlockState::CollectingOutput | BlockState::AltScreen)
+        && shell_is_foreground == Some(true)
+}
+
+fn command_history_exit_code(reported: Option<i32>) -> Option<i32> {
+    // The shared JSONL format has no unknown variant. Omission is honest;
+    // mapping None to 0 or a negative sentinel fabricates an outcome.
+    reported
+}
+
+fn long_block_notification_exit_code(reported: Option<i32>) -> Option<i32> {
+    // notify's legacy i32 API treats every non-zero value as a failure. Skip
+    // an unknown status instead of showing either a success or failure lie.
+    reported
+}
+
 pub struct TermView {
     root: gtk::Box,
     block_scroll: ScrolledWindow,
@@ -3299,6 +3446,9 @@ struct EngineState {
     /// Status from the shell's OSC 133 `D` packet. `None` means the shell did
     /// not report one — not that the command succeeded.
     pending_exit_code: Option<i32>,
+    /// Completion authority for the current command; reset at C and promoted
+    /// only by an accepted D or a foreground-shell A recovery.
+    pending_completion_provenance: CompletionProvenance,
     /// Duration the shell measured for the running command, when it sends one.
     /// Beats `block_start_time_for_cb`, which starts when this process noticed
     /// the mark.
@@ -3313,6 +3463,9 @@ struct EngineState {
     /// record.
     pending_zone: Option<PendingZone>,
     active_alt_screen_mode: Option<u32>,
+    /// Kitty data observed outside a running command must not spill into the
+    /// next command's Block or continuation stream.
+    idle_kitty_pipeline_dirty: bool,
 }
 
 /// The VTE/widget pair that presents one field of a completed record.
@@ -3711,6 +3864,10 @@ trait RenderBackend {
     fn close_prompt_zone(&self, _zone_id: Option<u64>) {}
     /// Invalidate row-address authority immediately before ED3 reaches VTE.
     fn erase_scrollback(&self) {}
+    /// Exact CSI 2 J clears image state before the bytes reach VTE.
+    fn erase_display(&self) {
+        self.reset_kitty_pipeline();
+    }
     /// Invalidate persistent-surface authority before RIS reaches VTE.
     fn hard_reset(&self) {}
     /// Reset the live surface for the next prompt. `preserve_scrollback` is
@@ -3833,6 +3990,13 @@ trait RenderBackend {
     /// That reply-between-feed-and-admit ordering is engine-side and holds for
     /// any implementation, including a headless recording one.
     fn kitty_feed(&self, payload: &[u8]) -> kitty_graphics::FeedStatus;
+    fn kitty_response(
+        &self,
+        payload: &[u8],
+        status: &kitty_graphics::FeedStatus,
+    ) -> Option<Vec<u8>> {
+        kitty_graphics::response_for(payload, status)
+    }
     /// Admit the texture parked by the last `Complete` [`Self::kitty_feed`]
     /// against the per-block image budget. No-op when nothing is pending.
     fn kitty_admit_pending(&self);
@@ -3984,7 +4148,7 @@ struct BlockBackend {
     /// cleared at the start of every feed, by `reset_kitty_pipeline`, and in
     /// finalize's kitty tail, so a skipped admit cannot leak a stale texture
     /// across events.
-    kitty_pending_admission: RefCell<Option<gtk::gdk::Texture>>,
+    kitty_pending_admission: RefCell<Option<(gtk::gdk::Texture, usize)>>,
 }
 
 /// Per-zone snapshot ceiling: finalize reads at most this many raw bytes from
@@ -4533,10 +4697,18 @@ struct UnifiedBackend {
     /// Probe/paint half of Unified zone chrome. Marker authority is separate
     /// from completed records so eviction cannot delete history metadata.
     chrome: unified_chrome::UnifiedChrome,
+    /// Probe-addressed images layered between VTE and the organism surface.
+    image_layer: unified_images::UnifiedImageLayer,
+    /// Strong owner for the retention observer rendezvous. Chrome's Terminal
+    /// signal closures retain only a Weak slot, so pane teardown releases the
+    /// layer, VTE, Fixed and textures instead of forming a GObject/Rc cycle.
+    _image_layer_slot_owner: Rc<RefCell<Option<unified_images::UnifiedImageLayer>>>,
     /// Shared with the engine so a replayed zone draws from the same id
     /// sequence a live one does; a persisted id is never reused.
     reserved_history_block_ids: Rc<RefCell<HashSet<u64>>>,
     kitty_assembler: RefCell<kitty_graphics::Assembler>,
+    /// Decoded result parked until the engine has written the protocol reply.
+    kitty_pending_admission: RefCell<Option<unified_images::PendingImage>>,
 }
 
 /// Captures the shared handles the PTY reader/exit callbacks need, so
@@ -4731,7 +4903,7 @@ impl ReaderCtx {
         // RIS invalidates saved screens and every row address. Completed
         // metadata remains in the backend document, but an old marker must
         // never become authoritative again after reset.
-        let (was_alt_screen, restored_state) = {
+        let was_alt_screen = {
             let mut engine = self.engine.borrow_mut();
             engine.pending_zone = None;
             engine.osc133_depth = 0;
@@ -4741,14 +4913,13 @@ impl ReaderCtx {
             engine.vte_typed_cmd.clear();
             engine.prompt_display.clear();
             engine.pending_exit_code = None;
+            engine.pending_completion_provenance = CompletionProvenance::Unknown;
             engine.shell_duration_ms = None;
             engine.execution_id_trusted = false;
             engine.agent_completion_trusted = false;
             engine.command_cwd = None;
-            (
-                self.bstate_rc.get() == BlockState::AltScreen,
-                engine.prev_state,
-            )
+            engine.idle_kitty_pipeline_dirty = false;
+            self.bstate_rc.get() == BlockState::AltScreen
         };
 
         // No pending settle/submission may publish trust derived from the
@@ -4804,8 +4975,8 @@ impl ReaderCtx {
             self.backend.exit_alt_screen_chrome();
             emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Left);
             self.backend.layout_active_surface();
-            self.bstate_rc.set(restored_state);
         }
+        self.bstate_rc.set(BlockState::Idle);
         self.engine.borrow_mut().active_alt_screen_mode = None;
         self.backend.reset_kitty_pipeline();
         self.bracketed_paste_rc.set(false);
@@ -4883,6 +5054,10 @@ impl ReaderCtx {
     }
 
     fn on_bytes(&self, bytes: &[u8], state: BlockState) {
+        if contains_exact_ed2(bytes) {
+            self.backend.erase_display();
+            self.engine.borrow_mut().idle_kitty_pipeline_dirty = false;
+        }
         if state == BlockState::AwaitingCommand {
             if let Some(submission) = self.verified_submission.submission.borrow_mut().as_mut() {
                 if submission.phase == ReviewedSubmissionPhase::Submitted
@@ -4943,8 +5118,11 @@ impl ReaderCtx {
                     if dropped {
                         self.live_raw_output_dropped_rc.set(true);
                     }
-                    self.live_output_bytes_rc
-                        .set(self.live_output_bytes_rc.get().saturating_add(bytes.len() as u64));
+                    self.live_output_bytes_rc.set(
+                        self.live_output_bytes_rc
+                            .get()
+                            .saturating_add(bytes.len() as u64),
+                    );
                 }
                 for cb in self.activity_cbs.borrow().iter() {
                     cb();
@@ -4966,9 +5144,46 @@ impl ReaderCtx {
 
     fn on_prompt_start(&self) {
         self.ftcs_seen_rc.set(true);
-        let state = self.bstate_rc.get();
+        let mut state = self.bstate_rc.get();
         if state == BlockState::CollectingOutput || state == BlockState::AltScreen {
-            return;
+            if !prompt_boundary_infers_command_end(state, self.pty_for_init.shell_is_foreground()) {
+                return;
+            }
+            if let Some(execution) = self.active_agent_execution_rc.take() {
+                emit_agent_execution_lost(
+                    &self.verified_submission.agent_execution_lost_callbacks,
+                    execution,
+                    "the shell returned to a prompt without a command-end marker",
+                );
+            }
+            if state == BlockState::AltScreen {
+                let (mode, restored_state, pending_zone) = {
+                    let mut engine = self.engine.borrow_mut();
+                    (
+                        engine.active_alt_screen_mode.take().unwrap_or(1049),
+                        engine.prev_state,
+                        engine.pending_zone,
+                    )
+                };
+                self.backend.feed_live(format!("\x1b[?{mode}l").as_bytes());
+                if let Some(id) = prompt_zone_to_reopen_after_alt(restored_state, pending_zone) {
+                    self.backend.begin_prompt_zone(id);
+                }
+                self.backend.exit_fullscreen();
+                self.backend.exit_alt_screen_chrome();
+                emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Left);
+                self.backend.layout_active_surface();
+            }
+            {
+                let mut engine = self.engine.borrow_mut();
+                engine.osc133_depth = 0;
+                engine.pending_exit_code = None;
+                engine.pending_completion_provenance = CompletionProvenance::BoundaryInferred;
+                engine.agent_completion_trusted = false;
+            }
+            self.cmd_running_rc.set(false);
+            self.bstate_rc.set(BlockState::PostCommand);
+            state = BlockState::PostCommand;
         }
         if state == BlockState::PostCommand
             && !agent_prompt_boundary_is_trusted(
@@ -5108,11 +5323,11 @@ impl ReaderCtx {
                 self.block_start_time_for_cb.get()
             };
             let now = SystemTime::now();
-            let end_time_ms = now
+            let mut end_time_ms = now
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .ok()
                 .map(|d| d.as_millis() as u64);
-            let start_time_ms = start_time.and_then(|st| {
+            let mut start_time_ms = start_time.and_then(|st| {
                 st.duration_since(SystemTime::UNIX_EPOCH)
                     .ok()
                     .map(|d| d.as_millis() as u64)
@@ -5124,7 +5339,7 @@ impl ReaderCtx {
             } else {
                 self.engine.borrow_mut().shell_duration_ms.take()
             };
-            let duration_ms = block_duration_ms(shell_duration_ms, start_time, now);
+            let mut duration_ms = block_duration_ms(shell_duration_ms, start_time, now);
 
             let block_cwd = {
                 // The cwd the shell said the command ran in wins
@@ -5155,6 +5370,24 @@ impl ReaderCtx {
             } else {
                 self.engine.borrow().pending_exit_code
             };
+            let completion_provenance = if is_background {
+                CompletionProvenance::Unknown
+            } else {
+                std::mem::replace(
+                    &mut self.engine.borrow_mut().pending_completion_provenance,
+                    CompletionProvenance::Unknown,
+                )
+            };
+            if !is_background
+                && matches!(
+                    completion_provenance,
+                    CompletionProvenance::BoundaryInferred | CompletionProvenance::Unknown
+                )
+            {
+                end_time_ms = None;
+                duration_ms = None;
+                start_time_ms = None;
+            }
 
             // The accepted A that opened this command's prompt preallocated
             // the identity. The following A consumes exactly that id here and
@@ -5171,6 +5404,8 @@ impl ReaderCtx {
                 duration_ms,
                 cwd: block_cwd,
                 is_background,
+                completion_provenance,
+                start_mark_seen: !is_background,
             };
             let payload =
                 LazyBlockRenderPayload::new(prompt, captured_output, output_dropped_front);
@@ -5208,13 +5443,15 @@ impl ReaderCtx {
                     cfg.command_history_max_entries as usize,
                 )
             };
-            if let Some(path) = history_path {
+            if let (Some(path), Some(history_exit_code)) =
+                (history_path, command_history_exit_code(record.exit_code))
+            {
                 if let Err(err) = crate::command_history::enqueue(
                     std::path::Path::new(&path),
                     history_limit,
                     &record.cmd,
                     record.cwd.as_deref(),
-                    exit_code_for_i32_api(record.exit_code),
+                    history_exit_code,
                     record.end_time_ms,
                 ) {
                     log::warn!("command history: {err}");
@@ -5300,7 +5537,8 @@ impl ReaderCtx {
         // finished block / export.
         {
             let mut engine = self.engine.borrow_mut();
-            let prompt_text = String::from_utf8_lossy(engine.prompt_buf.make_contiguous()).into_owned();
+            let prompt_text =
+                String::from_utf8_lossy(engine.prompt_buf.make_contiguous()).into_owned();
             let prompt_line = strip_ansi(&prompt_text)
                 .lines()
                 .rev()
@@ -5389,7 +5627,16 @@ impl ReaderCtx {
         if state != BlockState::AwaitingCommand {
             return;
         }
-        self.engine.borrow_mut().osc133_depth = 0;
+        {
+            let mut engine = self.engine.borrow_mut();
+            engine.osc133_depth = 0;
+            engine.pending_completion_provenance = CompletionProvenance::Unknown;
+        }
+        let reset_idle_kitty =
+            std::mem::take(&mut self.engine.borrow_mut().idle_kitty_pipeline_dirty);
+        if reset_idle_kitty {
+            self.backend.reset_kitty_pipeline();
+        }
         // A command start without an intervening PromptStart is
         // an ambiguous shell-integration edge. Keep those bytes
         // visible in the live VTE but do not merge them into the
@@ -5571,6 +5818,16 @@ impl ReaderCtx {
                 );
             }
         }
+        if exit.is_none() {
+            if let Some(execution) = self.active_agent_execution_rc.take() {
+                self.engine.borrow_mut().agent_completion_trusted = false;
+                emit_agent_execution_lost(
+                    &self.verified_submission.agent_execution_lost_callbacks,
+                    execution,
+                    AGENT_EXIT_STATUS_UNREPORTED,
+                );
+            }
+        }
         // Every arbitration above accepted this marker as the real end of the
         // command, so the client that owned the keyboard is gone. Resetting
         // higher up would have wiped a still-running client's kitty flags on a
@@ -5601,7 +5858,11 @@ impl ReaderCtx {
         // `None` stays `None`: a shell that reported no status
         // is not a shell that reported success, and this used
         // to collapse to a green `exit 0`.
-        self.engine.borrow_mut().pending_exit_code = exit;
+        {
+            let mut engine = self.engine.borrow_mut();
+            engine.pending_exit_code = exit;
+            engine.pending_completion_provenance = CompletionProvenance::ShellReported;
+        }
         // jsh measures the command itself; only fall back to
         // this process's timer when the shell said nothing.
         if meta.duration_ms.is_some() {
@@ -5630,6 +5891,8 @@ impl ReaderCtx {
                 cwd: finished_cwd,
                 exit_code: exit,
                 duration_ms,
+                completion_provenance: CompletionProvenance::ShellReported,
+                lifecycle_health: assess_lifecycle(true, CompletionProvenance::ShellReported),
             },
         );
         self.cmd_running_rc.set(false);
@@ -5639,7 +5902,10 @@ impl ReaderCtx {
 
     fn on_alt_screen_enter(&self, mode: u32) {
         let from_state = self.bstate_rc.get();
-        if from_state != BlockState::CollectingOutput && from_state != BlockState::AwaitingCommand {
+        if !matches!(
+            from_state,
+            BlockState::CollectingOutput | BlockState::AwaitingCommand | BlockState::RawFallback
+        ) {
             return;
         }
         self.engine.borrow_mut().prev_state = from_state;
@@ -5773,12 +6039,26 @@ impl ReaderCtx {
         // Non-G APC payloads keep today's behaviour: consumed
         // silently, since libvte would ignore them anyway.
         if jterm_core::kitty_graphics::is_graphics_payload(payload) {
-            let status = self.backend.kitty_feed(payload);
+            let status = if self.bstate_rc.get() == BlockState::AltScreen {
+                self.backend.reset_kitty_pipeline();
+                kitty_graphics::FeedStatus::Skipped
+            } else {
+                self.backend.kitty_feed(payload)
+            };
+            if matches!(
+                status,
+                kitty_graphics::FeedStatus::Pending | kitty_graphics::FeedStatus::Complete
+            ) && !matches!(
+                self.bstate_rc.get(),
+                BlockState::CollectingOutput | BlockState::AltScreen
+            ) {
+                self.engine.borrow_mut().idle_kitty_pipeline_dirty = true;
+            }
             // Answer before consuming the outcome: clients
             // like `kitten icat` block on the `i=`-keyed
             // OK/error reply. Keeping this ordering engine-side
             // is what makes the seam headlessly recordable.
-            if let Some(reply) = kitty_graphics::response_for(payload, &status) {
+            if let Some(reply) = self.backend.kitty_response(payload, &status) {
                 self.pty_for_init.write_bytes(&reply);
             }
             if status == kitty_graphics::FeedStatus::Complete {
@@ -5859,6 +6139,63 @@ fn coalesce_bytes_events(events: &mut Vec<ParserEvent>) {
         }
     }
     events.truncate(write);
+}
+
+/// Parser-complete exact CSI 2 J outside opaque control strings. Numeric and
+/// private-mode lookalikes are not clear authority.
+fn contains_exact_ed2(bytes: &[u8]) -> bool {
+    let numeric_is_two = |params: &[u8]| {
+        !params.is_empty()
+            && params.iter().all(u8::is_ascii_digit)
+            && params.iter().try_fold(0u32, |value, digit| {
+                value.checked_mul(10)?.checked_add(u32::from(*digit - b'0'))
+            }) == Some(2)
+    };
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let body_start = if bytes[index] == 0x9b {
+            Some(index + 1)
+        } else if bytes[index..].starts_with(b"\x1b[") {
+            Some(index + 2)
+        } else {
+            None
+        };
+        if let Some(body_start) = body_start {
+            let mut end = body_start;
+            while end < bytes.len() && !(0x40..=0x7e).contains(&bytes[end]) {
+                end += 1;
+            }
+            if end == bytes.len() {
+                return false;
+            }
+            if bytes[end] == b'J' && numeric_is_two(&bytes[body_start..end]) {
+                return true;
+            }
+            index = end + 1;
+            continue;
+        }
+        if bytes[index] == 0x1b
+            && bytes
+                .get(index + 1)
+                .is_some_and(|byte| matches!(*byte, b']' | b'P' | b'_' | b'X' | b'^'))
+        {
+            index += 2;
+            while index < bytes.len() {
+                if bytes[index] == 0x07 {
+                    index += 1;
+                    break;
+                }
+                if bytes[index..].starts_with(b"\x1b\\") {
+                    index += 2;
+                    break;
+                }
+                index += 1;
+            }
+            continue;
+        }
+        index += 1;
+    }
+    false
 }
 
 /// Minimum spacing between OSC 9/777 desktop notifications. The request
@@ -6260,41 +6597,60 @@ impl RenderBackend for BlockBackend {
         // A pending admission the engine never consumed must not survive into
         // this feed's outcome (trait contract: cleared at the start of feed).
         self.kitty_pending_admission.borrow_mut().take();
-        let outcome = self.kitty_assembler.borrow_mut().feed(payload);
-        let status = outcome.status();
+        let image_budget_saturated = self.kitty_pending_images.borrow().len()
+            >= kitty_graphics::MAX_IMAGES_PER_BLOCK
+            || self.kitty_pending_bytes.get() >= kitty_graphics::MAX_PENDING_BYTES_PER_BLOCK;
+        let outcome = if image_budget_saturated {
+            self.kitty_assembler.borrow_mut().reset();
+            kitty_graphics::Outcome::Skipped
+        } else {
+            self.kitty_assembler.borrow_mut().feed(payload)
+        };
+        let mut status = outcome.status();
         // Park a completed texture backend-side; only the texture-free status
         // crosses the trait, and `kitty_admit_pending` consumes the parked
         // texture after the engine has written the protocol reply.
-        if let kitty_graphics::Outcome::Complete(texture) = outcome {
-            *self.kitty_pending_admission.borrow_mut() = Some(texture);
+        if let kitty_graphics::Outcome::Complete {
+            texture,
+            encoded_source_backing_bytes,
+            ..
+        } = outcome
+        {
+            let pixel_bytes = (texture.width().max(0) as usize)
+                .saturating_mul(texture.height().max(0) as usize)
+                .saturating_mul(4);
+            if let Some(next) = kitty_graphics::pending_image_bytes_after_admission(
+                self.kitty_pending_bytes.get(),
+                self.kitty_pending_images.borrow().len(),
+                pixel_bytes,
+                encoded_source_backing_bytes,
+            ) {
+                self.kitty_assembler.borrow_mut().commit_display_id();
+                *self.kitty_pending_admission.borrow_mut() = Some((texture, next));
+            } else {
+                status = kitty_graphics::FeedStatus::Skipped;
+            }
         }
         status
     }
 
+    fn kitty_response(
+        &self,
+        payload: &[u8],
+        status: &kitty_graphics::FeedStatus,
+    ) -> Option<Vec<u8>> {
+        self.kitty_assembler
+            .borrow_mut()
+            .response_for(payload, status)
+    }
+
     fn kitty_admit_pending(&self) {
-        let Some(texture) = self.kitty_pending_admission.borrow_mut().take() else {
+        let Some((texture, next_retained_bytes)) = self.kitty_pending_admission.borrow_mut().take()
+        else {
             return;
         };
-        // Rough memory bound: width*height*4 (bytes
-        // per RGBA pixel). Once the shared per-block
-        // budget is exhausted, further images drop —
-        // the transmission was still acknowledged
-        // by the engine, only the display is skipped.
-        let approx = (texture.width() as usize)
-            .saturating_mul(texture.height() as usize)
-            .saturating_mul(4);
-        let used = self.kitty_pending_bytes.get();
-        if used + approx <= kitty_graphics::MAX_PENDING_BYTES_PER_BLOCK {
-            self.kitty_pending_bytes.set(used + approx);
-            self.kitty_pending_images.borrow_mut().push(texture);
-        } else {
-            log::warn!(
-                "kitty graphics: per-block image budget exhausted ({} + {} > {}), dropping",
-                used,
-                approx,
-                kitty_graphics::MAX_PENDING_BYTES_PER_BLOCK
-            );
-        }
+        self.kitty_pending_bytes.set(next_retained_bytes);
+        self.kitty_pending_images.borrow_mut().push(texture);
     }
 
     fn reset_kitty_pipeline(&self) {
@@ -6433,6 +6789,9 @@ impl RenderBackend for BlockBackend {
             cmd_markup: None,
             output: output_plain.trim().to_owned(),
             exit_code: record.exit_code,
+            lifecycle_schema: blocks::BLOCK_LIFECYCLE_SCHEMA,
+            completion_provenance: record.completion_provenance,
+            start_mark_seen: record.start_mark_seen,
             estimated_height,
             line_count,
             start_time_ms: record.start_time_ms,
@@ -6534,6 +6893,9 @@ impl RenderBackend for BlockBackend {
                 retained_bytes: Some(newest_estimated_bytes),
             },
         );
+        if let Some(notice) = record.lifecycle_notice() {
+            finished.widget().set_tooltip_text(Some(&notice));
+        }
         finished
             .widget()
             .insert_before(&self.block_list_rc, Some(self.active_rc.borrow().widget()));
@@ -6570,13 +6932,12 @@ impl RenderBackend for BlockBackend {
         {
             let cfg = self.config_for_cb.borrow();
             if !record.is_background && cfg.notify_long_blocks {
-                if let Some(ms) = record.duration_ms {
+                if let (Some(ms), Some(exit_code)) = (
+                    record.duration_ms,
+                    long_block_notification_exit_code(record.exit_code),
+                ) {
                     if ms >= cfg.notify_long_block_threshold_ms {
-                        crate::notify::long_block_finished(
-                            cmd,
-                            exit_code_for_i32_api(record.exit_code),
-                            ms,
-                        );
+                        crate::notify::long_block_finished(cmd, exit_code, ms);
                     }
                 }
             }
@@ -6853,6 +7214,15 @@ impl RenderBackend for UnifiedBackend {
 
     fn erase_scrollback(&self) {
         self.chrome.erase_scrollback(&self.vte);
+        self.image_layer.set_row_epoch(self.chrome.row_epoch());
+    }
+
+    fn erase_display(&self) {
+        self.chrome.erase_display();
+        self.kitty_assembler.borrow_mut().reset();
+        self.kitty_pending_admission.borrow_mut().take();
+        self.image_layer.hard_reset();
+        self.image_layer.set_row_epoch(self.chrome.row_epoch());
     }
 
     fn hard_reset(&self) {
@@ -6860,6 +7230,9 @@ impl RenderBackend for UnifiedBackend {
         self.chrome.clear_authority();
         find::clear_find_state(self.find_state_for_cb.as_ref(), &self.vte);
         self.kitty_assembler.borrow_mut().reset();
+        self.kitty_pending_admission.borrow_mut().take();
+        self.image_layer.hard_reset();
+        self.image_layer.set_row_epoch(self.chrome.row_epoch());
     }
 
     /// Preserve the continuous surface between prompts. A bare SGR reset keeps
@@ -7075,6 +7448,7 @@ impl RenderBackend for UnifiedBackend {
                     exit_code: record.exit_code,
                     duration_ms: record.duration_ms,
                     is_background: record.is_background,
+                    lifecycle_health: record.lifecycle_health(),
                 });
             let retired = {
                 let mut store = self.zones.borrow_mut();
@@ -7158,6 +7532,7 @@ impl RenderBackend for UnifiedBackend {
                 exit_code: record.exit_code,
                 duration_ms: record.duration_ms,
                 is_background: record.is_background,
+                lifecycle_health: record.lifecycle_health(),
             });
         log::debug!(
             "unified zone {} recorded: exit={:?} duration_ms={:?} background={} zones={}",
@@ -7167,13 +7542,15 @@ impl RenderBackend for UnifiedBackend {
             record.is_background,
             self.zones.borrow().records.len(),
         );
-        self.kitty_assembler.borrow_mut().reset();
+        self.kitty_assembler.borrow_mut().reset_in_flight();
+        self.kitty_pending_admission.borrow_mut().take();
     }
 
     // The block chrome is permanently absent. The organism overlay still has
     // to be suppressed while an alternate-screen application owns the VTE.
     fn enter_alt_screen_chrome(&self) {
         self.chrome.set_alt_screen(true);
+        self.image_layer.set_alt_screen(true);
         let active = self.active_rc.borrow();
         active.set_live_organism_visible(false);
         active.set_live_organism_alt_screen(true);
@@ -7181,6 +7558,7 @@ impl RenderBackend for UnifiedBackend {
 
     fn exit_alt_screen_chrome(&self) {
         self.chrome.set_alt_screen(false);
+        self.image_layer.set_alt_screen(false);
         self.active_rc.borrow().set_live_organism_alt_screen(false);
     }
 
@@ -7188,26 +7566,59 @@ impl RenderBackend for UnifiedBackend {
 
     fn exit_fullscreen(&self) {}
 
-    /// Consume complete Kitty transfers but refuse every display-capable
-    /// result: this backend has nowhere to mount the decoded texture yet.
     fn kitty_feed(&self, payload: &[u8]) -> kitty_graphics::FeedStatus {
-        let outcome = self.kitty_assembler.borrow_mut().feed(payload);
-        let status = outcome.status();
-        drop(outcome);
-        match status {
-            kitty_graphics::FeedStatus::Pending => kitty_graphics::FeedStatus::Pending,
-            kitty_graphics::FeedStatus::Invalid => kitty_graphics::FeedStatus::Invalid,
-            _ => {
-                log::debug!("unified: refusing Kitty graphics because no image surface exists");
-                kitty_graphics::FeedStatus::Skipped
-            }
+        self.kitty_pending_admission.borrow_mut().take();
+        let outcome = self
+            .kitty_assembler
+            .borrow_mut()
+            .feed_at(payload, self.vte.cursor_position());
+        self.image_layer.set_row_epoch(self.chrome.row_epoch());
+        match outcome {
+            kitty_graphics::Outcome::Complete {
+                texture,
+                encoded_source_backing_bytes,
+                placement,
+            } => match self
+                .image_layer
+                .prepare(texture, encoded_source_backing_bytes, placement)
+            {
+                Some(pending) => {
+                    self.kitty_assembler.borrow_mut().commit_display_id();
+                    *self.kitty_pending_admission.borrow_mut() = Some(pending);
+                    kitty_graphics::FeedStatus::Complete
+                }
+                None => {
+                    log::debug!(
+                        "unified: refusing Kitty placement without bounded in-viewport geometry"
+                    );
+                    kitty_graphics::FeedStatus::Skipped
+                }
+            },
+            outcome => outcome.status(),
         }
     }
 
-    fn kitty_admit_pending(&self) {}
+    fn kitty_response(
+        &self,
+        payload: &[u8],
+        status: &kitty_graphics::FeedStatus,
+    ) -> Option<Vec<u8>> {
+        self.kitty_assembler
+            .borrow_mut()
+            .response_for(payload, status)
+    }
+
+    fn kitty_admit_pending(&self) {
+        let Some(pending) = self.kitty_pending_admission.borrow_mut().take() else {
+            return;
+        };
+        let zone_reopen = self.zone_marker.borrow().open_bytes();
+        self.image_layer.admit(pending, zone_reopen.as_deref());
+    }
 
     fn reset_kitty_pipeline(&self) {
-        self.kitty_assembler.borrow_mut().reset();
+        self.kitty_assembler.borrow_mut().reset_in_flight();
+        self.kitty_pending_admission.borrow_mut().take();
     }
 
     fn set_system_clipboard(&self, text: &str) {
@@ -8827,8 +9238,7 @@ impl TermView {
         let kitty_keyboard: Rc<RefCell<KittyKeyboardStacks>> =
             Rc::new(RefCell::new(KittyKeyboardStacks::new()));
         let kitty_flags: Rc<Cell<u8>> = Rc::new(Cell::new(0));
-        let kitty_last_key: Rc<Cell<Option<(KittyKey, KittyModifiers)>>> =
-            Rc::new(Cell::new(None));
+        let kitty_last_key: Rc<Cell<Option<(KittyKey, KittyModifiers)>>> = Rc::new(Cell::new(None));
         // Dynamic OSC 10/11/12 overrides are recorded by the reader loop but
         // also read by TermView (block rebuilds) and cleared by it (theme
         // switch), so the cell is created here and shared with ReaderCtx.
@@ -9041,15 +9451,32 @@ impl TermView {
             // lifecycle engine and all state above and below it are shared.
             let backend: Rc<dyn RenderBackend> = if unified {
                 let zone_marker = Rc::new(RefCell::new(ZoneMarkerInjector::from_system_entropy()));
+                let image_layer_slot: Rc<RefCell<Option<unified_images::UnifiedImageLayer>>> =
+                    Rc::new(RefCell::new(None));
                 let chrome_authority = Rc::new(RefCell::new(
                     unified_chrome::ZoneChromeAuthority::new(zone_marker.borrow().nonce()),
                 ));
+                let image_layer_for_retention = Rc::downgrade(&image_layer_slot);
                 let chrome = unified_chrome::UnifiedChrome::new(
                     &active_vte_rc,
                     &active_rc.borrow().unified_chrome_surface,
                     chrome_authority,
                     config_for_cb.clone(),
+                    Rc::new(move |proof| {
+                        if let Some(slot) = image_layer_for_retention.upgrade() {
+                            if let Some(layer) = slot.borrow().as_ref() {
+                                layer.retire_before(proof);
+                            }
+                        }
+                    }),
                 );
+                let image_layer = unified_images::UnifiedImageLayer::new(
+                    &active_vte_rc,
+                    &active_rc.borrow().unified_image_surface,
+                    zone_marker.borrow().nonce(),
+                    chrome.image_row_projection(),
+                );
+                *image_layer_slot.borrow_mut() = Some(image_layer.clone());
                 active_rc.borrow().unified_chrome_surface.set_visible(true);
                 Rc::new(UnifiedBackend {
                     vte: active_vte_rc,
@@ -9063,8 +9490,11 @@ impl TermView {
                     find_state_for_cb: find_state.clone(),
                     zone_marker,
                     chrome,
+                    image_layer,
+                    _image_layer_slot_owner: image_layer_slot,
                     reserved_history_block_ids: reserved_history_block_ids.clone(),
                     kitty_assembler: RefCell::new(kitty_graphics::Assembler::new()),
+                    kitty_pending_admission: RefCell::new(None),
                 })
             } else {
                 Rc::new(BlockBackend {
@@ -9123,6 +9553,7 @@ impl TermView {
                     // omits the status — means "not reported", which the block
                     // header renders as neutral rather than as `exit 0`.
                     pending_exit_code: None,
+                    pending_completion_provenance: CompletionProvenance::Unknown,
                     // Metadata jsh attaches to the same marks (see
                     // ParserEvent::CommandStart).
                     shell_duration_ms: None,
@@ -9131,6 +9562,7 @@ impl TermView {
                     command_cwd: None,
                     pending_zone: None,
                     active_alt_screen_mode: None,
+                    idle_kitty_pipeline_dirty: false,
                 }),
                 live_raw_output_rc: live_raw_output.clone(),
                 live_raw_output_dropped_rc: live_raw_output_dropped.clone(),
@@ -10057,6 +10489,9 @@ impl TermView {
                             block.cwd.as_deref(),
                             cols,
                         );
+                        if let Some(notice) = block.lifecycle_notice() {
+                            finished.widget().set_tooltip_text(Some(&notice));
+                        }
                         finished.widget().insert_before(
                             &term_view.block_list,
                             Some(term_view.active.borrow().widget()),
@@ -10071,7 +10506,10 @@ impl TermView {
                             &term_view.bstate,
                             &term_view.active,
                         );
-                        finished.connect_scroll_forwarding(&term_view.block_scroll, &term_view.scroll_debouncer);
+                        finished.connect_scroll_forwarding(
+                            &term_view.block_scroll,
+                            &term_view.scroll_debouncer,
+                        );
                         install_finished_block_selection(
                             &finished,
                             &term_view.active,
@@ -11112,6 +11550,9 @@ impl TermView {
                     block.cwd.as_deref(),
                     cols,
                 );
+                if let Some(notice) = block.lifecycle_notice() {
+                    finished.widget().set_tooltip_text(Some(&notice));
+                }
                 finished
                     .widget()
                     .insert_before(&self.block_list, Some(&anchor));
@@ -11570,11 +12011,13 @@ impl TermView {
         let output =
             block.with_stripped_output(|s| crate::ai::truncate_for_context(s, lines_per_side));
         let truncated = output.contains("lines elided") || output.contains("bytes elided");
+        let (output, exit_code) =
+            shared_block_context_output(output, bd.and_then(|block| block.exit_code));
         Some(crate::ai::BlockContext {
             cmd: block.cmd_text.clone(),
             output,
             cwd: bd.and_then(|b| b.cwd.clone()),
-            exit_code: exit_code_for_i32_api(bd.and_then(|b| b.exit_code)),
+            exit_code,
             truncated,
         })
     }
@@ -11717,7 +12160,6 @@ mod tests {
         assert_eq!(super::latched_live_origin(None, 7), 7);
     }
 
-
     #[test]
     fn prompt_capture_survives_a_multibyte_char_split_across_chunks() {
         // "中" is E4 B8 AD. Split it across two appends the way two PTY reads
@@ -11725,8 +12167,10 @@ mod tests {
         let mut buf = std::collections::VecDeque::new();
         let bytes = "prompt 中 ❯ ".as_bytes();
         let cut = bytes.iter().position(|&b| b == 0xE4).unwrap() + 1;
-        let _ = super::append_bounded_output(&mut buf, &bytes[..cut], super::MAX_PROMPT_CAPTURE_BYTES);
-        let _ = super::append_bounded_output(&mut buf, &bytes[cut..], super::MAX_PROMPT_CAPTURE_BYTES);
+        let _ =
+            super::append_bounded_output(&mut buf, &bytes[..cut], super::MAX_PROMPT_CAPTURE_BYTES);
+        let _ =
+            super::append_bounded_output(&mut buf, &bytes[cut..], super::MAX_PROMPT_CAPTURE_BYTES);
         let text = String::from_utf8_lossy(buf.make_contiguous()).into_owned();
         assert_eq!(text, "prompt 中 ❯ ");
         assert!(!text.contains('\u{fffd}'));
@@ -11824,6 +12268,8 @@ mod tests {
             duration_ms: Some(id * 10),
             cwd: Some("/work".to_string()),
             is_background: false,
+            completion_provenance: super::CompletionProvenance::ShellReported,
+            start_mark_seen: true,
         };
         let mut zones = UnifiedZoneStore::new();
         let _ = record_unified_zone(&mut zones, finalized(1, "first"), 2);
@@ -11855,6 +12301,8 @@ mod tests {
                 duration_ms: Some(30),
                 cwd: Some("/work".to_string()),
                 is_background: false,
+                completion_provenance: super::CompletionProvenance::ShellReported,
+                start_mark_seen: true,
             }
         );
 
@@ -11881,6 +12329,8 @@ mod tests {
             duration_ms: None,
             cwd: None,
             is_background: false,
+            completion_provenance: super::CompletionProvenance::ShellReported,
+            start_mark_seen: true,
         };
         let mut zones = UnifiedZoneStore::new();
         for id in 1..=3 {
@@ -12891,6 +13341,9 @@ mod tests {
                 cmd_markup: None,
                 output: payload.output_plain.trim().to_string(),
                 exit_code: record.exit_code,
+                lifecycle_schema: super::blocks::BLOCK_LIFECYCLE_SCHEMA,
+                completion_provenance: record.completion_provenance,
+                start_mark_seen: record.start_mark_seen,
                 estimated_height,
                 line_count: output_trimmed.lines().count(),
                 start_time_ms: record.start_time_ms,
@@ -13315,12 +13768,14 @@ mod tests {
                     vte_typed_cmd: String::new(),
                     prompt_display: String::new(),
                     pending_exit_code: None,
+                    pending_completion_provenance: super::CompletionProvenance::Unknown,
                     shell_duration_ms: None,
                     execution_id_trusted: false,
                     agent_completion_trusted: false,
                     command_cwd: None,
                     pending_zone: None,
                     active_alt_screen_mode: None,
+                    idle_kitty_pipeline_dirty: false,
                 }),
                 live_raw_output_rc: live_raw_output.clone(),
                 live_raw_output_dropped_rc: live_raw_output_dropped.clone(),
@@ -13593,7 +14048,11 @@ mod tests {
 
         harness.feed_raw(bytes);
 
-        assert_eq!(harness.live_output(), "\x1bcafter");
+        assert_eq!(
+            harness.live_output(),
+            "",
+            "RIS atomically retires pre-reset capture and its display-only suffix"
+        );
         assert_eq!(
             harness.backend.take_calls(),
             vec![
@@ -13608,6 +14067,33 @@ mod tests {
             ]
         );
         assert_eq!(harness.ctx.engine.borrow().pending_zone, None);
+    }
+
+    #[test]
+    fn split_exact_ed2_clears_images_before_feed_and_lookalikes_do_not() {
+        assert!(super::contains_exact_ed2(b"before\x1b[2Jafter"));
+        for lookalike in [
+            b"\x1b[?2J".as_slice(),
+            b"\x1b[2;0J".as_slice(),
+            b"\x1b]0;inside \x1b[2J\x07".as_slice(),
+        ] {
+            assert!(!super::contains_exact_ed2(lookalike), "{lookalike:?}");
+        }
+        assert!(super::contains_exact_ed2(b"\x1b[02J"));
+
+        let harness = ReaderHarness::new();
+        harness.bstate.set(BlockState::CollectingOutput);
+        harness.backend.take_calls();
+        harness.feed_raw(b"\x1b[2");
+        assert!(harness.backend.take_calls().is_empty());
+        harness.feed_raw(b"J");
+        assert_eq!(
+            harness.backend.take_calls(),
+            [
+                DispatchCall::ResetKittyPipeline,
+                DispatchCall::Feed(b"\x1b[2J".to_vec()),
+            ]
+        );
     }
 
     #[test]
@@ -13627,7 +14113,7 @@ mod tests {
                     DispatchCall::ResetKittyPipeline,
                     DispatchCall::Feed(b"\x1bc".to_vec()),
                 ],
-                "\x1bc",
+                "",
             ),
             (
                 b"\x1b]0;t\x1b[3J".as_slice(),
@@ -13802,7 +14288,11 @@ mod tests {
         assert!(!harness.prompt_ready.get());
         assert_eq!(harness.ctx.agent_prompt_generation_rc.get(), 42);
         assert!(harness.ctx.typed_cmd_rc.borrow().is_empty());
-        assert_eq!(harness.live_output(), "\x1bc");
+        assert_eq!(
+            harness.live_output(),
+            "",
+            "RIS bytes belong to the reset boundary, never the next command capture"
+        );
         assert!(!harness.ctx.idle_input_dirty_rc.get());
         assert!(!harness.ctx.pty_synced_rc.get());
         assert!(!harness.ctx.cmd_running_rc.get());
@@ -13817,6 +14307,18 @@ mod tests {
             .borrow()
             .is_none());
         assert!(!harness.ctx.agent_execution_supported_rc.get());
+        assert_eq!(
+            harness.bstate.get(),
+            BlockState::RawFallback,
+            "the exact RIS bytes are display-only fallback, not command capture"
+        );
+        assert!(harness.backend.finalized_ids.borrow().is_empty());
+
+        // The first authenticated prompt after RIS starts a new lifecycle;
+        // it must not reinterpret pre-reset C/output as a missing-D block.
+        harness.feed(ParserEvent::PromptStart);
+        assert_eq!(harness.bstate.get(), BlockState::CollectingPrompt);
+        assert!(harness.backend.finalized_ids.borrow().is_empty());
     }
 
     #[test]
@@ -14104,6 +14606,99 @@ mod tests {
         assert!(!snapshot.truncated);
         drop(store);
         assert!(harness.live_output().is_empty());
+    }
+
+    #[test]
+    fn missing_d_at_a_records_degraded_provenance_without_fabricated_timing() {
+        let harness = ReaderHarness::new();
+        harness.backend.set_metadata_only(true);
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            dispatch_bytes("$ "),
+            ParserEvent::PromptEnd,
+            dispatch_command_start(Some("printf partial")),
+            dispatch_bytes("partial"),
+            ParserEvent::PromptStart,
+        ]);
+
+        let records = harness.backend.records();
+        let BackendRecords::Metadata(store) = records else {
+            panic!("metadata backend expected");
+        };
+        assert_eq!(store.records.len(), 1);
+        let record = &store.records[0];
+        assert_eq!(
+            record.completion_provenance,
+            super::CompletionProvenance::BoundaryInferred
+        );
+        assert_eq!(
+            record.lifecycle_health(),
+            super::BlockLifecycleHealth::Degraded
+        );
+        assert_eq!(record.exit_code, None);
+        assert_eq!(record.end_time_ms, None);
+        assert_eq!(record.duration_ms, None);
+        assert_eq!(super::command_history_exit_code(record.exit_code), None);
+    }
+
+    #[test]
+    fn trusted_agent_d_without_status_loses_correlation_and_observes_no_block() {
+        let harness = ReaderHarness::new();
+        let execution = AgentExecutionRef {
+            epoch: AgentSession::new(1, 2, 1).epoch(),
+            generation: 29,
+        };
+        harness.feed_all([ParserEvent::PromptStart, ParserEvent::PromptEnd]);
+        harness.feed(dispatch_command_start(Some("agent-unknown")));
+        let trusted_id = "0123456789abcdef0123456789abcdef-7".to_string();
+        *harness.ctx.execution_id_rc.borrow_mut() = Some(trusted_id.clone());
+        harness.ctx.engine.borrow_mut().execution_id_trusted = true;
+        harness.ctx.active_agent_execution_rc.set(Some(execution));
+        harness.feed(ParserEvent::CommandEnd {
+            exit: None,
+            meta: CommandMeta {
+                id: Some(trusted_id),
+                ..CommandMeta::default()
+            },
+        });
+        assert_eq!(harness.ctx.active_agent_execution_rc.get(), None);
+        assert_eq!(
+            harness.agent_lost.borrow().as_slice(),
+            &[(execution, super::AGENT_EXIT_STATUS_UNREPORTED)]
+        );
+        harness.feed(ParserEvent::PromptStart);
+        assert_eq!(harness.blocks_finished.borrow()[0].agent_execution, None);
+        assert_eq!(harness.blocks_finished.borrow()[0].exit_code, None);
+    }
+
+    #[test]
+    fn background_record_has_no_command_lifecycle_tooltip() {
+        let record = CompletedCommandRecord {
+            id: 1,
+            cmd: String::new(),
+            exit_code: None,
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: None,
+            cwd: None,
+            is_background: true,
+            completion_provenance: super::CompletionProvenance::Unknown,
+            start_mark_seen: false,
+        };
+        assert_eq!(record.lifecycle_notice(), None);
+        assert_eq!(super::long_block_notification_exit_code(None), None);
+        assert_eq!(super::long_block_notification_exit_code(Some(0)), Some(0));
+
+        let (output, exit_code) = super::shared_block_context_output("captured".to_string(), None);
+        assert_eq!(exit_code, super::UNKNOWN_EXIT_SENTINEL);
+        assert_eq!(super::exit_code_from_shared_surface(exit_code), None);
+        assert!(output.starts_with(super::UNKNOWN_EXIT_NOTE));
+        assert!(output.ends_with("captured"));
+        let (output, exit_code) =
+            super::shared_block_context_output("captured".to_string(), Some(0));
+        assert_eq!(exit_code, 0);
+        assert_eq!(super::exit_code_from_shared_surface(exit_code), Some(0));
+        assert_eq!(output, "captured");
     }
 
     /// Pin for the snapshot provenance invariant, driven through the real
@@ -15163,6 +15758,34 @@ mod tests {
     }
 
     #[test]
+    fn idle_kitty_complete_or_partial_upload_never_spills_into_the_next_command() {
+        for status in [
+            crate::terminal::kitty_graphics::FeedStatus::Complete,
+            crate::terminal::kitty_graphics::FeedStatus::Pending,
+        ] {
+            let harness = ReaderHarness::new();
+            harness.feed_all([ParserEvent::PromptStart, ParserEvent::PromptEnd]);
+            harness.backend.kitty_status.set(status);
+            harness.feed(ParserEvent::ApcSequence(b"Gi=41,a=T;AAAA".to_vec()));
+            assert!(harness.ctx.engine.borrow().idle_kitty_pipeline_dirty);
+
+            harness.feed_all([ParserEvent::PromptStart, ParserEvent::PromptEnd]);
+            harness.backend.take_calls();
+            harness.feed(dispatch_command_start(Some("next")));
+            let calls = harness.backend.take_calls();
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| matches!(call, DispatchCall::ResetKittyPipeline))
+                    .count(),
+                1,
+                "{status:?}: {calls:?}"
+            );
+            assert!(!harness.ctx.engine.borrow().idle_kitty_pipeline_dirty);
+        }
+    }
+
+    #[test]
     fn reader_dispatch_cpr_uses_the_dedicated_row_then_column_query() {
         let harness = ReaderHarness::new();
         harness.backend.render_row(3, "user@host $ ");
@@ -15261,7 +15884,10 @@ mod tests {
             Some(Key::Cyrillic_ghe)
         );
         // A layout with no level-0 entry falls back to any.
-        assert_eq!(super::base_keyval_in_layout(&entries, 7), Some(Key::Cyrillic_ghe));
+        assert_eq!(
+            super::base_keyval_in_layout(&entries, 7),
+            Some(Key::Cyrillic_ghe)
+        );
         assert_eq!(super::base_keyval_in_layout(&[], 0), None);
         // Without a keymap the lowercase keyval is the base form.
         assert_eq!(base_unicode_for(Key::A, 0, 0, None), Some('a'));
@@ -16467,6 +17093,13 @@ mod tests {
             cmd_markup: None,
             output: format!("output-{id}"),
             exit_code,
+            lifecycle_schema: super::blocks::BLOCK_LIFECYCLE_SCHEMA,
+            completion_provenance: if cmd.trim().is_empty() {
+                super::CompletionProvenance::Unknown
+            } else {
+                super::CompletionProvenance::ShellReported
+            },
+            start_mark_seen: !cmd.trim().is_empty(),
             estimated_height: 1,
             line_count: 1,
             start_time_ms: None,

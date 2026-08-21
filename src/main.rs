@@ -1922,21 +1922,24 @@ impl SimpleComponent for AppModel {
             } => {
                 if let Some((tab_index, pane_index)) = self.find_pane(pane_id) {
                     let tab_id = self.tabs[tab_index].id;
+                    let reported_exit = crate::block_view::exit_code_from_shared_surface(exit_code);
                     {
                         let pane = &mut self.tabs[tab_index].panes[pane_index];
-                        pane.last_exit = Some(exit_code);
+                        pane.last_exit = reported_exit;
                         pane.last_duration_ms = duration_ms;
                     }
                     self.refresh_bottom_bar();
                     self.pin_command_suggestion(pane_id);
-                    self.maybe_start_command_correction(
-                        pane_id,
-                        command.clone(),
-                        exit_code,
-                        output_sample.clone(),
-                        agent_execution.is_some(),
-                        &sender,
-                    );
+                    if let Some(exit_code) = reported_exit {
+                        self.maybe_start_command_correction(
+                            pane_id,
+                            command.clone(),
+                            exit_code,
+                            output_sample.clone(),
+                            agent_execution.is_some(),
+                            &sender,
+                        );
+                    }
                     self.agent_handle_block_finished(
                         agent_ops::AgentBlockCompletion {
                             tab_id,

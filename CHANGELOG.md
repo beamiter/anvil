@@ -7,6 +7,17 @@ versioning for tagged releases while it remains experimental.
 
 ### Added
 
+- Unified mode now renders Kitty `a=T` images on a probe-addressed GTK layer
+  below the organism surface. Chunked uploads retain first-chunk geometry and
+  final-chunk cursor identity; images stay aligned across scrolling and rewrap, while
+  ED3, RIS, alternate-screen transitions, row retention and memory limits all
+  fail closed. Block image accounting now also includes PNG backing and GTK
+  object overhead, with a 64-image cap.
+- Block and Unified command records now keep completion provenance separately
+  from exit status. A missing OSC 133 `D` can recover only when the shell owns
+  the PTY foreground; inferred records are visibly degraded and never receive
+  fabricated end times or durations. Legacy/restored weak records do not gain
+  trust, and RIS clears active Agent/command correlation before the next prompt.
 - A persistent Relm4-native **AI Chats** side panel with a searchable retained
   chat library, per-chat drafts and selected-Block context, automatic titles,
   rename/archive/delete, concurrent owner-bound streaming requests, Stop/Retry,

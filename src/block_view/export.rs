@@ -27,6 +27,10 @@ struct MetadataRecordExport<'a> {
     duration_ms: Option<u64>,
     cwd: Option<&'a str>,
     is_background: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completion_provenance: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lifecycle_health: Option<&'a str>,
     /// The bounded finalize-time snapshot. Omitted — never an empty string —
     /// when no snapshot is retained (none was captured, or the global budget
     /// evicted it).
@@ -47,11 +51,23 @@ fn metadata_record_export<'a>(
         id: record.id,
         cmd: &record.cmd,
         exit_code: record.exit_code,
-        start_time_ms: record.start_time_ms,
-        end_time_ms: record.end_time_ms,
-        duration_ms: record.duration_ms,
+        start_time_ms: record
+            .timing_is_authoritative()
+            .then_some(record.start_time_ms)
+            .flatten(),
+        end_time_ms: record
+            .timing_is_authoritative()
+            .then_some(record.end_time_ms)
+            .flatten(),
+        duration_ms: record
+            .timing_is_authoritative()
+            .then_some(record.duration_ms)
+            .flatten(),
         cwd: record.cwd.as_deref(),
         is_background: record.is_background,
+        completion_provenance: (!record.is_background)
+            .then_some(record.completion_provenance.as_str()),
+        lifecycle_health: (!record.is_background).then_some(record.lifecycle_health().as_str()),
         output: snapshot.map(|snapshot| snapshot.plain.as_str()),
         output_truncated: snapshot.map(|snapshot| snapshot.truncated),
         output_available: snapshot.is_some(),
@@ -65,8 +81,9 @@ fn metadata_record_markdown(
     let mut markdown = if record.is_background {
         "## Background Output\n\n".to_string()
     } else {
+        let fence = markdown_fence(&record.cmd);
         format!(
-            "## Command Record\n\n**Command:**\n```bash\n{}\n```\n\n",
+            "## Command Record\n\n**Command:**\n{fence}bash\n{}\n{fence}\n\n",
             record.cmd
         )
     };
@@ -91,8 +108,17 @@ fn metadata_record_markdown(
             Some(code) => markdown.push_str(&format!("**Exit Code:** {code}\n\n")),
             None => markdown.push_str("**Exit Code:** unknown (the shell reported none)\n\n"),
         }
+        markdown.push_str(&format!(
+            "**Lifecycle:** {} ({})\n\n",
+            record.lifecycle_health().as_str(),
+            record.completion_provenance.as_str(),
+        ));
     }
-    if let Some(duration_ms) = record.duration_ms {
+    if let Some(duration_ms) = record
+        .timing_is_authoritative()
+        .then_some(record.duration_ms)
+        .flatten()
+    {
         markdown.push_str(&format!(
             "**Duration:** {:.3}s\n\n",
             duration_ms as f64 / 1_000.0
@@ -324,6 +350,8 @@ mod tests {
             duration_ms: Some(15),
             cwd: Some("/work".to_string()),
             is_background: false,
+            completion_provenance: crate::block_view::CompletionProvenance::ShellReported,
+            start_mark_seen: true,
         }
     }
 
@@ -341,6 +369,25 @@ mod tests {
         let markdown = metadata_record_markdown(&record, None);
         assert!(markdown.contains("retained on the live Unified terminal surface only"));
         assert!(markdown.contains("**Exit Code:** 1"));
+    }
+
+    #[test]
+    fn inferred_completion_exports_degraded_without_fabricated_timing() {
+        let mut record = metadata_record(12);
+        record.exit_code = None;
+        record.completion_provenance = crate::block_view::CompletionProvenance::BoundaryInferred;
+        // Even a hand-edited/older persistence record cannot smuggle timing
+        // back onto a source which did not report its completion boundary.
+        record.end_time_ms = Some(25);
+        record.duration_ms = Some(15);
+        let export = serde_json::to_value(metadata_record_export(&record, None)).unwrap();
+        assert_eq!(export["completion_provenance"], "boundary_inferred");
+        assert_eq!(export["lifecycle_health"], "degraded");
+        assert_eq!(export["end_time_ms"], serde_json::Value::Null);
+        assert_eq!(export["duration_ms"], serde_json::Value::Null);
+        let markdown = metadata_record_markdown(&record, None);
+        assert!(markdown.contains("**Lifecycle:** degraded (boundary_inferred)"));
+        assert!(!markdown.contains("**Duration:**"));
     }
 
     #[test]
@@ -371,13 +418,15 @@ mod tests {
     /// let it escape its own block and forge document structure.
     #[test]
     fn snapshot_markdown_fence_outlives_backticks_in_the_output() {
-        let record = metadata_record(9);
+        let mut record = metadata_record(9);
+        record.cmd = "printf '```'".to_string();
         let snapshot = ZoneOutputSnapshot {
             plain: "```\n## not a document heading".to_string(),
             truncated: false,
         };
-        assert!(metadata_record_markdown(&record, Some(&snapshot))
-            .contains("**Output:**\n````\n```\n## not a document heading\n````\n\n"));
+        let markdown = metadata_record_markdown(&record, Some(&snapshot));
+        assert!(markdown.contains("**Command:**\n````bash\nprintf '```'\n````\n\n"));
+        assert!(markdown.contains("**Output:**\n````\n```\n## not a document heading\n````\n\n"));
     }
 
     /// Budget eviction removes only snapshot bytes; the surviving record must

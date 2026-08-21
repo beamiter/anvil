@@ -352,7 +352,10 @@ mod tests {
         let outer = block.widget().clone();
         block.connect_scroll_forwarding(
             &gtk::ScrolledWindow::new(),
-            &ScrollDebouncer::with_scroll_lock(Rc::new(Cell::new(false)), Rc::new(Cell::new(false))),
+            &ScrollDebouncer::with_scroll_lock(
+                Rc::new(Cell::new(false)),
+                Rc::new(Cell::new(false)),
+            ),
         );
         drop(block);
         pool.release(outer);
