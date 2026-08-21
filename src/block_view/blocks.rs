@@ -213,7 +213,7 @@ pub(crate) struct BlockData {
     #[serde(skip, default = "block_lifecycle_schema")]
     pub(crate) lifecycle_schema: u32,
     #[serde(default)]
-    pub(crate) completion_provenance: CompletionProvenance,
+    pub(crate) completion_provenance: CompletionProvenanceWire,
     #[serde(default)]
     pub(crate) start_mark_seen: bool,
     pub(crate) estimated_height: i32,
@@ -258,13 +258,14 @@ impl BlockData {
     }
 
     pub(crate) fn lifecycle_health(&self) -> BlockLifecycleHealth {
-        assess_lifecycle(self.start_mark_seen, self.completion_provenance)
+        assess_lifecycle(self.start_mark_seen, self.completion_provenance.into())
     }
 
     pub(crate) fn timing_is_authoritative(&self) -> bool {
+        let completion_provenance = CompletionProvenance::from(self.completion_provenance);
         self.is_background()
-            || self.completion_provenance == CompletionProvenance::JournalRecovered
-            || (self.completion_provenance == CompletionProvenance::ShellReported
+            || completion_provenance == CompletionProvenance::JournalRecovered
+            || (completion_provenance == CompletionProvenance::ShellReported
                 && self.start_mark_seen)
     }
 
@@ -278,7 +279,7 @@ impl BlockData {
                 "Recovered command record — terminal rows were reconstructed from session history"
                     .to_string(),
             ),
-            BlockLifecycleHealth::Degraded => Some(match self.completion_provenance {
+            BlockLifecycleHealth::Degraded => Some(match self.completion_provenance.into() {
                 CompletionProvenance::BoundaryInferred =>
                     "Command completion inferred from a trusted prompt boundary; exit status and timing are unavailable".to_string(),
                 CompletionProvenance::ShellReported =>
@@ -323,7 +324,7 @@ impl BlockData {
             } else {
                 object.insert(
                     "lifecycle_health".to_string(),
-                    serde_json::Value::String(self.lifecycle_health().as_str().to_string()),
+                    serde_json::Value::String(self.lifecycle_health().schema_name().to_string()),
                 );
             }
             if !self.timing_is_authoritative() {
@@ -372,7 +373,7 @@ impl BlockData {
             }
             md.push_str(&format!(
                 "**Lifecycle:** {} ({})\n\n",
-                self.lifecycle_health().as_str(),
+                self.lifecycle_health().schema_name(),
                 self.completion_provenance.as_str(),
             ));
         }
@@ -1374,7 +1375,7 @@ mod tests {
             output: "built".to_string(),
             exit_code,
             lifecycle_schema: BLOCK_LIFECYCLE_SCHEMA,
-            completion_provenance: CompletionProvenance::ShellReported,
+            completion_provenance: CompletionProvenance::ShellReported.into(),
             start_mark_seen: true,
             estimated_height: 1,
             line_count: 1,
@@ -1549,7 +1550,7 @@ mod tests {
     #[test]
     fn block_json_uses_shared_lifecycle_vocabulary_and_background_omits_it() {
         let mut inferred = finished_block(None);
-        inferred.completion_provenance = super::CompletionProvenance::BoundaryInferred;
+        inferred.completion_provenance = super::CompletionProvenance::BoundaryInferred.into();
         inferred.start_mark_seen = true;
         let json: serde_json::Value = serde_json::from_str(&inferred.to_json()).unwrap();
         assert_eq!(json["completion_provenance"], "boundary_inferred");

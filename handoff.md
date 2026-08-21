@@ -225,8 +225,8 @@ captured, queued, written, and restored.
   holding the private parent lock. The public name is consumed once, invalid
   evidence is quarantined, typed claim-acquisition errors retain the public
   path, and the parent namespace is synced before a claimed session is accepted.
-  `jterm_core` is pinned to `48d25f155b960417609ffc85a98b7c9ba44c5772`
-  (transitively jagent `a09fd1563b862f96bed7047834720aeb31c163e2`).
+  `jterm_core` is pinned to `3e09b161a36e2ec30f730eee8f8d6702b2bacc35`
+  (transitively jagent `d52002e4a18735e8cfec718da5fea8f0a5cfaaf8`).
 
 ## Remaining boundaries
 

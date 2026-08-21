@@ -20,6 +20,9 @@ use crate::parser::{
 use crate::pty::OwnedPty;
 use crate::pty_input;
 use crate::terminal::kitty_graphics;
+pub(crate) use jterm_core::block_contract::{
+    assess_lifecycle, BlockLifecycleHealth, CompletionProvenance,
+};
 use jterm_core::kitty_keyboard::{
     self, KittyKey, KittyKeyboardStacks, Modifiers as KittyModifiers,
 };
@@ -2572,9 +2575,10 @@ pub(crate) enum AltScreenTransition {
     Left,
 }
 
-/// Local mirror of the next `jterm_core::block_contract` lifecycle contract.
-/// The current dependency pin predates it; names and truth table intentionally
-/// match so moving to the shared type is mechanical.
+/// Stable frontend-owned wire representation for Block/Unified persistence.
+/// Runtime lifecycle semantics come from `jterm_core::block_contract`; keeping
+/// this enum local prevents UI serialization dependencies from leaking into
+/// the renderer-neutral core contract.
 #[derive(
     Clone,
     Copy,
@@ -2590,7 +2594,7 @@ pub(crate) enum AltScreenTransition {
     rkyv::Deserialize,
 )]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum CompletionProvenance {
+pub(crate) enum CompletionProvenanceWire {
     ShellReported,
     JournalRecovered,
     BoundaryInferred,
@@ -2598,8 +2602,8 @@ pub(crate) enum CompletionProvenance {
     Unknown,
 }
 
-impl CompletionProvenance {
-    const fn as_str(self) -> &'static str {
+impl CompletionProvenanceWire {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::ShellReported => "shell_reported",
             Self::JournalRecovered => "journal_recovered",
@@ -2609,36 +2613,25 @@ impl CompletionProvenance {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum BlockLifecycleHealth {
-    Healthy,
-    Recovered,
-    Degraded,
-    Incomplete,
-}
-
-impl BlockLifecycleHealth {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Healthy => "healthy",
-            Self::Recovered => "recovered",
-            Self::Degraded => "degraded",
-            Self::Incomplete => "incomplete",
+impl From<CompletionProvenance> for CompletionProvenanceWire {
+    fn from(value: CompletionProvenance) -> Self {
+        match value {
+            CompletionProvenance::ShellReported => Self::ShellReported,
+            CompletionProvenance::JournalRecovered => Self::JournalRecovered,
+            CompletionProvenance::BoundaryInferred => Self::BoundaryInferred,
+            CompletionProvenance::Unknown => Self::Unknown,
         }
     }
 }
 
-const fn assess_lifecycle(
-    start_mark_seen: bool,
-    provenance: CompletionProvenance,
-) -> BlockLifecycleHealth {
-    match provenance {
-        CompletionProvenance::ShellReported if start_mark_seen => BlockLifecycleHealth::Healthy,
-        CompletionProvenance::JournalRecovered => BlockLifecycleHealth::Recovered,
-        CompletionProvenance::ShellReported | CompletionProvenance::BoundaryInferred => {
-            BlockLifecycleHealth::Degraded
+impl From<CompletionProvenanceWire> for CompletionProvenance {
+    fn from(value: CompletionProvenanceWire) -> Self {
+        match value {
+            CompletionProvenanceWire::ShellReported => Self::ShellReported,
+            CompletionProvenanceWire::JournalRecovered => Self::JournalRecovered,
+            CompletionProvenanceWire::BoundaryInferred => Self::BoundaryInferred,
+            CompletionProvenanceWire::Unknown => Self::Unknown,
         }
-        CompletionProvenance::Unknown => BlockLifecycleHealth::Incomplete,
     }
 }
 
@@ -4850,10 +4843,11 @@ impl ReaderCtx {
             // ahead of dispatch. Core's copy of the token needs no handling.
             ParserEvent::AgentIntegrationReady(_) => {}
             // Core barrier events: emitted immediately before the exact
-            // ED3/RIS bytes are passed through as Bytes, so the invalidation
+            // ED2/ED3/RIS bytes are passed through as Bytes, so invalidation
             // runs once per sequence, ahead of the VTE feed. The splitter
             // keeps the part boundary (observation ordering) but no longer
             // synthesizes these calls itself.
+            ParserEvent::EraseDisplay => self.on_erase_display(),
             ParserEvent::EraseScrollback => self.on_erase_scrollback(),
             ParserEvent::HardReset => self.on_hard_reset(),
             ParserEvent::KittyKeyboard(op) => self.on_kitty_keyboard(*op),
@@ -4872,6 +4866,14 @@ impl ReaderCtx {
         // adjustment/cursor pair that settles asynchronously.
         self.live_extent_force_full_rc.set(true);
         self.backend.erase_scrollback();
+    }
+
+    fn on_erase_display(&self) {
+        // Core recognizes only the ordinary numeric ED2 forms and emits this
+        // barrier before the bytes reach VTE. Image and row authority must be
+        // invalidated against that pre-feed mapping.
+        self.backend.erase_display();
+        self.engine.borrow_mut().idle_kitty_pipeline_dirty = false;
     }
 
     fn on_decset_mode(&self, mode: u32, set: bool) {
@@ -5054,10 +5056,6 @@ impl ReaderCtx {
     }
 
     fn on_bytes(&self, bytes: &[u8], state: BlockState) {
-        if contains_exact_ed2(bytes) {
-            self.backend.erase_display();
-            self.engine.borrow_mut().idle_kitty_pipeline_dirty = false;
-        }
         if state == BlockState::AwaitingCommand {
             if let Some(submission) = self.verified_submission.submission.borrow_mut().as_mut() {
                 if submission.phase == ReviewedSubmissionPhase::Submitted
@@ -6141,63 +6139,6 @@ fn coalesce_bytes_events(events: &mut Vec<ParserEvent>) {
     events.truncate(write);
 }
 
-/// Parser-complete exact CSI 2 J outside opaque control strings. Numeric and
-/// private-mode lookalikes are not clear authority.
-fn contains_exact_ed2(bytes: &[u8]) -> bool {
-    let numeric_is_two = |params: &[u8]| {
-        !params.is_empty()
-            && params.iter().all(u8::is_ascii_digit)
-            && params.iter().try_fold(0u32, |value, digit| {
-                value.checked_mul(10)?.checked_add(u32::from(*digit - b'0'))
-            }) == Some(2)
-    };
-    let mut index = 0usize;
-    while index < bytes.len() {
-        let body_start = if bytes[index] == 0x9b {
-            Some(index + 1)
-        } else if bytes[index..].starts_with(b"\x1b[") {
-            Some(index + 2)
-        } else {
-            None
-        };
-        if let Some(body_start) = body_start {
-            let mut end = body_start;
-            while end < bytes.len() && !(0x40..=0x7e).contains(&bytes[end]) {
-                end += 1;
-            }
-            if end == bytes.len() {
-                return false;
-            }
-            if bytes[end] == b'J' && numeric_is_two(&bytes[body_start..end]) {
-                return true;
-            }
-            index = end + 1;
-            continue;
-        }
-        if bytes[index] == 0x1b
-            && bytes
-                .get(index + 1)
-                .is_some_and(|byte| matches!(*byte, b']' | b'P' | b'_' | b'X' | b'^'))
-        {
-            index += 2;
-            while index < bytes.len() {
-                if bytes[index] == 0x07 {
-                    index += 1;
-                    break;
-                }
-                if bytes[index..].starts_with(b"\x1b\\") {
-                    index += 2;
-                    break;
-                }
-                index += 1;
-            }
-            continue;
-        }
-        index += 1;
-    }
-    false
-}
-
 /// Minimum spacing between OSC 9/777 desktop notifications. The request
 /// originates inside the PTY (and may be remote over SSH), so spawning
 /// `notify-send` is rate-limited app-wide rather than per pane.
@@ -6790,7 +6731,7 @@ impl RenderBackend for BlockBackend {
             output: output_plain.trim().to_owned(),
             exit_code: record.exit_code,
             lifecycle_schema: blocks::BLOCK_LIFECYCLE_SCHEMA,
-            completion_provenance: record.completion_provenance,
+            completion_provenance: record.completion_provenance.into(),
             start_mark_seen: record.start_mark_seen,
             estimated_height,
             line_count,
@@ -13342,7 +13283,7 @@ mod tests {
                 output: payload.output_plain.trim().to_string(),
                 exit_code: record.exit_code,
                 lifecycle_schema: super::blocks::BLOCK_LIFECYCLE_SCHEMA,
-                completion_provenance: record.completion_provenance,
+                completion_provenance: record.completion_provenance.into(),
                 start_mark_seen: record.start_mark_seen,
                 estimated_height,
                 line_count: output_trimmed.lines().count(),
@@ -14070,17 +14011,7 @@ mod tests {
     }
 
     #[test]
-    fn split_exact_ed2_clears_images_before_feed_and_lookalikes_do_not() {
-        assert!(super::contains_exact_ed2(b"before\x1b[2Jafter"));
-        for lookalike in [
-            b"\x1b[?2J".as_slice(),
-            b"\x1b[2;0J".as_slice(),
-            b"\x1b]0;inside \x1b[2J\x07".as_slice(),
-        ] {
-            assert!(!super::contains_exact_ed2(lookalike), "{lookalike:?}");
-        }
-        assert!(super::contains_exact_ed2(b"\x1b[02J"));
-
+    fn core_ed2_event_clears_images_before_feed_and_lookalikes_do_not() {
         let harness = ReaderHarness::new();
         harness.bstate.set(BlockState::CollectingOutput);
         harness.backend.take_calls();
@@ -14094,6 +14025,51 @@ mod tests {
                 DispatchCall::Feed(b"\x1b[2J".to_vec()),
             ]
         );
+
+        let zero_padded = ReaderHarness::new();
+        zero_padded.bstate.set(BlockState::CollectingOutput);
+        zero_padded.backend.take_calls();
+        zero_padded.feed_raw(b"\x1b[02J");
+        assert_eq!(
+            zero_padded.backend.take_calls(),
+            [
+                DispatchCall::ResetKittyPipeline,
+                DispatchCall::Feed(b"\x1b[02J".to_vec()),
+            ]
+        );
+
+        for c1 in [b"\x9b2J".as_slice(), b"\xc2\x9b2J".as_slice()] {
+            let harness = ReaderHarness::new();
+            harness.bstate.set(BlockState::CollectingOutput);
+            harness.backend.take_calls();
+            harness.feed_raw(c1);
+            assert_eq!(
+                harness.backend.take_calls(),
+                [
+                    DispatchCall::ResetKittyPipeline,
+                    DispatchCall::Feed(c1.to_vec()),
+                ],
+                "C1 CSI must retain the pre-feed EraseDisplay barrier: {c1:?}"
+            );
+        }
+
+        for lookalike in [
+            b"\x1b[?2J".as_slice(),
+            b"\x1b[2;0J".as_slice(),
+            b"\x1b]0;inside [2J\x07".as_slice(),
+            b"\xe1\x9b\x802J".as_slice(),
+            b"\xe2\x82\x9b2J".as_slice(),
+        ] {
+            let harness = ReaderHarness::new();
+            harness.bstate.set(BlockState::CollectingOutput);
+            harness.backend.take_calls();
+            harness.feed_raw(lookalike);
+            let calls = harness.backend.take_calls();
+            assert!(
+                !calls.contains(&DispatchCall::ResetKittyPipeline),
+                "lookalike must not emit EraseDisplay: {lookalike:?}; calls={calls:?}"
+            );
+        }
     }
 
     #[test]
@@ -17094,11 +17070,12 @@ mod tests {
             output: format!("output-{id}"),
             exit_code,
             lifecycle_schema: super::blocks::BLOCK_LIFECYCLE_SCHEMA,
-            completion_provenance: if cmd.trim().is_empty() {
+            completion_provenance: (if cmd.trim().is_empty() {
                 super::CompletionProvenance::Unknown
             } else {
                 super::CompletionProvenance::ShellReported
-            },
+            })
+            .into(),
             start_mark_seen: !cmd.trim().is_empty(),
             estimated_height: 1,
             line_count: 1,

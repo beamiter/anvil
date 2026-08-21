@@ -18,7 +18,9 @@
 use std::io;
 use std::path::Path;
 
-use super::{CompletedCommandRecord, ZoneOutputSnapshot};
+use super::{
+    CompletedCommandRecord, CompletionProvenance, CompletionProvenanceWire, ZoneOutputSnapshot,
+};
 
 /// Zones retained across a restart. The design bound: enough to recognise the
 /// session, far short of the 200-zone in-memory cap.
@@ -34,39 +36,21 @@ pub(super) const MAX_ZONE_HISTORY_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
 const FORMAT_VERSION: u32 = 1;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum PersistedCompletionProvenance {
-    ShellReported,
-    JournalRecovered,
-    BoundaryInferred,
-    #[default]
-    Unknown,
-}
-
-impl From<super::CompletionProvenance> for PersistedCompletionProvenance {
-    fn from(value: super::CompletionProvenance) -> Self {
-        match value {
-            super::CompletionProvenance::ShellReported => Self::ShellReported,
-            super::CompletionProvenance::JournalRecovered => Self::JournalRecovered,
-            super::CompletionProvenance::BoundaryInferred => Self::BoundaryInferred,
-            super::CompletionProvenance::Unknown => Self::Unknown,
+/// Persistence may describe where a live record originally came from, but
+/// replay must never upgrade a weak source. Only an originally trusted or
+/// already-recovered record becomes JournalRecovered in this process.
+fn replayed_completion_provenance(
+    provenance: CompletionProvenanceWire,
+    start_mark_seen: bool,
+) -> CompletionProvenance {
+    match provenance {
+        CompletionProvenanceWire::ShellReported if start_mark_seen => {
+            CompletionProvenance::JournalRecovered
         }
-    }
-}
-
-impl PersistedCompletionProvenance {
-    /// Persistence may describe where a live record originally came from, but
-    /// replay must never upgrade a weak source. Only an originally trusted or
-    /// already-recovered record becomes JournalRecovered in this process.
-    fn replayed(self, start_mark_seen: bool) -> super::CompletionProvenance {
-        match self {
-            Self::ShellReported if start_mark_seen => super::CompletionProvenance::JournalRecovered,
-            Self::ShellReported => super::CompletionProvenance::ShellReported,
-            Self::JournalRecovered => super::CompletionProvenance::JournalRecovered,
-            Self::BoundaryInferred => super::CompletionProvenance::BoundaryInferred,
-            Self::Unknown => super::CompletionProvenance::Unknown,
-        }
+        CompletionProvenanceWire::ShellReported => CompletionProvenance::ShellReported,
+        CompletionProvenanceWire::JournalRecovered => CompletionProvenance::JournalRecovered,
+        CompletionProvenanceWire::BoundaryInferred => CompletionProvenance::BoundaryInferred,
+        CompletionProvenanceWire::Unknown => CompletionProvenance::Unknown,
     }
 }
 
@@ -88,7 +72,7 @@ pub(super) struct PersistedZone {
     #[serde(default)]
     pub(super) is_background: bool,
     #[serde(default)]
-    completion_provenance: PersistedCompletionProvenance,
+    completion_provenance: CompletionProvenanceWire,
     #[serde(default)]
     start_mark_seen: bool,
     /// Absent when the zone retained no snapshot. An absent snapshot must
@@ -134,15 +118,14 @@ impl PersistedZone {
             truncated: self.output_truncated,
         });
         let completion_provenance = if self.is_background {
-            super::CompletionProvenance::Unknown
+            CompletionProvenance::Unknown
         } else {
-            self.completion_provenance.replayed(self.start_mark_seen)
+            replayed_completion_provenance(self.completion_provenance, self.start_mark_seen)
         };
         let start_mark_seen = !self.is_background && self.start_mark_seen;
         let timing_is_authoritative = completion_provenance
-            == super::CompletionProvenance::JournalRecovered
-            || (completion_provenance == super::CompletionProvenance::ShellReported
-                && start_mark_seen);
+            == CompletionProvenance::JournalRecovered
+            || (completion_provenance == CompletionProvenance::ShellReported && start_mark_seen);
         (
             CompletedCommandRecord {
                 id,
@@ -331,7 +314,7 @@ mod tests {
             duration_ms: Some(5),
             cwd: Some("/tmp".to_string()),
             is_background: false,
-            completion_provenance: PersistedCompletionProvenance::ShellReported,
+            completion_provenance: CompletionProvenanceWire::ShellReported,
             start_mark_seen: true,
             output: output.map(str::to_string),
             output_truncated: false,
@@ -410,7 +393,7 @@ mod tests {
     #[test]
     fn inferred_completion_round_trip_is_never_upgraded_to_recovered() {
         let mut inferred = zone("inferred", None);
-        inferred.completion_provenance = PersistedCompletionProvenance::BoundaryInferred;
+        inferred.completion_provenance = CompletionProvenanceWire::BoundaryInferred;
         inferred.start_mark_seen = true;
         let encoded = encode_session(vec![inferred]).unwrap();
         let mut decoded = decode_session(&encoded).unwrap();
@@ -431,7 +414,7 @@ mod tests {
     #[test]
     fn contradictory_shell_report_without_start_mark_stays_degraded() {
         let mut contradictory = zone("contradictory", None);
-        contradictory.completion_provenance = PersistedCompletionProvenance::ShellReported;
+        contradictory.completion_provenance = CompletionProvenanceWire::ShellReported;
         contradictory.start_mark_seen = false;
         let encoded = encode_session(vec![contradictory]).unwrap();
         let mut decoded = decode_session(&encoded).unwrap();
@@ -457,7 +440,7 @@ mod tests {
         background.start_time_ms = Some(1);
         background.end_time_ms = Some(2);
         background.duration_ms = Some(1);
-        background.completion_provenance = PersistedCompletionProvenance::ShellReported;
+        background.completion_provenance = CompletionProvenanceWire::ShellReported;
         background.start_mark_seen = true;
         let (record, _) = background.into_live(12);
         assert!(record.is_background);

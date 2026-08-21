@@ -66,8 +66,9 @@ fn metadata_record_export<'a>(
         cwd: record.cwd.as_deref(),
         is_background: record.is_background,
         completion_provenance: (!record.is_background)
-            .then_some(record.completion_provenance.as_str()),
-        lifecycle_health: (!record.is_background).then_some(record.lifecycle_health().as_str()),
+            .then_some(record.completion_provenance.schema_name()),
+        lifecycle_health: (!record.is_background)
+            .then_some(record.lifecycle_health().schema_name()),
         output: snapshot.map(|snapshot| snapshot.plain.as_str()),
         output_truncated: snapshot.map(|snapshot| snapshot.truncated),
         output_available: snapshot.is_some(),
@@ -110,8 +111,8 @@ fn metadata_record_markdown(
         }
         markdown.push_str(&format!(
             "**Lifecycle:** {} ({})\n\n",
-            record.lifecycle_health().as_str(),
-            record.completion_provenance.as_str(),
+            record.lifecycle_health().schema_name(),
+            record.completion_provenance.schema_name(),
         ));
     }
     if let Some(duration_ms) = record

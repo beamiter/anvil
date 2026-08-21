@@ -551,11 +551,12 @@ impl From<LegacyBlockDataV2> for BlockData {
             output: legacy.output,
             exit_code: (!is_background).then_some(legacy.exit_code).flatten(),
             lifecycle_schema: super::blocks::BLOCK_LIFECYCLE_SCHEMA,
-            completion_provenance: if trusted_completion {
+            completion_provenance: (if trusted_completion {
                 super::CompletionProvenance::JournalRecovered
             } else {
                 super::CompletionProvenance::Unknown
-            },
+            })
+            .into(),
             start_mark_seen: trusted_completion,
             estimated_height: legacy.estimated_height,
             line_count: legacy.line_count,
@@ -603,7 +604,7 @@ fn decode_block_record(data: &[u8], prefer_compressed: bool) -> io::Result<(Bloc
 fn normalize_block_lifecycle(mut block: BlockData) -> BlockData {
     if block.is_background() {
         block.exit_code = None;
-        block.completion_provenance = super::CompletionProvenance::Unknown;
+        block.completion_provenance = super::CompletionProvenance::Unknown.into();
         block.start_mark_seen = false;
     }
     if block.is_background() || !block.timing_is_authoritative() {
@@ -1530,7 +1531,7 @@ mod tests {
             output: format!("output for {cmd}\n"),
             exit_code: Some(0),
             lifecycle_schema: super::super::blocks::BLOCK_LIFECYCLE_SCHEMA,
-            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            completion_provenance: super::super::CompletionProvenance::ShellReported.into(),
             start_mark_seen: true,
             estimated_height: 2,
             line_count: 1,
@@ -2011,7 +2012,7 @@ mod tests {
         assert_eq!(decoded.exit_code, None);
         assert_eq!(
             decoded.completion_provenance,
-            super::super::CompletionProvenance::Unknown
+            super::super::CompletionProvenanceWire::Unknown
         );
         assert!(!decoded.start_mark_seen);
     }
@@ -2042,7 +2043,7 @@ mod tests {
         assert_eq!(decoded.duration_ms, None);
         assert_eq!(
             decoded.completion_provenance,
-            super::super::CompletionProvenance::Unknown
+            super::super::CompletionProvenanceWire::Unknown
         );
         assert!(!decoded.start_mark_seen);
     }
