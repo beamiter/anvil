@@ -142,8 +142,12 @@ impl SidebarView {
 
 pub(crate) const MAX_REMOTE_HOSTS: usize = 128;
 pub(crate) const MAX_SESSION_ID_BYTES: usize = 1024;
+const MAX_REMOTE_ARGV_BYTES: usize = 512 * 1024;
 const MAX_CONFIG_PATH_BYTES: usize = 16 * 1024;
 const MAX_AI_BASE_URL_BYTES: usize = 4 * 1024;
+const MAX_FONT_DESC_BYTES: usize = 1024;
+const MAX_AI_IDENTIFIER_BYTES: usize = 1024;
+const MAX_STARTUP_COMMANDS_BYTES: usize = jterm_core::review_input::MAX_REVIEW_INPUT_BYTES;
 
 /// A saved SSH target. A new tab can be opened that runs the remote shell over
 /// `ssh -t`, reusing all local PTY/terminal infrastructure (OSC 133 markers
@@ -256,6 +260,7 @@ pub(crate) fn valid_session_id(session_id: &str) -> bool {
     !session_id.is_empty()
         && session_id.len() <= MAX_SESSION_ID_BYTES
         && !session_id.chars().any(char::is_control)
+        && !crate::review_input::contains_visual_spoofing(session_id)
 }
 
 /// Apply a saved jsh session id to either a direct jsh argv or the exact
@@ -301,6 +306,13 @@ pub(crate) fn shell_argv_with_session(
 
 /// Build the local argv that connects to a remote host via ssh.
 /// Produces e.g. `["ssh", "-t", "-p", "2222", "mm@100.x.x.x", "jsh --session home-main"]`.
+pub(crate) fn checked_remote_argv(host: &RemoteHost) -> Result<Vec<String>, &'static str> {
+    validate_remote_host(host)?;
+    Ok(build_remote_argv(host))
+}
+
+/// Low-level argv construction. Production consumers use
+/// [`checked_remote_argv`] so the gate is immediately adjacent to execution.
 pub(crate) fn build_remote_argv(host: &RemoteHost) -> Vec<String> {
     if host.deploy.is_enabled() {
         match jterm_core::jsh_remote::publish_launcher() {
@@ -727,7 +739,10 @@ pub(crate) fn builtin_themes() -> Vec<Theme> {
 // ---------------------------------------------------------------------------
 
 fn env_f64(name: &str) -> Option<f64> {
-    std::env::var(name).ok().and_then(|v| v.parse::<f64>().ok())
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite())
 }
 
 fn env_u32(name: &str) -> Option<u32> {
@@ -738,6 +753,14 @@ fn env_f32(name: &str) -> Option<f32> {
     std::env::var(name)
         .ok()
         .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|value| value.is_finite())
+}
+
+fn finite_clamp_f64(value: Option<f64>, fallback: f64, min: f64, max: f64) -> f64 {
+    value
+        .filter(|value| value.is_finite())
+        .unwrap_or(fallback)
+        .clamp(min, max)
 }
 
 fn env_bool(name: &str) -> Option<bool> {
@@ -816,11 +839,28 @@ pub(crate) fn default_ascii_organism_memory_path() -> PathBuf {
         .join("ascii-organism-native.json")
 }
 
-fn setting_text_is_safe(value: &str, max_bytes: usize) -> bool {
+pub(crate) fn setting_text_is_safe(value: &str, max_bytes: usize) -> bool {
     !value.trim().is_empty()
         && value.len() <= max_bytes
         && !value.chars().any(char::is_control)
         && !crate::review_input::contains_visual_spoofing(value)
+}
+
+/// Apply one textual environment override without letting malformed or
+/// visually deceptive text erase a valid file setting. The same normalized
+/// bytes then feed parsers, process resolution, and UI labels.
+fn resolve_setting_text(
+    override_value: Option<String>,
+    configured_value: Option<String>,
+    max_bytes: usize,
+) -> Option<String> {
+    let normalize = |value: String| {
+        let value = value.trim();
+        setting_text_is_safe(value, max_bytes).then(|| value.to_string())
+    };
+    override_value
+        .and_then(&normalize)
+        .or_else(|| configured_value.and_then(normalize))
 }
 
 pub(crate) fn configured_path_is_safe(value: &str, require_absolute_or_home: bool) -> bool {
@@ -1230,11 +1270,125 @@ pub(crate) fn remote_text_is_safe(value: &str, allow_whitespace: bool, max_chars
     !value.trim().is_empty()
         && value.chars().count() <= max_chars
         && !value.chars().any(char::is_control)
+        && !crate::review_input::contains_visual_spoofing(value)
         && (allow_whitespace || !value.chars().any(char::is_whitespace))
 }
 
 fn ssh_argument_is_safe(value: &str) -> bool {
-    value.chars().count() <= 16 * 1_024 && !value.chars().any(char::is_control)
+    value.chars().count() <= 16 * 1_024
+        && value.len() <= 64 * 1_024
+        && !value.chars().any(char::is_control)
+        && !crate::review_input::contains_visual_spoofing(value)
+}
+
+fn remote_ssh_args_are_structured(args: &[String]) -> bool {
+    let mut index = 0;
+    while index < args.len() {
+        let option = args[index].as_str();
+        if option == "--" || !option.starts_with('-') || option.starts_with("--") {
+            return false;
+        }
+        let bytes = option.as_bytes();
+        if bytes.len() < 2 || !bytes[1].is_ascii_alphabetic() {
+            return false;
+        }
+        let flag = bytes[1] as char;
+        let takes_operand = "BbcDEeFIiJLlmOoPpQRSWw".contains(flag);
+        if takes_operand {
+            if bytes.len() == 2 {
+                index += 1;
+                if index >= args.len() {
+                    return false;
+                }
+            }
+        } else if !option[1..]
+            .chars()
+            .all(|value| "46AaCfgKkMNnqTtVvXxYy".contains(value))
+        {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+/// Single application-level gate used at every connection and remote-fs argv
+/// boundary. Runtime objects and restored snapshots do not get to rely on the
+/// earlier, advisory config report.
+pub(crate) fn validate_remote_host(host: &RemoteHost) -> Result<(), &'static str> {
+    // An omitted display name inherits the target, whose documented limit is
+    // 1024 characters; UI consumers still render only a bounded safe prefix.
+    if !remote_text_is_safe(&host.name, true, 1_024) || host.name.len() > 4 * 1_024 {
+        return Err("Remote profile name is invalid; edit it in Settings or config.toml.");
+    }
+    if !remote_text_is_safe(&host.host, false, 1_024)
+        || host.host.len() > 4 * 1_024
+        || host.host.starts_with('-')
+    {
+        return Err("Remote target is invalid; edit it in Settings or config.toml.");
+    }
+    if host.user.as_deref().is_some_and(|user| {
+        !remote_text_is_safe(user, false, 256) || user.len() > 1024 || user.contains('@')
+    }) {
+        return Err("Remote user is invalid; edit it in Settings or config.toml.");
+    }
+    if !remote_text_is_safe(&host.remote_shell, true, 16 * 1_024)
+        || host.remote_shell.len() > 64 * 1_024
+    {
+        return Err("Remote shell is invalid; edit it in config.toml.");
+    }
+    if host
+        .session
+        .as_deref()
+        .is_some_and(|session| !valid_session_id(session))
+    {
+        return Err("Remote session id is invalid; edit it in config.toml.");
+    }
+    if host.ssh_args.len() > 128
+        || host.ssh_args.iter().any(|arg| !ssh_argument_is_safe(arg))
+        || !remote_ssh_args_are_structured(&host.ssh_args)
+    {
+        return Err("Remote SSH options are invalid; edit them in config.toml.");
+    }
+    if host.deploy_artifact.as_deref().is_some_and(|artifact| {
+        !remote_text_is_safe(artifact, false, 4_096)
+            || artifact.len() > 16 * 1_024
+            || !Path::new(artifact).is_absolute()
+    }) {
+        return Err("Remote deployment artifact is invalid; edit it in config.toml.");
+    }
+    let argv_bytes = host
+        .ssh_args
+        .iter()
+        .try_fold(
+            host.host
+                .len()
+                .saturating_add(host.name.len())
+                .saturating_add(host.remote_shell.len())
+                .saturating_add(host.user.as_deref().map_or(0, str::len))
+                .saturating_add(host.session.as_deref().map_or(0, str::len))
+                .saturating_add(host.deploy_artifact.as_deref().map_or(0, str::len)),
+            |total, argument| total.checked_add(argument.len()),
+        )
+        .unwrap_or(usize::MAX);
+    if argv_bytes > MAX_REMOTE_ARGV_BYTES {
+        return Err("Remote profile exceeds the execution byte budget.");
+    }
+    Ok(())
+}
+
+pub(crate) fn checked_remote_host(
+    hosts: &[RemoteHost],
+    index: usize,
+) -> Result<&RemoteHost, &'static str> {
+    if index >= MAX_REMOTE_HOSTS {
+        return Err("Remote host index exceeds the supported 128-profile limit.");
+    }
+    let host = hosts
+        .get(index)
+        .ok_or("That remote host is no longer configured.")?;
+    validate_remote_host(host)?;
+    Ok(host)
 }
 
 /// Parse `[[remote_hosts]]` array-of-tables. Entries missing a host or carrying
@@ -1339,7 +1493,7 @@ fn parse_remote_hosts(table: &toml::Table) -> Vec<RemoteHost> {
                 }
                 Some(_) => return None,
             };
-            Some(RemoteHost {
+            let host = RemoteHost {
                 name,
                 host,
                 user,
@@ -1351,7 +1505,9 @@ fn parse_remote_hosts(table: &toml::Table) -> Vec<RemoteHost> {
                 deploy,
                 docker,
                 deploy_artifact,
-            })
+            };
+            validate_remote_host(&host).ok()?;
+            Some(host)
         })
         .collect()
 }
@@ -1457,8 +1613,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     let themes = builtin_themes();
 
     // Resolve active theme
-    let theme_name = env_string("ANVIL_THEME")
-        .or(fc.theme)
+    let theme_name = resolve_setting_text(env_string("ANVIL_THEME"), fc.theme, 256)
         .unwrap_or_else(|| "default".to_string());
     let theme = themes
         .iter()
@@ -1466,20 +1621,18 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         .unwrap_or(&themes[0]);
 
     // Priority: env var > config file > theme default
-    let window_opacity = env_f64("ANVIL_OPACITY")
-        .or(fc.opacity)
-        .unwrap_or(0.95)
-        .clamp(0.01, 1.0);
+    let window_opacity = finite_clamp_f64(env_f64("ANVIL_OPACITY").or(fc.opacity), 0.95, 0.01, 1.0);
     let terminal_scrollback_lines = env_u32("ANVIL_SCROLLBACK")
         .or(fc.scrollback)
         .unwrap_or(5000)
         .min(1_000_000);
-    let default_font_scale = env_f64("ANVIL_FONT_SCALE")
-        .or(fc.font_scale)
-        .unwrap_or(1.0)
-        .clamp(0.1, 10.0);
-    let font_desc = env_string("ANVIL_FONT")
-        .or(fc.font)
+    let default_font_scale = finite_clamp_f64(
+        env_f64("ANVIL_FONT_SCALE").or(fc.font_scale),
+        1.0,
+        0.1,
+        10.0,
+    );
+    let font_desc = resolve_setting_text(env_string("ANVIL_FONT"), fc.font, MAX_FONT_DESC_BYTES)
         .unwrap_or_else(|| DEFAULT_FONT_DESC.to_string());
 
     let foreground = env_rgba("ANVIL_FG")
@@ -1556,13 +1709,14 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     }
     .or(fc.block_compact)
     .unwrap_or(false);
-    let shell = std::env::var("ANVIL_SHELL").ok().or(fc.shell);
+    let shell = resolve_setting_text(env_string("ANVIL_SHELL"), fc.shell, MAX_CONFIG_PATH_BYTES);
+    let startup_commands =
+        resolve_setting_text(None, fc.startup_commands, MAX_STARTUP_COMMANDS_BYTES);
 
     // Block mode is anvil's defining experience and is required for the
     // command-completion events consumed by Agent and command history. Users
     // can still opt into the compatibility VTE backend explicitly.
-    let terminal_mode_str = env_string("ANVIL_MODE")
-        .or(fc.terminal_mode)
+    let terminal_mode_str = resolve_setting_text(env_string("ANVIL_MODE"), fc.terminal_mode, 64)
         .unwrap_or_else(|| "block".to_string());
     let terminal_mode = TerminalMode::parse(&terminal_mode_str).unwrap_or_else(|| {
         log::warn!("Unknown terminal_mode '{terminal_mode_str}', using block");
@@ -1570,27 +1724,32 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     });
 
     let tab_placement = TabPlacement::parse(
-        &env_string("ANVIL_TAB_PLACEMENT")
-            .or(fc.tab_placement)
+        &resolve_setting_text(env_string("ANVIL_TAB_PLACEMENT"), fc.tab_placement, 64)
             .unwrap_or_else(|| "sidebar".to_string()),
     );
-    let sidebar_view = SidebarView::parse(&fc.sidebar_view.unwrap_or_else(|| "tabs".to_string()));
-    let jsh_update_check =
-        JshUpdateCheck::parse(&fc.jsh_update_check.unwrap_or_else(|| "daily".to_string()));
+    let sidebar_view = SidebarView::parse(
+        &resolve_setting_text(None, fc.sidebar_view, 64).unwrap_or_else(|| "tabs".to_string()),
+    );
+    let jsh_update_check = JshUpdateCheck::parse(
+        &resolve_setting_text(None, fc.jsh_update_check, 64).unwrap_or_else(|| "daily".to_string()),
+    );
     let sidebar_visible = resolve_sidebar_visibility(fc.sidebar_visible, tab_placement);
     let sidebar_width = fc.sidebar_width.unwrap_or(220).clamp(120, 800);
     let tab_width = fc.tab_width.unwrap_or(180).clamp(80, 480);
     let ascii_organism_enabled = env_bool("ANVIL_ASCII_ORGANISM_ENABLED")
         .or(fc.ascii_organism_enabled)
         .unwrap_or(false);
-    let ascii_organism_motion = env_string("ANVIL_ASCII_ORGANISM_MOTION")
-        .or(fc.ascii_organism_motion)
-        .as_deref()
-        .and_then(OrganismMotion::parse);
+    let ascii_organism_motion = resolve_setting_text(
+        env_string("ANVIL_ASCII_ORGANISM_MOTION"),
+        fc.ascii_organism_motion,
+        64,
+    )
+    .as_deref()
+    .and_then(OrganismMotion::parse);
 
-    let requested_ai_provider = env_string("ANVIL_AI_PROVIDER")
-        .or(fc.ai_provider)
-        .unwrap_or_else(|| "anthropic".to_string());
+    let requested_ai_provider =
+        resolve_setting_text(env_string("ANVIL_AI_PROVIDER"), fc.ai_provider, 64)
+            .unwrap_or_else(|| "anthropic".to_string());
     let ai_provider = normalize_ai_provider(&requested_ai_provider)
         .unwrap_or_else(|| {
             log::warn!(
@@ -1605,10 +1764,12 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         "ollama" => ("codellama:7b", "http://localhost:11434"),
         _ => ("claude-sonnet-4-6", "https://api.anthropic.com"),
     };
-    let ai_model = env_string("ANVIL_AI_MODEL")
-        .or(fc.ai_model)
-        .filter(|model| !model.trim().is_empty())
-        .unwrap_or_else(|| default_ai_model.to_string());
+    let ai_model = resolve_setting_text(
+        env_string("ANVIL_AI_MODEL"),
+        fc.ai_model,
+        MAX_AI_IDENTIFIER_BYTES,
+    )
+    .unwrap_or_else(|| default_ai_model.to_string());
     let ai_base_url = resolve_ai_base_url(
         env_string("ANVIL_AI_BASE_URL").or(fc.ai_base_url),
         default_ai_base_url,
@@ -1634,7 +1795,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         cursor_foreground,
         palette: theme.palette,
         shell,
-        startup_commands: fc.startup_commands,
+        startup_commands,
         terminal_mode,
         tab_placement,
         sidebar_view,
@@ -1831,6 +1992,45 @@ mod tests {
             example.get("font").and_then(toml::Value::as_str),
             Some(DEFAULT_FONT_DESC)
         );
+    }
+
+    #[test]
+    fn non_finite_presentation_numbers_fall_back_before_clamping() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(finite_clamp_f64(Some(value), 0.95, 0.01, 1.0), 0.95);
+        }
+        assert_eq!(finite_clamp_f64(Some(-1.0), 0.95, 0.01, 1.0), 0.01);
+        assert_eq!(finite_clamp_f64(Some(4.0), 0.95, 0.01, 1.0), 1.0);
+        assert_eq!(finite_clamp_f64(Some(0.7), 0.95, 0.01, 1.0), 0.7);
+    }
+
+    #[test]
+    fn invalid_text_override_does_not_erase_a_safe_file_setting() {
+        let configured = Some("  Monospace 15  ".to_string());
+        assert_eq!(
+            resolve_setting_text(
+                Some("spoof\u{202e}font".to_string()),
+                configured.clone(),
+                MAX_FONT_DESC_BYTES,
+            )
+            .as_deref(),
+            Some("Monospace 15")
+        );
+        assert_eq!(
+            resolve_setting_text(
+                Some("  JetBrains Mono  ".to_string()),
+                configured,
+                MAX_FONT_DESC_BYTES,
+            )
+            .as_deref(),
+            Some("JetBrains Mono")
+        );
+        assert!(resolve_setting_text(
+            Some("x".repeat(MAX_FONT_DESC_BYTES + 1)),
+            Some("bad\nfont".to_string()),
+            MAX_FONT_DESC_BYTES,
+        )
+        .is_none());
     }
 
     fn host() -> RemoteHost {
@@ -2260,6 +2460,15 @@ mod tests {
             "user = 'root@other.example'\n",
             "\n",
             "[[remote_hosts]]\n",
+            "name = 'visually-deceptive-host'\n",
+            "host = 'safe.example\u{202e}hidden'\n",
+            "\n",
+            "[[remote_hosts]]\n",
+            "name = 'visually-deceptive-argument'\n",
+            "host = 'argument-spoof.example'\n",
+            "ssh_args = ['-o', 'ProxyJump=safe\u{200b}hidden']\n",
+            "\n",
+            "[[remote_hosts]]\n",
             "name = 'safe'\n",
             "host = 'safe.example'\n",
             "ssh_args = ['-p', '2222']\n",
@@ -2498,5 +2707,27 @@ mod tests {
         );
         assert_eq!(OrganismMotion::parse("sleepy"), None);
         assert!(default_ascii_organism_memory_path().ends_with("anvil/ascii-organism-native.json"));
+    }
+
+    #[test]
+    fn execution_gate_rejects_spoofing_unstructured_ssh_args_and_high_indexes() {
+        let valid = host();
+        assert!(checked_remote_argv(&valid).is_ok());
+
+        let mut spoofed = valid.clone();
+        spoofed.name = "trusted\u{202e}host".into();
+        assert!(checked_remote_argv(&spoofed).is_err());
+
+        let mut second_destination = valid.clone();
+        second_destination.ssh_args = vec!["attacker.example".into()];
+        assert!(checked_remote_argv(&second_destination).is_err());
+
+        let mut premature_separator = valid.clone();
+        premature_separator.ssh_args = vec!["--".into()];
+        assert!(checked_remote_argv(&premature_separator).is_err());
+
+        let hosts = vec![valid; MAX_REMOTE_HOSTS + 1];
+        assert!(checked_remote_host(&hosts, MAX_REMOTE_HOSTS - 1).is_ok());
+        assert!(checked_remote_host(&hosts, MAX_REMOTE_HOSTS).is_err());
     }
 }

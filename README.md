@@ -72,6 +72,7 @@ git clone https://github.com/beamiter/anvil.git
 cd anvil
 ./scripts/install.sh
 ./scripts/install.sh --backend cargo
+./scripts/install.sh --binary /path/to/anvil
 ./scripts/install.sh --prefix /opt/anvil --data-dir /opt/anvil/share
 ./scripts/install.sh --dry-run
 ```
@@ -91,6 +92,32 @@ it builds a release binary and installs only user-local files:
 - sample workflows under
   `${XDG_DATA_HOME:-$HOME/.local/share}/anvil/workflows/`
 
+`--binary` skips the Rust toolchain for release archives and distro staging.
+Its input must be a readable, non-symlink regular file. Bash cannot make the
+initial no-follow check and open atomic. Only after the open succeeds and GNU
+`stat` verifies that the pathname and Linux `/proc/self/fd` descriptor identify
+the same inode is a later pathname replacement unable to change what gets
+copied. `mktemp` plus GNU `mv -T` then replaces the destination atomically on
+the same filesystem. Errors and exits clean up the private temporary file and
+retain the old executable until that rename commits the binary. The rename is
+the commit point: a later asset/config failure does not roll the binary back,
+and EXIT cleanup only removes a still-uncommitted temporary.
+Support tooling, shell integrations, the frozen workflow manifest, notebooks,
+AppStream metadata, and icons use the same same-directory temp/rename commit
+discipline with explicit public modes. Every source is preflighted before the
+build or first write. Initial config creation uses a same-directory temporary
+plus a no-clobber hard link; a concurrent creator wins and is retained.
+Zero-byte `--binary` inputs and explicit `--backend` plus `--binary` are
+rejected. A non-root caller-controlled `DESTDIR` is first normalized by
+collapsing repeated separators and lexical `.` components, then every existing
+component from `/` through the staging root is checked for symlinks before an
+install write or uninstall removal. Recursive purge roots are checked before
+ordinary files; normal host prefixes are unchanged. This checks existing state
+and does not promise safety against a concurrent path replacement after the
+check. Runtime and staging paths must be absolute and may contain spaces or
+Unicode, but control characters and lexical `..` components are rejected.
+Run `bash scripts/test-install-paths.sh` for the private DESTDIR contract suite.
+
 That desktop integration is what makes anvil appear in the GNOME/KDE
 application list with its own icon, ready to pin. Two details matter for it to
 show up at all, and the installer handles both:
@@ -99,7 +126,9 @@ show up at all, and the installer handles both:
   prefixes such as `/usr` keep the relocatable bare name). A desktop session
   fixes its `PATH` at login, so `TryExec=anvil` fails and hides the entry
   **completely** when `~/.local/bin` is not on that `PATH` — the usual reason an
-  install produces no launcher icon.
+  install produces no launcher icon. Spaces, backslashes, `$`, quotes and
+  backticks are encoded according to the Desktop Entry layers; ambiguous `=`
+  and `%` executable paths are rejected with a diagnostic.
 - `update-desktop-database` and `gtk-update-icon-cache` are refreshed after
   install and uninstall (a stale icon cache shadows newly installed icons).
   `DESTDIR` builds skip the refresh and leave it to the package manager.
@@ -538,6 +567,14 @@ anvil runs `ssh -t`, passes `ssh_args` before the target, and optionally uses
 OpenSSH ControlMaster sockets. The custom `jsh` remote shell additionally
 supports stable session IDs and block-aware reconnection; a regular remote
 shell works as a normal interactive SSH tab.
+
+The application repeats one host gate at the final argv boundary for fresh
+connections, reconnects, workspace restore, and every remote-filesystem probe.
+It enforces character and byte budgets, rejects visual-formatting spoofing,
+checks the first-128 index boundary, and treats `ssh_args` as structured
+OpenSSH options (`-p 22` and `-o Name=value` remain supported; a second bare
+destination or premature `--` does not). Rejection is diagnostic and occurs
+before a pane is replaced or a process is spawned.
 
 #### Hosts that do not have jsh
 

@@ -6,6 +6,10 @@ set -Eeuo pipefail
 APP_ID="io.github.beamiter.anvil"
 HOME_DIR="${HOME:-}"
 DESTDIR="${DESTDIR:-}"
+DESTDIR_ACTIVE=0
+if [[ -n "${DESTDIR}" ]]; then
+    DESTDIR_ACTIVE=1
+fi
 PREFIX="${HOME_DIR}/.local"
 BIN_DIR=""
 DATA_HOME=""
@@ -50,6 +54,7 @@ run() {
 
 remove_file() {
     local path="$1"
+    validate_staging_removal_target "${path}"
     if [[ -e "${path}" || -L "${path}" ]]; then
         run rm -f -- "${path}"
     fi
@@ -57,9 +62,77 @@ remove_file() {
 
 remove_dir_if_empty() {
     local path="$1"
+    validate_staging_removal_target "${path}"
     if [[ -d "${path}" ]]; then
         run rmdir --ignore-fail-on-non-empty -- "${path}"
     fi
+}
+
+validate_absolute_path() {
+    local label="$1" path="$2"
+    [[ -n "${path}" ]] || die "${label} must not be empty"
+    [[ "${path}" == /* ]] || die "${label} must be an absolute path"
+    if [[ "${path}" =~ [[:cntrl:]] ]]; then
+        die "${label} must not contain control characters"
+    fi
+    case "/${path#/}/" in
+        */../*) die "${label} must not contain '..' path components" ;;
+    esac
+}
+
+normalize_absolute_path() {
+    local path="$1" normalized="" component
+    local -a components=()
+    IFS='/' read -r -a components <<<"${path}"
+    for component in "${components[@]}"; do
+        [[ -n "${component}" && "${component}" != . ]] || continue
+        normalized="${normalized}/${component}"
+    done
+    printf '%s' "${normalized:-/}"
+}
+
+# Full-chain point-in-time check for the normalized staging boundary.
+validate_destdir_root() {
+    local suffix current="" component
+    local -a components=()
+    ((DESTDIR_ACTIVE == 1)) || return 0
+    [[ -n "${DESTDIR}" && "${DESTDIR}" != / ]] || return 0
+    suffix="${DESTDIR#/}"
+    IFS='/' read -r -a components <<<"${suffix}"
+    for component in "${components[@]}"; do
+        [[ -n "${component}" ]] || continue
+        current="${current}/${component}"
+        [[ ! -L "${current}" ]] \
+            || die "DESTDIR path contains a symbolic-link component: ${current}"
+        [[ -e "${current}" ]] || break
+    done
+}
+
+# Refuse a directory symlink in the parent chain of a staged removal.  The
+# final component may itself be a symlink because rm removes that link without
+# following it; an ancestor link would redirect deletion outside DESTDIR.
+validate_staging_removal_target() {
+    local target="$1" parent suffix current component
+    local -a components=()
+    ((DESTDIR_ACTIVE == 1)) || return 0
+    [[ -n "${DESTDIR}" ]] || return 0
+    validate_destdir_root
+    case "${target}" in
+        "${DESTDIR}"/*) ;;
+        *) die "staged uninstall target is outside DESTDIR: ${target}" ;;
+    esac
+    parent="${target%/*}"
+    suffix="${parent#"${DESTDIR}"}"
+    suffix="${suffix#/}"
+    current="${DESTDIR}"
+    IFS='/' read -r -a components <<<"${suffix}"
+    for component in "${components[@]}"; do
+        [[ -n "${component}" && "${component}" != . ]] || continue
+        current="${current}/${component}"
+        [[ ! -L "${current}" ]] \
+            || die "staged uninstall path contains a symbolic-link ancestor: ${current}"
+        [[ -e "${current}" ]] || break
+    done
 }
 
 while (($# > 0)); do
@@ -67,28 +140,34 @@ while (($# > 0)); do
         --prefix)
             (($# >= 2)) || die "--prefix requires a path"
             PREFIX="$2"
+            [[ -n "${PREFIX}" ]] || die "--prefix must not be empty"
             shift 2
             ;;
         --prefix=*)
             PREFIX="${1#*=}"
+            [[ -n "${PREFIX}" ]] || die "--prefix must not be empty"
             shift
             ;;
         --bin-dir)
             (($# >= 2)) || die "--bin-dir requires a path"
             BIN_DIR="$2"
+            [[ -n "${BIN_DIR}" ]] || die "--bin-dir must not be empty"
             shift 2
             ;;
         --bin-dir=*)
             BIN_DIR="${1#*=}"
+            [[ -n "${BIN_DIR}" ]] || die "--bin-dir must not be empty"
             shift
             ;;
         --data-dir)
             (($# >= 2)) || die "--data-dir requires a path"
             DATA_HOME="$2"
+            [[ -n "${DATA_HOME}" ]] || die "--data-dir must not be empty"
             shift 2
             ;;
         --data-dir=*)
             DATA_HOME="${1#*=}"
+            [[ -n "${DATA_HOME}" ]] || die "--data-dir must not be empty"
             shift
             ;;
         --purge-config)
@@ -114,26 +193,39 @@ while (($# > 0)); do
 done
 
 [[ -n "${HOME_DIR}" ]] || die "HOME is not set"
-[[ -n "${PREFIX}" && "${PREFIX}" == /* ]] || die "--prefix must be an absolute path"
+validate_absolute_path "--prefix" "${PREFIX}"
 if [[ -z "${BIN_DIR}" ]]; then
     BIN_DIR="${PREFIX}/bin"
 fi
-[[ "${BIN_DIR}" == /* ]] || die "--bin-dir must be an absolute path"
+validate_absolute_path "--bin-dir" "${BIN_DIR}"
 if [[ -z "${DATA_HOME}" ]]; then
     DATA_HOME="${XDG_DATA_HOME:-${PREFIX}/share}"
 fi
-[[ "${DATA_HOME}" == /* ]] || die "--data-dir/XDG_DATA_HOME must be an absolute path"
-if [[ -n "${DESTDIR}" ]]; then
-    [[ "${DESTDIR}" == /* ]] || die "DESTDIR must be an absolute path"
-    DESTDIR="${DESTDIR%/}"
+validate_absolute_path "--data-dir/XDG_DATA_HOME" "${DATA_HOME}"
+if ((DESTDIR_ACTIVE == 1)); then
+    validate_absolute_path "DESTDIR" "${DESTDIR}"
+    DESTDIR="$(normalize_absolute_path "${DESTDIR}")"
+    validate_destdir_root
+    if [[ "${DESTDIR}" == / ]]; then
+        DESTDIR=""
+    fi
+fi
+
+if ((PURGE_CONFIG == 1)); then
+    CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME_DIR}/.config}"
+    STATE_HOME="${XDG_STATE_HOME:-${HOME_DIR}/.local/state}"
+    validate_absolute_path "XDG_CONFIG_HOME" "${CONFIG_HOME}"
+    validate_absolute_path "XDG_STATE_HOME" "${STATE_HOME}"
+    validate_staging_removal_target "${DESTDIR}${CONFIG_HOME}/anvil"
+    validate_staging_removal_target "${DESTDIR}${STATE_HOME}/anvil"
 fi
 
 remove_file "${DESTDIR}${BIN_DIR}/anvil"
 remove_file "${DESTDIR}${BIN_DIR}/anvil-support-bundle"
 LEGACY_SOURCE_BIN="${HOME_DIR}/.cargo/bin/anvil"
-if [[ -z "${DESTDIR}" \
-    && "${LEGACY_SOURCE_BIN}" != "${BIN_DIR}/anvil" \
-    && ( -e "${LEGACY_SOURCE_BIN}" || -L "${LEGACY_SOURCE_BIN}" ) ]]; then
+if ((DESTDIR_ACTIVE == 0)) \
+    && [[ "${LEGACY_SOURCE_BIN}" != "${BIN_DIR}/anvil" ]] \
+    && [[ -e "${LEGACY_SOURCE_BIN}" || -L "${LEGACY_SOURCE_BIN}" ]]; then
     printf 'Note: legacy source install left untouched at %s.\n' "${LEGACY_SOURCE_BIN}"
 fi
 SHARE_DIR="${DESTDIR}${DATA_HOME}"
@@ -167,7 +259,7 @@ remove_dir_if_empty "${SHARE_DIR}/doc/anvil"
 remove_dir_if_empty "${SHARE_DIR}/doc"
 
 # Without this the launcher keeps offering a dead entry and a cached icon.
-if [[ -z "${DESTDIR}" ]] && ((DRY_RUN == 0)); then
+if ((DESTDIR_ACTIVE == 0 && DRY_RUN == 0)); then
     if command -v update-desktop-database >/dev/null 2>&1 \
         && [[ -d "${SHARE_DIR}/applications" ]]; then
         (umask 022 && update-desktop-database "${SHARE_DIR}/applications") \
@@ -181,12 +273,9 @@ if [[ -z "${DESTDIR}" ]] && ((DRY_RUN == 0)); then
 fi
 
 if ((PURGE_CONFIG == 1)); then
-    CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME_DIR}/.config}"
-    STATE_HOME="${XDG_STATE_HOME:-${HOME_DIR}/.local/state}"
-    [[ "${CONFIG_HOME}" == /* ]] || die "XDG_CONFIG_HOME must be an absolute path"
-    [[ "${STATE_HOME}" == /* ]] || die "XDG_STATE_HOME must be an absolute path"
     for directory in "${DESTDIR}${CONFIG_HOME}/anvil" "${DESTDIR}${STATE_HOME}/anvil"; do
-        if [[ -e "${directory}" ]]; then
+        validate_staging_removal_target "${directory}"
+        if [[ -e "${directory}" || -L "${directory}" ]]; then
             run rm -rf -- "${directory}"
         fi
     done

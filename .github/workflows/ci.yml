@@ -90,10 +90,11 @@ jobs:
       - name: Validate install and support scripts
         if: ${{ !cancelled() }}
         run: |
-          bash -n scripts/install.sh scripts/uninstall.sh scripts/package-release.sh \
-            scripts/support-bundle.sh packaging/install-release.sh
+          bash -n scripts/install.sh scripts/uninstall.sh scripts/test-install-paths.sh \
+            scripts/package-release.sh scripts/support-bundle.sh packaging/install-release.sh
           scripts/install.sh --help >/dev/null
           scripts/uninstall.sh --help >/dev/null
+          bash scripts/test-install-paths.sh
           install_plan="$(scripts/install.sh --backend cargo --no-config --no-desktop --dry-run)"
           grep -F "Installed anvil to ${HOME}/.local/bin/anvil" <<<"${install_plan}"
 

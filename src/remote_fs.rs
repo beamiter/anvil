@@ -175,24 +175,36 @@ impl FsLocation {
     pub(crate) fn label(&self, hosts: &[RemoteHost]) -> String {
         match self {
             FsLocation::Local => "Local".to_string(),
-            FsLocation::Remote(index) => match hosts.get(*index) {
-                Some(host) => location_label(host),
-                None => "Remote".to_string(),
-            },
+            FsLocation::Remote(index) => crate::config::checked_remote_host(hosts, *index)
+                .map(location_label)
+                .unwrap_or_else(|_| "Remote (unavailable)".to_string()),
         }
     }
 }
 
 fn location_label(host: &RemoteHost) -> String {
     let scheme = if host.docker { "docker" } else { "ssh" };
-    format!("{scheme}: {}", host.name)
+    let name = jterm_core::review_input::safe_inline_display(&host.name, 256);
+    format!("{scheme}: {name}")
 }
 
 /// Dropdown labels for the header's location selector; index 0 is `Local`.
 pub(crate) fn location_labels(hosts: &[RemoteHost]) -> Vec<String> {
-    let mut labels = Vec::with_capacity(hosts.len() + 1);
+    let mut labels = Vec::with_capacity(hosts.len().min(crate::config::MAX_REMOTE_HOSTS) + 1);
     labels.push("Local".to_string());
-    labels.extend(hosts.iter().map(location_label));
+    labels.extend(
+        hosts
+            .iter()
+            .take(crate::config::MAX_REMOTE_HOSTS)
+            .enumerate()
+            .map(|(index, host)| {
+                if crate::config::checked_remote_host(hosts, index).is_ok() {
+                    location_label(host)
+                } else {
+                    "Remote (unavailable)".to_string()
+                }
+            }),
+    );
     labels
 }
 
@@ -410,12 +422,22 @@ fn remote_host<'a>(loc: &FsLocation, hosts: &'a [RemoteHost]) -> io::Result<&'a 
             io::ErrorKind::InvalidInput,
             "local location has no remote host",
         )),
-        FsLocation::Remote(index) => hosts.get(*index).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "remote host is no longer configured",
-            )
-        }),
+        FsLocation::Remote(index) => {
+            if *index >= crate::config::MAX_REMOTE_HOSTS {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "remote host index exceeds the supported 128-profile limit",
+                ));
+            }
+            if hosts.get(*index).is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "that remote host is no longer configured",
+                ));
+            }
+            crate::config::checked_remote_host(hosts, *index)
+                .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))
+        }
     }
 }
 
@@ -548,7 +570,7 @@ fn run_probe(
     args: &[&OsStr],
     timeout: Duration,
 ) -> io::Result<Vec<u8>> {
-    let argv = probe_argv(host, op, args, ScriptDelivery::Stdin);
+    let argv = checked_probe_argv(host, op, args, ScriptDelivery::Stdin)?;
     probe_result(
         op,
         run_capture(&argv, PROBE_SCRIPT.as_bytes(), timeout, MAX_CAPTURE_BYTES)?,
@@ -622,6 +644,17 @@ fn probe_argv(host: &RemoteHost, op: &str, args: &[&OsStr], mode: ScriptDelivery
     } else {
         ssh_probe_argv(host, op, args, mode)
     }
+}
+
+fn checked_probe_argv(
+    host: &RemoteHost,
+    op: &str,
+    args: &[&OsStr],
+    mode: ScriptDelivery,
+) -> io::Result<Vec<OsString>> {
+    crate::config::validate_remote_host(host)
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+    Ok(probe_argv(host, op, args, mode))
 }
 
 /// The one remote command element for `sh -s`: `sh -s -- <op> [args]` with
@@ -1036,7 +1069,7 @@ fn spawn_probe_streaming(
     args: &[&OsStr],
     mode: ScriptDelivery,
 ) -> io::Result<ProbeChild> {
-    let argv = probe_argv(host, op, args, mode);
+    let argv = checked_probe_argv(host, op, args, mode)?;
     spawn_probe_argv(&argv, mode)
 }
 
@@ -1455,6 +1488,10 @@ fn upload(
 /// shell-reinterpreted. Best-effort: errors are logged, never propagated.
 fn cleanup_remote_part(host: &RemoteHost, dst: &Path) {
     let command = part_cleanup_command(dst);
+    if let Err(message) = crate::config::validate_remote_host(host) {
+        log::warn!("remote .fspart cleanup rejected by execution gate: {message}");
+        return;
+    }
     let argv = host_command_argv(host, &command);
     if let Err(error) = run_capture(&argv, &[], PROBE_OP_TIMEOUT, MAX_CAPTURE_BYTES) {
         log::warn!("remote .fspart cleanup failed to run: {error}");
@@ -2711,7 +2748,14 @@ mod tests {
         );
         assert_eq!(FsLocation::Local.label(&hosts), "Local");
         assert_eq!(FsLocation::Remote(1).label(&hosts), "docker: service");
-        assert_eq!(FsLocation::Remote(9).label(&hosts), "Remote");
+        assert_eq!(FsLocation::Remote(9).label(&hosts), "Remote (unavailable)");
+
+        let mut hostile = ssh_host();
+        hostile.name = "secret\u{202e}marker".to_string();
+        assert_eq!(
+            location_labels(&[hostile]),
+            ["Local", "Remote (unavailable)"]
+        );
     }
 
     #[test]
@@ -3638,5 +3682,18 @@ mod tests {
         assert_eq!(outcome.done, 0);
         assert_eq!(outcome.failed.len(), 1);
         assert!(Path::new("/").is_dir());
+    }
+
+    #[test]
+    fn production_probe_gate_rejects_invalid_runtime_hosts_before_spawn() {
+        let mut host = ssh_host();
+        host.host = "-oProxyCommand=attacker".to_string();
+        let error = checked_probe_argv(&host, "home", &[], ScriptDelivery::Stdin).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        let hosts = vec![ssh_host(); crate::config::MAX_REMOTE_HOSTS + 1];
+        let error =
+            remote_host(&FsLocation::Remote(crate::config::MAX_REMOTE_HOSTS), &hosts).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 }

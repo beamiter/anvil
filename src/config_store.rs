@@ -1207,7 +1207,9 @@ fn check_number_range(
     maximum: f64,
 ) {
     if let Some(value) = number_value(table, key) {
-        if !(minimum..=maximum).contains(&value) {
+        if !value.is_finite() {
+            report.warning(key, "must be finite; the safe default will be used");
+        } else if !(minimum..=maximum).contains(&value) {
             report.warning(
                 key,
                 format!("is outside the supported range {minimum}..={maximum}; it will be clamped"),
@@ -1257,6 +1259,25 @@ fn check_nonempty_string(report: &mut ConfigValidationReport, table: &toml::Tabl
         .is_some_and(|value| value.trim().is_empty())
     {
         report.error(key, "must not be empty");
+    }
+}
+
+fn check_safe_text(
+    report: &mut ConfigValidationReport,
+    table: &toml::Table,
+    key: &str,
+    max_bytes: usize,
+) {
+    let Some(value) = table.get(key).and_then(toml::Value::as_str) else {
+        return;
+    };
+    if !config::setting_text_is_safe(value, max_bytes) {
+        report.error(
+            key,
+            format!(
+                "must be non-empty, at most {max_bytes} bytes, and contain no control or invisible formatting characters"
+            ),
+        );
     }
 }
 
@@ -1366,6 +1387,12 @@ fn validate_remote_text(
 ) {
     if value.chars().any(char::is_control) {
         report.error(path.clone(), "must not contain control characters");
+    }
+    if crate::review_input::contains_visual_spoofing(value) {
+        report.error(
+            path.clone(),
+            "must not contain invisible or direction-changing formatting",
+        );
     }
     if !allow_whitespace && value.chars().any(char::is_whitespace) {
         report.error(path.clone(), "must not contain whitespace");
@@ -1697,6 +1724,24 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
     check_nonempty_string(&mut report, table, "shell");
     check_nonempty_string(&mut report, table, "ai_provider");
     check_nonempty_string(&mut report, table, "ai_model");
+    for (key, max_bytes) in [
+        ("font", 1_024),
+        ("theme", 64),
+        ("shell", 16 * 1_024),
+        (
+            "startup_commands",
+            jterm_core::review_input::MAX_REVIEW_INPUT_BYTES,
+        ),
+        ("terminal_mode", 64),
+        ("tab_placement", 64),
+        ("sidebar_view", 64),
+        ("jsh_update_check", 64),
+        ("ai_provider", 64),
+        ("ai_model", 1_024),
+        ("ascii_organism_motion", 64),
+    ] {
+        check_safe_text(&mut report, table, key, max_bytes);
+    }
     check_absolute_path(&mut report, table, "shell");
     check_enum(
         &mut report,
@@ -1950,6 +1995,34 @@ mod tests {
             .unwrap();
         let report = validate_table(Path::new("config.toml"), &table);
         assert!(report.healthy(), "unexpected issues: {:?}", report.issues);
+    }
+
+    #[test]
+    fn validator_explains_non_finite_numbers_and_unsafe_display_text() {
+        let table = concat!(
+            "opacity = nan\n",
+            "font_scale = inf\n",
+            "font = 'Mono\u{202e}spoof'\n",
+            "startup_commands = 'safe\u{200b}looking'\n",
+        )
+        .parse::<toml::Table>()
+        .unwrap();
+        let report = validate_table(Path::new("config.toml"), &table);
+
+        for key in ["opacity", "font_scale"] {
+            assert!(report.issues.iter().any(|issue| {
+                issue.key == key
+                    && issue.severity == ConfigIssueSeverity::Warning
+                    && issue.message.contains("finite")
+            }));
+        }
+        for key in ["font", "startup_commands"] {
+            assert!(report.issues.iter().any(|issue| {
+                issue.key == key
+                    && issue.severity == ConfigIssueSeverity::Error
+                    && issue.message.contains("invisible")
+            }));
+        }
     }
 
     fn temporary_directory(label: &str) -> PathBuf {
@@ -2428,25 +2501,34 @@ mod tests {
             &path,
             concat!(
                 "[[remote_hosts]]\n",
-                "name = 'staging'\n",
+                "name = 'staging\u{202e}hidden'\n",
                 "host = '-ProxyCommand=secret'\n",
                 "user = 'root@secret'\n",
                 "remote_shell = ''\n",
                 "session = \"prod\\tsecret\"\n",
-                "ssh_args = [\"-p\", \"22\\tProxyCommand=secret\"]\n",
+                "ssh_args = [\"-p\", \"22\\tProxyCommand=secret\", \"safe\u{200b}hidden\"]\n",
             ),
         );
         let report = validate_path(&path);
         let json = serde_json::to_string(&report).unwrap();
         for key in [
+            "remote_hosts[0].name",
             "remote_hosts[0].host",
             "remote_hosts[0].user",
             "remote_hosts[0].remote_shell",
             "remote_hosts[0].session",
             "remote_hosts[0].ssh_args[1]",
+            "remote_hosts[0].ssh_args[2]",
         ] {
             assert!(json.contains(key), "missing validation issue for {key}");
         }
+        assert!(report.issues.iter().any(|issue| {
+            issue.key == "remote_hosts[0].name"
+                && issue.message.contains("direction-changing formatting")
+        }));
+        assert!(report.issues.iter().any(|issue| {
+            issue.key == "remote_hosts[0].ssh_args[2]" && issue.message.contains("invisible")
+        }));
         assert!(!json.contains("ProxyCommand"));
         assert!(!json.contains("secret"));
         fs::remove_dir_all(directory).unwrap();

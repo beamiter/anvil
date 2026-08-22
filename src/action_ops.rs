@@ -387,7 +387,21 @@ impl AppModel {
                     self.show_toast("Remote connections are disabled in safe mode.");
                     return;
                 }
-                let hosts = self.config.borrow().remote_hosts.clone();
+                // Gate borrowed runtime objects before cloning or deriving
+                // picker text. Keep the original config index so skipping an
+                // invalid draft cannot redirect activation to another host.
+                let hosts: Vec<_> = self
+                    .config
+                    .borrow()
+                    .remote_hosts
+                    .iter()
+                    .take(config::MAX_REMOTE_HOSTS)
+                    .enumerate()
+                    .filter_map(|(index, host)| match config::validate_remote_host(host) {
+                        Ok(()) => Some((index, host.clone())),
+                        Err(_) => None,
+                    })
+                    .collect();
                 if hosts.is_empty() {
                     self.show_toast(format!(
                         "No remote hosts are configured. Add [[remote_hosts]] in {}.",
@@ -408,11 +422,13 @@ impl AppModel {
                     self.show_toast("Remote connections are disabled in safe mode.");
                     return;
                 }
-                let host = self.config.borrow().remote_hosts.get(n as usize).cloned();
-                if let Some(host) = host {
-                    self.add_remote_tab(&host, sender);
-                } else {
-                    self.show_toast("That remote host is no longer configured.");
+                let host = {
+                    let config = self.config.borrow();
+                    config::checked_remote_host(&config.remote_hosts, n as usize).cloned()
+                };
+                match host {
+                    Ok(host) => self.add_remote_tab(&host, sender),
+                    Err(message) => self.show_toast(message),
                 }
             }
             Action::ToggleAiPanel | Action::OpenAiPanel => {

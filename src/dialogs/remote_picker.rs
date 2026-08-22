@@ -50,15 +50,15 @@ impl FactoryComponent for RemoteRow {
         };
         Self {
             source_index,
-            name: host.name,
-            target,
+            name: jterm_core::review_input::safe_inline_display(&host.name, 256),
+            target: jterm_core::review_input::safe_inline_display(&target, 512),
         }
     }
 }
 
 #[derive(Debug)]
 pub(crate) enum RemotePickerMsg {
-    Toggle(Vec<RemoteHost>),
+    Toggle(Vec<(usize, RemoteHost)>),
     Search(String),
     Activate(usize),
     Move(i32),
@@ -73,7 +73,7 @@ pub(crate) enum RemotePickerOutput {
 
 pub(crate) struct RemotePickerModel {
     parent: adw::ApplicationWindow,
-    hosts: Vec<RemoteHost>,
+    hosts: Vec<(usize, RemoteHost)>,
     query: String,
     rows: FactoryVecDeque<RemoteRow>,
 }
@@ -236,14 +236,16 @@ impl RemotePickerModel {
         let query = self.query.trim().to_lowercase();
         let mut rows = self.rows.guard();
         rows.clear();
-        for (index, host) in self.hosts.iter().enumerate() {
+        for (source_index, host) in &self.hosts {
             let target = match &host.user {
                 Some(user) => format!("{user}@{}", host.host),
                 None => host.host.clone(),
             };
-            let haystack = format!("{} {target}", host.name).to_lowercase();
+            let name = jterm_core::review_input::safe_inline_display(&host.name, 256);
+            let target = jterm_core::review_input::safe_inline_display(&target, 512);
+            let haystack = format!("{name} {target}").to_lowercase();
             if query.is_empty() || haystack.contains(&query) {
-                rows.push_back((index, host.clone()));
+                rows.push_back((*source_index, host.clone()));
             }
         }
     }

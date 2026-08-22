@@ -12182,7 +12182,11 @@ mod tests {
             super::active_card_vchrome_px(false, false),
             super::css::BLOCK_ACTIVE_VCHROME_PX
         );
-        assert!(super::css::BLOCK_ACTIVE_COMPACT_VCHROME_PX < super::css::BLOCK_ACTIVE_VCHROME_PX);
+        const {
+            assert!(
+                super::css::BLOCK_ACTIVE_COMPACT_VCHROME_PX < super::css::BLOCK_ACTIVE_VCHROME_PX
+            );
+        }
     }
 
     #[test]
