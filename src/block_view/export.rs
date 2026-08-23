@@ -125,6 +125,10 @@ fn metadata_record_markdown(
             duration_ms as f64 / 1_000.0
         ));
     }
+    // Same reproduction context Block's own card export carries.
+    if let Some(cwd) = record.cwd.as_deref().filter(|cwd| !cwd.is_empty()) {
+        markdown.push_str(&format!("**Directory:** {cwd}\n\n"));
+    }
     markdown
 }
 

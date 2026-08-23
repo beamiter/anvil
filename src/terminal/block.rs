@@ -421,6 +421,11 @@ impl Component for BlockTerminal {
                 init.probe.shell_pid.set(view.pid_i32());
                 init.probe.pty_fd.set(view.pty_fd_i32());
                 connect_view_outputs(&view, &sender, &terminal_done);
+                // Needs the `Rc` the component holds: the menu's items call
+                // back into the view, and the gesture lives on a widget the
+                // view itself owns.
+                TermView::install_canvas_context_menu(&view);
+                TermView::arm_shell_integration_notice(&view, init.shell_argv.as_ref());
                 if let Some(container) = root.downcast_ref::<gtk::Box>() {
                     container.append(&view.widget());
                 }
@@ -507,6 +512,7 @@ impl Component for BlockTerminal {
             VteInput::SetScrollback(lines) => view.vte().set_scrollback_lines(lines),
             VteInput::ScrollLines(lines) => view.scroll_lines(lines),
             VteInput::ApplyTheme => view.apply_theme(),
+            VteInput::ApplyBlockDensity(compact) => view.apply_block_density(compact),
             VteInput::SyncConfig => view.reload_config(&self.config.borrow()),
             VteInput::Kill => self.terminate_once(),
             VteInput::FilterFailedBlocks => report_record_navigation(
@@ -525,9 +531,14 @@ impl Component for BlockTerminal {
                 let cleared = view.clear_blocks();
                 if cleared > 0 {
                     let plural = if cleared == 1 { "" } else { "s" };
-                    let _ = sender.output(VteOutput::Notice(format!(
-                        "Cleared {cleared} block{plural} — \"Undo clear blocks\" restores them."
-                    )));
+                    // The recovery is one button, not a palette search: an
+                    // accidental Ctrl+Shift+K is exactly the moment nobody wants
+                    // to go looking for the name of the action that undoes it.
+                    let _ = sender.output(VteOutput::NoticeWithUndo {
+                        message: format!("Cleared {cleared} block{plural}."),
+                        button: "Undo".to_string(),
+                        undo: crate::terminal::NoticeUndo::ClearBlocks,
+                    });
                 } else if view.is_unified() {
                     let _ = sender.output(VteOutput::Notice(
                         "Unified mode keeps no blocks to clear — use the shell's own clear."

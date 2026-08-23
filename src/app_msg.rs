@@ -25,6 +25,20 @@ pub(crate) enum AppMsg {
     Quit,
     ForceQuit,
     Toast(String),
+    /// A toast whose button takes back what the notice reports. `pane_id` binds
+    /// the recovery to the pane that raised it, so a toast still on screen after
+    /// a tab switch cannot undo somewhere else.
+    ToastWithUndo {
+        pane_id: u64,
+        message: String,
+        button: String,
+        undo: crate::terminal::NoticeUndo,
+    },
+    /// The button on such a toast was clicked.
+    ApplyNoticeUndo {
+        pane_id: u64,
+        undo: crate::terminal::NoticeUndo,
+    },
     CopyOutputOnly,
     Action(Action),
     /// Result of the background "is a newer jsh published?" check. Boxed so one

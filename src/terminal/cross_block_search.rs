@@ -38,6 +38,52 @@ fn jump_outcome(result: RecordNavigationResult) -> JumpOutcome {
     }
 }
 
+/// `exit:1 · 2.4s · …/anvil` for one hit, or `None` when the record carried
+/// none of the three.
+fn hit_outcome_label(hit: &CrossBlockHit) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    match hit.exit_code {
+        Some(0) => {}
+        Some(code) => parts.push(format!("exit:{code}")),
+        None => {}
+    }
+    if let Some(duration) = hit.duration_ms {
+        parts.push(crate::block_view::format_block_duration(duration));
+    }
+    if let Some(cwd) = hit.cwd.as_deref().filter(|cwd| !cwd.is_empty()) {
+        parts.push(crate::block_view::shorten_path(cwd));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// Bring `row` fully inside `scrolled` without moving keyboard focus.
+///
+/// Focus is what GTK scrolls to follow, and focus belongs to the search entry
+/// here — the whole point is that Down walks the list while typing still works.
+/// So the adjustment is driven directly: shift by the shortfall at whichever
+/// edge the row is past, and not at all when it is already visible.
+fn scroll_row_into_view(scrolled: &gtk::ScrolledWindow, row: &impl IsA<gtk::Widget>) {
+    let Some(bounds) = row.compute_bounds(scrolled) else {
+        return;
+    };
+    let adjustment = scrolled.vadjustment();
+    let page = adjustment.page_size();
+    let top = bounds.y() as f64;
+    let bottom = top + bounds.height() as f64;
+    let shift = if top < 0.0 {
+        top
+    } else if bottom > page {
+        bottom - page
+    } else {
+        return;
+    };
+    let target = (adjustment.value() + shift).clamp(
+        adjustment.lower(),
+        (adjustment.upper() - page).max(adjustment.lower()),
+    );
+    adjustment.set_value(target);
+}
+
 fn jump_unavailable_status() -> &'static str {
     "This result is searchable, but it has no terminal location and no retained output."
 }
@@ -65,6 +111,19 @@ pub(super) fn toggle(
         .tooltip_text("Treat the query as a regular expression")
         .build();
     header_bar.pack_end(&regex_toggle);
+    // The outcome and duration predicates existed already with no surface that
+    // could reach them, so "which failing build took over a second" was
+    // unanswerable with the data sitting right there.
+    let failed_toggle = gtk::ToggleButton::builder()
+        .label("Failed")
+        .tooltip_text("Only blocks whose command reported a non-zero exit")
+        .build();
+    let slow_toggle = gtk::ToggleButton::builder()
+        .label("Slow")
+        .tooltip_text("Only blocks that ran longer than the slow-block threshold")
+        .build();
+    header_bar.pack_end(&slow_toggle);
+    header_bar.pack_end(&failed_toggle);
 
     let filter_entry = gtk::SearchEntry::new();
     filter_entry.set_placeholder_text(Some("Search across blocks…"));
@@ -108,6 +167,8 @@ pub(super) fn toggle(
     let search_generation = Rc::new(Cell::new(0_u64));
     let rebuild = {
         let view = view.clone();
+        let failed_toggle = failed_toggle.clone();
+        let slow_toggle = slow_toggle.clone();
         let list_box = list_box.clone();
         let hits = hits.clone();
         let status_label = status_label.clone();
@@ -125,7 +186,13 @@ pub(super) fn toggle(
                 return;
             }
 
-            match view.cross_block_search(&query, is_regex, 500) {
+            let filters = crate::block_view::BlockFilters {
+                failed_only: failed_toggle.is_active(),
+                slow_only: slow_toggle.is_active(),
+                slow_threshold_ms: crate::block_view::SLOW_BLOCK_THRESHOLD_MS,
+                ..Default::default()
+            };
+            match view.cross_block_search(&query, is_regex, 500, &filters) {
                 Ok(results) => {
                     let total = results.len();
                     status_label.set_text(match total {
@@ -157,6 +224,18 @@ pub(super) fn toggle(
                             .subtitle(&subtitle)
                             .activatable(true)
                             .build();
+                        // Outcome at a glance: telling the failing `cargo build`
+                        // from the passing ones should not require visiting each.
+                        if let Some(outcome) = hit_outcome_label(hit) {
+                            let label = gtk::Label::new(Some(&outcome));
+                            label.add_css_class(if hit.exit_code.is_some_and(|code| code != 0) {
+                                "block-status-bad"
+                            } else {
+                                "block-status-ok"
+                            });
+                            label.set_valign(gtk::Align::Center);
+                            row.add_suffix(&label);
+                        }
                         list_box.append(&row);
                     }
                     *hits.borrow_mut() = results;
@@ -219,6 +298,14 @@ pub(super) fn toggle(
         let schedule_rebuild = schedule_rebuild.clone();
         regex_toggle.connect_toggled(move |_| schedule_rebuild());
     }
+    {
+        let schedule_rebuild = schedule_rebuild.clone();
+        failed_toggle.connect_toggled(move |_| schedule_rebuild());
+    }
+    {
+        let schedule_rebuild = schedule_rebuild.clone();
+        slow_toggle.connect_toggled(move |_| schedule_rebuild());
+    }
 
     let jump = {
         let view = view.clone();
@@ -279,6 +366,7 @@ pub(super) fn toggle(
     {
         let dialog = dialog.clone();
         let list_box = list_box.clone();
+        let scrolled = scrolled.clone();
         let jump = jump.clone();
         let apply_jump_outcome = apply_jump_outcome.clone();
         key_controller.connect_key_pressed(move |_, key, _, state| {
@@ -305,6 +393,12 @@ pub(super) fn toggle(
             let next = (current + delta).max(0);
             if let Some(row) = list_box.row_at_index(next) {
                 list_box.select_row(Some(&row));
+                // Selecting a row does not move the viewport: GTK scrolls to
+                // follow *focus*. Without this the selection walks off the
+                // bottom of the list while the user holds Down, and Enter jumps
+                // to a result they cannot see. The entry takes focus straight
+                // back so typing keeps working; the scroll is already queued.
+                scroll_row_into_view(&scrolled, &row);
             }
             gtk::glib::Propagation::Stop
         });
@@ -330,7 +424,51 @@ pub(super) fn toggle(
 
 #[cfg(test)]
 mod tests {
-    use super::{jump_outcome, JumpOutcome, RecordNavigationResult, CROSS_BLOCK_SEARCH_DEBOUNCE};
+    use super::{
+        hit_outcome_label, jump_outcome, CrossBlockHit, JumpOutcome, RecordNavigationResult,
+        CROSS_BLOCK_SEARCH_DEBOUNCE,
+    };
+
+    fn hit(exit_code: Option<i32>, duration_ms: Option<u64>, cwd: Option<&str>) -> CrossBlockHit {
+        CrossBlockHit {
+            block_id: 1,
+            is_output: true,
+            line_no: 1,
+            line_text: "error[E0308]".to_string(),
+            cmd_preview: "cargo build".to_string(),
+            exit_code,
+            duration_ms,
+            cwd: cwd.map(str::to_string),
+        }
+    }
+
+    /// The row suffix exists to answer "which of these `cargo build`s failed"
+    /// without visiting each one, so a success must not wear an `exit:` badge
+    /// and a record that carried nothing must not wear an empty one.
+    #[test]
+    fn outcome_suffix_reports_only_what_the_record_carried() {
+        // An absolute path outside `$HOME`, so the expectation does not depend
+        // on whose machine runs the test.
+        assert_eq!(
+            hit_outcome_label(&hit(Some(1), Some(2_400), Some("/srv/ci/work/anvil"))).as_deref(),
+            Some("exit:1 · 2.4s · …/work/anvil")
+        );
+        assert_eq!(
+            hit_outcome_label(&hit(Some(0), Some(2_400), None)).as_deref(),
+            Some("2.4s"),
+            "a success is the absence of an exit badge, not `exit:0`"
+        );
+        assert_eq!(
+            hit_outcome_label(&hit(None, None, None)),
+            None,
+            "a record with no outcome gets no suffix rather than an empty one"
+        );
+        assert_eq!(
+            hit_outcome_label(&hit(None, None, Some(""))),
+            None,
+            "an empty cwd is not a directory"
+        );
+    }
 
     /// The palette dispatches on the whole navigation ladder, not on "did it
     /// scroll": a record whose retained snapshot produced the hit is

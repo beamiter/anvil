@@ -414,6 +414,10 @@ pub enum VteInput {
     SetScrollback(i64),
     ScrollLines(i32),
     ApplyTheme,
+    /// Block-view only: switch existing cards and the live input cell between
+    /// the normal and compact densities. Card margins are set imperatively, so
+    /// a CSS reinstall alone cannot move them.
+    ApplyBlockDensity(bool),
     /// Refresh backend-owned behavioral configuration from the shared app value.
     /// VTE panes already hold that shared `Rc`; Block panes copy it internally.
     SyncConfig,
@@ -454,6 +458,13 @@ pub enum VteInput {
     AskAiAboutSelectedBlock,
 }
 
+/// What a [`VteOutput::NoticeWithUndo`] button takes back, in the pane that
+/// raised it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeUndo {
+    ClearBlocks,
+}
+
 #[derive(Debug)]
 pub enum VteOutput {
     /// The backend's child process was created successfully. Conventional VTE
@@ -480,6 +491,15 @@ pub enum VteOutput {
     /// User-facing feedback for a backend action (e.g. undo-clear, export)
     /// that the application surfaces as a toast.
     Notice(String),
+    /// A [`VteOutput::Notice`] whose action can be taken back. The application
+    /// puts `button` on the toast and sends `undo` to the pane that emitted
+    /// this — never to whichever pane happens to be focused when the button is
+    /// clicked, which a toast outliving a tab switch otherwise would be.
+    NoticeWithUndo {
+        message: String,
+        button: String,
+        undo: NoticeUndo,
+    },
     /// Current find-in-terminal result. Both backends emit the same state so
     /// the window search bar never has to infer a count or regex failure.
     SearchStatus(SearchStatus),
@@ -756,6 +776,8 @@ impl Component for VteTerminal {
             }
             VteInput::CrossBlockSearch => {}
             VteInput::AskAiAboutSelectedBlock => {}
+            // A conventional VTE pane has no cards to give a density to.
+            VteInput::ApplyBlockDensity(_) => {}
         }
     }
 }

@@ -53,6 +53,7 @@ pub(crate) use find::*;
 pub(crate) use palette::*;
 pub(crate) use scroll::*;
 use selection_hold::SelectionFeedHold;
+pub(crate) use unified_chrome::format_block_duration;
 
 // ── perf profiling (env JTERM_PROF=1) ───────────────────────────────────────
 pub(crate) fn prof_enabled() -> bool {
@@ -447,6 +448,19 @@ fn set_icon_button(button: &gtk::Button, icon_name: &str, label: &str) {
     button.update_property(&[gtk::accessible::Property::Label(label)]);
 }
 
+/// One row of a popover menu. Shared by the per-card menu and the canvas menu
+/// so the two cannot drift into looking like different kinds of menu.
+fn menu_item(label: &str) -> gtk::Button {
+    let button = gtk::Button::with_label(label);
+    button.set_has_frame(false);
+    button.set_halign(gtk::Align::Fill);
+    if let Some(child) = button.child() {
+        child.set_halign(gtk::Align::Start);
+    }
+    button.add_css_class("flat");
+    button
+}
+
 fn icon_button(icon_name: &str, label: &str) -> gtk::Button {
     let button = gtk::Button::from_icon_name(icon_name);
     set_icon_button(&button, icon_name, label);
@@ -472,6 +486,28 @@ fn set_jump_fab_label(fab: &gtk::Button, unread: u32) {
         fab.update_property(&[gtk::accessible::Property::Label("Jump to latest")]);
     }
     fab.set_child(Some(&content));
+}
+
+/// Put the viewport back on the live prompt and retire the unread badge.
+///
+/// Both callers arrive from the same situation — the user is interacting with
+/// the prompt while the history is parked somewhere above it — and the ordering
+/// is load-bearing: whatever brought them here (a focus grab, a committed
+/// keystroke) makes the ScrolledWindow reveal the live holder's *top*, so the
+/// bottom has to be re-pinned, and re-pinned across the frames that virtualized
+/// blocks take to regain their height.
+fn return_to_live_prompt(
+    debouncer: &ScrollDebouncer,
+    scroll: &ScrolledWindow,
+    fab: &gtk::Button,
+    unread: &Rc<Cell<u32>>,
+) {
+    unread.set(0);
+    set_jump_fab_label(fab, 0);
+    fab.set_visible(false);
+    debouncer.reset_scroll_lock();
+    debouncer.mark_dirty(scroll);
+    debouncer.pin_to_bottom_deferred(scroll);
 }
 
 /// Unread blocks are the newest suffix of the retained finished list. Prefix
@@ -640,6 +676,37 @@ fn shell_argv_uses_jsh(argv: &[String]) -> bool {
     })
 }
 
+/// Wrap a string as one POSIX shell word.
+///
+/// Single quotes take everything literally, so the only case to handle is a
+/// single quote itself: close the quote, emit an escaped one, reopen. A working
+/// directory arrives from OSC 7 — it is whatever the filesystem allows, which
+/// includes spaces, quotes, `$(`, and newlines.
+fn shell_single_quote(word: &str) -> String {
+    let mut quoted = String::with_capacity(word.len() + 2);
+    quoted.push('\'');
+    for ch in word.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+/// A `-c` / `--command` argv runs one command and exits. It never reaches an
+/// interactive prompt, so nothing that depends on prompt lifecycle applies.
+fn shell_argv_runs_one_command(argv: &[String]) -> bool {
+    argv.iter().skip(1).any(|argument| {
+        argument == "--command"
+            || (argument.starts_with('-')
+                && !argument.starts_with("--")
+                && argument[1..].bytes().any(|byte| byte == b'c'))
+    })
+}
+
 /// Only direct, interactive bundled bash/zsh startup can consume the private
 /// descriptor before user code. Wrappers, remote commands and `-c` execution
 /// cannot provide the same inherited-FD and prompt-lifecycle guarantees.
@@ -649,13 +716,54 @@ fn shell_argv_supports_agent_ids(argv: &[String]) -> bool {
         .and_then(|argument| std::path::Path::new(argument).file_name())
         .and_then(|name| name.to_str())
         .is_some_and(|name| matches!(name, "bash" | "zsh"));
-    let runs_one_command = argv.iter().skip(1).any(|argument| {
-        argument == "--command"
-            || (argument.starts_with('-')
-                && !argument.starts_with("--")
-                && argument[1..].bytes().any(|byte| byte == b'c'))
-    });
-    direct_shell && !runs_one_command && !shell_argv_uses_jsh(argv)
+    direct_shell && !shell_argv_runs_one_command(argv) && !shell_argv_uses_jsh(argv)
+}
+
+/// How to make a shell emit the marks block mode is built on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShellIntegrationHint {
+    shell: &'static str,
+    /// The line that loads the integration for this shell.
+    load: &'static str,
+    /// Where that line belongs so it survives the next session.
+    rc: &'static str,
+}
+
+/// The one-line fix for a pane whose shell never emits OSC 133, or `None` when
+/// there is nothing honest to offer.
+///
+/// `None` for anything but a direct interactive bash/zsh/fish/pwsh: `jsh`
+/// carries the marks itself, an `ssh` or `docker` pane is someone else's shell
+/// on someone else's machine, a `-c` pane runs one command and exits, and
+/// behind a wrapper we cannot name the rc file that would need the line.
+fn shell_integration_hint(argv: &[String]) -> Option<ShellIntegrationHint> {
+    if shell_argv_uses_jsh(argv) || shell_argv_runs_one_command(argv) {
+        return None;
+    }
+    let shell = argv
+        .first()
+        .and_then(|argument| std::path::Path::new(argument).file_name())
+        .and_then(|name| name.to_str())?;
+    let (shell, load, rc) = match shell {
+        "bash" => (
+            "bash",
+            "source <(anvil --shell-integration bash)",
+            "~/.bashrc",
+        ),
+        "zsh" => ("zsh", "source <(anvil --shell-integration zsh)", "~/.zshrc"),
+        "fish" => (
+            "fish",
+            "anvil --shell-integration fish | source",
+            "~/.config/fish/config.fish",
+        ),
+        "pwsh" | "powershell" => (
+            "pwsh",
+            "anvil --shell-integration pwsh | Out-String | Invoke-Expression",
+            "$PROFILE",
+        ),
+        _ => return None,
+    };
+    Some(ShellIntegrationHint { shell, load, rc })
 }
 
 const MAX_CAPABILITY_OSC_BYTES: usize = 128;
@@ -1505,11 +1613,13 @@ fn sync_finished_block_selection(
         let is_active = active == Some(block.id);
         if is_active {
             block.widget().add_css_class("block-selection-active");
-            block.action_box.set_visible(true);
+            block.action_box.set_opacity(1.0);
+            block.action_box.set_can_target(true);
         } else {
             block.widget().remove_css_class("block-selection-active");
             if !block.widget().has_css_class("block-hovered") {
-                block.action_box.set_visible(false);
+                block.action_box.set_opacity(0.0);
+                block.action_box.set_can_target(false);
             }
         }
     }
@@ -2096,445 +2206,6 @@ fn install_finished_block_selection(
     block.widget().add_controller(left_click);
 }
 
-impl BlockBackend {
-    /// Install the right-click context menu on a finished block.
-    ///
-    /// Live-finalize path only: `undo_clear_blocks` and session restore
-    /// deliberately rebuild blocks without this menu. Inherent rather than
-    /// part of [`RenderBackend`]: the menu is Block-mode chrome, and the
-    /// `*_for_menu` clones below are the closure's own captures — the
-    /// per-finalize context bundle that used to re-clone them is gone.
-    ///
-    /// `finished_widget` is the root widget of the finished block; the
-    /// right-click gesture attaches there.
-    fn install_finished_block_context_menu(
-        &self,
-        finished_widget: gtk::Box,
-        finished_menu_clone: FinishedBlock,
-        block_id: u64,
-    ) {
-        let block_data_for_export = self.block_data_for_cb.clone();
-        let finished_blocks_for_menu = self.finished_blocks_for_cb.clone();
-        let block_list_for_menu = self.block_list_rc.clone();
-        let vte_for_copy = self.active_vte.clone();
-        let pty_for_rerun_menu = self.pty_for_init.clone();
-        let pty_synced_for_rerun_menu = self.pty_synced_rc.clone();
-        let bracketed_paste_for_rerun_menu = self.bracketed_paste_rc.clone();
-        let typed_cmd_for_rerun_menu = self.typed_cmd_rc.clone();
-        let armed_agent_for_rerun_menu = self.armed_agent_execution_rc.clone();
-        let bstate_for_rerun_menu = self.bstate_rc.clone();
-        let active_for_rerun_menu = self.active_rc.clone();
-        let selected_ids_for_menu = self.selected_block_ids_rc.clone();
-        let selected_for_menu = self.selected_block_id_rc.clone();
-        let anchor_for_menu = self.selection_anchor_id_rc.clone();
-        let bookmarks_for_menu = self.bookmarks_rc.clone();
-        let block_scroll_for_menu = self.block_scroll_rc.clone();
-        let visible_for_menu = self.visible_indices_rc.clone();
-        let widget_pool_for_menu = self.widget_pool_for_cb.clone();
-        let ask_ai_cbs_for_menu = self.ask_ai_about_block_cbs.clone();
-        let failure_marker_redraw_for_menu = self.failure_marker_redraw.clone();
-        let unread_for_menu = self.unread_count_rc.clone();
-        let jump_fab_for_menu = self.jump_fab.clone();
-
-        let right_click = gtk::GestureClick::new();
-        right_click.set_button(3);
-
-        right_click.connect_pressed(move |gesture, _n_press, x, y| {
-            gesture.set_state(gtk::EventSequenceState::Claimed);
-            {
-                let finished = finished_blocks_for_menu.borrow();
-                activate_finished_block_selection(
-                    &finished,
-                    &selected_ids_for_menu,
-                    &selected_for_menu,
-                    &anchor_for_menu,
-                    block_id,
-                );
-            }
-
-            let popover = gtk::Popover::new();
-            let widget: &gtk::Widget =
-                &finished_menu_clone.widget().clone().upcast::<gtk::Widget>();
-            popover.set_parent(widget);
-            popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-            popover.set_has_arrow(false);
-
-            let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
-            vbox.add_css_class("menu");
-
-            let make_item = |label: &str| -> gtk::Button {
-                let btn = gtk::Button::with_label(label);
-                btn.set_has_frame(false);
-                btn.set_halign(gtk::Align::Fill);
-                if let Some(child) = btn.child() {
-                    child.set_halign(gtk::Align::Start);
-                }
-                btn.add_css_class("flat");
-                btn
-            };
-
-            let selected_count = selected_ids_for_menu.borrow().len();
-            let has_selected_commands = {
-                let selected = selected_ids_for_menu.borrow();
-                block_data_for_export
-                    .borrow()
-                    .iter()
-                    .any(|block| selected.contains(&block.id) && !block.cmd.trim().is_empty())
-            };
-
-            if has_selected_commands {
-                let item = make_item(if selected_count > 1 {
-                    "Copy Commands"
-                } else {
-                    "Copy Command"
-                });
-                let popover_c = popover.clone();
-                let block_data_for_copy = block_data_for_export.clone();
-                let selected_ids_for_copy = selected_ids_for_menu.clone();
-                let vte_for_action = vte_for_copy.clone();
-                item.connect_clicked(move |_| {
-                    popover_c.popdown();
-                    let selected = selected_ids_for_copy.borrow();
-                    let blocks = block_data_for_copy.borrow();
-                    let text = selected_command_text(
-                        blocks.iter().map(|block| (block.id, block.cmd.as_str())),
-                        &selected,
-                    );
-                    vte_for_action.clipboard().set_text(&text);
-                });
-                vbox.append(&item);
-            }
-
-            {
-                let item = make_item("Ask AI About Block");
-                let popover_c = popover.clone();
-                let finished_for_ai = finished_menu_clone.clone();
-                let block_data_for_ai = block_data_for_export.clone();
-                let callbacks_for_ai = ask_ai_cbs_for_menu.clone();
-                item.connect_clicked(move |_| {
-                    popover_c.popdown();
-                    let output = finished_for_ai
-                        .with_stripped_output(|text| crate::ai::truncate_for_context(text, 80));
-                    let data = block_data_for_ai.borrow();
-                    let record = data.iter().find(|block| block.id == block_id);
-                    let truncated =
-                        output.contains("lines elided") || output.contains("bytes elided");
-                    let (output, exit_code) = shared_block_context_output(
-                        output,
-                        record.and_then(|block| block.exit_code),
-                    );
-                    let context = crate::ai::BlockContext {
-                        cmd: finished_for_ai.cmd_text.clone(),
-                        output,
-                        cwd: record.and_then(|block| block.cwd.clone()),
-                        exit_code,
-                        truncated,
-                    };
-                    for callback in callbacks_for_ai.borrow().iter() {
-                        callback(context.clone());
-                    }
-                });
-                vbox.append(&item);
-            }
-            {
-                let item = make_item(if selected_count > 1 {
-                    "Copy Outputs"
-                } else {
-                    "Copy Output"
-                });
-                let popover_c = popover.clone();
-                let block_data_for_copy = block_data_for_export.clone();
-                let selected_ids_for_copy = selected_ids_for_menu.clone();
-                let vte_for_action = vte_for_copy.clone();
-                item.connect_clicked(move |_| {
-                    popover_c.popdown();
-                    let selected = selected_ids_for_copy.borrow();
-                    let blocks = block_data_for_copy.borrow();
-                    let text = blocks
-                        .iter()
-                        .filter(|block| selected.contains(&block.id))
-                        .map(|block| strip_ansi(&block.output))
-                        .collect::<Vec<_>>()
-                        .join("\n\n");
-                    vte_for_action.clipboard().set_text(&text);
-                });
-                vbox.append(&item);
-            }
-
-            {
-                let item = make_item(if selected_count > 1 {
-                    "Copy Blocks"
-                } else {
-                    "Copy Block"
-                });
-                let popover_c = popover.clone();
-                let block_data_for_copy = block_data_for_export.clone();
-                let selected_ids_for_copy = selected_ids_for_menu.clone();
-                let vte_for_action = vte_for_copy.clone();
-                item.connect_clicked(move |_| {
-                    popover_c.popdown();
-                    let selected = selected_ids_for_copy.borrow();
-                    let blocks = block_data_for_copy.borrow();
-                    let text = blocks
-                        .iter()
-                        .filter(|block| selected.contains(&block.id))
-                        .map(|block| {
-                            block_clipboard_text(&block.cmd, &strip_ansi(&block.output), false)
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n\n");
-                    vte_for_action.clipboard().set_text(&text);
-                });
-                vbox.append(&item);
-            }
-
-            {
-                let item = make_item("Scroll to Top of Block");
-                let popover_c = popover.clone();
-                let finished_for_scroll = finished_menu_clone.clone();
-                let scroll_for_action = block_scroll_for_menu.clone();
-                item.connect_clicked(move |_| {
-                    popover_c.popdown();
-                    finished_for_scroll.scroll_to_edge(&scroll_for_action, false);
-                });
-                vbox.append(&item);
-            }
-            if finished_menu_clone.long_output {
-                let item = make_item("Jump to Bottom of Block");
-                let popover_c = popover.clone();
-                let finished_for_scroll = finished_menu_clone.clone();
-                let scroll_for_action = block_scroll_for_menu.clone();
-                item.connect_clicked(move |_| {
-                    popover_c.popdown();
-                    finished_for_scroll.scroll_to_edge(&scroll_for_action, true);
-                });
-                vbox.append(&item);
-            }
-            {
-                let item = make_item("Toggle Output Filter");
-                let popover_c = popover.clone();
-                let finished_for_filter = finished_menu_clone.clone();
-                item.connect_clicked(move |_| {
-                    popover_c.popdown();
-                    (finished_for_filter.toggle_filter)();
-                });
-                vbox.append(&item);
-            }
-            {
-                let bookmarked = bookmarks_for_menu.borrow().contains(&block_id);
-                let item = make_item(if bookmarked {
-                    "Remove Bookmark"
-                } else {
-                    "Bookmark Block"
-                });
-                let popover_c = popover.clone();
-                let finished_for_bookmark = finished_menu_clone.clone();
-                let bookmarks_for_action = bookmarks_for_menu.clone();
-                item.connect_clicked(move |_| {
-                    popover_c.popdown();
-                    let mut marks = bookmarks_for_action.borrow_mut();
-                    let now_bookmarked = if marks.remove(&block_id) {
-                        false
-                    } else {
-                        marks.insert(block_id);
-                        true
-                    };
-                    finished_for_bookmark
-                        .bookmark_star
-                        .set_visible(now_bookmarked);
-                    if now_bookmarked {
-                        finished_for_bookmark
-                            .widget()
-                            .add_css_class("block-bookmarked");
-                    } else {
-                        finished_for_bookmark
-                            .widget()
-                            .remove_css_class("block-bookmarked");
-                    }
-                });
-                vbox.append(&item);
-            }
-            vbox.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-
-            {
-                let item = make_item(if selected_count > 1 {
-                    "Copy Blocks as Markdown"
-                } else {
-                    "Copy Block as Markdown"
-                });
-                let popover_c = popover.clone();
-                let block_data_for_md = block_data_for_export.clone();
-                let selected_ids_for_md = selected_ids_for_menu.clone();
-                let vte_for_action = vte_for_copy.clone();
-                let block_id_md = block_id;
-                item.connect_clicked(move |_| {
-                    popover_c.popdown();
-                    let selected = selected_ids_for_md.borrow();
-                    let blocks = block_data_for_md.borrow();
-                    let text = selected_blocks_markdown(blocks.iter(), &selected, block_id_md);
-                    vte_for_action.clipboard().set_text(&text);
-                });
-                vbox.append(&item);
-            }
-
-            {
-                let item = make_item("Export as JSON");
-                let popover_c = popover.clone();
-                let block_data_for_json = block_data_for_export.clone();
-                let vte_for_json = vte_for_copy.clone();
-                let block_id_json = block_id;
-                item.connect_clicked(move |_| {
-                    popover_c.popdown();
-                    let blocks = block_data_for_json.borrow();
-                    if let Some(block) = blocks.iter().find(|b| b.id == block_id_json) {
-                        let json = block.to_json();
-                        vte_for_json.clipboard().set_text(&json);
-                    }
-                });
-                vbox.append(&item);
-            }
-
-            if has_selected_commands {
-                let item = make_item(if selected_count > 1 {
-                    "Insert Commands at Prompt"
-                } else {
-                    "Insert Command at Prompt"
-                });
-                let popover_c = popover.clone();
-                let finished_for_rerun = finished_blocks_for_menu.clone();
-                let selected_ids_for_rerun = selected_ids_for_menu.clone();
-                let selected_for_rerun = selected_for_menu.clone();
-                let anchor_for_rerun = anchor_for_menu.clone();
-                let pty_for_action = pty_for_rerun_menu.clone();
-                let pty_synced_for_action = pty_synced_for_rerun_menu.clone();
-                let bracketed_paste_for_action = bracketed_paste_for_rerun_menu.clone();
-                let typed_cmd_for_action = typed_cmd_for_rerun_menu.clone();
-                let armed_agent_for_action = armed_agent_for_rerun_menu.clone();
-                let bstate_for_action = bstate_for_rerun_menu.clone();
-                let active_for_action = active_for_rerun_menu.clone();
-                item.set_sensitive(
-                    bstate_for_action.get() == BlockState::AwaitingCommand
-                        && armed_agent_for_action.borrow().is_none(),
-                );
-                item.connect_clicked(move |_| {
-                    popover_c.popdown();
-                    let finished = finished_for_rerun.borrow();
-                    let recalled = if armed_agent_for_action.borrow().is_some() {
-                        false
-                    } else {
-                        let selected = selected_ids_for_rerun.borrow();
-                        recall_selected_commands_at_prompt(
-                            &pty_for_action,
-                            &pty_synced_for_action,
-                            &typed_cmd_for_action,
-                            bstate_for_action.get(),
-                            &finished,
-                            &selected,
-                            bracketed_paste_for_action.get(),
-                        )
-                    };
-                    if recalled {
-                        clear_finished_block_selection(
-                            &finished,
-                            &selected_ids_for_rerun,
-                            &selected_for_rerun,
-                            &anchor_for_rerun,
-                        );
-                        active_for_action.borrow().grab_focus();
-                    }
-                });
-                vbox.append(&item);
-            }
-            vbox.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-
-            {
-                let item = make_item("Export as Markdown");
-                let popover_c = popover.clone();
-                let block_data_for_md = block_data_for_export.clone();
-                let vte_for_md = vte_for_copy.clone();
-                let block_id_md = block_id;
-                item.connect_clicked(move |_| {
-                    popover_c.popdown();
-                    let blocks = block_data_for_md.borrow();
-                    if let Some(block) = blocks.iter().find(|b| b.id == block_id_md) {
-                        let markdown = block.to_markdown();
-                        vte_for_md.clipboard().set_text(&markdown);
-                    }
-                });
-                vbox.append(&item);
-            }
-
-            {
-                let item = make_item("Delete Block");
-                let popover_c = popover.clone();
-                let finished_blocks_for_delete = finished_blocks_for_menu.clone();
-                let block_list_for_delete = block_list_for_menu.clone();
-                let block_data_for_delete = block_data_for_export.clone();
-                let selected_ids_for_delete = selected_ids_for_menu.clone();
-                let selected_for_delete = selected_for_menu.clone();
-                let anchor_for_delete = anchor_for_menu.clone();
-                let bookmarks_for_delete = bookmarks_for_menu.clone();
-                let visible_for_delete = visible_for_menu.clone();
-                let widget_pool_for_delete = widget_pool_for_menu.clone();
-                let failure_marker_redraw_for_delete = failure_marker_redraw_for_menu.clone();
-                let unread_for_delete = unread_for_menu.clone();
-                let jump_fab_for_delete = jump_fab_for_menu.clone();
-                let block_id_del = block_id;
-                item.connect_clicked(move |_| {
-                    popover_c.popdown();
-                    let mut blocks = finished_blocks_for_delete.borrow_mut();
-                    let removed_pos = blocks.iter().position(|b| b.id == block_id_del);
-                    if let Some(pos) = removed_pos {
-                        let unread =
-                            unread_after_index_removal(blocks.len(), unread_for_delete.get(), pos);
-                        unread_for_delete.set(unread);
-                        set_jump_fab_label(&jump_fab_for_delete, unread);
-                        let block = blocks.remove(pos);
-                        let widget = block.widget().clone();
-                        block_list_for_delete.remove(&widget);
-                        widget_pool_for_delete.borrow_mut().release(widget);
-                    }
-                    remove_finished_block_from_selection(
-                        &blocks,
-                        &selected_ids_for_delete,
-                        &selected_for_delete,
-                        &anchor_for_delete,
-                        block_id_del,
-                    );
-                    // Keep block_data in lockstep with the widget list.
-                    mutate_block_data_and_redraw(
-                        &block_data_for_delete,
-                        failure_marker_redraw_for_delete.as_ref(),
-                        |blocks| {
-                            if let Some(pos) = removed_pos {
-                                let removed = blocks.remove(pos);
-                                debug_assert_eq!(
-                                    removed.as_ref().map(|block| block.id),
-                                    Some(block_id_del),
-                                );
-                            }
-                        },
-                    );
-                    bookmarks_for_delete.borrow_mut().remove(&block_id_del);
-                    // Index-based virtualization must be recalculated after
-                    // any removal; retaining the old set can hide the block
-                    // that shifted into this slot until the next full scroll.
-                    visible_for_delete.borrow_mut().clear();
-                    block_list_for_delete.queue_allocate();
-                });
-                vbox.append(&item);
-            }
-
-            popover.set_child(Some(&vbox));
-            popover.connect_closed(move |p| {
-                p.unparent();
-            });
-            popover.popup();
-        });
-        finished_widget.add_controller(right_click);
-    }
-}
-
 /// Cap on the retained raw output buffer for a single running command. The raw
 /// byte buffer used to re-render the finished block grew without bound — a runaway
 /// command (`cat /dev/urandom`) could exhaust memory before CommandEnd. When the
@@ -2542,6 +2213,25 @@ impl BlockBackend {
 /// (the part a finished block actually shows). 8 MiB comfortably covers any normal
 /// command's output.
 const MAX_RAW_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+
+/// A completed command slower than this is what every "slow block" surface
+/// means by slow: the palette filter, the navigation action, and the debug
+/// counter. It was three separate literals before, two of which disagreed.
+pub(crate) const SLOW_BLOCK_THRESHOLD_MS: u64 = 1000;
+
+/// Seconds a command has to have been running before the live-edge pill
+/// appears. Long enough that an `ls` never flashes one, short enough that the
+/// pill is already there by the time anyone starts wondering.
+const RUNNING_PILL_MIN_SECS: u64 = 2;
+
+/// How often the shell-integration watch re-checks. It is one wakeup beside the
+/// pane's existing 250 ms sticky timer, and it stops for good once marks
+/// appear.
+const SHELL_INTEGRATION_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+/// Polls to wait before concluding that no integration is coming. A slow rc
+/// file, a login shell reading `/etc/profile.d`, or an ssh handshake can all
+/// put the first prompt several seconds out.
+const SHELL_INTEGRATION_GRACE_POLLS: u32 = 2;
 
 /// Keep moving bodies clear of the running-output scrollbar. The overlay
 /// itself remains full-width so clipping follows the live terminal exactly.
@@ -3371,6 +3061,10 @@ pub struct TermView {
     /// Tracks per-VTE selections so a drag that crosses block boundaries can be
     /// copied as one contiguous string via Ctrl+Shift+C.
     cross_selection: Rc<CrossSelection>,
+    /// Engine-owned latch: set by the first OSC 133 mark this pane ever sees.
+    /// Read by the shell-integration watch, which is the one consumer that has
+    /// to know the difference between "no marks yet" and "no marks coming".
+    ftcs_seen: Rc<Cell<bool>>,
     /// Defers raw PTY chunks while a user selection covers the streaming live
     /// VTE, then replays them through the original parser/state pipeline.
     selection_feed_hold: Rc<SelectionFeedHold>,
@@ -3696,6 +3390,15 @@ impl<'a> BackendRecordRef<'a> {
         }
     }
 
+    /// Working directory the record ran in. Both backing record types carry
+    /// it; only the search palette reads it, to show where a hit came from.
+    fn cwd(self) -> Option<&'a str> {
+        match self {
+            Self::Block(record) => record.cwd.as_deref(),
+            Self::Metadata { record, .. } => record.cwd.as_deref(),
+        }
+    }
+
     fn is_metadata_only(self) -> bool {
         matches!(self, Self::Metadata { .. })
     }
@@ -3956,6 +3659,15 @@ trait RenderBackend {
     fn supports_block_mutation(&self) -> bool {
         true
     }
+    /// Attach the per-card right-click menu. Defaulted to nothing for backends
+    /// whose records are not standalone card widgets.
+    fn install_finished_block_context_menu(
+        &self,
+        _finished_widget: gtk::Box,
+        _finished: FinishedBlock,
+        _block_id: u64,
+    ) {
+    }
     fn scroll_surface_lines(&self, _lines: i32) -> bool {
         false
     }
@@ -4149,6 +3861,10 @@ struct BlockBackend {
     /// finalize's kitty tail, so a skipped admit cannot leak a stale texture
     /// across events.
     kitty_pending_admission: RefCell<Option<(gtk::gdk::Texture, usize)>>,
+    /// Filled once `CrossSelection::install` has run — it needs widgets this
+    /// backend is built before. Read only by the context menu, to answer "what
+    /// text is selected right now" before the card selection repaints over it.
+    cross_selection_slot: Rc<RefCell<Option<Rc<CrossSelection>>>>,
 }
 
 /// Per-zone snapshot ceiling: finalize reads at most this many raw bytes from
@@ -6331,6 +6047,586 @@ fn finished_command(vte_capture: &str, input_shadow: &str) -> String {
 /// helper functions they wrap stay module-level because non-reader paths
 /// (restore, resize, submit) share them.
 impl RenderBackend for BlockBackend {
+    /// Install the right-click context menu on a finished block.
+    ///
+    /// Part of the trait, not an inherent method, so every path that builds a
+    /// card reaches it: session restore and `undo_clear_blocks` rebuild real
+    /// blocks, and a restored card whose right-click did nothing was simply a
+    /// card missing half its actions. Unified keeps the default no-op — its
+    /// records are not per-card widgets.
+    ///
+    /// `finished_widget` is the root widget of the finished block; the
+    /// right-click gesture attaches there.
+    fn install_finished_block_context_menu(
+        &self,
+        finished_widget: gtk::Box,
+        finished_menu_clone: FinishedBlock,
+        block_id: u64,
+    ) {
+        let block_data_for_export = self.block_data_for_cb.clone();
+        let finished_blocks_for_menu = self.finished_blocks_for_cb.clone();
+        let block_list_for_menu = self.block_list_rc.clone();
+        let vte_for_copy = self.active_vte.clone();
+        let pty_for_rerun_menu = self.pty_for_init.clone();
+        let pty_synced_for_rerun_menu = self.pty_synced_rc.clone();
+        let bracketed_paste_for_rerun_menu = self.bracketed_paste_rc.clone();
+        let typed_cmd_for_rerun_menu = self.typed_cmd_rc.clone();
+        let armed_agent_for_rerun_menu = self.armed_agent_execution_rc.clone();
+        let bstate_for_rerun_menu = self.bstate_rc.clone();
+        let active_for_rerun_menu = self.active_rc.clone();
+        let selected_ids_for_menu = self.selected_block_ids_rc.clone();
+        let selected_for_menu = self.selected_block_id_rc.clone();
+        let anchor_for_menu = self.selection_anchor_id_rc.clone();
+        let bookmarks_for_menu = self.bookmarks_rc.clone();
+        let block_scroll_for_menu = self.block_scroll_rc.clone();
+        let visible_for_menu = self.visible_indices_rc.clone();
+        let widget_pool_for_menu = self.widget_pool_for_cb.clone();
+        let ask_ai_cbs_for_menu = self.ask_ai_about_block_cbs.clone();
+        let failure_marker_redraw_for_menu = self.failure_marker_redraw.clone();
+        let unread_for_menu = self.unread_count_rc.clone();
+        let jump_fab_for_menu = self.jump_fab.clone();
+        let cross_selection_for_menu = self.cross_selection_slot.clone();
+
+        let right_click = gtk::GestureClick::new();
+        right_click.set_button(3);
+
+        right_click.connect_pressed(move |gesture, _n_press, x, y| {
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+
+            // Read the painted text selection BEFORE anything below touches it.
+            // Right-clicking a selected error line is how anyone would try to
+            // copy that line, and the card selection this menu is about to
+            // activate repaints over it.
+            let cross_selection = cross_selection_for_menu.borrow().clone();
+            let selected_text = cross_selection
+                .as_ref()
+                .filter(|cross| cross.has_cross_selection())
+                .and_then(|cross| cross.copy_text())
+                .or_else(|| {
+                    // A cross-block drag `select_all`s every VTE in range, so
+                    // this two-VTE walk would truncate that case — hence the
+                    // aggregate above first.
+                    [
+                        &finished_menu_clone.output_vte,
+                        &finished_menu_clone.command_vte,
+                    ]
+                    .into_iter()
+                    .find_map(|vte| {
+                        vte.text_selected(vte4::Format::Text)
+                            .map(|text| text.to_string())
+                            .filter(|text| !text.is_empty())
+                    })
+                });
+
+            {
+                // Kept deliberately: with an empty set `Copy Output` would set
+                // the clipboard to nothing, and with block A selected while B
+                // is right-clicked every other item would act on A.
+                let finished = finished_blocks_for_menu.borrow();
+                activate_finished_block_selection(
+                    &finished,
+                    &selected_ids_for_menu,
+                    &selected_for_menu,
+                    &anchor_for_menu,
+                    block_id,
+                );
+            }
+            // One selection model painted at a time. The card selection now on
+            // screen is what the Ctrl+Shift+C ladder will act on; leaving the
+            // text selection painted underneath makes the two contradict each
+            // other, silently.
+            if let Some(cross) = cross_selection.as_ref() {
+                cross.clear_all();
+            }
+
+            let popover = gtk::Popover::new();
+            let widget: &gtk::Widget =
+                &finished_menu_clone.widget().clone().upcast::<gtk::Widget>();
+            popover.set_parent(widget);
+            popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            popover.set_has_arrow(false);
+
+            let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            vbox.add_css_class("menu");
+
+            let make_item = menu_item;
+
+            if let Some(text) = selected_text {
+                let item = make_item("Copy Selection");
+                let popover_c = popover.clone();
+                let vte_for_action = vte_for_copy.clone();
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    vte_for_action.clipboard().set_text(&text);
+                });
+                vbox.append(&item);
+                vbox.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+            }
+
+            let selected_count = selected_ids_for_menu.borrow().len();
+            let has_selected_commands = {
+                let selected = selected_ids_for_menu.borrow();
+                block_data_for_export
+                    .borrow()
+                    .iter()
+                    .any(|block| selected.contains(&block.id) && !block.cmd.trim().is_empty())
+            };
+
+            if has_selected_commands {
+                let item = make_item(if selected_count > 1 {
+                    "Copy Commands"
+                } else {
+                    "Copy Command"
+                });
+                let popover_c = popover.clone();
+                let block_data_for_copy = block_data_for_export.clone();
+                let selected_ids_for_copy = selected_ids_for_menu.clone();
+                let vte_for_action = vte_for_copy.clone();
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    let selected = selected_ids_for_copy.borrow();
+                    let blocks = block_data_for_copy.borrow();
+                    let text = selected_command_text(
+                        blocks.iter().map(|block| (block.id, block.cmd.as_str())),
+                        &selected,
+                    );
+                    vte_for_action.clipboard().set_text(&text);
+                });
+                vbox.append(&item);
+            }
+
+            {
+                let item = make_item("Ask AI About Block");
+                let popover_c = popover.clone();
+                let finished_for_ai = finished_menu_clone.clone();
+                let block_data_for_ai = block_data_for_export.clone();
+                let callbacks_for_ai = ask_ai_cbs_for_menu.clone();
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    let output = finished_for_ai
+                        .with_stripped_output(|text| crate::ai::truncate_for_context(text, 80));
+                    let data = block_data_for_ai.borrow();
+                    let record = data.iter().find(|block| block.id == block_id);
+                    let truncated =
+                        output.contains("lines elided") || output.contains("bytes elided");
+                    let (output, exit_code) = shared_block_context_output(
+                        output,
+                        record.and_then(|block| block.exit_code),
+                    );
+                    let context = crate::ai::BlockContext {
+                        cmd: finished_for_ai.cmd_text.clone(),
+                        output,
+                        cwd: record.and_then(|block| block.cwd.clone()),
+                        exit_code,
+                        truncated,
+                    };
+                    for callback in callbacks_for_ai.borrow().iter() {
+                        callback(context.clone());
+                    }
+                });
+                vbox.append(&item);
+            }
+            {
+                let item = make_item(if selected_count > 1 {
+                    "Copy Outputs"
+                } else {
+                    "Copy Output"
+                });
+                let popover_c = popover.clone();
+                let block_data_for_copy = block_data_for_export.clone();
+                let selected_ids_for_copy = selected_ids_for_menu.clone();
+                let vte_for_action = vte_for_copy.clone();
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    let selected = selected_ids_for_copy.borrow();
+                    let blocks = block_data_for_copy.borrow();
+                    let text = blocks
+                        .iter()
+                        .filter(|block| selected.contains(&block.id))
+                        .map(|block| strip_ansi(&block.output))
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    vte_for_action.clipboard().set_text(&text);
+                });
+                vbox.append(&item);
+            }
+
+            {
+                let item = make_item(if selected_count > 1 {
+                    "Copy Blocks"
+                } else {
+                    "Copy Block"
+                });
+                let popover_c = popover.clone();
+                let block_data_for_copy = block_data_for_export.clone();
+                let selected_ids_for_copy = selected_ids_for_menu.clone();
+                let vte_for_action = vte_for_copy.clone();
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    let selected = selected_ids_for_copy.borrow();
+                    let blocks = block_data_for_copy.borrow();
+                    let text = blocks
+                        .iter()
+                        .filter(|block| selected.contains(&block.id))
+                        .map(|block| {
+                            block_clipboard_text(&block.cmd, &strip_ansi(&block.output), false)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    vte_for_action.clipboard().set_text(&text);
+                });
+                vbox.append(&item);
+            }
+
+            // The directory a block ran in is half of what it means, and until
+            // now it was readable only as a shortened chip.
+            if let Some(cwd) = block_data_for_export
+                .borrow()
+                .iter()
+                .find(|block| block.id == block_id)
+                .and_then(|block| block.cwd.clone())
+                .filter(|cwd| !cwd.is_empty())
+            {
+                {
+                    let item = make_item("Copy Directory");
+                    let popover_c = popover.clone();
+                    let vte_for_action = vte_for_copy.clone();
+                    let cwd = cwd.clone();
+                    item.connect_clicked(move |_| {
+                        popover_c.popdown();
+                        vte_for_action.clipboard().set_text(&cwd);
+                    });
+                    vbox.append(&item);
+                }
+                {
+                    let item = make_item("Go to Directory");
+                    let popover_c = popover.clone();
+                    let pty_for_action = pty_for_rerun_menu.clone();
+                    let pty_synced_for_action = pty_synced_for_rerun_menu.clone();
+                    let bracketed_paste_for_action = bracketed_paste_for_rerun_menu.clone();
+                    let typed_cmd_for_action = typed_cmd_for_rerun_menu.clone();
+                    let armed_agent_for_action = armed_agent_for_rerun_menu.clone();
+                    let bstate_for_action = bstate_for_rerun_menu.clone();
+                    let active_for_action = active_for_rerun_menu.clone();
+                    // Same gate as "Insert Command at Prompt": this writes to
+                    // the prompt, so it needs a clean, idle one.
+                    item.set_sensitive(
+                        bstate_for_action.get() == BlockState::AwaitingCommand
+                            && armed_agent_for_action.borrow().is_none(),
+                    );
+                    // Inserted, never run — the same rule every recall here
+                    // follows. A cwd comes from OSC 7 and can hold spaces and
+                    // quotes, so it is quoted rather than trusted.
+                    let command = format!("cd {}", shell_single_quote(&cwd));
+                    item.connect_clicked(move |_| {
+                        popover_c.popdown();
+                        if recall_command_at_prompt(
+                            &pty_for_action,
+                            &pty_synced_for_action,
+                            &typed_cmd_for_action,
+                            bstate_for_action.get(),
+                            armed_agent_for_action.borrow().is_some(),
+                            &command,
+                            bracketed_paste_for_action.get(),
+                        ) {
+                            active_for_action.borrow().grab_focus();
+                        }
+                    });
+                    vbox.append(&item);
+                }
+            }
+
+            {
+                let item = make_item("Scroll to Top of Block");
+                let popover_c = popover.clone();
+                let finished_for_scroll = finished_menu_clone.clone();
+                let scroll_for_action = block_scroll_for_menu.clone();
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    finished_for_scroll.scroll_to_edge(&scroll_for_action, false);
+                });
+                vbox.append(&item);
+            }
+            if finished_menu_clone.long_output {
+                let item = make_item("Jump to Bottom of Block");
+                let popover_c = popover.clone();
+                let finished_for_scroll = finished_menu_clone.clone();
+                let scroll_for_action = block_scroll_for_menu.clone();
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    finished_for_scroll.scroll_to_edge(&scroll_for_action, true);
+                });
+                vbox.append(&item);
+            }
+            {
+                let item = make_item(if finished_menu_clone.is_output_collapsed() {
+                    "Unfold Output"
+                } else {
+                    "Fold Output"
+                });
+                let popover_c = popover.clone();
+                let finished_for_fold = finished_menu_clone.clone();
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    (finished_for_fold.toggle_collapsed)();
+                });
+                vbox.append(&item);
+            }
+            {
+                let item = make_item("Toggle Output Filter");
+                let popover_c = popover.clone();
+                let finished_for_filter = finished_menu_clone.clone();
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    (finished_for_filter.toggle_filter)();
+                });
+                vbox.append(&item);
+            }
+            {
+                let bookmarked = bookmarks_for_menu.borrow().contains(&block_id);
+                let item = make_item(if bookmarked {
+                    "Remove Bookmark"
+                } else {
+                    "Bookmark Block"
+                });
+                let popover_c = popover.clone();
+                let finished_for_bookmark = finished_menu_clone.clone();
+                let bookmarks_for_action = bookmarks_for_menu.clone();
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    let mut marks = bookmarks_for_action.borrow_mut();
+                    let now_bookmarked = if marks.remove(&block_id) {
+                        false
+                    } else {
+                        marks.insert(block_id);
+                        true
+                    };
+                    finished_for_bookmark
+                        .bookmark_star
+                        .set_visible(now_bookmarked);
+                    if now_bookmarked {
+                        finished_for_bookmark
+                            .widget()
+                            .add_css_class("block-bookmarked");
+                    } else {
+                        finished_for_bookmark
+                            .widget()
+                            .remove_css_class("block-bookmarked");
+                    }
+                });
+                vbox.append(&item);
+            }
+            vbox.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+
+            {
+                let item = make_item(if selected_count > 1 {
+                    "Copy Blocks as Markdown"
+                } else {
+                    "Copy Block as Markdown"
+                });
+                let popover_c = popover.clone();
+                let block_data_for_md = block_data_for_export.clone();
+                let selected_ids_for_md = selected_ids_for_menu.clone();
+                let vte_for_action = vte_for_copy.clone();
+                let block_id_md = block_id;
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    let selected = selected_ids_for_md.borrow();
+                    let blocks = block_data_for_md.borrow();
+                    let text = selected_blocks_markdown(blocks.iter(), &selected, block_id_md);
+                    vte_for_action.clipboard().set_text(&text);
+                });
+                vbox.append(&item);
+            }
+
+            {
+                let item = make_item("Export as JSON");
+                let popover_c = popover.clone();
+                let block_data_for_json = block_data_for_export.clone();
+                let vte_for_json = vte_for_copy.clone();
+                let block_id_json = block_id;
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    let blocks = block_data_for_json.borrow();
+                    if let Some(block) = blocks.iter().find(|b| b.id == block_id_json) {
+                        let json = block.to_json();
+                        vte_for_json.clipboard().set_text(&json);
+                    }
+                });
+                vbox.append(&item);
+            }
+
+            if has_selected_commands {
+                let item = make_item(if selected_count > 1 {
+                    "Insert Commands at Prompt"
+                } else {
+                    "Insert Command at Prompt"
+                });
+                let popover_c = popover.clone();
+                let finished_for_rerun = finished_blocks_for_menu.clone();
+                let selected_ids_for_rerun = selected_ids_for_menu.clone();
+                let selected_for_rerun = selected_for_menu.clone();
+                let anchor_for_rerun = anchor_for_menu.clone();
+                let pty_for_action = pty_for_rerun_menu.clone();
+                let pty_synced_for_action = pty_synced_for_rerun_menu.clone();
+                let bracketed_paste_for_action = bracketed_paste_for_rerun_menu.clone();
+                let typed_cmd_for_action = typed_cmd_for_rerun_menu.clone();
+                let armed_agent_for_action = armed_agent_for_rerun_menu.clone();
+                let bstate_for_action = bstate_for_rerun_menu.clone();
+                let active_for_action = active_for_rerun_menu.clone();
+                item.set_sensitive(
+                    bstate_for_action.get() == BlockState::AwaitingCommand
+                        && armed_agent_for_action.borrow().is_none(),
+                );
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    let finished = finished_for_rerun.borrow();
+                    let recalled = if armed_agent_for_action.borrow().is_some() {
+                        false
+                    } else {
+                        let selected = selected_ids_for_rerun.borrow();
+                        recall_selected_commands_at_prompt(
+                            &pty_for_action,
+                            &pty_synced_for_action,
+                            &typed_cmd_for_action,
+                            bstate_for_action.get(),
+                            &finished,
+                            &selected,
+                            bracketed_paste_for_action.get(),
+                        )
+                    };
+                    if recalled {
+                        clear_finished_block_selection(
+                            &finished,
+                            &selected_ids_for_rerun,
+                            &selected_for_rerun,
+                            &anchor_for_rerun,
+                        );
+                        active_for_action.borrow().grab_focus();
+                    }
+                });
+                vbox.append(&item);
+            }
+            vbox.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+
+            {
+                let item = make_item("Export as Markdown");
+                let popover_c = popover.clone();
+                let block_data_for_md = block_data_for_export.clone();
+                let vte_for_md = vte_for_copy.clone();
+                let block_id_md = block_id;
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    let blocks = block_data_for_md.borrow();
+                    if let Some(block) = blocks.iter().find(|b| b.id == block_id_md) {
+                        let markdown = block.to_markdown();
+                        vte_for_md.clipboard().set_text(&markdown);
+                    }
+                });
+                vbox.append(&item);
+            }
+
+            {
+                // Every sibling item already pluralizes with the selection;
+                // this one silently deleted one of five.
+                let delete_label = if selected_count > 1 {
+                    format!("Delete {selected_count} Blocks")
+                } else {
+                    "Delete Block".to_string()
+                };
+                let item = make_item(&delete_label);
+                let popover_c = popover.clone();
+                let finished_blocks_for_delete = finished_blocks_for_menu.clone();
+                let block_list_for_delete = block_list_for_menu.clone();
+                let block_data_for_delete = block_data_for_export.clone();
+                let selected_ids_for_delete = selected_ids_for_menu.clone();
+                let selected_for_delete = selected_for_menu.clone();
+                let anchor_for_delete = anchor_for_menu.clone();
+                let bookmarks_for_delete = bookmarks_for_menu.clone();
+                let visible_for_delete = visible_for_menu.clone();
+                let widget_pool_for_delete = widget_pool_for_menu.clone();
+                let failure_marker_redraw_for_delete = failure_marker_redraw_for_menu.clone();
+                let unread_for_delete = unread_for_menu.clone();
+                let jump_fab_for_delete = jump_fab_for_menu.clone();
+                let block_id_del = block_id;
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    // Opening this menu already folded the clicked card into
+                    // the selection, so "what is highlighted" is the honest
+                    // target set. Collected in document order and removed from
+                    // the back, so each removal cannot shift the next index.
+                    let targets: Vec<u64> = {
+                        let selected = selected_ids_for_delete.borrow();
+                        if selected.is_empty() {
+                            vec![block_id_del]
+                        } else {
+                            finished_blocks_for_delete
+                                .borrow()
+                                .iter()
+                                .filter(|block| selected.contains(&block.id))
+                                .map(|block| block.id)
+                                .collect()
+                        }
+                    };
+                    for target in targets.into_iter().rev() {
+                        let mut blocks = finished_blocks_for_delete.borrow_mut();
+                        let removed_pos = blocks.iter().position(|block| block.id == target);
+                        if let Some(pos) = removed_pos {
+                            let unread = unread_after_index_removal(
+                                blocks.len(),
+                                unread_for_delete.get(),
+                                pos,
+                            );
+                            unread_for_delete.set(unread);
+                            set_jump_fab_label(&jump_fab_for_delete, unread);
+                            let block = blocks.remove(pos);
+                            let widget = block.widget().clone();
+                            block_list_for_delete.remove(&widget);
+                            widget_pool_for_delete.borrow_mut().release(widget);
+                        }
+                        remove_finished_block_from_selection(
+                            &blocks,
+                            &selected_ids_for_delete,
+                            &selected_for_delete,
+                            &anchor_for_delete,
+                            target,
+                        );
+                        drop(blocks);
+                        // Keep block_data in lockstep with the widget list.
+                        mutate_block_data_and_redraw(
+                            &block_data_for_delete,
+                            failure_marker_redraw_for_delete.as_ref(),
+                            |blocks| {
+                                if let Some(pos) = removed_pos {
+                                    let removed = blocks.remove(pos);
+                                    debug_assert_eq!(
+                                        removed.as_ref().map(|block| block.id),
+                                        Some(target),
+                                    );
+                                }
+                            },
+                        );
+                        bookmarks_for_delete.borrow_mut().remove(&target);
+                    }
+                    // Index-based virtualization must be recalculated after
+                    // any removal; retaining the old set can hide the block
+                    // that shifted into this slot until the next full scroll.
+                    // Once, after the whole batch.
+                    visible_for_delete.borrow_mut().clear();
+                    block_list_for_delete.queue_allocate();
+                });
+                vbox.append(&item);
+            }
+
+            popover.set_child(Some(&vbox));
+            popover.connect_closed(move |p| {
+                p.unparent();
+            });
+            popover.popup();
+        });
+        finished_widget.add_controller(right_click);
+    }
+
     fn feed_live(&self, bytes: &[u8]) {
         self.active_vte.feed(bytes);
     }
@@ -6457,8 +6753,8 @@ impl RenderBackend for BlockBackend {
                 };
             }
             if remaining == 0 {
-                let has_more =
-                    !block.full_output.borrow().is_empty() || block_index + 1 < finished.len();
+                let has_more = block.with_searchable_output(|output| !output.is_empty())
+                    || block_index + 1 < finished.len();
                 surfaces
                     .last_mut()
                     .expect("the command surface was just appended")
@@ -6475,26 +6771,29 @@ impl RenderBackend for BlockBackend {
 
             // Bound the decorated prefix before ANSI stripping so both the
             // copied input and retained UTF-8 stay under the aggregate budget.
+            // The haystack is what the card displays, so the count this pass
+            // reports and the hit the VTE can actually step to are the same set.
             let mut output_incomplete = false;
             if !push_search_surface_before_deadline(&mut surfaces, deadline_exhausted, || {
-                let raw_output = block.full_output.borrow();
-                let raw_prefix = utf8_prefix_bounded(&raw_output, remaining);
-                output_incomplete = raw_prefix.len() < raw_output.len();
-                remaining = remaining.saturating_sub(raw_prefix.len());
-                BackendSearchSurface {
-                    block_id: block.id,
-                    block_index,
-                    is_output: true,
-                    is_live: false,
-                    windows: vec![BackendSearchWindow {
-                        text: strip_ansi(raw_prefix),
-                        incomplete: output_incomplete,
-                        initial_wrap: false,
-                    }],
-                    scanned_bytes: raw_prefix.len(),
-                    reset_cursor: false,
-                    terminal: block.output_vte.clone(),
-                }
+                block.with_searchable_output(|output| {
+                    let raw_prefix = utf8_prefix_bounded(output, remaining);
+                    output_incomplete = raw_prefix.len() < output.len();
+                    remaining = remaining.saturating_sub(raw_prefix.len());
+                    BackendSearchSurface {
+                        block_id: block.id,
+                        block_index,
+                        is_output: true,
+                        is_live: false,
+                        windows: vec![BackendSearchWindow {
+                            text: strip_ansi(raw_prefix),
+                            incomplete: output_incomplete,
+                            initial_wrap: false,
+                        }],
+                        scanned_bytes: raw_prefix.len(),
+                        reset_cursor: false,
+                        terminal: block.output_vte.clone(),
+                    }
+                })
             }) {
                 return BackendSearchBatch {
                     surfaces,
@@ -6882,9 +7181,10 @@ impl RenderBackend for BlockBackend {
                 retained_bytes: Some(newest_estimated_bytes),
             },
         );
-        if let Some(notice) = record.lifecycle_notice() {
-            finished.widget().set_tooltip_text(Some(&notice));
-        }
+        finished.set_lifecycle(
+            record.lifecycle_health(),
+            record.lifecycle_notice().as_deref(),
+        );
         finished
             .widget()
             .insert_before(&self.block_list_rc, Some(self.active_rc.borrow().widget()));
@@ -8261,13 +8561,49 @@ impl KeyCtx {
                 bstate_for_key.get(),
                 BlockState::CollectingOutput | BlockState::AltScreen | BlockState::RawFallback
             );
+            // Bare Home/End belong to whoever owns the line being edited.
+            // Claiming them for the viewport meant a shell prompt could never
+            // reach the start of its own command — the single most common
+            // editing key in a terminal, spent on a jump the FAB, PageUp and
+            // `Ctrl+Shift+N` all already offer. With a block selected they walk
+            // the selection to its ends (the selection owns the arrows there
+            // for the same reason), and the viewport edges moved to Ctrl+Home /
+            // Ctrl+End, which no shell binds and no default chord claims.
             if !ctrl
                 && !shift
                 && !alt
                 && history_navigation
+                && selected_block_id_for_key.get().is_some()
                 && matches!(keyval, Key::Home | Key::End)
             {
-                scroll_history_to_edge(&block_scroll_for_key, keyval == Key::End);
+                let finished = finished_blocks_for_key.borrow();
+                let edge = if keyval == Key::Home {
+                    finished.first()
+                } else {
+                    finished.last()
+                };
+                if let Some(block) = edge {
+                    replace_finished_block_selection(
+                        &finished,
+                        &selected_block_ids_for_key,
+                        &selected_block_id_for_key,
+                        &selection_anchor_id_for_key,
+                        Some(block.id),
+                    );
+                    scroll_finished_block_into_view(block, &block_scroll_for_key);
+                    return glib::Propagation::Stop;
+                }
+            }
+            if ctrl
+                && !shift
+                && !alt
+                && history_navigation
+                && matches!(keyval, Key::Home | Key::End | Key::KP_Home | Key::KP_End)
+            {
+                scroll_history_to_edge(
+                    &block_scroll_for_key,
+                    matches!(keyval, Key::End | Key::KP_End),
+                );
                 return glib::Propagation::Stop;
             }
             if !ctrl
@@ -8425,6 +8761,26 @@ impl KeyCtx {
                 }
             }
 
+            // Alt+Shift+O folds or unfolds the selected block's output, with
+            // the same selected-or-latest target the filter chord above uses.
+            // A 400-line `cargo build` was mouse-only to collapse.
+            if alt
+                && shift
+                && !ctrl
+                && matches!(keyval, Key::o | Key::O)
+                && bstate_for_key.get() != BlockState::AltScreen
+            {
+                let finished = finished_blocks_for_key.borrow();
+                let target = selected_block_id_for_key
+                    .get()
+                    .and_then(|id| finished.iter().find(|block| block.id == id))
+                    .or_else(|| finished.last());
+                if let Some(block) = target {
+                    (block.toggle_collapsed)();
+                    return glib::Propagation::Stop;
+                }
+            }
+
             // Ctrl+Shift+B: toggle a bookmark on the selected block (Warp's
             // Linux binding). Shows the gutter star + accent stripe.
             // Only consume the key when bookmark logic actually fires.
@@ -8434,36 +8790,50 @@ impl KeyCtx {
                 && matches!(keyval, Key::b | Key::B)
                 && bstate_for_key.get() != BlockState::AltScreen
             {
-                if let Some(sel_id) = selected_block_id_for_key.get() {
-                    let finished = finished_blocks_for_key.borrow();
-                    if let Some(block) = finished.iter().find(|b| b.id == sel_id) {
-                        let mut marks = bookmarks_for_key.borrow_mut();
-                        let now_marked = if marks.remove(&sel_id) {
-                            false
-                        } else {
-                            marks.insert(sel_id);
-                            true
-                        };
-                        block.bookmark_star.set_visible(now_marked);
-                        if now_marked {
-                            block.widget().add_css_class("block-bookmarked");
-                        } else {
-                            block.widget().remove_css_class("block-bookmarked");
-                        }
-                        return glib::Propagation::Stop;
+                // No selection targets the newest block, the same fallback the
+                // output-filter chord above uses. Requiring a selection first
+                // made the chord a no-op in the one moment it is reached for:
+                // right after watching a command finish.
+                let finished = finished_blocks_for_key.borrow();
+                let target = selected_block_id_for_key
+                    .get()
+                    .and_then(|id| finished.iter().find(|block| block.id == id))
+                    .or_else(|| finished.last());
+                if let Some(block) = target {
+                    let mut marks = bookmarks_for_key.borrow_mut();
+                    let now_marked = if marks.remove(&block.id) {
+                        false
+                    } else {
+                        marks.insert(block.id);
+                        true
+                    };
+                    block.bookmark_star.set_visible(now_marked);
+                    if now_marked {
+                        block.widget().add_css_class("block-bookmarked");
+                    } else {
+                        block.widget().remove_css_class("block-bookmarked");
                     }
+                    return glib::Propagation::Stop;
                 }
             }
 
             // Ctrl+,/Ctrl+. : jump to the previous/next bookmarked block (Warp's
             // SelectBookmarkUp/Down). The global pane-cycle defaults deliberately
             // leave these two context-sensitive chords available to block mode.
-            if ctrl && !alt && !shift && matches!(keyval, Key::comma | Key::period) {
+            //
+            // The chord is only claimed when there is somewhere to jump to and
+            // the shell owns a prompt. `Ctrl+,` is the near-universal
+            // preferences chord: consuming it in a pane that has never
+            // bookmarked anything took it away from every program that runs in
+            // the terminal, for the whole life of the session.
+            if ctrl
+                && !alt
+                && !shift
+                && history_navigation
+                && matches!(keyval, Key::comma | Key::period)
+            {
                 let finished = finished_blocks_for_key.borrow();
                 let marks = bookmarks_for_key.borrow();
-                if marks.is_empty() {
-                    return glib::Propagation::Stop;
-                }
                 let marked_idx: Vec<usize> = finished
                     .iter()
                     .enumerate()
@@ -8471,7 +8841,7 @@ impl KeyCtx {
                     .map(|(i, _)| i)
                     .collect();
                 if marked_idx.is_empty() {
-                    return glib::Propagation::Stop;
+                    return glib::Propagation::Proceed;
                 }
                 let cur = selected_block_id_for_key
                     .get()
@@ -8629,6 +8999,39 @@ impl TermView {
         jump_fab.set_visible(false);
         jump_fab.set_can_focus(false);
 
+        // ── Running-command pill ──────────────────────────────────────────
+        // The sticky header below only exists once the user has scrolled away
+        // from the prompt. At the live edge — where most commands are actually
+        // watched — a command that prints nothing looked exactly like a hung
+        // shell: no elapsed time, and nothing to aim at to stop it. Ctrl+C
+        // always worked; the readout and the pointer target did not exist.
+        //
+        // It waits out short commands, so an `ls` never flashes one.
+        let running_pill = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        running_pill.add_css_class("running-pill");
+        running_pill.set_halign(gtk::Align::End);
+        running_pill.set_valign(gtk::Align::Start);
+        running_pill.set_margin_top(10);
+        // Clears the failure-marker strip on the right edge.
+        running_pill.set_margin_end(22);
+        running_pill.set_visible(false);
+        running_pill.set_focusable(false);
+        running_pill.set_accessible_role(gtk::AccessibleRole::Status);
+        let running_pill_icon = gtk::Image::from_icon_name("content-loading-symbolic");
+        running_pill_icon.add_css_class("running-pill-icon");
+        let running_pill_label = gtk::Label::new(None);
+        running_pill_label.add_css_class("sticky-running-label");
+        let running_pill_stop = icon_button(
+            "media-playback-stop-symbolic",
+            "Interrupt the running command (Ctrl+C)",
+        );
+        running_pill_stop.add_css_class("sticky-header-control");
+        running_pill_stop.add_css_class("flat");
+        running_pill_stop.set_focusable(false);
+        running_pill.append(&running_pill_icon);
+        running_pill.append(&running_pill_label);
+        running_pill.append(&running_pill_stop);
+
         // ── Sticky running-command header ─────────────────────────────────
         // When a command is running and the user has scrolled up into history,
         // a thin bar pins to the top of the scroll area showing the live command
@@ -8706,6 +9109,7 @@ impl TermView {
         scroll_overlay.set_child(Some(&block_scroll));
         scroll_overlay.add_overlay(&sticky_bar);
         scroll_overlay.add_overlay(&jump_fab);
+        scroll_overlay.add_overlay(&running_pill);
 
         // Streaming output would normally repaint away a live-VTE selection.
         // Park the raw feed during that drag and explain the frozen surface only
@@ -9397,6 +9801,11 @@ impl TermView {
         // ── Wire PTY → parser → block events ─────────────────────────────
         let render_backend_slot: Rc<RefCell<Option<Rc<dyn RenderBackend>>>> =
             Rc::new(RefCell::new(None));
+        // Same late-binding shape: cross-block selection needs widgets the
+        // backend is constructed before, and the backend's context menu needs
+        // to ask it what is selected.
+        let cross_selection_slot: Rc<RefCell<Option<Rc<CrossSelection>>>> =
+            Rc::new(RefCell::new(None));
         {
             let active_rc = active.clone();
             let active_vte_rc = active_vte.clone();
@@ -9522,6 +9931,7 @@ impl TermView {
                     kitty_pending_images: RefCell::new(Vec::new()),
                     kitty_pending_bytes: Cell::new(0),
                     kitty_pending_admission: RefCell::new(None),
+                    cross_selection_slot: cross_selection_slot.clone(),
                 })
             };
             *render_backend_slot.borrow_mut() = Some(backend.clone());
@@ -9829,6 +10239,19 @@ impl TermView {
                 emit_human_input(&human_input, HumanInputKind::StickyStop);
             });
         }
+        {
+            // The pill's stop is the same interrupt as the sticky header's: the
+            // two are never on screen together, so they are one control that
+            // moves with the viewport.
+            let pty = pty.clone();
+            let human_input = human_input_callbacks.clone();
+            let selection_feed_hold = selection_feed_hold.clone();
+            running_pill_stop.connect_clicked(move |_| {
+                selection_feed_hold.flush_now();
+                pty.write_bytes(b"\x03");
+                emit_human_input(&human_input, HumanInputKind::StickyStop);
+            });
+        }
         let sticky_timer_id = {
             let sticky = sticky_bar.clone();
             let sticky_label = sticky_label.clone();
@@ -9844,6 +10267,9 @@ impl TermView {
             let finished = finished_blocks_rc.clone();
             let scroll = block_scroll.clone();
             let fullscreen = fullscreen.clone();
+            let pill = running_pill.clone();
+            let pill_label = running_pill_label.clone();
+            let pill_tooltip: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
             glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
                 if sticky.parent().is_none() {
                     return glib::ControlFlow::Break;
@@ -9856,8 +10282,43 @@ impl TermView {
                     sticky_stop.set_visible(false);
                     sticky_organism.set_visible(false);
                     sticky.set_visible(false);
+                    // A full-screen program owns the viewport; the pill would
+                    // be painted over its content.
+                    pill.set_visible(false);
                     return glib::ControlFlow::Continue;
                 }
+
+                // Elapsed is computed before the live-edge early return below,
+                // because that is exactly where the pill lives: the two
+                // readouts are the same command's age, shown wherever the
+                // viewport happens to be, and never both at once.
+                let running = cmd_running.get();
+                let elapsed = block_start_time
+                    .get()
+                    .and_then(|start| SystemTime::now().duration_since(start).ok())
+                    .map(|duration| duration.as_secs())
+                    .unwrap_or(0);
+                let elapsed_str = unified_chrome::format_elapsed_clock(elapsed);
+                let show_pill = running && elapsed >= RUNNING_PILL_MIN_SECS && !user_scrolled.get();
+                if show_pill {
+                    pill_label.set_text(&elapsed_str);
+                    let cmd = running_cmd.borrow();
+                    let tooltip = crate::review_input::safe_inline_display(cmd.trim(), 1024);
+                    let tooltip = if tooltip.is_empty() {
+                        "Running".to_string()
+                    } else {
+                        tooltip
+                    };
+                    // Tooltips are cheap to compare and not cheap to set four
+                    // times a second for the whole life of a build.
+                    if *pill_tooltip.borrow() != tooltip {
+                        pill.set_tooltip_text(Some(&tooltip));
+                        pill.update_property(&[gtk::accessible::Property::Label(&tooltip)]);
+                        *pill_tooltip.borrow_mut() = tooltip;
+                    }
+                }
+                pill.set_visible(show_pill);
+
                 // At the live prompt there is no sticky header to compute. Avoid
                 // walking every finished block and querying GTK geometry on a
                 // permanent timer while the terminal is idle.
@@ -9870,7 +10331,7 @@ impl TermView {
                     return glib::ControlFlow::Continue;
                 }
 
-                if cmd_running.get() {
+                if running {
                     sticky_target.set(None);
                     sticky_jump_bottom.set_visible(false);
                     sticky_stop.set_visible(!minimized);
@@ -9881,18 +10342,6 @@ impl TermView {
                     );
                     let cmd = running_cmd.borrow();
                     let cmd_disp = crate::review_input::safe_inline_display(cmd.trim(), 1024);
-                    let elapsed = block_start_time
-                        .get()
-                        .and_then(|st| SystemTime::now().duration_since(st).ok())
-                        .map(|duration| duration.as_secs())
-                        .unwrap_or(0);
-                    let elapsed_str = if elapsed >= 3600 {
-                        format!("{}h{:02}m", elapsed / 3600, (elapsed % 3600) / 60)
-                    } else if elapsed >= 60 {
-                        format!("{}m{:02}s", elapsed / 60, elapsed % 60)
-                    } else {
-                        format!("{}s", elapsed)
-                    };
                     let label = if cmd_disp.is_empty() {
                         format!("\u{25b6}  (running)    {}", elapsed_str)
                     } else {
@@ -9966,6 +10415,12 @@ impl TermView {
             let human_input_for_commit = human_input_callbacks.clone();
             let kitty_flags_for_commit = kitty_flags.clone();
             let kitty_last_key_for_commit = kitty_last_key.clone();
+            let unified_for_commit = unified;
+            let user_scrolled_up_for_commit = user_scrolled_up.clone();
+            let debouncer_for_commit = scroll_debouncer.clone();
+            let scroll_for_commit = block_scroll.clone();
+            let fab_for_commit = jump_fab.clone();
+            let unread_for_commit = unread_count.clone();
             active_vte.connect_commit(move |_, text, _size| {
                 if armed_agent_execution_for_commit.borrow().is_some()
                     || verified_submission_for_commit.submission.borrow().is_some()
@@ -9995,6 +10450,27 @@ impl TermView {
                         }
                     }
                 }
+                // Typing is a statement about where the user is. Leaving the
+                // viewport parked in history means watching your own keystrokes
+                // land somewhere off screen — the scroll-on-keystroke rule every
+                // other terminal applies, expressed against the history canvas
+                // because that is what scrolls here. The flag is read first so
+                // the ordinary at-the-bottom keystroke costs one `Cell` read.
+                // Unified is excluded: there `user_scrolled_up` belongs to the
+                // VTE adjustment detector, and releasing the lock would hide the
+                // FAB while its scrollback is still parked above the prompt.
+                if user_scrolled_up_for_commit.get()
+                    && !unified_for_commit
+                    && bstate_for_commit.get() != BlockState::AltScreen
+                {
+                    return_to_live_prompt(
+                        &debouncer_for_commit,
+                        &scroll_for_commit,
+                        &fab_for_commit,
+                        &unread_for_commit,
+                    );
+                }
+
                 // Real terminal input exits historical block selection. Without
                 // this, Enter can recall an old selection after the user has
                 // already begun editing a new command at the live prompt.
@@ -10131,16 +10607,15 @@ impl TermView {
                     return glib::Propagation::Proceed;
                 }
                 active_vte_for_refocus.grab_focus();
-                unread_for_refocus.set(0);
-                set_jump_fab_label(&fab_for_refocus, 0);
-                fab_for_refocus.set_visible(false);
-                debouncer_for_refocus.reset_scroll_lock();
                 // Focusing the live VTE makes the ScrolledWindow scroll to
                 // reveal the holder's *top* (see the palette-dismissal note in
-                // palette.rs) — pin the bottom right after, and keep pinning
-                // across frames while virtualized blocks settle.
-                debouncer_for_refocus.mark_dirty(&scroll_for_refocus);
-                debouncer_for_refocus.pin_to_bottom_deferred(&scroll_for_refocus);
+                // palette.rs); `return_to_live_prompt` pins the bottom back.
+                return_to_live_prompt(
+                    &debouncer_for_refocus,
+                    &scroll_for_refocus,
+                    &fab_for_refocus,
+                    &unread_for_refocus,
+                );
                 glib::Propagation::Stop
             });
             root.add_controller(refocus_key);
@@ -10364,6 +10839,7 @@ impl TermView {
             bstate.clone(),
             mouse_reporting_mode.clone(),
         );
+        *cross_selection_slot.borrow_mut() = Some(cross_selection.clone());
 
         let term_view = TermView {
             root,
@@ -10431,6 +10907,7 @@ impl TermView {
             resize_tick_id: RefCell::new(None),
             sticky_timer_id: RefCell::new(Some(sticky_timer_id)),
             cross_selection,
+            ftcs_seen: ftcs_seen.clone(),
             selection_feed_hold,
             layout_active_surface,
             render_backend: render_backend_slot
@@ -10479,9 +10956,10 @@ impl TermView {
                             block.cwd.as_deref(),
                             cols,
                         );
-                        if let Some(notice) = block.lifecycle_notice() {
-                            finished.widget().set_tooltip_text(Some(&notice));
-                        }
+                        finished.set_lifecycle(
+                            block.lifecycle_health(),
+                            block.lifecycle_notice().as_deref(),
+                        );
                         finished.widget().insert_before(
                             &term_view.block_list,
                             Some(term_view.active.borrow().widget()),
@@ -10508,6 +10986,13 @@ impl TermView {
                             &term_view.selected_block_id,
                             &term_view.selection_anchor_id,
                         );
+                        term_view
+                            .render_backend
+                            .install_finished_block_context_menu(
+                                finished.widget().clone(),
+                                finished.clone(),
+                                finished.id,
+                            );
                         term_view.finished_blocks.borrow_mut().push(finished);
                     }
                 },
@@ -11021,6 +11506,298 @@ impl TermView {
     /// PRIMARY alone is unreliable across compositors (notably Wayland).
     pub fn copy_to_clipboard(&self) {
         self.copy_to_clipboard_with_modifier(false);
+    }
+
+    /// Whether the copy ladder would find anything, without touching the
+    /// clipboard. Same order and same sources as
+    /// [`Self::copy_to_clipboard_with_modifier`], so a greyed-out Copy and a
+    /// Copy that does nothing cannot disagree.
+    pub(crate) fn has_copyable_selection(&self) -> bool {
+        if !self.selected_block_ids.borrow().is_empty() {
+            return true;
+        }
+        if self.cross_selection.has_cross_selection() {
+            return true;
+        }
+        if self
+            .active_vte
+            .text_selected(vte4::Format::Text)
+            .is_some_and(|text| !text.is_empty())
+        {
+            return true;
+        }
+        self.finished_blocks.borrow().iter().any(|block| {
+            [&block.output_vte, &block.command_vte]
+                .into_iter()
+                .any(|vte| {
+                    vte.text_selected(vte4::Format::Text)
+                        .is_some_and(|text| !text.is_empty())
+                })
+        })
+    }
+
+    /// Say so, once, when this pane's shell is not reporting command
+    /// boundaries.
+    ///
+    /// Without OSC 133 there are no blocks at all — no cards, no exit codes, no
+    /// durations. The entire premise of this mode is silently absent while the
+    /// terminal otherwise works perfectly, which is the worst way for a feature
+    /// to be missing: nothing looks broken, so nobody goes looking for the
+    /// cause. It gets an inline card rather than a toast because it describes a
+    /// standing condition, and the card is dismissible for the same reason.
+    ///
+    /// Polled rather than hooked: the marker flag is engine-owned, and the card
+    /// has to come back down the moment a late `source` produces a first
+    /// prompt. The poll stops for good as soon as marks appear, and it never
+    /// starts at all for a shell we have no honest advice for.
+    pub(crate) fn arm_shell_integration_notice(view: &Rc<Self>, shell_argv: &[String]) {
+        let Some(hint) = shell_integration_hint(shell_argv) else {
+            return;
+        };
+        let weak = Rc::downgrade(view);
+        let card: RefCell<Option<gtk::Widget>> = RefCell::new(None);
+        let polls = Cell::new(0u32);
+        glib::timeout_add_local(SHELL_INTEGRATION_POLL, move || {
+            let Some(view) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if view.ftcs_seen.get() {
+                // A late `source` counts as much as an early one: take the card
+                // back down and stop watching.
+                if let Some(card) = card.borrow_mut().take() {
+                    view.remove_inline_notice(&card);
+                }
+                return glib::ControlFlow::Break;
+            }
+            if card.borrow().is_some() {
+                // Mounted, or dismissed. Keep watching only for marks.
+                return glib::ControlFlow::Continue;
+            }
+            polls.set(polls.get().saturating_add(1));
+            if polls.get() < SHELL_INTEGRATION_GRACE_POLLS {
+                return glib::ControlFlow::Continue;
+            }
+            // `RawFallback` is the engine's own verdict that no marks are
+            // coming; anything else is still deciding.
+            if view.bstate.get() != BlockState::RawFallback {
+                return glib::ControlFlow::Continue;
+            }
+            let widget = view.build_shell_integration_notice(hint);
+            // Docked, not inserted into the document. `RawFallback` gives the
+            // live surface the whole viewport — that is what a pane with no
+            // command boundaries *is* — so a card in the scrolling document
+            // would sit above a full-page live cell at a position the
+            // follow-bottom pin guarantees nobody ever sees. The dock is the
+            // surface that exists for exactly that condition.
+            if !view.dock_inline_notice(&widget) {
+                // Nothing can host a card in this pane; nothing to retry.
+                return glib::ControlFlow::Break;
+            }
+            *card.borrow_mut() = Some(widget);
+            glib::ControlFlow::Continue
+        });
+    }
+
+    /// The card [`Self::arm_shell_integration_notice`] mounts. Same shape as
+    /// the other standalone inline cards (`command_review`'s), so it reads as
+    /// part of the document rather than as a dialog that landed in it.
+    fn build_shell_integration_notice(self: &Rc<Self>, hint: ShellIntegrationHint) -> gtk::Widget {
+        let compact = self.config.borrow().block_compact;
+        let root = gtk::Box::new(Orientation::Vertical, 4);
+        root.add_css_class("block-finished");
+        root.add_css_class("block-assistant");
+        root.add_css_class("block-integration-notice");
+        root.set_hexpand(true);
+        root.set_vexpand(false);
+        if compact {
+            root.add_css_class("block-compact");
+            root.set_margin_top(1);
+            root.set_margin_bottom(1);
+            root.set_margin_start(4);
+            root.set_margin_end(4);
+        } else {
+            root.set_margin_top(4);
+            root.set_margin_bottom(4);
+            root.set_margin_start(8);
+            root.set_margin_end(8);
+        }
+
+        let header = gtk::Box::new(Orientation::Horizontal, 8);
+        header.add_css_class("block-header");
+        header.set_margin_start(12);
+        header.set_margin_end(8);
+        header.set_margin_top(6);
+        header.set_margin_bottom(2);
+        let icon = gtk::Image::from_icon_name("dialog-information-symbolic");
+        icon.add_css_class("assistant-card-icon");
+        let title = gtk::Label::new(Some("No blocks: this shell is not marking commands"));
+        title.add_css_class("assistant-card-title");
+        title.set_halign(gtk::Align::Start);
+        title.set_hexpand(true);
+        title.set_xalign(0.0);
+        let dismiss = icon_button("window-close-symbolic", "Dismiss");
+        dismiss.add_css_class("flat");
+        header.append(&icon);
+        header.append(&title);
+        header.append(&dismiss);
+        root.append(&header);
+
+        let body = gtk::Label::new(Some(&format!(
+            "Block mode splits output into cards using the OSC 133 marks a shell \
+             emits around each command. This pane's {} is not sending them, so \
+             commands, exit codes and durations cannot be separated. Add this \
+             line to {}:",
+            hint.shell, hint.rc
+        )));
+        body.add_css_class("block-header-label");
+        body.set_wrap(true);
+        body.set_xalign(0.0);
+        body.set_margin_start(12);
+        body.set_margin_end(12);
+        root.append(&body);
+
+        let load = gtk::Label::new(Some(hint.load));
+        load.add_css_class("integration-notice-code");
+        load.set_selectable(true);
+        load.set_wrap(true);
+        load.set_xalign(0.0);
+        load.set_margin_start(12);
+        load.set_margin_end(12);
+        load.set_margin_top(4);
+        root.append(&load);
+
+        let actions = gtk::Box::new(Orientation::Horizontal, 8);
+        actions.set_halign(gtk::Align::End);
+        actions.set_margin_end(12);
+        actions.set_margin_top(6);
+        actions.set_margin_bottom(8);
+        let copy = gtk::Button::with_label("Copy Command");
+        copy.add_css_class("flat");
+        {
+            let clipboard_vte = self.active_vte.clone();
+            copy.connect_clicked(move |button| {
+                clipboard_vte.clipboard().set_text(hint.load);
+                button.set_label("Copied");
+            });
+        }
+        actions.append(&copy);
+        root.append(&actions);
+
+        let widget: gtk::Widget = root.upcast();
+        {
+            // Dismissal is permanent for this pane: the watch keeps the slot
+            // filled, so nothing re-mounts a card the user has answered.
+            let weak = Rc::downgrade(self);
+            let card = widget.clone();
+            dismiss.connect_clicked(move |_| {
+                if let Some(view) = weak.upgrade() {
+                    view.remove_inline_notice(&card);
+                }
+            });
+        }
+        widget
+    }
+
+    /// Right-click menu for the pane canvas: the live prompt, and the space
+    /// around the cards.
+    ///
+    /// Block mode was the one backend where that button did nothing. The live
+    /// VTE is display-only — it owns no child PTY — so VTE's own menu never
+    /// applied to it, and the per-card menu covers only the cards. Paste on
+    /// right-click is what every other terminal on the desktop does.
+    ///
+    /// Bubble phase, so a card's own gesture claims the sequence first and the
+    /// block menu keeps winning inside a card. Weak throughout: the gesture
+    /// lives on a widget this view owns.
+    pub(crate) fn install_canvas_context_menu(view: &Rc<Self>) {
+        let gesture = gtk::GestureClick::new();
+        gesture.set_button(3);
+        gesture.set_propagation_phase(gtk::PropagationPhase::Bubble);
+        let weak = Rc::downgrade(view);
+        gesture.connect_pressed(move |gesture, _clicks, x, y| {
+            let Some(view) = weak.upgrade() else {
+                return;
+            };
+            // A full-screen program owns this viewport and its own mouse
+            // protocol. Painting a menu over `htop` would also swallow the
+            // button it was waiting for.
+            if view.fullscreen.get() || view.bstate.get() == BlockState::AltScreen {
+                return;
+            }
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+
+            let popover = gtk::Popover::new();
+            popover.set_parent(&view.block_scroll);
+            popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            popover.set_has_arrow(false);
+            let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            vbox.add_css_class("menu");
+
+            {
+                let item = menu_item("Copy");
+                item.set_sensitive(view.has_copyable_selection());
+                let popover_c = popover.clone();
+                let view = Rc::downgrade(&view);
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    if let Some(view) = view.upgrade() {
+                        view.copy_to_clipboard();
+                    }
+                });
+                vbox.append(&item);
+            }
+            {
+                let item = menu_item("Paste");
+                let popover_c = popover.clone();
+                let view = Rc::downgrade(&view);
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    if let Some(view) = view.upgrade() {
+                        view.paste_from_clipboard();
+                    }
+                });
+                vbox.append(&item);
+            }
+
+            // Unified's records are not selectable cards; the same scroll area
+            // serves both backends.
+            if view.render_backend.supports_block_mutation()
+                && !view.finished_blocks.borrow().is_empty()
+            {
+                vbox.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+                let item = menu_item("Select All Blocks");
+                let popover_c = popover.clone();
+                let view = Rc::downgrade(&view);
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    if let Some(view) = view.upgrade() {
+                        view.select_all_blocks();
+                    }
+                });
+                vbox.append(&item);
+            }
+            // Deliberately no Clear Blocks: the confirmation toast that carries
+            // its Undo button is emitted by the component around the
+            // `ClearBlocks` message, not by `TermView::clear_blocks`, so a menu
+            // entry here would be a silent destructive action with no visible
+            // way back. It stays on `Ctrl+Shift+K` and in the palette.
+
+            popover.set_child(Some(&vbox));
+            let live_vte = view.active_vte.downgrade();
+            popover.connect_closed(move |popover| {
+                popover.unparent();
+                // The popover took focus off the prompt to open. Hand it back
+                // on idle, after GTK has finished tearing the popover down.
+                let live_vte = live_vte.clone();
+                glib::idle_add_local_once(move || {
+                    if let Some(live_vte) = live_vte.upgrade() {
+                        live_vte.grab_focus();
+                    }
+                });
+            });
+            popover.popup();
+        });
+        view.block_scroll.add_controller(gesture);
     }
 
     /// Same as `copy_to_clipboard` but also honors the Warp "copy block output
@@ -11540,9 +12317,10 @@ impl TermView {
                     block.cwd.as_deref(),
                     cols,
                 );
-                if let Some(notice) = block.lifecycle_notice() {
-                    finished.widget().set_tooltip_text(Some(&notice));
-                }
+                finished.set_lifecycle(
+                    block.lifecycle_health(),
+                    block.lifecycle_notice().as_deref(),
+                );
                 finished
                     .widget()
                     .insert_before(&self.block_list, Some(&anchor));
@@ -11564,6 +12342,11 @@ impl TermView {
                     &self.selected_block_ids,
                     &self.selected_block_id,
                     &self.selection_anchor_id,
+                );
+                self.render_backend.install_finished_block_context_menu(
+                    finished.widget().clone(),
+                    finished.clone(),
+                    finished.id,
                 );
                 restored.push(finished);
             }
@@ -11605,7 +12388,11 @@ impl TermView {
     }
 
     pub(crate) fn apply_slow_filter(&self) -> RecordNavigationResult {
-        let Some(record_id) = self.get_slow_blocks(1000).first().copied() else {
+        let Some(record_id) = self
+            .get_slow_blocks(SLOW_BLOCK_THRESHOLD_MS)
+            .first()
+            .copied()
+        else {
             return RecordNavigationResult::NoMatchingRecord;
         };
         self.navigate_to_record_id(record_id, false)
@@ -11688,6 +12475,29 @@ impl TermView {
     /// 10/11/12: every surface below is repainted from the theme, so the tracked
     /// overrides are dropped too and the next color query answers with the new
     /// theme instead of the superseded app color.
+    /// Switch every card in this pane, and the live input cell, to the
+    /// requested density.
+    ///
+    /// The setting used to reach only panes created after it changed, so the
+    /// switch toasted success and left the pane the user was looking at exactly
+    /// as it was. Cards keep their own margins (GTK margins are not styleable),
+    /// so this cannot be done from CSS alone. One layout pass and one winsize
+    /// sync for the whole pane, not one per card: the live cell's chrome height
+    /// differs between densities, so the grid the child was told about moves.
+    pub(crate) fn apply_block_density(&self, compact: bool) {
+        if self.is_unified() {
+            // Unified's holder carries `block-fullscreen`; its records are not
+            // cards and have no margins of their own.
+            return;
+        }
+        self.active.borrow().set_compact(compact);
+        for block in self.finished_blocks.borrow().iter() {
+            block.set_compact(compact);
+        }
+        (self.layout_active_surface)();
+        self.render_backend.sync_geometry_to_pty();
+    }
+
     pub fn apply_theme(&self) {
         clear_dynamic_colors(&self.dynamic_colors);
         let config = self.config.borrow();
@@ -11783,7 +12593,7 @@ impl TermView {
         let finished_len = self.finished_blocks.borrow().len();
         let block_data_len = self.block_data.borrow().len();
         let failed = self.get_failed_blocks().len();
-        let slow = self.get_slow_blocks(1000).len();
+        let slow = self.get_slow_blocks(SLOW_BLOCK_THRESHOLD_MS).len();
         let total_output_bytes: usize = self
             .block_data
             .borrow()
@@ -12036,19 +12846,19 @@ mod tests {
         record_external_input, record_unified_zone, resolve_command_text,
         reviewed_pre_command_bytes_are_identity_neutral, reviewed_submission_matches,
         screen_relative_cpr_row, selected_blocks_markdown, selected_command_text,
-        selected_id_range, shell_argv_supports_agent_ids, stable_visible_indices,
-        step_marked_indices, step_marked_record_ids, stranded_focus_key_recovers, strip_ansi,
-        strip_ansi_with_clear_detect, take_armed_agent_execution, take_background_output,
-        unread_after_index_removal, unread_after_prefix_eviction, viewport_page_size_changed,
-        viewport_state_for_scroll, viewport_states_for_scroll, visible_indices_for_viewport,
-        vte_answers_query_natively, zone_output_snapshot_from_plain,
-        zone_output_snapshot_from_ring, AgentCommandEndDecision, AgentExecutionLostCallbacks,
-        AltScreenCallbacks, AltScreenTransition, AnchorSettleArgs, ArmedAgentExecution,
-        BackendRecords, BlockData, BlockFinishedCallback, BlockFinishedCallbacks,
-        BlockRenderPayloadAccessor, BlockState, CommandFinishedCallbacks, CommandFinishedEvent,
-        CommandPromptStatus, CommandStartedCallbacks, CommandStartedEvent, CommandTextSource,
-        CompletedCommandRecord, DynamicColors, DynamicColorsRc, EngineState, PendingZone,
-        ReaderCtx, RenderBackend, ResetAwareParserPart, ResetAwareParserSplitter,
+        selected_id_range, shell_argv_supports_agent_ids, shell_integration_hint,
+        shell_single_quote, stable_visible_indices, step_marked_indices, step_marked_record_ids,
+        stranded_focus_key_recovers, strip_ansi, strip_ansi_with_clear_detect,
+        take_armed_agent_execution, take_background_output, unread_after_index_removal,
+        unread_after_prefix_eviction, viewport_page_size_changed, viewport_state_for_scroll,
+        viewport_states_for_scroll, visible_indices_for_viewport, vte_answers_query_natively,
+        zone_output_snapshot_from_plain, zone_output_snapshot_from_ring, AgentCommandEndDecision,
+        AgentExecutionLostCallbacks, AltScreenCallbacks, AltScreenTransition, AnchorSettleArgs,
+        ArmedAgentExecution, BackendRecords, BlockData, BlockFinishedCallback,
+        BlockFinishedCallbacks, BlockRenderPayloadAccessor, BlockState, CommandFinishedCallbacks,
+        CommandFinishedEvent, CommandPromptStatus, CommandStartedCallbacks, CommandStartedEvent,
+        CommandTextSource, CompletedCommandRecord, DynamicColors, DynamicColorsRc, EngineState,
+        PendingZone, ReaderCtx, RenderBackend, ResetAwareParserPart, ResetAwareParserSplitter,
         ReviewedSubmission, ReviewedSubmissionPhase, SelectionFeedHold, ShellCapabilityObserver,
         SubmissionSurface, TerminalResetKind, UnifiedZoneStore, VerifiedSubmissionCtx,
         ZoneMarkerInjector, ZoneOutputSnapshot, BLOCK_ID_SEQUENCE_LIMIT, LAST_NOTIFICATION_AT,
@@ -12064,6 +12874,59 @@ mod tests {
     use std::collections::{HashSet, VecDeque};
     use std::rc::Rc;
     use std::time::{Instant, SystemTime};
+
+    #[test]
+    fn a_quoted_directory_survives_everything_a_filesystem_allows() {
+        assert_eq!(shell_single_quote("/home/yj/anvil"), "'/home/yj/anvil'");
+        assert_eq!(shell_single_quote("/tmp/two words"), "'/tmp/two words'");
+        // The one character single quotes cannot carry.
+        assert_eq!(shell_single_quote("/tmp/it's"), "'/tmp/it'\\''s'");
+        // Everything else is literal inside single quotes, including the
+        // substitutions that would otherwise run on the way to `cd`.
+        assert_eq!(shell_single_quote("/tmp/$(id)"), "'/tmp/$(id)'");
+        assert_eq!(shell_single_quote("/tmp/a\nb"), "'/tmp/a\nb'");
+        assert_eq!(shell_single_quote("/tmp/`id`"), "'/tmp/`id`'");
+        assert_eq!(shell_single_quote(""), "''");
+    }
+
+    #[test]
+    fn shell_integration_advice_only_where_it_would_be_true() {
+        let argv =
+            |parts: &[&str]| -> Vec<String> { parts.iter().map(|part| part.to_string()).collect() };
+
+        // The four shells the integration ships for, named absolutely or not.
+        for (command, shell, rc) in [
+            ("/bin/bash", "bash", "~/.bashrc"),
+            ("zsh", "zsh", "~/.zshrc"),
+            ("/usr/bin/fish", "fish", "~/.config/fish/config.fish"),
+            ("pwsh", "pwsh", "$PROFILE"),
+        ] {
+            let hint = shell_integration_hint(&argv(&[command])).expect(command);
+            assert_eq!(hint.shell, shell);
+            assert_eq!(hint.rc, rc);
+            assert!(hint.load.contains("--shell-integration"));
+        }
+        // A login shell is still an interactive shell.
+        assert!(shell_integration_hint(&argv(&["bash", "-l"])).is_some());
+
+        // jsh emits the marks itself: telling its user to source anything would
+        // be advice for a problem they do not have.
+        assert!(shell_integration_hint(&argv(&["jsh"])).is_none());
+        assert!(shell_integration_hint(&argv(&["/usr/local/bin/jsh", "-l"])).is_none());
+
+        // One command and exit — there is no prompt to mark.
+        assert!(shell_integration_hint(&argv(&["bash", "-c", "ls"])).is_none());
+        assert!(shell_integration_hint(&argv(&["bash", "--command", "ls"])).is_none());
+        assert!(shell_integration_hint(&argv(&["bash", "-lc", "ls"])).is_none());
+
+        // Someone else's shell on someone else's machine, and wrappers whose rc
+        // file we cannot name.
+        assert!(shell_integration_hint(&argv(&["ssh", "build-host"])).is_none());
+        assert!(shell_integration_hint(&argv(&["docker", "exec", "-it", "box", "bash"])).is_none());
+        assert!(shell_integration_hint(&argv(&["flatpak-spawn", "--host", "bash"])).is_none());
+        assert!(shell_integration_hint(&argv(&["sh"])).is_none());
+        assert!(shell_integration_hint(&[]).is_none());
+    }
 
     #[test]
     fn live_card_grows_with_output_but_never_past_the_viewport() {

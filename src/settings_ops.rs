@@ -107,7 +107,10 @@ impl AppModel {
         self.sync_terminal_configs();
         for tab in &self.tabs {
             for pane in &tab.panes {
-                pane.terminal.emit(VteInput::ApplyTheme);
+                // Not `ApplyTheme`: no color changed, and the density the cards
+                // already on screen are drawn at is imperative margins that a
+                // CSS reinstall cannot reach.
+                pane.terminal.emit(VteInput::ApplyBlockDensity(enabled));
             }
         }
         self.persist_config();

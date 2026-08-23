@@ -8,6 +8,11 @@ use super::*;
 
 const PERSISTENCE_FAILURE_NOTICE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Seconds an undo offer stays on screen. The default toast timeout is tuned
+/// for statements; this one is a decision, and the user has to notice the
+/// mistake before they can decide to take it back.
+const UNDO_TOAST_TIMEOUT: u32 = 12;
+
 /// Run every fallible preparation step before allowing a structural commit.
 /// Split uses this with an injected constructor in tests and with Relm4's
 /// synchronously initialized Block component in production.
@@ -1046,6 +1051,31 @@ impl AppModel {
     pub(crate) fn show_toast(&self, message: impl AsRef<str>) {
         self.toast_overlay
             .add_toast(adw::Toast::new(message.as_ref()));
+    }
+
+    /// A toast that offers to take back what it reports.
+    ///
+    /// The click sends the recovery to `pane_id`, not to the focused pane: the
+    /// toast outlives a tab switch, and `Action::UndoClearBlocks` would land
+    /// wherever focus happened to be when the button was pressed. Longer than
+    /// the default timeout, because an offer nobody has time to read is not an
+    /// offer.
+    pub(crate) fn show_undo_toast(
+        &self,
+        pane_id: u64,
+        message: &str,
+        button: &str,
+        undo: crate::terminal::NoticeUndo,
+        sender: &ComponentSender<AppModel>,
+    ) {
+        let toast = adw::Toast::new(message);
+        toast.set_button_label(Some(button));
+        toast.set_timeout(UNDO_TOAST_TIMEOUT);
+        let sender = sender.clone();
+        toast.connect_button_clicked(move |_| {
+            sender.input(AppMsg::ApplyNoticeUndo { pane_id, undo });
+        });
+        self.toast_overlay.add_toast(toast);
     }
 
     /// Drain failures on the GTK thread and turn them into a bounded,

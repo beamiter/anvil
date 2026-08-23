@@ -238,6 +238,10 @@ impl WidgetPool {
     }
 
     pub(crate) fn teardown(widget: &gtk::Box) {
+        // A degraded block explains itself in a tooltip on this shell. Nothing
+        // clears one on the way back out, and the card that reuses the shell
+        // only ever sets a tooltip when it is degraded itself.
+        widget.set_has_tooltip(false);
         // Pool only the lightweight outer shell. A finished card's child tree
         // owns both VTEs and their scrollback; retaining it here would put up to
         // twenty evicted cards outside the completed-block byte ledger.

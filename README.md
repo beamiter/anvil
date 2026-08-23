@@ -372,7 +372,7 @@ are currently active.
 | `Ctrl+Alt+B` | Move tabs between sidebar and top bar |
 | `Ctrl+Shift+L` | Focus the tab filter |
 | `Ctrl+Shift+S` | Remote host picker |
-| `Ctrl+Shift+X` | Jump to the first failed block |
+| `Ctrl+Shift+X` | Step to the next failed block, wrapping at the end |
 | `Ctrl+Shift+N` | Jump to the oldest block |
 | `Ctrl+Shift+A` | Select all finished blocks |
 | `Ctrl+Shift+I` | Reinput selected block commands without running them |
@@ -388,18 +388,24 @@ are currently active.
 
 Block mode also has context-sensitive navigation:
 
-- `Home` / `End` and `PageUp` / `PageDown` navigate completed output while no
-  command or full-screen application owns the viewport.
+- `Ctrl+Home` / `Ctrl+End` and `PageUp` / `PageDown` navigate completed output
+  while no command or full-screen application owns the viewport. Bare `Home` /
+  `End` belong to the shell, so they still move the cursor within the command
+  being typed.
 - With one or more blocks selected, `Up` / `Down` moves the active edge,
-  `Shift+Up/Down` extends the range, `Enter` recalls every selected command in
-  terminal order without running it, and `Escape` clears the selection.
-- `Ctrl+Shift+B` bookmarks the selected block.
-- `Ctrl+,` / `Ctrl+.` jumps to the previous / next bookmarked block.
+  `Shift+Up/Down` extends the range, `Home` / `End` moves the selection to the
+  oldest / newest block, `Enter` recalls every selected command in terminal
+  order without running it, and `Escape` clears the selection.
+- `Ctrl+Shift+B` bookmarks the selected block, or the newest block when nothing
+  is selected.
+- `Ctrl+,` / `Ctrl+.` jumps to the previous / next bookmarked block. Until a
+  block is bookmarked both chords reach the program in the terminal.
 - `Alt+Shift+F` toggles the selected or most recent block's output filter.
+- `Alt+Shift+O` folds or unfolds that block's output.
 
-Slow-block, pinned-block, and non-contextual pinned-navigation actions remain
-available in the command palette and can be assigned in `[keybindings]`, but
-have no default shortcuts.
+Jump-to-oldest failed/slow/pinned, previous-failed, and pinned-navigation
+actions remain available in the command palette and can be assigned in
+`[keybindings]`, but have no default shortcuts.
 
 ## Installing and updating jsh
 

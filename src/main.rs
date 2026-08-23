@@ -329,6 +329,16 @@ fn create_pane(
         VteOutput::CommandFinished(false) => AppMsg::Bell(pane_id),
         VteOutput::RemoteSessionId(id) => AppMsg::PaneRemoteSessionId(pane_id, id),
         VteOutput::Notice(message) => AppMsg::Toast(message),
+        VteOutput::NoticeWithUndo {
+            message,
+            button,
+            undo,
+        } => AppMsg::ToastWithUndo {
+            pane_id,
+            message,
+            button,
+            undo,
+        },
         VteOutput::SearchStatus(status) => AppMsg::SearchStatus(pane_id, status),
         VteOutput::BlockFinished {
             command,
@@ -1409,6 +1419,23 @@ impl SimpleComponent for AppModel {
             }
             AppMsg::ForceQuit => self.force_quit(),
             AppMsg::Toast(message) => self.show_toast(message),
+            AppMsg::ToastWithUndo {
+                pane_id,
+                message,
+                button,
+                undo,
+            } => self.show_undo_toast(pane_id, &message, &button, undo, &sender),
+            AppMsg::ApplyNoticeUndo { pane_id, undo } => {
+                let input = match undo {
+                    terminal::NoticeUndo::ClearBlocks => VteInput::UndoClearBlocks,
+                };
+                match self.find_pane(pane_id) {
+                    Some((tab_index, pane_index)) => {
+                        self.tabs[tab_index].panes[pane_index].terminal.emit(input)
+                    }
+                    None => self.show_toast("That pane has closed — nothing to undo."),
+                }
+            }
             AppMsg::ImageFilesDropped { pane_id, paths } => {
                 match image_drop::prompt_payload(&paths) {
                     Ok(payload) => {

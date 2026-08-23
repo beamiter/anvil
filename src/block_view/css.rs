@@ -3,8 +3,10 @@ use crate::config::Config;
 use gtk::gdk::RGBA;
 use relm4::gtk;
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::io::Read;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 const MAX_GIT_POINTER_BYTES: u64 = 16 * 1024;
 const MAX_BRANCH_DISPLAY_CHARS: usize = 256;
@@ -46,10 +48,63 @@ pub(crate) fn shorten_path(path: &str) -> String {
     }
 }
 
+/// How long a resolved branch is reused for the context chip.
+const GIT_BRANCH_CACHE_TTL: Duration = Duration::from_secs(3);
+/// Distinct working directories remembered at once.
+const GIT_BRANCH_CACHE_ENTRIES: usize = 64;
+
+#[cfg(test)]
+thread_local! {
+    static GIT_BRANCH_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+thread_local! {
+    /// `(cwd, resolved at, branch)`. Cards are built on the GTK thread only, so
+    /// this needs no lock. Misses are cached too: "not inside a repository" is
+    /// the answer that costs a walk all the way to `/`.
+    static GIT_BRANCH_CACHE: RefCell<VecDeque<(String, Instant, Option<String>)>> =
+        const { RefCell::new(VecDeque::new()) };
+}
+
+/// Branch for the card's context chip, memoized for a few seconds.
+///
+/// The chip is built once per card and a restored session builds every card it
+/// has in one pass, so a 200-block restore of a single repository paid for the
+/// same directory walk 200 times — synchronously, on the GTK thread, before the
+/// first frame. The TTL keeps that to one walk per directory per burst while
+/// still letting a branch switch reach the next command's card, which is the
+/// only resolution the chip has ever promised: it shows the branch as of when
+/// the card was built, not as of when the command ran.
+pub(crate) fn git_branch_for(cwd: &str) -> Option<String> {
+    let now = Instant::now();
+    let cached = GIT_BRANCH_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.retain(|(_, resolved, _)| now.duration_since(*resolved) < GIT_BRANCH_CACHE_TTL);
+        cache
+            .iter()
+            .find(|(key, _, _)| key == cwd)
+            .map(|(_, _, branch)| branch.clone())
+    });
+    if let Some(branch) = cached {
+        return branch;
+    }
+    let branch = git_branch_uncached(cwd);
+    GIT_BRANCH_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.push_back((cwd.to_string(), now, branch.clone()));
+        while cache.len() > GIT_BRANCH_CACHE_ENTRIES {
+            cache.pop_front();
+        }
+    });
+    branch
+}
+
 /// Cheap git-branch lookup for the context chip: walk up from `cwd` to find a
 /// `.git` dir (or `.git` file for worktrees/submodules), then read `HEAD`. No
 /// subprocess, no dirty-state — just the branch name (or short SHA if detached).
-pub(crate) fn git_branch_for(cwd: &str) -> Option<String> {
+pub(crate) fn git_branch_uncached(cwd: &str) -> Option<String> {
+    #[cfg(test)]
+    GIT_BRANCH_WALKS.with(|walks| walks.set(walks.get().saturating_add(1)));
     use std::path::PathBuf;
     let mut dir: Option<&Path> = Some(Path::new(cwd));
     while let Some(d) = dir {
@@ -303,7 +358,11 @@ pub(crate) fn install_block_css(config: &Config) {
             outline-width: 1px;
             outline-color: rgba({fg_r},{fg_g},{fg_b},0.08);
             outline-offset: -1px;
-            padding: 1px 1px 1px 0;
+            /* Bottom padding only: the sides are load-bearing. Horizontal
+               padding would narrow the output terminal, and its column count
+               comes from that widget's pixel width — so `ls` would wrap
+               differently inside a card than it did in the live pane. */
+            padding: 1px 1px 5px 0;
             border-radius: 10px;
             background-color: {block_bg_hex};
             min-height: 40px;
@@ -314,6 +373,7 @@ pub(crate) fn install_block_css(config: &Config) {
             border-radius: 6px;
             min-height: 32px;
             box-shadow: none;
+            padding: 1px 1px 2px 0;
         }}
         .block-success {{
             border-color: {ok_stripe};
@@ -331,6 +391,18 @@ pub(crate) fn install_block_css(config: &Config) {
         .block-correction, .command-suggestion, .command-review-standalone {{
             border-color: rgba({acc_r},{acc_g},{acc_b},0.85);
             background-color: rgba({acc_r},{acc_g},{acc_b},0.05);
+        }}
+        .block-integration-notice {{
+            border-color: rgba({warn_r},{warn_g},{warn_b},0.85);
+            background-color: rgba({warn_r},{warn_g},{warn_b},0.06);
+        }}
+        .integration-notice-code {{
+            color: {accent};
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.07);
+            border-radius: 6px;
+            font-family: "{font_family}";
+            font-size: 0.92em;
+            padding: 6px 10px;
         }}
         .block-agent {{
             border-color: rgba({agent_r},{agent_g},{agent_b},0.85);
@@ -688,8 +760,6 @@ pub(crate) fn install_block_css(config: &Config) {
             font-family: "{font_family}";
             font-size: {font_size};
             font-weight: bold;
-            margin-left: 10px;
-            margin-right: 6px;
         }}
         .block-chip {{
             color: {dim_fg};
@@ -761,6 +831,15 @@ pub(crate) fn install_block_css(config: &Config) {
             font-family: "{font_family}";
             font-size: 0.82em;
             font-weight: bold;
+        }}
+        .block-lifecycle-chip {{
+            color: {warn_hex};
+            background-color: rgba({warn_r},{warn_g},{warn_b},0.12);
+            border: 1px solid rgba({warn_r},{warn_g},{warn_b},0.35);
+            border-radius: 999px;
+            font-family: "{font_family}";
+            font-size: 0.78em;
+            padding: 1px 9px;
         }}
         .block-background-chip {{
             color: {async_hex};
@@ -995,6 +1074,19 @@ pub(crate) fn install_block_css(config: &Config) {
             background-color: rgba({bg_r},{bg_g},{bg_b},0.92);
             box-shadow: 0 1px 4px rgba(0,0,0,0.24);
         }}
+        .block-action-box {{
+            transition: opacity 120ms ease;
+        }}
+        .running-pill {{
+            background-color: rgba({bg_r},{bg_g},{bg_b},0.94);
+            border: 1px solid rgba({acc_r},{acc_g},{acc_b},0.45);
+            border-radius: 999px;
+            padding: 2px 4px 2px 12px;
+            box-shadow: 0 3px 10px rgba(0,0,0,0.30);
+        }}
+        .running-pill-icon {{
+            color: {accent};
+        }}
         .feed-hold-badge {{
             color: {bg_hex};
             background-color: {accent};
@@ -1082,7 +1174,7 @@ mod tests {
         );
         std::fs::write(git.join("HEAD"), format!("ref: refs/heads/{branch}\n")).unwrap();
 
-        let display = git_branch_for(repo.to_str().unwrap()).unwrap();
+        let display = git_branch_uncached(repo.to_str().unwrap()).unwrap();
         assert!(!display.contains('\u{202e}'));
         assert!(!display.contains('\u{200b}'));
         assert!(display.contains("��"));
@@ -1101,7 +1193,7 @@ mod tests {
         std::fs::write(repo.join(".git"), "gitdir: ../real-git\n").unwrap();
         std::fs::write(real.join("HEAD"), "ref: refs/heads/worktree\n").unwrap();
         assert_eq!(
-            git_branch_for(repo.to_str().unwrap()).as_deref(),
+            git_branch_uncached(repo.to_str().unwrap()).as_deref(),
             Some("worktree")
         );
 
@@ -1111,7 +1203,50 @@ mod tests {
             .open(repo.join(".git"))
             .unwrap();
         oversized.set_len(MAX_GIT_POINTER_BYTES + 1).unwrap();
-        assert!(git_branch_for(repo.to_str().unwrap()).is_none());
+        assert!(git_branch_uncached(repo.to_str().unwrap()).is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repeated_cards_in_one_directory_walk_the_tree_once() {
+        let root = test_root("memo");
+        let repo = root.join("repo");
+        let git = repo.join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/memo\n").unwrap();
+        let cwd = repo.to_str().unwrap();
+        // Another test on this thread may have primed the cache for its own
+        // path; only this key's walk count is being asserted.
+        GIT_BRANCH_CACHE.with(|cache| cache.borrow_mut().clear());
+        GIT_BRANCH_WALKS.with(|walks| walks.set(0));
+
+        // What a session restore does: one card per block, all in one pass.
+        for _ in 0..200 {
+            assert_eq!(git_branch_for(cwd).as_deref(), Some("memo"));
+        }
+        assert_eq!(GIT_BRANCH_WALKS.with(std::cell::Cell::get), 1);
+
+        // A directory that is in no repository is the walk worth caching most:
+        // it runs all the way to `/` before answering.
+        let bare = root.to_str().unwrap();
+        for _ in 0..10 {
+            assert_eq!(git_branch_for(bare), None);
+        }
+        assert_eq!(GIT_BRANCH_WALKS.with(std::cell::Cell::get), 2);
+
+        // The memo is bounded, and eviction is by age then insertion order.
+        GIT_BRANCH_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            for index in 0..GIT_BRANCH_CACHE_ENTRIES * 2 {
+                cache.push_back((format!("/nowhere/{index}"), Instant::now(), None));
+                while cache.len() > GIT_BRANCH_CACHE_ENTRIES {
+                    cache.pop_front();
+                }
+            }
+            assert_eq!(cache.len(), GIT_BRANCH_CACHE_ENTRIES);
+        });
+
+        GIT_BRANCH_CACHE.with(|cache| cache.borrow_mut().clear());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1130,7 +1265,7 @@ mod tests {
         // SAFETY: head_c is a live NUL-terminated pathname for this call.
         assert_eq!(unsafe { nix::libc::mkfifo(head_c.as_ptr(), 0o600) }, 0);
         let started = std::time::Instant::now();
-        assert!(git_branch_for(repo.to_str().unwrap()).is_none());
+        assert!(git_branch_uncached(repo.to_str().unwrap()).is_none());
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
         std::fs::remove_dir_all(root).unwrap();
     }

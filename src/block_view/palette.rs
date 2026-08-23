@@ -53,7 +53,7 @@ pub(crate) struct PaletteEntry {
 }
 
 /// A run taking longer than this is flagged "slow" for the palette filter.
-pub(crate) const PALETTE_SLOW_MS: u64 = 2000;
+pub(crate) const PALETTE_SLOW_MS: u64 = super::SLOW_BLOCK_THRESHOLD_MS;
 const MAX_PALETTE_ENTRIES: usize = 2_000;
 const MAX_PALETTE_DISPLAY_BYTES: usize = 4 * 1024;
 

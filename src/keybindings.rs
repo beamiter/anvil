@@ -498,7 +498,12 @@ impl KeybindingMap {
         bind("Ctrl+Shift+R", Action::ReloadConfig);
         bind("Ctrl+backslash", Action::ToggleSidebar);
         bind("Ctrl+Shift+L", Action::FilterTabs);
-        bind("Ctrl+Shift+X", Action::FilterFailedBlocks);
+        // The one bound failure chord steps, with wraparound. Bound to
+        // `FilterFailedBlocks` it re-landed on the oldest failure however many
+        // times it was pressed, which reads as a dead key in the exact session
+        // that has more than one failure to look at. `FilterFailedBlocks` keeps
+        // its jump-to-oldest meaning in the palette and in `[keybindings]`.
+        bind("Ctrl+Shift+X", Action::JumpToNextFailed);
         bind("Ctrl+Shift+N", Action::ClearBlockFilter);
         bind("Ctrl+Shift+A", Action::SelectAllBlocks);
         bind("Ctrl+Shift+K", Action::ClearBlocks);
@@ -893,7 +898,7 @@ mod tests {
             ("Ctrl+Shift+R", Action::ReloadConfig),
             ("Ctrl+backslash", Action::ToggleSidebar),
             ("Ctrl+Shift+L", Action::FilterTabs),
-            ("Ctrl+Shift+X", Action::FilterFailedBlocks),
+            ("Ctrl+Shift+X", Action::JumpToNextFailed),
             ("Ctrl+Shift+N", Action::ClearBlockFilter),
             ("Ctrl+Shift+A", Action::SelectAllBlocks),
             ("Ctrl+Shift+K", Action::ClearBlocks),
@@ -982,12 +987,12 @@ mod tests {
         assert!(map
             .binding_display(&Action::CyclePaneFocusBackward)
             .is_empty());
+        assert!(map.binding_display(&Action::FilterFailedBlocks).is_empty());
         assert!(map.binding_display(&Action::FilterSlowBlocks).is_empty());
         assert!(map.binding_display(&Action::FilterPinnedBlocks).is_empty());
         assert!(map.binding_display(&Action::JumpToPrevPinned).is_empty());
         assert!(map.binding_display(&Action::JumpToNextPinned).is_empty());
         assert!(map.binding_display(&Action::JumpToPrevFailed).is_empty());
-        assert!(map.binding_display(&Action::JumpToNextFailed).is_empty());
         assert!(map.binding_display(&Action::UndoClearBlocks).is_empty());
         assert!(map
             .binding_display(&Action::ExportSessionMarkdown)

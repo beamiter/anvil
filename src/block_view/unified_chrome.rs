@@ -123,15 +123,9 @@ impl ZoneChromeRecord {
                 None => "exit:?".to_owned(),
             }
         };
-        let status = if self.is_background {
-            status
-        } else {
-            match self.lifecycle_health {
-                super::BlockLifecycleHealth::Healthy => status,
-                super::BlockLifecycleHealth::Recovered => format!("{status} · recovered"),
-                super::BlockLifecycleHealth::Degraded => format!("{status} · inferred"),
-                super::BlockLifecycleHealth::Incomplete => format!("{status} · incomplete"),
-            }
+        let status = match lifecycle_badge(self.lifecycle_health).filter(|_| !self.is_background) {
+            Some(badge) => format!("{status} · {badge}"),
+            None => status,
         };
         self.duration_ms.map_or(status.clone(), |duration| {
             format!("{status} · {}", format_block_duration(duration))
@@ -139,7 +133,35 @@ impl ZoneChromeRecord {
     }
 }
 
-pub(super) fn format_block_duration(dur_ms: u64) -> String {
+/// One word for a record whose lifecycle is not fully trusted, or `None` when
+/// it is. Block's card chip and Unified's status line share this so the same
+/// record cannot be described two ways depending on which mode is showing it.
+pub(super) fn lifecycle_badge(health: super::BlockLifecycleHealth) -> Option<&'static str> {
+    match health {
+        super::BlockLifecycleHealth::Healthy => None,
+        super::BlockLifecycleHealth::Recovered => Some("recovered"),
+        super::BlockLifecycleHealth::Degraded => Some("inferred"),
+        super::BlockLifecycleHealth::Incomplete => Some("incomplete"),
+    }
+}
+
+/// Wall-clock readout for a command that is still running.
+///
+/// Whole seconds, because that is the resolution the 250 ms tick can honestly
+/// claim and a jittering sub-second digit reads as noise. Shared by the sticky
+/// header and the live-edge pill so the same command cannot be shown two ages
+/// depending on where the viewport happens to be.
+pub(super) fn format_elapsed_clock(seconds: u64) -> String {
+    if seconds >= 3600 {
+        format!("{}h{:02}m", seconds / 3600, (seconds % 3600) / 60)
+    } else if seconds >= 60 {
+        format!("{}m{:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+pub(crate) fn format_block_duration(dur_ms: u64) -> String {
     if dur_ms < 1000 {
         format!("{dur_ms}ms")
     } else if dur_ms < 60_000 {
@@ -1681,6 +1703,32 @@ mod tests {
     use super::*;
 
     const NONCE: [u8; 16] = [0xab; 16];
+
+    /// Block's card badge shares this formatter now. Its own float ladder
+    /// rendered whole minutes with `{:.0}`, so 90s read as `2m` and an hour
+    /// read as `60m` — the two cases pinned here.
+    #[test]
+    fn duration_keeps_the_seconds_and_minutes_it_rounds_past() {
+        assert_eq!(format_block_duration(0), "0ms");
+        assert_eq!(format_block_duration(999), "999ms");
+        assert_eq!(format_block_duration(1_000), "1.0s");
+        assert_eq!(format_block_duration(59_940), "59.9s");
+        assert_eq!(format_block_duration(60_000), "1m");
+        assert_eq!(format_block_duration(90_000), "1m30s");
+        assert_eq!(format_block_duration(3_599_000), "59m59s");
+        assert_eq!(format_block_duration(3_600_000), "1h");
+        assert_eq!(format_block_duration(5_400_000), "1h30m");
+    }
+
+    #[test]
+    fn elapsed_clock_keeps_two_units_at_every_scale() {
+        assert_eq!(format_elapsed_clock(0), "0s");
+        assert_eq!(format_elapsed_clock(59), "59s");
+        assert_eq!(format_elapsed_clock(60), "1m00s");
+        assert_eq!(format_elapsed_clock(3599), "59m59s");
+        assert_eq!(format_elapsed_clock(3600), "1h00m");
+        assert_eq!(format_elapsed_clock(7_265), "2h01m");
+    }
 
     #[test]
     fn fractional_adjustment_uses_the_pixel_rounded_probe_row() {

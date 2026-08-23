@@ -387,6 +387,13 @@ impl BlockData {
             md.push_str(&format!("**Duration:** {:.3}s\n\n", dur_sec));
         }
 
+        // Where it ran is part of what it means. A pasted block without it is
+        // not reproducible, and half the commands worth exporting are
+        // directory-relative.
+        if let Some(cwd) = self.cwd.as_deref().filter(|cwd| !cwd.is_empty()) {
+            md.push_str(&format!("**Directory:** {cwd}\n\n"));
+        }
+
         md
     }
 }
@@ -543,6 +550,10 @@ pub(crate) struct FinishedBlock {
     pub(crate) rerun_btn: gtk::Button,
     pub(crate) header_row: gtk::Box,
     pub(crate) action_box: gtk::Box,
+    /// Fold or unfold this card's output, and whether it is folded now. Same
+    /// exposure as `toggle_filter`, for the menu item and the keyboard action.
+    pub(crate) toggle_collapsed: Rc<dyn Fn()>,
+    collapsed_state: Rc<Cell<bool>>,
     /// Toggle the per-block output filter without discarding its query. Exposed
     /// so the Warp-compatible keyboard action can target the selected/latest block.
     pub(crate) toggle_filter: Rc<dyn Fn()>,
@@ -550,6 +561,8 @@ pub(crate) struct FinishedBlock {
     pub(crate) jump_bottom_btn: gtk::Button,
     pub(crate) bookmark_star: gtk::Image,
     pub(crate) status_icon: gtk::Image,
+    /// Header chip naming an untrusted completion; hidden on a healthy record.
+    lifecycle_chip: gtk::Label,
     /// Column count the output VTE is sized to — needed for re-feed (filter).
     pub(crate) cols: i64,
     /// Number of rows allocated to this finished output. Kept with the widget
@@ -603,10 +616,13 @@ impl Clone for FinishedBlock {
             rerun_btn: self.rerun_btn.clone(),
             header_row: self.header_row.clone(),
             action_box: self.action_box.clone(),
+            toggle_collapsed: self.toggle_collapsed.clone(),
+            collapsed_state: self.collapsed_state.clone(),
             toggle_filter: self.toggle_filter.clone(),
             jump_bottom_btn: self.jump_bottom_btn.clone(),
             bookmark_star: self.bookmark_star.clone(),
             status_icon: self.status_icon.clone(),
+            lifecycle_chip: self.lifecycle_chip.clone(),
             cols: self.cols,
             viewport_cap: self.viewport_cap,
             dynamic_viewport_rows: self.dynamic_viewport_rows.clone(),
@@ -1245,6 +1261,228 @@ mod tests {
         let (hits, misses) = visual_row_cache_counters();
         assert_eq!(hits + misses, 1, "map resolves output rows exactly once");
         assert!(block.dynamic_viewport_rows.get() > 0);
+        window.close();
+        while glib::MainContext::default().iteration(false) {}
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn only_an_untrusted_record_wears_a_lifecycle_chip() {
+        gtk::init().expect("gtk init");
+        let config = Config::safe_defaults();
+        let block = FinishedBlock::new(
+            6,
+            "$ ",
+            "make",
+            None,
+            "built\n",
+            Some(0),
+            &config,
+            None,
+            None,
+            None,
+            80,
+        );
+
+        block.set_lifecycle(BlockLifecycleHealth::Healthy, None);
+        assert!(!block.lifecycle_chip.is_visible());
+
+        block.set_lifecycle(BlockLifecycleHealth::Degraded, Some("no end marker"));
+        assert!(block.lifecycle_chip.is_visible());
+        assert_eq!(block.lifecycle_chip.text(), "inferred");
+        assert_eq!(
+            block.lifecycle_chip.tooltip_text().as_deref(),
+            Some("no end marker"),
+            "the explanation belongs on the chip, where no other tooltip shadows it"
+        );
+
+        // Card shells are pooled, so the healthy record that reuses this one
+        // has to be able to take the mark back off.
+        block.set_lifecycle(BlockLifecycleHealth::Healthy, None);
+        assert!(!block.lifecycle_chip.is_visible());
+        assert_eq!(block.lifecycle_chip.tooltip_text(), None);
+
+        // Background output never ran a command, so it has no completion to
+        // doubt — and its header already says what it is.
+        let background = FinishedBlock::new(
+            7, "$ ", "", None, "async\n", None, &config, None, None, None, 80,
+        );
+        background.set_lifecycle(BlockLifecycleHealth::Degraded, Some("no end marker"));
+        assert!(!background.lifecycle_chip.is_visible());
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn search_reads_the_filtered_view_and_falls_back_to_the_superset() {
+        gtk::init().expect("gtk init");
+        let transcript = "keep one\ndrop two\nkeep three\n";
+        let block = FinishedBlock::new(
+            5,
+            "$ ",
+            "cargo test",
+            None,
+            transcript,
+            Some(0),
+            &Config::safe_defaults(),
+            None,
+            None,
+            None,
+            80,
+        );
+        assert_eq!(
+            block.with_searchable_output(str::to_string),
+            transcript,
+            "an unfiltered card searches its whole transcript"
+        );
+
+        // What the filter does to a card: swap in the visible subset. A hit
+        // counted in `drop two` cannot be stepped to in the VTE, and the find
+        // pass treats that failure as "no matches" for the whole session.
+        let filtered = "keep one\nkeep three\n";
+        *block.displayed_output.borrow_mut() = Some(filtered.to_string());
+        assert_eq!(block.with_searchable_output(str::to_string), filtered);
+
+        // The filter's own re-render holds this cell mutably on the same main
+        // loop. The fallback is this card's superset — never another card's
+        // text, and never a panic.
+        let rendering = block.displayed_output.borrow_mut();
+        assert_eq!(block.with_searchable_output(str::to_string), transcript);
+        drop(rendering);
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn block_density_switches_on_widgets_that_already_exist() {
+        gtk::init().expect("gtk init");
+        let config = Config::safe_defaults();
+        assert!(
+            !config.block_compact,
+            "the default density is the roomy one"
+        );
+        let block = FinishedBlock::new(
+            4,
+            "$ ",
+            "echo density",
+            None,
+            "density\n",
+            Some(0),
+            &config,
+            None,
+            None,
+            None,
+            80,
+        );
+
+        // Card margins are GTK properties, not CSS, so the class alone proves
+        // nothing: the setting used to reach only panes built after it changed,
+        // and a switch that repainted the class while leaving the spacing would
+        // look exactly as wrong.
+        let roomy = (
+            block.widget().margin_top(),
+            block.widget().margin_start(),
+            block.header_row.margin_start(),
+            block.header_row.margin_top(),
+        );
+        assert!(!block.widget().has_css_class("block-compact"));
+
+        block.set_compact(true);
+        let compact = (
+            block.widget().margin_top(),
+            block.widget().margin_start(),
+            block.header_row.margin_start(),
+            block.header_row.margin_top(),
+        );
+        assert!(block.widget().has_css_class("block-compact"));
+        assert!(
+            compact.0 < roomy.0
+                && compact.1 < roomy.1
+                && compact.2 < roomy.2
+                && compact.3 < roomy.3,
+            "compact must tighten every margin: {compact:?} vs {roomy:?}"
+        );
+
+        block.set_compact(false);
+        assert!(!block.widget().has_css_class("block-compact"));
+        assert_eq!(
+            (
+                block.widget().margin_top(),
+                block.widget().margin_start(),
+                block.header_row.margin_start(),
+                block.header_row.margin_top(),
+            ),
+            roomy,
+            "switching back must restore construction's own margins"
+        );
+
+        // The live input cell carries the density as a class only; its height
+        // comes from `BLOCK_ACTIVE_COMPACT_VCHROME_PX` via the same class.
+        let live = ActiveBlock::new(&config, Rc::new(RefCell::new(VecDeque::new())));
+        assert!(!live.widget().has_css_class("block-compact"));
+        live.set_compact(true);
+        assert!(live.widget().has_css_class("block-compact"));
+        live.set_compact(false);
+        assert!(!live.widget().has_css_class("block-compact"));
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn output_scrollbar_visibility_cannot_change_the_terminal_width() {
+        gtk::init().expect("gtk init");
+        let block = FinishedBlock::new(
+            3,
+            "$ ",
+            "cat transcript.log",
+            None,
+            &"ordinary output line\n".repeat(400),
+            Some(0),
+            &Config::safe_defaults(),
+            None,
+            None,
+            None,
+            80,
+        );
+        let scrolled = gtk::ScrolledWindow::builder()
+            .min_content_width(800)
+            .min_content_height(400)
+            .child(block.widget())
+            .build();
+        let window = gtk::Window::builder().child(&scrolled).build();
+        window.present();
+        spin_main_context_until(|| block.output_vte.is_mapped() && block.output_vte.width() > 0);
+
+        // Whether this scrollbar is shown is decided from VTE's ring measured
+        // against the visible page — a quantity the terminal's own width
+        // produces. A scrollbar that took layout width would therefore move the
+        // input of the decision that showed it: hide it, the terminal widens,
+        // the ring rewraps to fewer rows, the ring stops overflowing, and the
+        // next frame hides it again. That cycle closes inside GTK, so no
+        // render-stamp guard can break it; the width edge has to not exist.
+        block.output_scrollbar.set_visible(true);
+        spin_main_context_for(std::time::Duration::from_millis(60));
+        let with_scrollbar = block.output_vte.width();
+        block.output_scrollbar.set_visible(false);
+        spin_main_context_for(std::time::Duration::from_millis(60));
+        let without_scrollbar = block.output_vte.width();
+
+        assert!(
+            with_scrollbar > 0,
+            "the output terminal was never allocated"
+        );
+        assert_eq!(
+            with_scrollbar, without_scrollbar,
+            "the per-block scrollbar must not take width from its own terminal"
+        );
+
+        let overlay = block
+            .output_scrollbar
+            .parent()
+            .and_then(|parent| parent.downcast::<gtk::Overlay>().ok())
+            .expect("the scrollbar rides an overlay, not a box sibling");
+        assert!(
+            !overlay.is_measure_overlay(&block.output_scrollbar),
+            "an overlay that is measured would put the width edge back"
+        );
+
         window.close();
         while glib::MainContext::default().iteration(false) {}
     }
@@ -2224,6 +2462,42 @@ fn flash_button_icon(btn: &gtk::Button, icon_name: &'static str, tooltip: &'stat
 /// back to back and the block showed its output twice — the doubled `ls` listing
 /// this fixes. RIS (`ESC c`) travels *with* these bytes, so it clears whatever is
 /// still queued ahead of them, in order, whether or not VTE has caught up yet.
+/// Outer margins and density class of a finished card.
+///
+/// Construction and the live setter share this so a pane cannot end up with
+/// half its cards at one density and half at the other; the CSS side of the
+/// same switch keys off the `block-compact` class set here.
+fn apply_card_density(outer: &gtk::Box, compact: bool) {
+    if compact {
+        outer.add_css_class("block-compact");
+        outer.set_margin_top(1);
+        outer.set_margin_bottom(1);
+        outer.set_margin_start(4);
+        outer.set_margin_end(4);
+    } else {
+        outer.remove_css_class("block-compact");
+        outer.set_margin_top(4);
+        outer.set_margin_bottom(4);
+        outer.set_margin_start(8);
+        outer.set_margin_end(8);
+    }
+}
+
+/// Header-strip margins for the same two densities. See [`apply_card_density`].
+fn apply_header_density(header_row: &gtk::Box, compact: bool) {
+    if compact {
+        header_row.set_margin_start(8);
+        header_row.set_margin_end(6);
+        header_row.set_margin_top(3);
+        header_row.set_margin_bottom(1);
+    } else {
+        header_row.set_margin_start(12);
+        header_row.set_margin_end(8);
+        header_row.set_margin_top(6);
+        header_row.set_margin_bottom(2);
+    }
+}
+
 fn feed_snapshot_bytes(vte: &vte4::Terminal, bytes: &[u8]) {
     vte.feed(&snapshot_payload(bytes));
 }
@@ -2423,6 +2697,28 @@ impl FinishedBlock {
         f(guard.as_deref().unwrap_or(""))
     }
 
+    /// The transcript a search should scan: whatever this card is displaying.
+    ///
+    /// Counting a hit in a line the filter has hidden makes the VTE's own
+    /// `search_find_next` come up empty, and the find pass reads that as "no
+    /// matches" — then clears the query for the **whole session**, not just for
+    /// this block. One filtered card could therefore zero the result count for
+    /// every other card.
+    ///
+    /// `try_borrow`: the filter's apply closure holds this mutably while it
+    /// re-renders, on the same main loop. Falling back to the full transcript
+    /// there can over-count inside one block for one pass; it cannot invalidate
+    /// the pass.
+    pub(crate) fn with_searchable_output<R>(&self, f: impl FnOnce(&str) -> R) -> R {
+        match self.displayed_output.try_borrow() {
+            Ok(displayed) => match displayed.as_deref() {
+                Some(filtered) => f(filtered),
+                None => f(&self.full_output.borrow()),
+            },
+            Err(_) => f(&self.full_output.borrow()),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         id: u64,
@@ -2536,6 +2832,11 @@ impl FinishedBlock {
             // A pooled widget keeps every class it was last given, so the new
             // block's status stripe would sit under the recycled one.
             reused.remove_css_class("block-unknown");
+            // Same for the lifecycle notice. Only a degraded record sets one,
+            // and only as an `if let Some` with no `else`, so a healthy card
+            // built on a recycled shell inherited the dead block's explanation
+            // of why *its* status could not be trusted.
+            reused.set_has_tooltip(false);
             reused
         } else {
             let b = gtk::Box::new(Orientation::Vertical, 0);
@@ -2557,19 +2858,7 @@ impl FinishedBlock {
         content.set_hexpand(true);
         content.set_vexpand(false);
         outer.append(&content);
-        if config.block_compact {
-            outer.add_css_class("block-compact");
-            outer.set_margin_top(1);
-            outer.set_margin_bottom(1);
-            outer.set_margin_start(4);
-            outer.set_margin_end(4);
-        } else {
-            outer.remove_css_class("block-compact");
-            outer.set_margin_top(4);
-            outer.set_margin_bottom(4);
-            outer.set_margin_start(8);
-            outer.set_margin_end(8);
-        }
+        apply_card_density(&outer, config.block_compact);
 
         // Status stripe: green on success, red on failure, cyan for output
         // emitted while the shell prompt was idle (Warp background blocks),
@@ -2593,17 +2882,14 @@ impl FinishedBlock {
         } else {
             "Click to select · Shift-click range · Ctrl+Shift-click toggle · Enter recalls"
         }));
-        if config.block_compact {
-            header_row.set_margin_start(8);
-            header_row.set_margin_end(6);
-            header_row.set_margin_top(3);
-            header_row.set_margin_bottom(1);
-        } else {
-            header_row.set_margin_start(12);
-            header_row.set_margin_end(8);
-            header_row.set_margin_top(6);
-            header_row.set_margin_bottom(2);
-        }
+        apply_header_density(&header_row, config.block_compact);
+
+        // Warp-style accent prompt chevron. Leads the header rather than the
+        // command row; see the command-row comment below.
+        let chevron = gtk::Label::new(Some("\u{276f}"));
+        chevron.add_css_class("block-prompt-chevron");
+        chevron.set_visible(!is_background);
+        header_row.append(&chevron);
 
         // Bookmark marker (gutter marker), hidden until the block is bookmarked.
         let bookmark_star = gtk::Image::from_icon_name("user-bookmarks-symbolic");
@@ -2630,11 +2916,27 @@ impl FinishedBlock {
             header_row.append(&background_chip);
         }
 
+        // Lifecycle chip: shown only when this record's completion is not fully
+        // trusted. It used to be a card-level tooltip, which is the one place a
+        // caveat about an exit code cannot be seen — the header's own chips and
+        // buttons shadow it, and a tooltip has to be hunted for. The full
+        // explanation is this chip's tooltip, where nothing can shadow it.
+        let lifecycle_chip = gtk::Label::new(None);
+        lifecycle_chip.add_css_class("block-lifecycle-chip");
+        lifecycle_chip.set_halign(gtk::Align::Start);
+        lifecycle_chip.set_max_width_chars(14);
+        lifecycle_chip.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        lifecycle_chip.set_visible(false);
+        header_row.append(&lifecycle_chip);
+
         // Context chips (Warp-style): cwd pill + git-branch pill.
         if let Some(cwd_path) = cwd {
             let shortened = shorten_path(cwd_path);
             let cwd_chip = gtk::Label::new(Some(&format!("Folder: {shortened}")));
             cwd_chip.add_css_class("block-chip");
+            // The chip shows `…/two/tail`; the tooltip is where the rest of a
+            // deep path lives.
+            cwd_chip.set_tooltip_text(Some(cwd_path));
             cwd_chip.set_halign(gtk::Align::Start);
             cwd_chip.set_ellipsize(gtk::pango::EllipsizeMode::Start);
             cwd_chip.set_max_width_chars(40);
@@ -2668,19 +2970,16 @@ impl FinishedBlock {
             header_row.append(&ts_label);
         }
 
-        // Duration badge
+        // Duration badge. Shares Unified's formatter: the card used to round
+        // whole minutes off a float, so a 90-second command was labelled `2m`
+        // and an hour was labelled `60m`.
         if let Some(dur_ms) = duration_ms {
-            let dur_sec = dur_ms as f64 / 1000.0;
-            let duration_text = if dur_sec < 1.0 {
-                format!("{:.0}ms", dur_ms)
-            } else if dur_sec < 60.0 {
-                format!("{:.1}s", dur_sec)
-            } else {
-                let min = dur_sec / 60.0;
-                format!("{:.0}m", min)
-            };
+            let duration_text = super::unified_chrome::format_block_duration(dur_ms);
             let dur_label = gtk::Label::new(Some(&duration_text));
             dur_label.add_css_class("block-meta-badge");
+            // The badge rounds; the tooltip does not. Comparing two runs of the
+            // same build is the reason anyone reads this number at all.
+            dur_label.set_tooltip_text(Some(&format!("{dur_ms} ms")));
             header_row.append(&dur_label);
         }
 
@@ -2694,14 +2993,24 @@ impl FinishedBlock {
         // Quick-action buttons (hidden until the block is hovered). Handlers are
         // wired by the caller, which has access to the clipboard + active block.
         let action_box = gtk::Box::new(Orientation::Horizontal, 2);
-        action_box.set_visible(false);
+        // Faded, not hidden. Hiding it removed ~150px from a hexpand header, so
+        // every timestamp/duration/exit badge slid left on hover and snapped
+        // back on leave — once per card while dragging the pointer down a list.
+        // `can_target(false)` is load-bearing: an invisible-but-present button
+        // would otherwise swallow the header clicks that select the block.
+        action_box.add_css_class("block-action-box");
+        action_box.set_opacity(0.0);
+        action_box.set_can_target(false);
         // Small gap between the meta badges (timestamp/duration/exit) on the
         // right and the action button group, so they read as separate units
         // rather than one undifferentiated cluster.
         action_box.set_margin_start(6);
+        // Three distinct glyphs. The two copy actions shared `edit-copy` and
+        // were therefore separable only by hovering for a tooltip, which is the
+        // one thing a quick-action row exists to avoid.
         let copy_cmd_btn = icon_button("edit-copy-symbolic", "Copy command");
-        let copy_output_btn = icon_button("edit-copy-symbolic", "Copy output");
-        let rerun_btn = icon_button("edit-paste-symbolic", "Insert command at prompt");
+        let copy_output_btn = icon_button("text-x-generic-symbolic", "Copy output");
+        let rerun_btn = icon_button("insert-text-symbolic", "Insert command at prompt");
         // Commandless background blocks retain output actions, find/filter,
         // bookmarks and selection, but cannot copy or recall a command.
         copy_cmd_btn.set_visible(!is_background);
@@ -2732,7 +3041,8 @@ impl FinishedBlock {
         let action_box_for_enter = action_box.clone();
         hover_ctrl.connect_enter(move |_, _, _| {
             outer_for_enter.add_css_class("block-hovered");
-            action_box_for_enter.set_visible(true);
+            action_box_for_enter.set_opacity(1.0);
+            action_box_for_enter.set_can_target(true);
         });
         let outer_for_leave = outer.clone();
         let action_box_for_leave = action_box.clone();
@@ -2740,7 +3050,8 @@ impl FinishedBlock {
             outer_for_leave.remove_css_class("block-hovered");
             // Only the active edge of a multi-selection owns persistent actions.
             if !outer_for_leave.has_css_class("block-selection-active") {
-                action_box_for_leave.set_visible(false);
+                action_box_for_leave.set_opacity(0.0);
+                action_box_for_leave.set_can_target(false);
             }
         });
         outer.add_controller(hover_ctrl);
@@ -2980,24 +3291,42 @@ impl FinishedBlock {
             });
         }
 
-        // Command row: Warp-style accent prompt chevron + the command VTE.
+        // Command row: just the command VTE. The prompt chevron moved up into
+        // the header, because as a sibling here it indented the command by its
+        // own width while the output below started at the card's edge — two
+        // left margins inside one card, for text meant to be read together.
+        // Giving the *output* the matching indent instead was the other way to
+        // align them, and it is not available: column count comes from the
+        // terminal's pixel width, so the card would re-wrap `ls` differently
+        // from the live pane the user watched it in.
         let cmd_row = gtk::Box::new(Orientation::Horizontal, 0);
-        let chevron = gtk::Label::new(Some("\u{276f}")); // ❯
-        chevron.add_css_class("block-prompt-chevron");
-        chevron.set_valign(gtk::Align::Start);
-        cmd_row.append(&chevron);
         cmd_row.append(&command_vte);
 
         content.append(&cmd_row);
         cmd_row.set_visible(!is_background);
-        let output_box = gtk::Box::new(Orientation::Horizontal, 0);
+        // The per-block scrollbar rides an overlay, never a box sibling.
+        //
+        // As a sibling its ~14px came out of the terminal's own allocation, and
+        // the condition that shows it — VTE's ring overflowing the visible page
+        // — is itself a function of that width. So hiding it widened the
+        // terminal by a column, the wider terminal rewrapped its ring to fewer
+        // rows, the ring stopped overflowing, and the next frame hid it again:
+        // a two-state layout loop that flickered the whole card (and the output
+        // row inside it) at frame rate, for as long as the pane stayed open.
+        // The loop closes entirely inside GTK — no anvil re-feed is involved —
+        // so it cannot be broken by any of the render-stamp guards above it.
+        // Overlaying the scrollbar breaks the width edge of that cycle; the
+        // live card's scrollbar already rides its clip for the same reason.
+        let output_box = gtk::Overlay::new();
         output_box.set_hexpand(true);
-        output_box.append(&output_vte);
+        output_box.set_child(Some(&output_vte));
         let output_scrollbar =
             gtk::Scrollbar::new(Orientation::Vertical, output_vte.vadjustment().as_ref());
         output_scrollbar.add_css_class("block-output-scrollbar");
         output_scrollbar.set_visible(output_scrollable);
         output_scrollbar.set_tooltip_text(Some("Scroll within this block"));
+        output_scrollbar.set_halign(gtk::Align::End);
+        output_scrollbar.set_valign(gtk::Align::Fill);
         if let Some(adjustment) = output_vte.vadjustment() {
             let scrollbar = output_scrollbar.downgrade();
             let sync_visibility = move |adjustment: &gtk::Adjustment| {
@@ -3011,7 +3340,9 @@ impl FinishedBlock {
             sync_visibility(&adjustment);
             adjustment.connect_changed(sync_visibility);
         }
-        output_box.append(&output_scrollbar);
+        output_box.add_overlay(&output_scrollbar);
+        output_box.set_measure_overlay(&output_scrollbar, false);
+        output_box.set_clip_overlay(&output_scrollbar, true);
         let output_widget: gtk::Widget = output_box.clone().upcast::<gtk::Widget>();
         content.append(&output_box);
 
@@ -3100,7 +3431,9 @@ impl FinishedBlock {
                 &format!("Toggle output ({})", line_count_text(output_rows)),
             );
         }
+        let collapsed_state: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let set_collapsed: Rc<dyn Fn(bool)> = {
+            let collapsed_state = collapsed_state.clone();
             let output_widget = output_widget.downgrade();
             let collapsed_summary = collapsed_summary.downgrade();
             let collapse_btn = collapse_btn.downgrade();
@@ -3113,6 +3446,7 @@ impl FinishedBlock {
                 ) else {
                     return;
                 };
+                collapsed_state.set(collapsed);
                 // Image-only blocks keep their empty output VTE hidden even
                 // while expanded; only the Pictures fold and unfold.
                 output_widget.set_visible(!collapsed && has_output);
@@ -3151,6 +3485,19 @@ impl FinishedBlock {
             let set_collapsed = set_collapsed.clone();
             collapsed_summary.connect_clicked(move |_| set_collapsed(false));
         }
+        // Same shape as `toggle_filter`: a weak-only closure the menu and the
+        // keyboard action can call without either of them knowing how folding
+        // is implemented. A 400-line `cargo build` should not need a mouse.
+        let toggle_collapsed: Rc<dyn Fn()> = {
+            let set_collapsed = set_collapsed.clone();
+            let collapsed_state = collapsed_state.clone();
+            let can_fold = has_output || has_images;
+            Rc::new(move || {
+                if can_fold {
+                    set_collapsed(!collapsed_state.get());
+                }
+            })
+        };
         if !has_output && !has_images {
             set_icon_button(&collapse_btn, "go-next-symbolic", "No output");
             collapsed_summary.set_visible(false);
@@ -3506,9 +3853,12 @@ impl FinishedBlock {
             rerun_btn,
             header_row,
             action_box,
+            toggle_collapsed,
+            collapsed_state,
             toggle_filter,
             jump_bottom_btn,
             bookmark_star,
+            lifecycle_chip,
             status_icon,
             cols,
             viewport_cap,
@@ -3600,6 +3950,42 @@ impl FinishedBlock {
             self.widget.set_height_request(-1);
             self.virtualized_height.get().max(1)
         }
+    }
+
+    /// Whether this card's output is currently folded away.
+    pub(crate) fn is_output_collapsed(&self) -> bool {
+        self.collapsed_state.get()
+    }
+
+    /// Mark, or unmark, this card as carrying a completion nobody vouched for.
+    ///
+    /// Takes the notice as well as the health because the two backing record
+    /// types word it from different evidence; the chip's own word comes from
+    /// the vocabulary Unified's status line uses, so one record cannot be
+    /// described two ways depending on which mode is showing it.
+    pub(crate) fn set_lifecycle(&self, health: BlockLifecycleHealth, notice: Option<&str>) {
+        // A background block has no command to have completed, and its header
+        // already says what it is.
+        let badge = super::unified_chrome::lifecycle_badge(health).filter(|_| !self.is_background);
+        match badge {
+            Some(badge) => {
+                self.lifecycle_chip.set_text(badge);
+                self.lifecycle_chip.set_tooltip_text(notice);
+                self.lifecycle_chip
+                    .update_property(&[gtk::accessible::Property::Label(notice.unwrap_or(badge))]);
+                self.lifecycle_chip.set_visible(true);
+            }
+            None => {
+                self.lifecycle_chip.set_visible(false);
+                self.lifecycle_chip.set_tooltip_text(None);
+            }
+        }
+    }
+
+    /// Switch this card between the normal and compact densities in place.
+    pub(crate) fn set_compact(&self, compact: bool) {
+        apply_card_density(&self.widget, compact);
+        apply_header_density(&self.header_row, compact);
     }
 
     /// Re-fit this block's output to the pane's current geometry.
@@ -3810,13 +4196,29 @@ impl FinishedBlock {
         });
 
         let vte_for_out = vte.clone();
-        // Copy the FULL output (ANSI stripped), not just the collapsed first-N
-        // lines shown in output_buffer before "Show more" is clicked.
+        // Copies what the card is showing: the whole transcript normally, and
+        // the filtered lines while a filter is on. Copying the full transcript
+        // out of a filtered card is the one thing nobody asks for — filtering
+        // is how you decide what to copy — and it arrives with no sign that the
+        // clipboard holds more than the screen does.
+        //
+        // `try_borrow`: the filter's own apply closure holds this mutably while
+        // it re-renders, on the same main loop. Falling back to the full
+        // transcript there copies a superset, never a wrong block.
         let full_output_for_copy = self.full_output.clone();
+        let displayed_output_for_copy = self.displayed_output.clone();
         self.copy_output_btn.connect_clicked(move |btn| {
-            let text = strip_ansi(&full_output_for_copy.borrow());
+            let displayed = displayed_output_for_copy.try_borrow().ok();
+            let filtered = displayed
+                .as_ref()
+                .and_then(|displayed| displayed.as_deref())
+                .map(strip_ansi);
+            let (text, label) = match filtered {
+                Some(text) => (text, "Filtered output copied"),
+                None => (strip_ansi(&full_output_for_copy.borrow()), "Output copied"),
+            };
             vte_for_out.clipboard().set_text(&text);
-            flash_button_icon(btn, "emblem-ok-symbolic", "Output copied");
+            flash_button_icon(btn, "emblem-ok-symbolic", label);
         });
 
         let pty_for_rerun = Rc::clone(pty);
@@ -4230,6 +4632,16 @@ impl ActiveBlock {
 
     pub(crate) fn widget(&self) -> &gtk::Box {
         &self.widget
+    }
+
+    /// Switch the live input cell's density. Unified's holder carries
+    /// `block-fullscreen` instead and is left alone by its caller.
+    pub(crate) fn set_compact(&self, compact: bool) {
+        if compact {
+            self.widget.add_css_class("block-compact");
+        } else {
+            self.widget.remove_css_class("block-compact");
+        }
     }
 
     pub(crate) fn grab_focus(&self) {

@@ -365,7 +365,7 @@ impl Component for SettingsModel {
                     #[name(block_compact_row)]
                     adw::SwitchRow {
                         set_title: "Compact Block Layout",
-                        set_subtitle: "Use denser spacing in new Block panes",
+                        set_subtitle: "Denser spacing for blocks and the input cell",
                         set_active: model.values.block_compact,
                         set_sensitive: !model.values.safe_mode,
                         connect_active_notify[sender] => move |row| {

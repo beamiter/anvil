@@ -508,6 +508,12 @@ pub struct CrossBlockHit {
     pub line_no: usize,
     pub line_text: String,
     pub cmd_preview: String,
+    /// Outcome of the record the hit came from. Carried on the hit so the
+    /// palette can show which `cargo build` failed without making the user
+    /// jump to each one to find out.
+    pub exit_code: Option<i32>,
+    pub duration_ms: Option<u64>,
+    pub cwd: Option<String>,
 }
 
 /// Trim a line to a reasonable display width — the palette row is one
@@ -1028,11 +1034,19 @@ impl TermView {
     ///
     /// Errors only on invalid regex; an empty pattern returns `Ok(vec![])`
     /// so the caller can clear results without a special branch.
+    /// Scan every retained record for `pattern`, honoring the same outcome and
+    /// duration predicates the block filters use.
+    ///
+    /// `filters` is applied per record, before its lines are scanned: the
+    /// predicates already existed and had no surface that could reach them, so
+    /// "which failing command took over two seconds" was unanswerable with the
+    /// data sitting right there.
     pub fn cross_block_search(
         &self,
         pattern: &str,
         is_regex: bool,
         max_hits: usize,
+        filters: &BlockFilters,
     ) -> Result<Vec<CrossBlockHit>, String> {
         if pattern.is_empty() {
             return Ok(Vec::new());
@@ -1056,7 +1070,15 @@ impl TermView {
                 break;
             }
             let command = record.command();
+            if !outcome_matches_filters(command, record.exit_code(), filters)
+                || !duration_matches(record.duration_ms(), filters)
+            {
+                continue;
+            }
             let cmd_preview = command_preview(command);
+            let exit_code = record.exit_code();
+            let duration_ms = record.duration_ms();
+            let cwd = record.cwd().map(str::to_string);
 
             // Cmd surface — usually 1 line, but multiline commands exist.
             for (ln_idx, line) in command.lines().enumerate() {
@@ -1070,6 +1092,9 @@ impl TermView {
                         line_no: ln_idx + 1,
                         line_text: snippet(line),
                         cmd_preview: cmd_preview.clone(),
+                        exit_code,
+                        duration_ms,
+                        cwd: cwd.clone(),
                     });
                 }
             }
@@ -1085,6 +1110,9 @@ impl TermView {
                         line_no: ln_idx + 1,
                         line_text: snippet(line),
                         cmd_preview: cmd_preview.clone(),
+                        exit_code,
+                        duration_ms,
+                        cwd: cwd.clone(),
                     });
                 }
             }

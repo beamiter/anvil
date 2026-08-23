@@ -7,6 +7,66 @@ versioning for tagged releases while it remains experimental.
 
 ### Added
 
+- The cross-block search palette (`Ctrl+Shift+G`) gained **Failed** and **Slow**
+  toggles and an outcome column. The two predicates already existed with no
+  surface that could reach them, so "which failing build took over a second" was
+  unanswerable with the data sitting right there; and every row looked alike, so
+  telling the failing `cargo build` from the passing ones meant visiting each.
+  Rows now carry `exit:1 · 2.4s · …/anvil`, coloured by outcome. Holding Down
+  also keeps the selection on screen: GTK scrolls to follow focus, and focus
+  belongs to the search entry here, so the list is scrolled directly instead —
+  the selection used to walk off the bottom and Enter jumped somewhere the user
+  could not see. The three surfaces that mean "slow" now share one threshold
+  constant rather than three literals, two of which disagreed.
+- A card's output folds and unfolds from the keyboard (`Alt+Shift+O`, selected
+  or most recent block) and from its right-click menu, not only from the
+  chevron. A 400-line `cargo build` was mouse-only to collapse.
+- The block right-click menu can copy a block's working directory, or insert a
+  correctly quoted `cd` for it at the prompt (inserted, never run, under the
+  same clean-prompt gate as the other recalls). The cwd chip's tooltip carries
+  the full path the chip shortens, and both Markdown exports carry a
+  `**Directory:**` line — a pasted block that does not say where it ran is not
+  reproducible.
+- Block mode tells you when the shell is not reporting command boundaries.
+  Without OSC 133 there are no blocks at all — no cards, no exit codes, no
+  durations — while the terminal otherwise works perfectly, which is the worst
+  way for a feature to be missing: nothing looks broken, so nobody goes looking
+  for the cause. A pane that reaches the raw fallback with a bash, zsh, fish or
+  pwsh shell now docks a dismissible card naming that shell's rc file and the
+  one line that fixes it, with a Copy button. It retires itself the moment marks
+  appear, including from a `source` typed minutes later. Nothing is said for a
+  shell there is no honest advice for: `jsh` carries the marks itself, an `ssh`
+  or `docker` pane is someone else's shell, a `-c` pane runs one command and
+  exits, and behind a wrapper the rc file cannot be named.
+- The card right-click menu offers **Copy Selection** when text is selected, and
+  opening it no longer leaves two selection models painted at once. The menu
+  reads the text selection before it activates the card selection that repaints
+  over it, then clears the text selection — so the Ctrl+Shift+C that follows
+  copies what the screen now shows is selected instead of silently disagreeing
+  with it.
+- Right-click on the block-mode canvas opens a menu with Copy, Paste and Select
+  All Blocks. Block mode was the one backend where that button did nothing: the
+  live cell is a display-only VTE with no child PTY, so VTE's own menu never
+  applied to it, and the per-card menu covers only the cards. The card menu
+  still wins inside a card, and a full-screen program keeps the button — the
+  menu does not open over `htop`. Clear Blocks is deliberately absent: the
+  toast that carries its Undo is emitted around the message, not by the view,
+  so a menu entry would be a silent destructive action.
+- A running-command pill at the live edge: after two seconds, a chip appears at
+  the top right of the pane with a ticking elapsed time, the command in its
+  tooltip, and a stop button. The sticky running header only exists once the
+  user has scrolled away from the prompt, so at the live edge — where most
+  commands are actually watched — a command that printed nothing looked exactly
+  like a hung shell. Ctrl+C always worked; what was missing was the readout and
+  something to aim at. The two are never on screen together and share one
+  elapsed formatter, so the same command cannot be shown two different ages
+  depending on where the viewport is. Short commands never flash one.
+- The clear-blocks toast carries an **Undo** button. Recovery existed but was
+  only reachable by name, through the palette, which is not where anyone looks
+  in the second after an accidental `Ctrl+Shift+K`. The button is bound to the
+  pane that raised it, not to whichever pane has focus when it is clicked: the
+  toast outlives a tab switch, and undoing into the wrong pane would be a second
+  accident on top of the first. If that pane has closed, the toast says so.
 - Unified mode now renders Kitty `a=T` images on a probe-addressed GTK layer
   below the organism surface. Chunked uploads retain first-chunk geometry and
   final-chunk cursor identity; images stay aligned across scrolling and rewrap, while
@@ -162,6 +222,53 @@ versioning for tagged releases while it remains experimental.
 
 ### Changed
 
+- Typing at a prompt that has been scrolled away brings the viewport back to
+  it, clears the unread badge, and retires the jump-to-latest button. Every
+  other terminal applies scroll-on-keystroke; block mode did not, so the
+  keystrokes went to a prompt the user could not see. Unified is excluded —
+  there the scroll lock belongs to its VTE's own adjustment — and a full-screen
+  program still owns the viewport it took.
+- **Compact Block Layout** applies to the pane you are looking at. The switch
+  reached only panes created after it, so it toasted success and left a
+  half-dense workspace behind; card margins are GTK properties rather than CSS,
+  so reinstalling the stylesheet could never have moved them. Existing cards and
+  the live input cell now switch in place, through one layout pass and one
+  winsize sync for the whole pane rather than one per card. Its subtitle no
+  longer says "in new Block panes".
+- The card's git-branch chip is memoized for a few seconds per working
+  directory. It is built once per card, and restoring a 200-block session builds
+  every card in one pass, so a single repository paid for the same walk-to-`.git`
+  200 times — synchronously, on the GTK thread, before the first frame. Misses
+  are cached too: "not inside a repository" is the answer that walks all the way
+  to `/`.
+- Block mode stops claiming keys the shell needs more than it does. Bare
+  `Home` / `End` at a prompt jumped the viewport to the ends of history, which
+  meant the command line being typed could never reach its own start — the
+  single most-used editing key in a terminal, spent on a jump the FAB,
+  `PageUp`, and `Ctrl+Shift+N` already offer. They now reach the shell; with
+  blocks selected they move the selection to the oldest / newest card, and the
+  viewport edges moved to `Ctrl+Home` / `Ctrl+End`. `Ctrl+,` / `Ctrl+.` are no
+  longer swallowed in a pane that has never bookmarked a block, or while a
+  command or full-screen program owns the PTY: until there is somewhere to
+  jump, the near-universal preferences chord reaches the program in the
+  terminal.
+- `Ctrl+Shift+X` now steps to the *next* failed block and wraps, instead of
+  re-landing on the oldest one however many times it is pressed — a dead key
+  in exactly the session that has more than one failure worth reading. It is
+  bound to `jump_to_next_failed`; `filter_failed_blocks` keeps its
+  jump-to-oldest meaning in the palette and in `[keybindings]`.
+- `Ctrl+Shift+B` with no selection bookmarks the newest block instead of doing
+  nothing, matching how `Alt+Shift+F` already picks its target. Bookmarking
+  the command you just watched finish no longer needs a selection first.
+- Card quick actions have three distinct icons: copy-command and copy-output
+  shared one glyph and were separable only by hovering for a tooltip, which is
+  the thing a quick-action row exists to avoid. The duration badge shares
+  Unified's formatter — a 90-second command reads `1m30s`, not `2m`, and an
+  hour reads `1h`, not `60m` — and its tooltip carries the unrounded
+  milliseconds.
+- The finished-block right-click menu is part of the render backend, so cards
+  rebuilt by session restore and by "Undo clear blocks" get it too. A restored
+  card whose right-click did nothing was a card missing half its actions.
 - Command Palette disk discovery no longer blocks GTK. Workflow directories
   are prewarmed through a single-flight background refresh and each opening
   reads its bounded command-history tail asynchronously with generation checks;
@@ -276,6 +383,60 @@ versioning for tagged releases while it remains experimental.
   open with that error rather than starting unmanaged.
 
 ### Fixed
+
+- A block whose completion nobody vouched for says so on the card. The caveat
+  used to live in a card-level tooltip — the one place a doubt about an exit
+  code cannot be seen, because the header's own chips and buttons shadow it and
+  a tooltip has to be hunted for. It is now a header chip reading `inferred`,
+  `recovered` or `incomplete`, from the same vocabulary Unified's status line
+  uses, with the full explanation as the chip's own unshadowable tooltip.
+  Background output, which never ran a command, keeps none of it.
+- Card output stops being wedged into the bottom-left corner: cards gained
+  bottom padding, and the prompt chevron moved from the command row into the
+  header so the command and its output share one left edge. Neither costs a
+  column — horizontal padding would have narrowed the output terminal, and its
+  column count comes from that widget's pixel width, so `ls` would wrap
+  differently inside a card than it did in the live pane.
+- A filtered block no longer copies more than it shows, or zeroes find for the
+  whole session. Copy-output took the full transcript out of a card the user had
+  just filtered down — filtering is *how* you decide what to copy — with nothing
+  to say the clipboard held more than the screen. And find counted hits in lines
+  the filter had hidden: the VTE could not step to them, and that failure is
+  read as "no matches", which cleared the query for every other block too. Both
+  now read what the card is displaying.
+- "Delete Block" deletes the blocks that are selected. Every sibling item in
+  that menu already acted on the whole selection; this one removed one of five
+  and left the rest highlighted. The label counts them, and removal walks the
+  selection from the back so bookmarks, the unread badge and virtualization
+  stay consistent.
+- The card's metadata cluster stops jumping sideways on hover. The quick-action
+  buttons were hidden rather than faded, so revealing them took ~150px out of a
+  hexpand header and slid every timestamp, duration and exit badge left, then
+  snapped them back on leave — once per card while dragging the pointer down a
+  list. They now fade in place, and stay untargetable while faded so they cannot
+  swallow the header click that selects the block.
+- A healthy block no longer inherits a dead one's "this status could not be
+  trusted" tooltip. Only a degraded record sets that tooltip, and only as an
+  `if let Some` with no `else`, while the card shells it is set on are pooled
+  and reused — so clearing a degraded block and running one ordinary command
+  produced a perfectly healthy card explaining why its exit code was inferred.
+  Both the pool teardown and the recycled-shell path now drop the tooltip.
+- Block mode no longer flickers between two layouts at an idle prompt. A
+  finished card's own scrollbar was a box sibling of its output terminal, so
+  showing it took ~14px — one column — out of that terminal's allocation. But
+  the condition that shows it is VTE's ring overflowing the visible page, and
+  that is a function of the same width: hiding the scrollbar widened the
+  terminal, the wider terminal rewrapped its ring to fewer rows, the ring
+  stopped overflowing the page, and the next frame hid it again. The card (and
+  the output row inside it) alternated between two states at frame rate for as
+  long as the pane stayed open, burning ~16% of a core; blocks holding a
+  transcript that lands near the overflow boundary — anything that entered and
+  left the alternate screen, most visibly — reproduced it every time. The cycle
+  closes entirely inside GTK, so none of the render-stamp guards on the re-feed
+  paths could see it, let alone break it. The scrollbar now rides a non-measured
+  overlay instead, exactly as the live card's already does, which removes the
+  width edge rather than damping it. A display-backed regression test pins that
+  toggling the scrollbar leaves the terminal's allocated width unchanged.
 
 - Block mode no longer flashes a full-screen block on every command. The live
   cell was sized by state, not by content: at `CommandStart` it jumped from the
