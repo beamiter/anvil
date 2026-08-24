@@ -325,7 +325,13 @@ pub(super) fn toggle(
                     // The surface has already scrolled and taken focus. A
                     // highlight that cannot be set is not a reason to strand
                     // this modal over it.
-                    view.focus_match_in_block(hit.block_id, &pattern, is_regex, hit.is_output);
+                    view.focus_match_in_block(
+                        hit.block_id,
+                        &pattern,
+                        is_regex,
+                        hit.is_output,
+                        hit.occurrence,
+                    );
                 }
                 JumpOutcome::KeepOpen => status_label.set_text(jump_unavailable_status()),
                 JumpOutcome::ShowSnapshot(_) => {}
@@ -439,6 +445,7 @@ mod tests {
             exit_code,
             duration_ms,
             cwd: cwd.map(str::to_string),
+            occurrence: 0,
         }
     }
 

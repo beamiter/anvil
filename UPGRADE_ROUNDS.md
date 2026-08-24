@@ -3,8 +3,8 @@
 This ledger records the behavior-backed increments in the current upgrade
 pass.
 
-Rounds 1–10 record the preceding pass; this pass's additional twenty rounds
-are numbered 11–30.
+Rounds 1–10 record the preceding pass; this pass's additional twenty-one rounds
+are numbered 11–31.
 
 1. **Prefix boundary** — install and uninstall reject empty, relative,
    control-bearing, or parent-traversing prefixes while retaining valid Unicode
@@ -77,6 +77,11 @@ are numbered 11–30.
 30. **Consumer/UI regression suite** — tests cover spoofing, semantic option
     confusion, high indexes, and pre-spawn rejection; picker rows are bounded
     and safe-display normalized.
+31. **Exact search render identity** — Block card searches carry render stamps
+    and rebuild retained queries after a resize/re-feed even at a stationary
+    one-hit edge; cross-block activation reaches the named surface occurrence
+    or fails closed. Cargo and Nix consume the same published hardened-core
+    revision.
 
 Verification: `bash scripts/test-install-paths.sh`, `bash -n
 scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.

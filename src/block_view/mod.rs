@@ -3169,6 +3169,10 @@ struct RecordSearchTarget {
     /// Unified deliberately cannot return a record-specific target until
     /// marker ranges exist. Kept explicit for Block's ordinary card targets.
     uses_live_surface: bool,
+    /// What this record's VTE holds now. Find compares it with the scan-time
+    /// value before moving a native cursor whose rows may have been reset or
+    /// re-windowed. Persistent/live surfaces use the neutral stamp.
+    render_stamp: blocks::RenderStamp,
 }
 
 /// One bounded window inside a native VTE search domain. Windows are ordered
@@ -3193,9 +3197,12 @@ struct BackendSearchSurface {
     /// Hard-budget charge for extracting every window.
     scanned_bytes: usize,
     /// Clear the native selection/search anchor before entering the selected
-    /// window. Unified shares one persistent cursor across successive queries.
+    /// window. Both the persistent Unified VTE and per-card Block VTEs retain
+    /// anchors across queries.
     reset_cursor: bool,
     terminal: Terminal,
+    /// What the terminal held when these windows were scanned.
+    render_stamp: blocks::RenderStamp,
 }
 
 /// Last-resort native search for a persistent surface whose absolute ring
@@ -6674,6 +6681,7 @@ impl RenderBackend for BlockBackend {
             terminal,
             widget: block.widget().clone().upcast(),
             uses_live_surface: false,
+            render_stamp: block.render_stamp(),
         })
     }
 
@@ -6735,8 +6743,9 @@ impl RenderBackend for BlockBackend {
                         initial_wrap: false,
                     }],
                     scanned_bytes: command_prefix.len(),
-                    reset_cursor: false,
+                    reset_cursor: true,
                     terminal: block.command_vte.clone(),
+                    render_stamp: block.render_stamp(),
                 }
             }) {
                 return BackendSearchBatch {
@@ -6790,8 +6799,9 @@ impl RenderBackend for BlockBackend {
                             initial_wrap: false,
                         }],
                         scanned_bytes: raw_prefix.len(),
-                        reset_cursor: false,
+                        reset_cursor: true,
                         terminal: block.output_vte.clone(),
+                        render_stamp: block.render_stamp(),
                     }
                 })
             }) {
@@ -7681,6 +7691,7 @@ impl RenderBackend for UnifiedBackend {
                 scanned_bytes,
                 reset_cursor: true,
                 terminal: self.vte.clone(),
+                render_stamp: blocks::NEUTRAL_RENDER_STAMP,
             }],
             incomplete,
             native_fallback: incomplete.then(native_fallback),

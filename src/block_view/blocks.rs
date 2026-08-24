@@ -2530,7 +2530,17 @@ fn snapshot_visible_rows(content_rows: i64, viewport_cap: i64) -> i64 {
 /// against changes from the map-time default to the layout's fitted value.
 /// `(effective_cols, visible_rows, fits, generation)` — see
 /// [`stamp_change_needs_refeed`] for which half is content and which geometry.
-type RenderStamp = (i64, i64, bool, u64);
+/// Identity of what a card's output VTE currently holds: wrap columns, visible
+/// rows, whether the whole document fits, and which displayed text generation
+/// produced it. Two equal stamps mean the parsed ring and the window onto it
+/// are both unchanged; any difference means a re-feed or a re-window happened,
+/// which moves every native search position inside that VTE.
+pub(crate) type RenderStamp = (i64, i64, bool, u64);
+
+/// The stamp reported by a surface with no independently re-rendered snapshot.
+/// Real card stamps always have positive columns and rows, so they cannot alias
+/// this value.
+pub(crate) const NEUTRAL_RENDER_STAMP: RenderStamp = (0, 0, false, 0);
 
 fn output_render_stamp(
     cols: i64,
@@ -2544,6 +2554,18 @@ fn output_render_stamp(
         content_rows <= viewport_cap,
         generation,
     )
+}
+
+/// Test-only view of [`output_render_stamp`], used by the find-state contract
+/// without duplicating the stamp packing rule.
+#[cfg(test)]
+pub(crate) fn output_render_stamp_for_test(
+    cols: i64,
+    output_rows: i64,
+    cap: i64,
+    generation: u64,
+) -> RenderStamp {
+    output_render_stamp(cols, output_rows, cap, generation)
 }
 
 /// Render `bytes` into a read-only finished VTE. Keep a generous temporary
@@ -3136,7 +3158,7 @@ impl FinishedBlock {
         // Tracks whether the user has toggled this block to its expanded
         // height. Survives unmap/remap so re-feeding picks the right cap.
         let expanded: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        let render_stamp: Rc<Cell<(i64, i64, bool, u64)>> = Rc::new(Cell::new((0, 0, false, 0)));
+        let render_stamp: Rc<Cell<RenderStamp>> = Rc::new(Cell::new(NEUTRAL_RENDER_STAMP));
         let displayed_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
         // Construction already paid for the initial transcript scan. Seed the
         // cache so a first map at the recorded width, and every same-width
@@ -3986,6 +4008,15 @@ impl FinishedBlock {
     pub(crate) fn set_compact(&self, compact: bool) {
         apply_card_density(&self.widget, compact);
         apply_header_density(&self.header_row, compact);
+    }
+
+    /// What this card's output VTE currently holds.
+    ///
+    /// A find pass records this value per surface. If it changes before the
+    /// pass navigates, a reset/re-window has invalidated the native cursor that
+    /// pass was stepping from, so the caller must rebuild the search.
+    pub(crate) fn render_stamp(&self) -> RenderStamp {
+        self.render_stamp.get()
     }
 
     /// Re-fit this block's output to the pane's current geometry.

@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-21 (exactly-once command lifecycle closure)
+Updated: 2026-08-24 (Block/Unified exact-search cursor identity)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,14 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **Exact search cursor identity and core repin (2026-08-24)**: Block card
+  surfaces carry render stamps through the backend/find contract, so a resize,
+  fold, or output re-feed invalidates and rebuilds the retained query before
+  navigation—including a one-hit pass whose logical cursor does not move.
+  Cross-block rows carry their first surface occurrence and activation reaches
+  it exactly or fails closed at the 4096-step bound. The app now pins published
+  `jterm_core` `0f47569`; Cargo and Nix source identities were updated together.
 
 - **Exactly-once command lifecycle closure (2026-08-21)**: Block and Unified
   now share one observer-side `C -> finish` latch. An accepted `D` consumes it

@@ -80,6 +80,11 @@ pub(crate) struct FindSurface {
     /// Occurrence whose entry crosses VTE's one physical wrap boundary. For a
     /// viewport-first Unified domain this is the first counted history hit.
     wrap_before: Option<usize>,
+    /// What this surface held at scan time. A card re-feed resets VTE's native
+    /// selection and a re-window moves its rows, so the recorded cursor cannot
+    /// be used after this stamp changes. Live/Unified surfaces use the neutral
+    /// stamp because they are not independently re-rendered per record.
+    render_stamp: super::blocks::RenderStamp,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -487,6 +492,23 @@ fn native_cursor_action(
     Some(NativeCursorAction::Step { wrap_once })
 }
 
+/// Resolve a logical move only while it still names the render VTE was counted
+/// against. This guard deliberately precedes `AlreadySelected`: a one-hit pass
+/// can otherwise keep reporting its stale highlight forever without taking a
+/// native step that would notice the card was re-fed.
+fn validated_native_cursor_action(
+    surface: &FindSurface,
+    occurrence: usize,
+    direction: FindDirection,
+    current_render_stamp: Option<super::blocks::RenderStamp>,
+) -> Option<NativeCursorAction> {
+    let render_is_current = (surface.is_live && surface.block_id == 0)
+        || current_render_stamp.is_some_and(|stamp| stamp == surface.render_stamp);
+    render_is_current
+        .then(|| native_cursor_action(surface, occurrence, direction))
+        .flatten()
+}
+
 fn find_progress(state: &FindState) -> Option<FindProgress> {
     (!state.surfaces.is_empty() && state.total > 0).then_some(FindProgress {
         current: state.cursor.global + 1,
@@ -514,6 +536,25 @@ pub struct CrossBlockHit {
     pub exit_code: Option<i32>,
     pub duration_ms: Option<u64>,
     pub cwd: Option<String>,
+    /// Zero-based index of this row's first match within its command/output
+    /// surface. VTE advances by matches (not matching lines), so this is the
+    /// position required to make an activated result land where its label says.
+    pub occurrence: usize,
+}
+
+/// Bound native VTE cursor work performed by one palette activation.
+fn bounded_occurrence_steps(occurrence: usize) -> Option<usize> {
+    const MAX_JUMP_STEPS: usize = 4_096;
+    occurrence
+        .checked_add(1)
+        .filter(|steps| *steps <= MAX_JUMP_STEPS)
+}
+
+/// Execute the complete bounded jump. `all` short-circuits on the first native
+/// miss, so a surface that contains fewer matches than the scan recorded can
+/// never turn a partial walk into a successful (but wrong) highlight.
+fn step_to_occurrence_exact(occurrence: usize, mut step: impl FnMut() -> bool) -> bool {
+    bounded_occurrence_steps(occurrence).is_some_and(|steps| (0..steps).all(|_| step()))
 }
 
 /// Trim a line to a reasonable display width — the palette row is one
@@ -733,6 +774,7 @@ impl TermView {
                     complete: !plan.incomplete,
                     initial_wrap: plan.initial_wrap,
                     wrap_before: plan.wrap_before,
+                    render_stamp: backend_surface.render_stamp,
                 });
                 total += plan.count;
                 if plan.reached_limit {
@@ -782,6 +824,7 @@ impl TermView {
                         complete: false,
                         initial_wrap: false,
                         wrap_before: None,
+                        render_stamp: super::blocks::NEUTRAL_RENDER_STAMP,
                     });
                     total = 1;
                 }
@@ -826,6 +869,7 @@ impl TermView {
                     complete: true,
                     initial_wrap: false,
                     wrap_before: Some(0),
+                    render_stamp: super::blocks::NEUTRAL_RENDER_STAMP,
                 });
                 total += live.count;
             }
@@ -904,6 +948,10 @@ impl TermView {
             (current, next, current_progress)
         };
         if next == current {
+            if !self.focus_surface_occurrence(next.surface, next.occurrence, direction) {
+                self.clear_find();
+                return FindNavigationResult::Invalidated;
+            }
             return FindNavigationResult::Progress(current_progress);
         }
 
@@ -949,14 +997,8 @@ impl TermView {
             };
             surface.clone()
         };
-        let wrap_once = match native_cursor_action(&surface, occurrence, direction) {
-            Some(NativeCursorAction::AlreadySelected) => return true,
-            Some(NativeCursorAction::Step { wrap_once }) => wrap_once,
-            None => return false,
-        };
-
-        let vte = if surface.is_live && surface.block_id == 0 {
-            self.active_vte.clone()
+        let (vte, current_render_stamp) = if surface.is_live && surface.block_id == 0 {
+            (self.active_vte.clone(), None)
         } else {
             let Some(target) = self
                 .render_backend
@@ -964,7 +1006,21 @@ impl TermView {
             else {
                 return false;
             };
-            target.terminal
+            // A resize, expand/collapse or output filter changed this card's
+            // native row domain after it was counted. Stepping the old cursor
+            // would silently select a different occurrence; invalidate the
+            // pass so the adapter can rebuild it from the retained query.
+            (target.terminal, Some(target.render_stamp))
+        };
+        let wrap_once = match validated_native_cursor_action(
+            &surface,
+            occurrence,
+            direction,
+            current_render_stamp,
+        ) {
+            Some(NativeCursorAction::AlreadySelected) => return true,
+            Some(NativeCursorAction::Step { wrap_once }) => wrap_once,
+            None => return false,
         };
         vte.search_set_wrap_around(wrap_once);
         let found = match direction {
@@ -1080,12 +1136,16 @@ impl TermView {
             let duration_ms = record.duration_ms();
             let cwd = record.cwd().map(str::to_string);
 
-            // Cmd surface — usually 1 line, but multiline commands exist.
+            // Cmd surface — usually one line, but multiline commands exist.
+            // Count matches rather than matching lines because that is VTE's
+            // native cursor unit.
+            let mut occurrence = 0usize;
             for (ln_idx, line) in command.lines().enumerate() {
                 if hits.len() >= max_hits {
                     break;
                 }
-                if re.is_match(line) {
+                let matches = re.find_iter(line).count();
+                if matches > 0 {
                     hits.push(CrossBlockHit {
                         block_id: record.id(),
                         is_output: false,
@@ -1095,15 +1155,19 @@ impl TermView {
                         exit_code,
                         duration_ms,
                         cwd: cwd.clone(),
+                        occurrence,
                     });
                 }
+                occurrence = occurrence.saturating_add(matches);
             }
 
+            let mut occurrence = 0usize;
             for (ln_idx, line) in record.output().unwrap_or("").lines().enumerate() {
                 if hits.len() >= max_hits {
                     break;
                 }
-                if re.is_match(line) {
+                let matches = re.find_iter(line).count();
+                if matches > 0 {
                     hits.push(CrossBlockHit {
                         block_id: record.id(),
                         is_output: true,
@@ -1113,8 +1177,10 @@ impl TermView {
                         exit_code,
                         duration_ms,
                         cwd: cwd.clone(),
+                        occurrence,
                     });
                 }
+                occurrence = occurrence.saturating_add(matches);
             }
         }
         Ok(hits)
@@ -1253,6 +1319,7 @@ impl TermView {
         pattern: &str,
         is_regex: bool,
         is_output: bool,
+        occurrence: usize,
     ) -> bool {
         if pattern.is_empty() {
             return false;
@@ -1277,9 +1344,13 @@ impl TermView {
             return false;
         };
         let vte = target.terminal;
+        // Re-establish the cursor from the top of this surface. Reusing VTE's
+        // previous selection made repeated activation walk forward and made a
+        // row labelled L482 land on an unrelated next hit.
+        vte.unselect_all();
         vte.search_set_regex(Some(&vte_re), 0);
-        vte.search_set_wrap_around(true);
-        if !vte.search_find_next() {
+        vte.search_set_wrap_around(false);
+        if !step_to_occurrence_exact(occurrence, || vte.search_find_next()) {
             vte.search_set_regex(None::<&vte4::Regex>, 0);
             return false;
         }
@@ -1356,6 +1427,10 @@ pub(super) fn clear_find_state(
     };
     for vte in highlighted_terminals {
         vte.search_set_regex(None::<&vte4::Regex>, 0);
+        // VTE retains its last match as the next search anchor even after the
+        // regex is removed. Clear only terminals highlighted by this pass so a
+        // fresh query can reach a match above the old one.
+        vte.unselect_all();
     }
     // The UI's no-record fallback installs a regex directly on the live VTE,
     // outside `FindState`; always clear it before a new structured pass too.
@@ -1390,7 +1465,93 @@ mod tests {
             complete,
             initial_wrap: false,
             wrap_before: complete.then_some(0),
+            render_stamp: crate::block_view::blocks::NEUTRAL_RENDER_STAMP,
         }
+    }
+
+    #[test]
+    fn a_surface_remembers_the_render_it_was_counted_against() {
+        let scanned = surface(3, true);
+        assert_eq!(
+            scanned.render_stamp,
+            crate::block_view::blocks::NEUTRAL_RENDER_STAMP,
+            "a persistent/live surface is neutral"
+        );
+
+        let at_scan = crate::block_view::blocks::output_render_stamp_for_test(80, 40, 24, 7);
+        for moved in [
+            crate::block_view::blocks::output_render_stamp_for_test(100, 40, 24, 7),
+            crate::block_view::blocks::output_render_stamp_for_test(80, 40, 5_000, 7),
+            crate::block_view::blocks::output_render_stamp_for_test(80, 12, 24, 8),
+        ] {
+            assert_ne!(at_scan, moved);
+            assert_ne!(moved, crate::block_view::blocks::NEUTRAL_RENDER_STAMP);
+        }
+    }
+
+    #[test]
+    fn an_already_selected_one_hit_surface_still_invalidates_after_refeed() {
+        let at_scan = crate::block_view::blocks::output_render_stamp_for_test(80, 40, 24, 7);
+        let after_refeed = crate::block_view::blocks::output_render_stamp_for_test(100, 40, 24, 7);
+        let mut one_hit = surface(1, true);
+        one_hit.render_stamp = at_scan;
+        one_hit.vte_cursor = Some(0);
+
+        assert_eq!(
+            super::validated_native_cursor_action(&one_hit, 0, FindDirection::Next, Some(at_scan),),
+            Some(NativeCursorAction::AlreadySelected)
+        );
+        assert_eq!(
+            super::validated_native_cursor_action(
+                &one_hit,
+                0,
+                FindDirection::Next,
+                Some(after_refeed),
+            ),
+            None,
+            "the unchanged logical edge must not hide a stale native cursor"
+        );
+    }
+
+    #[test]
+    fn a_cross_block_position_counts_matches_not_matching_lines() {
+        let re = regex::Regex::new("ab").unwrap();
+        let mut occurrence = 0usize;
+        let hits = "ab\nnothing\nab ab ab\ntail ab"
+            .lines()
+            .enumerate()
+            .filter_map(|(index, line)| {
+                let matches = re.find_iter(line).count();
+                let first = (matches > 0).then_some((index + 1, occurrence));
+                occurrence = occurrence.saturating_add(matches);
+                first
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(hits, [(1, 0), (3, 1), (4, 4)]);
+        assert_eq!(occurrence, 5);
+    }
+
+    #[test]
+    fn a_palette_jump_bounds_native_cursor_work() {
+        assert_eq!(super::bounded_occurrence_steps(0), Some(1));
+        assert_eq!(super::bounded_occurrence_steps(41), Some(42));
+        assert_eq!(super::bounded_occurrence_steps(4_095), Some(4_096));
+        assert_eq!(super::bounded_occurrence_steps(4_096), None);
+        assert_eq!(super::bounded_occurrence_steps(usize::MAX), None);
+    }
+
+    #[test]
+    fn a_palette_jump_fails_when_any_native_step_is_exhausted() {
+        let mut outcomes = [true, false, true].into_iter();
+        assert!(!super::step_to_occurrence_exact(2, || outcomes
+            .next()
+            .unwrap_or(false)));
+        assert_eq!(
+            outcomes.next(),
+            Some(true),
+            "the exact jump stops at the first miss instead of claiming success"
+        );
     }
 
     #[test]

@@ -87,6 +87,11 @@ pub struct BlockTerminal {
     /// Keeping it backend-side prevents navigation after a compile error from
     /// turning that diagnostic into a misleading `(0, 0)` result.
     search_status: SearchStatus,
+    /// Query that produced `search_status`. A card resize/filter/expand can
+    /// invalidate VTE's native cursor between Next/Previous actions; retaining
+    /// the query lets the adapter rebuild the pass instead of claiming the
+    /// still-visible text disappeared.
+    search_query: Option<(String, bool)>,
 }
 
 fn validate_block_search_pattern(pattern: &str) -> Result<(), String> {
@@ -460,6 +465,7 @@ impl Component for BlockTerminal {
             cross_block_search_dialog: Rc::new(RefCell::new(None)),
             record_snapshot_dialog: Rc::new(RefCell::new(None)),
             search_status: SearchStatus::Idle,
+            search_query: None,
         };
         ComponentParts { model, widgets: () }
     }
@@ -482,6 +488,7 @@ impl Component for BlockTerminal {
                 }
                 VteInput::SearchClear => {
                     self.search_status = SearchStatus::Idle;
+                    self.search_query = None;
                     let _ = sender.output(VteOutput::SearchStatus(self.search_status.clone()));
                 }
                 _ => {}
@@ -578,6 +585,7 @@ impl Component for BlockTerminal {
                 let _ = sender.output(VteOutput::Notice(message));
             }
             VteInput::SearchSet(query, use_regex) => {
+                self.search_query = Some((query.clone(), use_regex));
                 let pattern = super::vte::search_pattern(&query, use_regex);
                 self.search_status = match validate_block_search_pattern(&pattern) {
                     Ok(_) => block_result_status(view.find_in_blocks(&query, use_regex), use_regex),
@@ -605,7 +613,16 @@ impl Component for BlockTerminal {
                 } else {
                     FindNavigationResult::Inactive
                 };
-                self.search_status = block_navigation_status(&self.search_status, result, partial);
+                self.search_status = if result == FindNavigationResult::Invalidated {
+                    self.search_query.as_ref().map_or_else(
+                        || SearchStatus::results(0, 0),
+                        |(query, use_regex)| {
+                            block_result_status(view.find_in_blocks(query, *use_regex), *use_regex)
+                        },
+                    )
+                } else {
+                    block_navigation_status(&self.search_status, result, partial)
+                };
                 let _ = sender.output(VteOutput::SearchStatus(self.search_status.clone()));
             }
             VteInput::SearchPrev => {
@@ -625,12 +642,22 @@ impl Component for BlockTerminal {
                 } else {
                     FindNavigationResult::Inactive
                 };
-                self.search_status = block_navigation_status(&self.search_status, result, partial);
+                self.search_status = if result == FindNavigationResult::Invalidated {
+                    self.search_query.as_ref().map_or_else(
+                        || SearchStatus::results(0, 0),
+                        |(query, use_regex)| {
+                            block_result_status(view.find_in_blocks(query, *use_regex), *use_regex)
+                        },
+                    )
+                } else {
+                    block_navigation_status(&self.search_status, result, partial)
+                };
                 let _ = sender.output(VteOutput::SearchStatus(self.search_status.clone()));
             }
             VteInput::SearchClear => {
                 view.clear_find();
                 self.search_status = SearchStatus::Idle;
+                self.search_query = None;
                 let _ = sender.output(VteOutput::SearchStatus(self.search_status.clone()));
             }
             VteInput::CrossBlockSearch => cross_block_search::toggle(

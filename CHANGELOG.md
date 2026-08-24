@@ -384,6 +384,15 @@ versioning for tagged releases while it remains experimental.
 
 ### Fixed
 
+- Block/Unified 搜索现在把每个完成卡片的 render stamp 纳入游标身份。Resize、折叠/展开或
+  输出过滤重新灌入 VTE 后，Next/Previous 会用保留的查询重建计数；即使搜索只有一个命中、
+  逻辑游标停在原位，也会先验证 stamp，不再永久保留失效高亮。跨块结果按 surface 内实际
+  命中数记录 occurrence（同一行多个命中分别计步），激活会从顶部精确定位；超过 4096 步
+  或中途耗尽时 fail closed，而不是高亮较早的错误命中。
+- 共享核心升级到 `jterm_core` `0f47569`（transitively `jagent` `fcb9768`），采用最新的
+  AI origin、endpoint、credential、no-proxy 与
+  请求边界校验；Cargo 与 Nix 的精确 source hash 同步更新。
+
 - A block whose completion nobody vouched for says so on the card. The caveat
   used to live in a card-level tooltip — the one place a doubt about an exit
   code cannot be seen, because the header's own chips and buttons shadow it and
