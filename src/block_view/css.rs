@@ -422,6 +422,24 @@ fn block_css(config: &Config) -> String {
         .block-list {{
             background-color: {bg_hex};
         }}
+        .block-onboarding {{
+            color: {dim_fg};
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.055);
+            border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.12);
+            border-radius: 10px;
+            padding: 10px 14px;
+        }}
+        .block-onboarding-title {{
+            color: {fg_hex};
+            font-family: "{font_family}";
+            font-size: 0.92em;
+            font-weight: bold;
+        }}
+        .block-onboarding-body {{
+            color: {dim_fg};
+            font-family: "{font_family}";
+            font-size: 0.78em;
+        }}
         .notice-dock {{
             background-color: {bg_hex};
             border-top: 1px solid rgba({fg_r},{fg_g},{fg_b},0.14);
@@ -1033,6 +1051,12 @@ fn block_css(config: &Config) -> String {
         .block-header-label {{
             color: {dim_fg};
             font-size: 0.85em;
+        }}
+        .block-selection-hint {{
+            color: {accent};
+            font-family: "{font_family}";
+            font-size: 0.76em;
+            padding: 0 4px;
         }}
         .block-collapse-btn {{
             color: {dim_fg};

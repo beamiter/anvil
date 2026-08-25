@@ -7,6 +7,32 @@ versioning for tagged releases while it remains experimental.
 
 ### Added
 
+- A fresh, empty Block pane now shows one accessible orientation card explaining
+  reusable completed cards, header selection, right-click actions, and
+  `Ctrl+Shift+G` search. A completion or restored history retires it permanently.
+  The card is a non-targetable, non-measuring overlay: it consumes no live PTY
+  rows, does not compete for shell-integration/AI notice ownership, and never
+  appears in Unified or conventional VTE panes. It suspends during alternate-
+  screen ownership and returns afterward, so it cannot cover the first TUI.
+- Finished Block cards now keep their selection keyboard contract even after a
+  snapshot VTE or header control takes focus. The active edge shows a dynamic
+  hint in the header's existing spacer slack: multi-card selections advertise
+  recall only, background/empty cards advertise only cancel, and a lone safe
+  command advertises `Ctrl+Enter` re-run. Direct re-run inserts the command
+  without Enter, waits for an exact stable VTE render, and only then sends CR;
+  it fails closed unless the prompt is settled,
+  visibly empty, untouched, foreground-owned, and free of pending Agent or
+  reviewed submissions; every refusal consumes the chord so it cannot fall
+  through to an accidental VTE Enter. Plain Enter is likewise selection-owned:
+  busy/dirty/unsafe recalls ring instead of submitting unrelated prompt text,
+  and selected multiline text is refused when missing bracketed paste would
+  silently keep only its first line. Hints explicitly say `Prompt ready`.
+  The hint's natural-width cap follows its real longest row, so `Esc cancel`
+  remains visible when the header still has spacer room.
+  Focused header controls retain GTK Return/Space activation; Ctrl+Enter remains
+  the deliberate Block chord. Entering an alternate screen clears the now-hidden
+  Block selection. Delete is intentionally not advertised until a grouped
+  removal plus undo transaction exists.
 - The cross-block search palette (`Ctrl+Shift+G`) gained **Failed** and **Slow**
   toggles and an outcome column. The two predicates already existed with no
   surface that could reach them, so "which failing build took over a second" was

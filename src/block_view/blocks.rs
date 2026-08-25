@@ -554,6 +554,10 @@ pub(crate) struct FinishedBlock {
     pub(crate) rerun_btn: gtk::Button,
     pub(crate) header_row: gtk::Box,
     pub(crate) action_box: gtk::Box,
+    /// Visible keyboard contract for the active edge of a Block selection.
+    /// It sits before the expanding spacer so showing it consumes slack rather
+    /// than shifting timestamp/status metadata.
+    pub(crate) selection_hint: gtk::Label,
     /// Fold or unfold this card's output, and whether it is folded now. Same
     /// exposure as `toggle_filter`, for the menu item and the keyboard action.
     pub(crate) toggle_collapsed: Rc<dyn Fn()>,
@@ -621,6 +625,7 @@ impl Clone for FinishedBlock {
             rerun_btn: self.rerun_btn.clone(),
             header_row: self.header_row.clone(),
             action_box: self.action_box.clone(),
+            selection_hint: self.selection_hint.clone(),
             toggle_collapsed: self.toggle_collapsed.clone(),
             collapsed_state: self.collapsed_state.clone(),
             toggle_filter: self.toggle_filter.clone(),
@@ -1314,6 +1319,54 @@ mod tests {
         );
         background.set_lifecycle(BlockLifecycleHealth::Degraded, Some("no end marker"));
         assert!(!background.lifecycle_chip.is_visible());
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn the_selection_hint_sits_on_the_spacers_left() {
+        use gtk::prelude::*;
+
+        gtk::init().expect("gtk init");
+        let card = FinishedBlock::new(
+            1,
+            "$ ",
+            "cargo test",
+            None,
+            "ok\r\n",
+            Some(0),
+            &Config::safe_defaults(),
+            Some(5),
+            Some(1_700_000_000_000),
+            None,
+            80,
+        );
+
+        let hint_widget: gtk::Widget = card.selection_hint.clone().upcast();
+        let mut hint_index = None;
+        let mut spacer_index = None;
+        let mut index = 0;
+        let mut child = card.header_row.first_child();
+        while let Some(widget) = child {
+            if widget == hint_widget {
+                hint_index = Some(index);
+            } else if spacer_index.is_none() && widget.hexpands() {
+                spacer_index = Some(index);
+            }
+            child = widget.next_sibling();
+            index += 1;
+        }
+
+        let hint_index = hint_index.expect("header carries the selection hint");
+        let spacer_index = spacer_index.expect("header carries an expanding spacer");
+        assert!(
+            hint_index < spacer_index,
+            "hint at {hint_index} must precede spacer at {spacer_index}"
+        );
+        assert_eq!(
+            card.selection_hint.max_width_chars(),
+            super::super::SELECTION_HINT_RUN.chars().count() as i32,
+            "the natural-width cap must not permanently hide the final action"
+        );
     }
 
     #[test]
@@ -3157,6 +3210,22 @@ impl FinishedBlock {
             }
         }
 
+        // A selected card is a lightweight navigation mode. Put its actual
+        // keyboard actions on screen instead of requiring the user to remember
+        // them. This label deliberately precedes the expanding spacer: it
+        // spends the spacer's slack and therefore cannot shove timestamp,
+        // duration, exit status, or quick actions sideways as selection moves.
+        let selection_hint = gtk::Label::new(None);
+        selection_hint.add_css_class("block-selection-hint");
+        selection_hint.set_visible(false);
+        selection_hint.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        // This caps natural width rather than merely setting a ceiling. Keep
+        // it in lockstep with the longest capability row, otherwise the final
+        // `Esc cancel` is permanently ellipsized even when the header has
+        // ample spacer slack (visible in the cross-app Xvfb comparison).
+        selection_hint.set_max_width_chars(super::SELECTION_HINT_RUN.chars().count() as i32);
+        header_row.append(&selection_hint);
+
         // Spacer
         let spacer = gtk::Box::new(Orientation::Horizontal, 0);
         spacer.set_hexpand(true);
@@ -4059,6 +4128,7 @@ impl FinishedBlock {
             rerun_btn,
             header_row,
             action_box,
+            selection_hint,
             toggle_collapsed,
             collapsed_state,
             toggle_filter,

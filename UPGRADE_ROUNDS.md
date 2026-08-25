@@ -3,8 +3,8 @@
 This ledger records the behavior-backed increments in the current upgrade
 pass.
 
-Rounds 1–10 record the preceding pass; this pass's additional twenty-six rounds
-are numbered 11–36.
+Rounds 1–10 record the preceding pass; this pass's additional thirty-one rounds
+are numbered 11–41.
 
 1. **Prefix boundary** — install and uninstall reject empty, relative,
    control-bearing, or parent-traversing prefixes while retaining valid Unicode
@@ -99,6 +99,30 @@ are numbered 11–36.
     repeated directory walks while safely rereading HEAD for every card, so
     branch switches are visible immediately and negative lookups expire after
     200 milliseconds.
+37. **Focused-card keyboard and safe reuse** — one shared handler preserves
+    Block navigation, selection, filtering, folding and bookmarks when focus
+    sits on finished-card chrome while printable input still returns through
+    the live VTE/IME. A dynamic, spacer-safe hint advertises only actions the
+    current selection can perform; lone safe commands gain a foreground-owned,
+    clean-prompt `Ctrl+Enter` path that inserts first and sends CR only after an
+    exact stable VTE render, consuming every refusal. Alternate-screen takeover clears hidden selection,
+    and Delete stays unadvertised until grouped removal has a matching undo.
+38. **One-shot Block orientation** — an empty Block pane exposes card selection,
+    context actions, and cross-block search without measuring or intercepting the
+    live surface; a completion or restored history dismisses it permanently,
+    while Unified/VTE and inline-notice ownership remain untouched.
+39. **Selection-owned Enter** — both recall and re-run refuse with a bell while
+    retaining key ownership, so busy/dirty prompts and running applications
+    cannot receive an advertised selection Enter as unrelated input; the hint
+    explicitly scopes those actions to a ready prompt.
+40. **Lossless recall with accessible controls** — selected multiline commands
+    are never reduced to their first line when bracketed paste is unavailable,
+    while focused header buttons retain ordinary GTK Return/Space activation and
+    only the explicit Ctrl+Enter chord enters Block re-run; the natural-width cap
+    now follows the longest hint so `Esc cancel` is not permanently ellipsized.
+41. **Alternate-screen-safe orientation** — the first-use overlay suspends while
+    a full-screen program owns the surface and returns on exit, so an initial TUI
+    is never hidden behind guidance intended for an empty prompt.
 
 Verification: `bash scripts/test-install-paths.sh`, `bash -n
 scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.

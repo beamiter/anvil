@@ -35,6 +35,7 @@ mod css;
 mod export;
 mod find;
 mod history;
+mod onboarding;
 #[allow(dead_code)]
 mod palette;
 mod scroll;
@@ -49,6 +50,7 @@ pub(crate) use cross_selection::*;
 pub(crate) use css::*;
 pub(crate) use export::SessionExportFormat;
 pub(crate) use find::*;
+use onboarding::BlockOnboarding;
 #[allow(unused_imports)]
 pub(crate) use palette::*;
 pub(crate) use scroll::*;
@@ -597,10 +599,47 @@ fn stranded_focus_key_recovers(keyval: gtk::gdk::Key, modifiers: gtk::gdk::Modif
     )
 }
 
+/// Keys promised by the visible finished-Block selection hint which must reach
+/// selection handling even when a snapshot VTE or header control currently has
+/// focus. The ordinary stranded-focus recovery controller is installed first
+/// and would otherwise spend Enter/Escape merely returning to the live prompt.
+fn selection_owns_key(has_selection: bool, keyval: gtk::gdk::Key) -> bool {
+    use gtk::gdk::Key;
+
+    has_selection
+        && matches!(
+            keyval,
+            Key::Return | Key::KP_Enter | Key::ISO_Enter | Key::Escape
+        )
+}
+
+/// Ctrl+Enter belongs to Block selection mode independently of whether its
+/// fail-closed re-run checks later admit execution. A refused chord must never
+/// fall through to VTE and submit unrelated editor contents.
+fn block_selection_owns_ctrl_enter(active_selection: Option<u64>, selected_count: usize) -> bool {
+    active_selection.is_some() || selected_count > 0
+}
+
+fn widget_is_within(widget: &gtk::Widget, ancestor: &gtk::Widget) -> bool {
+    let mut current = Some(widget.clone());
+    while let Some(candidate) = current {
+        if candidate == *ancestor {
+            return true;
+        }
+        current = candidate.parent();
+    }
+    false
+}
+
 /// Focused widgets that own their keystrokes even though they live inside the
 /// block pane: text entries (the per-block output filter row, search entries),
 /// popover contents (context menus), and buttons for their activation keys.
-fn focused_widget_keeps_key(focused: &gtk::Widget, keyval: gtk::gdk::Key) -> bool {
+fn focused_widget_keeps_key(
+    focused: &gtk::Widget,
+    keyval: gtk::gdk::Key,
+    modifiers: gtk::gdk::ModifierType,
+    _has_block_selection: bool,
+) -> bool {
     use gtk::gdk::Key;
 
     if focused.is::<gtk::Editable>() || focused.is::<gtk::TextView>() {
@@ -609,11 +648,22 @@ fn focused_widget_keeps_key(focused: &gtk::Widget, keyval: gtk::gdk::Key) -> boo
     if focused.ancestor(gtk::Popover::static_type()).is_some() {
         return true;
     }
-    if matches!(
-        keyval,
-        Key::Return | Key::KP_Enter | Key::ISO_Enter | Key::space
-    ) && (focused.is::<gtk::Button>() || focused.is::<gtk::CheckButton>())
+    let modified_activation = modifiers.intersects(
+        gtk::gdk::ModifierType::CONTROL_MASK
+            | gtk::gdk::ModifierType::ALT_MASK
+            | gtk::gdk::ModifierType::SUPER_MASK
+            | gtk::gdk::ModifierType::META_MASK,
+    );
+    if !modified_activation
+        && matches!(
+            keyval,
+            Key::Return | Key::KP_Enter | Key::ISO_Enter | Key::space
+        )
+        && (focused.is::<gtk::Button>() || focused.is::<gtk::CheckButton>())
     {
+        // Preserve GTK keyboard accessibility: unmodified Return and Space
+        // activate the focused header control. Ctrl+Return remains modified
+        // and therefore falls through to Block's explicit re-run chord.
         return true;
     }
     false
@@ -1117,6 +1167,94 @@ pub(crate) fn build_command_recall(command: &str, bracketed_paste: bool) -> pty_
     pty_input::encode_prompt_insert(command, modes, prompt_insert_policy(), true)
 }
 
+/// Command-shape half of the Ctrl+Enter contract. Prompt cleanliness is
+/// checked separately at the instant the key is pressed; this half is also
+/// what keeps the visible hint honest for background, multiline, truncated or
+/// control-tainted history records.
+fn historical_command_is_rerunnable(command: &str) -> bool {
+    if command.trim().is_empty()
+        || command == TRUNCATED_COMMAND_PLACEHOLDER
+        || command == UNAVAILABLE_COMMAND_PLACEHOLDER
+        || command
+            .chars()
+            .any(|character| matches!(character, '\r' | '\n'))
+    {
+        return false;
+    }
+    let encoded = build_command_recall(command, false);
+    !encoded.is_empty()
+        && !encoded.risk.truncated_to_first_line
+        && !encoded.risk.had_controls
+        && !encoded.risk.had_embedded_paste_marker
+        && encoded.echo_text == command
+}
+
+/// Synchronously observable prompt state required by Ctrl+Enter re-run.
+/// Keeping this pure makes every refusal independently testable without a GTK
+/// event or a live shell.
+#[derive(Clone, Copy, Debug)]
+struct PromptRerunGuards {
+    state: BlockState,
+    pty_synced: bool,
+    idle_input_dirty: bool,
+    typed_command_empty: bool,
+    prompt_anchor_ready: bool,
+    verified_submission_pending: bool,
+    agent_execution_pending: bool,
+    shell_is_foreground: Option<bool>,
+    cursor_at_prompt_anchor: bool,
+    suffix_is_empty: Option<bool>,
+}
+
+/// Decide whether Ctrl+Enter may hand this history command to the shared
+/// two-phase verified-submission boundary.
+///
+/// Unlike ordinary recall, a re-run cannot safely sanitize or truncate and
+/// then rely on the user to review the result. It therefore refuses whenever
+/// the insertion encoder would change the recorded command in any way. Paste
+/// framing is intentionally absent: the admitted command is single-line, and
+/// readline may consume a CR immediately following a bracketed-paste frame as
+/// part of the paste instead of submitting it.
+fn rerun_is_admissible(guards: PromptRerunGuards, command: &str, bracketed_paste: bool) -> bool {
+    if guards.state != BlockState::AwaitingCommand
+        || guards.pty_synced
+        || guards.idle_input_dirty
+        || !guards.typed_command_empty
+        || !guards.prompt_anchor_ready
+        || guards.verified_submission_pending
+        || guards.agent_execution_pending
+        || guards.shell_is_foreground != Some(true)
+        || !guards.cursor_at_prompt_anchor
+        || guards.suffix_is_empty != Some(true)
+    {
+        return false;
+    }
+    let _ = bracketed_paste;
+    if !historical_command_is_rerunnable(command) {
+        return false;
+    }
+    true
+}
+
+/// The one selected, command-bearing card Ctrl+Enter may act on.
+fn lone_rerunnable_selection<'a>(
+    finished: &'a [FinishedBlock],
+    selected: &HashSet<u64>,
+    active: Option<u64>,
+) -> Option<&'a FinishedBlock> {
+    if selected.len() != 1 {
+        return None;
+    }
+    let id = active?;
+    if !selected.contains(&id) {
+        return None;
+    }
+    finished
+        .iter()
+        .find(|block| block.id == id)
+        .filter(|block| !block.is_background && historical_command_is_rerunnable(&block.cmd_text))
+}
+
 /// Collect commands from a block selection in terminal order. Background
 /// blocks are intentionally skipped: they have output but no command to put
 /// back into the editor. A newline between commands creates one editable
@@ -1219,6 +1357,12 @@ fn recall_selected_commands_at_prompt(
             .map(|block| (block.id, block.cmd_text.as_str())),
         selected,
     );
+    // Without bracketed paste, the generic recall encoder deliberately keeps
+    // only the first line. Never apply that fallback to a multi-card selection:
+    // silently dropping selected commands is worse than refusing the action.
+    if !selected_command_recall_is_lossless(&command, bracketed_paste) {
+        return false;
+    }
     recall_command_at_prompt(
         pty,
         pty_synced,
@@ -1228,6 +1372,11 @@ fn recall_selected_commands_at_prompt(
         &command,
         bracketed_paste,
     )
+}
+
+fn selected_command_recall_is_lossless(command: &str, bracketed_paste: bool) -> bool {
+    let recall = build_command_recall(command, bracketed_paste);
+    !recall.is_empty() && !recall.risk.truncated_to_first_line
 }
 
 /// Mirror text this app wrote to the shell into the live editor shadow.
@@ -1592,6 +1741,27 @@ fn base_keyval_in_layout(
 
 type SelectedBlockIds = Rc<RefCell<std::collections::HashSet<u64>>>;
 
+const SELECTION_HINT_RUN: &str = "Prompt ready: ↵ recall  ·  Ctrl+↵ run  ·  Esc cancel";
+const SELECTION_HINT_RECALL: &str = "Prompt ready: ↵ recall  ·  Esc cancel";
+const SELECTION_HINT_CANCEL: &str = "Esc cancel";
+
+/// Text for the active selection edge. This is a capability matrix, not a
+/// static cheat-sheet: cards with no recallable command cannot advertise
+/// recall, and Ctrl+Enter appears only for the lone command shape it can run.
+fn finished_selection_hint(
+    selected_count: usize,
+    can_recall: bool,
+    active_command_is_rerunnable: bool,
+) -> &'static str {
+    if selected_count == 1 && can_recall && active_command_is_rerunnable {
+        SELECTION_HINT_RUN
+    } else if can_recall {
+        SELECTION_HINT_RECALL
+    } else {
+        SELECTION_HINT_CANCEL
+    }
+}
+
 /// Apply the Warp-style multi-selection model to every finished block. All
 /// selected blocks get a light outline; the active edge gets the stronger outline
 /// and owns the persistent quick-action row.
@@ -1602,6 +1772,20 @@ fn sync_finished_block_selection(
 ) {
     let selected = selected_block_ids.borrow();
     let active = selected_block_id.get();
+    let recalled = selected_command_text(
+        finished
+            .iter()
+            .filter(|block| !block.is_background)
+            .map(|block| (block.id, block.cmd_text.as_str())),
+        &selected,
+    );
+    let can_recall = !recalled.is_empty() && !build_command_recall(&recalled, true).is_empty();
+    let active_command_is_rerunnable = active
+        .and_then(|id| finished.iter().find(|block| block.id == id))
+        .is_some_and(|block| {
+            !block.is_background && historical_command_is_rerunnable(&block.cmd_text)
+        });
+    let hint = finished_selection_hint(selected.len(), can_recall, active_command_is_rerunnable);
     for block in finished {
         let is_selected = selected.contains(&block.id);
         if is_selected {
@@ -1611,6 +1795,10 @@ fn sync_finished_block_selection(
         }
 
         let is_active = active == Some(block.id);
+        if is_active {
+            block.selection_hint.set_text(hint);
+        }
+        block.selection_hint.set_visible(is_active);
         if is_active {
             block.widget().add_css_class("block-selection-active");
             block.action_box.set_opacity(1.0);
@@ -2815,6 +3003,31 @@ impl VerifiedSubmissionCtx {
         Ok(())
     }
 
+    /// Submit one already-run command only when the live editor is provably
+    /// untouched. The history-specific admission check runs first, then the
+    /// shared reviewed boundary inserts without Enter, waits for an exact
+    /// generation-stable render, and only then queues CR.
+    fn try_submit_historical_rerun(&self, command: &str, bracketed_paste: bool) -> bool {
+        let anchor = self.current_anchor();
+        let guards = PromptRerunGuards {
+            state: self.bstate.get(),
+            pty_synced: self.pty_synced.get(),
+            idle_input_dirty: self.idle_input_dirty.get(),
+            typed_command_empty: self.typed_cmd.borrow().is_empty(),
+            prompt_anchor_ready: self.prompt_anchor_ready.get(),
+            verified_submission_pending: self.submission.borrow().is_some()
+                || self.source_id.borrow().is_some(),
+            agent_execution_pending: self.armed_agent_execution.borrow().is_some(),
+            shell_is_foreground: self.pty.shell_is_foreground(),
+            cursor_at_prompt_anchor: self.surface.cursor_position() == anchor,
+            suffix_is_empty: self.surface.suffix_is_empty(),
+        };
+        if !rerun_is_admissible(guards, command, bracketed_paste) {
+            return false;
+        }
+        self.begin(command, None).is_ok()
+    }
+
     fn command_start_observed(
         &self,
         shell_command: Option<&str>,
@@ -2942,6 +3155,9 @@ pub struct TermView {
     root: gtk::Box,
     block_scroll: ScrolledWindow,
     block_list: gtk::Box,
+    /// Pane-local, one-shot guidance for an empty Block document. It is a
+    /// non-measuring overlay and never participates in card/notice ownership.
+    block_onboarding: BlockOnboarding,
     /// Space-occupying card region below the surface. Used by a backend whose
     /// document cannot scroll to a mounted card; empty and hidden otherwise.
     notice_dock: gtk::Box,
@@ -3831,6 +4047,9 @@ struct BlockBackend {
     scroll_debouncer: ScrollDebouncer,
     failure_marker_redraw: FailureMarkerRedraw,
     finished_blocks_for_cb: Rc<RefCell<Vec<FinishedBlock>>>,
+    /// Shared with `TermView`. A real completed card permanently retires this
+    /// pane's empty-state guidance.
+    block_onboarding: BlockOnboarding,
     widget_pool_for_cb: Rc<RefCell<WidgetPool>>,
     find_state_rc: Rc<RefCell<FindState>>,
     visible_indices_rc: Rc<RefCell<std::collections::HashSet<usize>>>,
@@ -6931,10 +7150,14 @@ impl RenderBackend for BlockBackend {
     }
 
     fn enter_fullscreen(&self) {
+        self.block_onboarding.set_surface_suspended(true);
         enter_fullscreen(
             &self.finished_blocks_for_cb,
             &self.visible_indices_rc,
             &self.fullscreen_rc,
+            &self.selected_block_ids_rc,
+            &self.selected_block_id_rc,
+            &self.selection_anchor_id_rc,
         );
     }
 
@@ -6944,6 +7167,7 @@ impl RenderBackend for BlockBackend {
             &self.visible_indices_rc,
             &self.fullscreen_rc,
         );
+        self.block_onboarding.set_surface_suspended(false);
     }
 
     fn kitty_feed(&self, payload: &[u8]) -> kitty_graphics::FeedStatus {
@@ -7282,6 +7506,7 @@ impl RenderBackend for BlockBackend {
         finished_clone.connect_scroll_forwarding(&self.block_scroll_rc, &self.scroll_debouncer);
 
         self.finished_blocks_for_cb.borrow_mut().push(finished);
+        self.block_onboarding.finished_block_observed();
 
         {
             let cfg = self.config_for_cb.borrow();
@@ -8561,11 +8786,23 @@ fn enter_fullscreen(
     finished: &Rc<RefCell<Vec<FinishedBlock>>>,
     visible_indices: &Rc<RefCell<std::collections::HashSet<usize>>>,
     fullscreen: &Rc<Cell<bool>>,
+    selected_block_ids: &SelectedBlockIds,
+    selected_block_id: &Rc<Cell<Option<u64>>>,
+    selection_anchor_id: &Rc<Cell<Option<u64>>>,
 ) {
     if fullscreen.replace(true) {
         return;
     }
     let finished = finished.borrow();
+    // Hidden history must not retain a keyboard mode. Otherwise navigation or
+    // Ctrl+Enter could be claimed from the alternate-screen application even
+    // though there is no selected card on screen.
+    clear_finished_block_selection(
+        &finished,
+        selected_block_ids,
+        selected_block_id,
+        selection_anchor_id,
+    );
     // Virtual-scroll state is untouched: each card remembers whether it was
     // parked, so exiting restores exactly the pre-TUI document.
     let _visible = visible_indices.borrow();
@@ -8592,16 +8829,29 @@ fn exit_fullscreen(
     }
 }
 
-/// Captures the handles the live-VTE key handler needs. With the VTE owning line
-/// editing + IME natively (anvil model), this is reduced to a Capture-phase
-/// navigation / copy-paste / block-selection handler; printable keys and editing
-/// fall through to the VTE.
+/// Where the Block keyboard contract is mounted.
+///
+/// Finished command/output VTEs and header buttons can take focus. Mounting the
+/// handler only on the live VTE makes every Block-only key die after the common
+/// drag-to-copy gesture, so the same shared-state handler also lives on the pane
+/// root as a narrowly gated fallback.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyScope {
+    LiveSurface,
+    StrandedFocus,
+}
+
+/// Captures the handles the Block key handler needs. Cloneable because one
+/// instance is mounted on the live surface and one on the pane root. Printable
+/// input still belongs exclusively to the live VTE and its IME.
+#[derive(Clone)]
 struct KeyCtx {
     pty_for_key: Rc<OwnedPty>,
     /// Kitty keyboard protocol: the flags in effect, and the last key pressed
     /// so the commit handler can replace the legacy bytes VTE emits for it.
     kitty_flags_for_key: Rc<Cell<u8>>,
     kitty_last_key_for_key: Rc<Cell<Option<(KittyKey, KittyModifiers)>>>,
+    active_vte_for_key: glib::WeakRef<Terminal>,
     pty_synced_for_key: Rc<Cell<bool>>,
     bracketed_paste_for_key: Rc<Cell<bool>>,
     typed_cmd_for_key: Rc<RefCell<String>>,
@@ -8613,14 +8863,18 @@ struct KeyCtx {
     block_scroll_for_key: ScrolledWindow,
     bookmarks_for_key: Rc<RefCell<std::collections::HashSet<u64>>>,
     bstate_for_key: Rc<Cell<BlockState>>,
+    root_for_key: glib::WeakRef<gtk::Box>,
+    verified_submission_for_key: VerifiedSubmissionCtx,
+    human_input_for_key: HumanInputCallbacks,
 }
 
 impl KeyCtx {
-    fn connect(self, key_ctrl: &gtk::EventControllerKey) {
+    fn connect(self, key_ctrl: &gtk::EventControllerKey, scope: KeyScope) {
         let KeyCtx {
             pty_for_key,
             kitty_flags_for_key,
             kitty_last_key_for_key,
+            active_vte_for_key,
             pty_synced_for_key,
             bracketed_paste_for_key,
             typed_cmd_for_key,
@@ -8632,30 +8886,75 @@ impl KeyCtx {
             block_scroll_for_key,
             bookmarks_for_key,
             bstate_for_key,
+            root_for_key,
+            verified_submission_for_key,
+            human_input_for_key,
         } = self;
         key_ctrl.connect_key_pressed(move |controller, keyval, keycode, modifiers| {
             use gtk::gdk::Key;
+            let Some(active_vte_for_key) = active_vte_for_key.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            // The pane-root mount is only a fallback for focus stranded on a
+            // finished card. Never take keys from the live VTE, a filter/search
+            // entry, a context popover, or a focused button's activation.
+            if scope == KeyScope::StrandedFocus {
+                if active_vte_for_key.has_focus() {
+                    return glib::Propagation::Proceed;
+                }
+                let focused = root_for_key
+                    .upgrade()
+                    .and_then(|root| root.root())
+                    .and_then(|window| window.focus());
+                let Some(focused) = focused else {
+                    return glib::Propagation::Proceed;
+                };
+                let focus_is_in_finished_block = finished_blocks_for_key
+                    .borrow()
+                    .iter()
+                    .any(|block| widget_is_within(&focused, block.widget().upcast_ref()));
+                if !focus_is_in_finished_block {
+                    return glib::Propagation::Proceed;
+                }
+                if focused_widget_keeps_key(
+                    &focused,
+                    keyval,
+                    modifiers,
+                    selected_block_id_for_key.get().is_some(),
+                ) {
+                    return glib::Propagation::Proceed;
+                }
+            }
             // Kitty keyboard protocol: remember what was pressed so the commit
             // handler can replace the legacy bytes VTE is about to emit for it.
             // Recording only — the key still reaches VTE and its input method,
             // which is what keeps IME composition, Esc-cancels-preedit and
             // Ctrl+Space intact while a kitty client runs.
-            kitty_last_key_for_key.set(
-                (kitty_flags_for_key.get() & kitty_keyboard::DISAMBIGUATE != 0).then(|| {
-                    let display = controller.widget().map(|widget| widget.display());
-                    // The event's own layout group, so a multi-layout user is
-                    // not reported the first installed layout's letters.
-                    let layout = controller
-                        .current_event()
-                        .and_then(|event| event.downcast::<gtk::gdk::KeyEvent>().ok())
-                        .map(|event| event.layout())
-                        .unwrap_or(0);
-                    kitty_key_event(keyval, keycode, layout, modifiers, display.as_ref())
-                }),
-            );
+            if scope == KeyScope::LiveSurface {
+                kitty_last_key_for_key.set(
+                    (kitty_flags_for_key.get() & kitty_keyboard::DISAMBIGUATE != 0).then(|| {
+                        let display = controller.widget().map(|widget| widget.display());
+                        // The event's own layout group, so a multi-layout user is
+                        // not reported the first installed layout's letters.
+                        let layout = controller
+                            .current_event()
+                            .and_then(|event| event.downcast::<gtk::gdk::KeyEvent>().ok())
+                            .map(|event| event.layout())
+                            .unwrap_or(0);
+                        kitty_key_event(keyval, keycode, layout, modifiers, display.as_ref())
+                    }),
+                );
+            }
             let ctrl = modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK);
             let shift = modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK);
             let alt = modifiers.contains(gtk::gdk::ModifierType::ALT_MASK);
+
+            // The alternate-screen client owns every key. Selection is cleared
+            // on takeover, but this hard gate also covers a programmatic
+            // history selection made while the cards are hidden.
+            if bstate_for_key.get() == BlockState::AltScreen {
+                return glib::Propagation::Proceed;
+            }
 
             // Warp pages and jumps through block history locally. While a command
             // or fullscreen/raw terminal owns the viewport, forward these keys to it.
@@ -8795,11 +9094,52 @@ impl KeyCtx {
                 return glib::Propagation::Stop;
             }
 
-            // Enter while blocks are selected: recall every selected command in
-            // terminal order as one editable multiline buffer. If the PTY is not
-            // at a prompt (or the selection contains only background output), do
-            // not swallow Enter from the running program/live editor.
-            if matches!(keyval, Key::Return | Key::KP_Enter) {
+            // Ctrl+Enter runs exactly one selected foreground command. Every
+            // refusal is still consumed while selection mode is active: letting
+            // the chord fall through would make VTE submit whatever happens to
+            // be visible at the prompt, defeating all of the checks below.
+            if ctrl
+                && !shift
+                && !alt
+                && matches!(keyval, Key::Return | Key::KP_Enter | Key::ISO_Enter)
+                && block_selection_owns_ctrl_enter(
+                    selected_block_id_for_key.get(),
+                    selected_block_ids_for_key.borrow().len(),
+                )
+            {
+                let finished = finished_blocks_for_key.borrow();
+                let target = {
+                    let selected = selected_block_ids_for_key.borrow();
+                    lone_rerunnable_selection(&finished, &selected, selected_block_id_for_key.get())
+                        .map(|block| block.cmd_text.clone())
+                };
+                let submitted = target.as_deref().is_some_and(|command| {
+                    verified_submission_for_key
+                        .try_submit_historical_rerun(command, bracketed_paste_for_key.get())
+                });
+                if submitted {
+                    clear_finished_block_selection(
+                        &finished,
+                        &selected_block_ids_for_key,
+                        &selected_block_id_for_key,
+                        &selection_anchor_id_for_key,
+                    );
+                    active_vte_for_key.grab_focus();
+                    emit_human_input(&human_input_for_key, HumanInputKind::Keyboard);
+                } else {
+                    active_vte_for_key.error_bell();
+                }
+                return glib::Propagation::Stop;
+            }
+
+            // Enter while blocks are selected recalls every selected command
+            // in terminal order as one editable multiline buffer. Selection
+            // mode owns the key even when a fail-closed guard refuses it.
+            if !ctrl
+                && !shift
+                && !alt
+                && matches!(keyval, Key::Return | Key::KP_Enter | Key::ISO_Enter)
+            {
                 if selected_block_id_for_key.get().is_some() {
                     let finished = finished_blocks_for_key.borrow();
                     let recalled = if armed_agent_execution_for_key.borrow().is_some() {
@@ -8823,8 +9163,14 @@ impl KeyCtx {
                             &selected_block_id_for_key,
                             &selection_anchor_id_for_key,
                         );
+                        active_vte_for_key.grab_focus();
                         return glib::Propagation::Stop;
                     }
+                    // Selection mode owns its visible Enter action. A refusal
+                    // must not leak that Enter into a dirty prompt or running
+                    // application and submit unrelated input.
+                    active_vte_for_key.error_bell();
+                    return glib::Propagation::Stop;
                 }
                 return glib::Propagation::Proceed;
             }
@@ -9215,6 +9561,10 @@ impl TermView {
         scroll_overlay.add_overlay(&sticky_bar);
         scroll_overlay.add_overlay(&jump_fab);
         scroll_overlay.add_overlay(&running_pill);
+        let block_onboarding = BlockOnboarding::attach(
+            &scroll_overlay,
+            matches!(mode, crate::config::TerminalMode::Block),
+        );
 
         // Streaming output would normally repaint away a live-VTE selection.
         // Park the raw feed during that drag and explain the frozen surface only
@@ -10012,6 +10362,7 @@ impl TermView {
                     scroll_debouncer,
                     failure_marker_redraw: failure_marker_redraw.clone(),
                     finished_blocks_for_cb,
+                    block_onboarding: block_onboarding.clone(),
                     widget_pool_for_cb,
                     find_state_rc: find_state.clone(),
                     visible_indices_rc,
@@ -10696,10 +11047,12 @@ impl TermView {
             let debouncer_for_refocus = scroll_debouncer.clone();
             let unread_for_refocus = unread_count.clone();
             let fab_for_refocus = jump_fab.clone();
+            let selected_for_refocus = selected_block_id.clone();
             let refocus_key = gtk::EventControllerKey::new();
             refocus_key.set_propagation_phase(gtk::PropagationPhase::Capture);
             refocus_key.connect_key_pressed(move |_controller, keyval, _keycode, modifiers| {
                 if active_vte_for_refocus.has_focus()
+                    || selection_owns_key(selected_for_refocus.get().is_some(), keyval)
                     || !stranded_focus_key_recovers(keyval, modifiers)
                 {
                     return glib::Propagation::Proceed;
@@ -10708,7 +11061,12 @@ impl TermView {
                 else {
                     return glib::Propagation::Proceed;
                 };
-                if focused_widget_keeps_key(&focused, keyval) {
+                if focused_widget_keeps_key(
+                    &focused,
+                    keyval,
+                    modifiers,
+                    selected_for_refocus.get().is_some(),
+                ) {
                     return glib::Propagation::Proceed;
                 }
                 active_vte_for_refocus.grab_focus();
@@ -10735,13 +11093,11 @@ impl TermView {
             let selected_block_id_for_key = selected_block_id.clone();
             let selection_anchor_id_for_key = selection_anchor_id.clone();
             let block_scroll_for_key = block_scroll.clone();
-            let key_ctrl = gtk::EventControllerKey::new();
-            key_ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
-
-            KeyCtx {
+            let key_ctx = KeyCtx {
                 pty_for_key,
                 kitty_flags_for_key: kitty_flags.clone(),
                 kitty_last_key_for_key: kitty_last_key.clone(),
+                active_vte_for_key: active_vte.downgrade(),
                 pty_synced_for_key: pty_synced.clone(),
                 bracketed_paste_for_key: bracketed_paste.clone(),
                 typed_cmd_for_key,
@@ -10753,9 +11109,25 @@ impl TermView {
                 block_scroll_for_key,
                 bookmarks_for_key: block_bookmarks.clone(),
                 bstate_for_key: bstate.clone(),
-            }
-            .connect(&key_ctrl);
+                root_for_key: root.downgrade(),
+                verified_submission_for_key: verified_submission.clone(),
+                human_input_for_key: human_input_callbacks.clone(),
+            };
 
+            // Root fallback is added after the stranded-focus recovery
+            // controller: printable input still takes the IME-safe route back
+            // to the live VTE, while Block-owned navigation/actions are handled
+            // at their original focus site.
+            let stranded_ctrl = gtk::EventControllerKey::new();
+            stranded_ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
+            key_ctx
+                .clone()
+                .connect(&stranded_ctrl, KeyScope::StrandedFocus);
+            root.add_controller(stranded_ctrl);
+
+            let key_ctrl = gtk::EventControllerKey::new();
+            key_ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
+            key_ctx.connect(&key_ctrl, KeyScope::LiveSurface);
             active_vte.add_controller(key_ctrl);
         }
 
@@ -10950,6 +11322,7 @@ impl TermView {
             root,
             block_scroll,
             block_list,
+            block_onboarding,
             notice_dock,
             active_vte,
             active,
@@ -11103,6 +11476,9 @@ impl TermView {
                 },
             );
         }
+        term_view
+            .block_onboarding
+            .history_resolved(!term_view.finished_blocks.borrow().is_empty());
 
         // Initialize viewport and visibility
         term_view.update_viewport();
@@ -17959,6 +18335,147 @@ mod tests {
     }
 
     #[test]
+    fn a_visible_selection_owns_every_key_its_hint_advertises() {
+        use gtk::gdk::{Key, ModifierType};
+        use relm4::gtk;
+
+        for key in [Key::Return, Key::KP_Enter, Key::ISO_Enter, Key::Escape] {
+            assert!(super::selection_owns_key(true, key));
+            assert!(!super::selection_owns_key(false, key));
+            assert!(stranded_focus_key_recovers(key, ModifierType::empty()));
+        }
+        for key in [Key::Up, Key::Down, Key::Page_Up, Key::Home, Key::End] {
+            assert!(!super::selection_owns_key(true, key));
+            assert!(!stranded_focus_key_recovers(key, ModifierType::empty()));
+        }
+        assert!(
+            !super::SELECTION_HINT_RUN.contains("Del"),
+            "Delete is not advertised until grouped removal and undo exist"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn finished_card_focus_keeps_the_block_keyboard_contract() {
+        use gtk::gdk::{Key, ModifierType};
+        use relm4::gtk;
+        use relm4::gtk::prelude::*;
+
+        gtk::init().expect("gtk init");
+        let card_shell = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        card_shell.add_css_class("block-finished");
+        let card_vte: gtk::Widget = vte4::Terminal::new().upcast();
+        card_shell.append(&card_vte);
+        assert!(super::widget_is_within(&card_vte, card_shell.upcast_ref()));
+        let outside: gtk::Widget = gtk::Label::new(Some("outside history")).upcast();
+        assert!(!super::widget_is_within(&outside, card_shell.upcast_ref()));
+        for key in [Key::Up, Key::Down, Key::Escape, Key::Return] {
+            assert!(!super::focused_widget_keeps_key(
+                &card_vte,
+                key,
+                ModifierType::empty(),
+                true,
+            ));
+        }
+
+        let entry: gtk::Widget = gtk::SearchEntry::new().upcast();
+        for key in [Key::Up, Key::Escape, Key::Return, Key::a] {
+            assert!(super::focused_widget_keeps_key(
+                &entry,
+                key,
+                ModifierType::empty(),
+                true,
+            ));
+        }
+
+        let button: gtk::Widget = gtk::Button::new().upcast();
+        card_shell.append(&button);
+        assert!(super::focused_widget_keeps_key(
+            &button,
+            Key::Return,
+            ModifierType::empty(),
+            false,
+        ));
+        assert!(
+            super::focused_widget_keeps_key(&button, Key::Return, ModifierType::empty(), true,),
+            "a selected header keeps ordinary GTK keyboard activation"
+        );
+        assert!(super::focused_widget_keeps_key(
+            &button,
+            Key::space,
+            ModifierType::empty(),
+            true,
+        ));
+        assert!(!super::focused_widget_keeps_key(
+            &button,
+            Key::Return,
+            ModifierType::CONTROL_MASK,
+            true,
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn entering_alt_screen_ends_the_block_selection_it_hides() {
+        use relm4::gtk::prelude::*;
+
+        relm4::gtk::init().expect("gtk init");
+        let config = Config::safe_defaults();
+        let cards: Vec<super::FinishedBlock> = (1..=2)
+            .map(|id| {
+                super::FinishedBlock::new(
+                    id,
+                    "$ ",
+                    "echo hi",
+                    None,
+                    "hi\r\n",
+                    Some(0),
+                    &config,
+                    Some(5),
+                    None,
+                    None,
+                    80,
+                )
+            })
+            .collect();
+        let finished = Rc::new(RefCell::new(cards));
+        let visible = Rc::new(RefCell::new(HashSet::new()));
+        let fullscreen = Rc::new(Cell::new(false));
+        let selected: super::SelectedBlockIds = Rc::new(RefCell::new(HashSet::from([1, 2])));
+        let active = Rc::new(Cell::new(Some(2)));
+        let anchor = Rc::new(Cell::new(Some(1)));
+        super::sync_finished_block_selection(&finished.borrow(), &selected, &active);
+        assert_eq!(
+            finished.borrow()[1].selection_hint.text(),
+            super::SELECTION_HINT_RECALL,
+            "multi-selection must not advertise direct execution"
+        );
+
+        super::enter_fullscreen(
+            &finished,
+            &visible,
+            &fullscreen,
+            &selected,
+            &active,
+            &anchor,
+        );
+
+        assert!(fullscreen.get());
+        assert!(finished
+            .borrow()
+            .iter()
+            .all(|card| !card.widget().is_visible()));
+        assert!(selected.borrow().is_empty());
+        assert_eq!(active.get(), None);
+        assert_eq!(anchor.get(), None);
+        for card in finished.borrow().iter() {
+            assert!(!card.widget().has_css_class("block-selected"));
+            assert!(!card.widget().has_css_class("block-selection-active"));
+            assert!(!card.selection_hint.is_visible());
+        }
+    }
+
+    #[test]
     fn keyboard_protocol_queries_have_safe_fallback_replies() {
         assert_eq!(
             build_keyboard_query_reply(KeyboardProtocolQuery::KittyQuery, 0, 0, 0),
@@ -18284,6 +18801,169 @@ mod tests {
         );
     }
 
+    fn idle_rerun_guards() -> super::PromptRerunGuards {
+        super::PromptRerunGuards {
+            state: BlockState::AwaitingCommand,
+            pty_synced: false,
+            idle_input_dirty: false,
+            typed_command_empty: true,
+            prompt_anchor_ready: true,
+            verified_submission_pending: false,
+            agent_execution_pending: false,
+            shell_is_foreground: Some(true),
+            cursor_at_prompt_anchor: true,
+            suffix_is_empty: Some(true),
+        }
+    }
+
+    #[test]
+    fn a_safe_rerun_is_admitted_with_or_without_bracketed_paste() {
+        for bracketed_paste in [false, true] {
+            assert!(super::rerun_is_admissible(
+                idle_rerun_guards(),
+                "cargo test",
+                bracketed_paste
+            ));
+        }
+    }
+
+    #[test]
+    fn a_rerun_refuses_every_dirty_or_unowned_prompt() {
+        type GuardMutation = (&'static str, fn(&mut super::PromptRerunGuards));
+        let mutations: [GuardMutation; 11] = [
+            ("running state", |guards| {
+                guards.state = BlockState::CollectingOutput
+            }),
+            ("prior PTY input", |guards| guards.pty_synced = true),
+            ("dirty editor", |guards| guards.idle_input_dirty = true),
+            ("typed shadow", |guards| guards.typed_command_empty = false),
+            ("unsettled anchor", |guards| {
+                guards.prompt_anchor_ready = false
+            }),
+            ("reviewed submission", |guards| {
+                guards.verified_submission_pending = true
+            }),
+            ("Agent submission", |guards| {
+                guards.agent_execution_pending = true
+            }),
+            ("foreign foreground", |guards| {
+                guards.shell_is_foreground = Some(false)
+            }),
+            ("unknown foreground", |guards| {
+                guards.shell_is_foreground = None
+            }),
+            ("cursor moved", |guards| {
+                guards.cursor_at_prompt_anchor = false
+            }),
+            ("unproven suffix", |guards| guards.suffix_is_empty = None),
+        ];
+        for (name, mutate) in mutations {
+            let mut guards = idle_rerun_guards();
+            mutate(&mut guards);
+            assert!(
+                !super::rerun_is_admissible(guards, "ls", true),
+                "{name} must refuse"
+            );
+        }
+        let mut visible_suffix = idle_rerun_guards();
+        visible_suffix.suffix_is_empty = Some(false);
+        assert!(!super::rerun_is_admissible(visible_suffix, "ls", true));
+    }
+
+    #[test]
+    fn a_rerun_refuses_commands_it_could_execute_differently() {
+        for command in [
+            "",
+            "   ",
+            "printf one\nprintf two",
+            "printf one\rprintf two",
+            "echo \x1b[31mred",
+            "printf docs\x1b[201~oops",
+            TRUNCATED_COMMAND_PLACEHOLDER,
+            UNAVAILABLE_COMMAND_PLACEHOLDER,
+        ] {
+            assert!(
+                !super::rerun_is_admissible(idle_rerun_guards(), command, true),
+                "unsafe historical command must refuse: {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_selection_hint_only_names_actions_available_for_that_selection() {
+        assert_eq!(
+            super::finished_selection_hint(1, true, true),
+            super::SELECTION_HINT_RUN
+        );
+        assert_eq!(
+            super::finished_selection_hint(2, true, true),
+            super::SELECTION_HINT_RECALL,
+            "multi-selection is insert-only"
+        );
+        assert_eq!(
+            super::finished_selection_hint(1, true, false),
+            super::SELECTION_HINT_RECALL,
+            "a multiline or otherwise non-rerunnable command remains recallable"
+        );
+        assert_eq!(
+            super::finished_selection_hint(1, false, false),
+            super::SELECTION_HINT_CANCEL,
+            "a background/empty card can only leave selection mode"
+        );
+        assert!(!super::SELECTION_HINT_RUN.contains("Del"));
+    }
+
+    #[test]
+    fn selection_mode_consumes_ctrl_enter_even_when_rerun_refuses() {
+        assert!(!super::block_selection_owns_ctrl_enter(None, 0));
+        assert!(super::block_selection_owns_ctrl_enter(Some(7), 1));
+        assert!(
+            super::block_selection_owns_ctrl_enter(None, 1),
+            "a transient active/set mismatch must still fail closed"
+        );
+        let mut busy = idle_rerun_guards();
+        busy.state = BlockState::CollectingOutput;
+        assert!(!super::rerun_is_admissible(busy, "ls", false));
+        assert!(super::block_selection_owns_ctrl_enter(Some(7), 1));
+    }
+
+    #[test]
+    fn historical_rerun_waits_for_an_exact_render_before_enter_on_the_real_pty() {
+        let harness = ReaderHarness::new();
+        harness.arm_verified_prompt();
+        assert!(harness
+            .ctx
+            .verified_submission
+            .try_submit_historical_rerun("cargo test", true));
+        assert_eq!(
+            harness.pty.drain_test_slave(PTY_REPLY_WAIT),
+            b"cargo test",
+            "phase one must not submit before the rendered editor is verified"
+        );
+        assert_eq!(&*harness.ctx.typed_cmd_rc.borrow(), "cargo test");
+        assert!(harness.ctx.idle_input_dirty_rc.get());
+        assert!(harness.ctx.pty_synced_rc.get());
+        assert!(harness.ctx.verified_submission.source_id.borrow().is_some());
+        assert!(harness
+            .ctx
+            .verified_submission
+            .cancel_if_pending("test cleanup"));
+    }
+
+    #[test]
+    fn historical_rerun_writes_nothing_without_foreground_ownership() {
+        let harness = ReaderHarness::with_foreground(false);
+        harness.arm_verified_prompt();
+        assert!(!harness
+            .ctx
+            .verified_submission
+            .try_submit_historical_rerun("cargo test", false));
+        assert!(harness.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty());
+        assert!(harness.ctx.typed_cmd_rc.borrow().is_empty());
+        assert!(!harness.ctx.idle_input_dirty_rc.get());
+        assert!(!harness.ctx.pty_synced_rc.get());
+    }
+
     #[test]
     fn multiline_recall_uses_bracketed_paste_when_available() {
         let recall = build_command_recall("printf a\r\nprintf b", true);
@@ -18300,6 +18980,21 @@ mod tests {
         assert_eq!(recall.echo_text, "printf a");
         assert_eq!(recall.bytes, b"\x15printf a");
         assert!(recall.risk.truncated_to_first_line);
+    }
+
+    #[test]
+    fn selected_multiline_recall_refuses_any_lossy_first_line_fallback() {
+        assert!(super::selected_command_recall_is_lossless(
+            "printf a\nprintf b",
+            true,
+        ));
+        assert!(!super::selected_command_recall_is_lossless(
+            "printf a\nprintf b",
+            false,
+        ));
+        assert!(super::selected_command_recall_is_lossless(
+            "printf a", false,
+        ));
     }
 
     /// Was `single_line_recall_does_not_add_paste_markers`. The shared encoder
