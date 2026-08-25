@@ -1,7 +1,7 @@
 # anvil Makefile
 # Convenience wrapper for common development tasks
 
-.PHONY: help build run test check fmt clippy security verify package support-bundle clean install dev watch benchmark debug
+.PHONY: help build run test test-display check fmt clippy security verify package support-bundle clean install dev watch benchmark debug
 
 help:
 	@echo "anvil Development Commands"
@@ -15,6 +15,7 @@ help:
 	@echo ""
 	@echo "Quality Commands:"
 	@echo "  make test       - Run all tests"
+	@echo "  make test-display - Run explicit GTK/VTE regressions under Xvfb"
 	@echo "  make check      - Check code without building"
 	@echo "  make fmt        - Format code"
 	@echo "  make clippy     - Run the repository lint policy"
@@ -40,6 +41,9 @@ run:
 
 test:
 	@./scripts/dev.sh test
+
+test-display:
+	@./scripts/dev.sh test-display
 
 check:
 	@./scripts/dev.sh check

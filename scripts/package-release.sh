@@ -24,7 +24,7 @@ if [[ -z "${TARGET}" ]]; then
 fi
 if [[ ! -x "${BINARY}" ]]; then
     echo "Error: release binary not found or not executable: ${BINARY}" >&2
-    echo "Run 'cargo build --release --locked' first." >&2
+    echo "Run 'make package' outside a Nix shell, or pass an explicit system-linked release binary." >&2
     exit 1
 fi
 

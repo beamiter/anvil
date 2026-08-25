@@ -3,8 +3,8 @@
 This ledger records the behavior-backed increments in the current upgrade
 pass.
 
-Rounds 1–10 record the preceding pass; this pass's additional twenty-one rounds
-are numbered 11–31.
+Rounds 1–10 record the preceding pass; this pass's additional twenty-six rounds
+are numbered 11–36.
 
 1. **Prefix boundary** — install and uninstall reject empty, relative,
    control-bearing, or parent-traversing prefixes while retaining valid Unicode
@@ -82,6 +82,23 @@ are numbered 11–31.
     one-hit edge; cross-block activation reaches the named surface occurrence
     or fails closed. Cargo and Nix consume the same published hardened-core
     revision.
+32. **Foreground-owned OSC lifecycle** — definite PTY foreground ownership by
+    ssh, tmux, docker, or another child rejects both nested `C` and `D` marks,
+    so foreign shell integration cannot change local depth or finish a command.
+33. **Composable card states** — outcome, hover, selection, and bookmark
+    styling use independent properties plus explicit compound selectors, so
+    one state no longer erases another.
+34. **Display-backed quality gate** — the real GTK/VTE regressions are named in
+    one script, run in isolated D-Bus/Xvfb processes, and are shared by CI and
+    `make test-display`.
+35. **Density-safe virtual document** — hot density changes update finished
+    and inline cards together, preserve filtered zero-height sentinels, and
+    synchronize parked placeholders plus the viewport metadata before one PTY
+    geometry update.
+36. **Fresh bounded branch chips** — a 64-entry `cwd → HEAD` locator LRU avoids
+    repeated directory walks while safely rereading HEAD for every card, so
+    branch switches are visible immediately and negative lookups expire after
+    200 milliseconds.
 
 Verification: `bash scripts/test-install-paths.sh`, `bash -n
 scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.

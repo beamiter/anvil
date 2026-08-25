@@ -789,7 +789,7 @@ fn join_reader(
     }
 }
 
-/// Spawn argv[0] with piped stdio, feed it `stdin_bytes`, and capture both
+/// Spawn `argv[0]` with piped stdio, feed it `stdin_bytes`, and capture both
 /// output streams bounded to `max_out`. A watchdog kills the child once
 /// `timeout` passes so a stuck ssh/docker can never wedge a worker thread.
 fn run_capture(

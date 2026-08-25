@@ -43,6 +43,7 @@ jobs:
             appstream \
             desktop-file-utils \
             file \
+            dbus-x11 \
             xauth \
             xvfb
 
@@ -73,6 +74,9 @@ jobs:
       - name: Run tests
         id: tests
         run: xvfb-run --auto-servernum cargo test --all-targets --locked --no-fail-fast 2>&1 | tee test.log
+
+      - name: Run display-backed GTK/VTE regressions
+        run: bash scripts/test-gtk-display.sh
 
       - name: Run Clippy
         id: clippy

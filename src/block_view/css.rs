@@ -5,11 +5,96 @@ use relm4::gtk;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const MAX_GIT_POINTER_BYTES: u64 = 16 * 1024;
 const MAX_BRANCH_DISPLAY_CHARS: usize = 256;
+/// A negative lookup is useful while restoring many cards, but must not hide a
+/// repository created immediately afterwards for long.
+const GIT_NEGATIVE_CACHE_TTL: Duration = Duration::from_millis(200);
+/// Distinct working directories remembered at once.
+const GIT_BRANCH_CACHE_ENTRIES: usize = 64;
+
+#[cfg(test)]
+thread_local! {
+    static GIT_BRANCH_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+thread_local! {
+    /// Cards are built on the GTK thread only, so this needs no lock. Positive
+    /// entries remember only the HEAD locator: HEAD itself is read for every
+    /// card so a branch switch is visible immediately. Negative entries get a
+    /// short TTL because walking a non-repository path is the expensive miss.
+    static GIT_BRANCH_CACHE: RefCell<GitBranchCache> =
+        const { RefCell::new(GitBranchCache::new()) };
+}
+
+#[derive(Clone, Debug)]
+enum GitHeadCacheValue {
+    Found(PathBuf),
+    Missing { resolved_at: Instant },
+}
+
+#[derive(Debug)]
+struct GitBranchCache {
+    entries: VecDeque<(String, GitHeadCacheValue)>,
+}
+
+#[derive(Debug)]
+enum GitHeadCacheHit {
+    Found(PathBuf),
+    Missing,
+    None,
+}
+
+impl GitBranchCache {
+    const fn new() -> Self {
+        Self {
+            entries: VecDeque::new(),
+        }
+    }
+
+    fn get(&mut self, cwd: &str, now: Instant) -> GitHeadCacheHit {
+        let Some(index) = self.entries.iter().position(|(key, _)| key == cwd) else {
+            return GitHeadCacheHit::None;
+        };
+        let (_, value) = self.entries.remove(index).expect("cache index exists");
+        match value {
+            GitHeadCacheValue::Found(head) => {
+                self.entries
+                    .push_back((cwd.to_string(), GitHeadCacheValue::Found(head.clone())));
+                GitHeadCacheHit::Found(head)
+            }
+            GitHeadCacheValue::Missing { resolved_at }
+                if now.saturating_duration_since(resolved_at) < GIT_NEGATIVE_CACHE_TTL =>
+            {
+                self.entries
+                    .push_back((cwd.to_string(), GitHeadCacheValue::Missing { resolved_at }));
+                GitHeadCacheHit::Missing
+            }
+            GitHeadCacheValue::Missing { .. } => GitHeadCacheHit::None,
+        }
+    }
+
+    fn remove(&mut self, cwd: &str) {
+        if let Some(index) = self.entries.iter().position(|(key, _)| key == cwd) {
+            self.entries.remove(index);
+        }
+    }
+
+    fn insert(&mut self, cwd: &str, value: GitHeadCacheValue) {
+        self.remove(cwd);
+        self.entries.push_back((cwd.to_string(), value));
+        while self.entries.len() > GIT_BRANCH_CACHE_ENTRIES {
+            self.entries.pop_front();
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
 
 /// Vertical chrome the `.block-active` holder adds around the live VTE:
 /// 4px top margin + 4px bottom margin + 3px top padding + 3px bottom padding
@@ -48,100 +133,107 @@ pub(crate) fn shorten_path(path: &str) -> String {
     }
 }
 
-/// How long a resolved branch is reused for the context chip.
-const GIT_BRANCH_CACHE_TTL: Duration = Duration::from_secs(3);
-/// Distinct working directories remembered at once.
-const GIT_BRANCH_CACHE_ENTRIES: usize = 64;
-
-#[cfg(test)]
-thread_local! {
-    static GIT_BRANCH_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-thread_local! {
-    /// `(cwd, resolved at, branch)`. Cards are built on the GTK thread only, so
-    /// this needs no lock. Misses are cached too: "not inside a repository" is
-    /// the answer that costs a walk all the way to `/`.
-    static GIT_BRANCH_CACHE: RefCell<VecDeque<(String, Instant, Option<String>)>> =
-        const { RefCell::new(VecDeque::new()) };
-}
-
-/// Branch for the card's context chip, memoized for a few seconds.
+/// Branch for the card's context chip, with its HEAD locator memoized.
 ///
-/// The chip is built once per card and a restored session builds every card it
-/// has in one pass, so a 200-block restore of a single repository paid for the
-/// same directory walk 200 times — synchronously, on the GTK thread, before the
-/// first frame. The TTL keeps that to one walk per directory per burst while
-/// still letting a branch switch reach the next command's card, which is the
-/// only resolution the chip has ever promised: it shows the branch as of when
-/// the card was built, not as of when the command ran.
+/// The chip is built once per card and a restored session builds every card in
+/// one pass. Remembering the locator avoids repeating the directory walk, while
+/// reading HEAD on each call makes branch switches visible without a stale TTL.
 pub(crate) fn git_branch_for(cwd: &str) -> Option<String> {
-    let now = Instant::now();
-    let cached = GIT_BRANCH_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        cache.retain(|(_, resolved, _)| now.duration_since(*resolved) < GIT_BRANCH_CACHE_TTL);
-        cache
-            .iter()
-            .find(|(key, _, _)| key == cwd)
-            .map(|(_, _, branch)| branch.clone())
-    });
-    if let Some(branch) = cached {
-        return branch;
+    git_branch_for_at(cwd, Instant::now())
+}
+
+fn git_branch_for_at(cwd: &str, now: Instant) -> Option<String> {
+    match GIT_BRANCH_CACHE.with(|cache| cache.borrow_mut().get(cwd, now)) {
+        GitHeadCacheHit::Found(head_path) => match read_git_head(&head_path) {
+            Some(branch) => return branch,
+            None => {
+                // A worktree can replace its `.git` pointer. If the remembered
+                // HEAD disappeared (or became unsafe), discard the locator and
+                // perform exactly one fresh resolution below.
+                GIT_BRANCH_CACHE.with(|cache| cache.borrow_mut().remove(cwd));
+            }
+        },
+        GitHeadCacheHit::Missing => return None,
+        GitHeadCacheHit::None => {}
     }
-    let branch = git_branch_uncached(cwd);
-    GIT_BRANCH_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        cache.push_back((cwd.to_string(), now, branch.clone()));
-        while cache.len() > GIT_BRANCH_CACHE_ENTRIES {
-            cache.pop_front();
+
+    let head_path = git_head_locator_uncached(cwd);
+    match head_path {
+        Some(head_path) => {
+            GIT_BRANCH_CACHE.with(|cache| {
+                cache
+                    .borrow_mut()
+                    .insert(cwd, GitHeadCacheValue::Found(head_path.clone()));
+            });
+            read_git_head(&head_path).flatten()
         }
-    });
-    branch
+        None => {
+            GIT_BRANCH_CACHE.with(|cache| {
+                cache
+                    .borrow_mut()
+                    .insert(cwd, GitHeadCacheValue::Missing { resolved_at: now });
+            });
+            None
+        }
+    }
 }
 
 /// Cheap git-branch lookup for the context chip: walk up from `cwd` to find a
 /// `.git` dir (or `.git` file for worktrees/submodules), then read `HEAD`. No
 /// subprocess, no dirty-state — just the branch name (or short SHA if detached).
 pub(crate) fn git_branch_uncached(cwd: &str) -> Option<String> {
+    let head_path = git_head_locator_uncached(cwd)?;
+    read_git_head(&head_path).flatten()
+}
+
+fn git_head_locator_uncached(cwd: &str) -> Option<PathBuf> {
     #[cfg(test)]
     GIT_BRANCH_WALKS.with(|walks| walks.set(walks.get().saturating_add(1)));
-    use std::path::PathBuf;
+
     let mut dir: Option<&Path> = Some(Path::new(cwd));
     while let Some(d) = dir {
         let dot_git = d.join(".git");
-        let head_path: Option<PathBuf> = if dot_git.is_dir() {
-            Some(dot_git.join("HEAD"))
-        } else if dot_git.is_file() {
-            // "gitdir: <path>" → real git dir lives elsewhere
-            read_small_git_file(&dot_git).and_then(|c| {
-                c.strip_prefix("gitdir:").map(|p| {
-                    let g = Path::new(p.trim());
-                    if g.is_absolute() {
-                        g.join("HEAD")
-                    } else {
-                        d.join(g).join("HEAD")
-                    }
+        let file_type = std::fs::symlink_metadata(&dot_git)
+            .ok()
+            .map(|metadata| metadata.file_type());
+        let head_path: Option<PathBuf> = match file_type {
+            Some(file_type) if file_type.is_dir() => Some(dot_git.join("HEAD")),
+            Some(file_type) if file_type.is_file() => {
+                // "gitdir: <path>" → real git dir lives elsewhere
+                read_small_git_file(&dot_git).and_then(|c| {
+                    c.strip_prefix("gitdir:").map(|p| {
+                        let g = Path::new(p.trim());
+                        if g.is_absolute() {
+                            g.join("HEAD")
+                        } else {
+                            d.join(g).join("HEAD")
+                        }
+                    })
                 })
-            })
-        } else {
-            None
-        };
-        if let Some(hp) = head_path {
-            if let Some(head) = read_small_git_file(&hp) {
-                let head = head.trim();
-                if let Some(branch) = head.strip_prefix("ref: refs/heads/") {
-                    return sanitize_branch(branch);
-                }
-                // Detached HEAD: show short SHA.
-                if head.len() >= 7 && head.chars().all(|c| c.is_ascii_hexdigit()) {
-                    return Some(head[..7].to_string());
-                }
-                return None;
             }
+            _ => None,
+        };
+        if let Some(head_path) = head_path {
+            return Some(head_path);
         }
         dir = d.parent();
     }
     None
+}
+
+/// `None` is an I/O or safety failure; `Some(None)` is readable HEAD content
+/// which is neither a branch ref nor a detached commit.
+fn read_git_head(path: &Path) -> Option<Option<String>> {
+    let head = read_small_git_file(path)?;
+    let head = head.trim();
+    if let Some(branch) = head.strip_prefix("ref: refs/heads/") {
+        return Some(sanitize_branch(branch));
+    }
+    // Detached HEAD: show short SHA.
+    if head.len() >= 7 && head.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Some(Some(head[..7].to_string()));
+    }
+    Some(None)
 }
 
 fn read_small_git_file(path: &Path) -> Option<String> {
@@ -199,7 +291,7 @@ pub(crate) fn chrono_local_offset_secs() -> i64 {
 
 // ─── CSS ──────────────────────────────────────────────────────────────────────
 
-pub(crate) fn install_block_css(config: &Config) {
+fn block_css(config: &Config) -> String {
     let fg = &config.foreground;
     let bg = &config.background;
     let bg_hex = rgba_to_hex(bg);
@@ -378,15 +470,16 @@ pub(crate) fn install_block_css(config: &Config) {
         .block-success {{
             border-color: {ok_stripe};
         }}
+        /* Outcome, hover, selection and bookmark are independent states. Keep
+           them on separate CSS properties where possible, and spell out the
+           combinations that must share `box-shadow` or `background-color`. */
         .block-failed {{
             border-color: {err_stripe};
             background-color: rgba({err_r},{err_g},{err_b},0.11);
-            box-shadow: inset 2px 0 0 0 {err_stripe};
         }}
         .block-background {{
             border-color: {async_stripe};
             background-color: rgba({async_r},{async_g},{async_b},0.07);
-            box-shadow: inset 2px 0 0 0 {async_stripe};
         }}
         .block-correction, .command-suggestion, .command-review-standalone {{
             border-color: rgba({acc_r},{acc_g},{acc_b},0.85);
@@ -688,21 +781,56 @@ pub(crate) fn install_block_css(config: &Config) {
             outline-color: rgba({fg_r},{fg_g},{fg_b},0.16);
             box-shadow: 0 4px 14px rgba(0,0,0,0.22);
         }}
+        .block-failed.block-hovered {{
+            background-color: rgba({err_r},{err_g},{err_b},0.17);
+            outline-color: rgba({err_r},{err_g},{err_b},0.34);
+        }}
+        .block-background.block-hovered {{
+            background-color: rgba({async_r},{async_g},{async_b},0.12);
+            outline-color: rgba({async_r},{async_g},{async_b},0.28);
+        }}
+        .block-unknown.block-hovered {{
+            outline-color: rgba({warn_r},{warn_g},{warn_b},0.30);
+        }}
         /* The inset rings are anchored to the PADDING box, which moved one pixel
            outward when the top/right/bottom border became a layout-free
            `outline`. Widen each by that pixel so a selected card keeps the same
            2px band, and the active end its 3px one. */
         .block-selected {{
             background-color: rgba({acc_r},{acc_g},{acc_b},0.08);
-            border-color: rgba({acc_r},{acc_g},{acc_b},0.48);
             outline-color: rgba({acc_r},{acc_g},{acc_b},0.48);
             box-shadow: inset 0 0 0 2px rgba({acc_r},{acc_g},{acc_b},0.65);
         }}
         .block-selected.block-selection-active {{
             background-color: rgba({acc_r},{acc_g},{acc_b},0.14);
-            border-color: rgba({acc_r},{acc_g},{acc_b},0.92);
             outline-color: rgba({acc_r},{acc_g},{acc_b},0.92);
             box-shadow: inset 0 0 0 3px {accent}, 0 0 0 1px rgba({acc_r},{acc_g},{acc_b},0.55);
+        }}
+        .block-selected.block-hovered {{
+            box-shadow: inset 0 0 0 2px rgba({acc_r},{acc_g},{acc_b},0.65),
+                        0 4px 14px rgba(0,0,0,0.22);
+        }}
+        .block-selected.block-selection-active.block-hovered {{
+            box-shadow: inset 0 0 0 3px {accent},
+                        0 0 0 1px rgba({acc_r},{acc_g},{acc_b},0.55),
+                        0 4px 14px rgba(0,0,0,0.22);
+        }}
+        /* Selection uses an accent wash for neutral/success cards, but outcome
+           owns the wash of failed/background cards. These pair and triple
+           rules make that ownership explicit at every specificity: pointing
+           at a selected outcome card deepens its own colour while the inset
+           selection ring and hover lift remain independently visible. */
+        .block-failed.block-selected {{
+            background-color: rgba({err_r},{err_g},{err_b},0.11);
+        }}
+        .block-background.block-selected {{
+            background-color: rgba({async_r},{async_g},{async_b},0.07);
+        }}
+        .block-failed.block-selected.block-hovered {{
+            background-color: rgba({err_r},{err_g},{err_b},0.17);
+        }}
+        .block-background.block-selected.block-hovered {{
+            background-color: rgba({async_r},{async_g},{async_b},0.12);
         }}
         /* Same split as `.block-finished`: one border colour so GTK never builds
            a corner mesh, ring on `outline`, and the layout the removed border
@@ -777,7 +905,12 @@ pub(crate) fn install_block_css(config: &Config) {
             margin-right: 2px;
         }}
         .block-bookmarked {{
-            box-shadow: inset 3px 0 0 0 #e5c07b;
+            background-image: linear-gradient(
+                to right,
+                {warn_hex} 0px,
+                {warn_hex} 3px,
+                transparent 3px
+            );
         }}
         .block-chip-git {{
             color: {accent};
@@ -1125,6 +1258,12 @@ pub(crate) fn install_block_css(config: &Config) {
         "#,
     );
 
+    css
+}
+
+pub(crate) fn install_block_css(config: &Config) {
+    let css = block_css(config);
+
     thread_local! {
         static BLOCK_CSS_PROVIDER: RefCell<Option<gtk::CssProvider>> = const { RefCell::new(None) };
     }
@@ -1153,6 +1292,121 @@ pub(crate) fn install_block_css(config: &Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rule_body<'a>(css: &'a str, selector: &str) -> &'a str {
+        let marker = format!("{selector} {{");
+        let start = css
+            .find(&marker)
+            .unwrap_or_else(|| panic!("missing CSS selector {selector}"))
+            + marker.len();
+        let end = css[start..]
+            .find('}')
+            .unwrap_or_else(|| panic!("unterminated CSS selector {selector}"));
+        &css[start..start + end]
+    }
+
+    /// `CssProvider::load_from_string` reports a syntax error through a signal
+    /// and can retain only the rules before it. Pin the real GTK parser, not
+    /// just the string structure asserted by the tests below.
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn the_generated_stylesheet_parses_without_error() {
+        use std::cell::RefCell as StdRefCell;
+        use std::rc::Rc;
+
+        gtk::init().expect("gtk init");
+        let config = Config::safe_defaults();
+        let errors: Rc<StdRefCell<Vec<String>>> = Rc::new(StdRefCell::new(Vec::new()));
+        let provider = gtk::CssProvider::new();
+        {
+            let errors = errors.clone();
+            provider.connect_parsing_error(move |_, section, error| {
+                errors
+                    .borrow_mut()
+                    .push(format!("{}: {error}", section.to_str()));
+            });
+        }
+        provider.load_from_string(&block_css(&config));
+        let errors = errors.borrow();
+        assert!(errors.is_empty(), "stylesheet parse errors: {errors:?}");
+    }
+
+    #[test]
+    fn independent_card_states_do_not_overwrite_each_other() {
+        let config = Config::safe_defaults();
+        let css = block_css(&config);
+
+        // A bookmark can coexist with hover and selection because it no
+        // longer competes for their single `box-shadow` property.
+        let bookmarked = rule_body(&css, ".block-bookmarked");
+        assert!(bookmarked.contains("background-image"));
+        assert!(!bookmarked.contains("box-shadow"));
+
+        // Outcome stripes belong to the border. Their washes are restated at
+        // hover specificity instead of being replaced by the neutral hover.
+        for (outcome, hovered) in [
+            (".block-failed", ".block-failed.block-hovered"),
+            (".block-background", ".block-background.block-hovered"),
+        ] {
+            let outcome_body = rule_body(&css, outcome);
+            let hovered_body = rule_body(&css, hovered);
+            assert!(outcome_body.contains("background-color"));
+            assert!(!outcome_body.contains("box-shadow"));
+            assert!(
+                hovered_body.contains("background-color"),
+                "{hovered} must preserve its outcome wash"
+            );
+        }
+
+        // Hovered selections keep both the inset selection ring and the
+        // ordinary hover elevation.
+        for selector in [
+            ".block-selected.block-hovered",
+            ".block-selected.block-selection-active.block-hovered",
+        ] {
+            let body = rule_body(&css, selector);
+            assert!(
+                body.contains("inset") && body.contains("14px"),
+                "{selector} must carry both selection and hover shadows: {body}"
+            );
+        }
+
+        // Selection is a ring, not a replacement status stripe. All four
+        // outcomes therefore keep the border colour they own above.
+        for selector in [".block-selected", ".block-selected.block-selection-active"] {
+            let body = rule_body(&css, selector);
+            assert!(
+                !body.contains("border-color"),
+                "{selector} must not overwrite the outcome stripe: {body}"
+            );
+        }
+
+        // Failed/background washes survive selection, and hover deepens that
+        // same outcome rather than falling back to either neutral hover or the
+        // selection accent. The triple is required because the two pair rules
+        // otherwise tie on specificity.
+        for (selected, selected_hovered) in [
+            (
+                ".block-failed.block-selected",
+                ".block-failed.block-selected.block-hovered",
+            ),
+            (
+                ".block-background.block-selected",
+                ".block-background.block-selected.block-hovered",
+            ),
+        ] {
+            let selected_body = rule_body(&css, selected);
+            let selected_hovered_body = rule_body(&css, selected_hovered);
+            assert!(
+                selected_body.contains("background-color"),
+                "{selected} must retain its outcome wash: {selected_body}"
+            );
+            assert!(
+                selected_hovered_body.contains("background-color"),
+                "{selected_hovered} must retain its hovered outcome wash: {selected_hovered_body}"
+            );
+        }
+    }
 
     fn test_root(label: &str) -> std::path::PathBuf {
         let path =
@@ -1208,45 +1462,125 @@ mod tests {
     }
 
     #[test]
-    fn repeated_cards_in_one_directory_walk_the_tree_once() {
-        let root = test_root("memo");
+    fn cached_head_locator_observes_branch_switch_without_another_walk() {
+        let root = test_root("fresh-head");
         let repo = root.join("repo");
         let git = repo.join(".git");
         std::fs::create_dir_all(&git).unwrap();
-        std::fs::write(git.join("HEAD"), "ref: refs/heads/memo\n").unwrap();
+        let head = git.join("HEAD");
+        std::fs::write(&head, "ref: refs/heads/first\n").unwrap();
         let cwd = repo.to_str().unwrap();
-        // Another test on this thread may have primed the cache for its own
-        // path; only this key's walk count is being asserted.
         GIT_BRANCH_CACHE.with(|cache| cache.borrow_mut().clear());
         GIT_BRANCH_WALKS.with(|walks| walks.set(0));
+        let now = Instant::now();
 
-        // What a session restore does: one card per block, all in one pass.
+        assert_eq!(git_branch_for_at(cwd, now).as_deref(), Some("first"));
+        std::fs::write(&head, "ref: refs/heads/second\n").unwrap();
         for _ in 0..200 {
-            assert_eq!(git_branch_for(cwd).as_deref(), Some("memo"));
+            assert_eq!(git_branch_for_at(cwd, now).as_deref(), Some("second"));
         }
         assert_eq!(GIT_BRANCH_WALKS.with(std::cell::Cell::get), 1);
 
-        // A directory that is in no repository is the walk worth caching most:
-        // it runs all the way to `/` before answering.
-        let bare = root.to_str().unwrap();
-        for _ in 0..10 {
-            assert_eq!(git_branch_for(bare), None);
-        }
+        GIT_BRANCH_CACHE.with(|cache| cache.borrow_mut().clear());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_worktree_locator_is_evicted_and_resolved_once() {
+        let root = test_root("worktree-repoint");
+        let worktree = root.join("worktree");
+        let first_git = root.join("first-git");
+        let second_git = root.join("second-git");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&first_git).unwrap();
+        std::fs::create_dir_all(&second_git).unwrap();
+        std::fs::write(worktree.join(".git"), "gitdir: ../first-git\n").unwrap();
+        std::fs::write(first_git.join("HEAD"), "ref: refs/heads/first\n").unwrap();
+        std::fs::write(second_git.join("HEAD"), "ref: refs/heads/second\n").unwrap();
+        let cwd = worktree.to_str().unwrap();
+        GIT_BRANCH_CACHE.with(|cache| cache.borrow_mut().clear());
+        GIT_BRANCH_WALKS.with(|walks| walks.set(0));
+        let now = Instant::now();
+
+        assert_eq!(git_branch_for_at(cwd, now).as_deref(), Some("first"));
+        std::fs::write(worktree.join(".git"), "gitdir: ../second-git\n").unwrap();
+        std::fs::remove_file(first_git.join("HEAD")).unwrap();
+        assert_eq!(git_branch_for_at(cwd, now).as_deref(), Some("second"));
         assert_eq!(GIT_BRANCH_WALKS.with(std::cell::Cell::get), 2);
 
-        // The memo is bounded, and eviction is by age then insertion order.
+        GIT_BRANCH_CACHE.with(|cache| cache.borrow_mut().clear());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn negative_locator_cache_hits_then_expires_without_sleeping() {
+        // `/proc/self` has no repository marker in its ancestor chain. Avoid a
+        // temp directory here: another test process may intentionally create
+        // `/tmp/.git` while probing hostile metadata.
+        let cwd = "/proc/self";
+        GIT_BRANCH_CACHE.with(|cache| cache.borrow_mut().clear());
+        GIT_BRANCH_WALKS.with(|walks| walks.set(0));
+        let now = Instant::now();
+
+        assert_eq!(git_branch_for_at(cwd, now), None);
+        assert_eq!(
+            git_branch_for_at(cwd, now + Duration::from_millis(199)),
+            None
+        );
+        assert_eq!(GIT_BRANCH_WALKS.with(std::cell::Cell::get), 1);
+
+        assert_eq!(git_branch_for_at(cwd, now + GIT_NEGATIVE_CACHE_TTL), None);
+        assert_eq!(GIT_BRANCH_WALKS.with(std::cell::Cell::get), 2);
+
+        GIT_BRANCH_CACHE.with(|cache| cache.borrow_mut().clear());
+    }
+
+    #[test]
+    fn git_locator_cache_is_bounded_to_64_working_directories() {
+        let root = test_root("locator-capacity");
+        let git = root.join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        GIT_BRANCH_CACHE.with(|cache| cache.borrow_mut().clear());
+        let now = Instant::now();
+        let mut cwds = Vec::new();
+
+        for index in 0..=GIT_BRANCH_CACHE_ENTRIES {
+            let cwd = root.join(format!("dir-{index}"));
+            std::fs::create_dir(&cwd).unwrap();
+            let cwd = cwd.to_string_lossy().into_owned();
+            assert_eq!(git_branch_for_at(&cwd, now).as_deref(), Some("main"));
+            cwds.push(cwd);
+        }
+
         GIT_BRANCH_CACHE.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            for index in 0..GIT_BRANCH_CACHE_ENTRIES * 2 {
-                cache.push_back((format!("/nowhere/{index}"), Instant::now(), None));
-                while cache.len() > GIT_BRANCH_CACHE_ENTRIES {
-                    cache.pop_front();
-                }
-            }
-            assert_eq!(cache.len(), GIT_BRANCH_CACHE_ENTRIES);
+            let cache = cache.borrow();
+            assert_eq!(cache.entries.len(), GIT_BRANCH_CACHE_ENTRIES);
+            assert!(!cache.entries.iter().any(|(cwd, _)| cwd == &cwds[0]));
+            assert!(cache.entries.iter().any(|(cwd, _)| cwd == &cwds[1]));
         });
 
         GIT_BRANCH_CACHE.with(|cache| cache.borrow_mut().clear());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn git_metadata_reader_rejects_oversized_and_linked_files() {
+        let root = test_root("metadata");
+        let git = root.join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+        let head = git.join("HEAD");
+        std::fs::write(&head, vec![b'x'; MAX_GIT_POINTER_BYTES as usize + 1]).unwrap();
+        assert_eq!(git_branch_uncached(root.to_str().unwrap()), None);
+
+        #[cfg(unix)]
+        {
+            let target = root.join("target");
+            std::fs::write(&target, "ref: refs/heads/linked\n").unwrap();
+            std::fs::remove_file(&head).unwrap();
+            std::os::unix::fs::symlink(&target, &head).unwrap();
+            assert_eq!(git_branch_uncached(root.to_str().unwrap()), None);
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -187,12 +187,18 @@ For development:
 ```bash
 make run       # debug build and launch
 make test      # cargo test --all-targets
+make test-display # isolated GTK/VTE regressions under Xvfb
 make check     # cargo check --all-targets
 make build     # release build
 make clippy    # repository lint policy
 make security  # dependency audit + ShellCheck
+make verify    # full tests, Xvfb regressions, docs, release, script contracts
 make help      # all helpers
 ```
+
+`make package` deliberately uses the host Cargo and system GTK/VTE development
+libraries. The relocatable archive targets a compatible system-library ABI;
+building its bare binary inside Nix would bake `/nix/store` paths into it.
 
 ## Diagnostics and recovery
 

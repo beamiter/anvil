@@ -414,10 +414,6 @@ pub enum VteInput {
     SetScrollback(i64),
     ScrollLines(i32),
     ApplyTheme,
-    /// Block-view only: switch existing cards and the live input cell between
-    /// the normal and compact densities. Card margins are set imperatively, so
-    /// a CSS reinstall alone cannot move them.
-    ApplyBlockDensity(bool),
     /// Refresh backend-owned behavioral configuration from the shared app value.
     /// VTE panes already hold that shared `Rc`; Block panes copy it internally.
     SyncConfig,
@@ -776,8 +772,6 @@ impl Component for VteTerminal {
             }
             VteInput::CrossBlockSearch => {}
             VteInput::AskAiAboutSelectedBlock => {}
-            // A conventional VTE pane has no cards to give a density to.
-            VteInput::ApplyBlockDensity(_) => {}
         }
     }
 }

@@ -104,15 +104,11 @@ impl AppModel {
 
     pub(crate) fn apply_settings_block_compact(&mut self, enabled: bool) {
         self.config.borrow_mut().block_compact = enabled;
+        // `reload_config` edge-detects this value and applies density to every
+        // existing Block pane. Keep that config-sync message as the single
+        // mutation/geometry-sync path rather than following it with a second
+        // density command for the same change.
         self.sync_terminal_configs();
-        for tab in &self.tabs {
-            for pane in &tab.panes {
-                // Not `ApplyTheme`: no color changed, and the density the cards
-                // already on screen are drawn at is imperative margins that a
-                // CSS reinstall cannot reach.
-                pane.terminal.emit(VteInput::ApplyBlockDensity(enabled));
-            }
-        }
         self.persist_config();
         self.show_toast("Block density updated.");
     }

@@ -519,7 +519,6 @@ impl Component for BlockTerminal {
             VteInput::SetScrollback(lines) => view.vte().set_scrollback_lines(lines),
             VteInput::ScrollLines(lines) => view.scroll_lines(lines),
             VteInput::ApplyTheme => view.apply_theme(),
-            VteInput::ApplyBlockDensity(compact) => view.apply_block_density(compact),
             VteInput::SyncConfig => view.reload_config(&self.config.borrow()),
             VteInput::Kill => self.terminate_once(),
             VteInput::FilterFailedBlocks => report_record_navigation(

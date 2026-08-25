@@ -222,6 +222,18 @@ versioning for tagged releases while it remains experimental.
 
 ### Changed
 
+- Changing Block density now updates every existing finished, virtualized,
+  correction/review, suggestion, Agent, and notice card in place. The
+  virtualization height model changes with the chrome, so long histories do
+  not accumulate stale offsets while switching between roomy and compact.
+- Git branch chips now share a 64-entry HEAD-locator cache without caching the
+  branch value: every card observes branch switches immediately, while missing
+  repositories use only a short 200 ms negative cache.
+- The complete local verification gate now includes the explicitly named
+  GTK/VTE regressions in isolated D-Bus/Xvfb sessions. Portable release
+  packaging uses a separate system-linked target and refuses a Nix shell,
+  preventing a bare archive from embedding `/nix/store` interpreter paths.
+
 - Typing at a prompt that has been scrolled away brings the viewport back to
   it, clears the unread badge, and retires the jump-to-latest button. Every
   other terminal applies scroll-on-keystroke; block mode did not, so the
