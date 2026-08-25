@@ -36,15 +36,9 @@ fn read_agent_snapshot(path: &Path) -> Option<AgentSessionSnapshot> {
 /// Atomically claim, validate, restore, and consume exactly once while holding
 /// anvil's directory namespace lock. Multiple NON_UNIQUE anvil processes can
 /// open concurrently; only the process that wins the core claim may receive
-/// this session. Invalid evidence is moved aside for inspection.
+/// this session. Core durably retires the public name before exposing a live
+/// session and moves invalid evidence aside for inspection.
 fn restore_agent_snapshot_once(path: &Path) -> Option<jterm_core::agent::AgentSession> {
-    restore_agent_snapshot_once_with_sync(path, crate::config_store::sync_config_parent)
-}
-
-fn restore_agent_snapshot_once_with_sync(
-    path: &Path,
-    sync_parent: impl FnOnce(&Path) -> Result<(), crate::config_store::ConfigWriteError>,
-) -> Option<jterm_core::agent::AgentSession> {
     let _parent_lock = match crate::config_store::PrivateParentLock::acquire(path) {
         Ok(lock) => lock,
         Err(error) => {
@@ -54,16 +48,7 @@ fn restore_agent_snapshot_once_with_sync(
     };
     match jterm_core::agent::try_claim_session_file(path) {
         Ok(jterm_core::agent::SessionClaim::Vacant) => None,
-        Ok(jterm_core::agent::SessionClaim::Restored(restored)) => {
-            if let Err(error) = sync_parent(path) {
-                log::warn!(
-                    "agent: snapshot claim for {} was not durable: {error}",
-                    path.display()
-                );
-                return None;
-            }
-            Some(restored)
-        }
+        Ok(jterm_core::agent::SessionClaim::Restored(restored)) => Some(restored),
         Ok(jterm_core::agent::SessionClaim::Quarantined {
             path: quarantined,
             error,
@@ -73,12 +58,6 @@ fn restore_agent_snapshot_once_with_sync(
                 path.display(),
                 quarantined.display()
             );
-            if let Err(sync_error) = sync_parent(path) {
-                log::warn!(
-                    "agent: snapshot quarantine for {} was not durable: {sync_error}",
-                    path.display()
-                );
-            }
             None
         }
         Err(error) => {
@@ -1374,50 +1353,6 @@ mod snapshot_tests {
             .count();
         assert_eq!(restored, 1);
         assert!(!path.exists());
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn one_shot_restore_fails_closed_when_the_namespace_cannot_be_synced() {
-        let root = test_directory("sync-failure");
-        let path = root.join("agent_session.json");
-        write_agent_snapshot(&path, &snapshot_fixture()).unwrap();
-        let sync_called = std::cell::Cell::new(false);
-
-        let restored = restore_agent_snapshot_once_with_sync(&path, |_| {
-            sync_called.set(true);
-            Err(crate::config_store::ConfigWriteError::Io(
-                "injected directory sync failure".to_string(),
-            ))
-        });
-
-        assert!(sync_called.get(), "a successful claim must sync its parent");
-        assert!(restored.is_none(), "an undurable claim must fail closed");
-        assert!(!path.exists(), "the claimed public name remains consumed");
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn claim_error_keeps_the_public_path_and_does_not_sync() {
-        let root = test_directory("claim-error");
-        let path = root.join("agent_session.json");
-        std::fs::create_dir(&path).unwrap();
-        let sync_called = std::cell::Cell::new(false);
-
-        assert!(restore_agent_snapshot_once_with_sync(&path, |_| {
-            sync_called.set(true);
-            Ok(())
-        })
-        .is_none());
-        assert!(
-            !sync_called.get(),
-            "a failed claim did not mutate the namespace"
-        );
-        assert!(
-            path.is_dir(),
-            "claim errors must retain the public evidence"
-        );
-
         std::fs::remove_dir_all(root).unwrap();
     }
 

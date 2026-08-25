@@ -181,7 +181,8 @@ impl PaneLayout {
             cwd: retain_bounded_string(cwd, MAX_RESTORED_CWD_BYTES),
             cwd_external,
             remote_name: retain_bounded_string(remote_name, MAX_RESTORED_REMOTE_NAME_BYTES),
-            sid: retain_bounded_string(sid, MAX_RESTORED_SID_BYTES),
+            sid: retain_bounded_string(sid, MAX_RESTORED_SID_BYTES)
+                .filter(|value| crate::config::valid_session_id(value)),
             cmds: cmds.filter(|argv| restorable_command_within_limits(argv)),
         }
     }
@@ -1087,7 +1088,7 @@ impl<'de> serde::de::Visitor<'de> for PaneLayoutSeed<'_> {
                     cwd,
                     cwd_external: cwd_external.unwrap_or_default(),
                     remote_name,
-                    sid,
+                    sid: sid.filter(|value| crate::config::valid_session_id(value)),
                     cmds,
                 })
             }
@@ -1478,9 +1479,10 @@ fn pane_layout_within_restore_limits(layout: &PaneLayout) -> Option<usize> {
                     || remote_name
                         .as_ref()
                         .is_some_and(|value| value.len() > MAX_RESTORED_REMOTE_NAME_BYTES)
-                    || sid
-                        .as_ref()
-                        .is_some_and(|value| value.len() > MAX_RESTORED_SID_BYTES)
+                    || sid.as_ref().is_some_and(|value| {
+                        value.len() > MAX_RESTORED_SID_BYTES
+                            || !crate::config::valid_session_id(value)
+                    })
                     || cmds
                         .as_deref()
                         .is_some_and(|argv| !restorable_command_within_limits(argv))
@@ -3217,6 +3219,16 @@ mod tests {
         );
         assert!(matches!(oversized_sid, PaneLayout::Leaf { sid: None, .. }));
 
+        let invalid_sid = PaneLayout::captured_leaf(
+            "block".to_string(),
+            None,
+            false,
+            None,
+            Some("session.with.dots".to_string()),
+            None,
+        );
+        assert!(matches!(invalid_sid, PaneLayout::Leaf { sid: None, .. }));
+
         let title = "界".repeat(MAX_RESTORED_TITLE_BYTES / "界".len() + 2);
         let tab = SavedTab::captured(title, true, false, false, layout);
         assert!(tab.title.len() <= MAX_RESTORED_TITLE_BYTES);
@@ -3656,7 +3668,7 @@ mod tests {
     }
 
     #[test]
-    fn pane_session_id_round_trips_and_old_snapshots_remain_compatible() {
+    fn pane_session_id_round_trips_and_invalid_snapshots_degrade_safely() {
         let with_sid = PaneLayout::Leaf {
             mode: "block".to_string(),
             cwd: Some("/tmp".to_string()),
@@ -3680,6 +3692,15 @@ mod tests {
             decode_pane_layout(r#"{"type":"leaf","mode":"block","cwd":"/tmp","cmds":null}"#)
                 .unwrap();
         assert!(matches!(legacy, PaneLayout::Leaf { sid: None, .. }));
+
+        for invalid in ["session.with.dots", "session with spaces", "雪"] {
+            let encoded = format!(
+                r#"{{"type":"leaf","mode":"block","sid":{}}}"#,
+                serde_json::to_string(invalid).unwrap()
+            );
+            let decoded = decode_pane_layout(&encoded).unwrap();
+            assert!(matches!(decoded, PaneLayout::Leaf { sid: None, .. }));
+        }
     }
 
     #[test]

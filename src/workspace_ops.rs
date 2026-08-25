@@ -797,18 +797,19 @@ impl AppModel {
             } => {
                 let pane_id = self.next_pane_id;
                 self.next_pane_id += 1;
+                let restored_sid = sid
+                    .as_deref()
+                    .filter(|value| config::valid_session_id(value))
+                    .map(str::to_string);
+                if sid.is_some() && restored_sid.is_none() {
+                    log::warn!("Ignoring invalid session id in pane snapshot");
+                }
                 let managed_host = remote_name.as_deref().and_then(|name| {
                     managed_remote_host_for_restore(&self.config.borrow().remote_hosts, name)
                 });
                 if let Some(mut host) = managed_host {
-                    let restored_sid = sid
-                        .as_deref()
-                        .filter(|value| config::valid_session_id(value))
-                        .map(str::to_string);
                     if let Some(restored_sid) = restored_sid.as_ref() {
                         host.session = Some(restored_sid.clone());
-                    } else if sid.is_some() {
-                        log::warn!("Ignoring invalid session id in managed remote snapshot");
                     }
                     match config::checked_remote_argv(&host) {
                         Ok(shell_argv) => {
@@ -822,7 +823,7 @@ impl AppModel {
                                 TerminalMode::Block,
                                 InitialCommands::default(),
                                 None,
-                                restored_sid,
+                                restored_sid.clone(),
                                 true,
                                 sender,
                             );
@@ -866,7 +867,7 @@ impl AppModel {
                     || *cwd_external
                     || replay_argv.is_some_and(process::command_uses_external_cwd);
                 let remote_integrated = !missing_managed_remote
-                    && (sid.is_some()
+                    && (restored_sid.is_some()
                         || replay_argv.is_some_and(process::command_requires_block_integration));
                 let mode =
                     restored_leaf_mode(self.config.borrow().terminal_mode, remote_integrated);
@@ -902,7 +903,7 @@ impl AppModel {
                     if missing_managed_remote {
                         None
                     } else {
-                        sid.clone()
+                        restored_sid
                     },
                     external_cwd,
                     sender,

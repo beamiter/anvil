@@ -141,7 +141,8 @@ impl SidebarView {
 // ---------------------------------------------------------------------------
 
 pub(crate) const MAX_REMOTE_HOSTS: usize = 128;
-pub(crate) const MAX_SESSION_ID_BYTES: usize = 1024;
+pub(crate) const MAX_SESSION_ID_BYTES: usize =
+    jterm_core::execution_journal::MAX_JSH_SESSION_ID_BYTES;
 const MAX_REMOTE_ARGV_BYTES: usize = 512 * 1024;
 const MAX_CONFIG_PATH_BYTES: usize = 16 * 1024;
 const MAX_AI_BASE_URL_BYTES: usize = 4 * 1024;
@@ -257,10 +258,7 @@ fn wrap_jsh_argv_in_interactive_bash(jsh_path: &str) -> Option<Vec<String>> {
 }
 
 pub(crate) fn valid_session_id(session_id: &str) -> bool {
-    !session_id.is_empty()
-        && session_id.len() <= MAX_SESSION_ID_BYTES
-        && !session_id.chars().any(char::is_control)
-        && !crate::review_input::contains_visual_spoofing(session_id)
+    jterm_core::execution_journal::is_valid_jsh_session_id(session_id)
 }
 
 /// Apply a saved jsh session id to either a direct jsh argv or the exact
@@ -2291,9 +2289,9 @@ mod tests {
     #[test]
     fn saved_session_is_applied_to_direct_and_wrapped_jsh_argv() {
         let direct = vec!["/usr/bin/jsh".to_string()];
-        let (direct, applied) = shell_argv_with_session(&direct, Some("session one"));
+        let (direct, applied) = shell_argv_with_session(&direct, Some("session-one"));
         assert!(applied);
-        assert_eq!(&direct[1..], ["--session", "session one"]);
+        assert_eq!(&direct[1..], ["--session", "session-one"]);
 
         let wrapped = vec![
             "/usr/bin/bash".to_string(),
@@ -2301,20 +2299,25 @@ mod tests {
             "exec \"$0\" \"$@\"".to_string(),
             "/usr/bin/jsh".to_string(),
         ];
-        let (wrapped, applied) = shell_argv_with_session(&wrapped, Some("session two"));
+        let (wrapped, applied) = shell_argv_with_session(&wrapped, Some("session_two"));
         assert!(applied);
-        assert_eq!(&wrapped[4..], ["--session", "session two"]);
+        assert_eq!(&wrapped[4..], ["--session", "session_two"]);
 
-        let (_, applied) = shell_argv_with_session(&wrapped, Some("bad\nsession"));
-        assert!(!applied);
+        for invalid in ["bad session", "bad.session", "bad\nsession", "雪"] {
+            let (_, applied) = shell_argv_with_session(&wrapped, Some(invalid));
+            assert!(!applied, "{invalid:?}");
+        }
     }
 
     #[test]
-    fn session_id_budget_is_shared_with_persisted_panes() {
+    fn session_id_grammar_is_shared_with_jsh_and_persisted_panes() {
         assert!(valid_session_id(&"s".repeat(MAX_SESSION_ID_BYTES)));
         assert!(!valid_session_id(&"s".repeat(MAX_SESSION_ID_BYTES + 1)));
         assert!(!valid_session_id(""));
         assert!(!valid_session_id("session\nspoof"));
+        assert!(!valid_session_id("session with spaces"));
+        assert!(!valid_session_id("session.with.dots"));
+        assert!(!valid_session_id("雪"));
     }
 
     #[test]

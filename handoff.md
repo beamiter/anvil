@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-24 (Block/Unified exact-search cursor identity)
+Updated: 2026-08-25 (shared SID and core-owned Agent claim durability)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -12,13 +12,27 @@ captured, queued, written, and restored.
 
 ## Completed since the previous handoff
 
+- **Shared jsh session identity (2026-08-25)**: configured and persisted pane
+  identities now use `jterm_core`'s exact 1..=128-byte ASCII
+  `[A-Za-z0-9_-]` contract. Unicode, dotted, spaced, or otherwise
+  grammar-invalid ids within the field budget safely degrade to no claimed id,
+  while an over-budget field still rejects the snapshot at the bounded decoder;
+  neither case can forward an invalid identity to `jsh`.
+
+- **Core-owned Agent claim durability (2026-08-25)**: the exact core pin is now
+  `852d33d197d3a46becc76a3b85c13f981506a61c` (transitively jagent
+  `2570e5e9324d1fb6823e731b53e7ea9a6033177a`). Core durably retires the public
+  snapshot name before exposing `SessionClaim::Restored` and owns the later
+  cleanup sync, so anvil removed its redundant post-restore sync failure gate
+  and test-only injection seam. Cargo and Nix source identities move together.
+
 - **Exact search cursor identity and core repin (2026-08-24)**: Block card
   surfaces carry render stamps through the backend/find contract, so a resize,
   fold, or output re-feed invalidates and rebuilds the retained query before
   navigation—including a one-hit pass whose logical cursor does not move.
   Cross-block rows carry their first surface occurrence and activation reaches
-  it exactly or fails closed at the 4096-step bound. The app now pins published
-  `jterm_core` `0f47569`; Cargo and Nix source identities were updated together.
+  it exactly or fails closed at the 4096-step bound. That round pinned
+  `jterm_core` `0f47569`; the current exact pin is recorded above.
 
 - **Exactly-once command lifecycle closure (2026-08-21)**: Block and Unified
   now share one observer-side `C -> finish` latch. An accepted `D` consumes it
@@ -244,9 +258,8 @@ captured, queued, written, and restored.
 - Agent snapshot restore uses `jterm_core::agent::try_claim_session_file` while
   holding the private parent lock. The public name is consumed once, invalid
   evidence is quarantined, typed claim-acquisition errors retain the public
-  path, and the parent namespace is synced before a claimed session is accepted.
-  `jterm_core` is pinned to `3e09b161a36e2ec30f730eee8f8d6702b2bacc35`
-  (transitively jagent `d52002e4a18735e8cfec718da5fea8f0a5cfaaf8`).
+  path, and core syncs the retired public namespace before a claimed session is
+  accepted. Anvil deliberately adds no second post-restore durability gate.
 
 ## Remaining boundaries
 

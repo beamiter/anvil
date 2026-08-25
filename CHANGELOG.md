@@ -444,9 +444,10 @@ versioning for tagged releases while it remains experimental.
   逻辑游标停在原位，也会先验证 stamp，不再永久保留失效高亮。跨块结果按 surface 内实际
   命中数记录 occurrence（同一行多个命中分别计步），激活会从顶部精确定位；超过 4096 步
   或中途耗尽时 fail closed，而不是高亮较早的错误命中。
-- 共享核心升级到 `jterm_core` `0f47569`（transitively `jagent` `fcb9768`），采用最新的
-  AI origin、endpoint、credential、no-proxy 与
-  请求边界校验；Cargo 与 Nix 的精确 source hash 同步更新。
+- 共享核心升级到 `jterm_core` `852d33d`（transitively `jagent` `2570e5e`）。
+  Core 在暴露恢复会话前持久退役公开快照名，anvil 因此删除重复的恢复后
+  目录同步失败门控；新 jagent 也在所有 JSON 边界拒绝重复对象成员。Cargo 与
+  Nix 的精确 source hash 同步更新。
 
 - A block whose completion nobody vouched for says so on the card. The caveat
   used to live in a card-level tooltip — the one place a doubt about an exit
