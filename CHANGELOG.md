@@ -9,7 +9,8 @@ versioning for tagged releases while it remains experimental.
 
 - A fresh, empty Block pane now shows one accessible orientation card explaining
   reusable completed cards, header selection, right-click actions, and
-  `Ctrl+Shift+G` search. A completion or restored history retires it permanently.
+  `Ctrl+Shift+G` search. The first accepted human input, completion, or restored
+  history retires it permanently, so it cannot linger over a long first command.
   The card is a non-targetable, non-measuring overlay: it consumes no live PTY
   rows, does not compete for shell-integration/AI notice ownership, and never
   appears in Unified or conventional VTE panes. It suspends during alternate-
@@ -22,16 +23,24 @@ versioning for tagged releases while it remains experimental.
   without Enter, waits for an exact stable VTE render, and only then sends CR;
   it fails closed unless the prompt is settled,
   visibly empty, untouched, foreground-owned, and free of pending Agent or
-  reviewed submissions; every refusal consumes the chord so it cannot fall
-  through to an accidental VTE Enter. Plain Enter is likewise selection-owned:
-  busy/dirty/unsafe recalls ring instead of submitting unrelated prompt text,
+  reviewed submissions; every refusal consumes the chord, rings, and briefly
+  displays its visible reason so it cannot fall through to an accidental VTE
+  Enter. Plain Enter is likewise selection-owned: busy/dirty/unsafe recalls show
+  their reason and ring instead of submitting unrelated prompt text,
   and selected multiline text is refused when missing bracketed paste would
-  silently keep only its first line. Hints explicitly say `Prompt ready`.
+  silently keep only its first line. Hints no longer claim static prompt
+  readiness: they show the selected-card count and distinguish recall from
+  recall all.
   The hint's natural-width cap follows its real longest row, so `Esc cancel`
   remains visible when the header still has spacer room.
   Focused header controls retain GTK Return/Space activation; Ctrl+Enter remains
-  the deliberate Block chord. Entering an alternate screen clears the now-hidden
-  Block selection. Delete is intentionally not advertised until a grouped
+  the deliberate Block chord. Alternate-screen ownership suppresses selection
+  navigation as well as clearing the existing selection, so no hidden selection
+  can surface after a TUI exits. Every history-recall surface, including header
+  and context actions, shares the verified empty-prompt guard and cannot replace
+  a dirty edit. Faded card action strips are also insensitive and non-targetable,
+  preventing Tab or stale focus from activating an invisible control. Delete is
+  intentionally not advertised until a grouped
   removal plus undo transaction exists.
 - The cross-block search palette (`Ctrl+Shift+G`) gained **Failed** and **Slow**
   toggles and an outcome column. The two predicates already existed with no

@@ -36,10 +36,11 @@ pub(crate) enum BlockOnboardingPhase {
 enum BlockOnboardingEvent {
     HistoryResolved { restored_finished_block: bool },
     FinishedBlockObserved,
+    HumanInputObserved,
 }
 
 fn transition(phase: BlockOnboardingPhase, event: BlockOnboardingEvent) -> BlockOnboardingPhase {
-    use BlockOnboardingEvent::{FinishedBlockObserved, HistoryResolved};
+    use BlockOnboardingEvent::{FinishedBlockObserved, HistoryResolved, HumanInputObserved};
     use BlockOnboardingPhase::{AwaitingHistory, Disabled, Dismissed, Visible};
 
     match (phase, event) {
@@ -48,6 +49,7 @@ fn transition(phase: BlockOnboardingPhase, event: BlockOnboardingEvent) -> Block
         (
             _,
             FinishedBlockObserved
+            | HumanInputObserved
             | HistoryResolved {
                 restored_finished_block: true,
             },
@@ -122,6 +124,13 @@ impl BlockOnboarding {
     /// Permanently dismiss the card after the first completed block is mounted.
     pub(crate) fn finished_block_observed(&self) {
         self.apply(BlockOnboardingEvent::FinishedBlockObserved);
+    }
+
+    /// Permanently retire guidance when this pane accepts its first human
+    /// input. Keeping it until CommandEnd would cover the command being typed
+    /// and potentially a long first command's live output.
+    pub(crate) fn human_input_observed(&self) {
+        self.apply(BlockOnboardingEvent::HumanInputObserved);
     }
 
     /// Temporarily hide orientation while an alternate-screen program owns the
@@ -201,7 +210,7 @@ mod tests {
 
     #[test]
     fn block_onboarding_state_is_block_only_and_one_way() {
-        use BlockOnboardingEvent::{FinishedBlockObserved, HistoryResolved};
+        use BlockOnboardingEvent::{FinishedBlockObserved, HistoryResolved, HumanInputObserved};
         use BlockOnboardingPhase::{AwaitingHistory, Disabled, Dismissed, Visible};
 
         assert_eq!(transition(Disabled, FinishedBlockObserved), Disabled);
@@ -215,6 +224,8 @@ mod tests {
             Visible
         );
         assert_eq!(transition(Visible, FinishedBlockObserved), Dismissed);
+        assert_eq!(transition(Visible, HumanInputObserved), Dismissed);
+        assert_eq!(transition(AwaitingHistory, HumanInputObserved), Dismissed);
         assert_eq!(
             transition(
                 Dismissed,
@@ -310,6 +321,22 @@ mod tests {
             height_before,
             "revealing an overlay must not consume live terminal rows"
         );
+        let input_handle = onboarding.clone();
+        input_handle.human_input_observed();
+        assert_eq!(onboarding.phase(), BlockOnboardingPhase::Dismissed);
+        assert!(!card.is_visible());
+        onboarding.history_resolved(false);
+        assert!(
+            !card.is_visible(),
+            "accepted input permanently retires guidance before CommandEnd"
+        );
+
+        // A separate pane still covers the completion-driven path.
+        let completion_overlay = gtk::Overlay::new();
+        completion_overlay.set_child(Some(&gtk::Box::new(gtk::Orientation::Vertical, 0)));
+        let onboarding = BlockOnboarding::attach(&completion_overlay, true);
+        onboarding.history_resolved(false);
+        let card = onboarding.widget();
         let backend_handle = onboarding.clone();
         backend_handle.finished_block_observed();
         assert_eq!(onboarding.phase(), BlockOnboardingPhase::Dismissed);

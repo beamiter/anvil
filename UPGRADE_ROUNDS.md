@@ -3,8 +3,8 @@
 This ledger records the behavior-backed increments in the current upgrade
 pass.
 
-Rounds 1–10 record the preceding pass; this pass's additional thirty-one rounds
-are numbered 11–41.
+Rounds 1–10 record the preceding pass; this pass's additional thirty-two rounds
+are numbered 11–42.
 
 1. **Prefix boundary** — install and uninstall reject empty, relative,
    control-bearing, or parent-traversing prefixes while retaining valid Unicode
@@ -123,6 +123,12 @@ are numbered 11–41.
 41. **Alternate-screen-safe orientation** — the first-use overlay suspends while
     a full-screen program owns the surface and returns on exit, so an initial TUI
     is never hidden behind guidance intended for an empty prompt.
+42. **Truthful, focus-safe Block interaction** — first accepted human input
+    permanently retires orientation guidance; selection hints expose counts,
+    recall-all scope, and visible refusal reasons without claiming readiness.
+    Every history recall shares the verified empty-prompt gate, alternate-screen
+    navigation cannot create a hidden selection, and faded action strips leave
+    both pointer targeting and keyboard focus.
 
 Verification: `bash scripts/test-install-paths.sh`, `bash -n
 scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.

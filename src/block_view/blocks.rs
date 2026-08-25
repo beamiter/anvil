@@ -34,6 +34,17 @@ const VTE_RETAINED_BYTES_PER_MATERIALIZED_BYTE: usize = 32;
 const IMAGE_RETAINED_OWNERS: usize = 2;
 const FINISHED_OUTPUT_FILTER_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
 
+/// Fade a card's quick-action strip without changing the header allocation.
+///
+/// An invisible strip must also be insensitive: `can_target(false)` only
+/// removes pointer targeting, while its child buttons can still receive Tab
+/// focus and activate an action from a card that is no longer active.
+pub(crate) fn reveal_block_actions(action_box: &gtk::Box, revealed: bool) {
+    action_box.set_opacity(if revealed { 1.0 } else { 0.0 });
+    action_box.set_can_target(revealed);
+    action_box.set_sensitive(revealed);
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CompletedBlockRetentionPlan {
     /// Number of oldest entries to remove from every block-indexed collection.
@@ -1364,9 +1375,56 @@ mod tests {
         );
         assert_eq!(
             card.selection_hint.max_width_chars(),
-            super::super::SELECTION_HINT_RUN.chars().count() as i32,
+            super::super::SELECTION_HINT_MAX_CHARS,
             "the natural-width cap must not permanently hide the final action"
         );
+        assert_eq!(
+            card.selection_hint.width_chars(),
+            super::super::SELECTION_HINT_MIN_CHARS,
+            "a narrow header must reserve the complete Escape affordance"
+        );
+
+        assert!(
+            !card.action_box.is_sensitive(),
+            "a faded action strip must not participate in keyboard focus"
+        );
+        reveal_block_actions(&card.action_box, true);
+        assert!(card.action_box.is_sensitive());
+        assert!(card.action_box.can_target());
+        reveal_block_actions(&card.action_box, false);
+        assert!(!card.action_box.is_sensitive());
+        assert!(!card.action_box.can_target());
+
+        card.selection_hint
+            .set_text(super::super::SELECTION_HINT_RUN);
+        card.selection_hint.set_visible(true);
+        let refusal = "Esc cancel  ·  Prompt has input  ·  nothing recalled".to_string();
+        super::super::flash_finished_selection_refusal(
+            std::slice::from_ref(&card),
+            Some(1),
+            refusal.clone(),
+        );
+        assert_eq!(card.selection_hint.text().as_str(), refusal);
+        assert_eq!(
+            card.selection_hint.tooltip_text().as_deref(),
+            Some(refusal.as_str())
+        );
+        assert_eq!(
+            card.selection_hint.accessible_role(),
+            gtk::AccessibleRole::Status
+        );
+
+        let loop_ = glib::MainLoop::new(None, false);
+        let quit = loop_.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(1_700), move || {
+            quit.quit();
+        });
+        loop_.run();
+        assert_eq!(
+            card.selection_hint.text().as_str(),
+            super::super::SELECTION_HINT_RUN
+        );
+        assert_eq!(card.selection_hint.tooltip_text(), None);
     }
 
     #[test]
@@ -3217,13 +3275,15 @@ impl FinishedBlock {
         // duration, exit status, or quick actions sideways as selection moves.
         let selection_hint = gtk::Label::new(None);
         selection_hint.add_css_class("block-selection-hint");
+        selection_hint.set_accessible_role(gtk::AccessibleRole::Status);
         selection_hint.set_visible(false);
+        // Escape is first, so end ellipsis in a narrow split preserves the
+        // universal way out before trimming lower-priority actions.
         selection_hint.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        // This caps natural width rather than merely setting a ceiling. Keep
-        // it in lockstep with the longest capability row, otherwise the final
-        // `Esc cancel` is permanently ellipsized even when the header has
-        // ample spacer slack (visible in the cross-app Xvfb comparison).
-        selection_hint.set_max_width_chars(super::SELECTION_HINT_RUN.chars().count() as i32);
+        // Reserve the complete universal exit even when metadata/actions crowd
+        // a narrow header, while still capping the longest capability row.
+        selection_hint.set_width_chars(super::SELECTION_HINT_MIN_CHARS);
+        selection_hint.set_max_width_chars(super::SELECTION_HINT_MAX_CHARS);
         header_row.append(&selection_hint);
 
         // Spacer
@@ -3273,8 +3333,7 @@ impl FinishedBlock {
         // `can_target(false)` is load-bearing: an invisible-but-present button
         // would otherwise swallow the header clicks that select the block.
         action_box.add_css_class("block-action-box");
-        action_box.set_opacity(0.0);
-        action_box.set_can_target(false);
+        reveal_block_actions(&action_box, false);
         // Small gap between the meta badges (timestamp/duration/exit) on the
         // right and the action button group, so they read as separate units
         // rather than one undifferentiated cluster.
@@ -3315,8 +3374,7 @@ impl FinishedBlock {
         let action_box_for_enter = action_box.clone();
         hover_ctrl.connect_enter(move |_, _, _| {
             outer_for_enter.add_css_class("block-hovered");
-            action_box_for_enter.set_opacity(1.0);
-            action_box_for_enter.set_can_target(true);
+            reveal_block_actions(&action_box_for_enter, true);
         });
         let outer_for_leave = outer.clone();
         let action_box_for_leave = action_box.clone();
@@ -3324,8 +3382,7 @@ impl FinishedBlock {
             outer_for_leave.remove_css_class("block-hovered");
             // Only the active edge of a multi-selection owns persistent actions.
             if !outer_for_leave.has_css_class("block-selection-active") {
-                action_box_for_leave.set_opacity(0.0);
-                action_box_for_leave.set_can_target(false);
+                reveal_block_actions(&action_box_for_leave, false);
             }
         });
         outer.add_controller(hover_ctrl);
@@ -4488,12 +4545,8 @@ impl FinishedBlock {
     pub(super) fn connect_actions(
         &self,
         vte: &Terminal,
-        pty: &Rc<crate::pty::OwnedPty>,
-        pty_synced: &Rc<Cell<bool>>,
+        verified_submission: &super::VerifiedSubmissionCtx,
         bracketed_paste: &Rc<Cell<bool>>,
-        typed_cmd: &Rc<RefCell<String>>,
-        armed_agent_execution: &Rc<RefCell<Option<super::ArmedAgentExecution>>>,
-        bstate: &Rc<Cell<BlockState>>,
         active: &Rc<RefCell<ActiveBlock>>,
     ) {
         let vte_for_cmd = vte.clone();
@@ -4529,24 +4582,14 @@ impl FinishedBlock {
             flash_button_icon(btn, "emblem-ok-symbolic", label);
         });
 
-        let pty_for_rerun = Rc::clone(pty);
-        let pty_synced_for_rerun = pty_synced.clone();
+        let verified_submission_for_rerun = verified_submission.clone();
         let bracketed_paste_for_rerun = bracketed_paste.clone();
-        let typed_cmd_for_rerun = typed_cmd.clone();
-        let armed_agent_for_rerun = armed_agent_execution.clone();
-        let bstate_for_rerun = bstate.clone();
         let active_for_rerun = active.clone();
         let cmd_for_rerun = self.cmd_text.clone();
         self.rerun_btn.connect_clicked(move |btn| {
-            if recall_command_at_prompt(
-                &pty_for_rerun,
-                &pty_synced_for_rerun,
-                &typed_cmd_for_rerun,
-                bstate_for_rerun.get(),
-                armed_agent_for_rerun.borrow().is_some(),
-                &cmd_for_rerun,
-                bracketed_paste_for_rerun.get(),
-            ) {
+            if verified_submission_for_rerun
+                .try_recall_command(&cmd_for_rerun, bracketed_paste_for_rerun.get())
+            {
                 active_for_rerun.borrow().grab_focus();
                 flash_button_icon(btn, "emblem-ok-symbolic", "Command inserted");
             } else {

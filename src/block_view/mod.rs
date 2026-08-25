@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use vte4::Terminal;
 use vte4::TerminalExt;
 
@@ -1343,10 +1343,7 @@ where
 }
 
 fn recall_selected_commands_at_prompt(
-    pty: &OwnedPty,
-    pty_synced: &Cell<bool>,
-    typed_cmd: &RefCell<String>,
-    state: BlockState,
+    submission: &VerifiedSubmissionCtx,
     finished: &[FinishedBlock],
     selected: &HashSet<u64>,
     bracketed_paste: bool,
@@ -1363,15 +1360,7 @@ fn recall_selected_commands_at_prompt(
     if !selected_command_recall_is_lossless(&command, bracketed_paste) {
         return false;
     }
-    recall_command_at_prompt(
-        pty,
-        pty_synced,
-        typed_cmd,
-        state,
-        false,
-        &command,
-        bracketed_paste,
-    )
+    submission.try_recall_command(&command, bracketed_paste)
 }
 
 fn selected_command_recall_is_lossless(command: &str, bracketed_paste: bool) -> bool {
@@ -1430,38 +1419,6 @@ fn classify_command_prompt_status(
         BlockState::Idle | BlockState::CollectingPrompt => CommandPromptStatus::Initializing,
         BlockState::AltScreen => CommandPromptStatus::Fullscreen,
     }
-}
-
-/// Replace the current editable shell line with a finished command.
-///
-/// Refuse to write while a command or full-screen program owns the PTY. Besides
-/// preventing accidental input injection, keeping `typed_cmd` synchronized makes
-/// the compact live cell expand correctly for recalled multiline commands.
-pub(crate) fn recall_command_at_prompt(
-    pty: &OwnedPty,
-    pty_synced: &Cell<bool>,
-    typed_cmd: &RefCell<String>,
-    state: BlockState,
-    agent_submission_pending: bool,
-    command: &str,
-    bracketed_paste: bool,
-) -> bool {
-    if state != BlockState::AwaitingCommand || agent_submission_pending {
-        return false;
-    }
-
-    let recall = build_command_recall(command, bracketed_paste);
-    if recall.is_empty() {
-        return false;
-    }
-
-    // One write: the Ctrl+U, the framing and the body are a single payload, so
-    // the PTY boundary sees a whole frame and no other writer can interleave
-    // between the line kill and the text that replaces it.
-    pty.write_bytes(&recall.bytes);
-    *typed_cmd.borrow_mut() = recall.echo_text;
-    pty_synced.set(true);
-    true
 }
 
 /// Dynamic OSC 10/11/12 color overrides for one pane.
@@ -1741,9 +1698,12 @@ fn base_keyval_in_layout(
 
 type SelectedBlockIds = Rc<RefCell<std::collections::HashSet<u64>>>;
 
-const SELECTION_HINT_RUN: &str = "Prompt ready: ↵ recall  ·  Ctrl+↵ run  ·  Esc cancel";
-const SELECTION_HINT_RECALL: &str = "Prompt ready: ↵ recall  ·  Esc cancel";
+const SELECTION_HINT_RUN: &str = "Esc cancel  ·  ↵ recall  ·  Ctrl+↵ run";
+const SELECTION_HINT_RECALL: &str = "Esc cancel  ·  ↵ recall";
 const SELECTION_HINT_CANCEL: &str = "Esc cancel";
+const SELECTION_HINT_MIN_CHARS: i32 = 14;
+const SELECTION_HINT_MAX_CHARS: i32 = 52;
+const SELECTION_REFUSAL_VISIBLE_FOR: Duration = Duration::from_millis(1_600);
 
 /// Text for the active selection edge. This is a capability matrix, not a
 /// static cheat-sheet: cards with no recallable command cannot advertise
@@ -1752,14 +1712,78 @@ fn finished_selection_hint(
     selected_count: usize,
     can_recall: bool,
     active_command_is_rerunnable: bool,
-) -> &'static str {
+) -> String {
     if selected_count == 1 && can_recall && active_command_is_rerunnable {
-        SELECTION_HINT_RUN
+        SELECTION_HINT_RUN.to_string()
+    } else if selected_count > 1 && can_recall {
+        format!("Esc cancel  ·  {selected_count} selected  ·  ↵ recall all")
     } else if can_recall {
-        SELECTION_HINT_RECALL
+        SELECTION_HINT_RECALL.to_string()
+    } else if selected_count > 1 {
+        format!("Esc cancel  ·  {selected_count} selected")
     } else {
-        SELECTION_HINT_CANCEL
+        SELECTION_HINT_CANCEL.to_string()
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectionAction {
+    Recall,
+    Run,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectionActionRefusal {
+    Prompt(CommandPromptStatus),
+    UnsafeRecall,
+    NotRunnable,
+}
+
+fn selection_refusal_hint(action: SelectionAction, refusal: SelectionActionRefusal) -> String {
+    let consequence = match action {
+        SelectionAction::Recall => "nothing recalled",
+        SelectionAction::Run => "nothing run",
+    };
+    let reason = match refusal {
+        SelectionActionRefusal::Prompt(CommandPromptStatus::Ready) => "Prompt changed",
+        SelectionActionRefusal::Prompt(status) => status.short_label(),
+        SelectionActionRefusal::UnsafeRecall => "Selection cannot be recalled safely",
+        SelectionActionRefusal::NotRunnable => "Select one runnable command",
+    };
+    format!("Esc cancel  ·  {reason}  ·  {consequence}")
+}
+
+/// Briefly replace the action legend with a visible explanation of a refused
+/// Enter. The bell remains useful, but it cannot say whether the prompt was
+/// busy, dirty, or the selected command shape itself was not admissible.
+fn flash_finished_selection_refusal(
+    finished: &[FinishedBlock],
+    active: Option<u64>,
+    message: String,
+) {
+    let Some(label) = active
+        .and_then(|id| finished.iter().find(|block| block.id == id))
+        .map(|block| block.selection_hint.clone())
+    else {
+        return;
+    };
+    let previous = label.text().to_string();
+    label.set_text(&message);
+    label.set_tooltip_text(Some(&message));
+    label.update_property(&[gtk::accessible::Property::Label(&message)]);
+    let weak = label.downgrade();
+    glib::timeout_add_local_once(SELECTION_REFUSAL_VISIBLE_FOR, move || {
+        let Some(label) = weak.upgrade() else {
+            return;
+        };
+        // Selection movement or a newer refusal owns its newer text.
+        if label.text().as_str() != message {
+            return;
+        }
+        label.set_text(&previous);
+        label.set_tooltip_text(None);
+        label.update_property(&[gtk::accessible::Property::Label(&previous)]);
+    });
 }
 
 /// Apply the Warp-style multi-selection model to every finished block. All
@@ -1796,18 +1820,20 @@ fn sync_finished_block_selection(
 
         let is_active = active == Some(block.id);
         if is_active {
-            block.selection_hint.set_text(hint);
+            block.selection_hint.set_text(&hint);
+            block.selection_hint.set_tooltip_text(None);
+            block
+                .selection_hint
+                .update_property(&[gtk::accessible::Property::Label(&hint)]);
         }
         block.selection_hint.set_visible(is_active);
         if is_active {
             block.widget().add_css_class("block-selection-active");
-            block.action_box.set_opacity(1.0);
-            block.action_box.set_can_target(true);
+            blocks::reveal_block_actions(&block.action_box, true);
         } else {
             block.widget().remove_css_class("block-selection-active");
             if !block.widget().has_css_class("block-hovered") {
-                block.action_box.set_opacity(0.0);
-                block.action_box.set_can_target(false);
+                blocks::reveal_block_actions(&block.action_box, false);
             }
         }
     }
@@ -2845,6 +2871,75 @@ impl VerifiedSubmissionCtx {
     fn current_anchor(&self) -> (i64, i64) {
         self.surface
             .prompt_anchor(self.prompt_end_pos.get(), self.prompt_anchor_rows.get())
+    }
+
+    /// Describe the live editor using the same proof used by every history
+    /// insertion and reviewed submission path.
+    fn command_prompt_status(&self, fullscreen: bool) -> CommandPromptStatus {
+        let status = classify_command_prompt_status(
+            self.bstate.get(),
+            fullscreen,
+            self.idle_input_dirty.get(),
+            self.pty_synced.get(),
+            self.typed_cmd.borrow().trim().is_empty(),
+        );
+        if status != CommandPromptStatus::Ready {
+            return status;
+        }
+        if !self.prompt_anchor_ready.get() {
+            return CommandPromptStatus::Initializing;
+        }
+        match self.pty.shell_is_foreground() {
+            Some(false) => CommandPromptStatus::Running,
+            None => CommandPromptStatus::ShellIntegrationUnavailable,
+            Some(true) => {
+                if self.surface.cursor_position() == self.current_anchor()
+                    && self.surface.suffix_is_empty() == Some(true)
+                {
+                    CommandPromptStatus::Ready
+                } else {
+                    CommandPromptStatus::HasInput
+                }
+            }
+        }
+    }
+
+    fn can_recall_command(&self) -> bool {
+        classify_command_prompt_status(
+            self.bstate.get(),
+            false,
+            self.idle_input_dirty.get(),
+            self.pty_synced.get(),
+            self.typed_cmd.borrow().trim().is_empty(),
+        )
+        .is_ready()
+            && self.prompt_anchor_ready.get()
+            && self.surface.cursor_position() == self.current_anchor()
+            && self.surface.suffix_is_empty() == Some(true)
+            && self.submission.borrow().is_none()
+            && self.source_id.borrow().is_none()
+            && self.armed_agent_execution.borrow().is_none()
+    }
+
+    /// Recall history only into a provably empty editor. `Ctrl+U` kills only
+    /// from the cursor to BOL, so writing it over an unverified line could keep
+    /// a hidden suffix and silently merge two commands.
+    fn try_recall_command(&self, command: &str, bracketed_paste: bool) -> bool {
+        if !self.can_recall_command() {
+            return false;
+        }
+        let recall = build_command_recall(command, bracketed_paste);
+        if recall.is_empty() {
+            return false;
+        }
+        if let Err(error) = self.pty.try_write_bytes(&recall.bytes) {
+            log::warn!("could not queue recalled command: {error}");
+            return false;
+        }
+        *self.typed_cmd.borrow_mut() = recall.echo_text;
+        self.idle_input_dirty.set(true);
+        self.pty_synced.set(true);
+        true
     }
 
     fn fail(&self, reason: &'static str) {
@@ -4080,6 +4175,7 @@ struct BlockBackend {
     bstate_rc: Rc<Cell<BlockState>>,
     typed_cmd_rc: Rc<RefCell<String>>,
     armed_agent_execution_rc: Rc<RefCell<Option<ArmedAgentExecution>>>,
+    verified_submission: VerifiedSubmissionCtx,
     bracketed_paste_rc: Rc<Cell<bool>>,
     pty_synced_rc: Rc<Cell<bool>>,
     /// Kitty graphics (APC G) — multi-chunk uploads assemble here; completed
@@ -6348,12 +6444,8 @@ impl RenderBackend for BlockBackend {
         let finished_blocks_for_menu = self.finished_blocks_for_cb.clone();
         let block_list_for_menu = self.block_list_rc.clone();
         let vte_for_copy = self.active_vte.clone();
-        let pty_for_rerun_menu = self.pty_for_init.clone();
-        let pty_synced_for_rerun_menu = self.pty_synced_rc.clone();
         let bracketed_paste_for_rerun_menu = self.bracketed_paste_rc.clone();
-        let typed_cmd_for_rerun_menu = self.typed_cmd_rc.clone();
-        let armed_agent_for_rerun_menu = self.armed_agent_execution_rc.clone();
-        let bstate_for_rerun_menu = self.bstate_rc.clone();
+        let verified_submission_for_rerun_menu = self.verified_submission.clone();
         let active_for_rerun_menu = self.active_rc.clone();
         let selected_ids_for_menu = self.selected_block_ids_rc.clone();
         let selected_for_menu = self.selected_block_id_rc.clone();
@@ -6582,34 +6674,21 @@ impl RenderBackend for BlockBackend {
                 {
                     let item = make_item("Go to Directory");
                     let popover_c = popover.clone();
-                    let pty_for_action = pty_for_rerun_menu.clone();
-                    let pty_synced_for_action = pty_synced_for_rerun_menu.clone();
                     let bracketed_paste_for_action = bracketed_paste_for_rerun_menu.clone();
-                    let typed_cmd_for_action = typed_cmd_for_rerun_menu.clone();
-                    let armed_agent_for_action = armed_agent_for_rerun_menu.clone();
-                    let bstate_for_action = bstate_for_rerun_menu.clone();
+                    let verified_submission_for_action = verified_submission_for_rerun_menu.clone();
                     let active_for_action = active_for_rerun_menu.clone();
                     // Same gate as "Insert Command at Prompt": this writes to
                     // the prompt, so it needs a clean, idle one.
-                    item.set_sensitive(
-                        bstate_for_action.get() == BlockState::AwaitingCommand
-                            && armed_agent_for_action.borrow().is_none(),
-                    );
+                    item.set_sensitive(verified_submission_for_action.can_recall_command());
                     // Inserted, never run — the same rule every recall here
                     // follows. A cwd comes from OSC 7 and can hold spaces and
                     // quotes, so it is quoted rather than trusted.
                     let command = format!("cd {}", shell_single_quote(&cwd));
                     item.connect_clicked(move |_| {
                         popover_c.popdown();
-                        if recall_command_at_prompt(
-                            &pty_for_action,
-                            &pty_synced_for_action,
-                            &typed_cmd_for_action,
-                            bstate_for_action.get(),
-                            armed_agent_for_action.borrow().is_some(),
-                            &command,
-                            bracketed_paste_for_action.get(),
-                        ) {
+                        if verified_submission_for_action
+                            .try_recall_command(&command, bracketed_paste_for_action.get())
+                        {
                             active_for_action.borrow().grab_focus();
                         }
                     });
@@ -6748,29 +6827,17 @@ impl RenderBackend for BlockBackend {
                 let selected_ids_for_rerun = selected_ids_for_menu.clone();
                 let selected_for_rerun = selected_for_menu.clone();
                 let anchor_for_rerun = anchor_for_menu.clone();
-                let pty_for_action = pty_for_rerun_menu.clone();
-                let pty_synced_for_action = pty_synced_for_rerun_menu.clone();
                 let bracketed_paste_for_action = bracketed_paste_for_rerun_menu.clone();
-                let typed_cmd_for_action = typed_cmd_for_rerun_menu.clone();
-                let armed_agent_for_action = armed_agent_for_rerun_menu.clone();
-                let bstate_for_action = bstate_for_rerun_menu.clone();
+                let verified_submission_for_action = verified_submission_for_rerun_menu.clone();
                 let active_for_action = active_for_rerun_menu.clone();
-                item.set_sensitive(
-                    bstate_for_action.get() == BlockState::AwaitingCommand
-                        && armed_agent_for_action.borrow().is_none(),
-                );
+                item.set_sensitive(verified_submission_for_action.can_recall_command());
                 item.connect_clicked(move |_| {
                     popover_c.popdown();
                     let finished = finished_for_rerun.borrow();
-                    let recalled = if armed_agent_for_action.borrow().is_some() {
-                        false
-                    } else {
+                    let recalled = {
                         let selected = selected_ids_for_rerun.borrow();
                         recall_selected_commands_at_prompt(
-                            &pty_for_action,
-                            &pty_synced_for_action,
-                            &typed_cmd_for_action,
-                            bstate_for_action.get(),
+                            &verified_submission_for_action,
                             &finished,
                             &selected,
                             bracketed_paste_for_action.get(),
@@ -7495,12 +7562,8 @@ impl RenderBackend for BlockBackend {
 
         finished_clone.connect_actions(
             &self.active_vte,
-            &self.pty_for_init,
-            &self.pty_synced_rc,
+            &self.verified_submission,
             &self.bracketed_paste_rc,
-            &self.typed_cmd_rc,
-            &self.armed_agent_execution_rc,
-            &self.bstate_rc,
             &self.active_rc,
         );
         finished_clone.connect_scroll_forwarding(&self.block_scroll_rc, &self.scroll_debouncer);
@@ -8846,16 +8909,12 @@ enum KeyScope {
 /// input still belongs exclusively to the live VTE and its IME.
 #[derive(Clone)]
 struct KeyCtx {
-    pty_for_key: Rc<OwnedPty>,
     /// Kitty keyboard protocol: the flags in effect, and the last key pressed
     /// so the commit handler can replace the legacy bytes VTE emits for it.
     kitty_flags_for_key: Rc<Cell<u8>>,
     kitty_last_key_for_key: Rc<Cell<Option<(KittyKey, KittyModifiers)>>>,
     active_vte_for_key: glib::WeakRef<Terminal>,
-    pty_synced_for_key: Rc<Cell<bool>>,
     bracketed_paste_for_key: Rc<Cell<bool>>,
-    typed_cmd_for_key: Rc<RefCell<String>>,
-    armed_agent_execution_for_key: Rc<RefCell<Option<ArmedAgentExecution>>>,
     finished_blocks_for_key: Rc<RefCell<Vec<FinishedBlock>>>,
     selected_block_ids_for_key: SelectedBlockIds,
     selected_block_id_for_key: Rc<Cell<Option<u64>>>,
@@ -8871,14 +8930,10 @@ struct KeyCtx {
 impl KeyCtx {
     fn connect(self, key_ctrl: &gtk::EventControllerKey, scope: KeyScope) {
         let KeyCtx {
-            pty_for_key,
             kitty_flags_for_key,
             kitty_last_key_for_key,
             active_vte_for_key,
-            pty_synced_for_key,
             bracketed_paste_for_key,
-            typed_cmd_for_key,
-            armed_agent_execution_for_key,
             finished_blocks_for_key,
             selected_block_ids_for_key,
             selected_block_id_for_key,
@@ -9127,6 +9182,18 @@ impl KeyCtx {
                     active_vte_for_key.grab_focus();
                     emit_human_input(&human_input_for_key, HumanInputKind::Keyboard);
                 } else {
+                    let refusal = if target.is_some() {
+                        SelectionActionRefusal::Prompt(
+                            verified_submission_for_key.command_prompt_status(false),
+                        )
+                    } else {
+                        SelectionActionRefusal::NotRunnable
+                    };
+                    flash_finished_selection_refusal(
+                        &finished,
+                        selected_block_id_for_key.get(),
+                        selection_refusal_hint(SelectionAction::Run, refusal),
+                    );
                     active_vte_for_key.error_bell();
                 }
                 return glib::Propagation::Stop;
@@ -9142,15 +9209,10 @@ impl KeyCtx {
             {
                 if selected_block_id_for_key.get().is_some() {
                     let finished = finished_blocks_for_key.borrow();
-                    let recalled = if armed_agent_execution_for_key.borrow().is_some() {
-                        false
-                    } else {
+                    let recalled = {
                         let selected = selected_block_ids_for_key.borrow();
                         recall_selected_commands_at_prompt(
-                            &pty_for_key,
-                            &pty_synced_for_key,
-                            &typed_cmd_for_key,
-                            bstate_for_key.get(),
+                            &verified_submission_for_key,
                             &finished,
                             &selected,
                             bracketed_paste_for_key.get(),
@@ -9169,6 +9231,30 @@ impl KeyCtx {
                     // Selection mode owns its visible Enter action. A refusal
                     // must not leak that Enter into a dirty prompt or running
                     // application and submit unrelated input.
+                    let command = {
+                        let selected = selected_block_ids_for_key.borrow();
+                        selected_command_text(
+                            finished
+                                .iter()
+                                .map(|block| (block.id, block.cmd_text.as_str())),
+                            &selected,
+                        )
+                    };
+                    let refusal = if selected_command_recall_is_lossless(
+                        &command,
+                        bracketed_paste_for_key.get(),
+                    ) {
+                        SelectionActionRefusal::Prompt(
+                            verified_submission_for_key.command_prompt_status(false),
+                        )
+                    } else {
+                        SelectionActionRefusal::UnsafeRecall
+                    };
+                    flash_finished_selection_refusal(
+                        &finished,
+                        selected_block_id_for_key.get(),
+                        selection_refusal_hint(SelectionAction::Recall, refusal),
+                    );
                     active_vte_for_key.error_bell();
                     return glib::Propagation::Stop;
                 }
@@ -10069,6 +10155,12 @@ impl TermView {
         let title_callbacks: StrCallbacks = Rc::new(RefCell::new(vec![]));
         let activity_callbacks: VoidCallbacks = Rc::new(RefCell::new(vec![]));
         let human_input_callbacks: HumanInputCallbacks = Rc::new(RefCell::new(vec![]));
+        {
+            let onboarding = block_onboarding.clone();
+            human_input_callbacks
+                .borrow_mut()
+                .push(Box::new(move |_| onboarding.human_input_observed()));
+        }
         let alt_screen_callbacks: AltScreenCallbacks = Rc::new(RefCell::new(vec![]));
         let command_started_callbacks: CommandStartedCallbacks = Rc::new(RefCell::new(vec![]));
         let command_finished_callbacks: CommandFinishedCallbacks = Rc::new(RefCell::new(vec![]));
@@ -10381,6 +10473,7 @@ impl TermView {
                     bstate_rc: bstate_rc.clone(),
                     typed_cmd_rc: typed_cmd_rc.clone(),
                     armed_agent_execution_rc: armed_agent_execution.clone(),
+                    verified_submission: verified_submission.clone(),
                     bracketed_paste_rc: bracketed_paste_rc.clone(),
                     pty_synced_rc: pty_synced_rc.clone(),
                     kitty_assembler: RefCell::new(kitty_graphics::Assembler::new()),
@@ -11086,22 +11179,16 @@ impl TermView {
 
         // ── Keyboard navigation / copy-paste (Capture phase) ──────────────
         {
-            let pty_for_key = pty.clone();
-            let typed_cmd_for_key = typed_cmd.clone();
             let finished_blocks_for_key = finished_blocks_rc.clone();
             let selected_block_ids_for_key = selected_block_ids.clone();
             let selected_block_id_for_key = selected_block_id.clone();
             let selection_anchor_id_for_key = selection_anchor_id.clone();
             let block_scroll_for_key = block_scroll.clone();
             let key_ctx = KeyCtx {
-                pty_for_key,
                 kitty_flags_for_key: kitty_flags.clone(),
                 kitty_last_key_for_key: kitty_last_key.clone(),
                 active_vte_for_key: active_vte.downgrade(),
-                pty_synced_for_key: pty_synced.clone(),
                 bracketed_paste_for_key: bracketed_paste.clone(),
-                typed_cmd_for_key,
-                armed_agent_execution_for_key: armed_agent_execution.clone(),
                 finished_blocks_for_key,
                 selected_block_ids_for_key,
                 selected_block_id_for_key,
@@ -11444,12 +11531,8 @@ impl TermView {
                         );
                         finished.connect_actions(
                             &term_view.active_vte,
-                            &term_view.pty,
-                            &pty_synced,
+                            &term_view.verified_submission,
                             &term_view.bracketed_paste,
-                            &term_view.typed_cmd,
-                            &term_view.armed_agent_execution,
-                            &term_view.bstate,
                             &term_view.active,
                         );
                         finished.connect_scroll_forwarding(
@@ -11849,33 +11932,8 @@ impl TermView {
     /// diagnostic status is shared by the inline Agent card and execution
     /// boundary so the UI never advertises a weaker condition than the write.
     pub(crate) fn command_prompt_status(&self) -> CommandPromptStatus {
-        let status = classify_command_prompt_status(
-            self.bstate.get(),
-            self.fullscreen.get(),
-            self.idle_input_dirty.get(),
-            self.pty_synced.get(),
-            self.typed_cmd.borrow().trim().is_empty(),
-        );
-        if status != CommandPromptStatus::Ready {
-            return status;
-        }
-        if !self.prompt_anchor_ready.get() {
-            return CommandPromptStatus::Initializing;
-        }
-        match self.pty.shell_is_foreground() {
-            Some(false) => CommandPromptStatus::Running,
-            None => CommandPromptStatus::ShellIntegrationUnavailable,
-            Some(true) => {
-                if self.verified_submission.surface.cursor_position()
-                    == self.current_prompt_anchor()
-                    && self.verified_submission.surface.suffix_is_empty() == Some(true)
-                {
-                    CommandPromptStatus::Ready
-                } else {
-                    CommandPromptStatus::HasInput
-                }
-            }
-        }
+        self.verified_submission
+            .command_prompt_status(self.fullscreen.get())
     }
 
     pub fn can_accept_agent_command(&self) -> bool {
@@ -12564,6 +12622,12 @@ impl TermView {
         if self.render_backend.scroll_surface_lines(lines) {
             return;
         }
+        // A full-screen app owns the viewport and all cards are hidden. Do not
+        // let the global Ctrl+Up action create an invisible selection that
+        // unexpectedly reappears (and owns Delete/Enter) after the app exits.
+        if self.fullscreen.get() {
+            return;
+        }
         // Ctrl+Up enters Warp-style block selection at the newest block; once a
         // block is selected Ctrl+Up/Down continue moving the selection. Ctrl+Down
         // with no selection retains the ordinary small scroll behavior.
@@ -12621,17 +12685,14 @@ impl TermView {
     /// prompt. Bracketed paste keeps a multi-selection as a multiline buffer; on
     /// shells without it the existing safe first-line fallback still applies.
     pub fn reinput_selected_commands(&self) {
-        if self.fullscreen.get() || self.armed_agent_execution.borrow().is_some() {
+        if self.fullscreen.get() {
             return;
         }
         let finished = self.finished_blocks.borrow();
         let recalled = {
             let selected = self.selected_block_ids.borrow();
             recall_selected_commands_at_prompt(
-                &self.pty,
-                &self.pty_synced,
-                &self.typed_cmd,
-                self.bstate.get(),
+                &self.verified_submission,
                 &finished,
                 &selected,
                 self.bracketed_paste.get(),
@@ -12820,12 +12881,8 @@ impl TermView {
                     .insert_before(&self.block_list, Some(&anchor));
                 finished.connect_actions(
                     &self.active_vte,
-                    &self.pty,
-                    &self.pty_synced,
+                    &self.verified_submission,
                     &self.bracketed_paste,
-                    &self.typed_cmd,
-                    &self.armed_agent_execution,
-                    &self.bstate,
                     &self.active,
                 );
                 finished.connect_scroll_forwarding(&self.block_scroll, &self.scroll_debouncer);
@@ -18447,7 +18504,7 @@ mod tests {
         super::sync_finished_block_selection(&finished.borrow(), &selected, &active);
         assert_eq!(
             finished.borrow()[1].selection_hint.text(),
-            super::SELECTION_HINT_RECALL,
+            "Esc cancel  ·  2 selected  ·  ↵ recall all",
             "multi-selection must not advertise direct execution"
         );
 
@@ -18897,7 +18954,7 @@ mod tests {
         );
         assert_eq!(
             super::finished_selection_hint(2, true, true),
-            super::SELECTION_HINT_RECALL,
+            "Esc cancel  ·  2 selected  ·  ↵ recall all",
             "multi-selection is insert-only"
         );
         assert_eq!(
@@ -18911,6 +18968,21 @@ mod tests {
             "a background/empty card can only leave selection mode"
         );
         assert!(!super::SELECTION_HINT_RUN.contains("Del"));
+        assert!(!super::SELECTION_HINT_RUN.contains("Prompt ready"));
+        assert_eq!(
+            super::selection_refusal_hint(
+                super::SelectionAction::Run,
+                super::SelectionActionRefusal::Prompt(CommandPromptStatus::HasInput),
+            ),
+            "Esc cancel  ·  Prompt has input  ·  nothing run"
+        );
+        assert_eq!(
+            super::selection_refusal_hint(
+                super::SelectionAction::Recall,
+                super::SelectionActionRefusal::Prompt(CommandPromptStatus::Running),
+            ),
+            "Esc cancel  ·  Command running  ·  nothing recalled"
+        );
     }
 
     #[test]
@@ -18925,6 +18997,51 @@ mod tests {
         busy.state = BlockState::CollectingOutput;
         assert!(!super::rerun_is_admissible(busy, "ls", false));
         assert!(super::block_selection_owns_ctrl_enter(Some(7), 1));
+    }
+
+    #[test]
+    fn history_recall_never_replaces_a_dirty_or_unverified_editor() {
+        let harness = ReaderHarness::new();
+        harness.arm_verified_prompt();
+        let _ = harness.pty.drain_test_slave(PTY_REPLY_WAIT);
+
+        harness.ctx.typed_cmd_rc.borrow_mut().push_str("echo KEEP");
+        harness.ctx.idle_input_dirty_rc.set(true);
+        assert!(!harness
+            .ctx
+            .verified_submission
+            .try_recall_command("echo history", true));
+        assert_eq!(&*harness.ctx.typed_cmd_rc.borrow(), "echo KEEP");
+        assert!(
+            harness.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty(),
+            "a refusal must write neither Ctrl+U nor history bytes"
+        );
+
+        harness.ctx.typed_cmd_rc.borrow_mut().clear();
+        harness.ctx.idle_input_dirty_rc.set(false);
+        harness.surface.suffix_is_empty.set(Some(false));
+        assert!(!harness
+            .ctx
+            .verified_submission
+            .try_recall_command("echo history", true));
+        assert!(harness.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty());
+    }
+
+    #[test]
+    fn history_recall_updates_the_editor_shadow_after_verified_insertion() {
+        let harness = ReaderHarness::new();
+        harness.arm_verified_prompt();
+        let _ = harness.pty.drain_test_slave(PTY_REPLY_WAIT);
+
+        assert!(harness
+            .ctx
+            .verified_submission
+            .try_recall_command("echo history", false));
+        let expected = super::build_command_recall("echo history", false);
+        assert_eq!(harness.pty.drain_test_slave(PTY_REPLY_WAIT), expected.bytes);
+        assert_eq!(&*harness.ctx.typed_cmd_rc.borrow(), "echo history");
+        assert!(harness.ctx.idle_input_dirty_rc.get());
+        assert!(harness.ctx.pty_synced_rc.get());
     }
 
     #[test]

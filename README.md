@@ -265,9 +265,9 @@ terminal_mode = "block"
 A fresh Block pane with no completed or restored cards shows one accessible,
 one-shot orientation card: completed commands become reusable cards; click a
 card header to select it, right-click for more actions, and press
-`Ctrl+Shift+G` to search. The card retires permanently after the first
-completion or restored history, even if clear, filtering, or retention later
-leaves the pane empty. It is a non-targetable, non-measuring overlay, so it
+`Ctrl+Shift+G` to search. The card retires permanently after the first accepted
+human input, completion, or restored history, even if clear, filtering, or
+retention later leaves the pane empty. It is a non-targetable, non-measuring overlay, so it
 neither consumes live PTY rows nor competes with shell-integration or AI
 notices. It temporarily hides while an alternate-screen program owns the
 surface and returns afterward, so it never covers the first TUI. Unified and
@@ -415,19 +415,30 @@ Block mode also has context-sensitive navigation:
   order without running it, and `Escape` clears the selection. These keys keep
   working after a finished command/output surface or card header takes focus;
   ordinary typing still returns safely to the live prompt through its IME.
-- The selection hint prefixes prompt actions with `Prompt ready`. A refused
-  plain Enter is consumed and rings instead of reaching a dirty prompt or
-  running program. Multiline/multi-card recall also requires bracketed-paste
+- The selection hint reports how many cards are selected and distinguishes
+  `Enter recall` from `Enter recall all`; it no longer makes a static
+  prompt-readiness claim. A refused plain Enter is consumed, rings, and briefly
+  shows the busy, dirty, unsupported-paste, or unsafe-command reason instead of
+  reaching a dirty prompt or running program. Multiline/multi-card recall also
+  requires bracketed-paste
   support; without it the whole action is refused rather than silently keeping
   only the first command.
 - `Ctrl+Enter` directly re-runs only one selected foreground card whose command
   is complete and single-line, and only at a verified empty, foreground-owned
   prompt with no pending Agent/review submission. A refused re-run consumes the
-  chord instead of allowing VTE to submit unrelated prompt contents. An
+  chord, rings, and briefly shows the refusal reason instead of allowing VTE to
+  submit unrelated prompt contents. An
   admitted re-run first inserts without Enter, waits for the exact stable VTE
   rendering, and sends CR only in the second phase. The
   active card's hint omits the action whenever the selection itself is not
   eligible.
+
+Every history-recall entry point, including card actions and contextual insert,
+uses the same verified empty-prompt guard, so it cannot erase or splice into an
+existing edit. Alternate-screen ownership suppresses Block selection navigation
+entirely, preventing a hidden selection from appearing after a TUI exits. Card
+action strips that fade out are also insensitive and non-targetable, so Tab or
+stale keyboard focus cannot activate an invisible action on an old card.
 - A focused card-header button keeps ordinary GTK Return/Space activation;
   only the explicit Ctrl+Enter chord is delegated to Block re-run.
 - `Ctrl+Shift+B` bookmarks the selected block, or the newest block when nothing
