@@ -423,6 +423,13 @@ Block mode also has context-sensitive navigation:
   requires bracketed-paste
   support; without it the whole action is refused rather than silently keeping
   only the first command.
+- A visible text highlight always wins over whole-card copy, even if a card
+  selection still exists. `Ctrl+Shift+C` aggregates selected command/output/live
+  VTE text in document order; an oversized aggregation fails atomically instead
+  of falling back to unrelated card content.
+- All history insertion surfaces require lossless encoding. A multiline card is
+  therefore left untouched when bracketed paste is unavailable instead of being
+  reported as inserted after only its first line was written.
 - `Ctrl+Enter` directly re-runs only one selected foreground card whose command
   is complete and single-line, and only at a verified empty, foreground-owned
   prompt with no pending Agent/review submission. A refused re-run consumes the

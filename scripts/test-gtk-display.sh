@@ -60,6 +60,7 @@ tests=(
     block_view::blocks::tests::block_density_switches_on_widgets_that_already_exist
     block_view::blocks::tests::output_scrollbar_visibility_cannot_change_the_terminal_width
     block_view::blocks::tests::visual_row_cache_covers_filter_remap_expand_and_resize_refit
+    block_view::cross_selection::tests::a_single_native_text_selection_survives_whole_card_selection_precedence
     block_view::css::tests::the_generated_stylesheet_parses_without_error
     block_view::onboarding::tests::block_onboarding_overlay_is_non_measuring_and_non_targetable
     block_view::find::tests::unified_vte_fresh_query_reaches_scrollback_before_a_prior_match
@@ -70,6 +71,7 @@ tests=(
     block_view::tests::bounded_vte_capture_real_vte_uses_half_open_column_boundary
     block_view::tests::finished_card_focus_keeps_the_block_keyboard_contract
     block_view::tests::entering_alt_screen_ends_the_block_selection_it_hides
+    block_view::tests::refusal_feedback_refreshes_and_only_the_latest_status_restores
     block_view::scroll::tests::widget_pool_releases_heavy_children_and_stale_controllers
     block_view::unified_images::tests::real_vte_keeps_nonzero_marker_column_through_narrow_wide_rewrap
     block_view::unified_chrome::tests::real_vte_osc8_row_probe_and_rewrap_smoke

@@ -3,8 +3,8 @@
 This ledger records the behavior-backed increments in the current upgrade
 pass.
 
-Rounds 1–10 record the preceding pass; this pass's additional thirty-two rounds
-are numbered 11–42.
+Rounds 1–10 record the preceding pass; this pass's additional thirty-three rounds
+are numbered 11–43.
 
 1. **Prefix boundary** — install and uninstall reject empty, relative,
    control-bearing, or parent-traversing prefixes while retaining valid Unicode
@@ -129,6 +129,10 @@ are numbered 11–42.
     Every history recall shares the verified empty-prompt gate, alternate-screen
     navigation cannot create a hidden selection, and faded action strips leave
     both pointer targeting and keyboard focus.
+43. **Visible-selection copy and current feedback** — native and cross-VTE text
+    highlights take precedence over whole-card copy and oversized aggregation
+    fails atomically; generation-owned refusal timers refresh repeated status
+    and can restore only the steady legend, never an older transient message.
 
 Verification: `bash scripts/test-install-paths.sh`, `bash -n
 scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.

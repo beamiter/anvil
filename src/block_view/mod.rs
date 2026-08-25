@@ -463,6 +463,21 @@ fn menu_item(label: &str) -> gtk::Button {
     button
 }
 
+fn show_clipboard_failure(parent: &impl IsA<gtk::Widget>, detail: &str) {
+    let dialog = gtk::AlertDialog::builder()
+        .modal(true)
+        .message("Copy failed")
+        .detail(detail)
+        .build();
+    dialog.set_buttons(&["OK"]);
+    dialog.set_default_button(0);
+    dialog.set_cancel_button(0);
+    let parent = parent
+        .root()
+        .and_then(|root| root.downcast::<gtk::Window>().ok());
+    dialog.show(parent.as_ref());
+}
+
 fn icon_button(icon_name: &str, label: &str) -> gtk::Button {
     let button = gtk::Button::from_icon_name(icon_name);
     set_icon_button(&button, icon_name, label);
@@ -1761,28 +1776,43 @@ fn flash_finished_selection_refusal(
     active: Option<u64>,
     message: String,
 ) {
-    let Some(label) = active
-        .and_then(|id| finished.iter().find(|block| block.id == id))
-        .map(|block| block.selection_hint.clone())
-    else {
+    flash_finished_selection_refusal_for(finished, active, message, SELECTION_REFUSAL_VISIBLE_FOR);
+}
+
+fn flash_finished_selection_refusal_for(
+    finished: &[FinishedBlock],
+    active: Option<u64>,
+    message: String,
+    visible_for: Duration,
+) {
+    let Some(block) = active.and_then(|id| finished.iter().find(|block| block.id == id)) else {
         return;
     };
-    let previous = label.text().to_string();
+    let label = block.selection_hint.clone();
+    let steady_hint = {
+        let mut steady = block.selection_hint_steady.borrow_mut();
+        if steady.is_empty() {
+            *steady = label.text().to_string();
+        }
+        steady.clone()
+    };
+    let generation = block.selection_feedback_generation.get().wrapping_add(1);
+    block.selection_feedback_generation.set(generation);
     label.set_text(&message);
     label.set_tooltip_text(Some(&message));
     label.update_property(&[gtk::accessible::Property::Label(&message)]);
     let weak = label.downgrade();
-    glib::timeout_add_local_once(SELECTION_REFUSAL_VISIBLE_FOR, move || {
+    let current_generation = block.selection_feedback_generation.clone();
+    glib::timeout_add_local_once(visible_for, move || {
+        if current_generation.get() != generation {
+            return;
+        }
         let Some(label) = weak.upgrade() else {
             return;
         };
-        // Selection movement or a newer refusal owns its newer text.
-        if label.text().as_str() != message {
-            return;
-        }
-        label.set_text(&previous);
+        label.set_text(&steady_hint);
         label.set_tooltip_text(None);
-        label.update_property(&[gtk::accessible::Property::Label(&previous)]);
+        label.update_property(&[gtk::accessible::Property::Label(&steady_hint)]);
     });
 }
 
@@ -1811,6 +1841,9 @@ fn sync_finished_block_selection(
         });
     let hint = finished_selection_hint(selected.len(), can_recall, active_command_is_rerunnable);
     for block in finished {
+        block
+            .selection_feedback_generation
+            .set(block.selection_feedback_generation.get().wrapping_add(1));
         let is_selected = selected.contains(&block.id);
         if is_selected {
             block.widget().add_css_class("block-selected");
@@ -1820,11 +1853,14 @@ fn sync_finished_block_selection(
 
         let is_active = active == Some(block.id);
         if is_active {
+            *block.selection_hint_steady.borrow_mut() = hint.clone();
             block.selection_hint.set_text(&hint);
             block.selection_hint.set_tooltip_text(None);
             block
                 .selection_hint
                 .update_property(&[gtk::accessible::Property::Label(&hint)]);
+        } else {
+            block.selection_hint_steady.borrow_mut().clear();
         }
         block.selection_hint.set_visible(is_active);
         if is_active {
@@ -2929,7 +2965,14 @@ impl VerifiedSubmissionCtx {
             return false;
         }
         let recall = build_command_recall(command, bracketed_paste);
-        if recall.is_empty() {
+        // Every history surface promises to insert the recorded command, not
+        // a plausible-looking prefix of it. The low-level paste encoder keeps
+        // an intentionally safe first-line fallback for ordinary clipboard
+        // text, but a history recall must fail closed when the shell has not
+        // advertised bracketed paste: silently turning a two-line command into
+        // its first line makes the success feedback untrue and can make the
+        // next manual Enter run something other than what the card records.
+        if recall.is_empty() || recall.risk.truncated_to_first_line {
             return false;
         }
         if let Err(error) = self.pty.try_write_bytes(&recall.bytes) {
@@ -6473,23 +6516,7 @@ impl RenderBackend for BlockBackend {
             let cross_selection = cross_selection_for_menu.borrow().clone();
             let selected_text = cross_selection
                 .as_ref()
-                .filter(|cross| cross.has_cross_selection())
-                .and_then(|cross| cross.copy_text())
-                .or_else(|| {
-                    // A cross-block drag `select_all`s every VTE in range, so
-                    // this two-VTE walk would truncate that case — hence the
-                    // aggregate above first.
-                    [
-                        &finished_menu_clone.output_vte,
-                        &finished_menu_clone.command_vte,
-                    ]
-                    .into_iter()
-                    .find_map(|vte| {
-                        vte.text_selected(vte4::Format::Text)
-                            .map(|text| text.to_string())
-                            .filter(|text| !text.is_empty())
-                    })
-                });
+                .map_or(Ok(None), |cross| cross.copy_text());
 
             {
                 // Kept deliberately: with an empty set `Copy Output` would set
@@ -6524,16 +6551,28 @@ impl RenderBackend for BlockBackend {
 
             let make_item = menu_item;
 
-            if let Some(text) = selected_text {
-                let item = make_item("Copy Selection");
-                let popover_c = popover.clone();
-                let vte_for_action = vte_for_copy.clone();
-                item.connect_clicked(move |_| {
-                    popover_c.popdown();
-                    vte_for_action.clipboard().set_text(&text);
-                });
-                vbox.append(&item);
-                vbox.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+            match selected_text {
+                Ok(Some(text)) => {
+                    let item = make_item("Copy Selection");
+                    let popover_c = popover.clone();
+                    let vte_for_action = vte_for_copy.clone();
+                    item.connect_clicked(move |_| {
+                        popover_c.popdown();
+                        vte_for_action.clipboard().set_text(&text);
+                    });
+                    vbox.append(&item);
+                    vbox.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+                }
+                Err(error) => {
+                    let item = make_item("Copy Selection (too large)");
+                    item.set_sensitive(false);
+                    let detail = format!("{error}. Nothing was copied.");
+                    item.set_tooltip_text(Some(&detail));
+                    item.update_property(&[gtk::accessible::Property::Description(&detail)]);
+                    vbox.append(&item);
+                    vbox.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+                }
+                _ => {}
             }
 
             let selected_count = selected_ids_for_menu.borrow().len();
@@ -6830,7 +6869,27 @@ impl RenderBackend for BlockBackend {
                 let bracketed_paste_for_action = bracketed_paste_for_rerun_menu.clone();
                 let verified_submission_for_action = verified_submission_for_rerun_menu.clone();
                 let active_for_action = active_for_rerun_menu.clone();
-                item.set_sensitive(verified_submission_for_action.can_recall_command());
+                let selected_recall_is_lossless = {
+                    let finished = finished_for_rerun.borrow();
+                    let selected = selected_ids_for_rerun.borrow();
+                    let command = selected_command_text(
+                        finished
+                            .iter()
+                            .map(|block| (block.id, block.cmd_text.as_str())),
+                        &selected,
+                    );
+                    selected_command_recall_is_lossless(&command, bracketed_paste_for_action.get())
+                };
+                item.set_sensitive(
+                    selected_recall_is_lossless
+                        && verified_submission_for_action.can_recall_command(),
+                );
+                if !selected_recall_is_lossless {
+                    const REASON: &str =
+                        "Bracketed paste is required to preserve every command line";
+                    item.set_tooltip_text(Some(REASON));
+                    item.update_property(&[gtk::accessible::Property::Description(REASON)]);
+                }
                 item.connect_clicked(move |_| {
                     popover_c.popdown();
                     let finished = finished_for_rerun.borrow();
@@ -12050,12 +12109,9 @@ impl TermView {
         });
     }
 
-    /// Copy selected text to clipboard.
-    /// Priority: (1) live VTE selection (alt-screen apps + idle input cell),
-    /// (2) any finished-block TextBuffer with an active selection, (3) PRIMARY
-    /// clipboard as a last-resort fallback. Step 2 is what makes Ctrl+Shift+C
-    /// work for mouse-selected text inside finished command/output views —
-    /// PRIMARY alone is unreliable across compositors (notably Wayland).
+    /// Copy selected text to clipboard. A visible native/cross-VTE highlight
+    /// wins over whole-card selection, because it is the narrower selection
+    /// the user can still see on screen.
     pub fn copy_to_clipboard(&self) {
         self.copy_to_clipboard_with_modifier(false);
     }
@@ -12065,27 +12121,10 @@ impl TermView {
     /// [`Self::copy_to_clipboard_with_modifier`], so a greyed-out Copy and a
     /// Copy that does nothing cannot disagree.
     pub(crate) fn has_copyable_selection(&self) -> bool {
-        if !self.selected_block_ids.borrow().is_empty() {
+        if self.cross_selection.has_text_selection() {
             return true;
         }
-        if self.cross_selection.has_cross_selection() {
-            return true;
-        }
-        if self
-            .active_vte
-            .text_selected(vte4::Format::Text)
-            .is_some_and(|text| !text.is_empty())
-        {
-            return true;
-        }
-        self.finished_blocks.borrow().iter().any(|block| {
-            [&block.output_vte, &block.command_vte]
-                .into_iter()
-                .any(|vte| {
-                    vte.text_selected(vte4::Format::Text)
-                        .is_some_and(|text| !text.is_empty())
-                })
-        })
+        !self.selected_block_ids.borrow().is_empty()
     }
 
     /// Say so, once, when this pane's shell is not reporting command
@@ -12357,7 +12396,29 @@ impl TermView {
     pub fn copy_to_clipboard_with_modifier(&self, alt_held: bool) {
         log::debug!(">>> TermView::copy_to_clipboard called (alt={})", alt_held);
 
-        // (0) Whole-block selection (Warp's CopyBlock; +Alt → output only).
+        // A visible native or cross-widget text selection is more specific
+        // than card selection and therefore wins. The aggregator reads every
+        // tracked VTE in document order, including a single ordinary drag.
+        match self.cross_selection.copy_text() {
+            Ok(Some(text)) => {
+                log::debug!(
+                    ">>> TermView copy: got {} chars from visible text selection",
+                    text.len()
+                );
+                self.active_vte.clipboard().set_text(&text);
+                self.selection_feed_hold.flush_now();
+                return;
+            }
+            Err(error) => {
+                log::warn!("refused oversized VTE selection copy: {error}");
+                show_clipboard_failure(&self.active_vte, &format!("{error}. Nothing was copied."));
+                self.selection_feed_hold.flush_now();
+                return;
+            }
+            Ok(None) => {}
+        }
+
+        // Whole-block selection (Warp's CopyBlock; +Alt → output only).
         // Multi-selection copies blocks in terminal order with one blank line between
         // them, so the clipboard preserves the same visual grouping as the canvas.
         {
@@ -12383,67 +12444,9 @@ impl TermView {
             }
         }
 
-        // (0.5) Cross-block drag: if more than one VTE has a selection (the
-        // user dragged across block boundaries, see cross_selection.rs), copy
-        // the concatenated text in widget order instead of just one widget's.
-        if self.cross_selection.has_cross_selection() {
-            match self.cross_selection.copy_text() {
-                Some(text) => {
-                    log::debug!(
-                        ">>> TermView copy: got {} chars from cross-block selection",
-                        text.len()
-                    );
-                    self.active_vte.clipboard().set_text(&text);
-                }
-                None => {
-                    // Aggregation is deliberately atomic. Falling through to a
-                    // single VTE here would silently copy only part of an
-                    // oversized cross-surface selection.
-                    log::warn!(
-                        "Cross-block selection exceeds the clipboard safety limit; copied nothing"
-                    );
-                }
-            }
-            self.selection_feed_hold.flush_now();
-            return;
-        }
-
-        // (1) Live VTE selection
-        if let Some(text) = self.active_vte.text_selected(vte4::Format::Text) {
-            if !text.is_empty() {
-                log::debug!(">>> TermView copy: got {} chars from VTE", text.len());
-                self.active_vte.clipboard().set_text(&text);
-                self.selection_feed_hold.flush_now();
-                return;
-            }
-        }
-
-        // (2) Finished-block VTEs (output_vte / command_vte). GTK4 selection is
-        // per-widget so only one block can have a live selection at a time —
-        // that's the one we copy.
-        for blk in self.finished_blocks.borrow().iter() {
-            for vte in [&blk.output_vte, &blk.command_vte] {
-                if let Some(text) = vte.text_selected(vte4::Format::Text) {
-                    let s = text.to_string();
-                    if !s.is_empty() {
-                        log::debug!(
-                            ">>> TermView copy: got {} chars from finished block VTE",
-                            s.len()
-                        );
-                        self.active_vte.clipboard().set_text(&s);
-                        self.selection_feed_hold.flush_now();
-                        return;
-                    }
-                }
-            }
-        }
-
-        // No live VTE / finished-block selection. We deliberately do NOT
-        // fall back to PRIMARY — on Wayland it is empty for our own widgets
-        // anyway, and on X11 GTK already mirrors widget selections into both
-        // clipboards so the path was never actually load-bearing. Bailing out
-        // here keeps Ctrl+Shift+C deterministic: it copies what the user can
-        // see is selected, and only that.
+        // No visible text or whole-card selection. Do not fall back to PRIMARY:
+        // it is unreliable on Wayland and can copy text that is no longer shown
+        // as selected.
         log::debug!(">>> TermView copy: no selection found, nothing to copy");
     }
 
@@ -13453,11 +13456,11 @@ mod tests {
     use crate::agent::{AgentExecutionRef, AgentSession};
     use crate::config::Config;
     use crate::parser::{ColorKind, CommandMeta, KeyboardProtocolQuery, ParserEvent};
-    use relm4::gtk::gdk::RGBA;
+    use relm4::gtk::{gdk::RGBA, glib};
     use std::cell::{Cell, RefCell};
     use std::collections::{HashSet, VecDeque};
     use std::rc::Rc;
-    use std::time::{Instant, SystemTime};
+    use std::time::{Duration, Instant, SystemTime};
 
     #[test]
     fn a_quoted_directory_survives_everything_a_filesystem_allows() {
@@ -18986,6 +18989,77 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires DISPLAY"]
+    fn refusal_feedback_refreshes_and_only_the_latest_status_restores() {
+        use relm4::gtk::prelude::*;
+
+        relm4::gtk::init().expect("gtk init");
+        let config = Config::safe_defaults();
+        let card = super::FinishedBlock::new(
+            91,
+            "$ ",
+            "cargo test",
+            None,
+            "ok\r\n",
+            Some(0),
+            &config,
+            Some(5),
+            None,
+            None,
+            80,
+        );
+        let selected: super::SelectedBlockIds = Rc::new(RefCell::new(HashSet::from([91])));
+        let active = Rc::new(Cell::new(Some(91)));
+        super::sync_finished_block_selection(std::slice::from_ref(&card), &selected, &active);
+        let message = "Esc cancel  ·  Prompt has input  ·  nothing run".to_string();
+        super::flash_finished_selection_refusal_for(
+            std::slice::from_ref(&card),
+            Some(91),
+            message.clone(),
+            Duration::from_millis(30),
+        );
+        assert_eq!(card.selection_hint.text().as_str(), message);
+        assert_eq!(
+            card.selection_hint.tooltip_text().as_deref(),
+            Some(message.as_str())
+        );
+        assert_eq!(
+            card.selection_hint.accessible_role(),
+            relm4::gtk::AccessibleRole::Status
+        );
+
+        let run_for = |millis| {
+            let loop_ = glib::MainLoop::new(None, false);
+            let quit = loop_.clone();
+            glib::timeout_add_local_once(Duration::from_millis(millis), move || quit.quit());
+            loop_.run();
+        };
+
+        run_for(10);
+        super::flash_finished_selection_refusal_for(
+            std::slice::from_ref(&card),
+            Some(91),
+            message.clone(),
+            Duration::from_millis(70),
+        );
+        run_for(30);
+        assert_eq!(card.selection_hint.text().as_str(), message);
+
+        let newer = "Esc cancel  ·  Command running  ·  nothing recalled".to_string();
+        super::flash_finished_selection_refusal_for(
+            std::slice::from_ref(&card),
+            Some(91),
+            newer.clone(),
+            Duration::from_millis(70),
+        );
+        run_for(40);
+        assert_eq!(card.selection_hint.text().as_str(), newer);
+        run_for(40);
+        assert_eq!(card.selection_hint.text(), super::SELECTION_HINT_RUN);
+        assert_eq!(card.selection_hint.tooltip_text(), None);
+    }
+
+    #[test]
     fn selection_mode_consumes_ctrl_enter_even_when_rerun_refuses() {
         assert!(!super::block_selection_owns_ctrl_enter(None, 0));
         assert!(super::block_selection_owns_ctrl_enter(Some(7), 1));
@@ -19042,6 +19116,22 @@ mod tests {
         assert_eq!(&*harness.ctx.typed_cmd_rc.borrow(), "echo history");
         assert!(harness.ctx.idle_input_dirty_rc.get());
         assert!(harness.ctx.pty_synced_rc.get());
+    }
+
+    #[test]
+    fn every_history_recall_refuses_a_lossy_first_line_fallback() {
+        let harness = ReaderHarness::new();
+        harness.arm_verified_prompt();
+        let _ = harness.pty.drain_test_slave(PTY_REPLY_WAIT);
+
+        assert!(!harness
+            .ctx
+            .verified_submission
+            .try_recall_command("printf one\nprintf two", false));
+        assert!(harness.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty());
+        assert!(harness.ctx.typed_cmd_rc.borrow().is_empty());
+        assert!(!harness.ctx.idle_input_dirty_rc.get());
+        assert!(!harness.ctx.pty_synced_rc.get());
     }
 
     #[test]

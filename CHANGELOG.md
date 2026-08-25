@@ -42,6 +42,14 @@ versioning for tagged releases while it remains experimental.
   preventing Tab or stale focus from activating an invisible control. Delete is
   intentionally not advertised until a grouped
   removal plus undo transaction exists.
+- Visible text selection now outranks whole-card selection when copying: a
+  highlighted range in one command/output/live VTE or across several VTEs is
+  aggregated in document order before Block-card fallback. Oversized text is
+  rejected atomically with visible feedback instead of silently copying a card
+  or partial range. Repeated selection refusals also refresh one generation-owned
+  status lifetime, so older timers cannot hide or resurrect stale messages.
+  Every header, menu, and selection recall also refuses multiline history when
+  missing bracketed paste would reduce it to a misleading first-line prefix.
 - The cross-block search palette (`Ctrl+Shift+G`) gained **Failed** and **Slow**
   toggles and an outcome column. The two predicates already existed with no
   surface that could reach them, so "which failing build took over a second" was

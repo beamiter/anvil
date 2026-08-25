@@ -569,6 +569,10 @@ pub(crate) struct FinishedBlock {
     /// It sits before the expanding spacer so showing it consumes slack rather
     /// than shifting timestamp/status metadata.
     pub(crate) selection_hint: gtk::Label,
+    /// Persistent selection legend, independent of transient refusal text.
+    pub(crate) selection_hint_steady: Rc<RefCell<String>>,
+    /// Only the newest refusal timeout may restore the steady legend.
+    pub(crate) selection_feedback_generation: Rc<Cell<u64>>,
     /// Fold or unfold this card's output, and whether it is folded now. Same
     /// exposure as `toggle_filter`, for the menu item and the keyboard action.
     pub(crate) toggle_collapsed: Rc<dyn Fn()>,
@@ -637,6 +641,8 @@ impl Clone for FinishedBlock {
             header_row: self.header_row.clone(),
             action_box: self.action_box.clone(),
             selection_hint: self.selection_hint.clone(),
+            selection_hint_steady: self.selection_hint_steady.clone(),
+            selection_feedback_generation: self.selection_feedback_generation.clone(),
             toggle_collapsed: self.toggle_collapsed.clone(),
             collapsed_state: self.collapsed_state.clone(),
             toggle_filter: self.toggle_filter.clone(),
@@ -4186,6 +4192,8 @@ impl FinishedBlock {
             header_row,
             action_box,
             selection_hint,
+            selection_hint_steady: Rc::new(RefCell::new(String::new())),
+            selection_feedback_generation: Rc::new(Cell::new(0)),
             toggle_collapsed,
             collapsed_state,
             toggle_filter,
@@ -4587,11 +4595,21 @@ impl FinishedBlock {
         let active_for_rerun = active.clone();
         let cmd_for_rerun = self.cmd_text.clone();
         self.rerun_btn.connect_clicked(move |btn| {
+            let recall_is_lossless = super::selected_command_recall_is_lossless(
+                &cmd_for_rerun,
+                bracketed_paste_for_rerun.get(),
+            );
             if verified_submission_for_rerun
                 .try_recall_command(&cmd_for_rerun, bracketed_paste_for_rerun.get())
             {
                 active_for_rerun.borrow().grab_focus();
                 flash_button_icon(btn, "emblem-ok-symbolic", "Command inserted");
+            } else if !recall_is_lossless {
+                flash_button_icon(
+                    btn,
+                    "dialog-warning-symbolic",
+                    "Bracketed paste required for multiline command",
+                );
             } else {
                 flash_button_icon(
                     btn,

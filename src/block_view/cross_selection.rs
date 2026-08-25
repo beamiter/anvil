@@ -32,23 +32,44 @@ use super::{
 
 const MAX_CROSS_SELECTION_BYTES: usize = 32 * 1024 * 1024;
 
-fn append_selected_text(output: &mut String, text: &str, max_bytes: usize) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SelectionTextTooLarge {
+    bytes: usize,
+    limit: usize,
+}
+
+impl std::fmt::Display for SelectionTextTooLarge {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "selected text is {} bytes; the limit is {} bytes",
+            self.bytes, self.limit
+        )
+    }
+}
+
+fn append_selected_text(
+    output: &mut String,
+    text: &str,
+    max_bytes: usize,
+) -> Result<(), SelectionTextTooLarge> {
     let separator = usize::from(!output.is_empty());
-    let Some(next_len) = output
+    let next_len = output
         .len()
         .checked_add(separator)
         .and_then(|length| length.checked_add(text.len()))
-    else {
-        return false;
-    };
+        .unwrap_or(usize::MAX);
     if next_len > max_bytes {
-        return false;
+        return Err(SelectionTextTooLarge {
+            bytes: next_len,
+            limit: max_bytes,
+        });
     }
     if separator != 0 {
         output.push('\n');
     }
     output.push_str(text);
-    true
+    Ok(())
 }
 
 pub(crate) struct CrossSelection {
@@ -300,10 +321,11 @@ impl CrossSelection {
         }
     }
 
-    /// Collect text from every VTE that currently has a selection, in widget
-    /// order, joined with newlines. Used by Ctrl+Shift+C when more than one
-    /// VTE is selected (e.g. after a cross-block drag).
-    pub(crate) fn copy_text(&self) -> Option<String> {
+    /// Collect every visible native or cross-widget VTE selection in document
+    /// order. A single output-line drag is just as authoritative as a
+    /// cross-block drag: callers use this before the whole-card selection so
+    /// Ctrl+Shift+C copies the smaller highlight the user can still see.
+    pub(crate) fn copy_text(&self) -> Result<Option<String>, SelectionTextTooLarge> {
         let mut output = String::new();
         for vte in self.ordered_vtes() {
             if !vte.has_selection() {
@@ -311,35 +333,22 @@ impl CrossSelection {
             }
             if let Some(text) = vte.text_selected(vte4::Format::Text) {
                 let s = text.to_string();
-                if !s.is_empty()
-                    && !append_selected_text(&mut output, &s, MAX_CROSS_SELECTION_BYTES)
-                {
-                    // Never return a partial selection: it could silently omit
-                    // the command/output region the user intended to copy.
-                    return None;
+                if !s.is_empty() {
+                    append_selected_text(&mut output, &s, MAX_CROSS_SELECTION_BYTES)?;
                 }
             }
         }
         if output.is_empty() {
-            None
+            Ok(None)
         } else {
-            Some(output)
+            Ok(Some(output))
         }
     }
 
-    /// True when at least two VTEs are currently selected — the signal that
-    /// `copy_text()` is preferable to a single-widget VTE read.
-    pub(crate) fn has_cross_selection(&self) -> bool {
-        let mut count = 0;
-        for vte in self.ordered_vtes() {
-            if vte.has_selection() {
-                count += 1;
-                if count >= 2 {
-                    return true;
-                }
-            }
-        }
-        false
+    pub(crate) fn has_text_selection(&self) -> bool {
+        self.ordered_vtes()
+            .into_iter()
+            .any(|vte| vte.has_selection())
     }
 }
 
@@ -366,14 +375,81 @@ fn widget_contains(haystack: &impl IsA<gtk::Widget>, needle: &gtk::Widget) -> bo
 
 #[cfg(test)]
 mod tests {
-    use super::append_selected_text;
+    use super::{append_selected_text, CrossSelection};
 
     #[test]
     fn selected_text_aggregation_is_bounded_and_atomic() {
         let mut output = "first".to_owned();
-        assert!(append_selected_text(&mut output, "two", 9));
+        assert!(append_selected_text(&mut output, "two", 9).is_ok());
         assert_eq!(output, "first\ntwo");
-        assert!(!append_selected_text(&mut output, "x", 9));
+        assert!(append_selected_text(&mut output, "x", 9).is_err());
         assert_eq!(output, "first\ntwo");
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn a_single_native_text_selection_survives_whole_card_selection_precedence() {
+        use std::cell::{Cell, RefCell};
+        use std::collections::HashSet;
+        use std::rc::Rc;
+
+        use gtk::prelude::*;
+        use relm4::gtk;
+        use vte4::TerminalExt;
+
+        use crate::block_view::{BlockState, FinishedBlock, MouseReportingMode, SelectionFeedHold};
+        use crate::config::Config;
+
+        gtk::init().expect("gtk init");
+        let card = FinishedBlock::new(
+            41,
+            "$ ",
+            "whole-card command",
+            None,
+            "visible needle\r\nother output\r\n",
+            Some(0),
+            &Config::safe_defaults(),
+            Some(5),
+            None,
+            None,
+            80,
+        );
+        let active = vte4::Terminal::new();
+        let selected = Rc::new(RefCell::new(HashSet::from([41])));
+        let cross = CrossSelection {
+            finished_blocks: Rc::new(RefCell::new(vec![card.clone()])),
+            active_vte: active.clone(),
+            selected_block_ids: selected,
+            selected_block_id: Rc::new(Cell::new(Some(41))),
+            selection_anchor_id: Rc::new(Cell::new(Some(41))),
+            start_idx: Cell::new(None),
+            claimed: Cell::new(false),
+            feed_hold: SelectionFeedHold::new(),
+            bstate: Rc::new(Cell::new(BlockState::AwaitingCommand)),
+            mouse_reporting: Rc::new(Cell::new(MouseReportingMode::None)),
+        };
+
+        let pane = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        pane.append(card.widget());
+        pane.append(&active);
+        let window = gtk::Window::builder().child(&pane).build();
+        window.present();
+        while gtk::glib::MainContext::default().iteration(false) {}
+
+        card.output_vte.select_all();
+        while gtk::glib::MainContext::default().iteration(false) {}
+        assert!(cross.has_text_selection());
+        let copied = cross
+            .copy_text()
+            .expect("selection is below the clipboard cap")
+            .expect("native selection is visible");
+        assert!(copied.contains("visible needle"));
+        assert!(
+            !copied.contains("whole-card command"),
+            "the native output highlight must win over the active whole-card selection"
+        );
+
+        window.close();
+        while gtk::glib::MainContext::default().iteration(false) {}
     }
 }
