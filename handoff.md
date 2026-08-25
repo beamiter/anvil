@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-25 (shared SID and core-owned Agent claim durability)
+Updated: 2026-08-25 (single-interpretation session restore)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -12,6 +12,17 @@ captured, queued, written, and restored.
 
 ## Completed since the previous handoff
 
+- **Single-interpretation session restore (2026-08-25)**: every bounded legacy
+  workspace, pane-layout, and versioned-envelope decode now runs through
+  `jterm_core::bounded_json::validate_no_duplicate_members` before the existing
+  allocation-budgeted seeds. This closes the last-wins behavior inherent in
+  the hand-written `MapAccess` visitors for repeated `sid`, cwd, layout,
+  payload, or supersession fields, and also rejects escaped-equivalent names
+  and duplicates inside ignored future objects. The private serde_json RawValue
+  sentinel is reserved so feature unification cannot reopen unchecked JSON.
+  The shared preflight retains no decoded value tree and never reflects an
+  untrusted member name.
+
 - **Shared jsh session identity (2026-08-25)**: configured and persisted pane
   identities now use `jterm_core`'s exact 1..=128-byte ASCII
   `[A-Za-z0-9_-]` contract. Unicode, dotted, spaced, or otherwise
@@ -20,8 +31,8 @@ captured, queued, written, and restored.
   neither case can forward an invalid identity to `jsh`.
 
 - **Core-owned Agent claim durability (2026-08-25)**: the exact core pin is now
-  `852d33d197d3a46becc76a3b85c13f981506a61c` (transitively jagent
-  `2570e5e9324d1fb6823e731b53e7ea9a6033177a`). Core durably retires the public
+  `21437ba6f0cb85e74d4ce2a03ef1857de2c55d9d` (transitively jagent
+  `a462ec81f3a4c6ad85a455780ced232172f127ea`). Core durably retires the public
   snapshot name before exposing `SessionClaim::Restored` and owns the later
   cleanup sync, so anvil removed its redundant post-restore sync failure gate
   and test-only injection seam. Cargo and Nix source identities move together.

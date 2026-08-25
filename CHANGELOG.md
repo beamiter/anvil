@@ -7,6 +7,13 @@ versioning for tagged releases while it remains experimental.
 
 ### Added
 
+- Session restore now rejects duplicate JSON object members recursively before
+  interpreting envelope, saved-session, or pane-layout data, including escaped
+  spellings of the same key and duplicate members inside future extension
+  objects. Restore inputs remain byte-budgeted and malformed snapshots fail
+  closed, and serde_json's private RawValue sentinel is reserved so feature
+  unification cannot reopen unchecked JSON. The shared boundary is pinned to
+  `jterm_core` `21437ba` (and its transitive `jagent` `a462ec8`).
 - A fresh, empty Block pane now shows one accessible orientation card explaining
   reusable completed cards, header selection, right-click actions, and
   `Ctrl+Shift+G` search. The first accepted human input, completion, or restored

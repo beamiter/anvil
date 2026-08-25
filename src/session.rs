@@ -1420,6 +1420,11 @@ impl<'de> serde::de::Visitor<'de> for EnvelopePayloadSeed<'_> {
 
 /// Decode a bare legacy snapshot under the restore budgets.
 fn decode_saved_session(contents: &str) -> Result<SavedSession, serde_json::Error> {
+    jterm_core::bounded_json::validate_no_duplicate_members(contents.as_bytes())?;
+    decode_saved_session_after_preflight(contents)
+}
+
+fn decode_saved_session_after_preflight(contents: &str) -> Result<SavedSession, serde_json::Error> {
     let mut budget = RestoreBudget {
         remaining_panes: MAX_RESTORED_PANES_TOTAL,
     };
@@ -1436,6 +1441,7 @@ fn decode_saved_session(contents: &str) -> Result<SavedSession, serde_json::Erro
 
 #[cfg(test)]
 fn decode_pane_layout(contents: &str) -> Result<PaneLayout, serde_json::Error> {
+    jterm_core::bounded_json::validate_no_duplicate_members(contents.as_bytes())?;
     let mut budget = RestoreBudget {
         remaining_panes: MAX_RESTORED_PANES_TOTAL,
     };
@@ -1455,6 +1461,13 @@ fn decode_pane_layout(contents: &str) -> Result<PaneLayout, serde_json::Error> {
 
 /// Decode a versioned envelope under the restore budgets.
 fn decode_session_envelope(contents: &str) -> Result<DecodedEnvelope, serde_json::Error> {
+    jterm_core::bounded_json::validate_no_duplicate_members(contents.as_bytes())?;
+    decode_session_envelope_after_preflight(contents)
+}
+
+fn decode_session_envelope_after_preflight(
+    contents: &str,
+) -> Result<DecodedEnvelope, serde_json::Error> {
     let mut deserializer = serde_json::Deserializer::from_str(contents);
     let envelope = serde::de::DeserializeSeed::deserialize(EnvelopeSeed, &mut deserializer)?;
     deserializer.end()?;
@@ -2129,7 +2142,15 @@ fn parse_snapshot_payload(
     dir: &Path,
     source_file: &StateFileName,
 ) -> io::Result<(SnapshotState, Option<ClaimReference>)> {
-    match decode_session_envelope(contents) {
+    jterm_core::bounded_json::validate_no_duplicate_members(contents.as_bytes()).map_err(
+        |error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("ambiguous session snapshot: {error}"),
+            )
+        },
+    )?;
+    match decode_session_envelope_after_preflight(contents) {
         Ok(envelope) => {
             if envelope.format != SESSION_ENVELOPE_FORMAT
                 || envelope.version != SESSION_ENVELOPE_VERSION
@@ -2163,7 +2184,8 @@ fn parse_snapshot_payload(
             Ok((state, supersedes))
         }
         Err(envelope_error) => {
-            let mut session = decode_saved_session(contents).map_err(|legacy_error| {
+            let mut session =
+                decode_saved_session_after_preflight(contents).map_err(|legacy_error| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
@@ -3701,6 +3723,46 @@ mod tests {
             let decoded = decode_pane_layout(&encoded).unwrap();
             assert!(matches!(decoded, PaneLayout::Leaf { sid: None, .. }));
         }
+    }
+
+    #[test]
+    fn snapshot_decoders_reject_duplicate_members_at_every_depth() {
+        fn duplicate_error<T>(result: Result<T, serde_json::Error>) -> String {
+            match result {
+                Ok(_) => panic!("ambiguous snapshot unexpectedly decoded"),
+                Err(error) => error.to_string(),
+            }
+        }
+
+        for error in [
+            duplicate_error(decode_saved_session(
+                r#"{"active":0,"tabs":[{"title":"tab","custom_title":false,"layout":{"type":"leaf","mode":"block","sid":"first","sid":"second"}}]}"#,
+            )),
+            duplicate_error(decode_saved_session(
+                r#"{"active":0,"tabs":[],"future":{"scope":"read","scope":"write"}}"#,
+            )),
+            duplicate_error(decode_session_envelope(
+                r#"{"format":"future","version":1,"payload":{"kind":"empty","k\u0069nd":"workspace"}}"#,
+            )),
+        ] {
+            assert!(error.contains("duplicate JSON object member"), "{error}");
+            assert!(!error.contains("sid"), "{error}");
+            assert!(!error.contains("scope"), "{error}");
+            assert!(!error.contains("kind"), "{error}");
+        }
+    }
+
+    #[test]
+    fn snapshot_decoders_reject_serde_json_raw_value_sentinel() {
+        let error = match decode_saved_session(
+            r#"{"active":0,"tabs":[],"future":{"$serde_json::private::RawValue":"{\"scope\":\"read\",\"scope\":\"write\"}"}}"#,
+        ) {
+            Ok(_) => panic!("reserved serde_json sentinel unexpectedly decoded"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("reserved JSON object member"), "{error}");
+        assert!(!error.contains("RawValue"), "{error}");
+        assert!(!error.contains("scope"), "{error}");
     }
 
     #[test]
