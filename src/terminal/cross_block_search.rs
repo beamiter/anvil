@@ -57,7 +57,7 @@ fn memory(
 }
 
 fn idle_status() -> &'static str {
-    "Type to search across blocks. Shift+Enter jumps and advances."
+    "Type to search. Shift+Enter jumps and advances; Ctrl+Shift+U resets."
 }
 
 fn search_status(total: usize, selected: Option<usize>) -> String {
@@ -220,6 +220,9 @@ pub(super) fn toggle(
         .build();
     let scope_dropdown = gtk::DropDown::from_strings(&["All", "Cmd", "Out"]);
     scope_dropdown.set_tooltip_text(Some("Search all text, commands only, or output only"));
+    let reset_button = gtk::Button::with_label("Reset");
+    reset_button.set_tooltip_text(Some("Reset query, matching options, scope, and filters"));
+    header_bar.pack_start(&reset_button);
     header_bar.pack_end(&scope_dropdown);
     header_bar.pack_end(&whole_word_toggle);
     header_bar.pack_end(&regex_toggle);
@@ -444,27 +447,70 @@ pub(super) fn toggle(
     }
     {
         let schedule_rebuild = schedule_rebuild.clone();
-        regex_toggle.connect_toggled(move |_| schedule_rebuild());
+        let filter_entry = filter_entry.clone();
+        regex_toggle.connect_toggled(move |_| {
+            schedule_rebuild();
+            filter_entry.grab_focus();
+        });
     }
     {
         let schedule_rebuild = schedule_rebuild.clone();
-        case_toggle.connect_toggled(move |_| schedule_rebuild());
+        let filter_entry = filter_entry.clone();
+        case_toggle.connect_toggled(move |_| {
+            schedule_rebuild();
+            filter_entry.grab_focus();
+        });
     }
     {
         let schedule_rebuild = schedule_rebuild.clone();
-        whole_word_toggle.connect_toggled(move |_| schedule_rebuild());
+        let filter_entry = filter_entry.clone();
+        whole_word_toggle.connect_toggled(move |_| {
+            schedule_rebuild();
+            filter_entry.grab_focus();
+        });
     }
     {
         let schedule_rebuild = schedule_rebuild.clone();
-        scope_dropdown.connect_selected_notify(move |_| schedule_rebuild());
+        let filter_entry = filter_entry.clone();
+        scope_dropdown.connect_selected_notify(move |_| {
+            schedule_rebuild();
+            filter_entry.grab_focus();
+        });
     }
     {
         let schedule_rebuild = schedule_rebuild.clone();
-        failed_toggle.connect_toggled(move |_| schedule_rebuild());
+        let filter_entry = filter_entry.clone();
+        failed_toggle.connect_toggled(move |_| {
+            schedule_rebuild();
+            filter_entry.grab_focus();
+        });
     }
     {
         let schedule_rebuild = schedule_rebuild.clone();
-        slow_toggle.connect_toggled(move |_| schedule_rebuild());
+        let filter_entry = filter_entry.clone();
+        slow_toggle.connect_toggled(move |_| {
+            schedule_rebuild();
+            filter_entry.grab_focus();
+        });
+    }
+    {
+        let filter_entry = filter_entry.clone();
+        let case_toggle = case_toggle.clone();
+        let regex_toggle = regex_toggle.clone();
+        let whole_word_toggle = whole_word_toggle.clone();
+        let scope_dropdown = scope_dropdown.clone();
+        let failed_toggle = failed_toggle.clone();
+        let slow_toggle = slow_toggle.clone();
+        reset_button.connect_clicked(move |_| {
+            filter_entry.set_text("");
+            case_toggle.set_active(false);
+            regex_toggle.set_active(false);
+            whole_word_toggle.set_active(false);
+            scope_dropdown.set_selected(crate::block_view::CrossBlockSearchScope::All.index());
+            failed_toggle.set_active(false);
+            slow_toggle.set_active(false);
+            filter_entry.grab_focus();
+        });
     }
 
     let jump = {
@@ -547,6 +593,7 @@ pub(super) fn toggle(
         let regex_toggle = regex_toggle.clone();
         let whole_word_toggle = whole_word_toggle.clone();
         let scope_dropdown = scope_dropdown.clone();
+        let reset_button = reset_button.clone();
         key_controller.connect_key_pressed(move |_, key, _, state| {
             use gtk::gdk::{Key, ModifierType};
             if key == Key::Escape
@@ -558,8 +605,12 @@ pub(super) fn toggle(
             }
             if state.contains(ModifierType::CONTROL_MASK) {
                 if matches!(key, Key::u | Key::U) {
-                    filter_entry.set_text("");
-                    filter_entry.grab_focus();
+                    if state.contains(ModifierType::SHIFT_MASK) {
+                        reset_button.emit_clicked();
+                    } else {
+                        filter_entry.set_text("");
+                        filter_entry.grab_focus();
+                    }
                     return gtk::glib::Propagation::Stop;
                 }
                 let toggle = match key {
@@ -656,7 +707,7 @@ pub(super) fn toggle(
     let parent = view.widget();
     dialog.present(Some(&parent));
     if !remembered.query.is_empty() {
-        rebuild();
+        schedule_rebuild();
     }
     filter_entry.grab_focus();
 }
@@ -810,7 +861,7 @@ mod tests {
     fn continuous_review_advances_only_after_a_live_jump() {
         assert_eq!(
             idle_status(),
-            "Type to search across blocks. Shift+Enter jumps and advances."
+            "Type to search. Shift+Enter jumps and advances; Ctrl+Shift+U resets."
         );
         assert!(should_step(JumpOutcome::Close, true));
         assert!(!should_step(JumpOutcome::Close, false));

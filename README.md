@@ -288,8 +288,10 @@ hits still open their snapshot, while unavailable hits stay selected with a
 diagnostic instead of fake-stepping.
 Reopening restores the last valid query, matching controls, scope, and
 Failed/Slow filters for this pane's process lifetime only; nothing is written
-to config or session snapshots. `Ctrl+U` clears the query explicitly, and an
-invalid query above 8 KiB is never remembered.
+to config or session snapshots. `Ctrl+U` clears only the query; **Reset** or
+`Ctrl+Shift+U` restores the query, matching controls, scope, and both filters
+to defaults. An invalid query above 8 KiB is never remembered, and activating
+any control with the pointer returns focus to the query for uninterrupted typing.
 
 Unified mode keeps one continuous VTE scrollback while retaining authenticated
 command zones, status chrome, bounded per-zone output snapshots, search/export,
