@@ -113,6 +113,25 @@ fn selection_index(current: Option<usize>, total: usize, movement: SelectionMove
     })
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SelectionAnchor {
+    hit: CrossBlockHit,
+    index: usize,
+}
+
+/// Preserve exact row identity across a background refresh. When retention
+/// removed that hit, fall back to the closest surviving rank; only a changed
+/// search intent (no anchor) intentionally restarts at the first row.
+fn refresh_selection_index(results: &[CrossBlockHit], anchor: Option<&SelectionAnchor>) -> usize {
+    if results.is_empty() {
+        return 0;
+    }
+    anchor
+        .and_then(|anchor| results.iter().position(|hit| hit == &anchor.hit))
+        .or_else(|| anchor.map(|anchor| anchor.index.min(results.len() - 1)))
+        .unwrap_or(0)
+}
+
 /// What the palette does with one activated hit. Every arm of
 /// [`RecordNavigationResult`] resolves to exactly one of these: a record the
 /// view could reach, or could only show a snapshot of, always closes the
@@ -292,7 +311,7 @@ pub(super) fn toggle(
     dialog.set_child(Some(&toolbar_view));
 
     let hits: Rc<RefCell<Vec<CrossBlockHit>>> = Rc::new(RefCell::new(Vec::new()));
-    let retained_hit: Rc<RefCell<Option<CrossBlockHit>>> = Rc::new(RefCell::new(None));
+    let retained_hit: Rc<RefCell<Option<SelectionAnchor>>> = Rc::new(RefCell::new(None));
     let pending_rebuild: Rc<RefCell<Option<gtk::glib::SourceId>>> = Rc::new(RefCell::new(None));
     let search_generation = Rc::new(Cell::new(0_u64));
     {
@@ -320,7 +339,21 @@ pub(super) fn toggle(
         let retained_hit = retained_hit.clone();
         Rc::new(move || {
             let query = filter_entry.text().to_string();
-            let retained_hit = retained_hit.borrow_mut().take();
+            // The stale rows remain navigable during the refresh debounce.
+            // Capture again when the rebuild actually executes so a key move
+            // in that interval becomes the selection we restore.
+            let retained_hit = retained_hit.borrow_mut().take().map(|scheduled| {
+                list_box
+                    .selected_row()
+                    .and_then(|row| {
+                        let index = row.index() as usize;
+                        hits.borrow()
+                            .get(index)
+                            .cloned()
+                            .map(|hit| SelectionAnchor { hit, index })
+                    })
+                    .unwrap_or(scheduled)
+            });
             let options = crate::block_view::CrossBlockSearchOptions {
                 case_sensitive: case_toggle.is_active(),
                 regex: regex_toggle.is_active(),
@@ -393,9 +426,7 @@ pub(super) fn toggle(
                         }
                         list_box.append(&row);
                     }
-                    let selected = retained_hit
-                        .and_then(|retained| results.iter().position(|hit| hit == &retained))
-                        .unwrap_or(0);
+                    let selected = refresh_selection_index(&results, retained_hit.as_ref());
                     *hits.borrow_mut() = results;
                     list_box.select_row(list_box.row_at_index(selected as i32).as_ref());
                 }
@@ -424,9 +455,13 @@ pub(super) fn toggle(
             }
 
             *retained_hit.borrow_mut() = if preserve_selection {
-                list_box
-                    .selected_row()
-                    .and_then(|row| hits.borrow().get(row.index() as usize).cloned())
+                list_box.selected_row().and_then(|row| {
+                    let index = row.index() as usize;
+                    hits.borrow()
+                        .get(index)
+                        .cloned()
+                        .map(|hit| SelectionAnchor { hit, index })
+                })
             } else {
                 None
             };
@@ -768,9 +803,9 @@ pub(super) fn toggle(
 #[cfg(test)]
 mod tests {
     use super::{
-        hit_outcome_label, idle_status, jump_outcome, memory, query_error, refresh_status,
-        search_status, selection_index, should_step, CrossBlockHit, JumpOutcome,
-        RecordNavigationResult, SelectionMove, CROSS_BLOCK_SEARCH_DEBOUNCE,
+        hit_outcome_label, idle_status, jump_outcome, memory, query_error, refresh_selection_index,
+        refresh_status, search_status, selection_index, should_step, CrossBlockHit, JumpOutcome,
+        RecordNavigationResult, SelectionAnchor, SelectionMove, CROSS_BLOCK_SEARCH_DEBOUNCE,
         CROSS_BLOCK_SEARCH_LIMIT, CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
     };
     use crate::block_view::{CrossBlockSearchOptions, CrossBlockSearchScope};
@@ -908,6 +943,32 @@ mod tests {
         assert_eq!(selection_index(Some(2), 37, Move::Last), Some(36));
         assert_eq!(selection_index(Some(23), 37, Move::PagePrevious), Some(13));
         assert_eq!(selection_index(Some(31), 37, Move::PageNext), Some(36));
+    }
+
+    #[test]
+    fn refresh_preserves_identity_then_nearest_rank() {
+        let mut selected = hit(None, None, None);
+        selected.block_id = 2;
+        let anchor = SelectionAnchor {
+            hit: selected.clone(),
+            index: 1,
+        };
+        let with_id = |block_id| {
+            let mut value = hit(None, None, None);
+            value.block_id = block_id;
+            value
+        };
+        assert_eq!(
+            refresh_selection_index(&[with_id(4), with_id(3), selected], Some(&anchor)),
+            2
+        );
+        assert_eq!(
+            refresh_selection_index(&[with_id(4), with_id(3)], Some(&anchor)),
+            1
+        );
+        assert_eq!(refresh_selection_index(&[with_id(4)], Some(&anchor)), 0);
+        assert_eq!(refresh_selection_index(&[with_id(4)], None), 0);
+        assert_eq!(refresh_selection_index(&[], Some(&anchor)), 0);
     }
 
     #[test]

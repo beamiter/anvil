@@ -296,6 +296,9 @@ While open, a 500 ms identity-only probe detects completed-block additions and
 same-length retention rotation, then refreshes through the existing debounce.
 The exact selected hit remains selected when it survives; the probe never clones
 command or output text.
+Block Search 3.7 keeps the closest surviving old rank when retention removes
+that exact hit, avoiding a jump to the first row. Query, matching, scope, or
+metadata-filter edits remain new intent and deliberately restart at the top.
 
 Unified mode keeps one continuous VTE scrollback while retaining authenticated
 command zones, status chrome, bounded per-zone output snapshots, search/export,
