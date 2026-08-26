@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-26 (Block Search 3.3)
+Updated: 2026-08-26 (Block Search metadata browsing)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,21 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **Block Search metadata browsing (2026-08-26)**: Failed and Slow now work
+  without a text query. Each eligible retained block contributes one
+  representative row on the selected surface; both predicates run before the
+  500-hit cap, and activating a filter-only row navigates without installing an
+  empty VTE search pattern.
+
+- **Block Search 3.9 (2026-08-26)**: the GTK search header now exposes a
+  pointer-accessible refresh button with an accessible action name and `F5`
+  shortcut. Clicking it, or pressing unmodified F5, synchronizes the automatic
+  version probe and immediately performs the same selection-preserving rebuild;
+  Ctrl/Shift/Alt/Super/Hyper/Meta-modified F5 passes through unchanged. A
+  press/release latch limits keyboard refresh to once per physical F5 press and
+  prevents releasing a modifier mid-hold from turning auto-repeat into refresh;
+  leaving the dialog focus domain resets the latch if GTK drops the release.
 
 - **Block Search 3.3 (2026-08-26)**: Shift+Enter now keeps the GTK palette
   open, restores query focus, and advances after a successful live jump only.

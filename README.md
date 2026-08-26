@@ -278,7 +278,9 @@ and `W` (Unicode whole word) controls. `Ctrl+I` / `Ctrl+R` / `Ctrl+W` toggle
 them while the query keeps focus; the result scan and the VTE highlight used
 after activation share the exact same options. `All / Cmd / Out` restricts the
 scan to all text, commands, or output, with `Ctrl+O` cycling the scope before
-the 500-hit cap is applied. Queries above 8 KiB are rejected
+the 500-hit cap is applied. `Failed` and `Slow` compose before that cap; with
+an empty text query, either filter turns the palette into a metadata browser
+with one representative, jumpable row per eligible retained block. Queries above 8 KiB are rejected
 before regex compilation, whose heap budget is capped independently. Result
 status includes the current position; `↑/↓` wraps, `Home/End` selects either
 edge, and `PageUp/PageDown` moves ten rows while keeping the row visible and
@@ -299,8 +301,15 @@ command or output text.
 Block Search 3.8 keeps the closest surviving old rank when retention removes
 that exact hit, avoiding a jump to the first row. Query, matching, scope, or
 metadata-filter edits remain new intent and deliberately restart at the top.
-`F5` forces an immediate selection-preserving rebuild and synchronizes the
-identity probe so the automatic timer cannot enqueue a duplicate refresh.
+Block Search 3.9 adds a pointer-accessible refresh button to the dialog header.
+The button and unmodified `F5` share one immediate, selection-preserving rebuild
+that synchronizes the identity probe so the automatic timer cannot enqueue a
+duplicate refresh; modified F5 chords pass through unchanged. The button exposes
+its full action name and `F5` shortcut to accessibility clients. Key auto-repeat
+is latched, so one physical unmodified F5 press performs at most one rebuild;
+pressing F5 with a modifier and then releasing that modifier while F5 remains
+held cannot accidentally refresh. Leaving the dialog focus domain clears the
+latch, so a window-manager focus change cannot strand F5 after a lost release.
 
 Unified mode keeps one continuous VTE scrollback while retaining authenticated
 command zones, status chrome, bounded per-zone output snapshots, search/export,

@@ -705,6 +705,75 @@ fn duration_matches(duration: Option<u64>, filters: &BlockFilters) -> bool {
     !filters.slow_only || duration >= filters.slow_threshold_ms
 }
 
+fn record_matches_filters(record: BackendRecordRef<'_>, filters: &BlockFilters) -> bool {
+    outcome_matches_filters(record.command(), record.exit_code(), filters)
+        && duration_matches(record.duration_ms(), filters)
+}
+
+fn has_metadata_filters(filters: &BlockFilters) -> bool {
+    filters.exit_code.is_some()
+        || filters.min_duration_ms.is_some()
+        || filters.max_duration_ms.is_some()
+        || filters.failed_only
+        || filters.slow_only
+}
+
+fn first_meaningful_line(text: &str) -> Option<(usize, &str)> {
+    text.lines()
+        .enumerate()
+        .find(|(_, line)| !line.trim().is_empty())
+}
+
+/// An empty text query with active metadata filters is a block browser rather
+/// than an idle picker. Represent each eligible record once, choosing the
+/// first meaningful line on the requested surface.
+fn metadata_filter_hit(
+    record: BackendRecordRef<'_>,
+    scope: CrossBlockSearchScope,
+) -> Option<CrossBlockHit> {
+    let command = record.command();
+    let command_line = first_meaningful_line(command);
+    let output_line = record.output().and_then(first_meaningful_line);
+    let (is_output, line_no, line) = match scope {
+        CrossBlockSearchScope::All => command_line
+            .map(|(index, line)| (false, index + 1, line))
+            .or_else(|| output_line.map(|(index, line)| (true, index + 1, line)))?,
+        CrossBlockSearchScope::Command => {
+            let (index, line) = command_line?;
+            (false, index + 1, line)
+        }
+        CrossBlockSearchScope::Output => {
+            let (index, line) = output_line?;
+            (true, index + 1, line)
+        }
+    };
+    Some(CrossBlockHit {
+        block_id: record.id(),
+        is_output,
+        line_no,
+        line_text: snippet(line),
+        cmd_preview: command_preview(command),
+        exit_code: record.exit_code(),
+        duration_ms: record.duration_ms(),
+        cwd: record.cwd().map(str::to_string),
+        occurrence: 0,
+    })
+}
+
+fn metadata_filter_hits<'a>(
+    records: impl IntoIterator<Item = BackendRecordRef<'a>>,
+    scope: CrossBlockSearchScope,
+    max_hits: usize,
+    filters: &BlockFilters,
+) -> Vec<CrossBlockHit> {
+    records
+        .into_iter()
+        .filter(|record| record_matches_filters(*record, filters))
+        .filter_map(|record| metadata_filter_hit(record, scope))
+        .take(max_hits)
+        .collect()
+}
+
 fn matching_record_ids<'a>(
     records: impl IntoIterator<Item = super::BackendRecordRef<'a>>,
     query: &str,
@@ -736,10 +805,7 @@ fn matching_record_ids<'a>(
                     || contains_case_insensitive(command.as_bytes(), q_bytes)
                     || contains_case_insensitive(output.as_bytes(), q_bytes)
             };
-            if !text_match
-                || !outcome_matches_filters(command, record.exit_code(), filters)
-                || !duration_matches(record.duration_ms(), filters)
-            {
+            if !text_match || !record_matches_filters(record, filters) {
                 return None;
             }
             Some(record.id())
@@ -1208,8 +1274,9 @@ impl TermView {
     /// enough context (line number + the raw line + cmd preview) to drive a
     /// palette UI that lets the user pick one and jump to it.
     ///
-    /// Errors only on invalid regex; an empty pattern returns `Ok(vec![])`
-    /// so the caller can clear results without a special branch.
+    /// Errors only on invalid regex. An empty pattern returns one representative
+    /// row per eligible record when metadata filters are active, otherwise no
+    /// rows.
     /// Scan every retained record for `pattern`, honoring the same outcome and
     /// duration predicates the block filters use.
     ///
@@ -1243,8 +1310,18 @@ impl TermView {
         filters: &BlockFilters,
     ) -> Result<Vec<CrossBlockHit>, String> {
         if pattern.is_empty() {
-            return Ok(Vec::new());
+            if !has_metadata_filters(filters) {
+                return Ok(Vec::new());
+            }
+            let records = self.render_backend.records();
+            return Ok(metadata_filter_hits(
+                records.iter(),
+                scope,
+                max_hits,
+                filters,
+            ));
         }
+
         let compiled_pattern = cross_block_pattern(pattern, options);
         let re = regex::RegexBuilder::new(&compiled_pattern)
             .case_insensitive(!options.case_sensitive)
@@ -1260,12 +1337,13 @@ impl TermView {
             if hits.len() >= max_hits {
                 break;
             }
-            let command = record.command();
-            if !outcome_matches_filters(command, record.exit_code(), filters)
-                || !duration_matches(record.duration_ms(), filters)
-            {
+            // Metadata predicates run before this record contributes any
+            // command/output hit, so an excluded record cannot spend the
+            // bounded result budget and starve a later eligible record.
+            if !record_matches_filters(record, filters) {
                 continue;
             }
+            let command = record.command();
             let cmd_preview = command_preview(command);
             let exit_code = record.exit_code();
             let duration_ms = record.duration_ms();
@@ -1582,12 +1660,12 @@ mod tests {
     use super::{
         add_snapshot_jump_fallbacks, bounded_match_count, command_preview, cross_block_match_count,
         cross_block_pattern, cross_block_search_version, duration_matches,
-        focus_one_native_forward_match, matching_record_ids, native_cursor_action,
-        outcome_matches_filters, plan_matching_windows, regex_consumption, snippet,
-        step_compressed_cursor, unresolved_record_target_result, utf8_prefix,
-        vte_cross_block_pattern, CrossBlockSearchOptions, CrossBlockSearchScope, FindCursor,
-        FindDirection, FindScanBudget, FindSurface, NativeCursorAction, RecordNavigationResult,
-        RecordSnapshotView, RegexConsumption, VTE_SEARCH_FLAGS,
+        focus_one_native_forward_match, has_metadata_filters, matching_record_ids,
+        metadata_filter_hits, native_cursor_action, outcome_matches_filters, plan_matching_windows,
+        regex_consumption, snippet, step_compressed_cursor, unresolved_record_target_result,
+        utf8_prefix, vte_cross_block_pattern, CrossBlockSearchOptions, CrossBlockSearchScope,
+        FindCursor, FindDirection, FindScanBudget, FindSurface, NativeCursorAction,
+        RecordNavigationResult, RecordSnapshotView, RegexConsumption, VTE_SEARCH_FLAGS,
     };
     use crate::block_view::{
         BackendRecordRef, BackendSearchWindow, BlockFilters, CompletedCommandRecord,
@@ -2224,6 +2302,8 @@ mod tests {
             slow_threshold_ms: 1_000,
             ..Default::default()
         };
+        assert!(has_metadata_filters(&filters));
+        assert!(!has_metadata_filters(&BlockFilters::default()));
         assert!(!duration_matches(None, &filters));
     }
 
@@ -2298,6 +2378,55 @@ mod tests {
         assert_eq!(
             unresolved_record_target_result(records(), 999),
             RecordNavigationResult::NoMatchingRecord
+        );
+    }
+
+    #[test]
+    fn cross_block_metadata_filters_compose_before_the_result_cap() {
+        let record = |id, exit_code, duration_ms| CompletedCommandRecord {
+            id,
+            cmd: "needle".to_string(),
+            exit_code,
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms,
+            cwd: Some("/tmp".to_string()),
+            is_background: false,
+            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            start_mark_seen: true,
+        };
+        let metadata = [
+            record(1, Some(0), Some(2_000)),
+            record(2, Some(7), Some(20)),
+            record(3, Some(9), Some(2_000)),
+        ];
+        let filters = BlockFilters {
+            failed_only: true,
+            slow_only: true,
+            slow_threshold_ms: 1_000,
+            ..Default::default()
+        };
+
+        let records = || {
+            metadata.iter().map(|record| BackendRecordRef::Metadata {
+                record,
+                snapshot: None,
+            })
+        };
+        let hits = metadata_filter_hits(records(), CrossBlockSearchScope::All, 1, &filters);
+        assert_eq!(
+            hits.iter().map(|hit| hit.block_id).collect::<Vec<_>>(),
+            [3],
+            "ineligible records cannot spend a one-hit search budget"
+        );
+        let hit = &hits[0];
+        assert_eq!(hit.block_id, 3);
+        assert_eq!(hit.line_text, "needle");
+        assert_eq!(hit.exit_code, Some(9));
+        assert_eq!(hit.duration_ms, Some(2_000));
+        assert_eq!(hit.cwd.as_deref(), Some("/tmp"));
+        assert!(
+            metadata_filter_hits(records(), CrossBlockSearchScope::Output, 1, &filters).is_empty()
         );
     }
 

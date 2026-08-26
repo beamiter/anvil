@@ -61,8 +61,72 @@ fn idle_status() -> &'static str {
     "Type to search. F5 refreshes; Shift+Enter jumps and advances; Ctrl+Shift+U resets."
 }
 
+fn has_search_intent(query: &str, failed_only: bool, slow_only: bool) -> bool {
+    !query.is_empty() || failed_only || slow_only
+}
+
 fn refresh_status() -> &'static str {
     "Refreshing blocks…"
+}
+
+/// Manual refresh owns only an unmodified F5. Modified function keys remain
+/// available to the terminal/application below this capture controller.
+fn is_plain_refresh_key(key: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> bool {
+    use gtk::gdk::{Key, ModifierType};
+
+    key == Key::F5
+        && !state.intersects(
+            ModifierType::CONTROL_MASK
+                | ModifierType::SHIFT_MASK
+                | ModifierType::ALT_MASK
+                | ModifierType::SUPER_MASK
+                | ModifierType::HYPER_MASK
+                | ModifierType::META_MASK,
+        )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RefreshKeyPress {
+    NotF5,
+    Refresh,
+    ConsumeRepeat,
+    ProceedModified,
+}
+
+/// One physical F5 press may rebuild at most once. GTK reports auto-repeat as
+/// more key-pressed events without an intervening release, so the held state
+/// must also remember an initially modified press: releasing Ctrl while still
+/// holding F5 must not turn the next repeat into a plain refresh.
+#[derive(Default)]
+struct RefreshKeyLatch {
+    held: bool,
+}
+
+impl RefreshKeyLatch {
+    fn press(&mut self, key: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> RefreshKeyPress {
+        if key != gtk::gdk::Key::F5 {
+            return RefreshKeyPress::NotF5;
+        }
+        let first_press = !self.held;
+        self.held = true;
+        if !is_plain_refresh_key(key, state) {
+            RefreshKeyPress::ProceedModified
+        } else if first_press {
+            RefreshKeyPress::Refresh
+        } else {
+            RefreshKeyPress::ConsumeRepeat
+        }
+    }
+
+    fn release(&mut self, key: gtk::gdk::Key) {
+        if key == gtk::gdk::Key::F5 {
+            self.held = false;
+        }
+    }
+
+    fn reset(&mut self) {
+        self.held = false;
+    }
 }
 
 fn search_status(total: usize, selected: Option<usize>) -> String {
@@ -244,8 +308,15 @@ pub(super) fn toggle(
         .build();
     let scope_dropdown = gtk::DropDown::from_strings(&["All", "Cmd", "Out"]);
     scope_dropdown.set_tooltip_text(Some("Search all text, commands only, or output only"));
+    let refresh_button = gtk::Button::from_icon_name("view-refresh-symbolic");
+    refresh_button.set_tooltip_text(Some("Refresh block search results (F5)"));
+    refresh_button.update_property(&[
+        gtk::accessible::Property::Label("Refresh block search results"),
+        gtk::accessible::Property::KeyShortcuts("F5"),
+    ]);
     let reset_button = gtk::Button::with_label("Reset");
     reset_button.set_tooltip_text(Some("Reset query, matching options, scope, and filters"));
+    header_bar.pack_start(&refresh_button);
     header_bar.pack_start(&reset_button);
     header_bar.pack_end(&scope_dropdown);
     header_bar.pack_end(&whole_word_toggle);
@@ -256,11 +327,11 @@ pub(super) fn toggle(
     // unanswerable with the data sitting right there.
     let failed_toggle = gtk::ToggleButton::builder()
         .label("Failed")
-        .tooltip_text("Only blocks whose command reported a non-zero exit")
+        .tooltip_text("Only genuinely failed blocks (not user-interrupted commands)")
         .build();
     let slow_toggle = gtk::ToggleButton::builder()
         .label("Slow")
-        .tooltip_text("Only blocks that ran longer than the slow-block threshold")
+        .tooltip_text("Only blocks that ran at least as long as the slow-block threshold")
         .build();
     header_bar.pack_end(&slow_toggle);
     header_bar.pack_end(&failed_toggle);
@@ -359,10 +430,16 @@ pub(super) fn toggle(
                 regex: regex_toggle.is_active(),
                 whole_word: whole_word_toggle.is_active(),
             };
+            let filters = crate::block_view::BlockFilters {
+                failed_only: failed_toggle.is_active(),
+                slow_only: slow_toggle.is_active(),
+                slow_threshold_ms: crate::block_view::SLOW_BLOCK_THRESHOLD_MS,
+                ..Default::default()
+            };
             while let Some(child) = list_box.first_child() {
                 list_box.remove(&child);
             }
-            if query.is_empty() {
+            if !has_search_intent(&query, filters.failed_only, filters.slow_only) {
                 hits.borrow_mut().clear();
                 status_label.set_text(idle_status());
                 return;
@@ -373,12 +450,6 @@ pub(super) fn toggle(
                 return;
             }
 
-            let filters = crate::block_view::BlockFilters {
-                failed_only: failed_toggle.is_active(),
-                slow_only: slow_toggle.is_active(),
-                slow_threshold_ms: crate::block_view::SLOW_BLOCK_THRESHOLD_MS,
-                ..Default::default()
-            };
             let scope =
                 crate::block_view::CrossBlockSearchScope::from_index(scope_dropdown.selected());
             match view.cross_block_search_in_scope(
@@ -447,6 +518,8 @@ pub(super) fn toggle(
         let status_label = status_label.clone();
         let filter_entry = filter_entry.clone();
         let retained_hit = retained_hit.clone();
+        let failed_toggle = failed_toggle.clone();
+        let slow_toggle = slow_toggle.clone();
         Rc::new(move |preserve_selection: bool| {
             let generation = search_generation.get().wrapping_add(1);
             search_generation.set(generation);
@@ -465,7 +538,11 @@ pub(super) fn toggle(
             } else {
                 None
             };
-            if filter_entry.text().is_empty() {
+            if !has_search_intent(
+                filter_entry.text().as_str(),
+                failed_toggle.is_active(),
+                slow_toggle.is_active(),
+            ) {
                 while let Some(child) = list_box.first_child() {
                     list_box.remove(&child);
                 }
@@ -583,6 +660,39 @@ pub(super) fn toggle(
     // completion or same-length retention rotation refreshes the open picker,
     // preserving the exact selected hit when it still exists.
     let observed_version = Rc::new(Cell::new(view.cross_block_search_version()));
+    {
+        let view = view.clone();
+        let observed_version = observed_version.clone();
+        let pending_rebuild = pending_rebuild.clone();
+        let search_generation = search_generation.clone();
+        let retained_hit = retained_hit.clone();
+        let list_box = list_box.clone();
+        let hits = hits.clone();
+        let status_label = status_label.clone();
+        let filter_entry = filter_entry.clone();
+        let rebuild = rebuild.clone();
+        refresh_button.connect_clicked(move |_| {
+            // The button is the single manual-refresh path. Synchronize the
+            // cheap probe first, cancel any pending debounced intent refresh,
+            // retain the current stable row, and rebuild on this main-loop
+            // turn rather than waiting for the ordinary 150 ms debounce.
+            observed_version.set(view.cross_block_search_version());
+            search_generation.set(search_generation.get().wrapping_add(1));
+            if let Some(source) = pending_rebuild.borrow_mut().take() {
+                source.remove();
+            }
+            *retained_hit.borrow_mut() = list_box.selected_row().and_then(|row| {
+                let index = row.index() as usize;
+                hits.borrow()
+                    .get(index)
+                    .cloned()
+                    .map(|hit| SelectionAnchor { hit, index })
+            });
+            status_label.set_text(refresh_status());
+            rebuild();
+            filter_entry.grab_focus();
+        });
+    }
     let refresh_source = {
         let view = view.clone();
         let observed_version = observed_version.clone();
@@ -622,13 +732,15 @@ pub(super) fn toggle(
                     // The surface has already scrolled and taken focus. A
                     // highlight that cannot be set is not a reason to strand
                     // this modal over it.
-                    view.focus_match_in_block(
-                        hit.block_id,
-                        &pattern,
-                        options,
-                        hit.is_output,
-                        hit.occurrence,
-                    );
+                    if !pattern.is_empty() {
+                        view.focus_match_in_block(
+                            hit.block_id,
+                            &pattern,
+                            options,
+                            hit.is_output,
+                            hit.occurrence,
+                        );
+                    }
                 }
                 JumpOutcome::KeepOpen => status_label.set_text(jump_unavailable_status()),
                 JumpOutcome::ShowSnapshot(_) => {}
@@ -666,6 +778,7 @@ pub(super) fn toggle(
 
     let key_controller = gtk::EventControllerKey::new();
     key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let refresh_key_latch = Rc::new(RefCell::new(RefreshKeyLatch::default()));
     {
         let dialog = dialog.clone();
         let list_box = list_box.clone();
@@ -679,9 +792,8 @@ pub(super) fn toggle(
         let whole_word_toggle = whole_word_toggle.clone();
         let scope_dropdown = scope_dropdown.clone();
         let reset_button = reset_button.clone();
-        let view_for_refresh = view.clone();
-        let observed_version_for_refresh = observed_version.clone();
-        let schedule_refresh = schedule_rebuild.clone();
+        let refresh_button = refresh_button.clone();
+        let refresh_key_latch = refresh_key_latch.clone();
         key_controller.connect_key_pressed(move |_, key, _, state| {
             use gtk::gdk::{Key, ModifierType};
             if key == Key::Escape
@@ -691,11 +803,19 @@ pub(super) fn toggle(
                 dialog.force_close();
                 return gtk::glib::Propagation::Stop;
             }
-            if key == Key::F5 {
-                observed_version_for_refresh.set(view_for_refresh.cross_block_search_version());
-                schedule_refresh(true);
-                filter_entry.grab_focus();
-                return gtk::glib::Propagation::Stop;
+            let refresh_action = refresh_key_latch.borrow_mut().press(key, state);
+            match refresh_action {
+                RefreshKeyPress::Refresh => {
+                    refresh_button.emit_clicked();
+                    return gtk::glib::Propagation::Stop;
+                }
+                RefreshKeyPress::ConsumeRepeat => {
+                    return gtk::glib::Propagation::Stop;
+                }
+                RefreshKeyPress::ProceedModified => {
+                    return gtk::glib::Propagation::Proceed;
+                }
+                RefreshKeyPress::NotF5 => {}
             }
             if state.contains(ModifierType::CONTROL_MASK) {
                 if matches!(key, Key::u | Key::U) {
@@ -766,7 +886,23 @@ pub(super) fn toggle(
             gtk::glib::Propagation::Stop
         });
     }
+    {
+        let refresh_key_latch = refresh_key_latch.clone();
+        key_controller.connect_key_released(move |_, key, _, _| {
+            refresh_key_latch.borrow_mut().release(key);
+        });
+    }
     dialog.add_controller(key_controller);
+    let refresh_focus = gtk::EventControllerFocus::new();
+    {
+        let refresh_key_latch = refresh_key_latch.clone();
+        refresh_focus.connect_leave(move |_| {
+            // Window-manager deactivation can drop the physical key-release
+            // event. Do not strand this dialog in the repeat-suppressed state.
+            refresh_key_latch.borrow_mut().reset();
+        });
+    }
+    dialog.add_controller(refresh_focus);
 
     {
         let dialog_slot = dialog_slot.clone();
@@ -804,7 +940,11 @@ pub(super) fn toggle(
     *dialog_slot.borrow_mut() = Some(dialog.clone());
     let parent = view.widget();
     dialog.present(Some(&parent));
-    if !remembered.query.is_empty() {
+    if has_search_intent(
+        &remembered.query,
+        remembered.failed_only,
+        remembered.slow_only,
+    ) {
         schedule_rebuild(false);
     }
     filter_entry.grab_focus();
@@ -813,10 +953,12 @@ pub(super) fn toggle(
 #[cfg(test)]
 mod tests {
     use super::{
-        hit_outcome_label, idle_status, jump_outcome, memory, query_error, refresh_selection_index,
-        refresh_status, search_status, selection_index, should_step, CrossBlockHit, JumpOutcome,
-        RecordNavigationResult, SelectionAnchor, SelectionMove, CROSS_BLOCK_SEARCH_DEBOUNCE,
-        CROSS_BLOCK_SEARCH_LIMIT, CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
+        has_search_intent, hit_outcome_label, idle_status, is_plain_refresh_key, jump_outcome,
+        memory, query_error, refresh_selection_index, refresh_status, search_status,
+        selection_index, should_step, CrossBlockHit, JumpOutcome, RecordNavigationResult,
+        RefreshKeyLatch, RefreshKeyPress, SelectionAnchor, SelectionMove,
+        CROSS_BLOCK_SEARCH_DEBOUNCE, CROSS_BLOCK_SEARCH_LIMIT,
+        CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
     };
     use crate::block_view::{CrossBlockSearchOptions, CrossBlockSearchScope};
 
@@ -895,6 +1037,90 @@ mod tests {
     }
 
     #[test]
+    fn manual_refresh_f5_modifier_matrix_is_strict() {
+        use relm4::gtk::gdk::{Key, ModifierType};
+
+        let cases = [
+            (ModifierType::empty(), RefreshKeyPress::Refresh),
+            // Lock-state modifiers are not command modifiers and must not make
+            // an otherwise plain F5 depend on Caps Lock state.
+            (ModifierType::LOCK_MASK, RefreshKeyPress::Refresh),
+            (ModifierType::CONTROL_MASK, RefreshKeyPress::ProceedModified),
+            (ModifierType::SHIFT_MASK, RefreshKeyPress::ProceedModified),
+            (ModifierType::ALT_MASK, RefreshKeyPress::ProceedModified),
+            (ModifierType::SUPER_MASK, RefreshKeyPress::ProceedModified),
+            (ModifierType::HYPER_MASK, RefreshKeyPress::ProceedModified),
+            (ModifierType::META_MASK, RefreshKeyPress::ProceedModified),
+            (
+                ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK,
+                RefreshKeyPress::ProceedModified,
+            ),
+            (
+                ModifierType::ALT_MASK | ModifierType::SUPER_MASK | ModifierType::LOCK_MASK,
+                RefreshKeyPress::ProceedModified,
+            ),
+        ];
+        for (state, expected) in cases {
+            let mut latch = RefreshKeyLatch::default();
+            assert_eq!(latch.press(Key::F5, state), expected, "{state:?}");
+        }
+        assert!(!is_plain_refresh_key(Key::F6, ModifierType::empty()));
+    }
+
+    #[test]
+    fn manual_refresh_latch_allows_one_scan_per_physical_f5_press() {
+        use relm4::gtk::gdk::{Key, ModifierType};
+
+        let mut latch = RefreshKeyLatch::default();
+        assert_eq!(
+            latch.press(Key::F5, ModifierType::empty()),
+            RefreshKeyPress::Refresh
+        );
+        assert_eq!(
+            latch.press(Key::F5, ModifierType::empty()),
+            RefreshKeyPress::ConsumeRepeat,
+            "plain auto-repeat is consumed without another rebuild"
+        );
+        latch.release(Key::F6);
+        assert_eq!(
+            latch.press(Key::F5, ModifierType::empty()),
+            RefreshKeyPress::ConsumeRepeat,
+            "only an F5 release clears the held state"
+        );
+        latch.release(Key::F5);
+        assert_eq!(
+            latch.press(Key::F5, ModifierType::empty()),
+            RefreshKeyPress::Refresh
+        );
+        latch.reset();
+        assert_eq!(
+            latch.press(Key::F5, ModifierType::empty()),
+            RefreshKeyPress::Refresh,
+            "leaving the dialog focus domain clears a missed-release latch"
+        );
+
+        let mut modified_first = RefreshKeyLatch::default();
+        assert_eq!(
+            modified_first.press(Key::F5, ModifierType::CONTROL_MASK),
+            RefreshKeyPress::ProceedModified
+        );
+        assert_eq!(
+            modified_first.press(Key::F5, ModifierType::empty()),
+            RefreshKeyPress::ConsumeRepeat,
+            "releasing Ctrl while F5 stays held must not trigger a refresh"
+        );
+        modified_first.release(Key::F5);
+        assert_eq!(
+            modified_first.press(Key::F5, ModifierType::empty()),
+            RefreshKeyPress::Refresh
+        );
+        assert_eq!(
+            modified_first.press(Key::F6, ModifierType::empty()),
+            RefreshKeyPress::NotF5
+        );
+    }
+
+    #[test]
     fn cross_block_search_rejects_oversized_queries_before_regex_compilation() {
         assert_eq!(
             query_error(&"x".repeat(CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES)),
@@ -905,6 +1131,15 @@ mod tests {
             Some("Query is too long (maximum 8 KiB).")
         );
         assert!(query_error(&"界".repeat(CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES / 3 + 1)).is_some());
+    }
+
+    #[test]
+    fn metadata_filters_are_search_intent_without_text() {
+        assert!(!has_search_intent("", false, false));
+        assert!(has_search_intent("needle", false, false));
+        assert!(has_search_intent("", true, false));
+        assert!(has_search_intent("", false, true));
+        assert!(has_search_intent("", true, true));
     }
 
     #[test]
