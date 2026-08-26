@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-26 (Block Search 3.2)
+Updated: 2026-08-26 (Block Search 3.3)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,11 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **Block Search 3.3 (2026-08-26)**: Shift+Enter now keeps the GTK palette
+  open, restores query focus, and advances after a successful live jump only.
+  Snapshot results retain their dedicated view and unavailable results keep
+  their row plus diagnostic, so continuous review never pretends it navigated.
 
 - **Block Search 3.2 (2026-08-26)**: the GTK palette now wraps arrow
   navigation, supports Home/End plus ten-row PageUp/PageDown moves, scrolls the

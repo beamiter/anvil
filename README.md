@@ -282,7 +282,10 @@ the 500-hit cap is applied. Queries above 8 KiB are rejected
 before regex compilation, whose heap budget is capped independently. Result
 status includes the current position; `↑/↓` wraps, `Home/End` selects either
 edge, and `PageUp/PageDown` moves ten rows while keeping the row visible and
-the query focused.
+the query focused. `Enter` jumps and closes; `Shift+Enter` keeps the palette
+open and advances only after a successful live-terminal jump. Snapshot-only
+hits still open their snapshot, while unavailable hits stay selected with a
+diagnostic instead of fake-stepping.
 
 Unified mode keeps one continuous VTE scrollback while retaining authenticated
 command zones, status chrome, bounded per-zone output snapshots, search/export,

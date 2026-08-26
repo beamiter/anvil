@@ -25,6 +25,10 @@ fn query_error(query: &str) -> Option<&'static str> {
         .then_some("Query is too long (maximum 8 KiB).")
 }
 
+fn idle_status() -> &'static str {
+    "Type to search across blocks. Shift+Enter jumps and advances."
+}
+
 fn search_status(total: usize, selected: Option<usize>) -> String {
     if total == 0 {
         return "No matches.".to_string();
@@ -92,6 +96,13 @@ fn jump_outcome(result: RecordNavigationResult) -> JumpOutcome {
             JumpOutcome::KeepOpen
         }
     }
+}
+
+/// Only an exact live-terminal jump can remain in the palette and advance.
+/// Snapshot-only results still open their dedicated view; unavailable hits
+/// remain selected with their diagnostic.
+fn should_step(outcome: JumpOutcome, requested: bool) -> bool {
+    requested && outcome == JumpOutcome::Close
 }
 
 /// `exit:1 · 2.4s · …/anvil` for one hit, or `None` when the record carried
@@ -209,7 +220,7 @@ pub(super) fn toggle(
     list_box.set_margin_end(12);
     list_box.set_margin_bottom(12);
 
-    let status_label = gtk::Label::new(Some("Type to search across blocks."));
+    let status_label = gtk::Label::new(Some(idle_status()));
     status_label.add_css_class("dim-label");
     status_label.set_accessible_role(gtk::AccessibleRole::Status);
     status_label.set_xalign(0.0);
@@ -269,7 +280,7 @@ pub(super) fn toggle(
             }
             if query.is_empty() {
                 hits.borrow_mut().clear();
-                status_label.set_text("Type to search across blocks.");
+                status_label.set_text(idle_status());
                 return;
             }
             if let Some(message) = query_error(&query) {
@@ -362,7 +373,7 @@ pub(super) fn toggle(
             }
             hits.borrow_mut().clear();
             if filter_entry.text().is_empty() {
-                status_label.set_text("Type to search across blocks.");
+                status_label.set_text(idle_status());
                 return;
             }
             if let Some(message) = query_error(filter_entry.text().as_str()) {
@@ -489,6 +500,7 @@ pub(super) fn toggle(
         let list_box = list_box.clone();
         let scrolled = scrolled.clone();
         let hits = hits.clone();
+        let filter_entry = filter_entry.clone();
         let jump = jump.clone();
         let apply_jump_outcome = apply_jump_outcome.clone();
         let case_toggle = case_toggle.clone();
@@ -525,7 +537,21 @@ pub(super) fn toggle(
             }
             if matches!(key, Key::Return | Key::KP_Enter) {
                 if let Some(row) = list_box.selected_row() {
-                    apply_jump_outcome(jump(row.index() as usize));
+                    let index = row.index() as usize;
+                    let outcome = jump(index);
+                    if should_step(outcome, state.contains(ModifierType::SHIFT_MASK)) {
+                        if let Some(next) =
+                            selection_index(Some(index), hits.borrow().len(), SelectionMove::Next)
+                        {
+                            if let Some(next_row) = list_box.row_at_index(next as i32) {
+                                list_box.select_row(Some(&next_row));
+                                scroll_row_into_view(&scrolled, &next_row);
+                            }
+                        }
+                        filter_entry.grab_focus();
+                    } else {
+                        apply_jump_outcome(outcome);
+                    }
                 }
                 return gtk::glib::Propagation::Stop;
             }
@@ -572,8 +598,8 @@ pub(super) fn toggle(
 #[cfg(test)]
 mod tests {
     use super::{
-        hit_outcome_label, jump_outcome, query_error, search_status, selection_index,
-        CrossBlockHit, JumpOutcome, RecordNavigationResult, SelectionMove,
+        hit_outcome_label, idle_status, jump_outcome, query_error, search_status, selection_index,
+        should_step, CrossBlockHit, JumpOutcome, RecordNavigationResult, SelectionMove,
         CROSS_BLOCK_SEARCH_DEBOUNCE, CROSS_BLOCK_SEARCH_LIMIT,
         CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
     };
@@ -683,5 +709,17 @@ mod tests {
         assert_eq!(selection_index(Some(2), 37, Move::Last), Some(36));
         assert_eq!(selection_index(Some(23), 37, Move::PagePrevious), Some(13));
         assert_eq!(selection_index(Some(31), 37, Move::PageNext), Some(36));
+    }
+
+    #[test]
+    fn continuous_review_advances_only_after_a_live_jump() {
+        assert_eq!(
+            idle_status(),
+            "Type to search across blocks. Shift+Enter jumps and advances."
+        );
+        assert!(should_step(JumpOutcome::Close, true));
+        assert!(!should_step(JumpOutcome::Close, false));
+        assert!(!should_step(JumpOutcome::ShowSnapshot(7), true));
+        assert!(!should_step(JumpOutcome::KeepOpen, true));
     }
 }
