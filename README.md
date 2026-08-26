@@ -273,6 +273,14 @@ notices. It temporarily hides while an alternate-screen program owns the
 surface and returns afterward, so it never covers the first TUI. Unified and
 conventional VTE panes never show it.
 
+Cross-block search combines `Aa` (case sensitive), `.*` (regular expression),
+and `W` (Unicode whole word) controls. `Ctrl+I` / `Ctrl+R` / `Ctrl+W` toggle
+them while the query keeps focus; the result scan and the VTE highlight used
+after activation share the exact same options. `All / Cmd / Out` restricts the
+scan to all text, commands, or output, with `Ctrl+O` cycling the scope before
+the 500-hit cap is applied. Queries above 8 KiB are rejected
+before regex compilation, whose heap budget is capped independently.
+
 Unified mode keeps one continuous VTE scrollback while retaining authenticated
 command zones, status chrome, bounded per-zone output snapshots, search/export,
 and session replay. Kitty `a=T` images use nonce-scoped row probes and remain

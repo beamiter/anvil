@@ -16,6 +16,12 @@ use crate::block_view::{CrossBlockHit, RecordNavigationResult, TermView};
 use super::record_snapshot;
 
 const CROSS_BLOCK_SEARCH_DEBOUNCE: Duration = Duration::from_millis(150);
+const CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES: usize = 8 * 1024;
+
+fn query_error(query: &str) -> Option<&'static str> {
+    (query.len() > CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES)
+        .then_some("Query is too long (maximum 8 KiB).")
+}
 
 /// What the palette does with one activated hit. Every arm of
 /// [`RecordNavigationResult`] resolves to exactly one of these: a record the
@@ -110,7 +116,20 @@ pub(super) fn toggle(
         .label(".*")
         .tooltip_text("Treat the query as a regular expression")
         .build();
+    let case_toggle = gtk::ToggleButton::builder()
+        .label("Aa")
+        .tooltip_text("Match case")
+        .build();
+    let whole_word_toggle = gtk::ToggleButton::builder()
+        .label("W")
+        .tooltip_text("Match whole words")
+        .build();
+    let scope_dropdown = gtk::DropDown::from_strings(&["All", "Cmd", "Out"]);
+    scope_dropdown.set_tooltip_text(Some("Search all text, commands only, or output only"));
+    header_bar.pack_end(&scope_dropdown);
+    header_bar.pack_end(&whole_word_toggle);
     header_bar.pack_end(&regex_toggle);
+    header_bar.pack_end(&case_toggle);
     // The outcome and duration predicates existed already with no surface that
     // could reach them, so "which failing build took over a second" was
     // unanswerable with the data sitting right there.
@@ -174,15 +193,27 @@ pub(super) fn toggle(
         let status_label = status_label.clone();
         let filter_entry = filter_entry.clone();
         let regex_toggle = regex_toggle.clone();
+        let case_toggle = case_toggle.clone();
+        let whole_word_toggle = whole_word_toggle.clone();
+        let scope_dropdown = scope_dropdown.clone();
         Rc::new(move || {
             let query = filter_entry.text().to_string();
-            let is_regex = regex_toggle.is_active();
+            let options = crate::block_view::CrossBlockSearchOptions {
+                case_sensitive: case_toggle.is_active(),
+                regex: regex_toggle.is_active(),
+                whole_word: whole_word_toggle.is_active(),
+            };
             while let Some(child) = list_box.first_child() {
                 list_box.remove(&child);
             }
             if query.is_empty() {
                 hits.borrow_mut().clear();
                 status_label.set_text("Type to search across blocks.");
+                return;
+            }
+            if let Some(message) = query_error(&query) {
+                hits.borrow_mut().clear();
+                status_label.set_text(message);
                 return;
             }
 
@@ -192,7 +223,9 @@ pub(super) fn toggle(
                 slow_threshold_ms: crate::block_view::SLOW_BLOCK_THRESHOLD_MS,
                 ..Default::default()
             };
-            match view.cross_block_search(&query, is_regex, 500, &filters) {
+            let scope =
+                crate::block_view::CrossBlockSearchScope::from_index(scope_dropdown.selected());
+            match view.cross_block_search_in_scope(&query, options, scope, 500, &filters) {
                 Ok(results) => {
                     let total = results.len();
                     status_label.set_text(match total {
@@ -272,6 +305,10 @@ pub(super) fn toggle(
                 status_label.set_text("Type to search across blocks.");
                 return;
             }
+            if let Some(message) = query_error(filter_entry.text().as_str()) {
+                status_label.set_text(message);
+                return;
+            }
             status_label.set_text("Searching blocks…");
 
             let pending_slot = pending_rebuild.clone();
@@ -300,6 +337,18 @@ pub(super) fn toggle(
     }
     {
         let schedule_rebuild = schedule_rebuild.clone();
+        case_toggle.connect_toggled(move |_| schedule_rebuild());
+    }
+    {
+        let schedule_rebuild = schedule_rebuild.clone();
+        whole_word_toggle.connect_toggled(move |_| schedule_rebuild());
+    }
+    {
+        let schedule_rebuild = schedule_rebuild.clone();
+        scope_dropdown.connect_selected_notify(move |_| schedule_rebuild());
+    }
+    {
+        let schedule_rebuild = schedule_rebuild.clone();
         failed_toggle.connect_toggled(move |_| schedule_rebuild());
     }
     {
@@ -312,13 +361,19 @@ pub(super) fn toggle(
         let hits = hits.clone();
         let filter_entry = filter_entry.clone();
         let regex_toggle = regex_toggle.clone();
+        let case_toggle = case_toggle.clone();
+        let whole_word_toggle = whole_word_toggle.clone();
         let status_label = status_label.clone();
         Rc::new(move |index: usize| -> JumpOutcome {
             let Some(hit) = hits.borrow().get(index).cloned() else {
                 return JumpOutcome::KeepOpen;
             };
             let pattern = filter_entry.text().to_string();
-            let is_regex = regex_toggle.is_active();
+            let options = crate::block_view::CrossBlockSearchOptions {
+                case_sensitive: case_toggle.is_active(),
+                regex: regex_toggle.is_active(),
+                whole_word: whole_word_toggle.is_active(),
+            };
             let outcome = jump_outcome(view.navigate_to_record_id(hit.block_id, hit.is_output));
             match outcome {
                 JumpOutcome::Close => {
@@ -328,7 +383,7 @@ pub(super) fn toggle(
                     view.focus_match_in_block(
                         hit.block_id,
                         &pattern,
-                        is_regex,
+                        options,
                         hit.is_output,
                         hit.occurrence,
                     );
@@ -375,6 +430,10 @@ pub(super) fn toggle(
         let scrolled = scrolled.clone();
         let jump = jump.clone();
         let apply_jump_outcome = apply_jump_outcome.clone();
+        let case_toggle = case_toggle.clone();
+        let regex_toggle = regex_toggle.clone();
+        let whole_word_toggle = whole_word_toggle.clone();
+        let scope_dropdown = scope_dropdown.clone();
         key_controller.connect_key_pressed(move |_, key, _, state| {
             use gtk::gdk::{Key, ModifierType};
             if key == Key::Escape
@@ -383,6 +442,25 @@ pub(super) fn toggle(
             {
                 dialog.force_close();
                 return gtk::glib::Propagation::Stop;
+            }
+            if state.contains(ModifierType::CONTROL_MASK) {
+                let toggle = match key {
+                    Key::i | Key::I => Some(&case_toggle),
+                    Key::r | Key::R => Some(&regex_toggle),
+                    Key::w | Key::W => Some(&whole_word_toggle),
+                    _ => None,
+                };
+                if let Some(toggle) = toggle {
+                    toggle.set_active(!toggle.is_active());
+                    return gtk::glib::Propagation::Stop;
+                }
+                if matches!(key, Key::o | Key::O) {
+                    let scope = crate::block_view::CrossBlockSearchScope::from_index(
+                        scope_dropdown.selected(),
+                    );
+                    scope_dropdown.set_selected(scope.cycled().index());
+                    return gtk::glib::Propagation::Stop;
+                }
             }
             if matches!(key, Key::Return | Key::KP_Enter) {
                 if let Some(row) = list_box.selected_row() {
@@ -431,8 +509,8 @@ pub(super) fn toggle(
 #[cfg(test)]
 mod tests {
     use super::{
-        hit_outcome_label, jump_outcome, CrossBlockHit, JumpOutcome, RecordNavigationResult,
-        CROSS_BLOCK_SEARCH_DEBOUNCE,
+        hit_outcome_label, jump_outcome, query_error, CrossBlockHit, JumpOutcome,
+        RecordNavigationResult, CROSS_BLOCK_SEARCH_DEBOUNCE, CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
     };
 
     fn hit(exit_code: Option<i32>, duration_ms: Option<u64>, cwd: Option<&str>) -> CrossBlockHit {
@@ -507,5 +585,18 @@ mod tests {
             CROSS_BLOCK_SEARCH_DEBOUNCE,
             std::time::Duration::from_millis(150)
         );
+    }
+
+    #[test]
+    fn cross_block_search_rejects_oversized_queries_before_regex_compilation() {
+        assert_eq!(
+            query_error(&"x".repeat(CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES)),
+            None
+        );
+        assert_eq!(
+            query_error(&"x".repeat(CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES + 1)),
+            Some("Query is too long (maximum 8 KiB).")
+        );
+        assert!(query_error(&"界".repeat(CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES / 3 + 1)).is_some());
     }
 }

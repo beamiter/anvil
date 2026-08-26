@@ -46,6 +46,7 @@ fn outcome_matches_filters(
 pub(crate) const FIND_MATCH_LIMIT: usize = 10_000;
 const FIND_SCAN_BYTE_LIMIT: usize = 4 * 1024 * 1024;
 const FIND_SCAN_TIME_LIMIT: Duration = Duration::from_millis(12);
+const CROSS_BLOCK_REGEX_SIZE_LIMIT: usize = 2 * 1024 * 1024;
 /// VTE uses PCRE2 while match counting uses Rust's Unicode-aware regex engine.
 /// UTF validates/decodes the subject as Unicode and UCP makes shorthand classes
 /// such as `\d`, `\s`, and `\w` use Unicode properties on the VTE side too.
@@ -516,6 +517,95 @@ fn find_progress(state: &FindState) -> Option<FindProgress> {
         capped: state.capped,
         scan_limited: state.scan_limited,
     })
+}
+
+/// Matching controls for the cross-block result picker. Keeping this as one
+/// value prevents the scan and the VTE jump highlighter from interpreting the
+/// same query differently.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CrossBlockSearchOptions {
+    pub case_sensitive: bool,
+    pub regex: bool,
+    pub whole_word: bool,
+}
+
+/// Text surfaces included in a cross-block scan. Scope is applied before the
+/// hit cap so a command-heavy history cannot hide output-only results.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CrossBlockSearchScope {
+    #[default]
+    All,
+    Command,
+    Output,
+}
+
+impl CrossBlockSearchScope {
+    pub fn includes_command(self) -> bool {
+        matches!(self, Self::All | Self::Command)
+    }
+
+    pub fn includes_output(self) -> bool {
+        matches!(self, Self::All | Self::Output)
+    }
+
+    pub fn from_index(index: u32) -> Self {
+        match index {
+            1 => Self::Command,
+            2 => Self::Output,
+            _ => Self::All,
+        }
+    }
+
+    pub fn index(self) -> u32 {
+        match self {
+            Self::All => 0,
+            Self::Command => 1,
+            Self::Output => 2,
+        }
+    }
+
+    pub fn cycled(self) -> Self {
+        match self {
+            Self::All => Self::Command,
+            Self::Command => Self::Output,
+            Self::Output => Self::All,
+        }
+    }
+}
+
+fn cross_block_pattern(pattern: &str, options: CrossBlockSearchOptions) -> String {
+    if options.regex {
+        pattern.to_string()
+    } else {
+        regex::escape(pattern)
+    }
+}
+
+fn vte_cross_block_pattern(pattern: &str, options: CrossBlockSearchOptions) -> String {
+    let pattern = cross_block_pattern(pattern, options);
+    if options.whole_word {
+        format!(r"(?<![\p{{L}}\p{{N}}_])(?:{pattern})(?![\p{{L}}\p{{N}}_])")
+    } else {
+        pattern
+    }
+}
+
+fn is_word_character(character: char) -> bool {
+    character == '_' || character.is_alphanumeric()
+}
+
+fn is_whole_word_match(text: &str, range: std::ops::Range<usize>) -> bool {
+    let before = text[..range.start].chars().next_back();
+    let after = text[range.end..].chars().next();
+    before.is_none_or(|character| !is_word_character(character))
+        && after.is_none_or(|character| !is_word_character(character))
+}
+
+fn cross_block_match_count(regex: &regex::Regex, line: &str, whole_word: bool) -> usize {
+    regex
+        .find_iter(line)
+        .filter(|matched| !whole_word || is_whole_word_match(line, matched.range()))
+        .count()
 }
 
 /// One result row from the built-in cross-block substring/regex scan. Carries enough
@@ -1100,21 +1190,36 @@ impl TermView {
     pub fn cross_block_search(
         &self,
         pattern: &str,
-        is_regex: bool,
+        options: CrossBlockSearchOptions,
+        max_hits: usize,
+        filters: &BlockFilters,
+    ) -> Result<Vec<CrossBlockHit>, String> {
+        self.cross_block_search_in_scope(
+            pattern,
+            options,
+            CrossBlockSearchScope::All,
+            max_hits,
+            filters,
+        )
+    }
+
+    /// Scope-aware counterpart of [`Self::cross_block_search`].
+    pub fn cross_block_search_in_scope(
+        &self,
+        pattern: &str,
+        options: CrossBlockSearchOptions,
+        scope: CrossBlockSearchScope,
         max_hits: usize,
         filters: &BlockFilters,
     ) -> Result<Vec<CrossBlockHit>, String> {
         if pattern.is_empty() {
             return Ok(Vec::new());
         }
-        let compiled_pattern = if is_regex {
-            pattern.to_string()
-        } else {
-            regex::escape(pattern)
-        };
+        let compiled_pattern = cross_block_pattern(pattern, options);
         let re = regex::RegexBuilder::new(&compiled_pattern)
-            .case_insensitive(true)
+            .case_insensitive(!options.case_sensitive)
             .multi_line(true)
+            .size_limit(CROSS_BLOCK_REGEX_SIZE_LIMIT)
             .build()
             .map_err(|e| format!("{e}"))?;
 
@@ -1139,48 +1244,52 @@ impl TermView {
             // Cmd surface — usually one line, but multiline commands exist.
             // Count matches rather than matching lines because that is VTE's
             // native cursor unit.
-            let mut occurrence = 0usize;
-            for (ln_idx, line) in command.lines().enumerate() {
-                if hits.len() >= max_hits {
-                    break;
+            if scope.includes_command() {
+                let mut occurrence = 0usize;
+                for (ln_idx, line) in command.lines().enumerate() {
+                    if hits.len() >= max_hits {
+                        break;
+                    }
+                    let matches = cross_block_match_count(&re, line, options.whole_word);
+                    if matches > 0 {
+                        hits.push(CrossBlockHit {
+                            block_id: record.id(),
+                            is_output: false,
+                            line_no: ln_idx + 1,
+                            line_text: snippet(line),
+                            cmd_preview: cmd_preview.clone(),
+                            exit_code,
+                            duration_ms,
+                            cwd: cwd.clone(),
+                            occurrence,
+                        });
+                    }
+                    occurrence = occurrence.saturating_add(matches);
                 }
-                let matches = re.find_iter(line).count();
-                if matches > 0 {
-                    hits.push(CrossBlockHit {
-                        block_id: record.id(),
-                        is_output: false,
-                        line_no: ln_idx + 1,
-                        line_text: snippet(line),
-                        cmd_preview: cmd_preview.clone(),
-                        exit_code,
-                        duration_ms,
-                        cwd: cwd.clone(),
-                        occurrence,
-                    });
-                }
-                occurrence = occurrence.saturating_add(matches);
             }
 
-            let mut occurrence = 0usize;
-            for (ln_idx, line) in record.output().unwrap_or("").lines().enumerate() {
-                if hits.len() >= max_hits {
-                    break;
+            if scope.includes_output() {
+                let mut occurrence = 0usize;
+                for (ln_idx, line) in record.output().unwrap_or("").lines().enumerate() {
+                    if hits.len() >= max_hits {
+                        break;
+                    }
+                    let matches = cross_block_match_count(&re, line, options.whole_word);
+                    if matches > 0 {
+                        hits.push(CrossBlockHit {
+                            block_id: record.id(),
+                            is_output: true,
+                            line_no: ln_idx + 1,
+                            line_text: snippet(line),
+                            cmd_preview: cmd_preview.clone(),
+                            exit_code,
+                            duration_ms,
+                            cwd: cwd.clone(),
+                            occurrence,
+                        });
+                    }
+                    occurrence = occurrence.saturating_add(matches);
                 }
-                let matches = re.find_iter(line).count();
-                if matches > 0 {
-                    hits.push(CrossBlockHit {
-                        block_id: record.id(),
-                        is_output: true,
-                        line_no: ln_idx + 1,
-                        line_text: snippet(line),
-                        cmd_preview: cmd_preview.clone(),
-                        exit_code,
-                        duration_ms,
-                        cwd: cwd.clone(),
-                        occurrence,
-                    });
-                }
-                occurrence = occurrence.saturating_add(matches);
             }
         }
         Ok(hits)
@@ -1317,19 +1426,20 @@ impl TermView {
         &self,
         block_id: u64,
         pattern: &str,
-        is_regex: bool,
+        options: CrossBlockSearchOptions,
         is_output: bool,
         occurrence: usize,
     ) -> bool {
         if pattern.is_empty() {
             return false;
         }
-        let compiled = if is_regex {
-            pattern.to_string()
+        let compiled = vte_cross_block_pattern(pattern, options);
+        let flags = if options.case_sensitive {
+            VTE_SEARCH_FLAGS & !pcre2_sys::PCRE2_CASELESS
         } else {
-            regex::escape(pattern)
+            VTE_SEARCH_FLAGS
         };
-        let Ok(vte_re) = vte4::Regex::for_search(&compiled, VTE_SEARCH_FLAGS) else {
+        let Ok(vte_re) = vte4::Regex::for_search(&compiled, flags) else {
             return false;
         };
         let records = self.render_backend.records();
@@ -1440,10 +1550,11 @@ pub(super) fn clear_find_state(
 #[cfg(test)]
 mod tests {
     use super::{
-        add_snapshot_jump_fallbacks, bounded_match_count, command_preview, duration_matches,
-        focus_one_native_forward_match, matching_record_ids, native_cursor_action,
-        outcome_matches_filters, plan_matching_windows, regex_consumption, snippet,
-        step_compressed_cursor, unresolved_record_target_result, utf8_prefix, FindCursor,
+        add_snapshot_jump_fallbacks, bounded_match_count, command_preview, cross_block_match_count,
+        cross_block_pattern, duration_matches, focus_one_native_forward_match, matching_record_ids,
+        native_cursor_action, outcome_matches_filters, plan_matching_windows, regex_consumption,
+        snippet, step_compressed_cursor, unresolved_record_target_result, utf8_prefix,
+        vte_cross_block_pattern, CrossBlockSearchOptions, CrossBlockSearchScope, FindCursor,
         FindDirection, FindScanBudget, FindSurface, NativeCursorAction, RecordNavigationResult,
         RecordSnapshotView, RegexConsumption, VTE_SEARCH_FLAGS,
     };
@@ -1487,6 +1598,47 @@ mod tests {
             assert_ne!(at_scan, moved);
             assert_ne!(moved, crate::block_view::blocks::NEUTRAL_RENDER_STAMP);
         }
+    }
+
+    #[test]
+    fn cross_block_options_keep_scan_and_vte_whole_word_semantics_aligned() {
+        let options = CrossBlockSearchOptions {
+            whole_word: true,
+            ..CrossBlockSearchOptions::default()
+        };
+        let pattern = cross_block_pattern("test", options);
+        let regex = regex::RegexBuilder::new(&pattern)
+            .case_insensitive(true)
+            .build()
+            .unwrap();
+        assert_eq!(
+            cross_block_match_count(&regex, "contest TEST test_testing (test)", true),
+            2
+        );
+        let vte_pattern = vte_cross_block_pattern("test", options);
+        assert_eq!(vte_pattern, r"(?<![\p{L}\p{N}_])(?:test)(?![\p{L}\p{N}_])");
+        assert!(vte4::Regex::for_search(&vte_pattern, VTE_SEARCH_FLAGS).is_ok());
+
+        let unicode_pattern = cross_block_pattern("测试", options);
+        let unicode = regex::Regex::new(&unicode_pattern).unwrap();
+        assert_eq!(
+            cross_block_match_count(&unicode, "测试 测试版 (测试)", true),
+            2
+        );
+
+        assert!(CrossBlockSearchScope::Command.includes_command());
+        assert!(!CrossBlockSearchScope::Command.includes_output());
+        assert!(CrossBlockSearchScope::Output.includes_output());
+        assert!(!CrossBlockSearchScope::Output.includes_command());
+        assert_eq!(
+            CrossBlockSearchScope::from_index(99),
+            CrossBlockSearchScope::All
+        );
+        assert_eq!(
+            CrossBlockSearchScope::All.cycled(),
+            CrossBlockSearchScope::Command
+        );
+        assert_eq!(CrossBlockSearchScope::Output.cycled().index(), 0);
     }
 
     #[test]

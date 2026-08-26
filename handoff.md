@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-25 (single-interpretation session restore)
+Updated: 2026-08-26 (Block Search 3.1)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,19 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **Block Search 3.1 (2026-08-26)**: the cross-block palette now has `All /
+  Cmd / Out` surface scopes plus a `Ctrl+O` cycle. Scope filtering runs before
+  the 500-hit cap and composes with failed/slow predicates without changing
+  the scan-to-VTE highlight contract.
+
+- **Block Search 3.0 (2026-08-26)**: cross-block search now composes `Aa`
+  case sensitivity, regex, and Unicode whole-word matching. One typed options
+  value drives both the bounded record scan and the activated VTE/PCRE2
+  highlighter, closing the old scan/jump interpretation split. `Ctrl+I`,
+  `Ctrl+R`, and `Ctrl+W` expose all three controls without moving focus. The
+  formerly unbounded dialog query now fails visibly above 8 KiB, and Rust-regex
+  compilation has a 2 MiB heap ceiling before retained records are scanned.
 
 - **Single-interpretation session restore (2026-08-25)**: every bounded legacy
   workspace, pane-layout, and versioned-envelope decode now runs through
