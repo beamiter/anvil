@@ -278,9 +278,10 @@ and `W` (Unicode whole word) controls. `Ctrl+I` / `Ctrl+R` / `Ctrl+W` toggle
 them while the query keeps focus; the result scan and the VTE highlight used
 after activation share the exact same options. `All / Cmd / Out` restricts the
 scan to all text, commands, or output, with `Ctrl+O` cycling the scope before
-the 500-hit cap is applied. `Failed` and `Slow` compose before that cap; with
-an empty text query, either filter turns the palette into a metadata browser
-with one representative, jumpable row per eligible retained block. Queries above 8 KiB are rejected
+the 500-hit cap is applied. `Failed`, `Slow`, and `Background` compose before
+that cap; with an empty text query, any filter turns the palette into a metadata
+browser with one representative row for each eligible retained block that has
+meaningful text on the selected surface. Queries above 8 KiB are rejected
 before regex compilation, whose heap budget is capped independently. Result
 status includes the current position; `↑/↓` wraps, `Home/End` selects either
 edge, and `PageUp/PageDown` moves ten rows while keeping the row visible and
@@ -288,10 +289,10 @@ the query focused. `Enter` jumps and closes; `Shift+Enter` keeps the palette
 open and advances only after a successful live-terminal jump. Snapshot-only
 hits still open their snapshot, while unavailable hits stay selected with a
 diagnostic instead of fake-stepping.
-Reopening restores the last valid query, matching controls, scope, and
-Failed/Slow filters for this pane's process lifetime only; nothing is written
+Reopening restores the last valid query, matching controls, scope, and all
+three metadata filters for this pane's process lifetime only; nothing is written
 to config or session snapshots. `Ctrl+U` clears only the query; **Reset** or
-`Ctrl+Shift+U` restores the query, matching controls, scope, and both filters
+`Ctrl+Shift+U` restores the query, matching controls, scope, and all filters
 to defaults. An invalid query above 8 KiB is never remembered, and activating
 any control with the pointer returns focus to the query for uninterrupted typing.
 While open, a 500 ms identity-only probe detects completed-block additions and
@@ -302,7 +303,7 @@ Block Search 3.8 keeps the closest surviving old rank when retention removes
 that exact hit, avoiding a jump to the first row. Query, matching, scope, or
 metadata-filter edits remain new intent and deliberately restart at the top.
 Block Search 3.9 adds a pointer-accessible refresh button to the dialog header.
-The button and unmodified `F5` share one immediate, selection-preserving rebuild
+The button and unmodified `F5` share one selection-preserving rebuild
 that synchronizes the identity probe so the automatic timer cannot enqueue a
 duplicate refresh; modified F5 chords pass through unchanged. The button exposes
 its full action name and `F5` shortcut to accessibility clients. Key auto-repeat
@@ -310,6 +311,31 @@ is latched, so one physical unmodified F5 press performs at most one rebuild;
 pressing F5 with a modifier and then releasing that modifier while F5 remains
 held cannot accidentally refresh. Leaving the dialog focus domain clears the
 latch, so a window-manager focus change cannot strand F5 after a lost release.
+Block Search 4.0 keeps a held opening toggle from immediately closing the new
+dialog: the window capture layer remembers the opener's physical keycode before
+the asynchronous action dispatch, consumes its repeats even if modifiers are
+released mid-hold, and clears the guard on physical release or window
+deactivation. Fresh presses still toggle normally, including user-remapped
+`cross_block_search` bindings. Refresh/Reset remain in the title bar while
+scope/matching and metadata controls occupy two compact content rows. Each row
+automatically scrolls horizontally when the active theme, font, or window width
+cannot fit every control, preserving their keyboard order and reachability. A
+manual refresh now exposes `Refreshing blocks…` as an accessible status for
+one drawable frame before the synchronous bounded rebuild; a generation check
+prevents that deferred edge from reviving stale query intent or a closed dialog.
+The pending frame callback is explicitly replaced or removed on another search
+intent, refresh, or close, so a closed widget without a frame clock cannot keep
+the dialog graph alive. A dialog also retains its singleton slot through the
+close animation; toggles during that transition keep closing the same instance,
+and only its `closed` signal permits the next one to open.
+Block Search 4.1 adds `Background` as a composable metadata condition backed by
+the completed record's real commandless-output identity in both Block and
+Unified modes. Background records have no command lifecycle, so they never
+match Failed, exact-exit, Slow, or duration-bound predicates even if defensive
+legacy input carries contradictory fields; result rows likewise suppress those
+raw exit and duration values. Empty-query browsing produces only
+rows backed by retained output: `All` and `Out` use the first meaningful output
+line, while `Cmd` and records without retained output produce no synthetic hit.
 
 Unified mode keeps one continuous VTE scrollback while retaining authenticated
 command zones, status chrome, bounded per-zone output snapshots, search/export,

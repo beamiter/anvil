@@ -705,17 +705,44 @@ fn duration_matches(duration: Option<u64>, filters: &BlockFilters) -> bool {
     !filters.slow_only || duration >= filters.slow_threshold_ms
 }
 
-fn record_matches_filters(record: BackendRecordRef<'_>, filters: &BlockFilters) -> bool {
-    outcome_matches_filters(record.command(), record.exit_code(), filters)
-        && duration_matches(record.duration_ms(), filters)
-}
-
-fn has_metadata_filters(filters: &BlockFilters) -> bool {
+fn has_command_lifecycle_filters(filters: &BlockFilters) -> bool {
     filters.exit_code.is_some()
         || filters.min_duration_ms.is_some()
         || filters.max_duration_ms.is_some()
         || filters.failed_only
         || filters.slow_only
+}
+
+fn record_matches_filters(record: BackendRecordRef<'_>, filters: &BlockFilters) -> bool {
+    let is_background = record.is_background();
+    (!filters.background_only || is_background)
+        // A background record belongs to no command lifecycle. Its raw status
+        // and duration are therefore never outcome/timing matches, even if a
+        // legacy or contradictory source happened to carry either field.
+        && (!is_background || !has_command_lifecycle_filters(filters))
+        && record_outcome_matches_filters(record, filters)
+        && duration_matches(record.duration_ms(), filters)
+}
+
+/// Classify outcome without allowing command text to override the backend's
+/// record identity. Block records derive that identity from commandlessness,
+/// while Unified metadata carries an explicit bit that is authoritative in
+/// both directions. The sentinel is classification-only: it never becomes
+/// searchable or visible in a result row.
+fn record_outcome_matches_filters(record: BackendRecordRef<'_>, filters: &BlockFilters) -> bool {
+    const EXPLICIT_FOREGROUND_COMMAND: &str = "<foreground command unavailable>";
+
+    let command = record.command();
+    let classification_command = if !record.is_background() && command.trim().is_empty() {
+        EXPLICIT_FOREGROUND_COMMAND
+    } else {
+        command
+    };
+    outcome_matches_filters(classification_command, record.exit_code(), filters)
+}
+
+fn has_metadata_filters(filters: &BlockFilters) -> bool {
+    has_command_lifecycle_filters(filters) || filters.background_only
 }
 
 fn first_meaningful_line(text: &str) -> Option<(usize, &str)> {
@@ -1662,13 +1689,14 @@ mod tests {
         cross_block_pattern, cross_block_search_version, duration_matches,
         focus_one_native_forward_match, has_metadata_filters, matching_record_ids,
         metadata_filter_hits, native_cursor_action, outcome_matches_filters, plan_matching_windows,
-        regex_consumption, snippet, step_compressed_cursor, unresolved_record_target_result,
-        utf8_prefix, vte_cross_block_pattern, CrossBlockSearchOptions, CrossBlockSearchScope,
-        FindCursor, FindDirection, FindScanBudget, FindSurface, NativeCursorAction,
-        RecordNavigationResult, RecordSnapshotView, RegexConsumption, VTE_SEARCH_FLAGS,
+        record_matches_filters, regex_consumption, snippet, step_compressed_cursor,
+        unresolved_record_target_result, utf8_prefix, vte_cross_block_pattern,
+        CrossBlockSearchOptions, CrossBlockSearchScope, FindCursor, FindDirection, FindScanBudget,
+        FindSurface, NativeCursorAction, RecordNavigationResult, RecordSnapshotView,
+        RegexConsumption, VTE_SEARCH_FLAGS,
     };
     use crate::block_view::{
-        BackendRecordRef, BackendSearchWindow, BlockFilters, CompletedCommandRecord,
+        BackendRecordRef, BackendSearchWindow, BlockData, BlockFilters, CompletedCommandRecord,
         ZoneOutputSnapshot,
     };
     use std::collections::HashSet;
@@ -2303,6 +2331,10 @@ mod tests {
             ..Default::default()
         };
         assert!(has_metadata_filters(&filters));
+        assert!(has_metadata_filters(&BlockFilters {
+            background_only: true,
+            ..Default::default()
+        }));
         assert!(!has_metadata_filters(&BlockFilters::default()));
         assert!(!duration_matches(None, &filters));
     }
@@ -2323,6 +2355,183 @@ mod tests {
     #[test]
     fn duration_is_irrelevant_without_duration_predicates() {
         assert!(duration_matches(None, &BlockFilters::default()));
+    }
+
+    #[test]
+    fn background_classification_is_backend_neutral_and_ignores_raw_failure_status() {
+        let block = BlockData {
+            id: 1,
+            prompt: String::new(),
+            cmd: " \t".to_string(),
+            cmd_markup: None,
+            output: "block background".to_string(),
+            exit_code: Some(7),
+            lifecycle_schema: crate::block_view::blocks::BLOCK_LIFECYCLE_SCHEMA,
+            completion_provenance: super::super::CompletionProvenance::Unknown.into(),
+            start_mark_seen: false,
+            estimated_height: 1,
+            line_count: 1,
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: Some(2_000),
+            cwd: None,
+            cols: 80,
+        };
+        let metadata = CompletedCommandRecord {
+            id: 2,
+            // Metadata's explicit bit is authoritative even for a defensive
+            // contradictory fixture; search must not relabel it from text.
+            cmd: "legacy payload".to_string(),
+            exit_code: Some(9),
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: Some(2_000),
+            cwd: None,
+            is_background: true,
+            completion_provenance: super::super::CompletionProvenance::Unknown,
+            start_mark_seen: false,
+        };
+        let records = [
+            BackendRecordRef::Block(&block),
+            BackendRecordRef::Metadata {
+                record: &metadata,
+                snapshot: None,
+            },
+        ];
+        let background = BlockFilters {
+            background_only: true,
+            ..Default::default()
+        };
+        let failed = BlockFilters {
+            failed_only: true,
+            ..Default::default()
+        };
+        let exact = BlockFilters {
+            exit_code: Some(7),
+            ..Default::default()
+        };
+        let slow_background = BlockFilters {
+            slow_only: true,
+            slow_threshold_ms: 1_000,
+            background_only: true,
+            ..Default::default()
+        };
+        let bounded_background = BlockFilters {
+            min_duration_ms: Some(1),
+            max_duration_ms: Some(3_000),
+            background_only: true,
+            ..Default::default()
+        };
+
+        for record in records {
+            assert!(record.is_background());
+            assert_eq!(record.command(), "");
+            assert_eq!(record.exit_code(), None);
+            assert_eq!(record.duration_ms(), None);
+            assert!(record_matches_filters(record, &background));
+            assert!(!record_matches_filters(record, &failed));
+            assert!(!record_matches_filters(record, &exact));
+            assert!(!record_matches_filters(record, &slow_background));
+            assert!(!record_matches_filters(record, &bounded_background));
+        }
+
+        let retained = ZoneOutputSnapshot {
+            plain: "\nactual background output".to_string(),
+            truncated: false,
+        };
+        let metadata_record = || {
+            [BackendRecordRef::Metadata {
+                record: &metadata,
+                snapshot: Some(&retained),
+            }]
+        };
+        assert!(metadata_filter_hits(
+            metadata_record(),
+            CrossBlockSearchScope::Command,
+            1,
+            &background,
+        )
+        .is_empty());
+        let hits = metadata_filter_hits(
+            metadata_record(),
+            CrossBlockSearchScope::All,
+            1,
+            &background,
+        );
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].is_output);
+        assert_eq!(hits[0].line_text, "actual background output");
+        assert_eq!(hits[0].cmd_preview, "");
+        assert_eq!(hits[0].exit_code, None);
+        assert_eq!(hits[0].duration_ms, None);
+    }
+
+    #[test]
+    fn explicit_foreground_metadata_identity_survives_an_empty_legacy_command() {
+        let metadata = CompletedCommandRecord {
+            id: 8,
+            // The explicit Unified identity is authoritative in this direction
+            // too: missing legacy command text must not erase a real lifecycle.
+            cmd: String::new(),
+            exit_code: Some(7),
+            start_time_ms: Some(10),
+            end_time_ms: Some(2_010),
+            duration_ms: Some(2_000),
+            cwd: Some("/srv/legacy".to_string()),
+            is_background: false,
+            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            start_mark_seen: true,
+        };
+        let retained = ZoneOutputSnapshot {
+            plain: "\nlegacy foreground output".to_string(),
+            truncated: false,
+        };
+        let record = BackendRecordRef::Metadata {
+            record: &metadata,
+            snapshot: Some(&retained),
+        };
+        let background = BlockFilters {
+            background_only: true,
+            ..Default::default()
+        };
+        let exact = BlockFilters {
+            exit_code: Some(7),
+            ..Default::default()
+        };
+        let failed = BlockFilters {
+            failed_only: true,
+            ..Default::default()
+        };
+        let slow = BlockFilters {
+            slow_only: true,
+            slow_threshold_ms: 1_000,
+            ..Default::default()
+        };
+
+        assert!(!record.is_background());
+        assert_eq!(record.command(), "");
+        assert_eq!(record.exit_code(), Some(7));
+        assert_eq!(record.duration_ms(), Some(2_000));
+        assert!(!record_matches_filters(record, &background));
+        assert!(record_matches_filters(record, &exact));
+        assert!(record_matches_filters(record, &failed));
+        assert!(record_matches_filters(record, &slow));
+
+        assert!(
+            metadata_filter_hits([record], CrossBlockSearchScope::Command, 1, &failed,).is_empty()
+        );
+        for scope in [CrossBlockSearchScope::All, CrossBlockSearchScope::Output] {
+            let hits = metadata_filter_hits([record], scope, 1, &failed);
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].block_id, 8);
+            assert!(hits[0].is_output);
+            assert_eq!(hits[0].line_no, 2);
+            assert_eq!(hits[0].line_text, "legacy foreground output");
+            assert_eq!(hits[0].cmd_preview, "");
+            assert_eq!(hits[0].exit_code, Some(7));
+            assert_eq!(hits[0].duration_ms, Some(2_000));
+            assert_eq!(hits[0].cwd.as_deref(), Some("/srv/legacy"));
+        }
     }
 
     #[test]
@@ -2428,6 +2637,129 @@ mod tests {
         assert!(
             metadata_filter_hits(records(), CrossBlockSearchScope::Output, 1, &filters).is_empty()
         );
+    }
+
+    #[test]
+    fn background_filter_composes_before_cap_and_uses_only_real_scoped_text() {
+        let record = |id, cmd: &str, duration_ms, is_background| CompletedCommandRecord {
+            id,
+            cmd: cmd.to_string(),
+            exit_code: None,
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms,
+            cwd: None,
+            is_background,
+            completion_provenance: super::super::CompletionProvenance::Unknown,
+            start_mark_seen: !is_background,
+        };
+        let metadata = [
+            record(1, "foreground one", Some(2_000), false),
+            record(2, "foreground two", Some(20), false),
+            record(3, "", None, true),
+            record(4, "", None, true),
+        ];
+        let foreground_output = ZoneOutputSnapshot {
+            plain: "foreground output".to_string(),
+            truncated: false,
+        };
+        let second_foreground_output = ZoneOutputSnapshot {
+            plain: "second foreground output".to_string(),
+            truncated: false,
+        };
+        let retained_output = ZoneOutputSnapshot {
+            plain: "\nretained background".to_string(),
+            truncated: false,
+        };
+        let records = || {
+            [
+                BackendRecordRef::Metadata {
+                    record: &metadata[0],
+                    snapshot: Some(&foreground_output),
+                },
+                BackendRecordRef::Metadata {
+                    record: &metadata[1],
+                    snapshot: Some(&second_foreground_output),
+                },
+                BackendRecordRef::Metadata {
+                    record: &metadata[2],
+                    snapshot: None,
+                },
+                BackendRecordRef::Metadata {
+                    record: &metadata[3],
+                    snapshot: Some(&retained_output),
+                },
+            ]
+            .into_iter()
+        };
+        let filters = BlockFilters {
+            background_only: true,
+            ..Default::default()
+        };
+
+        for scope in [CrossBlockSearchScope::All, CrossBlockSearchScope::Output] {
+            let hits = metadata_filter_hits(records(), scope, 1, &filters);
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].block_id, 4);
+            assert!(hits[0].is_output);
+            assert_eq!(hits[0].line_no, 2);
+            assert_eq!(hits[0].line_text, "retained background");
+        }
+        assert!(
+            metadata_filter_hits(records(), CrossBlockSearchScope::Command, 10, &filters)
+                .is_empty()
+        );
+        assert!(metadata_filter_hits(
+            [BackendRecordRef::Metadata {
+                record: &metadata[2],
+                snapshot: None,
+            }],
+            CrossBlockSearchScope::All,
+            10,
+            &filters,
+        )
+        .is_empty());
+
+        let block = BlockData {
+            id: 5,
+            prompt: String::new(),
+            cmd: String::new(),
+            cmd_markup: None,
+            output: "retained block background".to_string(),
+            exit_code: None,
+            lifecycle_schema: crate::block_view::blocks::BLOCK_LIFECYCLE_SCHEMA,
+            completion_provenance: super::super::CompletionProvenance::Unknown.into(),
+            start_mark_seen: false,
+            estimated_height: 1,
+            line_count: 1,
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: None,
+            cwd: None,
+            cols: 80,
+        };
+        let block_record = || [BackendRecordRef::Block(&block)];
+        let hits = metadata_filter_hits(block_record(), CrossBlockSearchScope::All, 1, &filters);
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].is_output);
+        assert_eq!(hits[0].line_text, "retained block background");
+        let command_hits =
+            metadata_filter_hits(block_record(), CrossBlockSearchScope::Command, 1, &filters);
+        assert!(command_hits.is_empty());
+
+        let background_and_slow = BlockFilters {
+            background_only: true,
+            slow_only: true,
+            slow_threshold_ms: 1_000,
+            ..Default::default()
+        };
+        assert!(metadata_filter_hits(
+            block_record(),
+            CrossBlockSearchScope::All,
+            1,
+            &background_and_slow,
+        )
+        .is_empty());
     }
 
     /// A retained snapshot makes a metadata record searchable by its output;

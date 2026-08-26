@@ -33,6 +33,7 @@ pub(super) struct Memory {
     scope: crate::block_view::CrossBlockSearchScope,
     failed_only: bool,
     slow_only: bool,
+    background_only: bool,
 }
 
 fn memory(
@@ -41,6 +42,7 @@ fn memory(
     scope: crate::block_view::CrossBlockSearchScope,
     failed_only: bool,
     slow_only: bool,
+    background_only: bool,
 ) -> Memory {
     Memory {
         // Keep the pane-lifetime state bounded even if the user closes while
@@ -54,6 +56,7 @@ fn memory(
         scope,
         failed_only,
         slow_only,
+        background_only,
     }
 }
 
@@ -61,8 +64,13 @@ fn idle_status() -> &'static str {
     "Type to search. F5 refreshes; Shift+Enter jumps and advances; Ctrl+Shift+U resets."
 }
 
-fn has_search_intent(query: &str, failed_only: bool, slow_only: bool) -> bool {
-    !query.is_empty() || failed_only || slow_only
+fn has_search_intent(
+    query: &str,
+    failed_only: bool,
+    slow_only: bool,
+    background_only: bool,
+) -> bool {
+    !query.is_empty() || failed_only || slow_only || background_only
 }
 
 fn refresh_status() -> &'static str {
@@ -126,6 +134,91 @@ impl RefreshKeyLatch {
 
     fn reset(&mut self) {
         self.held = false;
+    }
+}
+
+enum RefreshTickState<T> {
+    Waiting { generation: u64, id: T },
+    Fired { generation: u64 },
+}
+
+struct RefreshTickSlot<T> {
+    state: Option<RefreshTickState<T>>,
+}
+
+impl<T> Default for RefreshTickSlot<T> {
+    fn default() -> Self {
+        Self { state: None }
+    }
+}
+
+impl<T> RefreshTickSlot<T> {
+    /// Replace the pending callback and return an older callback id for removal.
+    /// A callback that already fired owns no removable id, but its later idle
+    /// cleanup must not erase a replacement installed in the meantime.
+    fn replace(&mut self, generation: u64, id: T) -> Option<T> {
+        let previous = self.cancel();
+        self.state = Some(RefreshTickState::Waiting { generation, id });
+        previous
+    }
+
+    fn mark_fired(&mut self, generation: u64) -> bool {
+        if matches!(
+            self.state.as_ref(),
+            Some(RefreshTickState::Waiting {
+                generation: current,
+                ..
+            }) if *current == generation
+        ) {
+            self.state = Some(RefreshTickState::Fired { generation });
+            true
+        } else {
+            false
+        }
+    }
+
+    fn finish_fired(&mut self, generation: u64) {
+        if matches!(
+            self.state.as_ref(),
+            Some(RefreshTickState::Fired {
+                generation: current
+            }) if *current == generation
+        ) {
+            self.state = None;
+        }
+    }
+
+    fn cancel(&mut self) -> Option<T> {
+        match self.state.take() {
+            Some(RefreshTickState::Waiting { id, .. }) => Some(id),
+            Some(RefreshTickState::Fired { .. }) | None => None,
+        }
+    }
+}
+
+fn cancel_refresh_tick(slot: &RefCell<RefreshTickSlot<gtk::TickCallbackId>>) {
+    // Drop the RefCell borrow before GTK destroys callback user data: that
+    // destroy path releases strong widget/closure references and must never
+    // re-enter while the lifecycle slot is borrowed.
+    let pending = slot.borrow_mut().cancel();
+    if let Some(id) = pending {
+        id.remove();
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DialogTogglePlan<T> {
+    Open,
+    CloseExisting(T),
+}
+
+/// Keep an existing dialog claimed until its `closed` signal. Taking the slot
+/// before the close animation finishes would let a fresh toggle open a second
+/// dialog, whose claim the first dialog's delayed callback could then erase.
+fn dialog_toggle_plan<T: Clone>(claimed: &Option<T>) -> DialogTogglePlan<T> {
+    match claimed {
+        Some(dialog) => DialogTogglePlan::CloseExisting(dialog.clone()),
+        None => DialogTogglePlan::Open,
     }
 }
 
@@ -280,8 +373,13 @@ pub(super) fn toggle(
     snapshot_slot: Rc<RefCell<Option<adw::Dialog>>>,
     memory_slot: Rc<RefCell<Memory>>,
 ) {
-    let open_dialog = { dialog_slot.borrow_mut().take() };
-    if let Some(dialog) = open_dialog {
+    let toggle_plan = {
+        // Drop the immutable slot borrow before `force_close`: libadwaita may
+        // synchronously emit `closed`, whose callback mutably clears the slot.
+        let claimed = dialog_slot.borrow();
+        dialog_toggle_plan(&claimed)
+    };
+    if let DialogTogglePlan::CloseExisting(dialog) = toggle_plan {
         dialog.force_close();
         return;
     }
@@ -318,10 +416,6 @@ pub(super) fn toggle(
     reset_button.set_tooltip_text(Some("Reset query, matching options, scope, and filters"));
     header_bar.pack_start(&refresh_button);
     header_bar.pack_start(&reset_button);
-    header_bar.pack_end(&scope_dropdown);
-    header_bar.pack_end(&whole_word_toggle);
-    header_bar.pack_end(&regex_toggle);
-    header_bar.pack_end(&case_toggle);
     // The outcome and duration predicates existed already with no surface that
     // could reach them, so "which failing build took over a second" was
     // unanswerable with the data sitting right there.
@@ -333,8 +427,10 @@ pub(super) fn toggle(
         .label("Slow")
         .tooltip_text("Only blocks that ran at least as long as the slow-block threshold")
         .build();
-    header_bar.pack_end(&slow_toggle);
-    header_bar.pack_end(&failed_toggle);
+    let background_toggle = gtk::ToggleButton::builder()
+        .label("Background")
+        .tooltip_text("Only commandless background-output blocks")
+        .build();
 
     let filter_entry = gtk::SearchEntry::new();
     filter_entry.set_placeholder_text(Some("Search across blocks…"));
@@ -349,6 +445,7 @@ pub(super) fn toggle(
     scope_dropdown.set_selected(remembered.scope.index());
     failed_toggle.set_active(remembered.failed_only);
     slow_toggle.set_active(remembered.slow_only);
+    background_toggle.set_active(remembered.background_only);
     filter_entry.set_text(&remembered.query);
 
     let list_box = gtk::ListBox::new();
@@ -371,8 +468,40 @@ pub(super) fn toggle(
         .vexpand(true)
         .child(&list_box)
         .build();
+    // Keep the title bar usable when the dialog is width-constrained. Matching
+    // and metadata intent have separate horizontally scrollable content rows
+    // instead of competing with the title and window controls.
+    let matching_controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    matching_controls.set_margin_start(12);
+    matching_controls.set_margin_end(12);
+    matching_controls.append(&scope_dropdown);
+    matching_controls.append(&case_toggle);
+    matching_controls.append(&regex_toggle);
+    matching_controls.append(&whole_word_toggle);
+    let matching_controls_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .vscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_height(true)
+        .child(&matching_controls)
+        .build();
+    let metadata_controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    metadata_controls.set_margin_start(12);
+    metadata_controls.set_margin_end(12);
+    metadata_controls.set_margin_top(6);
+    metadata_controls.set_margin_bottom(6);
+    metadata_controls.append(&failed_toggle);
+    metadata_controls.append(&slow_toggle);
+    metadata_controls.append(&background_toggle);
+    let metadata_controls_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .vscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_height(true)
+        .child(&metadata_controls)
+        .build();
     let search_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     search_box.append(&filter_entry);
+    search_box.append(&matching_controls_scroll);
+    search_box.append(&metadata_controls_scroll);
     search_box.append(&status_label);
     search_box.append(&scrolled);
 
@@ -384,6 +513,9 @@ pub(super) fn toggle(
     let hits: Rc<RefCell<Vec<CrossBlockHit>>> = Rc::new(RefCell::new(Vec::new()));
     let retained_hit: Rc<RefCell<Option<SelectionAnchor>>> = Rc::new(RefCell::new(None));
     let pending_rebuild: Rc<RefCell<Option<gtk::glib::SourceId>>> = Rc::new(RefCell::new(None));
+    let pending_refresh_tick = Rc::new(RefCell::new(
+        RefreshTickSlot::<gtk::TickCallbackId>::default(),
+    ));
     let search_generation = Rc::new(Cell::new(0_u64));
     {
         let hits = hits.clone();
@@ -399,6 +531,7 @@ pub(super) fn toggle(
         let view = view.clone();
         let failed_toggle = failed_toggle.clone();
         let slow_toggle = slow_toggle.clone();
+        let background_toggle = background_toggle.clone();
         let list_box = list_box.clone();
         let hits = hits.clone();
         let status_label = status_label.clone();
@@ -433,13 +566,19 @@ pub(super) fn toggle(
             let filters = crate::block_view::BlockFilters {
                 failed_only: failed_toggle.is_active(),
                 slow_only: slow_toggle.is_active(),
+                background_only: background_toggle.is_active(),
                 slow_threshold_ms: crate::block_view::SLOW_BLOCK_THRESHOLD_MS,
                 ..Default::default()
             };
             while let Some(child) = list_box.first_child() {
                 list_box.remove(&child);
             }
-            if !has_search_intent(&query, filters.failed_only, filters.slow_only) {
+            if !has_search_intent(
+                &query,
+                filters.failed_only,
+                filters.slow_only,
+                filters.background_only,
+            ) {
                 hits.borrow_mut().clear();
                 status_label.set_text(idle_status());
                 return;
@@ -511,6 +650,7 @@ pub(super) fn toggle(
 
     let schedule_rebuild = {
         let pending_rebuild = pending_rebuild.clone();
+        let pending_refresh_tick = pending_refresh_tick.clone();
         let search_generation = search_generation.clone();
         let rebuild = rebuild.clone();
         let hits = hits.clone();
@@ -520,7 +660,9 @@ pub(super) fn toggle(
         let retained_hit = retained_hit.clone();
         let failed_toggle = failed_toggle.clone();
         let slow_toggle = slow_toggle.clone();
+        let background_toggle = background_toggle.clone();
         Rc::new(move |preserve_selection: bool| {
+            cancel_refresh_tick(pending_refresh_tick.as_ref());
             let generation = search_generation.get().wrapping_add(1);
             search_generation.set(generation);
             if let Some(source) = pending_rebuild.borrow_mut().take() {
@@ -542,6 +684,7 @@ pub(super) fn toggle(
                 filter_entry.text().as_str(),
                 failed_toggle.is_active(),
                 slow_toggle.is_active(),
+                background_toggle.is_active(),
             ) {
                 while let Some(child) = list_box.first_child() {
                     list_box.remove(&child);
@@ -637,6 +780,14 @@ pub(super) fn toggle(
         });
     }
     {
+        let schedule_rebuild = schedule_rebuild.clone();
+        let filter_entry = filter_entry.clone();
+        background_toggle.connect_toggled(move |_| {
+            schedule_rebuild(false);
+            filter_entry.grab_focus();
+        });
+    }
+    {
         let filter_entry = filter_entry.clone();
         let case_toggle = case_toggle.clone();
         let regex_toggle = regex_toggle.clone();
@@ -644,6 +795,7 @@ pub(super) fn toggle(
         let scope_dropdown = scope_dropdown.clone();
         let failed_toggle = failed_toggle.clone();
         let slow_toggle = slow_toggle.clone();
+        let background_toggle = background_toggle.clone();
         reset_button.connect_clicked(move |_| {
             filter_entry.set_text("");
             case_toggle.set_active(false);
@@ -652,6 +804,7 @@ pub(super) fn toggle(
             scope_dropdown.set_selected(crate::block_view::CrossBlockSearchScope::All.index());
             failed_toggle.set_active(false);
             slow_toggle.set_active(false);
+            background_toggle.set_active(false);
             filter_entry.grab_focus();
         });
     }
@@ -664,6 +817,7 @@ pub(super) fn toggle(
         let view = view.clone();
         let observed_version = observed_version.clone();
         let pending_rebuild = pending_rebuild.clone();
+        let pending_refresh_tick = pending_refresh_tick.clone();
         let search_generation = search_generation.clone();
         let retained_hit = retained_hit.clone();
         let list_box = list_box.clone();
@@ -674,10 +828,14 @@ pub(super) fn toggle(
         refresh_button.connect_clicked(move |_| {
             // The button is the single manual-refresh path. Synchronize the
             // cheap probe first, cancel any pending debounced intent refresh,
-            // retain the current stable row, and rebuild on this main-loop
-            // turn rather than waiting for the ordinary 150 ms debounce.
+            // and retain the current stable row. Rebuild after one frame has
+            // painted the Status update, rather than hiding "Refreshing…" in
+            // the same synchronous callback or waiting for the ordinary
+            // 150 ms debounce.
+            cancel_refresh_tick(pending_refresh_tick.as_ref());
             observed_version.set(view.cross_block_search_version());
-            search_generation.set(search_generation.get().wrapping_add(1));
+            let generation = search_generation.get().wrapping_add(1);
+            search_generation.set(generation);
             if let Some(source) = pending_rebuild.borrow_mut().take() {
                 source.remove();
             }
@@ -689,8 +847,41 @@ pub(super) fn toggle(
                     .map(|hit| SelectionAnchor { hit, index })
             });
             status_label.set_text(refresh_status());
-            rebuild();
+            status_label.announce(
+                refresh_status(),
+                gtk::AccessibleAnnouncementPriority::Medium,
+            );
             filter_entry.grab_focus();
+
+            let tick_slot = pending_refresh_tick.clone();
+            let search_generation = search_generation.clone();
+            let rebuild = rebuild.clone();
+            let tick_id = status_label.add_tick_callback(move |_, _| {
+                if !tick_slot.borrow_mut().mark_fired(generation) {
+                    return gtk::glib::ControlFlow::Break;
+                }
+                // Tick callbacks run before this frame's layout/paint. An
+                // idle source cannot run until that frame-clock dispatch
+                // returns, so the status has one drawable/accessibility frame
+                // before the synchronous bounded scan replaces it.
+                let tick_slot = tick_slot.clone();
+                let search_generation = search_generation.clone();
+                let rebuild = rebuild.clone();
+                gtk::glib::idle_add_local_once(move || {
+                    tick_slot.borrow_mut().finish_fired(generation);
+                    if search_generation.get() == generation {
+                        rebuild();
+                    }
+                });
+                gtk::glib::ControlFlow::Break
+            });
+            let replaced = pending_refresh_tick
+                .borrow_mut()
+                .replace(generation, tick_id);
+            if let Some(id) = replaced {
+                // Keep callback destruction outside the RefCell borrow.
+                id.remove();
+            }
         });
     }
     let refresh_source = {
@@ -796,10 +987,7 @@ pub(super) fn toggle(
         let refresh_key_latch = refresh_key_latch.clone();
         key_controller.connect_key_pressed(move |_, key, _, state| {
             use gtk::gdk::{Key, ModifierType};
-            if key == Key::Escape
-                || (matches!(key, Key::g | Key::G)
-                    && state.contains(ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK))
-            {
+            if key == Key::Escape {
                 dialog.force_close();
                 return gtk::glib::Propagation::Stop;
             }
@@ -907,7 +1095,9 @@ pub(super) fn toggle(
     {
         let dialog_slot = dialog_slot.clone();
         let pending_rebuild = pending_rebuild.clone();
+        let pending_refresh_tick = pending_refresh_tick.clone();
         let refresh_source = refresh_source.clone();
+        let search_generation = search_generation.clone();
         let filter_entry = filter_entry.clone();
         let case_toggle = case_toggle.clone();
         let regex_toggle = regex_toggle.clone();
@@ -915,7 +1105,14 @@ pub(super) fn toggle(
         let scope_dropdown = scope_dropdown.clone();
         let failed_toggle = failed_toggle.clone();
         let slow_toggle = slow_toggle.clone();
+        let background_toggle = background_toggle.clone();
         dialog.connect_closed(move |_| {
+            // Remove an unfired frame callback so it cannot retain this closed
+            // dialog indefinitely on a widget that no longer has a frame clock.
+            // A tick that already scheduled its one-shot idle is invalidated by
+            // the generation below and releases its captures on that next idle.
+            cancel_refresh_tick(pending_refresh_tick.as_ref());
+            search_generation.set(search_generation.get().wrapping_add(1));
             if let Some(source) = refresh_source.borrow_mut().take() {
                 source.remove();
             }
@@ -932,6 +1129,7 @@ pub(super) fn toggle(
                 crate::block_view::CrossBlockSearchScope::from_index(scope_dropdown.selected()),
                 failed_toggle.is_active(),
                 slow_toggle.is_active(),
+                background_toggle.is_active(),
             );
             *dialog_slot.borrow_mut() = None;
         });
@@ -944,6 +1142,7 @@ pub(super) fn toggle(
         &remembered.query,
         remembered.failed_only,
         remembered.slow_only,
+        remembered.background_only,
     ) {
         schedule_rebuild(false);
     }
@@ -953,12 +1152,12 @@ pub(super) fn toggle(
 #[cfg(test)]
 mod tests {
     use super::{
-        has_search_intent, hit_outcome_label, idle_status, is_plain_refresh_key, jump_outcome,
-        memory, query_error, refresh_selection_index, refresh_status, search_status,
-        selection_index, should_step, CrossBlockHit, JumpOutcome, RecordNavigationResult,
-        RefreshKeyLatch, RefreshKeyPress, SelectionAnchor, SelectionMove,
-        CROSS_BLOCK_SEARCH_DEBOUNCE, CROSS_BLOCK_SEARCH_LIMIT,
-        CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
+        dialog_toggle_plan, has_search_intent, hit_outcome_label, idle_status,
+        is_plain_refresh_key, jump_outcome, memory, query_error, refresh_selection_index,
+        refresh_status, search_status, selection_index, should_step, CrossBlockHit,
+        DialogTogglePlan, JumpOutcome, RecordNavigationResult, RefreshKeyLatch, RefreshKeyPress,
+        RefreshTickSlot, SelectionAnchor, SelectionMove, CROSS_BLOCK_SEARCH_DEBOUNCE,
+        CROSS_BLOCK_SEARCH_LIMIT, CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
     };
     use crate::block_view::{CrossBlockSearchOptions, CrossBlockSearchScope};
 
@@ -1121,6 +1320,69 @@ mod tests {
     }
 
     #[test]
+    fn refresh_tick_slot_cancels_replaces_and_ignores_stale_idle_cleanup() {
+        let mut slot = RefreshTickSlot::<u64>::default();
+        assert_eq!(slot.cancel(), None);
+
+        assert_eq!(slot.replace(1, 10), None);
+        assert_eq!(
+            slot.replace(2, 20),
+            Some(10),
+            "replacing an unfired tick returns its id for explicit removal"
+        );
+        assert!(
+            !slot.mark_fired(1),
+            "a stale callback cannot claim the slot"
+        );
+        assert!(slot.mark_fired(2));
+        assert_eq!(
+            slot.cancel(),
+            None,
+            "a fired callback has already relinquished its removable id"
+        );
+
+        assert_eq!(slot.replace(3, 30), None);
+        assert!(slot.mark_fired(3));
+        assert_eq!(slot.replace(4, 40), None);
+        slot.finish_fired(3);
+        assert_eq!(
+            slot.cancel(),
+            Some(40),
+            "an older idle cleanup must not erase a replacement tick"
+        );
+
+        assert_eq!(slot.replace(5, 50), None);
+        assert!(slot.mark_fired(5));
+        slot.finish_fired(5);
+        assert_eq!(slot.cancel(), None);
+    }
+
+    #[test]
+    fn closing_dialog_keeps_the_slot_claimed_until_closed() {
+        let mut slot = None;
+        assert_eq!(dialog_toggle_plan(&slot), DialogTogglePlan::Open);
+
+        // Model presenting one dialog, followed by any number of fresh toggle
+        // presses while libadwaita is still running its close animation.
+        slot = Some(7_u64);
+        assert_eq!(
+            dialog_toggle_plan(&slot),
+            DialogTogglePlan::CloseExisting(7)
+        );
+        assert_eq!(slot, Some(7));
+        assert_eq!(
+            dialog_toggle_plan(&slot),
+            DialogTogglePlan::CloseExisting(7)
+        );
+        assert_eq!(slot, Some(7), "force-close must not release the claim");
+
+        // Only the dialog's `closed` signal clears the slot, after which a
+        // genuinely new toggle may open the next instance.
+        slot = None;
+        assert_eq!(dialog_toggle_plan(&slot), DialogTogglePlan::Open);
+    }
+
+    #[test]
     fn cross_block_search_rejects_oversized_queries_before_regex_compilation() {
         assert_eq!(
             query_error(&"x".repeat(CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES)),
@@ -1135,11 +1397,12 @@ mod tests {
 
     #[test]
     fn metadata_filters_are_search_intent_without_text() {
-        assert!(!has_search_intent("", false, false));
-        assert!(has_search_intent("needle", false, false));
-        assert!(has_search_intent("", true, false));
-        assert!(has_search_intent("", false, true));
-        assert!(has_search_intent("", true, true));
+        assert!(!has_search_intent("", false, false, false));
+        assert!(has_search_intent("needle", false, false, false));
+        assert!(has_search_intent("", true, false, false));
+        assert!(has_search_intent("", false, true, false));
+        assert!(has_search_intent("", false, false, true));
+        assert!(has_search_intent("", true, true, true));
     }
 
     #[test]
@@ -1149,12 +1412,20 @@ mod tests {
             regex: true,
             whole_word: true,
         };
-        let remembered = memory("needle", options, CrossBlockSearchScope::Output, true, true);
+        let remembered = memory(
+            "needle",
+            options,
+            CrossBlockSearchScope::Output,
+            true,
+            true,
+            true,
+        );
         assert_eq!(remembered.query, "needle");
         assert_eq!(remembered.options, options);
         assert_eq!(remembered.scope, CrossBlockSearchScope::Output);
         assert!(remembered.failed_only);
         assert!(remembered.slow_only);
+        assert!(remembered.background_only);
 
         let oversized = memory(
             &"x".repeat(CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES + 1),
@@ -1162,12 +1433,15 @@ mod tests {
             CrossBlockSearchScope::Command,
             true,
             false,
+            true,
         );
         assert!(oversized.query.is_empty());
         assert_eq!(oversized.options, options);
         assert_eq!(oversized.scope, CrossBlockSearchScope::Command);
         assert!(oversized.failed_only);
         assert!(!oversized.slow_only);
+        assert!(oversized.background_only);
+        assert!(!super::Memory::default().background_only);
     }
 
     #[test]

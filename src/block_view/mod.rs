@@ -3724,6 +3724,9 @@ impl<'a> BackendRecordRef<'a> {
     }
 
     fn command(self) -> &'a str {
+        if self.is_background() {
+            return "";
+        }
         match self {
             Self::Block(record) => &record.cmd,
             Self::Metadata { record, .. } => &record.cmd,
@@ -3748,6 +3751,9 @@ impl<'a> BackendRecordRef<'a> {
     }
 
     fn exit_code(self) -> Option<i32> {
+        if self.is_background() {
+            return None;
+        }
         match self {
             Self::Block(record) => record.exit_code,
             Self::Metadata { record, .. } => record.exit_code,
@@ -3755,9 +3761,19 @@ impl<'a> BackendRecordRef<'a> {
     }
 
     fn duration_ms(self) -> Option<u64> {
+        if self.is_background() {
+            return None;
+        }
         match self {
             Self::Block(record) => record.duration_ms,
             Self::Metadata { record, .. } => record.duration_ms,
+        }
+    }
+
+    fn is_background(self) -> bool {
+        match self {
+            Self::Block(record) => record.is_background(),
+            Self::Metadata { record, .. } => record.is_background,
         }
     }
 

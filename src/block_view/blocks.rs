@@ -516,6 +516,7 @@ pub struct BlockFilters {
     pub max_duration_ms: Option<u64>,
     pub failed_only: bool,
     pub slow_only: bool,
+    pub background_only: bool,
     pub slow_threshold_ms: u64,
     pub use_regex: bool,
 }

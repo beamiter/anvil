@@ -71,6 +71,7 @@ use relm4::factory::FactoryVecDeque;
 use relm4::gtk;
 use relm4::prelude::*;
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use app_msg::AppMsg;
@@ -118,6 +119,47 @@ fn widget_is_within(mut current: gtk::Widget, ancestor: &gtk::Widget) -> bool {
             return false;
         };
         current = parent;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CrossBlockSearchKeyPress {
+    Proceed,
+    DispatchToggle,
+    SuppressHeldRepeat,
+}
+
+/// Window-capture state for the physical key that opened Block Search.
+///
+/// `AdwDialog` is a widget presented inside this same window, so repeats from
+/// the opening press still cross the window controller before reaching the
+/// dialog. Remember the hardware keycode here, before the asynchronous
+/// `AppMsg::Action` opens the dialog: subsequent press edges are repeats even
+/// if the user releases a modifier and changes their keysym/chord mid-hold.
+#[derive(Debug, Default)]
+struct CrossBlockSearchKeyLatch {
+    held_keycodes: HashSet<u32>,
+}
+
+impl CrossBlockSearchKeyLatch {
+    fn press(&mut self, keycode: u32, is_toggle: bool) -> CrossBlockSearchKeyPress {
+        if self.held_keycodes.contains(&keycode) {
+            return CrossBlockSearchKeyPress::SuppressHeldRepeat;
+        }
+        if is_toggle {
+            self.held_keycodes.insert(keycode);
+            CrossBlockSearchKeyPress::DispatchToggle
+        } else {
+            CrossBlockSearchKeyPress::Proceed
+        }
+    }
+
+    fn release(&mut self, keycode: u32) {
+        self.held_keycodes.remove(&keycode);
+    }
+
+    fn reset(&mut self) {
+        self.held_keycodes.clear();
     }
 }
 
@@ -1126,6 +1168,8 @@ impl SimpleComponent for AppModel {
         top_bar_handle.set_child(Some(top_bar));
         let toast_overlay = &model.toast_overlay;
         let widgets = view_output!();
+        let cross_block_search_key_latch =
+            Rc::new(RefCell::new(CrossBlockSearchKeyLatch::default()));
 
         // Route both the title-bar button and the window manager's close action
         // through the same running-process confirmation. ForceQuit flips the
@@ -1152,6 +1196,7 @@ impl SimpleComponent for AppModel {
         {
             let window_sender = sender.clone();
             let organism_hub = model.organism_hub.clone();
+            let cross_block_search_key_latch = cross_block_search_key_latch.clone();
             root.connect_is_active_notify(move |window| {
                 let active = window.is_active();
                 // Revocation is a visibility safety boundary, so perform it
@@ -1160,6 +1205,10 @@ impl SimpleComponent for AppModel {
                 // the active edge; delayed focus events remain gated there.
                 if !active {
                     organism_hub.revoke_organism_presence();
+                    // A compositor may deactivate us without delivering the
+                    // opening key's release. The next real press must not stay
+                    // trapped behind a stale repeat guard.
+                    cross_block_search_key_latch.borrow_mut().reset();
                 }
                 window_sender.input(AppMsg::WindowActive(active));
             });
@@ -1200,7 +1249,8 @@ impl SimpleComponent for AppModel {
             let ksender = sender.clone();
             let window = root.clone();
             let ai_panel_root = model.ai_panel.widget().clone().upcast::<gtk::Widget>();
-            key_controller.connect_key_pressed(move |_c, keyval, _kc, state| {
+            let cross_block_search_key_latch = cross_block_search_key_latch.clone();
+            key_controller.connect_key_pressed(move |_c, keyval, keycode, state| {
                 let ai_panel_focused = gtk::prelude::RootExt::focus(&window)
                     .is_some_and(|focus| widget_is_within(focus, &ai_panel_root));
                 // Composer/search/list Enter semantics and IME candidate
@@ -1213,10 +1263,25 @@ impl SimpleComponent for AppModel {
                 }
                 // The GTK edge: keysym + modifier state -> toolkit-neutral
                 // chord. `None` means no chord string could name this key.
-                let Some(chord) = chord_from_gdk(keyval, state) else {
+                let chord = chord_from_gdk(keyval, state);
+                let action = chord.as_ref().and_then(|chord| kb.borrow().lookup(chord));
+                match cross_block_search_key_latch
+                    .borrow_mut()
+                    .press(keycode, action == Some(Action::CrossBlockSearch))
+                {
+                    CrossBlockSearchKeyPress::DispatchToggle => {
+                        ksender.input(AppMsg::Action(Action::CrossBlockSearch));
+                        return glib::Propagation::Stop;
+                    }
+                    CrossBlockSearchKeyPress::SuppressHeldRepeat => {
+                        return glib::Propagation::Stop;
+                    }
+                    CrossBlockSearchKeyPress::Proceed => {}
+                }
+                let Some(chord) = chord else {
                     return glib::Propagation::Proceed;
                 };
-                if let Some(action) = kb.borrow().lookup(&chord) {
+                if let Some(action) = action {
                     ksender.input(AppMsg::Action(action));
                     return glib::Propagation::Stop;
                 }
@@ -1235,6 +1300,12 @@ impl SimpleComponent for AppModel {
                     }
                 }
                 glib::Propagation::Proceed
+            });
+        }
+        {
+            let cross_block_search_key_latch = cross_block_search_key_latch.clone();
+            key_controller.connect_key_released(move |_, _, keycode, _| {
+                cross_block_search_key_latch.borrow_mut().release(keycode);
             });
         }
         root.add_controller(key_controller);
@@ -2332,6 +2403,62 @@ fn init_input_method_env() {
     }
     if is_unset("XMODIFIERS") {
         unsafe { std::env::set_var("XMODIFIERS", "@im=fcitx") };
+    }
+}
+
+#[cfg(test)]
+mod cross_block_search_key_latch_tests {
+    use super::*;
+
+    #[test]
+    fn opening_toggle_dispatches_once_per_physical_key_press() {
+        let mut latch = CrossBlockSearchKeyLatch::default();
+        assert_eq!(
+            latch.press(42, true),
+            CrossBlockSearchKeyPress::DispatchToggle
+        );
+        assert_eq!(
+            latch.press(42, true),
+            CrossBlockSearchKeyPress::SuppressHeldRepeat,
+            "auto-repeat must not close the dialog opened by the first edge"
+        );
+        assert_eq!(
+            latch.press(42, false),
+            CrossBlockSearchKeyPress::SuppressHeldRepeat,
+            "dropping Ctrl/Shift mid-hold must not leak the opener into the query"
+        );
+        assert_eq!(
+            latch.press(7, false),
+            CrossBlockSearchKeyPress::Proceed,
+            "an unrelated physical key remains available"
+        );
+
+        latch.release(7);
+        assert_eq!(
+            latch.press(42, true),
+            CrossBlockSearchKeyPress::SuppressHeldRepeat,
+            "only the opening physical key's release clears its guard"
+        );
+        latch.release(42);
+        assert_eq!(
+            latch.press(42, true),
+            CrossBlockSearchKeyPress::DispatchToggle,
+            "a new physical press may intentionally close the dialog"
+        );
+    }
+
+    #[test]
+    fn deactivation_recovers_a_lost_toggle_release() {
+        let mut latch = CrossBlockSearchKeyLatch::default();
+        assert_eq!(
+            latch.press(99, true),
+            CrossBlockSearchKeyPress::DispatchToggle
+        );
+        latch.reset();
+        assert_eq!(
+            latch.press(99, true),
+            CrossBlockSearchKeyPress::DispatchToggle
+        );
     }
 }
 

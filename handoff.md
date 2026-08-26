@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-26 (Block Search metadata browsing)
+Updated: 2026-08-26 (Block Search 4.1)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -12,6 +12,30 @@ captured, queued, written, and restored.
 
 ## Completed since the previous handoff
 
+- **Block Search 4.1 (2026-08-26)**: Cross Block Search now exposes a
+  `Background` metadata condition backed by the same commandless-record
+  identity in Block and Unified backends. It composes before the hit cap and
+  persists with the dialog's process-lifetime intent, but deliberately matches
+  no Failed/exit/duration predicate because background output has no command
+  lifecycle; result rows normalize contradictory raw exit/duration fields away.
+  Empty-query `All`/`Out` rows require real retained output;
+  command scope and snapshot-evicted metadata create no synthetic hit. The two
+  compact control rows gain automatic horizontal overflow so theme and font
+  growth cannot make later controls unreachable by keyboard.
+
+- **Block Search 4.0 (2026-08-26)**: the window capture controller now carries
+  the opening toggle's physical keycode across the asynchronous action dispatch.
+  Auto-repeat is consumed before it can close the newly presented GTK dialog,
+  even if Ctrl/Shift is released mid-hold; physical release or window
+  deactivation clears the guard. The title bar now keeps only Refresh/Reset,
+  while matching and metadata controls occupy two compact content rows. Manual
+  refresh paints and exposes its `Refreshing blocks…` status for one frame,
+  then performs the same generation-gated, selection-preserving bounded rebuild.
+  Its pending frame callback is explicitly cancelled on replacement, new intent,
+  or close. The dialog slot now remains claimed through the close animation, so
+  a toggle during that transition cannot open an instance that the old `closed`
+  callback would later orphan.
+
 - **Block Search metadata browsing (2026-08-26)**: Failed and Slow now work
   without a text query. Each eligible retained block contributes one
   representative row on the selected surface; both predicates run before the
@@ -21,7 +45,7 @@ captured, queued, written, and restored.
 - **Block Search 3.9 (2026-08-26)**: the GTK search header now exposes a
   pointer-accessible refresh button with an accessible action name and `F5`
   shortcut. Clicking it, or pressing unmodified F5, synchronizes the automatic
-  version probe and immediately performs the same selection-preserving rebuild;
+  version probe and requests the same selection-preserving rebuild;
   Ctrl/Shift/Alt/Super/Hyper/Meta-modified F5 passes through unchanged. A
   press/release latch limits keyboard refresh to once per physical F5 press and
   prevents releasing a modifier mid-hold from turning auto-repeat into refresh;
