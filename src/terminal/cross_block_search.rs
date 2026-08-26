@@ -8,7 +8,7 @@ use relm4::adw;
 use relm4::adw::prelude::*;
 use relm4::gtk;
 use std::cell::{Cell, RefCell};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::time::Duration;
 
 use crate::block_view::{CrossBlockHit, RecordNavigationResult, TermView};
@@ -33,6 +33,7 @@ pub(super) struct Memory {
     scope: crate::block_view::CrossBlockSearchScope,
     failed_only: bool,
     slow_only: bool,
+    bookmarked_only: bool,
     background_only: bool,
 }
 
@@ -42,6 +43,7 @@ fn memory(
     scope: crate::block_view::CrossBlockSearchScope,
     failed_only: bool,
     slow_only: bool,
+    bookmarked_only: bool,
     background_only: bool,
 ) -> Memory {
     Memory {
@@ -56,6 +58,7 @@ fn memory(
         scope,
         failed_only,
         slow_only,
+        bookmarked_only,
         background_only,
     }
 }
@@ -68,9 +71,105 @@ fn has_search_intent(
     query: &str,
     failed_only: bool,
     slow_only: bool,
+    bookmarked_only: bool,
     background_only: bool,
 ) -> bool {
-    !query.is_empty() || failed_only || slow_only || background_only
+    !query.is_empty() || failed_only || slow_only || bookmarked_only || background_only
+}
+
+fn bookmark_action_label(bookmarked: bool) -> &'static str {
+    if bookmarked {
+        "Remove bookmark from this block"
+    } else {
+        "Bookmark this block"
+    }
+}
+
+fn bookmark_change_status(bookmarked: bool, refreshing: bool) -> &'static str {
+    match (bookmarked, refreshing) {
+        (true, true) => "Bookmarked block; refreshing results.",
+        (false, true) => "Removed bookmark; refreshing results.",
+        (true, false) => "Bookmarked block.",
+        (false, false) => "Removed bookmark.",
+    }
+}
+
+fn set_announced_status(label: &gtk::Label, message: &str) {
+    label.set_text(message);
+    label.announce(message, gtk::AccessibleAnnouncementPriority::Medium);
+}
+
+fn sync_bookmark_button(button: &gtk::ToggleButton, bookmarked: bool) {
+    button.set_active(bookmarked);
+    let label = bookmark_action_label(bookmarked);
+    button.set_tooltip_text(Some(label));
+    // Ctrl+Shift+B targets the selected result, which can differ from the
+    // suffix button that currently owns keyboard focus. Do not advertise that
+    // dialog-level action as a shortcut on this specific button.
+    button.update_property(&[gtk::accessible::Property::Label(label)]);
+}
+
+fn is_selected_bookmark_key(key: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> bool {
+    use gtk::gdk::{Key, ModifierType};
+
+    matches!(key, Key::b | Key::B)
+        && state.contains(ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK)
+        && !state.intersects(
+            ModifierType::ALT_MASK
+                | ModifierType::SUPER_MASK
+                | ModifierType::HYPER_MASK
+                | ModifierType::META_MASK,
+        )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BookmarkKeyPress {
+    Toggle,
+    ConsumeRepeat,
+    Proceed,
+}
+
+#[derive(Default)]
+struct BookmarkKeyLatch {
+    held: bool,
+    claimed: bool,
+}
+
+impl BookmarkKeyLatch {
+    fn press(&mut self, key: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> BookmarkKeyPress {
+        if !matches!(key, gtk::gdk::Key::b | gtk::gdk::Key::B) {
+            return BookmarkKeyPress::Proceed;
+        }
+        if self.held {
+            return if self.claimed {
+                BookmarkKeyPress::ConsumeRepeat
+            } else {
+                BookmarkKeyPress::Proceed
+            };
+        }
+        // Latch every physical B press, including an ineligible chord. If the
+        // user releases Alt while holding Ctrl+Shift+Alt+B, GTK's next repeat
+        // must not masquerade as a fresh eligible Ctrl+Shift+B press.
+        self.held = true;
+        self.claimed = is_selected_bookmark_key(key, state);
+        if self.claimed {
+            BookmarkKeyPress::Toggle
+        } else {
+            BookmarkKeyPress::Proceed
+        }
+    }
+
+    fn release(&mut self, key: gtk::gdk::Key) {
+        if matches!(key, gtk::gdk::Key::b | gtk::gdk::Key::B) {
+            self.held = false;
+            self.claimed = false;
+        }
+    }
+
+    fn reset(&mut self) {
+        self.held = false;
+        self.claimed = false;
+    }
 }
 
 fn refresh_status() -> &'static str {
@@ -427,6 +526,16 @@ pub(super) fn toggle(
         .label("Slow")
         .tooltip_text("Only blocks that ran at least as long as the slow-block threshold")
         .build();
+    let bookmarked_toggle = gtk::ToggleButton::builder()
+        .label("Bookmarked")
+        .tooltip_text("Only bookmarked completed blocks; combines with other filters")
+        .build();
+    bookmarked_toggle.update_property(&[
+        gtk::accessible::Property::Label("Bookmarked"),
+        gtk::accessible::Property::Description(
+            "Only bookmarked completed blocks; combines with other filters",
+        ),
+    ]);
     let background_toggle = gtk::ToggleButton::builder()
         .label("Background")
         .tooltip_text("Only commandless background-output blocks")
@@ -445,6 +554,7 @@ pub(super) fn toggle(
     scope_dropdown.set_selected(remembered.scope.index());
     failed_toggle.set_active(remembered.failed_only);
     slow_toggle.set_active(remembered.slow_only);
+    bookmarked_toggle.set_active(remembered.bookmarked_only);
     background_toggle.set_active(remembered.background_only);
     filter_entry.set_text(&remembered.query);
 
@@ -491,6 +601,7 @@ pub(super) fn toggle(
     metadata_controls.set_margin_bottom(6);
     metadata_controls.append(&failed_toggle);
     metadata_controls.append(&slow_toggle);
+    metadata_controls.append(&bookmarked_toggle);
     metadata_controls.append(&background_toggle);
     let metadata_controls_scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Automatic)
@@ -511,12 +622,17 @@ pub(super) fn toggle(
     dialog.set_child(Some(&toolbar_view));
 
     let hits: Rc<RefCell<Vec<CrossBlockHit>>> = Rc::new(RefCell::new(Vec::new()));
+    let row_bookmark_buttons: Rc<RefCell<Vec<(u64, gtk::ToggleButton)>>> =
+        Rc::new(RefCell::new(Vec::new()));
     let retained_hit: Rc<RefCell<Option<SelectionAnchor>>> = Rc::new(RefCell::new(None));
     let pending_rebuild: Rc<RefCell<Option<gtk::glib::SourceId>>> = Rc::new(RefCell::new(None));
     let pending_refresh_tick = Rc::new(RefCell::new(
         RefreshTickSlot::<gtk::TickCallbackId>::default(),
     ));
     let search_generation = Rc::new(Cell::new(0_u64));
+    let observed_version = Rc::new(Cell::new(view.cross_block_search_version()));
+    let bookmark_changed: Rc<RefCell<Option<Weak<dyn Fn(bool, bool)>>>> =
+        Rc::new(RefCell::new(None));
     {
         let hits = hits.clone();
         let status_label = status_label.clone();
@@ -531,6 +647,7 @@ pub(super) fn toggle(
         let view = view.clone();
         let failed_toggle = failed_toggle.clone();
         let slow_toggle = slow_toggle.clone();
+        let bookmarked_toggle = bookmarked_toggle.clone();
         let background_toggle = background_toggle.clone();
         let list_box = list_box.clone();
         let hits = hits.clone();
@@ -541,6 +658,9 @@ pub(super) fn toggle(
         let whole_word_toggle = whole_word_toggle.clone();
         let scope_dropdown = scope_dropdown.clone();
         let retained_hit = retained_hit.clone();
+        let row_bookmark_buttons = row_bookmark_buttons.clone();
+        let bookmark_changed = bookmark_changed.clone();
+        let bookmarked_filter = bookmarked_toggle.clone();
         Rc::new(move || {
             let query = filter_entry.text().to_string();
             // The stale rows remain navigable during the refresh debounce.
@@ -566,6 +686,7 @@ pub(super) fn toggle(
             let filters = crate::block_view::BlockFilters {
                 failed_only: failed_toggle.is_active(),
                 slow_only: slow_toggle.is_active(),
+                bookmarked_only: bookmarked_toggle.is_active(),
                 background_only: background_toggle.is_active(),
                 slow_threshold_ms: crate::block_view::SLOW_BLOCK_THRESHOLD_MS,
                 ..Default::default()
@@ -577,14 +698,17 @@ pub(super) fn toggle(
                 &query,
                 filters.failed_only,
                 filters.slow_only,
+                filters.bookmarked_only,
                 filters.background_only,
             ) {
                 hits.borrow_mut().clear();
+                row_bookmark_buttons.borrow_mut().clear();
                 status_label.set_text(idle_status());
                 return;
             }
             if let Some(message) = query_error(&query) {
                 hits.borrow_mut().clear();
+                row_bookmark_buttons.borrow_mut().clear();
                 status_label.set_text(message);
                 return;
             }
@@ -600,8 +724,16 @@ pub(super) fn toggle(
             ) {
                 Ok(results) => {
                     let total = results.len();
-                    status_label.set_text(&search_status(total, None));
+                    let status = if total == 0 && filters.bookmarked_only {
+                        view.bookmarked_empty_search_status(&query, scope, &filters)
+                            .unwrap_or("No matches.")
+                            .to_string()
+                    } else {
+                        search_status(total, None)
+                    };
+                    status_label.set_text(&status);
                     let jumpable = view.jumpable_search_hits(&results);
+                    row_bookmark_buttons.borrow_mut().clear();
                     for hit in &results {
                         let surface = if hit.is_output { "out" } else { "cmd" };
                         // A hit whose record has no location and no retained
@@ -622,6 +754,57 @@ pub(super) fn toggle(
                             .subtitle(&subtitle)
                             .activatable(true)
                             .build();
+                        let bookmark_button = gtk::ToggleButton::builder()
+                            .icon_name("user-bookmarks-symbolic")
+                            .valign(gtk::Align::Center)
+                            .build();
+                        bookmark_button.add_css_class("flat");
+                        sync_bookmark_button(
+                            &bookmark_button,
+                            view.is_record_bookmarked(hit.block_id),
+                        );
+                        let record_id = hit.block_id;
+                        let view_for_bookmark = view.clone();
+                        let buttons_for_bookmark = row_bookmark_buttons.clone();
+                        let status_for_bookmark = status_label.clone();
+                        let entry_for_bookmark = filter_entry.clone();
+                        let bookmark_changed = bookmark_changed.clone();
+                        let bookmarked_filter = bookmarked_filter.clone();
+                        bookmark_button.connect_clicked(move |button| {
+                            let requested = button.is_active();
+                            let authoritative = match view_for_bookmark
+                                .set_record_bookmarked(record_id, requested)
+                            {
+                                Some(authoritative) => {
+                                    for (id, sibling) in buttons_for_bookmark.borrow().iter() {
+                                        if *id == record_id {
+                                            sync_bookmark_button(sibling, authoritative);
+                                        }
+                                    }
+                                    Some(authoritative)
+                                }
+                                None => {
+                                    sync_bookmark_button(button, false);
+                                    set_announced_status(
+                                        &status_for_bookmark,
+                                        "That block is no longer retained.",
+                                    );
+                                    None
+                                }
+                            };
+                            if let Some(authoritative) = authoritative {
+                                let callback =
+                                    bookmark_changed.borrow().as_ref().and_then(Weak::upgrade);
+                                if let Some(callback) = callback {
+                                    callback(authoritative, bookmarked_filter.is_active());
+                                }
+                            }
+                            entry_for_bookmark.grab_focus();
+                        });
+                        row.add_suffix(&bookmark_button);
+                        row_bookmark_buttons
+                            .borrow_mut()
+                            .push((record_id, bookmark_button));
                         // Outcome at a glance: telling the failing `cargo build`
                         // from the passing ones should not require visiting each.
                         if let Some(outcome) = hit_outcome_label(hit) {
@@ -642,6 +825,7 @@ pub(super) fn toggle(
                 }
                 Err(error) => {
                     hits.borrow_mut().clear();
+                    row_bookmark_buttons.borrow_mut().clear();
                     status_label.set_text(&format!("Bad regex: {error}"));
                 }
             }
@@ -654,12 +838,14 @@ pub(super) fn toggle(
         let search_generation = search_generation.clone();
         let rebuild = rebuild.clone();
         let hits = hits.clone();
+        let row_bookmark_buttons = row_bookmark_buttons.clone();
         let list_box = list_box.clone();
         let status_label = status_label.clone();
         let filter_entry = filter_entry.clone();
         let retained_hit = retained_hit.clone();
         let failed_toggle = failed_toggle.clone();
         let slow_toggle = slow_toggle.clone();
+        let bookmarked_toggle = bookmarked_toggle.clone();
         let background_toggle = background_toggle.clone();
         Rc::new(move |preserve_selection: bool| {
             cancel_refresh_tick(pending_refresh_tick.as_ref());
@@ -684,12 +870,14 @@ pub(super) fn toggle(
                 filter_entry.text().as_str(),
                 failed_toggle.is_active(),
                 slow_toggle.is_active(),
+                bookmarked_toggle.is_active(),
                 background_toggle.is_active(),
             ) {
                 while let Some(child) = list_box.first_child() {
                     list_box.remove(&child);
                 }
                 hits.borrow_mut().clear();
+                row_bookmark_buttons.borrow_mut().clear();
                 status_label.set_text(idle_status());
                 return;
             }
@@ -698,6 +886,7 @@ pub(super) fn toggle(
                     list_box.remove(&child);
                 }
                 hits.borrow_mut().clear();
+                row_bookmark_buttons.borrow_mut().clear();
                 status_label.set_text(message);
                 return;
             }
@@ -708,6 +897,7 @@ pub(super) fn toggle(
                     list_box.remove(&child);
                 }
                 hits.borrow_mut().clear();
+                row_bookmark_buttons.borrow_mut().clear();
                 status_label.set_text("Searching blocks…");
             }
 
@@ -726,6 +916,27 @@ pub(super) fn toggle(
             *pending_slot.borrow_mut() = Some(source);
         })
     };
+    let bookmark_changed_callback: Rc<dyn Fn(bool, bool)> = {
+        let view = view.clone();
+        let observed_version = observed_version.clone();
+        let schedule_rebuild = schedule_rebuild.clone();
+        let status_label = status_label.clone();
+        Rc::new(move |bookmarked, bookmarked_filter_active| {
+            // The mutation itself advanced the cheap version. Synchronize the
+            // poll now so it cannot enqueue a duplicate 500 ms refresh. If the
+            // result set depends on bookmarks, enqueue the ordinary
+            // selection-preserving rebuild immediately.
+            observed_version.set(view.cross_block_search_version());
+            if bookmarked_filter_active {
+                schedule_rebuild(true);
+            }
+            set_announced_status(
+                &status_label,
+                bookmark_change_status(bookmarked, bookmarked_filter_active),
+            );
+        })
+    };
+    *bookmark_changed.borrow_mut() = Some(Rc::downgrade(&bookmark_changed_callback));
 
     {
         let schedule_rebuild = schedule_rebuild.clone();
@@ -782,6 +993,14 @@ pub(super) fn toggle(
     {
         let schedule_rebuild = schedule_rebuild.clone();
         let filter_entry = filter_entry.clone();
+        bookmarked_toggle.connect_toggled(move |_| {
+            schedule_rebuild(false);
+            filter_entry.grab_focus();
+        });
+    }
+    {
+        let schedule_rebuild = schedule_rebuild.clone();
+        let filter_entry = filter_entry.clone();
         background_toggle.connect_toggled(move |_| {
             schedule_rebuild(false);
             filter_entry.grab_focus();
@@ -795,6 +1014,7 @@ pub(super) fn toggle(
         let scope_dropdown = scope_dropdown.clone();
         let failed_toggle = failed_toggle.clone();
         let slow_toggle = slow_toggle.clone();
+        let bookmarked_toggle = bookmarked_toggle.clone();
         let background_toggle = background_toggle.clone();
         reset_button.connect_clicked(move |_| {
             filter_entry.set_text("");
@@ -804,15 +1024,16 @@ pub(super) fn toggle(
             scope_dropdown.set_selected(crate::block_view::CrossBlockSearchScope::All.index());
             failed_toggle.set_active(false);
             slow_toggle.set_active(false);
+            bookmarked_toggle.set_active(false);
             background_toggle.set_active(false);
             filter_entry.grab_focus();
         });
     }
 
-    // Probe finalized-record identity without cloning terminal content. A
-    // completion or same-length retention rotation refreshes the open picker,
-    // preserving the exact selected hit when it still exists.
-    let observed_version = Rc::new(Cell::new(view.cross_block_search_version()));
+    // Probe finalized-record identity and bookmark revision without cloning
+    // terminal content. A completion, same-length retention rotation, or
+    // external bookmark change refreshes the open picker while preserving the
+    // exact selected hit when it still exists.
     {
         let view = view.clone();
         let observed_version = observed_version.clone();
@@ -970,7 +1191,9 @@ pub(super) fn toggle(
     let key_controller = gtk::EventControllerKey::new();
     key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
     let refresh_key_latch = Rc::new(RefCell::new(RefreshKeyLatch::default()));
+    let bookmark_key_latch = Rc::new(RefCell::new(BookmarkKeyLatch::default()));
     {
+        let view = view.clone();
         let dialog = dialog.clone();
         let list_box = list_box.clone();
         let scrolled = scrolled.clone();
@@ -985,11 +1208,52 @@ pub(super) fn toggle(
         let reset_button = reset_button.clone();
         let refresh_button = refresh_button.clone();
         let refresh_key_latch = refresh_key_latch.clone();
+        let bookmark_key_latch = bookmark_key_latch.clone();
+        let row_bookmark_buttons = row_bookmark_buttons.clone();
+        let bookmarked_toggle = bookmarked_toggle.clone();
+        let bookmark_changed_callback = bookmark_changed_callback.clone();
         key_controller.connect_key_pressed(move |_, key, _, state| {
             use gtk::gdk::{Key, ModifierType};
             if key == Key::Escape {
                 dialog.force_close();
                 return gtk::glib::Propagation::Stop;
+            }
+            match bookmark_key_latch.borrow_mut().press(key, state) {
+                BookmarkKeyPress::Toggle => {
+                    let selected_id = list_box.selected_row().and_then(|row| {
+                        hits.borrow()
+                            .get(row.index() as usize)
+                            .map(|hit| hit.block_id)
+                    });
+                    if let Some(record_id) = selected_id {
+                        let authoritative = match view.toggle_record_bookmark(record_id) {
+                            Some(authoritative) => {
+                                for (id, button) in row_bookmark_buttons.borrow().iter() {
+                                    if *id == record_id {
+                                        sync_bookmark_button(button, authoritative);
+                                    }
+                                }
+                                Some(authoritative)
+                            }
+                            None => {
+                                set_announced_status(
+                                    &status_label,
+                                    "That block is no longer retained.",
+                                );
+                                None
+                            }
+                        };
+                        if let Some(authoritative) = authoritative {
+                            bookmark_changed_callback(authoritative, bookmarked_toggle.is_active());
+                        }
+                    }
+                    filter_entry.grab_focus();
+                    return gtk::glib::Propagation::Stop;
+                }
+                BookmarkKeyPress::ConsumeRepeat => {
+                    return gtk::glib::Propagation::Stop;
+                }
+                BookmarkKeyPress::Proceed => {}
             }
             let refresh_action = refresh_key_latch.borrow_mut().press(key, state);
             match refresh_action {
@@ -1076,18 +1340,22 @@ pub(super) fn toggle(
     }
     {
         let refresh_key_latch = refresh_key_latch.clone();
+        let bookmark_key_latch = bookmark_key_latch.clone();
         key_controller.connect_key_released(move |_, key, _, _| {
             refresh_key_latch.borrow_mut().release(key);
+            bookmark_key_latch.borrow_mut().release(key);
         });
     }
     dialog.add_controller(key_controller);
     let refresh_focus = gtk::EventControllerFocus::new();
     {
         let refresh_key_latch = refresh_key_latch.clone();
+        let bookmark_key_latch = bookmark_key_latch.clone();
         refresh_focus.connect_leave(move |_| {
             // Window-manager deactivation can drop the physical key-release
             // event. Do not strand this dialog in the repeat-suppressed state.
             refresh_key_latch.borrow_mut().reset();
+            bookmark_key_latch.borrow_mut().reset();
         });
     }
     dialog.add_controller(refresh_focus);
@@ -1105,6 +1373,7 @@ pub(super) fn toggle(
         let scope_dropdown = scope_dropdown.clone();
         let failed_toggle = failed_toggle.clone();
         let slow_toggle = slow_toggle.clone();
+        let bookmarked_toggle = bookmarked_toggle.clone();
         let background_toggle = background_toggle.clone();
         dialog.connect_closed(move |_| {
             // Remove an unfired frame callback so it cannot retain this closed
@@ -1129,6 +1398,7 @@ pub(super) fn toggle(
                 crate::block_view::CrossBlockSearchScope::from_index(scope_dropdown.selected()),
                 failed_toggle.is_active(),
                 slow_toggle.is_active(),
+                bookmarked_toggle.is_active(),
                 background_toggle.is_active(),
             );
             *dialog_slot.borrow_mut() = None;
@@ -1142,6 +1412,7 @@ pub(super) fn toggle(
         &remembered.query,
         remembered.failed_only,
         remembered.slow_only,
+        remembered.bookmarked_only,
         remembered.background_only,
     ) {
         schedule_rebuild(false);
@@ -1152,9 +1423,10 @@ pub(super) fn toggle(
 #[cfg(test)]
 mod tests {
     use super::{
-        dialog_toggle_plan, has_search_intent, hit_outcome_label, idle_status,
-        is_plain_refresh_key, jump_outcome, memory, query_error, refresh_selection_index,
-        refresh_status, search_status, selection_index, should_step, CrossBlockHit,
+        bookmark_action_label, bookmark_change_status, dialog_toggle_plan, has_search_intent,
+        hit_outcome_label, idle_status, is_plain_refresh_key, is_selected_bookmark_key,
+        jump_outcome, memory, query_error, refresh_selection_index, refresh_status, search_status,
+        selection_index, should_step, BookmarkKeyLatch, BookmarkKeyPress, CrossBlockHit,
         DialogTogglePlan, JumpOutcome, RecordNavigationResult, RefreshKeyLatch, RefreshKeyPress,
         RefreshTickSlot, SelectionAnchor, SelectionMove, CROSS_BLOCK_SEARCH_DEBOUNCE,
         CROSS_BLOCK_SEARCH_LIMIT, CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
@@ -1320,6 +1592,88 @@ mod tests {
     }
 
     #[test]
+    fn selected_bookmark_chord_is_exact_and_latched_per_physical_press() {
+        use relm4::gtk::gdk::{Key, ModifierType};
+
+        let chord = ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK;
+        assert!(is_selected_bookmark_key(Key::b, chord));
+        assert!(is_selected_bookmark_key(
+            Key::B,
+            chord | ModifierType::LOCK_MASK
+        ));
+        for extra in [
+            ModifierType::ALT_MASK,
+            ModifierType::SUPER_MASK,
+            ModifierType::HYPER_MASK,
+            ModifierType::META_MASK,
+        ] {
+            assert!(!is_selected_bookmark_key(Key::b, chord | extra));
+        }
+        assert!(!is_selected_bookmark_key(
+            Key::b,
+            ModifierType::CONTROL_MASK
+        ));
+
+        let mut latch = BookmarkKeyLatch::default();
+        assert_eq!(latch.press(Key::b, chord), BookmarkKeyPress::Toggle);
+        assert_eq!(latch.press(Key::b, chord), BookmarkKeyPress::ConsumeRepeat);
+        assert_eq!(
+            latch.press(Key::b, ModifierType::empty()),
+            BookmarkKeyPress::ConsumeRepeat,
+            "modifier release while B remains held cannot oscillate the bookmark"
+        );
+        latch.release(Key::B);
+        assert_eq!(latch.press(Key::b, chord), BookmarkKeyPress::Toggle);
+        latch.reset();
+        assert_eq!(
+            latch.press(Key::b, ModifierType::empty()),
+            BookmarkKeyPress::Proceed
+        );
+        assert_eq!(
+            latch.press(Key::b, chord),
+            BookmarkKeyPress::Proceed,
+            "adding modifiers while the same B press is held is not a fresh chord"
+        );
+        latch.release(Key::b);
+
+        let mut modified_first = BookmarkKeyLatch::default();
+        assert_eq!(
+            modified_first.press(Key::b, chord | ModifierType::ALT_MASK),
+            BookmarkKeyPress::Proceed
+        );
+        assert_eq!(
+            modified_first.press(Key::b, chord),
+            BookmarkKeyPress::Proceed,
+            "dropping Alt during repeat must not turn an ineligible press into a toggle"
+        );
+        modified_first.release(Key::b);
+        assert_eq!(
+            modified_first.press(Key::b, chord),
+            BookmarkKeyPress::Toggle
+        );
+        assert_eq!(latch.press(Key::x, chord), BookmarkKeyPress::Proceed);
+    }
+
+    #[test]
+    fn result_bookmark_action_names_both_toggle_states() {
+        assert_eq!(bookmark_action_label(false), "Bookmark this block");
+        assert_eq!(
+            bookmark_action_label(true),
+            "Remove bookmark from this block"
+        );
+        assert_eq!(bookmark_change_status(true, false), "Bookmarked block.");
+        assert_eq!(bookmark_change_status(false, false), "Removed bookmark.");
+        assert_eq!(
+            bookmark_change_status(true, true),
+            "Bookmarked block; refreshing results."
+        );
+        assert_eq!(
+            bookmark_change_status(false, true),
+            "Removed bookmark; refreshing results."
+        );
+    }
+
+    #[test]
     fn refresh_tick_slot_cancels_replaces_and_ignores_stale_idle_cleanup() {
         let mut slot = RefreshTickSlot::<u64>::default();
         assert_eq!(slot.cancel(), None);
@@ -1397,12 +1751,13 @@ mod tests {
 
     #[test]
     fn metadata_filters_are_search_intent_without_text() {
-        assert!(!has_search_intent("", false, false, false));
-        assert!(has_search_intent("needle", false, false, false));
-        assert!(has_search_intent("", true, false, false));
-        assert!(has_search_intent("", false, true, false));
-        assert!(has_search_intent("", false, false, true));
-        assert!(has_search_intent("", true, true, true));
+        assert!(!has_search_intent("", false, false, false, false));
+        assert!(has_search_intent("needle", false, false, false, false));
+        assert!(has_search_intent("", true, false, false, false));
+        assert!(has_search_intent("", false, true, false, false));
+        assert!(has_search_intent("", false, false, true, false));
+        assert!(has_search_intent("", false, false, false, true));
+        assert!(has_search_intent("", true, true, true, true));
     }
 
     #[test]
@@ -1419,12 +1774,14 @@ mod tests {
             true,
             true,
             true,
+            true,
         );
         assert_eq!(remembered.query, "needle");
         assert_eq!(remembered.options, options);
         assert_eq!(remembered.scope, CrossBlockSearchScope::Output);
         assert!(remembered.failed_only);
         assert!(remembered.slow_only);
+        assert!(remembered.bookmarked_only);
         assert!(remembered.background_only);
 
         let oversized = memory(
@@ -1434,13 +1791,16 @@ mod tests {
             true,
             false,
             true,
+            true,
         );
         assert!(oversized.query.is_empty());
         assert_eq!(oversized.options, options);
         assert_eq!(oversized.scope, CrossBlockSearchScope::Command);
         assert!(oversized.failed_only);
         assert!(!oversized.slow_only);
+        assert!(oversized.bookmarked_only);
         assert!(oversized.background_only);
+        assert!(!super::Memory::default().bookmarked_only);
         assert!(!super::Memory::default().background_only);
     }
 

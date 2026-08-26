@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-26 (Block Search 4.1)
+Updated: 2026-08-26 (Block Search 4.2)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,15 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **Block Search 4.2 (2026-08-26)**: pane-local, runtime-only bookmarks now
+  share one revisioned source of truth across Block cards and Unified records.
+  `Bookmarked` composes with Failed, Slow, and Background before scope and the
+  hit cap, including empty-query browsing. Every result exposes a star toggle;
+  `Ctrl+Shift+B` toggles the selected live record, synchronizes duplicate-hit
+  buttons and Block chrome, and immediately refreshes an active Bookmarked
+  result set. Unified retirement prunes only the retired record IDs, while
+  snapshot-budget and visual-chrome eviction leave live-record bookmarks intact.
 
 - **Block Search 4.1 (2026-08-26)**: Cross Block Search now exposes a
   `Background` metadata condition backed by the same commandless-record

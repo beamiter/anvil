@@ -30,6 +30,7 @@ use jterm_core::kitty_keyboard::{
 mod alt_screen;
 mod ansi;
 mod blocks;
+mod bookmarks;
 mod cross_selection;
 mod css;
 mod export;
@@ -46,6 +47,7 @@ mod zone_history;
 pub(crate) use alt_screen::*;
 pub(crate) use ansi::*;
 pub(crate) use blocks::*;
+use bookmarks::BookmarkState;
 pub(crate) use cross_selection::*;
 pub(crate) use css::*;
 pub(crate) use export::SessionExportFormat;
@@ -2084,11 +2086,23 @@ fn remove_finished_block_from_selection(
     sync_finished_block_selection(finished, selected_block_ids, selected_block_id);
 }
 
+/// Project the pane's bookmark truth onto one Block card. No caller may infer
+/// model state back from these GTK properties; pooled/rebuilt widgets start
+/// unmarked and are synchronized through this helper.
+fn set_finished_block_bookmarked(block: &FinishedBlock, bookmarked: bool) {
+    block.bookmark_star.set_visible(bookmarked);
+    if bookmarked {
+        block.widget().add_css_class("block-bookmarked");
+    } else {
+        block.widget().remove_css_class("block-bookmarked");
+    }
+}
+
 struct BlockRemovalRefs<'a> {
     selected_ids: &'a SelectedBlockIds,
     selected: &'a Rc<Cell<Option<u64>>>,
     anchor: &'a Rc<Cell<Option<u64>>>,
-    bookmarks: &'a Rc<RefCell<HashSet<u64>>>,
+    bookmarks: &'a Rc<BookmarkState>,
     visible_indices: &'a Rc<RefCell<HashSet<usize>>>,
     failure_marker_redraw: &'a dyn Fn(),
     unread_count: &'a Rc<Cell<u32>>,
@@ -2223,9 +2237,7 @@ fn evict_finished_block_prefix(
     sync_finished_block_selection(&finished, refs.selected_ids, refs.selected);
     drop(finished);
 
-    refs.bookmarks
-        .borrow_mut()
-        .retain(|id| !evicted_ids.contains(id));
+    refs.bookmarks.remove_ids(evicted_ids.iter().copied());
     {
         let mut visible = refs.visible_indices.borrow_mut();
         *visible = visible
@@ -3387,7 +3399,7 @@ pub struct TermView {
     /// the record this view last navigated to, so next/previous can advance.
     navigated_record_id: Cell<Option<u64>>,
     selection_anchor_id: Rc<Cell<Option<u64>>>,
-    bookmarks: Rc<RefCell<std::collections::HashSet<u64>>>,
+    bookmarks: Rc<BookmarkState>,
     /// Blocks removed by the most recent Clear Blocks, kept as data so an
     /// explicit undo can rebuild their widgets. Single-level: a later clear
     /// with content replaces it; cleared again only when consumed by undo.
@@ -4211,7 +4223,7 @@ struct BlockBackend {
     selected_block_ids_rc: SelectedBlockIds,
     selected_block_id_rc: Rc<Cell<Option<u64>>>,
     selection_anchor_id_rc: Rc<Cell<Option<u64>>>,
-    bookmarks_rc: Rc<RefCell<std::collections::HashSet<u64>>>,
+    bookmarks_rc: Rc<BookmarkState>,
     block_data_for_cb: Rc<RefCell<VecDeque<BlockData>>>,
     unread_count_rc: Rc<Cell<u32>>,
     /// Switches the live surface between compact prompt and full-screen
@@ -4404,6 +4416,13 @@ fn record_unified_zone(
         return drained;
     }
     Vec::new()
+}
+
+/// A Unified bookmark lives exactly as long as its completed metadata record.
+/// Snapshot-budget eviction and chrome-marker retirement are deliberately not
+/// inputs here: neither one makes the record unavailable to search/navigation.
+fn prune_retired_record_bookmarks(bookmarks: &BookmarkState, retired_record_ids: &[u64]) {
+    bookmarks.remove_ids(retired_record_ids.iter().copied());
 }
 
 /// TAIL cut of raw captured bytes. The cut may land inside an escape sequence
@@ -4821,6 +4840,10 @@ struct UnifiedBackend {
     /// finalize. The terminal text remains on `vte`, so no finished widget is
     /// mounted.
     zones: Rc<RefCell<UnifiedZoneStore>>,
+    /// Pane-local record annotations. Only metadata-record retirement prunes
+    /// these ids; snapshot and marker authority have intentionally shorter
+    /// lifetimes than searchable Unified records.
+    bookmarks: Rc<BookmarkState>,
     find_state_for_cb: Rc<RefCell<FindState>>,
     /// Per-pane fail-closed marker state. Marker bytes are fed only inside the
     /// backend, never through the parser or any engine capture buffer.
@@ -6798,7 +6821,7 @@ impl RenderBackend for BlockBackend {
                 vbox.append(&item);
             }
             {
-                let bookmarked = bookmarks_for_menu.borrow().contains(&block_id);
+                let bookmarked = bookmarks_for_menu.contains(block_id);
                 let item = make_item(if bookmarked {
                     "Remove Bookmark"
                 } else {
@@ -6807,27 +6830,22 @@ impl RenderBackend for BlockBackend {
                 let popover_c = popover.clone();
                 let finished_for_bookmark = finished_menu_clone.clone();
                 let bookmarks_for_action = bookmarks_for_menu.clone();
+                let block_data_for_bookmark = block_data_for_export.clone();
                 item.connect_clicked(move |_| {
                     popover_c.popdown();
-                    let mut marks = bookmarks_for_action.borrow_mut();
-                    let now_bookmarked = if marks.remove(&block_id) {
-                        false
-                    } else {
-                        marks.insert(block_id);
-                        true
+                    // A PTY completion can evict and recycle this card while its
+                    // popover is open. Reject the stale closure instead of
+                    // inserting an id no backend record owns.
+                    let record_exists = block_data_for_bookmark
+                        .borrow()
+                        .iter()
+                        .any(|record| record.id == block_id);
+                    let Some(now_bookmarked) =
+                        bookmarks_for_action.toggle_existing(block_id, record_exists)
+                    else {
+                        return;
                     };
-                    finished_for_bookmark
-                        .bookmark_star
-                        .set_visible(now_bookmarked);
-                    if now_bookmarked {
-                        finished_for_bookmark
-                            .widget()
-                            .add_css_class("block-bookmarked");
-                    } else {
-                        finished_for_bookmark
-                            .widget()
-                            .remove_css_class("block-bookmarked");
-                    }
+                    set_finished_block_bookmarked(&finished_for_bookmark, now_bookmarked);
                 });
                 vbox.append(&item);
             }
@@ -7029,7 +7047,7 @@ impl RenderBackend for BlockBackend {
                                 }
                             },
                         );
-                        bookmarks_for_delete.borrow_mut().remove(&target);
+                        bookmarks_for_delete.remove(target);
                     }
                     // Index-based virtualization must be recalculated after
                     // any removal; retaining the old set can hide the block
@@ -8177,6 +8195,7 @@ impl RenderBackend for UnifiedBackend {
                 store.enforce_snapshot_budget(MAX_TOTAL_SNAPSHOT_BYTES);
                 retired
             };
+            prune_retired_record_bookmarks(&self.bookmarks, &retired);
             self.chrome.retire_ids(&retired);
             restored += 1;
         }
@@ -8242,6 +8261,7 @@ impl RenderBackend for UnifiedBackend {
             zones.enforce_snapshot_budget(MAX_TOTAL_SNAPSHOT_BYTES);
             retired
         };
+        prune_retired_record_bookmarks(&self.bookmarks, &retired_record_ids);
         self.chrome.retire_ids(&retired_record_ids);
         self.chrome.enforce_limit(max_zones);
         self.chrome
@@ -8995,7 +9015,7 @@ struct KeyCtx {
     selected_block_id_for_key: Rc<Cell<Option<u64>>>,
     selection_anchor_id_for_key: Rc<Cell<Option<u64>>>,
     block_scroll_for_key: ScrolledWindow,
-    bookmarks_for_key: Rc<RefCell<std::collections::HashSet<u64>>>,
+    bookmarks_for_key: Rc<BookmarkState>,
     bstate_for_key: Rc<Cell<BlockState>>,
     root_for_key: glib::WeakRef<gtk::Box>,
     verified_submission_for_key: VerifiedSubmissionCtx,
@@ -9409,19 +9429,10 @@ impl KeyCtx {
                     .and_then(|id| finished.iter().find(|block| block.id == id))
                     .or_else(|| finished.last());
                 if let Some(block) = target {
-                    let mut marks = bookmarks_for_key.borrow_mut();
-                    let now_marked = if marks.remove(&block.id) {
-                        false
-                    } else {
-                        marks.insert(block.id);
-                        true
-                    };
-                    block.bookmark_star.set_visible(now_marked);
-                    if now_marked {
-                        block.widget().add_css_class("block-bookmarked");
-                    } else {
-                        block.widget().remove_css_class("block-bookmarked");
-                    }
+                    let now_marked = bookmarks_for_key
+                        .toggle_existing(block.id, true)
+                        .expect("finished bookmark target is a live record");
+                    set_finished_block_bookmarked(block, now_marked);
                     return glib::Propagation::Stop;
                 }
             }
@@ -9442,7 +9453,7 @@ impl KeyCtx {
                 && matches!(keyval, Key::comma | Key::period)
             {
                 let finished = finished_blocks_for_key.borrow();
-                let marks = bookmarks_for_key.borrow();
+                let marks = bookmarks_for_key.snapshot();
                 let marked_idx: Vec<usize> = finished
                     .iter()
                     .enumerate()
@@ -10305,10 +10316,10 @@ impl TermView {
             Rc::new(RefCell::new(std::collections::HashSet::new()));
         let selected_block_id: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
         let selection_anchor_id: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
-        // Bookmarked block ids (in-memory for the session). Toggled with Ctrl+B;
-        // navigated with Ctrl+,/Ctrl+.. Not persisted (avoids an rkyv schema bump).
-        let block_bookmarks: Rc<RefCell<std::collections::HashSet<u64>>> =
-            Rc::new(RefCell::new(std::collections::HashSet::new()));
+        // Completed-record bookmarks are pane-local runtime state. They remain
+        // outside both persisted history formats (Block rkyv and Unified zone
+        // JSON), while a monotonic revision lets an open search observe changes.
+        let block_bookmarks = Rc::new(BookmarkState::default());
         // Sticky running-command header state: true while a command is executing,
         // plus the command text captured at CommandStart.
         let cmd_running: Rc<Cell<bool>> = Rc::new(Cell::new(false));
@@ -10507,6 +10518,7 @@ impl TermView {
                     config_for_cb: config_for_cb.clone(),
                     pty_for_init: pty_for_init.clone(),
                     zones: unified_zones.clone(),
+                    bookmarks: block_bookmarks.clone(),
                     find_state_for_cb: find_state.clone(),
                     zone_marker,
                     chrome,
@@ -12774,7 +12786,7 @@ impl TermView {
         // BlockData and FinishedBlock are parallel lists. Virtualization,
         // bookmarks, selection, and unread state all reference their IDs or
         // indices, so clearing only the widgets would corrupt the next block.
-        self.bookmarks.borrow_mut().clear();
+        self.bookmarks.clear();
         self.visible_indices.borrow_mut().clear();
         self.selected_block_ids.borrow_mut().clear();
         self.selected_block_id.set(None);
@@ -12968,15 +12980,59 @@ impl TermView {
         self.navigate_to_record_id(record_id, false)
     }
 
+    /// Read the pane-local bookmark model, independent of whether this backend
+    /// represents the record as a Block card or Unified metadata.
+    pub(crate) fn is_record_bookmarked(&self, record_id: u64) -> bool {
+        self.bookmarks.contains(record_id)
+    }
+
+    /// Set one completed record's bookmark after proving the id is still owned
+    /// by the active backend. Block card chrome is a projection of this model;
+    /// Unified has no per-record widget, but uses the same searchable state.
+    pub(crate) fn set_record_bookmarked(&self, record_id: u64, bookmarked: bool) -> Option<bool> {
+        let record_exists = {
+            let records = self.render_backend.records();
+            records.iter().any(|record| record.id() == record_id)
+        };
+        let authoritative = self
+            .bookmarks
+            .set_existing(record_id, bookmarked, record_exists)?;
+        if let Some(block) = self
+            .finished_blocks
+            .borrow()
+            .iter()
+            .find(|block| block.id == record_id)
+        {
+            set_finished_block_bookmarked(block, authoritative);
+        }
+        Some(authoritative)
+    }
+
+    pub(crate) fn toggle_record_bookmark(&self, record_id: u64) -> Option<bool> {
+        let record_exists = {
+            let records = self.render_backend.records();
+            records.iter().any(|record| record.id() == record_id)
+        };
+        let authoritative = self.bookmarks.toggle_existing(record_id, record_exists)?;
+        if let Some(block) = self
+            .finished_blocks
+            .borrow()
+            .iter()
+            .find(|block| block.id == record_id)
+        {
+            set_finished_block_bookmarked(block, authoritative);
+        }
+        Some(authoritative)
+    }
+
     pub fn apply_pinned_filter(&self) {
         let finished = self.finished_blocks.borrow();
-        let bookmarks = self.bookmarks.borrow();
+        let bookmarks = self.bookmarks.snapshot();
         if let Some((idx, _)) = finished
             .iter()
             .enumerate()
             .find(|(_, block)| bookmarks.contains(&block.id))
         {
-            drop(bookmarks);
             drop(finished);
             self.scroll_to_block(idx);
         }
@@ -12989,7 +13045,7 @@ impl TermView {
     pub fn jump_to_pinned(&self, direction: i32) {
         let marked: Vec<usize> = {
             let finished = self.finished_blocks.borrow();
-            let bookmarks = self.bookmarks.borrow();
+            let bookmarks = self.bookmarks.snapshot();
             finished
                 .iter()
                 .enumerate()
@@ -13369,7 +13425,7 @@ impl TermView {
                 debug_assert_eq!(removed.as_ref().map(|block| block.id), Some(block_id));
             },
         );
-        self.bookmarks.borrow_mut().remove(&block_id);
+        self.bookmarks.remove(block_id);
         // Stored indices no longer identify the same widgets after removal.
         // Recompute them on the next viewport update rather than retaining a
         // stale set that can keep an unrelated block hidden.
@@ -13445,20 +13501,21 @@ mod tests {
         materialize_plain_output_legacy, mounted_jumpable_records, mutate_block_data_and_redraw,
         normalize_captured_command, notification_permitted, parse_color_spec, plan_prompt_zone,
         pop_typed_command_shadow, process_block_id_namespace, prompt_anchor_for_surface,
-        prompt_anchor_rebases_on_row_delta, prompt_zone_to_reopen_after_alt, rebase_prompt_anchor,
-        record_external_input, record_unified_zone, resolve_command_text,
-        reviewed_pre_command_bytes_are_identity_neutral, reviewed_submission_matches,
-        screen_relative_cpr_row, selected_blocks_markdown, selected_command_text,
-        selected_id_range, shell_argv_supports_agent_ids, shell_integration_hint,
-        shell_single_quote, stable_visible_indices, step_marked_indices, step_marked_record_ids,
-        stranded_focus_key_recovers, strip_ansi, strip_ansi_with_clear_detect,
-        take_armed_agent_execution, take_background_output, unread_after_index_removal,
-        unread_after_prefix_eviction, viewport_page_size_changed, viewport_state_for_scroll,
-        viewport_states_for_scroll, visible_indices_for_viewport, vte_answers_query_natively,
-        zone_output_snapshot_from_plain, zone_output_snapshot_from_ring, AgentCommandEndDecision,
-        AgentExecutionLostCallbacks, AltScreenCallbacks, AltScreenTransition, AnchorSettleArgs,
-        ArmedAgentExecution, BackendRecords, BlockData, BlockFinishedCallback,
-        BlockFinishedCallbacks, BlockRenderPayloadAccessor, BlockState, CommandFinishedCallbacks,
+        prompt_anchor_rebases_on_row_delta, prompt_zone_to_reopen_after_alt,
+        prune_retired_record_bookmarks, rebase_prompt_anchor, record_external_input,
+        record_unified_zone, resolve_command_text, reviewed_pre_command_bytes_are_identity_neutral,
+        reviewed_submission_matches, screen_relative_cpr_row, selected_blocks_markdown,
+        selected_command_text, selected_id_range, shell_argv_supports_agent_ids,
+        shell_integration_hint, shell_single_quote, stable_visible_indices, step_marked_indices,
+        step_marked_record_ids, stranded_focus_key_recovers, strip_ansi,
+        strip_ansi_with_clear_detect, take_armed_agent_execution, take_background_output,
+        unread_after_index_removal, unread_after_prefix_eviction, viewport_page_size_changed,
+        viewport_state_for_scroll, viewport_states_for_scroll, visible_indices_for_viewport,
+        vte_answers_query_natively, zone_output_snapshot_from_plain,
+        zone_output_snapshot_from_ring, AgentCommandEndDecision, AgentExecutionLostCallbacks,
+        AltScreenCallbacks, AltScreenTransition, AnchorSettleArgs, ArmedAgentExecution,
+        BackendRecords, BlockData, BlockFinishedCallback, BlockFinishedCallbacks,
+        BlockRenderPayloadAccessor, BlockState, BookmarkState, CommandFinishedCallbacks,
         CommandFinishedEvent, CommandPromptStatus, CommandStartedCallbacks, CommandStartedEvent,
         CommandTextSource, CompletedCommandRecord, DynamicColors, DynamicColorsRc, EngineState,
         PendingZone, ReaderCtx, RenderBackend, ResetAwareParserPart, ResetAwareParserSplitter,
@@ -13773,6 +13830,53 @@ mod tests {
             "a zero configuration still stays bounded"
         );
         assert_eq!(zones.records[0].id, 4);
+    }
+
+    #[test]
+    fn unified_bookmarks_follow_record_retirement_not_snapshot_eviction() {
+        let record = |id: u64| CompletedCommandRecord {
+            id,
+            cmd: format!("command-{id}"),
+            exit_code: Some(0),
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: None,
+            cwd: None,
+            is_background: false,
+            completion_provenance: super::CompletionProvenance::ShellReported,
+            start_mark_seen: true,
+        };
+        let bookmarks = BookmarkState::default();
+        let mut zones = UnifiedZoneStore::new();
+
+        let _ = record_unified_zone(&mut zones, record(1), 2);
+        let _ = record_unified_zone(&mut zones, record(2), 2);
+        assert_eq!(bookmarks.set_existing(1, true, true), Some(true));
+        assert_eq!(bookmarks.set_existing(2, true, true), Some(true));
+        let bookmarked_revision = bookmarks.revision();
+
+        zones.insert_snapshot(
+            2,
+            ZoneOutputSnapshot {
+                plain: "retained output".to_string(),
+                truncated: false,
+            },
+        );
+        zones.enforce_snapshot_budget(0);
+        assert!(bookmarks.contains(1));
+        assert!(bookmarks.contains(2));
+        assert_eq!(
+            bookmarks.revision(),
+            bookmarked_revision,
+            "snapshot bytes are not record ownership"
+        );
+
+        let retired = record_unified_zone(&mut zones, record(3), 2);
+        assert_eq!(retired, [1]);
+        prune_retired_record_bookmarks(&bookmarks, &retired);
+        assert!(!bookmarks.contains(1));
+        assert!(bookmarks.contains(2));
+        assert_eq!(bookmarks.revision(), bookmarked_revision + 1);
     }
 
     /// The global budget only ever removes snapshot BYTES, oldest record

@@ -278,7 +278,7 @@ and `W` (Unicode whole word) controls. `Ctrl+I` / `Ctrl+R` / `Ctrl+W` toggle
 them while the query keeps focus; the result scan and the VTE highlight used
 after activation share the exact same options. `All / Cmd / Out` restricts the
 scan to all text, commands, or output, with `Ctrl+O` cycling the scope before
-the 500-hit cap is applied. `Failed`, `Slow`, and `Background` compose before
+the 500-hit cap is applied. `Failed`, `Slow`, `Bookmarked`, and `Background` compose before
 that cap; with an empty text query, any filter turns the palette into a metadata
 browser with one representative row for each eligible retained block that has
 meaningful text on the selected surface. Queries above 8 KiB are rejected
@@ -290,13 +290,14 @@ open and advances only after a successful live-terminal jump. Snapshot-only
 hits still open their snapshot, while unavailable hits stay selected with a
 diagnostic instead of fake-stepping.
 Reopening restores the last valid query, matching controls, scope, and all
-three metadata filters for this pane's process lifetime only; nothing is written
+four metadata filters for this pane's process lifetime only; nothing is written
 to config or session snapshots. `Ctrl+U` clears only the query; **Reset** or
 `Ctrl+Shift+U` restores the query, matching controls, scope, and all filters
 to defaults. An invalid query above 8 KiB is never remembered, and activating
 any control with the pointer returns focus to the query for uninterrupted typing.
-While open, a 500 ms identity-only probe detects completed-block additions and
-same-length retention rotation, then refreshes through the existing debounce.
+While open, a 500 ms identity-and-bookmark-revision probe detects completed-block
+additions, same-length retention rotation, and bookmark changes, then refreshes
+through the existing debounce.
 The exact selected hit remains selected when it survives; the probe never clones
 command or output text.
 Block Search 3.8 keeps the closest surviving old rank when retention removes
@@ -336,6 +337,11 @@ legacy input carries contradictory fields; result rows likewise suppress those
 raw exit and duration values. Empty-query browsing produces only
 rows backed by retained output: `All` and `Out` use the first meaningful output
 line, while `Cmd` and records without retained output produce no synthetic hit.
+Bookmarked search is pane-local and runtime-only in both Block and Unified modes.
+Use the visible star on any result or `Ctrl+Shift+B` on the selected result;
+`Bookmarked` composes with the other metadata filters before scope and the
+500-hit cap. Unified bookmarks are removed only when their completed record is
+retired, not when bounded output snapshots or visual chrome are discarded.
 
 Unified mode keeps one continuous VTE scrollback while retaining authenticated
 command zones, status chrome, bounded per-zone output snapshots, search/export,
