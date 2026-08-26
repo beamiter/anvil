@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-26 (Block Search 4.3)
+Updated: 2026-08-26 (Block Search 4.4)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,15 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **Block Search 4.4 (2026-08-26)**: the capture-phase picker key router now
+  confirms only when focus belongs to the query editor or a result row. Every
+  other focused widget receives `Return`/`KP_Enter` normally — including
+  Refresh/Reset, scope and filter controls, row bookmark stars, and
+  `AdwHeaderBar`'s implicit Close button — instead of jumping and closing on
+  an unrelated selected result. Query/list confirmation and Shift+Enter
+  advance semantics remain unchanged; pure routing and DISPLAY-backed GTK
+  focus-classification regressions cover both sides of the allowlist.
 
 - **Block Search 4.3 (2026-08-26)**: exact VTE occurrence jumps now roll back
   transactionally when any native step fails, removing both the search regex

@@ -202,6 +202,42 @@ enum RefreshKeyPress {
     ProceedModified,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EnterKeyRoute {
+    Propagate,
+    ConfirmResult,
+    Other,
+}
+
+/// Only the query and a result row opt into picker-wide confirmation. This
+/// allowlist makes every other focusable widget safe by default, including
+/// AdwHeaderBar's implicit window Close control and controls added later.
+fn enter_key_route(key: gtk::gdk::Key, confirmation_focused: bool) -> EnterKeyRoute {
+    if !matches!(key, gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter) {
+        EnterKeyRoute::Other
+    } else if confirmation_focused {
+        EnterKeyRoute::ConfirmResult
+    } else {
+        EnterKeyRoute::Propagate
+    }
+}
+
+fn focus_confirms_result(
+    focused: Option<&gtk::Widget>,
+    query: &gtk::SearchEntry,
+    results: &gtk::ListBox,
+) -> bool {
+    let Some(focused) = focused else {
+        return false;
+    };
+    let query = query.upcast_ref::<gtk::Widget>();
+    let results = results.upcast_ref::<gtk::Widget>();
+    focused == query
+        || focused.is_ancestor(query)
+        || focused == results
+        || (focused.is::<gtk::ListBoxRow>() && focused.is_ancestor(results))
+}
+
 /// One physical F5 press may rebuild at most once. GTK reports auto-repeat as
 /// more key-pressed events without an intervening release, so the held state
 /// must also remember an initially modified press: releasing Ctrl while still
@@ -1298,25 +1334,34 @@ pub(super) fn toggle(
                     return gtk::glib::Propagation::Stop;
                 }
             }
-            if matches!(key, Key::Return | Key::KP_Enter) {
-                if let Some(row) = list_box.selected_row() {
-                    let index = row.index() as usize;
-                    let outcome = jump(index);
-                    if should_step(outcome, state.contains(ModifierType::SHIFT_MASK)) {
-                        if let Some(next) =
-                            selection_index(Some(index), hits.borrow().len(), SelectionMove::Next)
-                        {
-                            if let Some(next_row) = list_box.row_at_index(next as i32) {
-                                list_box.select_row(Some(&next_row));
-                                scroll_row_into_view(&scrolled, &next_row);
+            let focused = filter_entry.root().and_then(|root| root.focus());
+            let confirmation_focused =
+                focus_confirms_result(focused.as_ref(), &filter_entry, &list_box);
+            match enter_key_route(key, confirmation_focused) {
+                EnterKeyRoute::Propagate => return gtk::glib::Propagation::Proceed,
+                EnterKeyRoute::ConfirmResult => {
+                    if let Some(row) = list_box.selected_row() {
+                        let index = row.index() as usize;
+                        let outcome = jump(index);
+                        if should_step(outcome, state.contains(ModifierType::SHIFT_MASK)) {
+                            if let Some(next) = selection_index(
+                                Some(index),
+                                hits.borrow().len(),
+                                SelectionMove::Next,
+                            ) {
+                                if let Some(next_row) = list_box.row_at_index(next as i32) {
+                                    list_box.select_row(Some(&next_row));
+                                    scroll_row_into_view(&scrolled, &next_row);
+                                }
                             }
+                            filter_entry.grab_focus();
+                        } else {
+                            apply_jump_outcome(outcome);
                         }
-                        filter_entry.grab_focus();
-                    } else {
-                        apply_jump_outcome(outcome);
                     }
+                    return gtk::glib::Propagation::Stop;
                 }
-                return gtk::glib::Propagation::Stop;
+                EnterKeyRoute::Other => {}
             }
             let movement = match key {
                 Key::Home | Key::KP_Home => SelectionMove::First,
@@ -1424,13 +1469,14 @@ pub(super) fn toggle(
 #[cfg(test)]
 mod tests {
     use super::{
-        bookmark_action_label, bookmark_change_status, dialog_toggle_plan, has_search_intent,
-        hit_outcome_label, idle_status, is_plain_refresh_key, is_selected_bookmark_key,
-        jump_outcome, memory, query_error, refresh_selection_index, refresh_status, search_status,
-        selection_index, should_step, BookmarkKeyLatch, BookmarkKeyPress, CrossBlockHit,
-        DialogTogglePlan, JumpOutcome, RecordNavigationResult, RefreshKeyLatch, RefreshKeyPress,
-        RefreshTickSlot, SelectionAnchor, SelectionMove, CROSS_BLOCK_SEARCH_DEBOUNCE,
-        CROSS_BLOCK_SEARCH_LIMIT, CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
+        bookmark_action_label, bookmark_change_status, dialog_toggle_plan, enter_key_route,
+        focus_confirms_result, has_search_intent, hit_outcome_label, idle_status,
+        is_plain_refresh_key, is_selected_bookmark_key, jump_outcome, memory, query_error,
+        refresh_selection_index, refresh_status, search_status, selection_index, should_step,
+        BookmarkKeyLatch, BookmarkKeyPress, CrossBlockHit, DialogTogglePlan, EnterKeyRoute,
+        JumpOutcome, RecordNavigationResult, RefreshKeyLatch, RefreshKeyPress, RefreshTickSlot,
+        SelectionAnchor, SelectionMove, CROSS_BLOCK_SEARCH_DEBOUNCE, CROSS_BLOCK_SEARCH_LIMIT,
+        CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
     };
     use crate::block_view::{CrossBlockSearchOptions, CrossBlockSearchScope};
 
@@ -1506,6 +1552,72 @@ mod tests {
             CROSS_BLOCK_SEARCH_DEBOUNCE,
             std::time::Duration::from_millis(150)
         );
+    }
+
+    #[test]
+    fn only_confirmation_focus_routes_enter_to_the_selected_result() {
+        use relm4::gtk::gdk::Key;
+
+        for key in [Key::Return, Key::KP_Enter] {
+            assert_eq!(
+                enter_key_route(key, true),
+                EnterKeyRoute::ConfirmResult,
+                "query and result-list focus preserve picker confirmation"
+            );
+            assert_eq!(
+                enter_key_route(key, false),
+                EnterKeyRoute::Propagate,
+                "every other focused widget, including header controls, owns Enter"
+            );
+        }
+        assert_eq!(
+            enter_key_route(Key::space, true),
+            EnterKeyRoute::Other,
+            "non-Enter keys keep their normal widget routing"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn enter_focus_classifier_allows_query_and_row_but_not_nested_or_header_controls() {
+        use relm4::gtk::prelude::*;
+
+        relm4::gtk::init().expect("GTK display");
+        let query = relm4::gtk::SearchEntry::new();
+        let results = relm4::gtk::ListBox::new();
+        let row = relm4::gtk::ListBoxRow::new();
+        let bookmark = relm4::gtk::ToggleButton::new();
+        row.set_child(Some(&bookmark));
+        results.append(&row);
+        let close = relm4::gtk::Button::from_icon_name("window-close-symbolic");
+        let query_delegate = query.first_child().expect("SearchEntry text delegate");
+
+        assert!(focus_confirms_result(
+            Some(query.upcast_ref()),
+            &query,
+            &results
+        ));
+        assert!(focus_confirms_result(
+            Some(&query_delegate),
+            &query,
+            &results
+        ));
+        assert!(focus_confirms_result(
+            Some(row.upcast_ref()),
+            &query,
+            &results
+        ));
+        assert!(!focus_confirms_result(
+            Some(bookmark.upcast_ref()),
+            &query,
+            &results
+        ));
+        assert!(!focus_confirms_result(
+            Some(close.upcast_ref()),
+            &query,
+            &results
+        ));
+        assert!(!focus_confirms_result(None, &query, &results));
     }
 
     #[test]
