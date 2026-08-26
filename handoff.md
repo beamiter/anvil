@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-26 (Block Search 4.2)
+Updated: 2026-08-26 (Block Search 4.3)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,12 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **Block Search 4.3 (2026-08-26)**: exact VTE occurrence jumps now roll back
+  transactionally when any native step fails, removing both the search regex
+  and VTE's partial selection so an unavailable target cannot leave a wrong
+  match highlighted. A real DISPLAY-backed VTE regression covers two
+  successful steps followed by a failed third occurrence.
 
 - **Block Search 4.2 (2026-08-26)**: pane-local, runtime-only bookmarks now
   share one revisioned source of truth across Block cards and Unified records.

@@ -676,6 +676,20 @@ fn step_to_occurrence_exact(occurrence: usize, mut step: impl FnMut() -> bool) -
     bounded_occurrence_steps(occurrence).is_some_and(|steps| (0..steps).all(|_| step()))
 }
 
+/// Drive one VTE search cursor transactionally. A miss can happen only after
+/// earlier steps selected a real (but wrong) match; removing the regex alone
+/// leaves that partial selection behind in VTE. Roll the whole native cursor
+/// state back so a failed palette activation cannot strand a stale highlight.
+fn step_vte_to_occurrence_exact(terminal: &vte4::Terminal, occurrence: usize) -> bool {
+    if step_to_occurrence_exact(occurrence, || terminal.search_find_next()) {
+        true
+    } else {
+        terminal.search_set_regex(None::<&vte4::Regex>, 0);
+        terminal.unselect_all();
+        false
+    }
+}
+
 /// Trim a line to a reasonable display width — the palette row is one
 /// horizontal line so an unbounded long line (think bundled JSON) would
 /// just blow out the dialog width. We truncate with a leading ellipsis if
@@ -1743,8 +1757,7 @@ impl TermView {
         vte.unselect_all();
         vte.search_set_regex(Some(&vte_re), 0);
         vte.search_set_wrap_around(false);
-        if !step_to_occurrence_exact(occurrence, || vte.search_find_next()) {
-            vte.search_set_regex(None::<&vte4::Regex>, 0);
+        if !step_vte_to_occurrence_exact(&vte, occurrence) {
             return false;
         }
         let highlight = FindHighlight {
@@ -2014,6 +2027,56 @@ mod tests {
             Some(true),
             "the exact jump stops at the first miss instead of claiming success"
         );
+    }
+
+    /// A native miss can follow one or more successful cursor steps. VTE keeps
+    /// the last successful match selected after its regex is removed, so the
+    /// production rollback must clear that partial, incorrect highlight too.
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn a_failed_palette_vte_jump_rolls_back_its_partial_selection() {
+        use gtk::prelude::*;
+        use relm4::gtk;
+        use std::time::Duration;
+        use vte4::TerminalExt;
+
+        gtk::init().expect("gtk init");
+        let terminal = vte4::Terminal::new();
+        terminal.set_size(32, 8);
+        terminal.set_scrollback_lines(0);
+        let window = gtk::Window::new();
+        window.set_child(Some(&terminal));
+        window.present();
+        terminal.feed(b"needle-one\r\nneedle-two");
+        let context = gtk::glib::MainContext::default();
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_millis(100) {
+            while context.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        let regex = vte4::Regex::for_search("needle-(?:one|two)", VTE_SEARCH_FLAGS).unwrap();
+        terminal.unselect_all();
+        terminal.search_set_regex(Some(&regex), 0);
+        terminal.search_set_wrap_around(false);
+        assert!(
+            !super::step_vte_to_occurrence_exact(&terminal, 2),
+            "a requested third occurrence must fail after two partial steps"
+        );
+        assert_eq!(
+            terminal
+                .text_selected(vte4::Format::Text)
+                .map(|text| text.to_string())
+                .unwrap_or_default(),
+            "",
+            "the failed exact jump must not leave the second hit selected"
+        );
+        assert!(
+            !terminal.search_find_next(),
+            "rollback must remove the failed jump's regex as well"
+        );
+        window.close();
+        while context.iteration(false) {}
     }
 
     #[test]

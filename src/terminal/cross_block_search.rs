@@ -129,6 +129,8 @@ enum BookmarkKeyPress {
     Proceed,
 }
 
+type BookmarkChangedCallback = Rc<RefCell<Option<Weak<dyn Fn(bool, bool)>>>>;
+
 #[derive(Default)]
 struct BookmarkKeyLatch {
     held: bool,
@@ -631,8 +633,7 @@ pub(super) fn toggle(
     ));
     let search_generation = Rc::new(Cell::new(0_u64));
     let observed_version = Rc::new(Cell::new(view.cross_block_search_version()));
-    let bookmark_changed: Rc<RefCell<Option<Weak<dyn Fn(bool, bool)>>>> =
-        Rc::new(RefCell::new(None));
+    let bookmark_changed: BookmarkChangedCallback = Rc::new(RefCell::new(None));
     {
         let hits = hits.clone();
         let status_label = status_label.clone();
