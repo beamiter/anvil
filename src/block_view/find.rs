@@ -573,6 +573,28 @@ impl CrossBlockSearchScope {
     }
 }
 
+/// Finalized-record identity observed by an open cross-block picker. Length
+/// alone is insufficient because retention can evict one old record while a
+/// new one arrives in the same update.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CrossBlockSearchVersion {
+    len: usize,
+    oldest: Option<u64>,
+    newest: Option<u64>,
+}
+
+fn cross_block_search_version(ids: impl IntoIterator<Item = u64>) -> CrossBlockSearchVersion {
+    ids.into_iter()
+        .fold(CrossBlockSearchVersion::default(), |mut version, id| {
+            if version.len == 0 {
+                version.oldest = Some(id);
+            }
+            version.len = version.len.saturating_add(1);
+            version.newest = Some(id);
+            version
+        })
+}
+
 fn cross_block_pattern(pattern: &str, options: CrossBlockSearchOptions) -> String {
     if options.regex {
         pattern.to_string()
@@ -613,7 +635,7 @@ fn cross_block_match_count(regex: &regex::Regex, line: &str, whole_word: bool) -
 /// the per-block VTE search cursor goes to the right widget), the 1-based
 /// line number inside that surface, the line snippet itself (trimmed/
 /// truncated for display), and a one-line cmd preview for context.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CrossBlockHit {
     pub block_id: u64,
     pub is_output: bool,
@@ -764,6 +786,14 @@ fn add_snapshot_jump_fallbacks<'a>(
 
 #[allow(dead_code)]
 impl TermView {
+    /// Cheap version probe for an open picker. No command/output text is
+    /// cloned; callers can poll this and rebuild only when finalized record
+    /// identity actually changes.
+    pub fn cross_block_search_version(&self) -> CrossBlockSearchVersion {
+        let records = self.render_backend.records();
+        cross_block_search_version(records.iter().map(|record| record.id()))
+    }
+
     /// Search records for a query string, returning stable record ids.
     pub fn search_blocks(&self, query: &str) -> Vec<u64> {
         self.search_blocks_with_filters(query, &BlockFilters::default())
@@ -1551,9 +1581,10 @@ pub(super) fn clear_find_state(
 mod tests {
     use super::{
         add_snapshot_jump_fallbacks, bounded_match_count, command_preview, cross_block_match_count,
-        cross_block_pattern, duration_matches, focus_one_native_forward_match, matching_record_ids,
-        native_cursor_action, outcome_matches_filters, plan_matching_windows, regex_consumption,
-        snippet, step_compressed_cursor, unresolved_record_target_result, utf8_prefix,
+        cross_block_pattern, cross_block_search_version, duration_matches,
+        focus_one_native_forward_match, matching_record_ids, native_cursor_action,
+        outcome_matches_filters, plan_matching_windows, regex_consumption, snippet,
+        step_compressed_cursor, unresolved_record_target_result, utf8_prefix,
         vte_cross_block_pattern, CrossBlockSearchOptions, CrossBlockSearchScope, FindCursor,
         FindDirection, FindScanBudget, FindSurface, NativeCursorAction, RecordNavigationResult,
         RecordSnapshotView, RegexConsumption, VTE_SEARCH_FLAGS,
@@ -1578,6 +1609,23 @@ mod tests {
             wrap_before: complete.then_some(0),
             render_stamp: crate::block_view::blocks::NEUTRAL_RENDER_STAMP,
         }
+    }
+
+    #[test]
+    fn cross_block_version_detects_same_length_retention_rotation() {
+        let empty = cross_block_search_version([]);
+        assert_eq!(empty.len, 0);
+        assert_eq!(empty.oldest, None);
+        assert_eq!(empty.newest, None);
+
+        let before = cross_block_search_version([7, 8, 9]);
+        let after = cross_block_search_version([8, 9, 10]);
+        assert_eq!(before.len, after.len);
+        assert_eq!(before.oldest, Some(7));
+        assert_eq!(before.newest, Some(9));
+        assert_eq!(after.oldest, Some(8));
+        assert_eq!(after.newest, Some(10));
+        assert_ne!(before, after);
     }
 
     #[test]

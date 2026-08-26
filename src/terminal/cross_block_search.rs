@@ -16,6 +16,7 @@ use crate::block_view::{CrossBlockHit, RecordNavigationResult, TermView};
 use super::record_snapshot;
 
 const CROSS_BLOCK_SEARCH_DEBOUNCE: Duration = Duration::from_millis(150);
+const CROSS_BLOCK_SEARCH_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 const CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES: usize = 8 * 1024;
 const CROSS_BLOCK_SEARCH_LIMIT: usize = 500;
 const CROSS_BLOCK_SEARCH_PAGE_STEP: usize = 10;
@@ -58,6 +59,10 @@ fn memory(
 
 fn idle_status() -> &'static str {
     "Type to search. Shift+Enter jumps and advances; Ctrl+Shift+U resets."
+}
+
+fn refresh_status() -> &'static str {
+    "Refreshing blocks…"
 }
 
 fn search_status(total: usize, selected: Option<usize>) -> String {
@@ -287,6 +292,7 @@ pub(super) fn toggle(
     dialog.set_child(Some(&toolbar_view));
 
     let hits: Rc<RefCell<Vec<CrossBlockHit>>> = Rc::new(RefCell::new(Vec::new()));
+    let retained_hit: Rc<RefCell<Option<CrossBlockHit>>> = Rc::new(RefCell::new(None));
     let pending_rebuild: Rc<RefCell<Option<gtk::glib::SourceId>>> = Rc::new(RefCell::new(None));
     let search_generation = Rc::new(Cell::new(0_u64));
     {
@@ -311,8 +317,10 @@ pub(super) fn toggle(
         let case_toggle = case_toggle.clone();
         let whole_word_toggle = whole_word_toggle.clone();
         let scope_dropdown = scope_dropdown.clone();
+        let retained_hit = retained_hit.clone();
         Rc::new(move || {
             let query = filter_entry.text().to_string();
+            let retained_hit = retained_hit.borrow_mut().take();
             let options = crate::block_view::CrossBlockSearchOptions {
                 case_sensitive: case_toggle.is_active(),
                 regex: regex_toggle.is_active(),
@@ -385,8 +393,11 @@ pub(super) fn toggle(
                         }
                         list_box.append(&row);
                     }
+                    let selected = retained_hit
+                        .and_then(|retained| results.iter().position(|hit| hit == &retained))
+                        .unwrap_or(0);
                     *hits.borrow_mut() = results;
-                    list_box.select_row(list_box.row_at_index(0).as_ref());
+                    list_box.select_row(list_box.row_at_index(selected as i32).as_ref());
                 }
                 Err(error) => {
                     hits.borrow_mut().clear();
@@ -404,26 +415,46 @@ pub(super) fn toggle(
         let list_box = list_box.clone();
         let status_label = status_label.clone();
         let filter_entry = filter_entry.clone();
-        Rc::new(move || {
+        let retained_hit = retained_hit.clone();
+        Rc::new(move |preserve_selection: bool| {
             let generation = search_generation.get().wrapping_add(1);
             search_generation.set(generation);
             if let Some(source) = pending_rebuild.borrow_mut().take() {
                 source.remove();
             }
 
-            while let Some(child) = list_box.first_child() {
-                list_box.remove(&child);
-            }
-            hits.borrow_mut().clear();
+            *retained_hit.borrow_mut() = if preserve_selection {
+                list_box
+                    .selected_row()
+                    .and_then(|row| hits.borrow().get(row.index() as usize).cloned())
+            } else {
+                None
+            };
             if filter_entry.text().is_empty() {
+                while let Some(child) = list_box.first_child() {
+                    list_box.remove(&child);
+                }
+                hits.borrow_mut().clear();
                 status_label.set_text(idle_status());
                 return;
             }
             if let Some(message) = query_error(filter_entry.text().as_str()) {
+                while let Some(child) = list_box.first_child() {
+                    list_box.remove(&child);
+                }
+                hits.borrow_mut().clear();
                 status_label.set_text(message);
                 return;
             }
-            status_label.set_text("Searching blocks…");
+            if preserve_selection {
+                status_label.set_text(refresh_status());
+            } else {
+                while let Some(child) = list_box.first_child() {
+                    list_box.remove(&child);
+                }
+                hits.borrow_mut().clear();
+                status_label.set_text("Searching blocks…");
+            }
 
             let pending_slot = pending_rebuild.clone();
             let pending_clear = pending_rebuild.clone();
@@ -443,13 +474,13 @@ pub(super) fn toggle(
 
     {
         let schedule_rebuild = schedule_rebuild.clone();
-        filter_entry.connect_search_changed(move |_| schedule_rebuild());
+        filter_entry.connect_search_changed(move |_| schedule_rebuild(false));
     }
     {
         let schedule_rebuild = schedule_rebuild.clone();
         let filter_entry = filter_entry.clone();
         regex_toggle.connect_toggled(move |_| {
-            schedule_rebuild();
+            schedule_rebuild(false);
             filter_entry.grab_focus();
         });
     }
@@ -457,7 +488,7 @@ pub(super) fn toggle(
         let schedule_rebuild = schedule_rebuild.clone();
         let filter_entry = filter_entry.clone();
         case_toggle.connect_toggled(move |_| {
-            schedule_rebuild();
+            schedule_rebuild(false);
             filter_entry.grab_focus();
         });
     }
@@ -465,7 +496,7 @@ pub(super) fn toggle(
         let schedule_rebuild = schedule_rebuild.clone();
         let filter_entry = filter_entry.clone();
         whole_word_toggle.connect_toggled(move |_| {
-            schedule_rebuild();
+            schedule_rebuild(false);
             filter_entry.grab_focus();
         });
     }
@@ -473,7 +504,7 @@ pub(super) fn toggle(
         let schedule_rebuild = schedule_rebuild.clone();
         let filter_entry = filter_entry.clone();
         scope_dropdown.connect_selected_notify(move |_| {
-            schedule_rebuild();
+            schedule_rebuild(false);
             filter_entry.grab_focus();
         });
     }
@@ -481,7 +512,7 @@ pub(super) fn toggle(
         let schedule_rebuild = schedule_rebuild.clone();
         let filter_entry = filter_entry.clone();
         failed_toggle.connect_toggled(move |_| {
-            schedule_rebuild();
+            schedule_rebuild(false);
             filter_entry.grab_focus();
         });
     }
@@ -489,7 +520,7 @@ pub(super) fn toggle(
         let schedule_rebuild = schedule_rebuild.clone();
         let filter_entry = filter_entry.clone();
         slow_toggle.connect_toggled(move |_| {
-            schedule_rebuild();
+            schedule_rebuild(false);
             filter_entry.grab_focus();
         });
     }
@@ -512,6 +543,24 @@ pub(super) fn toggle(
             filter_entry.grab_focus();
         });
     }
+
+    // Probe finalized-record identity without cloning terminal content. A
+    // completion or same-length retention rotation refreshes the open picker,
+    // preserving the exact selected hit when it still exists.
+    let refresh_source = {
+        let view = view.clone();
+        let observed_version = Rc::new(Cell::new(view.cross_block_search_version()));
+        let schedule_rebuild = schedule_rebuild.clone();
+        gtk::glib::timeout_add_local(CROSS_BLOCK_SEARCH_REFRESH_INTERVAL, move || {
+            let current = view.cross_block_search_version();
+            if current != observed_version.get() {
+                observed_version.set(current);
+                schedule_rebuild(true);
+            }
+            gtk::glib::ControlFlow::Continue
+        })
+    };
+    let refresh_source = Rc::new(RefCell::new(Some(refresh_source)));
 
     let jump = {
         let view = view.clone();
@@ -677,6 +726,7 @@ pub(super) fn toggle(
     {
         let dialog_slot = dialog_slot.clone();
         let pending_rebuild = pending_rebuild.clone();
+        let refresh_source = refresh_source.clone();
         let filter_entry = filter_entry.clone();
         let case_toggle = case_toggle.clone();
         let regex_toggle = regex_toggle.clone();
@@ -685,6 +735,9 @@ pub(super) fn toggle(
         let failed_toggle = failed_toggle.clone();
         let slow_toggle = slow_toggle.clone();
         dialog.connect_closed(move |_| {
+            if let Some(source) = refresh_source.borrow_mut().take() {
+                source.remove();
+            }
             if let Some(source) = pending_rebuild.borrow_mut().take() {
                 source.remove();
             }
@@ -707,7 +760,7 @@ pub(super) fn toggle(
     let parent = view.widget();
     dialog.present(Some(&parent));
     if !remembered.query.is_empty() {
-        schedule_rebuild();
+        schedule_rebuild(false);
     }
     filter_entry.grab_focus();
 }
@@ -715,10 +768,10 @@ pub(super) fn toggle(
 #[cfg(test)]
 mod tests {
     use super::{
-        hit_outcome_label, idle_status, jump_outcome, memory, query_error, search_status,
-        selection_index, should_step, CrossBlockHit, JumpOutcome, RecordNavigationResult,
-        SelectionMove, CROSS_BLOCK_SEARCH_DEBOUNCE, CROSS_BLOCK_SEARCH_LIMIT,
-        CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
+        hit_outcome_label, idle_status, jump_outcome, memory, query_error, refresh_status,
+        search_status, selection_index, should_step, CrossBlockHit, JumpOutcome,
+        RecordNavigationResult, SelectionMove, CROSS_BLOCK_SEARCH_DEBOUNCE,
+        CROSS_BLOCK_SEARCH_LIMIT, CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
     };
     use crate::block_view::{CrossBlockSearchOptions, CrossBlockSearchScope};
 
@@ -863,6 +916,7 @@ mod tests {
             idle_status(),
             "Type to search. Shift+Enter jumps and advances; Ctrl+Shift+U resets."
         );
+        assert_eq!(refresh_status(), "Refreshing blocks…");
         assert!(should_step(JumpOutcome::Close, true));
         assert!(!should_step(JumpOutcome::Close, false));
         assert!(!should_step(JumpOutcome::ShowSnapshot(7), true));

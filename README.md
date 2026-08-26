@@ -292,6 +292,10 @@ to config or session snapshots. `Ctrl+U` clears only the query; **Reset** or
 `Ctrl+Shift+U` restores the query, matching controls, scope, and both filters
 to defaults. An invalid query above 8 KiB is never remembered, and activating
 any control with the pointer returns focus to the query for uninterrupted typing.
+While open, a 500 ms identity-only probe detects completed-block additions and
+same-length retention rotation, then refreshes through the existing debounce.
+The exact selected hit remains selected when it survives; the probe never clones
+command or output text.
 
 Unified mode keeps one continuous VTE scrollback while retaining authenticated
 command zones, status chrome, bounded per-zone output snapshots, search/export,
