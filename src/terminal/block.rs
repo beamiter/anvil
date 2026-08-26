@@ -80,6 +80,9 @@ pub struct BlockTerminal {
     terminal_done: Rc<Cell<bool>>,
     config: Rc<RefCell<crate::config::Config>>,
     cross_block_search_dialog: Rc<RefCell<Option<relm4::adw::Dialog>>>,
+    /// Pane-lifetime search intent only; never serialized into config or a
+    /// restored session.
+    cross_block_search_memory: Rc<RefCell<cross_block_search::Memory>>,
     /// The read-only snapshot view opened by record navigation. One slot per
     /// pane, so a second navigation replaces the open view instead of stacking.
     record_snapshot_dialog: Rc<RefCell<Option<relm4::adw::Dialog>>>,
@@ -463,6 +466,7 @@ impl Component for BlockTerminal {
             terminal_done,
             config,
             cross_block_search_dialog: Rc::new(RefCell::new(None)),
+            cross_block_search_memory: Rc::new(RefCell::new(Default::default())),
             record_snapshot_dialog: Rc::new(RefCell::new(None)),
             search_status: SearchStatus::Idle,
             search_query: None,
@@ -663,6 +667,7 @@ impl Component for BlockTerminal {
                 view.clone(),
                 self.cross_block_search_dialog.clone(),
                 snapshot_dialog,
+                self.cross_block_search_memory.clone(),
             ),
             VteInput::AskAiAboutSelectedBlock => {
                 if let Some(context) = view.selected_block_context(80) {

@@ -25,6 +25,37 @@ fn query_error(query: &str) -> Option<&'static str> {
         .then_some("Query is too long (maximum 8 KiB).")
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct Memory {
+    query: String,
+    options: crate::block_view::CrossBlockSearchOptions,
+    scope: crate::block_view::CrossBlockSearchScope,
+    failed_only: bool,
+    slow_only: bool,
+}
+
+fn memory(
+    query: &str,
+    options: crate::block_view::CrossBlockSearchOptions,
+    scope: crate::block_view::CrossBlockSearchScope,
+    failed_only: bool,
+    slow_only: bool,
+) -> Memory {
+    Memory {
+        // Keep the pane-lifetime state bounded even if the user closes while
+        // the explicit oversized-query diagnostic is visible.
+        query: if query.len() <= CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES {
+            query.to_string()
+        } else {
+            String::new()
+        },
+        options,
+        scope,
+        failed_only,
+        slow_only,
+    }
+}
+
 fn idle_status() -> &'static str {
     "Type to search across blocks. Shift+Enter jumps and advances."
 }
@@ -159,12 +190,14 @@ pub(super) fn toggle(
     view: Rc<TermView>,
     dialog_slot: Rc<RefCell<Option<adw::Dialog>>>,
     snapshot_slot: Rc<RefCell<Option<adw::Dialog>>>,
+    memory_slot: Rc<RefCell<Memory>>,
 ) {
     let open_dialog = { dialog_slot.borrow_mut().take() };
     if let Some(dialog) = open_dialog {
         dialog.force_close();
         return;
     }
+    let remembered = memory_slot.borrow().clone();
 
     let dialog = adw::Dialog::builder()
         .title("Search Blocks (ripgrep)")
@@ -212,6 +245,13 @@ pub(super) fn toggle(
     filter_entry.set_margin_end(12);
     filter_entry.set_margin_top(8);
     filter_entry.set_margin_bottom(8);
+    case_toggle.set_active(remembered.options.case_sensitive);
+    regex_toggle.set_active(remembered.options.regex);
+    whole_word_toggle.set_active(remembered.options.whole_word);
+    scope_dropdown.set_selected(remembered.scope.index());
+    failed_toggle.set_active(remembered.failed_only);
+    slow_toggle.set_active(remembered.slow_only);
+    filter_entry.set_text(&remembered.query);
 
     let list_box = gtk::ListBox::new();
     list_box.set_selection_mode(gtk::SelectionMode::Single);
@@ -517,6 +557,11 @@ pub(super) fn toggle(
                 return gtk::glib::Propagation::Stop;
             }
             if state.contains(ModifierType::CONTROL_MASK) {
+                if matches!(key, Key::u | Key::U) {
+                    filter_entry.set_text("");
+                    filter_entry.grab_focus();
+                    return gtk::glib::Propagation::Stop;
+                }
                 let toggle = match key {
                     Key::i | Key::I => Some(&case_toggle),
                     Key::r | Key::R => Some(&regex_toggle),
@@ -581,10 +626,28 @@ pub(super) fn toggle(
     {
         let dialog_slot = dialog_slot.clone();
         let pending_rebuild = pending_rebuild.clone();
+        let filter_entry = filter_entry.clone();
+        let case_toggle = case_toggle.clone();
+        let regex_toggle = regex_toggle.clone();
+        let whole_word_toggle = whole_word_toggle.clone();
+        let scope_dropdown = scope_dropdown.clone();
+        let failed_toggle = failed_toggle.clone();
+        let slow_toggle = slow_toggle.clone();
         dialog.connect_closed(move |_| {
             if let Some(source) = pending_rebuild.borrow_mut().take() {
                 source.remove();
             }
+            *memory_slot.borrow_mut() = memory(
+                filter_entry.text().as_str(),
+                crate::block_view::CrossBlockSearchOptions {
+                    case_sensitive: case_toggle.is_active(),
+                    regex: regex_toggle.is_active(),
+                    whole_word: whole_word_toggle.is_active(),
+                },
+                crate::block_view::CrossBlockSearchScope::from_index(scope_dropdown.selected()),
+                failed_toggle.is_active(),
+                slow_toggle.is_active(),
+            );
             *dialog_slot.borrow_mut() = None;
         });
     }
@@ -592,17 +655,21 @@ pub(super) fn toggle(
     *dialog_slot.borrow_mut() = Some(dialog.clone());
     let parent = view.widget();
     dialog.present(Some(&parent));
+    if !remembered.query.is_empty() {
+        rebuild();
+    }
     filter_entry.grab_focus();
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        hit_outcome_label, idle_status, jump_outcome, query_error, search_status, selection_index,
-        should_step, CrossBlockHit, JumpOutcome, RecordNavigationResult, SelectionMove,
-        CROSS_BLOCK_SEARCH_DEBOUNCE, CROSS_BLOCK_SEARCH_LIMIT,
+        hit_outcome_label, idle_status, jump_outcome, memory, query_error, search_status,
+        selection_index, should_step, CrossBlockHit, JumpOutcome, RecordNavigationResult,
+        SelectionMove, CROSS_BLOCK_SEARCH_DEBOUNCE, CROSS_BLOCK_SEARCH_LIMIT,
         CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
     };
+    use crate::block_view::{CrossBlockSearchOptions, CrossBlockSearchScope};
 
     fn hit(exit_code: Option<i32>, duration_ms: Option<u64>, cwd: Option<&str>) -> CrossBlockHit {
         CrossBlockHit {
@@ -689,6 +756,34 @@ mod tests {
             Some("Query is too long (maximum 8 KiB).")
         );
         assert!(query_error(&"界".repeat(CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES / 3 + 1)).is_some());
+    }
+
+    #[test]
+    fn cross_block_search_memory_is_bounded_and_keeps_all_filters() {
+        let options = CrossBlockSearchOptions {
+            case_sensitive: true,
+            regex: true,
+            whole_word: true,
+        };
+        let remembered = memory("needle", options, CrossBlockSearchScope::Output, true, true);
+        assert_eq!(remembered.query, "needle");
+        assert_eq!(remembered.options, options);
+        assert_eq!(remembered.scope, CrossBlockSearchScope::Output);
+        assert!(remembered.failed_only);
+        assert!(remembered.slow_only);
+
+        let oversized = memory(
+            &"x".repeat(CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES + 1),
+            options,
+            CrossBlockSearchScope::Command,
+            true,
+            false,
+        );
+        assert!(oversized.query.is_empty());
+        assert_eq!(oversized.options, options);
+        assert_eq!(oversized.scope, CrossBlockSearchScope::Command);
+        assert!(oversized.failed_only);
+        assert!(!oversized.slow_only);
     }
 
     #[test]

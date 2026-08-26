@@ -286,6 +286,10 @@ the query focused. `Enter` jumps and closes; `Shift+Enter` keeps the palette
 open and advances only after a successful live-terminal jump. Snapshot-only
 hits still open their snapshot, while unavailable hits stay selected with a
 diagnostic instead of fake-stepping.
+Reopening restores the last valid query, matching controls, scope, and
+Failed/Slow filters for this pane's process lifetime only; nothing is written
+to config or session snapshots. `Ctrl+U` clears the query explicitly, and an
+invalid query above 8 KiB is never remembered.
 
 Unified mode keeps one continuous VTE scrollback while retaining authenticated
 command zones, status chrome, bounded per-zone output snapshots, search/export,
