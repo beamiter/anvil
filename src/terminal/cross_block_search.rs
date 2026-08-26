@@ -58,7 +58,7 @@ fn memory(
 }
 
 fn idle_status() -> &'static str {
-    "Type to search. Shift+Enter jumps and advances; Ctrl+Shift+U resets."
+    "Type to search. F5 refreshes; Shift+Enter jumps and advances; Ctrl+Shift+U resets."
 }
 
 fn refresh_status() -> &'static str {
@@ -582,9 +582,10 @@ pub(super) fn toggle(
     // Probe finalized-record identity without cloning terminal content. A
     // completion or same-length retention rotation refreshes the open picker,
     // preserving the exact selected hit when it still exists.
+    let observed_version = Rc::new(Cell::new(view.cross_block_search_version()));
     let refresh_source = {
         let view = view.clone();
-        let observed_version = Rc::new(Cell::new(view.cross_block_search_version()));
+        let observed_version = observed_version.clone();
         let schedule_rebuild = schedule_rebuild.clone();
         gtk::glib::timeout_add_local(CROSS_BLOCK_SEARCH_REFRESH_INTERVAL, move || {
             let current = view.cross_block_search_version();
@@ -678,6 +679,9 @@ pub(super) fn toggle(
         let whole_word_toggle = whole_word_toggle.clone();
         let scope_dropdown = scope_dropdown.clone();
         let reset_button = reset_button.clone();
+        let view_for_refresh = view.clone();
+        let observed_version_for_refresh = observed_version.clone();
+        let schedule_refresh = schedule_rebuild.clone();
         key_controller.connect_key_pressed(move |_, key, _, state| {
             use gtk::gdk::{Key, ModifierType};
             if key == Key::Escape
@@ -685,6 +689,12 @@ pub(super) fn toggle(
                     && state.contains(ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK))
             {
                 dialog.force_close();
+                return gtk::glib::Propagation::Stop;
+            }
+            if key == Key::F5 {
+                observed_version_for_refresh.set(view_for_refresh.cross_block_search_version());
+                schedule_refresh(true);
+                filter_entry.grab_focus();
                 return gtk::glib::Propagation::Stop;
             }
             if state.contains(ModifierType::CONTROL_MASK) {
@@ -975,7 +985,7 @@ mod tests {
     fn continuous_review_advances_only_after_a_live_jump() {
         assert_eq!(
             idle_status(),
-            "Type to search. Shift+Enter jumps and advances; Ctrl+Shift+U resets."
+            "Type to search. F5 refreshes; Shift+Enter jumps and advances; Ctrl+Shift+U resets."
         );
         assert_eq!(refresh_status(), "Refreshing blocks…");
         assert!(should_step(JumpOutcome::Close, true));
