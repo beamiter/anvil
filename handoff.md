@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-26 (Block Search 3.1)
+Updated: 2026-08-26 (Block Search 3.2)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,11 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **Block Search 3.2 (2026-08-26)**: the GTK palette now wraps arrow
+  navigation, supports Home/End plus ten-row PageUp/PageDown moves, scrolls the
+  selected row into view without moving query focus, and exposes current/total
+  position through an accessible status label.
 
 - **Block Search 3.1 (2026-08-26)**: the cross-block palette now has `All /
   Cmd / Out` surface scopes plus a `Ctrl+O` cycle. Scope filtering runs before

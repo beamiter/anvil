@@ -279,7 +279,10 @@ them while the query keeps focus; the result scan and the VTE highlight used
 after activation share the exact same options. `All / Cmd / Out` restricts the
 scan to all text, commands, or output, with `Ctrl+O` cycling the scope before
 the 500-hit cap is applied. Queries above 8 KiB are rejected
-before regex compilation, whose heap budget is capped independently.
+before regex compilation, whose heap budget is capped independently. Result
+status includes the current position; `↑/↓` wraps, `Home/End` selects either
+edge, and `PageUp/PageDown` moves ten rows while keeping the row visible and
+the query focused.
 
 Unified mode keeps one continuous VTE scrollback while retaining authenticated
 command zones, status chrome, bounded per-zone output snapshots, search/export,

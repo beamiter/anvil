@@ -17,10 +17,60 @@ use super::record_snapshot;
 
 const CROSS_BLOCK_SEARCH_DEBOUNCE: Duration = Duration::from_millis(150);
 const CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES: usize = 8 * 1024;
+const CROSS_BLOCK_SEARCH_LIMIT: usize = 500;
+const CROSS_BLOCK_SEARCH_PAGE_STEP: usize = 10;
 
 fn query_error(query: &str) -> Option<&'static str> {
     (query.len() > CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES)
         .then_some("Query is too long (maximum 8 KiB).")
+}
+
+fn search_status(total: usize, selected: Option<usize>) -> String {
+    if total == 0 {
+        return "No matches.".to_string();
+    }
+    let noun = if total == 1 { "match" } else { "matches" };
+    let position = selected
+        .filter(|index| *index < total)
+        .map(|index| format!("{} of ", index + 1))
+        .unwrap_or_default();
+    if total == CROSS_BLOCK_SEARCH_LIMIT {
+        format!("{position}{total} {noun} (capped) — refine your query.")
+    } else {
+        format!("{position}{total} {noun}")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectionMove {
+    First,
+    Previous,
+    Next,
+    PagePrevious,
+    PageNext,
+    Last,
+}
+
+fn selection_index(current: Option<usize>, total: usize, movement: SelectionMove) -> Option<usize> {
+    if total == 0 {
+        return None;
+    }
+    let Some(current) = current.filter(|index| *index < total) else {
+        return Some(match movement {
+            SelectionMove::Previous | SelectionMove::Last => total - 1,
+            _ => 0,
+        });
+    };
+    Some(match movement {
+        SelectionMove::First => 0,
+        SelectionMove::Previous => (current + total - 1) % total,
+        SelectionMove::Next => (current + 1) % total,
+        SelectionMove::PagePrevious => current.saturating_sub(CROSS_BLOCK_SEARCH_PAGE_STEP),
+        SelectionMove::PageNext => current
+            .saturating_add(CROSS_BLOCK_SEARCH_PAGE_STEP)
+            .min(total - 1),
+        SelectionMove::Last => total - 1,
+    })
 }
 
 /// What the palette does with one activated hit. Every arm of
@@ -161,6 +211,7 @@ pub(super) fn toggle(
 
     let status_label = gtk::Label::new(Some("Type to search across blocks."));
     status_label.add_css_class("dim-label");
+    status_label.set_accessible_role(gtk::AccessibleRole::Status);
     status_label.set_xalign(0.0);
     status_label.set_margin_start(12);
     status_label.set_margin_end(12);
@@ -184,6 +235,16 @@ pub(super) fn toggle(
     let hits: Rc<RefCell<Vec<CrossBlockHit>>> = Rc::new(RefCell::new(Vec::new()));
     let pending_rebuild: Rc<RefCell<Option<gtk::glib::SourceId>>> = Rc::new(RefCell::new(None));
     let search_generation = Rc::new(Cell::new(0_u64));
+    {
+        let hits = hits.clone();
+        let status_label = status_label.clone();
+        list_box.connect_row_selected(move |_, row| {
+            status_label.set_text(&search_status(
+                hits.borrow().len(),
+                row.map(|row| row.index() as usize),
+            ));
+        });
+    }
     let rebuild = {
         let view = view.clone();
         let failed_toggle = failed_toggle.clone();
@@ -225,17 +286,16 @@ pub(super) fn toggle(
             };
             let scope =
                 crate::block_view::CrossBlockSearchScope::from_index(scope_dropdown.selected());
-            match view.cross_block_search_in_scope(&query, options, scope, 500, &filters) {
+            match view.cross_block_search_in_scope(
+                &query,
+                options,
+                scope,
+                CROSS_BLOCK_SEARCH_LIMIT,
+                &filters,
+            ) {
                 Ok(results) => {
                     let total = results.len();
-                    status_label.set_text(match total {
-                        0 => "No matches.",
-                        500 => "500 matches (capped) — refine your query.",
-                        _ => "",
-                    });
-                    if total > 0 && total < 500 {
-                        status_label.set_text(&format!("{total} matches"));
-                    }
+                    status_label.set_text(&search_status(total, None));
                     let jumpable = view.jumpable_search_hits(&results);
                     for hit in &results {
                         let surface = if hit.is_output { "out" } else { "cmd" };
@@ -428,6 +488,7 @@ pub(super) fn toggle(
         let dialog = dialog.clone();
         let list_box = list_box.clone();
         let scrolled = scrolled.clone();
+        let hits = hits.clone();
         let jump = jump.clone();
         let apply_jump_outcome = apply_jump_outcome.clone();
         let case_toggle = case_toggle.clone();
@@ -468,21 +529,23 @@ pub(super) fn toggle(
                 }
                 return gtk::glib::Propagation::Stop;
             }
-            let delta = match key {
-                Key::Down => 1,
-                Key::Up => -1,
+            let movement = match key {
+                Key::Home | Key::KP_Home => SelectionMove::First,
+                Key::Up => SelectionMove::Previous,
+                Key::Down => SelectionMove::Next,
+                Key::Page_Up => SelectionMove::PagePrevious,
+                Key::Page_Down => SelectionMove::PageNext,
+                Key::End | Key::KP_End => SelectionMove::Last,
                 _ => return gtk::glib::Propagation::Proceed,
             };
-            let current = list_box.selected_row().map(|row| row.index()).unwrap_or(0);
-            let next = (current + delta).max(0);
-            if let Some(row) = list_box.row_at_index(next) {
-                list_box.select_row(Some(&row));
-                // Selecting a row does not move the viewport: GTK scrolls to
-                // follow *focus*. Without this the selection walks off the
-                // bottom of the list while the user holds Down, and Enter jumps
-                // to a result they cannot see. The entry takes focus straight
-                // back so typing keeps working; the scroll is already queued.
-                scroll_row_into_view(&scrolled, &row);
+            let current = list_box.selected_row().map(|row| row.index() as usize);
+            if let Some(next) = selection_index(current, hits.borrow().len(), movement) {
+                if let Some(row) = list_box.row_at_index(next as i32) {
+                    list_box.select_row(Some(&row));
+                    // Selection does not move focus away from the query, so
+                    // drive the viewport directly for page/edge navigation.
+                    scroll_row_into_view(&scrolled, &row);
+                }
             }
             gtk::glib::Propagation::Stop
         });
@@ -509,8 +572,10 @@ pub(super) fn toggle(
 #[cfg(test)]
 mod tests {
     use super::{
-        hit_outcome_label, jump_outcome, query_error, CrossBlockHit, JumpOutcome,
-        RecordNavigationResult, CROSS_BLOCK_SEARCH_DEBOUNCE, CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
+        hit_outcome_label, jump_outcome, query_error, search_status, selection_index,
+        CrossBlockHit, JumpOutcome, RecordNavigationResult, SelectionMove,
+        CROSS_BLOCK_SEARCH_DEBOUNCE, CROSS_BLOCK_SEARCH_LIMIT,
+        CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
     };
 
     fn hit(exit_code: Option<i32>, duration_ms: Option<u64>, cwd: Option<&str>) -> CrossBlockHit {
@@ -598,5 +663,25 @@ mod tests {
             Some("Query is too long (maximum 8 KiB).")
         );
         assert!(query_error(&"界".repeat(CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES / 3 + 1)).is_some());
+    }
+
+    #[test]
+    fn search_status_and_navigation_report_position_and_stay_bounded() {
+        use SelectionMove as Move;
+
+        assert_eq!(search_status(0, None), "No matches.");
+        assert_eq!(search_status(1, Some(0)), "1 of 1 match");
+        assert_eq!(
+            search_status(CROSS_BLOCK_SEARCH_LIMIT, Some(36)),
+            "37 of 500 matches (capped) — refine your query."
+        );
+        assert_eq!(selection_index(None, 0, Move::Next), None);
+        assert_eq!(selection_index(None, 37, Move::Previous), Some(36));
+        assert_eq!(selection_index(Some(36), 37, Move::Next), Some(0));
+        assert_eq!(selection_index(Some(0), 37, Move::Previous), Some(36));
+        assert_eq!(selection_index(Some(20), 37, Move::First), Some(0));
+        assert_eq!(selection_index(Some(2), 37, Move::Last), Some(36));
+        assert_eq!(selection_index(Some(23), 37, Move::PagePrevious), Some(13));
+        assert_eq!(selection_index(Some(31), 37, Move::PageNext), Some(36));
     }
 }
