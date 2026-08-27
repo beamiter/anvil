@@ -44,13 +44,20 @@ static ACTIVE_SCANS: AtomicUsize = AtomicUsize::new(0);
 struct ScanPermit;
 
 impl ScanPermit {
-    fn acquire() -> io::Result<Self> {
-        ACTIVE_SCANS
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+    /// Take one scan slot, waiting until another op releases its own. The cap
+    /// bounds concurrent ssh/docker subprocesses; it must never reject user
+    /// actions, so contention parks the worker thread instead of failing the
+    /// request.
+    fn acquire() -> Self {
+        loop {
+            let taken = ACTIVE_SCANS.fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < MAX_CONCURRENT_SCANS).then_some(active + 1)
-            })
-            .map(|_| Self)
-            .map_err(|_| io::Error::other("file-tree scan concurrency limit reached"))
+            });
+            if taken.is_ok() {
+                return Self;
+            }
+            std::thread::sleep(SCAN_POLL_INTERVAL);
+        }
     }
 }
 
@@ -771,12 +778,11 @@ where
     T: Send + 'static,
     F: FnMut(FsOpOutcome<T>) + 'static,
 {
-    let permit = ScanPermit::acquire()?;
     let (tx, rx) = mpsc::sync_channel::<FsOpOutcome<T>>(64);
     std::thread::Builder::new()
         .name("anvil-file-tree-op".to_string())
         .spawn(move || {
-            let _permit = permit;
+            let _permit = ScanPermit::acquire();
             let progress = |bytes: u64| {
                 let _ = tx.try_send(FsOpOutcome::Progress(bytes));
             };
@@ -827,12 +833,11 @@ where
     T: Send + 'static,
     F: FnOnce(io::Result<T>) + 'static,
 {
-    let permit = ScanPermit::acquire()?;
     let (tx, rx) = mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("anvil-file-tree-scan".to_string())
         .spawn(move || {
-            let _permit = permit;
+            let _permit = ScanPermit::acquire();
             let _ = tx.send(op());
         })?;
 
@@ -1498,6 +1503,25 @@ mod tests {
 
         let names: Vec<_> = entries.iter().map(|entry| entry.name.as_str()).collect();
         assert_eq!(names, ["Able", "beta", "Alpha.txt", "Zulu.txt"]);
+    }
+
+    #[test]
+    fn scan_permit_waits_for_a_slot_instead_of_failing() {
+        let held: Vec<ScanPermit> = (0..MAX_CONCURRENT_SCANS)
+            .map(|_| ScanPermit::acquire())
+            .collect();
+        let (tx, rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let _permit = ScanPermit::acquire();
+            tx.send(()).expect("waiter reports its acquisition");
+        });
+
+        // Every slot is held, so the queued acquire must still be parked.
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+        drop(held);
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("a freed slot lets the queued scan proceed");
+        waiter.join().expect("waiter thread finishes");
     }
 
     #[test]
