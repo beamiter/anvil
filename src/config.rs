@@ -309,6 +309,28 @@ pub(crate) fn checked_remote_argv(host: &RemoteHost) -> Result<Vec<String>, &'st
     Ok(build_remote_argv(host))
 }
 
+/// Build a plain interactive SSH login for an unsaved process-observed Files
+/// target. This deliberately has no trailing jsh command, deployment, saved
+/// session, or new ControlMaster configuration. A validated process-observed
+/// ControlPath may be retained so the plain login can reuse the live session;
+/// the user asked for a terminal at the temporary destination, not for that
+/// destination to become a saved Anvil profile.
+pub(crate) fn checked_interactive_ssh_argv(host: &RemoteHost) -> Result<Vec<String>, &'static str> {
+    validate_remote_host(host)?;
+    if host.docker {
+        return Err("a temporary SSH target cannot be a container");
+    }
+    let target = match &host.user {
+        Some(user) => format!("{user}@{}", host.host),
+        None => host.host.clone(),
+    };
+    let mut argv = vec!["ssh".to_string(), "-t".to_string()];
+    argv.extend(host.ssh_args.iter().cloned());
+    argv.push("--".to_string());
+    argv.push(target);
+    Ok(argv)
+}
+
 /// Low-level argv construction. Production consumers use
 /// [`checked_remote_argv`] so the gate is immediately adjacent to execution.
 pub(crate) fn build_remote_argv(host: &RemoteHost) -> Vec<String> {
@@ -2745,6 +2767,38 @@ mod tests {
         let hosts = vec![valid; MAX_REMOTE_HOSTS + 1];
         assert!(checked_remote_host(&hosts, MAX_REMOTE_HOSTS - 1).is_ok());
         assert!(checked_remote_host(&hosts, MAX_REMOTE_HOSTS).is_err());
+    }
+
+    #[test]
+    fn temporary_ssh_terminal_is_plain_interactive_without_a_remote_command() {
+        let mut temporary = host();
+        temporary.host = "dsw-notebook.example.com".into();
+        temporary.user = Some("root".into());
+        temporary.ssh_args = vec![
+            "-p".into(),
+            "22".into(),
+            "-S".into(),
+            "/run/user/1000/live-cm-%C".into(),
+        ];
+        temporary.remote_shell = "jsh --should-not-run".into();
+        temporary.deploy = jterm_core::jsh_remote::Deploy::Off;
+        temporary.deploy_artifact = None;
+        temporary.session = None;
+        temporary.multiplex = false;
+
+        assert_eq!(
+            checked_interactive_ssh_argv(&temporary).expect("validated temporary login"),
+            [
+                "ssh",
+                "-t",
+                "-p",
+                "22",
+                "-S",
+                "/run/user/1000/live-cm-%C",
+                "--",
+                "root@dsw-notebook.example.com"
+            ]
+        );
     }
 
     #[test]

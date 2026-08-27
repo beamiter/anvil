@@ -8,6 +8,362 @@
 use super::*;
 
 impl AppModel {
+    fn next_file_tree_ssh_detection_token(&self) -> u64 {
+        let token = self.file_tree_ssh_detection_revision.get().wrapping_add(1);
+        self.file_tree_ssh_detection_revision.set(token);
+        token
+    }
+
+    /// Revoke the authority of every queued SSH-to-Files result without
+    /// requiring mutable access to the observation itself. The next poll sees
+    /// the token mismatch and starts a fresh probe for the newly focused
+    /// context, even after an A -> B -> A focus ABA.
+    pub(crate) fn invalidate_file_tree_ssh_detection_context(&self) {
+        self.next_file_tree_ssh_detection_token();
+    }
+
+    fn clear_file_tree_ssh_observation(&mut self) {
+        if self.file_tree_ssh_observation.take().is_some() {
+            self.next_file_tree_ssh_detection_token();
+        }
+    }
+
+    pub(crate) fn clear_file_tree_ssh_observation_for_pane(&mut self, pane_id: u64) {
+        let belongs_to_pane = self
+            .file_tree_ssh_observation
+            .as_ref()
+            .is_some_and(|observation| match observation {
+                file_tree::SshFileTreeObservation::Unsupported {
+                    pane_id: observed, ..
+                } => *observed == pane_id,
+                file_tree::SshFileTreeObservation::Target(detection) => {
+                    detection.pane_id == pane_id
+                }
+            });
+        if belongs_to_pane {
+            self.clear_file_tree_ssh_observation();
+        }
+    }
+
+    fn active_process_observed_ssh_profile(
+        &self,
+    ) -> Option<(
+        u64,
+        process::ObservedSshCommand,
+        file_tree::ObservedRemoteProfile,
+    )> {
+        let tab = self.tabs.get(self.active)?;
+        let pane = tab.panes.get(tab.active_pane)?;
+        if tab
+            .remote
+            .as_ref()
+            .is_some_and(|remote| remote.pane_id == pane.id)
+        {
+            return None;
+        }
+        let command = pane.observed_ssh_command()?;
+        let jterm_core::jsh_remote::ObservedSshTarget::Target(observed) = &command.target else {
+            return None;
+        };
+        let profile = file_tree::observed_remote_profile(observed.clone())
+            .ok()?
+            .with_reusable_control_path(command.reusable_control_path.as_deref())
+            .ok()?;
+        Some((pane.id, command, profile))
+    }
+
+    fn show_file_tree_ssh_failure(
+        &self,
+        pane_id: u64,
+        token: u64,
+        message: impl AsRef<str>,
+        sender: &ComponentSender<AppModel>,
+    ) {
+        let toast = adw::Toast::new(message.as_ref());
+        toast.set_button_label(Some("Retry"));
+        let sender = sender.clone();
+        toast.connect_button_clicked(move |_| {
+            sender.input(AppMsg::FileTreeSshRetry { pane_id, token });
+        });
+        self.toast_overlay.add_toast(toast);
+    }
+
+    /// Observe only the active pane's real foreground process argv. Terminal
+    /// text and OSC command metadata never authorize a sidecar connection.
+    /// A target is probed without disturbing the visible tree; the result has
+    /// to survive all identity and navigation gates before it is committed.
+    pub(crate) fn poll_active_ssh_file_tree(&mut self, sender: &ComponentSender<AppModel>) {
+        if self.safe_mode {
+            self.clear_file_tree_ssh_observation();
+            return;
+        }
+        let Some((pane_id, managed_remote, command)) = self.tabs.get(self.active).and_then(|tab| {
+            let pane = tab.panes.get(tab.active_pane)?;
+            Some((
+                pane.id,
+                tab.remote
+                    .as_ref()
+                    .is_some_and(|remote| remote.pane_id == pane.id),
+                pane.observed_ssh_command(),
+            ))
+        }) else {
+            self.clear_file_tree_ssh_observation();
+            return;
+        };
+        if managed_remote {
+            self.clear_file_tree_ssh_observation_for_pane(pane_id);
+            return;
+        }
+        let Some(command) = command else {
+            self.clear_file_tree_ssh_observation_for_pane(pane_id);
+            return;
+        };
+
+        let observed_profile = match &command.target {
+            jterm_core::jsh_remote::ObservedSshTarget::NotSsh => {
+                self.clear_file_tree_ssh_observation_for_pane(pane_id);
+                return;
+            }
+            jterm_core::jsh_remote::ObservedSshTarget::Unsupported(reason) => {
+                let already_reported = matches!(
+                    self.file_tree_ssh_observation.as_ref(),
+                    Some(file_tree::SshFileTreeObservation::Unsupported {
+                        pane_id: observed_pane,
+                        reason: observed_reason,
+                    }) if *observed_pane == pane_id && *observed_reason == *reason
+                );
+                if !already_reported {
+                    self.next_file_tree_ssh_detection_token();
+                    self.file_tree_ssh_observation =
+                        Some(file_tree::SshFileTreeObservation::Unsupported { pane_id, reason });
+                    self.show_toast(format!(
+                        "Files did not follow SSH: {reason}. Run an interactive SSH login, or choose a saved host in Files."
+                    ));
+                }
+                return;
+            }
+            jterm_core::jsh_remote::ObservedSshTarget::Target(observed) => {
+                match file_tree::observed_remote_profile(observed.clone()).and_then(|profile| {
+                    profile.with_reusable_control_path(command.reusable_control_path.as_deref())
+                }) {
+                    Ok(profile) => profile,
+                    Err(reason) => {
+                        self.next_file_tree_ssh_detection_token();
+                        self.file_tree_ssh_observation =
+                            Some(file_tree::SshFileTreeObservation::Unsupported {
+                                pane_id,
+                                reason,
+                            });
+                        self.show_toast(format!(
+                            "Files did not follow SSH: {reason}. Choose a saved host in Files."
+                        ));
+                        return;
+                    }
+                }
+            }
+        };
+        let observed = observed_profile.identity;
+        let execution_overlay = observed_profile.execution_overlay;
+
+        let same_process_target = file_tree::ssh_file_tree_observation_matches_target(
+            self.file_tree_ssh_observation.as_ref(),
+            self.file_tree_ssh_detection_revision.get(),
+            pane_id,
+            &command.argv,
+            &observed,
+            &execution_overlay,
+        );
+        if same_process_target {
+            return;
+        }
+
+        let (authority, tree_intent, same_location) = {
+            let config = self.config.borrow();
+            let location = self.file_tree_location.borrow();
+            let authority =
+                file_tree::observed_remote_authority(observed.clone(), &config.remote_hosts);
+            let same_location = authority.matches_location(&location, &config.remote_hosts);
+            (
+                authority,
+                file_tree::capture_file_tree_intent(
+                    self.file_tree_scan_generation.get(),
+                    &location,
+                    &config.remote_hosts,
+                ),
+                same_location,
+            )
+        };
+        let token = self.next_file_tree_ssh_detection_token();
+        let operation_revision = self.file_tree_user_operation_revision.get();
+        self.file_tree_ssh_observation = Some(file_tree::SshFileTreeObservation::Target(Box::new(
+            file_tree::SshFileTreeDetection {
+                token,
+                pane_id,
+                observed,
+                observed_argv: command.argv,
+                execution_overlay: execution_overlay.clone(),
+                authority: authority.clone(),
+                tree_intent,
+                preserve_tree: same_location,
+                operation_revision,
+                resolved: false,
+            },
+        )));
+
+        // Always probe through a value-owned location. Even a managed profile
+        // may reorder while this worker is running; only the GTK-side commit
+        // resolves its immutable full identity back through the live config.
+        let probe_location = match authority.session_location(&execution_overlay) {
+            Ok(location) => location,
+            Err(error) => {
+                if let Some(file_tree::SshFileTreeObservation::Target(detection)) =
+                    self.file_tree_ssh_observation.as_mut()
+                {
+                    detection.resolved = true;
+                }
+                self.show_file_tree_ssh_failure(
+                    pane_id,
+                    token,
+                    format!("Files could not prepare this SSH connection: {error}"),
+                    sender,
+                );
+                return;
+            }
+        };
+
+        // Even when the rows already name this stable namespace, a different
+        // execution overlay is new authority and must prove connectivity on a
+        // worker before it can replace the current immutable endpoint. The
+        // callback preserves the existing root/rows after that proof.
+        let callback_sender = sender.clone();
+        if let Err(error) = file_tree::request_fs_op(
+            move || remote_fs::start_dir(&probe_location, &[]),
+            move |result| {
+                callback_sender.input(AppMsg::FileTreeSshProbeResolved {
+                    pane_id,
+                    token,
+                    start: result.map_err(|error| error.to_string()),
+                });
+            },
+        ) {
+            self.file_tree_ssh_probe_resolved(pane_id, token, Err(error.to_string()), sender);
+        }
+    }
+
+    pub(crate) fn retry_file_tree_ssh_follow(
+        &mut self,
+        pane_id: u64,
+        token: u64,
+        sender: &ComponentSender<AppModel>,
+    ) {
+        let retry_is_current = file_tree::ssh_file_tree_retry_is_current(
+            self.file_tree_ssh_observation.as_ref(),
+            pane_id,
+            token,
+        );
+        if !retry_is_current {
+            return;
+        }
+        self.clear_file_tree_ssh_observation();
+        self.poll_active_ssh_file_tree(sender);
+    }
+
+    pub(crate) fn file_tree_ssh_probe_resolved(
+        &mut self,
+        pane_id: u64,
+        token: u64,
+        start: Result<std::path::PathBuf, String>,
+        sender: &ComponentSender<AppModel>,
+    ) {
+        let detection = match self.file_tree_ssh_observation.as_mut() {
+            Some(file_tree::SshFileTreeObservation::Target(detection))
+                if detection.pane_id == pane_id
+                    && detection.token == token
+                    && self.file_tree_ssh_detection_revision.get() == token
+                    && !detection.resolved =>
+            {
+                detection.resolved = true;
+                detection.clone()
+            }
+            _ => return,
+        };
+
+        // A process can exit between the worker's final read and this queued
+        // GTK message. Re-read /proc now and require the same normalized argv.
+        let Some((live_pane_id, live_command, live_profile)) =
+            self.active_process_observed_ssh_profile()
+        else {
+            return;
+        };
+        let detection_is_current = {
+            let config = self.config.borrow();
+            let location = self.file_tree_location.borrow();
+            file_tree::ssh_file_tree_detection_is_current(
+                &detection,
+                live_pane_id,
+                &live_command.argv,
+                &live_profile.identity,
+                &live_profile.execution_overlay,
+                self.file_tree_user_operation_revision.get(),
+                self.file_tree_scan_generation.get(),
+                &location,
+                &config.remote_hosts,
+            )
+        };
+        if !detection_is_current {
+            return;
+        }
+
+        let root = match start {
+            Ok(root) if root.is_absolute() => root,
+            Ok(_) => {
+                self.show_file_tree_ssh_failure(
+                    pane_id,
+                    token,
+                    "SSH connected, but Files received an invalid remote home directory.",
+                    sender,
+                );
+                return;
+            }
+            Err(error) => {
+                let label = detection.authority.profile().name.as_str();
+                let label = review_input::safe_inline_display(label, 256);
+                let error = review_input::safe_inline_display(&error, 512);
+                self.show_file_tree_ssh_failure(
+                    pane_id,
+                    token,
+                    format!(
+                        "SSH is running, but Files could not open {label}: {error}. Use an SSH key/agent or choose a saved remote profile."
+                    ),
+                    sender,
+                );
+                return;
+            }
+        };
+
+        let location = {
+            let config = self.config.borrow();
+            detection
+                .authority
+                .current_location(&config.remote_hosts, &detection.execution_overlay)
+        };
+        let Some(location) = location else {
+            self.show_toast(
+                "The matching remote profile changed while Files was connecting; the automatic switch was cancelled.",
+            );
+            return;
+        };
+
+        *self.file_tree_location.borrow_mut() = location;
+        self.sync_file_header_locations();
+        if !detection.preserve_tree {
+            self.set_file_tree_root(root);
+        }
+        self.set_sidebar_visible(true, false);
+        self.sidebar_view.set(config::SidebarView::Files);
+        self.apply_sidebar_view(config::SidebarView::Files, false);
+    }
+
     /// Rebuild the file tree with `root` at the top of the current location.
     /// An open filter is closed: the fresh rows would otherwise be invisible
     /// until the query is retyped.
@@ -199,6 +555,13 @@ impl AppModel {
                     self.add_remote_tab(&host, sender);
                 }
             }
+            Ok(file_tree::FileTreeTerminalTarget::TemporarySsh(host)) => {
+                if self.safe_mode {
+                    self.show_toast("Remote connections are disabled in safe mode.");
+                } else {
+                    self.add_interactive_ssh_tab(&host, sender);
+                }
+            }
             Err(message) => self.show_toast(format!("Cannot open terminal: {message}")),
         }
     }
@@ -238,6 +601,10 @@ impl AppModel {
         }
 
         self.begin_file_tree_location_switch(loc, hosts, sender);
+        // A session-only observed target exists in the dropdown only while it
+        // is selected. Rebuild immediately after a manual move away so the
+        // stale transient row cannot remain clickable during the home probe.
+        self.sync_file_header_locations();
     }
 
     /// Start resolving one selected filesystem location. Clearing both the
@@ -322,7 +689,7 @@ impl AppModel {
                         file_tree::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
                     self.set_file_tree_root(root);
                 }
-                remote_fs::FsLocation::Remote(_) => {
+                remote_fs::FsLocation::Remote(_) | remote_fs::FsLocation::Transient(_) => {
                     let root = self.file_tree_root.borrow().clone();
                     if root.as_os_str().is_empty() {
                         self.begin_file_tree_location_switch(remapped, new_hosts.clone(), sender);
@@ -371,12 +738,19 @@ impl AppModel {
     /// selector after a config change or a rollback to Local.
     pub(crate) fn sync_file_header_locations(&self) {
         let hosts = self.config.borrow().remote_hosts.clone();
-        let selected = match &*self.file_tree_location.borrow() {
+        let location = self.file_tree_location.borrow();
+        let selected = match &*location {
             remote_fs::FsLocation::Local => 0,
             remote_fs::FsLocation::Remote(index) => (index + 1).min(hosts.len()),
+            remote_fs::FsLocation::Transient(endpoint) if endpoint.is_managed() => endpoint
+                .managed_profile()
+                .and_then(|profile| config::unique_checked_remote_profile_index(&hosts, profile))
+                .map_or(0, |index| index + 1),
+            remote_fs::FsLocation::Transient(_) => hosts.len() + 1,
         };
         self.file_header.emit(sidebar::FileHeaderMsg::SetLocations {
-            labels: remote_fs::location_labels(&hosts),
+            labels: remote_fs::location_labels_for(&hosts, &location),
+            details: remote_fs::location_details_for(&hosts, &location),
             selected,
         });
     }
@@ -396,7 +770,10 @@ impl AppModel {
     /// operation can reinterpret its targets against another filesystem.
     fn require_current_file_tree_intent(&self, intent: &file_tree::FileTreeIntent) -> bool {
         let current = self.file_tree_intent_is_current(intent);
-        if !current {
+        if current {
+            self.file_tree_user_operation_revision
+                .set(self.file_tree_user_operation_revision.get().wrapping_add(1));
+        } else {
             self.show_toast("The file-tree location changed; the pending operation was cancelled.");
         }
         current
@@ -598,8 +975,11 @@ impl AppModel {
         }
         let loc = self.file_tree_location.borrow().clone();
         let hosts = self.config.borrow().remote_hosts.clone();
-        let clipboard_token =
-            remote_fs::clipboard_token_for_location(&self.file_tree_clipboard.borrow(), &loc);
+        let clipboard_token = remote_fs::clipboard_token_for_location(
+            &self.file_tree_clipboard.borrow(),
+            &loc,
+            &hosts,
+        );
         // A renamed clipboard source would dangle; forget it on success.
         self.run_file_tree_op(
             intent,
@@ -628,7 +1008,8 @@ impl AppModel {
         let loc = self.file_tree_location.borrow().clone();
         let hosts = self.config.borrow().remote_hosts.clone();
         let clipboard = self.file_tree_clipboard.clone();
-        let clipboard_token = remote_fs::clipboard_token_for_location(&clipboard.borrow(), &loc);
+        let clipboard_token =
+            remote_fs::clipboard_token_for_location(&clipboard.borrow(), &loc, &hosts);
         let mut refresh: Vec<std::path::PathBuf> = Vec::new();
         for path in &paths {
             if let Some(parent) = path.parent() {
@@ -690,8 +1071,12 @@ impl AppModel {
         let cut = clip.cut;
         let count = clip.items.len();
 
-        if clip.loc == loc {
+        if remote_fs::locations_share_filesystem(&clip.loc, &loc, &hosts) {
             if count == 1 {
+                let execution_loc =
+                    remote_fs::direct_paste_execution_location(&hosts, &clip.loc, &loc)
+                        .expect("same namespace has a direct execution endpoint")
+                        .clone();
                 // Single-item fast path with the plain rename/copy semantics.
                 let src = clip.items[0].path.clone();
                 let dst = remote_fs::paste_destination(&dir, &src);
@@ -717,9 +1102,9 @@ impl AppModel {
                     refresh,
                     move || {
                         if cut {
-                            remote_fs::rename(&loc, &hosts, &src, &dst)
+                            remote_fs::rename(&execution_loc, &hosts, &src, &dst)
                         } else {
-                            remote_fs::copy(&loc, &hosts, &src, &dst)
+                            remote_fs::copy(&execution_loc, &hosts, &src, &dst)
                         }
                     },
                     |_| {},
@@ -791,17 +1176,15 @@ impl AppModel {
 
         // Cross-location: stream through the probe (or the local relay).
         let src_loc = clip.loc.clone();
-        let (verb, from_to) = match (&src_loc, &loc) {
-            (remote_fs::FsLocation::Remote(_), remote_fs::FsLocation::Local) => {
-                ("Downloading", format!("from {}", src_loc.label(&hosts)))
-            }
-            (remote_fs::FsLocation::Local, remote_fs::FsLocation::Remote(_)) => {
-                ("Uploading", format!("to {}", loc.label(&hosts)))
-            }
-            _ => (
+        let (verb, from_to) = if src_loc.is_remote() && loc == remote_fs::FsLocation::Local {
+            ("Downloading", format!("from {}", src_loc.label(&hosts)))
+        } else if src_loc == remote_fs::FsLocation::Local && loc.is_remote() {
+            ("Uploading", format!("to {}", loc.label(&hosts)))
+        } else {
+            (
                 "Relaying",
                 format!("from {} to {}", src_loc.label(&hosts), loc.label(&hosts)),
-            ),
+            )
         };
         let dst_loc = loc.clone();
         let control = remote_fs::TransferControl::new();
@@ -940,9 +1323,10 @@ impl AppModel {
         };
         let count = plan.items.len();
         let total = plan.total_bytes;
-        let action = match &loc {
-            remote_fs::FsLocation::Local => "Copying".to_string(),
-            remote_fs::FsLocation::Remote(_) => format!("Uploading to {}", loc.label(&hosts)),
+        let action = if loc.is_remote() {
+            format!("Uploading to {}", loc.label(&hosts))
+        } else {
+            "Copying".to_string()
         };
         let busy = format!("{action}: {count} item(s)…");
         let progress_label = {

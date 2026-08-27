@@ -75,6 +75,8 @@ pub(crate) enum FileHeaderMsg {
     /// `SelectLocation` (config edit or a rollback to Local).
     SetLocations {
         labels: Vec<String>,
+        /// Full endpoint descriptions corresponding one-for-one to `labels`.
+        details: Vec<String>,
         selected: usize,
     },
     /// The user moved the selector; internal, keeps programmatic rebuilds from
@@ -102,6 +104,7 @@ pub(crate) enum FileHeaderOutput {
 pub(crate) struct FileHeaderModel {
     display: String,
     tooltip: String,
+    location_details: Vec<String>,
     selected: usize,
     suppress_location_signal: bool,
     filter_open: bool,
@@ -109,8 +112,9 @@ pub(crate) struct FileHeaderModel {
 
 #[relm4::component(pub(crate))]
 impl Component for FileHeaderModel {
-    /// Initial selector labels; index 0 must be "Local".
-    type Init = Vec<String>;
+    /// Initial selector labels and their full endpoint details. Index 0 must
+    /// describe the local filesystem in both vectors.
+    type Init = (Vec<String>, Vec<String>);
     type Input = FileHeaderMsg;
     type Output = FileHeaderOutput;
     type CommandOutput = ();
@@ -126,6 +130,8 @@ impl Component for FileHeaderModel {
 
                 #[name(location_dropdown)]
                 gtk::DropDown {
+                    set_widget_name: "file-tree-location",
+                    set_hexpand: false,
                     set_tooltip_text: Some("Choose which filesystem the tree browses"),
                     connect_selected_notify[sender] => move |dropdown| {
                         sender.input(FileHeaderMsg::LocationActivated(dropdown.selected() as usize));
@@ -198,13 +204,19 @@ impl Component for FileHeaderModel {
     }
 
     fn init(
-        labels: Self::Init,
+        (labels, mut details): Self::Init,
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
+        if details.len() != labels.len() {
+            // A mismatched rebuild must not attach the wrong authority to a
+            // visible label. Falling back to the labels is safe and honest.
+            details = labels.clone();
+        }
         let model = Self {
             display: "~".to_string(),
             tooltip: String::new(),
+            location_details: details,
             selected: 0,
             suppress_location_signal: false,
             filter_open: false,
@@ -214,6 +226,13 @@ impl Component for FileHeaderModel {
         widgets
             .location_dropdown
             .set_model(Some(&gtk::StringList::new(&refs)));
+        widgets.location_dropdown.set_tooltip_text(Some(
+            model
+                .location_details
+                .first()
+                .map(String::as_str)
+                .unwrap_or("Choose which filesystem the tree browses"),
+        ));
         // Esc inside the entry closes the filter.
         let key_controller = gtk::EventControllerKey::new();
         {
@@ -243,17 +262,31 @@ impl Component for FileHeaderModel {
                 widgets.root_label.set_label(&self.display);
                 widgets.root_label.set_tooltip_text(Some(&self.tooltip));
             }
-            FileHeaderMsg::SetLocations { labels, selected } => {
+            FileHeaderMsg::SetLocations {
+                labels,
+                mut details,
+                selected,
+            } => {
                 // set_model/set_selected fire `selected` notifications
                 // synchronously; the flag keeps the rebuild from looking like
                 // user input and switching the tree underneath itself.
                 self.suppress_location_signal = true;
+                if details.len() != labels.len() {
+                    details = labels.clone();
+                }
+                self.location_details = details;
                 let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
                 widgets
                     .location_dropdown
                     .set_model(Some(&gtk::StringList::new(&refs)));
                 widgets.location_dropdown.set_selected(selected as u32);
                 self.selected = selected;
+                widgets.location_dropdown.set_tooltip_text(Some(
+                    self.location_details
+                        .get(selected)
+                        .map(String::as_str)
+                        .unwrap_or("Choose which filesystem the tree browses"),
+                ));
                 widgets
                     .terminal_button
                     .set_tooltip_text(Some(terminal_button_tooltip(selected)));
@@ -262,6 +295,12 @@ impl Component for FileHeaderModel {
             FileHeaderMsg::LocationActivated(index) => {
                 if !self.suppress_location_signal && index != self.selected {
                     self.selected = index;
+                    widgets.location_dropdown.set_tooltip_text(Some(
+                        self.location_details
+                            .get(index)
+                            .map(String::as_str)
+                            .unwrap_or("Choose which filesystem the tree browses"),
+                    ));
                     widgets
                         .terminal_button
                         .set_tooltip_text(Some(terminal_button_tooltip(index)));
@@ -330,9 +369,18 @@ mod tests {
     #[ignore = "requires DISPLAY"]
     fn file_header_terminal_button_is_focusable_and_updates_remote_semantics() {
         gtk::init().expect("GTK display");
-        let header = FileHeaderModel::builder()
-            .launch(vec!["Local".to_string(), "ssh: staging".to_string()]);
+        let header = FileHeaderModel::builder().launch((
+            vec!["Local".to_string(), "ssh: staging".to_string()],
+            vec![
+                "Local filesystem".to_string(),
+                "ssh: staging — deploy@server.example.com".to_string(),
+            ],
+        ));
         let root = header.widget().clone().upcast::<gtk::Widget>();
+        let location = descendant_named(&root, "file-tree-location")
+            .expect("location dropdown in file header")
+            .downcast::<gtk::DropDown>()
+            .expect("named widget is a dropdown");
         let terminal = descendant_named(&root, "file-tree-open-terminal")
             .expect("terminal button in file header")
             .downcast::<gtk::Button>()
@@ -347,15 +395,24 @@ mod tests {
             terminal.tooltip_text().as_deref(),
             Some(LOCAL_TERMINAL_TOOLTIP)
         );
+        assert_eq!(location.tooltip_text().as_deref(), Some("Local filesystem"));
 
         header.emit(FileHeaderMsg::SetLocations {
             labels: vec!["Local".to_string(), "ssh: staging".to_string()],
+            details: vec![
+                "Local filesystem".to_string(),
+                "ssh: staging — deploy@server.example.com".to_string(),
+            ],
             selected: 1,
         });
         while gtk::glib::MainContext::default().iteration(false) {}
         assert_eq!(
             terminal.tooltip_text().as_deref(),
             Some(REMOTE_TERMINAL_TOOLTIP)
+        );
+        assert_eq!(
+            location.tooltip_text().as_deref(),
+            Some("ssh: staging — deploy@server.example.com")
         );
     }
 }

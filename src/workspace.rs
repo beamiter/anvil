@@ -207,6 +207,14 @@ impl Pane {
         process::restorable_command(self.probe.pty_fd.get(), self.probe.shell_pid.get())
     }
 
+    /// A security-gated SSH login observed from the real foreground process.
+    /// Unlike generic command restoration this understands jsh's verified
+    /// launcher chain and may return its reusable ControlPath separately from
+    /// the stable destination argv.
+    pub(crate) fn observed_ssh_command(&self) -> Option<process::ObservedSshCommand> {
+        process::observed_ssh_command(self.probe.pty_fd.get(), self.probe.shell_pid.get())
+    }
+
     pub(crate) fn foreground_process(&self) -> Option<String> {
         process::foreground_process_name(self.probe.pty_fd.get(), self.probe.shell_pid.get())
     }

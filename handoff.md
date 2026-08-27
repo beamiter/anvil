@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-27 (File Tree terminal entry)
+Updated: 2026-08-27 (process-observed SSH Files follow)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,42 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **Process-observed SSH Files follow (2026-08-27)**: the active pane's existing
+  `/proc` foreground-command probe now uses `jterm_core`'s exact-pinned
+  `process::observed_ssh_command` contract
+  (`063af5d33f66e449336e06319096c90463c33938`), never the generic restorable
+  argv path or terminal/OSC text. The shared observer accepts direct SSH and
+  the provenance-checked real `jsh-remote.sh` launcher while refusing remote
+  commands, `-F`/provider loading, `ProxyCommand`, `LocalCommand`, and hidden
+  launcher SSH arguments. One transport-identical configured profile wins;
+  zero or ambiguous matches become a validated, non-persistent
+  `FsLocation::Transient`. Its stable base target is kept separate from an
+  immutable execution profile: a proven jsh ControlPath or a direct command's
+  explicit `-S`/`-o ControlPath` is moved only to the latter and revalidated.
+  The live observed socket takes precedence, with a saved explicit socket as
+  fallback. That frozen endpoint is carried through the home probe, scans,
+  file operations, clipboard, and transfers; saved/temporary views of the same
+  stable namespace paste directly and choose a live endpoint from either side.
+  The old tree stays intact
+  during the BatchMode probe. A result commits and reveals Files only if its
+  token, stable pane, exact live foreground argv, base target and execution
+  overlay, frozen tree authority, managed-profile uniqueness, and user
+  file-action revision remain current. Same-target follow still stages a probe
+  for every changed execution overlay, then refreshes its socket and reveals
+  the existing tree without losing rows/root. Failure preserves it and offers
+  an exact pane/token-bound Retry;
+  leaving SSH revokes pending authority but deliberately does not yank an
+  already-open remote tree back to Local. An unsaved location is labeled
+  `(temporary)`, never persisted, and long cloud names are middle-ellipsized
+  while their complete safe endpoint remains in the selector tooltip. Its
+  header terminal action opens plain
+  interactive SSH through the execution overlay without an implicit remote
+  jsh command. Safe mode and
+  Anvil-managed remote panes skip observation. Regressions include the actual
+  jsh wrapper argv, execution-only ControlPath identity, unique/ambiguous saved
+  transport matching, retry gates, navigation/process/file-action ABA, labels,
+  remap, and plain-terminal argv validation.
 
 - **Block live-card SSH burst settling (2026-08-27)**: the running Block card
   now keeps its command-start height in the expanded VTE coordinate system and
@@ -163,7 +199,7 @@ captured, queued, written, and restored.
   while an over-budget field still rejects the snapshot at the bounded decoder;
   neither case can forward an invalid identity to `jsh`.
 
-- **Core-owned Agent claim durability (2026-08-25)**: the exact core pin is now
+- **Core-owned Agent claim durability (2026-08-25)**: that round's exact core pin was
   `21437ba6f0cb85e74d4ce2a03ef1857de2c55d9d` (transitively jagent
   `a462ec81f3a4c6ad85a455780ced232172f127ea`). Core durably retires the public
   snapshot name before exposing `SessionClaim::Restored` and owns the later
@@ -421,3 +457,8 @@ cargo test --locked --all-targets --all-features --no-fail-fast
 cargo clippy --locked --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked
 ```
+
+Latest process-observed SSH Files-follow validation: 1180 passed, 38 ignored,
+0 failed in the full all-target/all-feature suite; display-backed tests passed
+23/23. Format checking, clippy with warnings denied, rustdoc with warnings
+denied, and both staged/unstaged diff checks passed.

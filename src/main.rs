@@ -266,6 +266,15 @@ struct AppModel {
     file_tree_filter: Rc<RefCell<file_tree::TreeFilter>>,
     /// Which filesystem the tree browses; drives both scans and file ops.
     file_tree_location: Rc<RefCell<remote_fs::FsLocation>>,
+    /// The active pane's last process-observed SSH intent. A worker may
+    /// publish only while its token, pane, process target, and captured tree
+    /// authority all remain current.
+    file_tree_ssh_observation: Option<file_tree::SshFileTreeObservation>,
+    file_tree_ssh_detection_revision: std::cell::Cell<u64>,
+    /// Monotonic user interaction token. A remote-follow probe captured
+    /// before a file action or explicit sidebar choice must never replace
+    /// that newer intent.
+    file_tree_user_operation_revision: std::cell::Cell<u64>,
     /// Copy/Cut row awaiting a Paste; usable only in its source location.
     file_tree_clipboard: Rc<RefCell<Option<remote_fs::FsClipboard>>>,
     /// Monotonic identity of user Copy/Cut intent. Async completions may retire
@@ -519,6 +528,11 @@ impl AppModel {
         let transfer =
             organism_focus_transfer_required(self.active_pane_id(), next_pane, hides_previous);
         if transfer {
+            // Any queued process-observed SSH result belonged to the previous
+            // focus epoch. Advancing its token here also closes the
+            // pane-A -> pane-B -> pane-A ABA window before model selection
+            // changes or GTK queues a delayed focus notification.
+            self.invalidate_file_tree_ssh_detection_context();
             self.organism_hub.revoke_organism_presence();
         }
         transfer
@@ -1094,6 +1108,9 @@ impl SimpleComponent for AppModel {
             file_tree_filter_model,
             file_tree_filter,
             file_tree_location,
+            file_tree_ssh_observation: None,
+            file_tree_ssh_detection_revision: std::cell::Cell::new(0),
+            file_tree_user_operation_revision: std::cell::Cell::new(0),
             file_tree_clipboard,
             file_tree_clipboard_revision: std::cell::Cell::new(0),
             file_tree_transfer_toast: Rc::new(RefCell::new(None)),
@@ -1634,6 +1651,9 @@ impl SimpleComponent for AppModel {
                 self.do_remote_reconnect(pane_id, attempt, &sender)
             }
             AppMsg::PaneCwdChanged(_, pane_id, path, external) => {
+                if !external {
+                    self.clear_file_tree_ssh_observation_for_pane(pane_id);
+                }
                 if let Some((ti, pi)) = self.find_pane(pane_id) {
                     let managed_remote = self.tabs[ti]
                         .remote
@@ -1797,6 +1817,7 @@ impl SimpleComponent for AppModel {
                 after,
             } => self.promote_pane_to_tab(pane_id, anchor_tab_id, after, &sender),
             AppMsg::RefreshPaneHeaders => {
+                self.poll_active_ssh_file_tree(&sender);
                 self.refresh_active_pane_headers();
                 // The bar's running-command and grid segments are polled too.
                 self.refresh_bottom_bar();
@@ -2165,6 +2186,14 @@ impl SimpleComponent for AppModel {
             AppMsg::FileTreeSelectLocation(index) => self.file_tree_select_location(index, &sender),
             AppMsg::FileTreeLocationResolved { intent, start } => {
                 self.file_tree_location_resolved(*intent, start)
+            }
+            AppMsg::FileTreeSshProbeResolved {
+                pane_id,
+                token,
+                start,
+            } => self.file_tree_ssh_probe_resolved(pane_id, token, start, &sender),
+            AppMsg::FileTreeSshRetry { pane_id, token } => {
+                self.retry_file_tree_ssh_follow(pane_id, token, &sender)
             }
             AppMsg::FileTreeNewFile { dir, intent } => {
                 self.file_tree_prompt_new(dir, false, *intent, &sender)

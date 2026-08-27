@@ -7,6 +7,6 @@
 
 pub(crate) use jterm_core::process::{
     command_requires_block_integration, command_uses_external_cwd, foreground_process_name,
-    foreground_uses_external_cwd, restorable_command, shell_quote_argv_for, shell_quote_path,
-    ChildLifecycle, EscalationPolicy, ReapOwner,
+    foreground_uses_external_cwd, observed_ssh_command, restorable_command, shell_quote_argv_for,
+    shell_quote_path, ChildLifecycle, EscalationPolicy, ObservedSshCommand, ReapOwner,
 };

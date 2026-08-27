@@ -155,6 +155,20 @@ pub(crate) enum AppMsg {
         intent: Box<crate::file_tree::FileTreeIntent>,
         start: Result<std::path::PathBuf, String>,
     },
+    /// A non-destructive home probe for the active pane's process-observed SSH
+    /// target answered. The app loop rechecks pane, process, token, and the
+    /// user's file-tree navigation intent before exposing this location.
+    FileTreeSshProbeResolved {
+        pane_id: u64,
+        token: u64,
+        start: Result<std::path::PathBuf, String>,
+    },
+    /// Retry a failed non-destructive SSH-to-Files probe against the active
+    /// pane's freshly observed process authority.
+    FileTreeSshRetry {
+        pane_id: u64,
+        token: u64,
+    },
     /// Context-menu requests; `dir: None` targets the current tree root.
     FileTreeNewFile {
         dir: Option<std::path::PathBuf>,

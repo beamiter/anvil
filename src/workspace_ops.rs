@@ -1282,6 +1282,34 @@ impl AppModel {
                 return;
             }
         };
+        self.add_remote_tab_with_argv(host, argv, sender);
+    }
+
+    /// Open an unsaved, process-observed target as a plain interactive SSH
+    /// login. It still uses the remote-tab lifecycle, but never appends the
+    /// configured jsh command used by a saved profile.
+    pub(crate) fn add_interactive_ssh_tab(
+        &mut self,
+        host: &config::RemoteHost,
+        sender: &ComponentSender<AppModel>,
+    ) {
+        let argv = match config::checked_interactive_ssh_argv(host) {
+            Ok(argv) => Rc::new(argv),
+            Err(message) => {
+                log::warn!("Temporary SSH connection rejected by execution gate: {message}");
+                self.show_toast(message);
+                return;
+            }
+        };
+        self.add_remote_tab_with_argv(host, argv, sender);
+    }
+
+    fn add_remote_tab_with_argv(
+        &mut self,
+        host: &config::RemoteHost,
+        argv: Rc<Vec<String>>,
+        sender: &ComponentSender<AppModel>,
+    ) {
         if !self.ensure_persisted_tab_capacity(true) {
             return;
         }

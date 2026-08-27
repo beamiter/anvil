@@ -786,12 +786,50 @@ File, New Folder, Rename, Delete (with confirmation), Copy, Cut, Paste, and
 Refresh; the same menu works locally, and a successful operation refreshes
 only the directories it touched, so unrelated expanded rows never collapse.
 
+Files also follows an ordinary interactive SSH login launched in the focused
+pane. Anvil uses the shared dedicated process observer to read the real
+foreground argv from `/proc`; terminal text, OSC command strings, and generic
+session-restore argv are never connection authority. It recognizes both a
+direct interactive `ssh` and jsh's provenance-checked `jsh-remote.sh` launcher,
+while refusing remote commands and options such as `ProxyCommand`,
+`LocalCommand`, `-F`, and provider loading. A field-for-field compatible,
+unique configured transport is preferred; otherwise the target becomes a
+clearly labeled `(temporary)` location that is never written to `config.toml`.
+When jsh proves its ControlPath, Files adds that socket only to an immutable
+execution snapshot: stable profile matching and UI identity continue to use
+the base target. An explicit `ssh -S …` or `-o ControlPath=…` is separated in
+the same way; an observed live socket wins over a matching saved profile's old
+socket, while that saved socket remains the fallback when the observed command
+has none. The home probe, scans, file operations, clipboard, and transfers then
+reuse the chosen authenticated connection. Saved and temporary authorities for
+the same stable SSH namespace paste directly rather than relaying locally, and
+Copy/Cut prefers the live endpoint from either side. The existing tree remains usable
+while the remote-home probe runs. Only a successful probe from the
+still-focused pane, with the same foreground base target, exact execution
+overlay, and unchanged tree navigation and file-action revisions, switches the
+root and reveals Files. A
+late result after a pane change, SSH exit, user file action, or Local →
+other-host → Local navigation is discarded. If Files is already on the same
+target, a changed execution socket first passes the same staged probe; only
+then is it refreshed and revealed without losing rows or the current directory.
+Exiting SSH does not yank a tree the user is still browsing back to Local.
+Password-only SSH cannot be borrowed from the terminal safely: when the
+BatchMode sidecar cannot authenticate, Anvil preserves the old tree and offers
+**Retry** alongside key/agent or saved-profile guidance. Automatic following
+is disabled in safe mode.
+Cloud-generated endpoint names are middle-ellipsized in the selector (keeping
+the recognizable login prefix and provider-domain suffix), while the selected
+entry's tooltip retains the complete safely rendered endpoint.
+
 The terminal button in that header is in the normal Tab order and has an
 explicit accessible action name. On `Local` it opens a normal local tab with
 the current tree root as its initial working directory. On an `ssh:` or
-`docker:` location it revalidates and connects the selected managed profile;
-it deliberately does **not** promise to start at the path currently shown by
-the tree, because the remote shell/profile owns its startup directory. Its
+`docker:` location it revalidates and connects the selected profile. A
+temporary observed target opens a plain interactive SSH login through the live
+socket when available, with no implicit remote jsh command. It deliberately
+does **not** promise to start at the path
+currently shown by the tree, because the remote shell/profile owns its startup
+directory. Its
 tooltip states that distinction before activation, and Enter or Space invokes
 the focused button. If `remote_hosts` is reloaded or edited, a browsed remote
 location follows only one field-for-field identical complete profile through a

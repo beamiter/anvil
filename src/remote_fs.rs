@@ -162,15 +162,105 @@ const STREAM_BUF_SIZE: usize = 64 * 1024;
 const MAX_ERROR_DISPLAY_BYTES: usize = 512;
 const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+/// A value-owned endpoint captured from a process-observed SSH login. The
+/// identity is the validated base target used for matching and UI intent;
+/// `execution` is a frozen launch snapshot which may additionally carry the
+/// jsh-created ControlPath. Keeping those separate prevents an ephemeral
+/// socket path from becoming filesystem identity while every async operation
+/// still reuses the exact connection that was proved reachable.
+#[derive(Clone, Debug)]
+pub(crate) struct SessionRemoteEndpoint {
+    identity: RemoteHost,
+    execution: RemoteHost,
+    /// Exact configured source, retained only for live config revocation and
+    /// saved-profile terminal launches. It is deliberately excluded from
+    /// equality because an explicit ControlPath is execution state, not stable
+    /// filesystem identity.
+    managed_profile: Option<RemoteHost>,
+}
+
+impl PartialEq for SessionRemoteEndpoint {
+    fn eq(&self, other: &Self) -> bool {
+        self.is_managed() == other.is_managed() && self.identity == other.identity
+    }
+}
+
+impl SessionRemoteEndpoint {
+    pub(crate) fn new(
+        identity: RemoteHost,
+        managed: bool,
+        reusable_control_path: Option<&str>,
+    ) -> Result<Self, &'static str> {
+        let managed_profile = managed.then(|| identity.clone());
+        let mut execution_overlay = Vec::new();
+        if let Some(path) = reusable_control_path {
+            execution_overlay.push("-S".to_string());
+            execution_overlay.push(path.to_string());
+        }
+        Self::with_execution_overlay(identity, managed_profile, &execution_overlay)
+    }
+
+    pub(crate) fn with_execution_overlay(
+        identity: RemoteHost,
+        managed_profile: Option<RemoteHost>,
+        execution_overlay: &[String],
+    ) -> Result<Self, &'static str> {
+        crate::config::validate_remote_host(&identity)?;
+        if identity.docker {
+            return Err("a process-observed SSH endpoint cannot be a container");
+        }
+        if let Some(profile) = &managed_profile {
+            crate::config::validate_remote_host(profile)?;
+        }
+        let mut execution = identity.clone();
+        execution.ssh_args.extend(execution_overlay.iter().cloned());
+        // The overlay is never executed until the complete augmented profile
+        // has passed the same structured argv gate as a saved profile.
+        crate::config::validate_remote_host(&execution)?;
+        Ok(Self {
+            identity,
+            execution,
+            managed_profile,
+        })
+    }
+
+    pub(crate) fn identity(&self) -> &RemoteHost {
+        &self.identity
+    }
+
+    pub(crate) fn execution(&self) -> &RemoteHost {
+        &self.execution
+    }
+
+    pub(crate) fn is_managed(&self) -> bool {
+        self.managed_profile.is_some()
+    }
+
+    pub(crate) fn managed_profile(&self) -> Option<&RemoteHost> {
+        self.managed_profile.as_ref()
+    }
+
+    pub(crate) fn has_execution_overlay(&self) -> bool {
+        self.execution.ssh_args != self.identity.ssh_args
+    }
+}
+
 /// Which filesystem the file tree browses. `Remote(i)` indexes
-/// `config.remote_hosts`.
-#[derive(Clone, PartialEq, Eq, Debug)]
+/// `config.remote_hosts`; `Transient` is an immutable process-observed SSH
+/// endpoint kept only for this application session. It can remember that its
+/// stable profile came from the saved list without borrowing a mutable index.
+#[derive(Clone, PartialEq, Debug)]
 pub(crate) enum FsLocation {
     Local,
     Remote(usize),
+    Transient(Box<SessionRemoteEndpoint>),
 }
 
 impl FsLocation {
+    pub(crate) fn session(endpoint: SessionRemoteEndpoint) -> Self {
+        Self::Transient(Box::new(endpoint))
+    }
+
     /// Selector label: "Local", or the host name prefixed by its scheme.
     pub(crate) fn label(&self, hosts: &[RemoteHost]) -> String {
         match self {
@@ -178,14 +268,114 @@ impl FsLocation {
             FsLocation::Remote(index) => crate::config::checked_remote_host(hosts, *index)
                 .map(location_label)
                 .unwrap_or_else(|_| "Remote (unavailable)".to_string()),
+            FsLocation::Transient(endpoint) => {
+                crate::config::validate_remote_host(endpoint.identity())
+                    .map(|()| {
+                        let suffix = if endpoint.is_managed() {
+                            ""
+                        } else {
+                            " (temporary)"
+                        };
+                        format!("{}{suffix}", location_label(endpoint.identity()))
+                    })
+                    .unwrap_or_else(|_| "Remote session (unavailable)".to_string())
+            }
         }
     }
+
+    pub(crate) fn is_remote(&self) -> bool {
+        !matches!(self, Self::Local)
+    }
+}
+
+/// Whether two location authorities name the same filesystem namespace.
+/// Index-backed locations retain their exact-slot semantics, but a saved SSH
+/// profile and a process-observed session endpoint are the same namespace when
+/// their stable transport matches after removing ControlPath. This lets paste
+/// use the live session endpoint directly instead of relaying through local
+/// storage or later deleting through a stale/password-only saved connection.
+pub(crate) fn locations_share_filesystem(
+    left: &FsLocation,
+    right: &FsLocation,
+    hosts: &[RemoteHost],
+) -> bool {
+    match (left, right) {
+        (FsLocation::Local, FsLocation::Local) => true,
+        (FsLocation::Remote(left), FsLocation::Remote(right)) => left == right,
+        (FsLocation::Transient(left), FsLocation::Transient(right)) => {
+            crate::file_tree::remote_profiles_share_filesystem(left.identity(), right.identity())
+        }
+        (FsLocation::Remote(index), FsLocation::Transient(endpoint))
+        | (FsLocation::Transient(endpoint), FsLocation::Remote(index)) => {
+            crate::config::checked_remote_host(hosts, *index).is_ok_and(|managed| {
+                crate::file_tree::remote_profiles_share_filesystem(managed, endpoint.identity())
+            })
+        }
+        _ => false,
+    }
+}
+
+// Keep the selector compact even for cloud-generated destinations. The split
+// deliberately leaves enough room for the common `root@dsw` prefix and
+// `aliyuncs.com` suffix; the complete endpoint remains available through the
+// selector tooltip.
+const LOCATION_LABEL_NAME_CHAR_LIMIT: usize = 21;
+
+fn middle_ellipsize(value: &str, limit: usize) -> String {
+    let count = value.chars().count();
+    if count <= limit || limit < 3 {
+        return value.to_string();
+    }
+    let kept = limit - 1;
+    // Cloud endpoints carry the provider/domain discriminator at the end, so
+    // preserve a little more suffix than prefix (8 + ellipsis + 12 at the
+    // selector's current limit).
+    let left = (kept * 2) / 5;
+    let right = kept - left;
+    let prefix: String = value.chars().take(left).collect();
+    let suffix: String = value
+        .chars()
+        .rev()
+        .take(right)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{prefix}…{suffix}")
 }
 
 fn location_label(host: &RemoteHost) -> String {
     let scheme = if host.docker { "docker" } else { "ssh" };
     let name = jterm_core::review_input::safe_inline_display(&host.name, 256);
+    let name = middle_ellipsize(&name, LOCATION_LABEL_NAME_CHAR_LIMIT);
     format!("{scheme}: {name}")
+}
+
+fn location_detail(host: &RemoteHost) -> String {
+    let scheme = if host.docker { "docker" } else { "ssh" };
+    let name = jterm_core::review_input::safe_inline_display(&host.name, 256);
+    let endpoint = match &host.user {
+        Some(user) => format!("{user}@{}", host.host),
+        None => host.host.clone(),
+    };
+    let endpoint = jterm_core::review_input::safe_inline_display(&endpoint, 2048);
+    let mut detail = if name == endpoint {
+        format!("{scheme}: {endpoint}")
+    } else {
+        format!("{scheme}: {name} — {endpoint}")
+    };
+    if !host.docker && !host.ssh_args.is_empty() {
+        let options = host
+            .ssh_args
+            .iter()
+            .map(|arg| jterm_core::review_input::safe_inline_display(arg, 256))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let options = jterm_core::review_input::safe_inline_display(&options, 2048);
+        detail.push_str(" · options: ");
+        detail.push_str(&options);
+    }
+    detail
 }
 
 /// Dropdown labels for the header's location selector; index 0 is `Local`.
@@ -208,6 +398,63 @@ pub(crate) fn location_labels(hosts: &[RemoteHost]) -> Vec<String> {
     labels
 }
 
+/// Full, safely rendered endpoint descriptions corresponding one-for-one to
+/// [`location_labels`]. These are intentionally not middle-ellipsized: the
+/// header exposes the selected entry as a tooltip so a compact label never
+/// hides which machine will receive an operation.
+pub(crate) fn location_details(hosts: &[RemoteHost]) -> Vec<String> {
+    let mut details = Vec::with_capacity(hosts.len().min(crate::config::MAX_REMOTE_HOSTS) + 1);
+    details.push("Local filesystem".to_string());
+    details.extend(
+        hosts
+            .iter()
+            .take(crate::config::MAX_REMOTE_HOSTS)
+            .enumerate()
+            .map(|(index, host)| {
+                if crate::config::checked_remote_host(hosts, index).is_ok() {
+                    location_detail(host)
+                } else {
+                    "Remote endpoint unavailable".to_string()
+                }
+            }),
+    );
+    details
+}
+
+/// Selector labels including the one non-persistent destination currently
+/// being browsed. A transient entry disappears as soon as the user selects a
+/// managed profile or Local; it is never written into `remote_hosts`.
+pub(crate) fn location_labels_for(hosts: &[RemoteHost], location: &FsLocation) -> Vec<String> {
+    let mut labels = location_labels(hosts);
+    if let FsLocation::Transient(endpoint) = location {
+        if !endpoint.is_managed() {
+            labels.push(
+                crate::config::validate_remote_host(endpoint.identity())
+                    .map(|()| format!("{} (temporary)", location_label(endpoint.identity())))
+                    .unwrap_or_else(|_| "Remote session (unavailable)".to_string()),
+            );
+        }
+    }
+    labels
+}
+
+/// Tooltip details matching [`location_labels_for`]. A temporary destination
+/// keeps its complete process-observed endpoint here even though the visible
+/// selector label is compact.
+pub(crate) fn location_details_for(hosts: &[RemoteHost], location: &FsLocation) -> Vec<String> {
+    let mut details = location_details(hosts);
+    if let FsLocation::Transient(endpoint) = location {
+        if !endpoint.is_managed() {
+            details.push(
+                crate::config::validate_remote_host(endpoint.identity())
+                    .map(|()| format!("{} (temporary)", location_detail(endpoint.identity())))
+                    .unwrap_or_else(|_| "Remote session endpoint unavailable".to_string()),
+            );
+        }
+    }
+    details
+}
+
 /// Keep a browsed remote filesystem bound to the exact profile that selected
 /// it when the configured host list changes. An index is presentation state,
 /// not identity: reordering may move the same profile, while reusing the slot
@@ -221,8 +468,35 @@ pub(crate) fn remap_location_by_profile(
     old_hosts: &[RemoteHost],
     new_hosts: &[RemoteHost],
 ) -> FsLocation {
-    let FsLocation::Remote(old_index) = location else {
-        return FsLocation::Local;
+    let old_index = match location {
+        FsLocation::Local => return FsLocation::Local,
+        FsLocation::Transient(endpoint) => {
+            if crate::config::validate_remote_host(endpoint.identity()).is_err()
+                || crate::config::validate_remote_host(endpoint.execution()).is_err()
+            {
+                return FsLocation::Local;
+            }
+            if !endpoint.is_managed() {
+                return FsLocation::Transient(endpoint.clone());
+            }
+            let Some(managed_profile) = endpoint.managed_profile() else {
+                return FsLocation::Local;
+            };
+            let mut matches = new_hosts
+                .iter()
+                .take(crate::config::MAX_REMOTE_HOSTS)
+                .enumerate()
+                .filter(|(index, host)| {
+                    *host == managed_profile
+                        && crate::config::checked_remote_host(new_hosts, *index).is_ok()
+                });
+            return if matches.next().is_some() && matches.next().is_none() {
+                FsLocation::Transient(endpoint.clone())
+            } else {
+                FsLocation::Local
+            };
+        }
+        FsLocation::Remote(old_index) => old_index,
     };
     let Ok(old_host) = crate::config::checked_remote_host(old_hosts, *old_index) else {
         return FsLocation::Local;
@@ -286,10 +560,11 @@ pub(crate) fn clipboard_for_token(
 pub(crate) fn clipboard_token_for_location(
     clipboard: &Option<FsClipboard>,
     operation_location: &FsLocation,
+    hosts: &[RemoteHost],
 ) -> Option<u64> {
     clipboard
         .as_ref()
-        .filter(|clipboard| clipboard.loc == *operation_location)
+        .filter(|clipboard| locations_share_filesystem(&clipboard.loc, operation_location, hosts))
         .map(|clipboard| clipboard.token)
 }
 
@@ -335,13 +610,17 @@ pub(crate) fn remap_clipboard_by_profile(
     let Some(current) = clipboard.as_mut() else {
         return false;
     };
-    let FsLocation::Remote(_) = current.loc else {
+    if matches!(current.loc, FsLocation::Local) {
         return false;
-    };
+    }
     let remapped = remap_location_by_profile(&current.loc, old_hosts, new_hosts);
     match remapped {
         FsLocation::Remote(index) => {
             current.loc = FsLocation::Remote(index);
+            false
+        }
+        FsLocation::Transient(endpoint) => {
+            current.loc = FsLocation::Transient(endpoint);
             false
         }
         FsLocation::Local => {
@@ -368,7 +647,7 @@ pub(crate) fn list_dir(
 ) -> io::Result<Vec<FileEntry>> {
     match loc {
         FsLocation::Local => crate::file_tree::scan_dir(dir),
-        FsLocation::Remote(_) => {
+        FsLocation::Remote(_) | FsLocation::Transient(_) => {
             require_absolute(dir)?;
             let host = remote_host(loc, hosts)?;
             let stdout = run_probe(host, "list", &[dir.as_os_str()], PROBE_LIST_TIMEOUT)?;
@@ -382,7 +661,7 @@ pub(crate) fn list_dir(
 pub(crate) fn start_dir(loc: &FsLocation, hosts: &[RemoteHost]) -> io::Result<PathBuf> {
     match loc {
         FsLocation::Local => Ok(crate::file_tree::home_dir().unwrap_or_else(|| PathBuf::from("/"))),
-        FsLocation::Remote(_) => {
+        FsLocation::Remote(_) | FsLocation::Transient(_) => {
             let host = remote_host(loc, hosts)?;
             let stdout = run_probe(host, "home", &[], PROBE_LIST_TIMEOUT)?;
             parse_home_output(&stdout)
@@ -394,7 +673,7 @@ pub(crate) fn start_dir(loc: &FsLocation, hosts: &[RemoteHost]) -> io::Result<Pa
 pub(crate) fn create_dir(loc: &FsLocation, hosts: &[RemoteHost], path: &Path) -> io::Result<()> {
     match loc {
         FsLocation::Local => std::fs::create_dir(path),
-        FsLocation::Remote(_) => {
+        FsLocation::Remote(_) | FsLocation::Transient(_) => {
             require_absolute(path)?;
             run_probe(
                 remote_host(loc, hosts)?,
@@ -415,7 +694,7 @@ pub(crate) fn create_file(loc: &FsLocation, hosts: &[RemoteHost], path: &Path) -
             .create_new(true)
             .open(path)
             .map(drop),
-        FsLocation::Remote(_) => {
+        FsLocation::Remote(_) | FsLocation::Transient(_) => {
             require_absolute(path)?;
             run_probe(
                 remote_host(loc, hosts)?,
@@ -443,7 +722,7 @@ pub(crate) fn delete(loc: &FsLocation, hosts: &[RemoteHost], path: &Path) -> io:
                 std::fs::remove_file(path)
             }
         }
-        FsLocation::Remote(_) => {
+        FsLocation::Remote(_) | FsLocation::Transient(_) => {
             require_absolute(path)?;
             run_probe(
                 remote_host(loc, hosts)?,
@@ -469,7 +748,7 @@ pub(crate) fn rename(
             require_missing(dst)?;
             std::fs::rename(src, dst)
         }
-        FsLocation::Remote(_) => {
+        FsLocation::Remote(_) | FsLocation::Transient(_) => {
             require_absolute(src)?;
             require_absolute(dst)?;
             run_probe(
@@ -497,7 +776,7 @@ pub(crate) fn copy(
             require_missing(dst)?;
             copy_recursive(src, dst)
         }
-        FsLocation::Remote(_) => {
+        FsLocation::Remote(_) | FsLocation::Transient(_) => {
             require_absolute(src)?;
             require_absolute(dst)?;
             run_probe(
@@ -543,7 +822,7 @@ pub(crate) fn new_name_error(name: &str) -> Option<&'static str> {
     None
 }
 
-fn remote_host<'a>(loc: &FsLocation, hosts: &'a [RemoteHost]) -> io::Result<&'a RemoteHost> {
+fn remote_host<'a>(loc: &'a FsLocation, hosts: &'a [RemoteHost]) -> io::Result<&'a RemoteHost> {
     match loc {
         FsLocation::Local => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -563,6 +842,11 @@ fn remote_host<'a>(loc: &FsLocation, hosts: &'a [RemoteHost]) -> io::Result<&'a 
                 ));
             }
             crate::config::checked_remote_host(hosts, *index)
+                .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))
+        }
+        FsLocation::Transient(endpoint) => {
+            crate::config::validate_remote_host(endpoint.execution())
+                .map(|()| endpoint.execution())
                 .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))
         }
     }
@@ -1441,7 +1725,7 @@ pub(crate) fn transfer(
 ) -> io::Result<PathBuf> {
     control.check()?;
     match (src_loc, dst_loc) {
-        (FsLocation::Remote(_), FsLocation::Local) => download(
+        (src, FsLocation::Local) if src.is_remote() => download(
             remote_host(src_loc, hosts)?,
             src_path,
             dst_dir,
@@ -1449,7 +1733,7 @@ pub(crate) fn transfer(
             control,
             progress,
         ),
-        (FsLocation::Local, FsLocation::Remote(_)) => upload(
+        (FsLocation::Local, dst) if dst.is_remote() => upload(
             remote_host(dst_loc, hosts)?,
             src_path,
             dst_dir,
@@ -1457,7 +1741,7 @@ pub(crate) fn transfer(
             control,
             progress,
         ),
-        (FsLocation::Remote(_), FsLocation::Remote(_)) => {
+        (src, dst) if src.is_remote() && dst.is_remote() => {
             // No host-to-host channel exists, so relay through a unique local
             // staging dir that is always cleaned up. Progress stays monotonic
             // across both legs: the upload leg offsets by the download's
@@ -1490,7 +1774,7 @@ pub(crate) fn transfer(
             let leg2_progress = move |bytes: u64| progress(base + bytes);
             upload(dst_host, &staged, dst_dir, is_dir, control, &leg2_progress)
         }
-        (FsLocation::Local, FsLocation::Local) => Err(io::Error::new(
+        _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "local-to-local paste uses rename/copy, not a transfer",
         )),
@@ -2052,9 +2336,10 @@ fn plan_drop_with_limit(
     if paths.len() > MAX_DROP_ITEMS {
         return Err(DropRejection::TooManyItems(paths.len()));
     }
-    let action = match dst_loc {
-        FsLocation::Local => DropAction::Copy,
-        FsLocation::Remote(_) => DropAction::Upload,
+    let action = if dst_loc.is_remote() {
+        DropAction::Upload
+    } else {
+        DropAction::Copy
     };
     let mut items = Vec::with_capacity(paths.len());
     let mut total_bytes = 0u64;
@@ -2122,6 +2407,26 @@ fn batch_display_name(path: &Path) -> String {
 /// (cut) or recursive-copy, cross-location items stream via `transfer` with
 /// cancel/timeout intact. Cut sources are deleted only after their own
 /// transfer succeeded. `progress` receives the running completed-item count.
+pub(crate) fn direct_paste_execution_location<'a>(
+    hosts: &[RemoteHost],
+    clip_loc: &'a FsLocation,
+    dst_loc: &'a FsLocation,
+) -> Option<&'a FsLocation> {
+    if !locations_share_filesystem(clip_loc, dst_loc, hosts) {
+        return None;
+    }
+    // Prefer a proven live ControlPath on either side, destination first only
+    // when both carry one. Then prefer any value-owned endpoint before falling
+    // back to the index-backed destination.
+    match (clip_loc, dst_loc) {
+        (_, FsLocation::Transient(endpoint)) if endpoint.has_execution_overlay() => Some(dst_loc),
+        (FsLocation::Transient(endpoint), _) if endpoint.has_execution_overlay() => Some(clip_loc),
+        (_, FsLocation::Transient(_)) => Some(dst_loc),
+        (FsLocation::Transient(_), _) => Some(clip_loc),
+        _ => Some(dst_loc),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn paste_all(
     hosts: &[RemoteHost],
@@ -2134,7 +2439,12 @@ pub(crate) fn paste_all(
     progress: &dyn Fn(u64),
     source_consumed: &dyn Fn(&Path),
 ) -> io::Result<BatchOutcome> {
-    let same_location = clip_loc == dst_loc;
+    // When a saved clipboard source and a temporary ControlPath endpoint share
+    // one namespace, every direct mutation uses the destination's live
+    // execution snapshot. The saved source is identity only; using it here
+    // could prompt again or lose the socket between copy and cut deletion.
+    let direct_location = direct_paste_execution_location(hosts, clip_loc, dst_loc);
+    let same_location = direct_location.is_some();
     let mut outcome = BatchOutcome {
         done: 0,
         failed: Vec::new(),
@@ -2151,9 +2461,19 @@ pub(crate) fn paste_all(
                     "source and destination are the same",
                 ))
             } else if cut {
-                rename(clip_loc, hosts, &item.path, &dst)
+                rename(
+                    direct_location.expect("same namespace has an execution endpoint"),
+                    hosts,
+                    &item.path,
+                    &dst,
+                )
             } else {
-                copy(clip_loc, hosts, &item.path, &dst)
+                copy(
+                    direct_location.expect("same namespace has an execution endpoint"),
+                    hosts,
+                    &item.path,
+                    &dst,
+                )
             }
         } else {
             transfer(
@@ -2345,6 +2665,12 @@ mod tests {
             multiplex: true,
             deploy: jterm_core::jsh_remote::Deploy::Off,
         }
+    }
+
+    fn session_location(host: RemoteHost, managed: bool) -> FsLocation {
+        SessionRemoteEndpoint::new(host, managed, None)
+            .map(FsLocation::session)
+            .expect("valid session endpoint")
     }
 
     /// Unique temp directory that removes itself on drop.
@@ -2899,6 +3225,23 @@ mod tests {
         assert_eq!(FsLocation::Local.label(&hosts), "Local");
         assert_eq!(FsLocation::Remote(1).label(&hosts), "docker: service");
         assert_eq!(FsLocation::Remote(9).label(&hosts), "Remote (unavailable)");
+        let transient = session_location(ssh_host(), false);
+        assert_eq!(transient.label(&[]), "ssh: staging (temporary)");
+        assert_eq!(
+            location_labels_for(&hosts, &transient),
+            [
+                "Local",
+                "ssh: staging",
+                "docker: service",
+                "ssh: staging (temporary)"
+            ]
+        );
+        let managed_session = session_location(hosts[0].clone(), true);
+        assert_eq!(managed_session.label(&hosts), "ssh: staging");
+        assert_eq!(
+            location_labels_for(&hosts, &managed_session),
+            location_labels(&hosts)
+        );
 
         let mut hostile = ssh_host();
         hostile.name = "secret\u{202e}marker".to_string();
@@ -2906,6 +3249,32 @@ mod tests {
             location_labels(&[hostile]),
             ["Local", "Remote (unavailable)"]
         );
+    }
+
+    #[test]
+    fn long_cloud_endpoint_label_is_compact_but_detail_stays_complete() {
+        let endpoint = "dsw-notebook-dsw-l8rnh0wm7vs81o7z6j-22.vpc-0jlbz3pri2042fd5xw2ov.instance-forward.dsw.cn-wulanchabu.aliyuncs.com";
+        let mut host = ssh_host();
+        host.name = format!("root@{endpoint}");
+        host.host = endpoint.to_string();
+        host.user = Some("root".to_string());
+        host.ssh_args = vec!["-p".to_string(), "22".to_string()];
+        host.deploy = jterm_core::jsh_remote::Deploy::Off;
+        host.multiplex = false;
+
+        let location = session_location(host.clone(), false);
+        let labels = location_labels_for(&[], &location);
+        assert_eq!(labels.len(), 2);
+        assert!(labels[1].starts_with("ssh: root@dsw"));
+        assert!(labels[1].contains('…'));
+        assert!(labels[1].contains("aliyuncs.com"));
+        assert!(labels[1].ends_with(" (temporary)"));
+        assert!(!labels[1].contains("instance-forward"));
+
+        let details = location_details_for(&[], &location);
+        assert_eq!(details.len(), labels.len());
+        assert!(details[1].contains(&format!("root@{endpoint}")));
+        assert!(details[1].ends_with("· options: -p 22 (temporary)"));
     }
 
     #[test]
@@ -2927,6 +3296,122 @@ mod tests {
             remap_location_by_profile(&FsLocation::Local, &old, &reordered),
             FsLocation::Local
         );
+
+        let transient = session_location(ssh_host(), false);
+        assert_eq!(
+            remap_location_by_profile(&transient, &old, &reordered),
+            transient,
+            "session-only authority is independent of configured indexes"
+        );
+    }
+
+    #[test]
+    fn transient_remote_host_is_validated_from_the_location_itself() {
+        let transient = session_location(ssh_host(), false);
+        assert_eq!(
+            remote_host(&transient, &[]).expect("valid transient host"),
+            match &transient {
+                FsLocation::Transient(endpoint) => endpoint.execution(),
+                _ => unreachable!(),
+            }
+        );
+
+        let mut invalid = ssh_host();
+        invalid.host = "-option".to_string();
+        assert!(SessionRemoteEndpoint::new(invalid, false, None).is_err());
+    }
+
+    #[test]
+    fn session_endpoint_control_path_is_execution_only_and_reaches_probe_argv() {
+        let base = ssh_host();
+        let first =
+            SessionRemoteEndpoint::new(base.clone(), false, Some("/run/user/1000/anvil/cm-%C"))
+                .expect("safe execution overlay");
+        let second =
+            SessionRemoteEndpoint::new(base.clone(), false, Some("/run/user/1000/anvil/new-cm-%C"))
+                .expect("safe execution overlay");
+        assert_eq!(first, second, "socket paths are not stable identity");
+        assert_eq!(first.identity().ssh_args, base.ssh_args);
+        assert_eq!(
+            &first.execution().ssh_args[first.execution().ssh_args.len() - 2..],
+            ["-S", "/run/user/1000/anvil/cm-%C"]
+        );
+
+        let location = FsLocation::session(first);
+        let execution = remote_host(&location, &[]).expect("frozen execution endpoint");
+        let argv = ssh_probe_argv(execution, "home", &[], ScriptDelivery::Stdin);
+        let argv = argv
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let socket = argv.iter().position(|argument| argument == "-S").unwrap();
+        assert_eq!(argv[socket + 1], "/run/user/1000/anvil/cm-%C");
+    }
+
+    #[test]
+    fn saved_clipboard_and_temporary_overlay_use_one_direct_live_namespace() {
+        let mut saved = ssh_host();
+        saved
+            .ssh_args
+            .extend(["-S".to_string(), "/saved/cm-%C".to_string()]);
+        let mut stable = saved.clone();
+        stable.ssh_args.truncate(2);
+        let temporary = FsLocation::session(
+            SessionRemoteEndpoint::with_execution_overlay(
+                stable,
+                None,
+                &["-S".to_string(), "/live/cm-%C".to_string()],
+            )
+            .expect("live session endpoint"),
+        );
+        let saved_location = FsLocation::Remote(0);
+        let hosts = vec![saved];
+        assert!(locations_share_filesystem(
+            &saved_location,
+            &temporary,
+            &hosts
+        ));
+        assert_eq!(
+            direct_paste_execution_location(&hosts, &saved_location, &temporary),
+            Some(&temporary),
+            "same-namespace copy/cut must execute through the live destination overlay"
+        );
+        assert_eq!(
+            direct_paste_execution_location(&hosts, &temporary, &FsLocation::Remote(0)),
+            Some(&temporary),
+            "temporary source to saved destination must retain the live source socket"
+        );
+        let clipboard = Some(FsClipboard {
+            loc: saved_location,
+            items: vec![FsClipboardItem {
+                path: PathBuf::from("/remote/file"),
+                is_dir: false,
+            }],
+            cut: true,
+            token: 91,
+        });
+        assert_eq!(
+            clipboard_token_for_location(&clipboard, &temporary, &hosts),
+            Some(91),
+            "rename/delete through the live endpoint retires the saved-source clipboard"
+        );
+        let live = remote_host(&temporary, &hosts).expect("execution profile");
+        assert_eq!(
+            &live.ssh_args[live.ssh_args.len() - 2..],
+            ["-S", "/live/cm-%C"]
+        );
+
+        let mut other = temporary.clone();
+        if let FsLocation::Transient(endpoint) = &mut other {
+            let mut identity = endpoint.identity().clone();
+            identity.ssh_args = vec!["-p".to_string(), "2200".to_string()];
+            **endpoint = SessionRemoteEndpoint::new(identity, false, None).unwrap();
+        }
+        assert!(!locations_share_filesystem(
+            &FsLocation::Remote(0),
+            &other,
+            &hosts
+        ));
     }
 
     #[test]
@@ -3028,11 +3513,11 @@ mod tests {
     fn clipboard_source_retirement_is_bound_at_dispatch_and_covers_descendants() {
         let mut clipboard = test_clipboard(FsLocation::Remote(0), 31, "/tree/dir/child.txt");
         assert_eq!(
-            clipboard_token_for_location(&clipboard, &FsLocation::Local),
+            clipboard_token_for_location(&clipboard, &FsLocation::Local, &[]),
             None,
             "a Local operation cannot consume a remote clipboard with the same path"
         );
-        let token = clipboard_token_for_location(&clipboard, &FsLocation::Remote(0));
+        let token = clipboard_token_for_location(&clipboard, &FsLocation::Remote(0), &[]);
         assert_eq!(token, Some(31));
 
         // Reordering after dispatch is harmless because the token, rather than

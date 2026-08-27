@@ -313,13 +313,20 @@ pub(crate) fn build_file_tree(
     let scroll = gtk::ScrolledWindow::new();
     scroll.set_vexpand(true);
     scroll.set_child(Some(&view));
-    let labels = remote_fs::location_labels(&config.borrow().remote_hosts);
+    let locations = {
+        let config = config.borrow();
+        let location = location.borrow();
+        (
+            remote_fs::location_labels_for(&config.remote_hosts, &location),
+            remote_fs::location_details_for(&config.remote_hosts, &location),
+        )
+    };
     let config_for_header = config.clone();
     let location_for_header = location.clone();
     let generation_for_header = scan_generation.clone();
-    let header = sidebar::FileHeaderModel::builder().launch(labels).forward(
-        sender.input_sender(),
-        move |output| match output {
+    let header = sidebar::FileHeaderModel::builder()
+        .launch(locations)
+        .forward(sender.input_sender(), move |output| match output {
             sidebar::FileHeaderOutput::Up => AppMsg::FileTreeGoUp,
             sidebar::FileHeaderOutput::CurrentDirectory => AppMsg::FileTreeGotoCwd,
             sidebar::FileHeaderOutput::OpenTerminal => {
@@ -337,8 +344,7 @@ pub(crate) fn build_file_tree(
                 AppMsg::FileTreeSelectLocation(index)
             }
             sidebar::FileHeaderOutput::FilterChanged(query) => AppMsg::FileTreeFilterChanged(query),
-        },
-    );
+        });
 
     FileTreeUi {
         store,
@@ -489,11 +495,8 @@ fn show_file_tree_context_menu(
 
     let loc = location.borrow().clone();
     let clip = clipboard.borrow().clone();
-    let menu_intent = file_tree::capture_file_tree_intent(
-        scan_generation.get(),
-        &loc,
-        &config.borrow().remote_hosts,
-    );
+    let hosts = config.borrow().remote_hosts.clone();
+    let menu_intent = file_tree::capture_file_tree_intent(scan_generation.get(), &loc, &hosts);
     // Cross-location paste streams between the two filesystems; the label
     // says which direction the bytes will flow.
     let (paste_sensitive, paste_label, paste_tooltip) = match &clip {
@@ -502,20 +505,22 @@ fn show_file_tree_context_menu(
             "Paste".to_string(),
             Some("Copy or cut an item first"),
         ),
-        Some(clip) if clip.loc == loc => (true, "Paste".to_string(), None),
-        Some(clip) => match (&clip.loc, &loc) {
-            (remote_fs::FsLocation::Remote(_), remote_fs::FsLocation::Local) => {
+        Some(clip) if remote_fs::locations_share_filesystem(&clip.loc, &loc, &hosts) => {
+            (true, "Paste".to_string(), None)
+        }
+        Some(clip) => {
+            if clip.loc.is_remote() && loc == remote_fs::FsLocation::Local {
                 (true, "Paste (download)".to_string(), None)
-            }
-            (remote_fs::FsLocation::Local, remote_fs::FsLocation::Remote(_)) => {
+            } else if clip.loc == remote_fs::FsLocation::Local && loc.is_remote() {
                 (true, "Paste (upload)".to_string(), None)
+            } else {
+                (
+                    true,
+                    "Paste (via local relay)".to_string(),
+                    Some("Downloaded to a local staging file, then uploaded"),
+                )
             }
-            _ => (
-                true,
-                "Paste (via local relay)".to_string(),
-                Some("Downloaded to a local staging file, then uploaded"),
-            ),
-        },
+        }
     };
 
     let popover = gtk::Popover::new();

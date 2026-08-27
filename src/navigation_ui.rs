@@ -8,6 +8,10 @@ use super::*;
 impl AppModel {
     /// Apply sidebar visibility and optionally persist the user's choice.
     pub(crate) fn set_sidebar_visible(&mut self, visible: bool, persist: bool) {
+        if persist {
+            self.file_tree_user_operation_revision
+                .set(self.file_tree_user_operation_revision.get().wrapping_add(1));
+        }
         self.sidebar_visible = visible;
         self.sidebar_box.set_visible(visible);
         if persist {
@@ -68,6 +72,13 @@ impl AppModel {
     /// Show one sidebar view (tab list vs file tree) and reflect it in the
     /// segmented buttons. When `persist`, remember the choice in config.
     pub(crate) fn apply_sidebar_view(&self, view: config::SidebarView, persist: bool) {
+        if persist {
+            // A pending auto-follow/retry must not undo an explicit sidebar
+            // choice. This revision changes without clearing the observed SSH
+            // key, so the same argv stays deduplicated after cancellation.
+            self.file_tree_user_operation_revision
+                .set(self.file_tree_user_operation_revision.get().wrapping_add(1));
+        }
         use config::SidebarView;
         match view {
             SidebarView::Tabs => self.sidebar_stack.set_visible_child_name("tabs"),

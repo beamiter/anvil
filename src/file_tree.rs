@@ -221,6 +221,363 @@ pub(crate) fn is_notebook_path(path: &Path) -> bool {
 pub(crate) enum FileTreeTerminalTarget {
     Local(String),
     Remote(crate::config::RemoteHost),
+    /// A process-observed unsaved destination opens a normal interactive SSH
+    /// login; it must not silently turn the target into an Anvil/jsh profile.
+    TemporarySsh(crate::config::RemoteHost),
+}
+
+/// Frozen launch authority chosen for a process-observed SSH destination.
+/// Managed profiles are re-resolved by their complete value when the probe
+/// returns; a transient profile is already its own immutable authority.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ObservedRemoteAuthority {
+    Managed {
+        /// Exact saved profile used only for config revalidation/launch UI.
+        source: crate::config::RemoteHost,
+        /// Stable identity with every explicit ControlPath removed.
+        identity: crate::config::RemoteHost,
+    },
+    Transient(crate::config::RemoteHost),
+}
+
+impl ObservedRemoteAuthority {
+    pub(crate) fn profile(&self) -> &crate::config::RemoteHost {
+        match self {
+            Self::Managed { identity, .. } | Self::Transient(identity) => identity,
+        }
+    }
+
+    pub(crate) fn session_location(
+        &self,
+        execution_overlay: &[String],
+    ) -> Result<crate::remote_fs::FsLocation, &'static str> {
+        let (identity, managed_profile) = match self {
+            Self::Managed { source, identity } => (identity.clone(), Some(source.clone())),
+            Self::Transient(identity) => (identity.clone(), None),
+        };
+        let mut effective_overlay = execution_overlay.to_vec();
+        if effective_overlay.is_empty() {
+            if let Some(source) = &managed_profile {
+                // A direct observed SSH without ControlPath can still match a
+                // saved profile that carries one. Stable matching ignores the
+                // socket, but execution must not silently discard it.
+                effective_overlay = split_control_path_ssh_args(&source.ssh_args).1;
+            }
+        }
+        crate::remote_fs::SessionRemoteEndpoint::with_execution_overlay(
+            identity,
+            managed_profile,
+            &effective_overlay,
+        )
+        .map(crate::remote_fs::FsLocation::session)
+    }
+
+    pub(crate) fn current_location(
+        &self,
+        hosts: &[crate::config::RemoteHost],
+        execution_overlay: &[String],
+    ) -> Option<crate::remote_fs::FsLocation> {
+        match self {
+            Self::Managed { source, identity } => {
+                let exact = crate::config::unique_checked_remote_profile_index(hosts, source)?;
+                (unique_managed_transport_profile_index(hosts, identity) == Some(exact))
+                    .then(|| self.session_location(execution_overlay).ok())
+                    .flatten()
+            }
+            Self::Transient(_) => self.session_location(execution_overlay).ok(),
+        }
+    }
+
+    pub(crate) fn matches_location(
+        &self,
+        location: &crate::remote_fs::FsLocation,
+        hosts: &[crate::config::RemoteHost],
+    ) -> bool {
+        match (self, location) {
+            (Self::Managed { source, .. }, crate::remote_fs::FsLocation::Remote(index)) => {
+                crate::config::checked_remote_host(hosts, *index)
+                    .is_ok_and(|current| current == source)
+            }
+            (
+                Self::Managed { source, identity },
+                crate::remote_fs::FsLocation::Transient(endpoint),
+            ) => endpoint.managed_profile() == Some(source) && endpoint.identity() == identity,
+            (Self::Transient(expected), crate::remote_fs::FsLocation::Transient(endpoint)) => {
+                !endpoint.is_managed() && endpoint.identity() == expected
+            }
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ObservedRemoteProfile {
+    pub(crate) identity: crate::config::RemoteHost,
+    /// Exact explicit ControlPath argv removed from stable identity and later
+    /// appended to the immutable execution snapshot.
+    pub(crate) execution_overlay: Vec<String>,
+}
+
+impl ObservedRemoteProfile {
+    /// Add the live, core-validated jsh multiplex socket to the execution-only
+    /// argv and re-run Anvil's complete structured profile gate. The socket is
+    /// never folded into stable identity, but it is part of the exact process
+    /// generation used by SSH-to-Files deduplication and final commit checks.
+    pub(crate) fn with_reusable_control_path(
+        mut self,
+        control_path: Option<&str>,
+    ) -> Result<Self, &'static str> {
+        if let Some(path) = control_path {
+            self.execution_overlay.push("-S".to_string());
+            self.execution_overlay.push(path.to_string());
+        }
+        crate::remote_fs::SessionRemoteEndpoint::with_execution_overlay(
+            self.identity.clone(),
+            None,
+            &self.execution_overlay,
+        )?;
+        Ok(self)
+    }
+}
+
+fn ssh_o_option_is_control_path(option: &str) -> bool {
+    option
+        .split_once('=')
+        .map_or(option, |(key, _)| key)
+        .eq_ignore_ascii_case("controlpath")
+}
+
+/// Split only ControlPath from already structured SSH options. The shared
+/// parser normalizes observed operand flags, while configured profiles may
+/// still use attached `-Spath`/`-oName=value`; both representations remain
+/// exact in the execution overlay.
+fn split_control_path_ssh_args(args: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut stable = Vec::with_capacity(args.len());
+    let mut overlay = Vec::new();
+    let mut index = 0usize;
+    while index < args.len() {
+        let argument = &args[index];
+        if argument == "-S" {
+            overlay.push(argument.clone());
+            if let Some(operand) = args.get(index + 1) {
+                overlay.push(operand.clone());
+                index += 1;
+            }
+        } else if argument.starts_with("-S") && argument.len() > 2 {
+            overlay.push(argument.clone());
+        } else if argument == "-o" {
+            if let Some(option) = args.get(index + 1) {
+                let target = if ssh_o_option_is_control_path(option) {
+                    &mut overlay
+                } else {
+                    &mut stable
+                };
+                target.push(argument.clone());
+                target.push(option.clone());
+                index += 1;
+            } else {
+                stable.push(argument.clone());
+            }
+        } else if let Some(option) = argument.strip_prefix("-o") {
+            if ssh_o_option_is_control_path(option) {
+                overlay.push(argument.clone());
+            } else {
+                stable.push(argument.clone());
+            }
+        } else {
+            stable.push(argument.clone());
+        }
+        index += 1;
+    }
+    (stable, overlay)
+}
+
+fn stable_remote_profile(profile: &crate::config::RemoteHost) -> crate::config::RemoteHost {
+    let mut identity = profile.clone();
+    identity.ssh_args = split_control_path_ssh_args(&profile.ssh_args).0;
+    identity
+}
+
+/// Convert the family's process-level target into Anvil's richer launch
+/// profile. Fields that have no meaning in the observed argv stay at safe,
+/// session-only defaults; in particular this never enables deployment or
+/// writes a ControlMaster configuration.
+pub(crate) fn observed_remote_profile(
+    observed: jterm_core::jsh_remote::RemoteHostConfig,
+) -> Result<ObservedRemoteProfile, &'static str> {
+    let deploy = jterm_core::jsh_remote::Deploy::parse(&observed.deploy)
+        .ok_or("the observed SSH deployment mode is invalid")?;
+    if observed.docker
+        || !matches!(deploy, jterm_core::jsh_remote::Deploy::Off)
+        || observed.deploy_artifact.is_some()
+        || observed.session.is_some()
+    {
+        return Err("the observed process is not a session-only SSH login");
+    }
+    let mut identity = crate::config::RemoteHost {
+        name: observed.name,
+        host: observed.host,
+        user: observed.user,
+        docker: false,
+        deploy_artifact: None,
+        remote_shell: observed.remote_shell,
+        session: None,
+        ssh_args: observed.ssh_args,
+        login_shell: true,
+        multiplex: false,
+        deploy,
+    };
+    crate::config::validate_remote_host(&identity)?;
+    let (stable, execution_overlay) = split_control_path_ssh_args(&identity.ssh_args);
+    identity.ssh_args = stable;
+    crate::config::validate_remote_host(&identity)?;
+    Ok(ObservedRemoteProfile {
+        identity,
+        execution_overlay,
+    })
+}
+
+pub(crate) fn remote_profiles_share_filesystem(
+    managed: &crate::config::RemoteHost,
+    observed: &crate::config::RemoteHost,
+) -> bool {
+    let managed = stable_remote_profile(managed);
+    !managed.docker
+        && managed.host == observed.host
+        && managed.user == observed.user
+        && managed.ssh_args == observed.ssh_args
+}
+
+fn unique_managed_transport_profile_index(
+    hosts: &[crate::config::RemoteHost],
+    observed: &crate::config::RemoteHost,
+) -> Option<usize> {
+    let mut matches = hosts
+        .iter()
+        .take(crate::config::MAX_REMOTE_HOSTS)
+        .enumerate()
+        .filter_map(|(index, _)| {
+            crate::config::checked_remote_host(hosts, index)
+                .ok()
+                .filter(|host| remote_profiles_share_filesystem(host, observed))
+                .map(|_| index)
+        });
+    let index = matches.next()?;
+    matches.next().is_none().then_some(index)
+}
+
+/// Prefer exactly one managed profile with the same process-observed SSH
+/// transport. Ambiguity deliberately stays transient: picking between two
+/// identity/proxy configurations by display order could browse the wrong
+/// machine even when their visible destination strings match.
+pub(crate) fn observed_remote_authority(
+    observed: crate::config::RemoteHost,
+    hosts: &[crate::config::RemoteHost],
+) -> ObservedRemoteAuthority {
+    match unique_managed_transport_profile_index(hosts, &observed) {
+        Some(index) => {
+            let source = crate::config::checked_remote_host(hosts, index)
+                .expect("unique transport helper admits only validated profiles")
+                .clone();
+            ObservedRemoteAuthority::Managed {
+                identity: stable_remote_profile(&source),
+                source,
+            }
+        }
+        None => ObservedRemoteAuthority::Transient(observed),
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SshFileTreeDetection {
+    pub(crate) token: u64,
+    pub(crate) pane_id: u64,
+    /// Normalized process observation. Re-resolving a managed profile after a
+    /// config edit must not turn one running SSH process into a second intent.
+    pub(crate) observed: crate::config::RemoteHost,
+    /// The actual foreground argv returned by the dedicated process observer.
+    /// It is diagnostic/dedup state only and is never reparsed here.
+    pub(crate) observed_argv: Vec<String>,
+    /// Execution-only overlay proven by the process observer. It never
+    /// participates in stable profile matching or source rechecks.
+    pub(crate) execution_overlay: Vec<String>,
+    pub(crate) authority: ObservedRemoteAuthority,
+    pub(crate) tree_intent: FileTreeIntent,
+    /// The tree already names this stable namespace. The replacement execution
+    /// overlay must still pass the staged probe, but a successful probe swaps
+    /// only the endpoint snapshot instead of navigating back to remote home.
+    pub(crate) preserve_tree: bool,
+    /// A user file action begun while the connection probe runs invalidates
+    /// the switch without cancelling or hiding that newer work.
+    pub(crate) operation_revision: u64,
+    pub(crate) resolved: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum SshFileTreeObservation {
+    Unsupported { pane_id: u64, reason: &'static str },
+    Target(Box<SshFileTreeDetection>),
+}
+
+/// Process-key dedup is intentionally independent of probe success and the
+/// captured file-action revision. A failed or user-cancelled attempt remains
+/// the seen instance of this live argv; only an explicit Retry creates a new
+/// token. Otherwise the periodic poll would silently turn cancellation into
+/// another automatic attempt.
+pub(crate) fn ssh_file_tree_observation_matches_target(
+    observation: Option<&SshFileTreeObservation>,
+    current_token: u64,
+    pane_id: u64,
+    argv: &[String],
+    observed: &crate::config::RemoteHost,
+    execution_overlay: &[String],
+) -> bool {
+    matches!(
+        observation,
+        Some(SshFileTreeObservation::Target(detection))
+            if detection.token == current_token
+                && detection.pane_id == pane_id
+                && detection.observed == *observed
+                && detection.observed_argv == argv
+                && detection.execution_overlay == execution_overlay
+    )
+}
+
+pub(crate) fn ssh_file_tree_retry_is_current(
+    observation: Option<&SshFileTreeObservation>,
+    pane_id: u64,
+    token: u64,
+) -> bool {
+    matches!(
+        observation,
+        Some(SshFileTreeObservation::Target(detection))
+            if detection.pane_id == pane_id
+                && detection.token == token
+                && detection.resolved
+    )
+}
+
+/// Final pure gate for an observed-SSH probe. The worker token is checked by
+/// the caller before this point; this covers the independently changing pane
+/// process and file-tree authority, including navigation ABA.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ssh_file_tree_detection_is_current(
+    detection: &SshFileTreeDetection,
+    pane_id: u64,
+    observed_argv: &[String],
+    observed: &crate::config::RemoteHost,
+    execution_overlay: &[String],
+    operation_revision: u64,
+    generation: u64,
+    location: &crate::remote_fs::FsLocation,
+    hosts: &[crate::config::RemoteHost],
+) -> bool {
+    detection.pane_id == pane_id
+        && detection.observed_argv == observed_argv
+        && detection.observed == *observed
+        && detection.execution_overlay == execution_overlay
+        && detection.operation_revision == operation_revision
+        && file_tree_intent_is_current(&detection.tree_intent, generation, location, hosts)
 }
 
 pub(crate) fn terminal_target(
@@ -242,6 +599,21 @@ pub(crate) fn terminal_target(
             crate::config::checked_remote_host(hosts, *index)
                 .cloned()
                 .map(FileTreeTerminalTarget::Remote)
+        }
+        crate::remote_fs::FsLocation::Transient(endpoint) => {
+            crate::config::validate_remote_host(endpoint.identity())?;
+            if endpoint.is_managed() {
+                let profile = endpoint
+                    .managed_profile()
+                    .ok_or("The matching saved remote profile is unavailable.")?;
+                crate::config::validate_remote_host(profile)?;
+                Ok(FileTreeTerminalTarget::Remote(profile.clone()))
+            } else {
+                crate::config::validate_remote_host(endpoint.execution())?;
+                Ok(FileTreeTerminalTarget::TemporarySsh(
+                    endpoint.execution().clone(),
+                ))
+            }
         }
     }
 }
@@ -270,6 +642,14 @@ pub(crate) fn capture_file_tree_intent(
                 .ok()
                 .cloned()
         }
+        crate::remote_fs::FsLocation::Transient(endpoint) => {
+            let profile = endpoint
+                .managed_profile()
+                .unwrap_or_else(|| endpoint.identity());
+            crate::config::validate_remote_host(profile)
+                .ok()
+                .map(|()| profile.clone())
+        }
     };
     FileTreeIntent {
         generation,
@@ -287,17 +667,45 @@ pub(crate) fn file_tree_intent_is_current(
     location: &crate::remote_fs::FsLocation,
     hosts: &[crate::config::RemoteHost],
 ) -> bool {
-    if intent.generation != generation || intent.location != *location {
+    if intent.generation != generation
+        || !crate::remote_fs::locations_share_filesystem(&intent.location, location, hosts)
+    {
         return false;
     }
-    match (&intent.location, &intent.remote_profile) {
+    let captured_is_valid = match (&intent.location, &intent.remote_profile) {
         (crate::remote_fs::FsLocation::Local, None) => true,
         (crate::remote_fs::FsLocation::Remote(index), Some(expected)) => {
             crate::config::checked_remote_host(hosts, *index)
                 .is_ok_and(|current| current == expected)
         }
+        (crate::remote_fs::FsLocation::Transient(current), Some(expected)) => {
+            let stable = crate::config::validate_remote_host(current.identity()).is_ok()
+                && crate::config::validate_remote_host(current.execution()).is_ok()
+                && if let Some(managed) = current.managed_profile() {
+                    managed == expected
+                        && crate::config::unique_checked_remote_profile_index(hosts, expected)
+                            .is_some()
+                } else {
+                    current.identity() == expected
+                };
+            stable
+        }
         _ => false,
-    }
+    };
+    let live_is_valid = match location {
+        crate::remote_fs::FsLocation::Local => true,
+        crate::remote_fs::FsLocation::Remote(index) => {
+            crate::config::checked_remote_host(hosts, *index).is_ok()
+        }
+        crate::remote_fs::FsLocation::Transient(endpoint) => {
+            crate::config::validate_remote_host(endpoint.identity()).is_ok()
+                && crate::config::validate_remote_host(endpoint.execution()).is_ok()
+                && endpoint.managed_profile().is_none_or(|profile| {
+                    crate::config::unique_checked_remote_profile_index(hosts, profile).is_some()
+                })
+        }
+    };
+    captured_is_valid && live_is_valid
 }
 
 /// Revalidate a background callback's tree authority and, for transfers, its
@@ -1037,6 +1445,30 @@ mod tests {
         }
     }
 
+    fn observed_profile(argv: &[&str]) -> crate::config::RemoteHost {
+        let argv = argv
+            .iter()
+            .map(|argument| argument.to_string())
+            .collect::<Vec<_>>();
+        let jterm_core::jsh_remote::ObservedSshTarget::Target(observed) =
+            jterm_core::jsh_remote::observed_ssh_target(&argv)
+        else {
+            panic!("expected process-observed SSH target");
+        };
+        observed_remote_profile(observed)
+            .expect("observed target converts to Anvil profile")
+            .identity
+    }
+
+    fn session_location(
+        host: crate::config::RemoteHost,
+        managed: bool,
+    ) -> crate::remote_fs::FsLocation {
+        crate::remote_fs::SessionRemoteEndpoint::new(host, managed, None)
+            .map(crate::remote_fs::FsLocation::session)
+            .expect("valid session endpoint")
+    }
+
     #[test]
     fn entries_sort_directories_first_then_by_name() {
         let mut entries = vec![
@@ -1087,6 +1519,389 @@ mod tests {
                 std::slice::from_ref(&host)
             ),
             Ok(FileTreeTerminalTarget::Remote(host))
+        );
+    }
+
+    #[test]
+    fn transient_terminal_target_carries_its_own_validated_profile() {
+        let observed =
+            observed_profile(&["/usr/bin/ssh", "root@dsw-notebook.example.com", "-p", "22"]);
+        let location = crate::remote_fs::SessionRemoteEndpoint::new(
+            observed.clone(),
+            false,
+            Some("/run/user/1000/live-cm-%C"),
+        )
+        .map(crate::remote_fs::FsLocation::session)
+        .expect("temporary execution endpoint");
+        let mut execution = observed;
+        execution
+            .ssh_args
+            .extend(["-S".to_string(), "/run/user/1000/live-cm-%C".to_string()]);
+        assert_eq!(
+            terminal_target(&location, Path::new("/remote/path"), &[]),
+            Ok(FileTreeTerminalTarget::TemporarySsh(execution))
+        );
+    }
+
+    #[test]
+    fn actual_jsh_launcher_fixture_keeps_base_identity_and_overlays_control_path() {
+        let argv = [
+            "/bin/sh",
+            "/home/alice/.cache/jsh/jsh-remote.sh",
+            "--persist",
+            "--local-jsh",
+            "/home/alice/.local/bin/jsh",
+            "root@dsw-notebook.example.com",
+            "--",
+            "-p",
+            "22",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let command = jterm_core::process::ObservedSshCommand {
+            target: jterm_core::jsh_remote::observed_ssh_target(&argv),
+            argv: argv.clone(),
+            reusable_control_path: Some("/run/user/1000/cm-%C".to_string()),
+        };
+        assert_eq!(command.argv, argv, "dedup retains the real wrapper argv");
+        let jterm_core::jsh_remote::ObservedSshTarget::Target(target) = command.target else {
+            panic!("the production jsh wrapper shape must classify as SSH")
+        };
+        let mut profile = observed_remote_profile(target).expect("base target profile");
+        profile
+            .execution_overlay
+            .extend(["-S".to_string(), "/run/user/1000/cm-%C".to_string()]);
+        let authority = observed_remote_authority(profile.identity.clone(), &[]);
+        let location = authority
+            .session_location(&profile.execution_overlay)
+            .expect("validated endpoint overlay");
+        let crate::remote_fs::FsLocation::Transient(endpoint) = location else {
+            panic!("observed target must be value-owned")
+        };
+        assert_eq!(endpoint.identity(), &profile.identity);
+        assert_eq!(endpoint.identity().ssh_args, ["-p", "22"]);
+        assert_eq!(
+            endpoint.execution().ssh_args,
+            ["-p", "22", "-S", "/run/user/1000/cm-%C"]
+        );
+    }
+
+    #[test]
+    fn explicit_control_path_is_execution_overlay_and_saved_matching_ignores_it() {
+        let argv = [
+            "ssh",
+            "-p2222",
+            "-S/run/user/1000/live-cm-%C",
+            "deploy@server.example.com",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let jterm_core::jsh_remote::ObservedSshTarget::Target(target) =
+            jterm_core::jsh_remote::observed_ssh_target(&argv)
+        else {
+            panic!("direct SSH with -S must be observable")
+        };
+        let observed = observed_remote_profile(target).expect("validated observed profile");
+        assert_eq!(observed.identity.ssh_args, ["-p", "2222"]);
+        assert_eq!(
+            observed.execution_overlay,
+            ["-S", "/run/user/1000/live-cm-%C"]
+        );
+
+        let mut managed = remote_host();
+        managed
+            .ssh_args
+            .extend(["-S".to_string(), "/saved/cm-%C".to_string()]);
+        let authority = observed_remote_authority(observed.identity.clone(), &[managed.clone()]);
+        assert!(matches!(
+            &authority,
+            ObservedRemoteAuthority::Managed { source, identity }
+                if source == &managed && identity.ssh_args == ["-p", "2222"]
+        ));
+        let location = authority
+            .current_location(&[managed.clone()], &observed.execution_overlay)
+            .expect("unique saved transport remains authoritative");
+        let crate::remote_fs::FsLocation::Transient(endpoint) = location else {
+            panic!("followed saved profile uses a frozen endpoint")
+        };
+        assert_eq!(endpoint.managed_profile(), Some(&managed));
+        assert_eq!(endpoint.identity().ssh_args, ["-p", "2222"]);
+        assert_eq!(
+            endpoint.execution().ssh_args,
+            ["-p", "2222", "-S", "/run/user/1000/live-cm-%C"]
+        );
+        let saved_fallback = authority
+            .current_location(&[managed.clone()], &[])
+            .expect("saved explicit ControlPath is the execution fallback");
+        let crate::remote_fs::FsLocation::Transient(saved_fallback) = saved_fallback else {
+            panic!("saved follow uses a session endpoint")
+        };
+        assert_eq!(
+            saved_fallback.execution().ssh_args,
+            ["-p", "2222", "-S", "/saved/cm-%C"]
+        );
+
+        let option_argv = [
+            "ssh",
+            "-o",
+            "ControlPath=/tmp/direct-cm-%C",
+            "deploy@server.example.com",
+            "-p",
+            "2222",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let jterm_core::jsh_remote::ObservedSshTarget::Target(target) =
+            jterm_core::jsh_remote::observed_ssh_target(&option_argv)
+        else {
+            panic!("direct SSH with -o ControlPath must be observable")
+        };
+        let option = observed_remote_profile(target).expect("validated -o profile");
+        assert_eq!(option.identity.ssh_args, ["-p", "2222"]);
+        assert_eq!(
+            option.execution_overlay,
+            ["-o", "ControlPath=/tmp/direct-cm-%C"]
+        );
+
+        let mut duplicate = managed.clone();
+        duplicate.name = "same transport, other socket".to_string();
+        duplicate.ssh_args.pop();
+        duplicate.ssh_args.pop();
+        duplicate
+            .ssh_args
+            .extend(["-S".to_string(), "/other/cm-%C".to_string()]);
+        assert!(matches!(
+            observed_remote_authority(observed.identity, &[managed, duplicate]),
+            ObservedRemoteAuthority::Transient(_)
+        ));
+    }
+
+    #[test]
+    fn observed_ssh_prefers_one_exact_managed_transport_but_not_ambiguity() {
+        let observed = observed_profile(&["ssh", "deploy@server.example.com", "-p", "2222"]);
+        let managed = remote_host();
+        let authority = observed_remote_authority(observed.clone(), std::slice::from_ref(&managed));
+        assert!(matches!(
+            &authority,
+            ObservedRemoteAuthority::Managed { source, .. } if source == &managed
+        ));
+        assert!(authority
+            .current_location(std::slice::from_ref(&managed), &[])
+            .is_some());
+
+        let mut same_transport = managed.clone();
+        same_transport.name = "same endpoint, different workflow".to_string();
+        same_transport.remote_shell = "bash".to_string();
+        assert!(matches!(
+            observed_remote_authority(
+                observed.clone(),
+                &[managed.clone(), same_transport.clone()]
+            ),
+            ObservedRemoteAuthority::Transient(profile) if profile == observed
+        ));
+        assert_eq!(
+            authority.current_location(&[managed, same_transport], &[]),
+            None,
+            "a second transport match appearing during the probe cancels managed commit"
+        );
+    }
+
+    #[test]
+    fn detected_ssh_commit_requires_same_process_and_tree_intent() {
+        let observed = observed_profile(&["ssh", "deploy@server.example.com", "-p2222"]);
+        let location = crate::remote_fs::FsLocation::Local;
+        let detection = SshFileTreeDetection {
+            token: 9,
+            pane_id: 44,
+            observed: observed.clone(),
+            observed_argv: vec!["ssh".to_string(), "deploy@server.example.com".to_string()],
+            execution_overlay: Vec::new(),
+            authority: ObservedRemoteAuthority::Transient(observed.clone()),
+            tree_intent: capture_file_tree_intent(7, &location, &[]),
+            preserve_tree: false,
+            operation_revision: 3,
+            resolved: false,
+        };
+        assert!(ssh_file_tree_detection_is_current(
+            &detection,
+            44,
+            &detection.observed_argv,
+            &observed,
+            &detection.execution_overlay,
+            3,
+            7,
+            &location,
+            &[],
+        ));
+        assert!(!ssh_file_tree_detection_is_current(
+            &detection,
+            45,
+            &detection.observed_argv,
+            &observed,
+            &detection.execution_overlay,
+            3,
+            7,
+            &location,
+            &[],
+        ));
+        assert!(!ssh_file_tree_detection_is_current(
+            &detection,
+            44,
+            &[
+                "ssh".to_string(),
+                "deploy@server.example.com".to_string(),
+                "-v".to_string()
+            ],
+            &observed,
+            &detection.execution_overlay,
+            3,
+            7,
+            &location,
+            &[],
+        ));
+
+        let mut failed = detection.clone();
+        failed.resolved = true;
+        let observation = SshFileTreeObservation::Target(Box::new(failed));
+        assert!(ssh_file_tree_retry_is_current(Some(&observation), 44, 9));
+        assert!(ssh_file_tree_observation_matches_target(
+            Some(&observation),
+            9,
+            44,
+            &detection.observed_argv,
+            &observed,
+            &detection.execution_overlay,
+        ));
+        assert!(
+            !ssh_file_tree_detection_is_current(
+                &detection,
+                44,
+                &detection.observed_argv,
+                &observed,
+                &detection.execution_overlay,
+                4,
+                7,
+                &location,
+                &[],
+            ) && ssh_file_tree_observation_matches_target(
+                Some(&observation),
+                9,
+                44,
+                &detection.observed_argv,
+                &observed,
+                &detection.execution_overlay,
+            ),
+            "a user-cancelled retry stays deduplicated instead of auto-rearming the same argv"
+        );
+        assert!(!ssh_file_tree_observation_matches_target(
+            Some(&observation),
+            10,
+            44,
+            &detection.observed_argv,
+            &observed,
+            &detection.execution_overlay,
+        ), "a focus-epoch change deliberately permits a fresh staged probe when A becomes active again");
+        let rotated_socket = vec!["-S".to_string(), "/tmp/jsh-new.sock".to_string()];
+        assert!(!ssh_file_tree_observation_matches_target(
+            Some(&observation),
+            9,
+            44,
+            &detection.observed_argv,
+            &observed,
+            &rotated_socket,
+        ));
+        assert!(!ssh_file_tree_detection_is_current(
+            &detection,
+            44,
+            &detection.observed_argv,
+            &observed,
+            &rotated_socket,
+            3,
+            7,
+            &location,
+            &[],
+        ));
+        assert!(!ssh_file_tree_retry_is_current(Some(&observation), 44, 8));
+        assert!(!ssh_file_tree_detection_is_current(
+            &detection,
+            44,
+            &detection.observed_argv,
+            &observed,
+            &detection.execution_overlay,
+            4,
+            7,
+            &location,
+            &[],
+        ));
+        assert!(!ssh_file_tree_detection_is_current(
+            &detection,
+            44,
+            &detection.observed_argv,
+            &observed,
+            &detection.execution_overlay,
+            3,
+            8,
+            &location,
+            &[],
+        ));
+
+        let replacement = observed_profile(&["ssh", "deploy@other.example.com", "-p2222"]);
+        assert!(!ssh_file_tree_detection_is_current(
+            &detection,
+            44,
+            &detection.observed_argv,
+            &replacement,
+            &detection.execution_overlay,
+            3,
+            7,
+            &location,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn transient_intent_freezes_the_complete_session_profile() {
+        let observed = observed_profile(&["ssh", "deploy@server.example.com", "-p2222"]);
+        let location = session_location(observed.clone(), false);
+        let intent = capture_file_tree_intent(12, &location, &[]);
+        assert!(file_tree_intent_is_current(&intent, 12, &location, &[]));
+
+        let mut replacement = observed;
+        replacement.ssh_args = vec!["-p".to_string(), "22".to_string()];
+        assert!(!file_tree_intent_is_current(
+            &intent,
+            12,
+            &session_location(replacement, false),
+            &[],
+        ));
+    }
+
+    #[test]
+    fn same_namespace_socket_upgrade_preserves_pending_file_intent() {
+        let managed = remote_host();
+        let observed = observed_profile(&["ssh", "deploy@server.example.com", "-p", "2222"]);
+        let hosts = vec![managed];
+        let old_location = crate::remote_fs::FsLocation::Remote(0);
+        let intent = capture_file_tree_intent(21, &old_location, &hosts);
+        let upgraded = observed_remote_authority(observed, &hosts)
+            .session_location(&["-S".to_string(), "/run/user/1000/live-cm-%C".to_string()])
+            .expect("same-target live endpoint");
+
+        assert!(crate::remote_fs::locations_share_filesystem(
+            &old_location,
+            &upgraded,
+            &hosts
+        ));
+        assert!(file_tree_intent_is_current(&intent, 21, &upgraded, &hosts));
+        let crate::remote_fs::FsLocation::Transient(endpoint) = upgraded else {
+            panic!("socket upgrade must be value-owned")
+        };
+        assert_eq!(
+            &endpoint.execution().ssh_args[endpoint.execution().ssh_args.len() - 2..],
+            ["-S", "/run/user/1000/live-cm-%C"]
         );
     }
 
