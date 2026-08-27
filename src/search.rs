@@ -4,6 +4,22 @@ use relm4::gtk;
 use relm4::gtk::prelude::*;
 use relm4::prelude::*;
 
+/// Find-bar text larger than this is rejected before VTE regex compilation
+/// or the block find scan ever sees it.
+pub(crate) const SEARCH_QUERY_BYTE_LIMIT: usize = 8 * 1024;
+
+/// The oversized-query rejection shared by both search backends: the backend
+/// clears its own highlights and shows this status instead of compiling a
+/// regex or scanning blocks with the oversized query.
+pub(crate) fn oversize_query_status(query: &str) -> Option<SearchStatus> {
+    (query.len() > SEARCH_QUERY_BYTE_LIMIT).then(|| {
+        SearchStatus::Error(format!(
+            "Query too long ({} KiB limit)",
+            SEARCH_QUERY_BYTE_LIMIT / 1024
+        ))
+    })
+}
+
 /// Backend-neutral state for the window search bar. `Searching` is a short
 /// UI-only transition while a pane computes its answer; terminal backends
 /// return `Idle`, `Results`, or `Error` through `VteOutput::SearchStatus`.
@@ -396,9 +412,22 @@ fn apply_status(widgets: &SearchModelWidgets, status: &SearchStatus) {
 #[cfg(test)]
 mod tests {
     use super::{
-        active_pane_changed, invalid_regex_message, pane_transition, presentation,
-        SearchPresentation, SearchStatus,
+        active_pane_changed, invalid_regex_message, oversize_query_status, pane_transition,
+        presentation, SearchPresentation, SearchStatus, SEARCH_QUERY_BYTE_LIMIT,
     };
+
+    #[test]
+    fn oversized_queries_are_rejected_before_the_backends() {
+        let within = "x".repeat(SEARCH_QUERY_BYTE_LIMIT);
+        assert!(oversize_query_status(&within).is_none());
+        let beyond = "x".repeat(SEARCH_QUERY_BYTE_LIMIT + 1);
+        match oversize_query_status(&beyond) {
+            Some(SearchStatus::Error(message)) => {
+                assert_eq!(message, "Query too long (8 KiB limit)")
+            }
+            other => panic!("expected an oversized-query error status, got {other:?}"),
+        }
+    }
 
     #[test]
     fn status_presentation_distinguishes_progress_empty_matches_and_errors() {

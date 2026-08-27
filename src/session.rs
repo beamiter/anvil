@@ -1774,16 +1774,24 @@ fn save_session_now(session: SavedSession) -> io::Result<()> {
     Ok(())
 }
 
+/// Conservative retained-bytes charge for one queued snapshot: the live
+/// `SavedSession` and the encoded buffer the worker builds from it are each
+/// bounded by the serialization cap, so charging two owners covers the pair.
+fn estimated_queued_session_bytes() -> usize {
+    (MAX_SNAPSHOT_BYTES as usize).saturating_mul(2)
+}
+
 /// Queue a main-thread snapshot for bounded, coalescing background persistence.
 /// Capturing GTK-owned state stays synchronous; JSON encoding, atomic replace,
 /// file/directory fsync, claim cleanup, and pruning all run on the worker.
 pub(crate) fn save_session(session: SavedSession) {
     let key = crate::persistence::PersistenceKey::for_path("session", &state_dir());
-    if let Err(error) =
-        crate::persistence::enqueue_session(key, "save session snapshot", move || {
-            save_session_now(session)
-        })
-    {
+    if let Err(error) = crate::persistence::enqueue_session_weighted(
+        key,
+        "save session snapshot",
+        estimated_queued_session_bytes(),
+        move || save_session_now(session),
+    ) {
         log::error!("Cannot queue session snapshot: {error}");
     }
 }

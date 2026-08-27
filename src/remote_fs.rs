@@ -157,6 +157,9 @@ const TRANSFER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const MAX_CAPTURE_BYTES: usize = 2 * 1024 * 1024;
 /// Payloads (files and directory tars) never exceed half a gigabyte.
 pub(crate) const MAX_TRANSFER_BYTES: u64 = 512 * 1024 * 1024;
+/// Local recursive copies refuse to descend deeper than this: a pathologically
+/// deep tree errors out instead of exhausting the op worker's stack.
+const MAX_COPY_DEPTH: usize = 128;
 const MAX_TRANSFER_STDERR_BYTES: usize = 64 * 1024;
 const STREAM_BUF_SIZE: usize = 64 * 1024;
 const MAX_ERROR_DISPLAY_BYTES: usize = 512;
@@ -774,7 +777,7 @@ pub(crate) fn copy(
     match loc {
         FsLocation::Local => {
             require_missing(dst)?;
-            copy_recursive(src, dst)
+            copy_recursive(src, dst, 0)
         }
         FsLocation::Remote(_) | FsLocation::Transient(_) => {
             require_absolute(src)?;
@@ -876,7 +879,9 @@ fn validate_delete_target(path: &Path) -> io::Result<()> {
 }
 
 /// `mv /a /a/b` and `cp -a /a /a/b` can never succeed; fail before spawning
-/// anything for what the Rust side already knows is nonsense.
+/// anything for what the Rust side already knows is nonsense. This textual
+/// comparison cannot see through symlink aliases; the local copier repeats
+/// the check on canonicalized paths (see `copy_recursive`).
 fn validate_not_into_self(src: &Path, dst: &Path) -> io::Result<()> {
     if dst == src || dst.starts_with(src) {
         return Err(io::Error::new(
@@ -903,15 +908,46 @@ fn require_missing(path: &Path) -> io::Result<()> {
 
 /// Recursive copy mirroring `cp -a` semantics closely enough for the tree:
 /// directory structure and file contents are preserved, symlinks are copied
-/// as links rather than followed.
-fn copy_recursive(src: &Path, dst: &Path) -> io::Result<()> {
+/// as links rather than followed. The recursion is depth-bounded, and the
+/// top level refuses to copy a directory into itself.
+fn copy_recursive(src: &Path, dst: &Path, depth: usize) -> io::Result<()> {
+    if depth >= MAX_COPY_DEPTH {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} is nested too deeply to copy",
+                crate::file_tree::display_full_path(src)
+            ),
+        ));
+    }
     let metadata = std::fs::symlink_metadata(src)?;
     if metadata.is_dir() {
+        if depth == 0 {
+            // `validate_not_into_self` compares textually, which a symlink
+            // alias defeats (`/link/a` vs `/a`); compare resolved paths once
+            // at the root so `cp -a /a /a/b` fails through symlinks too.
+            let canonical = src.canonicalize()?;
+            let dst_parent = dst
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("/"))
+                .canonicalize()
+                .unwrap_or_else(|_| dst.parent().map(Path::to_path_buf).unwrap_or_default());
+            if dst_parent
+                .join(dst.file_name().unwrap_or_default())
+                .starts_with(&canonical)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cannot move or copy an entry into itself",
+                ));
+            }
+        }
         std::fs::create_dir(dst)?;
         for entry in std::fs::read_dir(src)? {
             let entry = entry?;
             let name = entry.file_name();
-            copy_recursive(&src.join(&name), &dst.join(&name))?;
+            copy_recursive(&src.join(&name), &dst.join(&name), depth + 1)?;
         }
         Ok(())
     } else if metadata.file_type().is_symlink() {
@@ -1178,26 +1214,55 @@ fn sq_bytes(s: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Drain one child pipe on its own thread, keeping at most `max_out` bytes.
+/// Overflow keeps draining into the void so the child is never wedged on a
+/// full pipe; the returned flag lets the caller treat truncation as an error
+/// instead of silently acting on a short capture.
 fn spawn_bounded_reader(
     pipe: impl Read + Send + 'static,
     max_out: usize,
-) -> std::thread::JoinHandle<io::Result<Vec<u8>>> {
+) -> std::thread::JoinHandle<io::Result<(Vec<u8>, bool)>> {
     std::thread::spawn(move || {
+        let mut limited = pipe.take(max_out as u64 + 1);
         let mut buf = Vec::new();
-        pipe.take(max_out as u64).read_to_end(&mut buf)?;
-        Ok(buf)
+        limited.read_to_end(&mut buf)?;
+        if buf.len() <= max_out {
+            return Ok((buf, false));
+        }
+        buf.truncate(max_out);
+        io::copy(&mut limited.into_inner(), &mut io::sink())?;
+        Ok((buf, true))
     })
 }
 
 fn join_reader(
-    reader: Option<std::thread::JoinHandle<io::Result<Vec<u8>>>>,
-) -> io::Result<Vec<u8>> {
+    reader: Option<std::thread::JoinHandle<io::Result<(Vec<u8>, bool)>>>,
+) -> io::Result<(Vec<u8>, bool)> {
     match reader {
         Some(handle) => handle
             .join()
             .map_err(|_| io::Error::other("probe output reader panicked"))?,
-        None => Ok(Vec::new()),
+        None => Ok((Vec::new(), false)),
     }
+}
+
+/// Kill the child and (Unix) its whole process group, which it was made to
+/// lead at spawn: one signal reaps the probe and every descendant that did
+/// not setsid away — a remote `tar`, a relay pipeline — instead of orphaning
+/// them on the pipes. Returns immediately; the caller reaps.
+fn kill_tree(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        if let Ok(pid) = i32::try_from(child.id()) {
+            // SAFETY: one kill on the group the child was made to lead at
+            // spawn; failure (already exited, or never a group leader) is
+            // harmless and the plain kill below still covers the child.
+            unsafe {
+                nix::libc::kill(-pid, nix::libc::SIGKILL);
+            }
+        }
+    }
+    let _ = child.kill();
 }
 
 /// Spawn `argv[0]` with piped stdio, feed it `stdin_bytes`, and capture both
@@ -1215,12 +1280,20 @@ fn run_capture(
             "empty probe argv",
         ));
     };
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Own process group, led by the child: one group kill below reaps the
+        // probe and everything it forked.
+        command.process_group(0);
+    }
+    let mut child = command.spawn()?;
     // The script is smaller than any pipe buffer, so this write cannot
     // deadlock against the child's output. A far side that exits without
     // reading turns it into a broken pipe, which is not an error here.
@@ -1241,7 +1314,7 @@ fn run_capture(
         match child.try_wait()? {
             Some(status) => break status,
             None if started.elapsed() >= timeout => {
-                let _ = child.kill();
+                kill_tree(&mut child);
                 let _ = child.wait();
                 // The kill closes the pipes; collect the readers so no
                 // thread outlives the capture it fed.
@@ -1259,8 +1332,18 @@ fn run_capture(
             None => std::thread::sleep(WATCHDOG_POLL_INTERVAL),
         }
     };
-    let stdout = join_reader(stdout_reader)?;
-    let stderr = join_reader(stderr_reader)?;
+    let (stdout, stdout_truncated) = join_reader(stdout_reader)?;
+    let (stderr, stderr_truncated) = join_reader(stderr_reader)?;
+    if stdout_truncated || stderr_truncated {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} produced more than {} bytes of output",
+                crate::file_tree::display_os_str(program),
+                max_out
+            ),
+        ));
+    }
     Ok(Capture {
         code: status.code(),
         stdout,
@@ -1279,7 +1362,7 @@ struct ProbeChild {
     child: Arc<Mutex<Child>>,
     stdin: Option<ChildStdin>,
     stdout: Option<ChildStdout>,
-    stderr: Option<JoinHandle<io::Result<Vec<u8>>>>,
+    stderr: Option<JoinHandle<io::Result<(Vec<u8>, bool)>>>,
 }
 
 impl ProbeChild {
@@ -1343,7 +1426,7 @@ impl TransferControl {
 
     fn kill_child(child: &Arc<Mutex<Child>>) {
         if let Ok(mut child) = child.lock() {
-            let _ = child.kill();
+            kill_tree(&mut child);
         }
     }
 
@@ -1441,7 +1524,9 @@ fn too_large_error(max: u64) -> io::Error {
 
 /// Spawn the probe for streaming: piped stdio, script delivered per `mode`
 /// (for `Stdin` the script is written and stdin closed, so the far side's sh
-/// starts executing), stderr draining bounded on a reader thread.
+/// starts executing), stderr draining bounded on a reader thread, and (Unix)
+/// the child leading its own process group so cancel/timeout can reap the
+/// whole pipeline.
 fn spawn_probe_argv(argv: &[OsString], mode: ScriptDelivery) -> io::Result<ProbeChild> {
     let Some((program, args)) = argv.split_first() else {
         return Err(io::Error::new(
@@ -1449,12 +1534,18 @@ fn spawn_probe_argv(argv: &[OsString], mode: ScriptDelivery) -> io::Result<Probe
             "empty probe argv",
         ));
     };
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn()?;
     let mut stdin = child.stdin.take();
     if mode == ScriptDelivery::Stdin {
         if let Some(mut pipe) = stdin.take() {
@@ -1979,7 +2070,9 @@ fn download_file_with(
     let streamed = stream_to(&mut stdout, &mut file, max, control, progress);
     drop(stdout);
     let status = wait_child(&probe_handle)?;
-    let stderr = join_reader(probe.stderr)?;
+    // Transfer stderr is bounded error detail only; truncation is expected
+    // and silently capped here, unlike the probe captures above.
+    let (stderr, _) = join_reader(probe.stderr)?;
     if control.is_timed_out() {
         return Err(transfer_timed_out_error());
     }
@@ -2043,7 +2136,7 @@ fn upload_file_with(
     // stream_to owns and drops stdin here, so the far side sees the payload
     // EOF before it finishes `put`.
     let status = wait_child(&probe_handle)?;
-    let stderr = join_reader(probe.stderr)?;
+    let (stderr, _) = join_reader(probe.stderr)?;
     let _ = join_reader(stdout_drain);
     if control.is_timed_out() {
         return Err(transfer_timed_out_error());
@@ -2085,14 +2178,22 @@ fn upload_dir_with(
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "directory has no name"))?;
     let parent = local_path.parent().unwrap_or_else(|| Path::new("/"));
-    let mut tar = Command::new("tar")
+    let mut tar_command = Command::new("tar");
+    tar_command
         .args(["cf", "-", "-C"])
         .arg(parent)
         .arg(name)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // The tar registers with the transfer control below; lead its own
+        // group so the watchdog's group kill can never miss it.
+        tar_command.process_group(0);
+    }
+    let mut tar = tar_command.spawn()?;
     let tar_stdout = tar
         .stdout
         .take()
@@ -2118,13 +2219,13 @@ fn upload_dir_with(
         // After an overflow the tar can still be blocked writing; make sure
         // it is gone before reaping.
         if let Ok(mut child) = tar.lock() {
-            let _ = child.kill();
+            kill_tree(&mut child);
         }
     }
     let tar_status = wait_child(&tar)?;
-    let tar_stderr = join_reader(tar_stderr)?;
+    let (tar_stderr, _) = join_reader(tar_stderr)?;
     let status = wait_child(&probe_handle)?;
-    let stderr = join_reader(probe.stderr)?;
+    let (stderr, _) = join_reader(probe.stderr)?;
     let _ = join_reader(stdout_drain);
     if control.is_timed_out() {
         return Err(transfer_timed_out_error());
@@ -2171,13 +2272,21 @@ fn download_dir_with(
     let stdout = probe
         .stdout
         .ok_or_else(|| io::Error::other("probe has no stdout"))?;
-    let mut tar = Command::new("tar")
+    let mut tar_command = Command::new("tar");
+    tar_command
         .args(["xf", "-", "-C"])
         .arg(dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // The tar registers with the transfer control below; lead its own
+        // group so the watchdog's group kill can never miss it.
+        tar_command.process_group(0);
+    }
+    let mut tar = tar_command.spawn()?;
     let tar_stdin = tar
         .stdin
         .take()
@@ -2193,13 +2302,13 @@ fn download_dir_with(
     let streamed = stream_to(stdout, tar_stdin, max, control, progress);
     if streamed.is_err() {
         if let Ok(mut child) = tar.lock() {
-            let _ = child.kill();
+            kill_tree(&mut child);
         }
     }
     let tar_status = wait_child(&tar)?;
-    let tar_stderr = join_reader(tar_stderr)?;
+    let (tar_stderr, _) = join_reader(tar_stderr)?;
     let status = wait_child(&probe_handle)?;
-    let stderr = join_reader(probe.stderr)?;
+    let (stderr, _) = join_reader(probe.stderr)?;
     if control.is_timed_out() {
         let _ = std::fs::remove_dir_all(&dst);
         return Err(transfer_timed_out_error());
@@ -3012,6 +3121,113 @@ mod tests {
             assert!(copy(&loc, &hosts, src, dst).is_err());
             assert!(rename(&loc, &hosts, src, src).is_err());
         }
+    }
+
+    #[test]
+    fn local_copy_into_self_through_a_symlink_alias_is_rejected() {
+        let tmp = TestDir::new("copy-self-alias");
+        let hosts: Vec<RemoteHost> = Vec::new();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("f.txt"), b"x").unwrap();
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        // Textually outside `real`, but the alias resolves back inside it.
+        let dst = alias.join("inner");
+        let err = copy(&FsLocation::Local, &hosts, &real, &dst).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(!real.join("inner").exists());
+        // A sibling destination outside the source still copies fine.
+        let sibling = tmp.path().join("sibling");
+        copy(&FsLocation::Local, &hosts, &real, &sibling).unwrap();
+        assert_eq!(std::fs::read(sibling.join("f.txt")).unwrap(), b"x");
+    }
+
+    #[test]
+    fn local_copy_descends_no_deeper_than_the_copy_depth_limit() {
+        let tmp = TestDir::new("copy-depth");
+        let src = tmp.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::create_dir(src.join("inner")).unwrap();
+        // At the limit the guard fires before the destination is created.
+        let err = copy_recursive(&src, &tmp.path().join("dst"), MAX_COPY_DEPTH).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(!tmp.path().join("dst").exists());
+        // One level below, the child directory is what trips the guard.
+        let err = copy_recursive(&src, &tmp.path().join("dst2"), MAX_COPY_DEPTH - 1).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn run_capture_rejects_output_beyond_the_cap_instead_of_truncating() {
+        // Exactly at the cap the capture succeeds.
+        let argv = vec![
+            OsString::from("sh"),
+            OsString::from("-c"),
+            OsString::from("printf '%01024d' 0"),
+        ];
+        let capture = run_capture(&argv, b"", Duration::from_secs(5), 1024)
+            .expect("an exactly-at-cap capture is fine");
+        assert_eq!(capture.stdout.len(), 1024);
+        // One byte past it is an error, not a silent short listing.
+        let argv = vec![
+            OsString::from("sh"),
+            OsString::from("-c"),
+            OsString::from("printf '%01025d' 0"),
+        ];
+        let err = run_capture(&argv, b"", Duration::from_secs(5), 1024)
+            .map(drop)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn run_capture_drains_past_the_cap_so_a_verbose_child_cannot_wedge() {
+        // 200 KB far exceeds a pipe buffer: without drain-to-sink the child
+        // would block on write until the watchdog fired.
+        let argv = vec![
+            OsString::from("head"),
+            OsString::from("-c"),
+            OsString::from("200000"),
+            OsString::from("/dev/zero"),
+        ];
+        let started = std::time::Instant::now();
+        let err = run_capture(&argv, b"", Duration::from_secs(10), 1024)
+            .map(drop)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "an undrained child would have hit the watchdog timeout"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_tree_reaps_the_whole_process_group() {
+        use std::os::unix::process::CommandExt;
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 30 & wait"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command.process_group(0);
+        let mut child = command.spawn().unwrap();
+        let pgid = child.id() as i32;
+        // Give the background sleep time to exec before the kill lands.
+        std::thread::sleep(Duration::from_millis(200));
+        kill_tree(&mut child);
+        let _ = child.wait();
+        for _ in 0..50 {
+            // SAFETY: signal 0 probes group existence without signaling it.
+            let group_alive = unsafe { nix::libc::kill(-pgid, 0) } == 0;
+            if !group_alive {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("process group {pgid} survived kill_tree");
     }
 
     #[test]

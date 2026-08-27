@@ -76,7 +76,9 @@ fn read_notebook_file(path: &Path) -> io::Result<String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC);
+        // O_NOFOLLOW refuses a symlinked notebook (ELOOP surfaces through the
+        // open error below); O_NONBLOCK keeps a planted FIFO from hanging.
+        options.custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW);
     }
     let file = options.open(path)?;
     let metadata = file.metadata()?;
@@ -1302,6 +1304,19 @@ mod tests {
             io::ErrorKind::InvalidInput
         );
         assert!(started.elapsed() < Duration::from_secs(1));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn notebook_symlink_is_rejected_but_the_real_file_reads() {
+        let dir = notebook_test_dir("nofollow");
+        let real = dir.join("real.md");
+        std::fs::write(&real, "# real\n").unwrap();
+        let link = dir.join("link.md");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(read_notebook_file(&link).is_err());
+        assert_eq!(read_notebook_file(&real).unwrap(), "# real\n");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -588,13 +588,25 @@ impl Component for BlockTerminal {
                 let _ = sender.output(VteOutput::Notice(message));
             }
             VteInput::SearchSet(query, use_regex) => {
-                self.search_query = Some((query.clone(), use_regex));
-                let pattern = super::vte::search_pattern(&query, use_regex);
-                self.search_status = match validate_block_search_pattern(&pattern) {
-                    Ok(_) => block_result_status(view.find_in_blocks(&query, use_regex), use_regex),
-                    Err(error) => {
-                        view.clear_find();
-                        SearchStatus::Error(error)
+                self.search_status = if let Some(status) =
+                    crate::search::oversize_query_status(&query)
+                {
+                    // Do not retain the oversized query: an invalidated Find
+                    // rebuilds from `search_query` and must not re-scan with it.
+                    self.search_query = None;
+                    view.clear_find();
+                    status
+                } else {
+                    self.search_query = Some((query.clone(), use_regex));
+                    let pattern = super::vte::search_pattern(&query, use_regex);
+                    match validate_block_search_pattern(&pattern) {
+                        Ok(_) => {
+                            block_result_status(view.find_in_blocks(&query, use_regex), use_regex)
+                        }
+                        Err(error) => {
+                            view.clear_find();
+                            SearchStatus::Error(error)
+                        }
                     }
                 };
                 let _ = sender.output(VteOutput::SearchStatus(self.search_status.clone()));

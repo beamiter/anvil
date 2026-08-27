@@ -732,27 +732,33 @@ impl Component for VteTerminal {
             | VteInput::ExportSessionMarkdown
             | VteInput::ExportSessionJson => {}
             VteInput::SearchSet(query, use_regex) => {
-                let pattern = search_pattern(&query, use_regex);
-                self.search_status = match vte4::Regex::for_search(
-                    &pattern,
-                    pcre2_sys::PCRE2_CASELESS | pcre2_sys::PCRE2_MULTILINE,
-                ) {
-                    Ok(regex) => {
-                        self.terminal.search_set_regex(Some(&regex), 0);
-                        self.terminal.search_set_wrap_around(true);
-                        let found = self.terminal.search_find_next();
-                        search_status_for_vte(
-                            compile_count_regex(&pattern).ok().as_ref(),
-                            terminal_search_snapshot(&self.terminal),
-                            found,
-                            !use_regex,
-                        )
-                    }
-                    Err(error) => {
+                self.search_status =
+                    if let Some(status) = crate::search::oversize_query_status(&query) {
                         self.terminal.search_set_regex(None::<&vte4::Regex>, 0);
-                        SearchStatus::Error(invalid_regex_message(error))
-                    }
-                };
+                        status
+                    } else {
+                        let pattern = search_pattern(&query, use_regex);
+                        match vte4::Regex::for_search(
+                            &pattern,
+                            pcre2_sys::PCRE2_CASELESS | pcre2_sys::PCRE2_MULTILINE,
+                        ) {
+                            Ok(regex) => {
+                                self.terminal.search_set_regex(Some(&regex), 0);
+                                self.terminal.search_set_wrap_around(true);
+                                let found = self.terminal.search_find_next();
+                                search_status_for_vte(
+                                    compile_count_regex(&pattern).ok().as_ref(),
+                                    terminal_search_snapshot(&self.terminal),
+                                    found,
+                                    !use_regex,
+                                )
+                            }
+                            Err(error) => {
+                                self.terminal.search_set_regex(None::<&vte4::Regex>, 0);
+                                SearchStatus::Error(invalid_regex_message(error))
+                            }
+                        }
+                    };
                 let _ = sender.output(VteOutput::SearchStatus(self.search_status.clone()));
             }
             VteInput::SearchNext => {
