@@ -15,7 +15,7 @@ captured, queued, written, and restored.
 - **Process-observed SSH Files follow (2026-08-27)**: the active pane's existing
   `/proc` foreground-command probe now uses `jterm_core`'s exact-pinned
   `process::observed_ssh_command` contract
-  (`063af5d33f66e449336e06319096c90463c33938`), never the generic restorable
+  (`1f5f0fbcfd91a084da9216392fe5ab26a5994adc`), never the generic restorable
   argv path or terminal/OSC text. The shared observer accepts direct SSH and
   the provenance-checked real `jsh-remote.sh` launcher while refusing remote
   commands, `-F`/provider loading, `ProxyCommand`, `LocalCommand`, and hidden
