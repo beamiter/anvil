@@ -547,6 +547,60 @@ fn filter_boundary_input(
     guard.filter(data, modes, policy).into_owned()
 }
 
+fn filter_and_admit_input(
+    guard: &mut pty_input::InputGuard,
+    writer: &FdWriter,
+    data: &[u8],
+    modes: pty_input::PasteModes,
+) -> Result<(), FdWriterSendError> {
+    filter_and_admit_input_with(guard, writer, data, modes, |_, _| ())
+}
+
+/// Filter one outgoing chunk and admit it to the writer queue as one step.
+/// The caller holds the guard lock for the whole operation, so two writers
+/// cannot interleave filter/send into out-of-order frames, and a rejected
+/// write rolls the guard back: queue admission is the commit point, and an
+/// opener/closer whose bytes never reached the shell must not alter how the
+/// next independent write is sanitized.
+fn filter_and_admit_input_with<T>(
+    guard: &mut pty_input::InputGuard,
+    writer: &FdWriter,
+    data: &[u8],
+    modes: pty_input::PasteModes,
+    observe: impl FnOnce(&[u8], bool) -> T,
+) -> Result<T, FdWriterSendError> {
+    // Core's `InputGuard` exposes its frame state but no setter, so a rollback
+    // reconstructs an equivalent guard from the one-bit state.
+    let before_in_frame = guard.in_frame();
+    let safe_data = filter_boundary_input(guard, data, modes, boundary_policy());
+    if safe_data.is_empty() {
+        // No bytes crossed the boundary, so no frame transition did either.
+        *guard = input_guard_with_frame(before_in_frame);
+        return Ok(observe(&[], before_in_frame));
+    }
+    let observed = observe(&safe_data, before_in_frame);
+    let result = writer.send(safe_data);
+    if result.is_err() {
+        *guard = input_guard_with_frame(before_in_frame);
+    }
+    result.map(|()| observed)
+}
+
+/// Rebuild an `InputGuard` with the given frame state. Filtering an opener
+/// through a fresh guard is the one public transition into `in_frame`.
+fn input_guard_with_frame(in_frame: bool) -> pty_input::InputGuard {
+    let mut guard = pty_input::InputGuard::new();
+    if in_frame {
+        let _ = guard.filter(
+            pty_input::PASTE_START,
+            pty_input::PasteModes { bracketed: true },
+            boundary_policy(),
+        );
+        debug_assert!(guard.in_frame());
+    }
+    guard
+}
+
 /// Kill and reap a freshly forked child that no [`ChildLifecycle`] could be
 /// built for.
 ///
@@ -920,22 +974,20 @@ impl OwnedPty {
             // The guard does not track DECSET 2004; the reader thread below does.
             bracketed: self.shell_bracketed_paste.load(Ordering::Relaxed),
         };
-        let filtered = match self.input_guard.lock() {
-            Ok(mut guard) => filter_boundary_input(&mut guard, data, modes, boundary_policy()),
+        // Hold the guard through queue admission so the filtered bytes and the
+        // frame state they produced commit as one step, in write order.
+        let mut guard = match self.input_guard.lock() {
+            Ok(guard) => guard,
             Err(poisoned) => {
                 // A poisoned guard means another thread panicked mid-filter. Its
                 // frame state is unknowable, so start a fresh guard rather than
                 // writing unfiltered bytes to a shell.
                 let mut guard = poisoned.into_inner();
                 *guard = pty_input::InputGuard::new();
-                filter_boundary_input(&mut guard, data, modes, boundary_policy())
+                guard
             }
         };
-
-        if filtered.is_empty() {
-            return Ok(());
-        }
-        self.input_tx.send(filtered)
+        filter_and_admit_input(&mut guard, &self.input_tx, data, modes)
     }
 
     pub fn write_bytes(&self, data: &[u8]) {
@@ -1909,6 +1961,132 @@ mod tests {
         );
         drop(reader);
         drop(tx);
+    }
+
+    /// An `FdWriter` without a worker thread, preset to the exact queue state a
+    /// test needs: admitted messages stay queued for inspection, and a preset
+    /// byte count or the closed flag makes admission failures deterministic.
+    fn queued_writer(closed: bool, queued_bytes: usize) -> FdWriter {
+        FdWriter {
+            shared: Arc::new(FdWriterShared {
+                queue: Mutex::new(FdWriterQueue {
+                    messages: VecDeque::new(),
+                    bytes: queued_bytes,
+                    closed,
+                }),
+                ready: Condvar::new(),
+                senders: AtomicUsize::new(1),
+            }),
+        }
+    }
+
+    fn take_queued(writer: &FdWriter) -> Vec<u8> {
+        let mut queue = writer
+            .shared
+            .queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let data = queue.messages.pop_front().unwrap_or_default();
+        queue.bytes = queue.bytes.saturating_sub(data.len());
+        data
+    }
+
+    #[test]
+    fn rejected_paste_frame_transition_rolls_back_before_the_next_write() {
+        let modes = pty_input::PasteModes { bracketed: false };
+        let mut guard = pty_input::InputGuard::new();
+
+        // A saturated writer rejects the opener; the frame transition must
+        // roll back with it.
+        let full = queued_writer(false, FD_WRITER_MAX_QUEUED_BYTES);
+        let error = filter_and_admit_input(&mut guard, &full, b"\x1b[200~", modes).unwrap_err();
+        assert_eq!(error.len(), b"\x1b[200~".len());
+        assert!(!guard.in_frame());
+
+        // The next independent write is sanitized as if the rejected opener
+        // never happened: unframed multiline input keeps its first line only.
+        let working = queued_writer(false, 0);
+        filter_and_admit_input(&mut guard, &working, b"one\ntwo", modes).unwrap();
+        assert_eq!(take_queued(&working), b"one");
+        assert!(!guard.in_frame());
+
+        // The same rollback applies when the writer is already closed.
+        let closed = queued_writer(true, 0);
+        filter_and_admit_input(&mut guard, &closed, b"\x1b[200~", modes).unwrap_err();
+        assert!(!guard.in_frame());
+    }
+
+    #[test]
+    fn observed_admission_matches_the_bytes_that_crossed_the_filter() {
+        let writer = queued_writer(false, 0);
+        let mut guard = pty_input::InputGuard::new();
+
+        let unframed = filter_and_admit_input_with(
+            &mut guard,
+            &writer,
+            b"one\rtwo",
+            pty_input::PasteModes { bracketed: false },
+            pty_input::admitted_input,
+        )
+        .unwrap();
+        assert_eq!(take_queued(&writer), b"one");
+        assert_eq!(unframed.editor_bytes, b"one");
+        assert!(!unframed.submits_line);
+
+        let bracketed = filter_and_admit_input_with(
+            &mut guard,
+            &writer,
+            b"one\ntwo",
+            pty_input::PasteModes { bracketed: true },
+            pty_input::admitted_input,
+        )
+        .unwrap();
+        assert_eq!(take_queued(&writer), b"\x1b[200~one\ntwo\x1b[201~");
+        assert_eq!(bracketed.editor_bytes, b"one\ntwo");
+        assert!(bracketed.had_framing);
+        assert!(!bracketed.submits_line);
+
+        let opener = filter_and_admit_input_with(
+            &mut guard,
+            &writer,
+            b"\x1b[200~",
+            pty_input::PasteModes { bracketed: true },
+            pty_input::admitted_input,
+        )
+        .unwrap();
+        assert_eq!(take_queued(&writer), b"\x1b[200~");
+        assert!(opener.editor_bytes.is_empty());
+        let framed_body = filter_and_admit_input_with(
+            &mut guard,
+            &writer,
+            b"three\nfour",
+            pty_input::PasteModes { bracketed: true },
+            pty_input::admitted_input,
+        )
+        .unwrap();
+        assert_eq!(take_queued(&writer), b"three\nfour");
+        assert_eq!(framed_body.editor_bytes, b"three\nfour");
+        assert!(framed_body.had_framing);
+        assert!(!framed_body.submits_line);
+        filter_and_admit_input(
+            &mut guard,
+            &writer,
+            b"\x1b[201~",
+            pty_input::PasteModes { bracketed: true },
+        )
+        .unwrap();
+        assert_eq!(take_queued(&writer), b"\x1b[201~");
+
+        let filtered_empty = filter_and_admit_input_with(
+            &mut guard,
+            &writer,
+            b"\x1b[201~",
+            pty_input::PasteModes { bracketed: false },
+            pty_input::admitted_input,
+        )
+        .unwrap();
+        assert_eq!(filtered_empty, pty_input::AdmittedInput::default());
+        assert!(take_queued(&writer).is_empty());
     }
 
     /// The four tests below replace the `sanitize_input_chunk` suite: the encoder

@@ -1902,10 +1902,23 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         remote_hosts: fc.remote_hosts,
     };
 
-    let mut keybinding_map = KeybindingMap::from_defaults();
-    if let Some(ref kb_table) = fc.keybindings {
-        keybinding_map.apply_user_overrides(kb_table);
-    }
+    let keybinding_map =
+        fc.keybindings
+            .as_ref()
+            .map_or_else(KeybindingMap::from_defaults, |table| {
+                match KeybindingMap::from_user_overrides(table) {
+                    Ok(map) => map,
+                    Err(issues) => {
+                        // The apply is atomic, so an invalid table contributes
+                        // nothing: fall back to one coherent default map rather
+                        // than partially applying the user's overrides.
+                        for issue in issues {
+                            log::warn!("Ignoring keybindings.{}: {}", issue.key, issue.message);
+                        }
+                        KeybindingMap::from_defaults()
+                    }
+                }
+            });
 
     (config, themes, keybinding_map)
 }

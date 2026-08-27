@@ -186,7 +186,7 @@ struct WorkerShared {
 /// A byte-budget charge whose lifetime can extend beyond the worker closure
 /// which created a retained result. Dropping the last owner releases the
 /// charge; acquisition is non-blocking so the single worker can always
-/// discard a result instead of waiting behind its own pending jobs.
+/// shrink or discard a result instead of waiting behind its own pending jobs.
 pub(crate) struct EstimatedBytesReservation {
     shared: Arc<WorkerShared>,
     estimated_bytes: usize,
@@ -195,6 +195,22 @@ pub(crate) struct EstimatedBytesReservation {
 impl EstimatedBytesReservation {
     pub(crate) const fn estimated_bytes(&self) -> usize {
         self.estimated_bytes
+    }
+
+    pub(crate) fn shrink_to(&mut self, estimated_bytes: usize) {
+        assert!(
+            estimated_bytes <= self.estimated_bytes,
+            "retained-result reservations can only shrink"
+        );
+        let released = self.estimated_bytes - estimated_bytes;
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.release_estimated_bytes(released);
+        self.estimated_bytes = estimated_bytes;
+        self.shared.changed.notify_all();
     }
 }
 
@@ -407,6 +423,27 @@ impl PersistenceWorker {
             shared: Arc::clone(&self.shared),
             estimated_bytes,
         })
+    }
+
+    fn reserve_estimated_bytes_up_to(&self, max_bytes: usize) -> EstimatedBytesReservation {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let available = self
+            .shared
+            .estimated_byte_capacity
+            .saturating_sub(state.retained_estimated_bytes);
+        let estimated_bytes = max_bytes.min(available);
+        state.retained_estimated_bytes = state
+            .retained_estimated_bytes
+            .checked_add(estimated_bytes)
+            .expect("reservation is capped by available persistence bytes");
+        EstimatedBytesReservation {
+            shared: Arc::clone(&self.shared),
+            estimated_bytes,
+        }
     }
 
     fn drain_failures(&self) -> Vec<PersistenceFailure> {
@@ -629,6 +666,11 @@ impl PersistenceWorkers {
         self.ordinary.try_reserve_estimated_bytes(estimated_bytes)
     }
 
+    fn reserve_estimated_bytes_up_to(&self, max_bytes: usize) -> EstimatedBytesReservation {
+        // Same lane choice as `try_reserve_estimated_bytes`.
+        self.ordinary.reserve_estimated_bytes_up_to(max_bytes)
+    }
+
     fn drain_failures(&self) -> Vec<PersistenceFailure> {
         let mut failures = self.session.drain_failures();
         failures.extend(self.ordinary.drain_failures());
@@ -690,6 +732,16 @@ pub(crate) fn try_reserve_estimated_bytes(
     estimated_bytes: usize,
 ) -> io::Result<EstimatedBytesReservation> {
     global_workers()?.try_reserve_estimated_bytes(estimated_bytes)
+}
+
+/// Reserve as much of `max_bytes` as is currently available without waiting.
+/// The returned permit may be zero-sized; callers use its exact amount as the
+/// retained-result budget and revoke deletion authority if pressure forced a
+/// smaller result than the product-level cap.
+pub(crate) fn reserve_estimated_bytes_up_to(
+    max_bytes: usize,
+) -> io::Result<EstimatedBytesReservation> {
+    Ok(global_workers()?.reserve_estimated_bytes_up_to(max_bytes))
 }
 
 /// Queue the sole coalescing workspace snapshot target on a lane that cannot
@@ -984,6 +1036,60 @@ mod tests {
         drop(second);
         assert_eq!(retained_estimated_bytes(&worker), 0);
         worker.shutdown(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn partial_result_reservation_takes_available_bytes_and_shrinks_to_actual() {
+        let worker = PersistenceWorker::new_with_limits(4, 10).unwrap();
+        let blocker = worker.try_reserve_estimated_bytes(7).unwrap();
+        let mut partial = worker.reserve_estimated_bytes_up_to(10);
+        assert_eq!(partial.estimated_bytes(), 3);
+        assert_eq!(retained_estimated_bytes(&worker), 10);
+
+        partial.shrink_to(1);
+        assert_eq!(partial.estimated_bytes(), 1);
+        assert_eq!(retained_estimated_bytes(&worker), 8);
+        drop(partial);
+        drop(blocker);
+        assert_eq!(retained_estimated_bytes(&worker), 0);
+        worker.shutdown(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn four_retained_history_results_leave_room_for_one_decoder() {
+        let worker = PersistenceWorker::new_with_limits(16, MAX_PENDING_ESTIMATED_BYTES).unwrap();
+        let default_result_bytes = 100 * 1024 * 1024;
+        let decoder_bytes = 64 * 1024 * 1024;
+        let results: Vec<_> = (0..4)
+            .map(|_| {
+                let transient = worker.try_reserve_estimated_bytes(decoder_bytes).unwrap();
+                let mut result = worker.reserve_estimated_bytes_up_to(128 * 1024 * 1024);
+                assert_eq!(result.estimated_bytes(), 128 * 1024 * 1024);
+                result.shrink_to(default_result_bytes);
+                drop(transient);
+                result
+            })
+            .collect();
+        let decoder = worker.try_reserve_estimated_bytes(decoder_bytes).unwrap();
+        assert_eq!(retained_estimated_bytes(&worker), 464 * 1024 * 1024);
+
+        // Pending load closures retain paths and completion handles only, so
+        // multiple panes must remain target-count admitted without each being
+        // precharged for a worst-case result.
+        for pane in 0..8 {
+            worker
+                .enqueue(
+                    PersistenceKey::named(&format!("pane-{pane}")),
+                    "load history".into(),
+                    Box::new(|| Ok(())),
+                )
+                .unwrap();
+        }
+
+        drop(decoder);
+        drop(results);
+        worker.shutdown(Duration::from_secs(1)).unwrap();
+        assert_eq!(retained_estimated_bytes(&worker), 0);
     }
 
     #[test]

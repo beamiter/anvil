@@ -5,6 +5,7 @@
 
 use super::zone_history;
 use super::{mutate_block_data_and_redraw, BlockData, TermView};
+use crate::persistence;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
@@ -26,6 +27,11 @@ const MAX_HISTORY_FRAMES: usize = 100_000;
 const MAX_HISTORY_DECODE_DURATION: Duration = Duration::from_secs(5);
 const HISTORY_LOCK_TIMEOUT: Duration = Duration::from_millis(500);
 const HISTORY_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(5);
+/// One decode can briefly own the 16 MiB encoded frame, a 16 MiB decompressed
+/// archive, and the newly deserialized owned strings before either input Vec is
+/// released. Reserve another 16 MiB for zstd/allocator scratch; the retained
+/// result permit may legitimately be zero and cannot cover this peak.
+const HISTORY_LOAD_TRANSIENT_ESTIMATED_BYTES: usize = 64 * 1024 * 1024;
 const CLEAR_TOMBSTONE_MAGIC: &[u8] = b"ANVIL-BLOCK-HISTORY-CLEAR-V1\0";
 const CLEAR_TOMBSTONE_FRAME_BYTES: usize = 4 + CLEAR_TOMBSTONE_MAGIC.len() + 16;
 
@@ -627,6 +633,10 @@ struct LoadedRecords {
     revision: HistoryRevision,
     fully_decoded: bool,
     fully_retained: bool,
+    /// Estimated bytes held by `blocks`, matching the loader's retained-byte
+    /// accounting. The restore path charges exactly this against the
+    /// persistence byte budget.
+    retained_estimated_bytes: usize,
     /// Every successfully decoded id in the bounded scan, including records
     /// omitted from the resident tail. Returned to the UI loader without any
     /// process-global side effect; strict save rereads simply discard it.
@@ -723,6 +733,33 @@ fn read_history_records_with_retained_budget(
     )
 }
 
+/// Reserve decoder working memory first, then take only the currently
+/// available result budget. No permit waits: a queued weighted save may own
+/// the missing capacity and is itself waiting for this single worker. The
+/// returned reservation holds the exact retained charge; keep it alive until
+/// the decoded blocks are installed.
+fn read_history_records_reserved(
+    path: &Path,
+    prefer_compressed: bool,
+    load_limit: usize,
+) -> io::Result<(LoadedRecords, persistence::EstimatedBytesReservation)> {
+    let _transient =
+        persistence::try_reserve_estimated_bytes(HISTORY_LOAD_TRANSIENT_ESTIMATED_BYTES)?;
+    let mut reservation =
+        persistence::reserve_estimated_bytes_up_to(super::MAX_COMPLETED_BLOCK_RETAINED_BYTES)?;
+    let retained_budget = reservation.estimated_bytes();
+    let loaded = read_history_records_with_retained_budget(
+        path,
+        prefer_compressed,
+        load_limit,
+        UndecodablePolicy::Skip,
+        Some(retained_budget),
+    )?;
+    debug_assert!(loaded.retained_estimated_bytes <= retained_budget);
+    reservation.shrink_to(loaded.retained_estimated_bytes);
+    Ok((loaded, reservation))
+}
+
 fn read_history_records_with_options(
     path: &Path,
     prefer_compressed: bool,
@@ -738,6 +775,7 @@ fn read_history_records_with_options(
             revision: HistoryRevision::Missing,
             fully_decoded: true,
             fully_retained: true,
+            retained_estimated_bytes: 0,
             seen_ids: collect_seen_ids.then(HashSet::new),
             clear_tombstone: None,
         });
@@ -907,6 +945,7 @@ fn read_history_records_with_options(
         revision,
         fully_decoded: undecodable == 0,
         fully_retained: !retained_records_dropped,
+        retained_estimated_bytes,
         seen_ids,
         clear_tombstone,
     })
@@ -1405,22 +1444,23 @@ impl TermView {
             return Ok(());
         };
 
-        let loaded = read_history_records_with_retained_budget(
-            &target.path,
-            target.compress,
-            load_limit,
-            UndecodablePolicy::Skip,
-            Some(super::MAX_COMPLETED_BLOCK_RETAINED_BYTES),
-        )?;
+        // The reservation is held until the restored blocks are installed
+        // below: the restore charges the persistence byte budget for exactly
+        // the bytes it retains, and a pressured budget narrows this load
+        // instead of starving a queued save.
+        let (loaded, _reservation) =
+            read_history_records_reserved(&target.path, target.compress, load_limit)?;
         let LoadedRecords {
             blocks: recent_blocks,
             total_loaded,
             revision,
             fully_decoded,
             fully_retained,
+            retained_estimated_bytes,
             seen_ids,
             clear_tombstone,
         } = loaded;
+        debug_assert_eq!(_reservation.estimated_bytes(), retained_estimated_bytes);
         let seen_ids = seen_ids.unwrap_or_default();
         let max_seen_id = seen_ids.iter().copied().max();
         replace_reserved_history_ids(&self.reserved_history_block_ids, seen_ids);
@@ -1474,7 +1514,8 @@ mod tests {
         decode_clear_tombstone, decode_record, encode_clear_tombstone,
         encode_history_frames_bounded, enqueue_pending_clear, execute_history_saves,
         expand_home_prefix_with, lock_file_name, plan_history_saves, push_bounded_back,
-        read_history_records, read_history_records_with_retained_budget, replace_history_baseline,
+        read_history_records, read_history_records_reserved,
+        read_history_records_with_retained_budget, replace_history_baseline,
         replace_reserved_history_ids, save_history_snapshot, save_history_snapshot_with_intent,
         validate_history_progress, HistoryFileLock, HistoryRevision, HistoryTarget, SaveIntent,
         UndecodablePolicy, CLEAR_TOMBSTONE_FRAME_BYTES, MAX_HISTORY_DECODE_DURATION,
@@ -1629,6 +1670,26 @@ mod tests {
             tiny.blocks.iter().map(|block| block.id).collect::<Vec<_>>(),
             [3]
         );
+    }
+
+    #[test]
+    fn reserved_load_charges_exact_retained_bytes_against_the_budget() {
+        let dir = TestDir::new("reserved-load-charge");
+        let history = dir.path().join("history.bin");
+        let blocks = vec![sample_block(1, "first"), sample_block(2, "second")];
+        save_history_snapshot(&history, &blocks, false, Some(HistoryRevision::Missing)).unwrap();
+        let expected: usize = blocks
+            .iter()
+            .map(|block| block.estimated_restored_retained_bytes())
+            .sum();
+
+        let (loaded, reservation) = read_history_records_reserved(&history, false, 100).unwrap();
+
+        assert_eq!(loaded.blocks.len(), blocks.len());
+        assert!(loaded.fully_retained);
+        assert_eq!(loaded.retained_estimated_bytes, expected);
+        assert_eq!(reservation.estimated_bytes(), expected);
+        assert!(expected <= super::super::MAX_COMPLETED_BLOCK_RETAINED_BYTES);
     }
 
     #[test]
