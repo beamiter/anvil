@@ -6,6 +6,17 @@ use relm4::prelude::*;
 
 const PARENT_DIRECTORY_LABEL: &str = "Go to parent directory";
 const CURRENT_DIRECTORY_LABEL: &str = "Go to current terminal directory";
+const OPEN_TERMINAL_LABEL: &str = "Open terminal for current file-tree location";
+const LOCAL_TERMINAL_TOOLTIP: &str = "Open a local terminal in this tree directory";
+const REMOTE_TERMINAL_TOOLTIP: &str = "Connect to this remote profile; the remote shell chooses its start directory, which may differ from this tree path";
+
+fn terminal_button_tooltip(selected_location: usize) -> &'static str {
+    if selected_location == 0 {
+        LOCAL_TERMINAL_TOOLTIP
+    } else {
+        REMOTE_TERMINAL_TOOLTIP
+    }
+}
 
 #[derive(Debug)]
 pub(crate) enum TabFilterMsg {
@@ -81,6 +92,7 @@ pub(crate) enum FileHeaderMsg {
 pub(crate) enum FileHeaderOutput {
     Up,
     CurrentDirectory,
+    OpenTerminal,
     /// Dropdown index: 0 is Local, i > 0 is `config.remote_hosts[i - 1]`.
     SelectLocation(usize),
     /// Current filter query; "" when the filter is closed or cleared.
@@ -148,6 +160,20 @@ impl Component for FileHeaderModel {
                     set_xalign: 0.0,
                     set_hexpand: true,
                     set_ellipsize: gtk::pango::EllipsizeMode::Start,
+                },
+
+                #[name(terminal_button)]
+                gtk::Button {
+                    set_widget_name: "file-tree-open-terminal",
+                    set_icon_name: "utilities-terminal-symbolic",
+                    set_focusable: true,
+                    set_tooltip_text: Some(LOCAL_TERMINAL_TOOLTIP),
+                    update_property: &[
+                        gtk::accessible::Property::Label(OPEN_TERMINAL_LABEL),
+                    ],
+                    connect_clicked[sender] => move |_| {
+                        let _ = sender.output(FileHeaderOutput::OpenTerminal);
+                    },
                 },
 
                 #[name(filter_button)]
@@ -228,11 +254,17 @@ impl Component for FileHeaderModel {
                     .set_model(Some(&gtk::StringList::new(&refs)));
                 widgets.location_dropdown.set_selected(selected as u32);
                 self.selected = selected;
+                widgets
+                    .terminal_button
+                    .set_tooltip_text(Some(terminal_button_tooltip(selected)));
                 self.suppress_location_signal = false;
             }
             FileHeaderMsg::LocationActivated(index) => {
                 if !self.suppress_location_signal && index != self.selected {
                     self.selected = index;
+                    widgets
+                        .terminal_button
+                        .set_tooltip_text(Some(terminal_button_tooltip(index)));
                     let _ = sender.output(FileHeaderOutput::SelectLocation(index));
                 }
             }
@@ -263,10 +295,67 @@ impl Component for FileHeaderModel {
 mod tests {
     use super::*;
 
+    fn descendant_named(root: &gtk::Widget, name: &str) -> Option<gtk::Widget> {
+        let mut child = root.first_child();
+        while let Some(widget) = child {
+            if widget.widget_name() == name {
+                return Some(widget);
+            }
+            if let Some(found) = descendant_named(&widget, name) {
+                return Some(found);
+            }
+            child = widget.next_sibling();
+        }
+        None
+    }
+
     #[test]
     fn file_header_icon_buttons_have_distinct_accessible_labels() {
         assert!(!PARENT_DIRECTORY_LABEL.is_empty());
         assert!(!CURRENT_DIRECTORY_LABEL.is_empty());
+        assert!(!OPEN_TERMINAL_LABEL.is_empty());
         assert_ne!(PARENT_DIRECTORY_LABEL, CURRENT_DIRECTORY_LABEL);
+        assert_ne!(PARENT_DIRECTORY_LABEL, OPEN_TERMINAL_LABEL);
+        assert_ne!(CURRENT_DIRECTORY_LABEL, OPEN_TERMINAL_LABEL);
+    }
+
+    #[test]
+    fn terminal_tooltip_is_honest_about_local_and_remote_cwd_semantics() {
+        assert!(terminal_button_tooltip(0).contains("this tree directory"));
+        assert!(terminal_button_tooltip(1).contains("may differ from this tree path"));
+        assert_eq!(terminal_button_tooltip(128), REMOTE_TERMINAL_TOOLTIP);
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn file_header_terminal_button_is_focusable_and_updates_remote_semantics() {
+        gtk::init().expect("GTK display");
+        let header = FileHeaderModel::builder()
+            .launch(vec!["Local".to_string(), "ssh: staging".to_string()]);
+        let root = header.widget().clone().upcast::<gtk::Widget>();
+        let terminal = descendant_named(&root, "file-tree-open-terminal")
+            .expect("terminal button in file header")
+            .downcast::<gtk::Button>()
+            .expect("named widget is a button");
+
+        assert!(terminal.is_focusable());
+        assert_eq!(
+            terminal.icon_name().as_deref(),
+            Some("utilities-terminal-symbolic")
+        );
+        assert_eq!(
+            terminal.tooltip_text().as_deref(),
+            Some(LOCAL_TERMINAL_TOOLTIP)
+        );
+
+        header.emit(FileHeaderMsg::SetLocations {
+            labels: vec!["Local".to_string(), "ssh: staging".to_string()],
+            selected: 1,
+        });
+        while gtk::glib::MainContext::default().iteration(false) {}
+        assert_eq!(
+            terminal.tooltip_text().as_deref(),
+            Some(REMOTE_TERMINAL_TOOLTIP)
+        );
     }
 }

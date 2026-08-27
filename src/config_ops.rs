@@ -18,7 +18,7 @@ impl AppModel {
         }
     }
 
-    pub(crate) fn reload_config(&mut self, _sender: &ComponentSender<AppModel>) {
+    pub(crate) fn reload_config(&mut self, sender: &ComponentSender<AppModel>) {
         if self.safe_mode {
             self.show_toast("Configuration reload is disabled in safe mode.");
             return;
@@ -67,9 +67,11 @@ impl AppModel {
         let sidebar_view = new_config.sidebar_view;
         let sidebar_visible = new_config.sidebar_visible;
         let sidebar_width = new_config.sidebar_width.clamp(120, 800) as i32;
+        let old_remote_hosts = self.config.borrow().remote_hosts.clone();
         *self.config.borrow_mut() = new_config.clone();
         *self.config_revision.borrow_mut() = Some(revision);
         self.shell_argv = new_shell_argv;
+        self.reconcile_file_tree_remote_hosts(&old_remote_hosts, sender);
         self.sync_terminal_configs();
         if !new_config.ai_enabled {
             self.close_command_suggestion();

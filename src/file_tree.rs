@@ -213,6 +213,121 @@ pub(crate) fn is_notebook_path(path: &Path) -> bool {
     path.as_os_str().as_bytes().ends_with(b".jtnb.md")
 }
 
+/// The launch authority behind the file-tree header's terminal button.
+/// Local trees carry their exact root as the new pane cwd; remote trees carry
+/// only a freshly validated managed profile. A remote tree path is
+/// intentionally absent because ssh/docker startup decides its own directory.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum FileTreeTerminalTarget {
+    Local(String),
+    Remote(crate::config::RemoteHost),
+}
+
+pub(crate) fn terminal_target(
+    location: &crate::remote_fs::FsLocation,
+    root: &Path,
+    hosts: &[crate::config::RemoteHost],
+) -> Result<FileTreeTerminalTarget, &'static str> {
+    match location {
+        crate::remote_fs::FsLocation::Local => {
+            if !root.is_absolute() {
+                return Err("The current file-tree directory is unavailable.");
+            }
+            let cwd = root.to_str().ok_or(
+                "The current file-tree directory contains non-UTF-8 bytes and cannot be used as a terminal cwd.",
+            )?;
+            Ok(FileTreeTerminalTarget::Local(cwd.to_string()))
+        }
+        crate::remote_fs::FsLocation::Remote(index) => {
+            crate::config::checked_remote_host(hosts, *index)
+                .cloned()
+                .map(FileTreeTerminalTarget::Remote)
+        }
+    }
+}
+
+/// Authority captured when a user opens a delayed file-operation dialog.
+/// Paths alone are not enough: after the dialog appears, the tree can move to
+/// another filesystem or an index-backed remote profile can be edited in
+/// place. Confirming such a stale dialog must never reinterpret its old path
+/// against the new backend.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct FileTreeIntent {
+    generation: u64,
+    location: crate::remote_fs::FsLocation,
+    remote_profile: Option<crate::config::RemoteHost>,
+}
+
+pub(crate) fn capture_file_tree_intent(
+    generation: u64,
+    location: &crate::remote_fs::FsLocation,
+    hosts: &[crate::config::RemoteHost],
+) -> FileTreeIntent {
+    let remote_profile = match location {
+        crate::remote_fs::FsLocation::Local => None,
+        crate::remote_fs::FsLocation::Remote(index) => {
+            crate::config::checked_remote_host(hosts, *index)
+                .ok()
+                .cloned()
+        }
+    };
+    FileTreeIntent {
+        generation,
+        location: location.clone(),
+        remote_profile,
+    }
+}
+
+/// Revalidate every part of a delayed operation's launch authority. An
+/// invalid remote slot deliberately cannot match itself: both its original
+/// and current profile would otherwise be `None` and accidentally pass.
+pub(crate) fn file_tree_intent_is_current(
+    intent: &FileTreeIntent,
+    generation: u64,
+    location: &crate::remote_fs::FsLocation,
+    hosts: &[crate::config::RemoteHost],
+) -> bool {
+    if intent.generation != generation || intent.location != *location {
+        return false;
+    }
+    match (&intent.location, &intent.remote_profile) {
+        (crate::remote_fs::FsLocation::Local, None) => true,
+        (crate::remote_fs::FsLocation::Remote(index), Some(expected)) => {
+            crate::config::checked_remote_host(hosts, *index)
+                .is_ok_and(|current| current == expected)
+        }
+        _ => false,
+    }
+}
+
+/// Revalidate a background callback's tree authority and, for transfers, its
+/// monotonic UI identity. Filesystem/clipboard settlement is intentionally
+/// independent of this predicate; only progress, toasts, and refreshes are
+/// allowed to publish when it returns true.
+pub(crate) fn file_tree_async_ui_is_current(
+    intent: &FileTreeIntent,
+    generation: u64,
+    location: &crate::remote_fs::FsLocation,
+    hosts: &[crate::config::RemoteHost],
+    expected_transfer: Option<u64>,
+    current_transfer: u64,
+) -> bool {
+    file_tree_intent_is_current(intent, generation, location, hosts)
+        && expected_transfer.is_none_or(|expected| expected == current_transfer)
+}
+
+/// Following a managed pane must rebuild on a backend change even when both
+/// hosts report the same textual cwd. Paths are meaningful only together with
+/// their filesystem location; retaining the old rows would relabel B as A.
+pub(crate) fn file_tree_follow_requires_reroot(
+    current_location: &crate::remote_fs::FsLocation,
+    target_location: &crate::remote_fs::FsLocation,
+    current_root: &Path,
+    target_root: &Path,
+) -> bool {
+    current_location != target_location || current_root != target_root
+}
+
 /// Scan `dir` on a worker thread under the shared permit, then hand the
 /// result to `apply` on the GTK thread via the glib poll. `loc` + `hosts`
 /// snapshot the backend at request time; `remote_fs::list_dir` does the work.
@@ -906,6 +1021,22 @@ mod tests {
     use super::*;
     use std::os::unix::ffi::OsStringExt;
 
+    fn remote_host() -> crate::config::RemoteHost {
+        crate::config::RemoteHost {
+            name: "staging".to_string(),
+            host: "server.example.com".to_string(),
+            user: Some("deploy".to_string()),
+            docker: false,
+            deploy_artifact: None,
+            remote_shell: "jsh".to_string(),
+            session: None,
+            ssh_args: vec!["-p".to_string(), "2222".to_string()],
+            login_shell: true,
+            multiplex: true,
+            deploy: jterm_core::jsh_remote::Deploy::Persist,
+        }
+    }
+
     #[test]
     fn entries_sort_directories_first_then_by_name() {
         let mut entries = vec![
@@ -935,6 +1066,254 @@ mod tests {
 
         let names: Vec<_> = entries.iter().map(|entry| entry.name.as_str()).collect();
         assert_eq!(names, ["Able", "beta", "Alpha.txt", "Zulu.txt"]);
+    }
+
+    #[test]
+    fn terminal_target_keeps_local_cwd_but_remote_launches_only_the_profile() {
+        assert_eq!(
+            terminal_target(
+                &crate::remote_fs::FsLocation::Local,
+                Path::new("/work/tree"),
+                &[]
+            ),
+            Ok(FileTreeTerminalTarget::Local("/work/tree".to_string()))
+        );
+
+        let host = remote_host();
+        assert_eq!(
+            terminal_target(
+                &crate::remote_fs::FsLocation::Remote(0),
+                Path::new("/remote/browsed/path"),
+                std::slice::from_ref(&host)
+            ),
+            Ok(FileTreeTerminalTarget::Remote(host))
+        );
+    }
+
+    #[test]
+    fn terminal_target_rejects_unusable_local_roots_and_stale_remote_slots() {
+        assert!(terminal_target(
+            &crate::remote_fs::FsLocation::Local,
+            Path::new("relative"),
+            &[]
+        )
+        .is_err());
+        let non_utf8 = PathBuf::from(OsString::from_vec(b"/work/\xff".to_vec()));
+        assert!(terminal_target(&crate::remote_fs::FsLocation::Local, &non_utf8, &[]).is_err());
+        assert!(terminal_target(
+            &crate::remote_fs::FsLocation::Remote(1),
+            Path::new("/ignored"),
+            &[remote_host()]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn delayed_file_tree_intent_requires_the_same_generation_and_location() {
+        let intent = capture_file_tree_intent(41, &crate::remote_fs::FsLocation::Local, &[]);
+        assert!(file_tree_intent_is_current(
+            &intent,
+            41,
+            &crate::remote_fs::FsLocation::Local,
+            &[]
+        ));
+        assert!(!file_tree_intent_is_current(
+            &intent,
+            42,
+            &crate::remote_fs::FsLocation::Local,
+            &[]
+        ));
+        assert!(!file_tree_intent_is_current(
+            &intent,
+            41,
+            &crate::remote_fs::FsLocation::Remote(0),
+            &[remote_host()]
+        ));
+    }
+
+    #[test]
+    fn delayed_remote_intent_requires_the_complete_original_profile() {
+        let host = remote_host();
+        let intent = capture_file_tree_intent(
+            7,
+            &crate::remote_fs::FsLocation::Remote(0),
+            std::slice::from_ref(&host),
+        );
+        assert!(file_tree_intent_is_current(
+            &intent,
+            7,
+            &crate::remote_fs::FsLocation::Remote(0),
+            std::slice::from_ref(&host)
+        ));
+
+        let mut edited = host.clone();
+        edited.host = "replacement.example.com".to_string();
+        assert!(!file_tree_intent_is_current(
+            &intent,
+            7,
+            &crate::remote_fs::FsLocation::Remote(0),
+            &[edited]
+        ));
+        assert!(!file_tree_intent_is_current(
+            &intent,
+            7,
+            &crate::remote_fs::FsLocation::Local,
+            &[host]
+        ));
+    }
+
+    #[test]
+    fn remote_home_probe_cannot_cross_generation_or_reused_numeric_slot() {
+        let host_a = remote_host();
+        let intent = capture_file_tree_intent(
+            17,
+            &crate::remote_fs::FsLocation::Remote(0),
+            std::slice::from_ref(&host_a),
+        );
+
+        // A -> Local -> B -> slot 0 can end at the same numeric FsLocation,
+        // but both the intervening tree generation and profile identity are
+        // part of the frozen probe authority.
+        let mut host_b = host_a.clone();
+        host_b.host = "replacement.example.com".to_string();
+        assert!(!file_tree_intent_is_current(
+            &intent,
+            19,
+            &crate::remote_fs::FsLocation::Remote(0),
+            std::slice::from_ref(&host_b),
+        ));
+        assert!(!file_tree_intent_is_current(
+            &intent,
+            17,
+            &crate::remote_fs::FsLocation::Remote(0),
+            &[host_b],
+        ));
+    }
+
+    #[test]
+    fn delayed_header_terminal_and_drop_require_the_open_time_tree_authority() {
+        let local = capture_file_tree_intent(23, &crate::remote_fs::FsLocation::Local, &[]);
+        assert!(!file_tree_intent_is_current(
+            &local,
+            24,
+            &crate::remote_fs::FsLocation::Local,
+            &[],
+        ));
+
+        let host_a = remote_host();
+        let mut host_b = host_a.clone();
+        host_b.name = "production".to_string();
+        host_b.host = "production.example.com".to_string();
+        let remote = capture_file_tree_intent(
+            30,
+            &crate::remote_fs::FsLocation::Remote(0),
+            std::slice::from_ref(&host_a),
+        );
+        assert!(!file_tree_intent_is_current(
+            &remote,
+            30,
+            &crate::remote_fs::FsLocation::Remote(0),
+            std::slice::from_ref(&host_b),
+        ));
+        assert!(!file_tree_intent_is_current(
+            &remote,
+            31,
+            &crate::remote_fs::FsLocation::Remote(1),
+            &[host_b, host_a],
+        ));
+    }
+
+    #[test]
+    fn invalid_remote_slot_never_authorizes_a_delayed_operation() {
+        let intent = capture_file_tree_intent(
+            9,
+            &crate::remote_fs::FsLocation::Remote(1),
+            &[remote_host()],
+        );
+        assert!(!file_tree_intent_is_current(
+            &intent,
+            9,
+            &crate::remote_fs::FsLocation::Remote(1),
+            &[remote_host()]
+        ));
+    }
+
+    #[test]
+    fn async_ui_publication_requires_tree_authority_and_latest_transfer_identity() {
+        let host_a = remote_host();
+        let intent = capture_file_tree_intent(
+            12,
+            &crate::remote_fs::FsLocation::Remote(0),
+            std::slice::from_ref(&host_a),
+        );
+
+        assert!(file_tree_async_ui_is_current(
+            &intent,
+            12,
+            &crate::remote_fs::FsLocation::Remote(0),
+            std::slice::from_ref(&host_a),
+            Some(8),
+            8,
+        ));
+
+        // A -> B suppresses late progress, success, and error publication.
+        let mut host_b = host_a.clone();
+        host_b.host = "replacement.example.com".to_string();
+        for (event, transfer) in [
+            ("operation success/error", None),
+            ("transfer progress/success/error", Some(8)),
+        ] {
+            assert!(
+                !file_tree_async_ui_is_current(
+                    &intent,
+                    12,
+                    &crate::remote_fs::FsLocation::Remote(0),
+                    std::slice::from_ref(&host_b),
+                    transfer,
+                    8,
+                ),
+                "stale {event} must not publish after A -> B"
+            );
+        }
+
+        // Starting a newer transfer suppresses an older callback even when
+        // both transfers target the same tree (including an ABA payload).
+        assert!(!file_tree_async_ui_is_current(
+            &intent,
+            12,
+            &crate::remote_fs::FsLocation::Remote(0),
+            std::slice::from_ref(&host_a),
+            Some(8),
+            9,
+        ));
+
+        // Ordinary operations have no transfer identity but still fail closed
+        // across a root generation change.
+        assert!(!file_tree_async_ui_is_current(
+            &intent,
+            13,
+            &crate::remote_fs::FsLocation::Remote(0),
+            std::slice::from_ref(&host_a),
+            None,
+            9,
+        ));
+    }
+
+    #[test]
+    fn remote_follow_reroots_when_only_the_backend_changes() {
+        let same_path = Path::new("/home/deploy");
+        assert!(file_tree_follow_requires_reroot(
+            &crate::remote_fs::FsLocation::Remote(0),
+            &crate::remote_fs::FsLocation::Remote(1),
+            same_path,
+            same_path,
+        ));
+        assert!(!file_tree_follow_requires_reroot(
+            &crate::remote_fs::FsLocation::Remote(1),
+            &crate::remote_fs::FsLocation::Remote(1),
+            same_path,
+            same_path,
+        ));
     }
 
     #[test]

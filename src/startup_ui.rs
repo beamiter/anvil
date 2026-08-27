@@ -205,8 +205,10 @@ pub(crate) fn build_file_tree(
         let view_for_gesture = view.clone();
         let store_for_gesture = store.clone();
         let filter_model_for_gesture = filter_model.clone();
+        let config = config.clone();
         let location = location.clone();
         let clipboard = clipboard.clone();
+        let scan_generation = scan_generation.clone();
         let sender = sender.clone();
         gesture.connect_pressed(move |gesture, _n_press, x, y| {
             gesture.set_state(gtk::EventSequenceState::Claimed);
@@ -216,8 +218,10 @@ pub(crate) fn build_file_tree(
                 &filter_model_for_gesture,
                 x,
                 y,
+                &config,
                 &location,
                 &clipboard,
+                &scan_generation,
                 &sender,
             );
         });
@@ -264,6 +268,9 @@ pub(crate) fn build_file_tree(
             let view = view.clone();
             let store = store.clone();
             let filter_model = filter_model.clone();
+            let config = config.clone();
+            let location = location.clone();
+            let scan_generation = scan_generation.clone();
             let sender = sender.clone();
             drop_target.connect_drop(move |_, value, x, y| {
                 view.set_drag_dest_row(None, gtk::TreeViewDropPosition::After);
@@ -283,9 +290,19 @@ pub(crate) fn build_file_tree(
                     Some((path, false, _)) => path.parent().map(std::path::Path::to_path_buf),
                     None => None,
                 };
+                let intent = {
+                    let loc = location.borrow();
+                    let config = config.borrow();
+                    file_tree::capture_file_tree_intent(
+                        scan_generation.get(),
+                        &loc,
+                        &config.remote_hosts,
+                    )
+                };
                 sender.input(AppMsg::FileTreeImportPaths {
                     paths,
                     dir: target_dir,
+                    intent: Box::new(intent),
                 });
                 true
             });
@@ -297,11 +314,25 @@ pub(crate) fn build_file_tree(
     scroll.set_vexpand(true);
     scroll.set_child(Some(&view));
     let labels = remote_fs::location_labels(&config.borrow().remote_hosts);
+    let config_for_header = config.clone();
+    let location_for_header = location.clone();
+    let generation_for_header = scan_generation.clone();
     let header = sidebar::FileHeaderModel::builder().launch(labels).forward(
         sender.input_sender(),
-        |output| match output {
+        move |output| match output {
             sidebar::FileHeaderOutput::Up => AppMsg::FileTreeGoUp,
             sidebar::FileHeaderOutput::CurrentDirectory => AppMsg::FileTreeGotoCwd,
+            sidebar::FileHeaderOutput::OpenTerminal => {
+                let location = location_for_header.borrow();
+                let config = config_for_header.borrow();
+                AppMsg::FileTreeOpenTerminal {
+                    intent: Box::new(file_tree::capture_file_tree_intent(
+                        generation_for_header.get(),
+                        &location,
+                        &config.remote_hosts,
+                    )),
+                }
+            }
             sidebar::FileHeaderOutput::SelectLocation(index) => {
                 AppMsg::FileTreeSelectLocation(index)
             }
@@ -387,8 +418,10 @@ fn show_file_tree_context_menu(
     filter_model: &gtk::TreeModelFilter,
     x: f64,
     y: f64,
+    config: &Rc<RefCell<Config>>,
     location: &Rc<RefCell<remote_fs::FsLocation>>,
     clipboard: &Rc<RefCell<Option<remote_fs::FsClipboard>>>,
+    scan_generation: &Rc<std::cell::Cell<u64>>,
     sender: &ComponentSender<AppModel>,
 ) {
     // Resolve the row under the pointer and the current selection. A click
@@ -456,6 +489,11 @@ fn show_file_tree_context_menu(
 
     let loc = location.borrow().clone();
     let clip = clipboard.borrow().clone();
+    let menu_intent = file_tree::capture_file_tree_intent(
+        scan_generation.get(),
+        &loc,
+        &config.borrow().remote_hosts,
+    );
     // Cross-location paste streams between the two filesystems; the label
     // says which direction the bytes will flow.
     let (paste_sensitive, paste_label, paste_tooltip) = match &clip {
@@ -495,9 +533,13 @@ fn show_file_tree_context_menu(
         let popover = popover.clone();
         let sender = sender.clone();
         let dir = target_dir.clone();
+        let intent = menu_intent.clone();
         new_file.connect_clicked(move |_| {
             popover.popdown();
-            sender.input(AppMsg::FileTreeNewFile { dir: dir.clone() });
+            sender.input(AppMsg::FileTreeNewFile {
+                dir: dir.clone(),
+                intent: Box::new(intent.clone()),
+            });
         });
     }
     menu.append(&new_file);
@@ -507,9 +549,13 @@ fn show_file_tree_context_menu(
         let popover = popover.clone();
         let sender = sender.clone();
         let dir = target_dir.clone();
+        let intent = menu_intent.clone();
         new_folder.connect_clicked(move |_| {
             popover.popdown();
-            sender.input(AppMsg::FileTreeNewFolder { dir: dir.clone() });
+            sender.input(AppMsg::FileTreeNewFolder {
+                dir: dir.clone(),
+                intent: Box::new(intent.clone()),
+            });
         });
     }
     menu.append(&new_folder);
@@ -520,9 +566,13 @@ fn show_file_tree_context_menu(
             let popover = popover.clone();
             let sender = sender.clone();
             let path = path.clone();
+            let intent = menu_intent.clone();
             rename.connect_clicked(move |_| {
                 popover.popdown();
-                sender.input(AppMsg::FileTreeRename { path: path.clone() });
+                sender.input(AppMsg::FileTreeRename {
+                    path: path.clone(),
+                    intent: Box::new(intent.clone()),
+                });
             });
         }
         menu.append(&rename);
@@ -538,7 +588,10 @@ fn show_file_tree_context_menu(
             &delete_label,
             &popover,
             sender,
-            AppMsg::FileTreeDelete { paths },
+            AppMsg::FileTreeDelete {
+                paths,
+                intent: Box::new(menu_intent.clone()),
+            },
         );
         let items: Vec<(std::path::PathBuf, bool)> = targets.clone();
         add_file_menu_item(
@@ -548,6 +601,7 @@ fn show_file_tree_context_menu(
             sender,
             AppMsg::FileTreeCopy {
                 items: items.clone(),
+                intent: Box::new(menu_intent.clone()),
             },
         );
         add_file_menu_item(
@@ -555,7 +609,10 @@ fn show_file_tree_context_menu(
             "Cut",
             &popover,
             sender,
-            AppMsg::FileTreeCut { items },
+            AppMsg::FileTreeCut {
+                items,
+                intent: Box::new(menu_intent.clone()),
+            },
         );
         {
             // Remote rows copy the plain remote path (no prefix): that is
@@ -585,17 +642,30 @@ fn show_file_tree_context_menu(
         if let Some(tooltip) = paste_tooltip {
             button.set_tooltip_text(Some(tooltip));
         }
-        let popover = popover.clone();
-        let sender = sender.clone();
-        button.connect_clicked(move |_| {
-            popover.popdown();
-            sender.input(AppMsg::FileTreePaste {
-                dir: target_dir.clone(),
+        if let Some(clipboard_token) = clip.as_ref().map(|clipboard| clipboard.token) {
+            let popover = popover.clone();
+            let sender = sender.clone();
+            let intent = menu_intent.clone();
+            button.connect_clicked(move |_| {
+                popover.popdown();
+                sender.input(AppMsg::FileTreePaste {
+                    dir: target_dir.clone(),
+                    intent: Box::new(intent.clone()),
+                    clipboard_token,
+                });
             });
-        });
+        }
         menu.append(&button);
     }
-    add_file_menu_item(&menu, "Refresh", &popover, sender, AppMsg::FileTreeRefresh);
+    add_file_menu_item(
+        &menu,
+        "Refresh",
+        &popover,
+        sender,
+        AppMsg::FileTreeRefresh {
+            intent: Box::new(menu_intent),
+        },
+    );
 
     popover.set_child(Some(&menu));
     popover.connect_closed(|popover| popover.unparent());

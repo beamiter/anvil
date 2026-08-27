@@ -8598,17 +8598,41 @@ fn live_visible_rows_for_measurement(
     }
 }
 
-/// How many rows of the live grid this command has reached: from the row the
-/// prompt began on to the lowest row the cursor has reached, capped by the
-/// grid.
+/// Coalesce a burst of VTE content notifications into one measurement on the
+/// next frame. `Terminal::feed` can publish `contents-changed` before all of a
+/// large PTY chunk is reflected by cursor/text queries; the immediate layout is
+/// still useful for streaming output, while this frame pass observes the final
+/// state without requiring another keypress to trigger a redraw.
+fn schedule_live_layout_settle(
+    terminal: &Terminal,
+    pending: &Rc<Cell<bool>>,
+    settle: &Rc<dyn Fn()>,
+) {
+    if pending.replace(true) {
+        return;
+    }
+    let pending = pending.clone();
+    let settle = settle.clone();
+    terminal.add_tick_callback(move |_, _| {
+        // Clear first: if the layout itself makes VTE publish another content
+        // change, that genuinely belongs to a later frame instead of being
+        // swallowed by this completed request.
+        pending.set(false);
+        settle();
+        glib::ControlFlow::Break
+    });
+}
+
+/// How many rows of the live grid this command has reached: from the top of the
+/// compact card visible at CommandStart to the lowest row the cursor has
+/// reached, capped by the grid.
 ///
 /// The card is a clip over the TOP of the live grid — screen rows
-/// `0..visible_rows`, prompt included — so the count runs from the prompt, not
-/// from the row output happened to start on. Sampling the LATEST cursor row
-/// during the prompt phase (what this used to do) put the origin at the end of
-/// the echoed command line, so however many rows the prompt occupied above it
-/// were never counted and sat below the card's edge — exactly where an inline
-/// TUI such as codex or kimi draws its composer. Latch the LOWEST row instead.
+/// `0..visible_rows`, prompt included — so the origin retains the whole compact
+/// prompt/editor surface, not just the cursor's last row. It is established
+/// only after the running grid has been selected: compact and full-grid VTE row
+/// coordinates can settle separately, and carrying an earlier prompt sample
+/// across `set_size` would make an ordinary command look viewport-tall.
 ///
 /// Every reading here comes from `cursor_position()`, so they share one
 /// coordinate system by construction. Nothing else does: the live adjustment
@@ -8622,32 +8646,45 @@ fn live_content_extent(
     origin: &Cell<Option<i64>>,
     cursor_high: &Cell<i64>,
     output_started: bool,
+    visible_baseline_rows: i64,
 ) -> Option<i64> {
     let cursor_row = vte.cursor_position().1;
+    // Prompt bytes and OSC 133 `C` can be parsed in one GTK turn. If no
+    // contents-changed callback had a chance to record the prompt yet, retain
+    // the whole compact card that was visible at command start, not merely the
+    // cursor's last row. `on_command_start` synchronously calls
+    // `sync_geometry_to_pty` before the child can read its running winsize; that
+    // is the no-output pass which supplies the compact high-water baseline
+    // here. It may include blank rows, but it cannot expose more than the card
+    // already occupied and, critically, cannot clip a wrapped command above the
+    // running output.
     if !output_started {
-        // Still drawing the prompt. CommandStart lays the surface out before
-        // VTE has necessarily applied the bytes already queued, so the caller
-        // keeps the compact height until the capture proves output exists.
-        origin.set(Some(latched_live_origin(origin.get(), cursor_row)));
-        return None;
-    }
-    let Some(origin_row) = origin.get() else {
-        // Output beat every layout pass, so there is no origin to measure
-        // against yet. Adopt this cursor and report the sample as provisional,
-        // exactly as the caller's `None` contract expects.
-        origin.set(Some(cursor_row));
+        // CommandStart lays the surface out before VTE has necessarily applied
+        // the bytes already queued. Rebase the compact-card origin from every
+        // no-output sample so an asynchronous compact -> full grid transition
+        // cannot mix coordinates from two different row counts.
+        origin.set(Some(live_visible_baseline_origin(
+            cursor_row,
+            visible_baseline_rows,
+        )));
         cursor_high.set(cursor_row);
         return None;
-    };
+    }
+    let origin_row = origin.get().unwrap_or_else(|| {
+        // Defensive fallback for a backend which admitted output without the
+        // synchronous CommandStart layout. Block's production path always
+        // reaches the no-output branch first.
+        let origin_row = live_visible_baseline_origin(cursor_row, visible_baseline_rows);
+        origin.set(Some(origin_row));
+        origin_row
+    });
     let high = cursor_high.get().max(cursor_row).max(origin_row);
     cursor_high.set(high);
     Some(live_content_extent_for(origin_row, high, vte.row_count()))
 }
 
-/// The origin a prompt-phase sample leaves behind: the LOWEST cursor row seen
-/// since `reset_active`, which is the first row the prompt drew on.
-fn latched_live_origin(previous: Option<i64>, cursor_row: i64) -> i64 {
-    previous.map_or(cursor_row, |row| row.min(cursor_row))
+fn live_visible_baseline_origin(cursor_row: i64, visible_rows: i64) -> i64 {
+    cursor_row.saturating_sub(visible_rows.max(1).saturating_sub(1))
 }
 
 /// The lowest screen row in `from..grid_rows` that already holds text, if any,
@@ -10040,6 +10077,7 @@ impl TermView {
                         &live_origin_for_layout,
                         &live_cursor_high_for_layout,
                         output_started,
+                        live_rows_high_water.get(),
                     );
                     let (visible_rows, next_high_water) = live_visible_rows_for_measurement(
                         extent,
@@ -10206,18 +10244,39 @@ impl TermView {
             // requests into one timer, and is the same loop the command-finished
             // and refocus paths use — so a burst of output and a finishing block
             // no longer drive the viewport from two settling loops at once.
-            let f = layout_active_surface.clone();
-            let scroll = block_scroll.downgrade();
-            let debouncer = scroll_debouncer.clone();
+            let settle_layout: Rc<dyn Fn()> = {
+                let f = layout_active_surface.clone();
+                let scroll = block_scroll.downgrade();
+                let debouncer = scroll_debouncer.clone();
+                Rc::new(move || {
+                    f();
+                    if let Some(scroll) = scroll.upgrade() {
+                        debouncer.pin_to_bottom_deferred(&scroll);
+                    }
+                })
+            };
+            let settle_pending = Rc::new(Cell::new(false));
+            let bstate_for_contents = bstate.clone();
             let contents_generation_for_signal = contents_generation.clone();
-            active_vte.connect_contents_changed(move |_| {
+            active_vte.connect_contents_changed(move |terminal| {
                 contents_generation_for_signal
                     .set(contents_generation_for_signal.get().wrapping_add(1));
-                f();
-                let Some(scroll) = scroll.upgrade() else {
-                    return;
-                };
-                debouncer.pin_to_bottom_deferred(&scroll);
+                let state = bstate_for_contents.get();
+
+                // Preserve the low-latency growth path, then verify it on the
+                // next frame once a burst feed's cursor/text state has settled.
+                // Prompt/editor changes only need the immediate pass; the
+                // running transition preserves their visible height as its
+                // baseline without carrying compact-grid row coordinates over.
+                settle_layout();
+                if !unified
+                    && matches!(
+                        state,
+                        BlockState::CollectingOutput | BlockState::PostCommand
+                    )
+                {
+                    schedule_live_layout_settle(terminal, &settle_pending, &settle_layout);
+                }
             });
         }
 
@@ -13497,34 +13556,35 @@ mod tests {
         failed_block_marker_fractions_from_entries, failed_block_marker_fractions_legacy,
         feed_with_zone_marker, finished_block_config, finished_command, finished_layout_key,
         into_payload_plain_output, is_post_command_metadata, live_content_extent_for,
-        live_output_text, live_visible_rows, materialize_plain_output,
-        materialize_plain_output_legacy, mounted_jumpable_records, mutate_block_data_and_redraw,
-        normalize_captured_command, notification_permitted, parse_color_spec, plan_prompt_zone,
-        pop_typed_command_shadow, process_block_id_namespace, prompt_anchor_for_surface,
-        prompt_anchor_rebases_on_row_delta, prompt_zone_to_reopen_after_alt,
-        prune_retired_record_bookmarks, rebase_prompt_anchor, record_external_input,
-        record_unified_zone, resolve_command_text, reviewed_pre_command_bytes_are_identity_neutral,
-        reviewed_submission_matches, screen_relative_cpr_row, selected_blocks_markdown,
-        selected_command_text, selected_id_range, shell_argv_supports_agent_ids,
-        shell_integration_hint, shell_single_quote, stable_visible_indices, step_marked_indices,
-        step_marked_record_ids, stranded_focus_key_recovers, strip_ansi,
-        strip_ansi_with_clear_detect, take_armed_agent_execution, take_background_output,
-        unread_after_index_removal, unread_after_prefix_eviction, viewport_page_size_changed,
-        viewport_state_for_scroll, viewport_states_for_scroll, visible_indices_for_viewport,
-        vte_answers_query_natively, zone_output_snapshot_from_plain,
-        zone_output_snapshot_from_ring, AgentCommandEndDecision, AgentExecutionLostCallbacks,
-        AltScreenCallbacks, AltScreenTransition, AnchorSettleArgs, ArmedAgentExecution,
-        BackendRecords, BlockData, BlockFinishedCallback, BlockFinishedCallbacks,
-        BlockRenderPayloadAccessor, BlockState, BookmarkState, CommandFinishedCallbacks,
-        CommandFinishedEvent, CommandPromptStatus, CommandStartedCallbacks, CommandStartedEvent,
-        CommandTextSource, CompletedCommandRecord, DynamicColors, DynamicColorsRc, EngineState,
-        PendingZone, ReaderCtx, RenderBackend, ResetAwareParserPart, ResetAwareParserSplitter,
-        ReviewedSubmission, ReviewedSubmissionPhase, SelectionFeedHold, ShellCapabilityObserver,
-        SubmissionSurface, TerminalResetKind, UnifiedZoneStore, VerifiedSubmissionCtx,
-        ZoneMarkerInjector, ZoneOutputSnapshot, BLOCK_ID_SEQUENCE_LIMIT, LAST_NOTIFICATION_AT,
-        MAX_RAW_OUTPUT_BYTES, MAX_RECALLED_COMMAND_BYTES, MAX_TOTAL_SNAPSHOT_BYTES,
-        MAX_TYPED_COMMAND_SHADOW_BYTES, MAX_ZONE_SNAPSHOT_BYTES, NOTIFICATION_MIN_INTERVAL,
-        TRUNCATED_COMMAND_PLACEHOLDER, UNAVAILABLE_COMMAND_PLACEHOLDER, ZONE_MARKER_CLOSE,
+        live_output_text, live_visible_baseline_origin, live_visible_rows,
+        materialize_plain_output, materialize_plain_output_legacy, mounted_jumpable_records,
+        mutate_block_data_and_redraw, normalize_captured_command, notification_permitted,
+        parse_color_spec, plan_prompt_zone, pop_typed_command_shadow, process_block_id_namespace,
+        prompt_anchor_for_surface, prompt_anchor_rebases_on_row_delta,
+        prompt_zone_to_reopen_after_alt, prune_retired_record_bookmarks, rebase_prompt_anchor,
+        record_external_input, record_unified_zone, resolve_command_text,
+        reviewed_pre_command_bytes_are_identity_neutral, reviewed_submission_matches,
+        screen_relative_cpr_row, selected_blocks_markdown, selected_command_text,
+        selected_id_range, shell_argv_supports_agent_ids, shell_integration_hint,
+        shell_single_quote, stable_visible_indices, step_marked_indices, step_marked_record_ids,
+        stranded_focus_key_recovers, strip_ansi, strip_ansi_with_clear_detect,
+        take_armed_agent_execution, take_background_output, unread_after_index_removal,
+        unread_after_prefix_eviction, viewport_page_size_changed, viewport_state_for_scroll,
+        viewport_states_for_scroll, visible_indices_for_viewport, vte_answers_query_natively,
+        zone_output_snapshot_from_plain, zone_output_snapshot_from_ring, AgentCommandEndDecision,
+        AgentExecutionLostCallbacks, AltScreenCallbacks, AltScreenTransition, AnchorSettleArgs,
+        ArmedAgentExecution, BackendRecords, BlockData, BlockFinishedCallback,
+        BlockFinishedCallbacks, BlockRenderPayloadAccessor, BlockState, BookmarkState,
+        CommandFinishedCallbacks, CommandFinishedEvent, CommandPromptStatus,
+        CommandStartedCallbacks, CommandStartedEvent, CommandTextSource, CompletedCommandRecord,
+        DynamicColors, DynamicColorsRc, EngineState, PendingZone, ReaderCtx, RenderBackend,
+        ResetAwareParserPart, ResetAwareParserSplitter, ReviewedSubmission,
+        ReviewedSubmissionPhase, SelectionFeedHold, ShellCapabilityObserver, SubmissionSurface,
+        TerminalResetKind, UnifiedZoneStore, VerifiedSubmissionCtx, ZoneMarkerInjector,
+        ZoneOutputSnapshot, BLOCK_ID_SEQUENCE_LIMIT, LAST_NOTIFICATION_AT, MAX_RAW_OUTPUT_BYTES,
+        MAX_RECALLED_COMMAND_BYTES, MAX_TOTAL_SNAPSHOT_BYTES, MAX_TYPED_COMMAND_SHADOW_BYTES,
+        MAX_ZONE_SNAPSHOT_BYTES, NOTIFICATION_MIN_INTERVAL, TRUNCATED_COMMAND_PLACEHOLDER,
+        UNAVAILABLE_COMMAND_PLACEHOLDER, ZONE_MARKER_CLOSE,
     };
     use crate::agent::{AgentExecutionRef, AgentSession};
     use crate::config::Config;
@@ -13653,24 +13713,174 @@ mod tests {
     }
 
     #[test]
-    fn live_card_measures_from_the_row_the_prompt_began_on() {
-        // Prompt-phase samples: the shell draws a two-row prompt starting at
-        // ring row 5000 (rows climb for the life of the pane — `vte.reset()`
-        // never rewinds them), then echoes the command, leaving the cursor on
-        // 5001. The origin is the FIRST row, not the last sample; taking the
-        // last one is what hid an inline TUI's composer below the card.
-        let mut origin = None;
-        for row in [5000, 5001, 5001] {
-            origin = Some(super::latched_live_origin(origin, row));
-        }
-        assert_eq!(origin, Some(5000));
-        // Cursor parked in a composer 14 rows down: the card shows all 15.
-        assert_eq!(super::live_content_extent_for(5000, 5014, 32), 15);
+    fn live_card_measures_from_the_visible_command_start_baseline() {
+        // Row coordinates climb for the life of a VTE. At CommandStart the
+        // compact card already exposes six rows ending at the cursor, so all
+        // six remain part of the running card even if some are blank.
+        let origin = live_visible_baseline_origin(5_001, 6);
+        assert_eq!(origin, 4_996);
+        // Cursor parked in an inline composer's lower rows remains visible.
+        assert_eq!(super::live_content_extent_for(origin, 5_014, 32), 19);
         // Output past the grid caps at the grid.
-        assert_eq!(super::live_content_extent_for(5000, 9999, 32), 32);
-        // A lower sample still wins while the prompt is drawing.
-        assert_eq!(super::latched_live_origin(Some(5), 3), 3);
-        assert_eq!(super::latched_live_origin(None, 7), 7);
+        assert_eq!(super::live_content_extent_for(origin, 9_999, 32), 32);
+    }
+
+    #[test]
+    fn command_start_baseline_survives_grid_rebase_and_a_wrapped_ssh_command() {
+        // If prompt and CommandStart are delivered in one GTK turn, preserve
+        // the six compact rows that were visibly allocated before the running
+        // grid expanded instead of starting at the command's last row.
+        let compact_origin = live_visible_baseline_origin(9_003, 6);
+        assert_eq!(compact_origin, 8_998);
+
+        // VTE rebases ring coordinates when the grid grows from 6 to 40 rows.
+        // The no-output CommandStart layout recomputes the baseline in that
+        // new coordinate system; it must move by the same 34-row delta.
+        let expanded_origin = live_visible_baseline_origin(9_037, 6);
+        assert_eq!(expanded_origin, 9_032);
+        assert_eq!(expanded_origin - compact_origin, 34);
+
+        // A single SSH burst advances five more rows. Its complete extent is
+        // eleven rows (the six-row visible baseline plus five new rows), not
+        // the six-row minimum that produced the reported clip.
+        assert_eq!(live_content_extent_for(expanded_origin, 9_042, 40), 11);
+        assert_eq!(live_visible_rows(11, 40), 11);
+        assert_eq!(live_visible_baseline_origin(i64::MIN, 6), i64::MIN);
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn live_layout_settle_observes_a_complete_burst_without_more_input() {
+        use relm4::gtk;
+        use relm4::gtk::prelude::*;
+        use vte4::TerminalExt;
+
+        gtk::init().expect("gtk init");
+        let active = Rc::new(RefCell::new(super::ActiveBlock::new(
+            &Config::safe_defaults(),
+            Rc::new(RefCell::new(VecDeque::new())),
+        )));
+        let terminal = active.borrow().active_vte.clone();
+        let holder = active.borrow().widget.clone();
+        let window = gtk::Window::builder()
+            .default_width(900)
+            .default_height(480)
+            .child(&holder)
+            .build();
+        window.present();
+
+        let context = glib::MainContext::default();
+        let mapped_deadline = Instant::now() + Duration::from_secs(2);
+        while active.borrow().live_clip().width() <= 0 && Instant::now() < mapped_deadline {
+            while context.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(terminal.is_mapped(), "live VTE did not map");
+
+        let cell_height = (terminal.char_height() as i32).max(1);
+        terminal.set_size(100, 6);
+        holder.set_height_request(6 * cell_height);
+        assert!(active.borrow().set_live_geometry(cell_height, 6, 6));
+        terminal.feed(b"\x1b[H\x1b[2Jprompt $ ssh long-host");
+        let prompt_deadline = Instant::now() + Duration::from_millis(100);
+        while Instant::now() < prompt_deadline {
+            while context.iteration(false) {}
+        }
+
+        // The production CommandStart path expands the grid synchronously but
+        // retains the compact card's six visible rows as the measurement
+        // baseline. Establish that exact state before the one SSH output feed.
+        terminal.set_size(100, 24);
+        holder.set_height_request(6 * cell_height);
+        active.borrow().set_live_geometry(cell_height, 24, 6);
+        let origin = Rc::new(Cell::new(None::<i64>));
+        let cursor_high = Rc::new(Cell::new(0_i64));
+        assert_eq!(
+            super::live_content_extent(&terminal, &origin, &cursor_high, false, 6),
+            None
+        );
+
+        let pending = Rc::new(Cell::new(false));
+        let settled_cursor = Rc::new(Cell::new(None::<i64>));
+        let settled_visible_rows = Rc::new(Cell::new(None::<i64>));
+        let high_water = Rc::new(Cell::new(6_i64));
+        let settle: Rc<dyn Fn()> = {
+            let terminal = terminal.downgrade();
+            let active = Rc::downgrade(&active);
+            let holder = holder.downgrade();
+            let origin = origin.clone();
+            let cursor_high = cursor_high.clone();
+            let high_water = high_water.clone();
+            let settled_cursor = settled_cursor.clone();
+            let settled_visible_rows = settled_visible_rows.clone();
+            Rc::new(move || {
+                let (Some(terminal), Some(active), Some(holder)) =
+                    (terminal.upgrade(), active.upgrade(), holder.upgrade())
+                else {
+                    return;
+                };
+                let cursor = terminal.cursor_position().1;
+                settled_cursor.set(Some(cursor));
+                let Some(extent) =
+                    super::live_content_extent(&terminal, &origin, &cursor_high, true, 6)
+                else {
+                    return;
+                };
+                let (visible_rows, next_high_water) = super::live_visible_rows_for_measurement(
+                    Some(extent),
+                    true,
+                    false,
+                    high_water.get(),
+                    24,
+                );
+                high_water.set(next_high_water);
+                holder.set_height_request((visible_rows as i32) * cell_height);
+                active
+                    .borrow()
+                    .set_live_geometry(cell_height, 24, visible_rows);
+                settled_visible_rows.set(Some(visible_rows));
+            })
+        };
+        {
+            let pending = pending.clone();
+            let settle = settle.clone();
+            terminal.connect_contents_changed(move |terminal| {
+                super::schedule_live_layout_settle(terminal, &pending, &settle);
+            });
+        }
+
+        // One PTY-like burst, deliberately taller than Block's six-row compact
+        // card. No second feed/keypress is allowed to rescue the measurement.
+        terminal.feed(b"\r\njsh: bringing jsh\r\nfor this session\r\nwarning one\r\nwarning two\r\nremote banner\r\nlast login\r\nroot@remote ~ ");
+        let settle_deadline = Instant::now() + Duration::from_secs(2);
+        while (settled_cursor.get().is_none() || pending.get()) && Instant::now() < settle_deadline
+        {
+            while context.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let settled_cursor = settled_cursor
+            .get()
+            .expect("the frame callback must run without a second feed");
+        assert!(
+            settled_cursor >= 8,
+            "the next-frame pass must see every row of the first SSH burst; got row {settled_cursor}"
+        );
+        let settled_visible_rows = settled_visible_rows
+            .get()
+            .expect("the settled layout must publish a card height");
+        assert!(
+            settled_visible_rows > 6,
+            "the live-card clip must grow past its six-row floor; got {settled_visible_rows}"
+        );
+        assert_eq!(
+            active.borrow().live_visible_height_px(),
+            (settled_visible_rows as i32) * cell_height,
+            "the ActiveBlock clip request must cover the settled row extent"
+        );
+        assert!(!pending.get(), "the one-shot frame request must retire");
+
+        window.close();
+        while context.iteration(false) {}
     }
 
     #[test]

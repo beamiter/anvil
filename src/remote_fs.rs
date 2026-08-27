@@ -208,6 +208,44 @@ pub(crate) fn location_labels(hosts: &[RemoteHost]) -> Vec<String> {
     labels
 }
 
+/// Keep a browsed remote filesystem bound to the exact profile that selected
+/// it when the configured host list changes. An index is presentation state,
+/// not identity: reordering may move the same profile, while reusing the slot
+/// for a different profile must never redirect file operations or launches.
+///
+/// The match is deliberately over the complete [`RemoteHost`] value and must
+/// be unique. A stale/invalid old slot, an edited or removed profile, or an
+/// ambiguous duplicate all fail closed to Local.
+pub(crate) fn remap_location_by_profile(
+    location: &FsLocation,
+    old_hosts: &[RemoteHost],
+    new_hosts: &[RemoteHost],
+) -> FsLocation {
+    let FsLocation::Remote(old_index) = location else {
+        return FsLocation::Local;
+    };
+    let Ok(old_host) = crate::config::checked_remote_host(old_hosts, *old_index) else {
+        return FsLocation::Local;
+    };
+
+    let mut matches = new_hosts
+        .iter()
+        .take(crate::config::MAX_REMOTE_HOSTS)
+        .enumerate()
+        .filter(|(index, host)| {
+            *host == old_host && crate::config::checked_remote_host(new_hosts, *index).is_ok()
+        })
+        .map(|(index, _)| index);
+    let Some(index) = matches.next() else {
+        return FsLocation::Local;
+    };
+    if matches.next().is_some() {
+        FsLocation::Local
+    } else {
+        FsLocation::Remote(index)
+    }
+}
+
 /// One remembered Copy/Cut entry: a path and whether it is a directory.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FsClipboardItem {
@@ -222,6 +260,95 @@ pub(crate) struct FsClipboard {
     pub(crate) loc: FsLocation,
     pub(crate) items: Vec<FsClipboardItem>,
     pub(crate) cut: bool,
+    /// Identity of the user Copy/Cut action, not of its payload. Re-copying
+    /// identical rows is a new intent and must survive older async completions.
+    pub(crate) token: u64,
+}
+
+/// Resolve a delayed Paste through the live clipboard slot. Payload equality
+/// is deliberately irrelevant: repeating Copy/Cut for the same rows is a new
+/// user intent, while an exact profile reorder updates `loc` on the original
+/// intent and must be observed by the eventual Paste.
+pub(crate) fn clipboard_for_token(
+    clipboard: &Option<FsClipboard>,
+    expected_token: u64,
+) -> Option<FsClipboard> {
+    clipboard
+        .as_ref()
+        .filter(|clipboard| clipboard.token == expected_token)
+        .cloned()
+}
+
+/// Capture a clipboard token only when the filesystem operation starts in the
+/// clipboard's source authority. Comparing numeric locations later would reject
+/// a safe profile reorder; capturing the token now keeps that same intent
+/// recognizable without letting an unrelated Local/remote operation consume it.
+pub(crate) fn clipboard_token_for_location(
+    clipboard: &Option<FsClipboard>,
+    operation_location: &FsLocation,
+) -> Option<u64> {
+    clipboard
+        .as_ref()
+        .filter(|clipboard| clipboard.loc == *operation_location)
+        .map(|clipboard| clipboard.token)
+}
+
+/// Remove sources made stale by a successful rename/delete from the exact
+/// captured clipboard intent. Unrelated items remain available after a partial
+/// batch; removing a directory also consumes clipboard descendants beneath it.
+pub(crate) fn retire_clipboard_sources(
+    clipboard: &mut Option<FsClipboard>,
+    expected_token: Option<u64>,
+    affected_paths: &[PathBuf],
+) -> bool {
+    let Some(expected_token) = expected_token else {
+        return false;
+    };
+    let Some(current) = clipboard.as_mut() else {
+        return false;
+    };
+    if current.token != expected_token {
+        return false;
+    }
+    let previous_len = current.items.len();
+    current.items.retain(|item| {
+        !affected_paths
+            .iter()
+            .any(|affected| item.path == *affected || item.path.starts_with(affected))
+    });
+    let changed = current.items.len() != previous_len;
+    if changed && current.items.is_empty() {
+        *clipboard = None;
+    }
+    changed
+}
+
+/// Rebind an index-backed clipboard source through the same exact, unique,
+/// validated profile rule as the visible tree. A safe reorder preserves the
+/// clipboard token; any missing/edited/ambiguous identity clears it rather
+/// than redirecting old paths to the profile that reused its index.
+pub(crate) fn remap_clipboard_by_profile(
+    clipboard: &mut Option<FsClipboard>,
+    old_hosts: &[RemoteHost],
+    new_hosts: &[RemoteHost],
+) -> bool {
+    let Some(current) = clipboard.as_mut() else {
+        return false;
+    };
+    let FsLocation::Remote(_) = current.loc else {
+        return false;
+    };
+    let remapped = remap_location_by_profile(&current.loc, old_hosts, new_hosts);
+    match remapped {
+        FsLocation::Remote(index) => {
+            current.loc = FsLocation::Remote(index);
+            false
+        }
+        FsLocation::Local => {
+            *clipboard = None;
+            true
+        }
+    }
 }
 
 /// One finished probe run, output bounded on both streams.
@@ -1966,6 +2093,16 @@ pub(crate) struct BatchOutcome {
     pub(crate) failed: Vec<(String, String)>,
 }
 
+/// A delete batch additionally retains the exact paths that were removed.
+/// Display labels in `BatchOutcome::failed` are intentionally unsuitable as
+/// identities (two paths can share a basename), so clipboard retirement must
+/// consume this list rather than infer success from counts or labels.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DeleteBatchOutcome {
+    pub(crate) summary: BatchOutcome,
+    pub(crate) succeeded: Vec<PathBuf>,
+}
+
 /// Format one failed batch item's error for the summary toast.
 fn batch_failure(outcome: &mut BatchOutcome, display: String, error: &io::Error) {
     let message =
@@ -1995,6 +2132,7 @@ pub(crate) fn paste_all(
     cut: bool,
     control: &TransferControl,
     progress: &dyn Fn(u64),
+    source_consumed: &dyn Fn(&Path),
 ) -> io::Result<BatchOutcome> {
     let same_location = clip_loc == dst_loc;
     let mut outcome = BatchOutcome {
@@ -2036,16 +2174,21 @@ pub(crate) fn paste_all(
                 if cut && !same_location {
                     // The copy half of the cut landed; deleting the source is
                     // best-effort and reported per item.
-                    if let Err(error) = delete(clip_loc, hosts, &item.path) {
-                        let message = jterm_core::review_input::safe_inline_display(
-                            &error.to_string(),
-                            MAX_ERROR_DISPLAY_BYTES,
-                        );
-                        outcome.failed.push((
-                            display,
-                            format!("copied, but deleting the source failed: {message}"),
-                        ));
+                    match delete(clip_loc, hosts, &item.path) {
+                        Ok(()) => source_consumed(&item.path),
+                        Err(error) => {
+                            let message = jterm_core::review_input::safe_inline_display(
+                                &error.to_string(),
+                                MAX_ERROR_DISPLAY_BYTES,
+                            );
+                            outcome.failed.push((
+                                display,
+                                format!("copied, but deleting the source failed: {message}"),
+                            ));
+                        }
                     }
+                } else if cut {
+                    source_consumed(&item.path);
                 }
             }
             Err(error) => {
@@ -2067,18 +2210,25 @@ pub(crate) fn delete_all(
     loc: &FsLocation,
     hosts: &[RemoteHost],
     paths: &[PathBuf],
-) -> BatchOutcome {
+) -> DeleteBatchOutcome {
     let mut outcome = BatchOutcome {
         done: 0,
         failed: Vec::new(),
     };
+    let mut succeeded = Vec::new();
     for path in paths {
         match delete(loc, hosts, path) {
-            Ok(()) => outcome.done += 1,
+            Ok(()) => {
+                outcome.done += 1;
+                succeeded.push(path.clone());
+            }
             Err(error) => batch_failure(&mut outcome, batch_display_name(path), &error),
         }
     }
-    outcome
+    DeleteBatchOutcome {
+        summary: outcome,
+        succeeded,
+    }
 }
 
 /// Execute a drop plan item by item: copies via the local recursive copier,
@@ -2756,6 +2906,173 @@ mod tests {
             location_labels(&[hostile]),
             ["Local", "Remote (unavailable)"]
         );
+    }
+
+    #[test]
+    fn remote_location_reordering_follows_only_the_complete_profile() {
+        let ssh = ssh_host();
+        let docker = docker_host();
+        let old = vec![ssh.clone(), docker.clone()];
+        let reordered = vec![docker, ssh];
+
+        assert_eq!(
+            remap_location_by_profile(&FsLocation::Remote(1), &old, &reordered),
+            FsLocation::Remote(0)
+        );
+        assert_eq!(
+            remap_location_by_profile(&FsLocation::Remote(0), &old, &reordered),
+            FsLocation::Remote(1)
+        );
+        assert_eq!(
+            remap_location_by_profile(&FsLocation::Local, &old, &reordered),
+            FsLocation::Local
+        );
+    }
+
+    #[test]
+    fn edited_removed_stale_or_ambiguous_remote_profiles_fall_back_local() {
+        let ssh = ssh_host();
+        let docker = docker_host();
+        let old = vec![ssh.clone(), docker.clone()];
+
+        let mut edited = docker.clone();
+        edited.host.push_str("-replacement");
+        assert_eq!(
+            remap_location_by_profile(&FsLocation::Remote(1), &old, &[ssh.clone(), edited]),
+            FsLocation::Local,
+            "the same slot/name must not authorize an edited destination"
+        );
+        assert_eq!(
+            remap_location_by_profile(&FsLocation::Remote(1), &old, &[ssh]),
+            FsLocation::Local,
+            "a removed profile must not redirect to another slot"
+        );
+        assert_eq!(
+            remap_location_by_profile(&FsLocation::Remote(9), &old, &old),
+            FsLocation::Local,
+            "a stale old index has no identity to preserve"
+        );
+        assert_eq!(
+            remap_location_by_profile(&FsLocation::Remote(1), &old, &[docker.clone(), docker]),
+            FsLocation::Local,
+            "an ambiguous exact identity fails closed"
+        );
+    }
+
+    fn test_clipboard(loc: FsLocation, token: u64, path: &str) -> Option<FsClipboard> {
+        Some(FsClipboard {
+            loc,
+            items: vec![FsClipboardItem {
+                path: PathBuf::from(path),
+                is_dir: false,
+            }],
+            cut: true,
+            token,
+        })
+    }
+
+    #[test]
+    fn clipboard_retirement_requires_the_exact_user_intent_token() {
+        let affected = [PathBuf::from("/remote/same.txt")];
+        let mut newer_same_payload = test_clipboard(FsLocation::Remote(0), 12, "/remote/same.txt");
+
+        assert!(!retire_clipboard_sources(
+            &mut newer_same_payload,
+            Some(11),
+            &affected
+        ));
+        assert_eq!(
+            newer_same_payload.as_ref().map(|clipboard| clipboard.token),
+            Some(12),
+            "re-copying identical rows is still a new intent"
+        );
+        assert!(!retire_clipboard_sources(
+            &mut newer_same_payload,
+            None,
+            &affected,
+        ));
+        assert!(retire_clipboard_sources(
+            &mut newer_same_payload,
+            Some(12),
+            &affected,
+        ));
+        assert!(newer_same_payload.is_none());
+    }
+
+    #[test]
+    fn delayed_paste_resolves_only_its_live_token_and_observes_safe_remap() {
+        let mut clipboard = test_clipboard(FsLocation::Remote(0), 21, "/remote/same.txt");
+        assert_eq!(
+            clipboard_for_token(&clipboard, 21)
+                .expect("original intent resolves")
+                .loc,
+            FsLocation::Remote(0)
+        );
+
+        // Repeating the same Copy/Cut payload is still a new user intent.
+        clipboard.as_mut().unwrap().token = 22;
+        assert!(clipboard_for_token(&clipboard, 21).is_none());
+
+        // An exact profile reorder mutates only the live source location; a
+        // delayed menu must use that reconciled authority, not its old index.
+        clipboard.as_mut().unwrap().loc = FsLocation::Remote(3);
+        assert_eq!(
+            clipboard_for_token(&clipboard, 22)
+                .expect("live intent survives reorder")
+                .loc,
+            FsLocation::Remote(3)
+        );
+    }
+
+    #[test]
+    fn clipboard_source_retirement_is_bound_at_dispatch_and_covers_descendants() {
+        let mut clipboard = test_clipboard(FsLocation::Remote(0), 31, "/tree/dir/child.txt");
+        assert_eq!(
+            clipboard_token_for_location(&clipboard, &FsLocation::Local),
+            None,
+            "a Local operation cannot consume a remote clipboard with the same path"
+        );
+        let token = clipboard_token_for_location(&clipboard, &FsLocation::Remote(0));
+        assert_eq!(token, Some(31));
+
+        // Reordering after dispatch is harmless because the token, rather than
+        // the now-changed numeric location, identifies the same intent.
+        clipboard.as_mut().unwrap().loc = FsLocation::Remote(2);
+        assert!(retire_clipboard_sources(
+            &mut clipboard,
+            token,
+            &[PathBuf::from("/tree/dir")]
+        ));
+        assert!(clipboard.is_none());
+    }
+
+    #[test]
+    fn clipboard_profile_reorder_preserves_token_but_unsafe_remap_clears() {
+        let ssh = ssh_host();
+        let docker = docker_host();
+        let old = vec![ssh.clone(), docker.clone()];
+        let reordered = vec![docker, ssh.clone()];
+        let mut clipboard = test_clipboard(FsLocation::Remote(0), 77, "/remote/source.txt");
+
+        assert!(!remap_clipboard_by_profile(
+            &mut clipboard,
+            &old,
+            &reordered
+        ));
+        let remapped = clipboard.as_ref().expect("exact profile survives reorder");
+        assert_eq!(remapped.loc, FsLocation::Remote(1));
+        assert_eq!(remapped.token, 77, "reorder preserves intent identity");
+        assert!(retire_clipboard_sources(
+            &mut clipboard,
+            Some(77),
+            &[PathBuf::from("/remote/source.txt")],
+        ));
+
+        let mut replaced = test_clipboard(FsLocation::Remote(0), 78, "/remote/source.txt");
+        let mut edited = ssh;
+        edited.host = "replacement.example.com".to_string();
+        assert!(remap_clipboard_by_profile(&mut replaced, &old, &[edited]));
+        assert!(replaced.is_none());
     }
 
     #[test]
@@ -3597,6 +3914,7 @@ mod tests {
             false,
             &TransferControl::new(),
             &|_| {},
+            &|_| {},
         )
         .unwrap();
         assert_eq!(outcome.done, 1, "b.txt copied");
@@ -3618,6 +3936,7 @@ mod tests {
         std::fs::write(dst.join("blocked.txt"), b"existing").unwrap();
 
         let items = vec![clip_item(&ok, false), clip_item(&blocked, false)];
+        let consumed = std::cell::RefCell::new(Vec::new());
         let outcome = paste_all(
             &[],
             &FsLocation::Local,
@@ -3627,6 +3946,7 @@ mod tests {
             true,
             &TransferControl::new(),
             &|_| {},
+            &|path| consumed.borrow_mut().push(path.to_path_buf()),
         )
         .unwrap();
         assert_eq!(outcome.done, 1);
@@ -3634,6 +3954,128 @@ mod tests {
         assert!(!ok.exists(), "the moved source is gone");
         assert!(blocked.exists(), "the colliding source stays put");
         assert_eq!(std::fs::read(dst.join("ok.txt")).unwrap(), b"ok");
+        assert_eq!(*consumed.borrow(), std::slice::from_ref(&ok));
+
+        let mut clipboard = Some(FsClipboard {
+            loc: FsLocation::Local,
+            items,
+            cut: true,
+            token: 41,
+        });
+        assert!(retire_clipboard_sources(
+            &mut clipboard,
+            Some(41),
+            &consumed.borrow(),
+        ));
+        let remaining = clipboard.expect("failed cut item remains retryable");
+        assert_eq!(remaining.items.len(), 1);
+        assert_eq!(remaining.items[0].path, blocked);
+    }
+
+    #[test]
+    fn paste_all_cut_all_failures_preserve_the_clipboard() {
+        let tmp = TestDir::new("paste-cut-all-fail");
+        let a = tmp.path().join("a.txt");
+        let b = tmp.path().join("b.txt");
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir(&dst).unwrap();
+        std::fs::write(dst.join("a.txt"), b"existing").unwrap();
+        std::fs::write(dst.join("b.txt"), b"existing").unwrap();
+        let items = vec![clip_item(&a, false), clip_item(&b, false)];
+        let consumed = std::cell::RefCell::new(Vec::new());
+
+        let outcome = paste_all(
+            &[],
+            &FsLocation::Local,
+            &items,
+            &FsLocation::Local,
+            &dst,
+            true,
+            &TransferControl::new(),
+            &|_| {},
+            &|path| consumed.borrow_mut().push(path.to_path_buf()),
+        )
+        .unwrap();
+        assert_eq!(outcome.done, 0);
+        assert_eq!(outcome.failed.len(), 2);
+        assert!(consumed.borrow().is_empty());
+
+        let mut clipboard = Some(FsClipboard {
+            loc: FsLocation::Local,
+            items: items.clone(),
+            cut: true,
+            token: 42,
+        });
+        assert!(!retire_clipboard_sources(
+            &mut clipboard,
+            Some(42),
+            &consumed.borrow(),
+        ));
+        assert_eq!(clipboard.unwrap().items, items);
+    }
+
+    #[test]
+    fn cancelled_batch_cut_settles_only_its_completed_prefix_and_not_a_newer_intent() {
+        let tmp = TestDir::new("paste-cut-cancel-prefix");
+        let a = tmp.path().join("a.txt");
+        let b = tmp.path().join("b.txt");
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir(&dst).unwrap();
+        let items = vec![clip_item(&a, false), clip_item(&b, false)];
+        let control = TransferControl::new();
+        let cancel = control.clone();
+        let consumed = std::cell::RefCell::new(Vec::new());
+
+        let error = paste_all(
+            &[],
+            &FsLocation::Local,
+            &items,
+            &FsLocation::Local,
+            &dst,
+            true,
+            &control,
+            &|done| {
+                if done == 1 {
+                    cancel.cancel();
+                }
+            },
+            &|path| consumed.borrow_mut().push(path.to_path_buf()),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(*consumed.borrow(), std::slice::from_ref(&a));
+        assert!(!a.exists() && b.exists());
+
+        let mut original = Some(FsClipboard {
+            loc: FsLocation::Local,
+            items: items.clone(),
+            cut: true,
+            token: 51,
+        });
+        assert!(retire_clipboard_sources(
+            &mut original,
+            Some(51),
+            &consumed.borrow(),
+        ));
+        let remaining = original.expect("unfinished suffix remains");
+        assert_eq!(remaining.items, [clip_item(&b, false)]);
+
+        let mut newer = Some(FsClipboard {
+            loc: FsLocation::Local,
+            items: items.clone(),
+            cut: true,
+            token: 52,
+        });
+        assert!(!retire_clipboard_sources(
+            &mut newer,
+            Some(51),
+            &consumed.borrow(),
+        ));
+        assert_eq!(newer.unwrap().items, items);
     }
 
     #[test]
@@ -3651,6 +4093,7 @@ mod tests {
             false,
             &TransferControl::new(),
             &|_| {},
+            &|_| {},
         )
         .unwrap();
         assert_eq!(outcome.done, 0);
@@ -3667,10 +4110,16 @@ mod tests {
         std::fs::write(&b, b"2").unwrap();
         let missing = tmp.path().join("missing.txt");
 
-        let outcome = delete_all(&FsLocation::Local, &[], &[a.clone(), missing, b.clone()]);
-        assert_eq!(outcome.done, 2);
-        assert_eq!(outcome.failed.len(), 1);
-        assert!(outcome.failed[0].0.contains("missing.txt"));
+        let outcome = delete_all(
+            &FsLocation::Local,
+            &[],
+            &[a.clone(), missing.clone(), b.clone()],
+        );
+        assert_eq!(outcome.summary.done, 2);
+        assert_eq!(outcome.summary.failed.len(), 1);
+        assert!(outcome.summary.failed[0].0.contains("missing.txt"));
+        assert_eq!(outcome.succeeded, [a.clone(), b.clone()]);
+        assert!(!outcome.succeeded.contains(&missing));
         assert!(!a.exists() && !b.exists());
 
         // The filesystem root survives a batch delete.
@@ -3679,8 +4128,9 @@ mod tests {
             &[],
             std::slice::from_ref(&PathBuf::from("/")),
         );
-        assert_eq!(outcome.done, 0);
-        assert_eq!(outcome.failed.len(), 1);
+        assert_eq!(outcome.summary.done, 0);
+        assert_eq!(outcome.summary.failed.len(), 1);
+        assert!(outcome.succeeded.is_empty());
         assert!(Path::new("/").is_dir());
     }
 

@@ -268,9 +268,16 @@ struct AppModel {
     file_tree_location: Rc<RefCell<remote_fs::FsLocation>>,
     /// Copy/Cut row awaiting a Paste; usable only in its source location.
     file_tree_clipboard: Rc<RefCell<Option<remote_fs::FsClipboard>>>,
+    /// Monotonic identity of user Copy/Cut intent. Async completions may retire
+    /// only the exact intent they captured, even when a newer one has the same
+    /// paths and mode.
+    file_tree_clipboard_revision: std::cell::Cell<u64>,
     /// The live busy toast of an in-flight cross-location transfer, held so
     /// long transfers are not left without any indication.
     file_tree_transfer_toast: Rc<RefCell<Option<adw::Toast>>>,
+    /// Monotonic identity of the most recently started file transfer. A late
+    /// progress/completion event cannot publish over a newer transfer's UI.
+    file_tree_transfer_revision: Rc<std::cell::Cell<u64>>,
     tab_strip_scroll: gtk::ScrolledWindow,
     sidebar_tab_scroll: gtk::ScrolledWindow,
     top_tab_scroll: gtk::ScrolledWindow,
@@ -1088,7 +1095,9 @@ impl SimpleComponent for AppModel {
             file_tree_filter,
             file_tree_location,
             file_tree_clipboard,
+            file_tree_clipboard_revision: std::cell::Cell::new(0),
             file_tree_transfer_toast: Rc::new(RefCell::new(None)),
+            file_tree_transfer_revision: Rc::new(std::cell::Cell::new(0)),
             tab_strip_scroll: tab_strip_scroll.clone(),
             sidebar_tab_scroll: sidebar_tab_scroll.clone(),
             top_tab_scroll: top_tab_scroll.clone(),
@@ -1652,6 +1661,10 @@ impl SimpleComponent for AppModel {
                 }
             }
             AppMsg::PaneRemoteSessionId(pane_id, id) => {
+                if !config::valid_session_id(&id) {
+                    log::warn!("Ignoring invalid runtime remote session id");
+                    return;
+                }
                 if let Some((idx, pane_index)) = self.find_pane(pane_id) {
                     self.tabs[idx].panes[pane_index].session_id = Some(id.clone());
                     if let Some(conn) = self.tabs[idx]
@@ -1662,7 +1675,8 @@ impl SimpleComponent for AppModel {
                         // Learn jsh's session id so a reconnect passes the same
                         // `--session <id>` and jsh restores cwd/env/aliases.
                         // Overrides any static value the TOML config set.
-                        conn.host.session = Some(id);
+                        let learned = conn.learn_session(id);
+                        debug_assert!(learned, "session id was validated above");
                     }
                 }
             }
@@ -1887,7 +1901,7 @@ impl SimpleComponent for AppModel {
             AppMsg::SettingsRemoteClipboard(enabled) => {
                 self.apply_settings_remote_clipboard(enabled)
             }
-            AppMsg::SettingsRemoteHosts(hosts) => self.apply_settings_remote_hosts(hosts),
+            AppMsg::SettingsRemoteHosts(hosts) => self.apply_settings_remote_hosts(hosts, &sender),
             AppMsg::SearchChanged(text) => {
                 if let Some(t) = self.active_terminal() {
                     if text.is_empty() {
@@ -2149,30 +2163,56 @@ impl SimpleComponent for AppModel {
             AppMsg::FileTreeGotoCwd => self.file_tree_goto_current_cwd(),
             AppMsg::FileTreeGoUp => self.file_tree_go_up(),
             AppMsg::FileTreeSelectLocation(index) => self.file_tree_select_location(index, &sender),
-            AppMsg::FileTreeLocationResolved { loc, start } => {
-                self.file_tree_location_resolved(loc, start)
+            AppMsg::FileTreeLocationResolved { intent, start } => {
+                self.file_tree_location_resolved(*intent, start)
             }
-            AppMsg::FileTreeNewFile { dir } => self.file_tree_prompt_new(dir, false, &sender),
-            AppMsg::FileTreeNewFolder { dir } => self.file_tree_prompt_new(dir, true, &sender),
-            AppMsg::FileTreeRename { path } => self.file_tree_prompt_rename(path, &sender),
-            AppMsg::FileTreeDelete { paths } => self.file_tree_confirm_delete(paths, &sender),
-            AppMsg::FileTreeCopy { items } => self.file_tree_clipboard_set(items, false),
-            AppMsg::FileTreeCut { items } => self.file_tree_clipboard_set(items, true),
-            AppMsg::FileTreePaste { dir } => self.file_tree_paste(dir, &sender),
-            AppMsg::FileTreeImportPaths { paths, dir } => {
-                self.file_tree_import_paths(paths, dir, &sender)
+            AppMsg::FileTreeNewFile { dir, intent } => {
+                self.file_tree_prompt_new(dir, false, *intent, &sender)
             }
-            AppMsg::FileTreeRefresh => self.file_tree_refresh(),
+            AppMsg::FileTreeNewFolder { dir, intent } => {
+                self.file_tree_prompt_new(dir, true, *intent, &sender)
+            }
+            AppMsg::FileTreeRename { path, intent } => {
+                self.file_tree_prompt_rename(path, *intent, &sender)
+            }
+            AppMsg::FileTreeDelete { paths, intent } => {
+                self.file_tree_confirm_delete(paths, *intent, &sender)
+            }
+            AppMsg::FileTreeCopy { items, intent } => {
+                self.file_tree_clipboard_set(items, false, *intent)
+            }
+            AppMsg::FileTreeCut { items, intent } => {
+                self.file_tree_clipboard_set(items, true, *intent)
+            }
+            AppMsg::FileTreePaste {
+                dir,
+                intent,
+                clipboard_token,
+            } => self.file_tree_paste(dir, *intent, clipboard_token, &sender),
+            AppMsg::FileTreeImportPaths { paths, dir, intent } => {
+                self.file_tree_import_paths(paths, dir, *intent, &sender)
+            }
+            AppMsg::FileTreeRefresh { intent } => self.file_tree_refresh(*intent),
+            AppMsg::FileTreeOpenTerminal { intent } => {
+                self.file_tree_open_terminal(*intent, &sender)
+            }
             AppMsg::FileTreeFilterChanged(query) => self.file_tree_apply_filter(&query),
-            AppMsg::FileTreeOpSucceeded(dirs) => self.refresh_tree_dirs(dirs),
-            AppMsg::FileTreeCreateNamed { dir, name, is_dir } => {
-                self.file_tree_create_named(dir, name, is_dir, &sender)
+            AppMsg::FileTreeOpSucceeded {
+                dirs,
+                intent,
+                transfer_id,
+            } => self.file_tree_op_succeeded(dirs, *intent, transfer_id),
+            AppMsg::FileTreeCreateNamed {
+                dir,
+                name,
+                is_dir,
+                intent,
+            } => self.file_tree_create_named(dir, name, is_dir, *intent, &sender),
+            AppMsg::FileTreeRenameNamed { src, name, intent } => {
+                self.file_tree_rename_named(src, name, *intent, &sender)
             }
-            AppMsg::FileTreeRenameNamed { src, name } => {
-                self.file_tree_rename_named(src, name, &sender)
-            }
-            AppMsg::FileTreeDeleteConfirmed(paths) => {
-                self.file_tree_delete_confirmed(paths, &sender)
+            AppMsg::FileTreeDeleteConfirmed { paths, intent } => {
+                self.file_tree_delete_confirmed(paths, *intent, &sender)
             }
             AppMsg::SetSidebarView(view) => self.apply_sidebar_view(view, true),
             AppMsg::Ignore => {}

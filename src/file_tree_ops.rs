@@ -72,11 +72,24 @@ impl AppModel {
     /// the Local location and never yanks a deliberately browsed remote tree.
     pub(crate) fn file_tree_goto_current_cwd(&self) {
         if let Some((loc, cwd)) = self.active_remote_cwd() {
-            if *self.file_tree_location.borrow() != loc {
-                *self.file_tree_location.borrow_mut() = loc;
+            let (location_changed, reroot) = {
+                let current_location = self.file_tree_location.borrow();
+                let current_root = self.file_tree_root.borrow();
+                (
+                    *current_location != loc,
+                    file_tree::file_tree_follow_requires_reroot(
+                        &current_location,
+                        &loc,
+                        &current_root,
+                        &cwd,
+                    ),
+                )
+            };
+            if location_changed {
+                *self.file_tree_location.borrow_mut() = loc.clone();
                 self.sync_file_header_locations();
             }
-            if *self.file_tree_root.borrow() != cwd {
+            if reroot {
                 self.set_file_tree_root(cwd);
             }
             return;
@@ -108,15 +121,18 @@ impl AppModel {
         let tab = self.tabs.get(self.active)?;
         let conn = tab.remote.as_ref()?;
         let pane = tab.panes.get(tab.active_pane)?;
-        if !pane.cwd_external {
+        if pane.id != conn.pane_id || !pane.cwd_external {
             return None;
         }
         let cwd = pane.cwd.as_deref()?;
         if !std::path::Path::new(cwd).is_absolute() {
             return None;
         }
-        let hosts = &self.config.borrow().remote_hosts;
-        let index = hosts.iter().position(|host| host.name == conn.host.name)?;
+        let config = self.config.borrow();
+        let index = config::unique_checked_remote_profile_index(
+            &config.remote_hosts,
+            conn.configured_profile(),
+        )?;
         Some((
             remote_fs::FsLocation::Remote(index),
             std::path::PathBuf::from(cwd),
@@ -136,12 +152,54 @@ impl AppModel {
     }
 
     /// Reload the current root: bump the generation and scan it again.
-    pub(crate) fn file_tree_refresh(&self) {
+    pub(crate) fn file_tree_refresh(&self, intent: file_tree::FileTreeIntent) {
+        if !self.require_current_file_tree_intent(&intent) {
+            return;
+        }
         let root = self.file_tree_root.borrow().clone();
         if root.as_os_str().is_empty() {
             self.init_file_tree();
         } else {
             self.set_file_tree_root(root);
+        }
+    }
+
+    /// Open a terminal from the file-tree header without confusing a remote
+    /// browsing path for a remote-shell cwd. Local launches use the exact tree
+    /// root; remote launches revalidate and clone only the selected managed
+    /// profile, then use the ordinary connection lifecycle.
+    pub(crate) fn file_tree_open_terminal(
+        &mut self,
+        intent: file_tree::FileTreeIntent,
+        sender: &ComponentSender<AppModel>,
+    ) {
+        if !self.require_current_file_tree_intent(&intent) {
+            return;
+        }
+        let location = self.file_tree_location.borrow().clone();
+        let root = self.file_tree_root.borrow().clone();
+        let target = {
+            let config = self.config.borrow();
+            file_tree::terminal_target(&location, &root, &config.remote_hosts)
+        };
+        match target {
+            Ok(file_tree::FileTreeTerminalTarget::Local(cwd)) => {
+                let startup = self.config.borrow().startup_commands.clone();
+                self.add_tab_with(
+                    InitialCommands::from_config(startup.as_deref()),
+                    Some(cwd),
+                    self.shell_argv.clone(),
+                    sender,
+                );
+            }
+            Ok(file_tree::FileTreeTerminalTarget::Remote(host)) => {
+                if self.safe_mode {
+                    self.show_toast("Remote connections are disabled in safe mode.");
+                } else {
+                    self.add_remote_tab(&host, sender);
+                }
+            }
+            Err(message) => self.show_toast(format!("Cannot open terminal: {message}")),
         }
     }
 
@@ -170,7 +228,7 @@ impl AppModel {
         let hosts = self.config.borrow().remote_hosts.clone();
         let loc = if index == 0 {
             remote_fs::FsLocation::Local
-        } else if index <= hosts.len() {
+        } else if index <= hosts.len() && config::checked_remote_host(&hosts, index - 1).is_ok() {
             remote_fs::FsLocation::Remote(index - 1)
         } else {
             return; // stale dropdown after a config edit
@@ -178,6 +236,20 @@ impl AppModel {
         if *self.file_tree_location.borrow() == loc {
             return;
         }
+
+        self.begin_file_tree_location_switch(loc, hosts, sender);
+    }
+
+    /// Start resolving one selected filesystem location. Clearing both the
+    /// visible rows and the old root makes pending state explicit and prevents
+    /// a later profile remap from probing a local/other-host path remotely.
+    #[allow(deprecated)]
+    fn begin_file_tree_location_switch(
+        &self,
+        loc: remote_fs::FsLocation,
+        hosts: Vec<config::RemoteHost>,
+        sender: &ComponentSender<AppModel>,
+    ) {
         *self.file_tree_location.borrow_mut() = loc.clone();
 
         // Clear immediately so rows from the old location cannot be acted on
@@ -185,40 +257,98 @@ impl AppModel {
         let generation = self.file_tree_scan_generation.get().wrapping_add(1);
         self.file_tree_scan_generation.set(generation);
         self.file_tree_store.clear();
+        self.file_tree_root.borrow_mut().clear();
         self.file_header.emit(sidebar::FileHeaderMsg::SetRoot {
             display: loc.label(&hosts),
             tooltip: String::new(),
         });
 
-        let active_location = self.file_tree_location.clone();
         let start_loc = loc.clone();
-        let check_loc = loc.clone();
+        let intent = file_tree::capture_file_tree_intent(generation, &loc, &hosts);
+        let callback_intent = intent.clone();
+        let active_generation = self.file_tree_scan_generation.clone();
+        let active_location = self.file_tree_location.clone();
+        let active_config = self.config.clone();
         let sender = sender.clone();
         if let Err(error) = file_tree::request_fs_op(
             move || remote_fs::start_dir(&start_loc, &hosts),
             move |result| {
-                if *active_location.borrow() == check_loc {
+                let still_current = {
+                    let location = active_location.borrow();
+                    let config = active_config.borrow();
+                    file_tree::file_tree_intent_is_current(
+                        &callback_intent,
+                        active_generation.get(),
+                        &location,
+                        &config.remote_hosts,
+                    )
+                };
+                if still_current {
                     sender.input(AppMsg::FileTreeLocationResolved {
-                        loc: check_loc,
+                        intent: Box::new(callback_intent),
                         start: result.map_err(|error| error.to_string()),
                     });
                 }
             },
         ) {
             log::warn!("failed to start remote home probe: {error}");
-            self.file_tree_location_resolved(loc, Err(error.to_string()));
+            self.file_tree_location_resolved(intent, Err(error.to_string()));
         }
+    }
+
+    /// Rebind an index-backed tree location after `remote_hosts` changes.
+    /// Exactly one complete-profile match may survive. Reordering restarts any
+    /// in-flight work against the remapped index; missing, edited, invalid, or
+    /// ambiguous identities return to Local and synchronously clear old rows.
+    pub(crate) fn reconcile_file_tree_remote_hosts(
+        &self,
+        old_hosts: &[config::RemoteHost],
+        sender: &ComponentSender<AppModel>,
+    ) {
+        let previous = self.file_tree_location.borrow().clone();
+        let new_hosts = self.config.borrow().remote_hosts.clone();
+        let remapped = remote_fs::remap_location_by_profile(&previous, old_hosts, &new_hosts);
+        remote_fs::remap_clipboard_by_profile(
+            &mut self.file_tree_clipboard.borrow_mut(),
+            old_hosts,
+            &new_hosts,
+        );
+
+        if remapped != previous {
+            match remapped.clone() {
+                remote_fs::FsLocation::Local => {
+                    *self.file_tree_location.borrow_mut() = remote_fs::FsLocation::Local;
+                    let root =
+                        file_tree::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
+                    self.set_file_tree_root(root);
+                }
+                remote_fs::FsLocation::Remote(_) => {
+                    let root = self.file_tree_root.borrow().clone();
+                    if root.as_os_str().is_empty() {
+                        self.begin_file_tree_location_switch(remapped, new_hosts.clone(), sender);
+                    } else {
+                        *self.file_tree_location.borrow_mut() = remapped;
+                        self.set_file_tree_root(root);
+                    }
+                }
+            }
+        }
+        self.sync_file_header_locations();
     }
 
     /// Finish a location switch on the GTK thread.
     pub(crate) fn file_tree_location_resolved(
         &self,
-        loc: remote_fs::FsLocation,
+        intent: file_tree::FileTreeIntent,
         start: Result<std::path::PathBuf, String>,
     ) {
-        if *self.file_tree_location.borrow() != loc {
+        // Recheck after message delivery as well as before enqueueing it: the
+        // GTK queue itself is an async boundary across which location/config
+        // can change again.
+        if !self.file_tree_intent_is_current(&intent) {
             return;
         }
+        let loc = self.file_tree_location.borrow().clone();
         match start {
             Ok(root) => self.set_file_tree_root(root),
             Err(error) => {
@@ -251,14 +381,39 @@ impl AppModel {
         });
     }
 
+    fn file_tree_intent_is_current(&self, intent: &file_tree::FileTreeIntent) -> bool {
+        let location = self.file_tree_location.borrow();
+        let config = self.config.borrow();
+        file_tree::file_tree_intent_is_current(
+            intent,
+            self.file_tree_scan_generation.get(),
+            &location,
+            &config.remote_hosts,
+        )
+    }
+
+    /// A stale dialog fails closed before name/path validation or any worker
+    /// operation can reinterpret its targets against another filesystem.
+    fn require_current_file_tree_intent(&self, intent: &file_tree::FileTreeIntent) -> bool {
+        let current = self.file_tree_intent_is_current(intent);
+        if !current {
+            self.show_toast("The file-tree location changed; the pending operation was cancelled.");
+        }
+        current
+    }
+
     /// Ask for a name, then create the entry on confirm. `dir: None` targets
     /// the current tree root.
     pub(crate) fn file_tree_prompt_new(
         &self,
         dir: Option<std::path::PathBuf>,
         is_dir: bool,
+        intent: file_tree::FileTreeIntent,
         sender: &ComponentSender<AppModel>,
     ) {
+        if !self.require_current_file_tree_intent(&intent) {
+            return;
+        }
         let dir = dir.unwrap_or_else(|| self.file_tree_root.borrow().clone());
         if dir.as_os_str().is_empty() {
             return;
@@ -269,6 +424,7 @@ impl AppModel {
                 dir: dir.clone(),
                 name,
                 is_dir,
+                intent: Box::new(intent.clone()),
             }
         });
     }
@@ -279,8 +435,12 @@ impl AppModel {
     pub(crate) fn file_tree_prompt_rename(
         &self,
         path: std::path::PathBuf,
+        intent: file_tree::FileTreeIntent,
         sender: &ComponentSender<AppModel>,
     ) {
+        if !self.require_current_file_tree_intent(&intent) {
+            return;
+        }
         let initial = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -293,6 +453,7 @@ impl AppModel {
             move |name| AppMsg::FileTreeRenameNamed {
                 src: path.clone(),
                 name,
+                intent: Box::new(intent.clone()),
             },
         );
     }
@@ -302,9 +463,13 @@ impl AppModel {
     pub(crate) fn file_tree_confirm_delete(
         &self,
         paths: Vec<std::path::PathBuf>,
+        intent: file_tree::FileTreeIntent,
         sender: &ComponentSender<AppModel>,
     ) {
         if paths.is_empty() {
+            return;
+        }
+        if !self.require_current_file_tree_intent(&intent) {
             return;
         }
         let body = if paths.len() == 1 {
@@ -333,7 +498,10 @@ impl AppModel {
             let sender = sender.clone();
             dialog.connect_response(None, move |_, response| {
                 if response == "delete" {
-                    sender.input(AppMsg::FileTreeDeleteConfirmed(paths.clone()));
+                    sender.input(AppMsg::FileTreeDeleteConfirmed {
+                        paths: paths.clone(),
+                        intent: Box::new(intent.clone()),
+                    });
                 }
             });
         }
@@ -345,10 +513,19 @@ impl AppModel {
         &self,
         items: Vec<(std::path::PathBuf, bool)>,
         cut: bool,
+        intent: file_tree::FileTreeIntent,
     ) {
         if items.is_empty() {
             return;
         }
+        if !self.require_current_file_tree_intent(&intent) {
+            return;
+        }
+        let Some(token) = self.file_tree_clipboard_revision.get().checked_add(1) else {
+            self.show_toast("The file clipboard identity space is exhausted; restart Anvil.");
+            return;
+        };
+        self.file_tree_clipboard_revision.set(token);
         *self.file_tree_clipboard.borrow_mut() = Some(remote_fs::FsClipboard {
             loc: self.file_tree_location.borrow().clone(),
             items: items
@@ -356,6 +533,7 @@ impl AppModel {
                 .map(|(path, is_dir)| remote_fs::FsClipboardItem { path, is_dir })
                 .collect(),
             cut,
+            token,
         });
     }
 
@@ -364,8 +542,12 @@ impl AppModel {
         dir: std::path::PathBuf,
         name: String,
         is_dir: bool,
+        intent: file_tree::FileTreeIntent,
         sender: &ComponentSender<AppModel>,
     ) {
+        if !self.require_current_file_tree_intent(&intent) {
+            return;
+        }
         if let Some(error) = remote_fs::new_name_error(&name) {
             self.show_toast(format!("Invalid name: {error}"));
             return;
@@ -374,6 +556,8 @@ impl AppModel {
         let loc = self.file_tree_location.borrow().clone();
         let hosts = self.config.borrow().remote_hosts.clone();
         self.run_file_tree_op(
+            intent,
+            None,
             Vec::new(),
             vec![dir],
             move || {
@@ -384,6 +568,7 @@ impl AppModel {
                 }
             },
             |_| {},
+            |_| {},
             sender,
         );
     }
@@ -392,8 +577,12 @@ impl AppModel {
         &self,
         src: std::path::PathBuf,
         name: String,
+        intent: file_tree::FileTreeIntent,
         sender: &ComponentSender<AppModel>,
     ) {
+        if !self.require_current_file_tree_intent(&intent) {
+            return;
+        }
         if let Some(error) = remote_fs::new_name_error(&name) {
             self.show_toast(format!("Invalid name: {error}"));
             return;
@@ -409,11 +598,16 @@ impl AppModel {
         }
         let loc = self.file_tree_location.borrow().clone();
         let hosts = self.config.borrow().remote_hosts.clone();
+        let clipboard_token =
+            remote_fs::clipboard_token_for_location(&self.file_tree_clipboard.borrow(), &loc);
         // A renamed clipboard source would dangle; forget it on success.
         self.run_file_tree_op(
+            intent,
+            clipboard_token,
             vec![src.clone()],
             refresh,
             move || remote_fs::rename(&loc, &hosts, &src, &dst),
+            |_| {},
             |_| {},
             sender,
         );
@@ -422,13 +616,19 @@ impl AppModel {
     pub(crate) fn file_tree_delete_confirmed(
         &self,
         paths: Vec<std::path::PathBuf>,
+        intent: file_tree::FileTreeIntent,
         sender: &ComponentSender<AppModel>,
     ) {
         if paths.is_empty() {
             return;
         }
+        if !self.require_current_file_tree_intent(&intent) {
+            return;
+        }
         let loc = self.file_tree_location.borrow().clone();
         let hosts = self.config.borrow().remote_hosts.clone();
+        let clipboard = self.file_tree_clipboard.clone();
+        let clipboard_token = remote_fs::clipboard_token_for_location(&clipboard.borrow(), &loc);
         let mut refresh: Vec<std::path::PathBuf> = Vec::new();
         for path in &paths {
             if let Some(parent) = path.parent() {
@@ -438,12 +638,22 @@ impl AppModel {
         // Deleted clipboard sources would dangle; forget them on success.
         let toast_overlay = self.toast_overlay.clone();
         self.run_file_tree_op(
-            paths.clone(),
+            intent,
+            None,
+            Vec::new(),
             refresh,
             move || Ok(remote_fs::delete_all(&loc, &hosts, &paths)),
             move |outcome| {
-                if !outcome.failed.is_empty() {
-                    toast_overlay.add_toast(adw::Toast::new(&batch_summary(&outcome, "deleted")));
+                remote_fs::retire_clipboard_sources(
+                    &mut clipboard.borrow_mut(),
+                    clipboard_token,
+                    &outcome.succeeded,
+                );
+            },
+            move |outcome| {
+                if !outcome.summary.failed.is_empty() {
+                    toast_overlay
+                        .add_toast(adw::Toast::new(&batch_summary(&outcome.summary, "deleted")));
                 }
             },
             sender,
@@ -458,9 +668,17 @@ impl AppModel {
     pub(crate) fn file_tree_paste(
         &self,
         dir: Option<std::path::PathBuf>,
+        intent: file_tree::FileTreeIntent,
+        clipboard_token: u64,
         sender: &ComponentSender<AppModel>,
     ) {
-        let Some(clip) = self.file_tree_clipboard.borrow().clone() else {
+        if !self.require_current_file_tree_intent(&intent) {
+            return;
+        }
+        let clip =
+            remote_fs::clipboard_for_token(&self.file_tree_clipboard.borrow(), clipboard_token);
+        let Some(clip) = clip else {
+            self.show_toast("The file clipboard changed; reopen Paste.");
             return;
         };
         let loc = self.file_tree_location.borrow().clone();
@@ -493,6 +711,8 @@ impl AppModel {
                 };
                 let forget = if cut { vec![src.clone()] } else { Vec::new() };
                 self.run_file_tree_op(
+                    intent,
+                    cut.then_some(clip.token),
                     forget,
                     refresh,
                     move || {
@@ -503,6 +723,7 @@ impl AppModel {
                         }
                     },
                     |_| {},
+                    |_| {},
                     sender,
                 );
                 return;
@@ -510,11 +731,6 @@ impl AppModel {
             // Same-location batch: one worker job, per-item failures
             // collected into a summary toast.
             let items = clip.items.clone();
-            let forget: Vec<std::path::PathBuf> = if cut {
-                items.iter().map(|item| item.path.clone()).collect()
-            } else {
-                Vec::new()
-            };
             let mut refresh = vec![dir.clone()];
             if cut {
                 for item in &items {
@@ -525,8 +741,14 @@ impl AppModel {
             }
             let clip_loc = clip.loc.clone();
             let toast_overlay = self.toast_overlay.clone();
+            let consumed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let consumed_for_worker = consumed.clone();
+            let clipboard = self.file_tree_clipboard.clone();
+            let clipboard_token = clip.token;
             self.run_file_tree_op(
-                forget,
+                intent,
+                None,
+                Vec::new(),
                 refresh,
                 move || {
                     remote_fs::paste_all(
@@ -538,7 +760,23 @@ impl AppModel {
                         cut,
                         &remote_fs::TransferControl::new(),
                         &|_| {},
+                        &|path| {
+                            consumed_for_worker
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .push(path.to_path_buf());
+                        },
                     )
+                },
+                move |_| {
+                    let consumed = consumed
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    remote_fs::retire_clipboard_sources(
+                        &mut clipboard.borrow_mut(),
+                        cut.then_some(clipboard_token),
+                        &consumed,
+                    );
                 },
                 move |outcome| {
                     if !outcome.failed.is_empty() {
@@ -599,11 +837,17 @@ impl AppModel {
             let busy = format!("{verb} {name} {from_to}…");
             let done = format!("{name}: transfer complete");
             let cancelled = format!("{name}: transfer cancelled");
-            let cut_source = cut.then_some((src_loc.clone(), src.clone()));
+            // Source deletion must use the same profile snapshot as the copy.
+            // A settings reorder/edit while the transfer runs must never pair
+            // the old index with a new host list.
+            let cut_source = cut.then_some((src_loc.clone(), hosts.clone(), src.clone()));
             self.run_file_tree_transfer(
+                intent,
                 busy,
                 cancelled,
                 vec![dir.clone()],
+                cut.then_some(clip.token),
+                None,
                 control,
                 move |progress: &dyn Fn(u64)| {
                     remote_fs::transfer(
@@ -633,11 +877,15 @@ impl AppModel {
             let busy = busy.clone();
             move |done: u64| format!("{busy} {done}/{count}")
         };
-        let clipboard = self.file_tree_clipboard.clone();
+        let consumed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let consumed_for_worker = consumed.clone();
         self.run_file_tree_transfer(
+            intent,
             busy,
             "Paste cancelled".to_string(),
             vec![dir.clone()],
+            cut.then_some(clip.token),
+            cut.then_some(consumed),
             control,
             move |progress: &dyn Fn(u64)| {
                 remote_fs::paste_all(
@@ -649,17 +897,16 @@ impl AppModel {
                     cut,
                     &worker_control,
                     progress,
+                    &|path| {
+                        consumed_for_worker
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(path.to_path_buf());
+                    },
                 )
             },
             progress_label,
-            move |outcome| {
-                // A cut batch is spent once it ran; sources of failed items
-                // remain in place and are named in the summary.
-                if cut {
-                    *clipboard.borrow_mut() = None;
-                }
-                (batch_summary(&outcome, "pasted"), None)
-            },
+            move |outcome| (batch_summary(&outcome, "pasted"), None),
             sender,
         );
     }
@@ -672,8 +919,12 @@ impl AppModel {
         &self,
         paths: Vec<std::path::PathBuf>,
         dir: Option<std::path::PathBuf>,
+        intent: file_tree::FileTreeIntent,
         sender: &ComponentSender<AppModel>,
     ) {
+        if !self.require_current_file_tree_intent(&intent) {
+            return;
+        }
         let loc = self.file_tree_location.borrow().clone();
         let dir = dir.unwrap_or_else(|| self.file_tree_root.borrow().clone());
         if dir.as_os_str().is_empty() {
@@ -707,9 +958,12 @@ impl AppModel {
         let control = remote_fs::TransferControl::new();
         let worker_control = control.clone();
         self.run_file_tree_transfer(
+            intent,
             busy,
             "Import cancelled".to_string(),
             vec![dir.clone()],
+            None,
+            None,
             control,
             move |progress: &dyn Fn(u64)| {
                 remote_fs::run_drop(&plan, &loc, &hosts, &dir, &worker_control, progress)
@@ -761,35 +1015,79 @@ impl AppModel {
 
     /// Run one blocking op on a worker thread, then refresh only the affected
     /// directories in place on the GTK thread. `forget_clipboard` names
-    /// clipboard sources that a successful op consumes or makes dangle;
-    /// `on_success` turns the worker payload into any summary toast.
+    /// clipboard sources that a successful op consumes or makes dangle.
+    /// Backend/clipboard settlement always commits against the frozen token;
+    /// UI publication is separately gated by the frozen tree authority.
+    #[allow(clippy::too_many_arguments)]
     fn run_file_tree_op<T: Send + 'static>(
         &self,
+        intent: file_tree::FileTreeIntent,
+        clipboard_token: Option<u64>,
         forget_clipboard: Vec<std::path::PathBuf>,
         refresh: Vec<std::path::PathBuf>,
         op: impl FnOnce() -> std::io::Result<T> + Send + 'static,
-        on_success: impl FnOnce(T) + 'static,
+        settle_success: impl FnOnce(&T) + 'static,
+        on_current_success: impl FnOnce(T) + 'static,
         sender: &ComponentSender<AppModel>,
     ) {
         let toast_overlay = self.toast_overlay.clone();
         let clipboard = self.file_tree_clipboard.clone();
+        let active_generation = self.file_tree_scan_generation.clone();
+        let active_location = self.file_tree_location.clone();
+        let active_config = self.config.clone();
+        let transfer_revision = self.file_tree_transfer_revision.clone();
         let sender = sender.clone();
         if let Err(error) = file_tree::request_fs_op(op, move |result| match result {
             Ok(payload) => {
                 if !forget_clipboard.is_empty() {
-                    let dangling = clipboard.borrow().as_ref().is_some_and(|clip| {
-                        clip.items
-                            .iter()
-                            .any(|item| forget_clipboard.contains(&item.path))
-                    });
-                    if dangling {
-                        *clipboard.borrow_mut() = None;
-                    }
+                    remote_fs::retire_clipboard_sources(
+                        &mut clipboard.borrow_mut(),
+                        clipboard_token,
+                        &forget_clipboard,
+                    );
                 }
-                sender.input(AppMsg::FileTreeOpSucceeded(refresh));
-                on_success(payload);
+                // Settlement is about the backend result and the exact intent
+                // token, so it must happen even if the user has since browsed
+                // elsewhere. Only visible UI is suppressed for stale work.
+                settle_success(&payload);
+                let still_current = {
+                    let location = active_location.borrow();
+                    let config = active_config.borrow();
+                    file_tree::file_tree_async_ui_is_current(
+                        &intent,
+                        active_generation.get(),
+                        &location,
+                        &config.remote_hosts,
+                        None,
+                        transfer_revision.get(),
+                    )
+                };
+                if !still_current {
+                    return;
+                }
+                sender.input(AppMsg::FileTreeOpSucceeded {
+                    dirs: refresh,
+                    intent: Box::new(intent),
+                    transfer_id: None,
+                });
+                on_current_success(payload);
             }
             Err(error) => {
+                let still_current = {
+                    let location = active_location.borrow();
+                    let config = active_config.borrow();
+                    file_tree::file_tree_async_ui_is_current(
+                        &intent,
+                        active_generation.get(),
+                        &location,
+                        &config.remote_hosts,
+                        None,
+                        transfer_revision.get(),
+                    )
+                };
+                if !still_current {
+                    return;
+                }
                 let message = review_input::safe_inline_display(&error.to_string(), 512);
                 toast_overlay.add_toast(adw::Toast::new(&format!(
                     "File operation failed: {message}"
@@ -810,17 +1108,34 @@ impl AppModel {
     #[allow(clippy::too_many_arguments)]
     fn run_file_tree_transfer<T: Send + 'static>(
         &self,
+        intent: file_tree::FileTreeIntent,
         busy_label: String,
         cancelled_label: String,
         refresh: Vec<std::path::PathBuf>,
+        clipboard_token: Option<u64>,
+        consumed_sources: Option<std::sync::Arc<std::sync::Mutex<Vec<std::path::PathBuf>>>>,
         control: remote_fs::TransferControl,
         transfer: impl FnOnce(&dyn Fn(u64)) -> std::io::Result<T> + Send + 'static,
         progress_label: impl Fn(u64) -> String + 'static,
-        finish: impl FnOnce(T) -> (String, Option<(remote_fs::FsLocation, std::path::PathBuf)>)
-            + 'static,
+        finish: impl FnOnce(
+                T,
+            ) -> (
+                String,
+                Option<(
+                    remote_fs::FsLocation,
+                    Vec<config::RemoteHost>,
+                    std::path::PathBuf,
+                )>,
+            ) + 'static,
         sender: &ComponentSender<AppModel>,
     ) {
-        let busy_toast = self.file_tree_transfer_begin(&busy_label);
+        let (busy_toast, transfer_id) = match self.file_tree_transfer_begin(&busy_label) {
+            Ok(started) => started,
+            Err(message) => {
+                self.show_toast(message);
+                return;
+            }
+        };
         // The Cancel action races the transfer's own completion harmlessly:
         // cancelling an already-finished control only kills exited children.
         busy_toast.set_button_label(Some("Cancel"));
@@ -833,15 +1148,33 @@ impl AppModel {
         let transfer_toast = self.file_tree_transfer_toast.clone();
         let toast_overlay = self.toast_overlay.clone();
         let clipboard = self.file_tree_clipboard.clone();
-        let config = self.config.clone();
+        let active_generation = self.file_tree_scan_generation.clone();
+        let active_location = self.file_tree_location.clone();
+        let active_config = self.config.clone();
+        let transfer_revision = self.file_tree_transfer_revision.clone();
         let sender = sender.clone();
         let mut refresh = Some(refresh);
         let mut finish = Some(finish);
         let busy_toast_for_error = busy_toast.clone();
+        let intent_for_start_error = intent.clone();
         if let Err(error) =
             file_tree::request_fs_op_streaming(transfer, move |outcome| match outcome {
                 file_tree::FsOpOutcome::Progress(bytes) => {
-                    busy_toast.set_title(&progress_label(bytes));
+                    let still_current = {
+                        let location = active_location.borrow();
+                        let config = active_config.borrow();
+                        file_tree::file_tree_async_ui_is_current(
+                            &intent,
+                            active_generation.get(),
+                            &location,
+                            &config.remote_hosts,
+                            Some(transfer_id),
+                            transfer_revision.get(),
+                        ) && transfer_toast.borrow().as_ref() == Some(&busy_toast)
+                    };
+                    if still_current {
+                        busy_toast.set_title(&progress_label(bytes));
+                    }
                 }
                 file_tree::FsOpOutcome::Done(result) => {
                     busy_toast.dismiss();
@@ -853,54 +1186,159 @@ impl AppModel {
                             slot.take();
                         }
                     }
+                    // Batch cut reports each source only after its move, or
+                    // after a cross-location copy AND source delete, commits.
+                    // Settle the completed prefix even when a later item was
+                    // cancelled; the exact token protects a newer clipboard.
+                    if let (Some(token), Some(consumed_sources)) =
+                        (clipboard_token, consumed_sources.as_ref())
+                    {
+                        let consumed = consumed_sources
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone();
+                        remote_fs::retire_clipboard_sources(
+                            &mut clipboard.borrow_mut(),
+                            Some(token),
+                            &consumed,
+                        );
+                    }
                     match result {
                         Ok(payload) => {
                             let Some(finish) = finish.take() else { return };
                             let (done_label, cut_source) = finish(payload);
-                            toast_overlay.add_toast(adw::Toast::new(&done_label));
-                            sender.input(AppMsg::FileTreeOpSucceeded(
-                                refresh.take().unwrap_or_default(),
-                            ));
-                            let Some((loc, path)) = cut_source else {
+                            let still_current = {
+                                let location = active_location.borrow();
+                                let config = active_config.borrow();
+                                file_tree::file_tree_async_ui_is_current(
+                                    &intent,
+                                    active_generation.get(),
+                                    &location,
+                                    &config.remote_hosts,
+                                    Some(transfer_id),
+                                    transfer_revision.get(),
+                                )
+                            };
+                            if still_current {
+                                toast_overlay.add_toast(adw::Toast::new(&done_label));
+                                sender.input(AppMsg::FileTreeOpSucceeded {
+                                    dirs: refresh.take().unwrap_or_default(),
+                                    intent: Box::new(intent.clone()),
+                                    transfer_id: Some(transfer_id),
+                                });
+                            }
+                            let Some((loc, hosts, path)) = cut_source else {
                                 return;
                             };
-                            // The copy half of the cut is done: the clipboard
-                            // is spent either way, and the source delete is
-                            // best-effort.
-                            let dangling = clipboard.borrow().as_ref().is_some_and(|clip| {
-                                clip.items.iter().any(|item| item.path == path)
-                            });
-                            if dangling {
-                                *clipboard.borrow_mut() = None;
-                            }
-                            let hosts = config.borrow().remote_hosts.clone();
-                            let toast_overlay = toast_overlay.clone();
+                            // A single cross-location cut consumes its source
+                            // only after the delete commits. A failed delete
+                            // leaves the captured clipboard item retryable.
+                            let delete_toast_overlay = toast_overlay.clone();
+                            let clipboard = clipboard.clone();
+                            let path_for_retirement = path.clone();
+                            let delete_intent = intent.clone();
+                            let delete_generation = active_generation.clone();
+                            let delete_location = active_location.clone();
+                            let delete_config = active_config.clone();
+                            let delete_revision = transfer_revision.clone();
                             if let Err(error) = file_tree::request_fs_op(
                                 move || remote_fs::delete(&loc, &hosts, &path),
-                                move |result| {
-                                    if let Err(error) = result {
+                                move |result| match result {
+                                    Ok(()) => {
+                                        remote_fs::retire_clipboard_sources(
+                                            &mut clipboard.borrow_mut(),
+                                            clipboard_token,
+                                            &[path_for_retirement],
+                                        );
+                                    }
+                                    Err(error) => {
+                                        let still_current = {
+                                            let location = delete_location.borrow();
+                                            let config = delete_config.borrow();
+                                            file_tree::file_tree_async_ui_is_current(
+                                                &delete_intent,
+                                                delete_generation.get(),
+                                                &location,
+                                                &config.remote_hosts,
+                                                Some(transfer_id),
+                                                delete_revision.get(),
+                                            )
+                                        };
+                                        if !still_current {
+                                            return;
+                                        }
                                         let message = review_input::safe_inline_display(
                                             &error.to_string(),
                                             512,
                                         );
-                                        toast_overlay.add_toast(adw::Toast::new(&format!(
+                                        delete_toast_overlay.add_toast(adw::Toast::new(&format!(
                                             "Copied, but deleting the source failed: {message}"
                                         )));
                                     }
                                 },
                             ) {
                                 log::warn!("failed to start cut-paste source delete: {error}");
+                                let still_current = {
+                                    let location = active_location.borrow();
+                                    let config = active_config.borrow();
+                                    file_tree::file_tree_async_ui_is_current(
+                                        &intent,
+                                        active_generation.get(),
+                                        &location,
+                                        &config.remote_hosts,
+                                        Some(transfer_id),
+                                        transfer_revision.get(),
+                                    )
+                                };
+                                if still_current {
+                                    let message =
+                                        review_input::safe_inline_display(&error.to_string(), 512);
+                                    toast_overlay.add_toast(adw::Toast::new(&format!(
+                                        "Copied, but deleting the source could not start: {message}"
+                                    )));
+                                }
                             }
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
                             // Cancellation is a neutral outcome, not an error;
                             // refresh so any partial state shows truthfully.
-                            toast_overlay.add_toast(adw::Toast::new(&cancelled_label));
-                            sender.input(AppMsg::FileTreeOpSucceeded(
-                                refresh.take().unwrap_or_default(),
-                            ));
+                            let still_current = {
+                                let location = active_location.borrow();
+                                let config = active_config.borrow();
+                                file_tree::file_tree_async_ui_is_current(
+                                    &intent,
+                                    active_generation.get(),
+                                    &location,
+                                    &config.remote_hosts,
+                                    Some(transfer_id),
+                                    transfer_revision.get(),
+                                )
+                            };
+                            if still_current {
+                                toast_overlay.add_toast(adw::Toast::new(&cancelled_label));
+                                sender.input(AppMsg::FileTreeOpSucceeded {
+                                    dirs: refresh.take().unwrap_or_default(),
+                                    intent: Box::new(intent.clone()),
+                                    transfer_id: Some(transfer_id),
+                                });
+                            }
                         }
                         Err(error) => {
+                            let still_current = {
+                                let location = active_location.borrow();
+                                let config = active_config.borrow();
+                                file_tree::file_tree_async_ui_is_current(
+                                    &intent,
+                                    active_generation.get(),
+                                    &location,
+                                    &config.remote_hosts,
+                                    Some(transfer_id),
+                                    transfer_revision.get(),
+                                )
+                            };
+                            if !still_current {
+                                return;
+                            }
                             let message =
                                 review_input::safe_inline_display(&error.to_string(), 512);
                             toast_overlay
@@ -916,14 +1354,34 @@ impl AppModel {
                 slot.take();
             }
             drop(slot);
-            self.show_toast(format!("Could not start the transfer: {error}"));
+            let still_current = {
+                let location = self.file_tree_location.borrow();
+                let config = self.config.borrow();
+                file_tree::file_tree_async_ui_is_current(
+                    &intent_for_start_error,
+                    self.file_tree_scan_generation.get(),
+                    &location,
+                    &config.remote_hosts,
+                    Some(transfer_id),
+                    self.file_tree_transfer_revision.get(),
+                )
+            };
+            if still_current {
+                self.show_toast(format!("Could not start the transfer: {error}"));
+            }
         }
     }
 
     /// One held toast per transfer, dismissed when it finishes — the busy
     /// indication for payloads that can outlive a normal toast. Returns the
     /// toast so the completing transfer dismisses its own, not a newer one.
-    fn file_tree_transfer_begin(&self, label: &str) -> adw::Toast {
+    fn file_tree_transfer_begin(&self, label: &str) -> Result<(adw::Toast, u64), &'static str> {
+        let transfer_id = self
+            .file_tree_transfer_revision
+            .get()
+            .checked_add(1)
+            .ok_or("Could not start the transfer: transfer identity exhausted.")?;
+        self.file_tree_transfer_revision.set(transfer_id);
         if let Some(old) = self.file_tree_transfer_toast.borrow_mut().take() {
             old.dismiss();
         }
@@ -931,7 +1389,33 @@ impl AppModel {
         toast.set_timeout(0);
         self.toast_overlay.add_toast(toast.clone());
         *self.file_tree_transfer_toast.borrow_mut() = Some(toast.clone());
-        toast
+        Ok((toast, transfer_id))
+    }
+
+    /// Apply a queued refresh only while both the tree authority and optional
+    /// transfer identity are still current. This second gate covers a location
+    /// or new-transfer change after the worker callback enqueued its message.
+    pub(crate) fn file_tree_op_succeeded(
+        &self,
+        dirs: Vec<std::path::PathBuf>,
+        intent: file_tree::FileTreeIntent,
+        transfer_id: Option<u64>,
+    ) {
+        let location = self.file_tree_location.borrow();
+        let config = self.config.borrow();
+        let current = file_tree::file_tree_async_ui_is_current(
+            &intent,
+            self.file_tree_scan_generation.get(),
+            &location,
+            &config.remote_hosts,
+            transfer_id,
+            self.file_tree_transfer_revision.get(),
+        );
+        drop(config);
+        drop(location);
+        if current {
+            self.refresh_tree_dirs(dirs);
+        }
     }
 
     /// Refresh only the affected directories in place: locate each row by its

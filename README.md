@@ -786,6 +786,44 @@ File, New Folder, Rename, Delete (with confirmation), Copy, Cut, Paste, and
 Refresh; the same menu works locally, and a successful operation refreshes
 only the directories it touched, so unrelated expanded rows never collapse.
 
+The terminal button in that header is in the normal Tab order and has an
+explicit accessible action name. On `Local` it opens a normal local tab with
+the current tree root as its initial working directory. On an `ssh:` or
+`docker:` location it revalidates and connects the selected managed profile;
+it deliberately does **not** promise to start at the path currently shown by
+the tree, because the remote shell/profile owns its startup directory. Its
+tooltip states that distinction before activation, and Enter or Space invokes
+the focused button. If `remote_hosts` is reloaded or edited, a browsed remote
+location follows only one field-for-field identical complete profile through a
+reorder. An edited, removed, invalid, or ambiguously duplicated profile drops
+the tree to `Local` and clears the old remote rows instead of reusing its index
+for a different destination. Remote-home answers carry both the initiating
+scan generation and complete profile, so leaving and later reusing the same
+numeric slot cannot let an old answer replace the new host's root. Every
+context-menu filesystem action is likewise bound to the generation, location,
+and complete remote profile that opened the menu; New, Rename, and Delete keep
+that same authority through their confirmation dialog. The header terminal
+button and OS file drop capture the same click/drop-time authority before their
+Relm messages are queued. A stale action is cancelled with a notice instead of
+applying its old root or path to another backend.
+The file clipboard follows the same exact-profile rule across a safe reorder
+and gives every Copy/Cut action its own identity. Paste resolves the menu's
+frozen token through the live reconciled clipboard, so an old menu cannot use a
+later Copy/Cut. Slow rename, delete, or cut completion can consume only the
+intent it started with; batch delete retires clipboard sources only for paths
+actually removed. Batch cut removes only successfully moved sources from that
+intent, including the committed prefix of a cancelled batch, and retains
+colliding, unfinished, or source-delete-failed items for retry. Cut source
+cleanup also keeps the original validated host snapshot for its entire
+transfer. Background mutation and transfer callbacks settle that exact token
+first, then publish progress, completion/error notices, and row refreshes only
+while both the frozen tree authority and the transfer's monotonic identity are
+still current; a newer transfer or an A-to-B tree switch suppresses every late
+UI effect. Following an active remote tab's cwd uses the connection's immutable
+complete configured profile (kept separate from learned/restored runtime
+session state) and requires one valid exact match, so reorder remains safe but
+a same-name replacement, edit, removal, or duplicate cannot redirect the tree.
+
 Paste also works across locations. Copying or cutting on a host and pasting
 locally downloads (labeled "Paste (download)"); the reverse uploads; pasting
 between two different hosts relays through a staging file under the system

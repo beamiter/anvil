@@ -221,13 +221,59 @@ pub(crate) enum ConnStatus {
 
 #[derive(Clone)]
 pub(crate) struct RemoteConn {
+    /// Runtime launch target. It starts as `configured_profile` and may differ
+    /// only in `session`, which jsh learns or a validated snapshot restores.
     pub(crate) host: config::RemoteHost,
+    /// Immutable full profile that authorized this connection. Runtime session
+    /// learning must never erase the identity used for config remap/revocation.
+    configured_profile: config::RemoteHost,
     /// Stable identity of the pane that owns this connection. A tab can also
     /// contain local split panes, so tab-level metadata alone is ambiguous.
     pub(crate) pane_id: u64,
     pub(crate) status: ConnStatus,
     pub(crate) attempt: u32,
     pub(crate) spawn_at: std::time::Instant,
+}
+
+impl RemoteConn {
+    pub(crate) fn new(configured_profile: config::RemoteHost, pane_id: u64) -> Self {
+        Self::with_session_override(configured_profile, pane_id, None)
+    }
+
+    /// Restore a managed profile while allowing the separately validated pane
+    /// snapshot to override only its runtime jsh session id.
+    pub(crate) fn with_session_override(
+        configured_profile: config::RemoteHost,
+        pane_id: u64,
+        session_override: Option<String>,
+    ) -> Self {
+        let mut host = configured_profile.clone();
+        if let Some(session) = session_override.filter(|value| config::valid_session_id(value)) {
+            host.session = Some(session);
+        }
+        Self {
+            host,
+            configured_profile,
+            pane_id,
+            status: ConnStatus::Connecting,
+            attempt: 0,
+            spawn_at: std::time::Instant::now(),
+        }
+    }
+
+    pub(crate) fn configured_profile(&self) -> &config::RemoteHost {
+        &self.configured_profile
+    }
+
+    /// Learn the authenticated runtime session without changing configured
+    /// profile identity. Returns false for a non-jsh identifier.
+    pub(crate) fn learn_session(&mut self, session: String) -> bool {
+        if !config::valid_session_id(&session) {
+            return false;
+        }
+        self.host.session = Some(session);
+        true
+    }
 }
 
 /// Saved tree position of the active pane while a tab is pane-zoomed.
@@ -261,5 +307,65 @@ impl Tab {
         } else {
             &self.title
         }
+    }
+}
+
+#[cfg(test)]
+mod remote_conn_tests {
+    use super::*;
+
+    fn configured_profile() -> config::RemoteHost {
+        config::RemoteHost {
+            name: "staging".to_string(),
+            host: "staging.example.com".to_string(),
+            user: Some("deploy".to_string()),
+            docker: false,
+            deploy_artifact: None,
+            remote_shell: "jsh".to_string(),
+            session: Some("configured-session".to_string()),
+            ssh_args: vec!["-p".to_string(), "2222".to_string()],
+            login_shell: true,
+            multiplex: true,
+            deploy: jterm_core::jsh_remote::Deploy::Off,
+        }
+    }
+
+    #[test]
+    fn learned_session_changes_only_the_runtime_remote_host() {
+        let profile = configured_profile();
+        let mut connection = RemoteConn::new(profile.clone(), 7);
+
+        assert_eq!(connection.configured_profile(), &profile);
+        assert_eq!(connection.host, profile);
+        assert!(connection.learn_session("learned-session".to_string()));
+        assert_eq!(connection.host.session.as_deref(), Some("learned-session"));
+        assert_eq!(
+            connection.configured_profile().session.as_deref(),
+            Some("configured-session"),
+            "runtime OSC state must not rewrite config identity"
+        );
+    }
+
+    #[test]
+    fn restored_session_is_the_only_exception_to_the_frozen_profile() {
+        let profile = configured_profile();
+        let connection = RemoteConn::with_session_override(
+            profile.clone(),
+            8,
+            Some("restored-session".to_string()),
+        );
+
+        assert_eq!(connection.configured_profile(), &profile);
+        assert_eq!(connection.host.name, profile.name);
+        assert_eq!(connection.host.host, profile.host);
+        assert_eq!(connection.host.user, profile.user);
+        assert_eq!(connection.host.session.as_deref(), Some("restored-session"));
+
+        let invalid = RemoteConn::with_session_override(
+            profile.clone(),
+            9,
+            Some("invalid session".to_string()),
+        );
+        assert_eq!(invalid.host, profile, "invalid overrides fail closed");
     }
 }

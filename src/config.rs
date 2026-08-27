@@ -1389,6 +1389,19 @@ pub(crate) fn checked_remote_host(
     Ok(host)
 }
 
+/// Resolve one immutable configured profile through the live host list.
+/// Numeric positions are presentation state, so a reorder may move the match;
+/// edited, removed, invalid, out-of-range, or duplicated profiles fail closed.
+pub(crate) fn unique_checked_remote_profile_index(
+    hosts: &[RemoteHost],
+    expected: &RemoteHost,
+) -> Option<usize> {
+    let mut matches = (0..hosts.len().min(MAX_REMOTE_HOSTS))
+        .filter(|index| checked_remote_host(hosts, *index).is_ok_and(|host| host == expected));
+    let index = matches.next()?;
+    matches.next().is_none().then_some(index)
+}
+
 /// Parse `[[remote_hosts]]` array-of-tables. Entries missing a host or carrying
 /// unsafe semantic values are skipped, matching the validator's safe-default
 /// contract even when startup continues after reporting configuration errors.
@@ -2732,5 +2745,55 @@ mod tests {
         let hosts = vec![valid; MAX_REMOTE_HOSTS + 1];
         assert!(checked_remote_host(&hosts, MAX_REMOTE_HOSTS - 1).is_ok());
         assert!(checked_remote_host(&hosts, MAX_REMOTE_HOSTS).is_err());
+    }
+
+    #[test]
+    fn immutable_remote_profile_resolves_only_one_complete_valid_match() {
+        let expected = host();
+        let mut other = expected.clone();
+        other.name = "other".into();
+        other.host = "198.51.100.9".into();
+
+        assert_eq!(
+            unique_checked_remote_profile_index(&[other.clone(), expected.clone()], &expected),
+            Some(1),
+            "a pure reorder follows the complete configured profile"
+        );
+
+        let mut same_name_replacement = expected.clone();
+        same_name_replacement.host = "198.51.100.10".into();
+        assert_eq!(
+            unique_checked_remote_profile_index(&[same_name_replacement], &expected),
+            None,
+            "a display-name match is not profile identity"
+        );
+        let mut session_edited = expected.clone();
+        session_edited.session = Some("runtime-session".into());
+        assert_eq!(
+            unique_checked_remote_profile_index(&[session_edited], &expected),
+            None,
+            "a runtime session that happens to match edited config cannot rewrite identity"
+        );
+        assert_eq!(
+            unique_checked_remote_profile_index(&[expected.clone(), expected.clone()], &expected),
+            None,
+            "an ambiguous exact identity fails closed"
+        );
+
+        let mut invalid = expected.clone();
+        invalid.host = "-option-like-target".into();
+        assert_eq!(
+            unique_checked_remote_profile_index(&[invalid.clone()], &invalid),
+            None,
+            "an invalid profile cannot authorize itself"
+        );
+
+        let mut beyond_limit = vec![other; MAX_REMOTE_HOSTS];
+        beyond_limit.push(expected.clone());
+        assert_eq!(
+            unique_checked_remote_profile_index(&beyond_limit, &expected),
+            None,
+            "profile 129 is outside the execution authority"
+        );
     }
 }

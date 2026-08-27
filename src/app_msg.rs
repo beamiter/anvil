@@ -152,53 +152,78 @@ pub(crate) enum AppMsg {
     FileTreeSelectLocation(usize),
     /// The background `start_dir` probe for a location switch answered.
     FileTreeLocationResolved {
-        loc: crate::remote_fs::FsLocation,
+        intent: Box<crate::file_tree::FileTreeIntent>,
         start: Result<std::path::PathBuf, String>,
     },
     /// Context-menu requests; `dir: None` targets the current tree root.
     FileTreeNewFile {
         dir: Option<std::path::PathBuf>,
+        intent: Box<crate::file_tree::FileTreeIntent>,
     },
     FileTreeNewFolder {
         dir: Option<std::path::PathBuf>,
+        intent: Box<crate::file_tree::FileTreeIntent>,
     },
     FileTreeRename {
         path: std::path::PathBuf,
+        intent: Box<crate::file_tree::FileTreeIntent>,
     },
     FileTreeDelete {
         paths: Vec<std::path::PathBuf>,
+        intent: Box<crate::file_tree::FileTreeIntent>,
     },
     FileTreeCopy {
         items: Vec<(std::path::PathBuf, bool)>,
+        intent: Box<crate::file_tree::FileTreeIntent>,
     },
     FileTreeCut {
         items: Vec<(std::path::PathBuf, bool)>,
+        intent: Box<crate::file_tree::FileTreeIntent>,
     },
     FileTreePaste {
         dir: Option<std::path::PathBuf>,
+        intent: Box<crate::file_tree::FileTreeIntent>,
+        clipboard_token: u64,
     },
     /// OS file-manager drop onto the tree; `dir: None` targets the root.
     FileTreeImportPaths {
         paths: Vec<std::path::PathBuf>,
         dir: Option<std::path::PathBuf>,
+        intent: Box<crate::file_tree::FileTreeIntent>,
     },
-    FileTreeRefresh,
+    FileTreeRefresh {
+        intent: Box<crate::file_tree::FileTreeIntent>,
+    },
+    /// Open a local tab rooted at the browsed directory, or connect the exact
+    /// validated managed profile selected by a remote file-tree location.
+    FileTreeOpenTerminal {
+        intent: Box<crate::file_tree::FileTreeIntent>,
+    },
     /// The header filter entry's text changed ("" = filter cleared).
     FileTreeFilterChanged(String),
     /// A background op or transfer finished; refresh these directories in
     /// place, preserving all other expansion.
-    FileTreeOpSucceeded(Vec<std::path::PathBuf>),
+    FileTreeOpSucceeded {
+        dirs: Vec<std::path::PathBuf>,
+        intent: Box<crate::file_tree::FileTreeIntent>,
+        transfer_id: Option<u64>,
+    },
     /// Dialog results, names already validated against `remote_fs` rules.
     FileTreeCreateNamed {
         dir: std::path::PathBuf,
         name: String,
         is_dir: bool,
+        intent: Box<crate::file_tree::FileTreeIntent>,
     },
     FileTreeRenameNamed {
         src: std::path::PathBuf,
         name: String,
+        intent: Box<crate::file_tree::FileTreeIntent>,
     },
-    FileTreeDeleteConfirmed(Vec<std::path::PathBuf>),
+    FileTreeDeleteConfirmed {
+        paths: Vec<std::path::PathBuf>,
+        intent: Box<crate::file_tree::FileTreeIntent>,
+    },
     OpenNotebook(std::path::PathBuf),
     OpenAgent,
     OpenAgentSettings,

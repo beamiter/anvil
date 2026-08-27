@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-26 (Block Search 4.4)
+Updated: 2026-08-27 (File Tree terminal entry)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,53 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **Block live-card SSH burst settling (2026-08-27)**: the running Block card
+  now keeps its command-start height in the expanded VTE coordinate system and
+  coalesces each burst of `contents-changed` notifications into one next-frame
+  measurement. A long, soft-wrapped `ssh` command followed by the bridge banner,
+  locale warnings, and remote prompt therefore grows the clip to the complete
+  first burst without waiting for another keypress. The immediate streaming
+  layout remains in place, and the extra pass is one-shot and Block-only so
+  Unified and idle prompt sizing are unchanged. Pure geometry coverage plus a
+  DISPLAY-backed real-VTE regression exercise the compact-to-full baseline and
+  verify that an eight-row burst becomes visible without a second feed.
+
+- **File Tree terminal entry (2026-08-27)**: the Files header now exposes a
+  focusable, explicitly named terminal button. Local activation opens the
+  configured shell at the exact tree root; SSH/Docker activation revalidates
+  the selected managed profile and intentionally makes no remote-cwd promise,
+  which its tooltip states before Enter/Space or pointer activation. Settings
+  edits and config reloads now remap an active remote tree only through one
+  field-for-field identical complete profile; reorder is safe, while an edit,
+  removal, invalid old slot, or ambiguous duplicate falls back to Local and
+  clears the old remote model before it can be redirected by index. New,
+  Rename, Delete, Copy, Cut, Paste, and Refresh menu intents freeze the scan
+  generation, location, and complete remote identity; a refresh, location
+  switch, or profile edit before activation/confirmation now cancels visibly
+  before any filesystem call. Remote-home completion checks that authority both
+  before enqueue and again on message consumption, closing the A@slot0 → Local
+  → B@slot0 ABA. Header terminal clicks and OS drops carry the same click-time
+  authority through Relm dispatch, so a queued old root/path cannot target a
+  replacement profile. Pure target,
+  delayed-intent, and identity-remap regressions plus a DISPLAY-backed header
+  component test cover launch authority, focusability, icon, and changing
+  tooltip semantics. The file clipboard now remaps through that same exact
+  profile identity while preserving a per-Copy/Cut token. Paste resolves its
+  open-menu token through the live reconciled clipboard. Rename, delete, and cut
+  completions retire only their captured token—even a later identical payload
+  survives—and batch delete considers only paths that actually succeeded.
+  Partial/all-failed batch cuts retain every unconsumed item; cancellation
+  settles only the successfully moved-and-deleted prefix under the dispatch
+  token. Cross-location cut cleanup retains the transfer's original validated
+  host snapshot instead of resolving an old index against edited settings.
+  Worker completions now settle exact clipboard state before separately gating
+  all progress, success/error/cancel toasts, and refresh messages on the frozen
+  tree authority plus a monotonic transfer identity, with a second gate when a
+  queued refresh is consumed. Active remote-cwd following and reconnects retain
+  an immutable complete configured profile apart from learned/restored session
+  state: exactly one valid full-profile match may survive reorder, while a
+  same-name replacement, edit, removal, or duplicate fails closed.
 
 - **Block Search 4.4 (2026-08-26)**: the capture-phase picker key router now
   confirms only when focus belongs to the query editor or a result row. Every

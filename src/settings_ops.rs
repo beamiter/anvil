@@ -340,25 +340,18 @@ impl AppModel {
 
     /// The dialog already validated each entry against the parser's rules; the
     /// app replaces the whole list so removals persist too.
-    pub(crate) fn apply_settings_remote_hosts(&mut self, hosts: Vec<config::RemoteHost>) {
+    pub(crate) fn apply_settings_remote_hosts(
+        &mut self,
+        hosts: Vec<config::RemoteHost>,
+        sender: &ComponentSender<AppModel>,
+    ) {
         if self.safe_mode {
             self.show_toast("Remote host changes are not saved in safe mode.");
             return;
         }
+        let old_hosts = self.config.borrow().remote_hosts.clone();
         self.config.borrow_mut().remote_hosts = hosts;
-        // A removed host must not keep driving the tree: fall back to Local.
-        let stale = match &*self.file_tree_location.borrow() {
-            remote_fs::FsLocation::Local => false,
-            remote_fs::FsLocation::Remote(index) => {
-                *index >= self.config.borrow().remote_hosts.len()
-            }
-        };
-        if stale {
-            *self.file_tree_location.borrow_mut() = remote_fs::FsLocation::Local;
-            let root = file_tree::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
-            self.set_file_tree_root(root);
-        }
-        self.sync_file_header_locations();
+        self.reconcile_file_tree_remote_hosts(&old_hosts, sender);
         self.persist_config();
     }
 

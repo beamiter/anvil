@@ -513,11 +513,13 @@ fn managed_remote_host_for_restore(
     hosts: &[config::RemoteHost],
     name: &str,
 ) -> Option<config::RemoteHost> {
-    hosts
-        .iter()
-        .take(config::MAX_REMOTE_HOSTS)
-        .find(|host| host.name == name)
-        .cloned()
+    let mut matches = (0..hosts.len().min(config::MAX_REMOTE_HOSTS)).filter_map(|index| {
+        config::checked_remote_host(hosts, index)
+            .ok()
+            .filter(|host| host.name == name)
+    });
+    let host = matches.next()?.clone();
+    matches.next().is_none().then_some(host)
 }
 
 fn snapshot_restorable_command(
@@ -807,11 +809,13 @@ impl AppModel {
                 let managed_host = remote_name.as_deref().and_then(|name| {
                     managed_remote_host_for_restore(&self.config.borrow().remote_hosts, name)
                 });
-                if let Some(mut host) = managed_host {
-                    if let Some(restored_sid) = restored_sid.as_ref() {
-                        host.session = Some(restored_sid.clone());
-                    }
-                    match config::checked_remote_argv(&host) {
+                if let Some(configured_profile) = managed_host {
+                    let connection = RemoteConn::with_session_override(
+                        configured_profile,
+                        pane_id,
+                        restored_sid.clone(),
+                    );
+                    match config::checked_remote_argv(&connection.host) {
                         Ok(shell_argv) => {
                             let shell_argv = Rc::new(shell_argv);
                             let pane = create_pane(
@@ -828,13 +832,7 @@ impl AppModel {
                                 sender,
                             );
                             if restored_remote.is_none() {
-                                *restored_remote = Some(RemoteConn {
-                                    host,
-                                    pane_id,
-                                    status: ConnStatus::Connecting,
-                                    attempt: 0,
-                                    spawn_at: std::time::Instant::now(),
-                                });
+                                *restored_remote = Some(connection);
                             }
                             let widget = pane.widget();
                             panes.push(pane);
@@ -994,7 +992,7 @@ impl AppModel {
                         .to_string(),
                         p.cwd.clone(),
                         cwd_external,
-                        managed_remote.map(|remote| remote.host.name.clone()),
+                        managed_remote.map(|remote| remote.configured_profile().name.clone()),
                         p.session_id.clone(),
                         cmds,
                     )
@@ -1326,13 +1324,7 @@ impl AppModel {
             private_title: false,
             id,
             zoom: None,
-            remote: Some(RemoteConn {
-                host: host.clone(),
-                pane_id,
-                status: ConnStatus::Connecting,
-                attempt: 0,
-                spawn_at: std::time::Instant::now(),
-            }),
+            remote: Some(RemoteConn::new(host.clone(), pane_id)),
         };
         self.insert_tab_after_active(tab);
         self.select_tab(id, sender);
@@ -1367,12 +1359,7 @@ impl AppModel {
         let Some((idx, _)) = self.find_pane(pane_id) else {
             return false;
         };
-        if !reconnect_target_is_valid(
-            self.tabs[idx].panes.len(),
-            self.tabs[idx].zoom.is_some(),
-            self.tabs[idx].remote.as_ref().map(|conn| conn.pane_id),
-            pane_id,
-        ) {
+        if !self.remote_reconnect_target_is_valid(pane_id) {
             return false;
         }
         let Some(conn) = self.tabs[idx].remote.clone() else {
@@ -1449,13 +1436,10 @@ impl AppModel {
         let Some(conn) = self.tabs[idx].remote.clone() else {
             return;
         };
-        // Validate and build before removing the old widget. A runtime-mutated
-        // reconnect target must fail closed without destroying the dead pane.
-        let host_now = self.tabs[idx]
-            .remote
-            .as_ref()
-            .map(|c| c.host.clone())
-            .unwrap_or(conn.host.clone());
+        // The gate above revalidated the immutable configured profile. Build
+        // from the frozen runtime host so only its learned/restored session may
+        // differ, and validate again immediately adjacent to execution.
+        let host_now = conn.host.clone();
         let argv = match config::checked_remote_argv(&host_now) {
             Ok(argv) => Rc::new(argv),
             Err(message) => {
@@ -1513,12 +1497,19 @@ impl AppModel {
         let Some((idx, _)) = self.find_pane(pane_id) else {
             return false;
         };
+        let Some(connection) = self.tabs[idx].remote.as_ref() else {
+            return false;
+        };
         reconnect_target_is_valid(
             self.tabs[idx].panes.len(),
             self.tabs[idx].zoom.is_some(),
-            self.tabs[idx].remote.as_ref().map(|conn| conn.pane_id),
+            Some(connection.pane_id),
             pane_id,
+        ) && config::unique_checked_remote_profile_index(
+            &self.config.borrow().remote_hosts,
+            connection.configured_profile(),
         )
+        .is_some()
     }
 
     /// Cancel a stale reconnect and remove only its dead remote leaf. Live
@@ -3268,6 +3259,39 @@ mod pane_tree_tests {
         hosts.push(host("inactive-129".to_string()));
 
         assert!(super::managed_remote_host_for_restore(&hosts, "inactive-129").is_none());
+    }
+
+    #[test]
+    fn managed_restore_requires_one_valid_current_profile_name() {
+        let host = |name: &str, target: &str| crate::config::RemoteHost {
+            name: name.to_string(),
+            host: target.to_string(),
+            user: None,
+            docker: false,
+            deploy_artifact: None,
+            remote_shell: "jsh".to_string(),
+            session: Some("configured-session".to_string()),
+            ssh_args: Vec::new(),
+            login_shell: true,
+            multiplex: true,
+            deploy: jterm_core::jsh_remote::Deploy::Off,
+        };
+
+        let expected = host("managed", "first.example");
+        assert_eq!(
+            super::managed_remote_host_for_restore(std::slice::from_ref(&expected), "managed"),
+            Some(expected.clone())
+        );
+        assert!(super::managed_remote_host_for_restore(
+            &[expected.clone(), host("managed", "second.example")],
+            "managed"
+        )
+        .is_none());
+        assert!(super::managed_remote_host_for_restore(
+            &[host("managed", "-invalid-target")],
+            "managed"
+        )
+        .is_none());
     }
 
     #[test]
