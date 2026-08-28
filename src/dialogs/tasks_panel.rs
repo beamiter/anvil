@@ -6,7 +6,9 @@
 //! panel stages. Provider-controlled text arrives already display-safe; every
 //! widget here treats it as plain text.
 
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use relm4::adw::prelude::*;
 use relm4::gtk;
@@ -14,8 +16,8 @@ use relm4::prelude::*;
 
 use crate::agent_task::{ApprovalId, CodexAppServerApproval, TaskId};
 use crate::agent_task_ui::{
-    approval_summary, native_follow_up_can_send, render_stream_text, row_status_line,
-    TaskPanelAction, TaskRowSnapshot,
+    approval_summary, native_follow_up_can_send, plan_list_refresh, render_stream_text,
+    row_status_line, TaskPanelAction, TaskRowSnapshot,
 };
 
 const STREAM_PAGE: &str = "stream";
@@ -116,6 +118,16 @@ pub(crate) struct TasksPanelModel {
     /// final text carried by `TaskPanelAction::FollowUp`.
     follow_up_drafts: HashMap<TaskId, String>,
     action_buttons: Vec<(ActionKind, gtk::Button)>,
+    /// Render cache: what the list and approval widgets currently show.
+    /// Refresh diffs each pushed Sync against it and touches GTK only on
+    /// real change, so an unchanged Sync is a pure no-op — no widget churn,
+    /// and no signals feeding back into the component's input queue.
+    rendered_rows: Vec<TaskRowSnapshot>,
+    rendered_selected: Option<TaskId>,
+    rendered_approvals: Vec<CodexAppServerApproval>,
+    /// Set while refresh applies a programmatic selection, so the resulting
+    /// `row-selected` emission is not mistaken for a user gesture.
+    selection_guard: Rc<Cell<bool>>,
 }
 
 impl TasksPanelModel {
@@ -125,81 +137,117 @@ impl TasksPanelModel {
         }
     }
 
-    fn rebuild_task_list(&self, widgets: &TasksPanelModelWidgets) {
-        while let Some(child) = widgets.task_list.first_child() {
-            widgets.task_list.remove(&child);
+    /// Reconcile the task list widget with the pushed row table. Rows are
+    /// rebuilt only when their snapshots change, and selection is applied
+    /// only when it (or the table) changed, behind `selection_guard` so the
+    /// emitted `row-selected` cannot echo back as a `SelectRow` input.
+    /// Together these make refreshing unchanged state idempotent; an
+    /// unguarded re-select on every refresh previously re-queued `SelectRow`
+    /// per refresh and livelocked the component's message loop.
+    fn sync_task_list(&mut self, widgets: &TasksPanelModelWidgets) {
+        let plan = plan_list_refresh(
+            &self.rendered_rows,
+            self.rendered_selected,
+            &self.sync.rows,
+            self.sync.selected,
+        );
+        if plan.rebuild_rows {
+            while let Some(child) = widgets.task_list.first_child() {
+                widgets.task_list.remove(&child);
+            }
+            for row in &self.sync.rows {
+                let title = gtk::Label::new(Some(&row.title));
+                title.set_halign(gtk::Align::Start);
+                title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                title.set_max_width_chars(28);
+                let status = gtk::Label::new(Some(&row_status_line(row)));
+                status.set_halign(gtk::Align::Start);
+                status.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                status.add_css_class("dim-label");
+                status.add_css_class("caption");
+                if row.needs_attention {
+                    status.add_css_class("warning");
+                }
+                let lines = gtk::Box::new(gtk::Orientation::Vertical, 2);
+                lines.set_margin_top(4);
+                lines.set_margin_bottom(4);
+                lines.set_margin_start(4);
+                lines.append(&title);
+                lines.append(&status);
+                let list_row = gtk::ListBoxRow::new();
+                list_row.set_child(Some(&lines));
+                widgets.task_list.append(&list_row);
+            }
+            self.rendered_rows.clone_from(&self.sync.rows);
         }
-        for (index, row) in self.sync.rows.iter().enumerate() {
-            let title = gtk::Label::new(Some(&row.title));
-            title.set_halign(gtk::Align::Start);
-            title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            title.set_max_width_chars(28);
-            let status = gtk::Label::new(Some(&row_status_line(row)));
-            status.set_halign(gtk::Align::Start);
-            status.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            status.add_css_class("dim-label");
-            status.add_css_class("caption");
-            if row.needs_attention {
-                status.add_css_class("warning");
+        if plan.apply_selection {
+            self.selection_guard.set(true);
+            match plan.select_index {
+                Some(index) => {
+                    let row = widgets.task_list.row_at_index(index as i32);
+                    widgets.task_list.select_row(row.as_ref());
+                }
+                None => widgets.task_list.unselect_all(),
             }
-            let lines = gtk::Box::new(gtk::Orientation::Vertical, 2);
-            lines.set_margin_top(4);
-            lines.set_margin_bottom(4);
-            lines.set_margin_start(4);
-            lines.append(&title);
-            lines.append(&status);
-            let list_row = gtk::ListBoxRow::new();
-            list_row.set_child(Some(&lines));
-            widgets.task_list.append(&list_row);
-            if self.sync.selected == Some(row.id) {
-                widgets.task_list.select_row(Some(&list_row));
-            }
-            let _ = index;
+            self.selection_guard.set(false);
+        }
+        if plan.rebuild_rows || plan.apply_selection {
+            self.rendered_selected = self.sync.selected;
         }
     }
 
-    fn rebuild_approvals(&self, widgets: &TasksPanelModelWidgets, sender: &ComponentSender<Self>) {
+    /// Rebuild the approval cards only when the pushed approval set changed;
+    /// an unchanged Sync leaves the existing cards (and their wired Decide
+    /// closures) untouched.
+    fn sync_approvals(&mut self, widgets: &TasksPanelModelWidgets, sender: &ComponentSender<Self>) {
+        let incoming: &[CodexAppServerApproval] = self
+            .sync
+            .detail
+            .as_deref()
+            .map(|detail| detail.approvals.as_slice())
+            .unwrap_or(&[]);
+        if self.rendered_approvals.as_slice() == incoming {
+            widgets.approvals_box.set_visible(!incoming.is_empty());
+            return;
+        }
         while let Some(child) = widgets.approvals_box.first_child() {
             widgets.approvals_box.remove(&child);
         }
-        let Some(detail) = self.sync.detail.as_deref() else {
-            widgets.approvals_box.set_visible(false);
-            return;
-        };
-        widgets
-            .approvals_box
-            .set_visible(!detail.approvals.is_empty());
-        for approval in &detail.approvals {
-            let card = gtk::Box::new(gtk::Orientation::Vertical, 2);
-            card.add_css_class("card");
-            let summary = gtk::Label::new(Some(&approval_summary(approval)));
-            summary.set_halign(gtk::Align::Start);
-            summary.set_wrap(true);
-            summary.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-            summary.set_margin_all(6);
-            card.append(&summary);
-            let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-            buttons.set_halign(gtk::Align::End);
-            buttons.set_margin_bottom(4);
-            let approve = gtk::Button::with_label("Approve");
-            approve.add_css_class("suggested-action");
-            let deny = gtk::Button::with_label("Deny");
-            deny.add_css_class("destructive-action");
-            let task_id = detail.id;
-            let approval_id: ApprovalId = approval.id;
-            approve.connect_clicked({
-                let sender = sender.clone();
-                move |_| sender.input(TasksPanelMsg::Decide(task_id, approval_id, true))
-            });
-            deny.connect_clicked({
-                let sender = sender.clone();
-                move |_| sender.input(TasksPanelMsg::Decide(task_id, approval_id, false))
-            });
-            buttons.append(&approve);
-            buttons.append(&deny);
-            card.append(&buttons);
-            widgets.approvals_box.append(&card);
+        widgets.approvals_box.set_visible(!incoming.is_empty());
+        if let Some(detail) = self.sync.detail.as_deref() {
+            for approval in incoming {
+                let card = gtk::Box::new(gtk::Orientation::Vertical, 2);
+                card.add_css_class("card");
+                let summary = gtk::Label::new(Some(&approval_summary(approval)));
+                summary.set_halign(gtk::Align::Start);
+                summary.set_wrap(true);
+                summary.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+                summary.set_margin_all(6);
+                card.append(&summary);
+                let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+                buttons.set_halign(gtk::Align::End);
+                buttons.set_margin_bottom(4);
+                let approve = gtk::Button::with_label("Approve");
+                approve.add_css_class("suggested-action");
+                let deny = gtk::Button::with_label("Deny");
+                deny.add_css_class("destructive-action");
+                let task_id = detail.id;
+                let approval_id: ApprovalId = approval.id;
+                approve.connect_clicked({
+                    let sender = sender.clone();
+                    move |_| sender.input(TasksPanelMsg::Decide(task_id, approval_id, true))
+                });
+                deny.connect_clicked({
+                    let sender = sender.clone();
+                    move |_| sender.input(TasksPanelMsg::Decide(task_id, approval_id, false))
+                });
+                buttons.append(&approve);
+                buttons.append(&deny);
+                card.append(&buttons);
+                widgets.approvals_box.append(&card);
+            }
         }
+        self.rendered_approvals = incoming.to_vec();
     }
 }
 
@@ -213,7 +261,11 @@ impl Component for TasksPanelModel {
     view! {
         root = gtk::Box {
             set_orientation: gtk::Orientation::Vertical,
-            set_width_request: 340,
+            // Same floor as the AI Chats page (280): both pages share the
+            // `ai_paned` end slot through one stack, and a higher floor made
+            // the stack's minimum exceed the slot's default width, which
+            // GTK reported as a measure negotiation fight.
+            set_width_request: 280,
             set_hexpand: false,
             set_vexpand: true,
             add_css_class: "ai-panel",
@@ -436,10 +488,15 @@ impl Component for TasksPanelModel {
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
         let mut action_buttons = Vec::new();
+        let selection_guard = Rc::new(Cell::new(false));
         let model = Self {
             sync: TasksPanelSync::default(),
             follow_up_drafts: HashMap::new(),
             action_buttons: Vec::new(),
+            rendered_rows: Vec::new(),
+            rendered_selected: None,
+            rendered_approvals: Vec::new(),
+            selection_guard: selection_guard.clone(),
         };
         let widgets: TasksPanelModelWidgets = view_output!();
 
@@ -456,7 +513,13 @@ impl Component for TasksPanelModel {
 
         widgets.task_list.connect_row_selected({
             let sender = sender.clone();
+            let selection_guard = selection_guard.clone();
             move |_, row| {
+                // Only genuine gestures may queue SelectRow; programmatic
+                // selection applied by refresh runs behind the guard.
+                if selection_guard.get() {
+                    return;
+                }
                 if let Some(row) = row {
                     sender.input(TasksPanelMsg::SelectRow(row.index()));
                 }
@@ -586,7 +649,11 @@ impl Component for TasksPanelModel {
 }
 
 impl TasksPanelModel {
-    fn refresh_view(&self, widgets: &mut TasksPanelModelWidgets, _sender: &ComponentSender<Self>) {
+    fn refresh_view(
+        &mut self,
+        widgets: &mut TasksPanelModelWidgets,
+        sender: &ComponentSender<Self>,
+    ) {
         widgets
             .create_button
             .set_sensitive(self.sync.create_enabled && !self.sync.pending_creation);
@@ -596,7 +663,7 @@ impl TasksPanelModel {
             widgets.create_hint.set_label(&self.sync.create_hint);
         }
 
-        self.rebuild_task_list(widgets);
+        self.sync_task_list(widgets);
 
         let detail = self.sync.detail.as_deref();
         for (kind, button) in &self.action_buttons {
@@ -632,19 +699,7 @@ impl TasksPanelModel {
                 .unwrap_or_else(|| {
                     "No native Codex session snapshot for this task yet.".to_string()
                 });
-            if widgets
-                .stream_view
-                .buffer()
-                .text(
-                    &widgets.stream_view.buffer().start_iter(),
-                    &widgets.stream_view.buffer().end_iter(),
-                    false,
-                )
-                .as_str()
-                != stream_text
-            {
-                widgets.stream_view.buffer().set_text(&stream_text);
-            }
+            set_view_text(&widgets.stream_view, &stream_text);
 
             if let Some(diff) = &detail.diff {
                 widgets.diff_header.set_label(&diff.header);
@@ -662,12 +717,12 @@ impl TasksPanelModel {
                     }
                     text
                 };
-                widgets.diff_view.buffer().set_text(&text);
+                set_view_text(&widgets.diff_view, &text);
             } else {
                 widgets
                     .diff_header
                     .set_label("Use Diff to review this task's worktree changes.");
-                widgets.diff_view.buffer().set_text("");
+                set_view_text(&widgets.diff_view, "");
             }
 
             widgets.follow_up_row.set_visible(detail.can_follow_up);
@@ -694,6 +749,19 @@ impl TasksPanelModel {
         widgets
             .page_stack
             .set_visible_child_name(if on_diff { DIFF_PAGE } else { STREAM_PAGE });
-        self.rebuild_approvals(widgets, _sender);
+        self.sync_approvals(widgets, sender);
+    }
+}
+
+/// Set a read-only text view's buffer only when the content actually
+/// changed; re-setting identical text still forces a fresh layout pass.
+fn set_view_text(view: &gtk::TextView, text: &str) {
+    let buffer = view.buffer();
+    if buffer
+        .text(&buffer.start_iter(), &buffer.end_iter(), false)
+        .as_str()
+        != text
+    {
+        buffer.set_text(text);
     }
 }

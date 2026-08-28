@@ -310,6 +310,49 @@ pub(crate) fn row_status_line(row: &TaskRowSnapshot) -> String {
     )
 }
 
+/// Reconciliation plan for the panel's task list, computed against the state
+/// the list widget currently renders. A refresh applies only what the plan
+/// marks as changed, so a Sync identical to the last rendered one is a pure
+/// no-op: no row widgets are recreated and no `select_row` call re-emits
+/// `row-selected` back into the component's input queue. That no-op property
+/// is load-bearing — re-selecting on every refresh previously re-queued
+/// `SelectRow` for each refresh and livelocked the component's message loop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ListRefreshPlan {
+    /// The pushed row table differs from the rendered one: the row widgets
+    /// must be rebuilt. Fresh rows always start unselected.
+    pub(crate) rebuild_rows: bool,
+    /// The widget selection must be (re)applied to reach `select_index`.
+    pub(crate) apply_selection: bool,
+    /// Index into the pushed row table the list should select, or None for
+    /// no selection. None also when the selected task has no row.
+    pub(crate) select_index: Option<usize>,
+}
+
+/// Diff the pushed row table and selection against the rendered ones.
+pub(crate) fn plan_list_refresh(
+    rendered_rows: &[TaskRowSnapshot],
+    rendered_selected: Option<TaskId>,
+    sync_rows: &[TaskRowSnapshot],
+    sync_selected: Option<TaskId>,
+) -> ListRefreshPlan {
+    let rebuild_rows = rendered_rows != sync_rows;
+    let select_index = sync_selected.and_then(|id| sync_rows.iter().position(|row| row.id == id));
+    // A rebuild leaves every fresh row unselected, so a resolvable selection
+    // must be (re)applied even when its id did not change. Without a rebuild
+    // only an actual selection change justifies touching the widget.
+    let apply_selection = if rebuild_rows {
+        select_index.is_some()
+    } else {
+        rendered_selected != sync_selected
+    };
+    ListRefreshPlan {
+        rebuild_rows,
+        apply_selection,
+        select_index,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,6 +461,69 @@ mod tests {
         );
         row.native_preparing = true;
         assert!(row_status_line(&row).starts_with("preparing native Codex"));
+    }
+
+    #[test]
+    fn list_refresh_plan_is_a_noop_for_an_identical_push() {
+        let rows = vec![
+            row(TaskStatus::Created, false),
+            row(TaskStatus::Working, false),
+        ];
+        let plan = plan_list_refresh(&rows, Some(rows[1].id), &rows, Some(rows[1].id));
+        assert_eq!(
+            plan,
+            ListRefreshPlan {
+                rebuild_rows: false,
+                apply_selection: false,
+                select_index: Some(1),
+            },
+            "an unchanged Sync must leave the list widget untouched",
+        );
+    }
+
+    #[test]
+    fn list_refresh_plan_reapplies_selection_after_a_row_change() {
+        let old_rows = vec![row(TaskStatus::Created, false)];
+        let selected = old_rows[0].id;
+        let mut new_rows = old_rows.clone();
+        new_rows[0].status = TaskStatus::Working;
+        let plan = plan_list_refresh(&old_rows, Some(selected), &new_rows, Some(selected));
+        assert!(plan.rebuild_rows);
+        assert!(plan.apply_selection, "fresh rows start unselected");
+        assert_eq!(plan.select_index, Some(0));
+    }
+
+    #[test]
+    fn list_refresh_plan_tracks_selection_changes_without_rebuilding() {
+        let rows = vec![
+            row(TaskStatus::Created, false),
+            row(TaskStatus::Completed, false),
+        ];
+        let plan = plan_list_refresh(&rows, None, &rows, Some(rows[1].id));
+        assert!(!plan.rebuild_rows);
+        assert!(plan.apply_selection);
+        assert_eq!(plan.select_index, Some(1));
+
+        let plan = plan_list_refresh(&rows, Some(rows[1].id), &rows, None);
+        assert!(!plan.rebuild_rows);
+        assert!(plan.apply_selection, "clearing the selection is a change");
+        assert_eq!(plan.select_index, None);
+    }
+
+    #[test]
+    fn list_refresh_plan_drops_selection_for_a_task_without_a_row() {
+        let rows = vec![row(TaskStatus::Created, false)];
+        let ghost = TaskId::new();
+        let plan = plan_list_refresh(&rows, Some(ghost), &rows, Some(ghost));
+        assert!(!plan.rebuild_rows);
+        assert!(!plan.apply_selection, "no row can show it, nothing to do");
+        assert_eq!(plan.select_index, None);
+
+        let new_rows = vec![row(TaskStatus::Created, false)];
+        let plan = plan_list_refresh(&rows, Some(ghost), &new_rows, Some(ghost));
+        assert!(plan.rebuild_rows);
+        assert!(!plan.apply_selection);
+        assert_eq!(plan.select_index, None);
     }
 }
 
