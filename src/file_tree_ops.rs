@@ -507,7 +507,9 @@ impl AppModel {
         }
     }
 
-    /// Reload the current root: bump the generation and scan it again.
+    /// Reload the current root's rows in place: surviving rows keep their
+    /// identity, so expansion everywhere else and the open filter survive —
+    /// the same semantics every file operation's follow-up refresh uses.
     pub(crate) fn file_tree_refresh(&self, intent: file_tree::FileTreeIntent) {
         if !self.require_current_file_tree_intent(&intent) {
             return;
@@ -516,7 +518,7 @@ impl AppModel {
         if root.as_os_str().is_empty() {
             self.init_file_tree();
         } else {
-            self.set_file_tree_root(root);
+            self.refresh_tree_dirs(vec![root]);
         }
     }
 
@@ -1925,4 +1927,97 @@ fn batch_summary(outcome: &remote_fs::BatchOutcome, verb: &str) -> String {
         name,
         error
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn local() -> remote_fs::FsLocation {
+        remote_fs::FsLocation::Local
+    }
+
+    #[test]
+    fn batch_summary_counts_successes_and_names_the_first_failure() {
+        let clean = remote_fs::BatchOutcome {
+            done: 3,
+            failed: Vec::new(),
+        };
+        assert_eq!(batch_summary(&clean, "pasted"), "3 item(s) pasted.");
+
+        let partial = remote_fs::BatchOutcome {
+            done: 2,
+            failed: vec![
+                ("a.txt".to_string(), "denied".to_string()),
+                ("b.txt".to_string(), "gone".to_string()),
+            ],
+        };
+        assert_eq!(
+            batch_summary(&partial, "deleted"),
+            "2 of 4 failed (a.txt: denied)"
+        );
+
+        let single = remote_fs::BatchOutcome {
+            done: 0,
+            failed: vec![("only".to_string(), "boom".to_string())],
+        };
+        assert_eq!(
+            batch_summary(&single, "imported"),
+            "1 of 1 failed (only: boom)"
+        );
+    }
+
+    #[test]
+    fn drop_rejection_messages_name_the_reason_and_the_caps() {
+        let loc = local();
+        let hosts = Vec::new();
+        assert_eq!(
+            drop_rejection_message(&remote_fs::DropRejection::Empty, &loc, &hosts),
+            "Nothing to import."
+        );
+
+        let relative = std::path::PathBuf::from("relative/file.txt");
+        assert_eq!(
+            drop_rejection_message(
+                &remote_fs::DropRejection::NotAbsolute(relative.clone()),
+                &loc,
+                &hosts
+            ),
+            format!(
+                "Cannot import {}: not an absolute local path.",
+                file_tree::display_full_path(&relative)
+            )
+        );
+
+        let unreadable = std::path::PathBuf::from("/tmp/anvil-ops-test-unreadable");
+        assert_eq!(
+            drop_rejection_message(
+                &remote_fs::DropRejection::Unreadable(unreadable.clone()),
+                &loc,
+                &hosts
+            ),
+            format!(
+                "Cannot import {}: not readable.",
+                file_tree::display_full_path(&unreadable)
+            )
+        );
+
+        assert_eq!(
+            drop_rejection_message(&remote_fs::DropRejection::TooManyItems(300), &loc, &hosts),
+            format!(
+                "Refusing to import 300 items to Local: the limit is {}.",
+                remote_fs::MAX_DROP_ITEMS
+            )
+        );
+
+        let oversized = remote_fs::MAX_TRANSFER_BYTES + 1024 * 1024;
+        assert_eq!(
+            drop_rejection_message(&remote_fs::DropRejection::TooLarge(oversized), &loc, &hosts),
+            format!(
+                "Refusing to import to Local: {} exceeds the {} transfer limit.",
+                remote_fs::human_bytes(oversized),
+                remote_fs::human_bytes(remote_fs::MAX_TRANSFER_BYTES)
+            )
+        );
+    }
 }
