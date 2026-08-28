@@ -125,7 +125,7 @@ pub(crate) fn load_one(path: &Path) -> Result<Workflow, String> {
         .to_ascii_lowercase();
     let mut wf: Workflow = match extension.as_str() {
         "toml" => toml::from_str(&text).map_err(|e| format!("parse TOML: {e}"))?,
-        "yaml" | "yml" => serde_yaml::from_str(&text).map_err(|e| format!("parse YAML: {e}"))?,
+        "yaml" | "yml" => serde_yaml_ng::from_str(&text).map_err(|e| format!("parse YAML: {e}"))?,
         _ => return Err("unsupported workflow extension".to_string()),
     };
     validate_workflow(&wf)?;
