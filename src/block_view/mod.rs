@@ -2486,6 +2486,15 @@ pub(crate) const SLOW_BLOCK_THRESHOLD_MS: u64 = 1000;
 /// pill is already there by the time anyone starts wondering.
 const RUNNING_PILL_MIN_SECS: u64 = 2;
 
+/// Consecutive change-free frames after which the pane resize settle tick
+/// removes itself. The tick is armed by the scroll adjustments' `page-size`
+/// signals (and by the font setters) and re-runs the live layout and PTY grid
+/// push while geometry settles — the job a permanent tick used to do by
+/// pinning the frame clock at display refresh rate for the pane's whole life.
+/// Two frames cover the cascade one kick starts (size request → re-allocation
+/// → VTE grid) with a frame of margin.
+const RESIZE_TICK_SETTLE_FRAMES: u32 = 2;
+
 /// How often the shell-integration watch re-checks. It is one wakeup beside the
 /// pane's existing 250 ms sticky timer, and it stops for good once marks
 /// appear.
@@ -3427,12 +3436,20 @@ pub struct TermView {
     /// them (Warp's FindWithinBlock). Tags are stripped on close via clear_find.
     find_state: Rc<RefCell<FindState>>,
     current_cwd: Rc<RefCell<String>>,
-    /// Per-frame resize tick installed on `root`. Held so it can be removed on
-    /// Drop — otherwise the callback runs forever and keeps its Rc captures
-    /// (pty/active/vte/vte_box) alive past tab close.
-    resize_tick_id: RefCell<Option<gtk::TickCallbackId>>,
-    /// Periodic sticky-header refresh. Explicitly removed on tab close so its
-    /// GTK captures cannot keep the detached block tree alive.
+    /// Frame-clock resize tick armed by `resize_kick` while a pane resize
+    /// settles; `None` at rest so an idle pane holds no frame-clock callback.
+    /// Held so Drop can remove a tick caught mid-settle — otherwise the
+    /// callback keeps running and its Rc captures (pty/active/vte/vte_box)
+    /// stay alive past tab close.
+    resize_tick_id: Rc<RefCell<Option<gtk::TickCallbackId>>>,
+    /// Arms `resize_tick_id` (a no-op while one is already installed). Shared
+    /// with the font setters, whose metric changes settle over the same frames
+    /// the tick watches.
+    resize_kick: Rc<dyn Fn()>,
+    /// Periodic running-command chrome refresh (pill and elapsed readouts; the
+    /// finished-block sticky scan is event-driven instead). Explicitly removed
+    /// on tab close so its GTK captures cannot keep the detached block tree
+    /// alive.
     sticky_timer_id: RefCell<Option<glib::SourceId>>,
     /// Tracks per-VTE selections so a drag that crosses block boundaries can be
     /// copied as one contiguous string via Ctrl+Shift+C.
@@ -8479,7 +8496,7 @@ impl ReaderCtx {
 /// synchronously. Used at state
 /// transitions where the child needs to see a correct winsize on its very first
 /// read — `top` queries TIOCGWINSZ before painting, less/vim do the same.
-/// Without the synchronous push the per-frame resize tick would catch up only
+/// Without the synchronous push the resize settle tick would catch up only
 /// on the next frame, racing with the child.
 fn sync_active_to_pty(
     layout_active_surface: &Rc<dyn Fn()>,
@@ -10164,7 +10181,7 @@ impl TermView {
                 // (row_count * char_height) is larger — the cell would stay
                 // full-height. `set_size` sets the preferred grid, shrinking the
                 // VTE's natural height so the (non-expanding) holder collapses to
-                // it. The PTY-resize tick then follows row_count up/down.
+                // it. The resize settle tick then follows row_count up/down.
                 let target = (cols, target_rows);
                 if last_size_target.get() != target {
                     vte.set_size(cols, target_rows);
@@ -10947,7 +10964,23 @@ impl TermView {
                 emit_human_input(&human_input, HumanInputKind::StickyStop);
             });
         }
-        let sticky_timer_id = {
+        // ── Sticky finished-block scan: event-driven ─────────────────────
+        // The finished-block half of the sticky header has no time-driven
+        // input: its candidate only moves when the scroll position, the block
+        // geometry or the minimize toggle does. Walking every finished block
+        // with two `compute_bounds` each on the 250 ms timer paid that scan at
+        // 4 Hz for as long as the user read history. Subscribe to the moves
+        // instead — `value-changed` for scrolling, `changed` for the reflows,
+        // appends, font and density updates that all shift `upper`, and the
+        // minimize click — and coalesce each signal burst into one idle scan,
+        // so a scrollbar drag costs one walk per frame, not one per
+        // adjustment step. The idle reads the settled post-layout geometry
+        // and, running after the at-bottom detector's own idle, the settled
+        // `user_scrolled_up`. The bar is an overlay, so showing it cannot
+        // shift `upper` and re-trigger the scan. The pill and the running
+        // header keep the timer below: their elapsed readouts are genuinely
+        // time-driven.
+        let recompute_sticky_scan: Rc<dyn Fn()> = {
             let sticky = sticky_bar.clone();
             let sticky_label = sticky_label.clone();
             let sticky_jump_bottom = sticky_jump_bottom_btn.clone();
@@ -10956,98 +10989,31 @@ impl TermView {
             let sticky_target = sticky_target_id.clone();
             let sticky_minimized = sticky_minimized.clone();
             let cmd_running = cmd_running.clone();
-            let running_cmd = running_cmd.clone();
-            let block_start_time = block_start_time.clone();
             let user_scrolled = user_scrolled_up.clone();
             let finished = finished_blocks_rc.clone();
-            let scroll = block_scroll.clone();
+            // Weak: this closure is retained by signal handlers on the
+            // scroll's own adjustments, so a strong edge would cycle
+            // scroll -> adjustment -> handler -> scroll.
+            let scroll = block_scroll.downgrade();
             let fullscreen = fullscreen.clone();
-            let pill = running_pill.clone();
-            let pill_label = running_pill_label.clone();
-            let pill_tooltip: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
-            glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
-                if sticky.parent().is_none() {
-                    return glib::ControlFlow::Break;
+            Rc::new(move || {
+                // Fullscreen and running chrome are the timer's branches; it
+                // owns the bar in both states.
+                if fullscreen.get() || cmd_running.get() {
+                    return;
                 }
-
-                let minimized = sticky_minimized.get();
-                if fullscreen.get() {
-                    sticky_target.set(None);
-                    sticky_jump_bottom.set_visible(false);
-                    sticky_stop.set_visible(false);
-                    sticky_organism.set_visible(false);
-                    sticky.set_visible(false);
-                    // A full-screen program owns the viewport; the pill would
-                    // be painted over its content.
-                    pill.set_visible(false);
-                    return glib::ControlFlow::Continue;
-                }
-
-                // Elapsed is computed before the live-edge early return below,
-                // because that is exactly where the pill lives: the two
-                // readouts are the same command's age, shown wherever the
-                // viewport happens to be, and never both at once.
-                let running = cmd_running.get();
-                let elapsed = block_start_time
-                    .get()
-                    .and_then(|start| SystemTime::now().duration_since(start).ok())
-                    .map(|duration| duration.as_secs())
-                    .unwrap_or(0);
-                let elapsed_str = unified_chrome::format_elapsed_clock(elapsed);
-                let show_pill = running && elapsed >= RUNNING_PILL_MIN_SECS && !user_scrolled.get();
-                if show_pill {
-                    pill_label.set_text(&elapsed_str);
-                    let cmd = running_cmd.borrow();
-                    let tooltip = crate::review_input::safe_inline_display(cmd.trim(), 1024);
-                    let tooltip = if tooltip.is_empty() {
-                        "Running".to_string()
-                    } else {
-                        tooltip
-                    };
-                    // Tooltips are cheap to compare and not cheap to set four
-                    // times a second for the whole life of a build.
-                    if *pill_tooltip.borrow() != tooltip {
-                        pill.set_tooltip_text(Some(&tooltip));
-                        pill.update_property(&[gtk::accessible::Property::Label(&tooltip)]);
-                        *pill_tooltip.borrow_mut() = tooltip;
-                    }
-                }
-                pill.set_visible(show_pill);
-
-                // At the live prompt there is no sticky header to compute. Avoid
-                // walking every finished block and querying GTK geometry on a
-                // permanent timer while the terminal is idle.
                 if !user_scrolled.get() {
                     sticky_target.set(None);
                     sticky_jump_bottom.set_visible(false);
                     sticky_stop.set_visible(false);
                     sticky_organism.set_visible(false);
                     sticky.set_visible(false);
-                    return glib::ControlFlow::Continue;
+                    return;
                 }
-
-                if running {
-                    sticky_target.set(None);
-                    sticky_jump_bottom.set_visible(false);
-                    sticky_stop.set_visible(!minimized);
-                    sticky_organism.set_visible(
-                        sticky_organism
-                            .first_child()
-                            .is_some_and(|child| child.is_visible()),
-                    );
-                    let cmd = running_cmd.borrow();
-                    let cmd_disp = crate::review_input::safe_inline_display(cmd.trim(), 1024);
-                    let label = if cmd_disp.is_empty() {
-                        format!("\u{25b6}  (running)    {}", elapsed_str)
-                    } else {
-                        format!("\u{25b6}  {}    {}", cmd_disp, elapsed_str)
-                    };
-                    sticky_label.set_text(&label);
-                    sticky_label.set_visible(!minimized);
-                    sticky.set_visible(true);
-                    return glib::ControlFlow::Continue;
-                }
-
+                let Some(scroll) = scroll.upgrade() else {
+                    return;
+                };
+                let minimized = sticky_minimized.get();
                 let sticky_height = sticky.height().max(1) as f32;
                 let candidate = finished.borrow().iter().find_map(|block| {
                     let header = block.header_row.compute_bounds(&scroll)?;
@@ -11083,6 +11049,152 @@ impl TermView {
                     sticky_organism.set_visible(false);
                     sticky.set_visible(false);
                 }
+            })
+        };
+        let sticky_scan_pending = Rc::new(Cell::new(false));
+        let schedule_sticky_scan: Rc<dyn Fn()> = {
+            let recompute = recompute_sticky_scan.clone();
+            let pending = sticky_scan_pending.clone();
+            Rc::new(move || {
+                if pending.replace(true) {
+                    return;
+                }
+                let recompute = recompute.clone();
+                let pending = pending.clone();
+                glib::idle_add_local_once(move || {
+                    pending.set(false);
+                    recompute();
+                });
+            })
+        };
+        {
+            let schedule = schedule_sticky_scan.clone();
+            block_scroll
+                .vadjustment()
+                .connect_value_changed(move |_| schedule());
+            let schedule = schedule_sticky_scan.clone();
+            block_scroll
+                .vadjustment()
+                .connect_changed(move |_| schedule());
+            // The toggle rewrites the label and button visibility itself; the
+            // scan re-applies the candidate-dependent pieces (jump-bottom).
+            sticky_minimize_btn.connect_clicked(move |_| schedule_sticky_scan());
+        }
+        let sticky_timer_id = {
+            let sticky = sticky_bar.clone();
+            let sticky_label = sticky_label.clone();
+            let sticky_jump_bottom = sticky_jump_bottom_btn.clone();
+            let sticky_stop = sticky_stop_btn.clone();
+            let sticky_organism = sticky_organism_slot.clone();
+            let sticky_target = sticky_target_id.clone();
+            let sticky_minimized = sticky_minimized.clone();
+            let cmd_running = cmd_running.clone();
+            let running_cmd = running_cmd.clone();
+            let block_start_time = block_start_time.clone();
+            let user_scrolled = user_scrolled_up.clone();
+            let fullscreen = fullscreen.clone();
+            let pill = running_pill.clone();
+            let pill_label = running_pill_label.clone();
+            let pill_tooltip: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+            glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
+                if sticky.parent().is_none() {
+                    return glib::ControlFlow::Break;
+                }
+
+                let minimized = sticky_minimized.get();
+                if fullscreen.get() {
+                    sticky_target.set(None);
+                    sticky_jump_bottom.set_visible(false);
+                    sticky_stop.set_visible(false);
+                    sticky_organism.set_visible(false);
+                    sticky.set_visible(false);
+                    // A full-screen program owns the viewport; the pill would
+                    // be painted over its content.
+                    pill.set_visible(false);
+                    return glib::ControlFlow::Continue;
+                }
+
+                // The finished-block sticky is event-driven now (see
+                // `schedule_sticky_scan` above); the timer keeps only the
+                // genuinely time-driven chrome — the running command's pill
+                // and elapsed readouts. Computing the clock under `running`
+                // keeps an idle prompt from formatting a string four times a
+                // second that no branch would show.
+                let running = cmd_running.get();
+                let elapsed_str = if running {
+                    // Elapsed is computed before the live-edge early return below,
+                    // because that is exactly where the pill lives: the two
+                    // readouts are the same command's age, shown wherever the
+                    // viewport happens to be, and never both at once.
+                    let elapsed = block_start_time
+                        .get()
+                        .and_then(|start| SystemTime::now().duration_since(start).ok())
+                        .map(|duration| duration.as_secs())
+                        .unwrap_or(0);
+                    let elapsed_str = unified_chrome::format_elapsed_clock(elapsed);
+                    let show_pill = elapsed >= RUNNING_PILL_MIN_SECS && !user_scrolled.get();
+                    if show_pill {
+                        pill_label.set_text(&elapsed_str);
+                        let cmd = running_cmd.borrow();
+                        let tooltip = crate::review_input::safe_inline_display(cmd.trim(), 1024);
+                        let tooltip = if tooltip.is_empty() {
+                            "Running".to_string()
+                        } else {
+                            tooltip
+                        };
+                        // Tooltips are cheap to compare and not cheap to set four
+                        // times a second for the whole life of a build.
+                        if *pill_tooltip.borrow() != tooltip {
+                            pill.set_tooltip_text(Some(&tooltip));
+                            pill.update_property(&[gtk::accessible::Property::Label(&tooltip)]);
+                            *pill_tooltip.borrow_mut() = tooltip;
+                        }
+                    }
+                    pill.set_visible(show_pill);
+                    Some(elapsed_str)
+                } else {
+                    pill.set_visible(false);
+                    None
+                };
+
+                // At the live prompt there is no sticky header to show: the
+                // pill owns the running readout there, and the finished-block
+                // bar stays hidden. The event-driven scan hides it from its
+                // own scroll handler; hiding here too keeps the timer the
+                // backstop for every path that lands at the bottom.
+                if !user_scrolled.get() {
+                    sticky_target.set(None);
+                    sticky_jump_bottom.set_visible(false);
+                    sticky_stop.set_visible(false);
+                    sticky_organism.set_visible(false);
+                    sticky.set_visible(false);
+                    return glib::ControlFlow::Continue;
+                }
+
+                let Some(elapsed_str) = elapsed_str else {
+                    // Scrolled up with nothing running: the event-driven scan
+                    // owns the bar in this state.
+                    return glib::ControlFlow::Continue;
+                };
+
+                sticky_target.set(None);
+                sticky_jump_bottom.set_visible(false);
+                sticky_stop.set_visible(!minimized);
+                sticky_organism.set_visible(
+                    sticky_organism
+                        .first_child()
+                        .is_some_and(|child| child.is_visible()),
+                );
+                let cmd = running_cmd.borrow();
+                let cmd_disp = crate::review_input::safe_inline_display(cmd.trim(), 1024);
+                let label = if cmd_disp.is_empty() {
+                    format!("\u{25b6}  (running)    {}", elapsed_str)
+                } else {
+                    format!("\u{25b6}  {}    {}", cmd_disp, elapsed_str)
+                };
+                sticky_label.set_text(&label);
+                sticky_label.set_visible(!minimized);
+                sticky.set_visible(true);
                 glib::ControlFlow::Continue
             })
         };
@@ -11551,6 +11663,84 @@ impl TermView {
         );
         *cross_selection_slot.borrow_mut() = Some(cross_selection.clone());
 
+        // ── Pane resize watcher ───────────────────────────────────────────
+        // The live terminal is sized by an explicit pixel request (it lives
+        // in a `gtk::Fixed` and cannot expand into the pane on its own), and
+        // a resized pane at an idle prompt produces no `contents-changed` to
+        // re-run the layout. A frame-clock tick handles that — but a
+        // permanent one kept the frame clock in `begin_updating` at display
+        // refresh rate for the whole life of every pane, so the tick is
+        // armed on demand instead: the scroll adjustments' `page-size`
+        // signals fire it (see `install_resize_watchers`), it re-runs the
+        // layout and pushes the pane grid to the PTY while geometry keeps
+        // moving, and it removes itself after RESIZE_TICK_SETTLE_FRAMES
+        // change-free frames. Every widget edge is weak so a pane closing
+        // mid-settle cannot form signal -> callback -> widget cycles; Drop
+        // removes an installed tick via `resize_tick_id`.
+        let resize_tick_id: Rc<RefCell<Option<gtk::TickCallbackId>>> = Rc::new(RefCell::new(None));
+        let resize_kick: Rc<dyn Fn()> = {
+            let pty_for_resize = pty.clone();
+            let scroll_for_resize = block_scroll.downgrade();
+            let vte_for_resize = active_vte.downgrade();
+            let layout_for_resize = layout_active_surface.clone();
+            let clip_for_resize = active.borrow().live_clip().downgrade();
+            let last_grid: Rc<Cell<(u16, u16)>> = Rc::new(Cell::new((0, 0)));
+            let last_pane: Rc<Cell<(i32, i32)>> = Rc::new(Cell::new((0, 0)));
+            let stable_frames: Rc<Cell<u32>> = Rc::new(Cell::new(0));
+            let tick_id = resize_tick_id.clone();
+            Rc::new(move || {
+                if tick_id.borrow().is_some() {
+                    return;
+                }
+                let Some(vte) = vte_for_resize.upgrade() else {
+                    return;
+                };
+                let pty_for_resize = pty_for_resize.clone();
+                let scroll_for_resize = scroll_for_resize.clone();
+                let layout_for_resize = layout_for_resize.clone();
+                let clip_for_resize = clip_for_resize.clone();
+                let last_grid = last_grid.clone();
+                let last_pane = last_pane.clone();
+                let stable_frames = stable_frames.clone();
+                let tick_id_for_callback = tick_id.clone();
+                let id = vte.add_tick_callback(move |vte, _clock| {
+                    // Watch the pane from the frame clock so the grid — and
+                    // therefore the winsize pushed below — follows the window.
+                    let mut changed = false;
+                    if let (Some(clip), Some(scroll)) =
+                        (clip_for_resize.upgrade(), scroll_for_resize.upgrade())
+                    {
+                        let pane = (clip.width(), scroll.vadjustment().page_size() as i32);
+                        if pane != last_pane.get() && pane.0 > 0 {
+                            last_pane.set(pane);
+                            layout_for_resize();
+                            changed = true;
+                        }
+                        let (cols, rows) = pty_grid_size(vte, &scroll);
+                        if cols > 0 && rows > 0 && (cols, rows) != last_grid.get() {
+                            last_grid.set((cols, rows));
+                            pty_for_resize.resize(cols, rows);
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        stable_frames.set(0);
+                        return glib::ControlFlow::Continue;
+                    }
+                    let stable = stable_frames.get() + 1;
+                    stable_frames.set(stable);
+                    if stable >= RESIZE_TICK_SETTLE_FRAMES {
+                        // Hand the id back before breaking: the callback is
+                        // gone from here on, and Drop must not remove it twice.
+                        *tick_id_for_callback.borrow_mut() = None;
+                        return glib::ControlFlow::Break;
+                    }
+                    glib::ControlFlow::Continue
+                });
+                *tick_id.borrow_mut() = Some(id);
+            })
+        };
+
         let term_view = TermView {
             root,
             block_scroll,
@@ -11615,7 +11805,8 @@ impl TermView {
             sticky_organism_slot,
             find_state,
             current_cwd: current_cwd.clone(),
-            resize_tick_id: RefCell::new(None),
+            resize_tick_id,
+            resize_kick,
             sticky_timer_id: RefCell::new(Some(sticky_timer_id)),
             cross_selection,
             ftcs_seen: ftcs_seen.clone(),
@@ -11803,44 +11994,33 @@ impl TermView {
         }
 
         // ── Resize handler: sync PTY cols/rows when widget allocation changes ──
-        term_view.install_resize_tick();
+        term_view.install_resize_watchers();
 
         Ok(term_view)
     }
 
     /// Keep PTY geometry synchronized with the real pane viewport, independent
     /// of the compact/full visual state of the live VTE.
-    fn install_resize_tick(&self) {
-        let pty_for_resize = self.pty.clone();
-        let scroll_for_resize = self.block_scroll.clone();
-        let layout_for_resize = self.layout_active_surface.clone();
-        let clip_for_resize = self.active.borrow().live_clip().downgrade();
-        let last: Rc<Cell<(u16, u16)>> = Rc::new(Cell::new((0, 0)));
-        let last_pane: Rc<Cell<(i32, i32)>> = Rc::new(Cell::new((0, 0)));
-        let tick_id = self.active_vte.add_tick_callback(move |vte, _clock| {
-            // The live terminal is sized by an explicit pixel request (it lives
-            // in a `gtk::Fixed` and cannot expand into the pane on its own), and
-            // a resized pane at an idle prompt produces no `contents-changed`
-            // to re-run the layout. Watch the pane from the frame clock so the
-            // grid — and therefore the winsize read below — follows the window.
-            if let Some(clip) = clip_for_resize.upgrade() {
-                let pane = (
-                    clip.width(),
-                    scroll_for_resize.vadjustment().page_size() as i32,
-                );
-                if pane != last_pane.get() && pane.0 > 0 {
-                    last_pane.set(pane);
-                    layout_for_resize();
-                }
-            }
-            let (cols, rows) = pty_grid_size(vte, &scroll_for_resize);
-            if cols > 0 && rows > 0 && (cols, rows) != last.get() {
-                last.set((cols, rows));
-                pty_for_resize.resize(cols, rows);
-            }
-            glib::ControlFlow::Continue
-        });
-        *self.resize_tick_id.borrow_mut() = Some(tick_id);
+    ///
+    /// The watched quantities — the live clip's width and the vertical page
+    /// size — both surface through the scroll adjustments: the clip tracks the
+    /// viewport's width, which is the horizontal adjustment's `page-size`
+    /// (GTK4 widgets expose no `width` property to notify on). Font changes
+    /// reach the same kick from `set_font`/`set_font_scale`, and state
+    /// transitions push explicitly through `sync_active_to_pty`.
+    fn install_resize_watchers(&self) {
+        let kick = self.resize_kick.clone();
+        self.block_scroll
+            .vadjustment()
+            .connect_page_size_notify(move |_| kick());
+        let kick = self.resize_kick.clone();
+        self.block_scroll
+            .hadjustment()
+            .connect_page_size_notify(move |_| kick());
+        // Arm once up front: the first allocation arrives with the first map,
+        // and the permanent tick used to cover it from construction. The
+        // callback waits for the first mapped frame and settles from there.
+        (self.resize_kick)();
     }
 
     /// Root GTK widget to embed in the notebook page.
@@ -13223,6 +13403,10 @@ impl TermView {
         (self.layout_active_surface)();
         let refit = self.layout_active_surface.clone();
         glib::idle_add_local_once(move || refit());
+        // Cell metrics settle over the frames after the font applies; the
+        // settle tick pushes the resulting grid to the PTY, as the permanent
+        // resize tick did at every frame.
+        (self.resize_kick)();
     }
 
     /// Update font scale for VTE terminal and block view CSS.
@@ -13238,6 +13422,9 @@ impl TermView {
         (self.layout_active_surface)();
         let refit = self.layout_active_surface.clone();
         glib::idle_add_local_once(move || refit());
+        // Same settle window as set_font: the tick catches the new cell
+        // metrics and publishes the grid they imply.
+        (self.resize_kick)();
     }
 
     /// Update virtual scrolling viewport state based on scroll position.

@@ -4907,7 +4907,7 @@ impl ActiveBlock {
     /// the terminal is allocated exactly what it requests, so it cannot pick up
     /// the pane width by expanding. Before the first allocation there is no
     /// width to hand out and the request is left alone; the next layout pass
-    /// (contents, adjustment or resize tick) applies it.
+    /// (contents, adjustment or resize settle tick) applies it.
     pub(crate) fn set_live_geometry(&self, cell_h: i32, grid_rows: i64, visible_rows: i64) -> bool {
         let cell_h = cell_h.max(1);
         let grid_rows = grid_rows.max(1);
@@ -4937,7 +4937,7 @@ impl ActiveBlock {
         true
     }
 
-    /// The measured live card. The frame-clock resize tick watches its width:
+    /// The measured live card. The pane resize watcher keys off its width:
     /// the terminal is sized by an explicit request now and cannot follow the
     /// pane on its own.
     pub(crate) fn live_clip(&self) -> gtk::Overlay {
