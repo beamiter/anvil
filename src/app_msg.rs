@@ -306,7 +306,10 @@ pub(crate) enum AppMsg {
         generation: u64,
     },
     OpenAiPanel,
-    AskAiAboutBlock(crate::ai::BlockContext),
+    AskAiAboutBlock(crate::ai::BlockContext, crate::ai::BlockAiIntent),
+    /// The failed-block menu's Fix action, addressed to the pane that raised
+    /// it (menu clicks can target a background pane).
+    FixBlockWithAgent(u64),
     AiConversationSnapshot(String),
     AiPanelCloseRequested,
     AiPanelWidthChanged(u32),

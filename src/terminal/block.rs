@@ -391,8 +391,14 @@ fn connect_view_outputs(
     );
     view.connect_ask_ai_about_block({
         let sender = sender.clone();
-        move |context| {
-            let _ = sender.output(VteOutput::AskAiAboutBlock(context));
+        move |context, intent| {
+            let _ = sender.output(VteOutput::AskAiAboutBlock(context, intent));
+        }
+    });
+    view.connect_fix_block_with_agent({
+        let sender = sender.clone();
+        move || {
+            let _ = sender.output(VteOutput::FixBlockWithAgent);
         }
     });
 }
@@ -706,7 +712,10 @@ impl Component for BlockTerminal {
             ),
             VteInput::AskAiAboutSelectedBlock => {
                 if let Some(context) = view.selected_block_context(80) {
-                    let _ = sender.output(VteOutput::AskAiAboutBlock(context));
+                    let _ = sender.output(VteOutput::AskAiAboutBlock(
+                        context,
+                        crate::ai::BlockAiIntent::Ask,
+                    ));
                 }
             }
         }

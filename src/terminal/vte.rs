@@ -535,7 +535,11 @@ pub enum VteOutput {
     AgentExecutionStartFailed {
         execution: crate::agent::AgentExecutionRef,
     },
-    AskAiAboutBlock(crate::ai::BlockContext),
+    AskAiAboutBlock(crate::ai::BlockContext, crate::ai::BlockAiIntent),
+    /// The failed-block menu's Fix action. Carries no payload: the app
+    /// re-derives authoritative evidence from the emitting pane's live
+    /// selection and owns every task gate.
+    FixBlockWithAgent,
 }
 
 pub struct VteTerminal {

@@ -342,18 +342,70 @@ impl AppModel {
     /// sharing consent gates nothing here because no provider is contacted
     /// until Start Codex.
     fn create_task_from_block(&mut self, sender: &ComponentSender<AppModel>) {
+        let Some(pane_id) = self.active_pane().map(|pane| pane.id) else {
+            self.show_toast("No active terminal pane");
+            return;
+        };
+        self.create_task_from_block_in_pane(pane_id, false, sender);
+    }
+
+    /// The failed-block menu's Fix action (ember's `FixWithAgent`): create the
+    /// worktree task for the failed block right-clicked in `pane_id`, rather
+    /// than whatever pane happens to be active. The Tasks panel's own gates
+    /// apply unchanged — safe mode and the `agent_tasks_enabled` opt-in —
+    /// plus a failed-outcome recheck at dispatch. No provider is contacted
+    /// until the user starts Codex, so the `ai_share_command_context` consent
+    /// posture stays exactly where the native prompt gate already put it.
+    pub(crate) fn fix_block_with_agent(
+        &mut self,
+        pane_id: u64,
+        sender: &ComponentSender<AppModel>,
+    ) {
+        if self.safe_mode {
+            self.show_toast("Agent tasks are unavailable in safe mode.");
+            return;
+        }
+        if !self.config.borrow().agent_tasks_enabled {
+            self.show_toast(
+                "Agent tasks are opt-in: set agent_tasks_enabled = true in the config file first",
+            );
+            return;
+        }
+        self.create_task_from_block_in_pane(pane_id, true, sender);
+    }
+
+    /// Shared task creation from one pane's selected block. `require_failed`
+    /// is the block menu's Fix gate: only a genuinely failed command block
+    /// may anchor a fix task, re-checked here because the menu's visibility
+    /// gate is renderer-side and could be stale by dispatch time.
+    fn create_task_from_block_in_pane(
+        &mut self,
+        pane_id: u64,
+        require_failed: bool,
+        sender: &ComponentSender<AppModel>,
+    ) {
         if self.pending_task_creation.is_some() {
             self.show_toast("Another task worktree is still being created");
             return;
         }
-        let Some(pane) = self.active_pane() else {
-            self.show_toast("No active terminal pane");
+        let Some(pane) = self.pane(pane_id) else {
+            self.show_toast("The block's terminal pane is no longer available");
             return;
         };
         let Some(evidence) = pane.terminal.selected_block_agent_evidence(80) else {
             self.show_toast("Select a finished block in a Block-mode pane to create an agent task");
             return;
         };
+        if require_failed
+            && !jterm_core::block_contract::classify_completed(
+                evidence.command.as_deref(),
+                evidence.exit_code,
+            )
+            .is_failed()
+        {
+            self.show_toast("Fix tasks are available for failed command blocks");
+            return;
+        }
         if let Some(reason) = crate::agent_task::context::block_agent_context_disabled_reason(
             evidence.command.as_deref(),
             evidence.command_exact,

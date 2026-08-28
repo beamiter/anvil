@@ -582,12 +582,13 @@ impl AppModel {
 
     /// Open the session-level AI panel with the configured history source.
     pub(crate) fn show_ai_session_panel(&self) {
-        self.show_ai_session_panel_with_context(None);
+        self.show_ai_session_panel_with_context(None, ai::BlockAiIntent::Ask);
     }
 
     pub(crate) fn show_ai_session_panel_with_context(
         &self,
         initial_context: Option<ai::BlockContext>,
+        intent: ai::BlockAiIntent,
     ) {
         if self.safe_mode {
             self.show_toast("AI is unavailable in safe mode.");
@@ -614,7 +615,7 @@ impl AppModel {
             client,
             stream: self.config.borrow().ai_stream,
             redact_secrets: self.config.borrow().ai_redact_secrets,
-            initial_context,
+            initial_context: initial_context.map(|context| (context, intent)),
         });
     }
 

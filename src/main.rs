@@ -439,7 +439,8 @@ fn create_pane(
         VteOutput::AgentExecutionStartFailed { execution } => {
             AppMsg::AgentExecutionStartFailed { execution }
         }
-        VteOutput::AskAiAboutBlock(context) => AppMsg::AskAiAboutBlock(context),
+        VteOutput::AskAiAboutBlock(context, intent) => AppMsg::AskAiAboutBlock(context, intent),
+        VteOutput::FixBlockWithAgent => AppMsg::FixBlockWithAgent(pane_id),
     };
     let terminal = match mode {
         TerminalMode::Block | TerminalMode::Unified => {
@@ -2206,8 +2207,11 @@ impl SimpleComponent for AppModel {
             AppMsg::OpenAiPanel => {
                 self.show_ai_session_panel();
             }
-            AppMsg::AskAiAboutBlock(context) => {
-                self.show_ai_session_panel_with_context(Some(context));
+            AppMsg::AskAiAboutBlock(context, intent) => {
+                self.show_ai_session_panel_with_context(Some(context), intent);
+            }
+            AppMsg::FixBlockWithAgent(pane_id) => {
+                self.fix_block_with_agent(pane_id, &sender);
             }
             AppMsg::AiConversationSnapshot(snapshot) => {
                 self.ai_conversation = Some(snapshot);

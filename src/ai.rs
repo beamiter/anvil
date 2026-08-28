@@ -308,6 +308,41 @@ pub(crate) fn ask_turns_streaming(
     AiHandle { token, suppressed }
 }
 
+/// Which AI action a finished block's context menu asked for. `Ask` keeps the
+/// panel's long-standing opening question; `Explain` is the family's
+/// failed-block Explain (ember's `AgentTaskIntent::Explain`, frost's
+/// `FailedBlockAgentIntent::Explain`) routed into anvil's read-only block-chat
+/// panel. The sibling Fix action does not travel this channel: it creates an
+/// agent task instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BlockAiIntent {
+    Ask,
+    Explain,
+}
+
+/// The fixed opening question seeded into the AI panel alongside a block's
+/// context. Every variant is a compile-time constant: the command and output
+/// are untrusted PTY evidence and travel only inside the framed `BlockContext`
+/// envelope, never interpolated into the instruction where model-looking text
+/// could impersonate anvil (ember/frost's rule).
+pub(crate) fn seeded_block_question(intent: BlockAiIntent, exit_code: i32) -> &'static str {
+    match intent {
+        BlockAiIntent::Ask => {
+            if exit_code == 0 {
+                "Explain what this command does and what its output means."
+            } else {
+                "This command failed. Diagnose the error and suggest a fix."
+            }
+        }
+        // frost's wording, adapted only to the panel's "this command"
+        // vocabulary: the chat panel cannot change files, so the request is
+        // read-only by construction.
+        BlockAiIntent::Explain => {
+            "Explain this failed command: identify the root cause, cite the relevant evidence in its captured output, and propose the smallest safe next step. Do not propose changes unless I ask."
+        }
+    }
+}
+
 /// Build the first turn for "Ask AI about selected block". Attacker-controlled
 /// terminal bytes stay inside the explicitly untrusted user-role JSON envelope;
 /// the higher-trust system message contains policy only. Subsequent questions
@@ -383,5 +418,34 @@ mod tests {
         assert!(system.contains("untrusted"));
         assert!(user.starts_with("Question: why?"));
         assert!(user.contains("<selected_block_context>"));
+    }
+
+    #[test]
+    fn seeded_questions_are_fixed_strings_with_no_block_interpolation() {
+        // The Ask defaults are the panel's long-standing behavior and must not
+        // drift: success explains, anything else (including the -1 unknown
+        // sentinel) diagnoses.
+        assert_eq!(
+            seeded_block_question(BlockAiIntent::Ask, 0),
+            "Explain what this command does and what its output means."
+        );
+        assert_eq!(
+            seeded_block_question(BlockAiIntent::Ask, 1),
+            "This command failed. Diagnose the error and suggest a fix."
+        );
+        assert_eq!(
+            seeded_block_question(BlockAiIntent::Ask, -1),
+            "This command failed. Diagnose the error and suggest a fix."
+        );
+        let explain = seeded_block_question(BlockAiIntent::Explain, 2);
+        assert!(explain.contains("root cause"));
+        assert!(explain.contains("Do not propose changes unless I ask."));
+        // A failed block whose output begs to be quoted still gets the bare
+        // constant: evidence stays inside the framed context envelope.
+        for intent in [BlockAiIntent::Ask, BlockAiIntent::Explain] {
+            let question = seeded_block_question(intent, 1);
+            assert!(!question.contains("rm -rf"));
+            assert!(!question.contains("{cmd}"));
+        }
     }
 }

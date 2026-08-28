@@ -71,7 +71,7 @@ pub(crate) enum AiPanelMsg {
         client: ai::AiClient,
         stream: bool,
         redact_secrets: bool,
-        initial_context: Option<ai::BlockContext>,
+        initial_context: Option<(ai::BlockContext, ai::BlockAiIntent)>,
     },
     Restore(String),
     Ask,
@@ -450,16 +450,15 @@ impl Component for AiPanelModel {
                 self.stream = stream;
                 self.redact_secrets = redact_secrets;
                 widgets.page_stack.set_visible_child_name(CHAT_PAGE);
-                if let Some(context) = initial_context {
+                if let Some((context, intent)) = initial_context {
                     if self.store.active_archived() {
                         let _ = self.store.new_chat();
                     }
                     if self.store.active_request_token().is_none() {
-                        let prompt = if context.exit_code == 0 {
-                            "Explain what this command does and what its output means."
-                        } else {
-                            "This command failed. Diagnose the error and suggest a fix."
-                        };
+                        // The question is a fixed constant per intent; the
+                        // untrusted command/output travel only inside the
+                        // framed context envelope.
+                        let prompt = ai::seeded_block_question(intent, context.exit_code);
                         self.start_request(
                             widgets,
                             &sender,
