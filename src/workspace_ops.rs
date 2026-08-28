@@ -84,14 +84,42 @@ fn rebalance_pane_tree(widget: &gtk::Widget) {
     rebalance_pane_tree(&end);
 }
 
-pub(super) fn schedule_pane_rebalance(root: gtk::Widget) {
-    // The first idle observes the newly inserted Paned. Moving an ancestor
-    // divider changes nested allocations, so a second pass settles descendants.
+/// Set every divider in the tree to an even split of its own extent. Unlike
+/// the split-time rebalance this does not weight by leaf count: a nested
+/// subtree receives the same half as a single leaf, matching ember's
+/// PaneEqualize.
+fn equalize_pane_tree(widget: &gtk::Widget) {
+    let Ok(paned) = widget.clone().downcast::<gtk::Paned>() else {
+        return;
+    };
+    let (Some(start), Some(end)) = (paned.start_child(), paned.end_child()) else {
+        return;
+    };
+    let extent = if paned.orientation() == gtk::Orientation::Horizontal {
+        paned.width()
+    } else {
+        paned.height()
+    };
+    if let Some(position) = balanced_split_position(extent, 1, 1) {
+        paned.set_position(position);
+    }
+    equalize_pane_tree(&start);
+    equalize_pane_tree(&end);
+}
+
+/// Run `walk` twice on successive idles. The first pass observes the current
+/// allocation, and moving an ancestor divider changes nested allocations, so a
+/// second pass settles descendants.
+fn schedule_two_pass_tree_walk(root: gtk::Widget, walk: fn(&gtk::Widget)) {
     gtk::glib::idle_add_local_once(move || {
-        rebalance_pane_tree(&root);
+        walk(&root);
         let root = root.clone();
-        gtk::glib::idle_add_local_once(move || rebalance_pane_tree(&root));
+        gtk::glib::idle_add_local_once(move || walk(&root));
     });
+}
+
+pub(super) fn schedule_pane_rebalance(root: gtk::Widget) {
+    schedule_two_pass_tree_walk(root, rebalance_pane_tree);
 }
 
 /// GTK keeps per-container focus history across child removal. Clear the root
@@ -279,6 +307,14 @@ fn visual_pane_order(tab: &Tab) -> Vec<usize> {
         }
     }
     order
+}
+
+/// The pane `active` should swap with: the next entry in visual order,
+/// wrapping. `None` when there is no other pane to exchange with.
+fn swap_target_in_visual_order(order: &[usize], active: usize) -> Option<usize> {
+    let position = order.iter().position(|&index| index == active)?;
+    let next = order[(position + 1) % order.len()];
+    (next != active).then_some(next)
 }
 
 /// Working directory with `$HOME` collapsed to `~`, for the pane header.
@@ -1841,6 +1877,22 @@ impl AppModel {
         self.refresh_pane_headers(ti);
     }
 
+    /// Exchange the focused pane with the next one in visual order, wrapping
+    /// at the end (tmux-style `swap-pane`, frost's PaneSwap). Geometry stays
+    /// put and focus follows the moved pane, exactly like the header drag
+    /// swap, whose guards (zoom, pending spawns) apply here unchanged.
+    pub(crate) fn swap_active_pane_with_next(&mut self) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let Some(target) = swap_target_in_visual_order(&visual_pane_order(tab), tab.active_pane)
+        else {
+            return;
+        };
+        let (dragged, target) = (tab.panes[tab.active_pane].id, tab.panes[target].id);
+        self.swap_panes(dragged, target);
+    }
+
     /// Move an ordinary one-pane tab into another tab as a directional split.
     /// All identities and both GTK ancestry slots are validated before the
     /// source holder is detached, so an illegal or stale drop is a no-op.
@@ -2532,6 +2584,33 @@ impl AppModel {
         }
     }
 
+    /// Reset every split divider in the focused tab so each split's two
+    /// children share it evenly, matching ember's PaneEqualize: the whole tree
+    /// is equalized, not just the focused pane's nearest split. No-op for a
+    /// single pane or while a split spawn is still preparing.
+    pub(crate) fn equalize_panes(&mut self) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        if tab.panes.len() <= 1
+            || tab
+                .panes
+                .iter()
+                .any(|pane| self.pending_split_spawns.contains_key(&pane.id))
+        {
+            return;
+        }
+        // The real tree is detached while pane-zoomed; restore it first so the
+        // equalize lands on the splits the user actually arranged.
+        if self.tabs[self.active].zoom.is_some() {
+            self.toggle_pane_zoom_for(self.active);
+        }
+        let Some(root) = self.tabs[self.active].holder.first_child() else {
+            return;
+        };
+        schedule_two_pass_tree_walk(root, equalize_pane_tree);
+    }
+
     pub(crate) fn toggle_pane_zoom(&mut self) {
         let Some(tab) = self.tabs.get(self.active) else {
             return;
@@ -2802,12 +2881,12 @@ fn persistence_failure_notice(
 mod pane_tree_tests {
     use super::{
         abbreviate_prefix, active_index_after_remove, balanced_split_position, combined_axis_span,
-        detach_leaf_and_promote, format_running_process_summary, pane_header_title,
-        persistence_failure_notice, pinned_reorder_destination, plan_pane_into_tab,
-        plan_tab_into_pane, prepare_then_commit, reconnect_target_is_valid,
+        detach_leaf_and_promote, equalize_pane_tree, format_running_process_summary,
+        pane_header_title, persistence_failure_notice, pinned_reorder_destination,
+        plan_pane_into_tab, plan_tab_into_pane, prepare_then_commit, reconnect_target_is_valid,
         replay_argv_for_unmanaged_leaf, restored_leaf_mode, snapshot_restorable_command,
-        tab_drop_preview_is_valid, DropTabIdentity, LeafSlot, PaneIntoTabPlan, TabIntoPanePlan,
-        PERSISTENCE_FAILURE_NOTICE_COOLDOWN,
+        swap_target_in_visual_order, tab_drop_preview_is_valid, DropTabIdentity, LeafSlot,
+        PaneIntoTabPlan, TabIntoPanePlan, PERSISTENCE_FAILURE_NOTICE_COOLDOWN,
     };
     use crate::config::TerminalMode;
     use crate::workspace::ConnStatus;
@@ -2957,6 +3036,62 @@ mod pane_tree_tests {
         assert_eq!(balanced_split_position(1, 1, 1), None);
         assert_eq!(balanced_split_position(100, 0, 1), None);
         assert_eq!(balanced_split_position(100, 1, 0), None);
+    }
+
+    #[test]
+    fn equalize_halves_every_split_regardless_of_nesting() {
+        // Ember's PaneEqualize gives each split's two children an even share of
+        // that split's own extent, so A | (B | C) equalizes to halves at both
+        // dividers — not the leaf-weighted 1/3 slots of the split-time
+        // rebalance.
+        assert_eq!(balanced_split_position(1_200, 1, 1), Some(600));
+        let nested = balanced_split_position(1_200 - 600, 1, 1).unwrap();
+        assert_eq!([600, nested, 1_200 - 600 - nested], [600, 300, 300]);
+    }
+
+    #[test]
+    fn equalize_without_allocation_leaves_the_tree_untouched() {
+        if gtk::init().is_err() {
+            // Pure coverage still runs on headless builders; the live GTK
+            // boundary is exercised whenever a display backend exists.
+            return;
+        }
+
+        let root = gtk::Paned::new(gtk::Orientation::Horizontal);
+        let nested = gtk::Paned::new(gtk::Orientation::Vertical);
+        let leaf_a = gtk::Button::with_label("a");
+        let leaf_b = gtk::Button::with_label("b");
+        let leaf_c = gtk::Button::with_label("c");
+        nested.set_start_child(Some(&leaf_b));
+        nested.set_end_child(Some(&leaf_c));
+        root.set_start_child(Some(&leaf_a));
+        root.set_end_child(Some(&nested));
+
+        // An unrealized tree has zero extent, so every divider stays put and
+        // the walk must not disturb the structure.
+        let root_widget = root.clone().upcast::<gtk::Widget>();
+        let nested_widget = nested.clone().upcast::<gtk::Widget>();
+        let leaf_a_widget = leaf_a.clone().upcast::<gtk::Widget>();
+        let leaf_b_widget = leaf_b.clone().upcast::<gtk::Widget>();
+        let leaf_c_widget = leaf_c.clone().upcast::<gtk::Widget>();
+        equalize_pane_tree(&root_widget);
+        assert_eq!(root.position(), 0);
+        assert_eq!(nested.position(), 0);
+        assert_eq!(root.start_child().as_ref(), Some(&leaf_a_widget));
+        assert_eq!(root.end_child().as_ref(), Some(&nested_widget));
+        assert_eq!(nested.start_child().as_ref(), Some(&leaf_b_widget));
+        assert_eq!(nested.end_child().as_ref(), Some(&leaf_c_widget));
+    }
+
+    #[test]
+    fn swap_target_is_the_next_pane_in_visual_order_with_wraparound() {
+        assert_eq!(swap_target_in_visual_order(&[0, 1, 2], 0), Some(1));
+        assert_eq!(swap_target_in_visual_order(&[0, 1, 2], 1), Some(2));
+        assert_eq!(swap_target_in_visual_order(&[0, 1, 2], 2), Some(0));
+        // A single visible pane has no exchange partner.
+        assert_eq!(swap_target_in_visual_order(&[1], 1), None);
+        // A pane missing from the order cannot be swapped at all.
+        assert_eq!(swap_target_in_visual_order(&[0, 1], 2), None);
     }
 
     #[test]

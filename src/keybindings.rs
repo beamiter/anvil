@@ -55,6 +55,12 @@ pub(crate) enum Action {
     ResizePaneUp,
     ResizePaneDown,
     TogglePaneZoom,
+    /// Reset every split divider in the focused tab to an even share.
+    /// Palette-only by default, like ember's PaneEqualize.
+    EqualizePanes,
+    /// Exchange the focused pane with the next one in visual order.
+    /// Palette-only by default: frost's Ctrl+Shift+X is taken here.
+    SwapPanes,
     MovePaneToNewTab,
     FocusPaneLeft,
     FocusPaneRight,
@@ -183,6 +189,8 @@ impl Action {
             Action::ResizePaneUp => "Resize pane up",
             Action::ResizePaneDown => "Resize pane down",
             Action::TogglePaneZoom => "Toggle pane zoom",
+            Action::EqualizePanes => "Equalize pane sizes",
+            Action::SwapPanes => "Swap with next pane",
             Action::MovePaneToNewTab => "Move pane to new tab",
             Action::FocusPaneLeft => "Focus pane left",
             Action::FocusPaneRight => "Focus pane right",
@@ -276,6 +284,8 @@ impl Action {
             Action::ResizePaneUp => Some("resize_pane_up"),
             Action::ResizePaneDown => Some("resize_pane_down"),
             Action::TogglePaneZoom => Some("toggle_pane_zoom"),
+            Action::EqualizePanes => Some("equalize_panes"),
+            Action::SwapPanes => Some("swap_panes"),
             Action::MovePaneToNewTab => Some("move_pane_to_new_tab"),
             Action::FocusPaneLeft => Some("focus_pane_left"),
             Action::FocusPaneRight => Some("focus_pane_right"),
@@ -373,6 +383,8 @@ impl Action {
             Action::ResizePaneUp,
             Action::ResizePaneDown,
             Action::TogglePaneZoom,
+            Action::EqualizePanes,
+            Action::SwapPanes,
             Action::MovePaneToNewTab,
             Action::FocusPaneLeft,
             Action::FocusPaneRight,
@@ -1338,6 +1350,43 @@ toggle_block_collapsed = "F10"
         assert_eq!(
             map.lookup(&parse("F4").unwrap()),
             Some(Action::ConnectRemote(0))
+        );
+    }
+
+    #[test]
+    fn pane_equalize_and_swap_are_palette_only_by_default_but_bindable() {
+        // Ember ships PaneEqualize without a chord, and frost's PaneSwap chord
+        // (Ctrl+Shift+X) already belongs to JumpToNextFailed here, so both
+        // actions ship unbound while remaining configurable.
+        let map = KeybindingMap::from_defaults();
+        assert!(map.binding_display(&Action::EqualizePanes).is_empty());
+        assert!(map.binding_display(&Action::SwapPanes).is_empty());
+        let palette_actions = map.all_bound_actions();
+        assert!(palette_actions
+            .iter()
+            .any(|(action, _)| *action == Action::EqualizePanes));
+        assert!(palette_actions
+            .iter()
+            .any(|(action, _)| *action == Action::SwapPanes));
+
+        let mut table = toml::Table::new();
+        table.insert(
+            "equalize_panes".into(),
+            toml::Value::String("Ctrl+Alt+E".into()),
+        );
+        table.insert(
+            "swap_panes".into(),
+            toml::Value::String("Ctrl+Alt+X".into()),
+        );
+        let mut map = KeybindingMap::from_defaults();
+        map.apply_user_overrides(&table).unwrap();
+        assert_eq!(
+            map.lookup(&parse("Ctrl+Alt+E").unwrap()),
+            Some(Action::EqualizePanes)
+        );
+        assert_eq!(
+            map.lookup(&parse("Ctrl+Alt+X").unwrap()),
+            Some(Action::SwapPanes)
         );
     }
 }

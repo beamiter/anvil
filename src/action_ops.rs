@@ -111,6 +111,8 @@ impl AppModel {
             Action::ResizePaneUp => self.resize_pane(gtk::Orientation::Vertical, -40),
             Action::ResizePaneDown => self.resize_pane(gtk::Orientation::Vertical, 40),
             Action::TogglePaneZoom => self.toggle_pane_zoom(),
+            Action::EqualizePanes => self.equalize_panes(),
+            Action::SwapPanes => self.swap_active_pane_with_next(),
             Action::MovePaneToNewTab => self.move_pane_to_new_tab(sender),
             Action::Copy => {
                 if self.ai_panel_contains_focus() {
