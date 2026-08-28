@@ -456,6 +456,9 @@ impl AppModel {
             Action::OpenAgent => {
                 self.open_agent_panel(sender);
             }
+            Action::ToggleTasksPanel => {
+                self.toggle_tasks_panel(sender);
+            }
             Action::CrossBlockSearch => {
                 self.emit_block_action(VteInput::CrossBlockSearch, "Cross-block search");
             }

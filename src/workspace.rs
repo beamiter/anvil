@@ -104,6 +104,20 @@ impl TermCtl {
         }
     }
 
+    /// Agent-task evidence for the selected block; plain VTE panes have no
+    /// block provenance and therefore cannot anchor a task.
+    pub(crate) fn selected_block_agent_evidence(
+        &self,
+        max_output_lines: usize,
+    ) -> Option<crate::block_view::BlockAgentEvidence> {
+        match self {
+            Self::Vte(_) => None,
+            Self::Block(controller) => controller
+                .model()
+                .selected_block_agent_evidence(max_output_lines),
+        }
+    }
+
     pub(crate) fn insert_inline_notice(&self, widget: &gtk::Widget) -> bool {
         match self {
             Self::Vte(_) => false,
@@ -187,6 +201,14 @@ pub(crate) struct Pane {
     pub(crate) last_exit: Option<i32>,
     /// Wall-clock duration of that block, when one was recorded.
     pub(crate) last_duration_ms: Option<u64>,
+    /// Set when this pane hosts a native agent task terminal (the codex CLI or
+    /// a validation rerun). Task terminals exist only at runtime: their task
+    /// metadata is never persisted, so session snapshots exclude the whole
+    /// tab instead of restoring a stray shell inside the task worktree.
+    pub(crate) task_role: Option<crate::agent_task::TaskTerminalRole>,
+    /// Stable synthetic session identity binding this pane to its task in the
+    /// task manager (`anvil-<pid>-<pane_id>`). `None` for ordinary panes.
+    pub(crate) task_session_id: Option<String>,
 }
 
 impl Pane {

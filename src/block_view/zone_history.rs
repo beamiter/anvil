@@ -147,6 +147,8 @@ impl PersistedZone {
                 cwd: self.cwd,
                 is_background: self.is_background,
                 completion_provenance,
+                // Zone history predates command-text provenance: fail closed.
+                command_source: super::CommandTextSource::Screen,
                 start_mark_seen,
             },
             snapshot,

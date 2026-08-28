@@ -218,6 +218,7 @@ pub(crate) fn spawn_shell(
     session_id: Option<&str>,
     cwd_token: &str,
     initial_commands: &[String],
+    env_extra: &[(String, String)],
     probe: PaneProbe,
     sender: ComponentSender<VteTerminal>,
 ) {
@@ -234,7 +235,12 @@ pub(crate) fn spawn_shell(
     // The integration marker and cwd-authentication token must be encoded in
     // the host wrapper as well as VTE's environment. The shell integration
     // immediately removes the token from its exported environment.
-    let host_environment = crate::terminal::cwd_token_environment(cwd_token);
+    let mut host_environment = Vec::from(crate::terminal::cwd_token_environment(cwd_token));
+    host_environment.extend(
+        env_extra
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+    );
     let argv_vec =
         crate::host::wrap_argv(&argv_vec, effective_working_directory, &host_environment);
     let argv: Vec<&str> = argv_vec.iter().map(|s| s.as_str()).collect();
@@ -381,6 +387,10 @@ pub struct VteInit {
     pub cwd_token: String,
     pub initial_commands: InitialCommands,
     pub probe: PaneProbe,
+    /// Extra `KEY=value` pairs overlaid on the frozen child environment.
+    /// Empty for ordinary shells; task terminals use it to pin validation
+    /// children to no-rc startup files.
+    pub env_extra: Vec<(String, String)>,
 }
 
 /// Shared, cheaply-clonable handle exposing a pane's shell pid and PTY master fd
@@ -632,6 +642,7 @@ impl Component for VteTerminal {
             init.session_id.as_deref(),
             &init.cwd_token,
             init.initial_commands.as_slice(),
+            &init.env_extra,
             init.probe.clone(),
             sender.clone(),
         );

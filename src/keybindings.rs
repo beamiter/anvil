@@ -117,6 +117,9 @@ pub(crate) enum Action {
     OpenWorkflows,
     /// Open the multi-turn agent panel (Warp-style). Ctrl+Alt+G by default.
     OpenAgent,
+    /// Show or hide the native Codex agent Tasks panel (isolated-worktree
+    /// tasks). Ctrl+Alt+Shift+T by default; requires `agent_tasks_enabled`.
+    ToggleTasksPanel,
     /// Search command and output lines across all completed blocks.
     CrossBlockSearch,
 }
@@ -219,6 +222,7 @@ impl Action {
             Action::AskAiAboutSelectedBlock => "Ask AI about selected block",
             Action::OpenWorkflows => "Open workflows",
             Action::OpenAgent => "Toggle Shell Agent",
+            Action::ToggleTasksPanel => "Toggle agent Tasks panel",
             Action::CrossBlockSearch => "Search across blocks (ripgrep)",
         }
     }
@@ -308,6 +312,7 @@ impl Action {
             Action::AskAiAboutSelectedBlock => Some("ask_ai_about_selected_block"),
             Action::OpenWorkflows => Some("open_workflows"),
             Action::OpenAgent => Some("open_agent"),
+            Action::ToggleTasksPanel => Some("toggle_tasks_panel"),
             Action::CrossBlockSearch => Some("cross_block_search"),
         }
     }
@@ -404,6 +409,7 @@ impl Action {
             Action::AskAiAboutSelectedBlock,
             Action::OpenWorkflows,
             Action::OpenAgent,
+            Action::ToggleTasksPanel,
             Action::CrossBlockSearch,
         ]
     }
@@ -593,6 +599,7 @@ impl KeybindingMap {
         bind("Ctrl+Shift+Q", Action::AskAiAboutSelectedBlock);
         bind("Ctrl+Shift+M", Action::OpenWorkflows);
         bind("Ctrl+Alt+G", Action::OpenAgent);
+        bind("Ctrl+Alt+Shift+T", Action::ToggleTasksPanel);
         bind("Ctrl+Shift+G", Action::CrossBlockSearch);
 
         KeybindingMap { bindings }
@@ -1171,6 +1178,7 @@ history_palette = "F10"
             ("Ctrl+Shift+Q", Action::AskAiAboutSelectedBlock),
             ("Ctrl+Shift+M", Action::OpenWorkflows),
             ("Ctrl+Alt+G", Action::OpenAgent),
+            ("Ctrl+Alt+Shift+T", Action::ToggleTasksPanel),
             ("Ctrl+Shift+G", Action::CrossBlockSearch),
         ];
 

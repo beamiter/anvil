@@ -571,6 +571,9 @@ impl From<LegacyBlockDataV2> for BlockData {
             duration_ms: trusted_completion.then_some(legacy.duration_ms).flatten(),
             cwd: legacy.cwd,
             cols: legacy.cols,
+            // Legacy snapshots predate command-text provenance: fail closed.
+            command_exact: false,
+            command_truncated: false,
         }
     }
 }
@@ -1581,6 +1584,8 @@ mod tests {
             duration_ms: Some(1_000),
             cwd: Some("/tmp".into()),
             cols: 80,
+            command_exact: false,
+            command_truncated: false,
         }
     }
 

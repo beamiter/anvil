@@ -189,6 +189,15 @@ impl BlockTerminal {
             .and_then(|view| view.selected_block_context(max_output_lines))
     }
 
+    pub(crate) fn selected_block_agent_evidence(
+        &self,
+        max_output_lines: usize,
+    ) -> Option<crate::block_view::BlockAgentEvidence> {
+        self.view
+            .as_ref()
+            .and_then(|view| view.selected_block_agent_evidence(max_output_lines))
+    }
+
     pub(crate) fn insert_inline_notice(&self, widget: &gtk::Widget) -> bool {
         let Some(view) = self.view.as_ref() else {
             return false;
@@ -419,6 +428,7 @@ impl Component for BlockTerminal {
                 init.session_id.as_deref(),
                 &init.cwd_token,
                 init.initial_commands.as_slice(),
+                &init.env_extra,
             )
         }
         .map(Rc::new);

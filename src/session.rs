@@ -249,6 +249,27 @@ impl SavedSession {
     }
 }
 
+/// Select which tabs survive snapshot capture when some hold task terminals.
+///
+/// Task terminals (native agent / validation reruns) exist only at runtime:
+/// their task metadata is never persisted, and a restored pane would be an
+/// ordinary shell that happens to land inside the task worktree — an easy
+/// footgun. The save side therefore drops every tab containing a task pane as
+/// a whole, exactly like ember's `sessions_snapshot_for_persistence`, instead
+/// of resurrecting it. Returns the kept tab indices in original order plus
+/// the active index remapped into the kept list (falling back to the first
+/// survivor, and to 0 when nothing survives, which restores as the explicit
+/// empty tombstone).
+pub(crate) fn pruned_snapshot_tabs(tab_is_task: &[bool], active: usize) -> (Vec<usize>, usize) {
+    let kept: Vec<usize> = tab_is_task
+        .iter()
+        .enumerate()
+        .filter_map(|(index, is_task)| (!*is_task).then_some(index))
+        .collect();
+    let remapped = kept.iter().position(|&index| index == active).unwrap_or(0);
+    (kept, remapped)
+}
+
 pub(crate) fn can_add_persisted_tab(
     current_tabs: usize,
     current_panes: usize,
@@ -2930,6 +2951,40 @@ mod tests {
     /// A minimal leaf, and a `depth`-deep chain of splits ending in leaves.
     fn leaf_json() -> String {
         r#"{"type":"leaf","mode":"block"}"#.to_string()
+    }
+
+    #[test]
+    fn pruned_snapshot_tabs_keep_interactive_order_and_remap_active() {
+        // No task tabs: the selection is the identity.
+        assert_eq!(
+            pruned_snapshot_tabs(&[false, false, false], 2),
+            (vec![0, 1, 2], 2)
+        );
+        // A task tab in the middle is dropped; later tabs shift down.
+        assert_eq!(
+            pruned_snapshot_tabs(&[false, true, false, false], 3),
+            (vec![0, 2, 3], 2)
+        );
+        // Leading task tab: everything shifts and the active tab follows.
+        assert_eq!(
+            pruned_snapshot_tabs(&[true, false, false], 2),
+            (vec![1, 2], 1)
+        );
+    }
+
+    #[test]
+    fn pruned_snapshot_tabs_fall_back_when_active_was_pruned() {
+        // The active tab itself holds a task terminal: fall back to the first
+        // survivor rather than pointing past the kept list.
+        assert_eq!(
+            pruned_snapshot_tabs(&[false, true, false], 1),
+            (vec![0, 2], 0)
+        );
+        // Everything is a task tab: nothing survives and the snapshot becomes
+        // the explicit empty tombstone the restore path already understands.
+        assert_eq!(pruned_snapshot_tabs(&[true, true], 1), (Vec::new(), 0));
+        // Degenerate empty input stays empty.
+        assert_eq!(pruned_snapshot_tabs(&[], 0), (Vec::new(), 0));
     }
 
     fn nested_layout_json(depth: usize) -> String {

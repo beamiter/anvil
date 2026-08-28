@@ -12,6 +12,7 @@ pub(crate) mod command_palette;
 pub(crate) mod debug_dashboard;
 pub(crate) mod remote_picker;
 pub(crate) mod settings;
+pub(crate) mod tasks_panel;
 pub(crate) mod workflow;
 
 /// Confirm closing a tab/pane that has a running process (ssh, docker, nix

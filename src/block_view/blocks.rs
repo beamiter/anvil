@@ -244,6 +244,15 @@ pub(crate) struct BlockData {
     /// (old saves before this field existed) — caller should fall back.
     #[serde(default)]
     pub(crate) cols: u16,
+    /// The command line came from the shell's own OSC 133 report, not a
+    /// screen scrape. Defaults to false so blocks saved before this field
+    /// existed can never pose as exact evidence for agent tasks.
+    #[serde(default)]
+    pub(crate) command_exact: bool,
+    /// The shell admitted its command report was truncated; the visible text
+    /// must not be treated as the command that actually ran.
+    #[serde(default)]
+    pub(crate) command_truncated: bool,
 }
 
 /// Fence long enough to contain `text`: untrusted output may itself hold a run
@@ -1822,6 +1831,8 @@ mod tests {
             duration_ms: None,
             cwd: None,
             cols: 80,
+            command_exact: true,
+            command_truncated: false,
         }
     }
 

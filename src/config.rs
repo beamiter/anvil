@@ -512,6 +512,16 @@ pub struct Config {
     /// users who like the per-block AI helpers but find agent mode too
     /// risky can disable the multi-turn loop without losing the rest.
     pub(crate) agent_enabled: bool,
+    /// Allow the native Codex agent Tasks panel (isolated-worktree tasks
+    /// driven through the contained app-server). Default off, matching
+    /// ember's experimental rollout posture: a security surface this size
+    /// stays opt-in until it has seen real-world mileage. File-only toggle.
+    pub(crate) agent_tasks_enabled: bool,
+    /// Explicit consent to attach command/terminal evidence to provider
+    /// prompts. Required (together with `ai_enabled`) before a native Codex
+    /// task may start or receive follow-up turns; default off so no terminal
+    /// content leaves the machine without an explicit opt-in. File-only.
+    pub(crate) ai_share_command_context: bool,
     /// Hard cap on assistant turns per agent session. Once reached the
     /// session is sealed and the user must start a new one — this is a
     /// runaway-loop safety net, not a usability lever.
@@ -608,6 +618,8 @@ impl Config {
             ai_panel_visible: false,
             ai_panel_width: 360,
             agent_enabled: false,
+            agent_tasks_enabled: false,
+            ai_share_command_context: false,
             agent_max_turns: 20,
             command_correction_enabled: false,
             ai_provider: "anthropic".to_string(),
@@ -1048,6 +1060,8 @@ struct FileConfig {
     ai_panel_visible: Option<bool>,
     ai_panel_width: Option<u32>,
     agent_enabled: Option<bool>,
+    agent_tasks_enabled: Option<bool>,
+    ai_share_command_context: Option<bool>,
     agent_max_turns: Option<u32>,
     agent_auto_approve_readonly: Option<bool>,
     command_correction_enabled: Option<bool>,
@@ -1237,6 +1251,10 @@ fn load_file_config() -> FileConfig {
             .and_then(|v| v.as_integer())
             .and_then(|v| u32::try_from(v).ok()),
         agent_enabled: table.get("agent_enabled").and_then(|v| v.as_bool()),
+        agent_tasks_enabled: table.get("agent_tasks_enabled").and_then(|v| v.as_bool()),
+        ai_share_command_context: table
+            .get("ai_share_command_context")
+            .and_then(|v| v.as_bool()),
         agent_max_turns: table
             .get("agent_max_turns")
             .and_then(|v| v.as_integer())
@@ -1864,6 +1882,16 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         agent_enabled: env_bool("ANVIL_AGENT_ENABLED")
             .or(fc.agent_enabled)
             .unwrap_or(true),
+        // Fail-closed by design: the contained-agent surface and the sharing
+        // of terminal evidence with a provider both stay off until the user
+        // opts in (ember's `experimental_task_sidebar` /
+        // `ai_share_command_context` defaults).
+        agent_tasks_enabled: env_bool("ANVIL_AGENT_TASKS_ENABLED")
+            .or(fc.agent_tasks_enabled)
+            .unwrap_or(false),
+        ai_share_command_context: env_bool("ANVIL_AI_SHARE_COMMAND_CONTEXT")
+            .or(fc.ai_share_command_context)
+            .unwrap_or(false),
         agent_max_turns: env_u32("ANVIL_AGENT_MAX_TURNS")
             .or(fc.agent_max_turns)
             .unwrap_or(20)

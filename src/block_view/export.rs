@@ -356,6 +356,7 @@ mod tests {
             cwd: Some("/work".to_string()),
             is_background: false,
             completion_provenance: crate::block_view::CompletionProvenance::ShellReported,
+            command_source: crate::block_view::CommandTextSource::ShellReported,
             start_mark_seen: true,
         }
     }

@@ -623,11 +623,12 @@ impl AppModel {
         shell_argv: Rc<Vec<String>>,
         sender: &ComponentSender<AppModel>,
     ) {
-        self.add_tab_full(
+        self.add_tab_full_inner(
             initial_commands,
             working_directory,
             shell_argv,
             None,
+            Vec::new(),
             sender,
         );
     }
@@ -643,27 +644,60 @@ impl AppModel {
         argv: Vec<String>,
         sender: &ComponentSender<AppModel>,
     ) {
-        self.add_tab_full(
+        self.add_tab_full_inner(
             InitialCommands::default(),
             None,
             Rc::new(argv),
             Some((TerminalMode::Vte, title.to_string())),
+            Vec::new(),
             sender,
         );
     }
 
+    /// Launch an explicit argv in its own named tab as a native agent task
+    /// terminal. The pane is marked with its task role and synthetic session
+    /// identity so the task manager can bind it and the session snapshot
+    /// prunes the tab. Returns `(tab_id, pane_id)`, or `None` when the tab
+    /// budget refused the spawn.
+    pub(crate) fn add_task_terminal_tab(
+        &mut self,
+        title: &str,
+        argv: Vec<String>,
+        working_directory: Option<String>,
+        env_extra: Vec<(String, String)>,
+        role: crate::agent_task::TaskTerminalRole,
+        task_session_id: String,
+        sender: &ComponentSender<AppModel>,
+    ) -> Option<(u64, u64)> {
+        let (tab_id, pane_id) = self.add_tab_full_inner(
+            InitialCommands::default(),
+            working_directory,
+            Rc::new(argv),
+            Some((TerminalMode::Vte, title.to_string())),
+            env_extra,
+            sender,
+        )?;
+        let tab = self.tabs.iter_mut().find(|tab| tab.id == tab_id)?;
+        let pane = tab.panes.iter_mut().find(|pane| pane.id == pane_id)?;
+        pane.task_role = Some(role);
+        pane.task_session_id = Some(task_session_id);
+        Some((tab_id, pane_id))
+    }
+
     /// Shared body: `command` forces a terminal mode and a fixed tab title,
     /// which is what one-shot helper tabs need and ordinary tabs must not have.
-    fn add_tab_full(
+    #[allow(clippy::too_many_arguments)]
+    fn add_tab_full_inner(
         &mut self,
         initial_commands: InitialCommands,
         working_directory: Option<String>,
         shell_argv: Rc<Vec<String>>,
         command: Option<(TerminalMode, String)>,
+        env_extra: Vec<(String, String)>,
         sender: &ComponentSender<AppModel>,
-    ) {
+    ) -> Option<(u64, u64)> {
         if !self.ensure_persisted_tab_capacity(true) {
-            return;
+            return None;
         }
         let id = self.next_id;
         self.next_id += 1;
@@ -686,6 +720,7 @@ impl AppModel {
             working_directory,
             None,
             false,
+            env_extra,
             sender,
         );
         let holder = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -713,6 +748,7 @@ impl AppModel {
         };
         self.insert_tab_after_active(tab);
         self.select_tab(id, sender);
+        Some((id, pane_id))
     }
 
     /// Insert a newly-created tab immediately after the active tab. Session
@@ -829,6 +865,7 @@ impl AppModel {
                                 None,
                                 restored_sid.clone(),
                                 true,
+                                Vec::new(),
                                 sender,
                             );
                             if restored_remote.is_none() {
@@ -904,6 +941,7 @@ impl AppModel {
                         restored_sid
                     },
                     external_cwd,
+                    Vec::new(),
                     sender,
                 );
                 let widget = pane.widget();
@@ -1024,11 +1062,23 @@ impl AppModel {
 
     /// Capture the current tab list as a persistable snapshot, including each
     /// tab's full split layout.
+    ///
+    /// Tabs containing task terminals (native agent / validation reruns) are
+    /// excluded as a whole: their task metadata is runtime-only, and a
+    /// restored pane would become an ordinary shell that happens to land
+    /// inside the task worktree. Interactive tabs keep their original
+    /// relative order and `active` is remapped onto the survivors.
     pub(crate) fn snapshot_session(&self) -> session::SavedSession {
-        let tabs = self
+        let tab_is_task: Vec<bool> = self
             .tabs
             .iter()
-            .map(|t| {
+            .map(|tab| tab.panes.iter().any(|pane| pane.task_role.is_some()))
+            .collect();
+        let (kept, active) = session::pruned_snapshot_tabs(&tab_is_task, self.active);
+        let tabs = kept
+            .into_iter()
+            .map(|index| {
+                let t = &self.tabs[index];
                 session::SavedTab::captured(
                     t.title.clone(),
                     t.custom_title,
@@ -1038,7 +1088,7 @@ impl AppModel {
                 )
             })
             .collect();
-        session::SavedSession::captured(self.active, tabs, self.ai_conversation.clone())
+        session::SavedSession::captured(active, tabs, self.ai_conversation.clone())
     }
 
     pub(crate) fn persist_session(&self) {
@@ -1332,6 +1382,7 @@ impl AppModel {
             None,
             None,
             true,
+            Vec::new(),
             sender,
         );
         let holder = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -1499,6 +1550,7 @@ impl AppModel {
             None,
             None,
             true,
+            Vec::new(),
             sender,
         );
         self.tabs[idx].holder.append(&pane.widget());
@@ -1639,6 +1691,11 @@ impl AppModel {
             self.pending_split_spawns.remove(&pane_id);
             self.close_command_suggestion_for_pane(pane_id);
             self.close_command_correction_for_pane(pane_id);
+            // Closing a task-terminal tab without a process-exit message is
+            // the close half of ember's exit/closed split: the task model
+            // records the terminal as closed (a running validation becomes
+            // Cancelled, never silently Passed).
+            self.note_task_terminal_closed(pane_id);
         }
         let closes_agent = self
             .active_agent
@@ -2001,6 +2058,7 @@ impl AppModel {
             cwd,
             None,
             false,
+            Vec::new(),
             sender,
         );
         let holder = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -2189,6 +2247,7 @@ impl AppModel {
                     wd,
                     None,
                     false,
+                    Vec::new(),
                     sender,
                 );
                 if let Some(error) = pane.terminal.synchronous_launch_error() {

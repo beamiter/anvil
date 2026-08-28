@@ -2660,6 +2660,9 @@ struct CompletedCommandRecord {
     cwd: Option<String>,
     is_background: bool,
     completion_provenance: CompletionProvenance,
+    /// Exactness of `cmd` as resolved at the accepted C mark. Agent-task
+    /// evidence must never present a screen scrape as shell-reported text.
+    command_source: CommandTextSource,
     start_mark_seen: bool,
 }
 
@@ -3554,6 +3557,11 @@ struct EngineState {
     /// Completion authority for the current command; reset at C and promoted
     /// only by an accepted D or a foreground-shell A recovery.
     pending_completion_provenance: CompletionProvenance,
+    /// Provenance of the current command's text, set at the same accepted C
+    /// that resolves the command line and consumed into the finished record.
+    /// Defaults to (and resets to) the non-exact screen source so a command
+    /// whose start marker was never accepted can never look shell-reported.
+    pending_command_source: CommandTextSource,
     /// Exactly-once observer half of an accepted C lifecycle. Armed only by C,
     /// consumed by the first accepted D or trusted-A recovery, and cleared by
     /// RIS. This is deliberately separate from `cmd_running_rc`: prompt-trust
@@ -5624,6 +5632,17 @@ impl ReaderCtx {
                     CompletionProvenance::Unknown,
                 )
             };
+            // Background output was never a command, so it keeps the
+            // conservative screen source; a real command takes the provenance
+            // its accepted C recorded and resets the slot to non-exact.
+            let command_source = if is_background {
+                CommandTextSource::Screen
+            } else {
+                std::mem::replace(
+                    &mut self.engine.borrow_mut().pending_command_source,
+                    CommandTextSource::Screen,
+                )
+            };
             if !is_background
                 && matches!(
                     completion_provenance,
@@ -5651,6 +5670,7 @@ impl ReaderCtx {
                 cwd: block_cwd,
                 is_background,
                 completion_provenance,
+                command_source,
                 start_mark_seen: !is_background,
             };
             let payload =
@@ -5954,6 +5974,9 @@ impl ReaderCtx {
         let scraped = normalize_captured_command(&captured, &self.engine.borrow().prompt_display);
         let (command, source) =
             resolve_command_text(meta.command.as_deref(), meta.command_truncated, &scraped);
+        // The exactness provenance rides the same accepted-C authority as the
+        // resolved text: only this site may mark a command shell-reported.
+        self.engine.borrow_mut().pending_command_source = source;
         // Command capture (and every preceding parser feed in this chunk) has
         // completed while the prompt zone is still open. C now converts that
         // exact zone to Command and closes it before any command output can be
@@ -7576,6 +7599,8 @@ impl RenderBackend for BlockBackend {
             duration_ms: record.duration_ms,
             cwd: record.cwd.clone(),
             cols: cols as u16,
+            command_exact: record.command_source == CommandTextSource::ShellReported,
+            command_truncated: record.command_source == CommandTextSource::ScreenAfterTruncation,
         };
 
         let max_blocks = self.config_for_cb.borrow().max_visible_blocks as usize;
@@ -9614,6 +9639,7 @@ impl TermView {
         session_id: Option<&str>,
         cwd_token: &str,
         initial_commands: &[String],
+        env_overrides: &[(String, String)],
     ) -> std::io::Result<Self> {
         // ── Build widget tree ──────────────────────────────────────────────
         let root = gtk::Box::new(Orientation::Vertical, 0);
@@ -9874,6 +9900,11 @@ impl TermView {
         // also gets it right for the Flatpak bridge, where "the parent has no
         // LESS" is the wrong question to ask about the host session.
         let mut env_extra = Vec::from(crate::terminal::cwd_token_environment(cwd_token));
+        env_extra.extend(
+            env_overrides
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        );
         let session_id_owned = session_id.map(|s| s.to_string());
         if let Some(ref sid) = session_id_owned {
             if session_applied {
@@ -10688,6 +10719,7 @@ impl TermView {
                     // header renders as neutral rather than as `exit 0`.
                     pending_exit_code: None,
                     pending_completion_provenance: CompletionProvenance::Unknown,
+                    pending_command_source: CommandTextSource::Screen,
                     command_finished_event_pending: false,
                     // Metadata jsh attaches to the same marks (see
                     // ParserEvent::CommandStart).
@@ -13849,6 +13881,65 @@ impl TermView {
             truncated,
         })
     }
+
+    /// Snapshot the selected finished block as agent-task evidence, preserving
+    /// the command-text provenance the task preflight gates on. Unlike
+    /// [`Self::selected_block_context`] (AI chat), a block whose command came
+    /// from a screen scrape reports `command_exact == false` and can never
+    /// anchor a validation rerun. Returns `None` when no block is selected.
+    pub fn selected_block_agent_evidence(
+        &self,
+        lines_per_side: usize,
+    ) -> Option<BlockAgentEvidence> {
+        let id = self.selected_block_id.get()?;
+        let finished = self.finished_blocks.borrow();
+        let block = finished.iter().find(|b| b.id == id)?;
+        let data = self.block_data.borrow();
+        let bd = data.iter().find(|b| b.id == id);
+
+        let output_total_bytes = block.with_stripped_output(|s| s.len());
+        let output =
+            block.with_stripped_output(|s| crate::ai::truncate_for_context(s, lines_per_side));
+        let output_truncated = output.contains("lines elided") || output.contains("bytes elided");
+        let to_time = |ms: Option<u64>| {
+            ms.map(|ms| std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms))
+        };
+        Some(BlockAgentEvidence {
+            block_id: id,
+            command: (!block.cmd_text.trim().is_empty()).then(|| block.cmd_text.clone()),
+            command_exact: bd.is_some_and(|b| b.command_exact),
+            command_truncated: bd.is_some_and(|b| b.command_truncated),
+            cwd: bd.and_then(|b| b.cwd.clone()),
+            exit_code: bd.and_then(|b| b.exit_code),
+            duration_ms: bd.and_then(|b| b.duration_ms),
+            output_text: output,
+            output_available: true,
+            output_truncated,
+            output_total_bytes,
+            is_background: block.is_background,
+            started_at: to_time(bd.and_then(|b| b.start_time_ms)),
+            finished_at: to_time(bd.and_then(|b| b.end_time_ms)),
+        })
+    }
+}
+
+/// Owned evidence snapshot of one selected finished block, shaped for
+/// conversion into `agent_task::SemanticCommandContext` at the app layer.
+pub(crate) struct BlockAgentEvidence {
+    pub(crate) block_id: u64,
+    pub(crate) command: Option<String>,
+    pub(crate) command_exact: bool,
+    pub(crate) command_truncated: bool,
+    pub(crate) cwd: Option<String>,
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) duration_ms: Option<u64>,
+    pub(crate) output_text: String,
+    pub(crate) output_available: bool,
+    pub(crate) output_truncated: bool,
+    pub(crate) output_total_bytes: usize,
+    pub(crate) is_background: bool,
+    pub(crate) started_at: Option<std::time::SystemTime>,
+    pub(crate) finished_at: Option<std::time::SystemTime>,
 }
 
 #[cfg(test)]
@@ -14306,6 +14397,7 @@ mod tests {
             cwd: Some("/work".to_string()),
             is_background: false,
             completion_provenance: super::CompletionProvenance::ShellReported,
+            command_source: super::CommandTextSource::ShellReported,
             start_mark_seen: true,
         };
         let mut zones = UnifiedZoneStore::new();
@@ -14339,6 +14431,7 @@ mod tests {
                 cwd: Some("/work".to_string()),
                 is_background: false,
                 completion_provenance: super::CompletionProvenance::ShellReported,
+                command_source: super::CommandTextSource::ShellReported,
                 start_mark_seen: true,
             }
         );
@@ -14364,6 +14457,7 @@ mod tests {
             cwd: None,
             is_background: false,
             completion_provenance: super::CompletionProvenance::ShellReported,
+            command_source: super::CommandTextSource::ShellReported,
             start_mark_seen: true,
         };
         let bookmarks = BookmarkState::default();
@@ -14414,6 +14508,7 @@ mod tests {
             cwd: None,
             is_background: false,
             completion_provenance: super::CompletionProvenance::ShellReported,
+            command_source: super::CommandTextSource::ShellReported,
             start_mark_seen: true,
         };
         let mut zones = UnifiedZoneStore::new();
@@ -15435,6 +15530,9 @@ mod tests {
                 duration_ms: record.duration_ms,
                 cwd: record.cwd.clone(),
                 cols: cols as u16,
+                command_exact: record.command_source == super::CommandTextSource::ShellReported,
+                command_truncated: record.command_source
+                    == super::CommandTextSource::ScreenAfterTruncation,
             };
             self.block_records
                 .borrow_mut()
@@ -15853,6 +15951,7 @@ mod tests {
                     prompt_display: String::new(),
                     pending_exit_code: None,
                     pending_completion_provenance: super::CompletionProvenance::Unknown,
+                    pending_command_source: super::CommandTextSource::Screen,
                     command_finished_event_pending: false,
                     shell_duration_ms: None,
                     execution_id_trusted: false,
@@ -16959,6 +17058,7 @@ mod tests {
             cwd: None,
             is_background: true,
             completion_provenance: super::CompletionProvenance::Unknown,
+            command_source: super::CommandTextSource::Screen,
             start_mark_seen: false,
         };
         assert_eq!(record.lifecycle_notice(), None);
@@ -20039,6 +20139,8 @@ mod tests {
             duration_ms: None,
             cwd: None,
             cols: 80,
+            command_exact: !cmd.trim().is_empty(),
+            command_truncated: false,
         }
     }
 

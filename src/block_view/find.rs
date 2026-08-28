@@ -2599,6 +2599,8 @@ mod tests {
             duration_ms: Some(2_000),
             cwd: None,
             cols: 80,
+            command_exact: false,
+            command_truncated: false,
         };
         let metadata = CompletedCommandRecord {
             id: 2,
@@ -2612,6 +2614,7 @@ mod tests {
             cwd: None,
             is_background: true,
             completion_provenance: super::super::CompletionProvenance::Unknown,
+            command_source: super::super::CommandTextSource::Screen,
             start_mark_seen: false,
         };
         let records = [
@@ -2704,6 +2707,7 @@ mod tests {
             is_background: false,
             completion_provenance: super::super::CompletionProvenance::ShellReported,
             start_mark_seen: true,
+            command_source: crate::block_view::CommandTextSource::Screen,
         };
         let retained = ZoneOutputSnapshot {
             plain: "\nlegacy foreground output".to_string(),
@@ -2771,6 +2775,7 @@ mod tests {
                 is_background: false,
                 completion_provenance: super::super::CompletionProvenance::ShellReported,
                 start_mark_seen: true,
+                command_source: crate::block_view::CommandTextSource::Screen,
             },
             CompletedCommandRecord {
                 id: 7,
@@ -2783,6 +2788,7 @@ mod tests {
                 is_background: false,
                 completion_provenance: super::super::CompletionProvenance::ShellReported,
                 start_mark_seen: true,
+                command_source: crate::block_view::CommandTextSource::Screen,
             },
         ];
         let records = || {
@@ -2826,6 +2832,7 @@ mod tests {
             is_background: false,
             completion_provenance: super::super::CompletionProvenance::ShellReported,
             start_mark_seen: true,
+            command_source: crate::block_view::CommandTextSource::Screen,
         };
         let metadata = [
             record(1, Some(0), Some(2_000)),
@@ -2881,6 +2888,8 @@ mod tests {
             duration_ms: Some(2_000),
             cwd: None,
             cols: 80,
+            command_exact: false,
+            command_truncated: false,
         };
         let metadata = CompletedCommandRecord {
             id: 2,
@@ -2893,6 +2902,7 @@ mod tests {
             is_background: false,
             completion_provenance: super::super::CompletionProvenance::ShellReported,
             start_mark_seen: true,
+            command_source: crate::block_view::CommandTextSource::Screen,
         };
         let background = BlockData {
             id: 3,
@@ -2911,6 +2921,8 @@ mod tests {
             duration_ms: None,
             cwd: None,
             cols: 80,
+            command_exact: false,
+            command_truncated: false,
         };
         let records = || {
             [
@@ -3053,6 +3065,7 @@ mod tests {
             is_background,
             completion_provenance: super::super::CompletionProvenance::Unknown,
             start_mark_seen: !is_background,
+            command_source: crate::block_view::CommandTextSource::Screen,
         };
         let metadata = [
             record(1, "foreground one", Some(2_000), false),
@@ -3138,6 +3151,8 @@ mod tests {
             duration_ms: None,
             cwd: None,
             cols: 80,
+            command_exact: false,
+            command_truncated: false,
         };
         let block_record = || [BackendRecordRef::Block(&block)];
         let hits = metadata_filter_hits(block_record(), CrossBlockSearchScope::All, 1, &filters);
@@ -3179,6 +3194,7 @@ mod tests {
             is_background: false,
             completion_provenance: super::super::CompletionProvenance::ShellReported,
             start_mark_seen: true,
+            command_source: crate::block_view::CommandTextSource::Screen,
         };
         let with_snapshot = record(1, "cargo test");
         let evicted = record(2, "rg needle src");
@@ -3234,6 +3250,7 @@ mod tests {
             is_background: false,
             completion_provenance: super::super::CompletionProvenance::ShellReported,
             start_mark_seen: true,
+            command_source: crate::block_view::CommandTextSource::Screen,
         };
         let evicted = CompletedCommandRecord {
             id: 2,

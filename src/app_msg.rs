@@ -311,6 +311,12 @@ pub(crate) enum AppMsg {
     AiPanelCloseRequested,
     AiPanelWidthChanged(u32),
     PersistAiPanelWidth(u64),
+    /// One staged action from the agent Tasks panel, executed against the
+    /// live task domain at message time.
+    TaskPanelAction(crate::agent_task_ui::TaskPanelAction),
+    /// Self-re-arming drain of native runtime events, worktree creation, and
+    /// the diff worker.
+    AgentTasksTick,
     PaletteRunWorkflow(std::path::PathBuf),
     Ignore,
 }

@@ -1963,6 +1963,7 @@ mod tests {
                     is_background: false,
                     completion_provenance: super::super::CompletionProvenance::ShellReported,
                     start_mark_seen: true,
+                    command_source: crate::block_view::CommandTextSource::Screen,
                 },
                 100,
             );

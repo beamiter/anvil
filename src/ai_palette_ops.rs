@@ -618,13 +618,24 @@ impl AppModel {
         });
     }
 
+    /// Apply the combined right-side panel state: the shared stack is visible
+    /// when either panel wants the slot, and the Tasks panel takes the page
+    /// while it is open (the AI preference survives underneath).
+    pub(crate) fn sync_side_panel(&self) {
+        let tasks = self.tasks_panel_visible.get();
+        let chats = self.ai_panel_visible.get();
+        self.side_stack.set_visible(tasks || chats);
+        self.side_stack
+            .set_visible_child_name(if tasks { "tasks" } else { "chats" });
+    }
+
     pub(crate) fn set_ai_panel_visible(&self, visible: bool, persist: bool) {
         let visible = visible && !self.safe_mode && self.config.borrow().ai_enabled;
-        if self.ai_panel_visible.get() == visible && self.ai_panel.widget().is_visible() == visible
-        {
+        if self.ai_panel_visible.get() == visible {
             if visible {
                 self.restore_ai_panel_width();
             }
+            self.sync_side_panel();
             return;
         }
         if !visible && self.ai_panel_visible.get() {
@@ -638,8 +649,8 @@ impl AppModel {
             }
         }
         self.ai_panel_visible.set(visible);
-        self.ai_panel.widget().set_visible(visible);
         self.config.borrow_mut().ai_panel_visible = visible;
+        self.sync_side_panel();
         if visible {
             self.restore_ai_panel_width();
         }

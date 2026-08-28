@@ -3,6 +3,8 @@
 mod action_ops;
 mod agent;
 mod agent_ops;
+mod agent_task;
+mod agent_task_ui;
 mod ai;
 mod ai_palette_ops;
 mod app_msg;
@@ -48,6 +50,7 @@ mod process;
 mod pty;
 mod remote_fs;
 mod review_input_ops;
+mod review_text;
 mod search;
 mod session;
 mod settings_ops;
@@ -55,6 +58,7 @@ mod sidebar;
 mod sidebar_toggle;
 mod startup_ui;
 mod tab_strip;
+mod task_ops;
 mod terminal;
 mod top_bar;
 mod vte_pty;
@@ -315,6 +319,23 @@ struct AppModel {
     ai_panel: Controller<dialogs::ai_panel::AiPanelModel>,
     ai_panel_visible: std::cell::Cell<bool>,
     ai_panel_width_generation: Rc<std::cell::Cell<u64>>,
+    /// Right-side stack holding the AI Chats panel and the agent Tasks panel;
+    /// it is the `ai_paned` end child, so both share the persisted width.
+    side_stack: gtk::Stack,
+    tasks_panel: Controller<dialogs::tasks_panel::TasksPanelModel>,
+    tasks_panel_visible: std::cell::Cell<bool>,
+    /// Native Codex agent task domain: the reducer, the app-server runtime,
+    /// and the single-flight diff worker.
+    task_manager: crate::agent_task::TaskManager,
+    agent_runtime: crate::agent_task::AgentRuntimeManager,
+    agent_diff: crate::agent_task::AgentDiffPanel,
+    selected_task: Option<crate::agent_task::TaskId>,
+    pending_task_creation: Option<crate::agent_task_ui::PendingTaskCreation>,
+    /// Validation cwd pins retained between tab spawn and PaneLaunched so the
+    /// child enters the worktree through the validated descriptor.
+    pending_validation_pins:
+        std::collections::HashMap<u64, crate::agent_task::PreparedTaskValidation>,
+    agent_tasks_timer_armed: std::cell::Cell<bool>,
     ai_conversation: Option<String>,
     /// One pane-bound natural-language command draft. Keeping the request
     /// handle here makes Stop/Dismiss real transport cancellation.
@@ -352,6 +373,7 @@ fn create_pane(
     working_directory: Option<String>,
     session_id: Option<String>,
     cwd_external: bool,
+    env_extra: Vec<(String, String)>,
     sender: &ComponentSender<AppModel>,
 ) -> Pane {
     let probe = terminal::PaneProbe::default();
@@ -368,6 +390,7 @@ fn create_pane(
         cwd_token,
         initial_commands,
         probe: probe.clone(),
+        env_extra,
     };
     let forward = move |out| match out {
         VteOutput::Launched => AppMsg::PaneLaunched(pane_id),
@@ -499,6 +522,8 @@ fn create_pane(
         probe,
         last_exit: None,
         last_duration_ms: None,
+        task_role: None,
+        task_session_id: None,
     }
 }
 
@@ -1000,8 +1025,22 @@ impl SimpleComponent for AppModel {
                 }
                 dialogs::ai_panel::AiPanelOutput::CloseRequested => AppMsg::AiPanelCloseRequested,
             });
-        ai_panel.widget().set_visible(initial_ai_panel_visible);
-        ai_paned.set_end_child(Some(ai_panel.widget()));
+        let tasks_panel = dialogs::tasks_panel::TasksPanelModel::builder()
+            .launch(())
+            .forward(sender.input_sender(), |output| match output {
+                dialogs::tasks_panel::TasksPanelOutput::Action(action) => {
+                    AppMsg::TaskPanelAction(action)
+                }
+            });
+        // Both right-side panels share the `ai_paned` end slot through one
+        // stack: the persisted width/visibility behavior stays identical for
+        // AI Chats, and Tasks rides the same chrome without its own config.
+        let side_stack = gtk::Stack::new();
+        side_stack.add_named(ai_panel.widget(), Some("chats"));
+        side_stack.add_named(tasks_panel.widget(), Some("tasks"));
+        side_stack.set_visible_child_name("chats");
+        side_stack.set_visible(initial_ai_panel_visible);
+        ai_paned.set_end_child(Some(&side_stack));
         // The initial window is 800 px wide and the left sidebar has already
         // claimed its configured share. A map-time idle below corrects this
         // estimate against the compositor's actual allocation.
@@ -1139,6 +1178,16 @@ impl SimpleComponent for AppModel {
             ai_panel,
             ai_panel_visible: std::cell::Cell::new(initial_ai_panel_visible),
             ai_panel_width_generation: Rc::new(std::cell::Cell::new(0)),
+            side_stack: side_stack.clone(),
+            tasks_panel,
+            tasks_panel_visible: std::cell::Cell::new(false),
+            task_manager: crate::agent_task::TaskManager::new(),
+            agent_runtime: crate::agent_task::AgentRuntimeManager::new(),
+            agent_diff: crate::agent_task::AgentDiffPanel::new(),
+            selected_task: None,
+            pending_task_creation: None,
+            pending_validation_pins: std::collections::HashMap::new(),
+            agent_tasks_timer_armed: std::cell::Cell::new(false),
             ai_conversation: None,
             command_suggestion: Rc::new(RefCell::new(None)),
             command_suggestion_generation: Rc::new(std::cell::Cell::new(0)),
@@ -1162,7 +1211,7 @@ impl SimpleComponent for AppModel {
 
         {
             let width_sender = sender.clone();
-            let panel = model.ai_panel.widget().clone();
+            let panel = model.side_stack.clone();
             model.ai_paned.connect_position_notify(move |paned| {
                 if !panel.is_visible() {
                     return;
@@ -1557,6 +1606,8 @@ impl SimpleComponent for AppModel {
                 }
             }
             AppMsg::Action(action) => self.execute_action(action, &sender),
+            AppMsg::TaskPanelAction(action) => self.execute_task_panel_action(action, &sender),
+            AppMsg::AgentTasksTick => self.agent_tasks_tick(&sender),
             AppMsg::ReloadConfig => self.reload_config(&sender),
             AppMsg::PaneLaunched(pane_id) => {
                 if let Some((source_tab_id, _)) = self.pending_split_spawns.remove(&pane_id) {
@@ -1574,6 +1625,10 @@ impl SimpleComponent for AppModel {
                 if self.active_pane_id() == Some(pane_id) {
                     self.sync_organism_focus();
                 }
+                // The spawn consumed the pinned validation cwd: the child has
+                // entered the directory, so the descriptor no longer needs
+                // retention on the app side.
+                self.note_pane_launched_task_pin(pane_id);
             }
             AppMsg::PaneLaunchFailed(pane_id, message) => {
                 if let Some((source_tab_id, source_pane_id)) =
@@ -1627,6 +1682,13 @@ impl SimpleComponent for AppModel {
                 self.persist_config();
             }
             AppMsg::PaneExited(_, pane_id, code) => {
+                // A task terminal's exit is authoritative task evidence; the
+                // task model consumes it before the pane closes. Validation
+                // and agent terminals are never remote-reconnect candidates.
+                if self.note_task_terminal_exited(pane_id, code) {
+                    self.close_pane(pane_id, &sender);
+                    return;
+                }
                 // A remote single-pane tab that died abnormally is reconnected in
                 // place instead of closed; everything else closes normally.
                 if self.schedule_remote_reconnect(pane_id, code, &sender) {
