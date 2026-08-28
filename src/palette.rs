@@ -487,6 +487,36 @@ mod tests {
     }
 
     #[test]
+    fn collapse_actions_reach_palette_dispatch() {
+        // Folding is only reachable per card, by its chevron. These are how
+        // a keyboard user triages a long session at all.
+        let bindings = KeybindingMap::from_defaults();
+        for action in [
+            Action::CollapseAllBlocks,
+            Action::ExpandAllBlocks,
+            Action::ToggleBlockCollapsed,
+        ] {
+            let entries = gather(
+                &Query {
+                    mode: PaletteMode::Commands,
+                    text: action.name().to_string(),
+                },
+                &bindings,
+                &[],
+                &[],
+                100,
+            );
+            assert!(
+                entries.iter().any(
+                    |entry| matches!(&entry.accept, Accept::Action(found) if *found == action)
+                ),
+                "palette must offer {}",
+                action.name()
+            );
+        }
+    }
+
+    #[test]
     fn workflows_appear_under_colon_prefix() {
         let kbmap = KeybindingMap::from_defaults();
         let wf = Workflow {

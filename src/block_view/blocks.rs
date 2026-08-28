@@ -4311,6 +4311,19 @@ impl FinishedBlock {
         self.collapsed_state.get()
     }
 
+    /// Fold or unfold this card's output, reporting whether anything moved.
+    ///
+    /// The pane uses the answer to skip the layout pass entirely when a bulk
+    /// collapse found nothing to do. A card with neither output nor images
+    /// cannot fold, so the toggle no-ops there and the report stays honest.
+    pub(crate) fn set_collapsed(&self, collapsed: bool) -> bool {
+        if self.is_output_collapsed() == collapsed {
+            return false;
+        }
+        (self.toggle_collapsed)();
+        self.is_output_collapsed() == collapsed
+    }
+
     /// Mark, or unmark, this card as carrying a completion nobody vouched for.
     ///
     /// Takes the notice as well as the health because the two backing record

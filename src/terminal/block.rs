@@ -566,6 +566,19 @@ impl Component for BlockTerminal {
                 };
                 let _ = sender.output(VteOutput::Notice(message));
             }
+            VteInput::CollapseAllBlocks | VteInput::ExpandAllBlocks => {
+                let collapse = matches!(msg, VteInput::CollapseAllBlocks);
+                let folded = view.set_all_blocks_collapsed(collapse);
+                if folded > 0 {
+                    let plural = if folded == 1 { "" } else { "s" };
+                    let verb = if collapse { "Collapsed" } else { "Expanded" };
+                    let _ =
+                        sender.output(VteOutput::Notice(format!("{verb} {folded} block{plural}.")));
+                }
+            }
+            VteInput::ToggleBlockCollapsed => {
+                view.toggle_selected_block_collapsed();
+            }
             VteInput::ReinputSelectedCommands => view.reinput_selected_commands(),
             VteInput::JumpToPrevPinned => view.jump_to_pinned(-1),
             VteInput::JumpToNextPinned => view.jump_to_pinned(1),

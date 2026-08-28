@@ -429,6 +429,11 @@ pub enum VteInput {
     ClearBlocks,
     /// Block-view only: restore the blocks removed by the last ClearBlocks.
     UndoClearBlocks,
+    /// Block-view only: fold / unfold every finished block's output at once.
+    CollapseAllBlocks,
+    ExpandAllBlocks,
+    /// Block-view only: fold or unfold the selected block (or the newest one).
+    ToggleBlockCollapsed,
     /// Block-view only: put all selected commands back into the input editor.
     ReinputSelectedCommands,
     /// Block-view only: jump to the previous / next pinned block.
@@ -724,6 +729,9 @@ impl Component for VteTerminal {
             | VteInput::SelectAllBlocks
             | VteInput::ClearBlocks
             | VteInput::UndoClearBlocks
+            | VteInput::CollapseAllBlocks
+            | VteInput::ExpandAllBlocks
+            | VteInput::ToggleBlockCollapsed
             | VteInput::ReinputSelectedCommands
             | VteInput::JumpToPrevPinned
             | VteInput::JumpToNextPinned

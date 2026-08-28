@@ -443,6 +443,29 @@ fn mutate_block_data_and_redraw<R>(
     result
 }
 
+/// A card's virtualization height for the folded state it is in.
+///
+/// A folded card shows its header and command and nothing else, so its
+/// contribution to the document is the same as a command with no output. The
+/// estimator's own convention for that is zero output rows.
+fn collapsed_aware_block_height(
+    config: &Config,
+    data: &BlockData,
+    collapsed: bool,
+    fallback_cols: i64,
+) -> i32 {
+    let cols = if data.cols > 0 {
+        i64::from(data.cols)
+    } else {
+        fallback_cols
+    };
+    if collapsed {
+        estimated_finished_block_height_for_rows(config, 0, cols)
+    } else {
+        estimated_finished_block_height_for_text(config, &data.output, cols)
+    }
+}
+
 /// Give an icon-only button a stable tooltip and an explicit accessible name.
 /// GTK symbolic icons come from the active icon theme, so these controls do not
 /// depend on glyphs supplied only by patched terminal fonts.
@@ -13201,6 +13224,106 @@ impl TermView {
         restored_count
     }
 
+    /// Fold or unfold every finished card at once.
+    ///
+    /// Triaging a long session should not mean one chevron click per card. The
+    /// virtualization document is measured from `estimated_height`, so folding
+    /// has to shrink each card's recorded height too — otherwise the canvas
+    /// keeps the space the output used to take and the scrollbar lies. One
+    /// layout pass at the end, not one per card.
+    pub fn set_all_blocks_collapsed(&self, collapsed: bool) -> usize {
+        if self.fullscreen.get() || !self.render_backend.supports_block_mutation() {
+            return 0;
+        }
+        let moved = {
+            let finished = self.finished_blocks.borrow();
+            let config = self.config.borrow();
+            let fallback_cols =
+                bounded_finished_vte_columns(self.active.borrow().grid_cols() as i64);
+            let mut moved = 0usize;
+            mutate_block_data_and_redraw(
+                &self.block_data,
+                self.failure_marker_redraw.as_ref(),
+                |block_data| {
+                    for (index, card) in finished.iter().enumerate() {
+                        if !card.set_collapsed(collapsed) {
+                            continue;
+                        }
+                        moved += 1;
+                        if let Some(data) = block_data.get_mut(index) {
+                            // Zero is the filtered-document sentinel: such a card
+                            // contributes no pixels and must not regain a height
+                            // because its fold state changed.
+                            data.estimated_height = if data.estimated_height == 0 {
+                                0
+                            } else {
+                                collapsed_aware_block_height(
+                                    &config,
+                                    data,
+                                    collapsed,
+                                    fallback_cols,
+                                )
+                            };
+                        }
+                    }
+                },
+            );
+            moved
+        };
+        if moved > 0 {
+            self.update_viewport();
+            self.update_block_visibility();
+            self.block_list.queue_allocate();
+        }
+        moved
+    }
+
+    /// Fold or unfold the selected card, or the newest one when nothing is
+    /// selected — the same target the output filter shortcut uses.
+    pub fn toggle_selected_block_collapsed(&self) -> bool {
+        if self.fullscreen.get() || !self.render_backend.supports_block_mutation() {
+            return false;
+        }
+        let moved = {
+            let finished = self.finished_blocks.borrow();
+            let selected = self.selected_block_id.get();
+            let Some(index) = selected
+                .and_then(|id| finished.iter().position(|card| card.id == id))
+                .or_else(|| finished.len().checked_sub(1))
+            else {
+                return false;
+            };
+            let card = &finished[index];
+            let collapsed = !card.is_output_collapsed();
+            if !card.set_collapsed(collapsed) {
+                return false;
+            }
+            let config = self.config.borrow();
+            let fallback_cols =
+                bounded_finished_vte_columns(self.active.borrow().grid_cols() as i64);
+            mutate_block_data_and_redraw(
+                &self.block_data,
+                self.failure_marker_redraw.as_ref(),
+                |block_data| {
+                    if let Some(data) = block_data.get_mut(index) {
+                        data.estimated_height = if data.estimated_height == 0 {
+                            0
+                        } else {
+                            collapsed_aware_block_height(&config, data, collapsed, fallback_cols)
+                        };
+                    }
+                },
+            );
+            true
+        };
+        if moved {
+            self.update_viewport();
+            self.update_block_visibility();
+            self.block_list.queue_allocate();
+        }
+        moved
+    }
+
     pub(crate) fn apply_failed_filter(&self) -> RecordNavigationResult {
         let Some(record_id) = self.get_failed_blocks().first().copied() else {
             return RecordNavigationResult::NoMatchingRecord;
@@ -19923,6 +20046,41 @@ mod tests {
         let mut block = test_block(height as u64, "true", Some(0));
         block.estimated_height = height;
         block
+    }
+
+    /// Folding has to shrink the card's recorded height as well as hide its
+    /// widget. The virtualization canvas is measured from `estimated_height`,
+    /// so a bulk collapse that only hid widgets would leave the document the
+    /// same size and the scrollbar describing space nothing occupies.
+    #[test]
+    fn a_folded_card_stops_claiming_its_outputs_height() {
+        let config = Config::safe_defaults();
+        let mut data = test_block(1, "seq 1 200", Some(0));
+        data.output = (1..=200).map(|i| format!("line {i}\n")).collect();
+        data.line_count = 200;
+
+        let expanded = super::collapsed_aware_block_height(&config, &data, false, 80);
+        let folded = super::collapsed_aware_block_height(&config, &data, true, 80);
+        assert!(
+            folded < expanded,
+            "folded {folded} must be shorter than expanded {expanded}"
+        );
+
+        // Unfolding restores exactly the height the card had, so a
+        // collapse/expand round trip leaves the canvas where it started.
+        data.estimated_height = folded;
+        assert_eq!(
+            super::collapsed_aware_block_height(&config, &data, false, 80),
+            expanded
+        );
+
+        // A command with no output is already header-and-command tall, so
+        // folding it changes nothing.
+        data.output = String::new();
+        assert_eq!(
+            super::collapsed_aware_block_height(&config, &data, true, 80),
+            super::collapsed_aware_block_height(&config, &data, false, 80),
+        );
     }
 
     #[test]

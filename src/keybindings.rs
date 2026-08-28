@@ -80,6 +80,12 @@ pub(crate) enum Action {
     ClearBlocks,
     /// Restore the blocks removed by the most recent Clear Blocks.
     UndoClearBlocks,
+    /// Fold every finished block's output away.
+    CollapseAllBlocks,
+    /// Unfold every finished block's output.
+    ExpandAllBlocks,
+    /// Fold or unfold the selected block (or the newest one).
+    ToggleBlockCollapsed,
     /// Put the commands from the current block selection back into the live
     /// input editor, preserving terminal order for multi-selection.
     ReinputSelectedCommands,
@@ -203,6 +209,9 @@ impl Action {
             Action::SelectAllBlocks => "Select all blocks",
             Action::ClearBlocks => "Clear blocks",
             Action::UndoClearBlocks => "Undo clear blocks",
+            Action::CollapseAllBlocks => "Collapse all blocks",
+            Action::ExpandAllBlocks => "Expand all blocks",
+            Action::ToggleBlockCollapsed => "Collapse or expand block",
             Action::ReinputSelectedCommands => "Reinput selected commands",
             Action::ToggleDebugDashboard => "Toggle debug dashboard",
             Action::ToggleAiPanel => "Toggle AI panel",
@@ -289,6 +298,9 @@ impl Action {
             Action::SelectAllBlocks => Some("select_all_blocks"),
             Action::ClearBlocks => Some("clear_blocks"),
             Action::UndoClearBlocks => Some("undo_clear_blocks"),
+            Action::CollapseAllBlocks => Some("collapse_all_blocks"),
+            Action::ExpandAllBlocks => Some("expand_all_blocks"),
+            Action::ToggleBlockCollapsed => Some("toggle_block_collapsed"),
             Action::ReinputSelectedCommands => Some("reinput_selected_commands"),
             Action::ToggleDebugDashboard => Some("toggle_debug_dashboard"),
             Action::ToggleAiPanel => Some("toggle_ai_panel"),
@@ -382,6 +394,9 @@ impl Action {
             Action::SelectAllBlocks,
             Action::ClearBlocks,
             Action::UndoClearBlocks,
+            Action::CollapseAllBlocks,
+            Action::ExpandAllBlocks,
+            Action::ToggleBlockCollapsed,
             Action::ReinputSelectedCommands,
             Action::ToggleDebugDashboard,
             Action::ToggleAiPanel,
@@ -1214,10 +1229,51 @@ history_palette = "F10"
         assert!(map.binding_display(&Action::JumpToNextPinned).is_empty());
         assert!(map.binding_display(&Action::JumpToPrevFailed).is_empty());
         assert!(map.binding_display(&Action::UndoClearBlocks).is_empty());
+        assert!(map.binding_display(&Action::CollapseAllBlocks).is_empty());
+        assert!(map.binding_display(&Action::ExpandAllBlocks).is_empty());
+        assert!(map
+            .binding_display(&Action::ToggleBlockCollapsed)
+            .is_empty());
         assert!(map
             .binding_display(&Action::ExportSessionMarkdown)
             .is_empty());
         assert!(map.binding_display(&Action::ExportSessionJson).is_empty());
+    }
+
+    #[test]
+    fn collapse_actions_are_palette_only_but_bindable() {
+        // Folding is a triage gesture, not a hot key: reachable from the
+        // palette and bindable in TOML, like undo-clear and the failed-block
+        // jumps.
+        let mut map = KeybindingMap::from_defaults();
+        for action in [
+            Action::CollapseAllBlocks,
+            Action::ExpandAllBlocks,
+            Action::ToggleBlockCollapsed,
+        ] {
+            assert!(map.binding_display(&action).is_empty());
+        }
+
+        let table = r#"
+collapse_all_blocks = "F8"
+expand_all_blocks = "F9"
+toggle_block_collapsed = "F10"
+"#
+        .parse::<toml::Table>()
+        .unwrap();
+        map.apply_user_overrides(&table).unwrap();
+        assert_eq!(
+            map.lookup(&parse("F8").unwrap()),
+            Some(Action::CollapseAllBlocks)
+        );
+        assert_eq!(
+            map.lookup(&parse("F9").unwrap()),
+            Some(Action::ExpandAllBlocks)
+        );
+        assert_eq!(
+            map.lookup(&parse("F10").unwrap()),
+            Some(Action::ToggleBlockCollapsed)
+        );
     }
 
     #[test]
