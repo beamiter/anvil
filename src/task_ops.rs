@@ -534,8 +534,12 @@ impl AppModel {
             launch.argv,
             Some(worktree.to_string_lossy().into_owned()),
             Vec::new(),
-            TaskTerminalRole::Agent,
-            String::new(),
+            // The real session id keys on the pane that does not exist yet;
+            // it is stamped on immediately below.
+            crate::workspace_ops::TaskTerminalIdentity {
+                role: TaskTerminalRole::Agent,
+                session_id: String::new(),
+            },
             sender,
         ) else {
             if failed_terminal_retry.is_none() && !native_recovery {
@@ -647,8 +651,10 @@ impl AppModel {
             argv,
             Some(pinned_path.to_string_lossy().into_owned()),
             env_extra,
-            TaskTerminalRole::Validation,
-            String::new(),
+            crate::workspace_ops::TaskTerminalIdentity {
+                role: TaskTerminalRole::Validation,
+                session_id: String::new(),
+            },
             sender,
         ) else {
             return;

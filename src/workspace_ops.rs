@@ -8,6 +8,16 @@ use super::*;
 
 const PERSISTENCE_FAILURE_NOTICE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// What marks a freshly spawned pane as belonging to an agent task.
+///
+/// Both halves are stamped on the same pane in the same breath, and neither is
+/// meaningful on its own: the role decides how the task manager treats the
+/// terminal, the session id is what it binds to.
+pub(crate) struct TaskTerminalIdentity {
+    pub(crate) role: crate::agent_task::TaskTerminalRole,
+    pub(crate) session_id: String,
+}
+
 /// Seconds an undo offer stays on screen. The default toast timeout is tuned
 /// for statements; this one is a decision, and the user has to notice the
 /// mistake before they can decide to take it back.
@@ -695,14 +705,18 @@ impl AppModel {
     /// identity so the task manager can bind it and the session snapshot
     /// prunes the tab. Returns `(tab_id, pane_id)`, or `None` when the tab
     /// budget refused the spawn.
+    ///
+    /// The task identity travels as one value rather than two loose
+    /// parameters: the role and the session string are only ever meaningful
+    /// together, and splitting them pushed this call past clippy's argument
+    /// limit — which the repository lint policy no longer silences.
     pub(crate) fn add_task_terminal_tab(
         &mut self,
         title: &str,
         argv: Vec<String>,
         working_directory: Option<String>,
         env_extra: Vec<(String, String)>,
-        role: crate::agent_task::TaskTerminalRole,
-        task_session_id: String,
+        identity: TaskTerminalIdentity,
         sender: &ComponentSender<AppModel>,
     ) -> Option<(u64, u64)> {
         let (tab_id, pane_id) = self.add_tab_full_inner(
@@ -715,8 +729,8 @@ impl AppModel {
         )?;
         let tab = self.tabs.iter_mut().find(|tab| tab.id == tab_id)?;
         let pane = tab.panes.iter_mut().find(|pane| pane.id == pane_id)?;
-        pane.task_role = Some(role);
-        pane.task_session_id = Some(task_session_id);
+        pane.task_role = Some(identity.role);
+        pane.task_session_id = Some(identity.session_id);
         Some((tab_id, pane_id))
     }
 

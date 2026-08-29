@@ -26,7 +26,7 @@ use gtk::glib;
 pub(crate) use jterm_core::ai::{
     agent_user_prompt, build_agent_system_prompt, build_session_prompt, truncate_for_context,
     user_prompt_with_block_context, AiCancellationToken, AiClient, AiSettings, BlockContext,
-    ChatSnapshot, ConversationSnapshot, Role, Turn, MAX_PERSISTED_CHATS,
+    ConversationSnapshot, Role, Turn, MAX_PERSISTED_CHATS,
 };
 
 fn settings(config: &crate::config::Config) -> AiSettings {

@@ -607,7 +607,11 @@ impl KeybindingMap {
         bind("Ctrl+Alt+Shift+J", Action::ResizePaneDown);
         bind("Ctrl+Alt+Shift+K", Action::ResizePaneUp);
         bind("Ctrl+Alt+Shift+L", Action::ResizePaneRight);
-        bind("Ctrl+Alt+Shift+A", Action::ToggleAiPanel);
+        // Spelled in the family's canonical modifier order — the same order
+        // `Chord::display` renders and README/config.toml.example print — so
+        // the source, the docs and the UI all name one chord. The AI chat
+        // panel answers to it in anvil, forge and frost alike.
+        bind("Ctrl+Shift+Alt+A", Action::ToggleAiPanel);
         bind("Ctrl+Shift+Q", Action::AskAiAboutSelectedBlock);
         bind("Ctrl+Shift+M", Action::OpenWorkflows);
         bind("Ctrl+Alt+G", Action::OpenAgent);
@@ -1186,7 +1190,7 @@ history_palette = "F10"
             ("Ctrl+Alt+Shift+J", Action::ResizePaneDown),
             ("Ctrl+Alt+Shift+K", Action::ResizePaneUp),
             ("Ctrl+Alt+Shift+L", Action::ResizePaneRight),
-            ("Ctrl+Alt+Shift+A", Action::ToggleAiPanel),
+            ("Ctrl+Shift+Alt+A", Action::ToggleAiPanel),
             ("Ctrl+Shift+Q", Action::AskAiAboutSelectedBlock),
             ("Ctrl+Shift+M", Action::OpenWorkflows),
             ("Ctrl+Alt+G", Action::OpenAgent),
@@ -1301,6 +1305,11 @@ toggle_block_collapsed = "F10"
         let default = parse("Ctrl+Alt+Shift+A").unwrap();
         let mut map = KeybindingMap::from_defaults();
         assert_eq!(map.lookup(&default), Some(Action::ToggleAiPanel));
+        // Family contract: the AI chat panel is Ctrl+Shift+Alt+A everywhere,
+        // and every app must SPELL it the way `Chord::display` does, or the
+        // same chord reads as two different shortcuts across the docs.
+        assert_eq!(default.display(), "Ctrl+Shift+Alt+A");
+        assert_eq!(parse("Ctrl+Shift+Alt+A").unwrap(), default);
 
         let table = "open_ai_panel = 'F5'".parse::<toml::Table>().unwrap();
         map.apply_user_overrides(&table).unwrap();

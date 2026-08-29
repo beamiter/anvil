@@ -8,12 +8,10 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_ROOT}"
 
-cargo clippy --all-targets --locked -- \
-    -D warnings \
-    -A clippy::type_complexity \
-    -A clippy::doc_lazy_continuation \
-    -A clippy::items_after_test_module \
-    -A clippy::too_many_arguments \
-    -A clippy::manual_clamp \
-    -A clippy::if_same_then_else \
-    -A clippy::needless_range_loop
+# No blanket -A allowlist. It had grown to seven lints, two of which the
+# handoff simultaneously described as blocking the release check, so the
+# documented gate and the gate CI runs disagreed about whether the tree was
+# clean. Every sibling (forge, ember, frost, jsh, jagent, jterm_core) runs bare
+# `-D warnings`; anvil now does too. A genuinely unavoidable lint gets a local
+# #[allow] with a comment saying why, where a reviewer can see it.
+cargo clippy --all-targets --all-features --locked -- -D warnings

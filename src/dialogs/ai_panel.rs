@@ -3,7 +3,9 @@
 //! The component stays mounted beside the terminal stack. Its pure
 //! [`ChatStore`] owns every chat while GTK renders only the selected one.
 
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use relm4::adw;
 use relm4::adw::prelude::*;
@@ -11,7 +13,8 @@ use relm4::gtk;
 use relm4::prelude::*;
 
 use super::ai_chat_store::{
-    ChatStatus, ChatStore, ChatStoreError, RequestToken, MAX_LIVE_MESSAGE_BYTES,
+    new_chat_store, restore_chat_store, ChatStatus, ChatStore, ChatStoreError, RequestToken,
+    MAX_LIVE_MESSAGE_BYTES,
 };
 use crate::{ai, palette};
 
@@ -22,9 +25,26 @@ const NEW_CHAT_LABEL: &str = "New chat";
 const CLOSE_AI_PANEL_LABEL: &str = "Close AI panel";
 const CLEAR_BLOCK_CONTEXT_LABEL: &str = "Clear selected Block context";
 const BACK_TO_CONVERSATION_LABEL: &str = "Back to conversation";
+// The recent-shell checkbox states its own consent, because the checkbox is
+// only the inner, per-chat half of the gate. `ai_share_command_context` is the
+// outer half, and when it is off the box says so rather than silently doing
+// nothing — ember words the same withheld case inline, and forge/frost gate
+// the identical control on the identical config flag.
+const INCLUDE_RECENT_LABEL: &str = "Include recent shell context";
+const INCLUDE_RECENT_WITHHELD_LABEL: &str =
+    "Recent shell context withheld (needs ai_share_command_context)";
+const INCLUDE_RECENT_TOOLTIP: &str =
+    "Attach the last five commands and exit codes to the next question";
+const INCLUDE_RECENT_WITHHELD_TOOLTIP: &str = concat!(
+    "No terminal content is sent. Set ai_share_command_context = true in ",
+    "config.toml and reload the configuration to allow it.",
+);
 // The outer session JSON escapes this JSON string again. Keeping the inner
 // value at 1 MiB leaves ample room below session.rs's 4 MiB hard limit.
 const SESSION_SNAPSHOT_AI_BUDGET: usize = 1024 * 1024;
+/// A few pixels of tolerance so a viewport that rounds short of `upper` still
+/// counts as "at the bottom".
+const STREAM_FOLLOW_SLACK_PX: f64 = 32.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ComposerKeyAction {
@@ -71,6 +91,9 @@ pub(crate) enum AiPanelMsg {
         client: ai::AiClient,
         stream: bool,
         redact_secrets: bool,
+        /// `ai_enabled && ai_share_command_context`, resolved by the caller
+        /// exactly as the Codex/agent path resolves it in `agent_task_ui`.
+        share_command_context: bool,
         initial_context: Option<(ai::BlockContext, ai::BlockAiIntent)>,
     },
     Restore(String),
@@ -114,6 +137,10 @@ pub(crate) struct AiPanelModel {
     client: Option<ai::AiClient>,
     stream: bool,
     redact_secrets: bool,
+    /// The panel is not allowed to read the shell history file until the user
+    /// has opted in. It starts closed so a panel that was never opened — or
+    /// opened by a build that forgot to pass the flag — cannot leak anything.
+    share_command_context: bool,
     store: ChatStore,
     requests: HashMap<RequestToken, ai::AiHandle>,
     retry_payloads: HashMap<u64, RequestPayload>,
@@ -122,6 +149,13 @@ pub(crate) struct AiPanelModel {
     search: String,
     draft_generation: u64,
     rendering: bool,
+    /// How many bytes of `active_partial()` the transcript buffer already
+    /// shows. Streaming splices only the bytes past this offset instead of
+    /// rebuilding the buffer per fragment.
+    rendered_partial_bytes: usize,
+    /// One pending idle scroll at a time. A fast stream used to queue one
+    /// callback per SSE fragment; they all scroll to the same place.
+    scroll_queued: Rc<Cell<bool>>,
 }
 
 #[relm4::component(pub(crate))]
@@ -234,8 +268,12 @@ impl Component for AiPanelModel {
 
                     #[name(include_recent)]
                     gtk::CheckButton {
-                        set_label: Some("Include recent shell context"),
-                        set_active: true,
+                        set_label: Some(INCLUDE_RECENT_LABEL),
+                        // `render_all` owns the real state; starting inactive
+                        // means the box never claims to be sharing before the
+                        // consent flag has been read.
+                        set_active: false,
+                        set_sensitive: false,
                     },
 
                     gtk::ScrolledWindow {
@@ -370,7 +408,8 @@ impl Component for AiPanelModel {
             client: None,
             stream: true,
             redact_secrets: init.redact_secrets,
-            store: ChatStore::default(),
+            share_command_context: false,
+            store: new_chat_store(),
             requests: HashMap::new(),
             retry_payloads: HashMap::new(),
             conversation_systems: HashMap::new(),
@@ -378,6 +417,8 @@ impl Component for AiPanelModel {
             search: String::new(),
             draft_generation: 0,
             rendering: false,
+            rendered_partial_bytes: 0,
+            scroll_queued: Rc::new(Cell::new(false)),
         };
         let widgets = view_output!();
 
@@ -443,18 +484,20 @@ impl Component for AiPanelModel {
                 client,
                 stream,
                 redact_secrets,
+                share_command_context,
                 initial_context,
             } => {
                 self.history_path = history_path;
                 self.client = Some(client);
                 self.stream = stream;
                 self.redact_secrets = redact_secrets;
+                self.share_command_context = share_command_context;
                 widgets.page_stack.set_visible_child_name(CHAT_PAGE);
                 if let Some((context, intent)) = initial_context {
                     if self.store.active_archived() {
                         let _ = self.store.new_chat();
                     }
-                    if self.store.active_request_token().is_none() {
+                    if !self.store.is_active_busy() {
                         // The question is a fixed constant per intent; the
                         // untrusted command/output travel only inside the
                         // framed context envelope.
@@ -477,7 +520,7 @@ impl Component for AiPanelModel {
             AiPanelMsg::Restore(encoded) => match ai::ConversationSnapshot::from_json(&encoded) {
                 Ok(snapshot) => {
                     self.cancel_all();
-                    self.store = ChatStore::restore(snapshot);
+                    self.store = restore_chat_store(snapshot);
                     self.retry_payloads.clear();
                     self.conversation_systems.clear();
                     self.render_all(widgets, &sender);
@@ -489,7 +532,7 @@ impl Component for AiPanelModel {
                 }
             },
             AiPanelMsg::Ask => {
-                if self.store.active_request_token().is_some() {
+                if self.store.is_active_busy() {
                     return;
                 }
                 let text = text_view_text(&widgets.composer);
@@ -515,7 +558,7 @@ impl Component for AiPanelModel {
                 handle.cancel();
                 let _ = self.store.cancel_request(token, STOPPED_STATUS.to_string());
                 self.render_all(widgets, &sender);
-                self.publish_snapshot(&sender);
+                self.publish_snapshot(widgets, &sender);
             }
             AiPanelMsg::Retry => {
                 let id = self.store.active_id();
@@ -533,7 +576,7 @@ impl Component for AiPanelModel {
             }
             AiPanelMsg::Delta { token, text } => {
                 if self.store.push_delta(token, &text) == Some(true) {
-                    self.render_transcript(widgets);
+                    self.append_stream_text(widgets);
                 }
             }
             AiPanelMsg::Result { token, result } => {
@@ -577,7 +620,7 @@ impl Component for AiPanelModel {
                 } else {
                     self.render_all(widgets, &sender);
                 }
-                self.publish_snapshot(&sender);
+                self.publish_snapshot(widgets, &sender);
             }
             AiPanelMsg::DraftChanged(draft) => {
                 if self.rendering || !self.store.set_active_draft(draft) {
@@ -593,7 +636,7 @@ impl Component for AiPanelModel {
             }
             AiPanelMsg::PublishDraft(generation) => {
                 if generation == self.draft_generation {
-                    self.publish_snapshot(&sender);
+                    self.publish_snapshot(widgets, &sender);
                     self.refresh_library(&widgets.chat_list, &sender);
                 }
             }
@@ -601,18 +644,19 @@ impl Component for AiPanelModel {
                 Ok(_) => {
                     widgets.page_stack.set_visible_child_name(CHAT_PAGE);
                     self.render_all(widgets, &sender);
-                    self.publish_snapshot(&sender);
+                    self.publish_snapshot(widgets, &sender);
                     widgets.composer.grab_focus();
                 }
-                Err(ChatStoreError::LimitReached) => widgets
-                    .status
-                    .set_label("50 chats are already saved. Delete one before creating another."),
+                Err(ChatStoreError::LimitReached) => widgets.status.set_label(&format!(
+                    "{} chats are already saved. Delete one before creating another.",
+                    ai::MAX_PERSISTED_CHATS
+                )),
                 Err(_) => {}
             },
             AiPanelMsg::SelectChat(id) => {
                 if self.store.select_chat(id) {
                     self.render_all(widgets, &sender);
-                    self.publish_snapshot(&sender);
+                    self.publish_snapshot(widgets, &sender);
                 }
                 widgets.page_stack.set_visible_child_name(CHAT_PAGE);
             }
@@ -631,19 +675,26 @@ impl Component for AiPanelModel {
             AiPanelMsg::Rename(title) => {
                 if !self.rendering && self.store.rename_active(&title) {
                     self.refresh_library(&widgets.chat_list, &sender);
-                    self.publish_snapshot(&sender);
+                    self.publish_snapshot(widgets, &sender);
                 }
             }
             AiPanelMsg::ToggleArchive => match self.store.toggle_archive_active() {
                 Ok(_) => {
                     self.render_all(widgets, &sender);
-                    self.publish_snapshot(&sender);
+                    self.publish_snapshot(widgets, &sender);
                 }
                 Err(ChatStoreError::Busy) => {
                     widgets
                         .status
                         .set_label("Stop this response before archiving the chat.");
                 }
+                // Archiving the last writable chat needs a replacement, and a
+                // full library has no room for one. The store refuses before
+                // mutating, so the chat is still writable here.
+                Err(ChatStoreError::LimitReached) => widgets.status.set_label(&format!(
+                    "{} chats are already saved. Delete one before archiving this chat.",
+                    ai::MAX_PERSISTED_CHATS
+                )),
                 Err(_) => {}
             },
             AiPanelMsg::Delete => {
@@ -668,11 +719,11 @@ impl Component for AiPanelModel {
                 dialog.present(Some(root));
             }
             AiPanelMsg::DeleteConfirmed => match self.store.delete_active() {
-                Ok(id) => {
-                    self.retry_payloads.remove(&id);
-                    self.conversation_systems.remove(&id);
+                Ok(outcome) => {
+                    self.retry_payloads.remove(&outcome.deleted_chat_id);
+                    self.conversation_systems.remove(&outcome.deleted_chat_id);
                     self.render_all(widgets, &sender);
-                    self.publish_snapshot(&sender);
+                    self.publish_snapshot(widgets, &sender);
                 }
                 Err(ChatStoreError::Busy) => {
                     widgets
@@ -688,7 +739,7 @@ impl Component for AiPanelModel {
                     }
                     self.render_context(widgets);
                     if changed {
-                        self.publish_snapshot(&sender);
+                        self.publish_snapshot(widgets, &sender);
                     }
                 }
                 Err(ChatStoreError::Busy) => {
@@ -699,7 +750,10 @@ impl Component for AiPanelModel {
                 Err(_) => {}
             },
             AiPanelMsg::IncludeRecent(enabled) => {
-                if !self.rendering {
+                // Without consent the box is insensitive, so a toggle here can
+                // only come from a programmatic change; remembering it would
+                // arm sharing for the moment consent is later granted.
+                if !self.rendering && self.share_command_context {
                     self.include_recent.insert(self.store.active_id(), enabled);
                 }
             }
@@ -708,7 +762,7 @@ impl Component for AiPanelModel {
                 paste_focused_text(widgets, self.store.active_archived());
             }
             AiPanelMsg::Close => {
-                self.publish_snapshot(&sender);
+                self.publish_snapshot(widgets, &sender);
                 let _ = sender.output(AiPanelOutput::CloseRequested);
             }
         }
@@ -821,7 +875,11 @@ impl AiPanelModel {
         }
 
         let mut request_history = start.history;
-        let recent = if payload.context.is_none() && widgets.include_recent.is_active() {
+        let recent = if may_attach_recent_context(
+            self.share_command_context,
+            widgets.include_recent.is_active(),
+            payload.context.is_some(),
+        ) {
             self.recent_context()
         } else {
             None
@@ -863,7 +921,7 @@ impl AiPanelModel {
         };
         self.requests.insert(token, handle);
         self.render_all(widgets, sender);
-        self.publish_snapshot(sender);
+        self.publish_snapshot(widgets, sender);
         true
     }
 
@@ -877,12 +935,26 @@ impl AiPanelModel {
         }
     }
 
-    fn publish_snapshot(&self, sender: &ComponentSender<Self>) {
+    /// Materialize the durable view of the library and hand it to the app.
+    ///
+    /// Retry payloads are applied to a *clone*: the live composer must not
+    /// gain the question of a request that is still running, while a restart
+    /// must still find it. The clone is also why the detaching variant is the
+    /// right one — those chats are still marked busy, and their requests die
+    /// with the process.
+    fn publish_snapshot(&mut self, widgets: &AiPanelModelWidgets, sender: &ComponentSender<Self>) {
         let mut durable = self.store.clone();
         for (chat_id, payload) in &self.retry_payloads {
-            durable.recover_retry_payload(*chat_id, &payload.user_text, payload.context.clone());
+            durable.recover_retry_payload_detaching(
+                *chat_id,
+                &payload.user_text,
+                payload.context.clone(),
+            );
         }
-        let Ok(mut snapshot) = durable.snapshot(self.redact_secrets) else {
+        // The store compacts live history before serialising, so an oversized
+        // library still produces a snapshot instead of silently saving
+        // nothing from here on.
+        let Ok((mut snapshot, _)) = durable.snapshot_for_persistence(self.redact_secrets) else {
             return;
         };
         if snapshot
@@ -892,6 +964,12 @@ impl AiPanelModel {
             .is_none()
         {
             return;
+        }
+        // Both compactions ran on the clone. Pulling their markers back is how
+        // the live library learns that what it still shows is more than what
+        // was saved; the library rows say so.
+        if self.store.sync_truncation_markers(&snapshot) {
+            self.refresh_library(&widgets.chat_list, sender);
         }
         if let Ok(encoded) = snapshot.to_json() {
             let _ = sender.output(AiPanelOutput::SnapshotChanged(encoded));
@@ -908,12 +986,33 @@ impl AiPanelModel {
             } else {
                 "Archive"
             });
-        widgets.include_recent.set_active(
-            *self
-                .include_recent
-                .entry(self.store.active_id())
-                .or_insert(true),
-        );
+        // Consent is the outer gate: without it the box is off, unclickable,
+        // and relabelled, so the panel never shows an armed control that the
+        // request path would then refuse to honour.
+        let opted_in = *self
+            .include_recent
+            .entry(self.store.active_id())
+            .or_insert(true);
+        widgets
+            .include_recent
+            .set_active(self.share_command_context && opted_in);
+        widgets
+            .include_recent
+            .set_sensitive(self.share_command_context);
+        widgets
+            .include_recent
+            .set_label(Some(if self.share_command_context {
+                INCLUDE_RECENT_LABEL
+            } else {
+                INCLUDE_RECENT_WITHHELD_LABEL
+            }));
+        widgets
+            .include_recent
+            .set_tooltip_text(Some(if self.share_command_context {
+                INCLUDE_RECENT_TOOLTIP
+            } else {
+                INCLUDE_RECENT_WITHHELD_TOOLTIP
+            }));
         widgets
             .composer
             .buffer()
@@ -925,7 +1024,10 @@ impl AiPanelModel {
         self.refresh_library(&widgets.chat_list, sender);
     }
 
-    fn render_transcript(&self, widgets: &AiPanelModelWidgets) {
+    /// Full rebuild: every turn plus the streamed partial. Cheap when it runs
+    /// on a chat switch, ruinous when it ran per streamed fragment — see
+    /// [`Self::append_stream_text`].
+    fn render_transcript(&mut self, widgets: &AiPanelModelWidgets) {
         let buffer = widgets.transcript.buffer();
         buffer.set_text("");
         for turn in self.store.active_history() {
@@ -946,7 +1048,39 @@ impl AiPanelModel {
                 self.store.active_partial(),
             );
         }
-        scroll_to_end(&widgets.transcript);
+        self.rendered_partial_bytes = self.store.active_partial().len();
+        queue_scroll_to_end(&widgets.transcript, &self.scroll_queued);
+    }
+
+    /// Insert only the bytes that this fragment added.
+    ///
+    /// `ChatStore::push_delta` only ever pushes onto the end of the partial —
+    /// when the assistant budget is full it drops the incoming bytes rather
+    /// than rewriting what is already stored — so the transcript's tail stays
+    /// a prefix of the partial and the new bytes can be spliced in. Rendering
+    /// the whole buffer per SSE fragment made one token cost O(transcript),
+    /// which is what stalls the UI thread under the software renderer.
+    fn append_stream_text(&mut self, widgets: &AiPanelModelWidgets) {
+        match transcript_update(
+            self.rendered_partial_bytes,
+            self.store.active_partial().len(),
+        ) {
+            TranscriptUpdate::Rebuild => self.render_transcript(widgets),
+            TranscriptUpdate::Unchanged => {}
+            TranscriptUpdate::Append(from) => {
+                // Only follow the stream when the reader is already at the
+                // bottom; forge scrolls on the same condition, so scrolling
+                // back through a long reply is no longer fought by the panel.
+                let follow = transcript_follows_stream(&widgets.transcript);
+                let buffer = widgets.transcript.buffer();
+                let mut end = buffer.end_iter();
+                buffer.insert(&mut end, &self.store.active_partial()[from..]);
+                self.rendered_partial_bytes = self.store.active_partial().len();
+                if follow {
+                    queue_scroll_to_end(&widgets.transcript, &self.scroll_queued);
+                }
+            }
+        }
     }
 
     fn render_context(&self, widgets: &AiPanelModelWidgets) {
@@ -967,7 +1101,7 @@ impl AiPanelModel {
     }
 
     fn render_status(&self, widgets: &AiPanelModelWidgets) {
-        let busy = self.store.active_request_token().is_some();
+        let busy = self.store.is_active_busy();
         let status = match self.store.active_status() {
             ChatStatus::Idle => "",
             ChatStatus::Thinking(text) | ChatStatus::Info(text) | ChatStatus::Error(text) => text,
@@ -993,7 +1127,7 @@ impl AiPanelModel {
         while let Some(child) = list.first_child() {
             list.remove(&child);
         }
-        for summary in self.store.summaries(&self.search) {
+        for summary in self.store.summaries_filtered(&self.search) {
             let row = gtk::Button::new();
             row.add_css_class("flat");
             let body = gtk::Box::new(gtk::Orientation::Vertical, 2);
@@ -1013,6 +1147,8 @@ impl AiPanelModel {
                 meta.push_str(" · Error");
             } else if summary.unread {
                 meta.push_str(" · New reply");
+            } else if summary.history_truncated {
+                meta.push_str(" · Older messages trimmed");
             }
             let preview = gtk::Label::new(Some(&meta));
             preview.set_halign(gtk::Align::Start);
@@ -1029,6 +1165,12 @@ impl AiPanelModel {
     }
 
     fn recent_context(&self) -> Option<String> {
+        // Second, authoritative check. The checkbox is UI state and can be
+        // stale; this is the only place the history file is opened, so the
+        // consent flag is re-read here rather than trusted from the caller.
+        if !self.share_command_context {
+            return None;
+        }
         let path = self.history_path.as_deref()?;
         let items = palette::read_history(std::path::Path::new(path), 5);
         if items.is_empty() {
@@ -1043,6 +1185,44 @@ impl AiPanelModel {
                 .join("\n"),
         )
     }
+}
+
+/// How one streamed fragment reaches the transcript buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TranscriptUpdate {
+    /// The buffer does not yet hold the streaming row, or holds more than the
+    /// store does (a chat switch, a rollback): redraw from the store.
+    Rebuild,
+    /// The store gained nothing renderable — the assistant byte budget is
+    /// full, so `push_delta` dropped the fragment.
+    Unchanged,
+    /// Insert `partial[from..]` at the end of the buffer.
+    Append(usize),
+}
+
+fn transcript_update(rendered: usize, partial_len: usize) -> TranscriptUpdate {
+    if rendered == 0 || partial_len < rendered {
+        // `rendered == 0` also covers the first fragment of a reply, which is
+        // what creates the "Assistant" speaker row in the first place.
+        return TranscriptUpdate::Rebuild;
+    }
+    if partial_len == rendered {
+        return TranscriptUpdate::Unchanged;
+    }
+    TranscriptUpdate::Append(rendered)
+}
+
+/// Whether recent shell history may ride along with this question.
+///
+/// Three independent conditions, and consent is the outer one: the checkbox is
+/// the per-chat opt-out *inside* the consent, and a selected Block already
+/// carries its own evidence envelope so the recent lines would be noise.
+fn may_attach_recent_context(
+    share_command_context: bool,
+    checkbox_active: bool,
+    has_block_context: bool,
+) -> bool {
+    share_command_context && checkbox_active && !has_block_context
 }
 
 fn text_view_text(view: &gtk::TextView) -> String {
@@ -1072,17 +1252,147 @@ fn append_transcript(view: &gtk::TextView, label: &str, body: &str) {
     buffer.insert(&mut end, body);
 }
 
-fn scroll_to_end(view: &gtk::TextView) {
+/// Scroll after the pending insert has been laid out, at most once per idle
+/// turn. A streamed reply asks for this on every fragment and every one of
+/// them ends at the same iterator, so the extra callbacks were pure cost.
+fn queue_scroll_to_end(view: &gtk::TextView, queued: &Rc<Cell<bool>>) {
+    if queued.replace(true) {
+        return;
+    }
     let view = view.clone();
+    let queued = Rc::clone(queued);
     gtk::glib::idle_add_local_once(move || {
+        queued.set(false);
         let mut end = view.buffer().end_iter();
         view.scroll_to_iter(&mut end, 0.0, false, 0.0, 1.0);
     });
 }
 
+/// Whether the transcript is parked at its end, i.e. the reader is following
+/// the stream rather than scrolled back into it.
+fn transcript_follows_stream(view: &gtk::TextView) -> bool {
+    let Some(adjustment) = view.vadjustment() else {
+        return true;
+    };
+    let bottom = adjustment.upper() - adjustment.page_size();
+    adjustment.value() >= bottom - STREAM_FOLLOW_SLACK_PX
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A panel model with no widgets. Every field the tests below touch is
+    /// plain data; the GTK half is exercised by hand (see handoff.md).
+    fn panel_model(history_path: Option<String>, share_command_context: bool) -> AiPanelModel {
+        AiPanelModel {
+            history_path,
+            client: None,
+            stream: true,
+            redact_secrets: false,
+            share_command_context,
+            store: new_chat_store(),
+            requests: HashMap::new(),
+            retry_payloads: HashMap::new(),
+            conversation_systems: HashMap::new(),
+            include_recent: HashMap::new(),
+            search: String::new(),
+            draft_generation: 0,
+            rendering: false,
+            rendered_partial_bytes: 0,
+            scroll_queued: Rc::new(Cell::new(false)),
+        }
+    }
+
+    /// The consent flag is the outer gate on every path that could put shell
+    /// history into a provider prompt. The checkbox alone must never be able
+    /// to open it, which is exactly the regression this asserts.
+    #[test]
+    fn recent_shell_context_needs_the_sharing_consent_not_just_the_checkbox() {
+        for checkbox in [false, true] {
+            assert!(
+                !may_attach_recent_context(false, checkbox, false),
+                "consent off must withhold context (checkbox {checkbox})"
+            );
+        }
+        assert!(may_attach_recent_context(true, true, false));
+        assert!(!may_attach_recent_context(true, false, false));
+        // A Block context replaces the recent lines rather than joining them.
+        assert!(!may_attach_recent_context(true, true, true));
+    }
+
+    /// The file itself must not be opened without consent. Reading it and
+    /// then discarding the text would still be a local read of terminal
+    /// evidence, and the checkbox default (on) makes that the common path.
+    #[cfg(unix)]
+    #[test]
+    fn recent_context_reads_no_history_file_until_sharing_is_consented() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "anvil-ai-consent-{}-{}",
+            std::process::id(),
+            relm4::gtk::glib::uuid_string_random()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("history.jsonl");
+        std::fs::write(
+            &path,
+            "{\"command\":\"ssh deploy@internal.example\",\"exit_code\":0}\n",
+        )
+        .unwrap();
+        // `palette::read_history` refuses group/other-writable files.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let encoded = path.to_string_lossy().into_owned();
+
+        let withheld = panel_model(Some(encoded.clone()), false);
+        assert_eq!(withheld.recent_context(), None);
+
+        let consented = panel_model(Some(encoded), true);
+        let shared = consented
+            .recent_context()
+            .expect("the same file is readable once consent is granted");
+        assert!(shared.contains("ssh deploy@internal.example"), "{shared}");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The withheld state must be visible, not silent: an unchanged label with
+    /// a dead checkbox reads as a bug, and ember/frost both say why.
+    #[test]
+    fn the_withheld_state_names_the_config_key_that_unlocks_it() {
+        assert_ne!(INCLUDE_RECENT_LABEL, INCLUDE_RECENT_WITHHELD_LABEL);
+        assert!(INCLUDE_RECENT_WITHHELD_LABEL.contains("ai_share_command_context"));
+        assert!(INCLUDE_RECENT_WITHHELD_TOOLTIP.contains("ai_share_command_context"));
+    }
+
+    /// Streaming must cost the fragment, not the transcript.
+    #[test]
+    fn streaming_splices_the_fragment_and_rebuilds_only_when_it_must() {
+        // First fragment of a reply: the "Assistant" row does not exist yet.
+        assert_eq!(transcript_update(0, 12), TranscriptUpdate::Rebuild);
+        // Steady state: only the new bytes.
+        assert_eq!(transcript_update(12, 30), TranscriptUpdate::Append(12));
+        // The assistant byte budget is full, so `push_delta` stored nothing.
+        assert_eq!(transcript_update(30, 30), TranscriptUpdate::Unchanged);
+        // The store shrank under us (chat switch, rollback): never splice at a
+        // stale offset, redraw from the authoritative history.
+        assert_eq!(transcript_update(30, 4), TranscriptUpdate::Rebuild);
+    }
+
+    /// A long reply asks to scroll on every fragment; they all end up at the
+    /// same iterator, so only one idle callback may be outstanding.
+    #[test]
+    fn repeated_scroll_requests_collapse_into_one_pending_idle() {
+        let queued = Rc::new(Cell::new(false));
+        assert!(!queued.replace(true), "the first request schedules");
+        assert!(
+            queued.replace(true),
+            "a second request while pending does not"
+        );
+        queued.set(false);
+        assert!(!queued.replace(true), "the next idle turn schedules again");
+    }
 
     #[test]
     fn ai_panel_icon_buttons_have_distinct_accessible_labels() {

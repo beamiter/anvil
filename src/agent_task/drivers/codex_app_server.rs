@@ -3970,7 +3970,7 @@ mod tests {
     use crate::agent_task::event::next_agent_event_epoch;
     use crate::agent_task::{AgentEventStream, NativeAgentSessionId as SessionId, TaskId};
     use std::io::Cursor;
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::process::CommandExt;
 
     fn stream() -> AgentEventStream {
@@ -5675,15 +5675,29 @@ mod tests {
 
     #[test]
     fn cgroup_guardian_does_not_depend_on_a_single_digit_fd() {
-        let held: Vec<_> = (0..32).map(|_| File::open("/dev/null").unwrap()).collect();
         let path =
             std::env::temp_dir().join(format!("anvil-cgroup-guardian-test-{}", Uuid::new_v4()));
-        let mut target = OpenOptions::new()
+        let opened = OpenOptions::new()
             .create_new(true)
             .read(true)
             .write(true)
             .open(&path)
             .unwrap();
+        // Ask for a two-digit descriptor instead of engineering one. Holding 32
+        // files open and hoping the next fd lands above 9 races every other
+        // test in this binary: Linux hands out the lowest free descriptor, so a
+        // sibling thread closing one hands it straight back to us and the
+        // assertion fails for reasons that have nothing to do with the
+        // guardian. `F_DUPFD_CLOEXEC` with a minimum of 10 asks the kernel for
+        // the lowest free fd >= 10, which is exactly the property under test.
+        let raw = unsafe { libc::fcntl(opened.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
+        assert!(
+            raw >= 10,
+            "could not obtain a two-digit descriptor: {}",
+            std::io::Error::last_os_error()
+        );
+        drop(opened);
+        let mut target = unsafe { File::from_raw_fd(raw) };
         assert!(target.as_raw_fd() > 9);
         let mut guardian = CgroupGuardian::spawn(&target).unwrap();
         guardian.trigger_and_wait().unwrap();
@@ -5691,7 +5705,6 @@ mod tests {
         let mut written = String::new();
         target.read_to_string(&mut written).unwrap();
         assert_eq!(written, "1\n");
-        drop(held);
         drop(target);
         std::fs::remove_file(path).unwrap();
     }

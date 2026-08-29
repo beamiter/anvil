@@ -33,10 +33,10 @@
               # then run `nix flake check --no-write-lock-file` and copy `got:`.
               # Full revisions beside the hashes make a stale repin conspicuous.
               outputHashes = {
-                # a462ec81f3a4c6ad85a455780ced232172f127ea
-                "jagent-0.7.0" = "sha256-cbeGQaO0DPRFfbxWHXwVNqp3oIYGpkywTFRcuxiupwk=";
-                # 21437ba6f0cb85e74d4ce2a03ef1857de2c55d9d
-                "jterm_core-0.2.0" = "sha256-fta8pDXiW9wPcRp4NWoXCBm2DjXe2U9XWKT8reqEr14=";
+                # f9383ec56c7c94f1e25ba6fbeb17fa5e47132abf
+                "jagent-0.7.0" = "sha256-B0yaxtWe5tqE2SGfZxvJRWyiEsTOXKP7XYWd5rSnyCQ=";
+                # 1a04f1ef0d24cce7083cbbbb2efa7e34c02bdfcb
+                "jterm_core-0.2.0" = "sha256-yWmFJd9Fl1SqJsjOqb4mrLIBD5f6+HZr0hKbI/nvYco=";
               };
             };
             strictDeps = true;

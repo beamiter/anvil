@@ -1657,6 +1657,13 @@ impl SimpleComponent for AppModel {
                     client,
                     stream: model.config.borrow().ai_stream,
                     redact_secrets: model.config.borrow().ai_redact_secrets,
+                    // Same consent projection the native Codex prompt uses:
+                    // no terminal evidence leaves the machine until both the
+                    // AI switch and the sharing opt-in are on.
+                    share_command_context: crate::agent_task_ui::prompt_policy(
+                        &model.config.borrow(),
+                    )
+                    .share_command_context,
                     initial_context: None,
                 });
             }

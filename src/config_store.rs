@@ -1463,7 +1463,7 @@ fn validate_remote_hosts(report: &mut ConfigValidationReport, table: &toml::Tabl
                     } else {
                         let (allow_whitespace, max_chars) = match key {
                             "name" => (true, 256),
-                            "remote_shell" => (true, 16 * 1_024),
+                            "remote_shell" => (true, config::MAX_REMOTE_HOST_FIELD_BYTES),
                             "session" => (true, 1_024),
                             _ => (false, 256),
                         };
@@ -1498,7 +1498,7 @@ fn validate_remote_hosts(report: &mut ConfigValidationReport, table: &toml::Tabl
                         format!("{prefix}.deploy_artifact"),
                         text,
                         false,
-                        4_096,
+                        config::MAX_REMOTE_HOST_FIELD_BYTES,
                     );
                     if !Path::new(text).is_absolute() {
                         report.error(
@@ -1529,10 +1529,15 @@ fn validate_remote_hosts(report: &mut ConfigValidationReport, table: &toml::Tabl
         if let Some(value) = host.get("ssh_args") {
             match value.as_array() {
                 Some(arguments) if arguments.iter().all(toml::Value::is_str) => {
-                    if arguments.len() > 128 {
+                    // Same numbers as the execution gate, which now uses
+                    // forge's so one config.toml validates identically in both.
+                    if arguments.len() > config::MAX_REMOTE_SSH_ARGS {
                         report.error(
                             format!("{prefix}.ssh_args"),
-                            "must not contain more than 128 arguments",
+                            format!(
+                                "must not contain more than {} arguments",
+                                config::MAX_REMOTE_SSH_ARGS
+                            ),
                         );
                     }
                     for (argument_index, argument) in arguments.iter().enumerate() {
@@ -1541,7 +1546,7 @@ fn validate_remote_hosts(report: &mut ConfigValidationReport, table: &toml::Tabl
                             format!("{prefix}.ssh_args[{argument_index}]"),
                             argument.as_str().unwrap_or_default(),
                             true,
-                            16 * 1_024,
+                            config::MAX_REMOTE_HOST_FIELD_BYTES,
                         );
                     }
                 }

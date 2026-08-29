@@ -615,6 +615,11 @@ impl AppModel {
             client,
             stream: self.config.borrow().ai_stream,
             redact_secrets: self.config.borrow().ai_redact_secrets,
+            // `command_history_path` above is only where the file lives. This
+            // is whether the panel may open it at all: the chat panel now
+            // honours `ai_share_command_context` exactly like the Codex path.
+            share_command_context: crate::agent_task_ui::prompt_policy(&self.config.borrow())
+                .share_command_context,
             initial_context: initial_context.map(|context| (context, intent)),
         });
     }

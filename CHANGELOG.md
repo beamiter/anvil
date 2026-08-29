@@ -272,6 +272,23 @@ versioning for tagged releases while it remains experimental.
 
 ### Changed
 
+- The AI chat panel is a thin binding over `jterm_core::ai::chat_store` instead
+  of a private copy of the same state machine, so the aggregate live-history
+  budget, compaction-before-persistence, typed archive/delete outcomes and the
+  reported draft merge are shared with the siblings rather than re-derived.
+- `[[remote_hosts]]` validation adopts the caps forge enforces — 64 `ssh_args`,
+  4 KiB per field, 256 KiB of total argv. The schema is documented as shared,
+  but anvil accepted profiles (a long jump-host chain, a large `remote_shell`)
+  that forge rejected with an error pointing at the file rather than at the
+  sibling's stricter limit.
+- `scripts/clippy.sh` runs bare `-D warnings`. Its seven-lint `-A` allowlist
+  included the two lints the handoff called blocking, so the enforced gate and
+  the documented gate disagreed; both lints are fixed rather than silenced.
+- The AppStream metadata no longer declares a 0.2.0 release. No tag exists for
+  it in any sibling, and frost/ember already omit the node for that reason.
+- The default AI-panel binding is spelled `Ctrl+Shift+Alt+A`, the modifier
+  order `jterm_core::keybindings::Chord::display` renders and the README and
+  `config.toml.example` already used. The chord itself is unchanged.
 - Changing Block density now updates every existing finished, virtualized,
   correction/review, suggestion, Agent, and notice card in place. The
   virtualization height model changes with the chrome, so long histories do
@@ -446,6 +463,17 @@ versioning for tagged releases while it remains experimental.
 
 ### Fixed
 
+- A saved AI chat library that is too large or unreadable no longer invalidates
+  the whole session envelope. The chats are dropped on their own — while
+  decoding and again in the post-decode audit — so the tabs, panes, cwds and
+  restorable commands still restore. The `ai_conversation` format is shared,
+  and siblings write bigger libraries than anvil ever emits, so importing one
+  used to cost the user their workspace layout as well as their chats.
+- Streaming an AI reply no longer rebuilds the entire transcript buffer and
+  queues a scroll for every fragment. Only the new bytes are spliced in, the
+  panel scrolls only when the reader is already at the bottom, and at most one
+  idle scroll is pending, so a long reply into a long chat stops saturating the
+  UI thread under the software renderer.
 - Block/Unified 搜索现在把每个完成卡片的 render stamp 纳入游标身份。Resize、折叠/展开或
   输出过滤重新灌入 VTE 后，Next/Previous 会用保留的查询重建计数；即使搜索只有一个命中、
   逻辑游标停在原位，也会先验证 stamp，不再永久保留失效高亮。跨块结果按 surface 内实际
@@ -663,6 +691,15 @@ versioning for tagged releases while it remains experimental.
 
 ### Security
 
+- The AI chat panel now honours `ai_share_command_context` before attaching
+  recent shell history to a provider prompt. "Include recent shell context"
+  defaulted to on, so with the shipped default (consent off) the last five
+  `$ command (exit N)` lines were sent with every question — the terminal
+  content the setting promises will not leave the machine without an opt-in,
+  and the setting the Codex/agent path already enforced. Both open paths pass
+  the same `ai_enabled && ai_share_command_context` projection, the history
+  file is not opened without it, and without consent the checkbox is off,
+  unclickable and relabelled to name the config key.
 - Configuration reads reject group- or world-writable files in addition to
   enforcing ownership, regular-file, link-count, and no-follow rules. This
   closes the local multi-user command-injection boundary for alternate or

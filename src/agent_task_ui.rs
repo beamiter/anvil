@@ -353,180 +353,6 @@ pub(crate) fn plan_list_refresh(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::agent_task::{TaskStatus, TaskValidationStatus};
-
-    #[test]
-    fn prompt_policy_requires_both_ai_and_sharing_consent() {
-        let mut config = Config::safe_defaults();
-        assert!(!prompt_policy(&config).share_command_context);
-        config.ai_enabled = true;
-        assert!(!prompt_policy(&config).share_command_context);
-        config.ai_share_command_context = true;
-        assert!(prompt_policy(&config).share_command_context);
-        assert!(prompt_policy(&config).redact_secrets);
-        config.ai_redact_secrets = false;
-        assert!(!prompt_policy(&config).redact_secrets);
-    }
-
-    #[test]
-    fn terminal_session_ids_match_the_jsh_grammar_and_distinguish_panes() {
-        let first = terminal_session_id(1);
-        let second = terminal_session_id(2);
-        assert!(jterm_core::execution_journal::is_valid_jsh_session_id(
-            &first
-        ));
-        assert!(jterm_core::execution_journal::is_valid_jsh_session_id(
-            &second
-        ));
-        assert_ne!(first, second);
-    }
-
-    #[test]
-    fn follow_up_gate_bounds_text_and_turn_count() {
-        assert!(!native_follow_up_can_send("", 0));
-        assert!(!native_follow_up_can_send("  \n\t ", 0));
-        assert!(native_follow_up_can_send("please adjust the fix", 0));
-        assert!(!native_follow_up_can_send(
-            "x".repeat(NATIVE_AGENT_FOLLOW_UP_MAX_BYTES + 1).as_str(),
-            0
-        ));
-        assert!(native_follow_up_can_send(
-            "x".repeat(NATIVE_AGENT_FOLLOW_UP_MAX_BYTES).as_str(),
-            CODEX_APP_SERVER_LIVE_TURN_MAX - 1
-        ));
-        assert!(!native_follow_up_can_send(
-            "ok",
-            CODEX_APP_SERVER_LIVE_TURN_MAX
-        ));
-    }
-
-    #[test]
-    fn validation_argv_uses_non_login_no_rc_command_mode() {
-        let bash = validation_command_argv(Some("/bin/bash"), "cargo test")
-            .expect("bash is a supported validation shell");
-        assert_eq!(&bash[1..], ["--noprofile", "--norc", "-c", "cargo test"]);
-
-        let sh = validation_command_argv(Some("/bin/sh"), "cargo test")
-            .expect("sh is a supported validation shell");
-        assert_eq!(&sh[1..], ["-c", "cargo test"]);
-
-        assert!(validation_command_argv(None, "cargo test").is_err());
-        assert!(validation_command_argv(Some(""), "cargo test").is_err());
-        assert!(validation_command_argv(Some("/nonexistent-shell"), "cargo test").is_err());
-    }
-
-    fn row(status: TaskStatus, needs_attention: bool) -> TaskRowSnapshot {
-        TaskRowSnapshot {
-            id: TaskId::new(),
-            title: "task".to_string(),
-            provider: AgentProvider::Codex,
-            status,
-            runtime_kind: crate::agent_task::TaskRuntimeKind::Unassigned,
-            branch: "anvil/task".to_string(),
-            has_agent_terminal: false,
-            has_validation_terminal: false,
-            has_active_agent_stream: false,
-            native_preparing: false,
-            validation_status: TaskValidationStatus::NotRun,
-            validation_attempt: 0,
-            needs_attention,
-            status_detail: None,
-        }
-    }
-
-    #[test]
-    fn dashboard_orders_attention_then_running_then_finished() {
-        let waiting = row(TaskStatus::WaitingForApproval, true);
-        let mut running = row(TaskStatus::Working, false);
-        running.has_active_agent_stream = true;
-        let done = row(TaskStatus::Completed, false);
-        let done_id = done.id;
-        let mut rows = vec![done, running, waiting];
-        order_task_rows(&mut rows, |_| 0);
-        assert_eq!(rows[2].id, done_id, "finished sorts last");
-        assert!(rows[0].needs_attention, "attention sorts first");
-    }
-
-    #[test]
-    fn status_line_joins_task_and_validation_state() {
-        let mut row = row(TaskStatus::ReadyForReview, false);
-        assert_eq!(row_status_line(&row), "Ready for review");
-        row.validation_status = TaskValidationStatus::Passed;
-        assert_eq!(
-            row_status_line(&row),
-            "Ready for review · validation Passed"
-        );
-        row.native_preparing = true;
-        assert!(row_status_line(&row).starts_with("preparing native Codex"));
-    }
-
-    #[test]
-    fn list_refresh_plan_is_a_noop_for_an_identical_push() {
-        let rows = vec![
-            row(TaskStatus::Created, false),
-            row(TaskStatus::Working, false),
-        ];
-        let plan = plan_list_refresh(&rows, Some(rows[1].id), &rows, Some(rows[1].id));
-        assert_eq!(
-            plan,
-            ListRefreshPlan {
-                rebuild_rows: false,
-                apply_selection: false,
-                select_index: Some(1),
-            },
-            "an unchanged Sync must leave the list widget untouched",
-        );
-    }
-
-    #[test]
-    fn list_refresh_plan_reapplies_selection_after_a_row_change() {
-        let old_rows = vec![row(TaskStatus::Created, false)];
-        let selected = old_rows[0].id;
-        let mut new_rows = old_rows.clone();
-        new_rows[0].status = TaskStatus::Working;
-        let plan = plan_list_refresh(&old_rows, Some(selected), &new_rows, Some(selected));
-        assert!(plan.rebuild_rows);
-        assert!(plan.apply_selection, "fresh rows start unselected");
-        assert_eq!(plan.select_index, Some(0));
-    }
-
-    #[test]
-    fn list_refresh_plan_tracks_selection_changes_without_rebuilding() {
-        let rows = vec![
-            row(TaskStatus::Created, false),
-            row(TaskStatus::Completed, false),
-        ];
-        let plan = plan_list_refresh(&rows, None, &rows, Some(rows[1].id));
-        assert!(!plan.rebuild_rows);
-        assert!(plan.apply_selection);
-        assert_eq!(plan.select_index, Some(1));
-
-        let plan = plan_list_refresh(&rows, Some(rows[1].id), &rows, None);
-        assert!(!plan.rebuild_rows);
-        assert!(plan.apply_selection, "clearing the selection is a change");
-        assert_eq!(plan.select_index, None);
-    }
-
-    #[test]
-    fn list_refresh_plan_drops_selection_for_a_task_without_a_row() {
-        let rows = vec![row(TaskStatus::Created, false)];
-        let ghost = TaskId::new();
-        let plan = plan_list_refresh(&rows, Some(ghost), &rows, Some(ghost));
-        assert!(!plan.rebuild_rows);
-        assert!(!plan.apply_selection, "no row can show it, nothing to do");
-        assert_eq!(plan.select_index, None);
-
-        let new_rows = vec![row(TaskStatus::Created, false)];
-        let plan = plan_list_refresh(&rows, Some(ghost), &new_rows, Some(ghost));
-        assert!(plan.rebuild_rows);
-        assert!(!plan.apply_selection);
-        assert_eq!(plan.select_index, None);
-    }
-}
-
 /// Display bounds for the native stream text projection.
 pub(crate) const MAX_NATIVE_STREAM_DISPLAY_BYTES: usize = 64 * 1024;
 const MAX_NATIVE_ITEM_DISPLAY_BYTES: usize = 8 * 1024;
@@ -714,4 +540,178 @@ pub(crate) fn approval_summary(approval: &crate::agent_task::CodexAppServerAppro
         ),
         MAX_TASK_DETAIL_DISPLAY_BYTES,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent_task::{TaskStatus, TaskValidationStatus};
+
+    #[test]
+    fn prompt_policy_requires_both_ai_and_sharing_consent() {
+        let mut config = Config::safe_defaults();
+        assert!(!prompt_policy(&config).share_command_context);
+        config.ai_enabled = true;
+        assert!(!prompt_policy(&config).share_command_context);
+        config.ai_share_command_context = true;
+        assert!(prompt_policy(&config).share_command_context);
+        assert!(prompt_policy(&config).redact_secrets);
+        config.ai_redact_secrets = false;
+        assert!(!prompt_policy(&config).redact_secrets);
+    }
+
+    #[test]
+    fn terminal_session_ids_match_the_jsh_grammar_and_distinguish_panes() {
+        let first = terminal_session_id(1);
+        let second = terminal_session_id(2);
+        assert!(jterm_core::execution_journal::is_valid_jsh_session_id(
+            &first
+        ));
+        assert!(jterm_core::execution_journal::is_valid_jsh_session_id(
+            &second
+        ));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn follow_up_gate_bounds_text_and_turn_count() {
+        assert!(!native_follow_up_can_send("", 0));
+        assert!(!native_follow_up_can_send("  \n\t ", 0));
+        assert!(native_follow_up_can_send("please adjust the fix", 0));
+        assert!(!native_follow_up_can_send(
+            "x".repeat(NATIVE_AGENT_FOLLOW_UP_MAX_BYTES + 1).as_str(),
+            0
+        ));
+        assert!(native_follow_up_can_send(
+            "x".repeat(NATIVE_AGENT_FOLLOW_UP_MAX_BYTES).as_str(),
+            CODEX_APP_SERVER_LIVE_TURN_MAX - 1
+        ));
+        assert!(!native_follow_up_can_send(
+            "ok",
+            CODEX_APP_SERVER_LIVE_TURN_MAX
+        ));
+    }
+
+    #[test]
+    fn validation_argv_uses_non_login_no_rc_command_mode() {
+        let bash = validation_command_argv(Some("/bin/bash"), "cargo test")
+            .expect("bash is a supported validation shell");
+        assert_eq!(&bash[1..], ["--noprofile", "--norc", "-c", "cargo test"]);
+
+        let sh = validation_command_argv(Some("/bin/sh"), "cargo test")
+            .expect("sh is a supported validation shell");
+        assert_eq!(&sh[1..], ["-c", "cargo test"]);
+
+        assert!(validation_command_argv(None, "cargo test").is_err());
+        assert!(validation_command_argv(Some(""), "cargo test").is_err());
+        assert!(validation_command_argv(Some("/nonexistent-shell"), "cargo test").is_err());
+    }
+
+    fn row(status: TaskStatus, needs_attention: bool) -> TaskRowSnapshot {
+        TaskRowSnapshot {
+            id: TaskId::new(),
+            title: "task".to_string(),
+            provider: AgentProvider::Codex,
+            status,
+            runtime_kind: crate::agent_task::TaskRuntimeKind::Unassigned,
+            branch: "anvil/task".to_string(),
+            has_agent_terminal: false,
+            has_validation_terminal: false,
+            has_active_agent_stream: false,
+            native_preparing: false,
+            validation_status: TaskValidationStatus::NotRun,
+            validation_attempt: 0,
+            needs_attention,
+            status_detail: None,
+        }
+    }
+
+    #[test]
+    fn dashboard_orders_attention_then_running_then_finished() {
+        let waiting = row(TaskStatus::WaitingForApproval, true);
+        let mut running = row(TaskStatus::Working, false);
+        running.has_active_agent_stream = true;
+        let done = row(TaskStatus::Completed, false);
+        let done_id = done.id;
+        let mut rows = vec![done, running, waiting];
+        order_task_rows(&mut rows, |_| 0);
+        assert_eq!(rows[2].id, done_id, "finished sorts last");
+        assert!(rows[0].needs_attention, "attention sorts first");
+    }
+
+    #[test]
+    fn status_line_joins_task_and_validation_state() {
+        let mut row = row(TaskStatus::ReadyForReview, false);
+        assert_eq!(row_status_line(&row), "Ready for review");
+        row.validation_status = TaskValidationStatus::Passed;
+        assert_eq!(
+            row_status_line(&row),
+            "Ready for review · validation Passed"
+        );
+        row.native_preparing = true;
+        assert!(row_status_line(&row).starts_with("preparing native Codex"));
+    }
+
+    #[test]
+    fn list_refresh_plan_is_a_noop_for_an_identical_push() {
+        let rows = vec![
+            row(TaskStatus::Created, false),
+            row(TaskStatus::Working, false),
+        ];
+        let plan = plan_list_refresh(&rows, Some(rows[1].id), &rows, Some(rows[1].id));
+        assert_eq!(
+            plan,
+            ListRefreshPlan {
+                rebuild_rows: false,
+                apply_selection: false,
+                select_index: Some(1),
+            },
+            "an unchanged Sync must leave the list widget untouched",
+        );
+    }
+
+    #[test]
+    fn list_refresh_plan_reapplies_selection_after_a_row_change() {
+        let old_rows = vec![row(TaskStatus::Created, false)];
+        let selected = old_rows[0].id;
+        let mut new_rows = old_rows.clone();
+        new_rows[0].status = TaskStatus::Working;
+        let plan = plan_list_refresh(&old_rows, Some(selected), &new_rows, Some(selected));
+        assert!(plan.rebuild_rows);
+        assert!(plan.apply_selection, "fresh rows start unselected");
+        assert_eq!(plan.select_index, Some(0));
+    }
+
+    #[test]
+    fn list_refresh_plan_tracks_selection_changes_without_rebuilding() {
+        let rows = vec![
+            row(TaskStatus::Created, false),
+            row(TaskStatus::Completed, false),
+        ];
+        let plan = plan_list_refresh(&rows, None, &rows, Some(rows[1].id));
+        assert!(!plan.rebuild_rows);
+        assert!(plan.apply_selection);
+        assert_eq!(plan.select_index, Some(1));
+
+        let plan = plan_list_refresh(&rows, Some(rows[1].id), &rows, None);
+        assert!(!plan.rebuild_rows);
+        assert!(plan.apply_selection, "clearing the selection is a change");
+        assert_eq!(plan.select_index, None);
+    }
+
+    #[test]
+    fn list_refresh_plan_drops_selection_for_a_task_without_a_row() {
+        let rows = vec![row(TaskStatus::Created, false)];
+        let ghost = TaskId::new();
+        let plan = plan_list_refresh(&rows, Some(ghost), &rows, Some(ghost));
+        assert!(!plan.rebuild_rows);
+        assert!(!plan.apply_selection, "no row can show it, nothing to do");
+        assert_eq!(plan.select_index, None);
+
+        let new_rows = vec![row(TaskStatus::Created, false)];
+        let plan = plan_list_refresh(&rows, Some(ghost), &new_rows, Some(ghost));
+        assert!(plan.rebuild_rows);
+        assert!(!plan.apply_selection);
+        assert_eq!(plan.select_index, None);
+    }
 }

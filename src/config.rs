@@ -143,7 +143,17 @@ impl SidebarView {
 pub(crate) const MAX_REMOTE_HOSTS: usize = 128;
 pub(crate) const MAX_SESSION_ID_BYTES: usize =
     jterm_core::execution_journal::MAX_JSH_SESSION_ID_BYTES;
-const MAX_REMOTE_ARGV_BYTES: usize = 512 * 1024;
+// `[[remote_hosts]]` is a documented cross-app schema (jterm_core/handoff.md):
+// the same config.toml is meant to load in anvil and forge, and the two
+// `RemoteHost` structs are identical. The validators were not: anvil accepted
+// 128 ssh_args, a 64 KiB remote_shell and a 512 KiB argv where forge accepts
+// 64, 4 KiB and 256 KiB, so a jump-host chain that launched here failed there
+// with an error pointing at the file rather than at the stricter sibling.
+// These are forge's numbers, adopted verbatim; the schema's owner is the core,
+// so they belong beside `RemoteHost` there rather than in two apps.
+pub(crate) const MAX_REMOTE_HOST_FIELD_BYTES: usize = 4 * 1024;
+pub(crate) const MAX_REMOTE_SSH_ARGS: usize = 64;
+const MAX_REMOTE_ARGV_BYTES: usize = 256 * 1024;
 const MAX_CONFIG_PATH_BYTES: usize = 16 * 1024;
 const MAX_AI_BASE_URL_BYTES: usize = 4 * 1024;
 const MAX_FONT_DESC_BYTES: usize = 1024;
@@ -1313,8 +1323,7 @@ pub(crate) fn remote_text_is_safe(value: &str, allow_whitespace: bool, max_chars
 }
 
 fn ssh_argument_is_safe(value: &str) -> bool {
-    value.chars().count() <= 16 * 1_024
-        && value.len() <= 64 * 1_024
+    value.len() <= MAX_REMOTE_HOST_FIELD_BYTES
         && !value.chars().any(char::is_control)
         && !crate::review_input::contains_visual_spoofing(value)
 }
@@ -1370,8 +1379,8 @@ pub(crate) fn validate_remote_host(host: &RemoteHost) -> Result<(), &'static str
     }) {
         return Err("Remote user is invalid; edit it in Settings or config.toml.");
     }
-    if !remote_text_is_safe(&host.remote_shell, true, 16 * 1_024)
-        || host.remote_shell.len() > 64 * 1_024
+    if !remote_text_is_safe(&host.remote_shell, true, MAX_REMOTE_HOST_FIELD_BYTES)
+        || host.remote_shell.len() > MAX_REMOTE_HOST_FIELD_BYTES
     {
         return Err("Remote shell is invalid; edit it in config.toml.");
     }
@@ -1382,15 +1391,15 @@ pub(crate) fn validate_remote_host(host: &RemoteHost) -> Result<(), &'static str
     {
         return Err("Remote session id is invalid; edit it in config.toml.");
     }
-    if host.ssh_args.len() > 128
+    if host.ssh_args.len() > MAX_REMOTE_SSH_ARGS
         || host.ssh_args.iter().any(|arg| !ssh_argument_is_safe(arg))
         || !remote_ssh_args_are_structured(&host.ssh_args)
     {
         return Err("Remote SSH options are invalid; edit them in config.toml.");
     }
     if host.deploy_artifact.as_deref().is_some_and(|artifact| {
-        !remote_text_is_safe(artifact, false, 4_096)
-            || artifact.len() > 16 * 1_024
+        !remote_text_is_safe(artifact, false, MAX_REMOTE_HOST_FIELD_BYTES)
+            || artifact.len() > MAX_REMOTE_HOST_FIELD_BYTES
             || !Path::new(artifact).is_absolute()
     }) {
         return Err("Remote deployment artifact is invalid; edit it in config.toml.");
@@ -1484,7 +1493,7 @@ fn parse_remote_hosts(table: &toml::Table) -> Vec<RemoteHost> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("jsh")
                 .to_string();
-            if !remote_text_is_safe(&remote_shell, true, 16 * 1_024) {
+            if !remote_text_is_safe(&remote_shell, true, MAX_REMOTE_HOST_FIELD_BYTES) {
                 return None;
             }
             let session = t
@@ -1505,7 +1514,9 @@ fn parse_remote_hosts(table: &toml::Table) -> Vec<RemoteHost> {
                 Some(_) => return None,
                 None => Vec::new(),
             };
-            if ssh_args.len() > 128 || ssh_args.iter().any(|value| !ssh_argument_is_safe(value)) {
+            if ssh_args.len() > MAX_REMOTE_SSH_ARGS
+                || ssh_args.iter().any(|value| !ssh_argument_is_safe(value))
+            {
                 return None;
             }
             let login_shell = t
@@ -1521,7 +1532,7 @@ fn parse_remote_hosts(table: &toml::Table) -> Vec<RemoteHost> {
             let deploy_artifact = match t.get("deploy_artifact") {
                 None => None,
                 Some(toml::Value::String(value)) => {
-                    if !remote_text_is_safe(value, false, 4_096)
+                    if !remote_text_is_safe(value, false, MAX_REMOTE_HOST_FIELD_BYTES)
                         || !std::path::Path::new(value).is_absolute()
                     {
                         return None;
@@ -2786,6 +2797,63 @@ mod tests {
         );
         assert_eq!(OrganismMotion::parse("sleepy"), None);
         assert!(default_ascii_organism_memory_path().ends_with("anvil/ascii-organism-native.json"));
+    }
+
+    /// `[[remote_hosts]]` is a schema anvil and forge both consume, so the
+    /// same profile must be accepted or refused identically in both. anvil
+    /// used to be the lax half — 128 ssh_args, a 64 KiB remote_shell, a 512
+    /// KiB argv — so a jump-host chain that launched here failed in forge with
+    /// an error naming the file rather than the sibling's stricter cap. These
+    /// are forge's numbers; changing one here without changing it there is the
+    /// regression.
+    #[test]
+    fn remote_host_limits_match_the_schema_the_sibling_enforces() {
+        assert_eq!(MAX_REMOTE_SSH_ARGS, 64);
+        assert_eq!(MAX_REMOTE_HOST_FIELD_BYTES, 4 * 1024);
+        assert_eq!(MAX_REMOTE_ARGV_BYTES, 256 * 1024);
+
+        // 40 `-o` options: 80 entries, which anvil alone used to accept.
+        let mut chain = host();
+        chain.ssh_args = (0..40)
+            .flat_map(|index| ["-o".to_string(), format!("ProxyJump=hop{index}")])
+            .collect();
+        assert_eq!(chain.ssh_args.len(), 80);
+        assert_eq!(
+            validate_remote_host(&chain),
+            Err("Remote SSH options are invalid; edit them in config.toml.")
+        );
+        chain.ssh_args.truncate(MAX_REMOTE_SSH_ARGS);
+        assert!(validate_remote_host(&chain).is_ok());
+
+        let mut long_shell = host();
+        long_shell.remote_shell = format!("/{}", "s".repeat(MAX_REMOTE_HOST_FIELD_BYTES));
+        assert_eq!(
+            validate_remote_host(&long_shell),
+            Err("Remote shell is invalid; edit it in config.toml.")
+        );
+
+        let mut long_argument = host();
+        long_argument.ssh_args = vec![
+            "-o".to_string(),
+            "J".repeat(MAX_REMOTE_HOST_FIELD_BYTES + 1),
+        ];
+        assert_eq!(
+            validate_remote_host(&long_argument),
+            Err("Remote SSH options are invalid; edit them in config.toml.")
+        );
+
+        // The advisory parser must agree with the execution gate, or a
+        // profile is dropped at load and then blamed on the wrong layer.
+        let table: toml::Table = format!(
+            "[[remote_hosts]]\nhost = 'example'\nssh_args = [{}]\n",
+            (0..40)
+                .map(|index| format!("'-o', 'ProxyJump=hop{index}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+        .parse()
+        .unwrap();
+        assert!(parse_remote_hosts(&table).is_empty());
     }
 
     #[test]

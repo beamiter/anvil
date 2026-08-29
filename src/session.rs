@@ -922,6 +922,48 @@ impl<'de> serde::de::Visitor<'de> for BoundedText {
     }
 }
 
+/// [`BoundedText`]'s tolerant sibling: an oversized value is dropped rather
+/// than failing the whole snapshot. Only the AI chat library uses it — every
+/// other field describes the workspace itself, where a value that does not fit
+/// is a reason to distrust the file.
+struct DroppedIfOversized {
+    field: &'static str,
+    limit: usize,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for DroppedIfOversized {
+    type Value = Option<String>;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_str(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for DroppedIfOversized {
+    type Value = Option<String>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "a '{}' string", self.field)
+    }
+
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        if value.len() > self.limit {
+            // Not owned, so the oversized bytes are still never allocated.
+            log::warn!(
+                "Dropping '{}' from the session snapshot: {} bytes exceeds its {}-byte restore limit",
+                self.field,
+                value.len(),
+                self.limit
+            );
+            return Ok(None);
+        }
+        Ok(Some(value.to_owned()))
+    }
+}
+
 /// `Option<String>` with the same bound, for nullable fields.
 struct BoundedOptionalText(BoundedText);
 
@@ -1274,15 +1316,25 @@ impl<'de> serde::de::Visitor<'de> for SavedSessionSeed<'_> {
                     })?)
                 }
                 "ai_conversation" => {
-                    let encoded = map.next_value_seed(BoundedText {
-                        field: "ai_conversation",
-                        limit: MAX_RESTORED_AI_CONVERSATION_BYTES,
-                    })?;
-                    if jterm_core::ai::ConversationSnapshot::from_json(&encoded).is_ok() {
-                        ai_conversation = Some(encoded);
-                    } else {
-                        log::warn!("Ignoring invalid AI conversation in session snapshot");
-                    }
+                    // The one field whose size is not anvil's to bound: the
+                    // format is shared, and a sibling writes far larger
+                    // libraries (frost up to 8 MiB, ember 4 MiB). Rejecting the
+                    // snapshot for it would cost the user their tabs, panes and
+                    // cwds as well, so an oversized or unparsable library is
+                    // dropped on its own and the workspace still restores.
+                    ai_conversation = map
+                        .next_value_seed(DroppedIfOversized {
+                            field: "ai_conversation",
+                            limit: MAX_RESTORED_AI_CONVERSATION_BYTES,
+                        })?
+                        .filter(|encoded| {
+                            let parsed =
+                                jterm_core::ai::ConversationSnapshot::from_json(encoded).is_ok();
+                            if !parsed {
+                                log::warn!("Ignoring invalid AI conversation in session snapshot");
+                            }
+                            parsed
+                        });
                 }
                 _ => {
                     map.next_value::<serde::de::IgnoredAny>()?;
@@ -1539,14 +1591,38 @@ fn pane_layout_within_restore_limits(layout: &PaneLayout) -> Option<usize> {
     count(layout, &mut remaining)
 }
 
+fn ai_conversation_within_restore_limits(session: &SavedSession) -> bool {
+    !session.ai_conversation.as_ref().is_some_and(|encoded| {
+        encoded.len() > MAX_RESTORED_AI_CONVERSATION_BYTES
+            || jterm_core::ai::ConversationSnapshot::from_json(encoded).is_err()
+    })
+}
+
+/// Restore a workspace whose chat library does not fit, without the chats.
+///
+/// The blast radius of an out-of-limits library used to be the entire session
+/// envelope: tabs, panes, cwds and restorable commands went with it. anvil
+/// never writes more than `SESSION_SNAPSHOT_AI_BUDGET`, but the format is
+/// shared, so a library carried over from a sibling can be larger than
+/// anything anvil emits. Losing those chats is the intended fail-closed cost;
+/// losing the workspace is not. Returns whether a library was dropped.
+fn drop_unrestorable_ai_conversation(session: &mut SavedSession) -> bool {
+    if ai_conversation_within_restore_limits(session) {
+        return false;
+    }
+    log::warn!(
+        "Restoring the workspace without its saved AI chats: the library exceeds \
+         the {MAX_RESTORED_AI_CONVERSATION_BYTES}-byte restore limit or is unreadable"
+    );
+    session.ai_conversation = None;
+    true
+}
+
 fn session_within_restore_limits(session: &SavedSession) -> bool {
     if session.tabs.is_empty() || session.tabs.len() > MAX_RESTORED_TABS {
         return false;
     }
-    if session.ai_conversation.as_ref().is_some_and(|encoded| {
-        encoded.len() > MAX_RESTORED_AI_CONVERSATION_BYTES
-            || jterm_core::ai::ConversationSnapshot::from_json(encoded).is_err()
-    }) {
+    if !ai_conversation_within_restore_limits(session) {
         return false;
     }
     let mut total = 0usize;
@@ -2199,6 +2275,7 @@ fn parse_snapshot_payload(
                 .transpose()?;
             let state = match envelope.state {
                 SnapshotState::Workspace(mut session) => {
+                    drop_unrestorable_ai_conversation(&mut session);
                     if !session_within_restore_limits(&session) {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -2222,6 +2299,7 @@ fn parse_snapshot_payload(
                     ),
                 )
             })?;
+            drop_unrestorable_ai_conversation(&mut session);
             if !session_within_restore_limits(&session) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -3009,6 +3087,50 @@ mod tests {
 
     fn session_json(tabs: &str) -> String {
         format!(r#"{{"active":0,"tabs":[{tabs}]}}"#)
+    }
+
+    fn session_json_with_ai(tabs: &str, ai_conversation: &str) -> String {
+        format!(
+            r#"{{"active":0,"tabs":[{tabs}],"ai_conversation":{}}}"#,
+            serde_json::to_string(ai_conversation).unwrap()
+        )
+    }
+
+    /// The chat library must never be able to take the workspace with it.
+    ///
+    /// The `ai_conversation` format is shared with the siblings, and they
+    /// write bigger libraries than anvil ever emits (frost up to 8 MiB), so a
+    /// library carried into an anvil session file can legitimately exceed
+    /// anvil's own restore bound. Losing those chats is the intended cost;
+    /// losing the saved tabs, panes and cwds is not.
+    #[test]
+    fn an_out_of_limits_chat_library_costs_the_chats_not_the_workspace() {
+        let tabs = tabs_json(3, &leaf_json());
+
+        // Larger than anvil restores, still inside the 4 MiB file cap — the
+        // exact shape a library copied out of a sibling produces.
+        let oversized = "c".repeat(MAX_RESTORED_AI_CONVERSATION_BYTES + 1);
+        let encoded = session_json_with_ai(&tabs, &oversized);
+        assert!((encoded.len() as u64) < MAX_SNAPSHOT_BYTES);
+        let decoded = decode_saved_session(&encoded).expect("the workspace still decodes");
+        assert_eq!(decoded.tabs.len(), 3);
+        assert_eq!(decoded.ai_conversation, None);
+
+        // In-limits but not a conversation snapshot: same rule.
+        let decoded = decode_saved_session(&session_json_with_ai(&tabs, "{\"nope\":1}"))
+            .expect("an unreadable library is not a corrupt workspace");
+        assert_eq!(decoded.tabs.len(), 3);
+        assert_eq!(decoded.ai_conversation, None);
+
+        // And the post-decode audit agrees rather than vetoing the envelope.
+        let mut session = saved_session("kept");
+        session.ai_conversation = Some(oversized);
+        assert!(!session_within_restore_limits(&session));
+        assert!(drop_unrestorable_ai_conversation(&mut session));
+        assert!(session_within_restore_limits(&session));
+        assert_eq!(session.tabs.len(), 1);
+        assert_eq!(session.tabs[0].title, "kept");
+        assert!(!drop_unrestorable_ai_conversation(&mut session));
     }
 
     #[test]

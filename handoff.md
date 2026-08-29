@@ -12,6 +12,42 @@ captured, queued, written, and restored.
 
 ## Completed since the previous handoff
 
+- **AI chat panel on the shared core store, behind the family consent gate
+  (2026-08-29)**: anvil's 786-line private `ChatStore` is now a shim over
+  `jterm_core::ai::chat_store`, constructed with `BusyChatPolicy::Refuse`
+  because the panel has Archive/Delete buttons and no cancel-then-mutate step.
+  Persistence goes through `snapshot_for_persistence` (it compacts before
+  serialising, which is what stops a grown library from silently saving
+  nothing) plus `sync_truncation_markers`, and the persistence clone uses
+  `recover_retry_payload_detaching`.
+
+  The panel now honours `ai_share_command_context`. "Include recent shell
+  context" defaulted to on and `start_request` attached the last five
+  `$ command (exit N)` lines to every question, so the shipped default —
+  consent off — still shipped terminal evidence to the provider, while the
+  Codex/agent path enforced the same flag. Consent is resolved by the same
+  `agent_task_ui::prompt_policy` projection at both `AiPanelMsg::Open` call
+  sites; `recent_context` re-checks it before opening the history file, and
+  without consent the checkbox is off, insensitive and relabelled to name the
+  config key rather than failing silently.
+
+  Streaming no longer rebuilds the transcript per token: `push_delta` only
+  appends, so `append_stream_text` splices `active_partial()[rendered..]` and
+  scrolls only when the reader was already at the bottom, with at most one
+  idle scroll pending. A rebuild still happens on the first fragment, a chat
+  switch, or a rollback.
+
+  Related, from the same audit: an out-of-limits `ai_conversation` used to
+  invalidate the whole session envelope, so a chat library imported from a
+  sibling (ember writes 4 MiB, frost 8 MiB, anvil's own budget is 1 MiB) cost
+  the user their tab layout as well; it is now dropped on its own, both while
+  decoding and in the post-decode audit. `[[remote_hosts]]` validation adopts
+  forge's caps (64 `ssh_args`, 4 KiB per field, 256 KiB of argv) so one
+  config.toml validates identically in both apps. The AppStream `<releases>`
+  entry for an untagged 0.2.0 is gone, matching the policy frost states and
+  frost/ember follow. The default AI-panel binding is spelled
+  `Ctrl+Shift+Alt+A`, the order `Chord::display` renders.
+
 - **Files transactional navigation and authority isolation (2026-08-29)**:
   location selection, Parent/Home, directory activation, Back/Forward,
   breadcrumbs, terminal-cwd following, and Ctrl+L absolute paths now stage a
@@ -569,12 +605,17 @@ that boundary.
 ```text
 cargo fmt --all -- --check
 cargo test --locked --all-targets --all-features --no-fail-fast
-cargo clippy --locked --all-targets --all-features -- -D warnings
+bash scripts/clippy.sh   # cargo clippy --all-targets --all-features --locked -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked
 ```
 
-Latest Files scheduler/snapshot/navigation validation: 1451 passed, 39 ignored,
-0 failed in the full all-target suite. Format and diff checks pass. Clippy with
-warnings denied reaches no new Files/remote-fs diagnostics, but the shared dirty
-tree remains blocked by unrelated `workspace_ops.rs::add_task_terminal_tab`
-(`too_many_arguments`) and `agent_task_ui.rs` (`items_after_test_module`) lints.
+`scripts/clippy.sh` is the lint gate, and it is now exactly the command above:
+CI runs the script, the release check runs the script, and the script no longer
+carries a blanket `-A` allowlist. It used to allow seven lints, two of which
+this document simultaneously called blocking — so a reviewer trusting the green
+CI badge and a reviewer trusting this page were reading a gate nobody ran. Both
+of those lints are fixed rather than silenced: `add_task_terminal_tab` takes a
+`TaskTerminalIdentity` instead of a loose role plus session string, and
+`agent_task_ui.rs` keeps its `#[cfg(test)] mod tests` last. Every sibling runs
+bare `-D warnings`; anvil matches them. An unavoidable lint gets a local
+`#[allow]` with a reason, never a repository-wide one.

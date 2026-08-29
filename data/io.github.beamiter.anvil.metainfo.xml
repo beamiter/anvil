@@ -31,11 +31,11 @@
     <control>pointing</control>
   </recommends>
   <content_rating type="oars-1.1"/>
-  <releases>
-    <release version="0.2.0" date="2026-07-16">
-      <description>
-        <p>Parity release covering persistence, safety, workflows, notebooks, AI, and desktop integration.</p>
-      </description>
-    </release>
-  </releases>
+  <!--
+    No <releases> node on purpose. The repository has never been tagged (`git
+    tag` is empty locally and on the remote), so an AppStream release entry
+    would be a factual claim a packager or update checker cannot resolve to any
+    source. frost states the family policy and frost/ember already follow it;
+    add the entry in the same commit that creates the tag.
+  -->
 </component>

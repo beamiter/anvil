@@ -196,7 +196,7 @@ read -r value; printf 'value=%s\n' "$value"
 - [ ] `Ctrl+0` 能把字体缩放复位到 `1.0`。
 - [ ] `Ctrl+Alt+-` 能降低窗口透明度。
 - [ ] `Ctrl+Alt+=` 能提高窗口透明度。
-- [ ] `Ctrl+Alt+Shift+A` 能打开 Session AI panel。
+- [ ] `Ctrl+Shift+Alt+A` 能打开 Session AI panel。
 - [ ] `Ctrl+Shift+L` 仍聚焦 tab filter，不会清空块。
 
 ### BM-12 VTE 模式与全屏程序
