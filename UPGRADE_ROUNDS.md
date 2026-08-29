@@ -6,6 +6,11 @@ pass.
 Rounds 1–10 record the preceding pass; this pass's additional thirty-three rounds
 are numbered 11–43.
 
+The numbering stops at 43. The 32 commits since — including the shared
+chat-store adoption and the 2026-08-29 shared command-correction round —
+recorded their work in `CHANGELOG.md` and `handoff.md` instead of here, so this
+ledger is left closed rather than retro-fitted.
+
 1. **Prefix boundary** — install and uninstall reject empty, relative,
    control-bearing, or parent-traversing prefixes while retaining valid Unicode
    and whitespace.

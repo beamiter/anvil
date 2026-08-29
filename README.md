@@ -1033,7 +1033,32 @@ unchanged, non-dangerous host-verified candidate offers **Run verified
 command**; any edit, new risk, target-output hint, remote candidate, or AI
 candidate immediately uses **Insert for review** instead. Nothing runs or is
 inserted automatically. The option defaults to true and is available in
-Settings and the Agent dashboard.
+Settings and the Agent dashboard; `--safe-mode` suppresses it.
+
+Only the local stages run on consent you have already given by enabling the
+feature. The AI fallback sends the failed command, the working directory and a
+bounded terminal-output sample off the machine, so it additionally requires
+`ai_share_command_context = true` — the same switch Codex tasks and the AI
+palette honour. With it off (the default), a correction is offered from local
+evidence or not at all.
+
+This is a change in behaviour, and the largest one on this surface: correction
+defaults to on, so with the shipped default of consent off, failures that only
+the model could answer previously produced a card and now produce nothing. If
+you relied on AI corrections, set `ai_share_command_context = true`.
+
+Two further limits changed with it. An automatic helper is resolved through the
+family's one trust predicate, which requires every path component to be
+system-owned — or owned by you and not self-writable — and writable by neither
+group nor others. A binary owned by a *third* user found earlier on your `PATH`
+is therefore never executed; on a machine whose only usable helper was such a
+binary, the `PATH` and APT evidence it produced disappears and only
+target-output corrections remain. Conversely, anvil running as root (a
+container, or `sudo anvil`) produces APT- and `PATH`-verified corrections again.
+And a card is raised only for a command whose exit status the shell itself
+reported, so an interrupted or force-closed block — where the classifier could
+be reading the previous command's scrollback — no longer raises one, and
+dismisses any card still standing for an older command in that pane.
 
 The legacy `agent_auto_approve_readonly` /
 `ANVIL_AGENT_AUTO_APPROVE_READONLY` setting is accepted only for migration and

@@ -851,10 +851,11 @@ dependencies = [
 [[package]]
 name = "jterm_core"
 version = "0.2.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=1a04f1ef0d24cce7083cbbbb2efa7e34c02bdfcb#1a04f1ef0d24cce7083cbbbb2efa7e34c02bdfcb"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=badcce222fb5471a6afbfc5d5e898e2bc3faf632#badcce222fb5471a6afbfc5d5e898e2bc3faf632"
 dependencies = [
  "crossbeam-channel",
  "dirs",
+ "fuzzy-matcher",
  "jagent",
  "libc",
  "log",

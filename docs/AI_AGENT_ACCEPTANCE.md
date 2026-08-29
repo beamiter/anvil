@@ -10,7 +10,9 @@ finished commands report reliable prompt and exit metadata.
 2. Keep `ai_enabled = true` and `agent_enabled = true`.
 3. Start anvil from the repository with `cargo run` and open a clean Block prompt.
 4. **AI command correction** defaults on. Confirm it is enabled in Settings or
-   set `command_correction_enabled = true` explicitly.
+   set `command_correction_enabled = true` explicitly. The correction surface's
+   AI fallback also needs `ai_share_command_context = true`; leave it off to
+   exercise the local-evidence-only path.
 
 ## Inline `?` command suggestion
 
@@ -89,9 +91,16 @@ finished commands report reliable prompt and exit metadata.
 6. Disable correction and repeat the failure; no correction should appear.
 7. Close the target pane, open Agent, or disable AI while a fallback request is pending.
    No stale card or reply may attach to another pane.
-8. Fail an unrelated command that does not match command-not-found,
+8. Set `ai_share_command_context = false` and run a failure that only the AI
+   fallback could answer (an unknown subcommand with no target suggestion).
+   Steps 1–4 must still work; no provider request may be made and no card may
+   appear for this one.
+9. Fail an unrelated command that does not match command-not-found,
    unknown-subcommand, or invalid-option evidence. No speculative correction
    should appear.
+10. Interrupt a command so its block is closed by a later prompt rather than by
+    the shell's own end mark. No correction card may appear for it, even if the
+    scrollback above it looks like a classified failure.
 
 ## Automated regression suite
 

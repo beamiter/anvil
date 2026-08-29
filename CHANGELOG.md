@@ -272,6 +272,35 @@ versioning for tagged releases while it remains experimental.
 
 ### Changed
 
+- **AI command correction now requires `ai_share_command_context`, which is off
+  by default.** Correction itself defaults to on whenever `ai_enabled` is on,
+  and its AI fallback used to send the failed command, the working directory
+  and up to 8 KiB of terminal output to the provider for every classified
+  failure — the same context the switch exists to withhold, and the switch
+  anvil already enforced for Codex tasks, the AI palette and the chat panel.
+  With consent off, the fallback is now silent: locally verified corrections
+  from target output, the APT index and `PATH` are unaffected and still appear,
+  but a failure only the model could have answered now produces nothing. If you
+  relied on AI corrections, set `ai_share_command_context = true`.
+- The correction engine is `jterm_core::command_correction`, shared with the
+  sibling terminals, instead of a private 1,817-line copy of it.
+  `src/command_correction.rs` keeps anvil's inline review card, its per-pane
+  session lifetime, and the policy anvil states for itself: where local evidence
+  may come from, whether command context may be shared, and whether the monitor
+  runs at all (`--safe-mode` and `ANVIL_COMMAND_CORRECTION_ENABLED` still live
+  here). None of the three can be omitted and still compile.
+- A correction card is raised only for a completion whose exit status the shell
+  itself reported. anvil gated on an exit code merely being present, which
+  implied a shell-reported status only because `pending_exit_code` happens to be
+  cleared at the two reset boundaries and never at finalize — so a block forced
+  shut by a later prompt could be classified against the previous command's
+  scrollback and status. `CompletionProvenance` now travels the whole
+  output-capable block-finished bridge. A completion the shell did not report
+  also dismisses a card left over from an older command in that pane, instead of
+  leaving it on screen after the prompt has moved on.
+- A command line over 16 KiB is no longer classified at all — no ranking, no
+  probe, no prompt. The gate used the 256 KiB review-input limit, so a 200 KiB
+  pasted one-liner went through all four on a surface that declares 16 KiB.
 - The AI chat panel is a thin binding over `jterm_core::ai::chat_store` instead
   of a private copy of the same state machine, so the aggregate live-history
   budget, compaction-before-persistence, typed archive/delete outcomes and the
@@ -463,6 +492,20 @@ versioning for tagged releases while it remains experimental.
 
 ### Fixed
 
+- Accepting a correction re-validates the edited draft against this surface's
+  own 16 KiB budget. It was validated only by the shared review-input path,
+  whose limit is 256 KiB, so a large paste into the correction field could be
+  queued to the PTY from a surface that advertises a limit an order of magnitude
+  smaller. The refusal is shown inline on the card.
+- A leading or trailing space typed into a host-verified correction no longer
+  downgrades it to **Insert for review**. The button's label and what pressing
+  it does are now one decision taken against one validated string; the old
+  predicate compared the raw field text to the proposed command by exact
+  equality.
+- The correction probe's stdout reader thread is named
+  `anvil-command-correction-probe`, so a reader still blocked on a descendant
+  that kept the pipe open is attributable to anvil in `ps`. The worker thread
+  keeps its `anvil-command-correction-local` name.
 - A saved AI chat library that is too large or unreadable no longer invalidates
   the whole session envelope. The chats are dropped on their own — while
   decoding and again in the post-decode audit — so the tabs, panes, cwds and
@@ -691,6 +734,33 @@ versioning for tagged releases while it remains experimental.
 
 ### Security
 
+- **A helper binary owned by a third user is no longer executed.** Automatic
+  correction helpers were resolved by scanning the user's own `PATH`, and the
+  trust predicate — `owner_uid == euid || mode & 0o022 != 0` — called a binary
+  owned by *another* account trusted: an `/opt/vendor/bin/bash` owned by
+  `builder` at mode 0755, placed ahead of `/usr/bin` on a shared machine, was
+  spawned automatically by any classified command failure. Giving the child a
+  fixed system PATH, which the entry below described as the mitigation, never
+  addressed this: the helper is itself the hostile binary. Resolution now goes
+  through `jterm_core::helper`'s single trust predicate, the same one frost
+  already used. The cost is honest: on a host whose only usable helper was such
+  a binary, the `PATH` and APT evidence it produced simply disappears and only
+  target-output corrections remain.
+- The same predicate inverted for root: with euid 0, every root-owned system
+  binary answered "untrusted", so anvil in a container or under `sudo` silently
+  produced no APT- or `PATH`-verified corrections at all. Those work again.
+- A candidate that hands a pipeline stage to a shell or interpreter the original
+  did not — `| sh`, `|  sh`, `| /bin/sh`, `| zsh`, `| python3`, `| xargs sh -c`
+  — is refused. The gate asked only whether the candidate introduced a shell
+  syntax marker the original lacked, so against an original that already
+  contained a pipe, appending `| sh` introduced no new marker and the candidate
+  landed pre-filled in an auto-focused command field. The shared rule splits the
+  pipeline and compares the set of interpreters its stages run, pinned by a test
+  against jagent's own lexer.
+- The AI correction fallback requires `ai_share_command_context`. See the first
+  entry under **Changed**: the payload builder now takes a consent witness that
+  only a consenting policy can produce, so the provider request is unreachable
+  without consent by construction rather than by a call-site check.
 - The AI chat panel now honours `ai_share_command_context` before attaching
   recent shell history to a provider prompt. "Include recent shell context"
   defaulted to on, so with the shipped default (consent off) the last five
@@ -705,10 +775,12 @@ versioning for tagged releases while it remains experimental.
   closes the local multi-user command-injection boundary for alternate or
   manually chmodded configs that control shells and startup commands.
 - Automatic command-correction helpers are resolved only from absolute `PATH`
-  entries to canonical executable files whose entire target namespace is not
-  writable by the current user, group, or others. The child receives a fixed
-  system PATH; Flatpak helper probing fails closed until the host bridge can
-  provide the same proof.
+  entries to canonical executable files whose entire target namespace is
+  system-owned, or owned by this user and not self-writable, and is writable by
+  neither group nor others. The child receives a fixed system PATH; Flatpak
+  helper probing fails closed, because anvil ships no host bridge for this
+  surface. The ownership half of this rule was wrong until the entry above
+  corrected it — see it for what that permitted.
 - AI command-palette responses containing newlines or terminal control
   characters are rejected before any bytes reach the live PTY.
 - Potentially destructive AI-generated commands are highlighted for review.

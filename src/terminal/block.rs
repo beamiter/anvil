@@ -368,7 +368,12 @@ fn connect_view_outputs(
         move |agent_execution| supports_correction_output || agent_execution.is_some(),
         {
             let sender = sender.clone();
-            move |command, exit_code, output_sample, agent_execution, duration_ms| {
+            move |command,
+                  exit_code,
+                  completion_provenance,
+                  output_sample,
+                  agent_execution,
+                  duration_ms| {
                 let _ = sender.output(command_finished_output(exit_code));
                 let (exit_code, unknown_note) =
                     crate::block_view::exit_code_for_shared_surface(exit_code);
@@ -382,6 +387,7 @@ fn connect_view_outputs(
                     // The agent transcript still speaks one i32; -1 plus the
                     // note above is explicitly unknown, never fabricated 0.
                     exit_code,
+                    completion_provenance,
                     output_sample: output_sample.unwrap_or_default(),
                     agent_execution,
                     duration_ms,

@@ -505,6 +505,7 @@ fn create_pane(
         VteOutput::BlockFinished {
             command,
             exit_code,
+            completion_provenance,
             output_sample,
             agent_execution,
             duration_ms,
@@ -513,6 +514,7 @@ fn create_pane(
             pane_id,
             command,
             exit_code,
+            completion_provenance,
             output_sample,
             agent_execution,
             duration_ms,
@@ -2284,6 +2286,7 @@ impl SimpleComponent for AppModel {
                 pane_id,
                 command,
                 exit_code,
+                completion_provenance,
                 output_sample,
                 agent_execution,
                 duration_ms,
@@ -2298,16 +2301,17 @@ impl SimpleComponent for AppModel {
                     }
                     self.refresh_bottom_bar();
                     self.pin_command_suggestion(pane_id);
-                    if let Some(exit_code) = reported_exit {
-                        self.maybe_start_command_correction(
-                            pane_id,
-                            command.clone(),
-                            exit_code,
-                            output_sample.clone(),
-                            agent_execution.is_some(),
-                            &sender,
-                        );
-                    }
+                    self.maybe_start_command_correction(
+                        pane_id,
+                        crate::command_correction::FinishedBlock {
+                            command: command.clone(),
+                            exit_code: reported_exit,
+                            output: output_sample.clone(),
+                            agent_issued: agent_execution.is_some(),
+                            completion_provenance,
+                        },
+                        &sender,
+                    );
                     self.agent_handle_block_finished(
                         agent_ops::AgentBlockCompletion {
                             tab_id,

@@ -2771,11 +2771,19 @@ impl CompletedCommandRecord {
 /// this exact completion needs a bounded output sample. The predicate is what
 /// lets Anvil's permanent Relm4 bridge request output for a correlated Agent
 /// completion without materializing every ordinary Unified command.
+///
+/// The output-capable form also carries the completion's provenance. A
+/// consumer that reads meaning out of the *output* — the command-correction
+/// classifier does — must be able to tell a status the shell reported from one
+/// a boundary forced, because an inferred close attributes stale scrollback to
+/// the command it closed. Exit-code presence is not that signal: it is cleared
+/// only at the reset boundaries, never at finalize.
 type MetadataBlockFinishedCallback =
     dyn Fn(String, Option<i32>, Option<crate::agent::AgentExecutionRef>, Option<u64>);
 type OutputBlockFinishedCallback = dyn Fn(
     String,
     Option<i32>,
+    CompletionProvenance,
     Option<String>,
     Option<crate::agent::AgentExecutionRef>,
     Option<u64>,
@@ -5854,6 +5862,7 @@ impl ReaderCtx {
                             callback(
                                 record.cmd.clone(),
                                 record.exit_code,
+                                record.completion_provenance,
                                 sample,
                                 agent_execution,
                                 record.duration_ms,
@@ -13166,6 +13175,7 @@ impl TermView {
         F: Fn(
                 String,
                 Option<i32>,
+                CompletionProvenance,
                 Option<String>,
                 Option<crate::agent::AgentExecutionRef>,
                 Option<u64>,
@@ -16017,6 +16027,7 @@ mod tests {
     struct FinishedFanOut {
         command: String,
         exit_code: Option<i32>,
+        completion_provenance: super::CompletionProvenance,
         output_sample: String,
         agent_execution: Option<AgentExecutionRef>,
         blocks_finalized_before: usize,
@@ -16121,10 +16132,16 @@ mod tests {
                     .push(BlockFinishedCallback::ConditionalOutput {
                         needs_output: Box::new(|_| true),
                         callback: Box::new(
-                            move |command, exit_code, output_sample, agent_execution, _duration| {
+                            move |command,
+                                  exit_code,
+                                  completion_provenance,
+                                  output_sample,
+                                  agent_execution,
+                                  _duration| {
                                 seen.borrow_mut().push(FinishedFanOut {
                                     command,
                                     exit_code,
+                                    completion_provenance,
                                     output_sample: output_sample
                                         .expect("the recording harness requests output"),
                                     agent_execution,
@@ -17437,7 +17454,7 @@ mod tests {
             harness.ctx.block_finished_cbs.borrow_mut().push(
                 BlockFinishedCallback::ConditionalOutput {
                     needs_output: Box::new(|agent| agent.is_some()),
-                    callback: Box::new(move |_, _, sample, _, _| {
+                    callback: Box::new(move |_, _, _, sample, _, _| {
                         samples.borrow_mut().push(sample);
                     }),
                 },
@@ -17477,7 +17494,7 @@ mod tests {
             harness.ctx.block_finished_cbs.borrow_mut().push(
                 BlockFinishedCallback::ConditionalOutput {
                     needs_output: Box::new(|_| true),
-                    callback: Box::new(move |_, _, _, _, _| {
+                    callback: Box::new(move |_, _, _, _, _, _| {
                         observer_calls.set(observer_calls.get() + 1);
                     }),
                 },
@@ -18088,6 +18105,10 @@ mod tests {
             &[FinishedFanOut {
                 command: "echo hi".to_string(),
                 exit_code: Some(0),
+                // The output-capable bridge carries provenance because the
+                // command-correction classifier reads meaning out of that
+                // sample and must refuse an inferred close.
+                completion_provenance: super::CompletionProvenance::ShellReported,
                 output_sample: plain_output,
                 agent_execution: None,
                 blocks_finalized_before: 1,

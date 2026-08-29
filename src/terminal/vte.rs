@@ -520,6 +520,11 @@ pub enum VteOutput {
     BlockFinished {
         command: String,
         exit_code: i32,
+        /// How this block came to be closed. `exit_code` above is an i32 with
+        /// a sentinel and cannot say whether the shell reported anything, so
+        /// consumers that read the output as evidence about *this* command —
+        /// command correction — gate on this instead.
+        completion_provenance: jterm_core::block_contract::CompletionProvenance,
         /// Bytes sampled head+tail by the caller to a small bound — the
         /// agent already truncates to its own cap, but block.rs trims first
         /// so we don't ship 256 KB across a relm4 channel.

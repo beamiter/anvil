@@ -289,6 +289,11 @@ pub(crate) enum AppMsg {
         pane_id: u64,
         command: String,
         exit_code: i32,
+        /// Whether the shell reported this completion or a boundary forced it
+        /// closed. Command correction refuses to classify the latter: an
+        /// inferred close can attribute the previous command's scrollback, and
+        /// its status, to this one.
+        completion_provenance: jterm_core::block_contract::CompletionProvenance,
         output_sample: String,
         agent_execution: Option<crate::agent::AgentExecutionRef>,
         duration_ms: Option<u64>,

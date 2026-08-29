@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-29 (Files transactional navigation and authority isolation)
+Updated: 2026-08-29 (shared command-correction engine and its consent gate)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,133 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **Command correction on the shared engine, and three security holes it was
+  hiding (2026-08-29)**: `src/command_correction.rs` went from 1,817 lines to
+  843. The engine half — classification, token extraction, ranking, the safety
+  gate, the prompt builder, the strict-JSON reply parser, the probe layer, the
+  hand-rolled helper-trust predicate and both resolvers — contained no toolkit
+  code at all, which is exactly why four terminals each grew their own copy and
+  the copies then drifted apart on questions that decide whether a
+  model-proposed command may be offered for execution. That half is now
+  `jterm_core::command_correction` (core pinned to `badcce2`, Cargo and the Nix
+  `outputHashes` moved together). What stays is anvil's presentation and
+  submission channel: the inline `CommandReviewCard`, the per-pane session map
+  that owns that widget's lifetime, and the relm4 plumbing between them.
+
+  Three of the divergences were live holes here, and all three are closed.
+
+  First, the helper-trust predicate. anvil asked
+  `owner_uid == euid || mode & 0o022 != 0`, which answered "not untrusted" for a
+  binary owned by a *third* user: `/opt/vendor/bin/bash`, owner `builder`, mode
+  0755, placed ahead of `/usr/bin` on a shared machine was resolved by scanning
+  the user's own `PATH` and then spawned automatically by any classified
+  failure. Clamping the child's PATH — which anvil did, and which the CHANGELOG
+  advertised as the mitigation — never helped, because the helper *is* the
+  hostile binary. The same expression inverted under euid 0: every root-owned
+  system binary looked untrusted, so a container or `sudo anvil` silently lost
+  every APT- and PATH-verified correction. `jterm_core::helper` already answered
+  both halves and only frost was using it; anvil now reaches it through
+  `HelperStrategy::TrustedPathScan`, which keeps the PATH scan that non-FHS
+  hosts (`nix develop` included) depend on for evidence.
+
+  Second, the candidate safety gate. `syntax_markers` only asked whether a
+  marker was *present*, and the rule was "the candidate introduces no marker the
+  original lacked". Against an original that already contained a pipe, appending
+  `| sh` introduces no new marker, so the candidate passed and landed pre-filled
+  in an auto-focused command field. anvil had no interpreter check of any kind
+  (forge had one, as four literal spellings that `|  sh`, `| /bin/sh`, `| zsh`
+  and `| python3` all walked past). The shared rule splits the pipeline and
+  compares the *set* of interpreters its stages run, pinned in core by a test
+  against jagent's own lexer.
+
+  Third, consent. `ai_share_command_context` does not appear anywhere in the old
+  file. anvil honoured it in `task_ops`, `ai_palette_ops` and `agent_task_ui`,
+  and missed it on the surface with the largest payload of the four — the failed
+  command, the working directory and up to 8 KiB of terminal output, posted for
+  every classified failure. The engine's payload builder now takes a
+  `ConsentProof` that only a consenting policy can mint, so the fallback is
+  unreachable without consent by construction rather than by a call-site check
+  someone can forget to write.
+
+  The three legitimate disagreements became construction-time policy with no
+  `Default` where safety is involved, following the `BusyChatPolicy` precedent
+  from the chat-store round: `LocalEvidence` (anvil's `is_flatpak()` answer,
+  which used to be an early `return Vec::new()` buried inside the PATH walk),
+  `ContextSharing` (read per request, not at startup, because it must be the
+  value at the moment the payload would be sent), and `enabled`, which is where
+  `--safe-mode` suppression and `ANVIL_COMMAND_CORRECTION_ENABLED` stay —
+  `--safe-mode` means something narrower in forge and does not exist in the
+  other two, so it cannot live in shared code.
+
+  One plumbing change outside the module was unavoidable, and it is the point of
+  the engine's `trusted_completion` fact. anvil gated on "an exit code is
+  present", which implies a shell-reported status only by accident:
+  `pending_exit_code` happens to be cleared at the two reset boundaries and
+  never at finalize. A block closed by boundary inference can therefore carry
+  the *previous* command's status and scrollback, and the classifier would read
+  "command not found" out of the wrong output with every later step built on
+  that misattribution. `CompletionProvenance` now travels the whole
+  output-capable bridge — `block_view` fan-out → `terminal/block.rs` →
+  `VteOutput::BlockFinished` → `AppMsg::AgentBlockFinished` → the trigger — so
+  anvil states the fact instead of inferring it, and a `block_view` harness
+  assertion pins that the bridge really delivers `ShellReported`. The trigger is
+  now called for every completion rather than only for one with a code, so an
+  untrusted completion also *dismisses* a card left over from an older command
+  instead of leaving it on screen after the prompt has moved on.
+
+  Two budget gaps closed with it. Classification used
+  `review_input::validate`, whose limit is 256 KiB, so a 200 KiB pasted
+  one-liner was classified, ranked, probed and prompted by a surface that
+  declares a 16 KiB command; and accept used `CommandReviewCard::validated_command()`,
+  the same 256 KiB path, so an oversized paste into the correction field could
+  be queued to the PTY. Both are the engine's 16 KiB now, the second
+  automatically: `CorrectionProposal` is the single place anvil turns entry text
+  into a decision, so the card's primary label and what pressing it does come
+  from one object. That also ends a smaller disagreement — a leading or trailing
+  space typed into a verified proposal used to downgrade it to "Insert for
+  review", because the old predicate compared the raw field text to the proposed
+  command by exact equality.
+
+  Three adversarial audits ran against the shared module *before* any app
+  adopted it and found eight defects in it, including that the merged pipe rule
+  was still forge's four-spelling substring match; each fix carries a regression
+  test that fails when the fix is reverted. anvil's own six tests deliberately
+  do not re-test the engine — they pin the wiring: that each policy is stated,
+  that the label and the accept decision come from one proposal, that the
+  surface budget applies to an edited draft, and that no card is raised for a
+  completion the shell did not report.
+
+  Not done, deliberately. anvil did not adopt
+  `jterm_core::command_correction::CorrectionRequestState`: anvil's epoch is a
+  global generation counter plus a per-pane session map, and the map removal is
+  simultaneously the single-consumption step and the `remove_inline_notice`
+  widget teardown; adopting `retire()` would split one step into two and change
+  teardown ordering against the widget removal. The session map is documented as
+  app-side wiring in the module doc, with that reason. anvil also stays on
+  `LocalEvidence::Unavailable` under Flatpak rather than `Bridged`, because
+  anvil ships no `flatpak-spawn` helper bridge for this surface — adopting
+  `Bridged` would be inventing a capability rather than porting forge's; it is
+  now a one-line change in `local_evidence()` if the bridge ever arrives, which
+  is the improvement over the old buried early return. And the 16 KiB
+  accept-budget test pins `live_proposal(..).accept()`, the one function the GTK
+  accept path calls, rather than driving that path: `accept_command_correction`
+  needs a live model, panes and a `gtk::Entry`, so a future edit that routed
+  accept back through `CommandReviewCard::validated_command()` would not turn
+  the test red.
+
+  One non-reproducing SIGSEGV was observed in the anvil test binary during a
+  gate run and is *not* attributed to this work: it did not recur in 32
+  subsequent full runs of the same binary or in five further clean gate runs,
+  the change adds no `unsafe` and no new threading, the correction tests are
+  pure, and the crash appeared in a run that also had clippy running under load.
+  It is treated as pre-existing flakiness in the fork/PTY-touching tests
+  (`remote_fs::tests::kill_tree_reaps_the_whole_process_group`, `pty::tests::*`).
+  Worth watching rather than worth a claim.
+
+  `UPGRADE_ROUNDS.md` was not extended. Its numbering stops at 43 and the last
+  32 commits, this round included, did not use it; CHANGELOG.md and this file
+  are where recent rounds are recorded.
 
 - **AI chat panel on the shared core store, behind the family consent gate
   (2026-08-29)**: anvil's 786-line private `ChatStore` is now a shim over
