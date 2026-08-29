@@ -5,7 +5,6 @@ tags: [docker]
 args:
   - name: container
     description: "Container name or id"
-    default: ""
   - name: tail
     description: "How many recent lines to show before streaming"
     default: "100"

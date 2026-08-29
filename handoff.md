@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-29 (shared command-correction engine and its consent gate)
+Updated: 2026-08-29 (shared workflow library; an undefaulted argument is required again)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,117 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **Workflows on the shared library, and the guard four terminals wrote and
+  then defeated (2026-08-29)**: the headline is a defect, not a refactor. A
+  workflow argument whose file declares no `default` is required —
+  `render()` has always been supposed to refuse an unfilled one, anvil
+  implemented that rule, and `render_reports_missing_placeholder` unit-tested
+  it against an empty values map. The dialog then seeded *every* declared
+  argument with `arg.default.clone().unwrap_or_default()` before calling it, so
+  the key was always present, always bound, and the guard never fired once in
+  production: `kill -9 {pid}` with an untouched Pid field was inserted at the
+  prompt as `kill -9 `. All four terminals did the same thing, and three of them
+  carried the same green, unreachable test. A guard that is only tested through
+  a path no UI takes is not a guard.
+
+  The contract is now stated once and enforced twice. `jterm_core::workflows`'s
+  `render()` derives the missing set from the *values themselves* — declared,
+  undefaulted, and absent-or-blank is not supplied — so a caller that pre-seeds
+  cannot seed past it; and `ArgsForm` carries `Unset` versus `Supplied(String)`
+  in the type system, so the dialog's rows start empty for an undefaulted
+  argument without that emptiness being a value. anvil's dialog now drives
+  `ArgsForm` and the existing error label finally shows
+  `missing values: <names>`. The rule cuts both ways on purpose: an argument
+  that *declares* a default, `default = ""` included, may still render empty,
+  and emptying such a field is a deliberate empty value that does not fall back
+  to the default. `scripts/workflows/docker-tail-logs.yaml` declared
+  `default: ""` for its required `container`, which under the new contract is an
+  explicit empty value — the one bundled example on which the headline guard
+  would not have fired. That default is removed.
+
+  The subsystem underneath it moved: `src/workflows.rs` 772 → 437 lines, of
+  which ~135 are the shim body and the rest documentation plus five tests.
+  That is the only file that shrank. `src/workflow_ops.rs` grew 144 → 241 and
+  `src/dialogs/workflow.rs` 248 → 284, because refusal reporting and the
+  `ArgsForm` binding are new code, so the honest net across the four touched
+  source files is about 225 lines removed, not the 754 raw deletions the diff
+  shows. anvil also stops depending on a YAML parser directly: `serde_yaml_ng`
+  is gone from `Cargo.toml`, and the only YAML anvil reads now goes through the
+  shared loader.
+  Discovery, the bounded reader, both parsers, validation and the template
+  engine are `jterm_core::workflows` (core repinned `badcce2` → `790d06a`, Cargo
+  and the Nix `outputHashes` moved together). Four values are injected rather
+  than hardcoded because each would silently change behaviour for two of the
+  four apps: the XDG backend (`GlibDirs` — glib's lookups never fail,
+  `dirs::config_dir()` returns `None` with `HOME` unset), the app segment that
+  `ANVIL_WORKFLOW_DIR` is derived from, `LoadOrder::Precedence` (the palette's
+  sort is stable and score-free for an empty query, so load order *is* what the
+  user sees), and the source-tree tier — `env!("CARGO_MANIFEST_DIR")` resolves
+  against the crate being compiled, so evaluating it in the core would point all
+  four apps at `jterm_core/scripts/workflows` while their bundled-library tests
+  kept passing. `search_path_spec()` spells the segment out rather than calling
+  `SearchPathSpec::for_current_app`, because `identity::init` runs in `main` and
+  no test binary calls it: the `Option` would be `None` and anvil's own
+  search-path assertions would then be guarding nothing.
+
+  Three divergences were live here. anvil was the copy whose reader passed
+  `O_NONBLOCK | O_CLOEXEC` and **not** `O_NOFOLLOW`, so a symlink planted in
+  `~/.config/anvil/workflows/` was followed, parsed, and its command became a
+  palette entry that gets typed at a prompt — refused by the other three. anvil
+  accepted an argument `name` that was not equal to its own trim (`"pid "`),
+  which could never bind `{{pid}}` because template names are trimmed: the file
+  loaded, the row appeared, the typed value was discarded, and the placeholder
+  reached the prompt intact. And `find_close` took the first `}}` anywhere to
+  its right, so `awk '{{print $1}' {{log}} | sort -u` rendered as
+  `awk '{print $1}' access.log | sort -u` — a different, executable awk program
+  — while the same template without a later placeholder round-tripped fine; the
+  core counts brace depth instead, so an unmatched `{{` is unmatched regardless
+  of what follows, and nested escapes still collapse.
+
+  Gaining `O_NOFOLLOW` is a user-visible loss, because symlinking a file out of
+  a dotfiles checkout is deliberate, so the refusal is not left as a log line.
+  `workflows::refused_files` re-reads only the candidates that are *not* among
+  the loaded workflows — the healthy case costs one directory listing per tier
+  and zero extra file reads, and a name-shadowed override, which is a feature,
+  never surfaces as breakage — and `workflow_ops` toasts when that set changes,
+  keyed on paths and not on reasons or counts. Both halves cross
+  `review_input::safe_inline_display` bounded to 256 bytes: an attacker who can
+  write to a scanned directory picks the file name, and a parse error quotes the
+  offending source line back verbatim, so `command = "echo <ESC>]0;title<BEL>`
+  used to write that OSC sequence onto a warn line. Only a symlinked *file* is
+  refused; a symlinked directory in the search path is still scanned, so
+  `ln -s ~/dotfiles/workflows ~/.config/anvil/workflows` keeps working.
+
+  `src/workflow_ops.rs` keeps the whole off-thread single-flight refresh — named
+  thread, `catch_unwind`, keep-the-old-cache-on-error, the only refresh strategy
+  of the four that does not stall a UI on a cold or networked home directory —
+  but its hand-rolled `WorkflowRefreshState` is now a re-export of
+  `jterm_core::workflows::RefreshLatch`, so the invariant is shared and the GTK
+  threading is not. `src/diagnostics.rs` lost its second `toml|yaml|yml`
+  predicate and its uncapped `read_dir` walk, the one place in anvil that
+  ignored every bound the loader exists to enforce; it asks the loader now, and
+  as a consequence a *directory* named `x.yaml` counts as an invalid file rather
+  than being skipped by an `is_file()` pre-check.
+
+  Not done, deliberately: **Insert is not disabled while `ArgsForm::missing()`
+  is non-empty**, which the core's docs offer as an option. `missing()` is the
+  superset of outstanding rows, not a prediction of the error — a workflow may
+  declare an argument its template never references, and `render()` succeeds in
+  that case — so disabling Insert would refuse a command that would have
+  rendered fine. The failed render names the exact arguments in the error label
+  the dialog already had, which is anvil's existing idiom. Not done, and worth
+  doing: `--doctor` still reports only a count of rejected workflow files.
+  `crate::workflows::scan` returns the paths and the reasons, so naming them is
+  a one-liner, but changing the diagnostics schema was outside this round.
+
+  Environment hazard, unchanged and still worth knowing: `cargo` rewrites
+  `Cargo.lock` under a temporary local `[patch]`, after which the flake's
+  `outputHashes` refuses to evaluate ("A hash was specified for
+  jterm_core-0.2.0, but there is no corresponding git dependency"), so
+  `git show HEAD:Cargo.lock > Cargo.lock` must precede each `nix develop`.
+  `Cargo.lock` carries exactly two facts: the new core rev, and
+  `serde_yaml_ng` moving from anvil's dependency list to the core's.
 
 - **Command correction on the shared engine, and three security holes it was
   hiding (2026-08-29)**: `src/command_correction.rs` went from 1,817 lines to

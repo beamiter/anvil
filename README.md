@@ -637,7 +637,12 @@ the same name take precedence. `ANVIL_WORKFLOW_DIR` adds higher-priority search
 paths after the user config directory and before user/system data examples.
 Workflow names are deduplicated in that directory-precedence order. Tags,
 optional `shell`, and source-file metadata are retained. Workflows are reloaded
-whenever the palette opens. A minimal shared YAML workflow is:
+whenever the palette opens.
+
+The format is not anvil's. Discovery, both parsers, validation and the template
+engine are `jterm_core::workflows`, shared with the sibling jterm terminals,
+which read the same library out of the same directories — so a file that loads
+here loads there, and means the same thing. A minimal shared YAML workflow is:
 
 ```yaml
 name: "Search text"
@@ -647,23 +652,81 @@ tags: [search]
 args:
   - name: pattern
     description: "Pattern to find"
-    default: "TODO"
   - name: path
     description: "Directory to search"
     default: "."
 ```
 
 Press `Ctrl+Shift+M` or type `:` in the palette. Rendering a workflow inserts
-the command at the prompt; it does not press Enter. Both `{name}` and
-`{{name}}` placeholders are accepted, including Unicode names. Double braces
-without a matching argument produce literal braces, such as `{{a,b}}` →
-`{a,b}`. Rendered commands containing line breaks or terminal control
-characters are rejected by the shared review-only input boundary.
+the command at the prompt; it does not press Enter.
+
+#### Arguments with no default are required
+
+**An argument the file gives no `default` for must be filled in.** Leaving its
+field blank and pressing Insert reports `missing values: <names>` in the dialog
+and inserts nothing — it does not substitute the empty string. In the example
+above, `pattern` is required and `path` is not.
+
+That distinction is what `default` is for, so it cuts both ways:
+
+- No `default` key at all — required. Blank, or only whitespace, is *unfilled*.
+- `default: ""` — an explicit empty value. The field starts empty, renders
+  empty, and is never reported as missing.
+- Any other `default` — the field starts at that value. Clearing it by hand is
+  a deliberate empty value and renders as one; it does not spring back to the
+  default. The dialog has no revert control, so reopen the workflow to get the
+  declared default back.
+
+Before this, every field was pre-filled with `""` and blank meant blank:
+`kill -9 {pid}` with an untouched Pid field was inserted at the prompt as
+`kill -9 `. If you have workflow files that relied on that, add
+`default: ""` to the arguments you want to keep optional.
+
+#### Placeholders
+
+Both `{name}` and `{{name}}` placeholders are accepted, including Unicode
+names. Names are trimmed, so `{{ service }}` binds the argument named
+`service`; for the same reason a declared `name` may not have leading or
+trailing whitespace, and a file that declares one is rejected rather than
+loaded with a row that can never bind. Double braces with no matching argument
+produce literal braces, such as `{{a,b}}` → `{a,b}`; an unmatched `{{` is left
+exactly as authored, so `awk '{{print $1}' {{log}}` keeps its awk program and
+substitutes only `log`.
+
+#### What is refused, and how you find out
+
+Symlinked workflow *files* are not loaded: anvil opens candidates with
+`O_NOFOLLOW`. Symlinking the containing *directory* still works, and is the
+supported way to keep a library in a dotfiles checkout.
+
+```sh
+ln -s ~/dotfiles/workflows ~/.config/anvil/workflows            # scanned
+ln -s ~/dotfiles/deploy.toml ~/.config/anvil/workflows/deploy.toml  # refused
+```
+
+A symlinked file used to be followed, parsed, and turned into a palette entry
+that gets typed at a prompt; the sibling terminals refused it. If this removes
+a workflow you were using, move the file into the directory or link the
+directory instead.
+
+A file that is refused for any reason — a symlink, a parse error, a validation
+error, a special file, an oversized file — is skipped without disabling the
+rest of the library, and anvil raises a toast naming it the first time that
+happens ("Workflow file skipped — *path*: *reason*", or "N workflow files
+skipped, including …"). The toast repeats only when the set of refused files
+changes, so a broken file you have not fixed yet does not nag on every palette
+open. `anvil --doctor` reports the same thing as a count of invalid or
+unreadable files, alongside how many search locations were readable.
+
+Rendered commands containing line breaks or terminal control characters are
+rejected by the shared review-only input boundary.
 Each workflow file is limited to 256 KiB, directory/file/argument/tag counts
 are capped, and rendered commands are limited to 64 KiB before insertion.
 Special files are rejected without blocking. Display metadata and command
 values containing control, invisible, or bidirectional formatting characters
-are rejected so the palette cannot present a visually reordered command.
+are rejected so the palette cannot present a visually reordered command — as
+are file names and parse errors on their way to a log line or a toast, because
+whoever can write to a scanned directory chooses both.
 
 ### Remote hosts
 

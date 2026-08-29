@@ -136,38 +136,21 @@ fn config_backup_health() -> (usize, usize, usize) {
     (present, valid, invalid_or_unreadable)
 }
 
-fn workflow_file(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            matches!(
-                extension.to_ascii_lowercase().as_str(),
-                "toml" | "yaml" | "yml"
-            )
-        })
-}
-
 fn workflow_discovery() -> (usize, usize, usize, usize) {
+    // Every question here is asked through `crate::workflows`, which asks
+    // `jterm_core::workflows`. This report used to carry its own
+    // `toml|yaml|yml` predicate and an uncapped `read_dir` of every workflow
+    // directory — a second implementation of the same on-disk contract inside
+    // one app, and the only place that ignored the per-directory caps the
+    // loader exists to enforce.
     let dirs = crate::workflows::workflow_dirs();
-    let mut readable_dirs = 0;
-    let mut rejected = 0;
-    for dir in &dirs {
-        let Ok(entries) = fs::read_dir(dir) else {
-            continue;
-        };
-        readable_dirs += 1;
-        for path in entries.filter_map(Result::ok).map(|entry| entry.path()) {
-            if path.is_file() && workflow_file(&path) && crate::workflows::load_one(&path).is_err()
-            {
-                rejected += 1;
-            }
-        }
-    }
+    let readable_dirs = dirs.iter().filter(|dir| fs::read_dir(dir).is_ok()).count();
+    let scan = crate::workflows::scan(&dirs);
     (
-        crate::workflows::load_all(&dirs).len(),
+        scan.workflows.len(),
         readable_dirs,
         dirs.len(),
-        rejected,
+        scan.refused.len(),
     )
 }
 
@@ -550,14 +533,6 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(executable_exists(path.to_str().unwrap()));
         let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn workflow_discovery_recognizes_all_supported_extensions() {
-        assert!(workflow_file(Path::new("one.toml")));
-        assert!(workflow_file(Path::new("two.YAML")));
-        assert!(workflow_file(Path::new("three.yml")));
-        assert!(!workflow_file(Path::new("README.md")));
     }
 
     #[test]

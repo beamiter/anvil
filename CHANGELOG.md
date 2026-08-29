@@ -272,6 +272,50 @@ versioning for tagged releases while it remains experimental.
 
 ### Changed
 
+- **A workflow argument the file gives no default for is no longer filled with
+  the empty string.** Leaving such a field blank and pressing Insert now reports
+  `missing values: <names>` in the dialog instead of inserting the template with
+  the placeholder rubbed out — `kill -9 {pid}` with an untouched Pid field used
+  to reach the prompt as `kill -9 `. anvil wrote that guard, unit-tested it
+  (`render_reports_missing_placeholder`, which passed an empty map), and then
+  defeated it in the dialog by seeding every declared argument with
+  `arg.default.unwrap_or_default()`; two of the three sibling terminals had the
+  same green-and-dead pair. The rule now lives under the UI — it inspects the
+  values themselves — so a dialog cannot seed past it. An argument that
+  *declares* a default, including `default = ""`, may still render empty:
+  the declaration is what says an empty value is meaningful there, and emptying
+  such a field stays a deliberate empty value rather than falling back to the
+  default.
+- The bundled `scripts/workflows/docker-tail-logs.yaml` no longer declares
+  `default: ""` for its `container` argument, so `container` is a required
+  argument and the example ships with the rule above applying to it. Under the
+  new contract an explicit empty default is an explicit empty *value*, so the
+  shipped example would have been the one workflow where Insert still produced
+  `docker logs -f --tail 100 `.
+- The workflow subsystem — discovery, the bounded reader, the TOML and YAML
+  parsers, validation and the template engine — is `jterm_core::workflows`,
+  shared with the sibling terminals, instead of a private copy.
+  `src/workflows.rs` keeps what anvil decides for itself and cannot omit and
+  still compile: glib rather than the `dirs` crate as the XDG backend, the
+  `anvil` path segment that `ANVIL_WORKFLOW_DIR` is derived from, the
+  source-tree tier (which has to be passed in, because `CARGO_MANIFEST_DIR`
+  resolves against the crate being compiled), and directory-precedence load
+  order rather than alphabetical. The palette and the off-thread single-flight
+  refresh keep their behaviour — the refresh keeps its named thread, its panic
+  containment and its keep-the-old-cache-on-error policy, and only its
+  hand-rolled single-flight latch is now shared — and the parameter dialog keeps
+  every widget it had. `serde_yaml_ng` is no longer
+  a direct dependency of anvil — the only YAML it reads is workflow files, and
+  those go through the shared loader now.
+- `anvil --doctor`'s workflow counts go through the loader instead of a second
+  `toml|yaml|yml` predicate and an uncapped `read_dir` of every workflow
+  directory — the one place in anvil that ignored the per-directory limits the
+  loader exists to enforce, so a directory holding 100k files no longer makes
+  the report do unbounded work. One edge case follows the loader rather than the
+  old walk: a *directory* named `x.yaml` inside a workflow directory now counts
+  as an invalid file ("source is not a regular file") instead of being skipped
+  by an `is_file()` pre-check, which is what the loader already logged for it.
+  The report still gives only counts; it does not name the rejected files.
 - **AI command correction now requires `ai_share_command_context`, which is off
   by default.** Correction itself defaults to on whenever `ai_enabled` is on,
   and its AI fallback used to send the failed command, the working directory
@@ -492,6 +536,23 @@ versioning for tagged releases while it remains experimental.
 
 ### Fixed
 
+- An unterminated `{{` in a workflow command is preserved again when a later
+  placeholder in the same template closes a pair. The scanner took the first
+  `}}` it could find anywhere to the right, so
+  `awk '{{print $1}' {{log}} | sort -u` rendered as
+  `awk '{print $1}' access.log | sort -u` — a different, executable awk
+  program — while the same template with no later placeholder round-tripped
+  correctly. Matching braces are now counted by depth, so an unmatched `{{` is
+  unmatched regardless of what follows it, and genuinely nested escapes
+  (`-d '{{"a":{{"b":1}}}}'` → `-d '{"a":{"b":1}}'`) still collapse.
+- A declared argument name that is not equal to its own trim — `name = "pid "`
+  — now rejects the whole file with a named error instead of loading. Template
+  placeholder names are trimmed before lookup, so `"pid "` could never bind
+  `{{pid}}`: the file loaded, the dialog showed a Pid row, whatever the user
+  typed into it was discarded, and the command reached the prompt with the
+  placeholder still in it. Both sides of that lookup are now held to the same
+  spelling, which is also the whole duplicate-name rule (`"pid"` and `"pid "`
+  used to be two accepted arguments addressing one placeholder).
 - Accepting a correction re-validates the edited draft against this surface's
   own 16 KiB budget. It was validated only by the shared review-input path,
   whose limit is 256 KiB, so a large paste into the correction field could be
@@ -734,6 +795,29 @@ versioning for tagged releases while it remains experimental.
 
 ### Security
 
+- **A symlinked workflow file is no longer loaded.** anvil opened workflow files
+  with `O_NONBLOCK | O_CLOEXEC` and, alone among the four terminals, without
+  `O_NOFOLLOW`, so a link planted at `~/.config/anvil/workflows/deploy.toml`
+  pointing at a world-writable file (or another account's home) was followed and
+  parsed, and its command became a palette entry that gets typed at a prompt.
+  The three siblings refused the same planted link at `open`. anvil now refuses
+  it too. This is user-visible: symlinking individual workflow files out of a
+  dotfiles checkout is a legitimate habit and those files will stop appearing,
+  so every refusal is now announced — anvil raises a toast naming the file and
+  the reason whenever the set of refused files changes, and `--doctor` counts
+  them. A symlinked *directory* in the search path is still scanned; only a
+  symlinked file inside one is refused. Move such files in, or symlink the
+  containing directory instead.
+- The reason a workflow file was rejected is sanitised before it is logged or
+  shown, not just the path it came from. anvil logged
+  `workflows: skipping {path}: {err}` with the parser's message raw, and a TOML
+  or YAML parse error quotes the offending source line back verbatim — so an
+  unterminated `command = "echo <ESC>]0;title<BEL>` wrote that OSC sequence onto
+  a warn line, into whatever terminal was tailing the log. Both halves of the
+  new toast, and the "workflow not found" path beside it, cross
+  `review_input::safe_inline_display` first, bounded to 256 bytes each: an
+  attacker who can drop a file in a scanned directory chooses its name as well
+  as its contents.
 - **A helper binary owned by a third user is no longer executed.** Automatic
   correction helpers were resolved by scanning the user's own `PATH`, and the
   trust predicate — `owner_uid == euid || mode & 0o022 != 0` — called a binary

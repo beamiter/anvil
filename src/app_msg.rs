@@ -47,7 +47,7 @@ pub(crate) enum AppMsg {
     /// Completion of the single-flight workflow cache refresh. Discovery and
     /// parsing happen off the GTK thread; the app loop owns the cache swap and
     /// any user-facing error.
-    WorkflowRefreshFinished(Result<Vec<crate::workflows::Workflow>, String>),
+    WorkflowRefreshFinished(Result<crate::workflows::LibraryScan, String>),
     ReloadConfig,
     PaneLaunched(u64),
     PaneLaunchFailed(u64, String),

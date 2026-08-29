@@ -433,6 +433,11 @@ struct AppModel {
     /// presents immediately from the last completed snapshot.
     workflows: Rc<RefCell<Vec<workflows::Workflow>>>,
     workflow_refresh: workflow_ops::WorkflowRefreshState,
+    /// Workflow files the last completed scan refused, so a refusal is
+    /// announced when it appears rather than on every palette open. anvil
+    /// gained `O_NOFOLLOW` with the shared loader, and a symlinked file it
+    /// used to read must not just quietly stop being a workflow.
+    workflow_refusals: Vec<std::path::PathBuf>,
     /// At most one agent session is active per app. Opening the panel
     /// while another session is alive cancels the previous one.
     active_agent: Rc<RefCell<Option<agent::AgentSession>>>,
@@ -1300,6 +1305,7 @@ impl SimpleComponent for AppModel {
             notebook,
             workflows,
             workflow_refresh: workflow_ops::WorkflowRefreshState::default(),
+            workflow_refusals: Vec::new(),
             active_agent: Rc::new(RefCell::new(None)),
             agent_panel_generation: Rc::new(std::cell::Cell::new(0)),
             agent_panel,

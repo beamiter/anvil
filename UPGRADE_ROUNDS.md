@@ -6,10 +6,13 @@ pass.
 Rounds 1–10 record the preceding pass; this pass's additional thirty-three rounds
 are numbered 11–43.
 
-The numbering stops at 43. The 32 commits since — including the shared
-chat-store adoption and the 2026-08-29 shared command-correction round —
-recorded their work in `CHANGELOG.md` and `handoff.md` instead of here, so this
-ledger is left closed rather than retro-fitted.
+The numbering stops at 43. Every round since — including the shared chat-store
+adoption, the 2026-08-29 shared command-correction round, and the 2026-08-29
+shared workflow-library round that made an undefaulted workflow argument
+required — recorded its work in `CHANGELOG.md` and `handoff.md` instead of
+here, so this ledger is left closed rather than retro-fitted. Do not resume the
+numbering for a single round; either the ledger comes back for a whole pass or
+it stays shut.
 
 1. **Prefix boundary** — install and uninstall reject empty, relative,
    control-bearing, or parent-traversing prefixes while retaining valid Unicode
