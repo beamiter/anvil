@@ -781,10 +781,78 @@ switching re-roots the tree at that account's home directory. Listing and file
 operations spawn the system `ssh` (BatchMode, 10 s connect timeout, `ssh_args`
 honored) or `docker exec` and run a small POSIX sh probe on the far side whose
 arguments are single-quote-escaped or passed as raw argv, so paths with spaces
-or shell metacharacters survive the trip. Right-clicking a row offers New
+or shell metacharacters survive the trip. A remote listing admits a name only
+when its UTF-8 bytes can be reused exactly for the actionable path; malformed,
+duplicate, and conflicting same-name records fail closed. The probe checks
+symlinks before directories, so a link to a directory is shown as a file-like
+leaf and cannot create an expansion cycle. It receives a hard 4097-record
+budget, stops enumerating on the far side at that boundary, retains at most
+4096 unique rows, and carries an explicit truncated bit back to the scan
+consumer instead of silently treating the prefix as complete. Right-clicking a row offers New
 File, New Folder, Rename, Delete (with confirmation), Copy, Cut, Paste, and
 Refresh; the same menu works locally, and a successful operation refreshes
 only the directories it touched, so unrelated expanded rows never collapse.
+Refreshes are latest-wins per directory: an older remote reply cannot overwrite
+a newer snapshot. Superseding a same-path request now retires it while it is
+queued for a scan slot and cooperatively stops an already-running remote list
+probe, including its process group. A non-root row removed while its request is
+in flight is discarded instead of having its children merged into the root.
+Surviving rows keep their loaded children and expansion; a same-name file ↔
+directory type flip is replaced exactly, and surviving selection/cursor
+identities are restored after reconciliation. Scans and mutations share 16
+fixed workers behind a hard 128-job pending limit. Each immutable remote
+authority is additionally capped at four running and 32 pending jobs.
+Authorities round-robin inside the Interactive, listing, and bulk-transfer
+lanes while those lanes retain weighted 4:2:1 admission, so one slow host cannot
+occupy the queue or starve another; at most four background transfers run
+globally. Cancellation physically removes queued work. The Files status
+therefore distinguishes **Queued**, **Loading**, and in-place
+**Refreshing**. An initial expansion failure leaves its lazy row retryable,
+while a refresh failure leaves the last-good contents visible. Both expose a
+focusable, accessibly labelled **Retry** button. Completed failures are bounded
+to the newest eight and user-visible errors are allow-listed by category, so
+SSH stderr, credentials, hostile control characters, and endpoint details are
+kept in bounded logs rather than labels or toasts. Queue wait and running time
+are observable without displaying authority details. Typed failures enter an
+authority/path exponential cooldown; automatic expansion and TTL work respect
+it, while an explicit Retry bypasses it once.
+
+Successful listings record their completion time; loaded directory snapshots
+become stale after 30 seconds or immediately when an exact file-operation
+affected directory is invalidated. Re-expansion refreshes only that stale
+directory. While Files is visible and the window active, a five-second tick
+boundedly revalidates the root plus at most seven loaded expanded directories;
+activation and reopening Files trigger the same check. Successful root
+listings also populate an authority-bound eight-entry LRU used only as a safe
+reconciliation seed, and exact operation directories invalidate it even if the
+user navigated away before completion. Plain **F5** refreshes the root plus up
+to 63 materialized expanded directories, and a row context-menu Refresh targets
+that exact directory (or a
+file's parent). F5 is accepted only while focus or the pointer is inside the
+visible Files header, status, or tree; terminal-region F5 and modified F5
+keystrokes continue to the terminal. Reconciliation clears only a vanished
+selection/cursor and the drag-hover target, and advances a presentation
+revision when rows actually change. Menus or confirmation dialogs captured
+before that change are rejected, while a file operation already dispatched
+against the validated backend can still settle and report its result.
+Dot-prefixed entries are hidden by default; the focusable eye button reveals
+or hides them instantly over the loaded model without rescanning or losing
+loaded expansion state. The name filter composes with that preference.
+
+The header has Back/Forward, Parent, filesystem Home, active-terminal-directory,
+and clickable breadcrumb actions. Location changes, Parent/Home, directory
+activation, history, and typed paths are transactions: Anvil freezes the
+authority, lists the absolute target, and commits the location/root/history
+only after that latest request succeeds. A failure, stale token, or changed
+authority leaves the old rows, expansion, and selection untouched. History is
+success-only, bounded to 50 entries per authority, and Forward is truncated
+only by a successful divergent navigation. **Ctrl+L** opens the absolute-path
+entry; it rejects relative, dot-segment, oversized, control, and bidi/spoofing
+text before any probe. Non-UTF-8 local paths are never copied lossily into the
+actionable entry. **Alt+Left/Right**, **Alt+Up**, and **Alt+Home** invoke
+history, Parent, and Home only while keyboard focus is within the mapped Files
+region. Merely hovering Files never captures a terminal's Ctrl+L or Alt chord;
+F5 retains its separate focus-or-hover refresh policy.
 
 Files also follows an ordinary interactive SSH login launched in the focused
 pane. Anvil uses the shared dedicated process observer to read the real

@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-27 (process-observed SSH Files follow)
+Updated: 2026-08-29 (Files transactional navigation and authority isolation)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,121 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **Files transactional navigation and authority isolation (2026-08-29)**:
+  location selection, Parent/Home, directory activation, Back/Forward,
+  breadcrumbs, terminal-cwd following, and Ctrl+L absolute paths now stage a
+  frozen-authority list and mutate the live tree only after the latest token
+  succeeds. Failure or authority remap rejection preserves the old tree and
+  selection. Per-authority success-only history is capped at 50; Ctrl+L rejects
+  relative, dot-segment, oversized, control, and bidi/spoofing input, and never
+  turns a lossy non-UTF-8 display into an actionable local path. Alt+Left/Right
+  are keyboard-focus-scoped alongside Alt+Up/Home; pointer hover alone never
+  captures a terminal Ctrl+L or Alt navigation chord. Remote Home also owns a
+  navigation token while probing, so Home → Up/Ctrl+L/location deterministically
+  retires the old callback before it can stage a newer-root overwrite.
+
+  The fixed 16/128 scheduler now keys jobs by immutable authority, caps each
+  remote at four running and 32 pending, and round-robins authorities within
+  the existing 4:2:1 priority cycle. Queued cancellation still physically
+  retires work, and safe status text exposes queue wait plus running duration.
+  Typed per-authority/path failures use exponential cooldown for automatic
+  expansion and TTL work; explicit Retry bypasses once. While Files is visible
+  and active, activation/open plus a five-second tick revalidate a bounded root
+  + expanded set. An authority-bound eight-root LRU provides an incremental
+  reconciliation seed, and completed operations invalidate exact affected
+  roots even after navigation. Stress/fault regressions cover remote caps,
+  authority RR, stale token/authority rejection, typed backoff, bounded TTL
+  planning, history isolation/cap, path validation, and cache isolation.
+
+- **Files bounded scheduler, snapshots, and remote navigation (2026-08-29)**:
+  all tree scans, interactive mutations, and bulk transfers now enter one fixed
+  16-worker scheduler with a hard 128-job pending cap. Three FIFO lanes use a
+  4:2:1 Interactive/Normal/Background admission cycle and background work is
+  capped at four running jobs, so transfers cannot consume every listing slot.
+  The status transition is explicit Queued → Loading/Refreshing → success or
+  classified Error; a superseded queued listing is physically retired and
+  still receives a terminal callback, while the newest eight completed errors
+  remain retryable. Stress tests lock capacity, reclamation, weighted FIFO
+  order, cancellation-before-start, and the absence of stranded in-flight
+  state. User-visible filesystem errors are allow-listed categories and never
+  repeat SSH/probe stderr, credentials, endpoints, control characters, or bidi
+  text; detailed bounded diagnostics remain log-only.
+
+  Each successful listing carries `completed_at`; the per-path snapshot index
+  treats entries as stale after 30 seconds or immediately after an operation
+  invalidates its exact affected directories. Expanding a loaded stale row
+  refreshes only that directory. F5 now refreshes the root plus up to 63
+  materialized expanded directories, while right-click Refresh targets the
+  clicked directory or a clicked file's parent. Reconciliation replaces an
+  exact same-path file/directory type flip, restores surviving selection and
+  cursor identities, and drops only vanished identities plus drag hover.
+
+  The Files header now separates Parent, filesystem Home, and active-terminal
+  cwd. Remote Home re-probes the frozen complete backend authority and leaves
+  the current last-good tree untouched on failure. Row activation enters a
+  still-materialized directory as the new root; Alt+Up and Alt+Home perform the
+  two authority-safe navigation actions only within the mapped Files scope and
+  do not capture terminal-region keys. Pure regressions cover snapshot expiry
+  and explicit invalidation, selection survivors, type flips,
+  authority/generation ABA, lexical enter confinement, and keyboard scope.
+
+- **Files remote failure recovery and scoped refresh (2026-08-29)**: the Files
+  region now presents distinct Loading and in-place Refreshing states. A failed
+  first expansion keeps its lazy placeholder retryable; a failed refresh keeps
+  every last-good row and loaded subtree visible. Errors remain in the Files
+  region with a real focusable, accessibly labelled Retry button, and the
+  status tracker retains a bounded set of concurrent directory failures so
+  unrelated progress or success cannot erase them. A retry is bound to the
+  exact root, expansion, or refresh target and stale completions cannot replace
+  its state. Same-path
+  refresh tickets now cooperatively cancel their predecessor: a superseded
+  worker retires before scheduler dispatch or starting its probe, and an
+  already-running remote list uses the existing watchdog/process-group kill
+  path. Plain F5 refreshes only when focus or the pointer is within the mapped
+  Files header, status, or tree; it does not capture terminal-region or
+  modified F5 input. Pure state and scope regressions plus scheduler-wait and
+  real in-flight process-group cancellation coverage lock these contracts.
+
+- **Files remote listing and reconciliation hardening (2026-08-29)**: the
+  remote `list` protocol now receives the retained entry cap plus one, validates
+  that positive integer in the POSIX probe, and stops enumeration on the far
+  side at the hard boundary. The extra record is preserved as explicit
+  `DirectoryListing::truncated` metadata while only 4096 rows are retained.
+  Remote names must be valid UTF-8 before the same exact text is used to build
+  an actionable path; malformed names are skipped, identical records collapse,
+  and conflicting file/directory claims for one name suppress that path. The
+  probe checks `-L` before `-d`, keeping symlinked directories as non-expandable
+  leaves. A successful in-place reconciliation that actually changes rows now
+  restores surviving selection/cursor identities, clears drag-hover state, and
+  advances a separate content revision. Visible menu/drop/header intents capture
+  it, so a removed row's
+  delayed menu or confirmation cannot act on a replacement path; already
+  dispatched filesystem settlement remains governed by its frozen backend
+  authority and is not cancelled by presentation churn. Tests cover hostile
+  UTF-8 and duplicate output, type collisions, production entries-plus-one
+  argv, real POSIX-sh hard limiting, symlink-to-directory typing, truncation,
+  and delayed-versus-dispatched intent semantics.
+
+- **Files remote refresh ordering (2026-08-29)**: in-place directory refreshes
+  now carry a latest-wins revision per absolute path in addition to the tree's
+  navigation generation. A second refresh supersedes the first even when root
+  and remote authority do not change, so an older SSH/Docker listing cannot
+  roll the model back after a newer reply. Root and row refresh targets are
+  distinct variants: a non-root `TreeRowReference` that disappears or resolves
+  to another identity fails closed instead of accidentally merging that
+  directory's entries into the model root. Existing merge behavior remains
+  non-destructive for surviving rows, preserving loaded descendants and
+  expansion; refresh errors continue to leave the last good rows visible.
+  Pure regressions cover out-of-order same-path completion, one-shot
+  publication, reroot cancellation, replaced identities, and vanished targets.
+
+- **Files hidden-entry policy (2026-08-29)**: the header now has a focusable,
+  accessible eye toggle. Dot-prefixed entries are hidden by default and are
+  revealed by refiltering the already-loaded GTK tree, so no local/remote scan,
+  navigation generation, filesystem intent, or loaded expansion state is
+  disturbed. Name filtering composes with the preference, and pure policy
+  coverage locks its independence from query state.
 
 - **Process-observed SSH Files follow (2026-08-27)**: the active pane's existing
   `/proc` foreground-command probe now uses `jterm_core`'s exact-pinned
@@ -458,7 +573,8 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked
 ```
 
-Latest process-observed SSH Files-follow validation: 1180 passed, 38 ignored,
-0 failed in the full all-target/all-feature suite; display-backed tests passed
-23/23. Format checking, clippy with warnings denied, rustdoc with warnings
-denied, and both staged/unstaged diff checks passed.
+Latest Files scheduler/snapshot/navigation validation: 1451 passed, 39 ignored,
+0 failed in the full all-target suite. Format and diff checks pass. Clippy with
+warnings denied reaches no new Files/remote-fs diagnostics, but the shared dirty
+tree remains blocked by unrelated `workspace_ops.rs::add_task_terminal_tab`
+(`too_many_arguments`) and `agent_task_ui.rs` (`items_after_test_module`) lints.

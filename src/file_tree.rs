@@ -17,14 +17,16 @@ use gtk::{
     TreeView, TreeViewColumn,
 };
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 // TreeStore column indices.
 pub(crate) const COL_NAME: u32 = 0;
@@ -38,36 +40,440 @@ const MAX_FILE_NAME_DISPLAY_BYTES: usize = 512;
 const MAX_FILE_PATH_DISPLAY_BYTES: usize = 4 * 1024;
 const MAX_FILE_PATH_IDENTITY_BYTES: usize = 64 * 1024;
 const PATH_IDENTITY_PREFIX: &str = "unix-path-v1:";
+const FILE_TREE_RETRY_ACCESSIBLE_LABEL: &str = "Retry directory scan";
+const MAX_VISIBLE_DIRECTORY_ERRORS: usize = 8;
 const MAX_CONCURRENT_SCANS: usize = 16;
-static ACTIVE_SCANS: AtomicUsize = AtomicUsize::new(0);
+const MAX_PENDING_FS_JOBS: usize = 128;
+const MAX_BACKGROUND_FS_JOBS: usize = 4;
+const MAX_REMOTE_RUNNING_FS_JOBS: usize = 4;
+const MAX_REMOTE_PENDING_FS_JOBS: usize = 32;
+pub(crate) const MAX_BULK_REFRESH_DIRS: usize = 64;
+pub(crate) const MAX_TTL_REVALIDATE_DIRS: usize = 8;
+const DIRECTORY_SNAPSHOT_TTL: Duration = Duration::from_secs(30);
+const MAX_FILE_TREE_HISTORY: usize = 50;
+const MAX_ROOT_LISTING_CACHE: usize = 8;
+const MAX_TYPED_FILE_TREE_PATH_BYTES: usize = 4 * 1024;
+const SCHEDULER_WEIGHTS: [FsJobPriority; 7] = [
+    FsJobPriority::Interactive,
+    FsJobPriority::Interactive,
+    FsJobPriority::Interactive,
+    FsJobPriority::Interactive,
+    FsJobPriority::Normal,
+    FsJobPriority::Normal,
+    FsJobPriority::Background,
+];
 
-struct ScanPermit;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FsJobPriority {
+    Interactive,
+    Normal,
+    Background,
+}
 
-impl ScanPermit {
-    /// Take one scan slot, waiting until another op releases its own. The cap
-    /// bounds concurrent ssh/docker subprocesses; it must never reject user
-    /// actions, so contention parks the worker thread instead of failing the
-    /// request.
-    fn acquire() -> Self {
-        loop {
-            let taken = ACTIVE_SCANS.fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < MAX_CONCURRENT_SCANS).then_some(active + 1)
-            });
-            if taken.is_ok() {
-                return Self;
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum FsAuthorityKey {
+    Local,
+    Remote(Box<FsRemoteAuthorityKey>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct FsRemoteAuthorityKey {
+    identity: crate::config::RemoteHost,
+    execution: crate::config::RemoteHost,
+}
+
+impl FsAuthorityKey {
+    pub(crate) fn capture(
+        location: &crate::remote_fs::FsLocation,
+        hosts: &[crate::config::RemoteHost],
+    ) -> io::Result<Self> {
+        match location {
+            crate::remote_fs::FsLocation::Local => Ok(Self::Local),
+            crate::remote_fs::FsLocation::Remote(index) => {
+                crate::config::checked_remote_host(hosts, *index)
+                    .cloned()
+                    .map(|host| {
+                        Self::Remote(Box::new(FsRemoteAuthorityKey {
+                            identity: host.clone(),
+                            execution: host,
+                        }))
+                    })
+                    .map_err(|message| io::Error::new(io::ErrorKind::NotFound, message))
             }
-            std::thread::sleep(SCAN_POLL_INTERVAL);
+            crate::remote_fs::FsLocation::Transient(endpoint) => {
+                crate::config::validate_remote_host(endpoint.identity())
+                    .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+                crate::config::validate_remote_host(endpoint.execution())
+                    .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+                Ok(Self::Remote(Box::new(FsRemoteAuthorityKey {
+                    identity: endpoint.identity().clone(),
+                    execution: endpoint.execution().clone(),
+                })))
+            }
+        }
+    }
+
+    fn is_remote(&self) -> bool {
+        matches!(self, Self::Remote(_))
+    }
+}
+
+struct ScheduledFsJob {
+    authority: FsAuthorityKey,
+    queued_at: Instant,
+    cancellation: Option<ScanCancellation>,
+    run: Option<Box<dyn FnOnce(Duration) + Send + 'static>>,
+    cancel: Option<Box<dyn FnOnce() + Send + 'static>>,
+}
+
+impl ScheduledFsJob {
+    fn is_cancelled(&self) -> bool {
+        self.cancellation
+            .as_ref()
+            .is_some_and(ScanCancellation::is_cancelled)
+    }
+
+    fn run(mut self) {
+        if self.is_cancelled() {
+            self.cancel();
+        } else if let Some(run) = self.run.take() {
+            run(self.queued_at.elapsed());
+        }
+    }
+
+    fn cancel(mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            cancel();
         }
     }
 }
 
-impl Drop for ScanPermit {
-    fn drop(&mut self) {
-        ACTIVE_SCANS.fetch_sub(1, Ordering::AcqRel);
+struct SchedulerQueues {
+    interactive: AuthorityQueueLane,
+    normal: AuthorityQueueLane,
+    background: AuthorityQueueLane,
+    cursor: usize,
+    capacity: usize,
+}
+
+struct AuthorityQueue {
+    authority: FsAuthorityKey,
+    jobs: VecDeque<ScheduledFsJob>,
+}
+
+#[derive(Default)]
+struct AuthorityQueueLane {
+    authorities: VecDeque<AuthorityQueue>,
+}
+
+impl AuthorityQueueLane {
+    fn len(&self) -> usize {
+        self.authorities.iter().map(|queue| queue.jobs.len()).sum()
+    }
+
+    fn authority_len(&self, authority: &FsAuthorityKey) -> usize {
+        self.authorities
+            .iter()
+            .find(|queue| &queue.authority == authority)
+            .map_or(0, |queue| queue.jobs.len())
+    }
+
+    fn push(&mut self, job: ScheduledFsJob) {
+        if let Some(queue) = self
+            .authorities
+            .iter_mut()
+            .find(|queue| queue.authority == job.authority)
+        {
+            queue.jobs.push_back(job);
+        } else {
+            self.authorities.push_back(AuthorityQueue {
+                authority: job.authority.clone(),
+                jobs: VecDeque::from([job]),
+            });
+        }
+    }
+
+    fn pop_allowed(
+        &mut self,
+        running_authorities: &[(FsAuthorityKey, usize)],
+    ) -> Option<ScheduledFsJob> {
+        let count = self.authorities.len();
+        for _ in 0..count {
+            let Some(mut queue) = self.authorities.pop_front() else {
+                break;
+            };
+            let running = running_authorities
+                .iter()
+                .find(|(authority, _)| authority == &queue.authority)
+                .map_or(0, |(_, running)| *running);
+            if !queue.authority.is_remote() || running < MAX_REMOTE_RUNNING_FS_JOBS {
+                let job = queue.jobs.pop_front();
+                if !queue.jobs.is_empty() {
+                    self.authorities.push_back(queue);
+                }
+                if job.is_some() {
+                    return job;
+                }
+            } else {
+                self.authorities.push_back(queue);
+            }
+        }
+        None
+    }
+
+    fn drain_cancelled(&mut self, cancelled: &mut Vec<ScheduledFsJob>) {
+        let authority_count = self.authorities.len();
+        for _ in 0..authority_count {
+            let Some(mut queue) = self.authorities.pop_front() else {
+                break;
+            };
+            let job_count = queue.jobs.len();
+            for _ in 0..job_count {
+                let Some(job) = queue.jobs.pop_front() else {
+                    break;
+                };
+                if job.is_cancelled() {
+                    cancelled.push(job);
+                } else {
+                    queue.jobs.push_back(job);
+                }
+            }
+            if !queue.jobs.is_empty() {
+                self.authorities.push_back(queue);
+            }
+        }
     }
 }
 
-#[derive(Debug)]
+impl SchedulerQueues {
+    fn new(capacity: usize) -> Self {
+        Self {
+            interactive: AuthorityQueueLane::default(),
+            normal: AuthorityQueueLane::default(),
+            background: AuthorityQueueLane::default(),
+            cursor: 0,
+            capacity,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.interactive.len() + self.normal.len() + self.background.len()
+    }
+
+    fn push(&mut self, priority: FsJobPriority, job: ScheduledFsJob) -> Result<(), ScheduledFsJob> {
+        if self.len() >= self.capacity {
+            return Err(job);
+        }
+        if job.authority.is_remote() {
+            let pending = self.interactive.authority_len(&job.authority)
+                + self.normal.authority_len(&job.authority)
+                + self.background.authority_len(&job.authority);
+            if pending >= MAX_REMOTE_PENDING_FS_JOBS {
+                return Err(job);
+            }
+        }
+        self.queue_mut(priority).push(job);
+        Ok(())
+    }
+
+    fn pop_next(
+        &mut self,
+        allow_background: bool,
+        running_authorities: &[(FsAuthorityKey, usize)],
+    ) -> Option<(FsJobPriority, ScheduledFsJob)> {
+        for _ in 0..SCHEDULER_WEIGHTS.len() {
+            let priority = SCHEDULER_WEIGHTS[self.cursor];
+            self.cursor = (self.cursor + 1) % SCHEDULER_WEIGHTS.len();
+            if priority == FsJobPriority::Background && !allow_background {
+                continue;
+            }
+            if let Some(job) = self.queue_mut(priority).pop_allowed(running_authorities) {
+                return Some((priority, job));
+            }
+        }
+        None
+    }
+
+    fn drain_cancelled(&mut self) -> Vec<ScheduledFsJob> {
+        let mut cancelled = Vec::new();
+        self.interactive.drain_cancelled(&mut cancelled);
+        self.normal.drain_cancelled(&mut cancelled);
+        self.background.drain_cancelled(&mut cancelled);
+        cancelled
+    }
+
+    fn queue_mut(&mut self, priority: FsJobPriority) -> &mut AuthorityQueueLane {
+        match priority {
+            FsJobPriority::Interactive => &mut self.interactive,
+            FsJobPriority::Normal => &mut self.normal,
+            FsJobPriority::Background => &mut self.background,
+        }
+    }
+}
+
+struct SchedulerState {
+    queues: SchedulerQueues,
+    running_background: usize,
+    running_authorities: Vec<(FsAuthorityKey, usize)>,
+}
+
+struct FsSchedulerInner {
+    state: Mutex<SchedulerState>,
+    wake: Condvar,
+}
+
+struct FsScheduler {
+    inner: Arc<FsSchedulerInner>,
+}
+
+impl FsScheduler {
+    fn new() -> io::Result<Self> {
+        let inner = Arc::new(FsSchedulerInner {
+            state: Mutex::new(SchedulerState {
+                queues: SchedulerQueues::new(MAX_PENDING_FS_JOBS),
+                running_background: 0,
+                running_authorities: Vec::new(),
+            }),
+            wake: Condvar::new(),
+        });
+        let mut started = 0usize;
+        for index in 0..MAX_CONCURRENT_SCANS {
+            let worker = inner.clone();
+            match std::thread::Builder::new()
+                .name(format!("anvil-file-tree-worker-{index}"))
+                .spawn(move || fs_scheduler_worker(worker))
+            {
+                Ok(_) => started += 1,
+                Err(error) => log::error!("failed to start file-tree worker {index}: {error}"),
+            }
+        }
+        if started == 0 {
+            return Err(io::Error::other("could not start any file-tree workers"));
+        }
+        Ok(Self { inner })
+    }
+
+    fn global() -> io::Result<&'static Self> {
+        static SCHEDULER: OnceLock<Result<FsScheduler, String>> = OnceLock::new();
+        match SCHEDULER.get_or_init(|| Self::new().map_err(|error| error.to_string())) {
+            Ok(scheduler) => Ok(scheduler),
+            Err(message) => Err(io::Error::other(message.clone())),
+        }
+    }
+
+    fn submit(&self, priority: FsJobPriority, job: ScheduledFsJob) -> io::Result<()> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cancelled = state.queues.drain_cancelled();
+        let pushed = state.queues.push(priority, job).is_ok();
+        drop(state);
+        for job in cancelled {
+            job.cancel();
+        }
+        if !pushed {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "file-tree scheduler capacity reached; retry shortly",
+            ));
+        }
+        self.inner.wake.notify_one();
+        Ok(())
+    }
+}
+
+fn fs_scheduler_worker(inner: Arc<FsSchedulerInner>) {
+    loop {
+        let (cancelled, work) = {
+            let mut state = inner
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            loop {
+                let cancelled = state.queues.drain_cancelled();
+                let allow_background = state.running_background < MAX_BACKGROUND_FS_JOBS;
+                let running_authorities = state.running_authorities.clone();
+                if let Some((priority, job)) = state
+                    .queues
+                    .pop_next(allow_background, &running_authorities)
+                {
+                    if priority == FsJobPriority::Background {
+                        state.running_background += 1;
+                    }
+                    if let Some((_, running)) = state
+                        .running_authorities
+                        .iter_mut()
+                        .find(|(authority, _)| authority == &job.authority)
+                    {
+                        *running += 1;
+                    } else {
+                        state.running_authorities.push((job.authority.clone(), 1));
+                    }
+                    break (cancelled, Some((priority, job)));
+                }
+                if !cancelled.is_empty() {
+                    break (cancelled, None);
+                }
+                state = inner
+                    .wake
+                    .wait(state)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+        };
+        for job in cancelled {
+            job.cancel();
+        }
+        let Some((priority, job)) = work else {
+            continue;
+        };
+        let authority = job.authority.clone();
+        job.run();
+        {
+            let mut state = inner
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(index) = state
+                .running_authorities
+                .iter()
+                .position(|(running_authority, _)| running_authority == &authority)
+            {
+                state.running_authorities[index].1 =
+                    state.running_authorities[index].1.saturating_sub(1);
+                if state.running_authorities[index].1 == 0 {
+                    state.running_authorities.remove(index);
+                }
+            }
+            if priority == FsJobPriority::Background {
+                state.running_background = state.running_background.saturating_sub(1);
+            }
+        }
+        inner.wake.notify_all();
+    }
+}
+
+/// Cooperative cancellation shared by the GTK request registry, a queued
+/// scheduler job, and the remote capture watchdog.
+#[derive(Clone, Default)]
+pub(crate) struct ScanCancellation(Arc<AtomicBool>);
+
+impl ScanCancellation {
+    pub(crate) fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+fn cancelled_scan_error() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "directory scan was superseded")
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct FileEntry {
     name: String,
     path: PathBuf,
@@ -96,6 +502,828 @@ impl FileEntry {
     }
 }
 
+/// One bounded directory snapshot. `truncated` is explicit instead of silently
+/// presenting the retained prefix as the complete remote directory.
+#[derive(Clone, Debug)]
+pub(crate) struct DirectoryListing {
+    entries: Vec<FileEntry>,
+    truncated: bool,
+    completed_at: Instant,
+}
+
+impl DirectoryListing {
+    pub(crate) fn new(entries: Vec<FileEntry>, truncated: bool) -> Self {
+        Self {
+            entries,
+            truncated,
+            completed_at: Instant::now(),
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<FileEntry>, bool) {
+        (self.entries, self.truncated)
+    }
+
+    pub(crate) fn completed_at(&self) -> Instant {
+        self.completed_at
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entries(&self) -> &[FileEntry] {
+        &self.entries
+    }
+
+    pub(crate) fn truncated(&self) -> bool {
+        self.truncated
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DirectorySnapshot {
+    completed_at: Instant,
+    stale: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SnapshotFreshness {
+    Missing,
+    Fresh,
+    Stale,
+}
+
+#[derive(Default)]
+pub(crate) struct DirectorySnapshots {
+    by_path: std::collections::HashMap<PathBuf, DirectorySnapshot>,
+}
+
+impl DirectorySnapshots {
+    pub(crate) fn record_success(&mut self, path: PathBuf, completed_at: Instant) {
+        self.by_path.insert(
+            path,
+            DirectorySnapshot {
+                completed_at,
+                stale: false,
+            },
+        );
+    }
+
+    pub(crate) fn mark_stale<'a>(&mut self, paths: impl IntoIterator<Item = &'a PathBuf>) {
+        for path in paths {
+            if let Some(snapshot) = self.by_path.get_mut(path) {
+                snapshot.stale = true;
+            }
+        }
+    }
+
+    pub(crate) fn freshness_at(&self, path: &Path, now: Instant) -> SnapshotFreshness {
+        let Some(snapshot) = self.by_path.get(path) else {
+            return SnapshotFreshness::Missing;
+        };
+        if snapshot.stale
+            || now.saturating_duration_since(snapshot.completed_at) >= DIRECTORY_SNAPSHOT_TTL
+        {
+            SnapshotFreshness::Stale
+        } else {
+            SnapshotFreshness::Fresh
+        }
+    }
+
+    pub(crate) fn needs_refresh(&self, path: &Path) -> bool {
+        self.freshness_at(path, Instant::now()) == SnapshotFreshness::Stale
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.by_path.clear();
+    }
+
+    pub(crate) fn due_paths_at(
+        &self,
+        paths: impl IntoIterator<Item = PathBuf>,
+        now: Instant,
+        limit: usize,
+    ) -> Vec<PathBuf> {
+        paths
+            .into_iter()
+            .filter(|path| self.freshness_at(path, now) == SnapshotFreshness::Stale)
+            .take(limit)
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct FileTreeHistoryEntry {
+    pub(crate) location: crate::remote_fs::FsLocation,
+    pub(crate) hosts: Vec<crate::config::RemoteHost>,
+    pub(crate) root: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum NavigationHistoryAction {
+    Push,
+    MoveTo(usize),
+}
+
+#[derive(Default)]
+pub(crate) struct FileTreeNavigationHistory {
+    authorities: Vec<AuthorityNavigationHistory>,
+}
+
+struct AuthorityNavigationHistory {
+    authority: FsAuthorityKey,
+    entries: Vec<FileTreeHistoryEntry>,
+    cursor: Option<usize>,
+}
+
+impl FileTreeNavigationHistory {
+    pub(crate) fn back(&self, authority: &FsAuthorityKey) -> Option<(usize, FileTreeHistoryEntry)> {
+        let history = self
+            .authorities
+            .iter()
+            .find(|history| &history.authority == authority)?;
+        let index = history.cursor?.checked_sub(1)?;
+        Some((index, history.entries.get(index)?.clone()))
+    }
+
+    pub(crate) fn forward(
+        &self,
+        authority: &FsAuthorityKey,
+    ) -> Option<(usize, FileTreeHistoryEntry)> {
+        let history = self
+            .authorities
+            .iter()
+            .find(|history| &history.authority == authority)?;
+        let index = history.cursor?.checked_add(1)?;
+        Some((index, history.entries.get(index)?.clone()))
+    }
+
+    pub(crate) fn retry_action(
+        &self,
+        authority: &FsAuthorityKey,
+        root: &Path,
+    ) -> NavigationHistoryAction {
+        self.back(authority)
+            .filter(|(_, entry)| entry.root == root)
+            .or_else(|| {
+                self.forward(authority)
+                    .filter(|(_, entry)| entry.root == root)
+            })
+            .map_or(NavigationHistoryAction::Push, |(index, _)| {
+                NavigationHistoryAction::MoveTo(index)
+            })
+    }
+
+    pub(crate) fn commit(&mut self, action: NavigationHistoryAction, entry: FileTreeHistoryEntry) {
+        let Ok(authority) = FsAuthorityKey::capture(&entry.location, &entry.hosts) else {
+            return;
+        };
+        let history = if let Some(index) = self
+            .authorities
+            .iter()
+            .position(|history| history.authority == authority)
+        {
+            &mut self.authorities[index]
+        } else {
+            self.authorities.push(AuthorityNavigationHistory {
+                authority,
+                entries: Vec::new(),
+                cursor: None,
+            });
+            self.authorities.last_mut().expect("history was inserted")
+        };
+        match action {
+            NavigationHistoryAction::MoveTo(index) => {
+                if history
+                    .entries
+                    .get(index)
+                    .is_some_and(|candidate| candidate.root == entry.root)
+                {
+                    history.cursor = Some(index);
+                }
+            }
+            NavigationHistoryAction::Push => {
+                if history
+                    .cursor
+                    .and_then(|cursor| history.entries.get(cursor))
+                    == Some(&entry)
+                {
+                    return;
+                }
+                let keep = history.cursor.map_or(0, |cursor| cursor.saturating_add(1));
+                history.entries.truncate(keep);
+                history.entries.push(entry);
+                if history.entries.len() > MAX_FILE_TREE_HISTORY {
+                    let overflow = history.entries.len() - MAX_FILE_TREE_HISTORY;
+                    history.entries.drain(..overflow);
+                }
+                history.cursor = history.entries.len().checked_sub(1);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self, authority: &FsAuthorityKey) -> usize {
+        self.authorities
+            .iter()
+            .find(|history| &history.authority == authority)
+            .map_or(0, |history| history.entries.len())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PendingTreeNavigation {
+    pub(crate) token: u64,
+    pub(crate) location: crate::remote_fs::FsLocation,
+    pub(crate) hosts: Vec<crate::config::RemoteHost>,
+    pub(crate) root: PathBuf,
+    pub(crate) history: NavigationHistoryAction,
+    pub(crate) status_request: u64,
+    pub(crate) cached: Option<DirectoryListing>,
+}
+
+#[derive(Clone)]
+struct CachedRootListing {
+    authority: FsAuthorityKey,
+    root: PathBuf,
+    listing: DirectoryListing,
+}
+
+#[derive(Default)]
+pub(crate) struct RootListingCache {
+    entries: VecDeque<CachedRootListing>,
+}
+
+impl RootListingCache {
+    pub(crate) fn insert(
+        &mut self,
+        authority: FsAuthorityKey,
+        root: PathBuf,
+        listing: DirectoryListing,
+    ) {
+        self.entries
+            .retain(|entry| entry.authority != authority || entry.root != root);
+        self.entries.push_back(CachedRootListing {
+            authority,
+            root,
+            listing,
+        });
+        while self.entries.len() > MAX_ROOT_LISTING_CACHE {
+            self.entries.pop_front();
+        }
+    }
+
+    pub(crate) fn get(
+        &mut self,
+        authority: &FsAuthorityKey,
+        root: &Path,
+    ) -> Option<DirectoryListing> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| &entry.authority == authority && entry.root == root)?;
+        let entry = self.entries.remove(index)?;
+        let listing = entry.listing.clone();
+        self.entries.push_back(entry);
+        Some(listing)
+    }
+
+    pub(crate) fn invalidate<'a>(
+        &mut self,
+        authority: &FsAuthorityKey,
+        paths: impl IntoIterator<Item = &'a PathBuf>,
+    ) {
+        let paths: std::collections::HashSet<PathBuf> = paths.into_iter().cloned().collect();
+        self.entries
+            .retain(|entry| &entry.authority != authority || !paths.contains(&entry.root));
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DirectoryFailureRecord {
+    authority: FsAuthorityKey,
+    path: PathBuf,
+    count: u32,
+    retry_at: Instant,
+}
+
+#[derive(Default)]
+pub(crate) struct DirectoryFailureGate {
+    records: Vec<DirectoryFailureRecord>,
+}
+
+impl DirectoryFailureGate {
+    pub(crate) fn allows_auto_at(
+        &self,
+        authority: &FsAuthorityKey,
+        path: &Path,
+        now: Instant,
+    ) -> bool {
+        self.records
+            .iter()
+            .find(|record| &record.authority == authority && record.path == path)
+            .is_none_or(|record| now >= record.retry_at)
+    }
+
+    pub(crate) fn record_success(&mut self, authority: &FsAuthorityKey, path: &Path) {
+        self.records
+            .retain(|record| &record.authority != authority || record.path != path);
+    }
+
+    pub(crate) fn record_failure_at(
+        &mut self,
+        authority: FsAuthorityKey,
+        path: PathBuf,
+        kind: crate::remote_fs::FsFailureKind,
+        now: Instant,
+    ) -> Duration {
+        if kind == crate::remote_fs::FsFailureKind::Superseded {
+            return Duration::ZERO;
+        }
+        let existing = self
+            .records
+            .iter_mut()
+            .find(|record| record.authority == authority && record.path == path);
+        let count = existing
+            .as_ref()
+            .map_or(1, |record| record.count.saturating_add(1));
+        let delay = failure_retry_delay(kind, count);
+        let record = DirectoryFailureRecord {
+            authority,
+            path,
+            count,
+            retry_at: now + delay,
+        };
+        if let Some(existing) = existing {
+            *existing = record;
+        } else {
+            self.records.push(record);
+        }
+        delay
+    }
+}
+
+fn failure_retry_delay(kind: crate::remote_fs::FsFailureKind, count: u32) -> Duration {
+    use crate::remote_fs::FsFailureKind;
+    match kind {
+        FsFailureKind::Connection | FsFailureKind::TimedOut | FsFailureKind::QueueFull => {
+            Duration::from_secs(
+                1u64.checked_shl(count.saturating_sub(1).min(5))
+                    .unwrap_or(32)
+                    .min(30),
+            )
+        }
+        FsFailureKind::Missing => Duration::from_secs(2),
+        FsFailureKind::Permission
+        | FsFailureKind::InvalidRequest
+        | FsFailureKind::InvalidResponse => Duration::from_secs(30),
+        FsFailureKind::Exists | FsFailureKind::Other => Duration::from_secs(4),
+        FsFailureKind::Superseded => Duration::ZERO,
+    }
+}
+
+pub(crate) fn validate_typed_file_tree_path(text: &str) -> Result<PathBuf, &'static str> {
+    if text.is_empty() || text.len() > MAX_TYPED_FILE_TREE_PATH_BYTES {
+        return Err("Enter an absolute path no longer than 4096 bytes.");
+    }
+    if crate::review_input::contains_visual_spoofing(text) || text.chars().any(char::is_control) {
+        return Err("The path contains hidden, bidirectional, or control characters.");
+    }
+    if !text.starts_with('/') {
+        return Err("Enter an absolute path beginning with '/'.");
+    }
+    if text
+        .split('/')
+        .any(|component| component == "." || component == "..")
+    {
+        return Err("Use a normalized absolute path without '.' or '..' components.");
+    }
+    Ok(PathBuf::from(text))
+}
+
+pub(crate) fn pending_navigation_is_current(
+    token: u64,
+    current_token: u64,
+    expected_authority: &FsAuthorityKey,
+    current_authority: &FsAuthorityKey,
+) -> bool {
+    token == current_token && expected_authority == current_authority
+}
+
+pub(crate) fn home_navigation_is_current(
+    token: u64,
+    current_token: u64,
+    intent: &FileTreeIntent,
+    generation: u64,
+    location: &crate::remote_fs::FsLocation,
+    hosts: &[crate::config::RemoteHost],
+) -> bool {
+    token == current_token && file_tree_intent_is_current(intent, generation, location, hosts)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DirectoryScanTarget {
+    Root(PathBuf),
+    Expand(PathBuf),
+    Refresh(PathBuf),
+}
+
+impl DirectoryScanTarget {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Root(path) | Self::Expand(path) | Self::Refresh(path) => path,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DirectoryScanPhase {
+    Loading,
+    Refreshing,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectoryScanRunState {
+    Queued,
+    Running,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum VisibleDirectoryStatus {
+    InFlight {
+        request: u64,
+        target: DirectoryScanTarget,
+        phase: DirectoryScanPhase,
+        run_state: DirectoryScanRunState,
+        queue_wait: Option<Duration>,
+        running_at: Option<Instant>,
+    },
+    Error {
+        request: u64,
+        target: DirectoryScanTarget,
+        phase: DirectoryScanPhase,
+        message: String,
+    },
+}
+
+#[derive(Default)]
+pub(crate) struct DirectoryStatusTracker {
+    next: u64,
+    statuses: Vec<VisibleDirectoryStatus>,
+}
+
+impl DirectoryStatusTracker {
+    fn begin(&mut self, target: DirectoryScanTarget, phase: DirectoryScanPhase) -> u64 {
+        self.next = self.next.wrapping_add(1);
+        let request = self.next;
+        // A retry or newer same-target request replaces that target's old
+        // status. Unrelated errors stay queued and visible until the user has
+        // had a chance to retry each failed directory.
+        self.statuses.retain(|status| status.target() != &target);
+        self.statuses.push(VisibleDirectoryStatus::InFlight {
+            request,
+            target,
+            phase,
+            run_state: DirectoryScanRunState::Queued,
+            queue_wait: None,
+            running_at: None,
+        });
+        request
+    }
+
+    fn mark_running(&mut self, request: u64, queue_wait: Duration) -> bool {
+        let Some(VisibleDirectoryStatus::InFlight {
+            run_state,
+            queue_wait: current_wait,
+            running_at,
+            ..
+        }) = self.statuses.iter_mut().find(|status| {
+            matches!(
+                status,
+                VisibleDirectoryStatus::InFlight {
+                    request: current,
+                    ..
+                } if *current == request
+            )
+        })
+        else {
+            return false;
+        };
+        *run_state = DirectoryScanRunState::Running;
+        *current_wait = Some(queue_wait);
+        *running_at = Some(Instant::now());
+        true
+    }
+
+    fn finish_success(&mut self, request: u64) -> bool {
+        let Some(index) = self.statuses.iter().position(|status| {
+            matches!(
+                status,
+                VisibleDirectoryStatus::InFlight {
+                    request: current,
+                    ..
+                } if *current == request
+            )
+        }) else {
+            return false;
+        };
+        self.statuses.remove(index);
+        true
+    }
+
+    fn finish_error(&mut self, request: u64, message: String) -> bool {
+        let Some(status) = self.statuses.iter_mut().find(|status| {
+            matches!(
+                status,
+                VisibleDirectoryStatus::InFlight {
+                    request: current,
+                    ..
+                } if *current == request
+            )
+        }) else {
+            return false;
+        };
+        let VisibleDirectoryStatus::InFlight { target, phase, .. } = status else {
+            unreachable!("the lookup above accepts only an in-flight status")
+        };
+        *status = VisibleDirectoryStatus::Error {
+            request,
+            target: target.clone(),
+            phase: *phase,
+            message,
+        };
+        // Keep active Queued/Running rows until their terminal callback, but
+        // bound completed failures so a long offline traversal cannot grow
+        // the status registry forever. The newest failures remain retryable.
+        while self
+            .statuses
+            .iter()
+            .filter(|status| matches!(status, VisibleDirectoryStatus::Error { .. }))
+            .count()
+            > MAX_VISIBLE_DIRECTORY_ERRORS
+        {
+            let Some(oldest) = self
+                .statuses
+                .iter()
+                .enumerate()
+                .filter(|(_, status)| matches!(status, VisibleDirectoryStatus::Error { .. }))
+                .min_by_key(|(_, status)| status.request())
+                .map(|(index, _)| index)
+            else {
+                break;
+            };
+            self.statuses.remove(oldest);
+        }
+        true
+    }
+
+    /// A finished error takes precedence over progress so it cannot disappear
+    /// merely because another directory is still scanning. Within each class,
+    /// the newest request is shown first.
+    fn visible(&self) -> Option<&VisibleDirectoryStatus> {
+        self.statuses
+            .iter()
+            .filter(|status| matches!(status, VisibleDirectoryStatus::Error { .. }))
+            .max_by_key(|status| status.request())
+            .or_else(|| self.statuses.iter().max_by_key(|status| status.request()))
+    }
+
+    fn retry_target(&self) -> Option<DirectoryScanTarget> {
+        match self.visible() {
+            Some(VisibleDirectoryStatus::Error { target, .. }) => Some(target.clone()),
+            _ => None,
+        }
+    }
+
+    fn dismiss_target(&mut self, target: &DirectoryScanTarget) {
+        self.statuses.retain(|status| status.target() != target);
+    }
+
+    fn reset(&mut self) {
+        self.statuses.clear();
+    }
+}
+
+impl VisibleDirectoryStatus {
+    fn request(&self) -> u64 {
+        match self {
+            Self::InFlight { request, .. } | Self::Error { request, .. } => *request,
+        }
+    }
+
+    fn target(&self) -> &DirectoryScanTarget {
+        match self {
+            Self::InFlight { target, .. } | Self::Error { target, .. } => target,
+        }
+    }
+}
+
+/// Visible status immediately above the tree. GTK4's legacy `TreeView` cannot
+/// safely host a real focusable button in a cell, so Retry lives in the same
+/// Files tree region while last-good rows remain untouched underneath it.
+pub(crate) struct FileTreeStatusUi {
+    bar: gtk::Box,
+    label: gtk::Label,
+    retry: gtk::Button,
+    tracker: RefCell<DirectoryStatusTracker>,
+    stale_count: Cell<usize>,
+}
+
+impl FileTreeStatusUi {
+    pub(crate) fn new(on_retry: impl Fn(DirectoryScanTarget) + 'static) -> Rc<Self> {
+        let bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        bar.set_margin_start(6);
+        bar.set_margin_end(6);
+        bar.set_margin_top(4);
+        bar.set_margin_bottom(4);
+        bar.set_visible(false);
+
+        let label = gtk::Label::new(None);
+        label.set_xalign(0.0);
+        label.set_hexpand(true);
+        label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        let retry = gtk::Button::with_label("Retry");
+        retry.set_widget_name("file-tree-retry");
+        retry.set_focusable(true);
+        retry.set_tooltip_text(Some("Retry this directory scan"));
+        retry.update_property(&[gtk::accessible::Property::Label(
+            FILE_TREE_RETRY_ACCESSIBLE_LABEL,
+        )]);
+        retry.set_visible(false);
+        bar.append(&label);
+        bar.append(&retry);
+
+        let ui = Rc::new(Self {
+            bar,
+            label,
+            retry,
+            tracker: RefCell::new(DirectoryStatusTracker::default()),
+            stale_count: Cell::new(0),
+        });
+        let weak = Rc::downgrade(&ui);
+        ui.retry.connect_clicked(move |_| {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let target = ui.tracker.borrow().retry_target();
+            if let Some(target) = target {
+                on_retry(target);
+            }
+        });
+        let weak = Rc::downgrade(&ui);
+        glib::timeout_add_local(Duration::from_secs(1), move || {
+            let Some(ui) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if ui.bar.is_visible() {
+                ui.sync_visible_status();
+            }
+            glib::ControlFlow::Continue
+        });
+        ui
+    }
+
+    pub(crate) fn widget(&self) -> &gtk::Box {
+        &self.bar
+    }
+
+    pub(crate) fn begin(&self, target: DirectoryScanTarget, phase: DirectoryScanPhase) -> u64 {
+        let request = self.tracker.borrow_mut().begin(target, phase);
+        self.sync_visible_status();
+        request
+    }
+
+    pub(crate) fn finish_success(&self, request: u64) {
+        if self.tracker.borrow_mut().finish_success(request) {
+            self.sync_visible_status();
+        }
+    }
+
+    pub(crate) fn mark_running(&self, request: u64, queue_wait: Duration) {
+        if self.tracker.borrow_mut().mark_running(request, queue_wait) {
+            self.sync_visible_status();
+        }
+    }
+
+    pub(crate) fn finish_error(&self, request: u64, error: &io::Error) {
+        let message = crate::remote_fs::user_facing_fs_error(error).to_string();
+        self.finish_error_message(request, message);
+    }
+
+    pub(crate) fn finish_error_kind(&self, request: u64, kind: crate::remote_fs::FsFailureKind) {
+        self.finish_error_message(
+            request,
+            crate::remote_fs::user_facing_failure_kind(kind).to_string(),
+        );
+    }
+
+    fn finish_error_message(&self, request: u64, message: String) {
+        if !self
+            .tracker
+            .borrow_mut()
+            .finish_error(request, message.clone())
+        {
+            return;
+        }
+        self.sync_visible_status();
+    }
+
+    pub(crate) fn dismiss_target(&self, target: &DirectoryScanTarget) {
+        self.tracker.borrow_mut().dismiss_target(target);
+        self.sync_visible_status();
+    }
+
+    pub(crate) fn reset(&self) {
+        self.tracker.borrow_mut().reset();
+        self.stale_count.set(0);
+        self.sync_visible_status();
+    }
+
+    pub(crate) fn set_stale_count(&self, count: usize) {
+        self.stale_count.set(count);
+        self.sync_visible_status();
+    }
+
+    fn sync_visible_status(&self) {
+        let visible = self.tracker.borrow().visible().cloned();
+        match visible {
+            Some(VisibleDirectoryStatus::InFlight {
+                target,
+                phase,
+                run_state,
+                queue_wait,
+                running_at,
+                ..
+            }) => {
+                let path = display_full_path(target.path());
+                let mut message = match (phase, run_state) {
+                    (DirectoryScanPhase::Loading, DirectoryScanRunState::Queued) => {
+                        format!("Queued to load {path}…")
+                    }
+                    (DirectoryScanPhase::Refreshing, DirectoryScanRunState::Queued) => {
+                        format!("Queued to refresh {path}…")
+                    }
+                    (DirectoryScanPhase::Loading, DirectoryScanRunState::Running) => {
+                        format!("Loading {path}…")
+                    }
+                    (DirectoryScanPhase::Refreshing, DirectoryScanRunState::Running) => {
+                        format!("Refreshing {path}…")
+                    }
+                };
+                if let Some(queue_wait) = queue_wait.filter(|wait| !wait.is_zero()) {
+                    use std::fmt::Write as _;
+                    let _ = write!(message, " queued {} ms", queue_wait.as_millis());
+                }
+                if let Some(running_at) = running_at {
+                    let elapsed = running_at.elapsed();
+                    if elapsed >= Duration::from_secs(1) {
+                        use std::fmt::Write as _;
+                        let _ = write!(message, " · running {} s", elapsed.as_secs());
+                    }
+                }
+                self.bar.remove_css_class("error");
+                self.label.set_label(&message);
+                self.retry.set_visible(false);
+                self.bar.set_visible(true);
+            }
+            Some(VisibleDirectoryStatus::Error {
+                target,
+                phase,
+                message,
+                ..
+            }) => {
+                let path = display_full_path(target.path());
+                let action = match phase {
+                    DirectoryScanPhase::Loading => "loading",
+                    DirectoryScanPhase::Refreshing => "refreshing",
+                };
+                self.bar.add_css_class("error");
+                self.label
+                    .set_label(&format!("Error {action} {path}: {message}"));
+                self.retry.set_visible(true);
+                self.bar.set_visible(true);
+            }
+            None => {
+                self.bar.remove_css_class("error");
+                self.retry.set_visible(false);
+                let stale = self.stale_count.get();
+                if stale == 0 {
+                    self.bar.set_visible(false);
+                } else {
+                    self.label.set_label(&format!(
+                        "{stale} loaded director{} out of date; revalidation is queued",
+                        if stale == 1 { "y is" } else { "ies are" }
+                    ));
+                    self.bar.set_visible(true);
+                }
+            }
+        }
+    }
+}
+
 /// Directories first, then case-insensitive name order — the one comparator
 /// behind scans, inserts, and merge refreshes.
 fn entry_cmp(a: &FileEntry, b: &FileEntry) -> std::cmp::Ordering {
@@ -108,12 +1336,9 @@ pub(crate) fn sort_entries(entries: &mut [FileEntry]) {
     entries.sort_by(entry_cmp);
 }
 
-pub(crate) fn scan_dir(dir: &Path) -> io::Result<Vec<FileEntry>> {
+pub(crate) fn scan_dir(dir: &Path) -> io::Result<DirectoryListing> {
     let mut entries = Vec::new();
-    for entry in std::fs::read_dir(dir)?
-        .take(MAX_DIRECTORY_ENTRIES)
-        .flatten()
-    {
+    for entry in std::fs::read_dir(dir)?.flatten() {
         let path = entry.path();
         let Ok(file_type) = entry.file_type() else {
             continue;
@@ -125,9 +1350,14 @@ pub(crate) fn scan_dir(dir: &Path) -> io::Result<Vec<FileEntry>> {
             is_dir: file_type.is_dir(),
             path,
         });
+        if entries.len() > MAX_DIRECTORY_ENTRIES {
+            break;
+        }
     }
+    let truncated = entries.len() > MAX_DIRECTORY_ENTRIES;
+    entries.truncate(MAX_DIRECTORY_ENTRIES);
     sort_entries(&mut entries);
-    Ok(entries)
+    Ok(DirectoryListing::new(entries, truncated))
 }
 
 /// Encode a Linux path for storage in GTK's string-only tree model without
@@ -633,6 +1863,10 @@ pub(crate) fn terminal_target(
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct FileTreeIntent {
     generation: u64,
+    /// Present for actions captured from visible tree UI. Internal navigation
+    /// probes omit it because a harmless in-place reconciliation must not
+    /// cancel their backend authority.
+    content_revision: Option<u64>,
     location: crate::remote_fs::FsLocation,
     remote_profile: Option<crate::config::RemoteHost>,
 }
@@ -660,9 +1894,39 @@ pub(crate) fn capture_file_tree_intent(
     };
     FileTreeIntent {
         generation,
+        content_revision: None,
         location: location.clone(),
         remote_profile,
     }
+}
+
+/// Capture a visible-row/header action. Unlike an internal navigation probe,
+/// it is revoked when a successful reconciliation changes the loaded model.
+pub(crate) fn capture_file_tree_user_intent(
+    generation: u64,
+    content_revision: u64,
+    location: &crate::remote_fs::FsLocation,
+    hosts: &[crate::config::RemoteHost],
+) -> FileTreeIntent {
+    let mut intent = capture_file_tree_intent(generation, location, hosts);
+    intent.content_revision = Some(content_revision);
+    intent
+}
+
+/// User actions additionally require the exact loaded-model revision they saw.
+/// Async filesystem settlement deliberately uses the authority-only predicate
+/// below, so already-dispatched work can still finish and report honestly.
+pub(crate) fn file_tree_user_intent_is_current(
+    intent: &FileTreeIntent,
+    content_revision: u64,
+    generation: u64,
+    location: &crate::remote_fs::FsLocation,
+    hosts: &[crate::config::RemoteHost],
+) -> bool {
+    intent
+        .content_revision
+        .is_none_or(|captured| captured == content_revision)
+        && file_tree_intent_is_current(intent, generation, location, hosts)
 }
 
 /// Revalidate every part of a delayed operation's launch authority. An
@@ -743,22 +2007,127 @@ pub(crate) fn file_tree_follow_requires_reroot(
     current_location != target_location || current_root != target_root
 }
 
-/// Scan `dir` on a worker thread under the shared permit, then hand the
+/// Scan `dir` on a fixed scheduler worker, then hand the
 /// result to `apply` on the GTK thread via the glib poll. `loc` + `hosts`
 /// snapshot the backend at request time; `remote_fs::list_dir` does the work.
-pub(crate) fn request_dir_scan<F>(
+pub(crate) fn request_dir_scan<S, F>(
     loc: crate::remote_fs::FsLocation,
     hosts: Vec<crate::config::RemoteHost>,
     dir: PathBuf,
+    started: S,
     apply: F,
 ) -> io::Result<()>
 where
-    F: FnOnce(io::Result<Vec<FileEntry>>) + 'static,
+    S: FnOnce(Duration) + 'static,
+    F: FnOnce(io::Result<DirectoryListing>) + 'static,
 {
-    request_fs_op(
+    let authority = FsAuthorityKey::capture(&loc, &hosts)?;
+    request_fs_op_scheduled(
+        authority,
+        FsJobPriority::Normal,
+        None,
         move || crate::remote_fs::list_dir(&loc, &hosts, &dir),
+        started,
         apply,
     )
+}
+
+pub(crate) fn request_dir_scan_cancellable<S, F>(
+    loc: crate::remote_fs::FsLocation,
+    hosts: Vec<crate::config::RemoteHost>,
+    dir: PathBuf,
+    cancellation: ScanCancellation,
+    started: S,
+    apply: F,
+) -> io::Result<()>
+where
+    S: FnOnce(Duration) + 'static,
+    F: FnOnce(io::Result<DirectoryListing>) + 'static,
+{
+    let authority = FsAuthorityKey::capture(&loc, &hosts)?;
+    let op_cancellation = cancellation.clone();
+    request_fs_op_scheduled(
+        authority,
+        FsJobPriority::Normal,
+        Some(cancellation),
+        move || crate::remote_fs::list_dir_with_cancellation(&loc, &hosts, &dir, &op_cancellation),
+        started,
+        apply,
+    )
+}
+
+/// Latest-wins publication tokens for in-place directory refreshes. The tree
+/// generation protects navigation changes; this finer-grained registry also
+/// orders two refreshes of the same path within one generation. Finishing the
+/// current request consumes its entry, so an older completion arriving later
+/// cannot become current again.
+#[derive(Default)]
+pub(crate) struct DirectoryRefreshRevisions {
+    next: u64,
+    latest: std::collections::HashMap<PathBuf, DirectoryRefreshTicket>,
+}
+
+#[derive(Clone)]
+pub(crate) struct DirectoryRefreshTicket {
+    revision: u64,
+    cancellation: ScanCancellation,
+}
+
+impl DirectoryRefreshTicket {
+    pub(crate) fn cancellation(&self) -> ScanCancellation {
+        self.cancellation.clone()
+    }
+}
+
+impl DirectoryRefreshRevisions {
+    pub(crate) fn begin(&mut self, path: &Path) -> DirectoryRefreshTicket {
+        self.next = self.next.wrapping_add(1);
+        let ticket = DirectoryRefreshTicket {
+            revision: self.next,
+            cancellation: ScanCancellation::default(),
+        };
+        if let Some(previous) = self.latest.insert(path.to_path_buf(), ticket.clone()) {
+            previous.cancellation.cancel();
+        }
+        ticket
+    }
+
+    /// Return true only for the latest request for `path`, consuming that
+    /// request. A duplicate completion and every superseded request fail.
+    pub(crate) fn finish_if_latest(
+        &mut self,
+        path: &Path,
+        ticket: &DirectoryRefreshTicket,
+    ) -> bool {
+        if self.latest.get(path).map(|latest| latest.revision) != Some(ticket.revision) {
+            return false;
+        }
+        self.latest.remove(path);
+        true
+    }
+
+    /// A reroot invalidates every outstanding per-directory publication while
+    /// retaining the monotonic counter, including across an A -> B -> A ABA.
+    pub(crate) fn cancel_all(&mut self) {
+        for ticket in self.latest.values() {
+            ticket.cancellation.cancel();
+        }
+        self.latest.clear();
+    }
+
+    pub(crate) fn is_pending(&self, path: &Path) -> bool {
+        self.latest.contains_key(path)
+    }
+}
+
+/// A non-root refresh may publish only back into the exact row it captured.
+/// Missing rows and a row reference that now resolves to another identity are
+/// both rejected; callers must never reinterpret either case as the root.
+pub(crate) fn refresh_row_identity_is_current(
+    expected_identity: &str,
+    current_identity: Option<&str>,
+) -> bool {
+    current_identity == Some(expected_identity)
 }
 
 /// One event from a streaming filesystem op: throttled byte progress, then
@@ -768,27 +2137,43 @@ pub(crate) enum FsOpOutcome<T> {
     Done(io::Result<T>),
 }
 
-/// Run one blocking op on a worker thread under the shared permit, streaming
+/// Run one blocking op on a fixed scheduler worker, streaming
 /// throttled progress events and the terminal result to `apply` on the GTK
 /// thread via the glib poll. The worker's progress callback is non-blocking:
 /// a stalled UI must never back-pressure a transfer.
-pub(crate) fn request_fs_op_streaming<T, O, F>(op: O, apply: F) -> io::Result<()>
+pub(crate) fn request_fs_op_streaming_at<T, O, F>(
+    location: &crate::remote_fs::FsLocation,
+    hosts: &[crate::config::RemoteHost],
+    op: O,
+    apply: F,
+) -> io::Result<()>
 where
     O: FnOnce(&dyn Fn(u64)) -> io::Result<T> + Send + 'static,
     T: Send + 'static,
     F: FnMut(FsOpOutcome<T>) + 'static,
 {
+    let authority = FsAuthorityKey::capture(location, hosts)?;
     let (tx, rx) = mpsc::sync_channel::<FsOpOutcome<T>>(64);
-    std::thread::Builder::new()
-        .name("anvil-file-tree-op".to_string())
-        .spawn(move || {
-            let _permit = ScanPermit::acquire();
+    let job = ScheduledFsJob {
+        authority,
+        queued_at: Instant::now(),
+        cancellation: None,
+        cancel: None,
+        run: Some(Box::new(move |queue_wait| {
+            let running_at = Instant::now();
             let progress = |bytes: u64| {
                 let _ = tx.try_send(FsOpOutcome::Progress(bytes));
             };
             let result = op(&progress);
+            log::debug!(
+                "file-tree background job timing: queued={}ms running={}ms",
+                queue_wait.as_millis(),
+                running_at.elapsed().as_millis()
+            );
             let _ = tx.send(FsOpOutcome::Done(result));
-        })?;
+        })),
+    };
+    FsScheduler::global()?.submit(FsJobPriority::Background, job)?;
 
     let mut apply = Some(apply);
     glib::timeout_add_local(SCAN_POLL_INTERVAL, move || {
@@ -824,26 +2209,112 @@ where
     Ok(())
 }
 
-/// Run one blocking filesystem op on a worker thread with the same permit /
-/// glib-poll skeleton as directory scans, so mutations and listings share the
-/// concurrency budget.
-pub(crate) fn request_fs_op<T, O, F>(op: O, apply: F) -> io::Result<()>
+pub(crate) fn request_fs_op_at<T, O, F>(
+    location: &crate::remote_fs::FsLocation,
+    hosts: &[crate::config::RemoteHost],
+    op: O,
+    apply: F,
+) -> io::Result<()>
 where
     O: FnOnce() -> io::Result<T> + Send + 'static,
     T: Send + 'static,
     F: FnOnce(io::Result<T>) + 'static,
 {
-    let (tx, rx) = mpsc::sync_channel(1);
-    std::thread::Builder::new()
-        .name("anvil-file-tree-scan".to_string())
-        .spawn(move || {
-            let _permit = ScanPermit::acquire();
-            let _ = tx.send(op());
-        })?;
+    request_fs_op_scheduled(
+        FsAuthorityKey::capture(location, hosts)?,
+        FsJobPriority::Interactive,
+        None,
+        op,
+        |_| {},
+        apply,
+    )
+}
 
+pub(crate) fn request_fs_op_cancellable_at<T, O, F>(
+    location: &crate::remote_fs::FsLocation,
+    hosts: &[crate::config::RemoteHost],
+    cancellation: ScanCancellation,
+    op: O,
+    apply: F,
+) -> io::Result<()>
+where
+    O: FnOnce() -> io::Result<T> + Send + 'static,
+    T: Send + 'static,
+    F: FnOnce(io::Result<T>) + 'static,
+{
+    request_fs_op_scheduled(
+        FsAuthorityKey::capture(location, hosts)?,
+        FsJobPriority::Interactive,
+        Some(cancellation),
+        op,
+        |_| {},
+        apply,
+    )
+}
+
+enum FsOpEvent<T> {
+    Started(Duration),
+    Done(io::Result<T>),
+}
+
+fn request_fs_op_scheduled<T, O, S, F>(
+    authority: FsAuthorityKey,
+    priority: FsJobPriority,
+    cancellation: Option<ScanCancellation>,
+    op: O,
+    started: S,
+    apply: F,
+) -> io::Result<()>
+where
+    O: FnOnce() -> io::Result<T> + Send + 'static,
+    T: Send + 'static,
+    S: FnOnce(Duration) + 'static,
+    F: FnOnce(io::Result<T>) + 'static,
+{
+    let (tx, rx) = mpsc::sync_channel(2);
+    let run_tx = tx.clone();
+    let run_cancellation = cancellation.clone();
+    let cancel_tx = tx.clone();
+    let job = ScheduledFsJob {
+        authority,
+        queued_at: Instant::now(),
+        cancellation,
+        cancel: Some(Box::new(move || {
+            let _ = cancel_tx.send(FsOpEvent::Done(Err(cancelled_scan_error())));
+        })),
+        run: Some(Box::new(move |queue_wait| {
+            if run_cancellation
+                .as_ref()
+                .is_some_and(ScanCancellation::is_cancelled)
+            {
+                let _ = run_tx.send(FsOpEvent::Done(Err(cancelled_scan_error())));
+                return;
+            }
+            if run_tx.send(FsOpEvent::Started(queue_wait)).is_err() {
+                return;
+            }
+            let running_at = Instant::now();
+            let result = op();
+            log::debug!(
+                "file-tree job timing: queued={}ms running={}ms",
+                queue_wait.as_millis(),
+                running_at.elapsed().as_millis()
+            );
+            let _ = run_tx.send(FsOpEvent::Done(result));
+        })),
+    };
+    FsScheduler::global()?.submit(priority, job)?;
+
+    let mut started = Some(started);
     let mut apply = Some(apply);
     glib::timeout_add_local(SCAN_POLL_INTERVAL, move || match rx.try_recv() {
-        Ok(result) => {
+        Ok(FsOpEvent::Started(queue_wait)) => {
+            if let Some(started) = started.take() {
+                started(queue_wait);
+            }
+            glib::ControlFlow::Continue
+        }
+        Ok(FsOpEvent::Done(result)) => {
             if let Some(apply) = apply.take() {
                 apply(result);
             }
@@ -885,15 +2356,19 @@ pub(crate) fn new_view(
         let filter = filter.clone();
         filter_model.set_visible_func(move |model, iter| {
             let state = filter.borrow();
-            if !state.is_active() {
-                return true;
-            }
             let identity: String = model
                 .get_value(iter, COL_PATH as i32)
                 .get()
                 .unwrap_or_default();
             // Placeholders (empty identity) never count as matches.
-            !identity.is_empty() && state.is_visible(&identity)
+            if identity.is_empty() {
+                return !state.is_active();
+            }
+            let name: String = model
+                .get_value(iter, COL_NAME as i32)
+                .get()
+                .unwrap_or_default();
+            state.shows_name(&name) && state.is_visible(&identity)
         });
     }
     let view = TreeView::with_model(&filter_model);
@@ -998,6 +2473,95 @@ pub(crate) fn find_row_by_identity(store: &TreeStore, identity: &str) -> Option<
     walk(store, None, identity)
 }
 
+#[derive(Default)]
+pub(crate) struct TreeSelectionSnapshot {
+    selected: Vec<String>,
+    cursor: Option<String>,
+}
+
+#[allow(deprecated)]
+pub(crate) fn capture_tree_selection(
+    store: &TreeStore,
+    filter_model: &TreeModelFilter,
+    view: &TreeView,
+) -> TreeSelectionSnapshot {
+    let (selected_paths, _) = view.selection().selected_rows();
+    let selected = selected_paths
+        .iter()
+        .filter_map(|path| filter_model.convert_path_to_child_path(path))
+        .filter_map(|path| store.iter(&path))
+        .filter_map(|iter| {
+            store
+                .get_value(&iter, COL_PATH as i32)
+                .get::<String>()
+                .ok()
+                .filter(|identity| !identity.is_empty())
+        })
+        .collect();
+    let cursor = gtk::prelude::TreeViewExt::cursor(view)
+        .0
+        .and_then(|path| filter_model.convert_path_to_child_path(&path))
+        .and_then(|path| store.iter(&path))
+        .and_then(|iter| {
+            store
+                .get_value(&iter, COL_PATH as i32)
+                .get::<String>()
+                .ok()
+                .filter(|identity| !identity.is_empty())
+        });
+    TreeSelectionSnapshot { selected, cursor }
+}
+
+#[allow(deprecated)]
+pub(crate) fn restore_tree_selection(
+    store: &TreeStore,
+    filter_model: &TreeModelFilter,
+    view: &TreeView,
+    snapshot: TreeSelectionSnapshot,
+) {
+    let selection = view.selection();
+    let mut surviving_paths = Vec::new();
+    let mut first_survivor = None;
+    for identity in snapshot.selected {
+        let Some(iter) = find_row_by_identity(store, &identity) else {
+            continue;
+        };
+        let child_path = store.path(&iter);
+        let Some(view_path) = filter_model.convert_child_path_to_path(&child_path) else {
+            continue;
+        };
+        if first_survivor.is_none() {
+            first_survivor = Some(view_path.clone());
+        }
+        surviving_paths.push(view_path);
+    }
+    let cursor = snapshot
+        .cursor
+        .and_then(|identity| find_row_by_identity(store, &identity))
+        .map(|iter| store.path(&iter))
+        .and_then(|path| filter_model.convert_child_path_to_path(&path))
+        .or(first_survivor);
+    if let Some(path) = cursor {
+        gtk::prelude::TreeViewExt::set_cursor(view, &path, None::<&TreeViewColumn>, false);
+    }
+    selection.unselect_all();
+    for path in surviving_paths {
+        selection.select_path(&path);
+    }
+}
+
+#[cfg(test)]
+fn surviving_selection_identities(
+    selected: &[String],
+    loaded: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    selected
+        .iter()
+        .filter(|identity| loaded.contains(*identity))
+        .cloned()
+        .collect()
+}
+
 /// Attach identities to a fresh scan, dropping paths too long to encode.
 fn identified(entries: Vec<FileEntry>) -> Vec<(String, FileEntry)> {
     entries
@@ -1018,20 +2582,24 @@ struct MergeEdit<'a> {
     inserts: Vec<(u32, &'a FileEntry)>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CurrentMergeRow {
+    identity: String,
+    is_dir: bool,
+}
+
 /// Pure merge computation behind [`merge_refresh_children`]: rows whose path
 /// vanished are removed, new entries are inserted in sort order, survivors
 /// keep their place (and with it their children and expansion). Returns None
 /// when a placeholder child marks a never-expanded directory — its lazy scan
 /// sees the fresh state on expansion, so the row stays untouched.
 fn plan_merge_refresh<'a>(
-    current: &[String],
+    current: &[CurrentMergeRow],
     fresh: &'a [(String, FileEntry)],
 ) -> Option<MergeEdit<'a>> {
-    if current.iter().any(String::is_empty) {
+    if current.iter().any(|row| row.identity.is_empty()) {
         return None;
     }
-    let fresh_ids: std::collections::HashSet<&str> =
-        fresh.iter().map(|(id, _)| id.as_str()).collect();
     let fresh_by_id: std::collections::HashMap<&str, &FileEntry> = fresh
         .iter()
         .map(|(id, entry)| (id.as_str(), entry))
@@ -1039,9 +2607,12 @@ fn plan_merge_refresh<'a>(
 
     let mut removals = Vec::new();
     let mut survivors: Vec<&str> = Vec::new();
-    for (index, identity) in current.iter().enumerate() {
-        if fresh_ids.contains(identity.as_str()) {
-            survivors.push(identity.as_str());
+    for (index, row) in current.iter().enumerate() {
+        if fresh_by_id
+            .get(row.identity.as_str())
+            .is_some_and(|entry| entry.is_dir == row.is_dir)
+        {
+            survivors.push(row.identity.as_str());
         } else {
             removals.push(index);
         }
@@ -1074,22 +2645,27 @@ pub(crate) fn merge_refresh_children(
     store: &TreeStore,
     parent: Option<&TreeIter>,
     fresh: Vec<FileEntry>,
-) {
+) -> bool {
     let fresh = identified(fresh);
     let mut current = Vec::new();
     let mut index = 0;
     while let Some(iter) = store.iter_nth_child(parent, index) {
-        current.push(
-            store
+        current.push(CurrentMergeRow {
+            identity: store
                 .get_value(&iter, COL_PATH as i32)
                 .get::<String>()
                 .unwrap_or_default(),
-        );
+            is_dir: store
+                .get_value(&iter, COL_IS_DIR as i32)
+                .get::<bool>()
+                .unwrap_or(false),
+        });
         index += 1;
     }
     let Some(edit) = plan_merge_refresh(&current, &fresh) else {
-        return;
+        return false;
     };
+    let changed = !edit.removals.is_empty() || !edit.inserts.is_empty();
     // Descending removal keeps the still-valid lower indexes intact.
     for index in edit.removals.iter().rev() {
         if let Some(iter) = store.iter_nth_child(parent, *index as i32) {
@@ -1099,17 +2675,23 @@ pub(crate) fn merge_refresh_children(
     for (position, entry) in edit.inserts {
         insert_entry_row(store, parent, Some(position), entry);
     }
+    changed
 }
 
 /// Lazily fill a directory row's real children on first expansion. `location`
 /// decides the backend (local disk or one remote host); a location switch
 /// mid-scan drops the stale result before it touches the store.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn on_expand(
     store: &TreeStore,
     iter: &TreeIter,
     scan_generation: &Rc<Cell<u64>>,
     location: &Rc<RefCell<crate::remote_fs::FsLocation>>,
     hosts: Vec<crate::config::RemoteHost>,
+    snapshots: &Rc<RefCell<DirectorySnapshots>>,
+    status: &Rc<FileTreeStatusUi>,
+    failure_gate: &Rc<RefCell<DirectoryFailureGate>>,
+    bypass_failure_gate: bool,
 ) {
     // A not-yet-loaded directory has a single placeholder child (empty path).
     let Some(first_child) = store.iter_children(Some(iter)) else {
@@ -1140,6 +2722,17 @@ pub(crate) fn on_expand(
         log::warn!("file-tree row contains an invalid path identity");
         return;
     };
+    let loc = location.borrow().clone();
+    let Ok(authority) = FsAuthorityKey::capture(&loc, &hosts) else {
+        return;
+    };
+    if !bypass_failure_gate
+        && !failure_gate
+            .borrow()
+            .allows_auto_at(&authority, &dir_path, Instant::now())
+    {
+        return;
+    }
     let Some(row_ref) = TreeRowReference::new(store, &store.path(iter)) else {
         return;
     };
@@ -1150,43 +2743,99 @@ pub(crate) fn on_expand(
     let generation = active_generation.get();
     let expected_identity = dir_identity.clone();
     let expected_display = display_full_path(&dir_path);
-    let loc = location.borrow().clone();
+    let expected_dir = dir_path.clone();
+    let start_error_dir = dir_path.clone();
+    let snapshots_for_result = snapshots.clone();
+    let failures_for_result = failure_gate.clone();
+    let authority_for_result = authority.clone();
+    let status_request = status.begin(
+        DirectoryScanTarget::Expand(dir_path.clone()),
+        DirectoryScanPhase::Loading,
+    );
+    let status_for_started = status.clone();
+    let status_for_result = status.clone();
     let active_location = location.clone();
     let expected_loc = loc.clone();
-    if let Err(error) = request_dir_scan(loc, hosts, dir_path, move |result| {
-        if active_generation.get() != generation || *active_location.borrow() != expected_loc {
-            return;
-        }
-        let Some(row_path) = row_ref.path() else {
-            return;
-        };
-        let Some(parent) = store_for_result.iter(&row_path) else {
-            return;
-        };
-        let current_path: String = store_for_result
-            .get_value(&parent, COL_PATH as i32)
-            .get()
-            .unwrap_or_default();
-        if current_path != expected_identity {
-            return;
-        }
-        let Some(placeholder) = store_for_result.iter_children(Some(&parent)) else {
-            return;
-        };
-        let placeholder_path: String = store_for_result
-            .get_value(&placeholder, COL_PATH as i32)
-            .get()
-            .unwrap_or_default();
-        if !placeholder_path.is_empty() {
-            return;
-        }
-        store_for_result.remove(&placeholder);
-        match result {
-            Ok(entries) => append_entries(&store_for_result, Some(&parent), entries),
-            Err(error) => log::warn!("failed to scan directory {expected_display}: {error}"),
-        }
-    }) {
+    if let Err(error) = request_dir_scan(
+        loc,
+        hosts,
+        dir_path,
+        move |queue_wait| status_for_started.mark_running(status_request, queue_wait),
+        move |result| {
+            if active_generation.get() != generation || *active_location.borrow() != expected_loc {
+                status_for_result.finish_success(status_request);
+                return;
+            }
+            let Some(row_path) = row_ref.path() else {
+                status_for_result.finish_success(status_request);
+                return;
+            };
+            let Some(parent) = store_for_result.iter(&row_path) else {
+                status_for_result.finish_success(status_request);
+                return;
+            };
+            let current_path: String = store_for_result
+                .get_value(&parent, COL_PATH as i32)
+                .get()
+                .unwrap_or_default();
+            if current_path != expected_identity {
+                status_for_result.finish_success(status_request);
+                return;
+            }
+            let Some(placeholder) = store_for_result.iter_children(Some(&parent)) else {
+                status_for_result.finish_success(status_request);
+                return;
+            };
+            let placeholder_path: String = store_for_result
+                .get_value(&placeholder, COL_PATH as i32)
+                .get()
+                .unwrap_or_default();
+            if !placeholder_path.is_empty() {
+                status_for_result.finish_success(status_request);
+                return;
+            }
+            match result {
+                Ok(listing) => {
+                    let completed_at = listing.completed_at();
+                    store_for_result.remove(&placeholder);
+                    let (entries, truncated) = listing.into_parts();
+                    append_entries(&store_for_result, Some(&parent), entries);
+                    snapshots_for_result
+                        .borrow_mut()
+                        .record_success(expected_dir.clone(), completed_at);
+                    failures_for_result
+                        .borrow_mut()
+                        .record_success(&authority_for_result, &expected_dir);
+                    status_for_result.finish_success(status_request);
+                    if truncated {
+                        log::warn!(
+                        "directory listing retained only the first {} entries: {expected_display}",
+                        MAX_DIRECTORY_ENTRIES
+                    );
+                    }
+                }
+                Err(error) => {
+                    store_for_result.set(&placeholder, &[(COL_IS_DIR, &false)]);
+                    failures_for_result.borrow_mut().record_failure_at(
+                        authority_for_result.clone(),
+                        expected_dir.clone(),
+                        crate::remote_fs::classify_fs_error(&error),
+                        Instant::now(),
+                    );
+                    status_for_result.finish_error(status_request, &error);
+                    log::warn!("failed to scan directory {expected_display}: {error}");
+                }
+            }
+        },
+    ) {
         store.set(&first_child, &[(COL_IS_DIR, &false)]);
+        failure_gate.borrow_mut().record_failure_at(
+            authority,
+            start_error_dir,
+            crate::remote_fs::classify_fs_error(&error),
+            Instant::now(),
+        );
+        status.finish_error(status_request, &error);
         log::warn!("failed to start directory scan: {error}");
     }
 }
@@ -1249,6 +2898,7 @@ pub(crate) struct TreeFilter {
     query: String,
     visible: std::collections::HashSet<String>,
     saved_expansion: Option<std::collections::HashSet<String>>,
+    show_hidden: bool,
 }
 
 impl TreeFilter {
@@ -1257,6 +2907,7 @@ impl TreeFilter {
             query: String::new(),
             visible: std::collections::HashSet::new(),
             saved_expansion: None,
+            show_hidden: false,
         }
     }
 
@@ -1266,6 +2917,23 @@ impl TreeFilter {
 
     fn is_visible(&self, identity: &str) -> bool {
         !self.is_active() || self.visible.contains(identity)
+    }
+
+    fn shows_name(&self, name: &str) -> bool {
+        self.show_hidden || !name.starts_with('.')
+    }
+}
+
+/// Change the dotfile policy over already-loaded rows. No filesystem work is
+/// needed, so expansion state and remote authority remain untouched.
+pub(crate) fn set_tree_show_hidden(
+    filter_model: &TreeModelFilter,
+    state: &mut TreeFilter,
+    show_hidden: bool,
+) {
+    if state.show_hidden != show_hidden {
+        state.show_hidden = show_hidden;
+        filter_model.refilter();
     }
 }
 
@@ -1429,10 +3097,336 @@ fn collect_expanded_identities(
     expanded
 }
 
+/// Absolute paths for materialized expanded directory rows. The root is not a
+/// model row and is intentionally supplied by the caller. Sorting makes bulk
+/// refresh admission deterministic before its hard cap is applied.
+pub(crate) fn expanded_directory_paths(
+    store: &TreeStore,
+    view: &TreeView,
+    filter_model: &TreeModelFilter,
+) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = collect_expanded_identities(store, view, filter_model)
+        .into_iter()
+        .filter_map(|identity| decode_path_identity(&identity))
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// Lexical containment gate before a materialized directory row can become
+/// the new root. The authoritative model/type lookup remains in the caller.
+pub(crate) fn directory_navigation_path_is_allowed(root: &Path, target: &Path) -> bool {
+    root.is_absolute() && target.is_absolute() && target != root && target.starts_with(root)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn directory_status_retains_each_failure_and_distinguishes_refreshing() {
+        let mut tracker = DirectoryStatusTracker::default();
+        let expand_target = DirectoryScanTarget::Expand(PathBuf::from("/remote/first"));
+        let refresh_target = DirectoryScanTarget::Refresh(PathBuf::from("/remote/second"));
+        let expand_request = tracker.begin(expand_target.clone(), DirectoryScanPhase::Loading);
+        let refresh_request = tracker.begin(refresh_target.clone(), DirectoryScanPhase::Refreshing);
+
+        assert!(matches!(
+            tracker.visible(),
+            Some(VisibleDirectoryStatus::InFlight {
+                request,
+                target,
+                phase: DirectoryScanPhase::Refreshing,
+                run_state: DirectoryScanRunState::Queued,
+                ..
+            }) if *request == refresh_request && target == &refresh_target
+        ));
+        assert!(tracker.mark_running(refresh_request, Duration::from_millis(7)));
+        assert!(matches!(
+            tracker.visible(),
+            Some(VisibleDirectoryStatus::InFlight {
+                request,
+                run_state: DirectoryScanRunState::Running,
+                queue_wait: Some(wait),
+                running_at: Some(_),
+                ..
+            }) if *request == refresh_request && *wait == Duration::from_millis(7)
+        ));
+
+        assert!(tracker.finish_error(expand_request, "permission denied".to_string()));
+        assert!(matches!(
+            tracker.visible(),
+            Some(VisibleDirectoryStatus::Error {
+                request,
+                target,
+                phase: DirectoryScanPhase::Loading,
+                message,
+            }) if *request == expand_request
+                && target == &expand_target
+                && message == "permission denied"
+        ));
+        assert!(tracker.finish_success(refresh_request));
+        assert_eq!(tracker.retry_target(), Some(expand_target.clone()));
+
+        let retry_request = tracker.begin(expand_target.clone(), DirectoryScanPhase::Loading);
+        assert!(matches!(
+            tracker.visible(),
+            Some(VisibleDirectoryStatus::InFlight {
+                request,
+                target,
+                phase: DirectoryScanPhase::Loading,
+                run_state: DirectoryScanRunState::Queued,
+                ..
+            }) if *request == retry_request && target == &expand_target
+        ));
+        assert!(
+            !tracker.finish_error(expand_request, "stale failure".to_string()),
+            "a superseded completion cannot replace the retry's state"
+        );
+        assert!(tracker.finish_success(retry_request));
+        assert!(tracker.visible().is_none());
+    }
+
+    #[test]
+    fn directory_status_bounds_finished_errors_without_dropping_active_work() {
+        let mut tracker = DirectoryStatusTracker::default();
+        let active = tracker.begin(
+            DirectoryScanTarget::Refresh(PathBuf::from("/remote/still-running")),
+            DirectoryScanPhase::Refreshing,
+        );
+        assert!(tracker.mark_running(active, Duration::ZERO));
+        for index in 0..(MAX_VISIBLE_DIRECTORY_ERRORS + 5) {
+            let request = tracker.begin(
+                DirectoryScanTarget::Expand(PathBuf::from(format!("/remote/error-{index}"))),
+                DirectoryScanPhase::Loading,
+            );
+            assert!(tracker.finish_error(request, "classified failure".to_string()));
+        }
+        let errors = tracker
+            .statuses
+            .iter()
+            .filter(|status| matches!(status, VisibleDirectoryStatus::Error { .. }))
+            .count();
+        assert_eq!(errors, MAX_VISIBLE_DIRECTORY_ERRORS);
+        assert!(tracker.statuses.iter().any(|status| matches!(
+            status,
+            VisibleDirectoryStatus::InFlight { request, .. } if *request == active
+        )));
+        assert!(tracker.finish_success(active));
+    }
+
+    #[test]
+    fn snapshot_completed_time_and_explicit_stale_state_drive_refresh() {
+        let path = PathBuf::from("/remote/work");
+        let completed_at = Instant::now();
+        let mut snapshots = DirectorySnapshots::default();
+        assert_eq!(
+            snapshots.freshness_at(&path, completed_at),
+            SnapshotFreshness::Missing
+        );
+        snapshots.record_success(path.clone(), completed_at);
+        assert_eq!(
+            snapshots.freshness_at(&path, completed_at + Duration::from_secs(29)),
+            SnapshotFreshness::Fresh
+        );
+        assert_eq!(
+            snapshots.freshness_at(&path, completed_at + DIRECTORY_SNAPSHOT_TTL),
+            SnapshotFreshness::Stale
+        );
+        snapshots.record_success(path.clone(), completed_at);
+        snapshots.mark_stale(std::iter::once(&path));
+        assert_eq!(
+            snapshots.freshness_at(&path, completed_at),
+            SnapshotFreshness::Stale
+        );
+        snapshots.reset();
+        assert_eq!(
+            snapshots.freshness_at(&path, completed_at),
+            SnapshotFreshness::Missing
+        );
+    }
+
+    #[test]
+    fn ttl_revalidation_is_ordered_bounded_and_ignores_missing_rows() {
+        let now = Instant::now();
+        let mut snapshots = DirectorySnapshots::default();
+        for path in ["/root", "/root/a", "/root/b"] {
+            snapshots.record_success(
+                PathBuf::from(path),
+                now - DIRECTORY_SNAPSHOT_TTL - Duration::from_secs(1),
+            );
+        }
+        let due = snapshots.due_paths_at(
+            ["/root", "/root/a", "/root/missing", "/root/b"]
+                .into_iter()
+                .map(PathBuf::from),
+            now,
+            2,
+        );
+        assert_eq!(due, [PathBuf::from("/root"), PathBuf::from("/root/a")]);
+    }
+
+    #[test]
+    fn typed_path_validation_is_absolute_normalized_and_spoof_safe() {
+        assert_eq!(
+            validate_typed_file_tree_path("/srv/项目 one").unwrap(),
+            PathBuf::from("/srv/项目 one")
+        );
+        for invalid in [
+            "relative/path",
+            "/srv/../secret",
+            "/srv/./work",
+            "/srv/\0work",
+            "/srv/\u{202e}txt",
+        ] {
+            assert!(
+                validate_typed_file_tree_path(invalid).is_err(),
+                "{invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pending_navigation_rejects_stale_token_and_authority() {
+        let local = FsAuthorityKey::Local;
+        let remote = remote_authority(remote_host());
+        assert!(pending_navigation_is_current(7, 7, &remote, &remote));
+        assert!(!pending_navigation_is_current(6, 7, &remote, &remote));
+        assert!(!pending_navigation_is_current(7, 7, &remote, &local));
+        let first = crate::remote_fs::SessionRemoteEndpoint::new(
+            remote_host(),
+            false,
+            Some("/tmp/anvil-control-a"),
+        )
+        .map(crate::remote_fs::FsLocation::session)
+        .unwrap();
+        let second = crate::remote_fs::SessionRemoteEndpoint::new(
+            remote_host(),
+            false,
+            Some("/tmp/anvil-control-b"),
+        )
+        .map(crate::remote_fs::FsLocation::session)
+        .unwrap();
+        assert_ne!(
+            FsAuthorityKey::capture(&first, &[]).unwrap(),
+            FsAuthorityKey::capture(&second, &[]).unwrap(),
+            "execution overlays are part of immutable scheduler/navigation authority"
+        );
+    }
+
+    #[test]
+    fn failure_gate_is_typed_exponential_and_authority_bound() {
+        let authority = remote_authority(remote_host());
+        let other = FsAuthorityKey::Local;
+        let path = PathBuf::from("/remote/work");
+        let now = Instant::now();
+        let mut gate = DirectoryFailureGate::default();
+        assert_eq!(
+            gate.record_failure_at(
+                authority.clone(),
+                path.clone(),
+                crate::remote_fs::FsFailureKind::Connection,
+                now,
+            ),
+            Duration::from_secs(1)
+        );
+        assert!(!gate.allows_auto_at(&authority, &path, now));
+        assert!(gate.allows_auto_at(&other, &path, now));
+        assert_eq!(
+            gate.record_failure_at(
+                authority.clone(),
+                path.clone(),
+                crate::remote_fs::FsFailureKind::Connection,
+                now + Duration::from_secs(1),
+            ),
+            Duration::from_secs(2)
+        );
+        gate.record_success(&authority, &path);
+        assert!(gate.allows_auto_at(&authority, &path, now));
+        assert_eq!(
+            failure_retry_delay(crate::remote_fs::FsFailureKind::Permission, 9),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn navigation_history_is_success_commit_only_bounded_and_per_authority() {
+        let local = FsAuthorityKey::Local;
+        let remote_host = remote_host();
+        let remote_authority = remote_authority(remote_host.clone());
+        let mut history = FileTreeNavigationHistory::default();
+        for index in 0..(MAX_FILE_TREE_HISTORY + 5) {
+            history.commit(
+                NavigationHistoryAction::Push,
+                FileTreeHistoryEntry {
+                    location: crate::remote_fs::FsLocation::Local,
+                    hosts: Vec::new(),
+                    root: PathBuf::from(format!("/local/{index}")),
+                },
+            );
+        }
+        assert_eq!(history.len(&local), MAX_FILE_TREE_HISTORY);
+        assert_eq!(history.len(&remote_authority), 0);
+        let (back_index, back_entry) = history.back(&local).unwrap();
+        assert_eq!(
+            history.retry_action(&local, &back_entry.root),
+            NavigationHistoryAction::MoveTo(back_index)
+        );
+        history.commit(
+            NavigationHistoryAction::Push,
+            FileTreeHistoryEntry {
+                location: crate::remote_fs::FsLocation::Remote(0),
+                hosts: vec![remote_host],
+                root: PathBuf::from("/remote/home"),
+            },
+        );
+        assert_eq!(history.len(&remote_authority), 1);
+        assert!(history.back(&remote_authority).is_none());
+        assert!(history.back(&local).is_some());
+    }
+
+    #[test]
+    fn root_listing_cache_is_authority_bound_lru_and_exactly_invalidated() {
+        let local = FsAuthorityKey::Local;
+        let remote = remote_authority(remote_host());
+        let mut cache = RootListingCache::default();
+        for index in 0..(MAX_ROOT_LISTING_CACHE + 2) {
+            cache.insert(
+                local.clone(),
+                PathBuf::from(format!("/root/{index}")),
+                DirectoryListing::new(Vec::new(), false),
+            );
+        }
+        assert_eq!(cache.len(), MAX_ROOT_LISTING_CACHE);
+        assert!(cache.get(&local, Path::new("/root/0")).is_none());
+        cache.insert(
+            remote.clone(),
+            PathBuf::from("/root/9"),
+            DirectoryListing::new(Vec::new(), false),
+        );
+        cache.invalidate(&local, [&PathBuf::from("/root/9")]);
+        assert!(cache.get(&remote, Path::new("/root/9")).is_some());
+    }
+
+    #[test]
+    fn retry_accessibility_contract_is_nonempty_and_action_specific() {
+        assert_eq!(FILE_TREE_RETRY_ACCESSIBLE_LABEL, "Retry directory scan");
+        assert!(!FILE_TREE_RETRY_ACCESSIBLE_LABEL.trim().is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn retry_widget_is_a_focusable_button() {
+        gtk::init().expect("GTK display");
+        let status = FileTreeStatusUi::new(|_| {});
+        assert!(status.retry.is_focusable());
+        assert_eq!(status.retry.widget_name(), "file-tree-retry");
+        assert_eq!(
+            status.retry.tooltip_text().as_deref(),
+            Some("Retry this directory scan")
+        );
+    }
 
     fn remote_host() -> crate::config::RemoteHost {
         crate::config::RemoteHost {
@@ -1448,6 +3442,13 @@ mod tests {
             multiplex: true,
             deploy: jterm_core::jsh_remote::Deploy::Persist,
         }
+    }
+
+    fn remote_authority(host: crate::config::RemoteHost) -> FsAuthorityKey {
+        FsAuthorityKey::Remote(Box::new(FsRemoteAuthorityKey {
+            identity: host.clone(),
+            execution: host,
+        }))
     }
 
     fn observed_profile(argv: &[&str]) -> crate::config::RemoteHost {
@@ -1505,23 +3506,270 @@ mod tests {
         assert_eq!(names, ["Able", "beta", "Alpha.txt", "Zulu.txt"]);
     }
 
-    #[test]
-    fn scan_permit_waits_for_a_slot_instead_of_failing() {
-        let held: Vec<ScanPermit> = (0..MAX_CONCURRENT_SCANS)
-            .map(|_| ScanPermit::acquire())
-            .collect();
-        let (tx, rx) = mpsc::channel();
-        let waiter = std::thread::spawn(move || {
-            let _permit = ScanPermit::acquire();
-            tx.send(()).expect("waiter reports its acquisition");
-        });
+    fn scheduler_test_job(
+        id: usize,
+        cancellation: Option<ScanCancellation>,
+        ran: &Arc<Mutex<Vec<usize>>>,
+        cancelled: &Arc<Mutex<Vec<usize>>>,
+    ) -> ScheduledFsJob {
+        scheduler_test_job_at(id, FsAuthorityKey::Local, cancellation, ran, cancelled)
+    }
 
-        // Every slot is held, so the queued acquire must still be parked.
-        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
-        drop(held);
-        rx.recv_timeout(Duration::from_secs(5))
-            .expect("a freed slot lets the queued scan proceed");
-        waiter.join().expect("waiter thread finishes");
+    fn scheduler_test_job_at(
+        id: usize,
+        authority: FsAuthorityKey,
+        cancellation: Option<ScanCancellation>,
+        ran: &Arc<Mutex<Vec<usize>>>,
+        cancelled: &Arc<Mutex<Vec<usize>>>,
+    ) -> ScheduledFsJob {
+        let ran = ran.clone();
+        let cancelled = cancelled.clone();
+        ScheduledFsJob {
+            authority,
+            queued_at: Instant::now(),
+            cancellation,
+            run: Some(Box::new(move |_| ran.lock().unwrap().push(id))),
+            cancel: Some(Box::new(move || cancelled.lock().unwrap().push(id))),
+        }
+    }
+
+    #[test]
+    fn scheduler_has_a_hard_pending_cap_and_cancelled_jobs_free_capacity() {
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let cancelled = Arc::new(Mutex::new(Vec::new()));
+        let mut queues = SchedulerQueues::new(2);
+        let cancellation = ScanCancellation::default();
+        assert!(queues
+            .push(
+                FsJobPriority::Normal,
+                scheduler_test_job(1, Some(cancellation.clone()), &ran, &cancelled),
+            )
+            .is_ok());
+        assert!(queues
+            .push(
+                FsJobPriority::Interactive,
+                scheduler_test_job(2, None, &ran, &cancelled),
+            )
+            .is_ok());
+        assert!(queues
+            .push(
+                FsJobPriority::Background,
+                scheduler_test_job(3, None, &ran, &cancelled),
+            )
+            .is_err());
+
+        cancellation.cancel();
+        let retired = queues.drain_cancelled();
+        assert_eq!(retired.len(), 1);
+        for job in retired {
+            job.cancel();
+        }
+        assert_eq!(*cancelled.lock().unwrap(), [1]);
+        assert!(queues
+            .push(
+                FsJobPriority::Background,
+                scheduler_test_job(3, None, &ran, &cancelled),
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn scheduler_queue_stress_never_exceeds_the_production_pending_limit() {
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let cancelled = Arc::new(Mutex::new(Vec::new()));
+        let mut queues = SchedulerQueues::new(MAX_PENDING_FS_JOBS);
+        let mut tokens = Vec::new();
+        for id in 0..MAX_PENDING_FS_JOBS {
+            let token = ScanCancellation::default();
+            assert!(queues
+                .push(
+                    FsJobPriority::Normal,
+                    scheduler_test_job(id, Some(token.clone()), &ran, &cancelled),
+                )
+                .is_ok());
+            tokens.push(token);
+        }
+        assert_eq!(queues.len(), MAX_PENDING_FS_JOBS);
+        assert!(queues
+            .push(
+                FsJobPriority::Interactive,
+                scheduler_test_job(999, None, &ran, &cancelled),
+            )
+            .is_err());
+
+        for token in tokens.iter().step_by(2) {
+            token.cancel();
+        }
+        let retired = queues.drain_cancelled();
+        assert_eq!(retired.len(), MAX_PENDING_FS_JOBS / 2);
+        for job in retired {
+            job.cancel();
+        }
+        assert_eq!(queues.len(), MAX_PENDING_FS_JOBS / 2);
+        assert_eq!(cancelled.lock().unwrap().len(), MAX_PENDING_FS_JOBS / 2);
+    }
+
+    #[test]
+    fn scheduler_is_fifo_within_weighted_fair_priority_lanes() {
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let cancelled = Arc::new(Mutex::new(Vec::new()));
+        let mut queues = SchedulerQueues::new(32);
+        for id in 10..14 {
+            assert!(queues
+                .push(
+                    FsJobPriority::Interactive,
+                    scheduler_test_job(id, None, &ran, &cancelled),
+                )
+                .is_ok());
+        }
+        for id in 20..22 {
+            assert!(queues
+                .push(
+                    FsJobPriority::Normal,
+                    scheduler_test_job(id, None, &ran, &cancelled),
+                )
+                .is_ok());
+        }
+        assert!(queues
+            .push(
+                FsJobPriority::Background,
+                scheduler_test_job(30, None, &ran, &cancelled),
+            )
+            .is_ok());
+
+        while let Some((_priority, job)) = queues.pop_next(true, &[]) {
+            job.run();
+        }
+        assert_eq!(*ran.lock().unwrap(), [10, 11, 12, 13, 20, 21, 30]);
+        assert!(cancelled.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn scheduler_physically_skips_a_superseded_job_before_start() {
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let cancelled = Arc::new(Mutex::new(Vec::new()));
+        let cancellation = ScanCancellation::default();
+        let mut queues = SchedulerQueues::new(1);
+        assert!(queues
+            .push(
+                FsJobPriority::Normal,
+                scheduler_test_job(7, Some(cancellation.clone()), &ran, &cancelled),
+            )
+            .is_ok());
+        cancellation.cancel();
+        for job in queues.drain_cancelled() {
+            job.cancel();
+        }
+        assert!(queues.pop_next(true, &[]).is_none());
+        assert!(ran.lock().unwrap().is_empty());
+        assert_eq!(*cancelled.lock().unwrap(), [7]);
+    }
+
+    #[test]
+    fn scheduler_round_robins_authorities_and_enforces_remote_caps() {
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let cancelled = Arc::new(Mutex::new(Vec::new()));
+        let authority_a = remote_authority(remote_host());
+        let mut second = remote_host();
+        second.name = "production".to_string();
+        second.host = "prod.example.com".to_string();
+        let authority_b = remote_authority(second);
+        let mut queues = SchedulerQueues::new(MAX_PENDING_FS_JOBS);
+
+        for id in 0..MAX_REMOTE_PENDING_FS_JOBS {
+            assert!(queues
+                .push(
+                    FsJobPriority::Normal,
+                    scheduler_test_job_at(id, authority_a.clone(), None, &ran, &cancelled,),
+                )
+                .is_ok());
+        }
+        assert!(
+            queues
+                .push(
+                    FsJobPriority::Interactive,
+                    scheduler_test_job_at(999, authority_a.clone(), None, &ran, &cancelled,),
+                )
+                .is_err(),
+            "one remote cannot occupy more than its pending quota"
+        );
+        assert!(
+            queues
+                .push(
+                    FsJobPriority::Normal,
+                    scheduler_test_job_at(1000, authority_b.clone(), None, &ran, &cancelled,),
+                )
+                .is_ok(),
+            "another authority keeps independent capacity"
+        );
+
+        let running = vec![(authority_a.clone(), MAX_REMOTE_RUNNING_FS_JOBS)];
+        let (_, job) = queues
+            .pop_next(true, &running)
+            .expect("unblocked authority must remain runnable");
+        assert_eq!(job.authority, authority_b);
+    }
+
+    #[test]
+    fn scheduler_is_round_robin_within_one_priority_lane() {
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let cancelled = Arc::new(Mutex::new(Vec::new()));
+        let authority_a = remote_authority(remote_host());
+        let mut second = remote_host();
+        second.host = "other.example.com".to_string();
+        let authority_b = remote_authority(second);
+        let mut queues = SchedulerQueues::new(8);
+        for (id, authority) in [
+            (1, authority_a.clone()),
+            (2, authority_a),
+            (10, authority_b.clone()),
+            (11, authority_b),
+        ] {
+            assert!(queues
+                .push(
+                    FsJobPriority::Normal,
+                    scheduler_test_job_at(id, authority, None, &ran, &cancelled),
+                )
+                .is_ok());
+        }
+        while let Some((_, job)) = queues.pop_next(true, &[]) {
+            job.run();
+        }
+        assert_eq!(*ran.lock().unwrap(), [1, 10, 2, 11]);
+    }
+
+    #[test]
+    fn directory_refresh_revisions_are_latest_wins_per_path() {
+        let mut revisions = DirectoryRefreshRevisions::default();
+        let first_a = revisions.begin(Path::new("/remote/a"));
+        let only_b = revisions.begin(Path::new("/remote/b"));
+        let second_a = revisions.begin(Path::new("/remote/a"));
+
+        assert!(first_a.cancellation().is_cancelled());
+        assert!(!second_a.cancellation().is_cancelled());
+        assert!(!revisions.finish_if_latest(Path::new("/remote/a"), &first_a));
+        assert!(revisions.finish_if_latest(Path::new("/remote/b"), &only_b));
+        assert!(revisions.finish_if_latest(Path::new("/remote/a"), &second_a));
+        assert!(
+            !revisions.finish_if_latest(Path::new("/remote/a"), &second_a),
+            "one terminal result may publish only once"
+        );
+    }
+
+    #[test]
+    fn reroot_and_invalid_row_target_fail_closed() {
+        let mut revisions = DirectoryRefreshRevisions::default();
+        let request = revisions.begin(Path::new("/remote/project"));
+        revisions.cancel_all();
+        assert!(request.cancellation().is_cancelled());
+        assert!(!revisions.finish_if_latest(Path::new("/remote/project"), &request));
+
+        assert!(refresh_row_identity_is_current("row-a", Some("row-a")));
+        assert!(!refresh_row_identity_is_current("row-a", Some("row-b")));
+        assert!(
+            !refresh_row_identity_is_current("row-a", None),
+            "a vanished non-root target must not be treated as the root"
+        );
     }
 
     #[test]
@@ -1971,6 +4219,27 @@ mod tests {
     }
 
     #[test]
+    fn reconciliation_revision_revokes_delayed_ui_but_not_dispatched_settlement() {
+        let location = crate::remote_fs::FsLocation::Local;
+        let intent = capture_file_tree_user_intent(41, 7, &location, &[]);
+        assert!(file_tree_user_intent_is_current(
+            &intent,
+            7,
+            41,
+            &location,
+            &[]
+        ));
+        assert!(
+            !file_tree_user_intent_is_current(&intent, 8, 41, &location, &[]),
+            "a changed model revokes a menu or confirmation dialog captured before reconciliation"
+        );
+        assert!(
+            file_tree_async_ui_is_current(&intent, 41, &location, &[], None, 0),
+            "already-dispatched filesystem settlement remains bound to backend authority, not row presentation"
+        );
+    }
+
+    #[test]
     fn delayed_remote_intent_requires_the_complete_original_profile() {
         let host = remote_host();
         let intent = capture_file_tree_intent(
@@ -1998,6 +4267,43 @@ mod tests {
             7,
             &crate::remote_fs::FsLocation::Local,
             &[host]
+        ));
+    }
+
+    #[test]
+    fn remote_home_navigation_intent_cannot_cross_authority_or_generation() {
+        let host = remote_host();
+        let location = crate::remote_fs::FsLocation::Remote(0);
+        let intent = capture_file_tree_intent(55, &location, std::slice::from_ref(&host));
+        assert!(home_navigation_is_current(
+            9,
+            9,
+            &intent,
+            55,
+            &location,
+            std::slice::from_ref(&host),
+        ));
+        assert!(
+            !home_navigation_is_current(9, 10, &intent, 55, &location, std::slice::from_ref(&host),),
+            "Home -> Up/Ctrl+L/location must deterministically retire the old Home reply"
+        );
+        let mut replacement = host.clone();
+        replacement.user = Some("other-user".to_string());
+        assert!(!home_navigation_is_current(
+            9,
+            9,
+            &intent,
+            55,
+            &location,
+            &[replacement],
+        ));
+        assert!(!home_navigation_is_current(
+            9,
+            9,
+            &intent,
+            56,
+            &location,
+            std::slice::from_ref(&host),
         ));
     }
 
@@ -2261,6 +4567,18 @@ mod tests {
         assert_eq!(filter_visible(&rows, "  "), vec![false; 6]); // "  " matches nothing
     }
 
+    #[test]
+    fn hidden_file_policy_is_independent_from_name_filtering() {
+        let mut state = TreeFilter::new();
+        assert!(!state.shows_name(".git"));
+        assert!(state.shows_name("src"));
+        assert!(!state.is_active());
+
+        state.show_hidden = true;
+        assert!(state.shows_name(".git"));
+        assert!(!state.is_active(), "dotfile visibility is not a text query");
+    }
+
     // -- merge refresh (in-place directory update) ----------------------------
 
     fn entry(path: &str, is_dir: bool) -> FileEntry {
@@ -2272,10 +4590,19 @@ mod tests {
         encode_path_identity(Path::new(path)).expect("short paths encode")
     }
 
+    fn current_rows(spec: &[(&str, bool)]) -> Vec<CurrentMergeRow> {
+        spec.iter()
+            .map(|(path, is_dir)| CurrentMergeRow {
+                identity: identity_of(path),
+                is_dir: *is_dir,
+            })
+            .collect()
+    }
+
     /// Simulate the model after applying an edit: stale rows removed, inserts
     /// at their planned positions, survivors untouched.
-    fn apply_plan(current: &[String], edit: &MergeEdit) -> Vec<String> {
-        let mut model: Vec<String> = current.to_vec();
+    fn apply_plan(current: &[CurrentMergeRow], edit: &MergeEdit) -> Vec<String> {
+        let mut model: Vec<String> = current.iter().map(|row| row.identity.clone()).collect();
         for index in edit.removals.iter().rev() {
             model.remove(*index);
         }
@@ -2298,10 +4625,12 @@ mod tests {
 
     #[test]
     fn merge_plan_removes_stale_inserts_sorted_and_keeps_survivors() {
-        let current: Vec<String> = ["/r/aaa", "/r/bbb", "/r/file1", "/r/file2"]
-            .into_iter()
-            .map(identity_of)
-            .collect();
+        let current = current_rows(&[
+            ("/r/aaa", true),
+            ("/r/bbb", true),
+            ("/r/file1", false),
+            ("/r/file2", false),
+        ]);
         let mut fresh_entries = vec![
             entry("/r/aaa", true),    // survives
             entry("/r/ccc", true),    // new dir
@@ -2332,17 +4661,17 @@ mod tests {
     #[test]
     fn merge_plan_skips_placeholder_rows() {
         // A never-expanded directory has one placeholder child (empty path).
-        let current = vec![String::new()];
+        let current = vec![CurrentMergeRow {
+            identity: String::new(),
+            is_dir: false,
+        }];
         let fresh = identified(vec![entry("/r/aaa/new", false)]);
         assert!(plan_merge_refresh(&current, &fresh).is_none());
     }
 
     #[test]
     fn merge_plan_handles_rename_shape_and_empty_results() {
-        let current: Vec<String> = ["/r/alpha.txt", "/r/zeta.txt"]
-            .into_iter()
-            .map(identity_of)
-            .collect();
+        let current = current_rows(&[("/r/alpha.txt", false), ("/r/zeta.txt", false)]);
         let mut fresh_entries = vec![entry("/r/alpha.txt", false), entry("/r/mid.txt", false)];
         sort_entries(&mut fresh_entries);
         let fresh = identified(fresh_entries);
@@ -2355,5 +4684,52 @@ mod tests {
         assert_eq!(edit.removals, [0, 1]);
         assert!(edit.inserts.is_empty());
         assert!(apply_plan(&current, &edit).is_empty());
+    }
+
+    #[test]
+    fn merge_plan_replaces_a_same_path_type_flip() {
+        let current = current_rows(&[("/r/node", false)]);
+        let fresh = identified(vec![entry("/r/node", true)]);
+        let edit = plan_merge_refresh(&current, &fresh).expect("loaded parent");
+        assert_eq!(edit.removals, [0]);
+        assert_eq!(edit.inserts.len(), 1);
+        assert!(edit.inserts[0].1.is_dir);
+        assert_eq!(apply_plan(&current, &edit), ["/r/node"]);
+    }
+
+    #[test]
+    fn selection_restore_keeps_only_surviving_identities_in_original_order() {
+        let selected = vec![
+            identity_of("/r/removed"),
+            identity_of("/r/kept-b"),
+            identity_of("/r/kept-a"),
+        ];
+        let loaded = [identity_of("/r/kept-a"), identity_of("/r/kept-b")]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            surviving_selection_identities(&selected, &loaded),
+            [identity_of("/r/kept-b"), identity_of("/r/kept-a")]
+        );
+    }
+
+    #[test]
+    fn entering_a_directory_is_lexically_confined_to_the_current_root() {
+        assert!(directory_navigation_path_is_allowed(
+            Path::new("/remote/work"),
+            Path::new("/remote/work/src")
+        ));
+        assert!(!directory_navigation_path_is_allowed(
+            Path::new("/remote/work"),
+            Path::new("/remote/work")
+        ));
+        assert!(!directory_navigation_path_is_allowed(
+            Path::new("/remote/work"),
+            Path::new("/remote/other")
+        ));
+        assert!(!directory_navigation_path_is_allowed(
+            Path::new("relative"),
+            Path::new("relative/child")
+        ));
     }
 }

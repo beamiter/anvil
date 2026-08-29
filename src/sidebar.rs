@@ -5,8 +5,13 @@ use relm4::gtk::prelude::*;
 use relm4::prelude::*;
 
 const PARENT_DIRECTORY_LABEL: &str = "Go to parent directory";
+const HOME_DIRECTORY_LABEL: &str = "Go to filesystem home directory";
+const BACK_DIRECTORY_LABEL: &str = "Go back in file-tree history";
+const FORWARD_DIRECTORY_LABEL: &str = "Go forward in file-tree history";
 const CURRENT_DIRECTORY_LABEL: &str = "Go to current terminal directory";
 const OPEN_TERMINAL_LABEL: &str = "Open terminal for current file-tree location";
+const SHOW_HIDDEN_LABEL: &str = "Show hidden files";
+const MAX_BREADCRUMB_COMPONENTS: usize = 32;
 const LOCAL_TERMINAL_TOOLTIP: &str = "Open a local terminal in this tree directory";
 const REMOTE_TERMINAL_TOOLTIP: &str = "Connect to this remote profile; the remote shell chooses its start directory, which may differ from this tree path";
 
@@ -70,7 +75,14 @@ pub(crate) enum FileHeaderMsg {
     SetRoot {
         display: String,
         tooltip: String,
+        path: std::path::PathBuf,
     },
+    SetNavigationAvailable {
+        back: bool,
+        forward: bool,
+    },
+    OpenPathEntry,
+    ClosePathEntry,
     /// Rebuild the location selector's labels and selection without emitting
     /// `SelectLocation` (config edit or a rollback to Local).
     SetLocations {
@@ -88,17 +100,26 @@ pub(crate) enum FileHeaderMsg {
     FilterEdited(String),
     /// Esc in the entry or a programmatic close (e.g. a root change).
     CloseFilter,
+    /// The eye toggle changed; hidden rows are filtered client-side.
+    ToggleHidden,
 }
 
 #[derive(Debug)]
 pub(crate) enum FileHeaderOutput {
+    Back,
+    Forward,
     Up,
+    Home,
     CurrentDirectory,
     OpenTerminal,
     /// Dropdown index: 0 is Local, i > 0 is `config.remote_hosts[i - 1]`.
     SelectLocation(usize),
     /// Current filter query; "" when the filter is closed or cleared.
     FilterChanged(String),
+    /// Whether dot-prefixed entries should be visible.
+    ShowHiddenChanged(bool),
+    NavigatePath(std::path::PathBuf),
+    PathEntered(String),
 }
 
 pub(crate) struct FileHeaderModel {
@@ -108,6 +129,7 @@ pub(crate) struct FileHeaderModel {
     selected: usize,
     suppress_location_signal: bool,
     filter_open: bool,
+    show_hidden: bool,
 }
 
 #[relm4::component(pub(crate))]
@@ -138,6 +160,32 @@ impl Component for FileHeaderModel {
                     },
                 },
 
+                #[name(back_button)]
+                gtk::Button {
+                    set_icon_name: "go-previous-symbolic",
+                    set_sensitive: false,
+                    set_tooltip_text: Some("Back"),
+                    update_property: &[
+                        gtk::accessible::Property::Label(BACK_DIRECTORY_LABEL),
+                    ],
+                    connect_clicked[sender] => move |_| {
+                        let _ = sender.output(FileHeaderOutput::Back);
+                    },
+                },
+
+                #[name(forward_button)]
+                gtk::Button {
+                    set_icon_name: "go-next-symbolic",
+                    set_sensitive: false,
+                    set_tooltip_text: Some("Forward"),
+                    update_property: &[
+                        gtk::accessible::Property::Label(FORWARD_DIRECTORY_LABEL),
+                    ],
+                    connect_clicked[sender] => move |_| {
+                        let _ = sender.output(FileHeaderOutput::Forward);
+                    },
+                },
+
                 gtk::Button {
                     set_icon_name: "go-up-symbolic",
                     set_tooltip_text: Some("Parent directory"),
@@ -151,6 +199,17 @@ impl Component for FileHeaderModel {
 
                 gtk::Button {
                     set_icon_name: "go-home-symbolic",
+                    set_tooltip_text: Some("Filesystem home directory"),
+                    update_property: &[
+                        gtk::accessible::Property::Label(HOME_DIRECTORY_LABEL),
+                    ],
+                    connect_clicked[sender] => move |_| {
+                        let _ = sender.output(FileHeaderOutput::Home);
+                    },
+                },
+
+                gtk::Button {
+                    set_icon_name: "go-jump-symbolic",
                     set_tooltip_text: Some("Go to current directory"),
                     update_property: &[
                         gtk::accessible::Property::Label(CURRENT_DIRECTORY_LABEL),
@@ -190,6 +249,38 @@ impl Component for FileHeaderModel {
                         sender.input(FileHeaderMsg::ToggleFilter);
                     },
                 },
+
+                #[name(hidden_button)]
+                gtk::ToggleButton {
+                    set_widget_name: "file-tree-show-hidden",
+                    set_icon_name: "view-reveal-symbolic",
+                    set_focusable: true,
+                    set_tooltip_text: Some("Show hidden files"),
+                    update_property: &[
+                        gtk::accessible::Property::Label(SHOW_HIDDEN_LABEL),
+                    ],
+                    connect_toggled[sender] => move |_| {
+                        sender.input(FileHeaderMsg::ToggleHidden);
+                    },
+                },
+            },
+
+            #[name(breadcrumb_box)]
+            gtk::Box {
+                set_orientation: gtk::Orientation::Horizontal,
+                set_spacing: 2,
+                set_hexpand: true,
+            },
+
+            #[name(path_entry)]
+            gtk::Entry {
+                set_widget_name: "file-tree-path-entry",
+                set_placeholder_text: Some("Enter an absolute path…"),
+                set_max_length: 4096,
+                set_visible: false,
+                connect_activate[sender] => move |entry| {
+                    let _ = sender.output(FileHeaderOutput::PathEntered(entry.text().to_string()));
+                },
             },
 
             #[name(filter_entry)]
@@ -220,6 +311,7 @@ impl Component for FileHeaderModel {
             selected: 0,
             suppress_location_signal: false,
             filter_open: false,
+            show_hidden: false,
         };
         let widgets = view_output!();
         let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
@@ -245,6 +337,18 @@ impl Component for FileHeaderModel {
             });
         }
         widgets.filter_entry.add_controller(key_controller);
+        let path_key_controller = gtk::EventControllerKey::new();
+        {
+            let sender = sender.clone();
+            path_key_controller.connect_key_pressed(move |_, key, _, _| {
+                if key == gtk::gdk::Key::Escape {
+                    sender.input(FileHeaderMsg::ClosePathEntry);
+                    return gtk::glib::Propagation::Stop;
+                }
+                gtk::glib::Propagation::Proceed
+            });
+        }
+        widgets.path_entry.add_controller(path_key_controller);
         ComponentParts { model, widgets }
     }
 
@@ -256,12 +360,86 @@ impl Component for FileHeaderModel {
         _root: &Self::Root,
     ) {
         match msg {
-            FileHeaderMsg::SetRoot { display, tooltip } => {
+            FileHeaderMsg::SetRoot {
+                display,
+                tooltip,
+                path,
+            } => {
                 self.display = display;
                 self.tooltip = tooltip;
                 widgets.root_label.set_label(&self.display);
                 widgets.root_label.set_tooltip_text(Some(&self.tooltip));
+                while let Some(child) = widgets.breadcrumb_box.first_child() {
+                    widgets.breadcrumb_box.remove(&child);
+                }
+                let root_button = gtk::Button::with_label("/");
+                root_button.add_css_class("flat");
+                {
+                    let sender = sender.clone();
+                    root_button.connect_clicked(move |_| {
+                        let _ = sender.output(FileHeaderOutput::NavigatePath(
+                            std::path::PathBuf::from("/"),
+                        ));
+                    });
+                }
+                widgets.breadcrumb_box.append(&root_button);
+                let components: Vec<_> = path
+                    .components()
+                    .filter_map(|component| match component {
+                        std::path::Component::Normal(name) => Some(name.to_os_string()),
+                        _ => None,
+                    })
+                    .collect();
+                let hidden = components.len().saturating_sub(MAX_BREADCRUMB_COMPONENTS);
+                if hidden > 0 {
+                    let separator = gtk::Label::new(Some("›"));
+                    widgets.breadcrumb_box.append(&separator);
+                    widgets.breadcrumb_box.append(&gtk::Label::new(Some("…")));
+                }
+                let mut prefix = std::path::PathBuf::from("/");
+                for (index, name) in components.into_iter().enumerate() {
+                    prefix.push(&name);
+                    if index < hidden {
+                        continue;
+                    }
+                    let separator = gtk::Label::new(Some("›"));
+                    widgets.breadcrumb_box.append(&separator);
+                    let label =
+                        crate::review_input::safe_inline_display(&name.to_string_lossy(), 128);
+                    let button = gtk::Button::with_label(&label);
+                    button.add_css_class("flat");
+                    button.set_tooltip_text(Some(&crate::file_tree::display_full_path(&prefix)));
+                    {
+                        let sender = sender.clone();
+                        let path = prefix.clone();
+                        button.connect_clicked(move |_| {
+                            let _ = sender.output(FileHeaderOutput::NavigatePath(path.clone()));
+                        });
+                    }
+                    widgets.breadcrumb_box.append(&button);
+                }
+                if let Some(path) = path.to_str() {
+                    widgets.path_entry.set_text(path);
+                    widgets.path_entry.set_tooltip_text(None);
+                } else {
+                    // Never round-trip a lossy local name into an actionable
+                    // path. The user may still type a different UTF-8 path.
+                    widgets.path_entry.set_text("");
+                    widgets.path_entry.set_tooltip_text(Some(
+                        "The current path is not valid UTF-8 and cannot be copied into this entry",
+                    ));
+                }
             }
+            FileHeaderMsg::SetNavigationAvailable { back, forward } => {
+                widgets.back_button.set_sensitive(back);
+                widgets.forward_button.set_sensitive(forward);
+            }
+            FileHeaderMsg::OpenPathEntry => {
+                widgets.path_entry.set_visible(true);
+                widgets.path_entry.grab_focus();
+                widgets.path_entry.select_region(0, -1);
+            }
+            FileHeaderMsg::ClosePathEntry => widgets.path_entry.set_visible(false),
             FileHeaderMsg::SetLocations {
                 labels,
                 mut details,
@@ -326,6 +504,10 @@ impl Component for FileHeaderModel {
                     widgets.filter_button.set_active(false);
                 }
             }
+            FileHeaderMsg::ToggleHidden => {
+                self.show_hidden = widgets.hidden_button.is_active();
+                let _ = sender.output(FileHeaderOutput::ShowHiddenChanged(self.show_hidden));
+            }
         }
     }
 }
@@ -351,11 +533,20 @@ mod tests {
     #[test]
     fn file_header_icon_buttons_have_distinct_accessible_labels() {
         assert!(!PARENT_DIRECTORY_LABEL.is_empty());
+        assert!(!HOME_DIRECTORY_LABEL.is_empty());
+        assert!(!BACK_DIRECTORY_LABEL.is_empty());
+        assert!(!FORWARD_DIRECTORY_LABEL.is_empty());
         assert!(!CURRENT_DIRECTORY_LABEL.is_empty());
         assert!(!OPEN_TERMINAL_LABEL.is_empty());
+        assert!(!SHOW_HIDDEN_LABEL.is_empty());
         assert_ne!(PARENT_DIRECTORY_LABEL, CURRENT_DIRECTORY_LABEL);
+        assert_ne!(BACK_DIRECTORY_LABEL, FORWARD_DIRECTORY_LABEL);
+        assert_ne!(PARENT_DIRECTORY_LABEL, HOME_DIRECTORY_LABEL);
+        assert_ne!(HOME_DIRECTORY_LABEL, CURRENT_DIRECTORY_LABEL);
+        assert_ne!(HOME_DIRECTORY_LABEL, OPEN_TERMINAL_LABEL);
         assert_ne!(PARENT_DIRECTORY_LABEL, OPEN_TERMINAL_LABEL);
         assert_ne!(CURRENT_DIRECTORY_LABEL, OPEN_TERMINAL_LABEL);
+        assert_ne!(OPEN_TERMINAL_LABEL, SHOW_HIDDEN_LABEL);
     }
 
     #[test]

@@ -125,6 +125,11 @@ pub(crate) struct FileTreeUi {
     pub(crate) scroll: gtk::ScrolledWindow,
     pub(crate) header: Controller<sidebar::FileHeaderModel>,
     pub(crate) scan_generation: Rc<std::cell::Cell<u64>>,
+    pub(crate) content_revision: Rc<std::cell::Cell<u64>>,
+    pub(crate) snapshots: Rc<RefCell<file_tree::DirectorySnapshots>>,
+    pub(crate) failure_gate: Rc<RefCell<file_tree::DirectoryFailureGate>>,
+    pub(crate) status: Rc<file_tree::FileTreeStatusUi>,
+    pub(crate) pointer_inside: Rc<std::cell::Cell<bool>>,
 }
 
 #[allow(deprecated)]
@@ -138,6 +143,14 @@ pub(crate) fn build_file_tree(
     let filter = Rc::new(RefCell::new(file_tree::TreeFilter::new()));
     let (filter_model, view) = file_tree::new_view(&store, &filter);
     let scan_generation = Rc::new(std::cell::Cell::new(0));
+    let content_revision = Rc::new(std::cell::Cell::new(0));
+    let snapshots = Rc::new(RefCell::new(file_tree::DirectorySnapshots::default()));
+    let failure_gate = Rc::new(RefCell::new(file_tree::DirectoryFailureGate::default()));
+    let retry_sender = sender.clone();
+    let status = file_tree::FileTreeStatusUi::new(move |target| {
+        retry_sender.input(AppMsg::FileTreeRetry(target));
+    });
+    let pointer_inside = Rc::new(std::cell::Cell::new(false));
     view.add_css_class("file-tree");
 
     {
@@ -146,19 +159,63 @@ pub(crate) fn build_file_tree(
         let scan_generation = scan_generation.clone();
         let config = config.clone();
         let location = location.clone();
+        let snapshots = snapshots.clone();
+        let status = status.clone();
+        let failure_gate = failure_gate.clone();
+        let sender = sender.clone();
         view.connect_row_expanded(move |_view, iter, _path| {
             // The view's rows are filter-model coordinates; the store works
             // in child coordinates.
             let iter = filter_model.convert_iter_to_child_iter(iter);
             let hosts = config.borrow().remote_hosts.clone();
-            file_tree::on_expand(&store, &iter, &scan_generation, &location, hosts);
+            let identity: String = store
+                .get_value(&iter, file_tree::COL_PATH as i32)
+                .get()
+                .unwrap_or_default();
+            let loaded = store.iter_children(Some(&iter)).is_none_or(|first| {
+                store
+                    .get_value(&first, file_tree::COL_PATH as i32)
+                    .get::<String>()
+                    .is_ok_and(|identity| !identity.is_empty())
+            });
+            if loaded {
+                if let Some(path) = file_tree::decode_path_identity(&identity) {
+                    if snapshots.borrow().needs_refresh(&path) {
+                        let intent = file_tree::capture_file_tree_intent(
+                            scan_generation.get(),
+                            &location.borrow(),
+                            &hosts,
+                        );
+                        sender.input(AppMsg::FileTreeRefreshDirs {
+                            dirs: vec![path],
+                            intent: Box::new(intent),
+                        });
+                    }
+                }
+                return;
+            }
+            file_tree::on_expand(
+                &store,
+                &iter,
+                &scan_generation,
+                &location,
+                hosts,
+                &snapshots,
+                &status,
+                &failure_gate,
+                false,
+            );
         });
     }
     {
         let store = store.clone();
         let filter_model = filter_model.clone();
+        let config = config.clone();
+        let location = location.clone();
+        let scan_generation = scan_generation.clone();
+        let content_revision = content_revision.clone();
         let sender = sender.clone();
-        view.connect_row_activated(move |view, path, _column| {
+        view.connect_row_activated(move |_view, path, _column| {
             let Some(child_path) = filter_model.convert_path_to_child_path(path) else {
                 return;
             };
@@ -169,15 +226,6 @@ pub(crate) fn build_file_tree(
                 .get_value(&iter, file_tree::COL_IS_DIR as i32)
                 .get()
                 .unwrap_or(false);
-            if is_dir {
-                if view.row_expanded(path) {
-                    view.collapse_row(path);
-                } else {
-                    view.expand_row(path, false);
-                }
-                return;
-            }
-
             let path_identity: String = store
                 .get_value(&iter, file_tree::COL_PATH as i32)
                 .get()
@@ -189,6 +237,20 @@ pub(crate) fn build_file_tree(
                 log::warn!("file-tree activation ignored an invalid path identity");
                 return;
             };
+            if is_dir {
+                let hosts = config.borrow().remote_hosts.clone();
+                let intent = file_tree::capture_file_tree_user_intent(
+                    scan_generation.get(),
+                    content_revision.get(),
+                    &location.borrow(),
+                    &hosts,
+                );
+                sender.input(AppMsg::FileTreeEnterDirectory {
+                    path: file_path,
+                    intent: Box::new(intent),
+                });
+                return;
+            }
             if file_tree::is_notebook_path(&file_path) {
                 sender.input(AppMsg::OpenNotebook(file_path));
             } else {
@@ -209,6 +271,7 @@ pub(crate) fn build_file_tree(
         let location = location.clone();
         let clipboard = clipboard.clone();
         let scan_generation = scan_generation.clone();
+        let content_revision = content_revision.clone();
         let sender = sender.clone();
         gesture.connect_pressed(move |gesture, _n_press, x, y| {
             gesture.set_state(gtk::EventSequenceState::Claimed);
@@ -222,6 +285,7 @@ pub(crate) fn build_file_tree(
                 &location,
                 &clipboard,
                 &scan_generation,
+                &content_revision,
                 &sender,
             );
         });
@@ -271,6 +335,7 @@ pub(crate) fn build_file_tree(
             let config = config.clone();
             let location = location.clone();
             let scan_generation = scan_generation.clone();
+            let content_revision = content_revision.clone();
             let sender = sender.clone();
             drop_target.connect_drop(move |_, value, x, y| {
                 view.set_drag_dest_row(None, gtk::TreeViewDropPosition::After);
@@ -293,8 +358,9 @@ pub(crate) fn build_file_tree(
                 let intent = {
                     let loc = location.borrow();
                     let config = config.borrow();
-                    file_tree::capture_file_tree_intent(
+                    file_tree::capture_file_tree_user_intent(
                         scan_generation.get(),
+                        content_revision.get(),
                         &loc,
                         &config.remote_hosts,
                     )
@@ -313,6 +379,26 @@ pub(crate) fn build_file_tree(
     let scroll = gtk::ScrolledWindow::new();
     scroll.set_vexpand(true);
     scroll.set_child(Some(&view));
+    let pointer_controller = gtk::EventControllerMotion::new();
+    {
+        let pointer_inside = pointer_inside.clone();
+        pointer_controller.connect_enter(move |_, _, _| pointer_inside.set(true));
+    }
+    {
+        let pointer_inside = pointer_inside.clone();
+        pointer_controller.connect_leave(move |_| pointer_inside.set(false));
+    }
+    scroll.add_controller(pointer_controller);
+    let status_pointer_controller = gtk::EventControllerMotion::new();
+    {
+        let pointer_inside = pointer_inside.clone();
+        status_pointer_controller.connect_enter(move |_, _, _| pointer_inside.set(true));
+    }
+    {
+        let pointer_inside = pointer_inside.clone();
+        status_pointer_controller.connect_leave(move |_| pointer_inside.set(false));
+    }
+    status.widget().add_controller(status_pointer_controller);
     let locations = {
         let config = config.borrow();
         let location = location.borrow();
@@ -324,17 +410,22 @@ pub(crate) fn build_file_tree(
     let config_for_header = config.clone();
     let location_for_header = location.clone();
     let generation_for_header = scan_generation.clone();
+    let content_revision_for_header = content_revision.clone();
     let header = sidebar::FileHeaderModel::builder()
         .launch(locations)
         .forward(sender.input_sender(), move |output| match output {
+            sidebar::FileHeaderOutput::Back => AppMsg::FileTreeGoBack,
+            sidebar::FileHeaderOutput::Forward => AppMsg::FileTreeGoForward,
             sidebar::FileHeaderOutput::Up => AppMsg::FileTreeGoUp,
+            sidebar::FileHeaderOutput::Home => AppMsg::FileTreeGoHome,
             sidebar::FileHeaderOutput::CurrentDirectory => AppMsg::FileTreeGotoCwd,
             sidebar::FileHeaderOutput::OpenTerminal => {
                 let location = location_for_header.borrow();
                 let config = config_for_header.borrow();
                 AppMsg::FileTreeOpenTerminal {
-                    intent: Box::new(file_tree::capture_file_tree_intent(
+                    intent: Box::new(file_tree::capture_file_tree_user_intent(
                         generation_for_header.get(),
+                        content_revision_for_header.get(),
                         &location,
                         &config.remote_hosts,
                     )),
@@ -344,7 +435,22 @@ pub(crate) fn build_file_tree(
                 AppMsg::FileTreeSelectLocation(index)
             }
             sidebar::FileHeaderOutput::FilterChanged(query) => AppMsg::FileTreeFilterChanged(query),
+            sidebar::FileHeaderOutput::ShowHiddenChanged(show) => {
+                AppMsg::FileTreeShowHiddenChanged(show)
+            }
+            sidebar::FileHeaderOutput::NavigatePath(path) => AppMsg::FileTreeNavigatePath(path),
+            sidebar::FileHeaderOutput::PathEntered(path) => AppMsg::FileTreePathEntered(path),
         });
+    let header_pointer_controller = gtk::EventControllerMotion::new();
+    {
+        let pointer_inside = pointer_inside.clone();
+        header_pointer_controller.connect_enter(move |_, _, _| pointer_inside.set(true));
+    }
+    {
+        let pointer_inside = pointer_inside.clone();
+        header_pointer_controller.connect_leave(move |_| pointer_inside.set(false));
+    }
+    header.widget().add_controller(header_pointer_controller);
 
     FileTreeUi {
         store,
@@ -354,6 +460,11 @@ pub(crate) fn build_file_tree(
         scroll,
         header,
         scan_generation,
+        content_revision,
+        snapshots,
+        failure_gate,
+        status,
+        pointer_inside,
     }
 }
 
@@ -428,6 +539,7 @@ fn show_file_tree_context_menu(
     location: &Rc<RefCell<remote_fs::FsLocation>>,
     clipboard: &Rc<RefCell<Option<remote_fs::FsClipboard>>>,
     scan_generation: &Rc<std::cell::Cell<u64>>,
+    content_revision: &Rc<std::cell::Cell<u64>>,
     sender: &ComponentSender<AppModel>,
 ) {
     // Resolve the row under the pointer and the current selection. A click
@@ -496,7 +608,12 @@ fn show_file_tree_context_menu(
     let loc = location.borrow().clone();
     let clip = clipboard.borrow().clone();
     let hosts = config.borrow().remote_hosts.clone();
-    let menu_intent = file_tree::capture_file_tree_intent(scan_generation.get(), &loc, &hosts);
+    let menu_intent = file_tree::capture_file_tree_user_intent(
+        scan_generation.get(),
+        content_revision.get(),
+        &loc,
+        &hosts,
+    );
     // Cross-location paste streams between the two filesystems; the label
     // says which direction the bytes will flow.
     let (paste_sensitive, paste_label, paste_tooltip) = match &clip {
@@ -651,10 +768,11 @@ fn show_file_tree_context_menu(
             let popover = popover.clone();
             let sender = sender.clone();
             let intent = menu_intent.clone();
+            let paste_target_dir = target_dir.clone();
             button.connect_clicked(move |_| {
                 popover.popdown();
                 sender.input(AppMsg::FileTreePaste {
-                    dir: target_dir.clone(),
+                    dir: paste_target_dir.clone(),
                     intent: Box::new(intent.clone()),
                     clipboard_token,
                 });
@@ -662,15 +780,16 @@ fn show_file_tree_context_menu(
         }
         menu.append(&button);
     }
-    add_file_menu_item(
-        &menu,
-        "Refresh",
-        &popover,
-        sender,
-        AppMsg::FileTreeRefresh {
+    let refresh = match target_dir {
+        Some(dir) => AppMsg::FileTreeRefreshDirs {
+            dirs: vec![dir],
             intent: Box::new(menu_intent),
         },
-    );
+        None => AppMsg::FileTreeRefresh {
+            intent: Box::new(menu_intent),
+        },
+    };
+    add_file_menu_item(&menu, "Refresh", &popover, sender, refresh);
 
     popover.set_child(Some(&menu));
     popover.connect_closed(|popover| popover.unparent());

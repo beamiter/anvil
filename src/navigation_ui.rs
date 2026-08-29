@@ -14,6 +14,9 @@ impl AppModel {
         }
         self.sidebar_visible = visible;
         self.sidebar_box.set_visible(visible);
+        if visible && self.sidebar_view.get() == config::SidebarView::Files {
+            self.file_tree_revalidate_due();
+        }
         if persist {
             self.config.borrow_mut().sidebar_visible = visible;
             self.persist_config();
@@ -82,7 +85,10 @@ impl AppModel {
         use config::SidebarView;
         match view {
             SidebarView::Tabs => self.sidebar_stack.set_visible_child_name("tabs"),
-            SidebarView::Files => self.sidebar_stack.set_visible_child_name("files"),
+            SidebarView::Files => {
+                self.sidebar_stack.set_visible_child_name("files");
+                self.file_tree_revalidate_due();
+            }
         }
         self.sidebar_toggle
             .emit(sidebar_toggle::SidebarToggleMsg::SetView(view));
@@ -91,6 +97,9 @@ impl AppModel {
             self.sidebar_view.set(view);
             self.config.borrow_mut().sidebar_view = view;
             self.persist_config();
+        }
+        if view == SidebarView::Files && self.sidebar_visible {
+            self.file_tree_revalidate_due();
         }
     }
 

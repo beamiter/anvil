@@ -7,6 +7,17 @@
 
 use super::*;
 
+/// The model destination captured before an asynchronous directory refresh.
+/// Root is deliberately a distinct variant: a vanished non-root row must be
+/// discarded, never collapsed into `None` and reinterpreted as the root.
+enum FileTreeRefreshTarget {
+    Root,
+    Row {
+        reference: gtk::TreeRowReference,
+        identity: String,
+    },
+}
+
 impl AppModel {
     fn next_file_tree_ssh_detection_token(&self) -> u64 {
         let token = self.file_tree_ssh_detection_revision.get().wrapping_add(1);
@@ -236,17 +247,25 @@ impl AppModel {
         // worker before it can replace the current immutable endpoint. The
         // callback preserves the existing root/rows after that proof.
         let callback_sender = sender.clone();
-        if let Err(error) = file_tree::request_fs_op(
-            move || remote_fs::start_dir(&probe_location, &[]),
+        let worker_location = probe_location.clone();
+        if let Err(error) = file_tree::request_fs_op_at(
+            &probe_location,
+            &[],
+            move || remote_fs::start_dir(&worker_location, &[]),
             move |result| {
                 callback_sender.input(AppMsg::FileTreeSshProbeResolved {
                     pane_id,
                     token,
-                    start: result.map_err(|error| error.to_string()),
+                    start: result.map_err(|error| remote_fs::classify_fs_error(&error)),
                 });
             },
         ) {
-            self.file_tree_ssh_probe_resolved(pane_id, token, Err(error.to_string()), sender);
+            self.file_tree_ssh_probe_resolved(
+                pane_id,
+                token,
+                Err(remote_fs::classify_fs_error(&error)),
+                sender,
+            );
         }
     }
 
@@ -272,7 +291,7 @@ impl AppModel {
         &mut self,
         pane_id: u64,
         token: u64,
-        start: Result<std::path::PathBuf, String>,
+        start: Result<std::path::PathBuf, remote_fs::FsFailureKind>,
         sender: &ComponentSender<AppModel>,
     ) {
         let detection = match self.file_tree_ssh_observation.as_mut() {
@@ -328,7 +347,7 @@ impl AppModel {
             Err(error) => {
                 let label = detection.authority.profile().name.as_str();
                 let label = review_input::safe_inline_display(label, 256);
-                let error = review_input::safe_inline_display(&error, 512);
+                let error = remote_fs::user_facing_failure_kind(error);
                 self.show_file_tree_ssh_failure(
                     pane_id,
                     token,
@@ -354,14 +373,343 @@ impl AppModel {
             return;
         };
 
-        *self.file_tree_location.borrow_mut() = location;
-        self.sync_file_header_locations();
-        if !detection.preserve_tree {
-            self.set_file_tree_root(root);
+        if detection.preserve_tree {
+            *self.file_tree_location.borrow_mut() = location;
+            self.sync_file_header_locations();
+        } else {
+            self.stage_file_tree_navigation(
+                location,
+                self.config.borrow().remote_hosts.clone(),
+                root,
+                file_tree::NavigationHistoryAction::Push,
+                sender,
+            );
         }
         self.set_sidebar_visible(true, false);
         self.sidebar_view.set(config::SidebarView::Files);
         self.apply_sidebar_view(config::SidebarView::Files, false);
+    }
+
+    fn next_file_tree_navigation_token(&self) -> Option<(u64, file_tree::ScanCancellation)> {
+        let token = self.file_tree_navigation_revision.get().checked_add(1)?;
+        self.file_tree_navigation_revision.set(token);
+        if let Some(previous) = self.file_tree_navigation_cancellation.borrow_mut().take() {
+            previous.cancel();
+        }
+        let cancellation = file_tree::ScanCancellation::default();
+        *self.file_tree_navigation_cancellation.borrow_mut() = Some(cancellation.clone());
+        Some((token, cancellation))
+    }
+
+    fn invalidate_pending_file_tree_navigation(&self) {
+        self.file_tree_navigation_revision
+            .set(self.file_tree_navigation_revision.get().wrapping_add(1));
+        if let Some(previous) = self.file_tree_navigation_cancellation.borrow_mut().take() {
+            previous.cancel();
+        }
+    }
+
+    fn stage_file_tree_navigation(
+        &self,
+        location: remote_fs::FsLocation,
+        hosts: Vec<config::RemoteHost>,
+        root: std::path::PathBuf,
+        history: file_tree::NavigationHistoryAction,
+        sender: &ComponentSender<AppModel>,
+    ) {
+        if !root.is_absolute() {
+            self.show_toast("Cannot open a non-absolute file-tree path.");
+            return;
+        }
+        let authority = match file_tree::FsAuthorityKey::capture(&location, &hosts) {
+            Ok(authority) => authority,
+            Err(error) => {
+                self.show_toast(remote_fs::user_facing_fs_error(&error));
+                return;
+            }
+        };
+        let Some((token, cancellation)) = self.next_file_tree_navigation_token() else {
+            self.show_toast("File-tree navigation identity is exhausted; restart Anvil.");
+            return;
+        };
+        let cached = self
+            .file_tree_root_cache
+            .borrow_mut()
+            .get(&authority, &root);
+        let status_request = self.file_tree_status.begin(
+            file_tree::DirectoryScanTarget::Root(root.clone()),
+            file_tree::DirectoryScanPhase::Loading,
+        );
+        let navigation = file_tree::PendingTreeNavigation {
+            token,
+            location: location.clone(),
+            hosts: hosts.clone(),
+            root: root.clone(),
+            history,
+            status_request,
+            cached,
+        };
+        let callback_navigation = navigation.clone();
+        let sender = sender.clone();
+        let status = self.file_tree_status.clone();
+        if let Err(error) = file_tree::request_dir_scan_cancellable(
+            location,
+            hosts,
+            root,
+            cancellation,
+            move |queue_wait| status.mark_running(status_request, queue_wait),
+            move |result| {
+                sender.input(AppMsg::FileTreeNavigationResolved {
+                    navigation: Box::new(callback_navigation),
+                    listing: result.map_err(|error| remote_fs::classify_fs_error(&error)),
+                });
+            },
+        ) {
+            self.file_tree_navigation_resolved(
+                navigation,
+                Err(remote_fs::classify_fs_error(&error)),
+            );
+        }
+    }
+
+    pub(crate) fn file_tree_navigation_resolved(
+        &self,
+        navigation: file_tree::PendingTreeNavigation,
+        listing: Result<file_tree::DirectoryListing, remote_fs::FsFailureKind>,
+    ) {
+        let current_hosts = self.config.borrow().remote_hosts.clone();
+        let location = remote_fs::remap_location_by_profile(
+            &navigation.location,
+            &navigation.hosts,
+            &current_hosts,
+        );
+        let expected_authority =
+            file_tree::FsAuthorityKey::capture(&navigation.location, &navigation.hosts);
+        let current_authority = file_tree::FsAuthorityKey::capture(&location, &current_hosts);
+        let (Ok(expected_authority), Ok(current_authority)) =
+            (expected_authority, current_authority)
+        else {
+            self.file_tree_status
+                .finish_success(navigation.status_request);
+            return;
+        };
+        if !file_tree::pending_navigation_is_current(
+            navigation.token,
+            self.file_tree_navigation_revision.get(),
+            &expected_authority,
+            &current_authority,
+        ) {
+            self.file_tree_status
+                .finish_success(navigation.status_request);
+            if navigation.token == self.file_tree_navigation_revision.get() {
+                self.show_toast(
+                    "The remote filesystem authority changed; navigation was cancelled.",
+                );
+                self.sync_file_header_locations();
+            }
+            return;
+        }
+        let authority = expected_authority;
+        match listing {
+            Ok(listing) => {
+                self.file_tree_status
+                    .finish_success(navigation.status_request);
+                self.file_tree_failure_gate
+                    .borrow_mut()
+                    .record_success(&authority, &navigation.root);
+                self.commit_file_tree_navigation(
+                    location,
+                    navigation.root,
+                    listing,
+                    navigation.cached,
+                    navigation.history,
+                );
+            }
+            Err(error) => {
+                self.file_tree_status
+                    .finish_error_kind(navigation.status_request, error);
+                self.file_tree_failure_gate.borrow_mut().record_failure_at(
+                    authority,
+                    navigation.root,
+                    error,
+                    std::time::Instant::now(),
+                );
+                self.show_toast(format!(
+                    "Cannot open directory: {}",
+                    remote_fs::user_facing_failure_kind(error)
+                ));
+                self.sync_file_header_locations();
+            }
+        }
+    }
+
+    #[allow(deprecated)]
+    fn commit_file_tree_navigation(
+        &self,
+        location: remote_fs::FsLocation,
+        root: std::path::PathBuf,
+        listing: file_tree::DirectoryListing,
+        cached: Option<file_tree::DirectoryListing>,
+        history: file_tree::NavigationHistoryAction,
+    ) {
+        self.file_header.emit(sidebar::FileHeaderMsg::CloseFilter);
+        let generation = self.file_tree_scan_generation.get().wrapping_add(1);
+        self.file_tree_scan_generation.set(generation);
+        self.file_tree_refresh_revisions.borrow_mut().cancel_all();
+        self.file_tree_status.reset();
+        self.file_tree_snapshots.borrow_mut().reset();
+        self.file_tree_store.clear();
+        let display = if location == remote_fs::FsLocation::Local {
+            file_tree::display_path(&root)
+        } else {
+            file_tree::display_full_path(&root)
+        };
+        self.file_header.emit(sidebar::FileHeaderMsg::SetRoot {
+            display,
+            tooltip: file_tree::display_full_path(&root),
+            path: root.clone(),
+        });
+        *self.file_tree_location.borrow_mut() = location.clone();
+        *self.file_tree_root.borrow_mut() = root.clone();
+        self.sync_file_header_locations();
+
+        let completed_at = listing.completed_at();
+        let truncated = listing.truncated();
+        let fresh_for_cache = listing.clone();
+        let (fresh, _) = listing.into_parts();
+        if let Some(cached) = cached {
+            let (cached, _) = cached.into_parts();
+            file_tree::append_entries(&self.file_tree_store, None, cached);
+            let _ = file_tree::merge_refresh_children(&self.file_tree_store, None, fresh);
+        } else {
+            file_tree::append_entries(&self.file_tree_store, None, fresh);
+        }
+        self.file_tree_snapshots
+            .borrow_mut()
+            .record_success(root.clone(), completed_at);
+        if let Ok(authority) =
+            file_tree::FsAuthorityKey::capture(&location, &self.config.borrow().remote_hosts)
+        {
+            self.file_tree_root_cache
+                .borrow_mut()
+                .insert(authority, root.clone(), fresh_for_cache);
+        }
+        let history_hosts = if location == remote_fs::FsLocation::Local {
+            Vec::new()
+        } else {
+            self.config.borrow().remote_hosts.clone()
+        };
+        let entry = file_tree::FileTreeHistoryEntry {
+            location,
+            hosts: history_hosts,
+            root: root.clone(),
+        };
+        self.file_tree_navigation_history
+            .borrow_mut()
+            .commit(history, entry);
+        self.file_tree_content_revision
+            .set(self.file_tree_content_revision.get().wrapping_add(1));
+        self.sync_file_tree_navigation_controls();
+        self.file_tree_navigation_cancellation.borrow_mut().take();
+        if truncated {
+            log::warn!(
+                "file-tree navigation retained only the first {} entries: {}",
+                file_tree::MAX_DIRECTORY_ENTRIES,
+                root.display()
+            );
+        }
+    }
+
+    fn sync_file_tree_navigation_controls(&self) {
+        let location = self.file_tree_location.borrow();
+        let hosts = self.config.borrow();
+        let Ok(authority) = file_tree::FsAuthorityKey::capture(&location, &hosts.remote_hosts)
+        else {
+            self.file_header
+                .emit(sidebar::FileHeaderMsg::SetNavigationAvailable {
+                    back: false,
+                    forward: false,
+                });
+            return;
+        };
+        let history = self.file_tree_navigation_history.borrow();
+        self.file_header
+            .emit(sidebar::FileHeaderMsg::SetNavigationAvailable {
+                back: history.back(&authority).is_some(),
+                forward: history.forward(&authority).is_some(),
+            });
+    }
+
+    pub(crate) fn file_tree_go_back(&self, sender: &ComponentSender<AppModel>) {
+        let location = self.file_tree_location.borrow().clone();
+        let hosts = self.config.borrow().remote_hosts.clone();
+        let Ok(authority) = file_tree::FsAuthorityKey::capture(&location, &hosts) else {
+            return;
+        };
+        let previous = self.file_tree_navigation_history.borrow().back(&authority);
+        if let Some((index, entry)) = previous {
+            self.stage_file_tree_navigation(
+                entry.location,
+                entry.hosts,
+                entry.root,
+                file_tree::NavigationHistoryAction::MoveTo(index),
+                sender,
+            );
+        }
+    }
+
+    pub(crate) fn file_tree_go_forward(&self, sender: &ComponentSender<AppModel>) {
+        let location = self.file_tree_location.borrow().clone();
+        let hosts = self.config.borrow().remote_hosts.clone();
+        let Ok(authority) = file_tree::FsAuthorityKey::capture(&location, &hosts) else {
+            return;
+        };
+        let next = self
+            .file_tree_navigation_history
+            .borrow()
+            .forward(&authority);
+        if let Some((index, entry)) = next {
+            self.stage_file_tree_navigation(
+                entry.location,
+                entry.hosts,
+                entry.root,
+                file_tree::NavigationHistoryAction::MoveTo(index),
+                sender,
+            );
+        }
+    }
+
+    pub(crate) fn file_tree_navigate_path(
+        &self,
+        path: std::path::PathBuf,
+        sender: &ComponentSender<AppModel>,
+    ) {
+        if !path.is_absolute() {
+            self.show_toast("Enter an absolute file-tree path.");
+            return;
+        }
+        self.stage_file_tree_navigation(
+            self.file_tree_location.borrow().clone(),
+            self.config.borrow().remote_hosts.clone(),
+            path,
+            file_tree::NavigationHistoryAction::Push,
+            sender,
+        );
+    }
+
+    pub(crate) fn file_tree_path_entered(&self, text: String, sender: &ComponentSender<AppModel>) {
+        match file_tree::validate_typed_file_tree_path(&text) {
+            Ok(path) => {
+                self.file_header
+                    .emit(sidebar::FileHeaderMsg::ClosePathEntry);
+                self.file_tree_navigate_path(path, sender);
+            }
+            Err(message) => self.show_toast(message),
+        }
+    }
+
+    pub(crate) fn file_tree_open_path_entry(&self) {
+        self.file_header.emit(sidebar::FileHeaderMsg::OpenPathEntry);
     }
 
     /// Rebuild the file tree with `root` at the top of the current location.
@@ -369,9 +717,13 @@ impl AppModel {
     /// until the query is retyped.
     #[allow(deprecated)]
     pub(crate) fn set_file_tree_root(&self, root: std::path::PathBuf) {
+        self.invalidate_pending_file_tree_navigation();
         self.file_header.emit(sidebar::FileHeaderMsg::CloseFilter);
         let generation = self.file_tree_scan_generation.get().wrapping_add(1);
         self.file_tree_scan_generation.set(generation);
+        self.file_tree_refresh_revisions.borrow_mut().cancel_all();
+        self.file_tree_status.reset();
+        self.file_tree_snapshots.borrow_mut().reset();
         self.file_tree_store.clear();
         let loc = self.file_tree_location.borrow().clone();
         // `~` abbreviation uses the LOCAL home; it would lie about a remote
@@ -384,31 +736,102 @@ impl AppModel {
         self.file_header.emit(sidebar::FileHeaderMsg::SetRoot {
             display,
             tooltip: file_tree::display_full_path(&root),
+            path: root.clone(),
         });
         *self.file_tree_root.borrow_mut() = root.clone();
 
         let hosts = self.config.borrow().remote_hosts.clone();
+        let authority = file_tree::FsAuthorityKey::capture(&loc, &hosts).ok();
         let store = self.file_tree_store.clone();
         let active_generation = self.file_tree_scan_generation.clone();
         let active_root = self.file_tree_root.clone();
         let active_location = self.file_tree_location.clone();
         let expected_loc = loc.clone();
         let expected_root = root.clone();
-        if let Err(error) = file_tree::request_dir_scan(loc, hosts, root, move |result| {
-            if active_generation.get() != generation
-                || *active_root.borrow() != expected_root
-                || *active_location.borrow() != expected_loc
-            {
-                return;
-            }
-            match result {
-                Ok(entries) => file_tree::append_entries(&store, None, entries),
-                Err(error) => log::warn!(
-                    "failed to scan file-tree root {}: {error}",
-                    expected_root.display()
-                ),
-            }
-        }) {
+        let status_request = self.file_tree_status.begin(
+            file_tree::DirectoryScanTarget::Root(root.clone()),
+            file_tree::DirectoryScanPhase::Loading,
+        );
+        let status_for_started = self.file_tree_status.clone();
+        let status_for_result = self.file_tree_status.clone();
+        let snapshots_for_result = self.file_tree_snapshots.clone();
+        let cache_for_result = self.file_tree_root_cache.clone();
+        let history_for_result = self.file_tree_navigation_history.clone();
+        let failures_for_result = self.file_tree_failure_gate.clone();
+        let hosts_for_history = hosts.clone();
+        let authority_for_result = authority.clone();
+        if let Err(error) = file_tree::request_dir_scan(
+            loc,
+            hosts,
+            root,
+            move |queue_wait| status_for_started.mark_running(status_request, queue_wait),
+            move |result| {
+                if active_generation.get() != generation
+                    || *active_root.borrow() != expected_root
+                    || *active_location.borrow() != expected_loc
+                {
+                    status_for_result.finish_success(status_request);
+                    return;
+                }
+                match result {
+                    Ok(listing) => {
+                        let completed_at = listing.completed_at();
+                        let listing_for_cache = listing.clone();
+                        let (entries, truncated) = listing.into_parts();
+                        file_tree::append_entries(&store, None, entries);
+                        snapshots_for_result
+                            .borrow_mut()
+                            .record_success(expected_root.clone(), completed_at);
+                        if let Some(authority) = authority_for_result.as_ref() {
+                            failures_for_result
+                                .borrow_mut()
+                                .record_success(authority, &expected_root);
+                            cache_for_result.borrow_mut().insert(
+                                authority.clone(),
+                                expected_root.clone(),
+                                listing_for_cache,
+                            );
+                        }
+                        history_for_result.borrow_mut().commit(
+                            file_tree::NavigationHistoryAction::Push,
+                            file_tree::FileTreeHistoryEntry {
+                                location: expected_loc.clone(),
+                                hosts: if expected_loc == remote_fs::FsLocation::Local {
+                                    Vec::new()
+                                } else {
+                                    hosts_for_history.clone()
+                                },
+                                root: expected_root.clone(),
+                            },
+                        );
+                        if truncated {
+                            log::warn!(
+                                "file-tree root retained only the first {} entries: {}",
+                                file_tree::MAX_DIRECTORY_ENTRIES,
+                                expected_root.display()
+                            );
+                        }
+                        status_for_result.finish_success(status_request);
+                    }
+                    Err(error) => {
+                        if let Some(authority) = authority_for_result.clone() {
+                            failures_for_result.borrow_mut().record_failure_at(
+                                authority,
+                                expected_root.clone(),
+                                remote_fs::classify_fs_error(&error),
+                                std::time::Instant::now(),
+                            );
+                        }
+                        status_for_result.finish_error(status_request, &error);
+                        log::warn!(
+                            "failed to scan file-tree root {}: {error}",
+                            expected_root.display()
+                        );
+                    }
+                }
+            },
+        ) {
+            self.file_tree_status.finish_error(status_request, &error);
             log::warn!("failed to start file-tree scan: {error}");
         }
     }
@@ -426,27 +849,27 @@ impl AppModel {
     /// reports its cwd in the ssh session's own namespace, so the tree follows
     /// by browsing the matching configured host there; a local cwd only drives
     /// the Local location and never yanks a deliberately browsed remote tree.
-    pub(crate) fn file_tree_goto_current_cwd(&self) {
+    pub(crate) fn file_tree_goto_current_cwd(&self, sender: &ComponentSender<AppModel>) {
         if let Some((loc, cwd)) = self.active_remote_cwd() {
-            let (location_changed, reroot) = {
+            let reroot = {
                 let current_location = self.file_tree_location.borrow();
                 let current_root = self.file_tree_root.borrow();
-                (
-                    *current_location != loc,
-                    file_tree::file_tree_follow_requires_reroot(
-                        &current_location,
-                        &loc,
-                        &current_root,
-                        &cwd,
-                    ),
+                file_tree::file_tree_follow_requires_reroot(
+                    &current_location,
+                    &loc,
+                    &current_root,
+                    &cwd,
                 )
             };
-            if location_changed {
-                *self.file_tree_location.borrow_mut() = loc.clone();
-                self.sync_file_header_locations();
-            }
             if reroot {
-                self.set_file_tree_root(cwd);
+                let hosts = self.config.borrow().remote_hosts.clone();
+                self.stage_file_tree_navigation(
+                    loc,
+                    hosts,
+                    cwd,
+                    file_tree::NavigationHistoryAction::Push,
+                    sender,
+                );
             }
             return;
         }
@@ -456,13 +879,25 @@ impl AppModel {
         match self.active_cwd() {
             Some(dir) => {
                 if *self.file_tree_root.borrow() != dir {
-                    self.set_file_tree_root(dir);
+                    self.stage_file_tree_navigation(
+                        remote_fs::FsLocation::Local,
+                        self.config.borrow().remote_hosts.clone(),
+                        dir,
+                        file_tree::NavigationHistoryAction::Push,
+                        sender,
+                    );
                 }
             }
             None => {
                 if self.file_tree_root.borrow().as_os_str().is_empty() {
                     if let Some(home) = file_tree::home_dir() {
-                        self.set_file_tree_root(home);
+                        self.stage_file_tree_navigation(
+                            remote_fs::FsLocation::Local,
+                            self.config.borrow().remote_hosts.clone(),
+                            home,
+                            file_tree::NavigationHistoryAction::Push,
+                            sender,
+                        );
                     }
                 }
             }
@@ -496,20 +931,165 @@ impl AppModel {
     }
 
     /// Move the file tree root up to its parent directory.
-    pub(crate) fn file_tree_go_up(&self) {
+    pub(crate) fn file_tree_go_up(&self, sender: &ComponentSender<AppModel>) {
         let parent = self
             .file_tree_root
             .borrow()
             .parent()
             .map(std::path::Path::to_path_buf);
         if let Some(parent) = parent {
-            self.set_file_tree_root(parent);
+            self.stage_file_tree_navigation(
+                self.file_tree_location.borrow().clone(),
+                self.config.borrow().remote_hosts.clone(),
+                parent,
+                file_tree::NavigationHistoryAction::Push,
+                sender,
+            );
+        }
+    }
+
+    /// Resolve Home against the filesystem authority currently shown by the
+    /// tree. Remote homes are probed from the frozen complete profile rather
+    /// than borrowed from the active terminal or a numeric config slot.
+    pub(crate) fn file_tree_go_home(&self, sender: &ComponentSender<AppModel>) {
+        let loc = self.file_tree_location.borrow().clone();
+        if loc == remote_fs::FsLocation::Local {
+            let home = file_tree::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
+            if *self.file_tree_root.borrow() != home {
+                self.stage_file_tree_navigation(
+                    loc,
+                    self.config.borrow().remote_hosts.clone(),
+                    home,
+                    file_tree::NavigationHistoryAction::Push,
+                    sender,
+                );
+            }
+            return;
+        }
+
+        let hosts = self.config.borrow().remote_hosts.clone();
+        let Some((token, cancellation)) = self.next_file_tree_navigation_token() else {
+            self.show_toast("File-tree navigation identity is exhausted; restart Anvil.");
+            return;
+        };
+        let intent =
+            file_tree::capture_file_tree_intent(self.file_tree_scan_generation.get(), &loc, &hosts);
+        let callback_intent = intent.clone();
+        let callback_sender = sender.clone();
+        let worker_loc = loc.clone();
+        let worker_hosts = hosts.clone();
+        if let Err(error) = file_tree::request_fs_op_cancellable_at(
+            &loc,
+            &hosts,
+            cancellation,
+            move || remote_fs::start_dir(&worker_loc, &worker_hosts),
+            move |result| {
+                callback_sender.input(AppMsg::FileTreeHomeResolved {
+                    token,
+                    intent: Box::new(callback_intent),
+                    start: result.map_err(|error| remote_fs::classify_fs_error(&error)),
+                });
+            },
+        ) {
+            self.file_tree_home_resolved(
+                token,
+                intent,
+                Err(remote_fs::classify_fs_error(&error)),
+                sender,
+            );
+        }
+    }
+
+    /// Commit a Home probe only if its original backend and generation still
+    /// match. Failure keeps the current tree and its last-good contents.
+    pub(crate) fn file_tree_home_resolved(
+        &self,
+        token: u64,
+        intent: file_tree::FileTreeIntent,
+        start: Result<std::path::PathBuf, remote_fs::FsFailureKind>,
+        sender: &ComponentSender<AppModel>,
+    ) {
+        let current = {
+            let location = self.file_tree_location.borrow();
+            let config = self.config.borrow();
+            file_tree::home_navigation_is_current(
+                token,
+                self.file_tree_navigation_revision.get(),
+                &intent,
+                self.file_tree_scan_generation.get(),
+                &location,
+                &config.remote_hosts,
+            )
+        };
+        if !current {
+            return;
+        }
+        match start {
+            Ok(home) if home.is_absolute() => {
+                if *self.file_tree_root.borrow() != home {
+                    self.stage_file_tree_navigation(
+                        self.file_tree_location.borrow().clone(),
+                        self.config.borrow().remote_hosts.clone(),
+                        home,
+                        file_tree::NavigationHistoryAction::Push,
+                        sender,
+                    );
+                }
+            }
+            Ok(_) => self.show_toast(format!(
+                "Cannot open filesystem home: {}",
+                remote_fs::user_facing_failure_kind(remote_fs::FsFailureKind::InvalidResponse)
+            )),
+            Err(error) => self.show_toast(format!(
+                "Cannot open filesystem home: {}",
+                remote_fs::user_facing_failure_kind(error)
+            )),
+        }
+    }
+
+    /// Row activation enters an exact, still-materialized directory. The
+    /// second model lookup keeps synthetic/stale messages from navigating to
+    /// arbitrary paths even when they carry a once-valid authority token.
+    #[allow(deprecated)]
+    pub(crate) fn file_tree_enter_directory(
+        &self,
+        path: std::path::PathBuf,
+        intent: file_tree::FileTreeIntent,
+        sender: &ComponentSender<AppModel>,
+    ) {
+        if !self.require_current_file_tree_intent(&intent) {
+            return;
+        }
+        let root = self.file_tree_root.borrow().clone();
+        if !file_tree::directory_navigation_path_is_allowed(&root, &path) {
+            return;
+        }
+        let Some(identity) = file_tree::encode_path_identity(&path) else {
+            return;
+        };
+        let Some(iter) = file_tree::find_row_by_identity(&self.file_tree_store, &identity) else {
+            return;
+        };
+        let is_dir = self
+            .file_tree_store
+            .get_value(&iter, file_tree::COL_IS_DIR as i32)
+            .get::<bool>()
+            .unwrap_or(false);
+        if is_dir {
+            self.stage_file_tree_navigation(
+                self.file_tree_location.borrow().clone(),
+                self.config.borrow().remote_hosts.clone(),
+                path,
+                file_tree::NavigationHistoryAction::Push,
+                sender,
+            );
         }
     }
 
     /// Reload the current root's rows in place: surviving rows keep their
     /// identity, so expansion everywhere else and the open filter survive —
     /// the same semantics every file operation's follow-up refresh uses.
+    #[allow(deprecated)]
     pub(crate) fn file_tree_refresh(&self, intent: file_tree::FileTreeIntent) {
         if !self.require_current_file_tree_intent(&intent) {
             return;
@@ -518,7 +1098,119 @@ impl AppModel {
         if root.as_os_str().is_empty() {
             self.init_file_tree();
         } else {
-            self.refresh_tree_dirs(vec![root]);
+            let mut dirs = vec![root.clone()];
+            dirs.extend(
+                file_tree::expanded_directory_paths(
+                    &self.file_tree_store,
+                    &self.file_tree_view,
+                    &self.file_tree_filter_model,
+                )
+                .into_iter()
+                .filter(|path| path != &root)
+                .take(file_tree::MAX_BULK_REFRESH_DIRS.saturating_sub(1)),
+            );
+            self.refresh_tree_dirs(dirs);
+        }
+    }
+
+    pub(crate) fn file_tree_refresh_dirs(
+        &self,
+        dirs: Vec<std::path::PathBuf>,
+        intent: file_tree::FileTreeIntent,
+    ) {
+        if self.require_current_file_tree_intent(&intent) {
+            self.refresh_tree_dirs(dirs);
+        }
+    }
+
+    /// Retry the exact directory represented by the visible status. Expanded
+    /// failures retain their lazy placeholder; refresh/root failures keep their
+    /// last-good rows and run the same in-place reconciliation path again.
+    #[allow(deprecated)]
+    pub(crate) fn file_tree_retry(
+        &self,
+        target: file_tree::DirectoryScanTarget,
+        sender: &ComponentSender<AppModel>,
+    ) {
+        let status_target = target.clone();
+        match target {
+            file_tree::DirectoryScanTarget::Root(path) => {
+                if *self.file_tree_root.borrow() == path {
+                    self.refresh_tree_dirs_with_bypass(vec![path], true);
+                } else {
+                    let location = self.file_tree_location.borrow().clone();
+                    let hosts = self.config.borrow().remote_hosts.clone();
+                    let history = file_tree::FsAuthorityKey::capture(&location, &hosts)
+                        .ok()
+                        .map_or(file_tree::NavigationHistoryAction::Push, |authority| {
+                            self.file_tree_navigation_history
+                                .borrow()
+                                .retry_action(&authority, &path)
+                        });
+                    self.stage_file_tree_navigation(location, hosts, path, history, sender);
+                }
+            }
+            file_tree::DirectoryScanTarget::Refresh(path) => {
+                let target_is_materialized = if *self.file_tree_root.borrow() == path {
+                    true
+                } else {
+                    file_tree::encode_path_identity(&path)
+                        .and_then(|identity| {
+                            file_tree::find_row_by_identity(&self.file_tree_store, &identity)
+                        })
+                        .is_some_and(|iter| {
+                            self.file_tree_store
+                                .iter_children(Some(&iter))
+                                .is_none_or(|first| {
+                                    self.file_tree_store
+                                        .get_value(&first, file_tree::COL_PATH as i32)
+                                        .get::<String>()
+                                        .is_ok_and(|identity| !identity.is_empty())
+                                })
+                        })
+                };
+                if target_is_materialized {
+                    self.refresh_tree_dirs_with_bypass(vec![path], true);
+                } else {
+                    self.file_tree_status.dismiss_target(&status_target);
+                }
+            }
+            file_tree::DirectoryScanTarget::Expand(path) => {
+                let Some(identity) = file_tree::encode_path_identity(&path) else {
+                    self.file_tree_status.dismiss_target(&status_target);
+                    return;
+                };
+                let Some(iter) = file_tree::find_row_by_identity(&self.file_tree_store, &identity)
+                else {
+                    self.file_tree_status.dismiss_target(&status_target);
+                    return;
+                };
+                let has_lazy_placeholder = self
+                    .file_tree_store
+                    .iter_children(Some(&iter))
+                    .is_some_and(|first| {
+                        self.file_tree_store
+                            .get_value(&first, file_tree::COL_PATH as i32)
+                            .get::<String>()
+                            .is_ok_and(|identity| identity.is_empty())
+                    });
+                if !has_lazy_placeholder {
+                    self.file_tree_status.dismiss_target(&status_target);
+                    return;
+                }
+                let hosts = self.config.borrow().remote_hosts.clone();
+                file_tree::on_expand(
+                    &self.file_tree_store,
+                    &iter,
+                    &self.file_tree_scan_generation,
+                    &self.file_tree_location,
+                    hosts,
+                    &self.file_tree_snapshots,
+                    &self.file_tree_status,
+                    &self.file_tree_failure_gate,
+                    true,
+                );
+            }
         }
     }
 
@@ -581,6 +1273,15 @@ impl AppModel {
         );
     }
 
+    /// Apply the hidden-file policy to the loaded model in place. This is a
+    /// presentation preference, not navigation, so it does not invalidate
+    /// pending filesystem operations or trigger remote probes.
+    #[allow(deprecated)]
+    pub(crate) fn file_tree_set_show_hidden(&self, show_hidden: bool) {
+        let mut state = self.file_tree_filter.borrow_mut();
+        file_tree::set_tree_show_hidden(&self.file_tree_filter_model, &mut state, show_hidden);
+    }
+
     /// Selector moved: resolve the new location's start directory off-thread,
     /// then let `FileTreeLocationResolved` re-root the tree if the location
     /// is still current by the time the probe answers.
@@ -609,59 +1310,61 @@ impl AppModel {
         self.sync_file_header_locations();
     }
 
-    /// Start resolving one selected filesystem location. Clearing both the
-    /// visible rows and the old root makes pending state explicit and prevents
-    /// a later profile remap from probing a local/other-host path remotely.
-    #[allow(deprecated)]
+    /// Resolve and list a selected filesystem location as one transaction.
+    /// The old root, rows, expansion, and selection remain live until the
+    /// exact authority's latest successful result commits on the GTK thread.
     fn begin_file_tree_location_switch(
         &self,
         loc: remote_fs::FsLocation,
         hosts: Vec<config::RemoteHost>,
         sender: &ComponentSender<AppModel>,
     ) {
-        *self.file_tree_location.borrow_mut() = loc.clone();
-
-        // Clear immediately so rows from the old location cannot be acted on
-        // while the new start directory resolves over ssh/docker.
-        let generation = self.file_tree_scan_generation.get().wrapping_add(1);
-        self.file_tree_scan_generation.set(generation);
-        self.file_tree_store.clear();
-        self.file_tree_root.borrow_mut().clear();
-        self.file_header.emit(sidebar::FileHeaderMsg::SetRoot {
-            display: loc.label(&hosts),
-            tooltip: String::new(),
-        });
-
-        let start_loc = loc.clone();
-        let intent = file_tree::capture_file_tree_intent(generation, &loc, &hosts);
-        let callback_intent = intent.clone();
-        let active_generation = self.file_tree_scan_generation.clone();
-        let active_location = self.file_tree_location.clone();
-        let active_config = self.config.clone();
-        let sender = sender.clone();
-        if let Err(error) = file_tree::request_fs_op(
-            move || remote_fs::start_dir(&start_loc, &hosts),
-            move |result| {
-                let still_current = {
-                    let location = active_location.borrow();
-                    let config = active_config.borrow();
-                    file_tree::file_tree_intent_is_current(
-                        &callback_intent,
-                        active_generation.get(),
-                        &location,
-                        &config.remote_hosts,
-                    )
-                };
-                if still_current {
-                    sender.input(AppMsg::FileTreeLocationResolved {
-                        intent: Box::new(callback_intent),
-                        start: result.map_err(|error| error.to_string()),
-                    });
+        let Some((token, cancellation)) = self.next_file_tree_navigation_token() else {
+            self.show_toast("File-tree navigation identity is exhausted; restart Anvil.");
+            self.sync_file_header_locations();
+            return;
+        };
+        let worker_loc = loc.clone();
+        let worker_hosts = hosts.clone();
+        let callback_location = loc.clone();
+        let callback_hosts = hosts.clone();
+        let callback_sender = sender.clone();
+        let list_cancellation = cancellation.clone();
+        if let Err(error) = file_tree::request_fs_op_cancellable_at(
+            &loc,
+            &hosts,
+            cancellation,
+            move || {
+                let root = remote_fs::start_dir(&worker_loc, &worker_hosts)?;
+                if !root.is_absolute() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "filesystem home is not absolute",
+                    ));
                 }
+                let listing = remote_fs::list_dir_with_cancellation(
+                    &worker_loc,
+                    &worker_hosts,
+                    &root,
+                    &list_cancellation,
+                )?;
+                Ok((root, listing))
+            },
+            move |result| {
+                callback_sender.input(AppMsg::FileTreeLocationResolved {
+                    token,
+                    location: callback_location,
+                    hosts: callback_hosts,
+                    result: result.map_err(|error| remote_fs::classify_fs_error(&error)),
+                });
             },
         ) {
-            log::warn!("failed to start remote home probe: {error}");
-            self.file_tree_location_resolved(intent, Err(error.to_string()));
+            self.file_tree_location_resolved(
+                token,
+                loc,
+                hosts,
+                Err(remote_fs::classify_fs_error(&error)),
+            );
         }
     }
 
@@ -697,7 +1400,7 @@ impl AppModel {
                         self.begin_file_tree_location_switch(remapped, new_hosts.clone(), sender);
                     } else {
                         *self.file_tree_location.borrow_mut() = remapped;
-                        self.set_file_tree_root(root);
+                        self.invalidate_pending_file_tree_navigation();
                     }
                 }
             }
@@ -705,33 +1408,69 @@ impl AppModel {
         self.sync_file_header_locations();
     }
 
-    /// Finish a location switch on the GTK thread.
+    /// Finish a location switch on the GTK thread. Failure or any stale token
+    /// only restores the selector; the last-good tree remains untouched.
     pub(crate) fn file_tree_location_resolved(
         &self,
-        intent: file_tree::FileTreeIntent,
-        start: Result<std::path::PathBuf, String>,
+        token: u64,
+        location: remote_fs::FsLocation,
+        hosts: Vec<config::RemoteHost>,
+        result: Result<(std::path::PathBuf, file_tree::DirectoryListing), remote_fs::FsFailureKind>,
     ) {
-        // Recheck after message delivery as well as before enqueueing it: the
-        // GTK queue itself is an async boundary across which location/config
-        // can change again.
-        if !self.file_tree_intent_is_current(&intent) {
+        let current_hosts = self.config.borrow().remote_hosts.clone();
+        let remapped = remote_fs::remap_location_by_profile(&location, &hosts, &current_hosts);
+        let expected_authority = file_tree::FsAuthorityKey::capture(&location, &hosts);
+        let remapped_authority = file_tree::FsAuthorityKey::capture(&remapped, &current_hosts);
+        let (Ok(expected_authority), Ok(remapped_authority)) =
+            (expected_authority, remapped_authority)
+        else {
+            return;
+        };
+        if !file_tree::pending_navigation_is_current(
+            token,
+            self.file_tree_navigation_revision.get(),
+            &expected_authority,
+            &remapped_authority,
+        ) {
+            if token != self.file_tree_navigation_revision.get() {
+                return;
+            }
+            self.sync_file_header_locations();
+            self.show_toast("The selected filesystem authority changed; navigation was cancelled.");
             return;
         }
-        let loc = self.file_tree_location.borrow().clone();
-        match start {
-            Ok(root) => self.set_file_tree_root(root),
-            Err(error) => {
-                // A host that cannot answer `home` cannot list either; roll
-                // back to Local rather than strand the tree on a dead host.
-                *self.file_tree_location.borrow_mut() = remote_fs::FsLocation::Local;
+        match result {
+            Ok((root, listing)) if root.is_absolute() => {
+                let authority = expected_authority;
+                let cached = self
+                    .file_tree_root_cache
+                    .borrow_mut()
+                    .get(&authority, &root);
+                self.file_tree_failure_gate
+                    .borrow_mut()
+                    .record_success(&authority, &root);
+                self.commit_file_tree_navigation(
+                    remapped,
+                    root,
+                    listing,
+                    cached,
+                    file_tree::NavigationHistoryAction::Push,
+                );
+            }
+            Ok(_) => {
                 self.sync_file_header_locations();
-                let label = loc.label(&self.config.borrow().remote_hosts);
+                self.show_toast("Cannot browse filesystem: invalid directory response");
+            }
+            Err(error) => {
+                self.sync_file_header_locations();
+                if error == remote_fs::FsFailureKind::Superseded {
+                    return;
+                }
+                let label = location.label(&hosts);
                 self.show_toast(format!(
                     "Cannot browse {label}: {}",
-                    review_input::safe_inline_display(&error, 512)
+                    remote_fs::user_facing_failure_kind(error)
                 ));
-                let root = file_tree::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
-                self.set_file_tree_root(root);
             }
         }
     }
@@ -760,8 +1499,9 @@ impl AppModel {
     fn file_tree_intent_is_current(&self, intent: &file_tree::FileTreeIntent) -> bool {
         let location = self.file_tree_location.borrow();
         let config = self.config.borrow();
-        file_tree::file_tree_intent_is_current(
+        file_tree::file_tree_user_intent_is_current(
             intent,
+            self.file_tree_content_revision.get(),
             self.file_tree_scan_generation.get(),
             &location,
             &config.remote_hosts,
@@ -776,7 +1516,9 @@ impl AppModel {
             self.file_tree_user_operation_revision
                 .set(self.file_tree_user_operation_revision.get().wrapping_add(1));
         } else {
-            self.show_toast("The file-tree location changed; the pending operation was cancelled.");
+            self.show_toast(
+                "The file-tree contents or location changed; the pending operation was cancelled.",
+            );
         }
         current
     }
@@ -1416,6 +2158,9 @@ impl AppModel {
         on_current_success: impl FnOnce(T) + 'static,
         sender: &ComponentSender<AppModel>,
     ) {
+        self.file_tree_snapshots
+            .borrow_mut()
+            .mark_stale(refresh.iter());
         let toast_overlay = self.toast_overlay.clone();
         let clipboard = self.file_tree_clipboard.clone();
         let active_generation = self.file_tree_scan_generation.clone();
@@ -1423,64 +2168,85 @@ impl AppModel {
         let active_config = self.config.clone();
         let transfer_revision = self.file_tree_transfer_revision.clone();
         let sender = sender.clone();
-        if let Err(error) = file_tree::request_fs_op(op, move |result| match result {
-            Ok(payload) => {
-                if !forget_clipboard.is_empty() {
-                    remote_fs::retire_clipboard_sources(
-                        &mut clipboard.borrow_mut(),
-                        clipboard_token,
-                        &forget_clipboard,
-                    );
+        let schedule_location = self.file_tree_location.borrow().clone();
+        let schedule_hosts = self.config.borrow().remote_hosts.clone();
+        let schedule_authority =
+            file_tree::FsAuthorityKey::capture(&schedule_location, &schedule_hosts).ok();
+        let root_cache = self.file_tree_root_cache.clone();
+        let failure_gate = self.file_tree_failure_gate.clone();
+        if let Err(error) =
+            file_tree::request_fs_op_at(&schedule_location, &schedule_hosts, op, move |result| {
+                match result {
+                    Ok(payload) => {
+                        if let Some(authority) = schedule_authority.as_ref() {
+                            root_cache
+                                .borrow_mut()
+                                .invalidate(authority, refresh.iter());
+                            for dir in &refresh {
+                                failure_gate.borrow_mut().record_success(authority, dir);
+                            }
+                        }
+                        if !forget_clipboard.is_empty() {
+                            remote_fs::retire_clipboard_sources(
+                                &mut clipboard.borrow_mut(),
+                                clipboard_token,
+                                &forget_clipboard,
+                            );
+                        }
+                        // Settlement is about the backend result and the exact intent
+                        // token, so it must happen even if the user has since browsed
+                        // elsewhere. Only visible UI is suppressed for stale work.
+                        settle_success(&payload);
+                        let still_current = {
+                            let location = active_location.borrow();
+                            let config = active_config.borrow();
+                            file_tree::file_tree_async_ui_is_current(
+                                &intent,
+                                active_generation.get(),
+                                &location,
+                                &config.remote_hosts,
+                                None,
+                                transfer_revision.get(),
+                            )
+                        };
+                        if !still_current {
+                            return;
+                        }
+                        sender.input(AppMsg::FileTreeOpSucceeded {
+                            dirs: refresh,
+                            intent: Box::new(intent),
+                            transfer_id: None,
+                        });
+                        on_current_success(payload);
+                    }
+                    Err(error) => {
+                        let still_current = {
+                            let location = active_location.borrow();
+                            let config = active_config.borrow();
+                            file_tree::file_tree_async_ui_is_current(
+                                &intent,
+                                active_generation.get(),
+                                &location,
+                                &config.remote_hosts,
+                                None,
+                                transfer_revision.get(),
+                            )
+                        };
+                        if !still_current {
+                            return;
+                        }
+                        let message = remote_fs::user_facing_fs_error(&error);
+                        toast_overlay.add_toast(adw::Toast::new(&format!(
+                            "File operation failed: {message}"
+                        )));
+                    }
                 }
-                // Settlement is about the backend result and the exact intent
-                // token, so it must happen even if the user has since browsed
-                // elsewhere. Only visible UI is suppressed for stale work.
-                settle_success(&payload);
-                let still_current = {
-                    let location = active_location.borrow();
-                    let config = active_config.borrow();
-                    file_tree::file_tree_async_ui_is_current(
-                        &intent,
-                        active_generation.get(),
-                        &location,
-                        &config.remote_hosts,
-                        None,
-                        transfer_revision.get(),
-                    )
-                };
-                if !still_current {
-                    return;
-                }
-                sender.input(AppMsg::FileTreeOpSucceeded {
-                    dirs: refresh,
-                    intent: Box::new(intent),
-                    transfer_id: None,
-                });
-                on_current_success(payload);
-            }
-            Err(error) => {
-                let still_current = {
-                    let location = active_location.borrow();
-                    let config = active_config.borrow();
-                    file_tree::file_tree_async_ui_is_current(
-                        &intent,
-                        active_generation.get(),
-                        &location,
-                        &config.remote_hosts,
-                        None,
-                        transfer_revision.get(),
-                    )
-                };
-                if !still_current {
-                    return;
-                }
-                let message = review_input::safe_inline_display(&error.to_string(), 512);
-                toast_overlay.add_toast(adw::Toast::new(&format!(
-                    "File operation failed: {message}"
-                )));
-            }
-        }) {
-            self.show_toast(format!("Could not start the file operation: {error}"));
+            })
+        {
+            self.show_toast(format!(
+                "Could not start the file operation: {}",
+                remote_fs::user_facing_fs_error(&error)
+            ));
         }
     }
 
@@ -1515,6 +2281,9 @@ impl AppModel {
             ) + 'static,
         sender: &ComponentSender<AppModel>,
     ) {
+        self.file_tree_snapshots
+            .borrow_mut()
+            .mark_stale(refresh.iter());
         let (busy_toast, transfer_id) = match self.file_tree_transfer_begin(&busy_label) {
             Ok(started) => started,
             Err(message) => {
@@ -1543,8 +2312,16 @@ impl AppModel {
         let mut finish = Some(finish);
         let busy_toast_for_error = busy_toast.clone();
         let intent_for_start_error = intent.clone();
-        if let Err(error) =
-            file_tree::request_fs_op_streaming(transfer, move |outcome| match outcome {
+        let schedule_location = self.file_tree_location.borrow().clone();
+        let schedule_hosts = self.config.borrow().remote_hosts.clone();
+        let schedule_authority =
+            file_tree::FsAuthorityKey::capture(&schedule_location, &schedule_hosts).ok();
+        let root_cache = self.file_tree_root_cache.clone();
+        if let Err(error) = file_tree::request_fs_op_streaming_at(
+            &schedule_location,
+            &schedule_hosts,
+            transfer,
+            move |outcome| match outcome {
                 file_tree::FsOpOutcome::Progress(bytes) => {
                     let still_current = {
                         let location = active_location.borrow();
@@ -1563,6 +2340,11 @@ impl AppModel {
                     }
                 }
                 file_tree::FsOpOutcome::Done(result) => {
+                    if let (Some(authority), Some(dirs)) =
+                        (schedule_authority.as_ref(), refresh.as_ref())
+                    {
+                        root_cache.borrow_mut().invalidate(authority, dirs.iter());
+                    }
                     busy_toast.dismiss();
                     // Free the shared slot only if it still holds this
                     // transfer's toast; a newer one must survive.
@@ -1627,8 +2409,12 @@ impl AppModel {
                             let delete_location = active_location.clone();
                             let delete_config = active_config.clone();
                             let delete_revision = transfer_revision.clone();
-                            if let Err(error) = file_tree::request_fs_op(
-                                move || remote_fs::delete(&loc, &hosts, &path),
+                            let worker_loc = loc.clone();
+                            let worker_hosts = hosts.clone();
+                            if let Err(error) = file_tree::request_fs_op_at(
+                                &loc,
+                                &hosts,
+                                move || remote_fs::delete(&worker_loc, &worker_hosts, &path),
                                 move |result| match result {
                                     Ok(()) => {
                                         remote_fs::retire_clipboard_sources(
@@ -1653,10 +2439,7 @@ impl AppModel {
                                         if !still_current {
                                             return;
                                         }
-                                        let message = review_input::safe_inline_display(
-                                            &error.to_string(),
-                                            512,
-                                        );
+                                        let message = remote_fs::user_facing_fs_error(&error);
                                         delete_toast_overlay.add_toast(adw::Toast::new(&format!(
                                             "Copied, but deleting the source failed: {message}"
                                         )));
@@ -1677,8 +2460,7 @@ impl AppModel {
                                     )
                                 };
                                 if still_current {
-                                    let message =
-                                        review_input::safe_inline_display(&error.to_string(), 512);
+                                    let message = remote_fs::user_facing_fs_error(&error);
                                     toast_overlay.add_toast(adw::Toast::new(&format!(
                                         "Copied, but deleting the source could not start: {message}"
                                     )));
@@ -1725,15 +2507,14 @@ impl AppModel {
                             if !still_current {
                                 return;
                             }
-                            let message =
-                                review_input::safe_inline_display(&error.to_string(), 512);
+                            let message = remote_fs::user_facing_fs_error(&error);
                             toast_overlay
                                 .add_toast(adw::Toast::new(&format!("Transfer failed: {message}")));
                         }
                     }
                 }
-            })
-        {
+            },
+        ) {
             busy_toast_for_error.dismiss();
             let mut slot = self.file_tree_transfer_toast.borrow_mut();
             if slot.as_ref() == Some(&busy_toast_for_error) {
@@ -1753,7 +2534,10 @@ impl AppModel {
                 )
             };
             if still_current {
-                self.show_toast(format!("Could not start the transfer: {error}"));
+                self.show_toast(format!(
+                    "Could not start the transfer: {}",
+                    remote_fs::user_facing_fs_error(&error)
+                ));
             }
         }
     }
@@ -1800,8 +2584,74 @@ impl AppModel {
         drop(config);
         drop(location);
         if current {
+            if let Ok(authority) = file_tree::FsAuthorityKey::capture(
+                &self.file_tree_location.borrow(),
+                &self.config.borrow().remote_hosts,
+            ) {
+                self.file_tree_root_cache
+                    .borrow_mut()
+                    .invalidate(&authority, dirs.iter());
+                for dir in &dirs {
+                    self.file_tree_failure_gate
+                        .borrow_mut()
+                        .record_success(&authority, dir);
+                }
+            }
             self.refresh_tree_dirs(dirs);
         }
+    }
+
+    /// Revalidate only loaded directories while Files is visible and active.
+    /// The root is considered first, expanded rows are deterministic, and the
+    /// per-tick cap prevents a long-lived remote tree from flooding the queue.
+    #[allow(deprecated)]
+    pub(crate) fn file_tree_revalidate_due(&self) {
+        if !self.sidebar_visible
+            || self.sidebar_view.get() != config::SidebarView::Files
+            || !self.window.is_active()
+        {
+            return;
+        }
+        let root = self.file_tree_root.borrow().clone();
+        if root.as_os_str().is_empty() {
+            return;
+        }
+        let mut candidates = vec![root.clone()];
+        candidates.extend(
+            file_tree::expanded_directory_paths(
+                &self.file_tree_store,
+                &self.file_tree_view,
+                &self.file_tree_filter_model,
+            )
+            .into_iter()
+            .filter(|path| path != &root),
+        );
+        let now = std::time::Instant::now();
+        let due = self.file_tree_snapshots.borrow().due_paths_at(
+            candidates,
+            now,
+            file_tree::MAX_TTL_REVALIDATE_DIRS,
+        );
+        let location = self.file_tree_location.borrow().clone();
+        let hosts = self.config.borrow().remote_hosts.clone();
+        let Ok(authority) = file_tree::FsAuthorityKey::capture(&location, &hosts) else {
+            return;
+        };
+        let due: Vec<_> = due
+            .into_iter()
+            .filter(|path| {
+                !self.file_tree_refresh_revisions.borrow().is_pending(path)
+                    && self
+                        .file_tree_failure_gate
+                        .borrow()
+                        .allows_auto_at(&authority, path, now)
+            })
+            .collect();
+        self.file_tree_status.set_stale_count(due.len());
+        if !due.is_empty() {
+            self.refresh_tree_dirs(due);
+        }
+        self.file_tree_status.set_stale_count(0);
     }
 
     /// Refresh only the affected directories in place: locate each row by its
@@ -1811,16 +2661,40 @@ impl AppModel {
     /// work: their lazy scan sees the fresh state on expansion.
     #[allow(deprecated)]
     pub(crate) fn refresh_tree_dirs(&self, dirs: Vec<std::path::PathBuf>) {
+        self.refresh_tree_dirs_with_bypass(dirs, false);
+    }
+
+    #[allow(deprecated)]
+    fn refresh_tree_dirs_with_bypass(
+        &self,
+        dirs: Vec<std::path::PathBuf>,
+        bypass_failure_gate: bool,
+    ) {
         let loc = self.file_tree_location.borrow().clone();
         let hosts = self.config.borrow().remote_hosts.clone();
+        let Ok(authority) = file_tree::FsAuthorityKey::capture(&loc, &hosts) else {
+            return;
+        };
         let root = self.file_tree_root.borrow().clone();
         let mut seen = std::collections::HashSet::new();
         for dir in dirs {
             if dir.as_os_str().is_empty() || !seen.insert(dir.clone()) {
                 continue;
             }
-            let parent_ref = if dir == root {
-                None // the root merges at the model's top level
+            if !bypass_failure_gate
+                && !self.file_tree_failure_gate.borrow().allows_auto_at(
+                    &authority,
+                    &dir,
+                    std::time::Instant::now(),
+                )
+            {
+                continue;
+            }
+            self.file_tree_snapshots
+                .borrow_mut()
+                .mark_stale(std::iter::once(&dir));
+            let target = if dir == root {
+                FileTreeRefreshTarget::Root
             } else {
                 let Some(identity) = file_tree::encode_path_identity(&dir) else {
                     continue;
@@ -1849,35 +2723,152 @@ impl AppModel {
                 ) else {
                     continue;
                 };
-                Some(row_ref)
+                FileTreeRefreshTarget::Row {
+                    reference: row_ref,
+                    identity,
+                }
             };
+            let target_is_root = matches!(&target, FileTreeRefreshTarget::Root);
 
+            let ticket = self.file_tree_refresh_revisions.borrow_mut().begin(&dir);
+            let callback_ticket = ticket.clone();
+            let start_error_ticket = ticket.clone();
+            let refresh_revisions = self.file_tree_refresh_revisions.clone();
+            let expected_dir = dir.clone();
+            let start_error_dir = dir.clone();
+            let status_request = self.file_tree_status.begin(
+                file_tree::DirectoryScanTarget::Refresh(dir.clone()),
+                file_tree::DirectoryScanPhase::Refreshing,
+            );
+            let status_for_started = self.file_tree_status.clone();
+            let status_for_result = self.file_tree_status.clone();
+            let snapshots_for_result = self.file_tree_snapshots.clone();
+            let failures_for_result = self.file_tree_failure_gate.clone();
+            let cache_for_result = self.file_tree_root_cache.clone();
+            let authority_for_result = authority.clone();
             let store = self.file_tree_store.clone();
+            let tree_view = self.file_tree_view.clone();
+            let filter_model = self.file_tree_filter_model.clone();
+            let content_revision = self.file_tree_content_revision.clone();
             let active_generation = self.file_tree_scan_generation.clone();
             let generation = active_generation.get();
             let active_location = self.file_tree_location.clone();
             let expected_loc = loc.clone();
             let active_root = self.file_tree_root.clone();
             let expected_root = root.clone();
-            if let Err(error) =
-                file_tree::request_dir_scan(loc.clone(), hosts.clone(), dir, move |result| {
+            if let Err(error) = file_tree::request_dir_scan_cancellable(
+                loc.clone(),
+                hosts.clone(),
+                dir,
+                ticket.cancellation(),
+                move |queue_wait| status_for_started.mark_running(status_request, queue_wait),
+                move |result| {
+                    if !refresh_revisions
+                        .borrow_mut()
+                        .finish_if_latest(&expected_dir, &callback_ticket)
+                    {
+                        status_for_result.finish_success(status_request);
+                        return;
+                    }
                     if active_generation.get() != generation
                         || *active_location.borrow() != expected_loc
                         || *active_root.borrow() != expected_root
                     {
+                        status_for_result.finish_success(status_request);
                         return;
                     }
-                    let parent = parent_ref
-                        .and_then(|row_ref| row_ref.path())
-                        .and_then(|path| store.iter(&path));
-                    match result {
-                        Ok(entries) => {
-                            file_tree::merge_refresh_children(&store, parent.as_ref(), entries)
+                    let parent = match target {
+                        FileTreeRefreshTarget::Root => None,
+                        FileTreeRefreshTarget::Row {
+                            reference,
+                            identity,
+                        } => {
+                            let Some(path) = reference.path() else {
+                                status_for_result.finish_success(status_request);
+                                return;
+                            };
+                            let Some(iter) = store.iter(&path) else {
+                                status_for_result.finish_success(status_request);
+                                return;
+                            };
+                            let current_identity: String = store
+                                .get_value(&iter, file_tree::COL_PATH as i32)
+                                .get()
+                                .unwrap_or_default();
+                            if !file_tree::refresh_row_identity_is_current(
+                                &identity,
+                                Some(&current_identity),
+                            ) {
+                                status_for_result.finish_success(status_request);
+                                return;
+                            }
+                            Some(iter)
                         }
-                        Err(error) => log::warn!("failed to refresh directory rows: {error}"),
+                    };
+                    match result {
+                        Ok(listing) => {
+                            let completed_at = listing.completed_at();
+                            let listing_for_cache = listing.clone();
+                            let (entries, truncated) = listing.into_parts();
+                            let selection = file_tree::capture_tree_selection(
+                                &store,
+                                &filter_model,
+                                &tree_view,
+                            );
+                            let changed =
+                                file_tree::merge_refresh_children(&store, parent.as_ref(), entries);
+                            if changed {
+                                content_revision.set(content_revision.get().wrapping_add(1));
+                                tree_view.set_drag_dest_row(None, gtk::TreeViewDropPosition::After);
+                                file_tree::restore_tree_selection(
+                                    &store,
+                                    &filter_model,
+                                    &tree_view,
+                                    selection,
+                                );
+                            }
+                            if truncated {
+                                log::warn!(
+                                    "directory refresh retained only the first {} entries: {}",
+                                    file_tree::MAX_DIRECTORY_ENTRIES,
+                                    expected_dir.display()
+                                );
+                            }
+                            snapshots_for_result
+                                .borrow_mut()
+                                .record_success(expected_dir.clone(), completed_at);
+                            failures_for_result
+                                .borrow_mut()
+                                .record_success(&authority_for_result, &expected_dir);
+                            if target_is_root {
+                                cache_for_result.borrow_mut().insert(
+                                    authority_for_result.clone(),
+                                    expected_dir.clone(),
+                                    listing_for_cache,
+                                );
+                            }
+                            status_for_result.finish_success(status_request);
+                        }
+                        Err(error) => {
+                            failures_for_result.borrow_mut().record_failure_at(
+                                authority_for_result.clone(),
+                                expected_dir.clone(),
+                                remote_fs::classify_fs_error(&error),
+                                std::time::Instant::now(),
+                            );
+                            status_for_result.finish_error(status_request, &error);
+                            log::warn!("failed to refresh directory rows: {error}");
+                        }
                     }
-                })
-            {
+                },
+            ) {
+                let latest = self
+                    .file_tree_refresh_revisions
+                    .borrow_mut()
+                    .finish_if_latest(&start_error_dir, &start_error_ticket);
+                if latest {
+                    self.file_tree_status.finish_error(status_request, &error);
+                }
                 log::warn!("failed to start directory refresh: {error}");
             }
         }

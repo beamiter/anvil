@@ -152,8 +152,26 @@ pub(crate) enum AppMsg {
     FileTreeSelectLocation(usize),
     /// The background `start_dir` probe for a location switch answered.
     FileTreeLocationResolved {
+        token: u64,
+        location: crate::remote_fs::FsLocation,
+        hosts: Vec<crate::config::RemoteHost>,
+        result: Result<
+            (std::path::PathBuf, crate::file_tree::DirectoryListing),
+            crate::remote_fs::FsFailureKind,
+        >,
+    },
+    /// An explicit Home navigation probe answered for the exact filesystem
+    /// authority that was current when the shortcut/button was used.
+    FileTreeHomeResolved {
+        token: u64,
         intent: Box<crate::file_tree::FileTreeIntent>,
-        start: Result<std::path::PathBuf, String>,
+        start: Result<std::path::PathBuf, crate::remote_fs::FsFailureKind>,
+    },
+    /// A staged root/location scan answered. The live tree is mutated only by
+    /// the matching successful result.
+    FileTreeNavigationResolved {
+        navigation: Box<crate::file_tree::PendingTreeNavigation>,
+        listing: Result<crate::file_tree::DirectoryListing, crate::remote_fs::FsFailureKind>,
     },
     /// A non-destructive home probe for the active pane's process-observed SSH
     /// target answered. The app loop rechecks pane, process, token, and the
@@ -161,7 +179,7 @@ pub(crate) enum AppMsg {
     FileTreeSshProbeResolved {
         pane_id: u64,
         token: u64,
-        start: Result<std::path::PathBuf, String>,
+        start: Result<std::path::PathBuf, crate::remote_fs::FsFailureKind>,
     },
     /// Retry a failed non-destructive SSH-to-Files probe against the active
     /// pane's freshly observed process authority.
@@ -208,6 +226,14 @@ pub(crate) enum AppMsg {
     FileTreeRefresh {
         intent: Box<crate::file_tree::FileTreeIntent>,
     },
+    /// Refresh exact materialized directories selected by row UI or stale
+    /// snapshot re-expansion; unlike F5 this does not imply the root.
+    FileTreeRefreshDirs {
+        dirs: Vec<std::path::PathBuf>,
+        intent: Box<crate::file_tree::FileTreeIntent>,
+    },
+    /// Focusable Retry action from the visible file-tree scan status.
+    FileTreeRetry(crate::file_tree::DirectoryScanTarget),
     /// Open a local tab rooted at the browsed directory, or connect the exact
     /// validated managed profile selected by a remote file-tree location.
     FileTreeOpenTerminal {
@@ -215,6 +241,8 @@ pub(crate) enum AppMsg {
     },
     /// The header filter entry's text changed ("" = filter cleared).
     FileTreeFilterChanged(String),
+    /// Toggle visibility of dot-prefixed rows without rescanning.
+    FileTreeShowHiddenChanged(bool),
     /// A background op or transfer finished; refresh these directories in
     /// place, preserving all other expansion.
     FileTreeOpSucceeded {
@@ -271,6 +299,19 @@ pub(crate) enum AppMsg {
     AgentClose,
     FileTreeGotoCwd,
     FileTreeGoUp,
+    FileTreeGoHome,
+    FileTreeGoBack,
+    FileTreeGoForward,
+    FileTreeNavigatePath(std::path::PathBuf),
+    FileTreePathEntered(String),
+    FileTreeOpenPathEntry,
+    FileTreeTtlTick,
+    /// Enter a materialized directory as the new tree root. The captured user
+    /// intent prevents a stale row activation crossing a refresh/location.
+    FileTreeEnterDirectory {
+        path: std::path::PathBuf,
+        intent: Box<crate::file_tree::FileTreeIntent>,
+    },
     SetSidebarView(crate::config::SidebarView),
     PaletteTypeCommand(String),
     PaletteAskAi(String),

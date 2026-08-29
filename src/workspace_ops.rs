@@ -1707,7 +1707,7 @@ impl AppModel {
         if active_pane_changed {
             self.search.emit(search::SearchMsg::ActivePaneChanged);
         }
-        self.file_tree_goto_current_cwd();
+        self.file_tree_goto_current_cwd(sender);
         self.refresh_pane_headers(idx);
         self.rebuild_tab_strip(sender);
         self.refresh_bottom_bar();

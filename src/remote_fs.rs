@@ -41,16 +41,21 @@ case "$op" in
     pwd
     ;;
   list)
-    d=${2:-}
+    d=${2:-}; limit=${3:-}
     case "$d" in /*) ;; *) exit 2 ;; esac
+    case "$limit" in ''|*[!0-9]*) exit 2 ;; esac
+    [ "$limit" -gt 0 ] 2>/dev/null || exit 2
     cd "$d" 2>/dev/null || exit 3
+    count=0
     for f in * .[!.]* ..?*; do
-      if [ -d "$f" ]; then t=d
-      elif [ -L "$f" ]; then t=l
+      if [ -L "$f" ]; then t=l
+      elif [ -d "$f" ]; then t=d
       elif [ -e "$f" ]; then t=f
       else continue
       fi
       printf '%s\0%s\0' "$t" "$f"
+      count=$((count + 1))
+      [ "$count" -ge "$limit" ] && break
     done
     ;;
   mkdir)
@@ -148,6 +153,9 @@ const EXIT_EXISTS: i32 = 17;
 /// large directory tree, so they get the longer budget.
 const PROBE_LIST_TIMEOUT: Duration = Duration::from_secs(20);
 const PROBE_OP_TIMEOUT: Duration = Duration::from_secs(60);
+/// Ask the far side for one entry beyond the retained UI cap. Reaching that
+/// extra record is the bounded, protocol-level `truncated` signal.
+const LIST_PROBE_ENTRY_LIMIT: usize = crate::file_tree::MAX_DIRECTORY_ENTRIES + 1;
 /// Transfers get a generous overall cap: ssh's own ConnectTimeout still
 /// bounds the handshake, and this watchdog ends any transfer — busy or idle —
 /// after 15 minutes, so a stuck connection can never wedge a worker thread.
@@ -634,6 +642,7 @@ pub(crate) fn remap_clipboard_by_profile(
 }
 
 /// One finished probe run, output bounded on both streams.
+#[derive(Debug)]
 struct Capture {
     code: Option<i32>,
     stdout: Vec<u8>,
@@ -647,13 +656,58 @@ pub(crate) fn list_dir(
     loc: &FsLocation,
     hosts: &[RemoteHost],
     dir: &Path,
-) -> io::Result<Vec<FileEntry>> {
+) -> io::Result<crate::file_tree::DirectoryListing> {
+    list_dir_inner(loc, hosts, dir, None)
+}
+
+pub(crate) fn list_dir_with_cancellation(
+    loc: &FsLocation,
+    hosts: &[RemoteHost],
+    dir: &Path,
+    cancellation: &crate::file_tree::ScanCancellation,
+) -> io::Result<crate::file_tree::DirectoryListing> {
+    list_dir_inner(loc, hosts, dir, Some(cancellation))
+}
+
+fn list_dir_inner(
+    loc: &FsLocation,
+    hosts: &[RemoteHost],
+    dir: &Path,
+    cancellation: Option<&crate::file_tree::ScanCancellation>,
+) -> io::Result<crate::file_tree::DirectoryListing> {
+    if cancellation.is_some_and(crate::file_tree::ScanCancellation::is_cancelled) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "directory scan was superseded",
+        ));
+    }
     match loc {
-        FsLocation::Local => crate::file_tree::scan_dir(dir),
+        FsLocation::Local => {
+            let listing = crate::file_tree::scan_dir(dir)?;
+            if cancellation.is_some_and(crate::file_tree::ScanCancellation::is_cancelled) {
+                Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "directory scan was superseded",
+                ))
+            } else {
+                Ok(listing)
+            }
+        }
         FsLocation::Remote(_) | FsLocation::Transient(_) => {
             require_absolute(dir)?;
             let host = remote_host(loc, hosts)?;
-            let stdout = run_probe(host, "list", &[dir.as_os_str()], PROBE_LIST_TIMEOUT)?;
+            let limit = LIST_PROBE_ENTRY_LIMIT.to_string();
+            let args = [dir.as_os_str(), OsStr::new(&limit)];
+            let stdout = match cancellation {
+                Some(cancellation) => run_probe_with_cancellation(
+                    host,
+                    "list",
+                    &args,
+                    PROBE_LIST_TIMEOUT,
+                    cancellation,
+                )?,
+                None => run_probe(host, "list", &args, PROBE_LIST_TIMEOUT)?,
+            };
             Ok(parse_list_output(&stdout, dir))
         }
     }
@@ -959,15 +1013,18 @@ fn copy_recursive(src: &Path, dst: &Path, depth: usize) -> io::Result<()> {
 }
 
 /// Parse `list` output: NUL-separated `<t>` `<name>` pairs, t in {d,f,l},
-/// names relative to `dir`. Symlinks are files here — never expanded into
-/// directories, matching `file_tree::scan_dir`.
-fn parse_list_output(bytes: &[u8], dir: &Path) -> Vec<FileEntry> {
-    let mut entries = Vec::new();
+/// names relative to `dir`. Remote names must be valid UTF-8 before the same
+/// text is used for both display and the actionable path. Duplicate records of
+/// one type collapse to one row; conflicting types for one name suppress that
+/// name entirely. Symlinks are files here and are never expandable.
+fn parse_list_output(bytes: &[u8], dir: &Path) -> crate::file_tree::DirectoryListing {
+    let mut entries: Vec<Option<FileEntry>> = Vec::new();
+    let mut seen: std::collections::HashMap<String, (usize, bool)> =
+        std::collections::HashMap::new();
+    let mut collisions = std::collections::HashSet::new();
+    let mut valid_records = 0usize;
     let mut fields = bytes.split(|&byte| byte == 0);
     while let (Some(kind), Some(name)) = (fields.next(), fields.next()) {
-        if entries.len() >= crate::file_tree::MAX_DIRECTORY_ENTRIES {
-            break;
-        }
         // The probe's glob cannot produce these, but a hostile or buggy far
         // side must not smuggle a path outside `dir` into the tree.
         if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') {
@@ -978,15 +1035,40 @@ fn parse_list_output(bytes: &[u8], dir: &Path) -> Vec<FileEntry> {
             b"f" | b"l" => false,
             _ => continue,
         };
-        let name = OsStr::from_bytes(name);
-        entries.push(FileEntry::new(
-            crate::file_tree::display_os_str(name),
-            dir.join(name),
+        let Ok(name) = std::str::from_utf8(name) else {
+            continue;
+        };
+        valid_records = valid_records.saturating_add(1);
+        if valid_records > LIST_PROBE_ENTRY_LIMIT {
+            break;
+        }
+        if collisions.contains(name) {
+            continue;
+        }
+        if let Some((index, previous_is_dir)) = seen.get(name).copied() {
+            if previous_is_dir != is_dir {
+                entries[index] = None;
+                collisions.insert(name.to_string());
+            }
+            continue;
+        }
+        let name_os = OsStr::new(name);
+        let index = entries.len();
+        seen.insert(name.to_string(), (index, is_dir));
+        entries.push(Some(FileEntry::new(
+            crate::file_tree::display_os_str(name_os),
+            dir.join(name_os),
             is_dir,
-        ));
+        )));
     }
+    let truncated = valid_records > crate::file_tree::MAX_DIRECTORY_ENTRIES;
+    let mut entries: Vec<FileEntry> = entries
+        .into_iter()
+        .flatten()
+        .take(crate::file_tree::MAX_DIRECTORY_ENTRIES)
+        .collect();
     crate::file_tree::sort_entries(&mut entries);
-    entries
+    crate::file_tree::DirectoryListing::new(entries, truncated)
 }
 
 fn parse_home_output(bytes: &[u8]) -> io::Result<PathBuf> {
@@ -1024,6 +1106,26 @@ fn run_probe(
     )
 }
 
+fn run_probe_with_cancellation(
+    host: &RemoteHost,
+    op: &str,
+    args: &[&OsStr],
+    timeout: Duration,
+    cancellation: &crate::file_tree::ScanCancellation,
+) -> io::Result<Vec<u8>> {
+    let argv = checked_probe_argv(host, op, args, ScriptDelivery::Stdin)?;
+    probe_result(
+        op,
+        run_capture_with_cancellation(
+            &argv,
+            PROBE_SCRIPT.as_bytes(),
+            timeout,
+            MAX_CAPTURE_BYTES,
+            cancellation,
+        )?,
+    )
+}
+
 /// Map the probe's exit-code contract onto io error kinds; stderr text rides
 /// along, bounded and made safe to display.
 fn probe_result(op: &str, capture: Capture) -> io::Result<Vec<u8>> {
@@ -1047,12 +1149,78 @@ fn probe_result(op: &str, capture: Capture) -> io::Result<Vec<u8>> {
             &capture,
             "the probe rejected the request",
         )),
+        // The probe script never emits 255. OpenSSH reserves it for transport
+        // or authentication failure, which should be classified without
+        // exposing ssh's potentially sensitive stderr to the Files UI.
+        Some(255) => Err(probe_error(
+            io::ErrorKind::ConnectionAborted,
+            op,
+            &capture,
+            "remote connection unavailable",
+        )),
         _ => Err(probe_error(
             io::ErrorKind::Other,
             op,
             &capture,
             "operation failed",
         )),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FsFailureKind {
+    Superseded,
+    QueueFull,
+    TimedOut,
+    Missing,
+    Permission,
+    Exists,
+    Connection,
+    InvalidResponse,
+    InvalidRequest,
+    Other,
+}
+
+pub(crate) fn classify_fs_error(error: &io::Error) -> FsFailureKind {
+    match error.kind() {
+        io::ErrorKind::Interrupted => FsFailureKind::Superseded,
+        io::ErrorKind::WouldBlock => FsFailureKind::QueueFull,
+        io::ErrorKind::TimedOut => FsFailureKind::TimedOut,
+        io::ErrorKind::NotFound => FsFailureKind::Missing,
+        io::ErrorKind::PermissionDenied => FsFailureKind::Permission,
+        io::ErrorKind::AlreadyExists => FsFailureKind::Exists,
+        io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::ConnectionRefused
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::HostUnreachable
+        | io::ErrorKind::NetworkUnreachable
+        | io::ErrorKind::NotConnected
+        | io::ErrorKind::BrokenPipe => FsFailureKind::Connection,
+        io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof => FsFailureKind::InvalidResponse,
+        io::ErrorKind::InvalidInput => FsFailureKind::InvalidRequest,
+        _ => FsFailureKind::Other,
+    }
+}
+
+/// Stable allow-listed copy for GTK. Detailed bounded stderr remains in logs,
+/// but credentials, socket paths, shell fragments, and hostile Unicode from a
+/// remote process never cross into a user-visible label or toast.
+pub(crate) fn user_facing_fs_error(error: &io::Error) -> &'static str {
+    user_facing_failure_kind(classify_fs_error(error))
+}
+
+pub(crate) fn user_facing_failure_kind(kind: FsFailureKind) -> &'static str {
+    match kind {
+        FsFailureKind::Superseded => "This request was superseded.",
+        FsFailureKind::QueueFull => "Too many file operations are waiting; retry shortly.",
+        FsFailureKind::TimedOut => "The filesystem did not respond in time.",
+        FsFailureKind::Missing => "The path no longer exists or is unavailable.",
+        FsFailureKind::Permission => "Permission was denied.",
+        FsFailureKind::Exists => "The destination already exists.",
+        FsFailureKind::Connection => "The remote connection is unavailable.",
+        FsFailureKind::InvalidResponse => "The remote filesystem returned an invalid response.",
+        FsFailureKind::InvalidRequest => "The filesystem request was rejected as invalid.",
+        FsFailureKind::Other => "The filesystem operation failed.",
     }
 }
 
@@ -1218,10 +1386,9 @@ fn sq_bytes(s: &[u8]) -> Vec<u8> {
 /// Overflow keeps draining into the void so the child is never wedged on a
 /// full pipe; the returned flag lets the caller treat truncation as an error
 /// instead of silently acting on a short capture.
-fn spawn_bounded_reader(
-    pipe: impl Read + Send + 'static,
-    max_out: usize,
-) -> std::thread::JoinHandle<io::Result<(Vec<u8>, bool)>> {
+type BoundedReader = std::thread::JoinHandle<io::Result<(Vec<u8>, bool)>>;
+
+fn spawn_bounded_reader(pipe: impl Read + Send + 'static, max_out: usize) -> BoundedReader {
     std::thread::spawn(move || {
         let mut limited = pipe.take(max_out as u64 + 1);
         let mut buf = Vec::new();
@@ -1235,9 +1402,7 @@ fn spawn_bounded_reader(
     })
 }
 
-fn join_reader(
-    reader: Option<std::thread::JoinHandle<io::Result<(Vec<u8>, bool)>>>,
-) -> io::Result<(Vec<u8>, bool)> {
+fn join_reader(reader: Option<BoundedReader>) -> io::Result<(Vec<u8>, bool)> {
     match reader {
         Some(handle) => handle
             .join()
@@ -1273,6 +1438,26 @@ fn run_capture(
     stdin_bytes: &[u8],
     timeout: Duration,
     max_out: usize,
+) -> io::Result<Capture> {
+    run_capture_inner(argv, stdin_bytes, timeout, max_out, None)
+}
+
+fn run_capture_with_cancellation(
+    argv: &[OsString],
+    stdin_bytes: &[u8],
+    timeout: Duration,
+    max_out: usize,
+    cancellation: &crate::file_tree::ScanCancellation,
+) -> io::Result<Capture> {
+    run_capture_inner(argv, stdin_bytes, timeout, max_out, Some(cancellation))
+}
+
+fn run_capture_inner(
+    argv: &[OsString],
+    stdin_bytes: &[u8],
+    timeout: Duration,
+    max_out: usize,
+    cancellation: Option<&crate::file_tree::ScanCancellation>,
 ) -> io::Result<Capture> {
     let Some((program, args)) = argv.split_first() else {
         return Err(io::Error::new(
@@ -1311,6 +1496,16 @@ fn run_capture(
 
     let started = std::time::Instant::now();
     let status = loop {
+        if cancellation.is_some_and(crate::file_tree::ScanCancellation::is_cancelled) {
+            kill_tree(&mut child);
+            let _ = child.wait();
+            let _ = join_reader(stdout_reader);
+            let _ = join_reader(stderr_reader);
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "directory scan was superseded",
+            ));
+        }
         match child.try_wait()? {
             Some(status) => break status,
             None if started.elapsed() >= timeout => {
@@ -1362,7 +1557,7 @@ struct ProbeChild {
     child: Arc<Mutex<Child>>,
     stdin: Option<ChildStdin>,
     stdout: Option<ChildStdout>,
-    stderr: Option<JoinHandle<io::Result<(Vec<u8>, bool)>>>,
+    stderr: Option<BoundedReader>,
 }
 
 impl ProbeChild {
@@ -2499,17 +2694,18 @@ pub(crate) struct DeleteBatchOutcome {
 
 /// Format one failed batch item's error for the summary toast.
 fn batch_failure(outcome: &mut BatchOutcome, display: String, error: &io::Error) {
-    let message =
-        jterm_core::review_input::safe_inline_display(&error.to_string(), MAX_ERROR_DISPLAY_BYTES);
-    outcome.failed.push((display, message));
+    outcome
+        .failed
+        .push((display, user_facing_fs_error(error).to_string()));
 }
 
 /// Display name of a batch item path (escaped, unambiguous).
 fn batch_display_name(path: &Path) -> String {
-    match path.file_name() {
+    let display = match path.file_name() {
         Some(name) => crate::file_tree::display_os_str(name),
         None => crate::file_tree::display_full_path(path),
-    }
+    };
+    jterm_core::review_input::safe_inline_display(&display, MAX_ERROR_DISPLAY_BYTES)
 }
 
 /// Paste every clipboard item into `dst_dir`: same-location items rename
@@ -2606,10 +2802,7 @@ pub(crate) fn paste_all(
                     match delete(clip_loc, hosts, &item.path) {
                         Ok(()) => source_consumed(&item.path),
                         Err(error) => {
-                            let message = jterm_core::review_input::safe_inline_display(
-                                &error.to_string(),
-                                MAX_ERROR_DISPLAY_BYTES,
-                            );
+                            let message = user_facing_fs_error(&error);
                             outcome.failed.push((
                                 display,
                                 format!("copied, but deleting the source failed: {message}"),
@@ -2693,7 +2886,10 @@ pub(crate) fn run_drop(
             ));
             continue;
         };
-        let display = crate::file_tree::display_os_str(name);
+        let display = jterm_core::review_input::safe_inline_display(
+            &crate::file_tree::display_os_str(name),
+            MAX_ERROR_DISPLAY_BYTES,
+        );
         if item.collides {
             outcome
                 .failed
@@ -2726,11 +2922,9 @@ pub(crate) fn run_drop(
                 if error.kind() == io::ErrorKind::Interrupted {
                     return Err(error);
                 }
-                let message = jterm_core::review_input::safe_inline_display(
-                    &error.to_string(),
-                    MAX_ERROR_DISPLAY_BYTES,
-                );
-                outcome.failed.push((display, message));
+                outcome
+                    .failed
+                    .push((display, user_facing_fs_error(&error).to_string()));
             }
         }
         moved = moved.saturating_add(item.size);
@@ -2900,6 +3094,35 @@ mod tests {
     }
 
     #[test]
+    fn production_list_probe_argv_carries_entries_plus_one_limit() {
+        let limit = LIST_PROBE_ENTRY_LIMIT.to_string();
+        assert_eq!(
+            LIST_PROBE_ENTRY_LIMIT,
+            crate::file_tree::MAX_DIRECTORY_ENTRIES + 1
+        );
+        let dir = OsStr::new("/remote/tree");
+        let ssh = ssh_probe_argv(
+            &ssh_host(),
+            "list",
+            &[dir, OsStr::new(&limit)],
+            ScriptDelivery::Stdin,
+        );
+        assert_eq!(
+            ssh.last().expect("one remote command").to_string_lossy(),
+            format!("sh -s -- 'list' '/remote/tree' '{limit}'")
+        );
+
+        let docker = docker_probe_argv(
+            &docker_host(),
+            "list",
+            &[dir, OsStr::new(&limit)],
+            ScriptDelivery::Stdin,
+        );
+        assert_eq!(docker[docker.len() - 2], OsStr::new("/remote/tree"));
+        assert_eq!(docker.last().unwrap(), OsStr::new(&limit));
+    }
+
+    #[test]
     fn ssh_argv_without_user_uses_bare_host() {
         let mut host = ssh_host();
         host.user = None;
@@ -2979,17 +3202,20 @@ mod tests {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(0);
         }
-        // A non-UTF-8 name survives byte-exact and displays escaped.
+        // A remote name that cannot be represented exactly as UTF-8 is not
+        // admitted as an actionable path.
         bytes.extend_from_slice(b"f\0bad\xffname\0");
-        let entries = parse_list_output(&bytes, dir);
+        let listing = parse_list_output(&bytes, dir);
+        let entries = listing.entries();
         let names: Vec<_> = entries.iter().map(|e| e.name().to_string()).collect();
-        assert_eq!(entries.len(), 5);
+        assert_eq!(entries.len(), 4);
         assert_eq!(names[0], "dir with spaces", "directories sort first");
         assert!(entries[0].is_dir());
-        assert!(names.contains(&r"bad\xffname".to_string()));
         assert!(names.contains(&"quo'te.txt".to_string()));
         assert!(names.contains(&"link\nname".to_string()));
         assert!(names.contains(&r"back\\slash".to_string()));
+        assert!(entries.iter().all(|entry| entry.path().to_str().is_some()));
+        assert!(!listing.truncated());
     }
 
     #[test]
@@ -3003,10 +3229,29 @@ mod tests {
         bytes.extend_from_slice(b"f\0has/slash\0");
         bytes.extend_from_slice(b"d\0good\0");
         bytes.extend_from_slice(b"trailing-without-name");
-        let entries = parse_list_output(&bytes, dir);
+        let listing = parse_list_output(&bytes, dir);
+        let entries = listing.entries();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name(), "good");
         assert_eq!(entries[0].path(), PathBuf::from("/base/good"));
+    }
+
+    #[test]
+    fn list_output_deduplicates_names_and_suppresses_type_collisions() {
+        let dir = Path::new("/base");
+        let bytes = b"f\0once\0f\0once\0d\0conflict\0f\0conflict\0d\0safe\0";
+        let listing = parse_list_output(bytes, dir);
+        let entries = listing.entries();
+        let names: Vec<_> = entries.iter().map(FileEntry::name).collect();
+        assert_eq!(names, ["safe", "once"]);
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.name() == "once")
+                .count(),
+            1
+        );
+        assert!(!entries.iter().any(|entry| entry.name() == "conflict"));
     }
 
     #[test]
@@ -3016,14 +3261,22 @@ mod tests {
         for i in 0..crate::file_tree::MAX_DIRECTORY_ENTRIES + 32 {
             bytes.extend_from_slice(format!("f\0file{i:05}\0").as_bytes());
         }
-        let entries = parse_list_output(&bytes, dir);
-        assert_eq!(entries.len(), crate::file_tree::MAX_DIRECTORY_ENTRIES);
+        let listing = parse_list_output(&bytes, dir);
+        assert_eq!(
+            listing.entries().len(),
+            crate::file_tree::MAX_DIRECTORY_ENTRIES
+        );
+        assert!(listing.truncated());
     }
 
     #[test]
     fn list_output_empty_buffer_yields_no_entries() {
-        assert!(parse_list_output(b"", Path::new("/base")).is_empty());
-        assert!(parse_list_output(b"\0\0", Path::new("/base")).is_empty());
+        assert!(parse_list_output(b"", Path::new("/base"))
+            .entries()
+            .is_empty());
+        assert!(parse_list_output(b"\0\0", Path::new("/base"))
+            .entries()
+            .is_empty());
     }
 
     #[test]
@@ -3202,6 +3455,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cancelled_list_capture_kills_the_in_flight_process_group() {
+        let argv = vec![
+            OsString::from("sh"),
+            OsString::from("-c"),
+            OsString::from("sleep 30"),
+        ];
+        let cancellation = crate::file_tree::ScanCancellation::default();
+        let worker_cancellation = cancellation.clone();
+        let started = std::time::Instant::now();
+        let worker = std::thread::spawn(move || {
+            run_capture_with_cancellation(
+                &argv,
+                b"",
+                Duration::from_secs(30),
+                1024,
+                &worker_cancellation,
+            )
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        cancellation.cancel();
+        let error = worker.join().unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
     #[cfg(unix)]
     #[test]
     fn kill_tree_reaps_the_whole_process_group() {
@@ -3250,6 +3529,12 @@ mod tests {
             io::ErrorKind::InvalidInput
         );
         assert_eq!(
+            probe_result("list", capture(255, b"ssh transport failed"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::ConnectionAborted
+        );
+        assert_eq!(
             probe_result("rm", capture(4, b"rm: cannot remove"))
                 .unwrap_err()
                 .kind(),
@@ -3264,15 +3549,56 @@ mod tests {
     }
 
     #[test]
+    fn remote_failure_ui_is_classified_and_never_repeats_hostile_stderr() {
+        let secret = "deploy:hunter2@private.example\u{202e}\u{1b}[31m";
+        let error = probe_result(
+            "list",
+            Capture {
+                code: Some(255),
+                stdout: Vec::new(),
+                stderr: secret.as_bytes().to_vec(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(classify_fs_error(&error), FsFailureKind::Connection);
+        let visible = user_facing_fs_error(&error);
+        assert_eq!(visible, "The remote connection is unavailable.");
+        assert!(!visible.contains("hunter2"));
+        assert!(!visible.contains("private.example"));
+        assert!(!visible.chars().any(char::is_control));
+
+        for (kind, expected) in [
+            (io::ErrorKind::WouldBlock, FsFailureKind::QueueFull),
+            (io::ErrorKind::TimedOut, FsFailureKind::TimedOut),
+            (io::ErrorKind::NotFound, FsFailureKind::Missing),
+            (io::ErrorKind::PermissionDenied, FsFailureKind::Permission),
+            (io::ErrorKind::AlreadyExists, FsFailureKind::Exists),
+            (io::ErrorKind::InvalidData, FsFailureKind::InvalidResponse),
+            (io::ErrorKind::InvalidInput, FsFailureKind::InvalidRequest),
+        ] {
+            let error = io::Error::new(kind, secret);
+            assert_eq!(classify_fs_error(&error), expected);
+            assert!(!user_facing_fs_error(&error).contains("hunter2"));
+        }
+
+        let display = batch_display_name(Path::new("/tmp/report\u{202e}\u{1b}[31m.txt"));
+        assert!(!display.contains('\u{202e}'));
+        assert!(!display.chars().any(char::is_control));
+    }
+
+    #[test]
     fn probe_lists_a_real_directory_through_sh() {
         let tmp = TestDir::new("probe-list");
         std::fs::create_dir(tmp.path().join("subdir")).unwrap();
         std::fs::write(tmp.path().join("file.txt"), b"data").unwrap();
         std::os::unix::fs::symlink("file.txt", tmp.path().join("alink")).unwrap();
+        std::os::unix::fs::symlink("subdir", tmp.path().join("dirlink")).unwrap();
 
-        let capture = local_probe(&["list", tmp.path().to_str().unwrap()]);
+        let limit = LIST_PROBE_ENTRY_LIMIT.to_string();
+        let capture = local_probe(&["list", tmp.path().to_str().unwrap(), &limit]);
         assert_eq!(capture.code, Some(0));
-        let entries = parse_list_output(&capture.stdout, tmp.path());
+        let listing = parse_list_output(&capture.stdout, tmp.path());
+        let entries = listing.entries();
         let names: Vec<_> = entries
             .iter()
             .map(|e| (e.name().to_string(), e.is_dir()))
@@ -3282,9 +3608,33 @@ mod tests {
             vec![
                 ("subdir".to_string(), true),
                 ("alink".to_string(), false),
+                ("dirlink".to_string(), false),
                 ("file.txt".to_string(), false),
             ],
-            "symlinks are files, directories sort first"
+            "symlinks, including links to directories, are never expandable"
+        );
+    }
+
+    #[test]
+    fn probe_list_stops_at_the_client_supplied_hard_limit() {
+        let tmp = TestDir::new("probe-list-limit");
+        for name in ["a", "b", "c"] {
+            std::fs::write(tmp.path().join(name), b"x").unwrap();
+        }
+        let capture = local_probe(&["list", tmp.path().to_str().unwrap(), "2"]);
+        assert_eq!(capture.code, Some(0));
+        assert_eq!(
+            capture.stdout.split(|byte| *byte == 0).count() - 1,
+            4,
+            "two entries produce exactly four NUL-terminated fields"
+        );
+        assert_eq!(
+            local_probe(&["list", tmp.path().to_str().unwrap(), "0"]).code,
+            Some(EXIT_USAGE)
+        );
+        assert_eq!(
+            local_probe(&["list", tmp.path().to_str().unwrap(), "not-a-limit"]).code,
+            Some(EXIT_USAGE)
         );
     }
 
@@ -3335,7 +3685,7 @@ mod tests {
         assert_eq!(local_probe(&["rm", "/"]).code, Some(2));
         assert_eq!(local_probe(&["bogus"]).code, Some(2));
         assert_eq!(
-            local_probe(&["list", tmp.path().join("missing").to_str().unwrap()]).code,
+            local_probe(&["list", tmp.path().join("missing").to_str().unwrap(), "2",]).code,
             Some(3)
         );
     }
@@ -3781,9 +4131,11 @@ mod tests {
         let tmp = TestDir::new("local-list");
         std::fs::create_dir(tmp.path().join("zdir")).unwrap();
         std::fs::write(tmp.path().join("afile"), b"x").unwrap();
-        let entries = list_dir(&FsLocation::Local, &[], tmp.path()).unwrap();
+        let listing = list_dir(&FsLocation::Local, &[], tmp.path()).unwrap();
+        let entries = listing.entries();
         let names: Vec<_> = entries.iter().map(|e| e.name().to_string()).collect();
         assert_eq!(names, ["zdir", "afile"]);
+        assert!(!listing.truncated());
     }
 
     // -- probe v2 payload ops, end to end through local sh -------------------

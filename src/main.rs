@@ -126,6 +126,67 @@ fn widget_is_within(mut current: gtk::Widget, ancestor: &gtk::Widget) -> bool {
     }
 }
 
+fn file_tree_f5_should_refresh(
+    key: gtk::gdk::Key,
+    state: gtk::gdk::ModifierType,
+    focus_within_tree: bool,
+    pointer_within_tree: bool,
+    tree_mapped: bool,
+) -> bool {
+    let command_modifiers = gtk::gdk::ModifierType::CONTROL_MASK
+        | gtk::gdk::ModifierType::SHIFT_MASK
+        | gtk::gdk::ModifierType::ALT_MASK
+        | gtk::gdk::ModifierType::SUPER_MASK
+        | gtk::gdk::ModifierType::HYPER_MASK
+        | gtk::gdk::ModifierType::META_MASK;
+    key == gtk::gdk::Key::F5
+        && !state.intersects(command_modifiers)
+        && tree_mapped
+        && (focus_within_tree || pointer_within_tree)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileTreeNavigationShortcut {
+    Back,
+    Forward,
+    Up,
+    Home,
+    OpenPath,
+}
+
+fn file_tree_navigation_shortcut(
+    key: gtk::gdk::Key,
+    state: gtk::gdk::ModifierType,
+    focus_within_tree: bool,
+    _pointer_within_tree: bool,
+    tree_mapped: bool,
+) -> Option<FileTreeNavigationShortcut> {
+    if !tree_mapped || !focus_within_tree {
+        return None;
+    }
+    let command_state = state - gtk::gdk::ModifierType::LOCK_MASK;
+    if matches!(key, gtk::gdk::Key::l | gtk::gdk::Key::L)
+        && command_state == gtk::gdk::ModifierType::CONTROL_MASK
+    {
+        return Some(FileTreeNavigationShortcut::OpenPath);
+    }
+    let conflicting = gtk::gdk::ModifierType::CONTROL_MASK
+        | gtk::gdk::ModifierType::SHIFT_MASK
+        | gtk::gdk::ModifierType::SUPER_MASK
+        | gtk::gdk::ModifierType::HYPER_MASK
+        | gtk::gdk::ModifierType::META_MASK;
+    if !state.contains(gtk::gdk::ModifierType::ALT_MASK) || state.intersects(conflicting) {
+        return None;
+    }
+    match key {
+        gtk::gdk::Key::Left => Some(FileTreeNavigationShortcut::Back),
+        gtk::gdk::Key::Right => Some(FileTreeNavigationShortcut::Forward),
+        gtk::gdk::Key::Up => Some(FileTreeNavigationShortcut::Up),
+        gtk::gdk::Key::Home => Some(FileTreeNavigationShortcut::Home),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CrossBlockSearchKeyPress {
     Proceed,
@@ -263,11 +324,31 @@ struct AppModel {
     file_header: Controller<sidebar::FileHeaderModel>,
     file_tree_root: Rc<RefCell<std::path::PathBuf>>,
     file_tree_scan_generation: Rc<std::cell::Cell<u64>>,
+    /// Loaded-model revision captured by visible file-tree actions. A
+    /// successful reconciliation that changes rows revokes stale menus/dialogs
+    /// without cancelling already-dispatched filesystem settlement.
+    file_tree_content_revision: Rc<std::cell::Cell<u64>>,
+    /// Per-path completion time and explicit invalidation for loaded directory
+    /// snapshots in the current tree authority.
+    file_tree_snapshots: Rc<RefCell<file_tree::DirectorySnapshots>>,
+    /// Latest staged root/location navigation. Navigation lists before it
+    /// commits, so failures leave the live authority, rows, and selection.
+    file_tree_navigation_revision: Rc<std::cell::Cell<u64>>,
+    file_tree_navigation_cancellation: Rc<RefCell<Option<file_tree::ScanCancellation>>>,
+    file_tree_navigation_history: Rc<RefCell<file_tree::FileTreeNavigationHistory>>,
+    file_tree_root_cache: Rc<RefCell<file_tree::RootListingCache>>,
+    file_tree_failure_gate: Rc<RefCell<file_tree::DirectoryFailureGate>>,
+    /// Per-directory publication revisions for in-place refreshes. A later
+    /// request for one path supersedes every earlier result for that path,
+    /// even while the overall tree generation stays unchanged.
+    file_tree_refresh_revisions: Rc<RefCell<file_tree::DirectoryRefreshRevisions>>,
     /// The tree view, its filter model, and the live filter state behind the
     /// header's filter entry.
     file_tree_view: gtk::TreeView,
     file_tree_filter_model: gtk::TreeModelFilter,
     file_tree_filter: Rc<RefCell<file_tree::TreeFilter>>,
+    file_tree_status: Rc<file_tree::FileTreeStatusUi>,
+    file_tree_pointer_inside: Rc<std::cell::Cell<bool>>,
     /// Which filesystem the tree browses; drives both scans and file ops.
     file_tree_location: Rc<RefCell<remote_fs::FsLocation>>,
     /// The active pane's last process-observed SSH intent. A worker may
@@ -733,6 +814,11 @@ impl SimpleComponent for AppModel {
             scroll: file_tree_scroll,
             header: file_header,
             scan_generation: file_tree_scan_generation,
+            content_revision: file_tree_content_revision,
+            snapshots: file_tree_snapshots,
+            failure_gate: file_tree_failure_gate,
+            status: file_tree_status,
+            pointer_inside: file_tree_pointer_inside,
         } = startup_ui::build_file_tree(
             &sender,
             &config,
@@ -786,6 +872,7 @@ impl SimpleComponent for AppModel {
         // "files" page: root header (up / goto-cwd / path) + file tree.
         let files_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
         files_page.append(file_header.widget());
+        files_page.append(file_tree_status.widget());
         files_page.append(&file_tree_scroll);
 
         let sidebar_stack = gtk::Stack::new();
@@ -1144,9 +1231,23 @@ impl SimpleComponent for AppModel {
             file_header,
             file_tree_root: Rc::new(RefCell::new(std::path::PathBuf::new())),
             file_tree_scan_generation,
+            file_tree_content_revision,
+            file_tree_snapshots,
+            file_tree_navigation_revision: Rc::new(std::cell::Cell::new(0)),
+            file_tree_navigation_cancellation: Rc::new(RefCell::new(None)),
+            file_tree_navigation_history: Rc::new(RefCell::new(
+                file_tree::FileTreeNavigationHistory::default(),
+            )),
+            file_tree_root_cache: Rc::new(RefCell::new(file_tree::RootListingCache::default())),
+            file_tree_failure_gate,
+            file_tree_refresh_revisions: Rc::new(RefCell::new(
+                file_tree::DirectoryRefreshRevisions::default(),
+            )),
             file_tree_view,
             file_tree_filter_model,
             file_tree_filter,
+            file_tree_status,
+            file_tree_pointer_inside,
             file_tree_location,
             file_tree_ssh_observation: None,
             file_tree_ssh_detection_revision: std::cell::Cell::new(0),
@@ -1325,10 +1426,64 @@ impl SimpleComponent for AppModel {
             let ksender = sender.clone();
             let window = root.clone();
             let ai_panel_root = model.ai_panel.widget().clone().upcast::<gtk::Widget>();
+            let file_tree_header_root = model.file_header.widget().clone().upcast::<gtk::Widget>();
+            let file_tree_root = model.file_tree_view.clone().upcast::<gtk::Widget>();
+            let file_tree_status_root = model
+                .file_tree_status
+                .widget()
+                .clone()
+                .upcast::<gtk::Widget>();
+            let file_tree_pointer_inside = model.file_tree_pointer_inside.clone();
+            let file_tree_generation = model.file_tree_scan_generation.clone();
+            let file_tree_content_revision = model.file_tree_content_revision.clone();
+            let file_tree_location = model.file_tree_location.clone();
+            let file_tree_config = model.config.clone();
             let cross_block_search_key_latch = cross_block_search_key_latch.clone();
             key_controller.connect_key_pressed(move |_c, keyval, keycode, state| {
-                let ai_panel_focused = gtk::prelude::RootExt::focus(&window)
+                let focused = gtk::prelude::RootExt::focus(&window);
+                let ai_panel_focused = focused
+                    .clone()
                     .is_some_and(|focus| widget_is_within(focus, &ai_panel_root));
+                let file_tree_focused = focused.is_some_and(|focus| {
+                    widget_is_within(focus.clone(), &file_tree_header_root)
+                        || widget_is_within(focus.clone(), &file_tree_root)
+                        || widget_is_within(focus, &file_tree_status_root)
+                });
+                if file_tree_f5_should_refresh(
+                    keyval,
+                    state,
+                    file_tree_focused,
+                    file_tree_pointer_inside.get(),
+                    file_tree_root.is_mapped(),
+                ) {
+                    let location = file_tree_location.borrow();
+                    let config = file_tree_config.borrow();
+                    ksender.input(AppMsg::FileTreeRefresh {
+                        intent: Box::new(file_tree::capture_file_tree_user_intent(
+                            file_tree_generation.get(),
+                            file_tree_content_revision.get(),
+                            &location,
+                            &config.remote_hosts,
+                        )),
+                    });
+                    return glib::Propagation::Stop;
+                }
+                if let Some(shortcut) = file_tree_navigation_shortcut(
+                    keyval,
+                    state,
+                    file_tree_focused,
+                    file_tree_pointer_inside.get(),
+                    file_tree_root.is_mapped(),
+                ) {
+                    ksender.input(match shortcut {
+                        FileTreeNavigationShortcut::Back => AppMsg::FileTreeGoBack,
+                        FileTreeNavigationShortcut::Forward => AppMsg::FileTreeGoForward,
+                        FileTreeNavigationShortcut::Up => AppMsg::FileTreeGoUp,
+                        FileTreeNavigationShortcut::Home => AppMsg::FileTreeGoHome,
+                        FileTreeNavigationShortcut::OpenPath => AppMsg::FileTreeOpenPathEntry,
+                    });
+                    return glib::Propagation::Stop;
+                }
                 // Composer/search/list Enter semantics and IME candidate
                 // confirmation belong to the focused AI child before any
                 // optional global binding for Enter.
@@ -1508,6 +1663,13 @@ impl SimpleComponent for AppModel {
         }
 
         model.init_file_tree();
+        {
+            let ttl_sender = sender.clone();
+            gtk::glib::timeout_add_local(std::time::Duration::from_secs(5), move || {
+                ttl_sender.input(AppMsg::FileTreeTtlTick);
+                gtk::glib::ControlFlow::Continue
+            });
+        }
         model.refresh_bottom_bar();
 
         // anvil prefers jsh as its shell, so it is worth noticing when the
@@ -1560,6 +1722,9 @@ impl SimpleComponent for AppModel {
             AppMsg::WindowActive(active) => {
                 self.window_active = active;
                 self.sync_organism_focus();
+                if active {
+                    self.file_tree_revalidate_due();
+                }
             }
             AppMsg::Quit => {
                 self.request_quit(&sender);
@@ -2247,12 +2412,34 @@ impl SimpleComponent for AppModel {
             AppMsg::PaletteRunWorkflow(path) => {
                 self.run_workflow_from_path(path, &sender);
             }
-            AppMsg::FileTreeGotoCwd => self.file_tree_goto_current_cwd(),
-            AppMsg::FileTreeGoUp => self.file_tree_go_up(),
-            AppMsg::FileTreeSelectLocation(index) => self.file_tree_select_location(index, &sender),
-            AppMsg::FileTreeLocationResolved { intent, start } => {
-                self.file_tree_location_resolved(*intent, start)
+            AppMsg::FileTreeGotoCwd => self.file_tree_goto_current_cwd(&sender),
+            AppMsg::FileTreeGoUp => self.file_tree_go_up(&sender),
+            AppMsg::FileTreeGoHome => self.file_tree_go_home(&sender),
+            AppMsg::FileTreeGoBack => self.file_tree_go_back(&sender),
+            AppMsg::FileTreeGoForward => self.file_tree_go_forward(&sender),
+            AppMsg::FileTreeNavigatePath(path) => self.file_tree_navigate_path(path, &sender),
+            AppMsg::FileTreePathEntered(path) => self.file_tree_path_entered(path, &sender),
+            AppMsg::FileTreeOpenPathEntry => self.file_tree_open_path_entry(),
+            AppMsg::FileTreeTtlTick => self.file_tree_revalidate_due(),
+            AppMsg::FileTreeEnterDirectory { path, intent } => {
+                self.file_tree_enter_directory(path, *intent, &sender)
             }
+            AppMsg::FileTreeSelectLocation(index) => self.file_tree_select_location(index, &sender),
+            AppMsg::FileTreeLocationResolved {
+                token,
+                location,
+                hosts,
+                result,
+            } => self.file_tree_location_resolved(token, location, hosts, result),
+            AppMsg::FileTreeNavigationResolved {
+                navigation,
+                listing,
+            } => self.file_tree_navigation_resolved(*navigation, listing),
+            AppMsg::FileTreeHomeResolved {
+                token,
+                intent,
+                start,
+            } => self.file_tree_home_resolved(token, *intent, start, &sender),
             AppMsg::FileTreeSshProbeResolved {
                 pane_id,
                 token,
@@ -2288,10 +2475,15 @@ impl SimpleComponent for AppModel {
                 self.file_tree_import_paths(paths, dir, *intent, &sender)
             }
             AppMsg::FileTreeRefresh { intent } => self.file_tree_refresh(*intent),
+            AppMsg::FileTreeRefreshDirs { dirs, intent } => {
+                self.file_tree_refresh_dirs(dirs, *intent)
+            }
+            AppMsg::FileTreeRetry(target) => self.file_tree_retry(target, &sender),
             AppMsg::FileTreeOpenTerminal { intent } => {
                 self.file_tree_open_terminal(*intent, &sender)
             }
             AppMsg::FileTreeFilterChanged(query) => self.file_tree_apply_filter(&query),
+            AppMsg::FileTreeShowHiddenChanged(show) => self.file_tree_set_show_hidden(show),
             AppMsg::FileTreeOpSucceeded {
                 dirs,
                 intent,
@@ -2593,6 +2785,193 @@ mod cross_block_search_key_latch_tests {
         assert_eq!(
             latch.press(99, true),
             CrossBlockSearchKeyPress::DispatchToggle
+        );
+    }
+}
+
+#[cfg(test)]
+mod file_tree_f5_tests {
+    use super::*;
+
+    #[test]
+    fn plain_f5_refreshes_only_inside_the_visible_file_tree_scope() {
+        let plain = gtk::gdk::ModifierType::empty();
+        assert!(file_tree_f5_should_refresh(
+            gtk::gdk::Key::F5,
+            plain,
+            true,
+            false,
+            true
+        ));
+        assert!(file_tree_f5_should_refresh(
+            gtk::gdk::Key::F5,
+            gtk::gdk::ModifierType::LOCK_MASK,
+            false,
+            true,
+            true
+        ));
+        assert!(!file_tree_f5_should_refresh(
+            gtk::gdk::Key::F5,
+            plain,
+            false,
+            false,
+            true
+        ));
+        assert!(!file_tree_f5_should_refresh(
+            gtk::gdk::Key::F5,
+            plain,
+            true,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn modified_or_non_f5_keys_remain_available_to_the_terminal() {
+        for modifiers in [
+            gtk::gdk::ModifierType::CONTROL_MASK,
+            gtk::gdk::ModifierType::SHIFT_MASK,
+            gtk::gdk::ModifierType::ALT_MASK,
+            gtk::gdk::ModifierType::SUPER_MASK,
+            gtk::gdk::ModifierType::HYPER_MASK,
+            gtk::gdk::ModifierType::META_MASK,
+        ] {
+            assert!(!file_tree_f5_should_refresh(
+                gtk::gdk::Key::F5,
+                modifiers,
+                true,
+                true,
+                true
+            ));
+        }
+        assert!(!file_tree_f5_should_refresh(
+            gtk::gdk::Key::F6,
+            gtk::gdk::ModifierType::empty(),
+            true,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn alt_up_and_alt_home_navigate_only_in_the_visible_file_tree_scope() {
+        let alt = gtk::gdk::ModifierType::ALT_MASK;
+        assert_eq!(
+            file_tree_navigation_shortcut(gtk::gdk::Key::Up, alt, true, false, true),
+            Some(FileTreeNavigationShortcut::Up)
+        );
+        assert_eq!(
+            file_tree_navigation_shortcut(
+                gtk::gdk::Key::Home,
+                alt | gtk::gdk::ModifierType::LOCK_MASK,
+                true,
+                false,
+                true,
+            ),
+            Some(FileTreeNavigationShortcut::Home)
+        );
+        assert_eq!(
+            file_tree_navigation_shortcut(gtk::gdk::Key::Up, alt, false, false, true),
+            None
+        );
+        assert_eq!(
+            file_tree_navigation_shortcut(gtk::gdk::Key::Home, alt, true, true, false),
+            None
+        );
+    }
+
+    #[test]
+    fn history_and_path_shortcuts_are_scoped_to_the_visible_file_tree() {
+        let alt = gtk::gdk::ModifierType::ALT_MASK;
+        assert_eq!(
+            file_tree_navigation_shortcut(gtk::gdk::Key::Left, alt, true, false, true),
+            Some(FileTreeNavigationShortcut::Back)
+        );
+        assert_eq!(
+            file_tree_navigation_shortcut(gtk::gdk::Key::Right, alt, true, false, true),
+            Some(FileTreeNavigationShortcut::Forward)
+        );
+        assert_eq!(
+            file_tree_navigation_shortcut(
+                gtk::gdk::Key::l,
+                gtk::gdk::ModifierType::CONTROL_MASK,
+                true,
+                false,
+                true,
+            ),
+            Some(FileTreeNavigationShortcut::OpenPath)
+        );
+        assert_eq!(
+            file_tree_navigation_shortcut(
+                gtk::gdk::Key::l,
+                gtk::gdk::ModifierType::CONTROL_MASK,
+                false,
+                false,
+                true,
+            ),
+            None,
+            "Ctrl+L must remain available to the terminal outside Files"
+        );
+    }
+
+    #[test]
+    fn pointer_hover_never_captures_terminal_navigation_chords() {
+        let alt = gtk::gdk::ModifierType::ALT_MASK;
+        for key in [
+            gtk::gdk::Key::Left,
+            gtk::gdk::Key::Right,
+            gtk::gdk::Key::Up,
+            gtk::gdk::Key::Home,
+        ] {
+            assert_eq!(
+                file_tree_navigation_shortcut(key, alt, false, true, true),
+                None
+            );
+        }
+        assert_eq!(
+            file_tree_navigation_shortcut(
+                gtk::gdk::Key::l,
+                gtk::gdk::ModifierType::CONTROL_MASK,
+                false,
+                true,
+                true,
+            ),
+            None
+        );
+        assert!(
+            file_tree_f5_should_refresh(
+                gtk::gdk::Key::F5,
+                gtk::gdk::ModifierType::empty(),
+                false,
+                true,
+                true,
+            ),
+            "F5 deliberately retains the independent hover refresh policy"
+        );
+    }
+
+    #[test]
+    fn file_tree_navigation_does_not_capture_plain_or_conflicting_terminal_keys() {
+        for state in [
+            gtk::gdk::ModifierType::empty(),
+            gtk::gdk::ModifierType::ALT_MASK | gtk::gdk::ModifierType::CONTROL_MASK,
+            gtk::gdk::ModifierType::ALT_MASK | gtk::gdk::ModifierType::SHIFT_MASK,
+            gtk::gdk::ModifierType::ALT_MASK | gtk::gdk::ModifierType::SUPER_MASK,
+        ] {
+            assert_eq!(
+                file_tree_navigation_shortcut(gtk::gdk::Key::Up, state, true, true, true),
+                None
+            );
+        }
+        assert_eq!(
+            file_tree_navigation_shortcut(
+                gtk::gdk::Key::Left,
+                gtk::gdk::ModifierType::empty(),
+                true,
+                true,
+                true,
+            ),
+            None
         );
     }
 }
