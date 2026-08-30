@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-30 (Files commits and probes fail closed)
+Updated: 2026-08-30 (Files staging, commits, and probes fail closed)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,13 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **Transfer staging is exclusive before spawn (2026-08-30)**: a local partial
+  file is reserved mode 0600 with `create_new` before the remote producer
+  starts. A planted hidden symlink is rejected without touching its target or
+  spawning, a permissive umask cannot expose partial content, and a spawn error
+  after reservation cleans the empty staging file. Publishing retains mode
+  0600, so the completed regular-file download stays owner-only too.
 
 - **Local Files no-overwrite is atomic at commit (2026-08-30)**: local Rename
   and the final publication of a downloaded regular file now use Linux

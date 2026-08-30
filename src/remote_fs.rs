@@ -1963,6 +1963,33 @@ impl Drop for PartFile {
     }
 }
 
+fn open_transfer_staging(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+fn reserve_part_then_spawn(
+    path: &Path,
+    spawn: impl FnOnce() -> io::Result<ProbeChild>,
+) -> io::Result<(std::fs::File, ProbeChild)> {
+    // Reserve before starting a producer: O_EXCL refuses a planted symlink,
+    // and an open failure cannot leave an unobserved child behind.
+    let file = open_transfer_staging(path)?;
+    match spawn() {
+        Ok(child) => Ok((file, child)),
+        Err(error) => {
+            drop(file);
+            let _ = std::fs::remove_file(path);
+            Err(error)
+        }
+    }
+}
+
 /// Unique staging directory for remote→remote relays, removed on drop.
 struct StagingDir(PathBuf);
 
@@ -2312,16 +2339,15 @@ fn download_file_with(
     let dst = dir.join(name);
     require_missing(&dst)?;
     control.check()?;
-    let probe = spawn()?;
+    let temp = part_path(dir, name);
+    let (mut file, probe) = reserve_part_then_spawn(&temp, spawn)?;
+    let _guard = PartFile(temp.clone());
     let probe_handle = probe.handle();
     control.register(&probe_handle);
     let mut stdout = probe
         .stdout
         .ok_or_else(|| io::Error::other("probe has no stdout"))?;
     let _timeout = control.arm_timeout(TRANSFER_TIMEOUT)?;
-    let temp = part_path(dir, name);
-    let _guard = PartFile(temp.clone());
-    let mut file = std::fs::File::create(&temp)?;
     let streamed = stream_to(&mut stdout, &mut file, max, control, progress);
     drop(stdout);
     let status = wait_child(&probe_handle)?;
@@ -4531,6 +4557,47 @@ mod tests {
     // -- streaming transfer mechanics ----------------------------------------
 
     #[test]
+    fn stream_staging_refuses_a_symlink_before_spawning() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let local = TestDir::new("staging-symlink");
+        let victim = local.path().join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        let staging = local.path().join("staging");
+        std::os::unix::fs::symlink(&victim, &staging).unwrap();
+        let spawned = AtomicBool::new(false);
+
+        let error = match reserve_part_then_spawn(&staging, || {
+            spawned.store(true, Ordering::Relaxed);
+            Err(io::Error::other("producer should not start"))
+        }) {
+            Ok(_) => panic!("an occupied staging name must be refused"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(!spawned.load(Ordering::Relaxed));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        assert!(std::fs::symlink_metadata(&staging)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        let safe_staging = local.path().join("safe-staging");
+        let file = open_transfer_staging(&safe_staging).unwrap();
+        drop(file);
+        assert_eq!(
+            std::fs::metadata(&safe_staging)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o077,
+            0,
+            "partial transfer content must remain owner-only"
+        );
+    }
+
+    #[test]
     fn download_streams_file_content_and_refuses_existing_dst() {
         let remote = TestDir::new("download-src");
         let local = TestDir::new("download-dst");
@@ -4550,6 +4617,12 @@ mod tests {
         .unwrap();
         assert_eq!(dst, local.path().join("file.bin"));
         assert_eq!(std::fs::read(&dst).unwrap(), content);
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&dst).unwrap().permissions().mode() & 0o077,
+            0,
+            "published downloads retain their private staging mode"
+        );
         assert_eq!(
             std::fs::read_dir(local.path()).unwrap().count(),
             1,

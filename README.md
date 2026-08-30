@@ -1037,6 +1037,11 @@ Local Rename and downloaded-file publication use Linux
 the friendly existence check wins intact instead of being overwritten by the
 commit. A kernel or filesystem without that atomic primitive fails closed
 rather than falling back to a racy rename.
+Transfer staging names are reserved owner-only with exclusive create before
+their producer starts, so partial content is not published by a permissive
+umask, and a planted hidden symlink is refused without touching its target or
+leaving a child process to reap. The downloaded regular file retains that
+owner-only mode when its staging inode is published.
 
 The tree multi-selects: Ctrl+click toggles rows, Shift+click extends a range.
 A right-click inside the selection aims the menu at all of it (Delete reads

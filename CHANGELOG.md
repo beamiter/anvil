@@ -548,6 +548,12 @@ versioning for tagged releases while it remains experimental.
 
 ### Fixed
 
+- Local transfer staging is now reserved mode 0600 with exclusive create before
+  the remote producer starts. `File::create` followed a preplanted hidden
+  symlink and could truncate its target, while starting the child first left an
+  unobserved process path when the later open failed. A downloaded regular file
+  retains the staging inode's owner-only mode; a spawn failure after successful
+  reservation removes the empty staging file immediately.
 - Local Files Rename and downloaded-file publication now commit with
   `renameat2(RENAME_NOREPLACE)`. Their former final `require_missing` followed
   by ordinary `rename` left a check-to-commit window in which another process's
