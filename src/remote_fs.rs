@@ -26,11 +26,13 @@ use crate::file_tree::FileEntry;
 /// therefore run as `sh -c '<script>' -- <op> [args...]` instead: a shell's
 /// read-ahead on `sh -s` may legally swallow payload bytes into its own
 /// buffer. Keep the exit-code contract in sync with `probe_result`.
-pub(crate) const PROBE_SCRIPT: &str = r#"# remote-fs probe v3 — runs under `sh -s -- <op> [args...]`.
+pub(crate) const PROBE_SCRIPT: &str = r#"# remote-fs probe v4 — runs under `sh -s -- <op> [args...]`.
 # `list` stdout: NUL-separated pairs "<t>\0<name>\0", t in {d,f,l}, names relative.
-# `cat` streams a file to stdout; `put` stores stdin as a new file;
+# `cat` streams a file to stdout; `put <path> <transfer-id>` stores stdin as a new file;
 # `tar` streams a directory to stdout; `untar <dir> <name>` extracts stdin into
 # <dir>, refusing an existing <dir>/<name> before anything is extracted;
+# `put` receives bytes in a private same-parent directory, then publishes them
+# with an atomic no-replace hard link;
 # every creator treats a dangling symbolic link as an existing target;
 # `stat` classifies links first and never opens a special leaf to obtain size;
 # `stat` prints "<t> <size>" (bytes for regular files, otherwise 0).
@@ -98,17 +100,38 @@ case "$op" in
     cat "$p" || exit 4
     ;;
   put)
-    p=${2:-}
+    p=${2:-}; id=${3:-}
     case "$p" in /*) ;; *) exit 2 ;; esac
+    case "$id" in ''|*[!0-9a-f-]*) exit 2 ;; esac
+    [ "${#id}" -le 96 ] || exit 2
     if [ -e "$p" ] || [ -L "$p" ]; then exit 17; fi
-    t="$p.fspart.$$"
-    if cat > "$t"; then
-      if [ -e "$p" ] || [ -L "$p" ]; then rm -f "$t"; exit 17; fi
-      mv "$t" "$p" || { rm -f "$t"; exit 4; }
-    else
-      rm -f "$t"
-      exit 4
+    d=${p%/*}
+    d=${d:-/}
+    stage=
+    i=0
+    umask 077
+    while [ "$i" -lt 32 ]; do
+      case "$d" in
+        /) candidate="/.anvil-fs-put-$id-$i" ;;
+        *) candidate="$d/.anvil-fs-put-$id-$i" ;;
+      esac
+      i=$((i + 1))
+      [ "$candidate" = "$p" ] && continue
+      if mkdir "$candidate" 2>/dev/null; then stage=$candidate; break; fi
+    done
+    [ -n "$stage" ] || exit 4
+    payload="$stage/payload"
+    code=4
+    if cat > "$payload"; then
+      if ln -T "$payload" "$p" 2>/dev/null; then
+        code=0
+      elif [ -e "$p" ] || [ -L "$p" ]; then
+        code=17
+      fi
     fi
+    rm -f "$payload"
+    rmdir "$stage" 2>/dev/null || :
+    exit "$code"
     ;;
   tar)
     p=${2%/}
@@ -2450,19 +2473,27 @@ fn upload(
             progress,
         )?;
     } else {
+        let transfer_id = put_transfer_id();
         let result = upload_file_with(
-            || spawn_probe_streaming(host, "put", &[dst.as_os_str()], ScriptDelivery::Argv),
+            || {
+                spawn_probe_streaming(
+                    host,
+                    "put",
+                    &[dst.as_os_str(), OsStr::new(&transfer_id)],
+                    ScriptDelivery::Argv,
+                )
+            },
             local_path,
             MAX_TRANSFER_BYTES,
             control,
             progress,
         );
         if let Err(error) = &result {
-            // A kill (cancel/timeout) is the only way the probe's `.fspart`
-            // temp survives — the script cleans up after its own failures.
+            // A kill (cancel/timeout) is the only way the probe's private
+            // staging directory survives — it cleans up after other failures.
             if error.kind() == io::ErrorKind::Interrupted || error.kind() == io::ErrorKind::TimedOut
             {
-                cleanup_remote_part(host, &dst);
+                cleanup_remote_part(host, &dst, &transfer_id);
             }
         }
         result?;
@@ -2470,33 +2501,59 @@ fn upload(
     Ok(dst)
 }
 
-/// The probe's `put` temp name is `"$p.fspart.$$"` with the remote shell's
-/// pid unknown to us, so cancel cleanup globs the fixed suffix. The path is
-/// single-quote-escaped before the suffix is appended, so nothing here is
-/// shell-reinterpreted. Best-effort: errors are logged, never propagated.
-fn cleanup_remote_part(host: &RemoteHost, dst: &Path) {
-    let command = part_cleanup_command(dst);
+/// Process-unique, shell-safe token that binds remote staging and cancel
+/// cleanup to one upload. The probe independently bounds and validates it.
+fn put_transfer_id() -> String {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let epoch_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!(
+        "{:x}-{epoch_nanos:x}-{:x}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// A cancelled `put` can leave any one of its collision-retry directories.
+/// Cleanup is restricted to that upload's unique token, refuses links,
+/// and never acts on the final destination. Best-effort: errors are logged,
+/// never propagated.
+fn cleanup_remote_part(host: &RemoteHost, dst: &Path, transfer_id: &str) {
+    let command = part_cleanup_command(dst, transfer_id);
     if let Err(message) = crate::config::validate_remote_host(host) {
-        log::warn!("remote .fspart cleanup rejected by execution gate: {message}");
+        log::warn!("remote upload staging cleanup rejected by execution gate: {message}");
         return;
     }
-    let argv = host_command_argv(host, &command);
+    let argv = host_command_argv(host, command.as_os_str());
     if let Err(error) = run_capture(&argv, &[], PROBE_OP_TIMEOUT, MAX_CAPTURE_BYTES) {
-        log::warn!("remote .fspart cleanup failed to run: {error}");
+        log::warn!("remote upload staging cleanup failed to run: {error}");
     }
 }
 
-/// `rm -f '<dst>'.fspart.*` — a glob no-match is a harmless literal `rm -f`.
-/// A non-UTF-8 destination lossy-mangles into a pattern that matches nothing,
-/// which under best-effort semantics is a safe no-op, never a wrong delete.
-fn part_cleanup_command(dst: &Path) -> String {
-    format!("rm -f {}.fspart.*", sq(&dst.as_os_str().to_string_lossy()))
+/// Build the small remote cleanup command as raw Unix bytes so unusual but
+/// valid path bytes round-trip through ssh/docker without lossy conversion.
+fn part_cleanup_command(dst: &Path, transfer_id: &str) -> OsString {
+    let parent = dst
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let prefix = parent.join(format!(".anvil-fs-put-{transfer_id}-"));
+    let mut command = b"i=0; while [ \"$i\" -lt 32 ]; do d=".to_vec();
+    command.extend_from_slice(&sq_bytes(prefix.as_os_str().as_bytes()));
+    command.extend_from_slice(b"$i; i=$((i + 1)); [ \"$d\" = ");
+    command.extend_from_slice(&sq_bytes(dst.as_os_str().as_bytes()));
+    command.extend_from_slice(
+        b" ] && continue; [ -d \"$d\" ] && [ ! -L \"$d\" ] || continue; rm -f \"$d/payload\"; rmdir \"$d\" 2>/dev/null || :; done",
+    );
+    OsString::from_vec(command)
 }
 
 /// Run one small far-side shell command outside the probe protocol (ssh:
 /// one re-parsed command element; docker: `sh -c`). Used only for the
 /// best-effort cancel cleanup.
-fn host_command_argv(host: &RemoteHost, command: &str) -> Vec<OsString> {
+fn host_command_argv(host: &RemoteHost, command: &OsStr) -> Vec<OsString> {
     if host.docker {
         let mut argv = vec![
             OsString::from("docker"),
@@ -4039,7 +4096,7 @@ mod tests {
 
         let (victim, link, argument) = dangling("put");
         assert_refused(
-            &local_probe_payload(&["put", &argument], b"payload"),
+            &local_probe_payload(&["put", &argument, "feed-1"], b"payload"),
             &link,
             &victim,
         );
@@ -4529,7 +4586,7 @@ mod tests {
         assert!(!listing.truncated());
     }
 
-    // -- probe v2 payload ops, end to end through local sh -------------------
+    // -- payload ops, end to end through local sh ----------------------------
 
     #[test]
     fn probe_v2_cat_streams_binary_content() {
@@ -4553,26 +4610,114 @@ mod tests {
     }
 
     #[test]
-    fn probe_v2_put_writes_new_files_atomically() {
+    fn probe_v4_put_writes_privately_and_refuses_existing() {
+        use std::os::unix::fs::PermissionsExt;
+
         let tmp = TestDir::new("probe-put");
         let file = tmp.path().join("out.bin");
         let payload = binary_content(7, 20_000);
 
-        let capture = local_probe_payload(&["put", file.to_str().unwrap()], &payload);
+        let capture = local_probe_payload(&["put", file.to_str().unwrap(), "feed-1"], &payload);
         assert_eq!(capture.code, Some(0));
         assert_eq!(std::fs::read(&file).unwrap(), payload);
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o077,
+            0,
+            "published remote uploads remain owner-only"
+        );
 
         // Existing destination is refused, and no temp litter remains.
         assert_eq!(
-            local_probe_payload(&["put", file.to_str().unwrap()], b"x").code,
+            local_probe_payload(&["put", file.to_str().unwrap(), "feed-2"], b"x").code,
             Some(17)
         );
         let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
             .unwrap()
             .flatten()
-            .filter(|entry| entry.file_name().to_string_lossy().contains("fspart"))
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".anvil-fs-put-")
+            })
             .collect();
-        assert!(leftovers.is_empty(), "no .fspart temp files left behind");
+        assert!(leftovers.is_empty(), "no private staging left behind");
+
+        // The fixed staging component leaves a filesystem-limit destination
+        // transferable instead of appending bytes to its basename.
+        let long = tmp.path().join("x".repeat(255));
+        let long_arg = long.to_str().unwrap().to_string();
+        let capture = local_probe_payload(&["put", &long_arg, "feed-3"], &payload);
+        assert_eq!(capture.code, Some(0), "stderr: {:?}", capture.stderr);
+        assert_eq!(std::fs::read(long).unwrap(), payload);
+
+        assert_eq!(
+            local_probe_payload(&["put", "/tmp/unused", "bad_token"], b"").code,
+            Some(2),
+            "transfer ids are restricted to shell-safe bytes"
+        );
+    }
+
+    #[test]
+    fn probe_v4_put_atomically_preserves_a_racing_destination() {
+        let tmp = TestDir::new("probe-put-race");
+        let file = tmp.path().join("out.bin");
+        let argument = file.to_str().unwrap().to_string();
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(PROBE_SCRIPT)
+            .arg("remote-fs-probe")
+            .arg("put")
+            .arg(&argument)
+            .arg("feed-4")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+
+        // Hold stdin open after private staging is reserved, then let the
+        // final destination win before publication.
+        let started = std::time::Instant::now();
+        loop {
+            let staging_exists = std::fs::read_dir(tmp.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".anvil-fs-put-")
+                });
+            if staging_exists {
+                break;
+            }
+            if started.elapsed() > Duration::from_secs(2) {
+                drop(stdin);
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("put probe did not reserve staging");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        std::fs::write(&file, b"keep").unwrap();
+        stdin.write_all(&binary_content(9, 4_000)).unwrap();
+        drop(stdin);
+        let status = child.wait().unwrap();
+        assert_eq!(status.code(), Some(17));
+        assert_eq!(std::fs::read(&file).unwrap(), b"keep");
+        assert!(
+            std::fs::read_dir(tmp.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".anvil-fs-put-")),
+            "private staging is cleaned after a lost publication race"
+        );
     }
 
     #[test]
@@ -4730,13 +4875,13 @@ mod tests {
         let argv = ssh_probe_argv(
             &host,
             "put",
-            &[OsStr::new("/dst/a b'c")],
+            &[OsStr::new("/dst/a b'c"), OsStr::new("feed-1")],
             ScriptDelivery::Argv,
         );
         let command = argv.last().expect("command element").to_string_lossy();
         assert!(command.starts_with("sh -c '"));
-        assert!(command.contains("remote-fs probe v3"));
-        assert!(command.ends_with(" -- 'put' '/dst/a b'\\''c'"));
+        assert!(command.contains("remote-fs probe v4"));
+        assert!(command.ends_with(" -- 'put' '/dst/a b'\\''c' 'feed-1'"));
 
         // docker: script as one raw argv element, no quoting anywhere.
         let host = docker_host();
@@ -5003,7 +5148,7 @@ mod tests {
         let dst_str = dst.to_str().unwrap().to_string();
 
         upload_file_with(
-            || spawn_local(&["put", &dst_str], ScriptDelivery::Argv),
+            || spawn_local(&["put", &dst_str, "feed-1"], ScriptDelivery::Argv),
             &src,
             1 << 20,
             &TransferControl::new(),
@@ -5013,7 +5158,7 @@ mod tests {
         assert_eq!(std::fs::read(&dst).unwrap(), content);
 
         let err = upload_file_with(
-            || spawn_local(&["put", &dst_str], ScriptDelivery::Argv),
+            || spawn_local(&["put", &dst_str, "feed-2"], ScriptDelivery::Argv),
             &src,
             1 << 20,
             &TransferControl::new(),
@@ -5032,7 +5177,7 @@ mod tests {
         let dst = remote.path().join("big.bin");
         let dst_str = dst.to_str().unwrap().to_string();
         let err = upload_file_with(
-            || spawn_local(&["put", &dst_str], ScriptDelivery::Argv),
+            || spawn_local(&["put", &dst_str, "feed-3"], ScriptDelivery::Argv),
             &src,
             16,
             &TransferControl::new(),
@@ -5348,7 +5493,7 @@ mod tests {
 
         let events = std::sync::Mutex::new(Vec::new());
         upload_file_with(
-            || spawn_local(&["put", &dst_str], ScriptDelivery::Argv),
+            || spawn_local(&["put", &dst_str, "feed-4"], ScriptDelivery::Argv),
             &src,
             1 << 20,
             &TransferControl::new(),
@@ -5467,42 +5612,76 @@ mod tests {
     }
 
     #[test]
-    fn part_cleanup_command_globs_only_the_fixed_suffix() {
+    fn put_transfer_ids_are_unique_shell_safe_and_bounded() {
+        let first = put_transfer_id();
+        let second = put_transfer_id();
+        assert_ne!(first, second);
+        for id in [first, second] {
+            assert!(id.len() <= 96);
+            assert!(
+                id.bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() || byte == b'-'),
+                "unexpected transfer id: {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn part_cleanup_command_enumerates_only_token_candidates() {
         assert_eq!(
-            part_cleanup_command(Path::new("/dst/dir name")),
-            "rm -f '/dst/dir name'.fspart.*"
+            part_cleanup_command(Path::new("/dst/dir name"), "feed-1").to_string_lossy(),
+            "i=0; while [ \"$i\" -lt 32 ]; do d='/dst/.anvil-fs-put-feed-1-'$i; i=$((i + 1)); [ \"$d\" = '/dst/dir name' ] && continue; [ -d \"$d\" ] && [ ! -L \"$d\" ] || continue; rm -f \"$d/payload\"; rmdir \"$d\" 2>/dev/null || :; done"
         );
         assert_eq!(
-            part_cleanup_command(Path::new("/dst/don't")),
-            "rm -f '/dst/don'\\''t'.fspart.*"
+            part_cleanup_command(Path::new("/dst/don't"), "feed-1").to_string_lossy(),
+            "i=0; while [ \"$i\" -lt 32 ]; do d='/dst/.anvil-fs-put-feed-1-'$i; i=$((i + 1)); [ \"$d\" = '/dst/don'\\''t' ] && continue; [ -d \"$d\" ] && [ ! -L \"$d\" ] || continue; rm -f \"$d/payload\"; rmdir \"$d\" 2>/dev/null || :; done"
         );
     }
 
     #[test]
     fn part_cleanup_command_executes_against_local_sh() {
         let tmp = TestDir::new("part-cleanup");
-        let dst = tmp.path().join("up.bin");
-        std::fs::write(tmp.path().join("up.bin.fspart.111"), b"partial").unwrap();
-        std::fs::write(tmp.path().join("up.bin.fspart.222"), b"partial").unwrap();
-        std::fs::write(tmp.path().join("up.bin"), b"done").unwrap();
+        let stage =
+            |token: &str, index: usize| tmp.path().join(format!(".anvil-fs-put-{token}-{index}"));
+        for index in [0, 31] {
+            std::fs::create_dir(stage("feed-1", index)).unwrap();
+            std::fs::write(stage("feed-1", index).join("payload"), b"partial").unwrap();
+        }
+        let outside_range = stage("feed-1", 32);
+        std::fs::create_dir(&outside_range).unwrap();
+        std::fs::write(outside_range.join("payload"), b"keep").unwrap();
+        let other_transfer = stage("beef-2", 0);
+        std::fs::create_dir(&other_transfer).unwrap();
+        std::fs::write(other_transfer.join("payload"), b"keep").unwrap();
+
+        let victim = tmp.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::write(victim.join("payload"), b"keep").unwrap();
+        let planted_link = stage("feed-1", 5);
+        std::os::unix::fs::symlink(&victim, &planted_link).unwrap();
+
+        // Even a destination that happens to have the internal name shape is
+        // never considered staging by cancellation cleanup.
+        let dst = stage("feed-1", 7);
+        std::fs::create_dir(&dst).unwrap();
+        std::fs::write(dst.join("payload"), b"destination").unwrap();
         std::fs::write(tmp.path().join("other.txt"), b"keep").unwrap();
 
-        let command = part_cleanup_command(&dst);
-        let argv = vec![
-            OsString::from("sh"),
-            OsString::from("-c"),
-            OsString::from(command),
-        ];
+        let command = part_cleanup_command(&dst, "feed-1");
+        let argv = vec![OsString::from("sh"), OsString::from("-c"), command];
         let capture = run_capture(&argv, &[], Duration::from_secs(10), MAX_CAPTURE_BYTES).unwrap();
         assert_eq!(capture.code, Some(0));
-        assert!(dst.is_file(), "the destination itself survives");
+        assert_eq!(std::fs::read(dst.join("payload")).unwrap(), b"destination");
         assert!(tmp.path().join("other.txt").is_file());
-        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
-            .unwrap()
-            .flatten()
-            .filter(|entry| entry.file_name().to_string_lossy().contains("fspart"))
-            .collect();
-        assert!(leftovers.is_empty(), "the .fspart temps are gone");
+        assert!(!stage("feed-1", 0).exists());
+        assert!(!stage("feed-1", 31).exists());
+        assert!(
+            outside_range.is_dir(),
+            "indices outside probe retries survive"
+        );
+        assert!(other_transfer.is_dir(), "another transfer token survives");
+        assert!(planted_link.is_symlink(), "cleanup refuses planted links");
+        assert_eq!(std::fs::read(victim.join("payload")).unwrap(), b"keep");
     }
 
     // -- drag-and-drop import planning ----------------------------------------

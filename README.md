@@ -1004,8 +1004,8 @@ locally downloads (labeled "Paste (download)"); the reverse uploads; pasting
 between two different hosts relays through a staging file under the system
 temp dir, inside an exclusively-created mode-0700 wrapper that retries occupied
 names and verifies its held directory inode before cleanup. Files stream
-through the probe (`cat`/`put` — the upload is written
-to a temp name and moved into place atomically on the far side), directories
+through the probe (`cat`/`put` — the upload lands in a private same-parent
+directory and is hard-linked into place without replacement), directories
 stream as tar archives, and payloads are capped at 512 MiB with a 15-minute
 overall timeout. While a transfer runs, a held toast reports throttled
 progress ("Downloading name… 12.4 MiB", or "X / Y MiB" for single-file
@@ -1048,6 +1048,11 @@ a fixed-size basename independent of the transferred name, so a valid
 filesystem-limit name remains transferable; occupied candidates are retried
 without unlinking them or starting the producer, and cleanup verifies the
 reserved inode before unlinking so a replaced candidate survives.
+Remote regular-file uploads likewise receive bytes inside a private 0700
+same-parent directory and publish the mode-0600 payload with an atomic
+no-replace hard link. A destination created after preflight wins intact, and
+cancel cleanup enumerates only the 32 candidates bound to that upload's unique
+transfer token.
 Downloaded directories are extracted into a private 0700 same-parent directory,
 validated for one matching directory root, and only then published with the
 same no-replace rename. A concurrently-created destination is never merged
