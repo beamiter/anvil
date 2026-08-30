@@ -8,7 +8,7 @@
 //! thread + mpsc + glib-poll skeleton, never on the GTK thread.
 
 use std::ffi::{OsStr, OsString};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -2109,6 +2109,26 @@ fn open_directory(path: &Path) -> io::Result<std::fs::File> {
         .open(path)
 }
 
+fn open_source_directory(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+}
+
+fn open_source_file(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // O_NONBLOCK prevents a racing replacement with a FIFO from hanging the
+    // worker during open; it has no effect on subsequent regular-file reads.
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+}
+
 fn create_directory_at(parent: &std::fs::File, name: &OsStr) -> io::Result<()> {
     use std::os::fd::AsRawFd;
 
@@ -2154,7 +2174,7 @@ fn open_transfer_staging_at(parent: &std::fs::File, name: &OsStr) -> io::Result<
         libc::openat(
             parent.as_raw_fd(),
             name.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
             0o600,
         )
     };
@@ -2222,6 +2242,25 @@ fn anchored_entry_path(parent: &std::fs::File, name: &OsStr) -> PathBuf {
     PathBuf::from("/proc/self/fd")
         .join(parent.as_raw_fd().to_string())
         .join(name)
+}
+
+#[cfg(target_os = "linux")]
+fn anchored_descriptor_path(file: &std::fs::File) -> PathBuf {
+    use std::os::fd::AsRawFd;
+
+    PathBuf::from("/proc/self/fd").join(file.as_raw_fd().to_string())
+}
+
+fn tar_prefix_transform(name: &OsStr) -> OsString {
+    let mut transform = b"s,^\\./,".to_vec();
+    for byte in name.as_bytes() {
+        if matches!(byte, b'\\' | b'&' | b',') {
+            transform.push(b'\\');
+        }
+        transform.push(*byte);
+    }
+    transform.extend_from_slice(b"/,");
+    OsString::from_vec(transform)
 }
 
 /// One exclusively-created, owner-only staging file beside its eventual
@@ -3003,8 +3042,10 @@ fn download_file_with(
     Ok(dst)
 }
 
-/// Stream one local regular file into the probe's `put`. Follows symlinks
-/// like the remote `cat` does: a link uploads its target's content.
+/// Stream one local regular file into the probe's `put`. The source is opened
+/// once before the remote process starts, so a same-path replacement cannot
+/// redirect the transfer to a different inode. This follows an initial
+/// symlink like the remote `cat` does, but pins the resolved target.
 fn upload_file_with(
     spawn: impl FnOnce() -> io::Result<ProbeChild>,
     local_path: &Path,
@@ -3012,7 +3053,8 @@ fn upload_file_with(
     control: &TransferControl,
     progress: &dyn Fn(u64),
 ) -> io::Result<()> {
-    let metadata = std::fs::metadata(local_path)?;
+    let file = open_source_file(local_path)?;
+    let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -3028,6 +3070,7 @@ fn upload_file_with(
     control.check()?;
     let probe = spawn()?;
     let probe_handle = probe.handle();
+    let mut probe_cleanup = ChildCleanupGuard::new(&probe_handle);
     control.register(&probe_handle);
     let stdin = probe
         .stdin
@@ -3037,18 +3080,17 @@ fn upload_file_with(
         .stdout
         .map(|pipe| spawn_bounded_reader(pipe, MAX_TRANSFER_STDERR_BYTES));
     let _timeout = control.arm_timeout(TRANSFER_TIMEOUT)?;
-    let file = std::fs::File::open(local_path)?;
     let streamed = stream_to(file, stdin, max, control, progress);
     // stream_to owns and drops stdin here, so the far side sees the payload
     // EOF before it finishes `put`.
-    let status = wait_child(&probe_handle)?;
+    let status = probe_cleanup.wait()?;
     let (stderr, _) = join_reader(probe.stderr)?;
     let _ = join_reader(stdout_drain);
     if control.is_timed_out() {
         return Err(transfer_timed_out_error());
     }
     control.check()?;
-    streamed?;
+    let streamed = streamed?;
     probe_result(
         "put",
         Capture {
@@ -3056,11 +3098,19 @@ fn upload_file_with(
             stdout: Vec::new(),
             stderr,
         },
-    )
-    .map(drop)
+    )?;
+    if streamed != metadata.len() {
+        return Err(io::Error::other(format!(
+            "local file changed during upload ({streamed} of {} bytes sent)",
+            metadata.len()
+        )));
+    }
+    Ok(())
 }
 
-/// `tar` a local directory and stream it into the probe's `untar`.
+/// Archive a pinned local directory completely before starting the remote
+/// `untar`. A local traversal failure therefore cannot publish a partial or
+/// mixed archive on the far side.
 fn upload_dir_with(
     spawn: impl FnOnce() -> io::Result<ProbeChild>,
     local_path: &Path,
@@ -3068,76 +3118,101 @@ fn upload_dir_with(
     control: &TransferControl,
     progress: &dyn Fn(u64),
 ) -> io::Result<()> {
+    upload_dir_with_tar(spawn, local_path, Path::new("tar"), max, control, progress)
+}
+
+fn upload_dir_with_tar(
+    spawn: impl FnOnce() -> io::Result<ProbeChild>,
+    local_path: &Path,
+    tar_program: &Path,
+    max: u64,
+    control: &TransferControl,
+    progress: &dyn Fn(u64),
+) -> io::Result<()> {
     require_local_tar()?;
     control.check()?;
-    let metadata = std::fs::symlink_metadata(local_path)?;
-    if !metadata.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "{} is not a directory",
-                crate::file_tree::display_full_path(local_path)
-            ),
-        ));
-    }
     let name = local_path
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "directory has no name"))?;
-    let parent = local_path.parent().unwrap_or_else(|| Path::new("/"));
-    let mut tar_command = Command::new("tar");
+    let source = open_source_directory(local_path).map_err(|error| {
+        if std::fs::symlink_metadata(local_path).is_ok_and(|metadata| !metadata.is_dir()) {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{} is not a directory",
+                    crate::file_tree::display_full_path(local_path)
+                ),
+            )
+        } else {
+            error
+        }
+    })?;
+    let source_path = anchored_descriptor_path(&source);
+    let (_archive_staging, mut archive) = StagedFile::beside(local_path)?;
+    let mut tar_command = Command::new(tar_program);
     tar_command
-        .args(["cf", "-", "-C"])
-        .arg(parent)
-        .arg(name)
+        .args(["cf", "-"])
+        .arg("--transform")
+        .arg(tar_prefix_transform(name))
+        .arg("-C")
+        .arg(source_path)
+        .arg(".")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]
     {
+        use std::os::fd::AsRawFd;
         use std::os::unix::process::CommandExt;
         // The tar registers with the transfer control below; lead its own
         // group so the watchdog's group kill can never miss it.
         tar_command.process_group(0);
+        let source_fd = source.as_raw_fd();
+        // SAFETY: the closure only makes this transfer's already-open source
+        // directory visible to tar. The parent keeps its copy CLOEXEC.
+        unsafe {
+            tar_command.pre_exec(move || {
+                if libc::fcntl(source_fd, libc::F_SETFD, 0) == -1 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
     }
-    let mut tar = tar_command.spawn()?;
-    let tar_stdout = tar
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::other("local tar has no stdout"))?;
-    let tar_stderr = tar
-        .stderr
-        .take()
-        .map(|pipe| spawn_bounded_reader(pipe, MAX_TRANSFER_STDERR_BYTES));
-    let tar = Arc::new(Mutex::new(tar));
-    let probe = spawn()?;
-    let probe_handle = probe.handle();
-    control.register(&probe_handle);
+    let tar = Arc::new(Mutex::new(tar_command.spawn()?));
+    let mut tar_cleanup = ChildCleanupGuard::new(&tar);
+    let (tar_stdout, tar_stderr) = {
+        let mut child = tar
+            .lock()
+            .map_err(|_| io::Error::other("local tar child lock poisoned"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("local tar has no stdout"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .map(|pipe| spawn_bounded_reader(pipe, MAX_TRANSFER_STDERR_BYTES));
+        (stdout, stderr)
+    };
     control.register(&tar);
-    let stdin = probe
-        .stdin
-        .ok_or_else(|| io::Error::other("probe has no stdin"))?;
-    let stdout_drain = probe
-        .stdout
-        .map(|pipe| spawn_bounded_reader(pipe, MAX_TRANSFER_STDERR_BYTES));
     let _timeout = control.arm_timeout(TRANSFER_TIMEOUT)?;
-    let streamed = stream_to(tar_stdout, stdin, max, control, progress);
-    if streamed.is_err() {
+    let packed = stream_to(tar_stdout, &mut archive, max, control, &|_| {});
+    if packed.is_err() {
         // After an overflow the tar can still be blocked writing; make sure
         // it is gone before reaping.
         if let Ok(mut child) = tar.lock() {
             kill_tree(&mut child);
         }
     }
-    let tar_status = wait_child(&tar)?;
+    let tar_status = tar_cleanup.wait()?;
     let (tar_stderr, _) = join_reader(tar_stderr)?;
-    let status = wait_child(&probe_handle)?;
-    let (stderr, _) = join_reader(probe.stderr)?;
-    let _ = join_reader(stdout_drain);
     if control.is_timed_out() {
         return Err(transfer_timed_out_error());
     }
     control.check()?;
-    streamed?;
+    packed?;
     if !tar_status.success() {
         let detail = bounded_stderr_text(&tar_stderr);
         return Err(io::Error::other(format!(
@@ -3149,6 +3224,28 @@ fn upload_dir_with(
             }
         )));
     }
+    archive.sync_all()?;
+    archive.seek(SeekFrom::Start(0))?;
+
+    let probe = spawn()?;
+    let probe_handle = probe.handle();
+    let mut probe_cleanup = ChildCleanupGuard::new(&probe_handle);
+    control.register(&probe_handle);
+    let stdin = probe
+        .stdin
+        .ok_or_else(|| io::Error::other("probe has no stdin"))?;
+    let stdout_drain = probe
+        .stdout
+        .map(|pipe| spawn_bounded_reader(pipe, MAX_TRANSFER_STDERR_BYTES));
+    let streamed = stream_to(&mut archive, stdin, max, control, progress);
+    let status = probe_cleanup.wait()?;
+    let (stderr, _) = join_reader(probe.stderr)?;
+    let _ = join_reader(stdout_drain);
+    if control.is_timed_out() {
+        return Err(transfer_timed_out_error());
+    }
+    control.check()?;
+    streamed?;
     probe_result(
         "untar",
         Capture {
@@ -5911,6 +6008,81 @@ mod tests {
     }
 
     #[test]
+    fn file_upload_keeps_the_source_inode_open_across_remote_spawn() {
+        let local = TestDir::new("upload-source-swap");
+        let remote = TestDir::new("upload-source-swap-dst");
+        let src = local.path().join("source.bin");
+        let moved = local.path().join("original.bin");
+        std::fs::write(&src, b"declared source").unwrap();
+        let dst = remote.path().join("uploaded.bin");
+        let dst_str = dst.to_str().unwrap().to_string();
+
+        upload_file_with(
+            || {
+                std::fs::rename(&src, &moved).unwrap();
+                std::fs::write(&src, b"replacement").unwrap();
+                spawn_local(&["put", &dst_str, "feed-a"], ScriptDelivery::Argv)
+            },
+            &src,
+            1 << 20,
+            &TransferControl::new(),
+            &|_| {},
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(&dst).unwrap(), b"declared source");
+        assert_eq!(std::fs::read(&src).unwrap(), b"replacement");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinned_upload_sources_are_cloexec_and_transfer_scoped() {
+        let local = TestDir::new("upload-source-fds");
+        let file = local.path().join("source.bin");
+        let directory = local.path().join("tree");
+        std::fs::write(&file, b"source").unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("marker"), b"source").unwrap();
+
+        let file_handle = open_source_file(&file).unwrap();
+        assert_cloexec_and_not_inherited(&file_handle, &file);
+        drop(file_handle);
+        let directory_handle = open_source_directory(&directory).unwrap();
+        assert_cloexec_and_not_inherited(&directory_handle, &directory);
+        drop(directory_handle);
+        assert_eq!(open_descriptor_count_for(&file), 0);
+        assert_eq!(open_descriptor_count_for(&directory), 0);
+
+        let cancelled = TransferControl::new();
+        cancelled.cancel();
+        let error = upload_file_with(
+            || Err(io::Error::other("cancelled upload must not spawn")),
+            &file,
+            1 << 20,
+            &cancelled,
+            &|_| {},
+        )
+        .expect_err("a pre-cancelled upload must stop after opening its source");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(open_descriptor_count_for(&file), 0);
+
+        let error = upload_dir_with(
+            || Err(io::Error::other("injected remote spawn failure")),
+            &directory,
+            1 << 20,
+            &TransferControl::new(),
+            &|_| {},
+        )
+        .expect_err("a remote spawn failure must stop and reap local tar");
+        assert_eq!(error.to_string(), "injected remote spawn failure");
+        assert_eq!(
+            open_descriptor_count_for(&directory),
+            0,
+            "the completed tar and failed remote spawn must release the source root"
+        );
+    }
+
+    #[test]
     fn upload_rejects_oversize_before_streaming() {
         let local = TestDir::new("upload-cap-src");
         let remote = TestDir::new("upload-cap-dst");
@@ -5982,6 +6154,94 @@ mod tests {
             std::fs::read_dir(local_dst.path()).unwrap().count(),
             1,
             "a successful download leaves only the published directory"
+        );
+    }
+
+    #[test]
+    fn directory_upload_keeps_the_opened_root_across_path_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let local = TestDir::new("dir-upload-source-swap");
+        let remote = TestDir::new("dir-upload-source-swap-dst");
+        let src = local.path().join("tree");
+        let moved = local.path().join("original-tree");
+        std::fs::create_dir_all(src.join("nested")).unwrap();
+        std::fs::write(src.join("nested").join("marker"), b"declared source").unwrap();
+
+        let shim = local.path().join("tar-shim");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\nmv -- '{}' '{}'\nmkdir -p -- '{}/nested'\nprintf replacement > '{}/nested/marker'\nexec tar \"$@\"\n",
+                src.display(),
+                moved.display(),
+                src.display(),
+                src.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let remote_path = remote.path().to_str().unwrap().to_string();
+        upload_dir_with_tar(
+            || {
+                spawn_local(
+                    &["untar", &remote_path, "tree", "feed-b"],
+                    ScriptDelivery::Argv,
+                )
+            },
+            &src,
+            &shim,
+            1 << 20,
+            &TransferControl::new(),
+            &|_| {},
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(remote.path().join("tree").join("nested").join("marker")).unwrap(),
+            b"declared source"
+        );
+        assert_eq!(
+            std::fs::read(src.join("nested").join("marker")).unwrap(),
+            b"replacement"
+        );
+    }
+
+    #[test]
+    fn directory_upload_does_not_start_remote_publication_after_tar_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let local = TestDir::new("dir-upload-tar-failure");
+        let src = local.path().join("tree");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("marker"), b"source").unwrap();
+        let shim = local.path().join("failing-tar");
+        std::fs::write(&shim, "#!/bin/sh\nprintf partial-archive\nexit 42\n").unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let spawned = AtomicBool::new(false);
+
+        let error = upload_dir_with_tar(
+            || {
+                spawned.store(true, Ordering::Relaxed);
+                Err(io::Error::other("remote must not start"))
+            },
+            &src,
+            &shim,
+            1 << 20,
+            &TransferControl::new(),
+            &|_| {},
+        )
+        .expect_err("a failed local archive must stop before remote publication");
+
+        assert!(error.to_string().contains("local tar failed"));
+        assert!(!spawned.load(Ordering::Relaxed));
+        assert!(
+            std::fs::read_dir(local.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().as_bytes().starts_with(b".anvil-fs-part-")),
+            "the failed archive leaves no transfer staging file"
         );
     }
 
