@@ -3733,6 +3733,45 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn open_descriptor_count_for(path: &Path) -> usize {
+        use std::os::unix::fs::MetadataExt;
+
+        let expected = std::fs::metadata(path).unwrap();
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::metadata(entry.path()).ok())
+            .filter(|metadata| metadata.dev() == expected.dev() && metadata.ino() == expected.ino())
+            .count()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_cloexec_and_not_inherited(file: &std::fs::File, expected_path: &Path) {
+        use std::os::fd::AsRawFd;
+
+        let fd = file.as_raw_fd();
+        // SAFETY: F_GETFD only inspects the live descriptor owned by `file`.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert_ne!(flags, -1);
+        assert_ne!(flags & libc::FD_CLOEXEC, 0, "parent fd must be CLOEXEC");
+
+        let status = Command::new("sh")
+            .args([
+                "-c",
+                r#"[ "$(readlink "/proc/self/fd/$1" 2>/dev/null || :)" != "$2" ]"#,
+                "--",
+                &fd.to_string(),
+                expected_path.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "an unrelated child inherited a pinned parent descriptor"
+        );
+    }
+
     /// The far-side sh invocation, exactly as the ssh/docker argv would shape
     /// it for each delivery mode.
     fn local_probe_argv(args: &[&str], mode: ScriptDelivery) -> Vec<OsString> {
@@ -5564,6 +5603,70 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinned_download_parent_fds_are_cloexec_and_transfer_scoped() {
+        let local = TestDir::new("pinned-download-fds");
+        let parent = local.path().join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        let file_dst = parent.join("download.bin");
+        let dir_dst = parent.join("tree");
+        assert_eq!(open_descriptor_count_for(&parent), 0);
+
+        let (staging, file) = StagedFile::beside(&file_dst).unwrap();
+        assert_cloexec_and_not_inherited(&staging.parent, &parent);
+        drop(file);
+        drop(staging);
+        assert_eq!(open_descriptor_count_for(&parent), 0);
+
+        let staging = ExtractionDir::beside(&dir_dst).unwrap();
+        assert_cloexec_and_not_inherited(&staging.parent, &parent);
+        drop(staging);
+        assert_eq!(open_descriptor_count_for(&parent), 0);
+
+        for _ in 0..64 {
+            let (staging, file) = StagedFile::beside(&file_dst).unwrap();
+            drop(file);
+            drop(staging);
+            let staging = ExtractionDir::beside(&dir_dst).unwrap();
+            drop(staging);
+        }
+        assert_eq!(
+            open_descriptor_count_for(&parent),
+            0,
+            "repeated transfers must not retain destination-parent descriptors"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn published_downloads_survive_a_later_diagnostic_error() {
+        let local = TestDir::new("published-before-diagnostic");
+        let file_dst = local.path().join("download.bin");
+        let (file_staging, mut file) = StagedFile::beside(&file_dst).unwrap();
+        file.write_all(b"published file").unwrap();
+        drop(file);
+        file_staging.publish(&file_dst).unwrap();
+        let diagnostic: io::Result<()> = Err(io::Error::other("later diagnostic failed"));
+        assert!(diagnostic.is_err());
+        drop(file_staging);
+        assert_eq!(std::fs::read(&file_dst).unwrap(), b"published file");
+
+        let dir_dst = local.path().join("tree");
+        let dir_staging = ExtractionDir::beside(&dir_dst).unwrap();
+        let extracted = dir_staging.anchored_path().join("tree");
+        std::fs::create_dir(&extracted).unwrap();
+        std::fs::write(extracted.join("marker"), b"published directory").unwrap();
+        dir_staging.publish(OsStr::new("tree"), &dir_dst).unwrap();
+        let diagnostic: io::Result<()> = Err(io::Error::other("later diagnostic failed"));
+        assert!(diagnostic.is_err());
+        drop(dir_staging);
+        assert_eq!(
+            std::fs::read(dir_dst.join("marker")).unwrap(),
+            b"published directory"
+        );
+    }
+
     #[test]
     fn download_streams_file_content_and_refuses_existing_dst() {
         let remote = TestDir::new("download-src");
@@ -5654,6 +5757,7 @@ mod tests {
             0,
             "the transfer cleans its staging inode through the pinned parent"
         );
+        assert_eq!(open_descriptor_count_for(&moved_parent), 0);
     }
 
     #[test]
@@ -6123,6 +6227,7 @@ mod tests {
             0,
             "the transfer cleans its extraction tree through the pinned parent"
         );
+        assert_eq!(open_descriptor_count_for(&moved_parent), 0);
     }
 
     #[test]
