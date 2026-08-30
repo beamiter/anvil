@@ -272,6 +272,11 @@ versioning for tagged releases while it remains experimental.
 
 ### Changed
 
+- Configuration paths in `--doctor` no longer reach the terminal or JSON
+  detail raw. A path selected through `--config` or `ANVIL_CONFIG` can contain
+  newlines, terminal controls, or bidirectional formatting; Doctor now renders
+  those scalars inert and caps the path at 2 KiB, while support-bundle mode
+  continues to replace it with `<config-file>`.
 - `anvil --doctor` now names the first rejected workflow file and its bounded
   reason instead of reporting only a count, so a headless diagnosis identifies
   the file that needs repair. Both fields cross the same control/bidi-safe

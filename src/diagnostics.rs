@@ -109,12 +109,18 @@ fn diagnostics_redacted() -> bool {
         .is_some_and(|value| !value.is_empty() && value != "0")
 }
 
-fn diagnostic_path(path: &Path) -> String {
-    if diagnostics_redacted() {
+const DIAGNOSTIC_PATH_BYTES: usize = 2 * 1024;
+
+fn diagnostic_path_for(path: &Path, redacted: bool) -> String {
+    if redacted {
         "<config-file>".to_string()
     } else {
-        path.display().to_string()
+        crate::review_input::safe_inline_display(&path.to_string_lossy(), DIAGNOSTIC_PATH_BYTES)
     }
+}
+
+fn diagnostic_path(path: &Path) -> String {
+    diagnostic_path_for(path, diagnostics_redacted())
 }
 
 fn config_backup_health() -> (usize, usize, usize) {
@@ -575,6 +581,29 @@ mod tests {
         assert!(OPTIONAL_RUNTIME_TOOLS
             .iter()
             .any(|(name, purpose)| *name == "curl" && *purpose == "AI panel"));
+    }
+
+    #[test]
+    fn config_path_diagnostic_is_bounded_and_cannot_format_the_terminal() {
+        let path = PathBuf::from(format!(
+            "/config/{}\n\u{1b}]0;PWNED\u{7}\u{202e}.toml",
+            "x".repeat(DIAGNOSTIC_PATH_BYTES + 32)
+        ));
+        let detail = diagnostic_path_for(&path, false);
+        assert!(detail.len() <= DIAGNOSTIC_PATH_BYTES);
+        assert!(!detail.contains('\n'), "{detail}");
+        assert!(!detail.contains('\u{1b}'), "{detail}");
+        assert!(!detail.contains('\u{7}'), "{detail}");
+        assert!(!detail.contains('\u{202e}'), "{detail}");
+        assert!(detail.contains('…'), "{detail}");
+    }
+
+    #[test]
+    fn redacted_config_path_diagnostic_never_retains_the_path() {
+        assert_eq!(
+            diagnostic_path_for(Path::new("/private/config.toml"), true),
+            "<config-file>"
+        );
     }
 
     #[test]

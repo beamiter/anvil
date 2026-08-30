@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-30 (workflow doctor diagnostics name a safe rejection sample)
+Updated: 2026-08-30 (Doctor paths and workflow refusals are display-safe)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,15 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **Doctor no longer prints an attacker-shaped config path raw (2026-08-30)**:
+  `--config` and `ANVIL_CONFIG` accept a process-local filesystem path, and the
+  config check interpolated `path.display()` directly into human output and the
+  JSON `detail` field. A newline, OSC sequence, or bidi override in that path
+  therefore retained its formatting effect. Non-redacted diagnostics now pass
+  it through `safe_inline_display` under a 2 KiB budget; support-bundle mode
+  still emits the fixed `<config-file>` token. Tests pin both hostile and
+  redacted paths without mutating process-global environment state.
 
 - **`--doctor` identifies the rejected workflow (2026-08-30)**: the workflow
   check keeps the existing available/readable/refused counts and now appends

@@ -208,7 +208,8 @@ or support tooling; neither format includes configuration contents, terminal
 history, command output, environment values, or credentials. An ordinary run
 may include local paths and the bounded parser reason for the first rejected
 workflow file (which can quote part of that file); support-bundle mode redacts
-both while retaining the counts.
+both while retaining the counts. Paths shown by Doctor are bounded and render
+terminal controls, newlines, and bidirectional formatting as inert text.
 
 When configuration, startup commands, session restore, or an integration causes
 a bad launch, use:
