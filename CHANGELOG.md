@@ -548,6 +548,11 @@ versioning for tagged releases while it remains experimental.
 
 ### Fixed
 
+- Directory-download extraction staging now retains a no-follow directory
+  descriptor and compares its device/inode with the live path before recursive
+  cleanup. Moving the private staging root away and replacing its old name can
+  no longer redirect Drop into the replacement tree; mode-0700 isolation and
+  occupied-candidate retry remain unchanged.
 - Remote-to-remote relay staging directories are now created mode 0700, retry
   occupied `/tmp` candidates, and retain a no-follow directory descriptor for
   cleanup identity. Relay payloads are no longer exposed through a customary

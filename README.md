@@ -1051,7 +1051,9 @@ reserved inode before unlinking so a replaced candidate survives.
 Downloaded directories are extracted into a private 0700 same-parent directory,
 validated for one matching directory root, and only then published with the
 same no-replace rename. A concurrently-created destination is never merged
-with tar output or removed during cleanup.
+with tar output or removed during cleanup. The staging directory keeps a
+no-follow descriptor open, and recursive cleanup runs only while its path still
+resolves to that held inode.
 
 The tree multi-selects: Ctrl+click toggles rows, Shift+click extends a range.
 A right-click inside the selection aims the menu at all of it (Delete reads
