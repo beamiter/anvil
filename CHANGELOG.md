@@ -548,6 +548,11 @@ versioning for tagged releases while it remains experimental.
 
 ### Fixed
 
+- Regular-file download staging now uses short internal basenames independent
+  of the destination name. Filesystem-limit names remain transferable without
+  truncating user bytes into a temporary `OsStr`; stale or planted candidates
+  are retried with owner-only exclusive create before the producer starts, and
+  cleanup verifies the reserved inode so a path replaced afterward survives.
 - Directory downloads now extract into a private mode-0700 directory beside
   their destination, validate that the archive produced exactly one matching
   directory root, and publish it with `RENAME_NOREPLACE` only after both sides

@@ -1937,32 +1937,6 @@ fn stream_to<R: Read, W: Write>(
     }
 }
 
-/// Temporary download name in the destination directory: dot-prefixed,
-/// unique, and on the same filesystem so the final rename is atomic.
-fn part_path(dir: &Path, name: &OsStr) -> PathBuf {
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let bytes = name.as_bytes();
-    let keep = bytes.len().min(180);
-    let mut temp = OsString::from(".");
-    temp.push(OsStr::from_bytes(&bytes[..keep]));
-    temp.push(format!(
-        ".fspart-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    dir.join(temp)
-}
-
-/// Removes a partial download on every error path; after the final rename
-/// the temp path no longer exists, which makes the cleanup a no-op.
-struct PartFile(PathBuf);
-
-impl Drop for PartFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
 fn open_transfer_staging(path: &Path) -> io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -1973,6 +1947,85 @@ fn open_transfer_staging(path: &Path) -> io::Result<std::fs::File> {
         .open(path)
 }
 
+/// One exclusively-created, owner-only staging file beside its eventual
+/// destination. Its fixed-size basename neither exposes user-controlled bytes
+/// nor grows with a filesystem-limit name.
+struct StagedFile {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+impl StagedFile {
+    fn beside(anchor: &Path) -> io::Result<(Self, std::fs::File)> {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        Self::beside_with(anchor, || NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn beside_with(
+        anchor: &Path,
+        mut next: impl FnMut() -> usize,
+    ) -> io::Result<(Self, std::fs::File)> {
+        let parent = anchor
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        for _ in 0..32 {
+            let path = parent.join(format!(".anvil-fs-part-{}-{}", std::process::id(), next()));
+            // A legitimate target may have our internal name shape. Never
+            // reserve that target itself, even while it is absent.
+            if path.file_name() == anchor.file_name() {
+                continue;
+            }
+            match open_transfer_staging(&path) {
+                Ok(file) => {
+                    use std::os::unix::fs::MetadataExt;
+
+                    let metadata = match file.metadata() {
+                        Ok(metadata) => metadata,
+                        Err(error) => {
+                            drop(file);
+                            let _ = std::fs::remove_file(&path);
+                            return Err(error);
+                        }
+                    };
+                    return Ok((
+                        Self {
+                            path,
+                            device: metadata.dev(),
+                            inode: metadata.ino(),
+                        },
+                        file,
+                    ));
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not reserve a private transfer staging path",
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        use std::os::unix::fs::MetadataExt;
+
+        if std::fs::symlink_metadata(&self.path)
+            .is_ok_and(|metadata| metadata.dev() == self.device && metadata.ino() == self.inode)
+        {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[cfg(test)]
 fn reserve_part_then_spawn(
     path: &Path,
     spawn: impl FnOnce() -> io::Result<ProbeChild>,
@@ -2416,9 +2469,10 @@ fn download_file_with(
     let dst = dir.join(name);
     require_missing(&dst)?;
     control.check()?;
-    let temp = part_path(dir, name);
-    let (mut file, probe) = reserve_part_then_spawn(&temp, spawn)?;
-    let _guard = PartFile(temp.clone());
+    // Reserve before spawning the producer. Occupied internal candidates are
+    // retried, while failure to reserve cannot leave a child to reap.
+    let (temp, mut file) = StagedFile::beside(&dst)?;
+    let probe = spawn()?;
     let probe_handle = probe.handle();
     control.register(&probe_handle);
     let mut stdout = probe
@@ -2450,7 +2504,7 @@ fn download_file_with(
     drop(file);
     // Atomic backstop: a same-name file that appeared while streaming wins;
     // the commit itself, not a check before it, enforces no-overwrite.
-    rename_noreplace(&temp, &dst)?;
+    rename_noreplace(temp.path(), &dst)?;
     Ok(dst)
 }
 
@@ -4671,6 +4725,85 @@ mod tests {
     }
 
     #[test]
+    fn unique_transfer_staging_skips_aliases_and_planted_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let local = TestDir::new("unique-staging");
+        let pid = std::process::id();
+
+        let anchor = local.path().join(format!(".anvil-fs-part-{pid}-7"));
+        let mut sequence = [7, 8].into_iter();
+        let (staging, file) =
+            StagedFile::beside_with(&anchor, || sequence.next().expect("one retry is enough"))
+                .unwrap();
+        let staging_path = staging.path().to_path_buf();
+        assert_ne!(staging_path, anchor);
+        assert_eq!(
+            std::fs::metadata(&staging_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o077,
+            0,
+            "reserved staging must remain owner-only"
+        );
+        drop(file);
+        drop(staging);
+        assert!(!anchor.exists());
+        assert!(!staging_path.exists());
+
+        let victim = local.path().join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        let planted = local.path().join(format!(".anvil-fs-part-{pid}-11"));
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+        let ordinary_anchor = local.path().join("download.bin");
+        let mut sequence = [11, 12].into_iter();
+        let (staging, file) = StagedFile::beside_with(&ordinary_anchor, || {
+            sequence.next().expect("one retry is enough")
+        })
+        .unwrap();
+        let expected_name = format!(".anvil-fs-part-{pid}-12");
+        assert_eq!(staging.path().file_name(), Some(OsStr::new(&expected_name)));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        assert!(std::fs::symlink_metadata(&planted)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        drop(file);
+        drop(staging);
+        assert!(std::fs::symlink_metadata(&planted)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        let replacement_anchor = local.path().join("replacement.bin");
+        let (staging, file) = StagedFile::beside(&replacement_anchor).unwrap();
+        let staging_path = staging.path().to_path_buf();
+        std::fs::remove_file(&staging_path).unwrap();
+        std::fs::write(&staging_path, b"replacement").unwrap();
+        drop(file);
+        drop(staging);
+        assert_eq!(std::fs::read(&staging_path).unwrap(), b"replacement");
+
+        let failed = TestDir::new("staging-spawn-failure");
+        let error = download_file_with(
+            || Err(io::Error::other("injected spawn failure")),
+            OsStr::new("download.bin"),
+            failed.path(),
+            1 << 20,
+            &TransferControl::new(),
+            &|_| {},
+        )
+        .expect_err("a producer spawn failure must be returned");
+        assert_eq!(error.to_string(), "injected spawn failure");
+        assert_eq!(
+            std::fs::read_dir(failed.path()).unwrap().count(),
+            0,
+            "a failed spawn leaves no reserved staging file"
+        );
+    }
+
+    #[test]
     fn download_streams_file_content_and_refuses_existing_dst() {
         let remote = TestDir::new("download-src");
         let local = TestDir::new("download-dst");
@@ -4712,6 +4845,35 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn download_accepts_a_name_at_the_component_limit() {
+        let remote = TestDir::new("download-long-src");
+        let local = TestDir::new("download-long-dst");
+        let content = binary_content(13, 4_000);
+        let src = remote.path().join("source.bin");
+        std::fs::write(&src, &content).unwrap();
+        let src_str = src.to_str().unwrap().to_string();
+        let name = "x".repeat(255);
+
+        let dst = download_file_with(
+            || spawn_local(&["cat", &src_str], ScriptDelivery::Stdin),
+            OsStr::new(&name),
+            local.path(),
+            1 << 20,
+            &TransferControl::new(),
+            &|_| {},
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(&dst).unwrap(), content);
+        assert_eq!(dst.file_name().unwrap().as_encoded_bytes().len(), 255);
+        assert_eq!(
+            std::fs::read_dir(local.path()).unwrap().count(),
+            1,
+            "fixed-size staging names leave no litter"
+        );
     }
 
     #[test]

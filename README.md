@@ -1041,7 +1041,11 @@ Transfer staging names are reserved owner-only with exclusive create before
 their producer starts, so partial content is not published by a permissive
 umask, and a planted hidden symlink is refused without touching its target or
 leaving a child process to reap. The downloaded regular file retains that
-owner-only mode when its staging inode is published.
+owner-only mode when its staging inode is published. These private names have
+a fixed-size basename independent of the transferred name, so a valid
+filesystem-limit name remains transferable; occupied candidates are retried
+without unlinking them or starting the producer, and cleanup verifies the
+reserved inode before unlinking so a replaced candidate survives.
 Downloaded directories are extracted into a private 0700 same-parent directory,
 validated for one matching directory root, and only then published with the
 same no-replace rename. A concurrently-created destination is never merged
