@@ -26,11 +26,12 @@ use crate::file_tree::FileEntry;
 /// therefore run as `sh -c '<script>' -- <op> [args...]` instead: a shell's
 /// read-ahead on `sh -s` may legally swallow payload bytes into its own
 /// buffer. Keep the exit-code contract in sync with `probe_result`.
-pub(crate) const PROBE_SCRIPT: &str = r#"# remote-fs probe v4 — runs under `sh -s -- <op> [args...]`.
+pub(crate) const PROBE_SCRIPT: &str = r#"# remote-fs probe v5 — runs under `sh -s -- <op> [args...]`.
 # `list` stdout: NUL-separated pairs "<t>\0<name>\0", t in {d,f,l}, names relative.
 # `cat` streams a file to stdout; `put <path> <transfer-id>` stores stdin as a new file;
-# `tar` streams a directory to stdout; `untar <dir> <name>` extracts stdin into
-# <dir>, refusing an existing <dir>/<name> before anything is extracted;
+# `tar` streams a directory to stdout; `untar <dir> <name> <transfer-id>` extracts
+# stdin into private same-parent staging, validates one matching directory root,
+# then publishes it without replacing a destination created concurrently;
 # `put` receives bytes in a private same-parent directory, then publishes them
 # with an atomic no-replace hard link;
 # every creator treats a dangling symbolic link as an existing target;
@@ -143,13 +144,51 @@ case "$op" in
     tar cf - -C "$d" "${p##*/}" || exit 4
     ;;
   untar)
-    d=${2:-}; n=${3:-}
+    d=${2:-}; n=${3:-}; id=${4:-}
     case "$d" in /*) ;; *) exit 2 ;; esac
-    [ -d "$d" ] || exit 3
     case "$n" in ""|.|..|*/*) exit 2 ;; esac
-    if [ -e "$d/$n" ] || [ -L "$d/$n" ]; then exit 17; fi
+    case "$id" in ''|*[!0-9a-f-]*) exit 2 ;; esac
+    [ "${#id}" -le 96 ] || exit 2
+    [ -d "$d" ] || exit 3
     command -v tar >/dev/null 2>&1 || { echo "remote-fs probe: tar is not installed" >&2; exit 4; }
-    tar xf - -C "$d" || exit 4
+    command -v mv >/dev/null 2>&1 || { echo "remote-fs probe: mv is not installed" >&2; exit 4; }
+    cd "$d" 2>/dev/null || exit 3
+    if [ -e "$n" ] || [ -L "$n" ]; then exit 17; fi
+    stage=
+    i=0
+    umask 077
+    while [ "$i" -lt 32 ]; do
+      candidate=".anvil-fs-untar-$id-$i"
+      i=$((i + 1))
+      [ "$candidate" = "$n" ] && continue
+      if mkdir "$candidate" 2>/dev/null; then stage=$candidate; break; fi
+    done
+    [ -n "$stage" ] || exit 4
+    code=4
+    if (cd "$stage" && tar xf -); then
+      count=0
+      valid=1
+      source="$stage/$n"
+      for f in "$stage"/* "$stage"/.[!.]* "$stage"/..?*; do
+        if [ -e "$f" ] || [ -L "$f" ]; then
+          count=$((count + 1))
+          [ "$f" = "$source" ] || valid=0
+        fi
+      done
+      if [ "$count" -eq 1 ] && [ "$valid" -eq 1 ] && [ -d "$source" ] && [ ! -L "$source" ]; then
+        if mv --no-copy -nT -- "$source" "$n" 2>/dev/null; then
+          if [ -e "$source" ] || [ -L "$source" ]; then
+            if [ -e "$n" ] || [ -L "$n" ]; then code=17; fi
+          else
+            code=0
+          fi
+        elif [ -e "$n" ] || [ -L "$n" ]; then
+          code=17
+        fi
+      fi
+    fi
+    rm -rf -- "$stage"
+    exit "$code"
     ;;
   stat)
     p=${2:-}
@@ -2310,7 +2349,7 @@ fn parse_stat_output(bytes: &[u8]) -> io::Result<RemoteStat> {
 /// (Local→Remote), or a local staging relay between two remote hosts.
 /// Returns the destination path. Same-name collisions fail BEFORE streaming
 /// via the probe's `stat`; file uploads and directory untars are additionally
-/// enforced atomically by `put`/v3 `untar` exit 17. `control` carries
+/// enforced atomically by `put`/v5 `untar` exit 17. `control` carries
 /// cancel/timeout kill semantics; `progress` receives throttled byte totals.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn transfer(
@@ -2456,14 +2495,15 @@ fn upload(
         return Err(already_exists_error(name));
     }
     if is_dir {
-        // v3 untar takes <dir> <name> and refuses an existing destination
-        // before extracting anything; the tar stream carries the name.
-        upload_dir_with(
+        // v5 untar extracts only into private staging, validates the complete
+        // root, and publishes with an atomic no-replace rename.
+        let transfer_id = upload_transfer_id();
+        let result = upload_dir_with(
             || {
                 spawn_probe_streaming(
                     host,
                     "untar",
-                    &[remote_dir.as_os_str(), name],
+                    &[remote_dir.as_os_str(), name, OsStr::new(&transfer_id)],
                     ScriptDelivery::Argv,
                 )
             },
@@ -2471,9 +2511,13 @@ fn upload(
             MAX_TRANSFER_BYTES,
             control,
             progress,
-        )?;
+        );
+        if result.as_ref().is_err_and(upload_cleanup_needed) {
+            cleanup_remote_untar(host, remote_dir, name, &transfer_id);
+        }
+        result?;
     } else {
-        let transfer_id = put_transfer_id();
+        let transfer_id = upload_transfer_id();
         let result = upload_file_with(
             || {
                 spawn_probe_streaming(
@@ -2488,13 +2532,10 @@ fn upload(
             control,
             progress,
         );
-        if let Err(error) = &result {
-            // A kill (cancel/timeout) is the only way the probe's private
-            // staging directory survives — it cleans up after other failures.
-            if error.kind() == io::ErrorKind::Interrupted || error.kind() == io::ErrorKind::TimedOut
-            {
-                cleanup_remote_part(host, &dst, &transfer_id);
-            }
+        // A kill (cancel/timeout) is the only way the probe's private staging
+        // directory survives — it cleans up after other failures.
+        if result.as_ref().is_err_and(upload_cleanup_needed) {
+            cleanup_remote_put(host, &dst, &transfer_id);
         }
         result?;
     }
@@ -2503,7 +2544,7 @@ fn upload(
 
 /// Process-unique, shell-safe token that binds remote staging and cancel
 /// cleanup to one upload. The probe independently bounds and validates it.
-fn put_transfer_id() -> String {
+fn upload_transfer_id() -> String {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let epoch_nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2516,20 +2557,20 @@ fn put_transfer_id() -> String {
     )
 }
 
+fn upload_cleanup_needed(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::Interrupted | io::ErrorKind::TimedOut
+    )
+}
+
 /// A cancelled `put` can leave any one of its collision-retry directories.
 /// Cleanup is restricted to that upload's unique token, refuses links,
 /// and never acts on the final destination. Best-effort: errors are logged,
 /// never propagated.
-fn cleanup_remote_part(host: &RemoteHost, dst: &Path, transfer_id: &str) {
+fn cleanup_remote_put(host: &RemoteHost, dst: &Path, transfer_id: &str) {
     let command = part_cleanup_command(dst, transfer_id);
-    if let Err(message) = crate::config::validate_remote_host(host) {
-        log::warn!("remote upload staging cleanup rejected by execution gate: {message}");
-        return;
-    }
-    let argv = host_command_argv(host, command.as_os_str());
-    if let Err(error) = run_capture(&argv, &[], PROBE_OP_TIMEOUT, MAX_CAPTURE_BYTES) {
-        log::warn!("remote upload staging cleanup failed to run: {error}");
-    }
+    run_remote_upload_cleanup(host, command.as_os_str());
 }
 
 /// Build the small remote cleanup command as raw Unix bytes so unusual but
@@ -2548,6 +2589,45 @@ fn part_cleanup_command(dst: &Path, transfer_id: &str) -> OsString {
         b" ] && continue; [ -d \"$d\" ] && [ ! -L \"$d\" ] || continue; rm -f \"$d/payload\"; rmdir \"$d\" 2>/dev/null || :; done",
     );
     OsString::from_vec(command)
+}
+
+/// Enumerate only the bounded private-directory candidates for one directory
+/// upload. Raw bytes preserve every valid Unix destination name exactly.
+fn untar_cleanup_command(dst_dir: &Path, name: &OsStr, transfer_id: &str) -> OsString {
+    let prefix = dst_dir.join(format!(".anvil-fs-untar-{transfer_id}-"));
+    let target = dst_dir.join(name);
+    let mut command = b"i=0; while [ \"$i\" -lt 32 ]; do d=".to_vec();
+    command.extend_from_slice(&sq_bytes(prefix.as_os_str().as_bytes()));
+    command.extend_from_slice(b"$i; i=$((i + 1)); [ \"$d\" = ");
+    command.extend_from_slice(&sq_bytes(target.as_os_str().as_bytes()));
+    command.extend_from_slice(
+        b" ] && continue; [ -d \"$d\" ] && [ ! -L \"$d\" ] || continue; rm -rf -- \"$d\"; done",
+    );
+    OsString::from_vec(command)
+}
+
+fn cleanup_remote_untar(host: &RemoteHost, dst_dir: &Path, name: &OsStr, transfer_id: &str) {
+    let command = untar_cleanup_command(dst_dir, name, transfer_id);
+    run_remote_upload_cleanup(host, command.as_os_str());
+}
+
+/// Best-effort cleanup does not inherit the cancelled transfer control. A
+/// nonzero cleanup exit is still logged so leaked staging is diagnosable.
+fn run_remote_upload_cleanup(host: &RemoteHost, command: &OsStr) {
+    if let Err(message) = crate::config::validate_remote_host(host) {
+        log::warn!("remote upload staging cleanup rejected by execution gate: {message}");
+        return;
+    }
+    let argv = host_command_argv(host, command);
+    match run_capture(&argv, &[], PROBE_OP_TIMEOUT, MAX_CAPTURE_BYTES) {
+        Ok(capture) if capture.code == Some(0) => {}
+        Ok(capture) => log::warn!(
+            "remote upload staging cleanup exited {:?}: {}",
+            capture.code,
+            bounded_stderr_text(&capture.stderr)
+        ),
+        Err(error) => log::warn!("remote upload staging cleanup failed to run: {error}"),
+    }
 }
 
 /// Run one small far-side shell command outside the probe protocol (ssh:
@@ -4109,7 +4189,7 @@ mod tests {
         std::os::unix::fs::symlink(&victim, &link).unwrap();
         assert_refused(
             &local_probe_payload(
-                &["untar", &extraction_arg, "tree"],
+                &["untar", &extraction_arg, "tree", "feed-2"],
                 b"not consulted when the target is occupied",
             ),
             &link,
@@ -4721,7 +4801,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_v3_tar_untar_round_trip() {
+    fn probe_v5_tar_untar_round_trip() {
         let tmp = TestDir::new("probe-tar");
         let src = tmp.path().join("srcdir");
         std::fs::create_dir_all(src.join("nested")).unwrap();
@@ -4735,8 +4815,10 @@ mod tests {
 
         let out = tmp.path().join("out");
         std::fs::create_dir(&out).unwrap();
-        let capture =
-            local_probe_payload(&["untar", out.to_str().unwrap(), "srcdir"], &tarred.stdout);
+        let capture = local_probe_payload(
+            &["untar", out.to_str().unwrap(), "srcdir", "feed-3"],
+            &tarred.stdout,
+        );
         assert_eq!(capture.code, Some(0));
         assert_eq!(
             std::fs::read(out.join("srcdir").join("nested").join("data.bin")).unwrap(),
@@ -4757,7 +4839,8 @@ mod tests {
                 &[
                     "untar",
                     tmp.path().join("missing").to_str().unwrap(),
-                    "srcdir"
+                    "srcdir",
+                    "feed-4"
                 ],
                 b"x"
             )
@@ -4767,7 +4850,7 @@ mod tests {
         // Bad names are usage errors, not operations.
         for bad in ["", ".", "..", "a/b"] {
             assert_eq!(
-                local_probe_payload(&["untar", out.to_str().unwrap(), bad], b"x").code,
+                local_probe_payload(&["untar", out.to_str().unwrap(), bad, "feed-5"], b"x").code,
                 Some(2),
                 "name {bad:?} is rejected"
             );
@@ -4775,7 +4858,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_v3_untar_refuses_existing_name_before_extracting() {
+    fn probe_v5_untar_refuses_existing_name_before_extracting() {
         let tmp = TestDir::new("probe-untar-17");
         let src = tmp.path().join("srcdir");
         std::fs::create_dir(&src).unwrap();
@@ -4788,8 +4871,10 @@ mod tests {
         std::fs::create_dir_all(out.join("srcdir")).unwrap();
         std::fs::write(out.join("srcdir").join("marker.txt"), b"keep").unwrap();
 
-        let capture =
-            local_probe_payload(&["untar", out.to_str().unwrap(), "srcdir"], &tarred.stdout);
+        let capture = local_probe_payload(
+            &["untar", out.to_str().unwrap(), "srcdir", "feed-6"],
+            &tarred.stdout,
+        );
         assert_eq!(capture.code, Some(17));
         assert_eq!(
             std::fs::read(out.join("srcdir").join("marker.txt")).unwrap(),
@@ -4799,6 +4884,156 @@ mod tests {
         assert!(
             !out.join("srcdir").join("new.txt").exists(),
             "nothing was extracted before the refusal"
+        );
+    }
+
+    #[test]
+    fn probe_v5_untar_rejects_extra_roots_without_partial_publication() {
+        let tmp = TestDir::new("probe-untar-extra-root");
+        let archive_root = tmp.path().join("archive");
+        std::fs::create_dir(&archive_root).unwrap();
+        for name in ["tree", "extra"] {
+            std::fs::create_dir(archive_root.join(name)).unwrap();
+            std::fs::write(archive_root.join(name).join("file"), name).unwrap();
+        }
+        let archive = run_capture(
+            &[
+                OsString::from("tar"),
+                OsString::from("cf"),
+                OsString::from("-"),
+                OsString::from("-C"),
+                archive_root.as_os_str().to_os_string(),
+                OsString::from("tree"),
+                OsString::from("extra"),
+            ],
+            &[],
+            Duration::from_secs(10),
+            MAX_CAPTURE_BYTES,
+        )
+        .unwrap();
+        assert_eq!(archive.code, Some(0), "stderr: {:?}", archive.stderr);
+
+        let destination = tmp.path().join("destination");
+        std::fs::create_dir(&destination).unwrap();
+        let capture = local_probe_payload(
+            &["untar", destination.to_str().unwrap(), "tree", "feed-9"],
+            &archive.stdout,
+        );
+        assert_eq!(capture.code, Some(4));
+        assert!(
+            std::fs::read_dir(&destination).unwrap().next().is_none(),
+            "invalid archives leave neither published nor staged trees"
+        );
+    }
+
+    #[test]
+    fn probe_v5_untar_preserves_a_destination_created_before_publication() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TestDir::new("probe-untar-race");
+        let source = tmp.path().join("tree");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("archive-only"), b"archive").unwrap();
+        let archive = local_probe(&["tar", source.to_str().unwrap()]);
+        assert_eq!(archive.code, Some(0));
+
+        let destination = tmp.path().join("destination");
+        std::fs::create_dir(&destination).unwrap();
+        let collision_victim = tmp.path().join("collision-victim");
+        std::fs::create_dir(&collision_victim).unwrap();
+        std::fs::write(collision_victim.join("keep"), b"collision").unwrap();
+        let planted_stage = destination.join(".anvil-fs-untar-feed-a-0");
+        std::os::unix::fs::symlink(&collision_victim, &planted_stage).unwrap();
+
+        // A tar shim marks that private staging has been reserved, then waits
+        // until the test creates the final destination and releases it.
+        let shim_dir = tmp.path().join("bin");
+        std::fs::create_dir(&shim_dir).unwrap();
+        let marker = tmp.path().join("untar-started");
+        let gate = tmp.path().join("untar-release");
+        let tar_shim = shim_dir.join("tar");
+        std::fs::write(
+            &tar_shim,
+            "#!/bin/sh\n: > \"$UNTAR_MARKER\"\nwhile [ ! -e \"$UNTAR_GATE\" ]; do sleep 0.01; done\nPATH=$ORIGINAL_PATH\nexport PATH\nexec tar \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&tar_shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let original_path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string());
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(PROBE_SCRIPT)
+            .arg("remote-fs-probe")
+            .arg("untar")
+            .arg(&destination)
+            .arg("tree")
+            .arg("feed-a")
+            .env("PATH", format!("{}:{original_path}", shim_dir.display()))
+            .env("ORIGINAL_PATH", &original_path)
+            .env("UNTAR_MARKER", &marker)
+            .env("UNTAR_GATE", &gate)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+
+        let started = std::time::Instant::now();
+        while !marker.exists() {
+            if started.elapsed() > Duration::from_secs(2) {
+                drop(stdin);
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("untar probe did not reach extraction");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let reserved: Vec<_> = std::fs::read_dir(&destination)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.file_type().is_ok_and(|kind| kind.is_dir())
+                    && entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".anvil-fs-untar-feed-a-")
+            })
+            .collect();
+        assert_eq!(reserved.len(), 1, "one private staging directory is held");
+        assert_eq!(
+            reserved[0].metadata().unwrap().permissions().mode() & 0o077,
+            0,
+            "remote directory staging is owner-only"
+        );
+
+        let racing_target = destination.join("tree");
+        std::fs::create_dir(&racing_target).unwrap();
+        std::fs::write(racing_target.join("keep"), b"racer").unwrap();
+        std::fs::write(&gate, b"go").unwrap();
+        stdin.write_all(&archive.stdout).unwrap();
+        drop(stdin);
+
+        let status = child.wait().unwrap();
+        assert_eq!(status.code(), Some(17));
+        assert_eq!(std::fs::read(racing_target.join("keep")).unwrap(), b"racer");
+        assert!(!racing_target.join("archive-only").exists());
+        assert!(planted_stage.is_symlink(), "occupied staging survives");
+        assert_eq!(
+            std::fs::read(collision_victim.join("keep")).unwrap(),
+            b"collision"
+        );
+        assert!(
+            std::fs::read_dir(&destination)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path() != planted_stage)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".anvil-fs-untar-")),
+            "failed publication cleans only its private staging"
         );
     }
 
@@ -4880,7 +5115,7 @@ mod tests {
         );
         let command = argv.last().expect("command element").to_string_lossy();
         assert!(command.starts_with("sh -c '"));
-        assert!(command.contains("remote-fs probe v4"));
+        assert!(command.contains("remote-fs probe v5"));
         assert!(command.ends_with(" -- 'put' '/dst/a b'\\''c' 'feed-1'"));
 
         // docker: script as one raw argv element, no quoting anywhere.
@@ -4888,7 +5123,7 @@ mod tests {
         let argv = docker_probe_argv(
             &host,
             "untar",
-            &[OsStr::new("/dst"), OsStr::new("tree")],
+            &[OsStr::new("/dst"), OsStr::new("tree"), OsStr::new("feed-7")],
             ScriptDelivery::Argv,
         );
         let text: Vec<_> = argv
@@ -4897,7 +5132,7 @@ mod tests {
             .collect();
         let pos = text.iter().position(|a| a == "-c").expect("-c present");
         assert_eq!(text[pos + 1], PROBE_SCRIPT);
-        assert_eq!(text[pos + 2..], ["--", "untar", "/dst", "tree"]);
+        assert_eq!(text[pos + 2..], ["--", "untar", "/dst", "tree", "feed-7"]);
     }
 
     // -- streaming transfer mechanics ----------------------------------------
@@ -5202,7 +5437,12 @@ mod tests {
         // "upload": local tar → the untar probe writing into the relay dir.
         let relay_str = relay.path().to_str().unwrap().to_string();
         upload_dir_with(
-            || spawn_local(&["untar", &relay_str, "tree"], ScriptDelivery::Argv),
+            || {
+                spawn_local(
+                    &["untar", &relay_str, "tree", "feed-8"],
+                    ScriptDelivery::Argv,
+                )
+            },
             &src,
             1 << 24,
             &TransferControl::new(),
@@ -5612,9 +5852,9 @@ mod tests {
     }
 
     #[test]
-    fn put_transfer_ids_are_unique_shell_safe_and_bounded() {
-        let first = put_transfer_id();
-        let second = put_transfer_id();
+    fn upload_transfer_ids_are_unique_shell_safe_and_bounded() {
+        let first = upload_transfer_id();
+        let second = upload_transfer_id();
         assert_ne!(first, second);
         for id in [first, second] {
             assert!(id.len() <= 96);
@@ -5624,6 +5864,25 @@ mod tests {
                 "unexpected transfer id: {id}"
             );
         }
+    }
+
+    #[test]
+    fn upload_cleanup_is_reserved_for_cancelled_or_timed_out_probes() {
+        assert!(upload_cleanup_needed(&io::Error::new(
+            io::ErrorKind::Interrupted,
+            "cancelled"
+        )));
+        assert!(upload_cleanup_needed(&io::Error::new(
+            io::ErrorKind::TimedOut,
+            "timeout"
+        )));
+        assert!(!upload_cleanup_needed(&io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "probe cleaned itself"
+        )));
+        assert!(!upload_cleanup_needed(&io::Error::other(
+            "ordinary failure"
+        )));
     }
 
     #[test]
@@ -5682,6 +5941,67 @@ mod tests {
         assert!(other_transfer.is_dir(), "another transfer token survives");
         assert!(planted_link.is_symlink(), "cleanup refuses planted links");
         assert_eq!(std::fs::read(victim.join("payload")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn untar_cleanup_command_enumerates_only_token_candidates() {
+        assert_eq!(
+            untar_cleanup_command(Path::new("/dst"), OsStr::new("tree"), "feed-b")
+                .to_string_lossy(),
+            "i=0; while [ \"$i\" -lt 32 ]; do d='/dst/.anvil-fs-untar-feed-b-'$i; i=$((i + 1)); [ \"$d\" = '/dst/tree' ] && continue; [ -d \"$d\" ] && [ ! -L \"$d\" ] || continue; rm -rf -- \"$d\"; done"
+        );
+        assert_eq!(
+            untar_cleanup_command(
+                Path::new("/dst/don't"),
+                OsStr::new(".anvil-fs-untar-feed-b-7"),
+                "feed-b"
+            )
+            .to_string_lossy(),
+            "i=0; while [ \"$i\" -lt 32 ]; do d='/dst/don'\\''t/.anvil-fs-untar-feed-b-'$i; i=$((i + 1)); [ \"$d\" = '/dst/don'\\''t/.anvil-fs-untar-feed-b-7' ] && continue; [ -d \"$d\" ] && [ ! -L \"$d\" ] || continue; rm -rf -- \"$d\"; done"
+        );
+    }
+
+    #[test]
+    fn untar_cleanup_preserves_target_links_other_uploads_and_raw_names() {
+        let tmp = TestDir::new("untar-cleanup");
+        let raw_parent = tmp.path().join(OsString::from_vec(b"parent-\xff".to_vec()));
+        std::fs::create_dir(&raw_parent).unwrap();
+        let stage =
+            |token: &str, index: usize| raw_parent.join(format!(".anvil-fs-untar-{token}-{index}"));
+        for index in [0, 31] {
+            std::fs::create_dir(stage("feed-b", index)).unwrap();
+            std::fs::create_dir(stage("feed-b", index).join("partial-tree")).unwrap();
+            std::fs::write(stage("feed-b", index).join("partial-tree/file"), b"partial").unwrap();
+        }
+        let outside_range = stage("feed-b", 32);
+        std::fs::create_dir(&outside_range).unwrap();
+        let other_transfer = stage("beef-c", 0);
+        std::fs::create_dir(&other_transfer).unwrap();
+
+        let victim = raw_parent.join("victim-tree");
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::write(victim.join("keep"), b"victim").unwrap();
+        let planted_link = stage("feed-b", 5);
+        std::os::unix::fs::symlink(&victim, &planted_link).unwrap();
+
+        // The parent deliberately contains a non-UTF-8 byte and the target
+        // has the internal basename shape. Cleanup must round-trip and skip it.
+        let target_name = OsStr::new(".anvil-fs-untar-feed-b-7");
+        let target = raw_parent.join(target_name);
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keep"), b"target").unwrap();
+
+        let command = untar_cleanup_command(&raw_parent, target_name, "feed-b");
+        let argv = vec![OsString::from("sh"), OsString::from("-c"), command];
+        let capture = run_capture(&argv, &[], Duration::from_secs(10), MAX_CAPTURE_BYTES).unwrap();
+        assert_eq!(capture.code, Some(0), "stderr: {:?}", capture.stderr);
+        assert_eq!(std::fs::read(target.join("keep")).unwrap(), b"target");
+        assert!(!stage("feed-b", 0).exists());
+        assert!(!stage("feed-b", 31).exists());
+        assert!(outside_range.is_dir(), "indices outside retries survive");
+        assert!(other_transfer.is_dir(), "a concurrent upload survives");
+        assert!(planted_link.is_symlink(), "cleanup refuses planted links");
+        assert_eq!(std::fs::read(victim.join("keep")).unwrap(), b"victim");
     }
 
     // -- drag-and-drop import planning ----------------------------------------

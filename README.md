@@ -1006,7 +1006,8 @@ temp dir, inside an exclusively-created mode-0700 wrapper that retries occupied
 names and verifies its held directory inode before cleanup. Files stream
 through the probe (`cat`/`put` — the upload lands in a private same-parent
 directory and is hard-linked into place without replacement), directories
-stream as tar archives, and payloads are capped at 512 MiB with a 15-minute
+stream as tar archives into private same-parent extraction directories before
+atomic no-replace publication, and payloads are capped at 512 MiB with a 15-minute
 overall timeout. While a transfer runs, a held toast reports throttled
 progress ("Downloading name… 12.4 MiB", or "X / Y MiB" for single-file
 uploads) and offers a Cancel action that kills the stream, removes the
@@ -1015,8 +1016,8 @@ error. Destination preflight classifies links before directories and treats a
 FIFO, socket, or device as occupied without opening it for a size read. A
 destination that already holds the name is refused before
 any bytes move, including when that directory entry is a dangling symbolic
-link — for directory uploads the v3 probe checks the collision itself before
-extracting, so the refusal is atomic on the far side — a cut
+link — directory uploads also validate the complete extracted root and make
+the final no-replace publication the authoritative far-side collision check — a cut
 across locations deletes the source only after the copy
 landed, and partial transfers clean up after themselves. Names are validated
 before any dialog is accepted, `/` can never be a delete target, and a stale
@@ -1053,6 +1054,11 @@ same-parent directory and publish the mode-0600 payload with an atomic
 no-replace hard link. A destination created after preflight wins intact, and
 cancel cleanup enumerates only the 32 candidates bound to that upload's unique
 transfer token.
+Remote directory uploads extract inside a private 0700 same-parent directory,
+require exactly one matching non-link directory root, and then publish it with
+an atomic no-replace rename. A destination created after preparation wins
+without receiving any archive content; cancellation cleanup enumerates only
+the 32 directories bound to this transfer and reports nonzero cleanup exits.
 Downloaded directories are extracted into a private 0700 same-parent directory,
 validated for one matching directory root, and only then published with the
 same no-replace rename. A concurrently-created destination is never merged
