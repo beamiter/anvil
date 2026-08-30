@@ -3064,21 +3064,54 @@ fn upload(
     control: &TransferControl,
     progress: &dyn Fn(u64),
 ) -> io::Result<PathBuf> {
+    upload_with_remote_stat(
+        host,
+        local_path,
+        remote_dir,
+        is_dir,
+        control,
+        progress,
+        remote_stat,
+    )
+}
+
+fn upload_with_remote_stat(
+    host: &RemoteHost,
+    local_path: &Path,
+    remote_dir: &Path,
+    is_dir: bool,
+    control: &TransferControl,
+    progress: &dyn Fn(u64),
+    stat: impl Fn(&RemoteHost, &Path) -> io::Result<Option<RemoteStat>>,
+) -> io::Result<PathBuf> {
     require_absolute(remote_dir)?;
     let name = local_path.file_name().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "local path has no file name")
     })?;
     let dst = remote_dir.join(name);
-    // Fail before streaming: one `stat` answers the existence question.
-    if remote_stat(host, &dst)?.is_some() {
-        return Err(already_exists_error(name));
-    }
     if is_dir {
         // v5 untar extracts only into private staging, validates the complete
         // root, and publishes with an atomic no-replace rename.
         let transfer_id = upload_transfer_id();
+        let remote_probe_started = AtomicBool::new(false);
         let result = upload_dir_with(
             || {
+                // Local archive preparation owns the first phase. Do not
+                // contact the remote until its bytes and final manifest are
+                // complete; untar's no-replace publication remains the
+                // authority after this friendly existence preflight.
+                if control.is_timed_out() {
+                    return Err(transfer_timed_out_error());
+                }
+                control.check()?;
+                if stat(host, &dst)?.is_some() {
+                    return Err(already_exists_error(name));
+                }
+                if control.is_timed_out() {
+                    return Err(transfer_timed_out_error());
+                }
+                control.check()?;
+                remote_probe_started.store(true, Ordering::Relaxed);
                 spawn_probe_streaming(
                     host,
                     "untar",
@@ -3091,14 +3124,29 @@ fn upload(
             control,
             progress,
         );
-        if result.as_ref().is_err_and(upload_cleanup_needed) {
+        if result.as_ref().is_err_and(|error| {
+            upload_cleanup_needed(error, remote_probe_started.load(Ordering::Relaxed))
+        }) {
             cleanup_remote_untar(host, remote_dir, name, &transfer_id);
         }
         result?;
     } else {
         let transfer_id = upload_transfer_id();
+        let remote_probe_started = AtomicBool::new(false);
         let result = upload_file_with(
             || {
+                if control.is_timed_out() {
+                    return Err(transfer_timed_out_error());
+                }
+                control.check()?;
+                if stat(host, &dst)?.is_some() {
+                    return Err(already_exists_error(name));
+                }
+                if control.is_timed_out() {
+                    return Err(transfer_timed_out_error());
+                }
+                control.check()?;
+                remote_probe_started.store(true, Ordering::Relaxed);
                 spawn_probe_streaming(
                     host,
                     "put",
@@ -3113,7 +3161,9 @@ fn upload(
         );
         // A kill (cancel/timeout) is the only way the probe's private staging
         // directory survives — it cleans up after other failures.
-        if result.as_ref().is_err_and(upload_cleanup_needed) {
+        if result.as_ref().is_err_and(|error| {
+            upload_cleanup_needed(error, remote_probe_started.load(Ordering::Relaxed))
+        }) {
             cleanup_remote_put(host, &dst, &transfer_id);
         }
         result?;
@@ -3136,11 +3186,12 @@ fn upload_transfer_id() -> String {
     )
 }
 
-fn upload_cleanup_needed(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::Interrupted | io::ErrorKind::TimedOut
-    )
+fn upload_cleanup_needed(error: &io::Error, remote_probe_started: bool) -> bool {
+    remote_probe_started
+        && matches!(
+            error.kind(),
+            io::ErrorKind::Interrupted | io::ErrorKind::TimedOut
+        )
 }
 
 /// A cancelled `put` can leave any one of its collision-retry directories.
@@ -3518,6 +3569,10 @@ fn upload_dir_with_tar(
     }
     archive.sync_all()?;
     archive.seek(SeekFrom::Start(0))?;
+    if control.is_timed_out() {
+        return Err(transfer_timed_out_error());
+    }
+    control.check()?;
 
     let probe = spawn()?;
     let probe_handle = probe.handle();
@@ -6590,6 +6645,35 @@ mod tests {
     }
 
     #[test]
+    fn invalid_directory_upload_source_is_rejected_before_remote_stat_spawn() {
+        let local = TestDir::new("dir-upload-invalid-local");
+        let remote = TestDir::new("dir-upload-invalid-remote");
+        let src = local.path().join("not-a-directory");
+        std::fs::write(&src, b"ordinary file").unwrap();
+        let contacted_remote = AtomicBool::new(false);
+
+        let error = upload_with_remote_stat(
+            &docker_host(),
+            &src,
+            remote.path(),
+            true,
+            &TransferControl::new(),
+            &|_| {},
+            |_, _| {
+                contacted_remote.store(true, Ordering::Relaxed);
+                Ok(None)
+            },
+        )
+        .expect_err("an invalid local directory must fail before remote contact");
+
+        assert!(error.to_string().contains("is not a directory"));
+        assert!(
+            !contacted_remote.load(Ordering::Relaxed),
+            "remote stat spawned before local archive preparation"
+        );
+    }
+
+    #[test]
     fn directory_upload_download_round_trip() {
         let local_src = TestDir::new("dir-src");
         let relay = TestDir::new("dir-relay");
@@ -6781,6 +6865,99 @@ mod tests {
                 .filter_map(Result::ok)
                 .all(|entry| !entry.file_name().as_bytes().starts_with(b".anvil-fs-part-")),
             "the failed archive leaves no transfer staging file"
+        );
+    }
+
+    #[test]
+    fn directory_archive_cap_reaps_tar_before_remote_spawn() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let local = TestDir::new("dir-upload-archive-cap");
+        let src = local.path().join("tree");
+        std::fs::create_dir(&src).unwrap();
+        let shim = local.path().join("oversized-tar");
+        std::fs::write(&shim, "#!/bin/sh\nhead -c 262144 /dev/zero\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let remote_spawned = AtomicBool::new(false);
+
+        let error = upload_dir_with_tar(
+            || {
+                remote_spawned.store(true, Ordering::Relaxed);
+                Err(io::Error::other("remote must not start"))
+            },
+            &src,
+            &shim,
+            1024,
+            &TransferControl::new(),
+            &|_| {},
+        )
+        .expect_err("an oversized archive must kill local tar before publication");
+
+        assert!(error.to_string().contains("limit"), "{error}");
+        assert!(!remote_spawned.load(Ordering::Relaxed));
+        assert!(
+            std::fs::read_dir(local.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().as_bytes().starts_with(b".anvil-fs-part-")),
+            "the rejected archive leaves no transfer staging file"
+        );
+    }
+
+    #[test]
+    fn cancelling_local_tar_reaps_it_without_remote_spawn() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let local = TestDir::new("dir-upload-archive-cancel");
+        let src = local.path().join("tree");
+        std::fs::create_dir(&src).unwrap();
+        let ready = local.path().join("tar-ready");
+        let shim = local.path().join("blocking-tar");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\nprintf ready > '{}'\nwhile :; do sleep 30; done\n",
+                ready.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let control = TransferControl::new();
+        let worker_control = control.clone();
+        let remote_spawned = Arc::new(AtomicBool::new(false));
+        let worker_spawned = remote_spawned.clone();
+        let worker = std::thread::spawn(move || {
+            upload_dir_with_tar(
+                || {
+                    worker_spawned.store(true, Ordering::Relaxed);
+                    Err(io::Error::other("remote must not start"))
+                },
+                &src,
+                &shim,
+                1 << 20,
+                &worker_control,
+                &|_| {},
+            )
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(ready.exists(), "local tar did not reach its blocking point");
+
+        control.cancel();
+        let error = worker
+            .join()
+            .expect("upload worker must not panic")
+            .expect_err("cancellation must stop local archive preparation");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(!remote_spawned.load(Ordering::Relaxed));
+        assert!(
+            std::fs::read_dir(local.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().as_bytes().starts_with(b".anvil-fs-part-")),
+            "the cancelled archive leaves no transfer staging file"
         );
     }
 
@@ -7290,21 +7467,26 @@ mod tests {
 
     #[test]
     fn upload_cleanup_is_reserved_for_cancelled_or_timed_out_probes() {
-        assert!(upload_cleanup_needed(&io::Error::new(
-            io::ErrorKind::Interrupted,
-            "cancelled"
-        )));
-        assert!(upload_cleanup_needed(&io::Error::new(
-            io::ErrorKind::TimedOut,
-            "timeout"
-        )));
-        assert!(!upload_cleanup_needed(&io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "probe cleaned itself"
-        )));
-        assert!(!upload_cleanup_needed(&io::Error::other(
-            "ordinary failure"
-        )));
+        let cancelled = io::Error::new(io::ErrorKind::Interrupted, "cancelled");
+        let timed_out = io::Error::new(io::ErrorKind::TimedOut, "timeout");
+        assert!(upload_cleanup_needed(&cancelled, true));
+        assert!(upload_cleanup_needed(&timed_out, true));
+        assert!(
+            !upload_cleanup_needed(&cancelled, false),
+            "local cancellation before remote spawn must not contact remote cleanup"
+        );
+        assert!(
+            !upload_cleanup_needed(&timed_out, false),
+            "local timeout before remote spawn must not contact remote cleanup"
+        );
+        assert!(!upload_cleanup_needed(
+            &io::Error::new(io::ErrorKind::AlreadyExists, "probe cleaned itself"),
+            true,
+        ));
+        assert!(!upload_cleanup_needed(
+            &io::Error::other("ordinary failure"),
+            true,
+        ));
     }
 
     #[test]
