@@ -2169,6 +2169,139 @@ fn source_fingerprint(metadata: &std::fs::Metadata) -> SourceFingerprint {
     }
 }
 
+/// Make a content-stable local snapshot without turning sparse holes into
+/// allocated zero blocks. The transfer cap is logical bytes: holes still
+/// count when the snapshot is later streamed, but they do not amplify local
+/// staging space. Same-filesystem reflink is preferred; sparse extent copying
+/// is the bounded fallback.
+fn snapshot_source_file(
+    source: &mut std::fs::File,
+    snapshot: &mut std::fs::File,
+    metadata: &std::fs::Metadata,
+    max: u64,
+    control: &TransferControl,
+) -> io::Result<u64> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    if control.is_timed_out() {
+        return Err(transfer_timed_out_error());
+    }
+    control.check()?;
+    if unsafe { libc::ioctl(snapshot.as_raw_fd(), libc::FICLONE, source.as_raw_fd()) } == 0 {
+        if control.is_timed_out() {
+            return Err(transfer_timed_out_error());
+        }
+        control.check()?;
+        let snapshotted = snapshot.metadata()?.len();
+        if snapshotted != metadata.len() {
+            return Err(io::Error::other(
+                "local reflink snapshot has an unexpected size",
+            ));
+        }
+        return Ok(snapshotted);
+    }
+    let clone_error = io::Error::last_os_error();
+    if !matches!(
+        clone_error.raw_os_error(),
+        Some(libc::EOPNOTSUPP | libc::ENOTTY | libc::EINVAL | libc::EXDEV)
+    ) {
+        return Err(clone_error);
+    }
+
+    snapshot.set_len(0)?;
+    source.seek(SeekFrom::Start(0))?;
+    snapshot.seek(SeekFrom::Start(0))?;
+    let allocated = metadata.blocks().saturating_mul(512);
+    if allocated >= metadata.len() {
+        return stream_to(source, snapshot, max, control, &|_| {});
+    }
+    snapshot_sparse_extents(source, snapshot, metadata.len(), control)
+}
+
+fn snapshot_sparse_extents(
+    source: &mut std::fs::File,
+    snapshot: &mut std::fs::File,
+    logical_len: u64,
+    control: &TransferControl,
+) -> io::Result<u64> {
+    use std::os::fd::AsRawFd;
+
+    snapshot.set_len(logical_len)?;
+    let source_fd = source.as_raw_fd();
+    let mut offset = 0u64;
+    let mut buffer = [0u8; STREAM_BUF_SIZE];
+    while offset < logical_len {
+        if control.is_timed_out() {
+            return Err(transfer_timed_out_error());
+        }
+        control.check()?;
+        // SAFETY: source_fd remains open and the bounded logical offset fits
+        // off_t on supported Linux targets.
+        let data = unsafe { libc::lseek(source_fd, offset as libc::off_t, libc::SEEK_DATA) };
+        if data < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENXIO) {
+                break;
+            }
+            if error.raw_os_error() == Some(libc::EINVAL) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "source filesystem cannot preserve sparse upload snapshots",
+                ));
+            }
+            return Err(error);
+        }
+        let data = data as u64;
+        if data >= logical_len {
+            break;
+        }
+        // SAFETY: same live descriptor and a kernel-returned data offset.
+        let hole = unsafe { libc::lseek(source_fd, data as libc::off_t, libc::SEEK_HOLE) };
+        let hole = if hole < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENXIO) {
+                logical_len
+            } else if error.raw_os_error() == Some(libc::EINVAL) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "source filesystem cannot preserve sparse upload snapshots",
+                ));
+            } else {
+                return Err(error);
+            }
+        } else {
+            (hole as u64).min(logical_len)
+        };
+        if hole <= data {
+            return Err(io::Error::other(
+                "source filesystem returned an invalid sparse extent",
+            ));
+        }
+        source.seek(SeekFrom::Start(data))?;
+        snapshot.seek(SeekFrom::Start(data))?;
+        let mut remaining = hole - data;
+        while remaining > 0 {
+            if control.is_timed_out() {
+                return Err(transfer_timed_out_error());
+            }
+            control.check()?;
+            let wanted = usize::try_from(remaining.min(STREAM_BUF_SIZE as u64))
+                .expect("bounded transfer chunk fits usize");
+            let read = source.read(&mut buffer[..wanted])?;
+            if read == 0 {
+                return Err(io::Error::other(
+                    "local file changed while sparse extents were snapshotted",
+                ));
+            }
+            snapshot.write_all(&buffer[..read])?;
+            remaining -= read as u64;
+        }
+        offset = hole;
+    }
+    Ok(logical_len)
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct SourceManifestEntry {
     path: PathBuf,
@@ -3198,7 +3331,7 @@ fn upload_file_with(
     let _timeout = control.arm_timeout(TRANSFER_TIMEOUT)?;
     let initial_fingerprint = source_fingerprint(&metadata);
     let (_snapshot_staging, mut snapshot) = StagedFile::beside(local_path)?;
-    let snapshotted = stream_to(&mut file, &mut snapshot, max, control, &|_| {})?;
+    let snapshotted = snapshot_source_file(&mut file, &mut snapshot, &metadata, max, control)?;
     let final_fingerprint = source_fingerprint(&file.metadata()?);
     if snapshotted != metadata.len() || final_fingerprint != initial_fingerprint {
         return Err(io::Error::other(format!(
@@ -3208,6 +3341,10 @@ fn upload_file_with(
     }
     snapshot.sync_all()?;
     snapshot.seek(SeekFrom::Start(0))?;
+    if control.is_timed_out() {
+        return Err(transfer_timed_out_error());
+    }
+    control.check()?;
 
     let probe = spawn()?;
     let probe_handle = probe.handle();
@@ -6241,6 +6378,129 @@ mod tests {
 
         assert_eq!(std::fs::read(&dst).unwrap(), b"declared source");
         assert_eq!(std::fs::read(&src).unwrap(), b"short");
+    }
+
+    #[test]
+    fn file_upload_snapshot_preserves_sparse_allocation_before_remote_spawn() {
+        use std::os::unix::fs::MetadataExt;
+
+        let local = TestDir::new("upload-source-sparse");
+        let src = local.path().join("source.bin");
+        let mut source = std::fs::File::create(&src).unwrap();
+        source.set_len(16 * 1024 * 1024).unwrap();
+        source.seek(SeekFrom::Start(0)).unwrap();
+        source.write_all(b"start").unwrap();
+        source.seek(SeekFrom::End(-3)).unwrap();
+        source.write_all(b"end").unwrap();
+        source.sync_all().unwrap();
+        drop(source);
+        let source_blocks = std::fs::metadata(&src).unwrap().blocks();
+        let snapshot_blocks = std::cell::Cell::new(0);
+
+        let error = upload_file_with(
+            || {
+                let snapshot = std::fs::read_dir(local.path())
+                    .unwrap()
+                    .map(|entry| entry.unwrap())
+                    .find(|entry| entry.file_name().as_bytes().starts_with(b".anvil-fs-part-"))
+                    .expect("the complete private snapshot exists before remote spawn");
+                snapshot_blocks.set(snapshot.metadata().unwrap().blocks());
+                Err(io::Error::other("injected remote spawn failure"))
+            },
+            &src,
+            MAX_TRANSFER_BYTES,
+            &TransferControl::new(),
+            &|_| {},
+        )
+        .expect_err("the injected spawn failure ends the test transfer");
+
+        assert_eq!(error.to_string(), "injected remote spawn failure");
+        assert!(
+            snapshot_blocks.get() <= source_blocks.saturating_add(32),
+            "snapshot allocated {} blocks for a source using {source_blocks}",
+            snapshot_blocks.get()
+        );
+        assert_eq!(
+            std::fs::read_dir(local.path()).unwrap().count(),
+            1,
+            "the failed transfer removes only its sparse snapshot"
+        );
+    }
+
+    #[test]
+    fn sparse_upload_limit_counts_logical_bytes_and_preserves_hole_content() {
+        let local = TestDir::new("upload-source-sparse-content");
+        let remote = TestDir::new("upload-source-sparse-content-dst");
+        let src = local.path().join("source.bin");
+        let mut source = std::fs::File::create(&src).unwrap();
+        let logical_len = 1024 * 1024u64;
+        source.set_len(logical_len).unwrap();
+        source.seek(SeekFrom::Start(17)).unwrap();
+        source.write_all(b"start").unwrap();
+        source.seek(SeekFrom::Start(logical_len - 3)).unwrap();
+        source.write_all(b"end").unwrap();
+        drop(source);
+        let spawned = AtomicBool::new(false);
+
+        let error = upload_file_with(
+            || {
+                spawned.store(true, Ordering::Relaxed);
+                Err(io::Error::other("oversize upload must not spawn"))
+            },
+            &src,
+            logical_len - 1,
+            &TransferControl::new(),
+            &|_| {},
+        )
+        .expect_err("a sparse file's holes still count toward the logical cap");
+        assert!(error.to_string().contains("limit"));
+        assert!(!spawned.load(Ordering::Relaxed));
+
+        let dst = remote.path().join("uploaded.bin");
+        let dst_str = dst.to_str().unwrap().to_string();
+        upload_file_with(
+            || spawn_local(&["put", &dst_str, "feed-a3"], ScriptDelivery::Argv),
+            &src,
+            logical_len,
+            &TransferControl::new(),
+            &|_| {},
+        )
+        .unwrap();
+        let uploaded = std::fs::read(&dst).unwrap();
+        assert_eq!(uploaded.len() as u64, logical_len);
+        assert_eq!(&uploaded[17..22], b"start");
+        assert!(uploaded[22..logical_len as usize - 3]
+            .iter()
+            .all(|byte| *byte == 0));
+        assert_eq!(&uploaded[logical_len as usize - 3..], b"end");
+    }
+
+    #[test]
+    fn directory_manifest_keeps_each_hardlink_path() {
+        let local = TestDir::new("upload-manifest-hardlinks");
+        let src = local.path().join("tree");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("first"), b"shared content").unwrap();
+        std::fs::hard_link(src.join("first"), src.join("second")).unwrap();
+        let source = open_source_directory(&src).unwrap();
+
+        let manifest = source_directory_manifest(&source, &TransferControl::new()).unwrap();
+        let first = manifest
+            .iter()
+            .find(|entry| entry.path == Path::new("first"))
+            .unwrap();
+        let second = manifest
+            .iter()
+            .find(|entry| entry.path == Path::new("second"))
+            .unwrap();
+
+        assert_eq!(first.fingerprint, second.fingerprint);
+        assert_ne!(first.path, second.path);
+        assert_eq!(
+            manifest.len(),
+            3,
+            "root plus both hardlink paths are retained"
+        );
     }
 
     #[cfg(target_os = "linux")]
