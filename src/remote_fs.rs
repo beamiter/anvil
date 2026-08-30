@@ -237,6 +237,9 @@ const MAX_TRANSFER_STDERR_BYTES: usize = 64 * 1024;
 const STREAM_BUF_SIZE: usize = 64 * 1024;
 const MAX_ERROR_DISPLAY_BYTES: usize = 512;
 const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// A manifest prevents a locally changing tree from producing a mixed
+/// archive. Bound it so a hostile sparse tree cannot exhaust the worker.
+const MAX_UPLOAD_MANIFEST_ENTRIES: usize = 1_000_000;
 
 /// A value-owned endpoint captured from a process-observed SSH login. The
 /// identity is the validated base target used for matching and UI intent;
@@ -2066,6 +2069,10 @@ fn stream_to<R: Read, W: Write>(
     let mut buf = [0u8; STREAM_BUF_SIZE];
     let mut throttle = ProgressThrottle::new();
     loop {
+        if control.is_timed_out() {
+            return Err(transfer_timed_out_error());
+        }
+        control.check()?;
         let read = from.read(&mut buf)?;
         if read == 0 {
             let total = throttle.total();
@@ -2127,6 +2134,125 @@ fn open_source_file(path: &Path) -> io::Result<std::fs::File> {
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceFingerprint {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    rdev: u64,
+    len: u64,
+    modified_secs: i64,
+    modified_nanos: i64,
+    changed_secs: i64,
+    changed_nanos: i64,
+}
+
+fn source_fingerprint(metadata: &std::fs::Metadata) -> SourceFingerprint {
+    use std::os::unix::fs::MetadataExt;
+
+    SourceFingerprint {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        mode: metadata.mode(),
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        rdev: metadata.rdev(),
+        len: metadata.len(),
+        modified_secs: metadata.mtime(),
+        modified_nanos: metadata.mtime_nsec(),
+        changed_secs: metadata.ctime(),
+        changed_nanos: metadata.ctime_nsec(),
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SourceManifestEntry {
+    path: PathBuf,
+    fingerprint: SourceFingerprint,
+}
+
+fn source_directory_manifest(
+    root: &std::fs::File,
+    control: &TransferControl,
+) -> io::Result<Vec<SourceManifestEntry>> {
+    let mut root_fingerprint = source_fingerprint(&root.metadata()?);
+    // Renaming the pinned root changes its ctime without changing anything
+    // tar reads. Its parent path is deliberately outside the source-content
+    // contract; all archive-visible root metadata remains in the comparison.
+    root_fingerprint.changed_secs = 0;
+    root_fingerprint.changed_nanos = 0;
+    let mut manifest = vec![SourceManifestEntry {
+        path: PathBuf::new(),
+        fingerprint: root_fingerprint,
+    }];
+    append_source_directory_manifest(root, Path::new(""), 0, &mut manifest, control)?;
+    Ok(manifest)
+}
+
+fn append_source_directory_manifest(
+    directory: &std::fs::File,
+    relative: &Path,
+    depth: usize,
+    manifest: &mut Vec<SourceManifestEntry>,
+    control: &TransferControl,
+) -> io::Result<()> {
+    if control.is_timed_out() {
+        return Err(transfer_timed_out_error());
+    }
+    control.check()?;
+    if depth >= MAX_COPY_DEPTH {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "local directory is too deeply nested to upload safely",
+        ));
+    }
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(anchored_descriptor_path(directory))? {
+        if control.is_timed_out() {
+            return Err(transfer_timed_out_error());
+        }
+        control.check()?;
+        if manifest.len().saturating_add(names.len()) >= MAX_UPLOAD_MANIFEST_ENTRIES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("local directory contains more than {MAX_UPLOAD_MANIFEST_ENTRIES} entries"),
+            ));
+        }
+        names.push(entry?.file_name());
+    }
+    names.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+
+    for name in names {
+        if manifest.len() >= MAX_UPLOAD_MANIFEST_ENTRIES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("local directory contains more than {MAX_UPLOAD_MANIFEST_ENTRIES} entries"),
+            ));
+        }
+        let metadata = std::fs::symlink_metadata(anchored_entry_path(directory, &name))?;
+        let fingerprint = source_fingerprint(&metadata);
+        let path = relative.join(&name);
+        manifest.push(SourceManifestEntry {
+            path: path.clone(),
+            fingerprint,
+        });
+        if metadata.is_dir() {
+            let child = open_directory_at(directory, &name)?;
+            if source_fingerprint(&child.metadata()?) != fingerprint {
+                return Err(source_directory_changed_error());
+            }
+            append_source_directory_manifest(&child, &path, depth + 1, manifest, control)?;
+        }
+    }
+    Ok(())
+}
+
+fn source_directory_changed_error() -> io::Error {
+    io::Error::other("local directory changed while being archived")
 }
 
 fn create_directory_at(parent: &std::fs::File, name: &OsStr) -> io::Result<()> {
@@ -3042,10 +3168,11 @@ fn download_file_with(
     Ok(dst)
 }
 
-/// Stream one local regular file into the probe's `put`. The source is opened
-/// once before the remote process starts, so a same-path replacement cannot
-/// redirect the transfer to a different inode. This follows an initial
-/// symlink like the remote `cat` does, but pins the resolved target.
+/// Snapshot one local regular file before starting the probe's `put`. The
+/// source is opened once and copied into a private local staging file, so
+/// path replacement and later writes through a hard-link alias cannot change
+/// the bytes sent remotely. This follows an initial symlink like the remote
+/// `cat` does, but pins the resolved target while making the snapshot.
 fn upload_file_with(
     spawn: impl FnOnce() -> io::Result<ProbeChild>,
     local_path: &Path,
@@ -3053,7 +3180,7 @@ fn upload_file_with(
     control: &TransferControl,
     progress: &dyn Fn(u64),
 ) -> io::Result<()> {
-    let file = open_source_file(local_path)?;
+    let mut file = open_source_file(local_path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(io::Error::new(
@@ -3068,6 +3195,20 @@ fn upload_file_with(
         return Err(too_large_error(max));
     }
     control.check()?;
+    let _timeout = control.arm_timeout(TRANSFER_TIMEOUT)?;
+    let initial_fingerprint = source_fingerprint(&metadata);
+    let (_snapshot_staging, mut snapshot) = StagedFile::beside(local_path)?;
+    let snapshotted = stream_to(&mut file, &mut snapshot, max, control, &|_| {})?;
+    let final_fingerprint = source_fingerprint(&file.metadata()?);
+    if snapshotted != metadata.len() || final_fingerprint != initial_fingerprint {
+        return Err(io::Error::other(format!(
+            "local file changed while being snapshotted ({snapshotted} of {} bytes captured)",
+            metadata.len()
+        )));
+    }
+    snapshot.sync_all()?;
+    snapshot.seek(SeekFrom::Start(0))?;
+
     let probe = spawn()?;
     let probe_handle = probe.handle();
     let mut probe_cleanup = ChildCleanupGuard::new(&probe_handle);
@@ -3079,8 +3220,7 @@ fn upload_file_with(
     let stdout_drain = probe
         .stdout
         .map(|pipe| spawn_bounded_reader(pipe, MAX_TRANSFER_STDERR_BYTES));
-    let _timeout = control.arm_timeout(TRANSFER_TIMEOUT)?;
-    let streamed = stream_to(file, stdin, max, control, progress);
+    let streamed = stream_to(snapshot, stdin, max, control, progress);
     // stream_to owns and drops stdin here, so the far side sees the payload
     // EOF before it finishes `put`.
     let status = probe_cleanup.wait()?;
@@ -3099,10 +3239,9 @@ fn upload_file_with(
             stderr,
         },
     )?;
-    if streamed != metadata.len() {
+    if streamed != snapshotted {
         return Err(io::Error::other(format!(
-            "local file changed during upload ({streamed} of {} bytes sent)",
-            metadata.len()
+            "local upload snapshot was not fully sent ({streamed} of {snapshotted} bytes)"
         )));
     }
     Ok(())
@@ -3147,6 +3286,8 @@ fn upload_dir_with_tar(
             error
         }
     })?;
+    let _timeout = control.arm_timeout(TRANSFER_TIMEOUT)?;
+    let initial_manifest = source_directory_manifest(&source, control)?;
     let source_path = anchored_descriptor_path(&source);
     let (_archive_staging, mut archive) = StagedFile::beside(local_path)?;
     let mut tar_command = Command::new(tar_program);
@@ -3197,7 +3338,6 @@ fn upload_dir_with_tar(
         (stdout, stderr)
     };
     control.register(&tar);
-    let _timeout = control.arm_timeout(TRANSFER_TIMEOUT)?;
     let packed = stream_to(tar_stdout, &mut archive, max, control, &|_| {});
     if packed.is_err() {
         // After an overflow the tar can still be blocked writing; make sure
@@ -3223,6 +3363,21 @@ fn upload_dir_with_tar(
                 detail
             }
         )));
+    }
+    let final_manifest = source_directory_manifest(&source, control).map_err(|error| {
+        if matches!(
+            error.kind(),
+            io::ErrorKind::Interrupted | io::ErrorKind::TimedOut
+        ) {
+            error
+        } else {
+            io::Error::other(format!(
+                "local directory changed while being archived: {error}"
+            ))
+        }
+    })?;
+    if final_manifest != initial_manifest {
+        return Err(source_directory_changed_error());
     }
     archive.sync_all()?;
     archive.seek(SeekFrom::Start(0))?;
@@ -6034,6 +6189,60 @@ mod tests {
         assert_eq!(std::fs::read(&src).unwrap(), b"replacement");
     }
 
+    #[test]
+    fn file_upload_snapshots_content_before_remote_spawn_mutates_a_hardlink() {
+        let local = TestDir::new("upload-source-hardlink-write");
+        let remote = TestDir::new("upload-source-hardlink-write-dst");
+        let src = local.path().join("source.bin");
+        let alias = local.path().join("source-alias.bin");
+        std::fs::write(&src, b"declared source").unwrap();
+        std::fs::hard_link(&src, &alias).unwrap();
+        let dst = remote.path().join("uploaded.bin");
+        let dst_str = dst.to_str().unwrap().to_string();
+
+        upload_file_with(
+            || {
+                std::fs::write(&alias, b"replaced source").unwrap();
+                spawn_local(&["put", &dst_str, "feed-a1"], ScriptDelivery::Argv)
+            },
+            &src,
+            1 << 20,
+            &TransferControl::new(),
+            &|_| {},
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(&dst).unwrap(), b"declared source");
+        assert_eq!(std::fs::read(&src).unwrap(), b"replaced source");
+    }
+
+    #[test]
+    fn file_upload_snapshots_content_before_remote_spawn_truncates_a_hardlink() {
+        let local = TestDir::new("upload-source-hardlink-truncate");
+        let remote = TestDir::new("upload-source-hardlink-truncate-dst");
+        let src = local.path().join("source.bin");
+        let alias = local.path().join("source-alias.bin");
+        std::fs::write(&src, b"declared source").unwrap();
+        std::fs::hard_link(&src, &alias).unwrap();
+        let dst = remote.path().join("uploaded.bin");
+        let dst_str = dst.to_str().unwrap().to_string();
+
+        upload_file_with(
+            || {
+                std::fs::write(&alias, b"short").unwrap();
+                spawn_local(&["put", &dst_str, "feed-a2"], ScriptDelivery::Argv)
+            },
+            &src,
+            1 << 20,
+            &TransferControl::new(),
+            &|_| {},
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(&dst).unwrap(), b"declared source");
+        assert_eq!(std::fs::read(&src).unwrap(), b"short");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn pinned_upload_sources_are_cloexec_and_transfer_scoped() {
@@ -6065,6 +6274,24 @@ mod tests {
         .expect_err("a pre-cancelled upload must stop after opening its source");
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         assert_eq!(open_descriptor_count_for(&file), 0);
+
+        let error = upload_file_with(
+            || Err(io::Error::other("injected remote spawn failure")),
+            &file,
+            1 << 20,
+            &TransferControl::new(),
+            &|_| {},
+        )
+        .expect_err("a remote spawn failure must discard the completed snapshot");
+        assert_eq!(error.to_string(), "injected remote spawn failure");
+        assert_eq!(open_descriptor_count_for(&file), 0);
+        assert!(
+            std::fs::read_dir(local.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().as_bytes().starts_with(b".anvil-fs-part-")),
+            "a failed remote spawn leaves no local upload snapshot"
+        );
 
         let error = upload_dir_with(
             || Err(io::Error::other("injected remote spawn failure")),
@@ -6205,6 +6432,58 @@ mod tests {
         assert_eq!(
             std::fs::read(src.join("nested").join("marker")).unwrap(),
             b"replacement"
+        );
+    }
+
+    #[test]
+    fn directory_upload_refuses_in_place_content_change_before_remote_spawn() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let local = TestDir::new("dir-upload-content-change");
+        let src = local.path().join("tree");
+        std::fs::create_dir_all(src.join("nested")).unwrap();
+        let marker = src.join("nested").join("marker");
+        let alias = local.path().join("marker-alias");
+        std::fs::write(&marker, b"declared source").unwrap();
+        std::fs::hard_link(&marker, &alias).unwrap();
+
+        let shim = local.path().join("tar-shim");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\nprintf 'replaced source' > '{}'\nexec tar \"$@\"\n",
+                alias.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let spawned = AtomicBool::new(false);
+
+        let error = upload_dir_with_tar(
+            || {
+                spawned.store(true, Ordering::Relaxed);
+                Err(io::Error::other("remote must not start"))
+            },
+            &src,
+            &shim,
+            1 << 20,
+            &TransferControl::new(),
+            &|_| {},
+        )
+        .expect_err("a changed local tree must stop before remote publication");
+
+        assert!(
+            error.to_string().contains("changed while being archived"),
+            "the local source change must remain the primary error: {error}"
+        );
+        assert!(!spawned.load(Ordering::Relaxed));
+        assert_eq!(std::fs::read(&marker).unwrap(), b"replaced source");
+        assert!(
+            std::fs::read_dir(local.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().as_bytes().starts_with(b".anvil-fs-part-")),
+            "the rejected archive leaves no transfer staging file"
         );
     }
 
