@@ -26,9 +26,9 @@ use crate::file_tree::FileEntry;
 /// therefore run as `sh -c '<script>' -- <op> [args...]` instead: a shell's
 /// read-ahead on `sh -s` may legally swallow payload bytes into its own
 /// buffer. Keep the exit-code contract in sync with `probe_result`.
-pub(crate) const PROBE_SCRIPT: &str = r#"# remote-fs probe v5 — runs under `sh -s -- <op> [args...]`.
+pub(crate) const PROBE_SCRIPT: &str = r#"# remote-fs probe v6 — runs under `sh -s -- <op> [args...]`.
 # `list` stdout: NUL-separated pairs "<t>\0<name>\0", t in {d,f,l}, names relative.
-# `cat` streams a file to stdout; `put <path> <transfer-id>` stores stdin as a new file;
+# `cat` streams a file to stdout; `put <path> <transfer-id> [size sha256]` stores stdin as a new file;
 # `tar` streams a directory to stdout; `untar <dir> <name> <transfer-id>` extracts
 # stdin into private same-parent staging, validates one matching directory root,
 # then publishes it without replacing a destination created concurrently;
@@ -101,10 +101,18 @@ case "$op" in
     cat "$p" || exit 4
     ;;
   put)
-    p=${2:-}; id=${3:-}
+    p=${2:-}; id=${3:-}; expected_size=${4:-}; expected_digest=${5:-}
     case "$p" in /*) ;; *) exit 2 ;; esac
     case "$id" in ''|*[!0-9a-f-]*) exit 2 ;; esac
     [ "${#id}" -le 96 ] || exit 2
+    verified=0
+    if [ -n "$expected_size" ] || [ -n "$expected_digest" ]; then
+      case "$expected_size" in ''|*[!0-9]*) exit 2 ;; esac
+      case "$expected_digest" in ''|*[!0-9a-f]*) exit 2 ;; esac
+      [ "${#expected_digest}" -eq 64 ] || exit 2
+      command -v sha256sum >/dev/null 2>&1 || { echo "remote-fs probe: sha256sum is not installed" >&2; exit 4; }
+      verified=1
+    fi
     if [ -e "$p" ] || [ -L "$p" ]; then exit 17; fi
     d=${p%/*}
     d=${d:-/}
@@ -118,21 +126,73 @@ case "$op" in
       esac
       i=$((i + 1))
       [ "$candidate" = "$p" ] && continue
-      if mkdir "$candidate" 2>/dev/null; then stage=$candidate; break; fi
+      if mkdir "$candidate" 2>/dev/null; then
+        if printf '%s\n' "$id" > "$candidate/owner"; then stage=$candidate; break; fi
+        rmdir "$candidate" 2>/dev/null || :
+      fi
     done
     [ -n "$stage" ] || exit 4
     payload="$stage/payload"
     code=4
     if cat > "$payload"; then
-      if ln -T "$payload" "$p" 2>/dev/null; then
-        code=0
-      elif [ -e "$p" ] || [ -L "$p" ]; then
-        code=17
+      valid=1
+      if [ "$verified" -eq 1 ]; then
+        actual_size=$(wc -c < "$payload") || valid=0
+        actual_digest=$(sha256sum "$payload") || valid=0
+        actual_digest=${actual_digest%% *}
+        [ "$actual_size" = "$expected_size" ] || valid=0
+        [ "$actual_digest" = "$expected_digest" ] || valid=0
+        if [ "$valid" -eq 1 ]; then
+          printf '%s %s %s\n' "$id" "$expected_size" "$expected_digest" > "$stage/receipt" || valid=0
+        fi
+      fi
+      if [ "$valid" -eq 1 ]; then
+        if ln -T "$payload" "$p" 2>/dev/null; then
+          code=0
+        elif [ -e "$p" ] || [ -L "$p" ]; then
+          code=17
+        fi
       fi
     fi
-    rm -f "$payload"
-    rmdir "$stage" 2>/dev/null || :
+    if [ "$code" -ne 0 ] || [ "$verified" -ne 1 ]; then
+      rm -f "$stage/receipt" "$payload" "$stage/owner"
+      rmdir "$stage" 2>/dev/null || :
+    fi
     exit "$code"
+    ;;
+  put-status)
+    p=${2:-}; id=${3:-}; expected_size=${4:-}; expected_digest=${5:-}
+    case "$p" in /*) ;; *) exit 2 ;; esac
+    case "$id" in ''|*[!0-9a-f-]*) exit 2 ;; esac
+    case "$expected_size" in ''|*[!0-9]*) exit 2 ;; esac
+    case "$expected_digest" in ''|*[!0-9a-f]*) exit 2 ;; esac
+    [ "${#id}" -le 96 ] || exit 2
+    [ "${#expected_digest}" -eq 64 ] || exit 2
+    command -v sha256sum >/dev/null 2>&1 || exit 4
+    d=${p%/*}; d=${d:-/}; i=0
+    while [ "$i" -lt 32 ]; do
+      case "$d" in /) stage="/.anvil-fs-put-$id-$i" ;; *) stage="$d/.anvil-fs-put-$id-$i" ;; esac
+      i=$((i + 1))
+      [ -d "$stage" ] && [ ! -L "$stage" ] || continue
+      [ -f "$stage/owner" ] && [ ! -L "$stage/owner" ] || continue
+      owner=; IFS= read -r owner < "$stage/owner" || continue
+      [ "$owner" = "$id" ] || continue
+      [ -f "$stage/receipt" ] && [ ! -L "$stage/receipt" ] || continue
+      [ -f "$stage/payload" ] && [ ! -L "$stage/payload" ] || continue
+      rid=; rsize=; rdigest=; extra=
+      IFS=' ' read -r rid rsize rdigest extra < "$stage/receipt" || continue
+      [ "$rid" = "$id" ] && [ "$rsize" = "$expected_size" ] && [ "$rdigest" = "$expected_digest" ] && [ -z "$extra" ] || continue
+      if [ -e "$p" ] || [ -L "$p" ]; then
+        [ -f "$p" ] && [ ! -L "$p" ] && [ "$stage/payload" -ef "$p" ] || exit 17
+        actual_size=$(wc -c < "$stage/payload") || exit 4
+        actual_digest=$(sha256sum "$stage/payload") || exit 4
+        actual_digest=${actual_digest%% *}
+        [ "$actual_size" = "$expected_size" ] && [ "$actual_digest" = "$expected_digest" ] || exit 17
+        exit 0
+      fi
+    done
+    if [ -e "$p" ] || [ -L "$p" ]; then exit 17; fi
+    exit 3
     ;;
   tar)
     p=${2%/}
@@ -144,11 +204,20 @@ case "$op" in
     tar cf - -C "$d" "${p##*/}" || exit 4
     ;;
   untar)
-    d=${2:-}; n=${3:-}; id=${4:-}
+    d=${2:-}; n=${3:-}; id=${4:-}; expected_size=${5:-}; expected_digest=${6:-}
     case "$d" in /*) ;; *) exit 2 ;; esac
     case "$n" in ""|.|..|*/*) exit 2 ;; esac
     case "$id" in ''|*[!0-9a-f-]*) exit 2 ;; esac
     [ "${#id}" -le 96 ] || exit 2
+    verified=0
+    if [ -n "$expected_size" ] || [ -n "$expected_digest" ]; then
+      case "$expected_size" in ''|*[!0-9]*) exit 2 ;; esac
+      case "$expected_digest" in ''|*[!0-9a-f]*) exit 2 ;; esac
+      [ "${#expected_digest}" -eq 64 ] || exit 2
+      command -v sha256sum >/dev/null 2>&1 || { echo "remote-fs probe: sha256sum is not installed" >&2; exit 4; }
+      command -v stat >/dev/null 2>&1 || { echo "remote-fs probe: stat is not installed" >&2; exit 4; }
+      verified=1
+    fi
     [ -d "$d" ] || exit 3
     command -v tar >/dev/null 2>&1 || { echo "remote-fs probe: tar is not installed" >&2; exit 4; }
     command -v mv >/dev/null 2>&1 || { echo "remote-fs probe: mv is not installed" >&2; exit 4; }
@@ -161,20 +230,42 @@ case "$op" in
       candidate=".anvil-fs-untar-$id-$i"
       i=$((i + 1))
       [ "$candidate" = "$n" ] && continue
-      if mkdir "$candidate" 2>/dev/null; then stage=$candidate; break; fi
+      if mkdir "$candidate" 2>/dev/null; then
+        if printf '%s\n' "$id" > "$candidate/owner"; then stage=$candidate; break; fi
+        rmdir "$candidate" 2>/dev/null || :
+      fi
     done
     [ -n "$stage" ] || exit 4
     code=4
-    if (cd "$stage" && tar xf -); then
+    archive="$stage/archive"
+    valid_archive=1
+    cat > "$archive" || valid_archive=0
+    if [ "$verified" -eq 1 ] && [ "$valid_archive" -eq 1 ]; then
+      actual_size=$(wc -c < "$archive") || valid_archive=0
+      actual_digest=$(sha256sum "$archive") || valid_archive=0
+      actual_digest=${actual_digest%% *}
+      [ "$actual_size" = "$expected_size" ] || valid_archive=0
+      [ "$actual_digest" = "$expected_digest" ] || valid_archive=0
+    fi
+    if [ "$valid_archive" -eq 1 ] && mkdir "$stage/work" 2>/dev/null && (cd "$stage/work" && tar xf ../archive); then
+      rm -f "$archive"
       count=0
       valid=1
-      source="$stage/$n"
-      for f in "$stage"/* "$stage"/.[!.]* "$stage"/..?*; do
+      source="$stage/work/$n"
+      for f in "$stage/work"/* "$stage/work"/.[!.]* "$stage/work"/..?*; do
         if [ -e "$f" ] || [ -L "$f" ]; then
           count=$((count + 1))
           [ "$f" = "$source" ] || valid=0
         fi
       done
+      if [ "$count" -eq 1 ] && [ "$valid" -eq 1 ] && [ -d "$source" ] && [ ! -L "$source" ]; then
+        if [ "$verified" -eq 1 ]; then
+          identity=$(stat -c '%d:%i' "$source") || valid=0
+          if [ "$valid" -eq 1 ]; then
+            printf '%s %s %s %s\n' "$id" "$expected_size" "$expected_digest" "$identity" > "$stage/receipt" || valid=0
+          fi
+        fi
+      fi
       if [ "$count" -eq 1 ] && [ "$valid" -eq 1 ] && [ -d "$source" ] && [ ! -L "$source" ]; then
         if mv --no-copy -nT -- "$source" "$n" 2>/dev/null; then
           if [ -e "$source" ] || [ -L "$source" ]; then
@@ -187,8 +278,41 @@ case "$op" in
         fi
       fi
     fi
-    rm -rf -- "$stage"
+    if [ "$code" -ne 0 ] || [ "$verified" -ne 1 ]; then rm -rf -- "$stage"; fi
     exit "$code"
+    ;;
+  untar-status)
+    d=${2:-}; n=${3:-}; id=${4:-}; expected_size=${5:-}; expected_digest=${6:-}
+    case "$d" in /*) ;; *) exit 2 ;; esac
+    case "$n" in ""|.|..|*/*) exit 2 ;; esac
+    case "$id" in ''|*[!0-9a-f-]*) exit 2 ;; esac
+    case "$expected_size" in ''|*[!0-9]*) exit 2 ;; esac
+    case "$expected_digest" in ''|*[!0-9a-f]*) exit 2 ;; esac
+    [ "${#id}" -le 96 ] || exit 2
+    [ "${#expected_digest}" -eq 64 ] || exit 2
+    [ -d "$d" ] || exit 3
+    command -v stat >/dev/null 2>&1 || exit 4
+    cd "$d" 2>/dev/null || exit 3
+    i=0
+    while [ "$i" -lt 32 ]; do
+      stage=".anvil-fs-untar-$id-$i"; i=$((i + 1))
+      [ -d "$stage" ] && [ ! -L "$stage" ] || continue
+      [ -f "$stage/owner" ] && [ ! -L "$stage/owner" ] || continue
+      owner=; IFS= read -r owner < "$stage/owner" || continue
+      [ "$owner" = "$id" ] || continue
+      [ -f "$stage/receipt" ] && [ ! -L "$stage/receipt" ] || continue
+      rid=; rsize=; rdigest=; ridentity=; extra=
+      IFS=' ' read -r rid rsize rdigest ridentity extra < "$stage/receipt" || continue
+      [ "$rid" = "$id" ] && [ "$rsize" = "$expected_size" ] && [ "$rdigest" = "$expected_digest" ] && [ -n "$ridentity" ] && [ -z "$extra" ] || continue
+      if [ -e "$n" ] || [ -L "$n" ]; then
+        [ -d "$n" ] && [ ! -L "$n" ] || exit 17
+        identity=$(stat -c '%d:%i' "$n") || exit 4
+        [ "$identity" = "$ridentity" ] || exit 17
+        exit 0
+      fi
+    done
+    if [ -e "$n" ] || [ -L "$n" ]; then exit 17; fi
+    exit 3
     ;;
   stat)
     p=${2:-}
@@ -3094,8 +3218,10 @@ fn upload_with_remote_stat(
         // root, and publishes with an atomic no-replace rename.
         let transfer_id = upload_transfer_id();
         let remote_probe_started = AtomicBool::new(false);
-        let result = upload_dir_with(
-            || {
+        let mut expected_integrity = None;
+        let result = upload_dir_with_integrity(
+            |integrity| {
+                expected_integrity = Some(integrity.clone());
                 // Local archive preparation owns the first phase. Do not
                 // contact the remote until its bytes and final manifest are
                 // complete; untar's no-replace publication remains the
@@ -3111,30 +3237,51 @@ fn upload_with_remote_stat(
                     return Err(transfer_timed_out_error());
                 }
                 control.check()?;
-                remote_probe_started.store(true, Ordering::Relaxed);
-                spawn_probe_streaming(
+                let size = integrity.size.to_string();
+                let child = spawn_probe_streaming(
                     host,
                     "untar",
-                    &[remote_dir.as_os_str(), name, OsStr::new(&transfer_id)],
+                    &[
+                        remote_dir.as_os_str(),
+                        name,
+                        OsStr::new(&transfer_id),
+                        OsStr::new(&size),
+                        OsStr::new(&integrity.sha256),
+                    ],
                     ScriptDelivery::Argv,
-                )
+                )?;
+                remote_probe_started.store(true, Ordering::Relaxed);
+                Ok(child)
             },
             local_path,
+            Path::new("tar"),
             MAX_TRANSFER_BYTES,
             control,
             progress,
         );
-        if result.as_ref().is_err_and(|error| {
-            upload_cleanup_needed(error, remote_probe_started.load(Ordering::Relaxed))
-        }) {
-            cleanup_remote_untar(host, remote_dir, name, &transfer_id);
-        }
-        result?;
+        let started = remote_probe_started.load(Ordering::Relaxed);
+        let integrity = expected_integrity.as_ref();
+        settle_remote_upload(
+            result,
+            started,
+            || {
+                remote_untar_publication_state(
+                    host,
+                    remote_dir,
+                    name,
+                    &transfer_id,
+                    integrity.expect("a started upload has integrity"),
+                )
+            },
+            || cleanup_remote_untar(host, remote_dir, name, &transfer_id),
+        )?;
     } else {
         let transfer_id = upload_transfer_id();
         let remote_probe_started = AtomicBool::new(false);
-        let result = upload_file_with(
-            || {
+        let mut expected_integrity = None;
+        let result = upload_file_with_integrity(
+            |integrity| {
+                expected_integrity = Some(integrity.clone());
                 if control.is_timed_out() {
                     return Err(transfer_timed_out_error());
                 }
@@ -3146,27 +3293,41 @@ fn upload_with_remote_stat(
                     return Err(transfer_timed_out_error());
                 }
                 control.check()?;
-                remote_probe_started.store(true, Ordering::Relaxed);
-                spawn_probe_streaming(
+                let size = integrity.size.to_string();
+                let child = spawn_probe_streaming(
                     host,
                     "put",
-                    &[dst.as_os_str(), OsStr::new(&transfer_id)],
+                    &[
+                        dst.as_os_str(),
+                        OsStr::new(&transfer_id),
+                        OsStr::new(&size),
+                        OsStr::new(&integrity.sha256),
+                    ],
                     ScriptDelivery::Argv,
-                )
+                )?;
+                remote_probe_started.store(true, Ordering::Relaxed);
+                Ok(child)
             },
             local_path,
             MAX_TRANSFER_BYTES,
             control,
             progress,
         );
-        // A kill (cancel/timeout) is the only way the probe's private staging
-        // directory survives — it cleans up after other failures.
-        if result.as_ref().is_err_and(|error| {
-            upload_cleanup_needed(error, remote_probe_started.load(Ordering::Relaxed))
-        }) {
-            cleanup_remote_put(host, &dst, &transfer_id);
-        }
-        result?;
+        let started = remote_probe_started.load(Ordering::Relaxed);
+        let integrity = expected_integrity.as_ref();
+        settle_remote_upload(
+            result,
+            started,
+            || {
+                remote_put_publication_state(
+                    host,
+                    &dst,
+                    &transfer_id,
+                    integrity.expect("a started upload has integrity"),
+                )
+            },
+            || cleanup_remote_put(host, &dst, &transfer_id),
+        )?;
     }
     Ok(dst)
 }
@@ -3186,12 +3347,108 @@ fn upload_transfer_id() -> String {
     )
 }
 
-fn upload_cleanup_needed(error: &io::Error, remote_probe_started: bool) -> bool {
-    remote_probe_started
-        && matches!(
-            error.kind(),
-            io::ErrorKind::Interrupted | io::ErrorKind::TimedOut
-        )
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublicationState {
+    Published,
+    NotPublished,
+    ConflictingDestination,
+}
+
+fn publication_state(result: io::Result<Vec<u8>>) -> io::Result<PublicationState> {
+    match result {
+        Ok(_) => Ok(PublicationState::Published),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(PublicationState::NotPublished),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            Ok(PublicationState::ConflictingDestination)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn remote_put_publication_state(
+    host: &RemoteHost,
+    dst: &Path,
+    transfer_id: &str,
+    integrity: &UploadIntegrity,
+) -> io::Result<PublicationState> {
+    let size = integrity.size.to_string();
+    publication_state(run_probe(
+        host,
+        "put-status",
+        &[
+            dst.as_os_str(),
+            OsStr::new(transfer_id),
+            OsStr::new(&size),
+            OsStr::new(&integrity.sha256),
+        ],
+        PROBE_OP_TIMEOUT,
+    ))
+}
+
+fn remote_untar_publication_state(
+    host: &RemoteHost,
+    dst_dir: &Path,
+    name: &OsStr,
+    transfer_id: &str,
+    integrity: &UploadIntegrity,
+) -> io::Result<PublicationState> {
+    let size = integrity.size.to_string();
+    publication_state(run_probe(
+        host,
+        "untar-status",
+        &[
+            dst_dir.as_os_str(),
+            name,
+            OsStr::new(transfer_id),
+            OsStr::new(&size),
+            OsStr::new(&integrity.sha256),
+        ],
+        PROBE_OP_TIMEOUT,
+    ))
+}
+
+fn settle_remote_upload(
+    attempt: io::Result<()>,
+    remote_probe_started: bool,
+    reconcile: impl FnOnce() -> io::Result<PublicationState>,
+    cleanup: impl FnOnce(),
+) -> io::Result<()> {
+    if !remote_probe_started {
+        return attempt;
+    }
+    if attempt.is_ok() {
+        cleanup();
+        return Ok(());
+    }
+    let primary = attempt.expect_err("the successful branch returned above");
+    match reconcile() {
+        Ok(PublicationState::Published) => {
+            cleanup();
+            Ok(())
+        }
+        Ok(PublicationState::NotPublished) => {
+            cleanup();
+            Err(primary)
+        }
+        Ok(PublicationState::ConflictingDestination) => {
+            cleanup();
+            if primary.kind() == io::ErrorKind::AlreadyExists {
+                Err(primary)
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "remote upload lost publication to a concurrent destination",
+                ))
+            }
+        }
+        Err(error) => {
+            // The primary transfer result remains authoritative until a
+            // token-bound receipt can prove otherwise. Leave staging intact
+            // so a later diagnostic/retry can still reconcile it.
+            log::warn!("remote upload publication could not be reconciled: {error}");
+            Err(primary)
+        }
+    }
 }
 
 /// A cancelled `put` can leave any one of its collision-retry directories.
@@ -3216,7 +3473,11 @@ fn part_cleanup_command(dst: &Path, transfer_id: &str) -> OsString {
     command.extend_from_slice(b"$i; i=$((i + 1)); [ \"$d\" = ");
     command.extend_from_slice(&sq_bytes(dst.as_os_str().as_bytes()));
     command.extend_from_slice(
-        b" ] && continue; [ -d \"$d\" ] && [ ! -L \"$d\" ] || continue; rm -f \"$d/payload\"; rmdir \"$d\" 2>/dev/null || :; done",
+        b" ] && continue; [ -d \"$d\" ] && [ ! -L \"$d\" ] || continue; [ -f \"$d/owner\" ] && [ ! -L \"$d/owner\" ] || continue; owner=; IFS= read -r owner < \"$d/owner\" || continue; [ \"$owner\" = ",
+    );
+    command.extend_from_slice(&sq_bytes(transfer_id.as_bytes()));
+    command.extend_from_slice(
+        b" ] || continue; rm -f \"$d/receipt\" \"$d/payload\" \"$d/owner\"; rmdir \"$d\" 2>/dev/null || :; done",
     );
     OsString::from_vec(command)
 }
@@ -3231,8 +3492,10 @@ fn untar_cleanup_command(dst_dir: &Path, name: &OsStr, transfer_id: &str) -> OsS
     command.extend_from_slice(b"$i; i=$((i + 1)); [ \"$d\" = ");
     command.extend_from_slice(&sq_bytes(target.as_os_str().as_bytes()));
     command.extend_from_slice(
-        b" ] && continue; [ -d \"$d\" ] && [ ! -L \"$d\" ] || continue; rm -rf -- \"$d\"; done",
+        b" ] && continue; [ -d \"$d\" ] && [ ! -L \"$d\" ] || continue; [ -f \"$d/owner\" ] && [ ! -L \"$d/owner\" ] || continue; owner=; IFS= read -r owner < \"$d/owner\" || continue; [ \"$owner\" = ",
     );
+    command.extend_from_slice(&sq_bytes(transfer_id.as_bytes()));
+    command.extend_from_slice(b" ] || continue; rm -rf -- \"$d\"; done");
     OsString::from_vec(command)
 }
 
@@ -3357,8 +3620,56 @@ fn download_file_with(
 /// path replacement and later writes through a hard-link alias cannot change
 /// the bytes sent remotely. This follows an initial symlink like the remote
 /// `cat` does, but pins the resolved target while making the snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UploadIntegrity {
+    size: u64,
+    sha256: String,
+}
+
+fn upload_integrity(
+    file: &mut std::fs::File,
+    control: &TransferControl,
+) -> io::Result<UploadIntegrity> {
+    use sha2::{Digest, Sha256};
+
+    file.seek(SeekFrom::Start(0))?;
+    let mut digest = Sha256::new();
+    let mut size = 0u64;
+    let mut buffer = [0u8; STREAM_BUF_SIZE];
+    loop {
+        if control.is_timed_out() {
+            return Err(transfer_timed_out_error());
+        }
+        control.check()?;
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        size = size
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::other("upload integrity size overflow"))?;
+        digest.update(&buffer[..read]);
+    }
+    file.seek(SeekFrom::Start(0))?;
+    Ok(UploadIntegrity {
+        size,
+        sha256: format!("{:x}", digest.finalize()),
+    })
+}
+
+#[cfg(test)]
 fn upload_file_with(
     spawn: impl FnOnce() -> io::Result<ProbeChild>,
+    local_path: &Path,
+    max: u64,
+    control: &TransferControl,
+    progress: &dyn Fn(u64),
+) -> io::Result<()> {
+    upload_file_with_integrity(|_| spawn(), local_path, max, control, progress)
+}
+
+fn upload_file_with_integrity(
+    spawn: impl FnOnce(&UploadIntegrity) -> io::Result<ProbeChild>,
     local_path: &Path,
     max: u64,
     control: &TransferControl,
@@ -3391,13 +3702,19 @@ fn upload_file_with(
         )));
     }
     snapshot.sync_all()?;
-    snapshot.seek(SeekFrom::Start(0))?;
+    let integrity = upload_integrity(&mut snapshot, control)?;
+    if integrity.size != snapshotted {
+        return Err(io::Error::other(format!(
+            "local upload snapshot integrity covered {} of {snapshotted} bytes",
+            integrity.size
+        )));
+    }
     if control.is_timed_out() {
         return Err(transfer_timed_out_error());
     }
     control.check()?;
 
-    let probe = spawn()?;
+    let probe = spawn(&integrity)?;
     let probe_handle = probe.handle();
     let mut probe_cleanup = ChildCleanupGuard::new(&probe_handle);
     control.register(&probe_handle);
@@ -3438,6 +3755,7 @@ fn upload_file_with(
 /// Archive a pinned local directory completely before starting the remote
 /// `untar`. A local traversal failure therefore cannot publish a partial or
 /// mixed archive on the far side.
+#[cfg(test)]
 fn upload_dir_with(
     spawn: impl FnOnce() -> io::Result<ProbeChild>,
     local_path: &Path,
@@ -3445,11 +3763,30 @@ fn upload_dir_with(
     control: &TransferControl,
     progress: &dyn Fn(u64),
 ) -> io::Result<()> {
-    upload_dir_with_tar(spawn, local_path, Path::new("tar"), max, control, progress)
+    upload_dir_with_integrity(
+        |_| spawn(),
+        local_path,
+        Path::new("tar"),
+        max,
+        control,
+        progress,
+    )
 }
 
+#[cfg(test)]
 fn upload_dir_with_tar(
     spawn: impl FnOnce() -> io::Result<ProbeChild>,
+    local_path: &Path,
+    tar_program: &Path,
+    max: u64,
+    control: &TransferControl,
+    progress: &dyn Fn(u64),
+) -> io::Result<()> {
+    upload_dir_with_integrity(|_| spawn(), local_path, tar_program, max, control, progress)
+}
+
+fn upload_dir_with_integrity(
+    spawn: impl FnOnce(&UploadIntegrity) -> io::Result<ProbeChild>,
     local_path: &Path,
     tar_program: &Path,
     max: u64,
@@ -3540,7 +3877,7 @@ fn upload_dir_with_tar(
         return Err(transfer_timed_out_error());
     }
     control.check()?;
-    packed?;
+    let packed = packed?;
     if !tar_status.success() {
         let detail = bounded_stderr_text(&tar_stderr);
         return Err(io::Error::other(format!(
@@ -3568,13 +3905,18 @@ fn upload_dir_with_tar(
         return Err(source_directory_changed_error());
     }
     archive.sync_all()?;
-    archive.seek(SeekFrom::Start(0))?;
+    let integrity = upload_integrity(&mut archive, control)?;
+    if integrity.size != packed {
+        return Err(io::Error::other(
+            "local directory archive integrity did not cover the complete archive",
+        ));
+    }
     if control.is_timed_out() {
         return Err(transfer_timed_out_error());
     }
     control.check()?;
 
-    let probe = spawn()?;
+    let probe = spawn(&integrity)?;
     let probe_handle = probe.handle();
     let mut probe_cleanup = ChildCleanupGuard::new(&probe_handle);
     control.register(&probe_handle);
@@ -4256,6 +4598,23 @@ mod tests {
     fn spawn_local(args: &[&str], mode: ScriptDelivery) -> io::Result<ProbeChild> {
         let argv = local_probe_argv(args, mode);
         spawn_probe_argv(&argv, mode)
+    }
+
+    /// Run a payload probe to completion, then replace its successful status
+    /// with 42 to model an ssh/docker transport that reports nonzero after the
+    /// far side has already published.
+    fn spawn_local_with_lost_success(args: &[OsString]) -> io::Result<ProbeChild> {
+        let mut argv = vec![
+            OsString::from("sh"),
+            OsString::from("-c"),
+            OsString::from(
+                "script=$1; shift; sh -c \"$script\" remote-fs-probe \"$@\"; code=$?; [ \"$code\" -eq 0 ] && exit 42; exit \"$code\"",
+            ),
+            OsString::from("lost-success-wrapper"),
+            OsString::from(PROBE_SCRIPT),
+        ];
+        argv.extend_from_slice(args);
+        spawn_probe_argv(&argv, ScriptDelivery::Argv)
     }
 
     /// Binary-safe fixture content with NULs and high bytes.
@@ -5529,6 +5888,209 @@ mod tests {
     }
 
     #[test]
+    fn verified_put_retains_a_transfer_receipt_until_reconciliation() {
+        let tmp = TestDir::new("probe-put-receipt");
+        let file = tmp.path().join("out.bin");
+        let payload = b"payload";
+        let digest = "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5";
+
+        let capture = local_probe_payload(
+            &["put", file.to_str().unwrap(), "feed-ace", "7", digest],
+            payload,
+        );
+        assert_eq!(capture.code, Some(0), "stderr: {:?}", capture.stderr);
+
+        let stage = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".anvil-fs-put-feed-ace-")
+            })
+            .expect("publication must retain its token-bound receipt");
+        assert_eq!(
+            std::fs::read(stage.path().join("owner")).unwrap(),
+            b"feed-ace\n"
+        );
+        assert_eq!(
+            std::fs::read(stage.path().join("payload")).unwrap(),
+            payload
+        );
+        assert!(stage.path().join("receipt").is_file());
+        assert_eq!(
+            local_probe(&[
+                "put-status",
+                file.to_str().unwrap(),
+                "feed-ace",
+                "7",
+                digest,
+            ])
+            .code,
+            Some(0),
+            "the receipt, hard-link identity, size, and digest must all reconcile"
+        );
+    }
+
+    #[test]
+    fn completed_nonzero_put_reconciles_published_content_and_cleans_its_receipt() {
+        let local = TestDir::new("put-lost-success-local");
+        let remote = TestDir::new("put-lost-success-remote");
+        let src = local.path().join("source.bin");
+        let dst = remote.path().join("published.bin");
+        let payload = binary_content(31, 20_000);
+        std::fs::write(&src, &payload).unwrap();
+        let transfer_id = "fade-1";
+        let mut expected = None;
+
+        let attempt = upload_file_with_integrity(
+            |integrity| {
+                expected = Some(integrity.clone());
+                spawn_local_with_lost_success(&[
+                    OsString::from("put"),
+                    dst.as_os_str().to_os_string(),
+                    OsString::from(transfer_id),
+                    OsString::from(integrity.size.to_string()),
+                    OsString::from(&integrity.sha256),
+                ])
+            },
+            &src,
+            1 << 20,
+            &TransferControl::new(),
+            &|_| {},
+        );
+        assert!(
+            attempt.is_err(),
+            "the wrapper must hide the successful exit"
+        );
+        let integrity = expected.as_ref().unwrap();
+        let size = integrity.size.to_string();
+        let cleanup_command = part_cleanup_command(&dst, transfer_id);
+
+        settle_remote_upload(
+            attempt,
+            true,
+            || {
+                publication_state(probe_result(
+                    "put-status",
+                    local_probe(&[
+                        "put-status",
+                        dst.to_str().unwrap(),
+                        transfer_id,
+                        &size,
+                        &integrity.sha256,
+                    ]),
+                ))
+            },
+            || {
+                let capture = run_capture(
+                    &[OsString::from("sh"), OsString::from("-c"), cleanup_command],
+                    &[],
+                    Duration::from_secs(10),
+                    MAX_CAPTURE_BYTES,
+                )
+                .unwrap();
+                assert_eq!(capture.code, Some(0));
+            },
+        )
+        .expect("a verified published receipt must converge to success");
+
+        assert_eq!(std::fs::read(&dst).unwrap(), payload);
+        assert!(
+            std::fs::read_dir(remote.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".anvil-fs-put-")),
+            "confirmed publication removes only its receipt staging"
+        );
+    }
+
+    #[test]
+    fn completed_nonzero_untar_reconciles_the_published_directory_identity() {
+        let local = TestDir::new("untar-lost-success-local");
+        let remote = TestDir::new("untar-lost-success-remote");
+        let src = local.path().join("tree");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("marker"), b"published tree").unwrap();
+        let transfer_id = "fade-2";
+        let mut expected = None;
+
+        let attempt = upload_dir_with_integrity(
+            |integrity| {
+                expected = Some(integrity.clone());
+                spawn_local_with_lost_success(&[
+                    OsString::from("untar"),
+                    remote.path().as_os_str().to_os_string(),
+                    OsString::from("tree"),
+                    OsString::from(transfer_id),
+                    OsString::from(integrity.size.to_string()),
+                    OsString::from(&integrity.sha256),
+                ])
+            },
+            &src,
+            Path::new("tar"),
+            1 << 20,
+            &TransferControl::new(),
+            &|_| {},
+        );
+        assert!(
+            attempt.is_err(),
+            "the wrapper must hide the successful exit"
+        );
+        let integrity = expected.as_ref().unwrap();
+        let size = integrity.size.to_string();
+        let cleanup_command = untar_cleanup_command(remote.path(), OsStr::new("tree"), transfer_id);
+
+        settle_remote_upload(
+            attempt,
+            true,
+            || {
+                publication_state(probe_result(
+                    "untar-status",
+                    local_probe(&[
+                        "untar-status",
+                        remote.path().to_str().unwrap(),
+                        "tree",
+                        transfer_id,
+                        &size,
+                        &integrity.sha256,
+                    ]),
+                ))
+            },
+            || {
+                let capture = run_capture(
+                    &[OsString::from("sh"), OsString::from("-c"), cleanup_command],
+                    &[],
+                    Duration::from_secs(10),
+                    MAX_CAPTURE_BYTES,
+                )
+                .unwrap();
+                assert_eq!(capture.code, Some(0));
+            },
+        )
+        .expect("a verified directory receipt must converge to success");
+
+        assert_eq!(
+            std::fs::read(remote.path().join("tree/marker")).unwrap(),
+            b"published tree"
+        );
+        assert!(
+            std::fs::read_dir(remote.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".anvil-fs-untar-")),
+            "confirmed directory publication removes only its receipt staging"
+        );
+    }
+
+    #[test]
     fn probe_v4_put_atomically_preserves_a_racing_destination() {
         let tmp = TestDir::new("probe-put-race");
         let file = tmp.path().join("out.bin");
@@ -5768,11 +6330,12 @@ mod tests {
             .spawn()
             .unwrap();
         let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(&archive.stdout).unwrap();
+        drop(stdin);
 
         let started = std::time::Instant::now();
         while !marker.exists() {
             if started.elapsed() > Duration::from_secs(2) {
-                drop(stdin);
                 let _ = child.kill();
                 let _ = child.wait();
                 panic!("untar probe did not reach extraction");
@@ -5802,8 +6365,6 @@ mod tests {
         std::fs::create_dir(&racing_target).unwrap();
         std::fs::write(racing_target.join("keep"), b"racer").unwrap();
         std::fs::write(&gate, b"go").unwrap();
-        stdin.write_all(&archive.stdout).unwrap();
-        drop(stdin);
 
         let status = child.wait().unwrap();
         assert_eq!(status.code(), Some(17));
@@ -5905,7 +6466,7 @@ mod tests {
         );
         let command = argv.last().expect("command element").to_string_lossy();
         assert!(command.starts_with("sh -c '"));
-        assert!(command.contains("remote-fs probe v5"));
+        assert!(command.contains("remote-fs probe v6"));
         assert!(command.ends_with(" -- 'put' '/dst/a b'\\''c' 'feed-1'"));
 
         // docker: script as one raw argv element, no quoting anywhere.
@@ -7466,38 +8027,82 @@ mod tests {
     }
 
     #[test]
-    fn upload_cleanup_is_reserved_for_cancelled_or_timed_out_probes() {
-        let cancelled = io::Error::new(io::ErrorKind::Interrupted, "cancelled");
-        let timed_out = io::Error::new(io::ErrorKind::TimedOut, "timeout");
-        assert!(upload_cleanup_needed(&cancelled, true));
-        assert!(upload_cleanup_needed(&timed_out, true));
-        assert!(
-            !upload_cleanup_needed(&cancelled, false),
-            "local cancellation before remote spawn must not contact remote cleanup"
-        );
-        assert!(
-            !upload_cleanup_needed(&timed_out, false),
-            "local timeout before remote spawn must not contact remote cleanup"
-        );
-        assert!(!upload_cleanup_needed(
-            &io::Error::new(io::ErrorKind::AlreadyExists, "probe cleaned itself"),
+    fn upload_settlement_requires_a_started_probe_and_authoritative_receipt() {
+        let reconciled = AtomicBool::new(false);
+        let cleaned = AtomicBool::new(false);
+        let error = settle_remote_upload(
+            Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled")),
+            false,
+            || {
+                reconciled.store(true, Ordering::Relaxed);
+                Ok(PublicationState::Published)
+            },
+            || cleaned.store(true, Ordering::Relaxed),
+        )
+        .expect_err("a local cancellation remains the primary result");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(!reconciled.load(Ordering::Relaxed));
+        assert!(!cleaned.load(Ordering::Relaxed));
+
+        let cleaned = AtomicBool::new(false);
+        settle_remote_upload(
+            Err(io::Error::other("completed nonzero")),
             true,
-        ));
-        assert!(!upload_cleanup_needed(
-            &io::Error::other("ordinary failure"),
+            || Ok(PublicationState::Published),
+            || cleaned.store(true, Ordering::Relaxed),
+        )
+        .expect("a matching receipt converges an uncertain result to success");
+        assert!(cleaned.load(Ordering::Relaxed));
+
+        let cleaned = AtomicBool::new(false);
+        let error = settle_remote_upload(
+            Err(io::Error::new(io::ErrorKind::TimedOut, "timeout")),
             true,
-        ));
+            || Ok(PublicationState::NotPublished),
+            || cleaned.store(true, Ordering::Relaxed),
+        )
+        .expect_err("an absent publication retains the transfer error");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(cleaned.load(Ordering::Relaxed));
+
+        let cleaned = AtomicBool::new(false);
+        let error = settle_remote_upload(
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "connection lost",
+            )),
+            true,
+            || Ok(PublicationState::ConflictingDestination),
+            || cleaned.store(true, Ordering::Relaxed),
+        )
+        .expect_err("a foreign destination remains authoritative");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(cleaned.load(Ordering::Relaxed));
+
+        let cleaned = AtomicBool::new(false);
+        let error = settle_remote_upload(
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "primary connection loss",
+            )),
+            true,
+            || Err(io::Error::other("status unavailable")),
+            || cleaned.store(true, Ordering::Relaxed),
+        )
+        .expect_err("an unreconciled result must remain uncertain");
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+        assert!(!cleaned.load(Ordering::Relaxed));
     }
 
     #[test]
     fn part_cleanup_command_enumerates_only_token_candidates() {
         assert_eq!(
             part_cleanup_command(Path::new("/dst/dir name"), "feed-1").to_string_lossy(),
-            "i=0; while [ \"$i\" -lt 32 ]; do d='/dst/.anvil-fs-put-feed-1-'$i; i=$((i + 1)); [ \"$d\" = '/dst/dir name' ] && continue; [ -d \"$d\" ] && [ ! -L \"$d\" ] || continue; rm -f \"$d/payload\"; rmdir \"$d\" 2>/dev/null || :; done"
+            "i=0; while [ \"$i\" -lt 32 ]; do d='/dst/.anvil-fs-put-feed-1-'$i; i=$((i + 1)); [ \"$d\" = '/dst/dir name' ] && continue; [ -d \"$d\" ] && [ ! -L \"$d\" ] || continue; [ -f \"$d/owner\" ] && [ ! -L \"$d/owner\" ] || continue; owner=; IFS= read -r owner < \"$d/owner\" || continue; [ \"$owner\" = 'feed-1' ] || continue; rm -f \"$d/receipt\" \"$d/payload\" \"$d/owner\"; rmdir \"$d\" 2>/dev/null || :; done"
         );
         assert_eq!(
             part_cleanup_command(Path::new("/dst/don't"), "feed-1").to_string_lossy(),
-            "i=0; while [ \"$i\" -lt 32 ]; do d='/dst/.anvil-fs-put-feed-1-'$i; i=$((i + 1)); [ \"$d\" = '/dst/don'\\''t' ] && continue; [ -d \"$d\" ] && [ ! -L \"$d\" ] || continue; rm -f \"$d/payload\"; rmdir \"$d\" 2>/dev/null || :; done"
+            "i=0; while [ \"$i\" -lt 32 ]; do d='/dst/.anvil-fs-put-feed-1-'$i; i=$((i + 1)); [ \"$d\" = '/dst/don'\\''t' ] && continue; [ -d \"$d\" ] && [ ! -L \"$d\" ] || continue; [ -f \"$d/owner\" ] && [ ! -L \"$d/owner\" ] || continue; owner=; IFS= read -r owner < \"$d/owner\" || continue; [ \"$owner\" = 'feed-1' ] || continue; rm -f \"$d/receipt\" \"$d/payload\" \"$d/owner\"; rmdir \"$d\" 2>/dev/null || :; done"
         );
     }
 
@@ -7509,7 +8114,11 @@ mod tests {
         for index in [0, 31] {
             std::fs::create_dir(stage("feed-1", index)).unwrap();
             std::fs::write(stage("feed-1", index).join("payload"), b"partial").unwrap();
+            std::fs::write(stage("feed-1", index).join("owner"), b"feed-1\n").unwrap();
         }
+        let same_token_foreign = stage("feed-1", 1);
+        std::fs::create_dir(&same_token_foreign).unwrap();
+        std::fs::write(same_token_foreign.join("payload"), b"keep").unwrap();
         let outside_range = stage("feed-1", 32);
         std::fs::create_dir(&outside_range).unwrap();
         std::fs::write(outside_range.join("payload"), b"keep").unwrap();
@@ -7543,6 +8152,10 @@ mod tests {
             "indices outside probe retries survive"
         );
         assert!(other_transfer.is_dir(), "another transfer token survives");
+        assert!(
+            same_token_foreign.is_dir(),
+            "a same-token candidate without this transfer's owner marker survives"
+        );
         assert!(planted_link.is_symlink(), "cleanup refuses planted links");
         assert_eq!(std::fs::read(victim.join("payload")).unwrap(), b"keep");
     }
@@ -7552,7 +8165,7 @@ mod tests {
         assert_eq!(
             untar_cleanup_command(Path::new("/dst"), OsStr::new("tree"), "feed-b")
                 .to_string_lossy(),
-            "i=0; while [ \"$i\" -lt 32 ]; do d='/dst/.anvil-fs-untar-feed-b-'$i; i=$((i + 1)); [ \"$d\" = '/dst/tree' ] && continue; [ -d \"$d\" ] && [ ! -L \"$d\" ] || continue; rm -rf -- \"$d\"; done"
+            "i=0; while [ \"$i\" -lt 32 ]; do d='/dst/.anvil-fs-untar-feed-b-'$i; i=$((i + 1)); [ \"$d\" = '/dst/tree' ] && continue; [ -d \"$d\" ] && [ ! -L \"$d\" ] || continue; [ -f \"$d/owner\" ] && [ ! -L \"$d/owner\" ] || continue; owner=; IFS= read -r owner < \"$d/owner\" || continue; [ \"$owner\" = 'feed-b' ] || continue; rm -rf -- \"$d\"; done"
         );
         assert_eq!(
             untar_cleanup_command(
@@ -7561,7 +8174,7 @@ mod tests {
                 "feed-b"
             )
             .to_string_lossy(),
-            "i=0; while [ \"$i\" -lt 32 ]; do d='/dst/don'\\''t/.anvil-fs-untar-feed-b-'$i; i=$((i + 1)); [ \"$d\" = '/dst/don'\\''t/.anvil-fs-untar-feed-b-7' ] && continue; [ -d \"$d\" ] && [ ! -L \"$d\" ] || continue; rm -rf -- \"$d\"; done"
+            "i=0; while [ \"$i\" -lt 32 ]; do d='/dst/don'\\''t/.anvil-fs-untar-feed-b-'$i; i=$((i + 1)); [ \"$d\" = '/dst/don'\\''t/.anvil-fs-untar-feed-b-7' ] && continue; [ -d \"$d\" ] && [ ! -L \"$d\" ] || continue; [ -f \"$d/owner\" ] && [ ! -L \"$d/owner\" ] || continue; owner=; IFS= read -r owner < \"$d/owner\" || continue; [ \"$owner\" = 'feed-b' ] || continue; rm -rf -- \"$d\"; done"
         );
     }
 
@@ -7576,7 +8189,10 @@ mod tests {
             std::fs::create_dir(stage("feed-b", index)).unwrap();
             std::fs::create_dir(stage("feed-b", index).join("partial-tree")).unwrap();
             std::fs::write(stage("feed-b", index).join("partial-tree/file"), b"partial").unwrap();
+            std::fs::write(stage("feed-b", index).join("owner"), b"feed-b\n").unwrap();
         }
+        let same_token_foreign = stage("feed-b", 1);
+        std::fs::create_dir(&same_token_foreign).unwrap();
         let outside_range = stage("feed-b", 32);
         std::fs::create_dir(&outside_range).unwrap();
         let other_transfer = stage("beef-c", 0);
@@ -7604,6 +8220,10 @@ mod tests {
         assert!(!stage("feed-b", 31).exists());
         assert!(outside_range.is_dir(), "indices outside retries survive");
         assert!(other_transfer.is_dir(), "a concurrent upload survives");
+        assert!(
+            same_token_foreign.is_dir(),
+            "a same-token candidate without this transfer's owner marker survives"
+        );
         assert!(planted_link.is_symlink(), "cleanup refuses planted links");
         assert_eq!(std::fs::read(victim.join("keep")).unwrap(), b"victim");
     }
