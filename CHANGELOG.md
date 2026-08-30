@@ -548,6 +548,11 @@ versioning for tagged releases while it remains experimental.
 
 ### Fixed
 
+- Remote-to-remote relay staging directories are now created mode 0700, retry
+  occupied `/tmp` candidates, and retain a no-follow directory descriptor for
+  cleanup identity. Relay payloads are no longer exposed through a customary
+  0755 wrapper, a stale candidate does not abort the transfer immediately, and
+  replacing the path cannot make Drop recursively delete the replacement tree.
 - Regular-file download staging now uses short internal basenames independent
   of the destination name. Filesystem-limit names remain transferable without
   truncating user bytes into a temporary `OsStr`; stale or planted candidates

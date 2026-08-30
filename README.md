@@ -1002,7 +1002,9 @@ a same-name replacement, edit, removal, or duplicate cannot redirect the tree.
 Paste also works across locations. Copying or cutting on a host and pasting
 locally downloads (labeled "Paste (download)"); the reverse uploads; pasting
 between two different hosts relays through a staging file under the system
-temp dir. Files stream through the probe (`cat`/`put` — the upload is written
+temp dir, inside an exclusively-created mode-0700 wrapper that retries occupied
+names and verifies its held directory inode before cleanup. Files stream
+through the probe (`cat`/`put` — the upload is written
 to a temp name and moved into place atomically on the far side), directories
 stream as tar archives, and payloads are capped at 512 MiB with a 15-minute
 overall timeout. While a transfer runs, a held toast reports throttled

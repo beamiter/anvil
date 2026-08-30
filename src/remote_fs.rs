@@ -2043,29 +2043,72 @@ fn reserve_part_then_spawn(
     }
 }
 
-/// Unique staging directory for remote→remote relays, removed on drop.
-struct StagingDir(PathBuf);
+/// Private staging directory for remote→remote relays. The held directory
+/// descriptor pins its inode so cleanup can distinguish a replaced path.
+struct StagingDir {
+    path: PathBuf,
+    handle: std::fs::File,
+}
 
 impl StagingDir {
     fn new() -> io::Result<Self> {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "anvil-fs-relay-{}-{}",
-            std::process::id(),
+        Self::in_parent_with(&std::env::temp_dir(), || {
             NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir(&dir)?;
-        Ok(Self(dir))
+        })
+    }
+
+    fn in_parent_with(parent: &Path, mut next: impl FnMut() -> usize) -> io::Result<Self> {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+        for _ in 0..32 {
+            let path = parent.join(format!("anvil-fs-relay-{}-{}", std::process::id(), next()));
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            match builder.create(&path) {
+                Ok(()) => {
+                    let handle = match std::fs::OpenOptions::new()
+                        .read(true)
+                        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                        .open(&path)
+                    {
+                        Ok(handle) => handle,
+                        Err(error) => {
+                            let _ = std::fs::remove_dir(&path);
+                            return Err(error);
+                        }
+                    };
+                    return Ok(Self { path, handle });
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not reserve a private relay staging directory",
+        ))
     }
 
     fn path(&self) -> &Path {
-        &self.0
+        &self.path
     }
 }
 
 impl Drop for StagingDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        use std::os::unix::fs::MetadataExt;
+
+        let Ok(expected) = self.handle.metadata() else {
+            return;
+        };
+        if std::fs::symlink_metadata(&self.path).is_ok_and(|current| {
+            current.file_type().is_dir()
+                && current.dev() == expected.dev()
+                && current.ino() == expected.ino()
+        }) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
     }
 }
 
@@ -5105,14 +5148,57 @@ mod tests {
     }
 
     #[test]
-    fn staging_dir_is_removed_on_drop() {
+    fn relay_staging_dir_is_private_collision_safe_and_identity_bound() {
+        use std::os::unix::fs::PermissionsExt;
+
         let path = {
             let staging = StagingDir::new().expect("staging dir");
             let path = staging.path().to_path_buf();
             assert!(path.is_dir());
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o077,
+                0,
+                "relay contents must not be traversable by other users"
+            );
             path
         };
         assert!(!path.exists());
+
+        let local = TestDir::new("relay-staging-collisions");
+        let pid = std::process::id();
+        let victim = local.path().join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        let planted = local.path().join(format!("anvil-fs-relay-{pid}-11"));
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+        let mut sequence = [11, 12].into_iter();
+        let staging = StagingDir::in_parent_with(local.path(), || {
+            sequence.next().expect("one retry is enough")
+        })
+        .unwrap();
+        let expected_name = format!("anvil-fs-relay-{pid}-12");
+        assert_eq!(staging.path().file_name(), Some(OsStr::new(&expected_name)));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        drop(staging);
+        assert!(std::fs::symlink_metadata(&planted)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        let mut sequence = [20].into_iter();
+        let staging = StagingDir::in_parent_with(local.path(), || {
+            sequence.next().expect("one candidate is enough")
+        })
+        .unwrap();
+        let replaced_path = staging.path().to_path_buf();
+        std::fs::remove_dir(&replaced_path).unwrap();
+        std::fs::create_dir(&replaced_path).unwrap();
+        std::fs::write(replaced_path.join("replacement"), b"survive").unwrap();
+        drop(staging);
+        assert_eq!(
+            std::fs::read(replaced_path.join("replacement")).unwrap(),
+            b"survive",
+            "inode-bound cleanup must preserve a replacement directory"
+        );
     }
 
     #[test]
