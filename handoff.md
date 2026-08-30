@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-29 (shared workflow library; an undefaulted argument is required again)
+Updated: 2026-08-30 (workflow doctor diagnostics name a safe rejection sample)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,16 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **`--doctor` identifies the rejected workflow (2026-08-30)**: the workflow
+  check keeps the existing available/readable/refused counts and now appends
+  the first rejected path plus loader reason in both human and JSON detail.
+  Those are untrusted display fields — the directory writer chooses the name
+  and a parser error can quote a source line — so each crosses
+  `review_input::safe_inline_display` under a 256-byte budget. Support-bundle
+  mode retains the counts but replaces both fields with an explicit redaction
+  marker, preserving its no-local-path/no-user-content contract. Three pure
+  formatting tests pin the normal, hostile-input and redacted shapes.
 
 - **Workflows on the shared library, and the guard four terminals wrote and
   then defeated (2026-08-29)**: the headline is a defect, not a refactor. A
@@ -110,10 +120,7 @@ captured, queued, written, and restored.
   declare an argument its template never references, and `render()` succeeds in
   that case — so disabling Insert would refuse a command that would have
   rendered fine. The failed render names the exact arguments in the error label
-  the dialog already had, which is anvil's existing idiom. Not done, and worth
-  doing: `--doctor` still reports only a count of rejected workflow files.
-  `crate::workflows::scan` returns the paths and the reasons, so naming them is
-  a one-liner, but changing the diagnostics schema was outside this round.
+  the dialog already had, which is anvil's existing idiom.
 
   Environment hazard, unchanged and still worth knowing: `cargo` rewrites
   `Cargo.lock` under a temporary local `[patch]`, after which the flake's

@@ -205,7 +205,10 @@ building its bare binary inside Nix would bake `/nix/store` paths into it.
 `anvil --doctor` reports configuration, shell, display, integrations, remote
 readiness, permissions, and session-state metadata. Add `--json` for automation
 or support tooling; neither format includes configuration contents, terminal
-history, command output, environment values, or credentials.
+history, command output, environment values, or credentials. An ordinary run
+may include local paths and the bounded parser reason for the first rejected
+workflow file (which can quote part of that file); support-bundle mode redacts
+both while retaining the counts.
 
 When configuration, startup commands, session restore, or an integration causes
 a bad launch, use:
@@ -715,8 +718,10 @@ rest of the library, and anvil raises a toast naming it the first time that
 happens ("Workflow file skipped — *path*: *reason*", or "N workflow files
 skipped, including …"). The toast repeats only when the set of refused files
 changes, so a broken file you have not fixed yet does not nag on every palette
-open. `anvil --doctor` reports the same thing as a count of invalid or
-unreadable files, alongside how many search locations were readable.
+open. `anvil --doctor` reports the same count alongside how many search
+locations were readable, and an ordinary (unredacted) run names the first
+rejected file and its bounded reason. Support-bundle diagnostics retain the
+counts but redact that local path and parser detail.
 
 Rendered commands containing line breaks or terminal control characters are
 rejected by the shared review-only input boundary.

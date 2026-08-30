@@ -272,6 +272,13 @@ versioning for tagged releases while it remains experimental.
 
 ### Changed
 
+- `anvil --doctor` now names the first rejected workflow file and its bounded
+  reason instead of reporting only a count, so a headless diagnosis identifies
+  the file that needs repair. Both fields cross the same control/bidi-safe
+  display boundary as the graphical toast. Privacy-preserving support bundles
+  retain workflow and readable-location counts but explicitly redact the local
+  path and parser detail, which may quote a source line.
+
 - **A workflow argument the file gives no default for is no longer filled with
   the empty string.** Leaving such a field blank and pressing Insert now reports
   `missing values: <names>` in the dialog instead of inserting the template with

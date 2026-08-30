@@ -7,7 +7,7 @@
 use serde::Serialize;
 use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::cli::ReportFormat;
 use crate::config::{choose_shell_argv, config_file_path, load_config};
@@ -136,7 +136,15 @@ fn config_backup_health() -> (usize, usize, usize) {
     (present, valid, invalid_or_unreadable)
 }
 
-fn workflow_discovery() -> (usize, usize, usize, usize) {
+#[derive(Debug, Default)]
+struct WorkflowDiscovery {
+    available: usize,
+    readable_locations: usize,
+    locations: usize,
+    refused: Vec<(PathBuf, String)>,
+}
+
+fn workflow_discovery() -> WorkflowDiscovery {
     // Every question here is asked through `crate::workflows`, which asks
     // `jterm_core::workflows`. This report used to carry its own
     // `toml|yaml|yml` predicate and an uncapped `read_dir` of every workflow
@@ -146,12 +154,42 @@ fn workflow_discovery() -> (usize, usize, usize, usize) {
     let dirs = crate::workflows::workflow_dirs();
     let readable_dirs = dirs.iter().filter(|dir| fs::read_dir(dir).is_ok()).count();
     let scan = crate::workflows::scan(&dirs);
-    (
-        scan.workflows.len(),
-        readable_dirs,
-        dirs.len(),
-        scan.refused.len(),
-    )
+    WorkflowDiscovery {
+        available: scan.workflows.len(),
+        readable_locations: readable_dirs,
+        locations: dirs.len(),
+        refused: scan.refused,
+    }
+}
+
+const WORKFLOW_DIAGNOSTIC_FIELD_BYTES: usize = 256;
+
+fn workflow_diagnostic_detail(discovery: &WorkflowDiscovery, redacted: bool) -> String {
+    let mut detail = format!(
+        "{} available; {}/{} search locations readable; {} invalid or unreadable file(s)",
+        discovery.available,
+        discovery.readable_locations,
+        discovery.locations,
+        discovery.refused.len()
+    );
+    let Some((path, reason)) = discovery.refused.first() else {
+        return detail;
+    };
+    if redacted {
+        detail.push_str("; rejected file details redacted");
+        return detail;
+    }
+
+    // A scanned-directory writer chooses the path, and serde parse errors can
+    // quote source lines verbatim. Neither may regain formatting effects in a
+    // terminal or a JSON consumer just because this is a headless surface.
+    let path = crate::review_input::safe_inline_display(
+        &path.to_string_lossy(),
+        WORKFLOW_DIAGNOSTIC_FIELD_BYTES,
+    );
+    let reason = crate::review_input::safe_inline_display(reason, WORKFLOW_DIAGNOSTIC_FIELD_BYTES);
+    detail.push_str(&format!("; first rejected file: {path}: {reason}"));
+    detail
 }
 
 fn collect() -> DiagnosticReport {
@@ -319,18 +357,15 @@ fn collect() -> DiagnosticReport {
         None => report.push("command history", CheckStatus::Warning, "disabled"),
     }
 
-    let (workflow_count, readable_workflow_dirs, workflow_dirs, rejected_workflows) =
-        workflow_discovery();
+    let workflow_discovery = workflow_discovery();
     report.push(
         "workflows",
-        if workflow_count == 0 || rejected_workflows > 0 {
+        if workflow_discovery.available == 0 || !workflow_discovery.refused.is_empty() {
             CheckStatus::Warning
         } else {
             CheckStatus::Ok
         },
-        format!(
-            "{workflow_count} available; {readable_workflow_dirs}/{workflow_dirs} search locations readable; {rejected_workflows} invalid or unreadable file(s)"
-        ),
+        workflow_diagnostic_detail(&workflow_discovery, diagnostics_redacted()),
     );
 
     let welcome_notebook = crate::workflows::welcome_notebook_path();
@@ -561,5 +596,70 @@ mod tests {
         assert!(json.contains("\"status\":\"ok\""));
         assert!(json.contains("\"errors\":0"));
         assert!(!json.contains("API_KEY"));
+    }
+
+    #[test]
+    fn workflow_diagnostic_names_a_safe_bounded_rejection_sample() {
+        let discovery = WorkflowDiscovery {
+            available: 6,
+            readable_locations: 2,
+            locations: 4,
+            refused: vec![(
+                PathBuf::from(format!("/w/{}\u{1b}]0;PWNED\u{7}.toml", "x".repeat(300))),
+                "parse TOML: line 2\ncommand = \"echo \u{202e}".to_string(),
+            )],
+        };
+
+        let detail = workflow_diagnostic_detail(&discovery, false);
+        assert!(detail.starts_with(
+            "6 available; 2/4 search locations readable; 1 invalid or unreadable file(s); \
+             first rejected file: "
+        ));
+        assert!(!detail.contains('\u{1b}'), "{detail}");
+        assert!(!detail.contains('\u{7}'), "{detail}");
+        assert!(!detail.contains('\u{202e}'), "{detail}");
+        assert!(!detail.contains('\n'), "{detail}");
+        assert!(
+            detail.contains('…'),
+            "the long path should be bounded: {detail}"
+        );
+    }
+
+    #[test]
+    fn redacted_workflow_diagnostic_retains_counts_but_not_file_content() {
+        let discovery = WorkflowDiscovery {
+            available: 2,
+            readable_locations: 1,
+            locations: 3,
+            refused: vec![(
+                PathBuf::from("/private/workflows/secret.toml"),
+                "parse TOML: command = \"private value\"".to_string(),
+            )],
+        };
+
+        let detail = workflow_diagnostic_detail(&discovery, true);
+        assert_eq!(
+            detail,
+            "2 available; 1/3 search locations readable; 1 invalid or unreadable file(s); \
+             rejected file details redacted"
+        );
+        assert!(!detail.contains("secret"));
+        assert!(!detail.contains("private value"));
+    }
+
+    #[test]
+    fn healthy_workflow_diagnostic_has_no_rejection_suffix() {
+        assert_eq!(
+            workflow_diagnostic_detail(
+                &WorkflowDiscovery {
+                    available: 6,
+                    readable_locations: 2,
+                    locations: 4,
+                    refused: Vec::new(),
+                },
+                false,
+            ),
+            "6 available; 2/4 search locations readable; 0 invalid or unreadable file(s)"
+        );
     }
 }
