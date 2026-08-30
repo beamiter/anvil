@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-30 (Doctor paths and workflow refusals are display-safe)
+Updated: 2026-08-30 (Remote destinations include dangling links)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,14 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **Remote creation cannot follow a dangling destination link (2026-08-30)**:
+  every POSIX probe that creates, renames, copies, uploads, or extracts now
+  treats `-L` as occupied alongside `-e`. This closes the concrete `mkfile`
+  case where shell redirection followed a dangling link and created its target
+  outside the selected directory, and makes all no-overwrite operations return
+  the same exit-17 contract. A real local `sh` regression exercises all six
+  operations and proves each link and outside target stay untouched.
 
 - **Doctor no longer prints an attacker-shaped config path raw (2026-08-30)**:
   `--config` and `ANVIL_CONFIG` accept a process-local filesystem path, and the

@@ -807,6 +807,12 @@ versioning for tagged releases while it remains experimental.
 
 ### Security
 
+- Remote Files creation and transfer probes now treat dangling symbolic links
+  as occupied destinations. The former `test -e` checks missed dangling links;
+  `mkfile` could then follow one and create its target outside the directory the
+  user selected, while rename/copy/upload could replace the link despite their
+  no-overwrite contract. `mkdir`, `mkfile`, `mv`, `cp`, both `put` checks, and
+  `untar` now share the `-e || -L` rule and return the existing-target status.
 - **A symlinked workflow file is no longer loaded.** anvil opened workflow files
   with `O_NONBLOCK | O_CLOEXEC` and, alone among the four terminals, without
   `O_NOFOLLOW`, so a link planted at `~/.config/anvil/workflows/deploy.toml`

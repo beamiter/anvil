@@ -31,6 +31,7 @@ pub(crate) const PROBE_SCRIPT: &str = r#"# remote-fs probe v3 — runs under `sh
 # `cat` streams a file to stdout; `put` stores stdin as a new file;
 # `tar` streams a directory to stdout; `untar <dir> <name>` extracts stdin into
 # <dir>, refusing an existing <dir>/<name> before anything is extracted;
+# every creator treats a dangling symbolic link as an existing target;
 # `stat` prints "<t> <size>" (size 0 for d/l).
 # Exit codes: 0 ok, 2 usage/bad path, 3 cannot enter dir, 4 op failed, 17 target exists.
 set -u
@@ -61,13 +62,13 @@ case "$op" in
   mkdir)
     p=${2:-}
     case "$p" in /*) ;; *) exit 2 ;; esac
-    [ -e "$p" ] && exit 17
+    if [ -e "$p" ] || [ -L "$p" ]; then exit 17; fi
     mkdir "$p" || exit 4
     ;;
   mkfile)
     p=${2:-}
     case "$p" in /*) ;; *) exit 2 ;; esac
-    [ -e "$p" ] && exit 17
+    if [ -e "$p" ] || [ -L "$p" ]; then exit 17; fi
     : > "$p" || exit 4
     ;;
   rm)
@@ -79,14 +80,14 @@ case "$op" in
     s=${2:-}; n=${3:-}
     case "$s" in /*) ;; *) exit 2 ;; esac
     case "$n" in /*) ;; *) exit 2 ;; esac
-    [ -e "$n" ] && exit 17
+    if [ -e "$n" ] || [ -L "$n" ]; then exit 17; fi
     mv "$s" "$n" || exit 4
     ;;
   cp)
     s=${2:-}; n=${3:-}
     case "$s" in /*) ;; *) exit 2 ;; esac
     case "$n" in /*) ;; *) exit 2 ;; esac
-    [ -e "$n" ] && exit 17
+    if [ -e "$n" ] || [ -L "$n" ]; then exit 17; fi
     cp -a "$s" "$n" || exit 4
     ;;
   cat)
@@ -98,10 +99,10 @@ case "$op" in
   put)
     p=${2:-}
     case "$p" in /*) ;; *) exit 2 ;; esac
-    [ -e "$p" ] && exit 17
+    if [ -e "$p" ] || [ -L "$p" ]; then exit 17; fi
     t="$p.fspart.$$"
     if cat > "$t"; then
-      [ -e "$p" ] && { rm -f "$t"; exit 17; }
+      if [ -e "$p" ] || [ -L "$p" ]; then rm -f "$t"; exit 17; fi
       mv "$t" "$p" || { rm -f "$t"; exit 4; }
     else
       rm -f "$t"
@@ -3687,6 +3688,90 @@ mod tests {
         assert_eq!(
             local_probe(&["list", tmp.path().join("missing").to_str().unwrap(), "2",]).code,
             Some(3)
+        );
+    }
+
+    #[test]
+    fn probe_creators_refuse_dangling_symlink_targets() {
+        fn assert_refused(capture: &Capture, link: &Path, victim: &Path) {
+            assert_eq!(
+                capture.code,
+                Some(EXIT_EXISTS),
+                "stderr: {:?}",
+                capture.stderr
+            );
+            assert!(
+                !victim.exists(),
+                "probe followed dangling link and created {}",
+                victim.display()
+            );
+            assert!(
+                std::fs::symlink_metadata(link)
+                    .expect("destination link must remain")
+                    .file_type()
+                    .is_symlink(),
+                "probe replaced destination link {}",
+                link.display()
+            );
+        }
+
+        let tmp = TestDir::new("probe-dangling-targets");
+        let dangling = |name: &str| {
+            let victim = tmp.path().join(format!("outside-{name}"));
+            let link = tmp.path().join(format!("link-{name}"));
+            std::os::unix::fs::symlink(&victim, &link).unwrap();
+            let argument = link.to_str().unwrap().to_string();
+            (victim, link, argument)
+        };
+
+        let (victim, link, argument) = dangling("mkdir");
+        assert_refused(&local_probe(&["mkdir", &argument]), &link, &victim);
+
+        let (victim, link, argument) = dangling("mkfile");
+        assert_refused(&local_probe(&["mkfile", &argument]), &link, &victim);
+
+        let move_source = tmp.path().join("move-source");
+        std::fs::write(&move_source, b"move").unwrap();
+        let move_source_arg = move_source.to_str().unwrap().to_string();
+        let (victim, link, argument) = dangling("move");
+        assert_refused(
+            &local_probe(&["mv", &move_source_arg, &argument]),
+            &link,
+            &victim,
+        );
+        assert_eq!(std::fs::read(&move_source).unwrap(), b"move");
+
+        let copy_source = tmp.path().join("copy-source");
+        std::fs::write(&copy_source, b"copy").unwrap();
+        let copy_source_arg = copy_source.to_str().unwrap().to_string();
+        let (victim, link, argument) = dangling("copy");
+        assert_refused(
+            &local_probe(&["cp", &copy_source_arg, &argument]),
+            &link,
+            &victim,
+        );
+        assert_eq!(std::fs::read(&copy_source).unwrap(), b"copy");
+
+        let (victim, link, argument) = dangling("put");
+        assert_refused(
+            &local_probe_payload(&["put", &argument], b"payload"),
+            &link,
+            &victim,
+        );
+
+        let extraction_dir = tmp.path().join("extract");
+        std::fs::create_dir(&extraction_dir).unwrap();
+        let extraction_arg = extraction_dir.to_str().unwrap().to_string();
+        let victim = tmp.path().join("outside-untar");
+        let link = extraction_dir.join("tree");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        assert_refused(
+            &local_probe_payload(
+                &["untar", &extraction_arg, "tree"],
+                b"not consulted when the target is occupied",
+            ),
+            &link,
+            &victim,
         );
     }
 

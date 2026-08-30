@@ -1010,8 +1010,9 @@ progress ("Downloading name… 12.4 MiB", or "X / Y MiB" for single-file
 uploads) and offers a Cancel action that kills the stream, removes the
 partial temp file, and reports a neutral cancelled status rather than an
 error. A destination that already holds the name is refused before
-any bytes move — for directory uploads the v3 probe checks the collision
-itself before extracting, so the refusal is atomic on the far side — a cut
+any bytes move, including when that directory entry is a dangling symbolic
+link — for directory uploads the v3 probe checks the collision itself before
+extracting, so the refusal is atomic on the far side — a cut
 across locations deletes the source only after the copy
 landed, and partial transfers clean up after themselves. Names are validated
 before any dialog is accepted, `/` can never be a delete target, and a stale
