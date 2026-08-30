@@ -1704,6 +1704,41 @@ fn wait_child(child: &Arc<Mutex<Child>>) -> io::Result<std::process::ExitStatus>
     }
 }
 
+/// Owns one spawned transfer child until its normal wait completes. Any
+/// setup or streaming error before that point kills and reaps the process so
+/// a rejected producer/consumer cannot outlive its transfer.
+struct ChildCleanupGuard {
+    child: Arc<Mutex<Child>>,
+    reaped: bool,
+}
+
+impl ChildCleanupGuard {
+    fn new(child: &Arc<Mutex<Child>>) -> Self {
+        Self {
+            child: child.clone(),
+            reaped: false,
+        }
+    }
+
+    fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+        let status = wait_child(&self.child)?;
+        self.reaped = true;
+        Ok(status)
+    }
+}
+
+impl Drop for ChildCleanupGuard {
+    fn drop(&mut self) {
+        if self.reaped {
+            return;
+        }
+        if let Ok(mut child) = self.child.lock() {
+            kill_tree(&mut child);
+            let _ = child.wait();
+        }
+    }
+}
+
 /// Shared per-transfer state: cancellation from the UI, the overall timeout
 /// from the guard thread, and the children either one kills. One control is
 /// created per transfer before spawning; clones go to the worker, the cancel
@@ -2685,6 +2720,7 @@ fn download_file_with(
     let (temp, mut file) = StagedFile::beside(&dst)?;
     let probe = spawn()?;
     let probe_handle = probe.handle();
+    let mut probe_cleanup = ChildCleanupGuard::new(&probe_handle);
     control.register(&probe_handle);
     let mut stdout = probe
         .stdout
@@ -2692,7 +2728,7 @@ fn download_file_with(
     let _timeout = control.arm_timeout(TRANSFER_TIMEOUT)?;
     let streamed = stream_to(&mut stdout, &mut file, max, control, progress);
     drop(stdout);
-    let status = wait_child(&probe_handle)?;
+    let status = probe_cleanup.wait()?;
     // Transfer stderr is bounded error detail only; truncation is expected
     // and silently capped here, unlike the probe captures above.
     let (stderr, _) = join_reader(probe.stderr)?;
@@ -2892,6 +2928,7 @@ fn download_dir_with(
     let staging = ExtractionDir::beside(&dst)?;
     let probe = spawn()?;
     let probe_handle = probe.handle();
+    let mut probe_cleanup = ChildCleanupGuard::new(&probe_handle);
     let stdout = probe
         .stdout
         .ok_or_else(|| io::Error::other("probe has no stdout"))?;
@@ -2909,16 +2946,22 @@ fn download_dir_with(
         // group so the watchdog's group kill can never miss it.
         tar_command.process_group(0);
     }
-    let mut tar = tar_command.spawn()?;
-    let tar_stdin = tar
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::other("local tar has no stdin"))?;
-    let tar_stderr = tar
-        .stderr
-        .take()
-        .map(|pipe| spawn_bounded_reader(pipe, MAX_TRANSFER_STDERR_BYTES));
-    let tar = Arc::new(Mutex::new(tar));
+    let tar = Arc::new(Mutex::new(tar_command.spawn()?));
+    let mut tar_cleanup = ChildCleanupGuard::new(&tar);
+    let (tar_stdin, tar_stderr) = {
+        let mut child = tar
+            .lock()
+            .map_err(|_| io::Error::other("local tar child lock poisoned"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("local tar has no stdin"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .map(|pipe| spawn_bounded_reader(pipe, MAX_TRANSFER_STDERR_BYTES));
+        (stdin, stderr)
+    };
     control.register(&probe_handle);
     control.register(&tar);
     let _timeout = control.arm_timeout(TRANSFER_TIMEOUT)?;
@@ -2928,9 +2971,9 @@ fn download_dir_with(
             kill_tree(&mut child);
         }
     }
-    let tar_status = wait_child(&tar)?;
+    let tar_status = tar_cleanup.wait()?;
     let (tar_stderr, _) = join_reader(tar_stderr)?;
-    let status = wait_child(&probe_handle)?;
+    let status = probe_cleanup.wait()?;
     let (stderr, _) = join_reader(probe.stderr)?;
     if control.is_timed_out() {
         return Err(transfer_timed_out_error());
@@ -5475,6 +5518,57 @@ mod tests {
             std::fs::read_dir(local_dst.path()).unwrap().count(),
             1,
             "a successful download leaves only the published directory"
+        );
+    }
+
+    #[test]
+    fn directory_download_reaps_a_producer_rejected_during_setup() {
+        use std::os::unix::process::CommandExt;
+
+        let local = TestDir::new("dir-rejected-producer");
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let child = Arc::new(Mutex::new(child));
+        let observed = child.clone();
+
+        let error = download_dir_with(
+            || {
+                Ok(ProbeChild {
+                    child,
+                    stdin: None,
+                    stdout: None,
+                    stderr: None,
+                })
+            },
+            OsStr::new("tree"),
+            local.path(),
+            1 << 20,
+            &TransferControl::new(),
+            &|_| {},
+        )
+        .expect_err("a producer without its promised stdout must be rejected");
+        assert_eq!(error.to_string(), "probe has no stdout");
+
+        let reaped = {
+            let mut child = observed.lock().unwrap();
+            let status = child.try_wait().unwrap();
+            if status.is_none() {
+                kill_tree(&mut child);
+                let _ = child.wait();
+            }
+            status.is_some()
+        };
+        assert!(reaped, "a rejected producer must be killed and reaped");
+        assert_eq!(
+            std::fs::read_dir(local.path()).unwrap().count(),
+            0,
+            "setup failure must also remove this transfer's extraction root"
         );
     }
 
