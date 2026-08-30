@@ -16,6 +16,9 @@ concurrency:
   group: security-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_AUDIT_VERSION: "0.22.2"
+
 jobs:
   dependency-and-shell-audit:
     name: Dependency and shell audit
@@ -24,7 +27,9 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         run: |
@@ -33,24 +38,26 @@ jobs:
           cargo --version
 
       - name: Cache Cargo data
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6
         with:
           path: |
-            ~/.cargo/bin
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-security-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+            ~/.cache/cargo-audit-target
+          key: ${{ runner.os }}-security-${{ env.CARGO_AUDIT_VERSION }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
             ${{ runner.os }}-security-
 
       - name: Install audit tooling
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes shellcheck
-          if ! command -v cargo-audit >/dev/null 2>&1; then
-            cargo install cargo-audit --locked
-          fi
+          CARGO_TARGET_DIR="$HOME/.cache/cargo-audit-target" \
+            cargo install cargo-audit --version "$CARGO_AUDIT_VERSION" \
+            --locked --force
+          cargo audit --version | grep -Eq \
+            "[[:space:]]${CARGO_AUDIT_VERSION}$"
 
       - name: Audit dependencies and shell scripts
         run: bash scripts/security-check.sh

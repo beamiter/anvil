@@ -30,7 +30,9 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install GTK, VTE, and validation packages
         run: |
@@ -55,7 +57,7 @@ jobs:
           cargo --version
 
       - name: Cache Cargo data
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6
         with:
           path: |
             ~/.cargo/registry
@@ -73,6 +75,7 @@ jobs:
 
       - name: Run tests
         id: tests
+        shell: bash
         run: xvfb-run --auto-servernum cargo test --all-targets --locked --no-fail-fast 2>&1 | tee test.log
 
       - name: Run display-backed GTK/VTE regressions
@@ -81,6 +84,7 @@ jobs:
       - name: Run Clippy
         id: clippy
         if: ${{ !cancelled() }}
+        shell: bash
         run: bash scripts/clippy.sh 2>&1 | tee clippy.log
 
       - name: Check documentation build
@@ -118,6 +122,7 @@ jobs:
 
       - name: Validate CLI and desktop integration
         if: ${{ !cancelled() }}
+        shell: bash
         run: |
           target/release/anvil --help | grep -F "Block-first terminal workspace"
           version="$(awk -F ' *= *' '$1 == "version" { gsub(/"/, "", $2); print $2; exit }' Cargo.toml)"
@@ -150,9 +155,10 @@ jobs:
 
       - name: Build and verify relocatable release bundle
         if: ${{ !cancelled() }}
+        shell: bash
         run: |
           bash scripts/package-release.sh target/release/anvil
-          (cd target/dist && sha256sum --check *.sha256)
+          (cd target/dist && sha256sum --check ./*.sha256)
           support_dir="$(mktemp -d)"
           ANVIL_BIN=target/release/anvil bash scripts/support-bundle.sh "${support_dir}"
           support_archives=("${support_dir}"/anvil-support-*.tar.gz)
@@ -167,7 +173,7 @@ jobs:
 
       - name: Upload relocatable release bundle
         if: ${{ success() }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: anvil-${{ github.sha }}
           path: target/dist/*
@@ -176,7 +182,7 @@ jobs:
 
       - name: Upload CI diagnostics
         if: ${{ failure() }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: ci-diagnostics
           path: |
@@ -192,10 +198,12 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Nix
-        uses: cachix/install-nix-action@v31
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24  # v31
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
 

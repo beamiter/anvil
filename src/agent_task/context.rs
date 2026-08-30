@@ -60,7 +60,7 @@ pub fn block_agent_context_disabled_reason(
 /// The source identifiers remain stable when tabs and split panes are
 /// reordered. Terminal buffer anchors deliberately do not appear here: a task
 /// must keep its evidence after scrollback or the live
-/// [`crate::terminal::CommandRecord`] has been evicted.
+/// live command record has been evicted.
 ///
 /// `command_exact` means the shell supplied the complete command as OSC 133
 /// metadata. A display-reconstructed command can still be useful as untrusted

@@ -126,7 +126,7 @@ impl AgentDiffPanel {
     /// Start a read-only `HEAD` diff for `cwd` on a background thread.
     ///
     /// At most one request may be active. A successful request opens the
-    /// built-in window; callers embedding [`Self::show_contents`] may set
+    /// built-in window; callers embedding its contents may set
     /// `is_open` back to false without affecting the worker.
     pub fn request(&mut self, cwd: impl Into<PathBuf>) -> Result<(), DiffRequestError> {
         self.request_inner(cwd.into(), "HEAD".to_string())
