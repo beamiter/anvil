@@ -548,6 +548,12 @@ versioning for tagged releases while it remains experimental.
 
 ### Fixed
 
+- Remote Files destination `stat` now reports symbolic links before following
+  their target type and treats existing FIFOs, sockets, and devices as occupied
+  zero-size leaves. A special node was formerly reported as missing, so a
+  remote-to-remote paste could download its entire source before `put`/`untar`
+  finally refused the destination; a link to a directory also disagreed with
+  the listing protocol by reporting itself as a directory.
 - An unterminated `{{` in a workflow command is preserved again when a later
   placeholder in the same template closes a pair. The scanner took the first
   `}}` it could find anywhere to the right, so

@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-30 (Remote destinations include dangling links)
+Updated: 2026-08-30 (Remote destination probes are link-safe and nonblocking)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,13 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **Remote target preflight is type-stable and nonblocking (2026-08-30)**:
+  `stat` now tests `-L` before `-d`, so a link to a directory remains the same
+  leaf type the listing returned. FIFOs, sockets, and devices count as occupied
+  `f 0` targets without being opened for a size read; remote relays therefore
+  reject them before downloading a source they can never commit. The real-sh
+  test covers both a directory link and a FIFO.
 
 - **Remote creation cannot follow a dangling destination link (2026-08-30)**:
   every POSIX probe that creates, renames, copies, uploads, or extracts now

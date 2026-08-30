@@ -32,7 +32,8 @@ pub(crate) const PROBE_SCRIPT: &str = r#"# remote-fs probe v3 — runs under `sh
 # `tar` streams a directory to stdout; `untar <dir> <name>` extracts stdin into
 # <dir>, refusing an existing <dir>/<name> before anything is extracted;
 # every creator treats a dangling symbolic link as an existing target;
-# `stat` prints "<t> <size>" (size 0 for d/l).
+# `stat` classifies links first and never opens a special leaf to obtain size;
+# `stat` prints "<t> <size>" (bytes for regular files, otherwise 0).
 # Exit codes: 0 ok, 2 usage/bad path, 3 cannot enter dir, 4 op failed, 17 target exists.
 set -u
 op=${1:-}
@@ -130,11 +131,12 @@ case "$op" in
   stat)
     p=${2:-}
     case "$p" in /*) ;; *) exit 2 ;; esac
-    if [ -d "$p" ]; then t=d; s=0
-    elif [ -L "$p" ]; then t=l; s=0
+    if [ -L "$p" ]; then t=l; s=0
+    elif [ -d "$p" ]; then t=d; s=0
     elif [ -f "$p" ]; then
       t=f
       s=$(wc -c < "$p") || exit 4
+    elif [ -e "$p" ]; then t=f; s=0
     else
       exit 3
     fi
@@ -4359,6 +4361,17 @@ mod tests {
         std::fs::write(&file, &content).unwrap();
         std::fs::create_dir(tmp.path().join("dir")).unwrap();
         std::os::unix::fs::symlink("data.bin", tmp.path().join("link")).unwrap();
+        std::os::unix::fs::symlink("dir", tmp.path().join("dir-link")).unwrap();
+        let fifo = tmp.path().join("fifo");
+        let fifo_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(
+            // SAFETY: `fifo_path` is a live NUL-terminated path and the mode
+            // contains only ordinary permission bits.
+            unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) },
+            0,
+            "mkfifo failed: {}",
+            io::Error::last_os_error()
+        );
 
         let capture = local_probe(&["stat", file.to_str().unwrap()]);
         assert_eq!(capture.code, Some(0));
@@ -4368,6 +4381,16 @@ mod tests {
         assert_eq!(capture.stdout, b"d 0\n");
         let capture = local_probe(&["stat", tmp.path().join("link").to_str().unwrap()]);
         assert_eq!(capture.stdout, b"l 0\n");
+        let capture = local_probe(&["stat", tmp.path().join("dir-link").to_str().unwrap()]);
+        assert_eq!(
+            capture.stdout, b"l 0\n",
+            "a link to a directory must keep the list protocol's link type"
+        );
+        let capture = local_probe(&["stat", fifo.to_str().unwrap()]);
+        assert_eq!(
+            capture.stdout, b"f 0\n",
+            "a FIFO must count as occupied without being opened for a size read"
+        );
         assert_eq!(
             local_probe(&["stat", tmp.path().join("missing").to_str().unwrap()]).code,
             Some(3)
