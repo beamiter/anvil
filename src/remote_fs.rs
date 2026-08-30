@@ -2728,10 +2728,10 @@ fn download_file_with(
     let _timeout = control.arm_timeout(TRANSFER_TIMEOUT)?;
     let streamed = stream_to(&mut stdout, &mut file, max, control, progress);
     drop(stdout);
-    let status = probe_cleanup.wait()?;
+    let status = probe_cleanup.wait();
     // Transfer stderr is bounded error detail only; truncation is expected
     // and silently capped here, unlike the probe captures above.
-    let (stderr, _) = join_reader(probe.stderr)?;
+    let stderr = join_reader(probe.stderr);
     if control.is_timed_out() {
         return Err(transfer_timed_out_error());
     }
@@ -2739,6 +2739,8 @@ fn download_file_with(
     // the killed far side has no meaningful exit code of its own.
     control.check()?;
     streamed?;
+    let status = status?;
+    let (stderr, _) = stderr?;
     probe_result(
         "cat",
         Capture {
@@ -2971,44 +2973,40 @@ fn download_dir_with(
             kill_tree(&mut child);
         }
     }
-    let tar_status = tar_cleanup.wait()?;
-    let (tar_stderr, _) = join_reader(tar_stderr)?;
-    let status = probe_cleanup.wait()?;
-    let (stderr, _) = join_reader(probe.stderr)?;
+    let tar_status = tar_cleanup.wait();
+    let tar_stderr = join_reader(tar_stderr);
+    let status = probe_cleanup.wait();
+    let stderr = join_reader(probe.stderr);
     if control.is_timed_out() {
         return Err(transfer_timed_out_error());
     }
     control.check()?;
-    let outcome = streamed
-        .and_then(|_| {
-            // The remote's own exit code is the root cause more often than
-            // the local tar's, so it wins the error report.
-            probe_result(
-                "tar",
-                Capture {
-                    code: status.code(),
-                    stdout: Vec::new(),
-                    stderr,
-                },
-            )
-            .map(drop)
-        })
-        .and_then(|_| {
-            if tar_status.success() {
-                Ok(())
+    streamed?;
+    let tar_status = tar_status?;
+    let (tar_stderr, _) = tar_stderr?;
+    let status = status?;
+    let (stderr, _) = stderr?;
+    // The remote's own exit code is the root cause more often than the local
+    // tar's, so it wins the error report.
+    probe_result(
+        "tar",
+        Capture {
+            code: status.code(),
+            stdout: Vec::new(),
+            stderr,
+        },
+    )?;
+    if !tar_status.success() {
+        let detail = bounded_stderr_text(&tar_stderr);
+        return Err(io::Error::other(format!(
+            "local tar failed: {}",
+            if detail.is_empty() {
+                format!("exit status {tar_status}")
             } else {
-                let detail = bounded_stderr_text(&tar_stderr);
-                Err(io::Error::other(format!(
-                    "local tar failed: {}",
-                    if detail.is_empty() {
-                        format!("exit status {tar_status}")
-                    } else {
-                        detail
-                    }
-                )))
+                detail
             }
-        });
-    outcome?;
+        )));
+    }
     let extracted = extracted_top_level(staging.path(), &dst)?;
     // The directory becomes visible only after a complete, validated archive;
     // a destination that raced the transfer wins intact.
@@ -5395,6 +5393,54 @@ mod tests {
             std::fs::read_dir(local.path()).unwrap().count(),
             0,
             "no partial or temp file remains after an overflow abort"
+        );
+    }
+
+    #[test]
+    fn download_stream_error_kills_promptly_and_survives_reader_failure() {
+        use std::os::unix::process::CommandExt;
+
+        let local = TestDir::new("download-primary-error");
+        let started = std::time::Instant::now();
+        let error = download_file_with(
+            || {
+                let mut child = Command::new("sh")
+                    .args(["-c", "printf payload; sleep 1"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .process_group(0)
+                    .spawn()?;
+                let stdout = child.stdout.take();
+                Ok(ProbeChild {
+                    child: Arc::new(Mutex::new(child)),
+                    stdin: None,
+                    stdout,
+                    stderr: Some(std::thread::spawn(|| {
+                        Err(io::Error::other("injected stderr reader failure"))
+                    })),
+                })
+            },
+            OsStr::new("oversize.bin"),
+            local.path(),
+            1,
+            &TransferControl::new(),
+            &|_| {},
+        )
+        .expect_err("the one-byte transfer cap must reject the payload");
+
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "a stream failure must kill a producer that remains alive"
+        );
+        assert!(
+            error.to_string().contains("limit"),
+            "the primary stream error must survive diagnostic-reader failure: {error}"
+        );
+        assert_eq!(
+            std::fs::read_dir(local.path()).unwrap().count(),
+            0,
+            "the failed transfer leaves no staging file"
         );
     }
 
