@@ -2016,6 +2016,83 @@ impl Drop for StagingDir {
     }
 }
 
+/// Private same-parent extraction root for one downloaded directory. The
+/// archive never writes into the final namespace, and cleanup only targets
+/// this process-owned staging tree.
+struct ExtractionDir(PathBuf);
+
+impl ExtractionDir {
+    fn beside(dst: &Path) -> io::Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let parent = dst
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        for _ in 0..32 {
+            let path = parent.join(format!(
+                ".anvil-fs-extract-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            // A remote entry may legitimately have our hidden-name shape;
+            // never let the private staging root alias its final path.
+            if path.file_name() == dst.file_name() {
+                continue;
+            }
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            match builder.create(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not reserve a private directory extraction path",
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ExtractionDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn extracted_top_level(staging: &Path, dst: &Path) -> io::Result<PathBuf> {
+    let expected_name = dst.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "destination has no file name")
+    })?;
+    let mut entries = std::fs::read_dir(staging)?;
+    let entry = entries.next().transpose()?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "directory archive extracted no top-level entry",
+        )
+    })?;
+    if entry.file_name() != expected_name || entries.next().transpose()?.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "directory archive has an unexpected top-level shape",
+        ));
+    }
+    let path = entry.path();
+    if !std::fs::symlink_metadata(&path)?.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "directory archive top-level entry is not a directory",
+        ));
+    }
+    Ok(path)
+}
+
 /// Directory transfers shell out to the system `tar` on the local side too;
 /// fail up-front with a clear error when it is missing.
 fn require_local_tar() -> io::Result<()> {
@@ -2547,6 +2624,7 @@ fn download_dir_with(
     require_missing(&dst)?;
     require_local_tar()?;
     control.check()?;
+    let staging = ExtractionDir::beside(&dst)?;
     let probe = spawn()?;
     let probe_handle = probe.handle();
     let stdout = probe
@@ -2555,7 +2633,7 @@ fn download_dir_with(
     let mut tar_command = Command::new("tar");
     tar_command
         .args(["xf", "-", "-C"])
-        .arg(dir)
+        .arg(staging.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
@@ -2590,14 +2668,9 @@ fn download_dir_with(
     let status = wait_child(&probe_handle)?;
     let (stderr, _) = join_reader(probe.stderr)?;
     if control.is_timed_out() {
-        let _ = std::fs::remove_dir_all(&dst);
         return Err(transfer_timed_out_error());
     }
-    if let Err(error) = control.check() {
-        // tar streams straight into the destination: drop the partial tree.
-        let _ = std::fs::remove_dir_all(&dst);
-        return Err(error);
-    }
+    control.check()?;
     let outcome = streamed
         .and_then(|_| {
             // The remote's own exit code is the root cause more often than
@@ -2627,11 +2700,11 @@ fn download_dir_with(
                 )))
             }
         });
-    if let Err(error) = outcome {
-        // tar streams straight into the destination: drop the partial tree.
-        let _ = std::fs::remove_dir_all(&dst);
-        return Err(error);
-    }
+    outcome?;
+    let extracted = extracted_top_level(staging.path(), &dst)?;
+    // The directory becomes visible only after a complete, validated archive;
+    // a destination that raced the transfer wins intact.
+    rename_noreplace(&extracted, &dst)?;
     Ok(dst)
 }
 
@@ -4777,6 +4850,96 @@ mod tests {
             content
         );
         assert_eq!(std::fs::read(dst.join("readme")).unwrap(), b"hi");
+        assert_eq!(
+            std::fs::read_dir(local_dst.path()).unwrap().count(),
+            1,
+            "a successful download leaves only the published directory"
+        );
+    }
+
+    #[test]
+    fn directory_download_validates_then_publishes_without_overwrite() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let remote = TestDir::new("dir-transaction-src");
+        let local = TestDir::new("dir-transaction-dst");
+        let dst = local.path().join("tree");
+
+        let staging_path = {
+            let staging = ExtractionDir::beside(&dst).unwrap();
+            let path = staging.path().to_path_buf();
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o077,
+                0,
+                "archive staging must remain owner-only"
+            );
+            path
+        };
+        assert!(!staging_path.exists(), "private staging cleans up on drop");
+
+        // A successful tar command with the wrong root is still invalid input:
+        // none of its content may escape staging or become the destination.
+        let wrong = remote.path().join("wrong-root");
+        std::fs::create_dir(&wrong).unwrap();
+        std::fs::write(wrong.join("payload"), b"wrong").unwrap();
+        let wrong_str = wrong.to_str().unwrap().to_string();
+        let error = download_dir_with(
+            || spawn_local(&["tar", &wrong_str], ScriptDelivery::Stdin),
+            OsStr::new("tree"),
+            local.path(),
+            1 << 24,
+            &TransferControl::new(),
+            &|_| {},
+        )
+        .expect_err("an unexpected archive root must be refused");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read_dir(local.path()).unwrap().count(), 0);
+
+        // Make a valid archive, but have its producer create the final
+        // destination immediately before streaming. Atomic publication must
+        // leave that racing directory intact and discard the private tree.
+        let source = remote.path().join("tree");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("downloaded"), b"payload").unwrap();
+        let source_str = source.to_str().unwrap().to_string();
+        let capture = local_probe(&["tar", &source_str]);
+        assert_eq!(capture.code, Some(0));
+        let archive = remote.path().join("tree.tar");
+        std::fs::write(&archive, capture.stdout).unwrap();
+        let dst_arg = dst.as_os_str().to_os_string();
+        let archive_arg = archive.as_os_str().to_os_string();
+
+        let error = download_dir_with(
+            || {
+                let argv = vec![
+                    OsString::from("sh"),
+                    OsString::from("-c"),
+                    OsString::from("mkdir \"$1\" && printf keep > \"$1/marker\" && cat \"$2\""),
+                    OsString::from("--"),
+                    dst_arg,
+                    archive_arg,
+                ];
+                spawn_probe_argv(&argv, ScriptDelivery::Argv)
+            },
+            OsStr::new("tree"),
+            local.path(),
+            1 << 24,
+            &TransferControl::new(),
+            &|_| {},
+        )
+        .expect_err("the destination created during streaming must win");
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(dst.join("marker")).unwrap(), b"keep");
+        assert!(
+            !dst.join("downloaded").exists(),
+            "archive content must not merge into the racing destination"
+        );
+        let entries: Vec<_> = std::fs::read_dir(local.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, [OsString::from("tree")]);
     }
 
     #[test]

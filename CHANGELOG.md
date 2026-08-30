@@ -548,6 +548,12 @@ versioning for tagged releases while it remains experimental.
 
 ### Fixed
 
+- Directory downloads now extract into a private mode-0700 directory beside
+  their destination, validate that the archive produced exactly one matching
+  directory root, and publish it with `RENAME_NOREPLACE` only after both sides
+  finish successfully. A destination created while the tar stream is in flight
+  is no longer merged with archive content or recursively removed by failure
+  cleanup; only the process-owned staging tree is cleaned.
 - Local transfer staging is now reserved mode 0600 with exclusive create before
   the remote producer starts. `File::create` followed a preplanted hidden
   symlink and could truncate its target, while starting the child first left an
