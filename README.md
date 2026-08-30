@@ -1032,6 +1032,12 @@ total (estimated with a bounded, symlink-free size walk), and per-item
 failures — an existing name, an unreadable file — are summarized in the
 completion toast without aborting the rest.
 
+Local Rename and downloaded-file publication use Linux
+`renameat2(RENAME_NOREPLACE)`: a destination created by another process after
+the friendly existence check wins intact instead of being overwritten by the
+commit. A kernel or filesystem without that atomic primitive fails closed
+rather than falling back to a racy rename.
+
 The tree multi-selects: Ctrl+click toggles rows, Shift+click extends a range.
 A right-click inside the selection aims the menu at all of it (Delete reads
 "Delete N items" and the confirmation names up to five); a right-click

@@ -548,6 +548,12 @@ versioning for tagged releases while it remains experimental.
 
 ### Fixed
 
+- Local Files Rename and downloaded-file publication now commit with
+  `renameat2(RENAME_NOREPLACE)`. Their former final `require_missing` followed
+  by ordinary `rename` left a check-to-commit window in which another process's
+  destination could be silently overwritten. The early path-aware diagnostic
+  remains, but the namespace operation is now the authoritative existence
+  check and unsupported kernels/filesystems fail closed.
 - Remote Files destination `stat` now reports symbolic links before following
   their target type and treats existing FIFOs, sockets, and devices as occupied
   zero-size leaves. A special node was formerly reported as missing, so a

@@ -804,10 +804,7 @@ pub(crate) fn rename(
 ) -> io::Result<()> {
     validate_not_into_self(src, dst)?;
     match loc {
-        FsLocation::Local => {
-            require_missing(dst)?;
-            std::fs::rename(src, dst)
-        }
+        FsLocation::Local => rename_noreplace(src, dst),
         FsLocation::Remote(_) | FsLocation::Transient(_) => {
             require_absolute(src)?;
             require_absolute(dst)?;
@@ -961,6 +958,66 @@ fn require_missing(path: &Path) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn atomic_rename_noreplace(src: &Path, dst: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let src = std::ffi::CString::new(src.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source path contains NUL"))?;
+    let dst = std::ffi::CString::new(dst.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "destination path contains NUL")
+    })?;
+    // SAFETY: both C strings remain live for this single namespace syscall;
+    // RENAME_NOREPLACE makes a concurrently-created destination an error.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            src.as_ptr(),
+            libc::AT_FDCWD,
+            dst.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP)
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("atomic no-replace rename is unavailable: {error}"),
+        ));
+    }
+    Err(error)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn atomic_rename_noreplace(_src: &Path, _dst: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic no-replace rename requires Linux renameat2",
+    ))
+}
+
+fn rename_noreplace_with(
+    src: &Path,
+    dst: &Path,
+    commit: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    // Preserve the existing path-aware early diagnostic; the namespace
+    // operation remains authoritative when another process wins afterward.
+    require_missing(dst)?;
+    commit(src, dst)
+}
+
+fn rename_noreplace(src: &Path, dst: &Path) -> io::Result<()> {
+    rename_noreplace_with(src, dst, atomic_rename_noreplace)
 }
 
 /// Recursive copy mirroring `cp -a` semantics closely enough for the tree:
@@ -2288,10 +2345,9 @@ fn download_file_with(
     )?;
     file.sync_all()?;
     drop(file);
-    // Atomic backstop: a same-name file that appeared while streaming must
-    // never be overwritten.
-    require_missing(&dst)?;
-    std::fs::rename(&temp, &dst)?;
+    // Atomic backstop: a same-name file that appeared while streaming wins;
+    // the commit itself, not a check before it, enforces no-overwrite.
+    rename_noreplace(&temp, &dst)?;
     Ok(dst)
 }
 
@@ -3827,6 +3883,27 @@ mod tests {
         assert!(!dir_copy.exists());
         delete(&loc, &hosts, &renamed).unwrap();
         assert!(!renamed.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn atomic_rename_refuses_a_destination_created_after_preflight() {
+        let tmp = TestDir::new("rename-noreplace-race");
+        let src = tmp.path().join("source");
+        let dst = tmp.path().join("destination");
+        std::fs::write(&src, b"source bytes").unwrap();
+
+        let error = rename_noreplace_with(&src, &dst, |src, dst| {
+            // Occupy the name after require_missing returned, at the exact
+            // boundary the production syscall must protect.
+            std::fs::write(dst, b"racing winner")?;
+            atomic_rename_noreplace(src, dst)
+        })
+        .expect_err("the concurrent destination must win");
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&src).unwrap(), b"source bytes");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"racing winner");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-30 (Remote destination probes are link-safe and nonblocking)
+Updated: 2026-08-30 (Files commits and probes fail closed)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,13 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **Local Files no-overwrite is atomic at commit (2026-08-30)**: local Rename
+  and the final publication of a downloaded regular file now use Linux
+  `renameat2(RENAME_NOREPLACE)`. A deterministic injected race creates the
+  destination after the friendly precheck but before the real syscall and
+  proves the winner and source both remain byte-for-byte intact. Unsupported
+  kernels or filesystems fail closed; no racy fallback is used.
 
 - **Remote target preflight is type-stable and nonblocking (2026-08-30)**:
   `stat` now tests `-L` before `-d`, so a link to a directory remains the same
