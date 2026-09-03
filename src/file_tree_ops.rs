@@ -385,9 +385,6 @@ impl AppModel {
                 sender,
             );
         }
-        self.set_sidebar_visible(true, false);
-        self.sidebar_view.set(config::SidebarView::Files);
-        self.apply_sidebar_view(config::SidebarView::Files, false);
     }
 
     fn next_file_tree_navigation_token(&self) -> Option<(u64, file_tree::ScanCancellation)> {
