@@ -1,5 +1,8 @@
 //! Small Relm4 components used by the sidebar pages.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use relm4::gtk;
 use relm4::gtk::prelude::*;
 use relm4::prelude::*;
@@ -127,7 +130,13 @@ pub(crate) struct FileHeaderModel {
     tooltip: String,
     location_details: Vec<String>,
     selected: usize,
-    suppress_location_signal: bool,
+    /// Raised only while a programmatic rebuild is driving the dropdown.
+    /// The `notify::selected` handler reads it *inside* the emission, so the
+    /// echo never becomes a queued message: `set_model`/`set_selected` emit
+    /// synchronously, but `sender.input` would deliver after the rebuild has
+    /// already lowered the flag, and the stale index would then read as a
+    /// user-driven switch back to Local.
+    suppress_location_signal: Rc<Cell<bool>>,
     filter_open: bool,
     show_hidden: bool,
 }
@@ -155,7 +164,10 @@ impl Component for FileHeaderModel {
                     set_widget_name: "file-tree-location",
                     set_hexpand: false,
                     set_tooltip_text: Some("Choose which filesystem the tree browses"),
-                    connect_selected_notify[sender] => move |dropdown| {
+                    connect_selected_notify[sender, suppress_location_signal] => move |dropdown| {
+                        if suppress_location_signal.get() {
+                            return;
+                        }
                         sender.input(FileHeaderMsg::LocationActivated(dropdown.selected() as usize));
                     },
                 },
@@ -304,20 +316,23 @@ impl Component for FileHeaderModel {
             // visible label. Falling back to the labels is safe and honest.
             details = labels.clone();
         }
+        let suppress_location_signal = Rc::new(Cell::new(false));
         let model = Self {
             display: "~".to_string(),
             tooltip: String::new(),
             location_details: details,
             selected: 0,
-            suppress_location_signal: false,
+            suppress_location_signal: suppress_location_signal.clone(),
             filter_open: false,
             show_hidden: false,
         };
         let widgets = view_output!();
         let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        model.suppress_location_signal.set(true);
         widgets
             .location_dropdown
             .set_model(Some(&gtk::StringList::new(&refs)));
+        model.suppress_location_signal.set(false);
         widgets.location_dropdown.set_tooltip_text(Some(
             model
                 .location_details
@@ -448,7 +463,7 @@ impl Component for FileHeaderModel {
                 // set_model/set_selected fire `selected` notifications
                 // synchronously; the flag keeps the rebuild from looking like
                 // user input and switching the tree underneath itself.
-                self.suppress_location_signal = true;
+                self.suppress_location_signal.set(true);
                 if details.len() != labels.len() {
                     details = labels.clone();
                 }
@@ -468,10 +483,10 @@ impl Component for FileHeaderModel {
                 widgets
                     .terminal_button
                     .set_tooltip_text(Some(terminal_button_tooltip(selected)));
-                self.suppress_location_signal = false;
+                self.suppress_location_signal.set(false);
             }
             FileHeaderMsg::LocationActivated(index) => {
-                if !self.suppress_location_signal && index != self.selected {
+                if !self.suppress_location_signal.get() && index != self.selected {
                     self.selected = index;
                     widgets.location_dropdown.set_tooltip_text(Some(
                         self.location_details
@@ -554,6 +569,61 @@ mod tests {
         assert!(terminal_button_tooltip(0).contains("this tree directory"));
         assert!(terminal_button_tooltip(1).contains("may differ from this tree path"));
         assert_eq!(terminal_button_tooltip(128), REMOTE_TERMINAL_TOOLTIP);
+    }
+
+    /// A programmatic selector rebuild must not read back as a user switch.
+    /// `set_model`/`set_selected` emit `notify::selected` synchronously, but
+    /// the handler used to defer through `sender.input`, so the echo arrived
+    /// after the rebuild had lowered its suppression flag and looked like a
+    /// deliberate move back to Local. Because every location switch re-emits
+    /// `SetLocations`, that echo re-armed itself: pointing Files at a remote
+    /// host (manually, or automatically when Files follows an SSH session)
+    /// spun the GTK thread at 100% and froze the whole window.
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn programmatic_location_rebuild_does_not_echo_back_as_a_user_switch() {
+        gtk::init().expect("GTK display");
+        let labels = || vec!["Local".to_string(), "ssh: staging".to_string()];
+        let details = || {
+            vec![
+                "Local filesystem".to_string(),
+                "ssh: staging — deploy@server.example.com".to_string(),
+            ]
+        };
+        let switches: Rc<std::cell::RefCell<Vec<usize>>> = Rc::default();
+        let sink = switches.clone();
+        let header = FileHeaderModel::builder()
+            .launch((labels(), details()))
+            .connect_receiver(move |_, output| {
+                if let FileHeaderOutput::SelectLocation(index) = output {
+                    sink.borrow_mut().push(index);
+                }
+            });
+        while gtk::glib::MainContext::default().iteration(false) {}
+        switches.borrow_mut().clear();
+
+        header.emit(FileHeaderMsg::SetLocations {
+            labels: labels(),
+            details: details(),
+            selected: 1,
+        });
+        while gtk::glib::MainContext::default().iteration(false) {}
+        assert!(
+            switches.borrow().is_empty(),
+            "rebuilding the selector emitted {:?}",
+            switches.borrow()
+        );
+
+        // The suppression is scoped to the rebuild: moving the selector still
+        // switches the tree.
+        let root = header.widget().clone().upcast::<gtk::Widget>();
+        let location = descendant_named(&root, "file-tree-location")
+            .expect("location dropdown in file header")
+            .downcast::<gtk::DropDown>()
+            .expect("named widget is a dropdown");
+        location.set_selected(0);
+        while gtk::glib::MainContext::default().iteration(false) {}
+        assert_eq!(&*switches.borrow(), &[0]);
     }
 
     #[test]

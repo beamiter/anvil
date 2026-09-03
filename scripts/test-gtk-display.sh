@@ -76,6 +76,7 @@ tests=(
     block_view::unified_images::tests::real_vte_keeps_nonzero_marker_column_through_narrow_wide_rewrap
     block_view::unified_chrome::tests::real_vte_osc8_row_probe_and_rewrap_smoke
     block_view::unified_chrome::tests::real_vte_non_bottom_anchor_calibrates_and_wide_badge_probe_fails_closed
+    sidebar::tests::programmatic_location_rebuild_does_not_echo_back_as_a_user_switch
 )
 
 export RUST_TEST_THREADS=1
