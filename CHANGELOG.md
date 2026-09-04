@@ -548,6 +548,20 @@ versioning for tagged releases while it remains experimental.
 
 ### Fixed
 
+- A shell that draws below its input line — jsh's Tab completion menu above
+  all, but equally its AI explanation, its signature hint, or any two-line
+  prompt — is no longer clipped into the compact input card. The live grid was
+  pinned to the card's own `MIN_INPUT_ROWS` height at the prompt while the child
+  had been told the pane's full winsize through `pty_grid_size`, so a menu sized
+  to half the viewport overflowed a six-row terminal: most of it scrolled
+  straight into the live VTE's scrollback, four entries showed behind the
+  overlay scrollbar, and the rest of the pane stayed empty. The prompt now gets
+  the full viewport grid the running command already had, and the *card* is
+  measured from the rows the shell actually drew — so it grows to cover the menu
+  and collapses back to the compact input when the menu closes. Panes that keep
+  the previous command's live scrollback (`preserve_live_scrollback`) draw their
+  prompt at the bottom of the ring rather than the top of a cleared screen, and
+  keep the grid pinned to the card as before.
 - Directory-download extraction staging now retains a no-follow directory
   descriptor and compares its device/inode with the live path before recursive
   cleanup. Moving the private staging root away and replacing its old name can

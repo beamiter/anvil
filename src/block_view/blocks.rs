@@ -4684,6 +4684,15 @@ pub(crate) struct ActiveBlock {
     /// so rows keep climbing for the life of the pane.
     live_cursor_origin: Rc<Cell<Option<i64>>>,
     live_cursor_high: Rc<Cell<i64>>,
+    /// `preserve_live_scrollback` as it stands now (`reload_config` writes it).
+    /// It decides where the prompt lives inside the live grid, which is what
+    /// the compact-card layout has to know: with the default reset the prompt
+    /// starts at the top of a freshly cleared screen, so the card can show the
+    /// grid's first rows and grow into whatever the shell drew below the input.
+    /// When the previous command's output is deliberately kept, the prompt is
+    /// at the *bottom* of the ring instead, so the grid stays pinned to the
+    /// card exactly as it was before.
+    preserve_live_scrollback: Cell<bool>,
     /// Pass-through, non-measuring surface for small live widgets. The VTE
     /// remains the overlay's measured child, so the organism never changes
     /// the terminal grid or steals input.
@@ -4883,6 +4892,7 @@ impl ActiveBlock {
             live_extent_rows: Rc::new(Cell::new(0)),
             live_cursor_origin: Rc::new(Cell::new(None)),
             live_cursor_high: Rc::new(Cell::new(0)),
+            preserve_live_scrollback: Cell::new(config.preserve_live_scrollback),
             live_organism_surface,
             unified_image_surface,
             unified_chrome_surface,
@@ -4966,6 +4976,17 @@ impl ActiveBlock {
     /// pane on its own.
     pub(crate) fn live_clip(&self) -> gtk::Overlay {
         self.live_clip.clone()
+    }
+
+    /// Whether the live surface keeps the previous command's scrollback at the
+    /// prompt. Read by `block_layout_active_surface`; written by
+    /// `TermView::reload_config` so a runtime config change is not stale here.
+    pub(crate) fn preserve_live_scrollback(&self) -> bool {
+        self.preserve_live_scrollback.get()
+    }
+
+    pub(crate) fn set_preserve_live_scrollback(&self, preserve: bool) {
+        self.preserve_live_scrollback.set(preserve);
     }
 
     /// Shared high-water extent, cloned into `block_layout_active_surface`.
