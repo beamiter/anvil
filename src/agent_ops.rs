@@ -389,21 +389,21 @@ impl AppModel {
     pub(crate) fn refresh_agent_panel(&self) {
         if let Some(view) = self.agent_panel_view() {
             let pulse = if view.loading {
-                Some(crate::organism::AgentPulse::Working)
+                Some(jterm_core::organism::AgentPulse::Working)
             } else {
                 match view.state {
                     agent::AgentState::Ready => None,
                     agent::AgentState::AwaitingModel
                     | agent::AgentState::AwaitingObservation { .. } => {
-                        Some(crate::organism::AgentPulse::Working)
+                        Some(jterm_core::organism::AgentPulse::Working)
                     }
                     agent::AgentState::AwaitingApproval { .. } => {
-                        Some(crate::organism::AgentPulse::AskingReview)
+                        Some(jterm_core::organism::AgentPulse::AskingReview)
                     }
                     agent::AgentState::Completed | agent::AgentState::TurnLimitReached => {
-                        Some(crate::organism::AgentPulse::Finished)
+                        Some(jterm_core::organism::AgentPulse::Finished)
                     }
-                    agent::AgentState::Cancelled => Some(crate::organism::AgentPulse::Gone),
+                    agent::AgentState::Cancelled => Some(jterm_core::organism::AgentPulse::Gone),
                 }
             };
             if let Some(pulse) = pulse {
@@ -1050,7 +1050,7 @@ impl AppModel {
         if let Some(mut previous) = previous {
             self.organism_hub
                 .agent_signal()
-                .note_phase(crate::organism::AgentPulse::Gone);
+                .note_phase(jterm_core::organism::AgentPulse::Gone);
             let target = (previous.bound_tab, previous.bound_pane);
             previous.cancel();
             let card: gtk::Widget = self.agent_panel.widget().clone().upcast();

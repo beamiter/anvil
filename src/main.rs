@@ -39,9 +39,6 @@ mod jsh_ops;
 mod keybindings;
 mod navigation_ui;
 mod notebook;
-mod organism;
-mod organism_attention;
-mod organism_memory;
 mod organism_ui;
 mod palette;
 mod pane_header;
@@ -2533,6 +2530,29 @@ impl SimpleComponent for AppModel {
     }
 }
 
+/// Anvil's durability lane for `jterm_core::organism_memory`.
+///
+/// Core decides *what* an organism-memory update is and *when* to ask; the app
+/// decides *how* it reaches the disk. Routing it through `persistence` is the
+/// whole point of registering: the shared worker coalesces two pending writes
+/// to the same memory file into one, charges them against the same admission
+/// budget as history and session snapshots, and is drained by the same shutdown
+/// accounting. Core's unregistered fallback is a correct, bounded writer thread
+/// of its own, so nothing breaks without this — the organism still remembers —
+/// which is exactly why the registration below is asserted by a test instead of
+/// left to a compile error.
+struct OrganismLane;
+
+impl jterm_core::organism_memory::MemoryScheduler for OrganismLane {
+    fn schedule(&self, write: jterm_core::organism_memory::MemoryWrite) -> std::io::Result<()> {
+        // Copy the coalescing key out of `write` before the closure takes it,
+        // so the borrow ends before the move.
+        let key = persistence::PersistenceKey::for_path(write.kind(), write.path());
+        let operation = write.operation();
+        persistence::enqueue(key, operation, move || write.run())
+    }
+}
+
 fn main() {
     // Freeze the inherited environment before anything can mutate it: CLI
     // parsing writes ANVIL_CONFIG below, input-method setup writes
@@ -2553,6 +2573,12 @@ fn main() {
         // library's version paired with our name.
         app_version: env!("CARGO_PKG_VERSION"),
     });
+    // Beside `identity::init` and before the first `OrganismMemory::load`: a
+    // lane cannot be swapped underneath writes that are already in flight, and
+    // an unregistered process silently writes through core's own thread instead
+    // of ours. Every `main` exit path below shares this line, including the
+    // subcommands that never open a window, so no route can lose the lane.
+    jterm_core::organism_memory::init_scheduler(Box::new(OrganismLane));
     let parsed = match cli::parse(std::env::args_os().skip(1)) {
         Ok(parsed) => parsed,
         Err(error) => {
@@ -3038,6 +3064,84 @@ mod organism_focus_tests {
             "reparenting the same pane still hides its old surface"
         );
         assert!(!organism_focus_transfer_required(None, None, false));
+    }
+}
+
+#[cfg(test)]
+mod startup_wiring_tests {
+    /// The one adoption step no compiler error catches.
+    ///
+    /// `jterm_core::organism_memory` records commands whether or not this
+    /// process registers a lane: with none, core writes through a bounded
+    /// writer thread of its own. Deleting the registration therefore compiles,
+    /// passes every other test, and looks correct from the outside — while
+    /// every organism-memory write silently leaves anvil's persistence worker,
+    /// and with it the coalescing that collapses two pending writes to one
+    /// memory file, the shared admission budget, and the shutdown accounting
+    /// that `flush_pending` and `persistence::shutdown` perform in that order.
+    ///
+    /// There is nothing to observe at runtime instead. `main` is not callable
+    /// from a test binary, and `scheduler_is_registered` answers for whichever
+    /// process asks — in this one, `main` never ran. So the guard is
+    /// structural, as it is for frost's single flushing exit.
+    #[test]
+    fn organism_memory_writes_are_registered_onto_anvils_persistence_lane() {
+        let source = include_str!("main.rs");
+        // Built rather than written out, so this test's own source does not
+        // count as one of the call sites it is looking for.
+        let needle = format!("organism_memory::init_{}", "scheduler");
+        let call_sites: Vec<&str> = source
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.contains(&needle) && !line.starts_with("//"))
+            .collect();
+        assert_eq!(
+            call_sites,
+            [format!("jterm_core::{needle}(Box::new(OrganismLane));")],
+            "startup must register anvil's organism-memory lane exactly once"
+        );
+
+        // Inside `main`, after `identity::init`: a lane cannot be swapped
+        // underneath writes already in flight, so the first registration is the
+        // only one that counts and it has to precede every route that can load
+        // organism memory.
+        let main_body = source
+            .split_once("\nfn main() {")
+            .expect("the process entry point exists")
+            .1;
+        // Bounded to `main`'s own body: every block inside it is indented, so
+        // the first closing brace in column zero is its own. Without this the
+        // ordering below would also be satisfied by a registration parked in
+        // some helper further down the file, which `main` need never call.
+        let main_body = &main_body[..main_body.find("\n}\n").expect("main closes")];
+        let identity_at = main_body
+            .find("identity::init(")
+            .expect("main registers the app identity");
+        let lane_at = main_body
+            .find(&needle)
+            .expect("main registers the organism-memory lane");
+        assert!(
+            identity_at < lane_at,
+            "the lane is registered beside identity::init, not before it"
+        );
+
+        // And the lane is anvil's persistence worker rather than a stub that
+        // accepts writes and drops them, or one that runs the two cross-process
+        // `flock`s inline on the GTK main thread.
+        let lane = source
+            .split_once("impl jterm_core::organism_memory::MemoryScheduler for OrganismLane {")
+            .expect("the lane exists")
+            .1;
+        let lane = &lane[..lane.find("\nfn main() {").expect("the impl closes")];
+        assert!(
+            lane.contains("persistence::enqueue(key, operation, move || write.run())"),
+            "the lane must hand the write to anvil's persistence worker"
+        );
+        assert!(
+            lane.contains("PersistenceKey::for_path(write.kind(), write.path())"),
+            "coalescing must key on core's own kind and path, so two pending \
+             writes to one memory file collapse and unrelated ones never do"
+        );
     }
 }
 

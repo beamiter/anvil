@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-09-05 (Journal lifecycle tokens, one opener policy)
+Updated: 2026-09-06 (Organism subsystem adopted from core)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,72 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **The ASCII organism is consumed from `jterm_core`, and anvil's persistence
+  worker is registered as its write lane (2026-09-06, repin round)**:
+  `jterm_core` is repinned to `fa256d637570f5d03290f3db91627cb054271654`; its
+  transitive `jagent` pin is unchanged at
+  `bdc8023faa535ee00bb972cdb0adc11ba280fdc5`. `src/organism.rs`,
+  `src/organism_memory.rs` and `src/organism_attention.rs` are deleted — about
+  9,000 lines anvil and forge each carried a copy of — and their 119 tests now
+  run in core. forge's copy was taken as canonical upstream, so the
+  `s/Forge/Anvil/` rename damage in anvil's copy ("Anvilt exact ordering" for
+  "Forget exact ordering" at the old `organism_memory.rs:363`, a test local
+  renamed `anvild` at `:3754`) is gone rather than carried across. Call sites
+  spell `jterm_core::organism*` rather than going through a per-module
+  `pub use` shim: there are about twenty of them, the app's own GTK body keeps
+  the `organism_ui` name, and a shim would have left three files behind that
+  read as though the subsystem were still local. `src/process.rs` remains the
+  precedent for the other choice, where a shim keeps far more call sites still.
+
+  **The one step no compiler error catches, and the reason this entry exists:**
+  `main` registers anvil's durability lane —
+
+  ```rust
+  jterm_core::organism_memory::init_scheduler(Box::new(OrganismLane));
+  ```
+
+  — immediately after `jterm_core::identity::init`, and `OrganismLane::schedule`
+  hands each `MemoryWrite` to `persistence::enqueue` keyed by
+  `PersistenceKey::for_path(write.kind(), write.path())`. `persistence` itself
+  needed no change; the existing `enqueue` signature already fits. Without the
+  registration everything still compiles and every test still passes, because
+  core falls back to a bounded writer thread of its own — writes stay correct
+  and nothing is lost — but they leave anvil's persistence worker, and with it
+  the coalescing that collapses two pending writes to one memory file, the
+  shared admission budget, and the shutdown accounting that runs
+  `organism_memory::flush_pending` and then `persistence::shutdown`. The only
+  runtime evidence would be a single `log::warn!` at the first write. Core
+  exposes `scheduler_is_registered() -> bool` for a doctor command to assert;
+  anvil pins it structurally instead, in
+  `startup_wiring_tests::organism_memory_writes_are_registered_onto_anvils_persistence_lane`,
+  which fails if the call is deleted, moved before `identity::init`, or changed
+  to stop routing through `persistence::enqueue`. `main` is not callable from a
+  test binary and `scheduler_is_registered` answers only for the process that
+  asks, so the guard is structural for the same reason frost's
+  `the_process_has_exactly_one_exit_and_it_flushes_first` is.
+
+  Two API changes came with the move. `OrganismMemory::load_default()` no longer
+  exists — core has no opinion about where an app stores state, because a wrong
+  path there fails silently, loading clean and reporting no error — so
+  `OrganismHub::new` calls
+  `OrganismMemory::load(config::default_ascii_organism_memory_path())`; the file
+  is unchanged. And `CircadianProfile::from_mask` is replaced by
+  `from_window_start(start_bucket: u8)`, which makes the invalid state
+  unrepresentable rather than rejected: most `u8` masks name no window start,
+  and `from_mask(0)` and the obvious-looking `from_mask(0b1111_1111)` both built
+  profiles whose `session_day` panicked. The three `organism_ui` tests that
+  pinned a fixed window now pass the start bucket producing the mask each one
+  already asserted (`2` for `0b0001_1100`, `7` for `0b1000_0011`); no assertion
+  changed. `flush_pending(500ms)` stays exactly where it was in the shutdown
+  drain, ahead of `persistence::shutdown`; it is now a bounded join on core's
+  fallback writer, which a registered lane never starts.
+
+  Test count: **1497 → 1379 passing** (40 ignored both before and after; 1537 →
+  1419 collected). The whole difference is the 119 organism tests that moved to
+  core — 50 from `organism::`, 61 from `organism_memory::`, 8 from
+  `organism_attention::` — less the one test added above. Diffing the collected
+  test lists before and after names no other removal.
 
 - **Journal output is bound to a lifecycle token minted at `C`
   (2026-09-05, repin round)**: `jterm_core` is repinned to

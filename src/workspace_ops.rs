@@ -1288,7 +1288,7 @@ impl AppModel {
             log::warn!("execution-journal writer did not flush before shutdown");
         }
         if let Err(error) =
-            crate::organism_memory::flush_pending(std::time::Duration::from_millis(500))
+            jterm_core::organism_memory::flush_pending(std::time::Duration::from_millis(500))
         {
             log::warn!("ASCII organism memory could not be queued for shutdown: {error}");
         }

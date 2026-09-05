@@ -10,15 +10,15 @@ use std::time::{Duration, Instant};
 use crate::block_view::{AltScreenTransition, TermView};
 use crate::config::OrganismMotion;
 #[cfg(test)]
-use crate::organism::sprite_frame;
-use crate::organism::{
+use jterm_core::organism::sprite_frame;
+use jterm_core::organism::{
     classify_command, sprite_frame_with_context, sticky_glyph_with_context, AgentPulse,
     AmbientBehavior, AmbientMind, Behavior, BodyLanguage, CircadianPhase, CommandKind, LifeState,
     NativeOrganism, Reaction, RenderContext, RepoArrival, RepoVigil, RepoWorkState, Tone,
     VisualGrowthStage, VisualTransition, WatchRhythm,
 };
-use crate::organism_attention::{AttentionArbiter, AttentionCue};
-use crate::organism_memory::{
+use jterm_core::organism_attention::{AttentionArbiter, AttentionCue};
+use jterm_core::organism_memory::{
     local_circadian_time_at_ms, unix_ms, CircadianProfile, GrowthProgress, GrowthStage,
     LocalCircadianTime, MemoryEvent, MemoryInsight, RepoContext,
 };
@@ -1133,7 +1133,7 @@ impl OrganismCorrectionSignal {
         self.dismiss_streak.set(0);
         self.accepted.set(Some((pane, Instant::now())));
         self.life
-            .set(crate::organism::correction_accepted(self.life.get()));
+            .set(jterm_core::organism::correction_accepted(self.life.get()));
     }
 
     /// Drop a pending acceptance whose command demonstrably did not run.
@@ -1146,7 +1146,7 @@ impl OrganismCorrectionSignal {
     pub(crate) fn note_dismissed(&self) {
         let streak = self.dismiss_streak.get().saturating_add(1);
         self.dismiss_streak.set(streak);
-        self.life.set(crate::organism::correction_dismissed(
+        self.life.set(jterm_core::organism::correction_dismissed(
             self.life.get(),
             streak,
         ));
@@ -1596,7 +1596,7 @@ impl OrganismAgentSignal {
             return;
         }
         self.life
-            .set(crate::organism::agent_pulse(self.life.get(), pulse));
+            .set(jterm_core::organism::agent_pulse(self.life.get(), pulse));
     }
 }
 
@@ -2842,7 +2842,7 @@ fn percent(value: f32) -> u8 {
 /// application state machine.
 pub(crate) struct OrganismHub {
     config: Rc<RefCell<crate::config::Config>>,
-    organism_memory: Rc<RefCell<Option<crate::organism_memory::OrganismMemory>>>,
+    organism_memory: Rc<RefCell<Option<jterm_core::organism_memory::OrganismMemory>>>,
     organism_life: Rc<Cell<LifeState>>,
     organism_correction: Rc<OrganismCorrectionSignal>,
     organism_activity: Rc<OrganismActivity>,
@@ -2855,7 +2855,11 @@ impl OrganismHub {
         // Load even while the feature is disabled. A live config reload can
         // then opt a newly-created Block pane in without silently discarding
         // its existing local memory. Corrupt/future/unsafe state fails closed.
-        let organism_memory = match crate::organism_memory::OrganismMemory::load_default() {
+        // Core keeps no default path: a wrong one there would fail silently,
+        // loading clean and reporting nothing, so the app names its own file.
+        let organism_memory = match jterm_core::organism_memory::OrganismMemory::load(
+            crate::config::default_ascii_organism_memory_path(),
+        ) {
             Ok(memory) => Some(memory),
             Err(error) => {
                 log::error!("ASCII organism memory disabled: {error}");
@@ -2865,15 +2869,15 @@ impl OrganismHub {
         let organism_life = Rc::new(Cell::new(
             organism_memory
                 .as_ref()
-                .map(crate::organism_memory::OrganismMemory::life_state)
+                .map(jterm_core::organism_memory::OrganismMemory::life_state)
                 .unwrap_or_default(),
         ));
         let circadian = organism_memory
             .as_ref()
-            .and_then(|memory| memory.circadian_profile_at(crate::organism_memory::unix_ms()));
+            .and_then(|memory| memory.circadian_profile_at(jterm_core::organism_memory::unix_ms()));
         let growth = organism_memory
             .as_ref()
-            .map(crate::organism_memory::OrganismMemory::growth_progress)
+            .map(jterm_core::organism_memory::OrganismMemory::growth_progress)
             .unwrap_or_default();
 
         Rc::new(Self {
@@ -4881,7 +4885,7 @@ mod tests {
 
     #[test]
     fn morning_greeting_is_human_owned_once_per_work_session() {
-        let daytime = CircadianProfile::from_mask(0b0001_1100); // buckets 2, 3, 4
+        let daytime = CircadianProfile::from_window_start(2); // buckets 2, 3, 4
         let activity = OrganismActivity::new(Some(daytime), GrowthProgress::default());
         assert!(activity.circadian_profile_needs_refresh(10));
         activity.set_circadian_profile(Some(daytime), CircadianRefresh::Succeeded(10));
@@ -4905,7 +4909,7 @@ mod tests {
 
     #[test]
     fn failed_circadian_refresh_is_retried() {
-        let daytime = CircadianProfile::from_mask(0b0001_1100);
+        let daytime = CircadianProfile::from_window_start(2);
         let activity = OrganismActivity::new(Some(daytime), GrowthProgress::default());
 
         // Updating from the still-usable cache must not acknowledge the day
@@ -4927,7 +4931,7 @@ mod tests {
 
     #[test]
     fn wrapped_night_shift_does_not_greet_twice_across_midnight() {
-        let night = CircadianProfile::from_mask(0b1000_0011); // buckets 7, 0, 1
+        let night = CircadianProfile::from_window_start(7); // buckets 7, 0, 1
         let activity = OrganismActivity::new(Some(night), GrowthProgress::default());
         assert!(activity.take_morning_greeting(LocalCircadianTime { day: 20, bucket: 7 }, true));
         assert!(!activity.take_morning_greeting(LocalCircadianTime { day: 21, bucket: 0 }, true));

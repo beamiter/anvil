@@ -295,6 +295,50 @@ versioning for tagged releases while it remains experimental.
 
 ### Changed
 
+- **The ASCII organism moved into `jterm_core`; `jterm_core` is repinned to
+  `fa256d6` (transitively `jagent` `bdc8023`, unchanged).** `src/organism.rs`,
+  `src/organism_memory.rs` and `src/organism_attention.rs` — about 9,000 lines
+  that anvil and forge each carried a copy of — are deleted and consumed from
+  `jterm_core::organism`, `::organism_memory` and `::organism_attention`, along
+  with their 119 tests, which now run in core. forge's copy was taken as
+  canonical, so anvil's `s/Forge/Anvil/` rename damage goes away rather than
+  travelling: the doc comment that read "Anvilt exact ordering" is "Forget
+  exact ordering" again, and a test local named `anvild` is `rebuilt`. The
+  toolkit-free reducer, the durable memory transaction and the attention
+  arbiter are otherwise unchanged; `src/organism_ui.rs` stays here, because it
+  is GTK. Call sites name `jterm_core::organism*` directly instead of going
+  through a re-export shim, so the app/core boundary is visible where the
+  organism is actually used.
+- **anvil registers its persistence worker as organism memory's write lane at
+  startup.** `main` now calls
+  `jterm_core::organism_memory::init_scheduler(Box::new(OrganismLane))` beside
+  `identity::init`, and `OrganismLane` hands each `MemoryWrite` to
+  `persistence::enqueue` under `PersistenceKey::for_path(write.kind(),
+  write.path())`. This is the one part of the move that no compiler error
+  catches: core writes correctly without it, through a bounded writer thread of
+  its own, so omitting it would silently take every organism-memory write out
+  of anvil's coalescing, its admission budget and its shutdown accounting while
+  everything still appeared to work. A structural test,
+  `startup_wiring_tests::organism_memory_writes_are_registered_onto_anvils_persistence_lane`,
+  fails if the registration is deleted or stops routing through `persistence`.
+- Organism memory is opened with
+  `OrganismMemory::load(config::default_ascii_organism_memory_path())`.
+  `load_default()` is gone from core, which deliberately has no opinion about
+  where an app stores state: a wrong path there fails silently — it loads
+  clean, remembers nothing, and reports no error — so the app names its own
+  file. The path is unchanged (`$XDG_STATE_HOME/anvil/ascii-organism-native.json`).
+- `CircadianProfile::from_mask` is replaced by `from_window_start(start_bucket)`,
+  which makes the invalid state unrepresentable rather than rejected: most `u8`
+  masks have no window start, and both `from_mask(0)` and the obvious-looking
+  `from_mask(0b1111_1111)` built values whose `session_day` panicked. The three
+  organism-UI tests that pinned a fixed circadian window now name the window
+  start that produces the mask each one already asserted; every assertion is
+  unchanged.
+- `organism_memory::flush_pending` stays where it was in the shutdown drain,
+  ahead of `persistence::shutdown`. It is now a bounded join on core's fallback
+  writer rather than an unbounded inline attempt; because anvil registers a
+  lane, no fallback writer is ever started and the call returns as soon as the
+  lane has accepted, exactly as before.
 - **`jterm_core` is repinned to `9f94f77` (transitively `jagent` `bdc8023`).**
   Journaled command output is now bound to an `ExecutionLifecycle` token minted
   from a single OSC 133 `C` packet carrying all four of `id`, `session_id`,
