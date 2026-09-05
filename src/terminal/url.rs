@@ -1,6 +1,6 @@
 //! URL detection + Ctrl+click handling for finished-block text views.
 //!
-//! Plain-text URLs are recognised by a bounded scheme allowlist and made
+//! Plain-text URLs are recognised by the family's one opener policy and made
 //! clickable on Ctrl+click. OSC 8 targets are stored as private tag data rather
 //! than interpolated into GTK object names. Hovering a URL underlines it and
 //! shows the pointer cursor.
@@ -13,21 +13,22 @@ use relm4::gtk;
 
 use super::select::get_semantic_bounds_at_position;
 
-const SCHEMES: [&str; 7] = [
-    "http://", "https://", "file://", "ftp://", "git://", "ssh://", "mailto:",
-];
-pub(crate) const MAX_URI_BYTES: usize = 8 * 1024;
 pub(crate) const OSC8_URI_DATA_KEY: &str = "anvil-osc8-uri";
 
-pub fn is_url(text: &str) -> bool {
-    !text.is_empty()
-        && text.len() <= MAX_URI_BYTES
-        && !text.chars().any(|ch| {
-            ch.is_whitespace()
-                || ch.is_control()
-                || crate::review_input::is_visual_spoofing_character(ch)
-        })
-        && SCHEMES.iter().any(|scheme| text.starts_with(scheme))
+/// The one policy every clickable target must satisfy, shared with ember,
+/// forge and frost as `jterm_core::link::is_openable_url`.
+///
+/// Link text is process-controlled, so a click is the terminal acting on
+/// untrusted data: any `cat` of a hostile file could plant it. anvil used to
+/// allow `file:`, `ftp:`, `git:`, `ssh:` and `mailto:` beside HTTP(S), and
+/// applied no authority rule at all, so a single Ctrl+click handed the desktop
+/// opener a local file to open with its default application, started a network
+/// client, or passed `https://user:token@host` — a credential the user never
+/// typed — to the browser. Only an absolute HTTP(S) URL with an authority and
+/// no userinfo qualifies now. The same predicate gates detection and opening,
+/// so nothing is ever underlined as clickable that a click would refuse.
+pub fn is_openable_url(text: &str) -> bool {
+    jterm_core::link::is_openable_url(text)
 }
 
 fn trim_trailing(text: &str) -> &str {
@@ -40,7 +41,7 @@ fn trim_trailing(text: &str) -> &str {
 }
 
 pub fn open_uri(uri: &str) {
-    if !is_url(uri) {
+    if !is_openable_url(uri) {
         log::warn!("Refusing to open a malformed or unsupported URI");
         return;
     }
@@ -96,7 +97,7 @@ pub fn get_url_bounds_at_position(
 
     let raw = buffer.text(&start, &end, false).to_string();
     let trimmed = trim_trailing(&raw);
-    if !is_url(trimmed) {
+    if !is_openable_url(trimmed) {
         return None;
     }
     let trimmed_chars = trimmed.chars().count();
@@ -110,7 +111,7 @@ pub fn get_url_bounds_at_position(
 /// URL at `iter`: prefer a validated OSC 8 tag, else plain-text detection.
 pub fn get_url_at_position(buffer: &TextBuffer, iter: &gtk::TextIter) -> Option<String> {
     for tag in iter.tags() {
-        if let Some(uri) = osc8_uri(&tag).filter(|uri| is_url(uri)) {
+        if let Some(uri) = osc8_uri(&tag).filter(|uri| is_openable_url(uri)) {
             return Some(uri);
         }
     }
@@ -127,7 +128,7 @@ pub fn get_osc8_bounds_at_position(
     let tag = iter
         .tags()
         .into_iter()
-        .find(|tag| osc8_uri(tag).is_some_and(|uri| is_url(&uri)))?;
+        .find(|tag| osc8_uri(tag).is_some_and(|uri| is_openable_url(&uri)))?;
     let uri = osc8_uri(&tag)?;
     let mut start = *iter;
     if !start.starts_tag(Some(&tag)) {
@@ -232,22 +233,41 @@ pub fn attach_url_handlers(view: &gtk::TextView) {
 
 #[cfg(test)]
 mod tests {
-    use super::is_url;
+    use super::is_openable_url;
 
     #[test]
-    fn uri_policy_is_bounded_and_scheme_allowlisted() {
-        assert!(is_url("https://example.com/a?b=c"));
-        assert!(is_url("mailto:user@example.com"));
-        assert!(is_url("file:///tmp/report.txt"));
-        assert!(!is_url("javascript:alert(1)"));
-        assert!(!is_url("data:text/html,boom"));
-        assert!(!is_url("https://example.com/a path"));
-        assert!(!is_url("https://example.com/line\nnext"));
-        assert!(!is_url("https://example.com/safe\u{00ad}hidden"));
-        assert!(!is_url("https://example.com/safe\u{e0020}hidden"));
-        assert!(!is_url(&format!(
+    fn uri_policy_is_the_shared_family_opener_contract() {
+        assert!(is_openable_url("https://example.com/a?b=c"));
+        assert!(is_openable_url("HTTP://example.com"));
+        assert!(!is_openable_url("javascript:alert(1)"));
+        assert!(!is_openable_url("data:text/html,boom"));
+        assert!(!is_openable_url("https://example.com/a path"));
+        assert!(!is_openable_url("https://example.com/line\nnext"));
+        assert!(!is_openable_url("https://example.com/safe\u{00ad}hidden"));
+        assert!(!is_openable_url("https://example.com/safe\u{e0020}hidden"));
+        assert!(!is_openable_url(&format!(
             "https://example.com/{}",
-            "x".repeat(8192)
+            "x".repeat(jterm_core::link::MAX_OPENABLE_URL_BYTES)
         )));
+    }
+
+    /// The schemes anvil used to hand straight to the desktop opener. Each one
+    /// turns a `cat` of a hostile file into a one-click local-file open, a
+    /// network client launch, or a credential handed to the browser.
+    #[test]
+    fn the_schemes_anvil_used_to_launch_are_refused() {
+        for rejected in [
+            "file:///etc/passwd",
+            "ftp://example.com/archive",
+            "git://example.com/repo.git",
+            "ssh://example.com",
+            "mailto:user@example.com",
+            "https://user:token@example.com/",
+            "https://user@example.com/private",
+            "https:///missing-host",
+            "https://example.com\\evil",
+        ] {
+            assert!(!is_openable_url(rejected), "{rejected}");
+        }
     }
 }

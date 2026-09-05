@@ -703,7 +703,7 @@ fn osc8_tag_hash(uri: &str) -> u64 {
 }
 
 fn ensure_osc8_tag(buffer: &TextBuffer, uri: &str) -> Option<gtk::TextTag> {
-    if !super::url::is_url(uri) {
+    if !super::url::is_openable_url(uri) {
         return None;
     }
     let tag_table = buffer.tag_table();

@@ -498,7 +498,15 @@ impl BlockStatus {
     /// so the badge is absent rather than showing a made-up one.
     fn exit_badge(self) -> Option<String> {
         match self {
-            Self::Failed(code) => Some(format!("exit:{code}")),
+            Self::Failed(code) => Some(super::exit_status_badge_text(code)),
+            _ => None,
+        }
+    }
+
+    /// Explanation for a badge whose number is `128 + signal`.
+    fn exit_badge_tooltip(self) -> Option<String> {
+        match self {
+            Self::Failed(code) => super::exit_status_badge_tooltip(code),
             _ => None,
         }
     }
@@ -1930,11 +1938,32 @@ mod tests {
 
         // A number nobody reported cannot be shown, so no badge is rendered.
         assert_eq!(block_status(Some("make"), None).exit_badge(), None);
+        // Re-pinned deliberately: a 128+n status now names the signal that
+        // killed the command, matching ember, forge and frost. `exit:130`
+        // alone does not tell a user their command was interrupted.
         assert_eq!(
             block_status(Some("make"), Some(130))
                 .exit_badge()
                 .as_deref(),
-            Some("exit:130")
+            Some("exit:130 SIGINT")
+        );
+        assert_eq!(
+            block_status(Some("make"), Some(137))
+                .exit_badge()
+                .as_deref(),
+            Some("exit:137 SIGKILL")
+        );
+        assert!(block_status(Some("make"), Some(137))
+            .exit_badge_tooltip()
+            .is_some_and(|tooltip| tooltip.contains("SIGKILL")));
+        // An ordinary status keeps the bare number and needs no explanation.
+        assert_eq!(
+            block_status(Some("make"), Some(1)).exit_badge().as_deref(),
+            Some("exit:1")
+        );
+        assert_eq!(
+            block_status(Some("make"), Some(1)).exit_badge_tooltip(),
+            None
         );
         assert_eq!(block_status(Some("make"), Some(0)).exit_badge(), None);
         // The one state that cannot explain itself gets a tooltip.
@@ -3340,6 +3369,7 @@ impl FinishedBlock {
         if let Some(text) = status.exit_badge() {
             let badge = gtk::Label::new(Some(&text));
             badge.add_css_class("block-exit-bad");
+            badge.set_tooltip_text(status.exit_badge_tooltip().as_deref());
             header_row.append(&badge);
         }
 

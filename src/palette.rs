@@ -112,6 +112,16 @@ pub(crate) struct Entry {
     /// Right-aligned hint, e.g. the keybinding for an action or the cwd for a
     /// history entry.
     pub right: Option<String>,
+    /// Extra text this entry may be *found* by but is not labelled with.
+    ///
+    /// Only workflows use it, for their tags. A workflow's tags were rendered
+    /// into `right` and nothing else, and `right` never took part in matching,
+    /// so the one field an author writes specifically to make a workflow
+    /// findable was the one field the palette could not search — forge, ember
+    /// and frost all match tags. Deliberately not `right` itself: for an
+    /// action that field is the keybinding, and matching it would make "ctrl"
+    /// return every bound action in the palette.
+    pub search_extra: Option<String>,
     pub accept: Accept,
 }
 
@@ -301,6 +311,7 @@ pub(crate) fn gather(
                 } else {
                     Some(binding)
                 },
+                search_extra: None,
                 accept: Accept::Action(action),
             };
             push_if_match(&matcher, &query.text, entry, &mut out);
@@ -312,11 +323,16 @@ pub(crate) fn gather(
             let Some(path) = wf.source_path.clone() else {
                 continue;
             };
-            let right = if wf.tags.is_empty() {
-                Some(":".to_string())
-            } else {
-                Some(format!(":{}", wf.tags.join(",")))
-            };
+            // Two derivations of the same list, deliberately independent. A
+            // tag may contain interior spaces — core's `validate_display_field`
+            // rejects only empty, oversized, control and bidi text — so
+            // rebuilding the comma-separated label out of the space-joined
+            // search text would split `big deploy` into two tags the author
+            // never wrote. The label keeps commas because a reader has to see
+            // where one tag ends; the search text keeps spaces because that is
+            // what the fuzzy matcher treats as a word boundary.
+            let right = Some(format!(":{}", wf.tags.join(",")));
+            let search_extra = (!wf.tags.is_empty()).then(|| wf.tags.join(" "));
             let sublabel = if wf.description.is_empty() {
                 Some(wf.command.clone())
             } else {
@@ -328,6 +344,7 @@ pub(crate) fn gather(
                 label: format!("⚙ {}", wf.name),
                 sublabel,
                 right,
+                search_extra,
                 accept: Accept::RunWorkflow(path),
             };
             push_if_match(&matcher, &query.text, entry, &mut out);
@@ -362,6 +379,7 @@ pub(crate) fn gather(
             label,
             sublabel,
             right: Some("?".to_string()),
+            search_extra: None,
             accept,
         });
         out.truncate(limit);
@@ -388,6 +406,7 @@ pub(crate) fn gather(
                 ),
                 sublabel: Some(history_sublabel(item)),
                 right: None,
+                search_extra: None,
                 accept: Accept::TypeCommand(item.command.clone()),
             };
             push_if_match(&matcher, &query.text, entry, &mut out);
@@ -405,12 +424,16 @@ fn push_if_match(matcher: &SkimMatcherV2, needle: &str, mut e: Entry, out: &mut 
         return;
     }
     // Match against label first; fall back to sublabel for history entries
-    // whose command is short but whose cwd narrows intent ("ls" in ~/proj/foo).
+    // whose command is short but whose cwd narrows intent ("ls" in ~/proj/foo),
+    // and to `search_extra` for a workflow's tags. Both fallbacks score at half
+    // weight, so an entry named for the query still outranks one merely tagged
+    // with it.
     let primary = matcher.fuzzy_match(&e.label, needle);
-    let secondary = e
-        .sublabel
-        .as_deref()
-        .and_then(|s| matcher.fuzzy_match(s, needle));
+    let secondary = [e.sublabel.as_deref(), e.search_extra.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter_map(|text| matcher.fuzzy_match(text, needle))
+        .max();
     let score = match (primary, secondary) {
         (Some(p), Some(s)) => Some(p.max(s / 2)),
         (Some(p), None) => Some(p),
@@ -533,6 +556,118 @@ mod tests {
         let entries = gather(&q, &kbmap, &[], std::slice::from_ref(&wf), 50);
         assert_eq!(entries.len(), 1, "got {entries:?}");
         assert!(matches!(entries[0].accept, Accept::RunWorkflow(_)));
+    }
+
+    /// A workflow's tags are the field an author writes specifically to make
+    /// it findable, and they were the one field the palette never searched.
+    #[test]
+    fn a_workflow_is_findable_by_its_tags() {
+        let kbmap = KeybindingMap::from_defaults();
+        let workflows = [
+            Workflow {
+                name: "Tunnel".to_string(),
+                description: "ssh forward".to_string(),
+                command: "ssh -L {{p}}".to_string(),
+                tags: vec!["deploy".to_string(), "net".to_string()],
+                shell: None,
+                args: vec![],
+                source_path: Some(std::path::PathBuf::from("/tmp/tunnel.yaml")),
+            },
+            Workflow {
+                name: "Unrelated".to_string(),
+                description: "nothing".to_string(),
+                command: "true".to_string(),
+                tags: vec![],
+                shell: None,
+                args: vec![],
+                source_path: Some(std::path::PathBuf::from("/tmp/other.yaml")),
+            },
+        ];
+        let query = Query::parse(":deploy", PaletteMode::All);
+        let entries = gather(&query, &kbmap, &[], &workflows, 50);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["⚙ Tunnel"],
+            "the tag is what makes this workflow reachable at all"
+        );
+
+        // A name match still outranks a tag match, so tags widen the result
+        // set without reordering it.
+        let named = Workflow {
+            name: "Deploy".to_string(),
+            description: String::new(),
+            command: "make deploy".to_string(),
+            tags: vec![],
+            shell: None,
+            args: vec![],
+            source_path: Some(std::path::PathBuf::from("/tmp/deploy.yaml")),
+        };
+        let both = [workflows[0].clone(), named];
+        let entries = gather(&query, &kbmap, &[], &both, 50);
+        assert_eq!(entries[0].label, "⚙ Deploy");
+        assert_eq!(entries[1].label, "⚙ Tunnel");
+    }
+
+    /// A tag may contain interior spaces — core's `validate_display_field`
+    /// rejects only empty, oversized, control and bidi text — so the hint must
+    /// be built from the tag list itself and never by re-splitting the
+    /// space-joined text the matcher searches. `big deploy` rendered as
+    /// `big,deploy` shows the author two tags they never wrote.
+    #[test]
+    fn a_tag_containing_a_space_is_one_tag_in_the_hint() {
+        let kbmap = KeybindingMap::from_defaults();
+        let workflows = [Workflow {
+            name: "Tunnel".to_string(),
+            description: "ssh forward".to_string(),
+            command: "ssh -L {{p}}".to_string(),
+            tags: vec!["big deploy".to_string(), "net".to_string()],
+            shell: None,
+            args: vec![],
+            source_path: Some(std::path::PathBuf::from("/tmp/tunnel.yaml")),
+        }];
+
+        let query = Query::parse(":", PaletteMode::All);
+        let entries = gather(&query, &kbmap, &[], &workflows, 50);
+        assert_eq!(
+            entries[0].right.as_deref(),
+            Some(":big deploy,net"),
+            "the comma separates tags; a space inside one does not"
+        );
+
+        // And the space-joined search text is still what makes it findable, so
+        // the honest hint costs nothing on the matching side.
+        let query = Query::parse(":deploy", PaletteMode::All);
+        let entries = gather(&query, &kbmap, &[], &workflows, 50);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["⚙ Tunnel"]
+        );
+    }
+
+    /// Actions carry their keybinding in `right`, which must stay out of the
+    /// search: "ctrl" would otherwise return every bound action there is.
+    #[test]
+    fn a_keybinding_hint_is_not_searchable_text() {
+        let kbmap = KeybindingMap::from_defaults();
+        let query = Query {
+            mode: PaletteMode::Commands,
+            text: "Ctrl".to_string(),
+        };
+        let entries = gather(&query, &kbmap, &[], &[], 500);
+        for entry in &entries {
+            assert!(
+                entry.label.to_lowercase().contains("ctrl"),
+                "{:?} matched only through its keybinding hint {:?}",
+                entry.label,
+                entry.right
+            );
+        }
     }
 
     #[test]

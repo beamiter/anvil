@@ -1052,23 +1052,62 @@ pub(crate) enum CommandTextSource {
 /// what the renderer painted: a wrapped line, jsh's autosuggestion ghost text,
 /// or a right-hand prompt all land inside the captured range, and a `feed()`
 /// that has not been flushed yet leaves it empty.
+///
+/// A declared truncation disqualifies the reported text from exactness even
+/// when the packet also carried one. jsh sends either the whole command or
+/// `cmd_truncated=1`, never both, so a packet claiming both is a producer
+/// contradicting itself — and taking the text was the worse reading of it:
+/// [`CommandTextSource::ShellReported`] is what marks a block `command_exact`,
+/// which block re-run, copy and the Agent's block context all replay as the
+/// command that ran. `rm -rf /home/u/proj` cut to `rm -rf /home/u` would have
+/// been offered, and re-run, as exact. The pinned parser now drops the text of
+/// such a packet before it reaches here; this keeps the invariant local so it
+/// holds for any caller, including a future non-OSC producer.
 fn resolve_command_text(
     reported: Option<&str>,
     command_truncated: bool,
     scraped: &str,
 ) -> (String, CommandTextSource) {
-    if let Some(command) = reported {
-        return (command.to_string(), CommandTextSource::ShellReported);
-    }
     if command_truncated {
-        let text = if scraped.trim().is_empty() {
-            TRUNCATED_COMMAND_PLACEHOLDER.to_string()
-        } else {
-            scraped.to_string()
+        // A prefix is still the best text available — it is what the user
+        // typed, as far as it goes — so keep it and downgrade the provenance.
+        // The screen scrape wins over it for the same reason it always does
+        // when both exist: it is the whole line.
+        let text = match (scraped.trim().is_empty(), reported) {
+            (false, _) => scraped.to_string(),
+            (true, Some(prefix)) if !prefix.trim().is_empty() => prefix.to_string(),
+            (true, _) => TRUNCATED_COMMAND_PLACEHOLDER.to_string(),
         };
         return (text, CommandTextSource::ScreenAfterTruncation);
     }
+    if let Some(command) = reported {
+        return (command.to_string(), CommandTextSource::ShellReported);
+    }
     (scraped.to_string(), CommandTextSource::Screen)
+}
+
+/// Badge text for a reported nonzero exit status.
+///
+/// A `128 + n` code is the shell saying a signal killed the command, and that
+/// is the difference between "this build failed" and "something outside it
+/// killed the build": `exit:137` on its own sends a user hunting through
+/// output that was never written, `exit:137 SIGKILL` points at the OOM killer.
+/// ember, forge and frost all name the signal; anvil showed the bare number.
+/// One helper for every surface that paints a status — both block backends and
+/// the cross-block search row — so the same record cannot read two different
+/// ways depending on which one happens to be showing it.
+pub(super) fn exit_status_badge_text(code: i32) -> String {
+    match jterm_core::exit_status::signal_name_for_exit(code) {
+        Some(signal) => format!("exit:{code} {signal}"),
+        None => format!("exit:{code}"),
+    }
+}
+
+/// Why that badge names a signal, for the surface that can carry a tooltip.
+/// An ordinary status needs no explanation: the number is the explanation.
+pub(super) fn exit_status_badge_tooltip(code: i32) -> Option<String> {
+    jterm_core::exit_status::signal_name_for_exit(code)
+        .map(|signal| format!("128 + signal number: terminated by {signal}"))
 }
 
 pub(crate) const UNKNOWN_EXIT_SENTINEL: i32 = -1;
@@ -3355,6 +3394,40 @@ fn take_armed_agent_execution(
         .map(|armed| armed.execution)
 }
 
+/// What one accepted OSC 133 `C` established about the command now running.
+///
+/// Two capabilities of different strength, minted together out of that single
+/// packet so neither can be assembled from metadata observed at different
+/// times. `id` is the correlation key every FinalTerm producer sends — anvil's
+/// own bash/zsh/fish/pwsh integration emits an `id=` carrying the pane's
+/// private shell token and nothing else — and it is what nested-marker
+/// arbitration and the Agent's command-end trust compare a `D` against.
+/// `lifecycle` is the much narrower durable-journal capability: jsh earns it
+/// only by putting a complete `id`/`session_id`/`seq`/`started_at_ms` envelope
+/// on this one `C`, and `jterm_core`'s writer re-checks all four against the
+/// authoritative on-disk Start under the journal lock before any captured
+/// output is written under them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StartedExecution {
+    id: String,
+    lifecycle: Option<jterm_core::execution_journal::ExecutionLifecycle>,
+}
+
+impl StartedExecution {
+    /// Capture the running command's identity from its accepted `C`.
+    ///
+    /// `None` when the shell sent no id at all: there is then nothing for a
+    /// `D` to correlate against and no key a journal record could exist under.
+    /// A shell that sends only `id=` keeps the correlation and loses only the
+    /// journal — the envelope is not reconstructible from a later packet.
+    fn from_command_start(meta: &CommandMeta) -> Option<Self> {
+        Some(Self {
+            id: meta.id.clone()?,
+            lifecycle: jterm_core::execution_journal::ExecutionLifecycle::from_command_meta(meta),
+        })
+    }
+}
+
 fn command_end_matches_started_id(started_id: Option<&str>, finished_id: Option<&str>) -> bool {
     started_id.is_some() && started_id == finished_id
 }
@@ -3656,6 +3729,13 @@ struct EngineState {
     /// Beats `block_start_time_for_cb`, which starts when this process noticed
     /// the mark.
     shell_duration_ms: Option<u64>,
+    /// Wall-clock start the shell stamped on its own OSC 133 `C` (jsh carries
+    /// it on the lifecycle envelope). Beats `block_start_time_for_cb` for the
+    /// *recorded* start, which otherwise lags by however long the GTK dispatch
+    /// that delivered the mark took. It deliberately does not replace the
+    /// local `SystemTime`, because the duration fallback must not subtract a
+    /// possibly remote shell's clock from this machine's.
+    shell_started_at_ms: Option<u64>,
     execution_id_trusted: bool,
     agent_completion_trusted: bool,
     /// cwd the running command was started in, as the shell reported it at
@@ -5078,12 +5158,14 @@ struct ReaderCtx {
     init_cmds_queue_for_cb: Rc<RefCell<std::collections::VecDeque<String>>>,
     pty_for_init: Rc<OwnedPty>,
     block_start_time_for_cb: Rc<Cell<Option<SystemTime>>>,
-    /// The shell's execution id for the running command (jsh only): the key its
-    /// execution journal keeps the record under. Engine-private, but kept out
-    /// of `EngineState` so the `if let Some(id) = ...take()` at the journal
-    /// submit can hold its scrutinee borrow across the submit without pinning
-    /// the whole engine cell.
-    execution_id_rc: Rc<RefCell<Option<String>>>,
+    /// Identity the running command's accepted OSC 133 `C` established: the
+    /// correlation key a later `D` is compared against, and — for jsh — the
+    /// lifecycle token its execution journal keeps the record under.
+    /// Engine-private, but kept out of `EngineState` so the
+    /// `if let Some(started) = ...take()` at the journal submit can hold its
+    /// scrutinee borrow across the submit without pinning the whole engine
+    /// cell.
+    started_execution_rc: Rc<RefCell<Option<StartedExecution>>>,
     current_cwd_for_cb: Rc<RefCell<String>>,
     event_buf: Rc<RefCell<Vec<ParserEvent>>>,
     cmd_running_rc: Rc<Cell<bool>>,
@@ -5247,6 +5329,7 @@ impl ReaderCtx {
             engine.pending_completion_provenance = CompletionProvenance::Unknown;
             engine.command_finished_event_pending = false;
             engine.shell_duration_ms = None;
+            engine.shell_started_at_ms = None;
             engine.execution_id_trusted = false;
             engine.agent_completion_trusted = false;
             engine.command_cwd = None;
@@ -5267,7 +5350,7 @@ impl ReaderCtx {
         self.pty_synced_rc.set(false);
         self.clear_live_raw_output();
         self.block_start_time_for_cb.set(None);
-        self.execution_id_rc.borrow_mut().take();
+        self.started_execution_rc.borrow_mut().take();
         self.cmd_running_rc.set(false);
         self.running_cmd_rc.borrow_mut().clear();
 
@@ -5673,18 +5756,29 @@ impl ReaderCtx {
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .ok()
                 .map(|d| d.as_millis() as u64);
-            let mut start_time_ms = start_time.and_then(|st| {
-                st.duration_since(SystemTime::UNIX_EPOCH)
-                    .ok()
-                    .map(|d| d.as_millis() as u64)
-            });
             // Commandless background output has no shell-reported
             // figure of its own, so it keeps the local timer only.
-            let shell_duration_ms = if is_background {
-                None
+            let (shell_duration_ms, shell_started_at_ms) = if is_background {
+                (None, None)
             } else {
-                self.engine.borrow_mut().shell_duration_ms.take()
+                let mut engine = self.engine.borrow_mut();
+                (
+                    engine.shell_duration_ms.take(),
+                    engine.shell_started_at_ms.take(),
+                )
             };
+            // The shell's own stamp wins over `start_time`, which records when
+            // this process parsed the mark — one GTK dispatch after the shell
+            // actually began. The local clock stays the fallback and stays the
+            // basis of `block_duration_ms` below, so a remote shell's clock is
+            // never subtracted from this machine's.
+            let mut start_time_ms = shell_started_at_ms.or_else(|| {
+                start_time.and_then(|st| {
+                    st.duration_since(SystemTime::UNIX_EPOCH)
+                        .ok()
+                        .map(|d| d.as_millis() as u64)
+                })
+            });
             let mut duration_ms = block_duration_ms(shell_duration_ms, start_time, now);
 
             let block_cwd = {
@@ -5768,17 +5862,30 @@ impl ReaderCtx {
             let payload =
                 LazyBlockRenderPayload::new(prompt, captured_output, output_dropped_front);
 
-            // jsh owns the command lifecycle record. A trusted correlation id
-            // and an enabled output consumer must both exist before touching
-            // the lazy payload; jterm_core::submit repeats the same capability
-            // check at its queue boundary.
-            let journal_execution_id = (!is_background)
-                .then(|| self.execution_id_rc.borrow_mut().take())
-                .flatten();
+            // jsh owns the command lifecycle record. The lifecycle token its
+            // accepted C minted and an enabled output consumer must both exist
+            // before touching the lazy payload; jterm_core::submit repeats the
+            // same capability check at its queue boundary.
+            //
+            // Deliberately NOT gated on `execution_id_trusted`. That flag asks
+            // whether the id embeds *this pane's* shell-integration token,
+            // which is how anvil's own bash/zsh/fish/pwsh scripts authenticate
+            // their marks — jsh does not use it, so requiring it here would
+            // switch the journal off for the only shell that has one. The
+            // guarantee comes from the other end instead: core's writer
+            // re-checks all four envelope fields against the authoritative
+            // on-disk Start under the journal's exclusive lock, so a forged or
+            // stale token buys an attacker a rejected append, not a record.
+            // An earlier comment here claimed a trust check that no line of
+            // this block performed; this says what actually holds.
+            let journal_lifecycle = (!is_background)
+                .then(|| self.started_execution_rc.borrow_mut().take())
+                .flatten()
+                .and_then(|started| started.lifecycle);
             let truncation_limit = self.config_for_cb.borrow().truncation_threshold_lines as usize;
             if let Some(submitted) = build_journal_completion(
-                journal_execution_id,
-                execution_journal_output_capture_enabled(),
+                journal_lifecycle,
+                jterm_core::execution_journal::output_capture_enabled(),
                 &payload,
                 truncation_limit,
             ) {
@@ -6022,10 +6129,22 @@ impl ReaderCtx {
         // mark; jsh puts it on D. Reset it here so the previous
         // command's figure cannot be reused for this one.
         self.engine.borrow_mut().shell_duration_ms = meta.duration_ms;
-        // jsh's execution id: the key its journal is written
-        // under, so the output captured below can be attached
-        // to the record instead of living only in this window.
-        *self.execution_id_rc.borrow_mut() = meta.id.clone();
+        // jsh's execution lifecycle: the id its journal is
+        // written under, plus the session/seq/start-time
+        // envelope that authorizes attaching the output
+        // captured below to that record instead of leaving it
+        // to live only in this window. Both are minted here and
+        // nowhere else — see `StartedExecution`.
+        let started_execution = StartedExecution::from_command_start(meta);
+        // The shell stamps its own start inside that same envelope, so only a
+        // complete one offers a figure here. Assigned unconditionally for the
+        // same reason as the duration above: a shell that stops sending it
+        // must not leave the previous command's start behind.
+        self.engine.borrow_mut().shell_started_at_ms = started_execution
+            .as_ref()
+            .and_then(|started| started.lifecycle.as_ref())
+            .map(jterm_core::execution_journal::ExecutionLifecycle::started_at_ms);
+        *self.started_execution_rc.borrow_mut() = started_execution;
         let trusted_execution_id = meta.id.as_deref().is_some_and(|id| {
             self.pty_for_init
                 .shell_integration_token()
@@ -6143,10 +6262,13 @@ impl ReaderCtx {
         if foreign_foreground_owns_command_marker(shell_is_foreground) {
             return;
         }
-        let matches_started_id = command_end_matches_started_id(
-            self.execution_id_rc.borrow().as_deref(),
-            meta.id.as_deref(),
-        );
+        let matches_started_id = {
+            let started = self.started_execution_rc.borrow();
+            command_end_matches_started_id(
+                started.as_ref().map(|started| started.id.as_str()),
+                meta.id.as_deref(),
+            )
+        };
         let osc133_depth = self.engine.borrow().osc133_depth;
         if osc133_depth > 0 && !matches_started_id {
             self.engine.borrow_mut().osc133_depth = osc133_depth - 1;
@@ -6161,11 +6283,11 @@ impl ReaderCtx {
         }
         let active_agent_execution = self.active_agent_execution_rc.get();
         let execution_id_trusted = self.engine.borrow().execution_id_trusted;
-        let trusted_match = execution_id_trusted
-            && command_end_matches_started_id(
-                self.execution_id_rc.borrow().as_deref(),
-                meta.id.as_deref(),
-            );
+        // The same comparison the depth arbitration above already made,
+        // against a slot nothing between here and there writes; the Agent
+        // simply additionally requires that the id carry this pane's private
+        // shell-integration token.
+        let trusted_match = execution_id_trusted && matches_started_id;
         match decide_agent_command_end(
             active_agent_execution.is_some(),
             shell_is_foreground,
@@ -6247,11 +6369,14 @@ impl ReaderCtx {
         if meta.duration_ms.is_some() {
             self.engine.borrow_mut().shell_duration_ms = meta.duration_ms;
         }
-        // The D packet repeats the execution id, so a shell
-        // that only tags the finish still correlates.
-        if meta.id.is_some() {
-            *self.execution_id_rc.borrow_mut() = meta.id.clone();
-        }
+        // Nothing about the running command's identity is taken from D. The
+        // shared OSC parser accepts `session_id`, `seq` and `started_at_ms`
+        // only on C, so a D can never complete a journal lifecycle — and
+        // re-seating the correlation id here would let a D that arrived
+        // without a matching C (a foreground child printing its own marks)
+        // rename the execution the shell's own C opened, and file this
+        // block's output under it. A D id may only be compared, which the
+        // arbitration above already did.
         let shell_duration_ms = self.engine.borrow().shell_duration_ms;
         let duration_ms = shell_duration_ms.or_else(|| {
             self.block_start_time_for_cb.get().and_then(|started| {
@@ -6572,23 +6697,6 @@ fn take_background_output(pending: &mut VecDeque<u8>) -> Option<VecDeque<u8>> {
     }
 }
 
-/// Exact mirror of pinned jterm_core's private journal capability predicate.
-/// `std::env::var(...).ok()` means a missing or non-Unicode value defaults to
-/// enabled; only these five normalized spellings disable capture.
-fn execution_journal_output_capture_enabled_for(value: Option<&str>) -> bool {
-    value.is_none_or(|value| {
-        !matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "" | "0" | "false" | "no" | "off"
-        )
-    })
-}
-
-fn execution_journal_output_capture_enabled() -> bool {
-    let value = std::env::var("JSH_EXECUTION_JOURNAL").ok();
-    execution_journal_output_capture_enabled_for(value.as_deref())
-}
-
 fn truncate_output_for_journal(output_plain: &str, line_limit: usize) -> String {
     let trimmed = output_plain.trim();
     let lines: Vec<&str> = trimmed.lines().collect();
@@ -6625,18 +6733,27 @@ fn truncated_journal_line_count(total_lines: usize, line_limit: usize) -> usize 
     }
 }
 
+/// Build the journal payload for a finished block, or `None` when this block
+/// may not reach the journal at all.
+///
+/// The capability is the `ExecutionLifecycle` the block's accepted C minted,
+/// not a bare id: journaled output now requires jsh's complete
+/// `id`/`session_id`/`seq`/`started_at_ms` envelope on that one packet, so a
+/// shell that tags its marks with `id=` alone keeps its blocks and its
+/// correlation and simply writes nothing durable. Fail-closed on purpose —
+/// the missing slots are exactly what binds a payload to one Start generation.
 fn build_journal_completion(
-    id: Option<String>,
+    lifecycle: Option<jterm_core::execution_journal::ExecutionLifecycle>,
     enabled: bool,
     payload: &dyn BlockRenderPayloadAccessor,
     line_limit: usize,
 ) -> Option<jterm_core::execution_journal::CompletedExecution> {
-    let id = id.filter(|_| enabled)?;
+    let lifecycle = lifecycle.filter(|_| enabled)?;
     let output_plain = &payload.materialize().output_plain;
     let total_bytes = output_plain.trim().len();
     let output = truncate_output_for_journal(output_plain, line_limit);
     Some(jterm_core::execution_journal::CompletedExecution {
-        id,
+        lifecycle,
         truncated: output.len() != total_bytes,
         total_bytes,
         output,
@@ -10761,7 +10878,7 @@ impl TermView {
             });
         }
 
-        let execution_id: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let started_execution: Rc<RefCell<Option<StartedExecution>>> = Rc::new(RefCell::new(None));
 
         let widget_pool: Rc<RefCell<WidgetPool>> = Rc::new(RefCell::new(WidgetPool::new()));
         let pty_synced: Rc<Cell<bool>> = Rc::new(Cell::new(false));
@@ -11049,6 +11166,7 @@ impl TermView {
                     // Metadata jsh attaches to the same marks (see
                     // ParserEvent::CommandStart).
                     shell_duration_ms: None,
+                    shell_started_at_ms: None,
                     execution_id_trusted: false,
                     agent_completion_trusted: false,
                     command_cwd: None,
@@ -11088,7 +11206,7 @@ impl TermView {
                 init_cmds_queue_for_cb,
                 pty_for_init,
                 block_start_time_for_cb,
-                execution_id_rc: execution_id.clone(),
+                started_execution_rc: started_execution.clone(),
                 current_cwd_for_cb,
                 event_buf,
                 cmd_running_rc: cmd_running.clone(),
@@ -16319,6 +16437,7 @@ mod tests {
                     pending_command_source: super::CommandTextSource::Screen,
                     command_finished_event_pending: false,
                     shell_duration_ms: None,
+                    shell_started_at_ms: None,
                     execution_id_trusted: false,
                     agent_completion_trusted: false,
                     command_cwd: None,
@@ -16357,7 +16476,7 @@ mod tests {
                 init_cmds_queue_for_cb: Rc::new(RefCell::new(VecDeque::new())),
                 pty_for_init: pty.clone(),
                 block_start_time_for_cb: Rc::new(Cell::new(None)),
-                execution_id_rc: Rc::new(RefCell::new(None)),
+                started_execution_rc: Rc::new(RefCell::new(None)),
                 current_cwd_for_cb: Rc::new(RefCell::new(HARNESS_CWD.to_string())),
                 event_buf: Rc::new(RefCell::new(Vec::new())),
                 cmd_running_rc: cmd_running,
@@ -16461,6 +16580,36 @@ mod tests {
             exit,
             meta: CommandMeta::default(),
         }
+    }
+
+    const HARNESS_SESSION_ID: &str = "harness-session-1";
+    /// Deliberately far in the past, so a record that fell back to this
+    /// process's `SystemTime::now()` is trivially distinguishable from one
+    /// that took the shell's stamp.
+    const HARNESS_STARTED_AT_MS: u64 = 1_700_000_000_000;
+
+    /// The `C` metadata jsh actually emits: all four identity slots on the one
+    /// packet, which is the only shape that mints a journal lifecycle.
+    fn jsh_start_meta(command: Option<&str>, id: &str) -> CommandMeta {
+        CommandMeta {
+            id: Some(id.to_string()),
+            session_id: Some(HARNESS_SESSION_ID.to_string()),
+            seq: Some(7),
+            started_at_ms: Some(HARNESS_STARTED_AT_MS),
+            command: command.map(str::to_string),
+            ..CommandMeta::default()
+        }
+    }
+
+    fn dispatch_jsh_command_start(command: Option<&str>, id: &str) -> ParserEvent {
+        ParserEvent::CommandStart(jsh_start_meta(command, id))
+    }
+
+    fn harness_lifecycle(id: &str) -> jterm_core::execution_journal::ExecutionLifecycle {
+        jterm_core::execution_journal::ExecutionLifecycle::from_command_meta(&jsh_start_meta(
+            None, id,
+        ))
+        .expect("a complete jsh envelope mints a lifecycle")
     }
 
     fn dispatch_bytes(text: &str) -> ParserEvent {
@@ -16839,9 +16988,12 @@ mod tests {
         harness.ctx.cmd_running_rc.set(true);
         harness
             .ctx
-            .execution_id_rc
+            .started_execution_rc
             .borrow_mut()
-            .replace("exec".into());
+            .replace(super::StartedExecution {
+                id: "exec".into(),
+                lifecycle: None,
+            });
         harness.ctx.active_agent_execution_rc.set(Some(execution));
         harness
             .ctx
@@ -16895,7 +17047,7 @@ mod tests {
         assert!(!harness.ctx.pty_synced_rc.get());
         assert!(!harness.ctx.cmd_running_rc.get());
         assert!(harness.ctx.running_cmd_rc.borrow().is_empty());
-        assert!(harness.ctx.execution_id_rc.borrow().is_none());
+        assert!(harness.ctx.started_execution_rc.borrow().is_none());
         assert!(harness.ctx.active_agent_execution_rc.get().is_none());
         assert!(harness.ctx.armed_agent_execution_rc.borrow().is_none());
         assert!(harness
@@ -17391,7 +17543,10 @@ mod tests {
         harness.feed_all([ParserEvent::PromptStart, ParserEvent::PromptEnd]);
         harness.feed(dispatch_command_start(Some("agent-unknown")));
         let trusted_id = "0123456789abcdef0123456789abcdef-7".to_string();
-        *harness.ctx.execution_id_rc.borrow_mut() = Some(trusted_id.clone());
+        *harness.ctx.started_execution_rc.borrow_mut() = Some(super::StartedExecution {
+            id: trusted_id.clone(),
+            lifecycle: None,
+        });
         harness.ctx.engine.borrow_mut().execution_id_trusted = true;
         harness.ctx.active_agent_execution_rc.set(Some(execution));
         harness.feed(ParserEvent::CommandEnd {
@@ -17496,9 +17651,22 @@ mod tests {
         harness.feed(dispatch_command_start(Some("cargo build")));
         harness.feed(dispatch_bytes(&output));
         harness.feed(dispatch_command_end(Some(0)));
-        // A trusted jsh correlation id makes the journal submission — which
-        // runs before backend finalize — consume the ring.
-        *harness.ctx.execution_id_rc.borrow_mut() = Some("execution-1".to_string());
+        // This block really does reach `output_capture_enabled()` — with the
+        // journal off, nothing materializes the payload before finalize and the
+        // counter below reads 0 — so hold the same lock the capability test
+        // writes that variable under, and state the dependency instead of
+        // inheriting whatever the developer's shell exported.
+        let _serialized = JOURNAL_CAPABILITY_ENV
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let journal = JournalCapabilityEnv(std::env::var_os("JSH_EXECUTION_JOURNAL"));
+        journal.set(std::ffi::OsStr::new("1"));
+        // A jsh lifecycle token makes the journal submission — which runs
+        // before backend finalize — consume the ring.
+        *harness.ctx.started_execution_rc.borrow_mut() = Some(super::StartedExecution {
+            id: "execution-1".to_string(),
+            lifecycle: Some(harness_lifecycle("execution-1")),
+        });
         harness.feed(ParserEvent::PromptStart);
 
         assert_eq!(
@@ -17691,28 +17859,90 @@ mod tests {
         assert!(!cut.contains('\u{fffd}'));
     }
 
-    #[test]
-    fn journal_capability_matches_pinned_jterm_core_enabled_semantics() {
-        use super::execution_journal_output_capture_enabled_for as enabled;
+    /// Serializes the tests that depend on the live `JSH_EXECUTION_JOURNAL`
+    /// value. `set_var` and `var` are process-global and race each other
+    /// across libtest's worker threads, so every test that reads the switch
+    /// through core has to agree on this lock, not only the one that writes it.
+    static JOURNAL_CAPABILITY_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-        for disabled in ["", "0", "false", "no", "off", " FALSE ", "No"] {
-            assert!(!enabled(Some(disabled)), "{disabled:?}");
+    /// Puts `JSH_EXECUTION_JOURNAL` back exactly as it was found, including
+    /// "not set at all", so a failed assertion cannot leave the rest of the
+    /// binary running against a switch this test flipped.
+    struct JournalCapabilityEnv(Option<std::ffi::OsString>);
+
+    impl JournalCapabilityEnv {
+        fn set(&self, value: &std::ffi::OsStr) {
+            unsafe { std::env::set_var("JSH_EXECUTION_JOURNAL", value) };
         }
-        for enabled_value in ["1", "true", "yes", "on", "anything"] {
-            assert!(enabled(Some(enabled_value)), "{enabled_value:?}");
+
+        fn clear(&self) {
+            unsafe { std::env::remove_var("JSH_EXECUTION_JOURNAL") };
         }
-        assert!(enabled(None), "missing/non-Unicode values default enabled");
+    }
+
+    impl Drop for JournalCapabilityEnv {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => self.set(&value),
+                None => self.clear(),
+            }
+        }
+    }
+
+    /// The on/off switch for the entire execution journal.
+    ///
+    /// anvil used to own a hand-copy of this predicate and test it; the copy is
+    /// gone and core exports the real one, which core does not test. At the
+    /// pinned `9f94f77`, `output_capture_enabled` has three call sites and its
+    /// definition and no assertion anywhere — so deleting anvil's test would
+    /// have left the whole journal's on/off switch, and in particular the rule
+    /// that a *missing* variable means enabled, asserted in neither repository.
+    /// A core change to opt-in semantics would then silence anvil's journal
+    /// with both suites green, which is exactly the drift deleting the copy was
+    /// meant to avoid. This is that assertion, pointed at the real function.
+    #[test]
+    fn the_journal_capability_defaults_on_and_names_the_spellings_that_disable_it() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let _serialized = JOURNAL_CAPABILITY_ENV
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let env = JournalCapabilityEnv(std::env::var_os("JSH_EXECUTION_JOURNAL"));
+        let enabled = jterm_core::execution_journal::output_capture_enabled;
+
+        env.clear();
+        assert!(
+            enabled(),
+            "a shell that never heard of the variable still gets a journal"
+        );
+
+        // Case- and whitespace-insensitive, and matched whole: `offline` is
+        // not `off`.
+        for disabled in ["", "0", "false", "no", "off", " FALSE ", "No", "\toFf\n"] {
+            env.set(std::ffi::OsStr::new(disabled));
+            assert!(!enabled(), "{disabled:?} must disable capture");
+        }
+        for enabled_value in ["1", "true", "yes", "on", "00", "offline", "anything"] {
+            env.set(std::ffi::OsStr::new(enabled_value));
+            assert!(enabled(), "{enabled_value:?} must leave capture enabled");
+        }
+
+        // A value this process cannot decode is not a decision to switch the
+        // journal off, so it must land on the enabled default with the rest of
+        // the unrecognised spellings.
+        env.set(std::ffi::OsStr::from_bytes(&[b'o', b'f', b'f', 0x80]));
+        assert!(enabled(), "a non-Unicode value is not a disable");
     }
 
     #[test]
-    fn journal_id_and_capability_gate_lazy_output_materialization() {
+    fn journal_lifecycle_and_capability_gate_lazy_output_materialization() {
         let disabled = super::LazyBlockRenderPayload::new(
             "$ ".to_string(),
             super::CapturedFinalizeOutput::Background(b"disabled\r\n".iter().copied().collect()),
             false,
         );
         assert!(super::build_journal_completion(
-            Some("execution-disabled".to_string()),
+            Some(harness_lifecycle("execution-disabled")),
             false,
             &disabled,
             100,
@@ -17720,13 +17950,15 @@ mod tests {
         .is_none());
         assert_eq!(disabled.materialization_count(), 0);
 
-        let missing_id = super::LazyBlockRenderPayload::new(
+        let missing_lifecycle = super::LazyBlockRenderPayload::new(
             "$ ".to_string(),
-            super::CapturedFinalizeOutput::Background(b"missing id\r\n".iter().copied().collect()),
+            super::CapturedFinalizeOutput::Background(
+                b"missing lifecycle\r\n".iter().copied().collect(),
+            ),
             false,
         );
-        assert!(super::build_journal_completion(None, true, &missing_id, 100).is_none());
-        assert_eq!(missing_id.materialization_count(), 0);
+        assert!(super::build_journal_completion(None, true, &missing_lifecycle, 100).is_none());
+        assert_eq!(missing_lifecycle.materialization_count(), 0);
 
         let enabled = super::LazyBlockRenderPayload::new(
             "$ ".to_string(),
@@ -17734,14 +17966,242 @@ mod tests {
             false,
         );
         let completion = super::build_journal_completion(
-            Some("execution-enabled".to_string()),
+            Some(harness_lifecycle("execution-enabled")),
             true,
             &enabled,
             100,
         )
-        .expect("enabled correlated output is consumed");
+        .expect("an enabled consumer plus a lifecycle token consumes the output");
         assert_eq!(enabled.materialization_count(), 1);
         assert_eq!(completion.output, "enabled");
+        assert_eq!(completion.lifecycle.id(), "execution-enabled");
+        assert_eq!(completion.lifecycle.session_id(), HARNESS_SESSION_ID);
+        assert_eq!(completion.lifecycle.started_at_ms(), HARNESS_STARTED_AT_MS);
+    }
+
+    /// jsh puts all four identity slots on `C` and only `id=` on `D`. The
+    /// journal capability is therefore minted at `C` and nowhere else: a `D`
+    /// can neither complete a lifecycle nor re-seat one, because a token
+    /// assembled across two packets is not a token bound to one Start
+    /// generation. anvil used to copy the `D` id over the start slot, so a
+    /// stray `D` — the shape a foreground child prints — renamed the running
+    /// execution and the block's captured output was filed under that name.
+    #[test]
+    fn a_command_end_neither_mints_nor_replaces_the_start_lifecycle() {
+        let harness = ReaderHarness::new();
+        harness.arm_verified_prompt();
+        harness.feed_raw(
+            b"\x1b]133;C;id=jsh-b8c6-1;session_id=probe-session-1;seq=1;\
+started_at_ms=1700000000000;cmdline_url=echo%20hello-journal\x07",
+        );
+        let started = harness
+            .ctx
+            .started_execution_rc
+            .borrow()
+            .clone()
+            .expect("a jsh C establishes the running execution");
+        assert_eq!(started.id, "jsh-b8c6-1");
+        let lifecycle = started
+            .lifecycle
+            .clone()
+            .expect("a complete envelope on one C mints the journal capability");
+        assert_eq!(lifecycle.id(), "jsh-b8c6-1");
+        assert_eq!(lifecycle.session_id(), "probe-session-1");
+        assert_eq!(lifecycle.seq(), 1);
+        assert_eq!(lifecycle.started_at_ms(), HARNESS_STARTED_AT_MS);
+
+        // A D naming a different execution, and carrying every identity slot
+        // it could hope to smuggle. The pinned parser drops the three Start
+        // slots on D outright; anvil must not take the id either.
+        harness.feed_raw(
+            b"\x1b]133;D;0;id=hostile-1;session_id=hostile-session;seq=99;\
+started_at_ms=1;duration_ms=0\x07",
+        );
+        assert_eq!(
+            harness.ctx.started_execution_rc.borrow().as_ref(),
+            Some(&started),
+            "the accepted C owns this execution's identity for its whole life"
+        );
+    }
+
+    /// anvil's own bash/zsh/fish/pwsh integration emits `id=` and nothing
+    /// else. That id still has to arbitrate nested markers and still has to
+    /// close the command it opened; it simply never opens the journal. The
+    /// lifecycle gate must not be allowed to take the correlation with it.
+    #[test]
+    fn an_id_only_command_start_still_correlates_but_opens_no_journal() {
+        let harness = ReaderHarness::new();
+        harness.backend.set_metadata_only(true);
+        harness.arm_verified_prompt();
+        harness.feed_raw(b"\x1b]133;C;id=bare-1\x07");
+        {
+            let started = harness.ctx.started_execution_rc.borrow();
+            let started = started.as_ref().expect("an id alone still correlates");
+            assert_eq!(started.id, "bare-1");
+            assert!(
+                started.lifecycle.is_none(),
+                "a partial envelope must not be assembled into a journal capability"
+            );
+        }
+
+        // A foreground child printing its own C/D pair. Arbitration is by id
+        // against the start slot, so the child's D consumes its own nesting
+        // rather than closing the shell's command.
+        harness.feed_raw(b"\x1b]133;C;id=child-1\x07");
+        harness.feed_raw(b"\x1b]133;D;0;id=child-1\x07");
+        assert!(
+            harness.commands_finished.borrow().is_empty(),
+            "a nested D that does not name the started execution closes nothing"
+        );
+        harness.feed(dispatch_bytes("hello\r\n"));
+        harness.feed_raw(b"\x1b]133;D;0;id=bare-1\x07");
+        assert_eq!(harness.commands_finished.borrow().len(), 1);
+
+        // Losing the journal must cost such a shell nothing else: the block
+        // is still recorded, with its status and its output.
+        harness.feed(ParserEvent::PromptStart);
+        let store = harness.backend.metadata_records.borrow();
+        assert_eq!(store.records[0].exit_code, Some(0));
+        assert_eq!(
+            store.records[0].completion_provenance,
+            super::CompletionProvenance::ShellReported
+        );
+        assert!(store
+            .snapshot(store.records[0].id)
+            .expect("the block keeps its output")
+            .plain
+            .contains("hello"));
+    }
+
+    /// The recorded start is the shell's own stamp when it sent one. The local
+    /// `SystemTime` is taken when this process parsed the mark, one GTK
+    /// dispatch later, and stays only as the fallback.
+    #[test]
+    fn a_completed_record_prefers_the_shell_stamped_start_time() {
+        let harness = ReaderHarness::new();
+        harness.backend.set_metadata_only(true);
+        harness.arm_verified_prompt();
+        harness.feed_raw(
+            b"\x1b]133;C;id=jsh-start-1;session_id=probe-session-1;seq=4;\
+started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
+        );
+        harness.feed(dispatch_bytes("stamped\r\n"));
+        harness.feed_raw(b"\x1b]133;D;0;id=jsh-start-1;duration_ms=12\x07");
+        harness.feed(ParserEvent::PromptStart);
+        let store = harness.backend.metadata_records.borrow();
+        assert_eq!(
+            store.records[0].start_time_ms,
+            Some(HARNESS_STARTED_AT_MS),
+            "jsh timestamps its own start; the terminal's observation does not"
+        );
+        assert_eq!(store.records[0].duration_ms, Some(12));
+    }
+
+    /// jsh's `D` may name the status positionally or with one of three keyed
+    /// spellings. anvil parsed only the positional form and read the keyed
+    /// ones as "no status reported", which also kept the command out of
+    /// `command_history`. The pinned parser owns all four spellings now, so
+    /// this pins that anvil takes the status from it rather than re-deriving
+    /// one of its own.
+    #[test]
+    fn keyed_exit_status_spellings_reach_the_finished_record() {
+        for (packet, expected) in [
+            (&b"\x1b]133;D;3;id=keyed-1\x07"[..], 3),
+            (&b"\x1b]133;D;exit=4;id=keyed-1\x07"[..], 4),
+            (&b"\x1b]133;D;exit_code=5;id=keyed-1\x07"[..], 5),
+            (&b"\x1b]133;D;exit_status=6;id=keyed-1\x07"[..], 6),
+        ] {
+            let harness = ReaderHarness::new();
+            harness.backend.set_metadata_only(true);
+            harness.arm_verified_prompt();
+            harness.feed_raw(b"\x1b]133;C;id=keyed-1\x07");
+            harness.feed(dispatch_bytes("out\r\n"));
+            harness.feed_raw(packet);
+            harness.feed(ParserEvent::PromptStart);
+            let store = harness.backend.metadata_records.borrow();
+            assert_eq!(
+                store.records[0].exit_code,
+                Some(expected),
+                "{}",
+                String::from_utf8_lossy(packet)
+            );
+            assert_eq!(
+                super::command_history_exit_code(store.records[0].exit_code),
+                Some(expected),
+                "a reported status is also what history files the command under"
+            );
+        }
+    }
+
+    /// `cmd_truncated=` used to decode as "not truncated" for every spelling
+    /// but `1`/`true`, so a producer sending `yes` had its prefix presented as
+    /// the exact command. The pinned parser fails closed on any unrecognised
+    /// value; this pins that anvil inherits that reading all the way into the
+    /// finished record's exactness.
+    #[test]
+    fn an_unrecognised_truncation_disclosure_fails_closed_end_to_end() {
+        for value in ["1", "true", "yes", "on", "sure"] {
+            let harness = ReaderHarness::new();
+            harness.backend.set_metadata_only(true);
+            harness.arm_verified_prompt();
+            harness.feed_raw(
+                format!(
+                    "\x1b]133;C;id=trunc-1;cmdline_url=rm%20-rf%20%2Fhome%2Fu;cmd_truncated={value}\x07"
+                )
+                .as_bytes(),
+            );
+            harness.feed_raw(b"\x1b]133;D;0;id=trunc-1\x07");
+            harness.feed(ParserEvent::PromptStart);
+            let store = harness.backend.metadata_records.borrow();
+            assert_eq!(
+                store.records[0].command_source,
+                super::CommandTextSource::ScreenAfterTruncation,
+                "cmd_truncated={value} must not leave the prefix looking exact"
+            );
+            // The pinned parser drops the contradictory prefix before anvil
+            // sees it, so nothing is left to scrape or report and the block is
+            // still recorded as a command that ran rather than as background
+            // output. `resolve_command_text` keeps the prefix when a producer
+            // hands one over directly; its own test covers that path.
+            assert_eq!(store.records[0].cmd, TRUNCATED_COMMAND_PLACEHOLDER);
+        }
+
+        // The honest negative disclosure is still the exact path.
+        let harness = ReaderHarness::new();
+        harness.backend.set_metadata_only(true);
+        harness.arm_verified_prompt();
+        harness.feed_raw(
+            b"\x1b]133;C;id=trunc-2;cmdline_url=rm%20-rf%20%2Fhome%2Fu;cmd_truncated=0\x07",
+        );
+        harness.feed_raw(b"\x1b]133;D;0;id=trunc-2\x07");
+        harness.feed(ParserEvent::PromptStart);
+        let store = harness.backend.metadata_records.borrow();
+        assert_eq!(
+            store.records[0].command_source,
+            super::CommandTextSource::ShellReported
+        );
+    }
+
+    /// The complement: with no envelope there is no stamp, so the local timer
+    /// still supplies the start. A regression that dropped the fallback would
+    /// leave every non-jsh block with no start time at all.
+    #[test]
+    fn a_shell_without_a_start_stamp_keeps_the_local_timer() {
+        let harness = ReaderHarness::new();
+        harness.backend.set_metadata_only(true);
+        harness.arm_verified_prompt();
+        harness.feed_raw(b"\x1b]133;C;id=bare-1\x07");
+        harness.feed(dispatch_bytes("bare\r\n"));
+        harness.feed_raw(b"\x1b]133;D;0;id=bare-1\x07");
+        harness.feed(ParserEvent::PromptStart);
+        let store = harness.backend.metadata_records.borrow();
+        let start = store.records[0]
+            .start_time_ms
+            .expect("the local timer still records a start");
+        assert!(
+            start > HARNESS_STARTED_AT_MS,
+            "the fallback is this machine's clock, not a shell stamp: {start}"
+        );
     }
 
     #[test]
@@ -20613,6 +21073,29 @@ mod tests {
         // Contrast: no metadata at all and nothing on screen stays empty, which
         // the finalize path reads as "nothing meaningful to record".
         assert_eq!(resolve_command_text(None, false, "").0, "");
+    }
+
+    /// A producer that sends a command line *and* declares it truncated has
+    /// contradicted itself. The prefix may still be shown, but it must never
+    /// be the exact text that re-run, copy and the Agent replay: `rm -rf
+    /// /home/u/proj` cut to `rm -rf /home/u` names a different directory.
+    #[test]
+    fn a_declared_truncation_disqualifies_the_reported_text_from_exactness() {
+        let (command, source) = resolve_command_text(Some("rm -rf /home/u"), true, "");
+        assert_eq!(command, "rm -rf /home/u");
+        assert_eq!(source, CommandTextSource::ScreenAfterTruncation);
+
+        // The screen holds the whole line, so it still beats the prefix.
+        let (command, source) =
+            resolve_command_text(Some("rm -rf /home/u"), true, "rm -rf /home/u/proj");
+        assert_eq!(command, "rm -rf /home/u/proj");
+        assert_eq!(source, CommandTextSource::ScreenAfterTruncation);
+
+        // And a contradictory packet with nothing usable at all still records
+        // that a command ran, rather than degrading to background output.
+        let (command, source) = resolve_command_text(Some("   "), true, "");
+        assert_eq!(command, TRUNCATED_COMMAND_PLACEHOLDER);
+        assert_eq!(source, CommandTextSource::ScreenAfterTruncation);
     }
 
     #[test]

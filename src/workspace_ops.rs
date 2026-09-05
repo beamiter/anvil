@@ -1277,6 +1277,16 @@ impl AppModel {
         if let Err(error) = command_history::flush_pending(std::time::Duration::from_secs(3)) {
             log::warn!("flush command history on exit: {error}");
         }
+        // A finished block's captured output is queued to jsh's execution
+        // journal and written by a thread of that crate's own, which process
+        // teardown terminates wherever it happens to be. Without this bounded
+        // wait the last command's output is simply lost every time closing the
+        // window wins the race to disk — the one case where a user is most
+        // likely to be reaching for what just scrolled past. Same two-second
+        // budget as ember, forge and frost.
+        if !jterm_core::execution_journal::flush(std::time::Duration::from_secs(2)) {
+            log::warn!("execution-journal writer did not flush before shutdown");
+        }
         if let Err(error) =
             crate::organism_memory::flush_pending(std::time::Duration::from_millis(500))
         {

@@ -233,13 +233,16 @@ impl AppModel {
         }
         // The engine samples the block output itself before classifying it, so
         // the whole event sample goes in: sampling twice elides real content
-        // out of the middle of the first pass.
+        // out of the middle of the first pass. It is borrowed, not moved: the
+        // engine only ever reads a bounded head/tail out of it, so handing it
+        // an owned copy duplicated a whole finished block's capture budget on
+        // the GTK main thread for every trusted completion.
         let Some(request) = should_start(
             enabled,
             CompletionFacts {
                 command: block.command,
                 exit_code: block.exit_code,
-                output: block.output,
+                output: &block.output,
                 cwd: Some(pane.cwd.clone().unwrap_or_else(|| ".".to_string())),
                 remote: pane.cwd_external,
                 agent_issued: block.agent_issued,
@@ -691,7 +694,9 @@ impl AppModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jterm_core::command_correction::MAX_CORRECTION_COMMAND_BYTES;
+    use jterm_core::command_correction::{
+        Candidate, CorrectionEvidence, MAX_CORRECTION_COMMAND_BYTES,
+    };
 
     /// An AI-unverified candidate, which is the only kind a test can mint
     /// without a real probe. Verified evidence needs the APT index or the
@@ -790,7 +795,7 @@ mod tests {
                 CompletionFacts {
                     command: "carog check".to_string(),
                     exit_code: Some(127),
-                    output: "bash: carog: command not found".to_string(),
+                    output: "bash: carog: command not found",
                     cwd: None,
                     remote: false,
                     agent_issued: false,
@@ -799,6 +804,61 @@ mod tests {
             )
             .is_none());
         }
+    }
+
+    /// The verified branch: a candidate this host proved exists may be run
+    /// straight from the card, and the button must say so.
+    ///
+    /// anvil could not reach this branch in a test before — verified evidence
+    /// comes from the APT index or the executable PATH, neither of which a
+    /// hermetic test can arrange — so the half of `primary_label` that says
+    /// "Run verified command" and the `run_directly` path behind it were
+    /// uncovered. `CorrectionCandidate::for_tests` supplies only the evidence
+    /// and still runs the real `validate_candidate` gate.
+    #[test]
+    fn a_verified_candidate_runs_directly_until_the_draft_is_edited() {
+        let candidate = CorrectionCandidate::for_tests(
+            Original("git statsu"),
+            Candidate("git status"),
+            "Fix the typo.",
+            CorrectionEvidence::ExecutablePath,
+        )
+        .expect("a verified fixture passes the real candidate gate");
+        let proposal = CorrectionProposal::new(candidate);
+
+        let accepted = live_proposal(&proposal, "git status")
+            .accept()
+            .expect("the unedited verified command is acceptable");
+        assert!(accepted.run_directly);
+        assert_eq!(primary_label(accepted.run_directly), "Run verified command");
+
+        // Any edit — including whitespace the engine trims back to the same
+        // command — is a different string than the one this host verified, so
+        // the card must fall back to inserting for review.
+        for edited in ["git status --short", "git  status"] {
+            let accepted = live_proposal(&proposal, edited)
+                .accept()
+                .expect("an edited draft is still acceptable");
+            assert!(
+                !accepted.run_directly,
+                "{edited:?} is not the command that was verified"
+            );
+            assert_eq!(primary_label(accepted.run_directly), "Insert for review");
+        }
+    }
+
+    /// The probe's reader thread is named so a reader stuck on a descendant
+    /// that kept the pipe open is attributable to anvil in `ps`. Read back
+    /// through the engine's accessor rather than a `Debug` rendering, which
+    /// could not have caught a rename.
+    #[test]
+    fn the_correction_policy_carries_anvils_probe_thread_name() {
+        let mut config = Config::safe_defaults();
+        config.ai_share_command_context = true;
+        assert_eq!(
+            correction_policy(&config).probe_thread_name(),
+            "anvil-command-correction-probe"
+        );
     }
 
     /// The card's label and its action are one decision, taken against the

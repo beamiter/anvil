@@ -462,6 +462,15 @@ fn create_pane(
     env_extra: Vec<(String, String)>,
     sender: &ComponentSender<AppModel>,
 ) -> Pane {
+    // A restored or remote pane arrives with the identity it must keep, so jsh
+    // reopens the same session. Every other pane mints one here rather than
+    // launching without: `--session` is what makes jsh announce `session_id=`
+    // on OSC 133 `C`, and without that slot no pane can ever satisfy
+    // `ExecutionLifecycle::from_command_meta` and open a journal Output slot.
+    // Doing it in the constructor rather than at each of the seven call sites
+    // is deliberate — a new pane path added later inherits the identity instead
+    // of silently rejoining the set that journals nothing.
+    let session_id = Some(config::pane_session_id(session_id, pane_id));
     let probe = terminal::PaneProbe::default();
     // -1 means "no PTY yet"; foreground probing skips it (0 would alias stdin).
     probe.pty_fd.set(-1);

@@ -229,25 +229,23 @@ pub(super) fn decode_session(bytes: &[u8]) -> io::Result<Vec<PersistedZone>> {
 
 /// Read a bounded zone-history file. A file over the ceiling is refused
 /// without being decoded; a missing file is simply an empty session.
+///
+/// The read goes through `jterm_core::snapshot_file::read_bounded` rather than
+/// this module's former stat-then-read. The size check on a separate `stat`
+/// only described the file as it was *before* the open, so a path replaced
+/// between the two calls was read unbounded, and a file still being appended
+/// to could pass the check and then deliver more; the shared reader bounds the
+/// descriptor it actually reads. It also refuses what a stat cannot: a
+/// symlinked or hard-linked path, a fifo (whose `open` would otherwise block
+/// the GTK main thread until some writer appeared, leaving a window that never
+/// draws), a file owned by another user, and one another user may write. The
+/// writer beside this creates the document 0600, so nothing legitimate is lost.
 pub(super) fn read_session(path: &Path) -> io::Result<Vec<PersistedZone>> {
-    let metadata = match std::fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error),
-    };
-    if !metadata.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "zone history path is not a regular file",
-        ));
+    match jterm_core::snapshot_file::read_bounded(path, MAX_ZONE_HISTORY_FILE_BYTES) {
+        Ok(text) => decode_session(text.as_bytes()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error),
     }
-    if metadata.len() > MAX_ZONE_HISTORY_FILE_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "zone history file exceeds its bound",
-        ));
-    }
-    decode_session(&std::fs::read(path)?)
 }
 
 /// Terminal bytes that reconstruct one restored zone above the next prompt.
@@ -528,19 +526,56 @@ mod tests {
         let missing = dir.join("absent.json");
         assert!(read_session(&missing).expect("absent is empty").is_empty());
 
+        // The real writer creates this document 0600; a fixture written with
+        // the ambient umask would be group-writable under the common
+        // `umask 002` and correctly refused by the hardened reader.
+        let write_fixture = |path: &Path, bytes: &[u8]| {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::write(path, bytes).expect("write");
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .expect("private fixture");
+        };
+
         let file = dir.join("zones.json");
         let encoded = encode_session(vec![zone("echo hi", Some("hi"))]).expect("encodes");
-        std::fs::write(&file, &encoded).expect("write");
+        write_fixture(&file, &encoded);
         let restored = read_session(&file).expect("reads");
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].output.as_deref(), Some("hi"));
 
-        std::fs::write(&file, vec![b'x'; MAX_ZONE_HISTORY_FILE_BYTES as usize + 1]).expect("write");
+        write_fixture(&file, &vec![b'x'; MAX_ZONE_HISTORY_FILE_BYTES as usize + 1]);
         let error = read_session(&file).expect_err("refuses an oversized file");
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        // Deliberately re-pinned: the shared reader reports an oversize
+        // document as `FileTooLarge`, where the local stat-then-read reported
+        // `InvalidData`. Same refusal, a more accurate kind.
+        assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
 
         let error = read_session(&dir).expect_err("refuses a directory");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        // Hazards the former stat-then-read could not see.
+        let target = dir.join("target.json");
+        write_fixture(&target, &encoded);
+        let linked = dir.join("symlinked.json");
+        std::os::unix::fs::symlink(&target, &linked).expect("symlink");
+        assert!(
+            read_session(&linked).is_err(),
+            "a history path replaced by a symlink is not this pane's document"
+        );
+
+        let group_writable = dir.join("group-writable.json");
+        write_fixture(&group_writable, &encoded);
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(&group_writable, std::fs::Permissions::from_mode(0o620))
+                .expect("relax");
+        }
+        assert!(
+            read_session(&group_writable).is_err(),
+            "another user could have written every command replayed from this"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

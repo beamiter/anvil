@@ -456,11 +456,18 @@ fn should_step(outcome: JumpOutcome, requested: bool) -> bool {
 
 /// `exit:1 · 2.4s · …/anvil` for one hit, or `None` when the record carried
 /// none of the three.
+///
+/// The status goes through the same [`crate::block_view::exit_status_badge_text`]
+/// the two block backends paint, because this row and those cards describe the
+/// same record: a search summary reading `exit:137` beside a Block card reading
+/// `exit:137 SIGKILL` is the terminal telling a user two things about one
+/// command. There is no tooltip on this row, so the badge text is all the
+/// explanation the signal gets here.
 fn hit_outcome_label(hit: &CrossBlockHit) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     match hit.exit_code {
         Some(0) => {}
-        Some(code) => parts.push(format!("exit:{code}")),
+        Some(code) => parts.push(crate::block_view::exit_status_badge_text(code)),
         None => {}
     }
     if let Some(duration) = hit.duration_ms {
@@ -1519,6 +1526,29 @@ mod tests {
             hit_outcome_label(&hit(None, None, Some(""))),
             None,
             "an empty cwd is not a directory"
+        );
+    }
+
+    /// A `128 + n` status is the shell saying something outside the command
+    /// killed it, and this row describes the same record the Block card and
+    /// the Unified status line do. `exit:137` here beside `exit:137 SIGKILL`
+    /// there would be the terminal telling a user two things about one
+    /// command — the divergence the shared helper exists to prevent.
+    #[test]
+    fn a_signal_status_reads_the_same_here_as_on_the_block_card() {
+        assert_eq!(
+            hit_outcome_label(&hit(Some(137), Some(2_400), None)).as_deref(),
+            Some("exit:137 SIGKILL · 2.4s")
+        );
+        assert_eq!(
+            hit_outcome_label(&hit(Some(130), None, None)).as_deref(),
+            Some("exit:130 SIGINT"),
+            "the Ctrl-C a user pressed is the answer to \"why did this stop\""
+        );
+        // An ordinary failure is unchanged: only `128 + n` names a signal.
+        assert_eq!(
+            hit_outcome_label(&hit(Some(1), None, None)).as_deref(),
+            Some("exit:1")
         );
     }
 

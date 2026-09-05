@@ -2772,8 +2772,77 @@ fn reserve_part_then_spawn(
     }
 }
 
-/// Private staging directory for remote→remote relays. The held directory
-/// descriptor pins its inode so cleanup can distinguish a replaced path.
+/// One upload's staging file, together with whatever owns the directory it
+/// lives in.
+///
+/// Field order is the drop order: the file unlinks itself from its parent
+/// before a fallback directory is removed.
+struct UploadStaging {
+    file: StagedFile,
+    _directory: Option<StagingDir>,
+}
+
+/// Reserve the staging file an upload snapshots or tars into.
+///
+/// Beside the source first, because that is the only placement where
+/// `FICLONE` can make the snapshot a reflink: same filesystem, no second copy
+/// of the bytes and no second copy of the space. That was also the *only*
+/// placement, which made an upload out of a directory this process may read
+/// but not write — a checkout mounted read-only, a mode-`0555` release tree,
+/// someone else's `/srv` share — fail before it ever contacted the remote,
+/// with an error naming the source directory rather than the transfer.
+///
+/// So a directory that refuses the reservation falls back to a private
+/// process-owned directory under `TMPDIR`, the same one the remote→remote
+/// relay leg already stages in. Only a permission answer is treated as
+/// "wrong directory": `ENOSPC` or `EIO` beside the source is a real failure
+/// about the bytes, and silently retrying it in `TMPDIR` would move a large
+/// upload onto a tmpfs (that is, into RAM) behind the user's back.
+fn stage_upload(source: &Path) -> io::Result<(UploadStaging, std::fs::File)> {
+    match StagedFile::beside(source) {
+        Ok((file, handle)) => Ok((
+            UploadStaging {
+                file,
+                _directory: None,
+            },
+            handle,
+        )),
+        Err(error) if staging_parent_refused(&error) => {
+            let directory = StagingDir::new()?;
+            // `upload` is only an anchor: `beside` takes this path's parent
+            // and mints its own `.anvil-fs-part-*` name inside it.
+            let (file, handle) = StagedFile::beside(&directory.path().join("upload"))?;
+            Ok((
+                UploadStaging {
+                    file,
+                    _directory: Some(directory),
+                },
+                handle,
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether an error says the *directory* refused us, not that the write
+/// itself failed. Matched on the raw errno rather than an `ErrorKind`, which
+/// collapses `EROFS` and `EACCES` differently across releases.
+fn staging_parent_refused(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EACCES) | Some(libc::EPERM) | Some(libc::EROFS)
+    )
+}
+
+/// Private process-owned staging directory under `TMPDIR`, with two users: the
+/// remote→remote relay leg, which has nowhere local to put the bytes at all,
+/// and [`stage_upload`]'s fallback for a source directory that refuses the
+/// reservation beside the source. The name is deliberately neutral — it used
+/// to say `relay`, which asserted a relay to anyone auditing the path while an
+/// ordinary upload off a read-only mount was creating one.
+///
+/// The held directory descriptor pins its inode so cleanup can distinguish a
+/// replaced path.
 struct StagingDir {
     path: PathBuf,
     handle: std::fs::File,
@@ -2791,7 +2860,7 @@ impl StagingDir {
         use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
         for _ in 0..32 {
-            let path = parent.join(format!("anvil-fs-relay-{}-{}", std::process::id(), next()));
+            let path = parent.join(format!("anvil-fs-stage-{}-{}", std::process::id(), next()));
             let mut builder = std::fs::DirBuilder::new();
             builder.mode(0o700);
             match builder.create(&path) {
@@ -2815,7 +2884,7 @@ impl StagingDir {
         }
         Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
-            "could not reserve a private relay staging directory",
+            "could not reserve a private staging directory",
         ))
     }
 
@@ -3692,7 +3761,7 @@ fn upload_file_with_integrity(
     control.check()?;
     let _timeout = control.arm_timeout(TRANSFER_TIMEOUT)?;
     let initial_fingerprint = source_fingerprint(&metadata);
-    let (_snapshot_staging, mut snapshot) = StagedFile::beside(local_path)?;
+    let (_snapshot_staging, mut snapshot) = stage_upload(local_path)?;
     let snapshotted = snapshot_source_file(&mut file, &mut snapshot, &metadata, max, control)?;
     let final_fingerprint = source_fingerprint(&file.metadata()?);
     if snapshotted != metadata.len() || final_fingerprint != initial_fingerprint {
@@ -3814,7 +3883,7 @@ fn upload_dir_with_integrity(
     let _timeout = control.arm_timeout(TRANSFER_TIMEOUT)?;
     let initial_manifest = source_directory_manifest(&source, control)?;
     let source_path = anchored_descriptor_path(&source);
-    let (_archive_staging, mut archive) = StagedFile::beside(local_path)?;
+    let (_archive_staging, mut archive) = stage_upload(local_path)?;
     let mut tar_command = Command::new(tar_program);
     tar_command
         .args(["cf", "-"])
@@ -6529,6 +6598,93 @@ mod tests {
         );
     }
 
+    /// An upload snapshots or tars its source into a staging file first. That
+    /// file used to be reservable only beside the source, so an upload out of
+    /// a directory this process may read but not write — a read-only mount, a
+    /// mode-0555 release tree — failed before the remote was ever contacted.
+    #[test]
+    fn an_upload_stages_beside_its_source_and_falls_back_when_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let local = TestDir::new("upload-staging");
+        let source = local.path().join("payload.bin");
+        std::fs::write(&source, b"payload").unwrap();
+
+        let (staging, file) = stage_upload(&source).unwrap();
+        assert_eq!(
+            staging.file.path().parent(),
+            Some(local.path()),
+            "a writable source directory keeps the snapshot on the source's own \
+             filesystem, which is the only placement FICLONE can reflink"
+        );
+        drop(file);
+        drop(staging);
+
+        let refused = local.path().join("refused");
+        std::fs::create_dir(&refused).unwrap();
+        let guarded = refused.join("payload.bin");
+        std::fs::write(&guarded, b"payload").unwrap();
+        std::fs::set_permissions(&refused, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let staged = stage_upload(&guarded);
+        // Restore before asserting: a failed assertion must not leave a
+        // directory the harness cannot clean up.
+        std::fs::set_permissions(&refused, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (staging, file) =
+            staged.expect("a source directory that refuses staging must not fail the upload");
+        let staged_path = staging.file.path().to_path_buf();
+        let staged_parent = staged_path
+            .parent()
+            .expect("staging has a parent")
+            .to_owned();
+        assert_ne!(staged_parent, refused);
+        assert!(
+            staged_parent.starts_with(std::env::temp_dir()),
+            "the fallback is the private process-owned directory, not somewhere \
+             else in the user's tree: {}",
+            staged_parent.display()
+        );
+        // The directory a user finds in TMPDIR during a plain upload must not
+        // claim a relay leg that this transfer never had.
+        let staged_parent_name = staged_parent
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .expect("the staging directory is named");
+        assert!(
+            staged_parent_name.starts_with("anvil-fs-stage-"),
+            "the on-disk name must not assert a transfer shape: {staged_parent_name}"
+        );
+        assert_eq!(
+            std::fs::metadata(&staged_parent)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o077,
+            0,
+            "the fallback directory must be private to this process"
+        );
+        drop(file);
+        drop(staging);
+        assert!(!staged_path.exists(), "the staging file is unlinked");
+        assert!(!staged_parent.exists(), "and its private directory with it");
+    }
+
+    /// Only the directory's own refusal reroutes an upload. A write failure is
+    /// about the bytes, and retrying it in `TMPDIR` would quietly move a large
+    /// upload onto a tmpfs.
+    #[test]
+    fn only_a_permission_answer_reroutes_upload_staging() {
+        for refused in [libc::EACCES, libc::EPERM, libc::EROFS] {
+            assert!(staging_parent_refused(&io::Error::from_raw_os_error(
+                refused
+            )));
+        }
+        for kept in [libc::ENOSPC, libc::EIO, libc::EDQUOT, libc::ENOENT] {
+            assert!(!staging_parent_refused(&io::Error::from_raw_os_error(kept)));
+        }
+        assert!(!staging_parent_refused(&io::Error::other("no errno")));
+    }
+
     #[test]
     fn unique_transfer_staging_skips_aliases_and_planted_symlinks() {
         use std::os::unix::fs::PermissionsExt;
@@ -7768,7 +7924,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_staging_dir_is_private_collision_safe_and_identity_bound() {
+    fn staging_dir_is_private_collision_safe_and_identity_bound() {
         use std::os::unix::fs::PermissionsExt;
 
         let path = {
@@ -7778,7 +7934,7 @@ mod tests {
             assert_eq!(
                 std::fs::metadata(&path).unwrap().permissions().mode() & 0o077,
                 0,
-                "relay contents must not be traversable by other users"
+                "staged contents must not be traversable by other users"
             );
             path
         };
@@ -7788,14 +7944,14 @@ mod tests {
         let pid = std::process::id();
         let victim = local.path().join("victim");
         std::fs::write(&victim, b"keep").unwrap();
-        let planted = local.path().join(format!("anvil-fs-relay-{pid}-11"));
+        let planted = local.path().join(format!("anvil-fs-stage-{pid}-11"));
         std::os::unix::fs::symlink(&victim, &planted).unwrap();
         let mut sequence = [11, 12].into_iter();
         let staging = StagingDir::in_parent_with(local.path(), || {
             sequence.next().expect("one retry is enough")
         })
         .unwrap();
-        let expected_name = format!("anvil-fs-relay-{pid}-12");
+        let expected_name = format!("anvil-fs-stage-{pid}-12");
         assert_eq!(staging.path().file_name(), Some(OsStr::new(&expected_name)));
         assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
         drop(staging);

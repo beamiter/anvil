@@ -119,7 +119,7 @@ impl ZoneChromeRecord {
         } else {
             match self.exit_code {
                 Some(0) => "✓".to_owned(),
-                Some(code) => format!("exit:{code}"),
+                Some(code) => super::exit_status_badge_text(code),
                 None => "exit:?".to_owned(),
             }
         };

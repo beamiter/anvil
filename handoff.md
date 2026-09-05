@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-30 (Files staging, commits, and probes fail closed)
+Updated: 2026-09-05 (Journal lifecycle tokens, one opener policy)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,149 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **Journal output is bound to a lifecycle token minted at `C`
+  (2026-09-05, repin round)**: `jterm_core` is repinned to
+  `9f94f77b694ef5e0b20b9fd4bd776b98220360c4` and its transitive `jagent` to
+  `bdc8023faa535ee00bb972cdb0adc11ba280fdc5`.
+  `execution_journal::CompletedExecution` no longer carries an `id: String`; it
+  carries an `ExecutionLifecycle` whose only constructor,
+  `from_command_meta`, demands `id`, `session_id`, `seq` and `started_at_ms`
+  on ONE OSC 133 `C` packet. The reader's `execution_id_rc` became
+  `started_execution_rc: Rc<RefCell<Option<StartedExecution>>>`, a struct
+  holding two capabilities of different strength minted from that one packet:
+  `id`, the correlation key every FinalTerm producer sends, and `lifecycle`,
+  the durable-journal capability only jsh's complete envelope earns. They are
+  one struct rather than two cells precisely so they cannot be assembled out of
+  metadata seen at different times.
+
+  The hazard this closes is the `D` handler, which used to copy `meta.id` over
+  the start slot ("the D packet repeats the execution id, so a shell that only
+  tags the finish still correlates"). Under the lifecycle model a `D` carries
+  no Start identity at all — the pinned parser accepts `session_id`, `seq` and
+  `started_at_ms` only on `C` — so re-seating there could only rename the
+  execution the shell's own `C` opened, and file that block's captured output
+  under a name a foreground child printing its own marks chose. Nothing is
+  taken from `D` now; a `D` id is only ever compared, by the same
+  `command_end_matches_started_id` the nested-marker arbitration already used.
+  Core's writer re-checks all four fields against the authoritative on-disk
+  Start under the journal's exclusive lock, so a stale or forged token fails
+  closed on the far side too.
+
+  **Behaviour change, stated because it is user-visible:** journaled output now
+  requires a complete jsh lifecycle envelope, so a shell that emits only `id=`
+  — which is exactly what anvil's own bundled `anvil.bash`, `anvil.zsh`,
+  `anvil.fish` and `anvil.ps1` emit — no longer reaches the journal. That is the
+  intended fail-closed semantics: the missing slots are what bind a payload to
+  one Start generation. Such a shell loses nothing else: its blocks, its exit
+  status, its nested-marker arbitration and its Agent execution correlation all
+  still ride on the same `id`, which is why the correlation was kept beside the
+  lifecycle rather than replaced by it.
+
+  Deliberately NOT gated on `execution_id_trusted`. That flag asks whether the
+  id embeds this pane's private shell-integration token, which is how anvil's
+  own scripts authenticate their marks and is not something jsh uses; requiring
+  it would switch the journal off for the only shell that has one. A comment
+  above the submission claimed such a check while no line performed one — the
+  comment now states the actual guarantee, which comes from core's writer.
+
+- **One opener policy, applied to detection as well (2026-09-05)**: anvil's
+  `terminal/url.rs` allowlisted seven schemes — `http`, `https`, `file`, `ftp`,
+  `git`, `ssh`, `mailto` — and applied no authority rule, then handed the
+  result to `gio::AppInfo::launch_default_for_uri`. Link text is
+  process-controlled, so any `cat` of a hostile file was a one-click local-file
+  open with its default application, a network client launch, or
+  `https://user:token@host` handing the browser a credential the user never
+  typed. The other three terminals refuse all of that through
+  `jterm_core::link::is_openable_url`; anvil now calls the same predicate, and
+  calls it for hover/underline detection and OSC 8 tag validation too, so
+  nothing is ever presented as clickable that a click would refuse. The local
+  `MAX_URI_BYTES` (8 KiB) is gone in favour of core's 2 KiB
+  `MAX_OPENABLE_URL_BYTES`. `file:` and `mailto:` links in block output stop
+  being clickable, which is the intended loss.
+
+- **The exact-command provenance survives a self-contradicting packet
+  (2026-09-05)**: `cmdline_url=<prefix>` together with `cmd_truncated=1`
+  resolved to `CommandTextSource::ShellReported`, the provenance that marks a
+  block `command_exact` and is what block re-run, copy and the Agent's block
+  context replay. `rm -rf /home/u/proj` cut to `rm -rf /home/u` was presented,
+  and re-runnable, as exact. A declared truncation now disqualifies the
+  reported text from exactness whatever else the packet claims; the prefix is
+  still shown when nothing better exists, because it is what the user typed as
+  far as it goes, but under `ScreenAfterTruncation`. The pinned parser drops
+  such a prefix upstream, so the local rule is defence for any other producer.
+  The same repin makes `cmd_truncated=yes`/`=on`/anything unrecognised fail
+  closed (a producer that sent the disclosure but did not encode its state has
+  said the command is inexact), and teaches the `D` decoder the keyed
+  `exit=`/`exit_code=`/`exit_status=` spellings anvil used to read as "no
+  status", which also kept those commands out of `command_history`. All three
+  are pinned end-to-end from raw OSC bytes.
+
+- **Shutdown flushes the journal writer (2026-09-05)**: `force_quit` drained
+  command history, organism memory and persistence, and not the execution
+  journal, whose writer thread process teardown terminates wherever it happens
+  to be — so the last command's captured output was lost whenever closing the
+  window won the race to disk. A bounded two-second flush, the same budget
+  ember, forge and frost use, now sits with the other drains.
+
+- **Upload staging survives a non-writable source directory (2026-09-05)**: the
+  snapshot/tar staging file could only be reserved beside its source, so an
+  upload out of a read-only mount or a mode-0555 tree failed before the remote
+  was contacted, with an error about the source directory rather than the
+  transfer. `stage_upload` still tries beside the source first — that is the
+  only placement `FICLONE` can reflink, and the fast path matters for large
+  files — and falls back to the private `TMPDIR` directory the remote-to-remote
+  relay leg already stages in. Only `EACCES`/`EPERM`/`EROFS` reroute; `ENOSPC`
+  beside the source is a real failure about the bytes, and silently retrying it
+  in `TMPDIR` would move a large upload into RAM. `StagingDir` therefore has two
+  users now, and its directory is `anvil-fs-stage-<pid>-<n>` rather than
+  `anvil-fs-relay-<pid>-<n>`: an ordinary upload creates one, and both the old
+  name and the type's old doc comment asserted a relay leg that transfer never
+  had.
+
+- **Zone-history restore reads through the hardened reader (2026-09-05)**: the
+  local stat-then-read described the file as it was *before* the open, so a
+  path replaced between the two calls was read unbounded and a file still being
+  appended to could pass the size check and then deliver more.
+  `jterm_core::snapshot_file::read_bounded` bounds the descriptor it actually
+  reads and refuses what a stat cannot see: a symlink, a hard link, a fifo
+  (whose `open` would otherwise block the GTK main thread until some writer
+  appeared — a window that never draws), a foreign owner, and group/other write
+  bits. The writer beside it already creates the document 0600. One existing
+  assertion moved deliberately: an oversized document reports `FileTooLarge`
+  now instead of `InvalidData`.
+
+- **Two hand-copies of pinned core deleted (2026-09-05)**: the journal
+  capability predicate (`execution_journal_output_capture_enabled_for`, whose
+  own doc comment said it mirrored a *private* upstream function — exactly the
+  thing that drifts silently) is now `execution_journal::output_capture_enabled`,
+  and the URL scheme allowlist is now `link::is_openable_url`. The *tests* did
+  not move with the predicate, because there was nowhere for them to move to:
+  core has no assertion on `output_capture_enabled` at all, so anvil keeps
+  `the_journal_capability_defaults_on_and_names_the_spellings_that_disable_it`
+  pointed at the exported function. It is the only thing anywhere that pins the
+  opt-out default; a core change to opt-in would otherwise silence anvil's
+  journal with both suites green. It writes a process-global variable, so it
+  and `wrapped_raw_output_marks_the_snapshot_truncated_without_leaking_forward`
+  — the one other test whose outcome depends on the live switch — share a
+  `JOURNAL_CAPABILITY_ENV` mutex, and the latter now sets the switch it
+  depends on instead of inheriting the developer's shell. anvil keeps no
+  duplicate danger or read-only command classification: `is_dangerous` has
+  always come from `jterm_core::agent`, and `agent_auto_approve_readonly` is
+  retired, so jagent's growth from 32 to 54 warning classes reaches the Agent's
+  approval cards with no anvil-side change. `organism.rs`'s command classifier
+  stays local — it answers "is this a build or a `git push`" for the ASCII
+  organism's expression, which is not a safety opinion.
+
+- **Coverage the repin made reachable (2026-09-05)**: `CorrectionCandidate::for_tests`
+  reaches anvil's *verified* candidate branch, which needed the APT index or the
+  executable PATH and so was never covered — the "Run verified command" label
+  and the `run_directly` path behind it, plus the rule that any edit of a
+  verified draft downgrades it to insert-for-review.
+  `CorrectionPolicy::probe_thread_name()` pins anvil's probe reader thread name
+  against a literal instead of a `Debug` rendering. `CompletionFacts::output`
+  also became a borrow, which removes a per-command copy of up to
+  `MAX_CAPTURED_OUTPUT_BYTES` from the GTK main thread.
 
 - **Transfer staging is exclusive before spawn (2026-08-30)**: a local partial
   file is reserved mode 0600 with `create_new` before the remote producer
@@ -876,6 +1019,23 @@ captured, queued, written, and restored.
   accepted. Anvil deliberately adds no second post-restore durability gate.
 
 ## Remaining boundaries
+
+The test binary initializes GTK from whichever libtest worker thread first
+reaches a widget-touching test, and gtk4-rs refuses a second initialization
+from a different thread. Under the default threaded run this surfaces as the
+process dying at a random point — SIGSEGV, SIGABRT (often with GTK's
+`Two different plugins tried to register 'FcitxIMContext'` above it on a host
+with `GTK_IM_MODULE=fcitx`), or SIGKILL — after every test has already
+reported `ok` and with no test ever failing. Re-run the suite; a clean run
+reports the full count and exits 0. This is not new and is not
+`jterm_core`-related: at the previous pin (`f60c507`) the same runs crashed
+6 of 8 times with the same signatures, and forcing `--test-threads=1` makes the
+underlying cause explicit and identical at both pins —
+`workspace_ops::pane_tree_tests::leaf_slot_requires_the_exact_holder_tree_and_clears_focus_before_reparent`
+panics with `Attempted to initialize GTK from two different threads`. The fix
+is to give the widget-touching tests one owning thread (or mark them
+`#[ignore]` like their `requires DISPLAY` neighbours); it is a test-harness
+change, deliberately left out of a repin round.
 
 The current session transaction protects cooperating anvil writers with locks,
 revision checks, atomic replacement, and durable directory sync. As with most

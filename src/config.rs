@@ -271,6 +271,41 @@ pub(crate) fn valid_session_id(session_id: &str) -> bool {
     jterm_core::execution_journal::is_valid_jsh_session_id(session_id)
 }
 
+/// The jsh session identity a freshly created pane owns.
+///
+/// Every pane needs one, not only a restored or remote one. jsh emits
+/// `session_id=` on OSC 133 `C` only when it was given `--session`, and
+/// `ExecutionLifecycle::from_command_meta` requires that slot, so a pane
+/// launched without an id can never open a journal Output slot — the captured
+/// output is dropped with `submit` still returning `Ok(())`. anvil passed
+/// `None` from every pane constructor, which is why a real
+/// `~/.local/state/jsh/executions.jsonl` shows 3,867 of 4,637 `start` events
+/// with `"session_id": null`.
+///
+/// The pid keeps two concurrent anvils apart and the pane id keeps panes apart
+/// within one; both are what `terminal_session_id` already uses for task
+/// terminals, and the pane-id space is shared with those, so the two cannot
+/// collide. The grammar is `valid_session_id`'s by construction: decimal digits
+/// and `-`.
+pub(crate) fn fresh_session_id(pane_id: u64) -> String {
+    format!("anvil-{}-{pane_id}", std::process::id())
+}
+
+/// The identity one pane launches its shell with: the one it is restoring or
+/// reconnecting with, or a fresh one.
+///
+/// A separate function rather than an `unwrap_or_else` at the call site so the
+/// rule is testable without a GTK pane, and so removing the call is a build
+/// failure — this is dead code the moment nothing calls it, and the lint gate
+/// is `-D warnings`. An invalid stored id is replaced rather than dropped: it
+/// cannot be given to jsh, and leaving the pane with none is the bug this
+/// exists to prevent.
+pub(crate) fn pane_session_id(existing: Option<String>, pane_id: u64) -> String {
+    existing
+        .filter(|id| valid_session_id(id))
+        .unwrap_or_else(|| fresh_session_id(pane_id))
+}
+
 /// Apply a saved jsh session id to either a direct jsh argv or the exact
 /// interactive-bash wrapper generated above. Returns whether the id was
 /// applied, allowing callers to expose the matching environment marker.
@@ -2405,6 +2440,52 @@ mod tests {
         assert!(!valid_session_id("session with spaces"));
         assert!(!valid_session_id("session.with.dots"));
         assert!(!valid_session_id("雪"));
+    }
+
+    /// Every pane launches with an identity, because a pane without one can
+    /// never journal its output.
+    ///
+    /// `--session` is what makes jsh announce `session_id=` on OSC 133 `C`, and
+    /// `ExecutionLifecycle::from_command_meta` refuses without that slot, so a
+    /// pane launched with `None` drops every captured output while `submit`
+    /// still returns `Ok(())`. anvil passed `None` from all seven pane
+    /// constructors; a real journal shows 3,867 of 4,637 starts with
+    /// `"session_id": null` as a result.
+    #[test]
+    fn every_pane_launches_with_a_session_identity_jsh_will_accept() {
+        // A fresh id must be usable, not merely present: it has to survive the
+        // grammar and actually reach the argv of both jsh spawn shapes.
+        let fresh = pane_session_id(None, 7);
+        assert!(valid_session_id(&fresh), "{fresh}");
+        for shell in [
+            vec!["/usr/bin/jsh".to_string()],
+            vec![
+                "/usr/bin/bash".to_string(),
+                "-ic".to_string(),
+                "exec \"$0\" \"$@\"".to_string(),
+                "/usr/bin/jsh".to_string(),
+            ],
+        ] {
+            let (argv, applied) = shell_argv_with_session(&shell, Some(&fresh));
+            assert!(applied, "{shell:?}");
+            assert_eq!(&argv[argv.len() - 2..], ["--session", fresh.as_str()]);
+        }
+
+        // A restored or reconnecting pane keeps the identity it was given, or
+        // jsh opens a different session than the one whose cwd/env it holds.
+        assert_eq!(pane_session_id(Some("kept-1".to_string()), 7), "kept-1");
+
+        // A stored id that jsh would reject is replaced, never passed through
+        // and never dropped to `None` — dropping it is the bug itself.
+        for stored in ["", "bad session", "bad.session", "雪"] {
+            let resolved = pane_session_id(Some(stored.to_string()), 7);
+            assert!(valid_session_id(&resolved), "{stored:?} -> {resolved}");
+            assert_ne!(resolved, stored);
+        }
+
+        // Distinct panes are distinct sessions; two panes sharing one would
+        // make jsh restore the same cwd/env into both.
+        assert_ne!(pane_session_id(None, 7), pane_session_id(None, 8));
     }
 
     #[test]

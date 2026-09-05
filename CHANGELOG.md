@@ -7,6 +7,29 @@ versioning for tagged releases while it remains experimental.
 
 ### Added
 
+- **A workflow is findable by its tags.** The palette matched a workflow's name
+  and its description/command sublabel, and rendered its tags into the
+  right-hand hint, which never took part in matching — so the one field an
+  author writes specifically to make a workflow findable was the one field
+  `:deploy` could not search. forge, ember and frost all match tags. Entries now
+  carry a `search_extra` slot that is searched but not labelled, scoring at the
+  same half weight as the sublabel so a workflow *named* for the query still
+  outranks one merely tagged with it. Deliberately not the `right` field
+  itself: for an action that field is the keybinding, and searching it would
+  make `ctrl` return every bound action in the palette.
+- **A failed block whose exit code is `128 + n` names the signal.** `exit:137`
+  alone sends a user hunting through output that was never written; `exit:137
+  SIGKILL` points at the OOM killer. Both block backends and the cross-block
+  search result row share one helper, so a record cannot read two different ways
+  depending on which surface is showing it, and the Block card carries a tooltip
+  explaining the `128 + signal number` convention. ember, forge and frost
+  already did this; anvil showed the bare number.
+- A finished block's recorded start time is the shell's own `started_at_ms` when
+  jsh sent one, instead of the moment this process parsed the start mark — one
+  GTK dispatch later. The local `SystemTime` remains the fallback and remains
+  the basis of the duration fallback, so a remote shell's clock is never
+  subtracted from this machine's.
+
 - Session restore now rejects duplicate JSON object members recursively before
   interpreting envelope, saved-session, or pane-layout data, including escaped
   spellings of the same key and duplicate members inside future extension
@@ -271,6 +294,34 @@ versioning for tagged releases while it remains experimental.
 - Contribution, architecture, and private vulnerability reporting guidance.
 
 ### Changed
+
+- **`jterm_core` is repinned to `9f94f77` (transitively `jagent` `bdc8023`).**
+  Journaled command output is now bound to an `ExecutionLifecycle` token minted
+  from a single OSC 133 `C` packet carrying all four of `id`, `session_id`,
+  `seq` and `started_at_ms`; see the fail-closed note under Security. The repin
+  also brings 54 warning classes to the Agent's approval cards (up from 32:
+  signals, mount/swap/losetup/cryptsetup, set-id `chmod`, `shred`/`truncate`,
+  mode-aware `parted`/`sfdisk`/`fdisk`, `systemctl`/`service`/`shutdown`,
+  whole-pipeline network provenance, bounded `xargs`/`env -S` lexing) with no
+  anvil-side change: anvil has always classified through
+  `jterm_core::agent::is_dangerous` and keeps no list of its own.
+- A trusted completion no longer copies a whole finished block's captured
+  output to hand it to the correction engine. `CompletionFacts::output` borrows
+  now, and the engine reduces it to a bounded head/tail sample itself, so up to
+  `MAX_CAPTURED_OUTPUT_BYTES` no longer moves on the GTK main thread per
+  command.
+- anvil's hand-copy of the journal capability predicate is gone; core exports
+  `execution_journal::output_capture_enabled` and anvil calls it. The local
+  mirror was documented as tracking a private upstream function, which is
+  exactly the thing that silently drifts. The assertion that guarded the copy
+  stayed behind and now points at the exported function, because core ships no
+  test of its own for it: the whole journal's on/off switch, and in particular
+  the rule that a *missing* `JSH_EXECUTION_JOURNAL` means enabled, would
+  otherwise be asserted nowhere in either repository.
+- The zone-history document is read through
+  `jterm_core::snapshot_file::read_bounded` instead of a local
+  stat-then-read. An oversized document is now reported as `FileTooLarge`
+  rather than `InvalidData` — same refusal, more accurate kind.
 
 - Configuration paths in `--doctor` no longer reach the terminal or JSON
   detail raw. A path selected through `--config` or `ANVIL_CONFIG` can contain
@@ -547,6 +598,49 @@ versioning for tagged releases while it remains experimental.
   open with that error rather than starting unmanaged.
 
 ### Fixed
+
+- **A truncated command line is no longer presented as the exact one.** A
+  packet carrying both `cmdline_url=<prefix>` and `cmd_truncated=1` contradicts
+  itself, and anvil resolved it to `CommandTextSource::ShellReported` — the
+  provenance that marks a block `command_exact`, which block re-run, copy and
+  the Agent's block context all replay as the command that ran. `rm -rf
+  /home/u/proj` cut to `rm -rf /home/u` was offered, and re-runnable, as exact.
+  A declared truncation now disqualifies the reported text from exactness
+  whatever else the packet claims. The pinned parser drops such a prefix before
+  anvil sees it; the local rule is what holds for any other producer.
+- `cmd_truncated=yes` / `=on` / any unrecognised value is read as truncated
+  rather than as "not truncated". A producer that chose to send the disclosure
+  but did not encode its state has said the command is inexact, not that it is
+  complete.
+- An OSC 133 `D` packet that names its exit status as `exit=`, `exit_code=` or
+  `exit_status=` instead of positionally is now read. anvil parsed only the
+  positional form, so those completions recorded no status at all — which also
+  kept the command out of `command_history`.
+- **Window close no longer discards queued execution-journal output.**
+  `force_quit` drained the command-history, organism-memory and persistence
+  writers and not the journal's, so the last command's captured output was lost
+  whenever quit won the race to disk — precisely when a user is most likely to
+  be reaching for what just scrolled past. A bounded two-second flush, the same
+  budget ember, forge and frost use, now sits with the other drains.
+- **An upload out of a directory anvil may read but not write now works.** The
+  snapshot (or tar) staging file could only be reserved beside its source, so a
+  read-only mount or a mode-0555 tree failed the transfer before the remote was
+  ever contacted. Beside the source is still tried first, because it is the only
+  placement `FICLONE` can reflink; a directory that refuses the reservation
+  falls back to the private process-owned `TMPDIR` directory the remote-to-remote
+  relay leg already uses. Only a permission answer (`EACCES`, `EPERM`, `EROFS`)
+  reroutes: `ENOSPC` beside the source is a real failure about the bytes, and
+  retrying it in `TMPDIR` would move a large upload into RAM behind the user's
+  back. That shared directory is named `anvil-fs-stage-<pid>-<n>` now rather
+  than `anvil-fs-relay-<pid>-<n>`: a plain upload off a read-only mount creates
+  one, and the old name told anyone auditing the path that a relay was in
+  progress.
+- The comment above the journal submission claimed a trust check that no line
+  of that block performed. The check is deliberately absent — `execution_id_trusted`
+  asks whether the id embeds *this pane's* shell-integration token, which is how
+  anvil's own bash/zsh/fish/pwsh scripts authenticate their marks and is not
+  something jsh uses, so requiring it would switch the journal off for the only
+  shell that has one. The comment now says what actually holds.
 
 - A shell that draws below its input line — jsh's Tab completion menu above
   all, but equally its AI explanation, its signature hint, or any two-line
@@ -859,6 +953,40 @@ versioning for tagged releases while it remains experimental.
   (selection, bookmarks, undo-clear, context-menu copy).
 
 ### Security
+
+- **The link opener refuses every scheme but HTTP(S), and refuses userinfo.**
+  anvil handed `file://`, `ftp://`, `git://`, `ssh://`, `mailto:` and
+  `https://user:token@host` straight to `gio::AppInfo::launch_default_for_uri`,
+  with no authority rule at all. Link text is process-controlled, so any `cat`
+  of a hostile file became a one-click local-file open with its default
+  application, a network client launch, or a credential the user never typed
+  handed to the browser. anvil now applies the family's single opener policy,
+  `jterm_core::link::is_openable_url` — absolute HTTP(S), an authority with a
+  valid host, no userinfo, no whitespace/controls/backslashes/visually
+  ambiguous characters — and applies it to *detection* as well, so nothing is
+  underlined as clickable that a click would then refuse. `file:` and `mailto:`
+  links in block output stop being clickable; that is the point.
+- **Journaled output now requires jsh's complete lifecycle envelope, captured
+  at the start mark.** `CompletedExecution` carries an `ExecutionLifecycle`
+  whose only constructor demands `id`, `session_id`, `seq` and `started_at_ms`
+  on one OSC 133 `C`. anvil previously kept a bare id and *re-seated it from the
+  `D` packet*, so a `D` that arrived without a matching `C` — the shape a
+  foreground child printing its own marks produces — could rename the running
+  execution and file the block's captured output under that name. Nothing about
+  a command's identity is taken from `D` any more; a `D` id may only be
+  compared. Core's writer re-checks all four fields against the authoritative
+  on-disk Start under the journal's exclusive lock, so a stale or forged token
+  buys a rejected append rather than a record. Fail-closed and user-visible: a
+  shell that emits only `id=` no longer reaches the journal at all, though it
+  keeps its blocks, its marker arbitration and its Agent correlation unchanged.
+- Zone-history restore no longer stats a path and then reads it. The separate
+  `stat` described the file as it was *before* the open, so a path replaced
+  between the two calls was read unbounded and a file still being appended to
+  could pass the size check and then deliver more. The shared reader bounds the
+  descriptor it actually reads and additionally refuses what a stat cannot see:
+  a symlinked or hard-linked path, a fifo (whose `open` would otherwise block
+  the GTK main thread until some writer appeared, leaving a window that never
+  draws), a file owned by another user, and one another user may write.
 
 - Remote Files creation and transfer probes now treat dangling symbolic links
   as occupied destinations. The former `test -e` checks missed dangling links;
