@@ -5,7 +5,6 @@
 //! implementation itself is now the forge `block_view::TermView`; this file
 //! only adapts that GTK view to the existing anvil component surface.
 
-use gtk::pango::FontDescription;
 use gtk::prelude::*;
 use relm4::gtk;
 use relm4::prelude::*;
@@ -538,10 +537,7 @@ impl Component for BlockTerminal {
             VteInput::CopyOutputOnly => view.copy_to_clipboard_with_modifier(true),
             VteInput::Paste => view.paste_from_clipboard(),
             VteInput::SetFontScale(scale) => view.set_font_scale(scale),
-            VteInput::SetFont(desc) => {
-                let font = FontDescription::from_string(&desc);
-                view.set_font(&font);
-            }
+            VteInput::SetFont(desc) => view.set_font(&desc),
             VteInput::SetScrollback(lines) => view.vte().set_scrollback_lines(lines),
             VteInput::ScrollLines(lines) => view.scroll_lines(lines),
             VteInput::ApplyTheme => view.apply_theme(),

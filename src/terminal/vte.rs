@@ -10,7 +10,6 @@ use gtk::gdk::RGBA;
 use gtk::gio::{self, Cancellable};
 use gtk::glib::translate::IntoGlib;
 use gtk::glib::SpawnFlags;
-use gtk::pango::FontDescription;
 use gtk::prelude::*;
 use gtk::GestureClick;
 use gtk::Orientation;
@@ -62,7 +61,7 @@ pub(crate) fn create_terminal(config: &Config) -> Terminal {
     terminal.set_color_cursor(Some(&config.cursor));
     terminal.set_color_cursor_foreground(Some(&config.cursor_foreground));
 
-    let font_desc = FontDescription::from_string(&config.font_desc);
+    let font_desc = crate::font::terminal_font_description(&config.font_desc, config);
     terminal.set_font(Some(&font_desc));
 
     crate::block_view::add_url_match_regex(&terminal);
@@ -706,7 +705,7 @@ impl Component for VteTerminal {
             VteInput::Paste => self.terminal.paste_clipboard(),
             VteInput::SetFontScale(scale) => self.terminal.set_font_scale(scale),
             VteInput::SetFont(desc) => {
-                let fd = FontDescription::from_string(&desc);
+                let fd = crate::font::terminal_font_description(&desc, &self.config.borrow());
                 self.terminal.set_font(Some(&fd));
             }
             VteInput::SetScrollback(lines) => self.terminal.set_scrollback_lines(lines),

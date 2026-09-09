@@ -1,5 +1,4 @@
 use gtk::gdk::RGBA;
-use gtk::pango::FontDescription;
 use gtk::prelude::*;
 use gtk::{glib, Orientation, ScrolledWindow};
 use relm4::gtk;
@@ -14002,14 +14001,19 @@ impl TermView {
     }
 
     /// Update font for VTE terminal and block view CSS.
-    pub fn set_font(&self, font_desc: &FontDescription) {
-        self.active_vte.set_font(Some(font_desc));
+    ///
+    /// Takes the configured string rather than a parsed description: the
+    /// surfaces get an icon fallback appended, and round-tripping that back
+    /// into the config would persist a family list the user never chose.
+    pub fn set_font(&self, desc: &str) {
+        let font_desc = crate::font::terminal_font_description(desc, &self.config.borrow());
+        self.active_vte.set_font(Some(&font_desc));
         for block in self.finished_blocks.borrow().iter() {
-            block.command_vte.set_font(Some(font_desc));
-            block.output_vte.set_font(Some(font_desc));
+            block.command_vte.set_font(Some(&font_desc));
+            block.output_vte.set_font(Some(&font_desc));
         }
         // Update config and regenerate CSS with new font
-        self.config.borrow_mut().font_desc = font_desc.to_string();
+        self.config.borrow_mut().font_desc = desc.to_string();
         install_block_css(&self.config.borrow());
         (self.layout_active_surface)();
         let refit = self.layout_active_surface.clone();

@@ -20,6 +20,7 @@ mod diagnostics;
 mod dialogs;
 mod file_tree;
 mod file_tree_ops;
+mod font;
 mod git_meta_ui;
 mod image_drop;
 use jterm_core::{child_env, command_history, notify, parser, pty_input, review_input};

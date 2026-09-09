@@ -370,20 +370,29 @@ mod tests {
 /// finished-block VTEs stay visually identical.
 /// One Pango parse per distinct font string, shared by every VTE.
 ///
-/// `FontDescription::from_string` re-parses the same configured string for the
-/// live surface and for both read-only VTEs of every finished card. The value
-/// changes only when the config does, so a one-entry cache is enough.
-fn with_font_description<R>(desc: &str, f: impl FnOnce(&FontDescription) -> R) -> R {
+/// Building the description re-parses the same configured string for the live
+/// surface and for both read-only VTEs of every finished card. The value
+/// changes only when the config does, so a one-entry cache is enough — keyed
+/// on the icon fallback too, since that is the other half of what gets built.
+fn with_font_description<R>(config: &Config, f: impl FnOnce(&FontDescription) -> R) -> R {
     thread_local! {
-        static CACHED: std::cell::RefCell<Option<(String, FontDescription)>> =
+        static CACHED: std::cell::RefCell<Option<(String, Option<String>, FontDescription)>> =
             const { std::cell::RefCell::new(None) };
     }
+    let icon_family = crate::font::icon_family(config);
     CACHED.with(|cached| {
         let mut cached = cached.borrow_mut();
-        if cached.as_ref().map(|(key, _)| key.as_str()) != Some(desc) {
-            *cached = Some((desc.to_owned(), FontDescription::from_string(desc)));
+        let current = cached.as_ref().is_some_and(|(desc, icon, _)| {
+            desc == &config.font_desc && icon.as_deref() == icon_family
+        });
+        if !current {
+            *cached = Some((
+                config.font_desc.clone(),
+                icon_family.map(str::to_owned),
+                crate::font::font_description(&config.font_desc, icon_family),
+            ));
         }
-        let (_, parsed) = cached.as_ref().expect("populated above");
+        let (_, _, parsed) = cached.as_ref().expect("populated above");
         f(parsed)
     })
 }
@@ -398,7 +407,7 @@ pub(crate) fn apply_theme_to_vte(terminal: &Terminal, config: &Config) {
     terminal.set_color_bold(None);
     terminal.set_color_cursor(Some(&config.cursor));
     terminal.set_color_cursor_foreground(Some(&config.cursor_foreground));
-    with_font_description(&config.font_desc, |font_desc| {
+    with_font_description(config, |font_desc| {
         terminal.set_font(Some(font_desc));
     });
     terminal.set_font_scale(config.default_font_scale);

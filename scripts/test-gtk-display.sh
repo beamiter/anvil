@@ -62,6 +62,7 @@ tests=(
     block_view::blocks::tests::visual_row_cache_covers_filter_remap_expand_and_resize_refit
     block_view::cross_selection::tests::a_single_native_text_selection_survives_whole_card_selection_precedence
     block_view::css::tests::the_generated_stylesheet_parses_without_error
+    font::tests::a_real_vte_is_given_the_icon_family_behind_the_configured_one
     block_view::onboarding::tests::block_onboarding_overlay_is_non_measuring_and_non_targetable
     block_view::find::tests::unified_vte_fresh_query_reaches_scrollback_before_a_prior_match
     block_view::find::tests::unified_bounded_and_native_fallback_prefer_visible_match_with_huge_old_scrollback

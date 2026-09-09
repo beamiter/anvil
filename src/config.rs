@@ -10,7 +10,10 @@ use crate::keybindings::KeybindingMap;
 use jterm_core::host::{find_executable_in_path, is_executable_file};
 use jterm_core::process::shell_single_quote;
 
-const DEFAULT_FONT_DESC: &str = "Monospace 14";
+// A Nerd Font by default: a plain `Monospace` covers no icon glyph, and the
+// per-glyph fallback that follows is fontconfig's global sort, which hands
+// prompt and statusline icons to whichever font claims the Private Use Area.
+const DEFAULT_FONT_DESC: &str = "JetBrainsMono Nerd Font Mono 14";
 
 // ---------------------------------------------------------------------------
 // Terminal Mode
@@ -488,6 +491,10 @@ pub struct Config {
     pub(crate) window_opacity: f64,
     pub(crate) terminal_scrollback_lines: u32,
     pub(crate) font_desc: String,
+    /// Family Pango falls back to for icon glyphs `font_desc` does not
+    /// cover. `None` auto-detects an installed Nerd Font; `"none"` leaves
+    /// the glyphs to fontconfig's global sort.
+    pub(crate) icon_font: Option<String>,
     pub(crate) default_font_scale: f64,
     pub(crate) theme_name: String,
     pub(crate) foreground: RGBA,
@@ -622,6 +629,7 @@ impl Config {
             window_opacity: 0.95,
             terminal_scrollback_lines: 5_000,
             font_desc: DEFAULT_FONT_DESC.to_string(),
+            icon_font: None,
             default_font_scale: 1.0,
             theme_name: theme.name.clone(),
             foreground: theme.foreground,
@@ -1067,6 +1075,7 @@ struct FileConfig {
     opacity: Option<f64>,
     scrollback: Option<u32>,
     font: Option<String>,
+    icon_font: Option<String>,
     font_scale: Option<f64>,
     theme: Option<String>,
     foreground: Option<String>,
@@ -1163,6 +1172,10 @@ fn load_file_config() -> FileConfig {
             .and_then(|v| u32::try_from(v).ok()),
         font: table
             .get("font")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        icon_font: table
+            .get("icon_font")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
         font_scale: table.get("font_scale").and_then(|v| v.as_float()),
@@ -1731,6 +1744,12 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     );
     let font_desc = resolve_setting_text(env_string("ANVIL_FONT"), fc.font, MAX_FONT_DESC_BYTES)
         .unwrap_or_else(|| DEFAULT_FONT_DESC.to_string());
+    // Left unset so `crate::font` can pick whichever icon font is installed.
+    let icon_font = resolve_setting_text(
+        env_string("ANVIL_ICON_FONT"),
+        fc.icon_font,
+        MAX_FONT_DESC_BYTES,
+    );
 
     let foreground = env_rgba("ANVIL_FG")
         .or_else(|| fc.foreground.as_deref().and_then(|v| RGBA::parse(v).ok()))
@@ -1884,6 +1903,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         window_opacity,
         terminal_scrollback_lines,
         font_desc,
+        icon_font,
         default_font_scale,
         theme_name: theme.name.clone(),
         foreground,

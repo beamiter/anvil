@@ -13,7 +13,11 @@
 # Appearance. Built-in themes: default, light, solarized-dark,
 # solarized-light, gruvbox-dark, gruvbox-light, dracula, nord.
 theme = "default"
-font = "Monospace 14"
+font = "JetBrainsMono Nerd Font Mono 14"
+# Family used for icon glyphs `font` does not cover (Nerd Font powerline
+# separators, devicons, codicons). Unset auto-picks an installed Nerd Font;
+# set "none" to leave those glyphs to fontconfig's own fallback.
+# icon_font = "Symbols Nerd Font Mono"
 font_scale = 1.0
 opacity = 0.95
 scrollback = 5000

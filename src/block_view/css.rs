@@ -401,9 +401,12 @@ fn block_css(config: &Config) -> String {
     } else {
         (config.font_desc.clone(), 14)
     };
-    // Escape the family name so a quote/backslash in the font name can't break the
+    // Block chrome draws command text through GTK labels, so it needs the same
+    // icon fallback the VTE surfaces get; otherwise a prompt's Nerd-Font glyph
+    // lands on whichever font fontconfig happens to sort first. The stack also
+    // escapes each family, so a quote/backslash in a font name can't break the
     // surrounding CSS string and silently disable the whole stylesheet.
-    let font_family = font_family.replace('\\', "\\\\").replace('"', "\\\"");
+    let font_stack = crate::font::css_font_stack(&font_family, crate::font::icon_family(config));
 
     // Apply font scale to the base size
     let scaled_size = (base_size as f64 * config.default_font_scale)
@@ -431,13 +434,13 @@ fn block_css(config: &Config) -> String {
         }}
         .block-onboarding-title {{
             color: {fg_hex};
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-size: 0.92em;
             font-weight: bold;
         }}
         .block-onboarding-body {{
             color: {dim_fg};
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-size: 0.78em;
         }}
         .notice-dock {{
@@ -511,7 +514,7 @@ fn block_css(config: &Config) -> String {
             color: {accent};
             background-color: rgba({fg_r},{fg_g},{fg_b},0.07);
             border-radius: 6px;
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-size: 0.92em;
             padding: 6px 10px;
         }}
@@ -541,7 +544,7 @@ fn block_css(config: &Config) -> String {
         }}
         .organism-sprite {{
             color: {agent_hex};
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-weight: bold;
         }}
         .organism-live-body {{
@@ -550,7 +553,7 @@ fn block_css(config: &Config) -> String {
             border: 1px solid rgba({agent_r},{agent_g},{agent_b},0.32);
             border-radius: 6px;
             padding: 3px 6px;
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-size: {font_size};
             font-weight: bold;
         }}
@@ -572,7 +575,7 @@ fn block_css(config: &Config) -> String {
         }}
         .organism-sticky-avatar {{
             color: {agent_hex};
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-weight: bold;
             margin-right: 6px;
         }}
@@ -585,7 +588,7 @@ fn block_css(config: &Config) -> String {
         }}
         .organism-badge, .organism-state {{
             color: {dim_fg};
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-size: 0.82em;
         }}
         .organism-status {{ color: {fg_hex}; }}
@@ -593,7 +596,7 @@ fn block_css(config: &Config) -> String {
         .organism-success .organism-status {{ color: {ok_hex}; }}
         .agent-card-icon {{
             color: {agent_hex};
-            font-family: "{font_family}";
+            font-family: {font_stack};
         }}
         .agent-card-title {{
             color: {fg_hex};
@@ -669,7 +672,7 @@ fn block_css(config: &Config) -> String {
         }}
         .assistant-card-icon {{
             color: {accent};
-            font-family: "{font_family}";
+            font-family: {font_stack};
         }}
         .assistant-card-title {{
             color: {fg_hex};
@@ -713,7 +716,7 @@ fn block_css(config: &Config) -> String {
             font-size: 0.9em;
         }}
         .command-review-entry {{
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-size: {font_size};
             color: {fg_hex};
             background-color: {bg_hex};
@@ -737,7 +740,7 @@ fn block_css(config: &Config) -> String {
         }}
         .agent-msg-body {{
             color: {fg_hex};
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-size: {font_size};
         }}
         .agent-msg-error {{
@@ -752,7 +755,7 @@ fn block_css(config: &Config) -> String {
         }}
         .agent-danger-command {{
             padding: 8px;
-            font-family: "{font_family}";
+            font-family: {font_stack};
             background-color: rgba({err_r},{err_g},{err_b},0.16);
             border-radius: 7px;
         }}
@@ -903,7 +906,7 @@ fn block_css(config: &Config) -> String {
         }}
         .block-prompt-chevron {{
             color: {accent};
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-size: {font_size};
             font-weight: bold;
         }}
@@ -912,13 +915,13 @@ fn block_css(config: &Config) -> String {
             background-color: rgba({fg_r},{fg_g},{fg_b},0.07);
             border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.10);
             border-radius: 999px;
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-size: 0.78em;
             padding: 1px 9px;
         }}
         .block-bookmark-star {{
             color: #e5c07b;
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-size: 0.82em;
             margin-right: 2px;
         }}
@@ -935,7 +938,7 @@ fn block_css(config: &Config) -> String {
             background-color: rgba({acc_r},{acc_g},{acc_b},0.10);
             border: 1px solid rgba({acc_r},{acc_g},{acc_b},0.22);
             border-radius: 999px;
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-size: 0.78em;
             padding: 1px 9px;
         }}
@@ -946,7 +949,7 @@ fn block_css(config: &Config) -> String {
             min-width: 16px;
             min-height: 16px;
             padding: 1px 5px;
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-size: 0.82em;
             font-weight: bold;
         }}
@@ -957,7 +960,7 @@ fn block_css(config: &Config) -> String {
             min-width: 16px;
             min-height: 16px;
             padding: 1px 5px;
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-size: 0.82em;
             font-weight: bold;
         }}
@@ -968,7 +971,7 @@ fn block_css(config: &Config) -> String {
             min-width: 16px;
             min-height: 16px;
             padding: 1px 5px;
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-size: 0.82em;
             font-weight: bold;
         }}
@@ -979,7 +982,7 @@ fn block_css(config: &Config) -> String {
             min-width: 16px;
             min-height: 16px;
             padding: 1px 5px;
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-size: 0.82em;
             font-weight: bold;
         }}
@@ -988,7 +991,7 @@ fn block_css(config: &Config) -> String {
             background-color: rgba({warn_r},{warn_g},{warn_b},0.12);
             border: 1px solid rgba({warn_r},{warn_g},{warn_b},0.35);
             border-radius: 999px;
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-size: 0.78em;
             padding: 1px 9px;
         }}
@@ -997,7 +1000,7 @@ fn block_css(config: &Config) -> String {
             background-color: rgba({async_r},{async_g},{async_b},0.12);
             border: 1px solid rgba({async_r},{async_g},{async_b},0.28);
             border-radius: 999px;
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-size: 0.78em;
             padding: 1px 9px;
         }}
@@ -1007,7 +1010,7 @@ fn block_css(config: &Config) -> String {
             min-height: 24px;
             padding: 0 4px;
             border-radius: 999px;
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-size: 0.9em;
             transition: background-color 120ms ease, color 120ms ease;
         }}
@@ -1029,7 +1032,7 @@ fn block_css(config: &Config) -> String {
             min-height: 24px;
             padding: 0 4px;
             border-radius: 6px;
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-size: 0.8em;
         }}
         .block-filter-toggle:checked {{
@@ -1038,7 +1041,7 @@ fn block_css(config: &Config) -> String {
         }}
         .block-filter-status {{
             color: {dim_fg};
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-size: 0.78em;
             padding: 0 6px;
         }}
@@ -1054,13 +1057,13 @@ fn block_css(config: &Config) -> String {
         }}
         .block-selection-hint {{
             color: {accent};
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-size: 0.76em;
             padding: 0 4px;
         }}
         .block-collapse-btn {{
             color: {dim_fg};
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-size: 0.8em;
             min-width: 24px;
             min-height: 24px;
@@ -1074,7 +1077,7 @@ fn block_css(config: &Config) -> String {
         }}
         .block-output-summary {{
             color: {dim_fg};
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-size: 0.82em;
             padding: 2px 4px;
             border-radius: 5px;
@@ -1085,14 +1088,14 @@ fn block_css(config: &Config) -> String {
         }}
         .block-prompt {{
             color: {dim_fg};
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-size: {font_size};
             line-height: 1.0;
             margin: 0;
         }}
         .block-cmd {{
             color: {fg_hex};
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-size: {font_size};
             padding: 0;
             line-height: 1.0;
@@ -1101,7 +1104,7 @@ fn block_css(config: &Config) -> String {
         }}
         .block-cmd-active {{
             color: {fg_hex};
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-size: {font_size};
             padding: 0;
             line-height: 1.0;
@@ -1119,7 +1122,7 @@ fn block_css(config: &Config) -> String {
         }}
         .block-cmd-finished {{
             color: {fg_hex};
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-size: {font_size};
             padding: 0;
             line-height: 1.0;
@@ -1135,7 +1138,7 @@ fn block_css(config: &Config) -> String {
             background-color: {err_bg};
             border: 1px solid rgba({err_r},{err_g},{err_b},0.35);
             border-radius: 999px;
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-size: 0.78em;
             font-weight: bold;
             padding: 1px 8px;
@@ -1144,7 +1147,7 @@ fn block_css(config: &Config) -> String {
             color: {dim_fg};
             background-color: rgba({fg_r},{fg_g},{fg_b},0.08);
             border-radius: 999px;
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-size: 0.78em;
             padding: 1px 8px;
         }}
@@ -1156,7 +1159,7 @@ fn block_css(config: &Config) -> String {
         .block-output {{
             background-color: {bg_hex};
             color: {fg_hex};
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-size: {font_size};
             min-height: 0;
             line-height: 1.0;
@@ -1188,7 +1191,7 @@ fn block_css(config: &Config) -> String {
             background-image: none;
             border: 1px solid rgba({acc_r},{acc_g},{acc_b},0.55);
             border-radius: 999px;
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-size: 0.92em;
             font-weight: bold;
             min-width: 18px;
@@ -1209,7 +1212,7 @@ fn block_css(config: &Config) -> String {
         }}
         .sticky-running-label {{
             color: {accent};
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-size: 0.92em;
             font-weight: bold;
         }}
@@ -1219,7 +1222,7 @@ fn block_css(config: &Config) -> String {
             min-height: 22px;
             padding: 0 4px;
             border-radius: 999px;
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-size: 0.82em;
         }}
         .sticky-header-control:hover {{
@@ -1250,7 +1253,7 @@ fn block_css(config: &Config) -> String {
             background-image: none;
             border: 1px solid rgba({acc_r},{acc_g},{acc_b},0.55);
             border-radius: 999px;
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-size: 0.85em;
             font-weight: bold;
             padding: 4px 12px;
@@ -1275,7 +1278,7 @@ fn block_css(config: &Config) -> String {
         }}
         .command-palette-row {{
             color: {fg_hex};
-            font-family: "{font_family}";
+            font-family: {font_stack};
             font-size: 0.92em;
             padding: 6px 10px;
         }}
