@@ -1621,6 +1621,8 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
         "ai_stream",
         "ai_api_key_file",
         "agent_enabled",
+        "agent_tasks_enabled",
+        "ai_share_command_context",
         "agent_max_turns",
         "agent_auto_approve_readonly",
         "command_correction_enabled",
@@ -1698,6 +1700,8 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
         "ai_redact_secrets",
         "ai_stream",
         "agent_enabled",
+        "agent_tasks_enabled",
+        "ai_share_command_context",
         "agent_auto_approve_readonly",
         "command_correction_enabled",
         "mouse_reporting_enabled",
@@ -2941,5 +2945,29 @@ mod tests {
             .unwrap();
         let report = validate_table(Path::new("config.toml"), &table);
         assert_eq!(report.errors(), 0);
+        // Warnings too, not just errors. An unknown key is only a warning, so
+        // asserting errors alone let the example — and the validator's own
+        // known-key set — drift apart from what the parser actually reads.
+        assert_eq!(report.warnings(), 0, "example produced warnings");
+    }
+
+    /// Every key the example documents must be one the validator recognizes,
+    /// and every boolean the parser honours must be type-checked. Both lists
+    /// are hand-maintained, and a key that falls out of either is reported to
+    /// the user as "unknown ... ignored by this version" while still taking
+    /// effect — which is worse than silence for a consent gate.
+    #[test]
+    fn keys_the_parser_honours_are_neither_unknown_nor_untyped() {
+        for key in ["agent_tasks_enabled", "ai_share_command_context"] {
+            let mut table = toml::Table::new();
+            table.insert(key.to_string(), toml::Value::Boolean(true));
+            let report = validate_table(Path::new("config.toml"), &table);
+            assert_eq!(report.warnings(), 0, "{key} is reported as unknown");
+
+            let mut wrong = toml::Table::new();
+            wrong.insert(key.to_string(), toml::Value::String("true".into()));
+            let report = validate_table(Path::new("config.toml"), &wrong);
+            assert!(report.errors() > 0, "{key} accepts a string as a boolean");
+        }
     }
 }

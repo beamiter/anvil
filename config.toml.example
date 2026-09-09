@@ -76,6 +76,9 @@ preserve_live_scrollback = false
 # Bottom status bar: cwd, git branch, last command's status/duration, grid
 # size, and tab position. The same key toggles it in every jterm.
 bottom_bar = true
+# In a local Block prompt whose shell completes the capability handshake, a
+# single click moves the edit cursor to the character under the pointer.
+click_moves_cursor = true
 
 # Terminal protocol and clipboard behavior.
 mouse_reporting_enabled = true
@@ -98,6 +101,12 @@ notify_long_block_threshold_ms = 10000
 # request after a narrowly classified failure; no candidate is accepted automatically.
 ai_enabled = true
 agent_enabled = true
+# Native Codex task panel (Ctrl+Alt+Shift+T), each task in its own isolated
+# worktree. Off by default; enable it explicitly.
+agent_tasks_enabled = false
+# Allow the command and terminal evidence to travel with the provider prompt.
+# Off by default: this is a consent gate, not a convenience toggle.
+ai_share_command_context = false
 agent_max_turns = 20
 # Retired compatibility key. `true` is ignored; every proposal needs approval.
 agent_auto_approve_readonly = false
