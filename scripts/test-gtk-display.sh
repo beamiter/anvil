@@ -70,6 +70,7 @@ tests=(
     block_view::tests::dock_mount_refuses_a_widget_another_region_owns
     block_view::tests::late_inline_notice_adopts_the_panes_current_density
     block_view::tests::bounded_vte_capture_real_vte_uses_half_open_column_boundary
+    block_view::tests::real_vte_prompt_area_covers_a_menu_after_the_pane_has_scrolled
     block_view::tests::finished_card_focus_keeps_the_block_keyboard_contract
     block_view::tests::entering_alt_screen_ends_the_block_selection_it_hides
     block_view::tests::refusal_feedback_refreshes_and_only_the_latest_status_restores

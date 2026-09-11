@@ -9155,27 +9155,68 @@ fn lowest_drawn_screen_row(vte: &Terminal, origin: i64, from: i64, grid_rows: i6
 /// of the pane empty underneath.
 ///
 /// The grid is a full viewport at the prompt — the same winsize the child was
-/// told about — so the whole overlay is on screen and its lowest row holding
-/// text is the bottom of the prompt area. The scan starts at the adjustment's
-/// lower bound because PromptStart resets the live VTE and erases its
-/// scrollback (`ActiveBlock::reset_active`): that bound *is* the row the prompt
-/// began on. If a prompt ever outgrows the viewport the scan simply saturates
-/// at the grid, which is the largest card the pane can show anyway.
-fn prompt_area_rows(vte: &Terminal, grid_rows: i64) -> i64 {
-    let Some(adjustment) = vte.vadjustment() else {
+/// told about — so the whole overlay is on screen, and the card is a clip over
+/// the top of what the terminal displays. This reads exactly that: the
+/// displayed rows as one `get_text_format` string, whose lowest row holding
+/// text is the bottom of the prompt area. If a prompt ever outgrows the
+/// viewport the count saturates at the grid, which is the largest card the
+/// pane can show anyway.
+///
+/// The rows it counts against are the ones the terminal has now, not the grid
+/// the calling pass is about to give it. The layout measures before its own
+/// `set_size`, and while a pane grows the terminal is still allocated — and
+/// still displaying — the old grid; counting that text against the new one
+/// would stretch the card by the difference for the frame the resize takes.
+///
+/// It used to scan ring rows from the vertical adjustment's lower bound, on the
+/// theory that PromptStart's reset (`ActiveBlock::reset_active`) makes that
+/// bound the row the prompt began on. VTE 0.82 publishes the adjustment
+/// ring-relative — `lower` is always 0 — while `text_range_format` takes
+/// absolute ring rows, which climb for the life of the pane. The reset's own
+/// clear appends a screen of rows, so from the pane's second prompt on — after
+/// any command, with output or without — the scan read rows the reset had
+/// already dropped, found nothing, and the card sat at the floor again: the
+/// same handful of matches, the rest of the menu below the card's edge. An
+/// absolute anchor would not rescue it. The cursor read right after `reset()`
+/// names the new screen's top only if VTE has drained its input, and `feed()`
+/// merely queues: an output tail still queued is written onto the fresh screen
+/// first, and the clear queued behind it moves the top down past those rows. A
+/// shell's own Ctrl+L at the prompt moves it again. The displayed text needs no
+/// anchor at all.
+fn prompt_area_rows(vte: &Terminal) -> i64 {
+    vte.text_format(vte4::Format::Text).map_or(1, |text| {
+        drawn_rows_in_displayed_text(&text, vte.row_count())
+    })
+}
+
+/// The arithmetic behind [`prompt_area_rows`], separated so it can be tested
+/// without a display: how many of the `displayed_rows` rows, counted from the
+/// top, it takes to reach the last one holding text.
+///
+/// `get_text` ends each displayed row with a newline unless the row is
+/// soft-wrapped, so rows cannot be counted from the top — a prompt line wider
+/// than the pane is one newline-free segment over two rows. From the bottom
+/// they can: every row from the one holding the last text down to the last
+/// displayed row contributes one newline, which is exact for a grid scrolled
+/// to its bottom — where a prompt is drawn, and where the keystroke that opens
+/// a menu puts the view (`scroll_on_keystroke`). A soft-wrapped row among
+/// those only withholds a newline, which counts a blank row in rather than
+/// leaving a row of text out. Scrolled back into the live scrollback, the
+/// terminal also shows the partial row under the grid; the text's own newline
+/// count proves that extra row when no displayed row is soft-wrapped, and a
+/// wrapped one can still leave the count a row short until the view returns
+/// to the bottom.
+fn drawn_rows_in_displayed_text(text: &str, displayed_rows: i64) -> i64 {
+    let grid_rows = displayed_rows.max(1);
+    let Some(last_text) = text.rfind(|c: char| !c.is_whitespace()) else {
         return 1;
     };
-    let lower = adjustment.lower();
-    if !lower.is_finite() {
-        return 1;
-    }
-    let origin = lower as i64;
-    // A bound that has drifted past the cursor is not a row this prompt drew
-    // on; measuring from it would read rows the ring no longer holds.
-    if origin > vte.cursor_position().1 {
-        return 1;
-    }
-    lowest_drawn_screen_row(vte, origin, 0, grid_rows).map_or(1, |row| row + 1)
+    let newlines = |text: &str| text.bytes().filter(|&b| b == b'\n').count() as i64;
+    let displayed_rows = grid_rows.max(newlines(text));
+    displayed_rows
+        .saturating_sub(newlines(&text[last_text..]))
+        .saturating_add(1)
+        .clamp(1, grid_rows)
 }
 
 /// Height of the compact input card: the typed command, never less than
@@ -10655,7 +10696,7 @@ impl TermView {
                 };
                 let card_rows = if idle {
                     let drawn = if prompt_at_grid_top {
-                        prompt_area_rows(&vte, grid_rows)
+                        prompt_area_rows(&vte)
                     } else {
                         1
                     };
@@ -14824,6 +14865,117 @@ mod tests {
         // overflows it.
         assert_eq!(compact_card_rows(1, 1, 3), 3);
         assert_eq!(compact_card_rows(9, 9, 3), 3);
+    }
+
+    #[test]
+    fn the_prompt_area_is_counted_up_from_the_bottom_of_the_displayed_text() {
+        use super::drawn_rows_in_displayed_text as drawn;
+        // What `get_text_format` hands back for a 10-row grid: a newline per
+        // displayed row. A bare prompt is one row, an empty screen one too.
+        assert_eq!(drawn("\u{276f} ls\n\n\n\n\n\n\n\n\n\n", 10), 1);
+        assert_eq!(drawn("\n\n\n\n\n\n\n\n\n\n", 10), 1);
+        assert_eq!(drawn("", 10), 1);
+        // jsh after Tab on `ls`: path, input, count, group header, two entries.
+        let menu = "~/src\n\u{276f} ls \n  1/42 matches\n[/] Directories\n  a/\n  b/\n\n\n\n\n";
+        assert_eq!(drawn(menu, 10), 6);
+        // A path wider than the pane soft-wraps: rows 0 and 1 are one segment
+        // with no newline between them. Counting newlines from the top would
+        // put the entry on row 2 and clip it; from the bottom it is row 3.
+        let wrapped = "~/a-path-as-wide-as-the-pane/and-then-some\n\u{276f} ls\n  a\n\n\n\n\n\n\n";
+        assert_eq!(drawn(wrapped, 10), 4);
+        // Text on the last row is the whole grid, soft-wrapped or not, and
+        // nothing can ask for more than the grid.
+        let full = "0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n";
+        assert_eq!(drawn(full, 10), 10);
+        assert_eq!(drawn(full.trim_end(), 10), 10);
+        assert_eq!(drawn(full, 4), 4);
+        // Scrolled into the live scrollback, the terminal also shows the
+        // partial row under the grid: 11 newlines for a 10-row grid. The text
+        // proves the extra row, so the entry on row 5 still measures as 6.
+        let scrolled = "a\nb\nc\nd\ne\nf\n\n\n\n\n\n";
+        assert_eq!(drawn(scrolled, 10), 6);
+        // Trailing blanks on the last text row are not rows.
+        assert_eq!(drawn("\u{276f} ls   \n  a  \n\n\n\n\n\n\n\n\n", 10), 2);
+    }
+
+    /// The regression the arithmetic above cannot see. On a real VTE, once the
+    /// pane has scrolled past its first screen, a jsh completion menu must
+    /// measure as tall as it is drawn. The old scan read absolute ring rows
+    /// from an adjustment bound VTE 0.82 pins at 0, found nothing there, and
+    /// held every prompt after the pane's first at `MIN_INPUT_ROWS`: the
+    /// prompt, the match count, a group header and two entries.
+    #[test]
+    #[ignore = "requires a mapped GTK/VTE surface; run under Xvfb"]
+    fn real_vte_prompt_area_covers_a_menu_after_the_pane_has_scrolled() {
+        use relm4::gtk;
+        use vte4::prelude::*;
+
+        if gtk::init().is_err() {
+            return;
+        }
+        let terminal = vte4::Terminal::new();
+        terminal.set_scrollback_lines(1000);
+        let window = gtk::Window::builder()
+            .default_width(480)
+            .default_height(360)
+            .child(&terminal)
+            .build();
+        window.present();
+        let settle = || {
+            let context = gtk::glib::MainContext::default();
+            let started = std::time::Instant::now();
+            while started.elapsed() < std::time::Duration::from_millis(150) {
+                while context.iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        settle();
+        // The terminal takes its grid from the allocation, as the live card's
+        // does, and the measurement counts against that grid.
+        let grid = terminal.row_count();
+        assert!(
+            grid >= 12,
+            "the window must be tall enough for the menu: {grid} rows"
+        );
+
+        for row in 0..200 {
+            terminal.feed(format!("history-{row:03}\r\n").as_bytes());
+        }
+        settle();
+        // PromptStart as `ActiveBlock::reset_active` performs it, with the
+        // previous command's output tail still queued behind VTE's parser: it
+        // lands on the fresh screen first and the clear moves the top below it.
+        terminal.feed(b"tail-1\r\ntail-2\r\ntail-3\r\n");
+        terminal.reset(true, true);
+        terminal.feed(b"\x1b[H\x1b[2J\x1b[3J");
+        // jsh after Tab on `ls`: path, input, the menu, and the cursor parked
+        // back on the input line.
+        terminal.feed(
+            "~/src\r\n\u{276f} ls \r\n  1/42 matches\r\n[/] Directories\r\n  dir_a/\r\n  dir_b/\r\n\r\n[.] Files\r\n  file_01\r\n  file_02\r\n\x1b[9A\x1b[6G"
+                .as_bytes(),
+        );
+        settle();
+        assert!(
+            terminal.cursor_position().1 >= grid,
+            "the pane has to have scrolled past its first screen for this to test anything"
+        );
+        assert_eq!(super::prompt_area_rows(&terminal), 10);
+
+        // The menu closes and the card goes back to what is left.
+        terminal.feed(b"\x1b[J");
+        settle();
+        assert_eq!(super::prompt_area_rows(&terminal), 2);
+
+        // A shell's own Ctrl+L repaint moves the screen's top without any reset
+        // of ours, and a path wider than the pane soft-wraps onto a second row.
+        let wide = "d".repeat(terminal.column_count() as usize + 4);
+        terminal.feed(
+            format!("\x1b[H\x1b[2J~/{wide}\r\n\u{276f} ls \r\n  a\r\n  b\r\n\x1b[3A\x1b[6G")
+                .as_bytes(),
+        );
+        settle();
+        assert_eq!(super::prompt_area_rows(&terminal), 5);
+        window.close();
     }
 
     #[test]

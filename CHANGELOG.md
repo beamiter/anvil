@@ -686,6 +686,22 @@ versioning for tagged releases while it remains experimental.
   something jsh uses, so requiring it would switch the journal off for the only
   shell that has one. The comment now says what actually holds.
 
+- **The Tab completion menu is no longer clipped from a pane's second prompt
+  on.** The fix below only held at a pane's first prompt: from the second on —
+  after any command, with output or without — the menu was squeezed back into
+  the six-row card: the prompt, the match count, a group header and two
+  entries, the rest below the card's edge. The measurement scanned the live
+  VTE's ring from the vertical adjustment's lower bound, taking that for the
+  prompt's first row; VTE 0.82 publishes the adjustment ring-relative (`lower`
+  is always 0) while `text_range_format` takes absolute rows, and every reset's
+  own clear advances the ring a full screen, so the scan read rows the ring had
+  already dropped and found nothing. The card is now measured from what the
+  terminal displays — one `get_text_format` read, counted up from the bottom
+  against the rows the terminal has now — which needs no coordinate conversion,
+  is not thrown by output still queued at the reset or by a shell's Ctrl+L,
+  counts soft-wrapped path lines correctly, and does not stretch the card for
+  the frame a window grow takes. One VTE call replaces up to a screen of
+  per-row queries.
 - A shell that draws below its input line — jsh's Tab completion menu above
   all, but equally its AI explanation, its signature hint, or any two-line
   prompt — is no longer clipped into the compact input card. The live grid was
