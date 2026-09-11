@@ -137,8 +137,8 @@ pub(crate) fn sanitize_history_replay(
 ) -> Result<String, ReviewTextError> {
     // One implementation, in the crate that owns the replay channel. The
     // wrapper survives only to keep this module's error vocabulary.
-    jterm_core::agent_task::replay_text::sanitize_history_replay(text, max_bytes).map_err(
-        |error| match error {
+    jterm_core::agent_task::replay_text::sanitize_history_replay(text, max_bytes).map_err(|error| {
+        match error {
             jterm_core::agent_task::replay_text::ReplayTextError::Empty => ReviewTextError::Empty,
             jterm_core::agent_task::replay_text::ReplayTextError::TooLarge { limit } => {
                 ReviewTextError::TooLarge { limit }
@@ -149,8 +149,8 @@ pub(crate) fn sanitize_history_replay(
             jterm_core::agent_task::replay_text::ReplayTextError::VisualSpoof => {
                 ReviewTextError::VisualSpoof
             }
-        },
-    )
+        }
+    })
 }
 
 /// Make dangerous-to-display code points explicit without retaining their
