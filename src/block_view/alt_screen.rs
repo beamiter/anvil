@@ -75,54 +75,104 @@ pub(crate) use jterm_core::parser::{MouseEncoding, MouseMode};
 /// `?1015`). One last-write-wins mode used to stand for both, so `?1006;1000h`
 /// (htop, ncurses' `XM`) ended on "click" and got legacy `ESC [ M` wheel bytes
 /// it reads as keys, while `?1006h` alone counted as reporting switched on.
+///
+/// Every mode is its own bit, like libvte's private-mode set, so this mirrors
+/// the state the live VTE encodes its own click and motion reports from: the
+/// highest enabled tracking mode wins, and switching one off leaves the
+/// others (`?1000;1003h` then `?1003l` still reports clicks).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(crate) struct MouseReporting {
-    pub(crate) tracking: MouseMode,
-    pub(crate) encoding: MouseEncoding,
+    tracking: u8,
+    encoding: u8,
 }
+
+const MOUSE_TRACK_X10: u8 = 1;
+const MOUSE_TRACK_NORMAL: u8 = 1 << 1;
+const MOUSE_TRACK_BUTTON: u8 = 1 << 2;
+const MOUSE_TRACK_ANY: u8 = 1 << 3;
+const MOUSE_ENC_UTF8: u8 = 1;
+const MOUSE_ENC_URXVT: u8 = 1 << 1;
+const MOUSE_ENC_SGR: u8 = 1 << 2;
 
 impl MouseReporting {
     /// Nothing reported, default encoding: the state after RIS, and the one a
     /// prompt boundary restores.
     pub(crate) const OFF: Self = Self {
-        tracking: MouseMode::None,
-        encoding: MouseEncoding::Default,
+        tracking: 0,
+        encoding: 0,
     };
+
+    /// The state after enabling exactly `tracking` and `encoding`.
+    pub(crate) const fn new(tracking: MouseMode, encoding: MouseEncoding) -> Self {
+        Self {
+            tracking: match tracking {
+                MouseMode::None => 0,
+                MouseMode::X10 => MOUSE_TRACK_X10,
+                MouseMode::Normal => MOUSE_TRACK_NORMAL,
+                MouseMode::ButtonEvent => MOUSE_TRACK_BUTTON,
+                MouseMode::AnyEvent => MOUSE_TRACK_ANY,
+            },
+            encoding: match encoding {
+                MouseEncoding::Default => 0,
+                MouseEncoding::Utf8 => MOUSE_ENC_UTF8,
+                MouseEncoding::Urxvt => MOUSE_ENC_URXVT,
+                MouseEncoding::Sgr => MOUSE_ENC_SGR,
+            },
+        }
+    }
 
     /// Whether the program receives mouse events at all. The encoding alone
     /// reports nothing.
     pub(crate) fn is_tracking(self) -> bool {
-        self.tracking != MouseMode::None
+        self.tracking != 0
     }
 
-    /// Apply one DEC private mode from `CSI ? … h/l`, with the same rules as
-    /// `jterm_core::parser::Parser`: a tracking mode's `l` turns tracking off
-    /// whichever mode is on, and so does an encoding's `l` for the encoding.
-    /// Other modes are ignored.
-    pub(crate) fn apply_decset(&mut self, mode: u32, set: bool) {
-        let tracking = match mode {
-            9 => Some(MouseMode::X10),
-            1000 => Some(MouseMode::Normal),
-            1002 => Some(MouseMode::ButtonEvent),
-            1003 => Some(MouseMode::AnyEvent),
-            _ => None,
-        };
-        if let Some(tracking) = tracking {
-            self.tracking = if set { tracking } else { MouseMode::None };
-            return;
+    /// The effective tracking mode: the highest one enabled.
+    pub(crate) fn tracking(self) -> MouseMode {
+        if self.tracking & MOUSE_TRACK_ANY != 0 {
+            MouseMode::AnyEvent
+        } else if self.tracking & MOUSE_TRACK_BUTTON != 0 {
+            MouseMode::ButtonEvent
+        } else if self.tracking & MOUSE_TRACK_NORMAL != 0 {
+            MouseMode::Normal
+        } else if self.tracking & MOUSE_TRACK_X10 != 0 {
+            MouseMode::X10
+        } else {
+            MouseMode::None
         }
-        let encoding = match mode {
-            1005 => Some(MouseEncoding::Utf8),
-            1006 => Some(MouseEncoding::Sgr),
-            1015 => Some(MouseEncoding::Urxvt),
-            _ => None,
+    }
+
+    /// The effective wire encoding. SGR wins over urxvt over UTF-8, as in
+    /// libvte and xterm.
+    pub(crate) fn encoding(self) -> MouseEncoding {
+        if self.encoding & MOUSE_ENC_SGR != 0 {
+            MouseEncoding::Sgr
+        } else if self.encoding & MOUSE_ENC_URXVT != 0 {
+            MouseEncoding::Urxvt
+        } else if self.encoding & MOUSE_ENC_UTF8 != 0 {
+            MouseEncoding::Utf8
+        } else {
+            MouseEncoding::Default
+        }
+    }
+
+    /// Apply one DEC private mode from `CSI ? … h/l`: set or clear that
+    /// mode's bit and leave every other mode alone. Other modes are ignored.
+    pub(crate) fn apply_decset(&mut self, mode: u32, set: bool) {
+        let (field, bit) = match mode {
+            9 => (&mut self.tracking, MOUSE_TRACK_X10),
+            1000 => (&mut self.tracking, MOUSE_TRACK_NORMAL),
+            1002 => (&mut self.tracking, MOUSE_TRACK_BUTTON),
+            1003 => (&mut self.tracking, MOUSE_TRACK_ANY),
+            1005 => (&mut self.encoding, MOUSE_ENC_UTF8),
+            1006 => (&mut self.encoding, MOUSE_ENC_SGR),
+            1015 => (&mut self.encoding, MOUSE_ENC_URXVT),
+            _ => return,
         };
-        if let Some(encoding) = encoding {
-            self.encoding = if set {
-                encoding
-            } else {
-                MouseEncoding::Default
-            };
+        if set {
+            *field |= bit;
+        } else {
+            *field &= !bit;
         }
     }
 }
@@ -182,7 +232,7 @@ pub(crate) fn encode_mouse_wheel(
     let button: u32 = if delta_y < 0.0 { 64 } else { 65 };
     let c = col.clamp(1, u32::MAX as i64) as u32;
     let r = row.clamp(1, u32::MAX as i64) as u32;
-    Some(match reporting.encoding {
+    Some(match reporting.encoding() {
         MouseEncoding::Sgr => format!("\x1b[<{button};{c};{r}M").into_bytes(),
         MouseEncoding::Urxvt => format!("\x1b[{};{c};{r}M", button + 32).into_bytes(),
         // `?1005`: every field is `value + 32` as a UTF-8 character, which
@@ -359,7 +409,7 @@ mod tests {
     use super::*;
 
     fn reporting(tracking: MouseMode, encoding: MouseEncoding) -> MouseReporting {
-        MouseReporting { tracking, encoding }
+        MouseReporting::new(tracking, encoding)
     }
 
     #[test]
@@ -455,9 +505,6 @@ mod tests {
                 state.apply_decset(mode, set);
             }
         }
-        // The shadow must agree with the parser's own view of the stream.
-        assert_eq!(state.tracking, parser.mouse_mode());
-        assert_eq!(state.encoding, parser.mouse_encoding());
         state
     }
 
@@ -466,23 +513,57 @@ mod tests {
         // htop / ncurses `XM`: SGR first, then click tracking. The wheel must
         // still be written in SGR, not as legacy `ESC [ M` key-like bytes.
         let htop = reporting_after(b"\x1b[?1006;1000h");
-        assert_eq!(htop, reporting(MouseMode::Normal, MouseEncoding::Sgr));
+        assert_eq!(
+            (htop.tracking(), htop.encoding()),
+            (MouseMode::Normal, MouseEncoding::Sgr)
+        );
         assert_eq!(
             encode_mouse_wheel(htop, 1.0, 7, 9).unwrap(),
             b"\x1b[<65;7;9M"
         );
         // vim 9: the same, then button tracking on top.
         let vim = reporting_after(b"\x1b[?1006;1000h\x1b[?1002h");
-        assert_eq!(vim, reporting(MouseMode::ButtonEvent, MouseEncoding::Sgr));
+        assert_eq!(
+            (vim.tracking(), vim.encoding()),
+            (MouseMode::ButtonEvent, MouseEncoding::Sgr)
+        );
         // claude's fullscreen UI and opencode end on SGR any-event tracking.
         let claude = reporting_after(b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h");
-        assert_eq!(claude, reporting(MouseMode::AnyEvent, MouseEncoding::Sgr));
+        assert_eq!(
+            (claude.tracking(), claude.encoding()),
+            (MouseMode::AnyEvent, MouseEncoding::Sgr)
+        );
         // Their exit turns tracking off; a stray encoding alone is not
         // reporting.
         let exited = reporting_after(b"\x1b[?1000h\x1b[?1003h\x1b[?1006h\x1b[?1003l\x1b[?1000l");
         assert!(!exited.is_tracking());
-        assert_eq!(exited.encoding, MouseEncoding::Sgr);
+        assert_eq!(exited.encoding(), MouseEncoding::Sgr);
         assert_eq!(reporting_after(b"\x1b[?1006l"), MouseReporting::OFF);
+    }
+
+    #[test]
+    fn tracking_and_encoding_are_independent_modes() {
+        // Stopping motion reports leaves the click tracking libvte still
+        // reports with.
+        let partial = reporting_after(b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?1003l");
+        assert_eq!(partial.tracking(), MouseMode::ButtonEvent);
+        assert!(partial.is_tracking());
+        assert_eq!(
+            reporting_after(b"\x1b[?1000h\x1b[?1003h\x1b[?1003l").tracking(),
+            MouseMode::Normal
+        );
+        // Dropping SGR falls back to the urxvt encoding still enabled.
+        let urxvt = reporting_after(b"\x1b[?1000h\x1b[?1015h\x1b[?1006h\x1b[?1006l");
+        assert_eq!(urxvt.encoding(), MouseEncoding::Urxvt);
+        assert_eq!(
+            encode_mouse_wheel(urxvt, 1.0, 3, 4).unwrap(),
+            b"\x1b[97;3;4M"
+        );
+        // SGR outranks urxvt whatever the order they were enabled in.
+        assert_eq!(
+            reporting_after(b"\x1b[?1006h\x1b[?1015h").encoding(),
+            MouseEncoding::Sgr
+        );
     }
 
     #[test]

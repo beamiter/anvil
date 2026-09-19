@@ -133,41 +133,108 @@ impl AppModel {
 
     #[allow(deprecated)]
     pub(crate) fn apply_dynamic_css(&self) {
-        let config = self.config.borrow();
-        let bg = &config.background;
-        let fg = &config.foreground;
-        let br = (bg.red() * 255.0) as u8;
-        let bgg = (bg.green() * 255.0) as u8;
-        let bb = (bg.blue() * 255.0) as u8;
-        let fr = (fg.red() * 255.0) as u8;
-        let fgg = (fg.green() * 255.0) as u8;
-        let fb = (fg.blue() * 255.0) as u8;
-        // The bottom bar's positive/negative tones reuse the terminal
-        // palette's ANSI green/red (jterm_core::bottom_bar's Tone contract).
-        let ok = &config.palette[2];
-        let err = &config.palette[1];
-        let okr = (ok.red() * 255.0) as u8;
-        let okg = (ok.green() * 255.0) as u8;
-        let okb = (ok.blue() * 255.0) as u8;
-        let er = (err.red() * 255.0) as u8;
-        let eg = (err.green() * 255.0) as u8;
-        let eb = (err.blue() * 255.0) as u8;
-        let css = format!(
-            ".terminal-box scrollbar {{ background-color: rgb({br},{bgg},{bb}); }}
-             .terminal-box scrollbar trough {{ background-color: rgb({br},{bgg},{bb}); }}
-             .terminal-box scrollbar slider {{ background-color: rgba({fr},{fgg},{fb},0.4); }}
-             .terminal-box scrollbar slider:hover {{ background-color: rgba({fr},{fgg},{fb},0.7); }}
-             .top-bar {{ background-color: rgb({br},{bgg},{bb}); color: rgb({fr},{fgg},{fb}); }}
-             .top-bar-actions {{ background-color: rgb({br},{bgg},{bb}); }}
-             .top-bar button {{ color: rgb({fr},{fgg},{fb}); }}
-             .tab-strip {{ background-color: rgb({br},{bgg},{bb}); }}
-             .tab-strip-btn {{ color: rgba({fr},{fgg},{fb},0.6); }}
-             .tab-strip-btn:checked {{ color: rgb({fr},{fgg},{fb}); }}
-             .bottom-bar {{ background-color: rgb({br},{bgg},{bb}); color: rgb({fr},{fgg},{fb}); border-top-color: rgba({fr},{fgg},{fb},0.2); }}
-             .bottom-bar .bb-muted {{ color: rgba({fr},{fgg},{fb},0.55); }}
-             .bottom-bar .bb-ok {{ color: rgb({okr},{okg},{okb}); }}
-             .bottom-bar .bb-err {{ color: rgb({er},{eg},{eb}); }}"
-        );
+        let css = dynamic_css(&self.config.borrow());
         self.dyn_css.load_from_data(&css);
+    }
+}
+
+/// The theme-derived rules loaded into the provider above the static one.
+pub(crate) fn dynamic_css(config: &Config) -> String {
+    let bg = &config.background;
+    let fg = &config.foreground;
+    let br = (bg.red() * 255.0) as u8;
+    let bgg = (bg.green() * 255.0) as u8;
+    let bb = (bg.blue() * 255.0) as u8;
+    let fr = (fg.red() * 255.0) as u8;
+    let fgg = (fg.green() * 255.0) as u8;
+    let fb = (fg.blue() * 255.0) as u8;
+    // The bottom bar's positive/negative tones reuse the terminal
+    // palette's ANSI green/red (jterm_core::bottom_bar's Tone contract).
+    let ok = &config.palette[2];
+    let err = &config.palette[1];
+    let okr = (ok.red() * 255.0) as u8;
+    let okg = (ok.green() * 255.0) as u8;
+    let okb = (ok.blue() * 255.0) as u8;
+    let er = (err.red() * 255.0) as u8;
+    let eg = (err.green() * 255.0) as u8;
+    let eb = (err.blue() * 255.0) as u8;
+    // The bell badge is colour-only, so it has to outrank the tab colour
+    // this provider sets (a higher-priority provider wins over the static
+    // one's `.tab-bell` whatever the specificity), checked tab included:
+    // with the window inactive the current tab is badged too.
+    let warn = &config.palette[3];
+    let wr = (warn.red() * 255.0) as u8;
+    let wg = (warn.green() * 255.0) as u8;
+    let wb = (warn.blue() * 255.0) as u8;
+    format!(
+        ".terminal-box scrollbar {{ background-color: rgb({br},{bgg},{bb}); }}
+         .terminal-box scrollbar trough {{ background-color: rgb({br},{bgg},{bb}); }}
+         .terminal-box scrollbar slider {{ background-color: rgba({fr},{fgg},{fb},0.4); }}
+         .terminal-box scrollbar slider:hover {{ background-color: rgba({fr},{fgg},{fb},0.7); }}
+         .top-bar {{ background-color: rgb({br},{bgg},{bb}); color: rgb({fr},{fgg},{fb}); }}
+         .top-bar-actions {{ background-color: rgb({br},{bgg},{bb}); }}
+         .top-bar button {{ color: rgb({fr},{fgg},{fb}); }}
+         .tab-strip {{ background-color: rgb({br},{bgg},{bb}); }}
+         .tab-strip-btn {{ color: rgba({fr},{fgg},{fb},0.6); }}
+         .tab-strip-btn:checked {{ color: rgb({fr},{fgg},{fb}); }}
+         .bottom-bar {{ background-color: rgb({br},{bgg},{bb}); color: rgb({fr},{fgg},{fb}); border-top-color: rgba({fr},{fgg},{fb},0.2); }}
+         .bottom-bar .bb-muted {{ color: rgba({fr},{fgg},{fb},0.55); }}
+         .bottom-bar .bb-ok {{ color: rgb({okr},{okg},{okb}); }}
+         .bottom-bar .bb-err {{ color: rgb({er},{eg},{eb}); }}
+         .tab-strip-btn.tab-bell, .tab-strip-btn.tab-bell:checked {{ color: rgb({wr},{wg},{wb}); }}"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dynamic_css;
+    use crate::config::Config;
+
+    #[test]
+    fn the_bell_badge_outranks_the_tab_colour_checked_or_not() {
+        let css = dynamic_css(&Config::safe_defaults());
+        let tab_colour = css.find(".tab-strip-btn:checked").expect("tab colour");
+        let bell = css
+            .find(".tab-strip-btn.tab-bell, .tab-strip-btn.tab-bell:checked")
+            .expect("bell rule in the dynamic provider");
+        assert!(bell > tab_colour);
+    }
+
+    /// What the user sees: the static and dynamic providers together, read
+    /// back from a checked tab button that rang. Needs a display (`make
+    /// test-display`).
+    #[test]
+    #[ignore = "requires a GTK display"]
+    #[allow(deprecated)]
+    fn a_checked_tab_that_rang_is_drawn_in_the_bell_colour() {
+        use relm4::gtk::{self, prelude::*};
+
+        gtk::init().expect("GTK display");
+        crate::startup_ui::install_static_css();
+        let config = Config::safe_defaults();
+        crate::startup_ui::install_dynamic_css_provider().load_from_data(&dynamic_css(&config));
+        let window = gtk::Window::new();
+        let bell = gtk::ToggleButton::with_label("codex");
+        bell.add_css_class("tab-strip-btn");
+        bell.add_css_class("tab-bell");
+        bell.set_active(true);
+        let plain = gtk::ToggleButton::with_label("zsh");
+        plain.add_css_class("tab-strip-btn");
+        plain.set_active(true);
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        row.append(&bell);
+        row.append(&plain);
+        window.set_child(Some(&row));
+        let warn = config.palette[3];
+        let close = |a: f32, b: f32| (a - b).abs() < 0.01;
+        let colour = bell.color();
+        assert!(
+            close(colour.red(), warn.red())
+                && close(colour.green(), warn.green())
+                && close(colour.blue(), warn.blue()),
+            "{colour:?} vs {warn:?}"
+        );
+        assert_ne!(plain.color(), colour);
+        window.destroy();
     }
 }

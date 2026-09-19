@@ -138,6 +138,9 @@ pub(crate) struct FindState {
     /// in incremental navigation, but must still be cleared without walking all
     /// retained blocks on every debounced query.
     extra_highlights: Vec<FindHighlight>,
+    /// The live surface's counted range (see [`LiveAnchor`]), kept from the
+    /// count so the steps start exactly where it did.
+    live_anchor: Option<LiveAnchor>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -341,15 +344,101 @@ fn regex_consumption(pattern: &str) -> Result<RegexConsumption, ()> {
 /// The dump is bounded by the configured scrollback and is only taken for an
 /// explicit search. `None` when VTE cannot write it; the caller then falls
 /// back to the raw capture.
-fn live_vte_search_text(vte: &vte4::Terminal) -> Option<String> {
-    use gtk::gio;
-    use gtk::gio::prelude::*;
+fn live_vte_search_text(vte: &vte4::Terminal, from_row: i64) -> Option<String> {
+    use gtk::prelude::*;
 
-    let stream = gio::MemoryOutputStream::new_resizable();
-    vte.write_contents_sync(&stream, vte4::WriteFlags::Default, gio::Cancellable::NONE)
-        .ok()?;
-    stream.close(gio::Cancellable::NONE).ok()?;
-    Some(String::from_utf8_lossy(&stream.steal_as_bytes()).into_owned())
+    let adjustment = vte.vadjustment()?;
+    // Absolute ring rows, the coordinates of the adjustment and the cursor.
+    let last_row = adjustment.upper() as i64 - 1;
+    if from_row > last_row {
+        return Some(String::new());
+    }
+    vte.text_range_format(
+        vte4::Format::Text,
+        from_row,
+        0,
+        last_row,
+        vte.column_count(),
+    )
+    .0
+    .map(|text| text.to_string())
+}
+
+/// Where the live VTE's Find counts from and where its native steps start.
+///
+/// `from_row` is where the running command's card began (`origin`, the
+/// prompt's own row; the ring's first row when unknown). Below it everything
+/// is this command's: with `preserve_live_scrollback` the rows above are
+/// earlier commands' output, which their finished cards already count.
+///
+/// VTE starts a forward search with no selection at the top of its view, so
+/// the view is put at `view_row` before the first step (see
+/// [`anchor_live_native_search`]). A view cannot start below its last page,
+/// so `view_row` is `from_row` clamped there; the matches between the two
+/// are stepped over silently ([`LiveAnchor::skip`]). What is counted is then
+/// exactly what Next walks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LiveAnchor {
+    view_row: i64,
+    from_row: i64,
+    /// Matches in `view_row..from_row`, stepped over before the first one
+    /// counted.
+    skip: usize,
+}
+
+fn live_search_rows(lower: f64, upper: f64, page_size: f64, origin: Option<i64>) -> (i64, i64) {
+    let lower = lower as i64;
+    let last_row = (upper as i64 - 1).max(lower);
+    let last_page = ((upper - page_size) as i64).max(lower);
+    let from_row = origin.unwrap_or(lower).clamp(lower, last_row);
+    (from_row.min(last_page), from_row)
+}
+
+/// Point the live VTE's native search at the ends of the counted range before
+/// the first step into the live surface: a forward step starts at the view's
+/// top row (`anchor`), a backward one at the view's bottom (the buffer's end).
+fn anchor_live_native_search(vte: &vte4::Terminal, direction: FindDirection, anchor: LiveAnchor) {
+    use gtk::prelude::*;
+
+    vte.unselect_all();
+    let Some(adjustment) = vte.vadjustment() else {
+        return;
+    };
+    match direction {
+        FindDirection::Next => {
+            adjustment.set_value(anchor.view_row as f64);
+            vte.search_set_wrap_around(false);
+            for _ in 0..anchor.skip {
+                if !vte.search_find_next() {
+                    break;
+                }
+            }
+        }
+        FindDirection::Previous => adjustment
+            .set_value((adjustment.upper() - adjustment.page_size()).max(adjustment.lower())),
+    }
+}
+
+/// Matches in the live rows `view_row..from_row`: on the view's last page,
+/// above the running command, and not counted (see [`LiveAnchor`]).
+fn live_rows_skipped(
+    vte: &vte4::Terminal,
+    regex: &regex::Regex,
+    view_row: i64,
+    from_row: i64,
+) -> usize {
+    if view_row >= from_row {
+        return 0;
+    }
+    vte.text_range_format(
+        vte4::Format::Text,
+        view_row,
+        0,
+        from_row - 1,
+        vte.column_count(),
+    )
+    .0
+    .map_or(0, |text| regex.find_iter(&text).count())
 }
 
 fn bounded_match_count(
@@ -1135,6 +1224,7 @@ impl TermView {
         let mut total = 0usize;
         let mut match_limited = false;
         let mut scan_limited = false;
+        let mut live_anchor = None;
         let mut scan_budget = FindScanBudget::new();
         let completed_batch = {
             let mut deadline_exhausted = || scan_budget.time_exhausted();
@@ -1256,17 +1346,31 @@ impl TermView {
                 super::BlockState::CollectingOutput | super::BlockState::PostCommand
             )
         {
-            let (live_source, live_raw_incomplete, live_is_plain) =
-                match live_vte_search_text(&self.active_vte) {
-                    Some(text) => (text, false, true),
-                    None => {
-                        let (raw, incomplete) = self
-                            .active
-                            .borrow()
-                            .output_text_prefix(scan_budget.remaining_bytes());
-                        (raw, incomplete, false)
-                    }
-                };
+            let live_rows = self.active_vte.vadjustment().map(|adjustment| {
+                live_search_rows(
+                    adjustment.lower(),
+                    adjustment.upper(),
+                    adjustment.page_size(),
+                    self.active.borrow().live_cursor_origin().get(),
+                )
+            });
+            live_anchor = live_rows.map(|(view_row, from_row)| LiveAnchor {
+                view_row,
+                from_row,
+                skip: live_rows_skipped(&self.active_vte, &re, view_row, from_row),
+            });
+            let (live_source, live_raw_incomplete, live_is_plain) = match live_rows
+                .and_then(|(_, from_row)| live_vte_search_text(&self.active_vte, from_row))
+            {
+                Some(text) => (text, false, true),
+                None => {
+                    let (raw, incomplete) = self
+                        .active
+                        .borrow()
+                        .output_text_prefix(scan_budget.remaining_bytes());
+                    (raw, incomplete, false)
+                }
+            };
             let live_prefix = scan_budget.take_prefix(&live_source);
             let stripped;
             let live_text = if live_is_plain {
@@ -1326,6 +1430,7 @@ impl TermView {
             st.capped = capped;
             st.scan_limited = scan_limited;
             st.highlighted_terminals = highlighted_terminals;
+            st.live_anchor = live_anchor;
         }
         if !self.focus_current_match() {
             self.clear_find();
@@ -1454,6 +1559,12 @@ impl TermView {
             Some(NativeCursorAction::Step { wrap_once }) => wrap_once,
             None => return false,
         };
+        if surface.is_live && surface.block_id == 0 && surface.vte_cursor.is_none() {
+            let anchor = self.find_state.borrow().live_anchor;
+            if let Some(anchor) = anchor {
+                anchor_live_native_search(&vte, direction, anchor);
+            }
+        }
         vte.search_set_wrap_around(wrap_once);
         let found = match direction {
             FindDirection::Next => vte.search_find_next(),
@@ -2564,8 +2675,30 @@ mod tests {
             (window, terminal)
         };
 
+        // The count's text and anchor, taken the way the live pass does.
+        let counted_text = |terminal: &vte4::Terminal, origin: Option<i64>, pattern: &str| {
+            let adjustment = terminal.vadjustment().expect("a scrollable VTE");
+            let (view_row, from_row) = super::live_search_rows(
+                adjustment.lower(),
+                adjustment.upper(),
+                adjustment.page_size(),
+                origin,
+            );
+            let regex = regex::RegexBuilder::new(pattern)
+                .case_insensitive(true)
+                .build()
+                .unwrap();
+            let anchor = super::LiveAnchor {
+                view_row,
+                from_row,
+                skip: super::live_rows_skipped(terminal, &regex, view_row, from_row),
+            };
+            let text = super::live_vte_search_text(terminal, from_row)
+                .expect("the live VTE writes its buffer");
+            (anchor, text)
+        };
         let (window, terminal) = fed_terminal();
-        let text = super::live_vte_search_text(&terminal).expect("the live VTE writes its buffer");
+        let (_, text) = counted_text(&terminal, None, "x");
         window.close();
         assert!(
             text.contains("history line 0149"),
@@ -2576,14 +2709,22 @@ mod tests {
             "and the oldest, in scrollback"
         );
 
-        let native_steps = |pattern: &str| {
+        // Step the way the product does: a fresh pass with no selection,
+        // anchored before its first step, wrap off.
+        let native_steps = |pattern: &str, direction: super::FindDirection| {
             let (window, terminal) = fed_terminal();
+            let (anchor, _) = counted_text(&terminal, None, pattern);
             let regex = vte4::Regex::for_search(pattern, VTE_SEARCH_FLAGS).unwrap();
-            terminal.unselect_all();
             terminal.search_set_regex(Some(&regex), 0);
             terminal.search_set_wrap_around(false);
+            super::anchor_live_native_search(&terminal, direction, anchor);
             let mut steps = 0;
-            while steps <= INSERTED + 1 && terminal.search_find_previous() {
+            while steps <= INSERTED + 1
+                && match direction {
+                    super::FindDirection::Next => terminal.search_find_next(),
+                    super::FindDirection::Previous => terminal.search_find_previous(),
+                }
+            {
                 steps += 1;
             }
             window.close();
@@ -2597,12 +2738,22 @@ mod tests {
             super::bounded_match_count(&regex, haystack, super::FIND_MATCH_LIMIT).count
         };
 
-        for pattern in ["history line", "history line 0140", "Working", "Ask codex"] {
-            assert_eq!(
-                counted(pattern, &text),
-                native_steps(pattern),
-                "{pattern:?}: the count must equal VTE's own steps"
-            );
+        // "history line 0000" is only in scrollback, which Next could not
+        // reach from the view's top before the anchor.
+        for pattern in [
+            "history line",
+            "history line 0000",
+            "history line 0140",
+            "Working",
+            "Ask codex",
+        ] {
+            for direction in [super::FindDirection::Next, super::FindDirection::Previous] {
+                assert_eq!(
+                    counted(pattern, &text),
+                    native_steps(pattern, direction),
+                    "{pattern:?} {direction:?}: the count must equal VTE's own steps"
+                );
+            }
         }
         assert_eq!(counted("history line", &text), INSERTED);
         assert_eq!(counted("Working", &text), 1);
@@ -2613,6 +2764,89 @@ mod tests {
 
         window.close();
         while context.iteration(false) {}
+    }
+
+    /// `preserve_live_scrollback` keeps earlier commands' output above the
+    /// running one in the live VTE. Their finished cards count it already, so
+    /// the live pass counts from the command's own first row, and Next walks
+    /// exactly that many — when the command is short enough that its view
+    /// cannot start at that row, too.
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn a_live_find_over_kept_scrollback_counts_only_the_running_command() {
+        use gtk::prelude::*;
+        use relm4::gtk;
+        use std::time::Duration;
+        use vte4::TerminalExt;
+
+        gtk::init().expect("gtk init");
+        let context = gtk::glib::MainContext::default();
+        let settle = || {
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_millis(100) {
+                while context.iteration(false) {}
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        let regex = regex::RegexBuilder::new("needle")
+            .case_insensitive(true)
+            .build()
+            .unwrap();
+        for new_lines in [3usize, 25] {
+            let terminal = vte4::Terminal::new();
+            terminal.set_size(80, 10);
+            terminal.set_scrollback_lines(1_000);
+            let window = gtk::Window::new();
+            window.set_child(Some(&terminal));
+            window.present();
+            for index in 0..30 {
+                terminal.feed(format!("needle old {index}\r\n").as_bytes());
+            }
+            settle();
+            let origin = terminal.cursor_position().1;
+            terminal.feed(b"$ run\r\n");
+            for index in 0..new_lines {
+                terminal.feed(format!("needle new {index}\r\n").as_bytes());
+            }
+            settle();
+
+            let adjustment = terminal.vadjustment().expect("a scrollable VTE");
+            let (view_row, from_row) = super::live_search_rows(
+                adjustment.lower(),
+                adjustment.upper(),
+                adjustment.page_size(),
+                Some(origin),
+            );
+            let text = super::live_vte_search_text(&terminal, from_row).expect("live text");
+            let count = super::bounded_match_count(&regex, &text, super::FIND_MATCH_LIMIT).count;
+            assert_eq!(count, new_lines, "{new_lines}: {text:?}");
+            let anchor = super::LiveAnchor {
+                view_row,
+                from_row,
+                skip: super::live_rows_skipped(&terminal, &regex, view_row, from_row),
+            };
+            assert_eq!(anchor.skip > 0, new_lines == 3, "{anchor:?}");
+
+            let native = vte4::Regex::for_search("needle", VTE_SEARCH_FLAGS).unwrap();
+            terminal.search_set_regex(Some(&native), 0);
+            super::anchor_live_native_search(&terminal, super::FindDirection::Next, anchor);
+            terminal.search_set_wrap_around(false);
+            let mut steps = 0;
+            while steps <= 100 && terminal.search_find_next() {
+                steps += 1;
+                if steps == 1 {
+                    let selected = terminal.text_selected(vte4::Format::Text);
+                    assert_eq!(
+                        selected.as_deref(),
+                        Some("needle"),
+                        "{new_lines}: the first step lands on a match"
+                    );
+                }
+            }
+            assert_eq!(steps, count, "{new_lines}: Next walks what was counted");
+            window.close();
+            while context.iteration(false) {}
+        }
     }
 
     /// A huge old scrollback must not consume the structured search budget

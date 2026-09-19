@@ -206,10 +206,7 @@ mod tests {
         (hold, log)
     }
 
-    const SGR_ANY: MouseReporting = MouseReporting {
-        tracking: MouseMode::AnyEvent,
-        encoding: MouseEncoding::Sgr,
-    };
+    const SGR_ANY: MouseReporting = MouseReporting::new(MouseMode::AnyEvent, MouseEncoding::Sgr);
 
     #[test]
     fn eligibility_requires_streaming_or_shift_for_mouse_reporting() {
@@ -217,10 +214,7 @@ mod tests {
         // its own local selection.
         assert!(feed_hold_eligible(
             BlockState::CollectingOutput,
-            MouseReporting {
-                tracking: MouseMode::None,
-                encoding: MouseEncoding::Sgr,
-            },
+            MouseReporting::new(MouseMode::None, MouseEncoding::Sgr),
             false
         ));
         assert!(feed_hold_eligible(

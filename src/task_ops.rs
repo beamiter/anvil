@@ -396,12 +396,11 @@ impl AppModel {
             self.show_toast("Select a finished block in a Block-mode pane to create an agent task");
             return;
         };
+        // The card's own rule: an interrupt or a stop is not a failure.
         if require_failed
-            && !jterm_core::block_contract::classify_completed(
-                evidence.command.as_deref(),
-                evidence.exit_code,
-            )
-            .is_failed()
+            && !evidence.command.as_deref().is_some_and(|command| {
+                crate::block_view::block_is_failure(command, evidence.exit_code)
+            })
         {
             self.show_toast("Fix tasks are available for failed command blocks");
             return;

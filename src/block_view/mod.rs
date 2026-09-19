@@ -1480,9 +1480,10 @@ fn lone_rerunnable_selection<'a>(
 /// Whether a finished block's context menu shows the failed-block section
 /// (ember/frost family: Fix/Explain/Retry). Only an explicitly reported
 /// non-zero exit with a real command qualifies — background output and an
-/// unknown status are never reclassified as failures.
+/// unknown status are never reclassified as failures, and neither is an
+/// interrupt or a stop (Ctrl+C, Ctrl+Z), which the card shows as neutral.
 fn failed_block_section_visible(command: &str, exit_code: Option<i32>) -> bool {
-    jterm_core::block_contract::classify_completed(Some(command), exit_code).is_failed()
+    block_is_failure(command, exit_code)
 }
 
 /// frost's `verified_local_command_cwd` (ember's rule, verbatim). An
@@ -2107,6 +2108,25 @@ fn kitty_rewrite_applies(
         BlockState::CollectingOutput | BlockState::AltScreen => true,
         BlockState::RawFallback => shell_is_foreground() == Some(false),
         _ => false,
+    }
+}
+
+/// RawFallback's ownership answer for [`kitty_rewrite_applies`]: a program
+/// other than the shell holds the terminal *and* it is the process group
+/// that pushed the flags. Without shell integration no prompt ever clears a
+/// stack an agent left behind when it was killed (SIGKILL, OOM, a dropped
+/// ssh), so the next `sleep` or `ssh` would otherwise get Ctrl+C as
+/// `CSI 99;5u` and never see SIGINT. A different foreground group answers
+/// "unknown", which keeps legacy keys; a pusher whose group could not be read
+/// falls back to the plain foreground test.
+fn raw_fallback_shell_is_foreground(
+    shell_is_foreground: Option<bool>,
+    pusher_group: Option<i32>,
+    foreground_group: impl FnOnce() -> Option<i32>,
+) -> Option<bool> {
+    match (shell_is_foreground, pusher_group) {
+        (Some(false), Some(pusher)) => (foreground_group() == Some(pusher)).then_some(false),
+        (answer, _) => answer,
     }
 }
 
@@ -2929,6 +2949,16 @@ enum RunningHeaderMode {
     Full,
 }
 
+/// Whether the jump-to-live button shows. `live_top_visible` is the probe's
+/// geometric reading (the live card's top is inside the viewport), `locked`
+/// the scroll lock after it, `live_bottom_below` whether the card's bottom
+/// is below the viewport. A lock kept over a viewport-tall card refuses the
+/// follow-bottom pins, so its composer and new output arrive out of sight;
+/// without the button the only ways back were a manual scroll or Ctrl+End.
+fn jump_fab_visible(live_top_visible: bool, locked: bool, live_bottom_below: bool) -> bool {
+    !live_top_visible || (locked && live_bottom_below)
+}
+
 /// Choose the running readout. `covers_live` says the compact readout would
 /// sit over the live card's top edge: once an inline agent fills the pane the
 /// pill would hide the right-hand cells of its first rows for the whole
@@ -2948,11 +2978,24 @@ fn running_header_mode(
     }
 }
 
-/// Whether a readout whose bottom edge is at `readout_bottom_px` overlaps a
-/// live card whose top edge is at `live_top_px`, both in the history
-/// viewport's coordinates.
-fn running_readout_covers_live(live_top_px: f32, readout_bottom_px: f32) -> bool {
-    live_top_px < readout_bottom_px
+/// Whether the compact readout would sit over a live card that fills the
+/// pane: a Block-mode card whose top edge (`live_top_px`) is above the
+/// readout's bottom edge and whose bottom edge reaches the viewport's
+/// (`viewport_height_px`), all in the history viewport's coordinates. That is
+/// an inline agent owning the pane. A short card near the top — the first
+/// command of a fresh tab, or after Clear Blocks — keeps the pill: printing
+/// nothing is exactly when it is needed. Unified's one surface always starts
+/// at the top and fills the viewport, and keeps the pill it always had.
+fn running_readout_covers_live(
+    unified: bool,
+    live_top_px: f32,
+    live_height_px: f32,
+    viewport_height_px: f32,
+    readout_bottom_px: f32,
+) -> bool {
+    !unified
+        && live_top_px < readout_bottom_px
+        && live_top_px + live_height_px >= viewport_height_px - 1.0
 }
 
 /// Consecutive change-free frames after which the pane resize settle tick
@@ -3939,6 +3982,10 @@ pub struct TermView {
     /// explicit undo can rebuild their widgets. Single-level: a later clear
     /// with content replaces it; cleared again only when consumed by undo.
     cleared_stash: RefCell<Vec<BlockData>>,
+    /// Ids in `cleared_stash` whose cards said their output's beginning was
+    /// lost. `BlockData` does not carry that, so the rebuilt cards would
+    /// otherwise pass the surviving tail off as the whole transcript.
+    cleared_head_dropped: RefCell<std::collections::HashSet<u64>>,
     /// Per-path load/save observations move with the pane and never depend on
     /// a transient allocation address.
     history_baselines: RefCell<HashMap<std::path::PathBuf, history::HistoryBaseline>>,
@@ -4021,6 +4068,9 @@ impl Drop for TermView {
         if let Some(id) = self.resize_tick_id.borrow_mut().take() {
             id.remove();
         }
+        // The backends share this cell; drop the kick (and its PTY and layout
+        // captures) with the pane rather than with the last backend clone.
+        self.pty_winsize.settle.borrow_mut().take();
         if let Some(id) = self.sticky_timer_id.borrow_mut().take() {
             id.remove();
         }
@@ -4388,6 +4438,15 @@ struct ReplayedOutput {
     head_dropped: bool,
 }
 
+/// Whether a finished card shows less than the head of its output: the
+/// capture lost it (`payload_head_dropped`), or the transcript has more rows
+/// than the card's VTE grid can hold (`bounded_finished_vte_max_rows`), so
+/// its first rows fall off the top as it is fed. Copy and `BlockData` keep
+/// the whole text either way; the card has to say it does not.
+fn finished_card_loses_head(payload_head_dropped: bool, output_rows: i64, cols: i64) -> bool {
+    payload_head_dropped || output_rows > bounded_finished_vte_max_rows(cols)
+}
+
 /// The winsize the replay assumes when the pane never published one: the
 /// size `OwnedPty` opens every PTY with, so it is what the child saw too.
 const UNPUBLISHED_PTY_WINSIZE: (u16, u16) = (80, 24);
@@ -4565,19 +4624,23 @@ impl BlockRenderPayloadAccessor for LazyBlockRenderPayload {
             return zone_output_snapshot_from_plain(
                 &value.output_plain,
                 max_bytes,
-                self.dropped_front,
+                self.dropped_front || value.output_head_dropped,
             );
         }
         let mut output = self.output.borrow_mut();
         match output.as_mut()? {
-            CapturedFinalizeOutput::Foreground(ring) => zone_output_snapshot_from_ring(
+            CapturedFinalizeOutput::Foreground(ring) => zone_output_snapshot_from_capture(
                 &mut ring.borrow_mut(),
                 self.dropped_front,
+                self.pty_winsize,
                 max_bytes,
             ),
-            CapturedFinalizeOutput::Background(ring) => {
-                zone_output_snapshot_from_ring(ring, self.dropped_front, max_bytes)
-            }
+            CapturedFinalizeOutput::Background(ring) => zone_output_snapshot_from_capture(
+                ring,
+                self.dropped_front,
+                self.pty_winsize,
+                max_bytes,
+            ),
         }
     }
 
@@ -4622,6 +4685,14 @@ trait RenderBackend {
     /// touch the running command's output snapshot: the raw-output ring is
     /// engine-owned shared state and the engine clears it explicitly.
     fn reset_active_surface(&self, preserve_scrollback: bool);
+    /// Switch off every mouse and focus reporting mode on the live surface.
+    /// Called whenever the program that could have set them is known to be
+    /// gone (an accepted prompt, a command end out of the alternate screen),
+    /// so a program killed without undoing them cannot leave libvte turning
+    /// the shell's pointer motion into reports. Block's live VTE forgets the
+    /// modes in its own surface reset, so it keeps the default no-op; a
+    /// surface that is never reset must feed the modes off.
+    fn release_live_reporting(&self) {}
     /// Focus the live surface once the current main-loop turn finishes, but
     /// only if it already holds focus — the guard is a surface query, so it
     /// belongs on this side of the seam with the effect it gates.
@@ -5120,6 +5191,30 @@ fn unadjusted_output_tail(bytes: &[u8], max_bytes: usize) -> &[u8] {
 /// `dropped_front` is the ring's own wrap marker, which the retained bytes
 /// cannot carry. The ring stays usable afterwards: `make_contiguous`
 /// rearranges in place, and the engine clears the ring once fan-out completes.
+/// A zone snapshot straight from the capture, when no other consumer
+/// materialized the payload first (no jsh journal): the same text the
+/// materialized path would give. A stream an inline TUI repainted goes
+/// through the screen replay, exactly as the payload does; anything else is
+/// the plain tail strip, which never needs the whole ring decoded.
+fn zone_output_snapshot_from_capture(
+    ring: &mut VecDeque<u8>,
+    dropped_front: bool,
+    pty_winsize: (u16, u16),
+    max_bytes: usize,
+) -> Option<ZoneOutputSnapshot> {
+    let bytes: &[u8] = ring.make_contiguous();
+    let resynced = if dropped_front {
+        jterm_core::screen_replay::resync_ring_head(bytes)
+    } else {
+        bytes
+    };
+    if !jterm_core::screen_replay::stream_needs_screen_replay(resynced) {
+        return zone_output_snapshot_from_ring(ring, dropped_front, max_bytes);
+    }
+    let replayed = replay_captured_output(bytes, dropped_front, pty_winsize);
+    zone_output_snapshot_from_plain(&replayed.plain, max_bytes, replayed.head_dropped)
+}
+
 fn zone_output_snapshot_from_ring(
     ring: &mut VecDeque<u8>,
     dropped_front: bool,
@@ -5577,6 +5672,9 @@ struct ReaderCtx {
     /// of the flags in effect that the GTK-side key and commit handlers read.
     kitty_keyboard_rc: Rc<RefCell<KittyKeyboardStacks>>,
     kitty_flags_rc: Rc<Cell<u8>>,
+    /// Foreground process group that pushed the main-screen kitty flags in
+    /// RawFallback, where no prompt resets them.
+    kitty_pusher_rc: Rc<Cell<Option<i32>>>,
     /// Cursor position queries left to the live VTE whose answer has not yet
     /// come back through its `commit`. The commit handler settles one per
     /// matched report and the selection hold reads it; reset at an accepted
@@ -6102,6 +6200,10 @@ impl ReaderCtx {
         // reset this prompt runs; the shell re-enables anything it wants after
         // this marker.
         self.mouse_reporting_rc.set(MouseReporting::OFF);
+        // The live surface has to agree with the shadow: a surface that is not
+        // reset below (Unified's, whatever the command printed) would keep
+        // turning pointer motion and wheel into reports typed at the prompt.
+        self.backend.release_live_reporting();
         // A CPR the program never saw answered belongs to its lifecycle too;
         // left counted, the next shell's Shift+F3 would pass for its answer.
         self.cpr_outstanding_rc.set(0);
@@ -6800,6 +6902,9 @@ impl ReaderCtx {
             let mode = mode.unwrap_or(1049);
             let leave = format!("\x1b[?{mode}l");
             self.backend.feed_live(leave.as_bytes());
+            // libvte's mouse and focus modes are global, not per screen, so
+            // leaving the alternate screen does not switch them off.
+            self.backend.release_live_reporting();
             let prompt_zone = {
                 let engine = self.engine.borrow();
                 prompt_zone_to_reopen_after_alt(engine.prev_state, engine.pending_zone)
@@ -6978,6 +7083,17 @@ impl ReaderCtx {
     fn on_kitty_keyboard(&self, op: KittyKeyboardOp) {
         self.kitty_keyboard_rc.borrow_mut().apply(op);
         self.sync_kitty_flags();
+        // Without shell integration nothing tells the stack its owner died,
+        // so remember whose flags these are (see
+        // `raw_fallback_shell_is_foreground`).
+        if self.kitty_flags_rc.get() == 0 {
+            self.kitty_pusher_rc.set(None);
+        } else if self.bstate_rc.get() == BlockState::RawFallback
+            && !matches!(op, KittyKeyboardOp::Pop(_))
+        {
+            self.kitty_pusher_rc
+                .set(self.pty_for_init.foreground_group());
+        }
     }
 
     fn sync_kitty_flags(&self) {
@@ -6999,6 +7115,7 @@ impl ReaderCtx {
     fn reset_kitty_keyboard(&self) {
         self.kitty_keyboard_rc.borrow_mut().reset();
         self.sync_kitty_flags();
+        self.kitty_pusher_rc.set(None);
     }
 
     fn on_apc_sequence(&self, payload: &[u8]) {
@@ -8555,7 +8672,11 @@ impl RenderBackend for BlockBackend {
             record.lifecycle_health(),
             record.lifecycle_notice().as_deref(),
         );
-        finished.set_output_head_dropped(payload.output_head_dropped);
+        finished.set_output_head_dropped(finished_card_loses_head(
+            payload.output_head_dropped,
+            output_rows,
+            cols,
+        ));
         finished
             .widget()
             .insert_before(&self.block_list_rc, Some(self.active_rc.borrow().widget()));
@@ -8911,9 +9032,13 @@ impl RenderBackend for UnifiedBackend {
     /// an interrupted command's attributes from tinting the next prompt.
     fn reset_active_surface(&self, _preserve_scrollback: bool) {
         self.feed_live(b"\x1b[0m");
-        // Unified's VTE is never reset, so switch off by hand any mouse or
-        // focus reporting a killed program left on; the engine's shadow of
-        // those modes was just cleared with the prompt.
+        self.release_live_reporting();
+    }
+
+    /// Unified's VTE is never reset, so switch off by hand any mouse or
+    /// focus reporting a killed program left on; the engine's shadow of
+    /// those modes was just cleared with the prompt.
+    fn release_live_reporting(&self) {
         self.feed_live(MOUSE_AND_FOCUS_REPORTING_OFF);
     }
 
@@ -9467,14 +9592,7 @@ impl PtyWinsize {
     /// it was sent. An identical TIOCSWINSZ would be dropped by the kernel
     /// anyway; skipping it here keeps the one shared memory truthful.
     fn publish(&self, pty: &OwnedPty, sample: (u16, u16)) -> bool {
-        match next_winsize_to_publish(self.sent.get(), sample) {
-            Some((cols, rows)) => {
-                self.sent.set((cols, rows));
-                pty.resize(cols, rows);
-                true
-            }
-            None => false,
-        }
+        publish_winsize(&self.sent, pty, sample)
     }
 
     /// Arm the settle tick (a no-op while one is already running), so a grid
@@ -9484,6 +9602,21 @@ impl PtyWinsize {
         if let Some(kick) = kick {
             kick();
         }
+    }
+}
+
+/// [`PtyWinsize::publish`] on the shared `sent` cell alone. The settle tick
+/// publishes through this: holding the whole `PtyWinsize` would hold its
+/// `settle` cell, which holds the tick's kick, which would hold it back — a
+/// cycle that kept the kick's PTY and layout captures alive past the pane.
+fn publish_winsize(sent: &Cell<(u16, u16)>, pty: &OwnedPty, sample: (u16, u16)) -> bool {
+    match next_winsize_to_publish(sent.get(), sample) {
+        Some((cols, rows)) => {
+            sent.set((cols, rows));
+            pty.resize(cols, rows);
+            true
+        }
+        None => false,
     }
 }
 
@@ -10209,6 +10342,28 @@ struct KeyCtx {
     root_for_key: glib::WeakRef<gtk::Box>,
     verified_submission_for_key: VerifiedSubmissionCtx,
     human_input_for_key: HumanInputCallbacks,
+    /// A selection whose Enter was refused while a command runs: `(block id,
+    /// its selection generation)`. It stays on screen while the refusal is
+    /// read, but the next Enter goes to the program. See
+    /// [`selection_release_is_due`].
+    selection_release_for_key: Rc<Cell<Option<(u64, u64)>>>,
+}
+
+/// Whether a pending release (see `KeyCtx::selection_release_for_key`) takes
+/// this Enter: the same block is still selected, nothing re-synced the
+/// selection since, and the command is still running.
+fn selection_release_is_due(
+    pending: Option<(u64, u64)>,
+    selected: Option<u64>,
+    generation_of: impl FnOnce(u64) -> Option<u64>,
+    state: BlockState,
+) -> bool {
+    let Some((id, generation)) = pending else {
+        return false;
+    };
+    state == BlockState::CollectingOutput
+        && selected == Some(id)
+        && generation_of(id) == Some(generation)
 }
 
 impl KeyCtx {
@@ -10231,6 +10386,7 @@ impl KeyCtx {
             root_for_key,
             verified_submission_for_key,
             human_input_for_key,
+            selection_release_for_key,
         } = self;
         key_ctrl.connect_key_pressed(move |controller, keyval, keycode, modifiers| {
             use gtk::gdk::Key;
@@ -10543,6 +10699,28 @@ impl KeyCtx {
             {
                 if selected_block_id_for_key.get().is_some() {
                     let finished = finished_blocks_for_key.borrow();
+                    // The refusal below already cost one Enter; this one is
+                    // the program's.
+                    let release = selection_release_is_due(
+                        selection_release_for_key.take(),
+                        selected_block_id_for_key.get(),
+                        |id| {
+                            finished
+                                .iter()
+                                .find(|block| block.id == id)
+                                .map(|block| block.selection_feedback_generation.get())
+                        },
+                        bstate_for_key.get(),
+                    );
+                    if release {
+                        clear_finished_block_selection(
+                            &finished,
+                            &selected_block_ids_for_key,
+                            &selected_block_id_for_key,
+                            &selection_anchor_id_for_key,
+                        );
+                        return glib::Propagation::Proceed;
+                    }
                     let recalled = {
                         let selected = selected_block_ids_for_key.borrow();
                         recall_selected_commands_at_prompt(
@@ -10591,14 +10769,50 @@ impl KeyCtx {
                     );
                     active_vte_for_key.error_bell();
                     // While a command runs the refusal is certain, so it costs
-                    // one Enter: the next one reaches the program.
+                    // one Enter: the next one reaches the program. Clearing the
+                    // selection here would hide the explanation in the frame
+                    // that wrote it, so the card keeps it while it is read and
+                    // lets go afterwards (or at that next Enter).
                     if bstate_for_key.get() == BlockState::CollectingOutput {
-                        clear_finished_block_selection(
-                            &finished,
-                            &selected_block_ids_for_key,
-                            &selected_block_id_for_key,
-                            &selection_anchor_id_for_key,
-                        );
+                        let pending = selected_block_id_for_key.get().and_then(|id| {
+                            finished
+                                .iter()
+                                .find(|block| block.id == id)
+                                .map(|block| (id, block.selection_feedback_generation.get()))
+                        });
+                        selection_release_for_key.set(pending);
+                        if pending.is_some() {
+                            let release = selection_release_for_key.clone();
+                            let finished_rc = finished_blocks_for_key.clone();
+                            let ids = selected_block_ids_for_key.clone();
+                            let selected = selected_block_id_for_key.clone();
+                            let anchor = selection_anchor_id_for_key.clone();
+                            glib::timeout_add_local_once(
+                                SELECTION_REFUSAL_VISIBLE_FOR,
+                                move || {
+                                    if release.get() != pending {
+                                        return;
+                                    }
+                                    release.set(None);
+                                    let Ok(finished) = finished_rc.try_borrow() else {
+                                        return;
+                                    };
+                                    let still_selected = pending.is_some_and(|(id, generation)| {
+                                        selected.get() == Some(id)
+                                            && finished.iter().any(|block| {
+                                                block.id == id
+                                                    && block.selection_feedback_generation.get()
+                                                        == generation
+                                            })
+                                    });
+                                    if still_selected {
+                                        clear_finished_block_selection(
+                                            &finished, &ids, &selected, &anchor,
+                                        );
+                                    }
+                                },
+                            );
+                        }
                     }
                     return glib::Propagation::Stop;
                 }
@@ -11597,6 +11811,7 @@ impl TermView {
         let kitty_keyboard: Rc<RefCell<KittyKeyboardStacks>> =
             Rc::new(RefCell::new(KittyKeyboardStacks::new()));
         let kitty_flags: Rc<Cell<u8>> = Rc::new(Cell::new(0));
+        let kitty_pusher: Rc<Cell<Option<i32>>> = Rc::new(Cell::new(None));
         let live_keys: Rc<LiveKeyRecord> = Rc::new(LiveKeyRecord::default());
         // CPR queries the live VTE is left to answer; see ReaderCtx.
         let cpr_outstanding: Rc<Cell<u32>> = Rc::new(Cell::new(0));
@@ -11917,6 +12132,7 @@ impl TermView {
                 bstate_rc,
                 kitty_keyboard_rc: kitty_keyboard.clone(),
                 kitty_flags_rc: kitty_flags.clone(),
+                kitty_pusher_rc: kitty_pusher.clone(),
                 cpr_outstanding_rc: cpr_outstanding.clone(),
                 engine: RefCell::new(EngineState {
                     prev_state: BlockState::Idle,
@@ -12084,10 +12300,10 @@ impl TermView {
                             return;
                         };
                         let vp_h = scroll.height() as f64;
-                        let at_bottom = holder
-                            .compute_bounds(&scroll)
-                            .map(|b| (b.y() as f64) < vp_h - 4.0)
-                            .unwrap_or(true);
+                        let bounds = holder.compute_bounds(&scroll);
+                        let at_bottom = bounds.map(|b| (b.y() as f64) < vp_h - 4.0).unwrap_or(true);
+                        let live_bottom_below =
+                            bounds.is_some_and(|b| f64::from(b.y() + b.height()) > vp_h + 4.0);
                         let adj = scroll.vadjustment();
                         user_scrolled.set(scroll::next_scroll_lock(
                             user_scrolled.get(),
@@ -12095,9 +12311,11 @@ impl TermView {
                             adj.value(),
                             (adj.upper() - adj.page_size()).max(adj.lower()),
                         ));
-                        // The jump button keeps the geometric reading: it is
-                        // for getting back to a live card that is off screen.
-                        if at_bottom {
+                        // The jump button is for getting back to a live card
+                        // that is off screen — or, once the lock holds, to the
+                        // part of a tall one (an inline agent's composer) that
+                        // new output keeps landing in below the viewport.
+                        if !jump_fab_visible(at_bottom, user_scrolled.get(), live_bottom_below) {
                             unread.set(0);
                             fab.set_visible(false);
                         } else {
@@ -12441,7 +12659,13 @@ impl TermView {
                                 .widget()
                                 .compute_bounds(&scroll)
                                 .is_some_and(|bounds| {
-                                    running_readout_covers_live(bounds.y(), readout_bottom)
+                                    running_readout_covers_live(
+                                        unified,
+                                        bounds.y(),
+                                        bounds.height(),
+                                        scroll.height() as f32,
+                                        readout_bottom,
+                                    )
                                 })
                         });
                     let show_pill = running_header_mode(scrolled, Some(elapsed), covers_live)
@@ -12534,6 +12758,7 @@ impl TermView {
             let selection_anchor_id_for_commit = selection_anchor_id.clone();
             let human_input_for_commit = human_input_callbacks.clone();
             let kitty_flags_for_commit = kitty_flags.clone();
+            let kitty_pusher_for_commit = kitty_pusher.clone();
             let live_keys_for_commit = live_keys.clone();
             let cpr_outstanding_for_commit = cpr_outstanding.clone();
             let unified_for_commit = unified;
@@ -12553,7 +12778,11 @@ impl TermView {
                     kitty_flags_for_commit.get(),
                     || {
                         kitty_rewrite_applies(bstate_for_commit.get(), || {
-                            pty_for_commit.shell_is_foreground()
+                            raw_fallback_shell_is_foreground(
+                                pty_for_commit.shell_is_foreground(),
+                                kitty_pusher_for_commit.get(),
+                                || pty_for_commit.foreground_group(),
+                            )
                         })
                     },
                 );
@@ -12811,6 +13040,7 @@ impl TermView {
                 root_for_key: root.downgrade(),
                 verified_submission_for_key: verified_submission.clone(),
                 human_input_for_key: human_input_callbacks.clone(),
+                selection_release_for_key: Rc::new(Cell::new(None)),
             };
 
             // Root fallback is added after the stranded-focus recovery
@@ -13067,7 +13297,7 @@ impl TermView {
             // Shared with `sync_active_to_pty`: a value only the sync sent
             // must still count as sent here, or a tick sample equal to this
             // tick's own last value would skip the correction of it.
-            let winsize_for_resize = pty_winsize.clone();
+            let winsize_for_resize = pty_winsize.sent.clone();
             let last_pane: Rc<Cell<(i32, i32)>> = Rc::new(Cell::new((0, 0)));
             let stable_frames: Rc<Cell<u32>> = Rc::new(Cell::new(0));
             let tick_id = resize_tick_id.clone();
@@ -13086,6 +13316,10 @@ impl TermView {
                 let last_pane = last_pane.clone();
                 let stable_frames = stable_frames.clone();
                 let tick_id_for_callback = tick_id.clone();
+                // A re-armed tick counts its own quiet frames: left at the last
+                // settle's count it would stop on its first frame, which runs
+                // before the allocation it was armed for.
+                stable_frames.set(0);
                 let id = vte.add_tick_callback(move |vte, _clock| {
                     // Watch the pane from the frame clock so the grid — and
                     // therefore the winsize pushed below — follows the window.
@@ -13099,8 +13333,11 @@ impl TermView {
                             layout_for_resize();
                             changed = true;
                         }
-                        if winsize_for_resize.publish(&pty_for_resize, pty_grid_size(vte, &scroll))
-                        {
+                        if publish_winsize(
+                            &winsize_for_resize,
+                            &pty_for_resize,
+                            pty_grid_size(vte, &scroll),
+                        ) {
                             changed = true;
                         }
                     }
@@ -13182,6 +13419,7 @@ impl TermView {
             selection_anchor_id,
             bookmarks: block_bookmarks,
             cleared_stash: RefCell::new(Vec::new()),
+            cleared_head_dropped: RefCell::new(std::collections::HashSet::new()),
             history_baselines: RefCell::new(HashMap::new()),
             history_explicit_replace_pending: RefCell::new(VecDeque::new()),
             unread_count,
@@ -14394,6 +14632,13 @@ impl TermView {
         // reflexive second Ctrl+Shift+K cannot destroy the undo snapshot.
         if !cleared.is_empty() {
             *self.cleared_stash.borrow_mut() = cleared;
+            *self.cleared_head_dropped.borrow_mut() = self
+                .finished_blocks
+                .borrow()
+                .iter()
+                .filter(|block| block.output_head_dropped())
+                .map(|block| block.id)
+                .collect();
         }
 
         let widgets: Vec<gtk::Box> = self
@@ -14450,6 +14695,7 @@ impl TermView {
             return 0;
         }
         let mut stash: Vec<BlockData> = std::mem::take(&mut *self.cleared_stash.borrow_mut());
+        let head_dropped = std::mem::take(&mut *self.cleared_head_dropped.borrow_mut());
         if stash.is_empty() {
             return 0;
         }
@@ -14533,6 +14779,7 @@ impl TermView {
                     block.lifecycle_health(),
                     block.lifecycle_notice().as_deref(),
                 );
+                finished.set_output_head_dropped(head_dropped.contains(&block.id));
                 finished
                     .widget()
                     .insert_before(&self.block_list, Some(&anchor));
@@ -15309,20 +15556,21 @@ mod tests {
         take_armed_agent_execution, take_background_output, unread_after_index_removal,
         unread_after_prefix_eviction, viewport_page_size_changed, viewport_state_for_scroll,
         viewport_states_for_scroll, visible_indices_for_viewport, vte_answers_query_natively,
-        zone_output_snapshot_from_plain, zone_output_snapshot_from_ring, AgentCommandEndDecision,
-        AgentExecutionLostCallbacks, AltScreenCallbacks, AltScreenTransition, AnchorSettleArgs,
-        ArmedAgentExecution, BackendRecords, BlockData, BlockFinishedCallback,
-        BlockFinishedCallbacks, BlockRenderPayloadAccessor, BlockState, BookmarkState,
-        CommandFinishedCallbacks, CommandFinishedEvent, CommandPromptStatus,
-        CommandStartedCallbacks, CommandStartedEvent, CommandTextSource, CompletedCommandRecord,
-        DynamicColors, DynamicColorsRc, EngineState, PendingZone, ReaderCtx, RenderBackend,
-        ResetAwareParserPart, ResetAwareParserSplitter, ReviewedSubmission,
-        ReviewedSubmissionPhase, SelectionFeedHold, ShellCapabilityObserver, SubmissionSurface,
-        TerminalResetKind, UnifiedZoneStore, VerifiedSubmissionCtx, ZoneMarkerInjector,
-        ZoneOutputSnapshot, BLOCK_ID_SEQUENCE_LIMIT, LAST_NOTIFICATION_AT, MAX_RAW_OUTPUT_BYTES,
-        MAX_RECALLED_COMMAND_BYTES, MAX_TOTAL_SNAPSHOT_BYTES, MAX_TYPED_COMMAND_SHADOW_BYTES,
-        MAX_ZONE_SNAPSHOT_BYTES, MIN_INPUT_ROWS, NOTIFICATION_MIN_INTERVAL,
-        TRUNCATED_COMMAND_PLACEHOLDER, UNAVAILABLE_COMMAND_PLACEHOLDER, ZONE_MARKER_CLOSE,
+        zone_output_snapshot_from_capture, zone_output_snapshot_from_plain,
+        zone_output_snapshot_from_ring, AgentCommandEndDecision, AgentExecutionLostCallbacks,
+        AltScreenCallbacks, AltScreenTransition, AnchorSettleArgs, ArmedAgentExecution,
+        BackendRecords, BlockData, BlockFinishedCallback, BlockFinishedCallbacks,
+        BlockRenderPayloadAccessor, BlockState, BookmarkState, CommandFinishedCallbacks,
+        CommandFinishedEvent, CommandPromptStatus, CommandStartedCallbacks, CommandStartedEvent,
+        CommandTextSource, CompletedCommandRecord, DynamicColors, DynamicColorsRc, EngineState,
+        PendingZone, ReaderCtx, RenderBackend, ResetAwareParserPart, ResetAwareParserSplitter,
+        ReviewedSubmission, ReviewedSubmissionPhase, SelectionFeedHold, ShellCapabilityObserver,
+        SubmissionSurface, TerminalResetKind, UnifiedZoneStore, VerifiedSubmissionCtx,
+        ZoneMarkerInjector, ZoneOutputSnapshot, BLOCK_ID_SEQUENCE_LIMIT, LAST_NOTIFICATION_AT,
+        MAX_RAW_OUTPUT_BYTES, MAX_RECALLED_COMMAND_BYTES, MAX_TOTAL_SNAPSHOT_BYTES,
+        MAX_TYPED_COMMAND_SHADOW_BYTES, MAX_ZONE_SNAPSHOT_BYTES, MIN_INPUT_ROWS,
+        NOTIFICATION_MIN_INTERVAL, TRUNCATED_COMMAND_PLACEHOLDER, UNAVAILABLE_COMMAND_PLACEHOLDER,
+        ZONE_MARKER_CLOSE,
     };
     use crate::agent::{AgentExecutionRef, AgentSession};
     use crate::config::Config;
@@ -15480,17 +15728,78 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_enter_while_running_lets_the_next_one_through() {
+        use super::selection_release_is_due as due;
+        let generation = |id| (id == 7).then_some(3);
+        assert!(due(
+            Some((7, 3)),
+            Some(7),
+            generation,
+            BlockState::CollectingOutput
+        ));
+        // Nothing pending, another block selected, the selection re-synced
+        // since, or the command already finished: the selection keeps Enter.
+        assert!(!due(
+            None,
+            Some(7),
+            generation,
+            BlockState::CollectingOutput
+        ));
+        assert!(!due(
+            Some((7, 3)),
+            Some(8),
+            generation,
+            BlockState::CollectingOutput
+        ));
+        assert!(!due(
+            Some((7, 2)),
+            Some(7),
+            generation,
+            BlockState::CollectingOutput
+        ));
+        assert!(!due(
+            Some((7, 3)),
+            Some(7),
+            generation,
+            BlockState::AwaitingCommand
+        ));
+    }
+
+    #[test]
+    fn a_locked_view_over_a_tall_live_card_offers_the_jump_back() {
+        use super::jump_fab_visible as visible;
+        // The live card is off screen: always.
+        assert!(visible(false, false, true));
+        assert!(visible(false, true, false));
+        // codex's card fills the pane and the user nudged the scrollbar up:
+        // the lock holds and the composer is below the viewport.
+        assert!(visible(true, true, true));
+        // Following the bottom, or the whole card on screen: no button.
+        assert!(!visible(true, false, true));
+        assert!(!visible(true, true, false));
+    }
+
+    #[test]
     fn the_running_pill_never_sits_over_the_live_cards_top() {
+        use super::running_readout_covers_live as covers;
         use super::{running_header_mode as mode, RunningHeaderMode as M};
         let bottom = super::RUNNING_PILL_MARGIN_TOP as f32 + 28.0;
-        // An agent filling the pane: its card starts 7 px down.
-        let covered = super::running_readout_covers_live(7.0, bottom);
+        // An agent filling the pane: its card starts 7 px down and runs past
+        // the viewport's bottom.
+        let covered = covers(false, 7.0, 900.0, 600.0, bottom);
         assert!(covered);
         assert_eq!(mode(false, Some(60), covered), M::Hidden);
         // A short command below a few finished blocks keeps its pill.
-        let clear = super::running_readout_covers_live(400.0, bottom);
+        let clear = covers(false, 400.0, 40.0, 600.0, bottom);
         assert!(!clear);
         assert_eq!(mode(false, Some(60), clear), M::Compact);
+        // `sleep 30` as a fresh tab's first command: a short card at the top.
+        let fresh = covers(false, 4.0, 60.0, 600.0, bottom);
+        assert!(!fresh);
+        assert_eq!(mode(false, Some(60), fresh), M::Compact);
+        // Unified's one surface starts at 0 and fills the viewport, and keeps
+        // its pill.
+        assert!(!covers(true, 0.0, 600.0, 600.0, bottom));
         // Too young for the pill, and nothing running.
         assert_eq!(mode(false, Some(1), false), M::Hidden);
         assert_eq!(mode(false, None, false), M::Hidden);
@@ -16133,6 +16442,61 @@ mod tests {
         assert_eq!(zones.snapshot_bytes, 0);
         assert!((1..=3).all(|id| zones.snapshot(id).is_none()));
         assert_eq!(zones.records.len(), 3);
+    }
+
+    #[test]
+    fn a_replayed_card_copies_the_same_text_as_its_record() {
+        // `clear; cat app.log`: CSI H/2J sends the stream through the replay.
+        // A line longer than the screen and a tab must reach the card (its
+        // Copy output, Find and filter read `with_ansi`) the way the record
+        // keeps them, not hard-broken at the PTY width with spaces for tabs.
+        let mut stream = b"\x1b[H\x1b[2J".to_vec();
+        stream.extend(std::iter::repeat_n(b'x', 100));
+        stream.extend_from_slice(b"END\r\na\tb\r\n");
+        let replayed = super::replay_captured_output(&stream, false, (80, 24));
+        assert_eq!(replayed.plain, format!("{}END\na\tb", "x".repeat(100)));
+        assert_eq!(
+            super::strip_ansi(&replayed.with_ansi).replace('\r', ""),
+            replayed.plain
+        );
+    }
+
+    #[test]
+    fn a_card_too_short_for_its_transcript_says_its_head_is_gone() {
+        let cap = super::bounded_finished_vte_max_rows(120);
+        assert!(!super::finished_card_loses_head(false, cap, 120));
+        assert!(super::finished_card_loses_head(false, cap + 1, 120));
+        assert!(super::finished_card_loses_head(true, 10, 120));
+        // 10,000 codex transcript rows at 120 columns do not fit.
+        assert!(super::finished_card_loses_head(false, 10_000, 120));
+    }
+
+    #[test]
+    fn a_zone_snapshot_without_the_journal_replays_a_repainted_stream() {
+        // codex's status line repainted in place, with no jsh journal to
+        // materialize the payload first: the snapshot must read like the
+        // replayed card, not like every frame glued together.
+        let mut stream = Vec::new();
+        for turn in 0..5 {
+            stream.extend_from_slice(format!("\x1b[2;1H\x1b[2KWorking ({turn}s)").as_bytes());
+        }
+        stream.extend_from_slice(b"\x1b[3;1Hdone");
+        let mut ring: VecDeque<u8> = stream.iter().copied().collect();
+        let snapshot =
+            zone_output_snapshot_from_capture(&mut ring, false, (80, 24), MAX_ZONE_SNAPSHOT_BYTES)
+                .expect("a snapshot");
+        assert_eq!(snapshot.plain, "Working (4s)\ndone");
+        assert!(!snapshot.truncated);
+
+        // A plain stream keeps the tail strip.
+        let mut ring: VecDeque<u8> = b"\x1b[1mhello\x1b[0m\r\nworld\r\n"
+            .iter()
+            .copied()
+            .collect();
+        let snapshot =
+            zone_output_snapshot_from_capture(&mut ring, false, (80, 24), MAX_ZONE_SNAPSHOT_BYTES)
+                .expect("a snapshot");
+        assert_eq!(snapshot.plain.replace('\r', ""), "hello\nworld");
     }
 
     #[test]
@@ -17079,6 +17443,9 @@ mod tests {
         user_scrolled_up: Cell<bool>,
         /// Stands in for a VTE behind the backend that answers queries itself.
         answers_queries_natively: Cell<bool>,
+        /// How many times the engine asked the live surface to switch its
+        /// mouse and focus reporting off.
+        reporting_released: Cell<usize>,
     }
 
     impl RecordingBackend {
@@ -17105,6 +17472,7 @@ mod tests {
                 user_scrolled_up: Cell::new(false),
                 admit_probe: RefCell::new(None),
                 answers_queries_natively: Cell::new(false),
+                reporting_released: Cell::new(0),
             })
         }
 
@@ -17214,6 +17582,11 @@ mod tests {
             self.record(DispatchCall::ResetActiveSurface {
                 preserve_scrollback,
             });
+        }
+
+        fn release_live_reporting(&self) {
+            self.reporting_released
+                .set(self.reporting_released.get() + 1);
         }
 
         fn focus_live_deferred(&self) {
@@ -17784,6 +18157,7 @@ mod tests {
                 bracketed_paste_rc: Rc::new(Cell::new(false)),
                 kitty_keyboard_rc: Rc::new(RefCell::new(super::KittyKeyboardStacks::new())),
                 kitty_flags_rc: Rc::new(Cell::new(0)),
+                kitty_pusher_rc: Rc::new(Cell::new(None)),
                 cpr_outstanding_rc: Rc::new(Cell::new(0)),
                 dynamic_colors_rc: Rc::new(Cell::new(DynamicColors::default())),
                 config_for_cb: config.clone(),
@@ -20363,10 +20737,7 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
         ]);
         assert_eq!(
             harness.ctx.mouse_reporting_rc.get(),
-            super::MouseReporting {
-                tracking: super::MouseMode::AnyEvent,
-                encoding: super::MouseEncoding::Sgr,
-            }
+            super::MouseReporting::new(super::MouseMode::AnyEvent, super::MouseEncoding::Sgr)
         );
         // SIGKILL: no `?1003l`, no rmcup; the shell reports 137.
         harness.feed(dispatch_command_end(Some(137)));
@@ -20383,6 +20754,50 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
             harness.ctx.mouse_reporting_rc.get(),
             super::MouseReporting::OFF
         );
+    }
+
+    #[test]
+    fn a_killed_program_has_the_live_surface_switch_its_reporting_off() {
+        // Unified's VTE is never reset, so the shadow alone is not enough: an
+        // inline program with visible output, killed with its modes on, must
+        // have the live surface feed them off at the next prompt.
+        let harness = ReaderHarness::new();
+        harness.backend.render_row(3, "user@host $ htop");
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            dispatch_bytes("user@host $ "),
+            ParserEvent::PromptEnd,
+            dispatch_command_start(Some("htop")),
+            ParserEvent::DecsetMode {
+                mode: 1003,
+                set: true,
+            },
+            ParserEvent::DecsetMode {
+                mode: 1006,
+                set: true,
+            },
+            dispatch_bytes("CPU 12%\r\n"),
+        ]);
+        let before = harness.backend.reporting_released.get();
+        harness.feed(dispatch_command_end(Some(137)));
+        harness.feed(ParserEvent::PromptStart);
+        assert!(harness.backend.reporting_released.get() > before);
+
+        // Out of the alternate screen the command end itself releases them:
+        // leaving that screen does not switch libvte's global modes off.
+        harness.feed_all([
+            dispatch_bytes("user@host $ "),
+            ParserEvent::PromptEnd,
+            dispatch_command_start(Some("claude")),
+            ParserEvent::AltScreenEnter(1049),
+            ParserEvent::DecsetMode {
+                mode: 1003,
+                set: true,
+            },
+        ]);
+        let before = harness.backend.reporting_released.get();
+        harness.feed(dispatch_command_end(Some(137)));
+        assert!(harness.backend.reporting_released.get() > before);
     }
 
     #[test]
@@ -20744,6 +21159,9 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
             (b"\x1b[?2026;4$y", TerminalReport::ModeReport),
             (b"\x1bP>|VTE(7600)\x1b\\", TerminalReport::ControlString),
             (b"\x1b[0n", TerminalReport::StatusReport),
+            // DECXCPR, libvte's answer to `CSI ?6n`: the ledger never counts
+            // that query, so it must be a report with no CPR outstanding.
+            (b"\x1b[?1;1;1R", TerminalReport::CursorPosition),
         ] {
             assert_eq!(
                 route(commit, &cpr, &keys, 1),
@@ -20932,6 +21350,73 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
         harness.feed(ParserEvent::KittyKeyboard(super::KittyKeyboardOp::Push(1)));
         harness.feed(ParserEvent::HardReset);
         assert_eq!(harness.ctx.kitty_flags_rc.get(), 0);
+    }
+
+    #[test]
+    fn raw_fallback_flags_apply_only_to_the_group_that_pushed_them() {
+        use super::{
+            kitty_rewrite_applies, raw_fallback_shell_is_foreground, KittyKey, KittyModifiers,
+            LiveCommit, LiveKeyRecord,
+        };
+        let mut harness = ReaderHarness::new();
+        harness.set_test_foreground(false);
+        harness.pty.set_test_foreground_group(Some(4242));
+        // No OSC 133: the pane is in RawFallback when codex pushes its flags.
+        harness.feed(dispatch_bytes("$ codex\r\n"));
+        assert_eq!(harness.bstate.get(), BlockState::RawFallback);
+        harness.feed(ParserEvent::KittyKeyboard(super::KittyKeyboardOp::Push(7)));
+        assert_eq!(harness.ctx.kitty_flags_rc.get(), 1);
+        assert_eq!(harness.ctx.kitty_pusher_rc.get(), Some(4242));
+
+        let keys = LiveKeyRecord::default();
+        let cpr = Cell::new(0);
+        let ctrl_c = (
+            KittyKey::Unicode('c'),
+            KittyModifiers {
+                ctrl: true,
+                ..KittyModifiers::default()
+            },
+        );
+        let route = |foreground_group: Option<i32>| {
+            keys.record(ctrl_c);
+            super::route_live_commit(b"\x03", &cpr, false, &keys, 1, || {
+                kitty_rewrite_applies(BlockState::RawFallback, || {
+                    raw_fallback_shell_is_foreground(
+                        Some(false),
+                        harness.ctx.kitty_pusher_rc.get(),
+                        || foreground_group,
+                    )
+                })
+            })
+        };
+        // codex still runs: its Ctrl+C is a kitty key.
+        assert_eq!(
+            route(Some(4242)),
+            LiveCommit::Encoded(b"\x1b[99;5u".to_vec())
+        );
+        // codex was killed without popping; `sleep 100` now holds the
+        // terminal and has to get the SIGINT byte.
+        assert_eq!(route(Some(5151)), typed(b"\x03"));
+        assert_eq!(route(None), typed(b"\x03"));
+
+        // The pure rule: the shell or an unknown owner never encodes, and a
+        // pusher whose group was unreadable keeps the plain foreground test.
+        assert_eq!(
+            raw_fallback_shell_is_foreground(Some(true), Some(1), || panic!("not asked")),
+            Some(true)
+        );
+        assert_eq!(
+            raw_fallback_shell_is_foreground(None, Some(1), || panic!("not asked")),
+            None
+        );
+        assert_eq!(
+            raw_fallback_shell_is_foreground(Some(false), None, || panic!("not asked")),
+            Some(false)
+        );
+
+        // Popping the last flags forgets the pusher.
+        harness.feed(ParserEvent::KittyKeyboard(super::KittyKeyboardOp::Pop(1)));
+        assert_eq!(harness.ctx.kitty_pusher_rc.get(), None);
     }
 
     #[test]
@@ -22438,6 +22923,10 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
         // background output (blank command) trumps even a non-zero exit.
         assert!(!super::failed_block_section_visible("cargo test", Some(0)));
         assert!(!super::failed_block_section_visible("cargo test", None));
+        // Ctrl+C / Ctrl+Z / SIGTERM are not failures to fix or explain.
+        assert!(!super::failed_block_section_visible("codex", Some(148)));
+        assert!(!super::failed_block_section_visible("make", Some(130)));
+        assert!(super::failed_block_section_visible("codex", Some(137)));
         assert!(!super::failed_block_section_visible("", Some(1)));
         assert!(!super::failed_block_section_visible("   ", Some(1)));
     }

@@ -254,6 +254,17 @@ fn bell_badges_tab(window_active: bool, pane_is_current: bool) -> bool {
     !window_active || !pane_is_current
 }
 
+/// Body of the bell toast: the foreground program when it is known and may
+/// be named. A private tab passes `None` — its title already hides what runs
+/// there — and so does a probe that found nothing, which must not blame the
+/// shell for a bell it may not have rung.
+fn bell_attention_body(command: Option<&str>) -> String {
+    match command.map(str::trim).filter(|command| !command.is_empty()) {
+        Some(command) => format!("Bell from {command}"),
+        None => "The terminal rang the bell".to_string(),
+    }
+}
+
 /// The tab label an OSC title from the tab's selected pane asks for, or `None`
 /// when a custom label pins it. An empty title is a program resetting what it
 /// set (claude sends `OSC 0 ;` on exit), so the label goes back to the
@@ -2162,14 +2173,15 @@ impl SimpleComponent for AppModel {
                         self.sync_tab_strip();
                     }
                     let now = std::time::Instant::now();
+                    let private = self.tabs[idx].private_title;
                     let pane = &mut self.tabs[idx].panes[pane_index];
                     if notify::bell_should_notify(window_active, pane.last_bell_toast, now) {
                         pane.last_bell_toast = Some(now);
-                        let source = pane
-                            .foreground_process()
-                            .unwrap_or_else(|| "the shell".to_string());
+                        // A private tab hides what runs in it; the toast must
+                        // not name it either.
+                        let command = (!private).then(|| pane.foreground_process()).flatten();
                         let label = self.tabs[idx].display_title();
-                        notify::attention(label, &format!("Bell from {source}"));
+                        notify::attention(label, &bell_attention_body(command.as_deref()));
                     }
                 }
             }
@@ -3132,6 +3144,19 @@ mod organism_focus_tests {
 #[cfg(test)]
 mod bell_and_title_tests {
     use super::*;
+
+    #[test]
+    fn the_bell_toast_names_the_program_only_when_it_may() {
+        assert_eq!(bell_attention_body(Some("codex")), "Bell from codex");
+        assert_eq!(bell_attention_body(Some("  ssh \n")), "Bell from ssh");
+        // A private tab passes no command; an empty probe is not the shell.
+        assert_eq!(bell_attention_body(None), "The terminal rang the bell");
+        assert_eq!(bell_attention_body(Some("")), "The terminal rang the bell");
+        assert_eq!(
+            bell_attention_body(Some("   ")),
+            "The terminal rang the bell"
+        );
+    }
 
     #[test]
     fn a_bell_in_an_inactive_window_badges_even_the_current_tab() {

@@ -635,11 +635,11 @@ impl Component for VteTerminal {
             let sender = sender.clone();
             let term_for_title = terminal.clone();
             terminal.connect_window_title_changed(move |_term| {
+                // An empty title is forwarded too, as the Block view does: it
+                // is a program resetting the title it set (claude sends
+                // `OSC 0 ;` on exit), and the tab falls back to its default.
                 if let Some(title) = term_for_title.window_title() {
-                    let title_str = title.to_string();
-                    if !title_str.is_empty() {
-                        let _ = sender.output(VteOutput::TitleChanged(title_str));
-                    }
+                    let _ = sender.output(VteOutput::TitleChanged(title.to_string()));
                 }
             });
         }

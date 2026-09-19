@@ -463,6 +463,18 @@ const fn is_suspension(exit_code: i32) -> bool {
 
 /// Whether a finished block counts as a failure for the Failed filter,
 /// failure navigation and the scrollbar's failure ticks.
+/// Badge text for a non-zero exit, the same on every surface that shows the
+/// record (a Block card, Unified's zone badge, a cross-block search hit): an
+/// interrupt or a stop reads "interrupted"/"suspended", anything else
+/// [`super::exit_status_badge_text`].
+pub(crate) fn record_exit_badge_text(code: i32) -> String {
+    match interrupt_signal(code) {
+        Some(_) if is_suspension(code) => format!("exit:{code} · suspended"),
+        Some(_) => format!("exit:{code} · interrupted"),
+        None => super::exit_status_badge_text(code),
+    }
+}
+
 pub(crate) fn block_is_failure(resolved_command: &str, reported_exit_code: Option<i32>) -> bool {
     matches!(
         block_status(Some(resolved_command), reported_exit_code),
@@ -493,6 +505,17 @@ pub(crate) fn block_status(
 
 impl BlockStatus {
     /// Left-edge stripe on the block frame.
+    /// Every class [`Self::stripe_class`] can return. A recycled card shell
+    /// removes all of them, so a new status can never be left out of the
+    /// cleanup the way `block-interrupted` once was.
+    const STRIPE_CLASSES: [&'static str; 5] = [
+        "block-background",
+        "block-success",
+        "block-failed",
+        "block-interrupted",
+        "block-unknown",
+    ];
+
     fn stripe_class(self) -> &'static str {
         match self {
             Self::Background => "block-background",
@@ -549,11 +572,7 @@ impl BlockStatus {
     /// so the badge is absent rather than showing a made-up one.
     fn exit_badge(self) -> Option<String> {
         match self {
-            Self::Failed(code) => Some(super::exit_status_badge_text(code)),
-            Self::Interrupted(code) if is_suspension(code) => {
-                Some(format!("exit:{code} · suspended"))
-            }
-            Self::Interrupted(code) => Some(format!("exit:{code} · interrupted")),
+            Self::Failed(code) | Self::Interrupted(code) => Some(record_exit_badge_text(code)),
             _ => None,
         }
     }
@@ -1252,6 +1271,23 @@ fn scroll_target(
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_recycled_card_shell_drops_every_status_stripe() {
+        for status in [
+            BlockStatus::Background,
+            BlockStatus::Succeeded,
+            BlockStatus::Failed(1),
+            BlockStatus::Interrupted(130),
+            BlockStatus::Interrupted(148),
+            BlockStatus::Unreported,
+        ] {
+            assert!(
+                BlockStatus::STRIPE_CLASSES.contains(&status.stripe_class()),
+                "{status:?}"
+            );
+        }
+    }
+
     fn legacy_filter_output_lines(
         full: &str,
         query: &str,
@@ -1392,6 +1428,42 @@ mod tests {
         assert!(block.dynamic_viewport_rows.get() > 0);
         window.close();
         while glib::MainContext::default().iteration(false) {}
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn a_card_built_on_an_interrupted_cards_shell_carries_only_its_own_stripe() {
+        gtk::init().expect("gtk init");
+        let config = Config::safe_defaults();
+        let card = |exit_code, recycled| {
+            FinishedBlock::new_with_pool(
+                1,
+                "$ ",
+                "codex",
+                None,
+                "out",
+                exit_code,
+                &config,
+                None,
+                None,
+                None,
+                80,
+                &[],
+                3,
+                recycled,
+                FinishedBlockPrecomputed::default(),
+            )
+        };
+        let interrupted = card(Some(148), None);
+        let shell = interrupted.widget().clone();
+        assert!(shell.has_css_class("block-interrupted"));
+        drop(interrupted);
+        let succeeded = card(Some(0), Some(shell));
+        let stripes: Vec<_> = BlockStatus::STRIPE_CLASSES
+            .into_iter()
+            .filter(|class| succeeded.widget().has_css_class(class))
+            .collect();
+        assert_eq!(stripes, ["block-success"]);
     }
 
     /// The finished card is a real VTE fed the replay's serialized frame, so
@@ -3458,13 +3530,13 @@ impl FinishedBlock {
             reused.remove_css_class("block-hovered");
             reused.remove_css_class("block-selected");
             reused.remove_css_class("block-selection-active");
-            reused.remove_css_class("block-success");
-            reused.remove_css_class("block-failed");
-            reused.remove_css_class("block-background");
             reused.remove_css_class("block-bookmarked");
             // A pooled widget keeps every class it was last given, so the new
-            // block's status stripe would sit under the recycled one.
-            reused.remove_css_class("block-unknown");
+            // block's status stripe would sit under the recycled one (and a
+            // later rule such as `.block-interrupted` would win over it).
+            for class in BlockStatus::STRIPE_CLASSES {
+                reused.remove_css_class(class);
+            }
             // Same for the lifecycle notice. Only a degraded record sets one,
             // and only as an `if let Some` with no `else`, so a healthy card
             // built on a recycled shell inherited the dead block's explanation
@@ -4686,6 +4758,10 @@ impl FinishedBlock {
     /// dropped its front, or the finish replay evicted its oldest history.
     /// Without it the surviving tail reads as the command's whole transcript.
     /// A collapsed card shows the notice again when it is unfolded.
+    pub(crate) fn output_head_dropped(&self) -> bool {
+        self.output_head_dropped.get()
+    }
+
     pub(crate) fn set_output_head_dropped(&self, dropped: bool) {
         self.output_head_dropped.set(dropped);
         let has_output = !self.full_output.borrow().trim().is_empty();

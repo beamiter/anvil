@@ -454,10 +454,22 @@ fn should_step(outcome: JumpOutcome, requested: bool) -> bool {
     requested && outcome == JumpOutcome::Close
 }
 
+/// CSS class for [`hit_outcome_label`]: an interrupt or a stop is neutral, as
+/// on its card, and only a real failure is painted bad.
+fn hit_outcome_class(exit_code: Option<i32>) -> &'static str {
+    match exit_code {
+        Some(code) if crate::block_view::interrupt_signal(code).is_some() => {
+            "block-status-interrupted"
+        }
+        Some(code) if code != 0 => "block-status-bad",
+        _ => "block-status-ok",
+    }
+}
+
 /// `exit:1 · 2.4s · …/anvil` for one hit, or `None` when the record carried
 /// none of the three.
 ///
-/// The status goes through the same [`crate::block_view::exit_status_badge_text`]
+/// The status goes through the same [`crate::block_view::record_exit_badge_text`]
 /// the two block backends paint, because this row and those cards describe the
 /// same record: a search summary reading `exit:137` beside a Block card reading
 /// `exit:137 SIGKILL` is the terminal telling a user two things about one
@@ -467,7 +479,7 @@ fn hit_outcome_label(hit: &CrossBlockHit) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     match hit.exit_code {
         Some(0) => {}
-        Some(code) => parts.push(crate::block_view::exit_status_badge_text(code)),
+        Some(code) => parts.push(crate::block_view::record_exit_badge_text(code)),
         None => {}
     }
     if let Some(duration) = hit.duration_ms {
@@ -853,11 +865,7 @@ pub(super) fn toggle(
                         // from the passing ones should not require visiting each.
                         if let Some(outcome) = hit_outcome_label(hit) {
                             let label = gtk::Label::new(Some(&outcome));
-                            label.add_css_class(if hit.exit_code.is_some_and(|code| code != 0) {
-                                "block-status-bad"
-                            } else {
-                                "block-status-ok"
-                            });
+                            label.add_css_class(hit_outcome_class(hit.exit_code));
                             label.set_valign(gtk::Align::Center);
                             row.add_suffix(&label);
                         }
@@ -1477,13 +1485,13 @@ pub(super) fn toggle(
 mod tests {
     use super::{
         bookmark_action_label, bookmark_change_status, dialog_toggle_plan, enter_key_route,
-        focus_confirms_result, has_search_intent, hit_outcome_label, idle_status,
-        is_plain_refresh_key, is_selected_bookmark_key, jump_outcome, memory, query_error,
-        refresh_selection_index, refresh_status, search_status, selection_index, should_step,
-        BookmarkKeyLatch, BookmarkKeyPress, CrossBlockHit, DialogTogglePlan, EnterKeyRoute,
-        JumpOutcome, RecordNavigationResult, RefreshKeyLatch, RefreshKeyPress, RefreshTickSlot,
-        SelectionAnchor, SelectionMove, CROSS_BLOCK_SEARCH_DEBOUNCE, CROSS_BLOCK_SEARCH_LIMIT,
-        CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
+        focus_confirms_result, has_search_intent, hit_outcome_class, hit_outcome_label,
+        idle_status, is_plain_refresh_key, is_selected_bookmark_key, jump_outcome, memory,
+        query_error, refresh_selection_index, refresh_status, search_status, selection_index,
+        should_step, BookmarkKeyLatch, BookmarkKeyPress, CrossBlockHit, DialogTogglePlan,
+        EnterKeyRoute, JumpOutcome, RecordNavigationResult, RefreshKeyLatch, RefreshKeyPress,
+        RefreshTickSlot, SelectionAnchor, SelectionMove, CROSS_BLOCK_SEARCH_DEBOUNCE,
+        CROSS_BLOCK_SEARCH_LIMIT, CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
     };
     use crate::block_view::{CrossBlockSearchOptions, CrossBlockSearchScope};
 
@@ -1540,11 +1548,21 @@ mod tests {
             hit_outcome_label(&hit(Some(137), Some(2_400), None)).as_deref(),
             Some("exit:137 SIGKILL · 2.4s")
         );
+        // Ctrl+C and Ctrl+Z read as on the card, and are not painted as a
+        // failure.
         assert_eq!(
             hit_outcome_label(&hit(Some(130), None, None)).as_deref(),
-            Some("exit:130 SIGINT"),
-            "the Ctrl-C a user pressed is the answer to \"why did this stop\""
+            Some("exit:130 · interrupted")
         );
+        assert_eq!(
+            hit_outcome_label(&hit(Some(148), None, None)).as_deref(),
+            Some("exit:148 · suspended")
+        );
+        assert_eq!(hit_outcome_class(Some(148)), "block-status-interrupted");
+        assert_eq!(hit_outcome_class(Some(130)), "block-status-interrupted");
+        assert_eq!(hit_outcome_class(Some(137)), "block-status-bad");
+        assert_eq!(hit_outcome_class(Some(0)), "block-status-ok");
+        assert_eq!(hit_outcome_class(None), "block-status-ok");
         // An ordinary failure is unchanged: only `128 + n` names a signal.
         assert_eq!(
             hit_outcome_label(&hit(Some(1), None, None)).as_deref(),

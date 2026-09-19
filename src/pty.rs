@@ -61,6 +61,9 @@ pub struct OwnedPty {
     /// answer the real `tcgetpgrp` probe.
     #[cfg(test)]
     test_foreground: Option<bool>,
+    /// Recorded foreground process group for a bare test PTY (0 = unknown).
+    #[cfg(test)]
+    test_foreground_group: std::sync::atomic::AtomicI32,
 }
 
 #[cfg(target_os = "linux")]
@@ -908,6 +911,8 @@ impl OwnedPty {
                     test_slave: None,
                     #[cfg(test)]
                     test_foreground: None,
+                    #[cfg(test)]
+                    test_foreground_group: std::sync::atomic::AtomicI32::new(0),
                 })
             }
             Err(e) => Err(io::Error::other(e)),
@@ -949,6 +954,31 @@ impl OwnedPty {
         let foreground = unsafe { libc::tcgetpgrp(fd) };
         let shell_group = unsafe { libc::getpgid(self.child_lifecycle.pid()) };
         (foreground > 0 && shell_group > 0).then_some(foreground == shell_group)
+    }
+
+    /// The PTY's foreground process group, whoever it is. `None` when the
+    /// probe is unavailable (Flatpak host bridging, a closed master).
+    pub(crate) fn foreground_group(&self) -> Option<i32> {
+        #[cfg(test)]
+        if self.test_slave.is_some() {
+            let group = self.test_foreground_group.load(Ordering::Relaxed);
+            return (group > 0).then_some(group);
+        }
+        if !self.foreground_identity_available {
+            return None;
+        }
+        let fd = self.master_fd_raw();
+        if fd < 0 {
+            return None;
+        }
+        let foreground = unsafe { libc::tcgetpgrp(fd) };
+        (foreground > 0).then_some(foreground)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_foreground_group(&self, group: Option<i32>) {
+        self.test_foreground_group
+            .store(group.unwrap_or(0), Ordering::Relaxed);
     }
 
     /// Keep the outgoing paste boundary in sync with parser-observed resets.
@@ -1467,6 +1497,7 @@ impl OwnedPty {
             shell_integration_token: None,
             test_slave: Some(slave),
             test_foreground: foreground,
+            test_foreground_group: std::sync::atomic::AtomicI32::new(0),
         })
     }
 

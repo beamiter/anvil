@@ -29,8 +29,15 @@ pub use super::vte::{VteInit, VteInput, VteOutput};
 /// Only a status the shell actually reported can be a failure. `None` — a shell
 /// that emits bare OSC 133 marks — used to arrive here as `0` and be styled as a
 /// success; it is now styled as plain activity, which claims neither outcome.
+///
+/// An interrupt or a stop (130, 141, 143, 148 — Ctrl+C, a closed pipe, a
+/// kill, Ctrl+Z) is not a failure either: the card reads it as interrupted
+/// with a neutral stripe, and badging the tab like a crash would cry wolf.
 fn command_finished_output(exit_code: Option<i32>) -> VteOutput {
-    VteOutput::CommandFinished(exit_code.is_none_or(|code| code == 0))
+    VteOutput::CommandFinished(
+        exit_code
+            .is_none_or(|code| code == 0 || crate::block_view::interrupt_signal(code).is_some()),
+    )
 }
 
 /// Toast text for a session-export attempt.
@@ -151,6 +158,31 @@ fn block_result_status(result: FindSearchResult, use_regex: bool) -> SearchStatu
         FindSearchResult::InvalidRegex => SearchStatus::Error("Invalid regex".to_string()),
         FindSearchResult::ScanLimit => SearchStatus::partial_results(0, 0),
         FindSearchResult::Matches(progress) => progress_status(progress, use_regex),
+    }
+}
+
+/// What a Find Next/Previous does, given where the last search ran and the
+/// pane's scope now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FindStep {
+    /// Step the live screen's native search.
+    Native,
+    /// Search again in the pane's current scope: the scope changed under a
+    /// Find left open, or it had nothing to step through when an
+    /// alternate-screen app took the pane over.
+    Rescope,
+    /// Step the block hits.
+    Blocks,
+}
+
+fn find_step(search_live: bool, live_now: bool, block_hits: bool, has_query: bool) -> FindStep {
+    match (search_live, live_now) {
+        (true, true) => FindStep::Native,
+        (true, false) => FindStep::Rescope,
+        // No block hits to step (none found, an error, idle): stepping them
+        // would do nothing, so a query left open searches the app's screen.
+        (false, true) if !block_hits && has_query => FindStep::Rescope,
+        (false, _) => FindStep::Blocks,
     }
 }
 
@@ -677,7 +709,17 @@ impl Component for BlockTerminal {
                     -1
                 };
                 let live_now = view.find_scope() == FindScope::LiveScreen;
-                if self.search_live && live_now {
+                let active = matches!(
+                    self.search_status,
+                    SearchStatus::Results { total, .. } if total > 0
+                );
+                let plan = find_step(
+                    self.search_live,
+                    live_now,
+                    active,
+                    self.search_query.is_some(),
+                );
+                if plan == FindStep::Native {
                     // The alternate-screen app's screen, searched natively.
                     let found = if step > 0 {
                         view.vte().search_find_next()
@@ -685,8 +727,9 @@ impl Component for BlockTerminal {
                         view.vte().search_find_previous()
                     };
                     self.search_status = self.search_status.stepped(step, found);
-                } else if self.search_live {
-                    // The app left and the blocks are back: search them.
+                } else if plan == FindStep::Rescope {
+                    // The app left and the blocks are back, or it arrived while
+                    // the blocks had nothing to step: search the pane's scope.
                     self.search_status = self.search_query.as_ref().map_or_else(
                         || SearchStatus::results(0, 0),
                         |(query, use_regex)| {
@@ -696,10 +739,6 @@ impl Component for BlockTerminal {
                         },
                     );
                 } else {
-                    let active = matches!(
-                        self.search_status,
-                        SearchStatus::Results { total, .. } if total > 0
-                    );
                     let partial = matches!(
                         self.search_status,
                         SearchStatus::Results {
@@ -765,9 +804,9 @@ impl Component for BlockTerminal {
 #[cfg(test)]
 mod tests {
     use super::{
-        block_navigation_status, block_result_status, command_finished_output,
+        block_navigation_status, block_result_status, command_finished_output, find_step,
         record_navigation_notice, validate_block_search_pattern, FindNavigationResult,
-        FindProgress, FindSearchResult, RecordNavigationResult, VteOutput,
+        FindProgress, FindSearchResult, FindStep, RecordNavigationResult, VteOutput,
     };
     use crate::search::SearchStatus;
 
@@ -785,12 +824,40 @@ mod tests {
             command_finished_output(Some(-1)),
             VteOutput::CommandFinished(false)
         ));
+        // Ctrl+C, a SIGTERM and Ctrl+Z read as activity, a SIGKILL as a failure.
+        for code in [130, 143, 148] {
+            assert!(
+                matches!(
+                    command_finished_output(Some(code)),
+                    VteOutput::CommandFinished(true)
+                ),
+                "{code}"
+            );
+        }
+        assert!(matches!(
+            command_finished_output(Some(137)),
+            VteOutput::CommandFinished(false)
+        ));
         // New case: the shell reported no status. Styling the tab as a failure
         // would claim an outcome nothing observed, so it reads as activity.
         assert!(matches!(
             command_finished_output(None),
             VteOutput::CommandFinished(true)
         ));
+    }
+
+    #[test]
+    fn a_find_with_nothing_to_step_moves_to_an_alternate_screen_app() {
+        // Opened at the prompt with no block hits, then opencode took over:
+        // Next searches its screen instead of stepping nothing.
+        assert_eq!(find_step(false, true, false, true), FindStep::Rescope);
+        // Block hits still step (their pass rebuilds itself once invalidated).
+        assert_eq!(find_step(false, true, true, true), FindStep::Blocks);
+        assert_eq!(find_step(false, false, false, true), FindStep::Blocks);
+        // Without a query there is nothing to search again.
+        assert_eq!(find_step(false, true, false, false), FindStep::Blocks);
+        assert_eq!(find_step(true, true, false, true), FindStep::Native);
+        assert_eq!(find_step(true, false, true, true), FindStep::Rescope);
     }
 
     #[test]

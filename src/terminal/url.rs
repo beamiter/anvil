@@ -67,17 +67,25 @@ fn first_openable_link(candidates: impl IntoIterator<Item = Option<String>>) -> 
 
 /// The link a Ctrl+click at (`x`, `y`) opens on a VTE, in widget coordinates.
 ///
-/// The URL regex comes first, so a label that reads as a URL opens what it
-/// shows. Then the OSC 8 target: claude writes its links that way, with a
-/// label such as "Security guide" that no regex can match, so a regex-only
-/// click never opened them although VTE underlined them on hover.
+/// The OSC 8 target comes first: claude writes its links that way, with a
+/// label such as "Security guide" that no regex can match, and the hover
+/// tooltip names that target (see [`show_hyperlink_target_on_hover`]), so
+/// the click must open exactly what the tooltip said — not a URL-looking
+/// label's prefix (`https://github.com/org/…/pull/123` matches only up to
+/// the ellipsis). Plain-text URLs without OSC 8 go through the regex.
 pub(crate) fn openable_link_at(terminal: &vte4::Terminal, x: f64, y: f64) -> Option<String> {
     use vte4::TerminalExt;
 
-    first_openable_link([
-        terminal.check_match_at(x, y).0.map(|uri| uri.to_string()),
+    link_to_open(
         terminal.check_hyperlink_at(x, y).map(|uri| uri.to_string()),
-    ])
+        terminal.check_match_at(x, y).0.map(|uri| uri.to_string()),
+    )
+}
+
+/// [`openable_link_at`]'s order: the cell's OSC 8 target, then the regex
+/// match on its visible text.
+fn link_to_open(hyperlink: Option<String>, regex_match: Option<String>) -> Option<String> {
+    first_openable_link([hyperlink, regex_match])
 }
 
 /// Tooltip naming an OSC 8 link's target. The label is chosen by the program
@@ -289,7 +297,7 @@ pub fn attach_url_handlers(view: &gtk::TextView) {
 
 #[cfg(test)]
 mod tests {
-    use super::{first_openable_link, is_openable_url};
+    use super::{first_openable_link, is_openable_url, link_to_open};
 
     #[test]
     fn a_click_opens_the_first_link_the_policy_accepts() {
@@ -299,12 +307,30 @@ mod tests {
             first_openable_link([None, some("https://code.claude.com/docs/en/security")]),
             some("https://code.claude.com/docs/en/security")
         );
-        // A URL-looking label opens what it shows.
+        // An elided URL label matches the regex only up to the ellipsis; the
+        // click opens the OSC 8 target the hover tooltip names.
         assert_eq!(
-            first_openable_link([
-                some("https://shown.example/"),
-                some("https://target.example/")
-            ]),
+            link_to_open(
+                some("https://github.com/org/repo/pull/123"),
+                some("https://github.com/org/")
+            ),
+            some("https://github.com/org/repo/pull/123")
+        );
+        // A label that is a different URL: the tooltip's target, again.
+        assert_eq!(
+            link_to_open(
+                some("https://target.example/"),
+                some("https://shown.example/")
+            ),
+            some("https://target.example/")
+        );
+        // No OSC 8 target, or a refused one: the visible URL.
+        assert_eq!(
+            link_to_open(None, some("https://shown.example/")),
+            some("https://shown.example/")
+        );
+        assert_eq!(
+            link_to_open(some("file:///etc/passwd"), some("https://shown.example/")),
             some("https://shown.example/")
         );
         // A refused regex match does not hide the OSC 8 target beneath it.

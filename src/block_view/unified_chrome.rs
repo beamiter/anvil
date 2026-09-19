@@ -119,7 +119,7 @@ impl ZoneChromeRecord {
         } else {
             match self.exit_code {
                 Some(0) => "✓".to_owned(),
-                Some(code) => super::exit_status_badge_text(code),
+                Some(code) => super::record_exit_badge_text(code),
                 None => "exit:?".to_owned(),
             }
         };
@@ -192,6 +192,8 @@ struct ChromeColors {
     warning: gtk::gdk::RGBA,
     accent: gtk::gdk::RGBA,
     info: gtk::gdk::RGBA,
+    /// Interrupted and stopped commands: neither a success nor a failure.
+    muted: gtk::gdk::RGBA,
 }
 
 impl ChromeColors {
@@ -202,6 +204,7 @@ impl ChromeColors {
             warning: config.palette[3],
             accent: config.palette[6],
             info: config.palette[4],
+            muted: config.palette[8],
         }
     }
 }
@@ -1312,6 +1315,7 @@ impl UnifiedChrome {
                 } else {
                     match record.exit_code {
                         Some(0) => colors.success,
+                        Some(code) if super::interrupt_signal(code).is_some() => colors.muted,
                         Some(_) => colors.error,
                         None => colors.warning,
                     }
