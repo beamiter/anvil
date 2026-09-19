@@ -643,6 +643,43 @@ versioning for tagged releases while it remains experimental.
 
 ### Fixed
 
+- **Scrolling up while an agent streams stays where you put it.** Only the
+  mouse wheel recorded that the user had left the bottom. A scrollbar drag,
+  Page Up, a find match or a bookmark jump into the last few finished blocks
+  was undone within a frame: the scroll lock waited for the live card to leave
+  the viewport, which an agent's full-page card never did, and its next repaint
+  pinned the view back to the bottom. Every scroll of the user's own now sets
+  the lock at once, and a later layout pass keeps it until the view is back at
+  the bottom.
+- **The running pill no longer covers an agent's first rows.** Once an inline
+  agent's card filled the pane, the elapsed-time pill sat over the right-hand
+  cells of its top two rows for the whole session. It now hides while it would
+  overlap the live card's top edge; the full bar with Stop still appears when
+  the history is scrolled up.
+- **A block selection no longer holds a running program's keys.** Clicking a
+  finished card while claude or codex ran left the card selected, and until a
+  printable key cleared it the arrows walked the cards instead of the agent's
+  menu and every Enter was refused with a bell. While a command runs the plain
+  arrows now clear the selection and reach the program, and a refused Enter
+  clears it so only one keystroke is lost; Escape still leaves selection mode.
+  A card's header buttons (Copy command, Copy output, …) no longer select the
+  card or take keyboard focus when clicked.
+- **Links in a running command can be opened.** The live card had no Ctrl+click
+  handler at all, and every Ctrl+click site matched only the URL regex, so
+  claude's OSC 8 links, whose label reads "Security guide" rather than a URL,
+  underlined on hover and opened nothing. Ctrl+click now opens the regex match
+  or else the OSC 8 target, in the live card, finished cards and the plain
+  terminal, through the same HTTP(S)-only policy as before, and hovering an
+  OSC 8 link shows its target.
+- **Any file or folder can be dropped on a pane.** Drag-and-drop accepted only
+  images ("Image drop rejected: unsupported image type" for a source file, log
+  or directory) and typed the path as keystrokes. Any existing path is now
+  accepted with the same quoting and hidden-text checks, and in Block mode it
+  is pasted, framed as a bracketed paste when the program asked for one, so an
+  agent receives it as the paste it is. A refusal reads "Drop rejected: …".
+- The selection hold's tooltip no longer promises that output resumes after a
+  few seconds. The hold lasts until the selection is copied, the user types or
+  clicks elsewhere; a timer would let the next repaint wipe the selection.
 - **Entering or leaving the alternate screen no longer resizes the program.**
   A Block card went full-bleed for an alternate-screen app, which changed the
   winsize by a row at once and by two columns a frame later. codex answers any

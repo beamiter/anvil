@@ -53,6 +53,62 @@ pub fn open_uri(uri: &str) {
     }
 }
 
+/// The first candidate the opener would accept, in the order given.
+///
+/// Each candidate is checked on its own: a regex match that fails the policy
+/// must not hide an OSC 8 target under the same cell, and a refused OSC 8
+/// target (Unified's own zone markers, a `file:` link) is never opened.
+fn first_openable_link(candidates: impl IntoIterator<Item = Option<String>>) -> Option<String> {
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|uri| is_openable_url(uri))
+}
+
+/// The link a Ctrl+click at (`x`, `y`) opens on a VTE, in widget coordinates.
+///
+/// The URL regex comes first, so a label that reads as a URL opens what it
+/// shows. Then the OSC 8 target: claude writes its links that way, with a
+/// label such as "Security guide" that no regex can match, so a regex-only
+/// click never opened them although VTE underlined them on hover.
+pub(crate) fn openable_link_at(terminal: &vte4::Terminal, x: f64, y: f64) -> Option<String> {
+    use vte4::TerminalExt;
+
+    first_openable_link([
+        terminal.check_match_at(x, y).0.map(|uri| uri.to_string()),
+        terminal.check_hyperlink_at(x, y).map(|uri| uri.to_string()),
+    ])
+}
+
+/// Tooltip naming an OSC 8 link's target. The label is chosen by the program
+/// and can read as anything, so hover shows where a click would really go.
+fn hyperlink_tooltip(uri: &str) -> String {
+    format!("{uri}\nCtrl+click to open")
+}
+
+/// Show the target of the OSC 8 link under the pointer as the VTE's tooltip.
+/// Only a target the opener would accept is shown, and the tooltip is cleared
+/// only when this handler set it.
+pub(crate) fn show_hyperlink_target_on_hover(terminal: &vte4::Terminal) {
+    use vte4::TerminalExt;
+
+    let shown = std::rc::Rc::new(std::cell::Cell::new(false));
+    terminal.connect_hyperlink_hover_uri_notify(move |terminal| {
+        let target = terminal
+            .hyperlink_hover_uri()
+            .map(|uri| uri.to_string())
+            .filter(|uri| is_openable_url(uri));
+        match target {
+            Some(uri) => {
+                terminal.set_tooltip_text(Some(&hyperlink_tooltip(&uri)));
+                shown.set(true);
+            }
+            None if shown.replace(false) => terminal.set_tooltip_text(None),
+            None => {}
+        }
+    });
+}
+
 pub(crate) fn osc8_uri(tag: &gtk::TextTag) -> Option<String> {
     // The String is owned by the tag and lives for exactly as long as it does.
     unsafe {
@@ -233,7 +289,85 @@ pub fn attach_url_handlers(view: &gtk::TextView) {
 
 #[cfg(test)]
 mod tests {
-    use super::is_openable_url;
+    use super::{first_openable_link, is_openable_url};
+
+    #[test]
+    fn a_click_opens_the_first_link_the_policy_accepts() {
+        let some = |uri: &str| Some(uri.to_string());
+        // claude's OSC 8 label is not a URL: only the target matches.
+        assert_eq!(
+            first_openable_link([None, some("https://code.claude.com/docs/en/security")]),
+            some("https://code.claude.com/docs/en/security")
+        );
+        // A URL-looking label opens what it shows.
+        assert_eq!(
+            first_openable_link([
+                some("https://shown.example/"),
+                some("https://target.example/")
+            ]),
+            some("https://shown.example/")
+        );
+        // A refused regex match does not hide the OSC 8 target beneath it.
+        assert_eq!(
+            first_openable_link([some("ftp://example.com/x"), some("https://example.com/x")]),
+            some("https://example.com/x")
+        );
+        for refused in [
+            "javascript:alert(1)",
+            "file:///home/u/x.rs",
+            "file://otherhost/etc/passwd",
+            "block://0123abcd/zone/7",
+        ] {
+            assert_eq!(
+                first_openable_link([None, some(refused)]),
+                None,
+                "{refused}"
+            );
+        }
+        assert_eq!(first_openable_link([None, None]), None);
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn a_real_vte_opens_an_osc8_link_whose_label_is_not_a_url() {
+        use gtk::prelude::*;
+        use relm4::gtk;
+        use std::time::{Duration, Instant};
+        use vte4::TerminalExt;
+
+        gtk::init().expect("gtk init");
+        let terminal = vte4::Terminal::new();
+        terminal.set_allow_hyperlink(true);
+        terminal.set_size(40, 3);
+        let window = gtk::Window::new();
+        window.set_child(Some(&terminal));
+        window.present();
+        terminal.feed(b"\x1b]8;id=a;https://example.com/x\x07Security guide\x1b]8;;\x07 plain");
+        let context = gtk::glib::MainContext::default();
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_millis(200) {
+            while context.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        let cell_w = terminal.char_width().max(1) as f64;
+        let cell_h = terminal.char_height().max(1) as f64;
+        let (left, top) = gtk::prelude::ScrollableExt::border(&terminal)
+            .map_or((0.0, 0.0), |border| {
+                (f64::from(border.left()), f64::from(border.top()))
+            });
+        let at = |column: f64| {
+            super::openable_link_at(
+                &terminal,
+                left + (column + 0.5) * cell_w,
+                top + 0.5 * cell_h,
+            )
+        };
+        assert_eq!(at(3.0).as_deref(), Some("https://example.com/x"));
+        assert_eq!(at(20.0), None, "plain text after the link opens nothing");
+        window.close();
+        while context.iteration(false) {}
+    }
 
     #[test]
     fn uri_policy_is_the_shared_family_opener_contract() {

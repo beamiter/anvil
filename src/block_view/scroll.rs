@@ -20,6 +20,34 @@ fn scroll_value_changed(current: f64, target: f64) -> bool {
     (current - target).abs() > SCROLL_EPSILON_PX
 }
 
+/// The outer history's bottom scroll position: the value that follows the live
+/// prompt.
+fn bottom_value(adjustment: &gtk::Adjustment) -> f64 {
+    (adjustment.upper() - adjustment.page_size()).max(adjustment.lower())
+}
+
+/// Whether the history is scrolled away from its bottom, read straight from the
+/// adjustment. This is the scroll lock a user's own move sets at once: a
+/// scrollbar drag, a find or bookmark jump, Page Up or a wheel notch.
+pub(crate) fn scrolled_away_from_bottom(adjustment: &gtk::Adjustment) -> bool {
+    scroll_value_changed(adjustment.value(), bottom_value(adjustment))
+}
+
+/// The scroll lock after the deferred geometric probe has run.
+///
+/// `holder_visible` is the probe's own reading: the live card's top is still
+/// inside the viewport. On its own that reading only says "scrolled up" once
+/// the view has left the whole card behind — and an agent's card is a full
+/// viewport, so a scrollbar drag or a find jump into the last few finished
+/// blocks never got there, and the next repaint's follow-bottom pin snapped
+/// the view back within a frame. So the probe may still set the lock, and it
+/// keeps a lock the user's move already set while the adjustment is off the
+/// bottom. It never creates one from the value alone: `upper` can grow between
+/// the event and the idle, and that drift is not the user leaving the bottom.
+pub(crate) fn next_scroll_lock(prev: bool, holder_visible: bool, value: f64, bottom: f64) -> bool {
+    !holder_visible || (prev && scroll_value_changed(value, bottom))
+}
+
 fn next_stable_frame_count(last_target: Option<f64>, target: f64, current: u8) -> u8 {
     match last_target {
         Some(last) if !scroll_value_changed(last, target) => current.saturating_add(1),
@@ -193,10 +221,8 @@ impl ScrollDebouncer {
     /// Reading the adjustment we just wrote settles it in one step, and a notch
     /// that lands back at the bottom clears the flag again.
     pub(crate) fn record_wheel_intent(&self, scroll: &ScrolledWindow) {
-        let adjustment = scroll.vadjustment();
-        let bottom = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
         self.user_scrolled_up
-            .set(scroll_value_changed(adjustment.value(), bottom));
+            .set(scrolled_away_from_bottom(&scroll.vadjustment()));
     }
 
     pub(crate) fn reset_scroll_lock(&self) {
@@ -284,6 +310,31 @@ mod tests {
     fn ignores_subpixel_scroll_churn() {
         assert!(!scroll_value_changed(100.0, 100.4));
         assert!(scroll_value_changed(100.0, 100.6));
+    }
+
+    #[test]
+    fn a_user_scroll_shorter_than_the_live_card_keeps_the_lock() {
+        let bottom = 5000.0;
+        // A drag or find jump 200 px up, with the live card still on screen:
+        // the lock the move set survives the probe.
+        assert!(next_scroll_lock(true, true, bottom - 200.0, bottom));
+        // The probe never creates a lock from the value alone.
+        assert!(!next_scroll_lock(false, true, bottom - 200.0, bottom));
+        // Back at the bottom the lock clears, whoever set it.
+        assert!(!next_scroll_lock(true, true, bottom, bottom));
+        assert!(!next_scroll_lock(true, true, bottom - 0.3, bottom));
+        // The live card has left the viewport: scrolled up, as before.
+        assert!(next_scroll_lock(false, false, bottom - 2000.0, bottom));
+        assert!(next_scroll_lock(true, false, bottom - 2000.0, bottom));
+    }
+
+    #[test]
+    fn a_kept_scroll_lock_refuses_the_follow_bottom_pin() {
+        let active = Cell::new(false);
+        let generation = Cell::new(0u64);
+        let locked = next_scroll_lock(true, true, 4800.0, 5000.0);
+        assert!(!request_bottom_pin(locked, &active, &generation));
+        assert!(!active.get());
     }
 
     #[test]

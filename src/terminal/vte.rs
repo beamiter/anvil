@@ -183,8 +183,11 @@ pub(crate) fn default_tab_title(tab_index_1based: u32, working_directory: Option
     format!("{prefix}{}", out_parts.join("/"))
 }
 
-/// Ctrl+Click on a hyperlink opens it; other clicks pass through to VTE selection.
+/// Ctrl+Click on a link opens it — a URL the regex matches or an OSC 8 target
+/// the opener accepts; other clicks pass through to VTE selection and to a
+/// program's mouse reporting. Hovering an OSC 8 link shows its target.
 pub(crate) fn setup_terminal_click_handler(terminal: &Terminal) {
+    super::url::show_hyperlink_target_on_hover(terminal);
     let click_controller = GestureClick::new();
     click_controller.set_button(GDK_BUTTON_PRIMARY as u32);
     click_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -193,7 +196,7 @@ pub(crate) fn setup_terminal_click_handler(terminal: &Terminal) {
         if n_press == 1 {
             let state = controller.current_event_state();
             if state.contains(ModifierType::CONTROL_MASK) {
-                if let Some(uri) = terminal_clone.check_match_at(x, y).0 {
+                if let Some(uri) = super::url::openable_link_at(&terminal_clone, x, y) {
                     super::url::open_uri(&uri);
                     controller.set_state(gtk::EventSequenceState::Claimed);
                     return;
@@ -405,6 +408,10 @@ pub struct PaneProbe {
 #[derive(Debug)]
 pub enum VteInput {
     WriteInput(Vec<u8>),
+    /// Text inserted the way a clipboard paste is: bracketed when the
+    /// foreground program enabled bracketed paste (Block mode). A dropped
+    /// file's quoted path arrives this way.
+    PasteText(String),
     /// Block-mode only: atomically re-check a clean prompt, arm the local
     /// Agent execution identity, and submit the reviewed command.
     RunAgentCommand {
@@ -684,6 +691,8 @@ impl Component for VteTerminal {
     fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>, _root: &Self::Root) {
         match msg {
             VteInput::WriteInput(data) => self.terminal.feed_child(&data),
+            // The plain VTE keeps its drop on the write path it always used.
+            VteInput::PasteText(text) => self.terminal.feed_child(text.as_bytes()),
             VteInput::RunAgentCommand { execution, .. } => {
                 let _ = sender.output(VteOutput::AgentExecutionStartFailed { execution });
             }

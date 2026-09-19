@@ -727,6 +727,24 @@ fn selection_owns_key(has_selection: bool, keyval: gtk::gdk::Key) -> bool {
         )
 }
 
+/// A block selection made while a command runs — a header click to copy a
+/// card, say — must not keep the running program's own keys. The arrows walk
+/// an agent's menus and history, and Delete edits its composer; while the
+/// selection held them, a permission prompt could not be answered until a
+/// printable key happened to clear it. These keys clear the selection and
+/// reach the program. Enter stays with the selection (it is the visible
+/// recall action, and a refusal must not leak into the program), and so does
+/// Escape, the documented way out of selection mode.
+fn selection_yields_to_running_app(state: BlockState, keyval: gtk::gdk::Key) -> bool {
+    use gtk::gdk::Key;
+
+    state == BlockState::CollectingOutput
+        && matches!(
+            keyval,
+            Key::Up | Key::Down | Key::KP_Up | Key::KP_Down | Key::Delete | Key::KP_Delete
+        )
+}
+
 /// Ctrl+Enter belongs to Block selection mode independently of whether its
 /// fail-closed re-run checks later admit execution. A refused chord must never
 /// fall through to VTE and submit unrelated editor contents.
@@ -1300,6 +1318,53 @@ fn build_clipboard_paste(text: &str, bracketed_paste: bool) -> pty_input::Paste 
         },
         pty_input::PastePolicy::clipboard(pty_input::UnbracketedMultiline::FirstLineOnly),
     )
+}
+
+/// What a paste needs once its text is in hand. The clipboard read is
+/// asynchronous, so this owns its handles instead of borrowing the view.
+struct PasteSink {
+    pty: Rc<OwnedPty>,
+    bracketed_paste: Rc<Cell<bool>>,
+    bstate: Rc<Cell<BlockState>>,
+    typed_cmd: Rc<RefCell<String>>,
+    armed_agent_execution: Rc<RefCell<Option<ArmedAgentExecution>>>,
+    reviewed_submission: Rc<RefCell<Option<ReviewedSubmission>>>,
+    pty_synced: Rc<Cell<bool>>,
+    idle_input_dirty: Rc<Cell<bool>>,
+    human_input: HumanInputCallbacks,
+}
+
+impl PasteSink {
+    fn deliver(&self, text: &str) {
+        if self.armed_agent_execution.borrow().is_some()
+            || self.reviewed_submission.borrow().is_some()
+        {
+            log::warn!("Ignoring paste while a reviewed command submission is pending");
+            return;
+        }
+        let paste = build_clipboard_paste(text, self.bracketed_paste.get());
+        if paste.is_empty() {
+            return;
+        }
+        if paste.risk.had_embedded_paste_marker {
+            log::warn!(
+                "Removed a bracketed-paste marker from pasted text before writing it to the shell"
+            );
+        }
+        self.pty.write_bytes(&paste.bytes);
+        emit_human_input(&self.human_input, HumanInputKind::Clipboard);
+        // Mirror what the child actually received into the editor shadow, or
+        // the live input cell keeps the height of a command the shell no
+        // longer has and the next history recall appends to a line it thinks
+        // is empty.
+        record_external_input(
+            self.bstate.get(),
+            &paste.echo_text,
+            &self.typed_cmd,
+            &self.pty_synced,
+            &self.idle_input_dirty,
+        );
+    }
 }
 
 /// Encode a finished command for insertion at the live prompt.
@@ -2728,6 +2793,25 @@ fn scroll_selected_finished_block_edge(
 /// Shift-click selects a contiguous range, and Ctrl+Shift-click toggles a block.
 /// Modifier clicks work across the card; plain clicks remain header-only so VTE
 /// output keeps native text selection.
+/// Whether a press at (`x`, `y`) in `card`'s coordinates lands on a button
+/// inside the card's header row.
+fn press_lands_on_header_button(card: &gtk::Widget, header_row: &gtk::Box, x: f64, y: f64) -> bool {
+    let header: &gtk::Widget = header_row.upcast_ref();
+    let mut current = card.pick(x, y, gtk::PickFlags::DEFAULT);
+    let mut on_button = false;
+    while let Some(widget) = current {
+        if widget == *header {
+            return on_button;
+        }
+        if widget == *card {
+            return false;
+        }
+        on_button |= widget.is::<gtk::Button>();
+        current = widget.parent();
+    }
+    false
+}
+
 fn install_finished_block_selection(
     block: &FinishedBlock,
     active: &Rc<RefCell<ActiveBlock>>,
@@ -2746,8 +2830,18 @@ fn install_finished_block_selection(
     let left_click = gtk::GestureClick::new();
     left_click.set_button(1);
     left_click.set_propagation_phase(gtk::PropagationPhase::Capture);
-    left_click.connect_pressed(move |gesture, n_press, _, y| {
+    left_click.connect_pressed(move |gesture, n_press, x, y| {
         if n_press != 1 {
+            gesture.set_state(gtk::EventSequenceState::Denied);
+            return;
+        }
+        // A header button's action is the whole intent: Copy output while an
+        // agent runs must not also start keyboard selection mode, which would
+        // then hold the agent's arrows and Enter.
+        if gesture
+            .widget()
+            .is_some_and(|card| press_lands_on_header_button(&card, &header_for_click, x, y))
+        {
             gesture.set_state(gtk::EventSequenceState::Denied);
             return;
         }
@@ -2813,6 +2907,49 @@ pub(crate) const SLOW_BLOCK_THRESHOLD_MS: u64 = 1000;
 /// appears. Long enough that an `ls` never flashes one, short enough that the
 /// pill is already there by the time anyone starts wondering.
 const RUNNING_PILL_MIN_SECS: u64 = 2;
+/// The pill's gap below the top of the history viewport.
+const RUNNING_PILL_MARGIN_TOP: i32 = 10;
+/// The pill's height before it has ever been shown. GTK measures a hidden
+/// widget as 0 px, so this stands in until the first real measurement: a
+/// 22 px control plus the pill's padding and border.
+const RUNNING_PILL_FALLBACK_HEIGHT_PX: f32 = 28.0;
+
+/// Which running-command readout the pane shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunningHeaderMode {
+    /// No readout.
+    Hidden,
+    /// The pill at the live edge.
+    Compact,
+    /// The full sticky bar, with Stop, while the history is scrolled up.
+    Full,
+}
+
+/// Choose the running readout. `covers_live` says the compact readout would
+/// sit over the live card's top edge: once an inline agent fills the pane the
+/// pill would hide the right-hand cells of its first rows for the whole
+/// session, and the user is already looking at the running program there.
+/// Scrolled up, the full bar stays: that is where losing track of the
+/// command is the risk.
+fn running_header_mode(
+    user_scrolled: bool,
+    running_secs: Option<u64>,
+    covers_live: bool,
+) -> RunningHeaderMode {
+    match running_secs {
+        None => RunningHeaderMode::Hidden,
+        Some(_) if user_scrolled => RunningHeaderMode::Full,
+        Some(secs) if secs >= RUNNING_PILL_MIN_SECS && !covers_live => RunningHeaderMode::Compact,
+        Some(_) => RunningHeaderMode::Hidden,
+    }
+}
+
+/// Whether a readout whose bottom edge is at `readout_bottom_px` overlaps a
+/// live card whose top edge is at `live_top_px`, both in the history
+/// viewport's coordinates.
+fn running_readout_covers_live(live_top_px: f32, readout_bottom_px: f32) -> bool {
+    live_top_px < readout_bottom_px
+}
 
 /// Consecutive change-free frames after which the pane resize settle tick
 /// removes itself. The tick is armed by the scroll adjustments' `page-size`
@@ -10163,6 +10300,24 @@ impl KeyCtx {
                 }
             }
 
+            // A running program owns its plain arrows and Delete: the
+            // selection lets go of them instead of walking the cards.
+            if !ctrl
+                && !shift
+                && !alt
+                && selected_block_id_for_key.get().is_some()
+                && selection_yields_to_running_app(bstate_for_key.get(), keyval)
+            {
+                let finished = finished_blocks_for_key.borrow();
+                clear_finished_block_selection(
+                    &finished,
+                    &selected_block_ids_for_key,
+                    &selected_block_id_for_key,
+                    &selection_anchor_id_for_key,
+                );
+                return glib::Propagation::Proceed;
+            }
+
             // Once a block is selected, plain Up/Down walks blocks instead of
             // editing shell history. Without a selection the keys still reach VTE.
             if !ctrl
@@ -10321,6 +10476,16 @@ impl KeyCtx {
                         selection_refusal_hint(SelectionAction::Recall, refusal),
                     );
                     active_vte_for_key.error_bell();
+                    // While a command runs the refusal is certain, so it costs
+                    // one Enter: the next one reaches the program.
+                    if bstate_for_key.get() == BlockState::CollectingOutput {
+                        clear_finished_block_selection(
+                            &finished,
+                            &selected_block_ids_for_key,
+                            &selected_block_id_for_key,
+                            &selection_anchor_id_for_key,
+                        );
+                    }
                     return glib::Propagation::Stop;
                 }
                 return glib::Propagation::Proceed;
@@ -10616,7 +10781,7 @@ impl TermView {
         running_pill.add_css_class("running-pill");
         running_pill.set_halign(gtk::Align::End);
         running_pill.set_valign(gtk::Align::Start);
-        running_pill.set_margin_top(10);
+        running_pill.set_margin_top(RUNNING_PILL_MARGIN_TOP);
         // Clears the failure-marker strip on the right edge.
         running_pill.set_margin_end(22);
         running_pill.set_visible(false);
@@ -10732,7 +10897,9 @@ impl TermView {
                 "Output paused while text is selected",
             )]);
             hold_badge.set_tooltip_text(Some(
-                "Streaming output is held so your selection survives. Copy it, click elsewhere, or wait a few seconds to resume.",
+                // No timer releases the hold: a grace period let codex's next
+                // repaint wipe the selection before it was copied.
+                "Streaming output is held so your selection survives. Copy it, type, or click elsewhere to resume.",
             ));
             hold_badge.set_halign(gtk::Align::Start);
             hold_badge.set_valign(gtk::Align::End);
@@ -11759,13 +11926,22 @@ impl TermView {
             let pending_programmatic_only = Rc::new(Cell::new(true));
             block_scroll
                 .vadjustment()
-                .connect_value_changed(move |_adj| {
+                .connect_value_changed(move |adj| {
                     // `set_value()` emits this synchronously, while the geometry
                     // check below deliberately runs on idle. Preserve the source
                     // now: otherwise the programmatic flag has been cleared by
                     // the time the idle runs and a follow-bottom pin is mistaken
                     // for the user scrolling into history.
                     let caused_by_programmatic_scroll = programmatic_scroll.get();
+                    // A move of the user's own — scrollbar drag, find or
+                    // bookmark jump, Page Up — records its intent now, the way
+                    // the wheel always has. Waiting for the idle probe lost it:
+                    // an agent repaints about ten times a second, and each
+                    // repaint's follow-bottom pin put the view back before the
+                    // probe could see a card that had left the viewport.
+                    if !caused_by_programmatic_scroll {
+                        user_scrolled.set(scroll::scrolled_away_from_bottom(adj));
+                    }
                     if check_pending.get() {
                         if !caused_by_programmatic_scroll {
                             pending_programmatic_only.set(false);
@@ -11795,7 +11971,15 @@ impl TermView {
                             .compute_bounds(&scroll)
                             .map(|b| (b.y() as f64) < vp_h - 4.0)
                             .unwrap_or(true);
-                        user_scrolled.set(!at_bottom);
+                        let adj = scroll.vadjustment();
+                        user_scrolled.set(scroll::next_scroll_lock(
+                            user_scrolled.get(),
+                            at_bottom,
+                            adj.value(),
+                            (adj.upper() - adj.page_size()).max(adj.lower()),
+                        ));
+                        // The jump button keeps the geometric reading: it is
+                        // for getting back to a live card that is off screen.
                         if at_bottom {
                             unread.set(0);
                             fab.set_visible(false);
@@ -12081,6 +12265,9 @@ impl TermView {
             let pill = running_pill.clone();
             let pill_label = running_pill_label.clone();
             let pill_tooltip: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+            let pill_height = Rc::new(Cell::new(RUNNING_PILL_FALLBACK_HEIGHT_PX));
+            let active_for_pill = active.clone();
+            let scroll_for_pill = block_scroll.downgrade();
             glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
                 if sticky.parent().is_none() {
                     return glib::ControlFlow::Break;
@@ -12117,7 +12304,31 @@ impl TermView {
                         .map(|duration| duration.as_secs())
                         .unwrap_or(0);
                     let elapsed_str = unified_chrome::format_elapsed_clock(elapsed);
-                    let show_pill = elapsed >= RUNNING_PILL_MIN_SECS && !user_scrolled.get();
+                    let scrolled = user_scrolled.get();
+                    // Only read the geometry when the answer can matter.
+                    let covers_live = !scrolled
+                        && elapsed >= RUNNING_PILL_MIN_SECS
+                        && scroll_for_pill.upgrade().is_some_and(|scroll| {
+                            if pill.is_visible() {
+                                // Natural height, not `height()`: that is stale
+                                // until the next allocation.
+                                let (_, natural, _, _) =
+                                    pill.measure(gtk::Orientation::Vertical, -1);
+                                if natural > 0 {
+                                    pill_height.set(natural as f32);
+                                }
+                            }
+                            let readout_bottom = RUNNING_PILL_MARGIN_TOP as f32 + pill_height.get();
+                            active_for_pill
+                                .borrow()
+                                .widget()
+                                .compute_bounds(&scroll)
+                                .is_some_and(|bounds| {
+                                    running_readout_covers_live(bounds.y(), readout_bottom)
+                                })
+                        });
+                    let show_pill = running_header_mode(scrolled, Some(elapsed), covers_live)
+                        == RunningHeaderMode::Compact;
                     if show_pill {
                         pill_label.set_text(&elapsed_str);
                         let cmd = running_cmd.borrow();
@@ -13792,48 +14003,36 @@ impl TermView {
     pub fn paste_from_clipboard(&self) {
         self.selection_feed_hold.flush_now();
         let clipboard = self.active_vte.clipboard();
-        let pty = self.pty.clone();
-        let bracketed_paste = self.bracketed_paste.clone();
-        let bstate = self.bstate.clone();
-        let typed_cmd = self.typed_cmd.clone();
-        let armed_agent_execution = self.armed_agent_execution.clone();
-        let reviewed_submission = self.verified_submission.submission.clone();
-        let pty_synced = self.pty_synced.clone();
-        let idle_input_dirty = self.idle_input_dirty.clone();
-        let human_input = self.human_input_callbacks.clone();
+        let sink = self.paste_sink();
         clipboard.read_text_async(None::<&gtk::gio::Cancellable>, move |result| {
             let Ok(Some(text)) = result else {
                 return;
             };
-            if armed_agent_execution.borrow().is_some()
-                || reviewed_submission.borrow().is_some()
-            {
-                log::warn!("Ignoring paste while a reviewed command submission is pending");
-                return;
-            }
-            let paste = build_clipboard_paste(text.as_str(), bracketed_paste.get());
-            if paste.is_empty() {
-                return;
-            }
-            if paste.risk.had_embedded_paste_marker {
-                log::warn!(
-                    "Removed a bracketed-paste marker from pasted text before writing it to the shell"
-                );
-            }
-            pty.write_bytes(&paste.bytes);
-            emit_human_input(&human_input, HumanInputKind::Clipboard);
-            // Mirror what the child actually received into the editor shadow, or
-            // the live input cell keeps the height of a command the shell no
-            // longer has and the next history recall appends to a line it thinks
-            // is empty.
-            record_external_input(
-                bstate.get(),
-                &paste.echo_text,
-                &typed_cmd,
-                &pty_synced,
-                &idle_input_dirty,
-            );
+            sink.deliver(text.as_str());
         });
+    }
+
+    /// Paste `text` the way Ctrl+Shift+V pastes the clipboard: framed as a
+    /// bracketed paste when the foreground program asked for one, and
+    /// mirrored into the prompt shadow. A file drop comes through here, so an
+    /// agent sees the dropped paths as the paste they are.
+    pub(crate) fn paste_text(&self, text: &str) {
+        self.selection_feed_hold.flush_now();
+        self.paste_sink().deliver(text);
+    }
+
+    fn paste_sink(&self) -> PasteSink {
+        PasteSink {
+            pty: self.pty.clone(),
+            bracketed_paste: self.bracketed_paste.clone(),
+            bstate: self.bstate.clone(),
+            typed_cmd: self.typed_cmd.clone(),
+            armed_agent_execution: self.armed_agent_execution.clone(),
+            reviewed_submission: self.verified_submission.submission.clone(),
+            pty_synced: self.pty_synced.clone(),
+            idle_input_dirty: self.idle_input_dirty.clone(),
+            human_input: self.human_input_callbacks.clone(),
+        }
     }
 
     pub fn connect_cwd_changed<F: Fn(&str, bool) + 'static>(&self, f: F) {
@@ -15161,6 +15360,27 @@ mod tests {
             super::live_visible_rows_for_layout(false, Some(8), true, false, 6, 40),
             super::live_visible_rows_for_measurement(Some(8), true, false, 6, 40)
         );
+    }
+
+    #[test]
+    fn the_running_pill_never_sits_over_the_live_cards_top() {
+        use super::{running_header_mode as mode, RunningHeaderMode as M};
+        let bottom = super::RUNNING_PILL_MARGIN_TOP as f32 + 28.0;
+        // An agent filling the pane: its card starts 7 px down.
+        let covered = super::running_readout_covers_live(7.0, bottom);
+        assert!(covered);
+        assert_eq!(mode(false, Some(60), covered), M::Hidden);
+        // A short command below a few finished blocks keeps its pill.
+        let clear = super::running_readout_covers_live(400.0, bottom);
+        assert!(!clear);
+        assert_eq!(mode(false, Some(60), clear), M::Compact);
+        // Too young for the pill, and nothing running.
+        assert_eq!(mode(false, Some(1), false), M::Hidden);
+        assert_eq!(mode(false, None, false), M::Hidden);
+        assert_eq!(mode(true, None, true), M::Hidden);
+        // Scrolled up, the full bar shows wherever the card is.
+        assert_eq!(mode(true, Some(0), true), M::Full);
+        assert_eq!(mode(true, Some(60), false), M::Full);
     }
 
     #[test]
@@ -22093,6 +22313,105 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
         run_for(40);
         assert_eq!(card.selection_hint.text(), super::SELECTION_HINT_RUN);
         assert_eq!(card.selection_hint.tooltip_text(), None);
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn a_header_button_press_does_not_select_the_card() {
+        use relm4::gtk;
+        use relm4::gtk::prelude::*;
+        use std::time::Duration;
+
+        gtk::init().expect("gtk init");
+        let config = crate::config::Config::safe_defaults();
+        let block = super::FinishedBlock::new(
+            41,
+            "$ ",
+            "printf test",
+            None,
+            "test\n",
+            Some(0),
+            &config,
+            Some(1),
+            None,
+            None,
+            80,
+        );
+        super::blocks::reveal_block_actions(&block.action_box, true);
+        let window = gtk::Window::new();
+        window.set_default_size(900, 300);
+        window.set_child(Some(block.widget()));
+        window.present();
+        let context = gtk::glib::MainContext::default();
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_millis(200) {
+            while context.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        let card: gtk::Widget = block.widget().clone().upcast();
+        let button = &block.copy_output_btn;
+        assert!(
+            !button.gets_focus_on_click(),
+            "a click leaves focus where it was"
+        );
+        let bounds = button
+            .compute_bounds(&card)
+            .expect("the copy button is laid out in the card");
+        assert!(bounds.width() > 0.0 && bounds.height() > 0.0);
+        let (x, y) = (
+            f64::from(bounds.x() + bounds.width() / 2.0),
+            f64::from(bounds.y() + bounds.height() / 2.0),
+        );
+        assert!(super::press_lands_on_header_button(
+            &card,
+            &block.header_row,
+            x,
+            y
+        ));
+
+        // The rest of the header still selects the card.
+        let icon = block
+            .status_icon
+            .compute_bounds(&card)
+            .expect("the status icon is laid out in the card");
+        let spot = (
+            f64::from(icon.x() + icon.width() / 2.0),
+            f64::from(icon.y() + icon.height() / 2.0),
+        );
+        assert!(!super::press_lands_on_header_button(
+            &card,
+            &block.header_row,
+            spot.0,
+            spot.1
+        ));
+        window.close();
+        while context.iteration(false) {}
+    }
+
+    #[test]
+    fn a_dropped_path_reaches_a_bracketed_paste_program_as_a_paste() {
+        let payload = "'/tmp/a b.txt' ";
+        let framed = super::build_clipboard_paste(payload, true);
+        assert_eq!(framed.bytes, b"\x1b[200~'/tmp/a b.txt' \x1b[201~");
+        // Without bracketed paste the single line goes out as it is.
+        let plain = super::build_clipboard_paste(payload, false);
+        assert_eq!(plain.bytes, payload.as_bytes());
+    }
+
+    #[test]
+    fn a_running_program_gets_its_arrows_back_from_a_block_selection() {
+        use super::selection_yields_to_running_app as yields;
+        use relm4::gtk::gdk::Key;
+        for key in [Key::Up, Key::Down, Key::KP_Up, Key::KP_Down, Key::Delete] {
+            assert!(yields(BlockState::CollectingOutput, key), "{key:?}");
+            assert!(!yields(BlockState::AwaitingCommand, key), "{key:?}");
+        }
+        // Enter stays owned (one-shot), and Escape still leaves selection mode.
+        assert!(!yields(BlockState::CollectingOutput, Key::Return));
+        assert!(!yields(BlockState::CollectingOutput, Key::Escape));
+        // The alternate screen already hands every key to its program.
+        assert!(!yields(BlockState::AltScreen, Key::Up));
     }
 
     #[test]

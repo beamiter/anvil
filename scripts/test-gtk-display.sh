@@ -75,6 +75,8 @@ tests=(
     block_view::tests::finished_card_focus_keeps_the_block_keyboard_contract
     block_view::tests::real_vte_reports_travel_the_commit_path_as_reports_not_typing
     block_view::tests::entering_alt_screen_ends_the_block_selection_it_hides
+    block_view::tests::a_header_button_press_does_not_select_the_card
+    terminal::url::tests::a_real_vte_opens_an_osc8_link_whose_label_is_not_a_url
     block_view::tests::refusal_feedback_refreshes_and_only_the_latest_status_restores
     block_view::scroll::tests::widget_pool_releases_heavy_children_and_stale_controllers
     block_view::unified_images::tests::real_vte_keeps_nonzero_marker_column_through_narrow_wide_rewrap

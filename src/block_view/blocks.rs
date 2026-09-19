@@ -3415,6 +3415,11 @@ impl FinishedBlock {
         ] {
             btn.add_css_class("block-action-btn");
             btn.add_css_class("flat");
+            // A click runs the action and leaves focus where it was — the live
+            // terminal, while an agent runs. Taking focus stranded the next
+            // keys on the button: Enter re-ran the copy instead of reaching the
+            // agent. The buttons stay reachable with Tab.
+            btn.set_focus_on_click(false);
             action_box.append(btn);
         }
         header_row.append(&action_box);
@@ -3765,8 +3770,10 @@ impl FinishedBlock {
 
         // Ctrl+click on a URL inside the output VTE → open in browser.
         // VTE's `match_add_regex` (registered in create_finished_terminal) makes
-        // `check_match_at` return the matching URL at the pointer position;
-        // VTE handles word/line double/triple-click selection natively.
+        // `check_match_at` return the matching URL at the pointer position, and
+        // an OSC 8 link answers `check_hyperlink_at`; VTE handles
+        // word/line double/triple-click selection natively.
+        crate::terminal::url::show_hyperlink_target_on_hover(&output_vte);
         {
             let click = gtk::GestureClick::new();
             click.set_button(1);
@@ -3782,13 +3789,9 @@ impl FinishedBlock {
                 let Some(vte_for_click) = vte_for_click.upgrade() else {
                     return;
                 };
-                let (uri, _tag) = vte_for_click.check_match_at(x, y);
-                if let Some(uri) = uri {
-                    let s = uri.to_string();
-                    if !s.is_empty() {
-                        open_uri(&s);
-                        controller.set_state(gtk::EventSequenceState::Claimed);
-                    }
+                if let Some(uri) = crate::terminal::url::openable_link_at(&vte_for_click, x, y) {
+                    open_uri(&uri);
+                    controller.set_state(gtk::EventSequenceState::Claimed);
                 }
             });
             output_vte.add_controller(click);

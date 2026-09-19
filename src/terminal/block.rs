@@ -482,6 +482,11 @@ impl Component for BlockTerminal {
                 // back into the view, and the gesture lives on a widget the
                 // view itself owns.
                 TermView::install_canvas_context_menu(&view);
+                // The live card had no Ctrl+click at all: a running command's
+                // URLs and claude's OSC 8 links underlined on hover and did
+                // nothing. The handler denies every other click, so selection,
+                // click-to-move and a program's mouse reporting are untouched.
+                super::vte::setup_terminal_click_handler(view.vte());
                 TermView::arm_shell_integration_notice(&view, init.shell_argv.as_ref());
                 if let Some(container) = root.downcast_ref::<gtk::Box>() {
                     container.append(&view.widget());
@@ -555,6 +560,7 @@ impl Component for BlockTerminal {
         };
         match msg {
             VteInput::WriteInput(data) => view.write_input(&data),
+            VteInput::PasteText(text) => view.paste_text(&text),
             VteInput::RunAgentCommand { execution, command } => {
                 if !view.try_run_agent_command(execution, &command) {
                     let _ = sender.output(VteOutput::AgentExecutionStartFailed { execution });
