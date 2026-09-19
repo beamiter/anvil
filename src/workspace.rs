@@ -209,6 +209,10 @@ pub(crate) struct Pane {
     /// Stable synthetic session identity binding this pane to its task in the
     /// task manager (`anvil-<pid>-<pane_id>`). `None` for ordinary panes.
     pub(crate) task_session_id: Option<String>,
+    /// When this pane's bell last became a desktop toast. The limit
+    /// (`notify::bell_should_notify`) is per pane, so one agent ringing on
+    /// every turn cannot silence another pane's first ring.
+    pub(crate) last_bell_toast: Option<std::time::Instant>,
 }
 
 impl Pane {

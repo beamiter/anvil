@@ -430,7 +430,44 @@ pub(crate) enum BlockStatus {
     Background,
     Succeeded,
     Failed(i32),
+    /// The command was stopped by the user rather than going wrong: Ctrl+C
+    /// (130), a closed pipe (141), a TERM (143), or Ctrl+Z (148, suspended —
+    /// codex and claude both implement it, and `fg` resumes them). Drawn
+    /// neutral and kept out of the Failed filter and failure navigation; the
+    /// raw code stays on the badge, since a script that exits 130 by itself
+    /// lands here too. See [`interrupt_signal`].
+    Interrupted(i32),
     Unreported,
+}
+
+/// Exit statuses that mean "this was stopped", not "this went wrong", with the
+/// signal that stopped it. Painting these red floods a session with failures
+/// at exactly the moments the user was in control: leaving `top`, ending a
+/// `tail -f`, suspending an agent TUI with Ctrl+Z. Matches forge's
+/// `BlockOutcome::interrupt_signal`.
+pub(crate) const fn interrupt_signal(exit_code: i32) -> Option<&'static str> {
+    match exit_code {
+        130 => Some("SIGINT"),
+        141 => Some("SIGPIPE"),
+        143 => Some("SIGTERM"),
+        148 => Some("SIGTSTP"),
+        _ => None,
+    }
+}
+
+/// Ctrl+Z: the job is stopped, not gone, and the user brings it back with
+/// `fg`. The badge says "suspended" instead of "interrupted".
+const fn is_suspension(exit_code: i32) -> bool {
+    exit_code == 148
+}
+
+/// Whether a finished block counts as a failure for the Failed filter,
+/// failure navigation and the scrollbar's failure ticks.
+pub(crate) fn block_is_failure(resolved_command: &str, reported_exit_code: Option<i32>) -> bool {
+    matches!(
+        block_status(Some(resolved_command), reported_exit_code),
+        BlockStatus::Failed(_)
+    )
 }
 
 /// Translate the shared completed-block contract into anvil's renderer-owned
@@ -446,6 +483,9 @@ pub(crate) fn block_status(
     match classify_completed(resolved_command, reported_exit_code) {
         CompletedBlockOutcome::Background => BlockStatus::Background,
         CompletedBlockOutcome::Success => BlockStatus::Succeeded,
+        CompletedBlockOutcome::Failed(code) if interrupt_signal(code).is_some() => {
+            BlockStatus::Interrupted(code)
+        }
         CompletedBlockOutcome::Failed(code) => BlockStatus::Failed(code),
         CompletedBlockOutcome::Unknown => BlockStatus::Unreported,
     }
@@ -458,6 +498,7 @@ impl BlockStatus {
             Self::Background => "block-background",
             Self::Succeeded => "block-success",
             Self::Failed(_) => "block-failed",
+            Self::Interrupted(_) => "block-interrupted",
             Self::Unreported => "block-unknown",
         }
     }
@@ -476,6 +517,16 @@ impl BlockStatus {
                 "dialog-error-symbolic",
                 "block-status-bad",
                 "Command failed",
+            ),
+            Self::Interrupted(code) if is_suspension(code) => (
+                "media-playback-pause-symbolic",
+                "block-status-interrupted",
+                "Command suspended",
+            ),
+            Self::Interrupted(_) => (
+                "process-stop-symbolic",
+                "block-status-interrupted",
+                "Command interrupted",
             ),
             Self::Unreported => (
                 "dialog-question-symbolic",
@@ -499,6 +550,10 @@ impl BlockStatus {
     fn exit_badge(self) -> Option<String> {
         match self {
             Self::Failed(code) => Some(super::exit_status_badge_text(code)),
+            Self::Interrupted(code) if is_suspension(code) => {
+                Some(format!("exit:{code} · suspended"))
+            }
+            Self::Interrupted(code) => Some(format!("exit:{code} · interrupted")),
             _ => None,
         }
     }
@@ -507,7 +562,24 @@ impl BlockStatus {
     fn exit_badge_tooltip(self) -> Option<String> {
         match self {
             Self::Failed(code) => super::exit_status_badge_tooltip(code),
+            Self::Interrupted(code) => {
+                let signal = interrupt_signal(code).unwrap_or("a signal");
+                Some(if is_suspension(code) {
+                    format!("Stopped by {signal} — resume with fg")
+                } else {
+                    format!("128 + signal number: stopped by {signal}, not a command failure")
+                })
+            }
             _ => None,
+        }
+    }
+
+    /// The badge's colour: red for a failure, neutral for a stop the user
+    /// asked for.
+    fn exit_badge_class(self) -> &'static str {
+        match self {
+            Self::Interrupted(_) => "block-exit-interrupted",
+            _ => "block-exit-bad",
         }
     }
 }
@@ -1927,9 +1999,11 @@ mod tests {
     fn an_unreported_status_never_becomes_a_zero() {
         assert_eq!(block_status(Some("make"), None), BlockStatus::Unreported);
         assert_eq!(block_status(Some("make"), Some(0)), BlockStatus::Succeeded);
+        // Re-pinned deliberately: Ctrl+C is the user stopping a command, not
+        // the command failing, matching forge's Interrupted outcome.
         assert_eq!(
             block_status(Some("make"), Some(130)),
-            BlockStatus::Failed(130)
+            BlockStatus::Interrupted(130)
         );
         assert_eq!(block_status(None, None), BlockStatus::Background);
         // Background output never was a command, so its absent status is not a
@@ -1938,14 +2012,14 @@ mod tests {
 
         // A number nobody reported cannot be shown, so no badge is rendered.
         assert_eq!(block_status(Some("make"), None).exit_badge(), None);
-        // Re-pinned deliberately: a 128+n status now names the signal that
-        // killed the command, matching ember, forge and frost. `exit:130`
-        // alone does not tell a user their command was interrupted.
+        // A 128+n status names what stopped the command, matching ember,
+        // forge and frost. `exit:130` alone does not tell a user their command
+        // was interrupted; the raw code stays for a script that exits 130.
         assert_eq!(
             block_status(Some("make"), Some(130))
                 .exit_badge()
                 .as_deref(),
-            Some("exit:130 SIGINT")
+            Some("exit:130 · interrupted")
         );
         assert_eq!(
             block_status(Some("make"), Some(137))
@@ -1975,6 +2049,8 @@ mod tests {
             BlockStatus::Background,
             BlockStatus::Succeeded,
             BlockStatus::Failed(1),
+            BlockStatus::Interrupted(130),
+            BlockStatus::Interrupted(148),
             BlockStatus::Unreported,
         ] {
             let (icon_name, _class, accessible_label) = status.icon();
@@ -1992,6 +2068,53 @@ mod tests {
                 block_status(Some("make"), reported).icon()
             );
         }
+    }
+
+    #[test]
+    fn ctrl_z_on_an_agent_is_a_suspension_not_a_failure() {
+        let suspended = block_status(Some("codex"), Some(148));
+        assert_eq!(suspended, BlockStatus::Interrupted(148));
+        assert!(!block_is_failure("codex", Some(148)));
+        assert_eq!(
+            suspended.exit_badge().as_deref(),
+            Some("exit:148 · suspended")
+        );
+        assert_eq!(
+            suspended.exit_badge_tooltip().as_deref(),
+            Some("Stopped by SIGTSTP — resume with fg")
+        );
+        assert_eq!(suspended.icon().2, "Command suspended");
+        assert_eq!(suspended.exit_badge_class(), "block-exit-interrupted");
+        assert_ne!(
+            suspended.stripe_class(),
+            block_status(Some("codex"), Some(1)).stripe_class(),
+            "a suspension is not striped like a failure"
+        );
+
+        for code in [130, 141, 143] {
+            assert_eq!(
+                block_status(Some("make"), Some(code)),
+                BlockStatus::Interrupted(code)
+            );
+            assert!(!block_is_failure("make", Some(code)));
+            assert!(block_status(Some("make"), Some(code))
+                .exit_badge_tooltip()
+                .is_some_and(|tip| tip.contains("not a command failure")));
+        }
+        // A real failure, and a real kill, still are one.
+        assert!(block_is_failure("make", Some(1)));
+        assert!(block_is_failure("make", Some(137)));
+        assert!(!block_is_failure("make", Some(0)));
+        assert!(!block_is_failure("make", None));
+        // The other job-control stops are not in the neutral set, but their
+        // badge must not claim the job was terminated.
+        assert_eq!(
+            block_status(Some("vim"), Some(149)),
+            BlockStatus::Failed(149)
+        );
+        assert!(block_status(Some("vim"), Some(149))
+            .exit_badge_tooltip()
+            .is_some_and(|tip| tip.contains("suspended by SIGTTIN")));
     }
 
     #[test]
@@ -3368,7 +3491,7 @@ impl FinishedBlock {
         // Exit code badge
         if let Some(text) = status.exit_badge() {
             let badge = gtk::Label::new(Some(&text));
-            badge.add_css_class("block-exit-bad");
+            badge.add_css_class(status.exit_badge_class());
             badge.set_tooltip_text(status.exit_badge_tooltip().as_deref());
             header_row.append(&badge);
         }

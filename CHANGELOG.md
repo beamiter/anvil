@@ -643,6 +643,37 @@ versioning for tagged releases while it remains experimental.
 
 ### Fixed
 
+- **A bell from an agent in a window you left is no longer lost.** BEL is how
+  codex (by default) and claude (with its terminal-bell channel) say "your
+  turn", and it only badged a background tab: with the agent's tab current and
+  the window unfocused, nothing happened. An inactive window now badges even
+  the current tab, clears the badge when the window is activated again, and
+  posts a desktop toast titled with the tab ("Bell from codex"), at most once
+  every 30 seconds per pane. `config.toml.example` explains how to make claude
+  and codex use the bell or OSC 9/777.
+- **Ending a long agent session in front of you no longer toasts.** Every exit
+  of a claude or codex session, or a vim run, longer than the threshold posted
+  "Exit 0 after 3h 2m". The long-command toast is for a user who is elsewhere,
+  so it now also needs the window to be inactive or the pane to be on a
+  background tab.
+- **An agent's title reset restores the tab label.** claude sets "✳ Claude
+  Code" and clears it with an empty title on exit; the empty title was dropped,
+  so the tab kept claiming claude was running. It now falls back to the
+  directory label.
+- **Ctrl+Z and Ctrl+C are not failures.** Suspending codex or claude ended its
+  card red with a bare `exit:148`, counted in the Failed filter, failure
+  navigation and the scrollbar's failure ticks. Exit statuses 130 (SIGINT), 141
+  (SIGPIPE), 143 (SIGTERM) and 148 (SIGTSTP) now finish a card as neutral
+  "interrupted", or "suspended" with a "resume with fg" tooltip for 148, keep
+  their code on the badge, and stay out of the failure views, as in forge.
+  Other job-control stops (147, 149, 150) read "suspended by", not
+  "terminated by".
+- **Find counts the running command's matches the way it steps through them.**
+  The live card's count came from a replay of the raw output that knows
+  nothing of cursor addressing, so codex's repainted status line counted once
+  per repaint and Next stopped short of the number shown. The count now comes
+  from the live terminal's own buffer, the one its search walks; the raw
+  capture is only the fallback.
 - **Scrolling up while an agent streams stays where you put it.** Only the
   mouse wheel recorded that the user had left the bottom. A scrollbar drag,
   Page Up, a find match or a bookmark jump into the last few finished blocks

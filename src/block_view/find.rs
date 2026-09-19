@@ -51,11 +51,10 @@ fn outcome_matches_filters(
     {
         return false;
     }
-    !filters.failed_only
-        || matches!(
-            outcome,
-            jterm_core::block_contract::CompletedBlockOutcome::Failed(_)
-        )
+    // An interrupted or suspended command (130/141/143/148) keeps its code for
+    // the exit-code filter above, but is not a failure: Ctrl+Z on an agent TUI
+    // must not land in "failed only" or failure navigation.
+    !filters.failed_only || super::blocks::block_is_failure(resolved_command, raw_exit_code)
 }
 
 /// Stop common queries from turning a bounded output history into unbounded
@@ -334,6 +333,23 @@ fn regex_consumption(pattern: &str) -> Result<RegexConsumption, ()> {
         Some(_) => Ok(RegexConsumption::Consuming),
         None => Ok(RegexConsumption::Never),
     }
+}
+
+/// The live VTE's scrollback and screen as plain text: the buffer that
+/// `search_find_next` walks. VTE writes no newline inside a soft-wrapped row,
+/// so a wrapped line reads as one line here just as VTE's search sees it.
+/// The dump is bounded by the configured scrollback and is only taken for an
+/// explicit search. `None` when VTE cannot write it; the caller then falls
+/// back to the raw capture.
+fn live_vte_search_text(vte: &vte4::Terminal) -> Option<String> {
+    use gtk::gio;
+    use gtk::gio::prelude::*;
+
+    let stream = gio::MemoryOutputStream::new_resizable();
+    vte.write_contents_sync(&stream, vte4::WriteFlags::Default, gio::Cancellable::NONE)
+        .ok()?;
+    stream.close(gio::Cancellable::NONE).ok()?;
+    Some(String::from_utf8_lossy(&stream.steal_as_bytes()).into_owned())
 }
 
 fn bounded_match_count(
@@ -1225,9 +1241,13 @@ impl TermView {
         }
 
         // The still-running command's output is searchable too (document
-        // order: it sits below every finished block). Counted from the
-        // accumulated raw capture, so only states that accumulate qualify;
-        // VTE's own highlighter paints and steps the on-screen hits.
+        // order: it sits below every finished block). VTE's own highlighter
+        // paints and steps these hits, so they are counted from the text of
+        // that same live VTE buffer: a cursor-addressed inline TUI (codex's
+        // history insertion through a scroll region, a spinner repainted in
+        // place) leaves a raw byte capture that no replay of ours reads the
+        // way VTE does, and a count taken from it did not match the steps.
+        // The raw capture is only the fallback when the VTE cannot be read.
         if !match_limited
             && !scan_limited
             && !completed_owns_live_surface
@@ -1236,13 +1256,26 @@ impl TermView {
                 super::BlockState::CollectingOutput | super::BlockState::PostCommand
             )
         {
-            let (live_raw, live_raw_incomplete) = self
-                .active
-                .borrow()
-                .output_text_prefix(scan_budget.remaining_bytes());
-            let live_prefix = scan_budget.take_prefix(&live_raw);
-            let live_text = super::strip_ansi(live_prefix.text);
-            let live = bounded_match_count(&re, &live_text, FIND_MATCH_LIMIT.saturating_sub(total));
+            let (live_source, live_raw_incomplete, live_is_plain) =
+                match live_vte_search_text(&self.active_vte) {
+                    Some(text) => (text, false, true),
+                    None => {
+                        let (raw, incomplete) = self
+                            .active
+                            .borrow()
+                            .output_text_prefix(scan_budget.remaining_bytes());
+                        (raw, incomplete, false)
+                    }
+                };
+            let live_prefix = scan_budget.take_prefix(&live_source);
+            let stripped;
+            let live_text = if live_is_plain {
+                live_prefix.text
+            } else {
+                stripped = super::strip_ansi(live_prefix.text);
+                stripped.as_str()
+            };
+            let live = bounded_match_count(&re, live_text, FIND_MATCH_LIMIT.saturating_sub(total));
             if live.count > 0 {
                 self.active_vte.search_set_regex(Some(&vte_re), 0);
                 self.active_vte.search_set_wrap_around(false);
@@ -2470,6 +2503,118 @@ mod tests {
         while context.iteration(false) {}
     }
 
+    /// codex draws its inline UI at the bottom and inserts finished history
+    /// above it through a scroll region (`CSI 1;Nr`, LF at the region bottom),
+    /// which VTE pushes into scrollback, while its status line is repainted in
+    /// place. The live Find count must be taken from what VTE holds, the same
+    /// buffer its native steps walk, not from a replay of the raw bytes.
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn a_live_find_counts_what_the_live_vte_steps_through() {
+        use gtk::prelude::*;
+        use relm4::gtk;
+        use std::time::Duration;
+        use vte4::TerminalExt;
+
+        const ROWS: usize = 40;
+        const HISTORY_BOTTOM: usize = 30;
+        const INSERTED: usize = 150;
+
+        // A synthetic codex insert_history stream: 40x120, the inline
+        // viewport on rows 31-40, one history line per turn.
+        let mut stream = Vec::new();
+        stream.extend_from_slice(b"\x1b[2J\x1b[H");
+        for turn in 0..INSERTED {
+            stream.extend_from_slice(
+                format!(
+                    "\x1b[1;{HISTORY_BOTTOM}r\x1b[{HISTORY_BOTTOM};1H\r\nhistory line {turn:04}\x1b[r"
+                )
+                .as_bytes(),
+            );
+            stream.extend_from_slice(
+                format!(
+                    "\x1b[{};1H\x1b[J\u{2022} Working ({turn}s)\x1b[{ROWS};1H\u{203a} Ask codex",
+                    HISTORY_BOTTOM + 1
+                )
+                .as_bytes(),
+            );
+        }
+
+        gtk::init().expect("gtk init");
+        let context = gtk::glib::MainContext::default();
+        let settle = || {
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_millis(150) {
+                while context.iteration(false) {}
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        // Each native count runs on its own freshly fed terminal: with no
+        // selection VTE starts searching from where the view is, and a
+        // finished count leaves the view on its oldest match.
+        let fed_terminal = || {
+            let terminal = vte4::Terminal::new();
+            terminal.set_size(120, ROWS as i64);
+            terminal.set_scrollback_lines(1_000);
+            let window = gtk::Window::new();
+            window.set_child(Some(&terminal));
+            window.present();
+            terminal.feed(&stream);
+            settle();
+            (window, terminal)
+        };
+
+        let (window, terminal) = fed_terminal();
+        let text = super::live_vte_search_text(&terminal).expect("the live VTE writes its buffer");
+        window.close();
+        assert!(
+            text.contains("history line 0149"),
+            "the newest inserted history line is in the buffer"
+        );
+        assert!(
+            text.contains("history line 0000"),
+            "and the oldest, in scrollback"
+        );
+
+        let native_steps = |pattern: &str| {
+            let (window, terminal) = fed_terminal();
+            let regex = vte4::Regex::for_search(pattern, VTE_SEARCH_FLAGS).unwrap();
+            terminal.unselect_all();
+            terminal.search_set_regex(Some(&regex), 0);
+            terminal.search_set_wrap_around(false);
+            let mut steps = 0;
+            while steps <= INSERTED + 1 && terminal.search_find_previous() {
+                steps += 1;
+            }
+            window.close();
+            steps
+        };
+        let counted = |pattern: &str, haystack: &str| {
+            let regex = regex::RegexBuilder::new(pattern)
+                .case_insensitive(true)
+                .build()
+                .unwrap();
+            super::bounded_match_count(&regex, haystack, super::FIND_MATCH_LIMIT).count
+        };
+
+        for pattern in ["history line", "history line 0140", "Working", "Ask codex"] {
+            assert_eq!(
+                counted(pattern, &text),
+                native_steps(pattern),
+                "{pattern:?}: the count must equal VTE's own steps"
+            );
+        }
+        assert_eq!(counted("history line", &text), INSERTED);
+        assert_eq!(counted("Working", &text), 1);
+        // What the ring fallback replay makes of the same bytes: the
+        // repainted status line is counted once per repaint.
+        let replayed = super::super::strip_ansi(&String::from_utf8_lossy(&stream));
+        assert_ne!(counted("Working", &replayed), 1);
+
+        window.close();
+        while context.iteration(false) {}
+    }
+
     /// A huge old scrollback must not consume the structured search budget
     /// before a visible hit, and unknown row projection uses the same
     /// viewport-forward native fallback with a single capped result.
@@ -3392,6 +3537,24 @@ mod tests {
         assert!(!outcome_matches_filters("\t ", Some(7), &failed));
         assert!(outcome_matches_filters("false", Some(7), &exact));
         assert!(outcome_matches_filters("false", Some(7), &failed));
+    }
+
+    #[test]
+    fn a_suspended_or_interrupted_command_is_not_in_the_failed_filter() {
+        let failed = BlockFilters {
+            failed_only: true,
+            ..Default::default()
+        };
+        let exact = BlockFilters {
+            exit_code: Some(148),
+            ..Default::default()
+        };
+        for code in [130, 141, 143, 148] {
+            assert!(!outcome_matches_filters("codex", Some(code), &failed));
+        }
+        // The code itself is still searchable.
+        assert!(outcome_matches_filters("codex", Some(148), &exact));
+        assert!(outcome_matches_filters("codex", Some(1), &failed));
     }
 
     #[test]

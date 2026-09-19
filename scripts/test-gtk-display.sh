@@ -66,6 +66,7 @@ tests=(
     font::tests::a_real_vte_is_given_the_icon_family_behind_the_configured_one
     block_view::onboarding::tests::block_onboarding_overlay_is_non_measuring_and_non_targetable
     block_view::find::tests::unified_vte_fresh_query_reaches_scrollback_before_a_prior_match
+    block_view::find::tests::a_live_find_counts_what_the_live_vte_steps_through
     block_view::find::tests::unified_bounded_and_native_fallback_prefer_visible_match_with_huge_old_scrollback
     block_view::find::tests::unified_complete_windows_step_visible_then_wrapped_history_on_real_vte
     block_view::tests::dock_mount_refuses_a_widget_another_region_owns

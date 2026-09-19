@@ -86,9 +86,19 @@ focus_reporting_enabled = true
 scroll_reporting_enabled = true
 allow_remote_clipboard_write = false
 
-# Desktop notifications for commands that run at least the threshold duration.
+# Desktop notifications for commands that run at least the threshold duration,
+# posted only when the window is inactive or the pane is on a background tab.
 notify_long_blocks = true
 notify_long_block_threshold_ms = 10000
+# A terminal bell (BEL) badges the tab of a background pane, and, while the
+# window is inactive, even the current tab, with a desktop toast at most once
+# every 30 seconds per pane. OSC 9 and OSC 777 notifications always toast.
+# Agent CLIs choose how they ask for attention:
+#   Claude Code: its default `auto` channel is silent here. Set
+#     `preferredNotifChannel` to "terminal_bell" (BEL) or "ghostty" (OSC 777),
+#     for example with `/config` inside claude.
+#   codex: rings BEL by default; `notification_method = "osc9"` under `[tui]`
+#     in ~/.codex/config.toml switches it to OSC 9.
 
 # Optional AI surfaces. Credentials (ANVIL_AI_API_KEY, ANTHROPIC_API_KEY,
 # OPENAI_API_KEY, or OLLAMA_API_KEY) remain environment-only and are never

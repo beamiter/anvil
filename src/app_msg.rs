@@ -105,7 +105,11 @@ pub(crate) enum AppMsg {
     /// running command are polled, not pushed).
     RefreshPaneHeaders,
     TitleChanged(u64, String),
+    /// A program in the pane rang the terminal bell (BEL).
     Bell(u64),
+    /// A block in the pane finished with a failure. Background tabs show it
+    /// in the bell style; it is not a bell, so it never becomes a toast.
+    CommandFailed(u64),
     Activity(u64),
     SettingsTheme(usize),
     SettingsFontDesc(String),

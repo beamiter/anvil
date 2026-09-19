@@ -391,8 +391,7 @@ fn failed_block_marker_fractions(blocks: &VecDeque<BlockData>) -> Vec<f64> {
     failed_block_marker_fractions_from_entries(blocks.iter().map(|block| {
         (
             block.estimated_height.max(1) as u64,
-            jterm_core::block_contract::classify_completed(Some(&block.cmd), block.exit_code)
-                .is_failed(),
+            blocks::block_is_failure(&block.cmd, block.exit_code),
         )
     }))
 }
@@ -411,9 +410,7 @@ fn failed_block_marker_fractions_legacy(blocks: &VecDeque<BlockData>) -> Vec<f64
     let mut top = 0_u64;
     let mut markers = VecDeque::new();
     for block in blocks {
-        if jterm_core::block_contract::classify_completed(Some(&block.cmd), block.exit_code)
-            .is_failed()
-        {
+        if blocks::block_is_failure(&block.cmd, block.exit_code) {
             if markers.len() == MAX_FAILURE_MARKERS {
                 markers.pop_front();
             }
@@ -1197,9 +1194,16 @@ pub(super) fn exit_status_badge_text(code: i32) -> String {
 
 /// Why that badge names a signal, for the surface that can carry a tooltip.
 /// An ordinary status needs no explanation: the number is the explanation.
+/// SIGSTOP, SIGTSTP, SIGTTIN and SIGTTOU (147-150) stop a job without ending
+/// it, so those read "suspended", not "terminated".
 pub(super) fn exit_status_badge_tooltip(code: i32) -> Option<String> {
-    jterm_core::exit_status::signal_name_for_exit(code)
-        .map(|signal| format!("128 + signal number: terminated by {signal}"))
+    jterm_core::exit_status::signal_name_for_exit(code).map(|signal| {
+        if (147..=150).contains(&code) {
+            format!("128 + signal number: suspended by {signal} — resume with fg")
+        } else {
+            format!("128 + signal number: terminated by {signal}")
+        }
+    })
 }
 
 pub(crate) const UNKNOWN_EXIT_SENTINEL: i32 = -1;
@@ -8494,7 +8498,22 @@ impl RenderBackend for BlockBackend {
                     record.duration_ms,
                     long_block_notification_exit_code(record.exit_code),
                 ) {
-                    if ms >= cfg.notify_long_block_threshold_ms {
+                    // The toast is for a user who is elsewhere. A long
+                    // interactive session (claude, codex, vim) the user just
+                    // ended while looking at it must stay quiet, so the window
+                    // has to be inactive or this pane off screen (unmapped on
+                    // a background tab).
+                    let scroll = &self.block_scroll_rc;
+                    let window_active = scroll
+                        .root()
+                        .and_downcast::<gtk::Window>()
+                        .is_some_and(|window| window.is_active());
+                    if crate::notify::long_block_should_notify(
+                        ms,
+                        cfg.notify_long_block_threshold_ms,
+                        window_active,
+                        scroll.is_mapped(),
+                    ) {
                         crate::notify::long_block_finished(cmd, exit_code, ms);
                     }
                 }
@@ -11628,12 +11647,14 @@ impl TermView {
             let title_cbs = title_callbacks.clone();
             let vte_for_title = active_vte.clone();
             active_vte.connect_window_title_changed(move |_| {
+                // An empty title is forwarded too: it is a program resetting
+                // the title it set (claude sends `OSC 0 ;` on exit), and the
+                // tab label has to fall back to its default instead of keeping
+                // "✳ Claude Code" after the agent is gone.
                 if let Some(title) = vte_for_title.window_title() {
                     let title_str = title.to_string();
-                    if !title_str.is_empty() {
-                        for cb in title_cbs.borrow().iter() {
-                            cb(&title_str);
-                        }
+                    for cb in title_cbs.borrow().iter() {
+                        cb(&title_str);
                     }
                 }
             });

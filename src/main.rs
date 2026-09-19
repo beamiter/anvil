@@ -246,6 +246,28 @@ fn organism_focus_decision(
     }
 }
 
+/// Whether a BEL from a pane badges its tab. A focused window already shows
+/// the current pane, so only a background tab or split pane needs the badge
+/// there; with the window inactive even the current tab is badged, since that
+/// is where an agent the user left behind rings.
+fn bell_badges_tab(window_active: bool, pane_is_current: bool) -> bool {
+    !window_active || !pane_is_current
+}
+
+/// The tab label an OSC title from the tab's selected pane asks for, or `None`
+/// when a custom label pins it. An empty title is a program resetting what it
+/// set (claude sends `OSC 0 ;` on exit), so the label goes back to the
+/// cwd-derived `default` instead of keeping "✳ Claude Code" after it quits.
+fn tab_label_for_osc_title(title: &str, default: &str, custom: bool) -> Option<String> {
+    if custom {
+        None
+    } else if title.is_empty() {
+        Some(default.to_string())
+    } else {
+        Some(title.to_string())
+    }
+}
+
 /// A workspace mutation needs an explicit two-phase organism handoff whenever
 /// it changes pane identity or temporarily hides/reparents the current pane.
 /// The latter matters for moves where the same stable pane id remains selected
@@ -500,7 +522,7 @@ fn create_pane(
         // A command completed in this pane. Inactive tabs show failures with
         // the bell style and successes with the lighter activity style.
         VteOutput::CommandFinished(true) => AppMsg::Activity(pane_id),
-        VteOutput::CommandFinished(false) => AppMsg::Bell(pane_id),
+        VteOutput::CommandFinished(false) => AppMsg::CommandFailed(pane_id),
         VteOutput::RemoteSessionId(id) => AppMsg::PaneRemoteSessionId(pane_id, id),
         VteOutput::Notice(message) => AppMsg::Toast(message),
         VteOutput::NoticeWithUndo {
@@ -620,6 +642,7 @@ fn create_pane(
         last_duration_ms: None,
         task_role: None,
         task_session_id: None,
+        last_bell_toast: None,
     }
 }
 
@@ -1746,6 +1769,14 @@ impl SimpleComponent for AppModel {
                 self.sync_organism_focus();
                 if active {
                     self.file_tree_revalidate_due();
+                    // A bell that rang while the window was away badged the
+                    // current tab too; the user is looking at it now.
+                    if let Some(tab) = self.tabs.get_mut(self.active) {
+                        if tab.bell {
+                            tab.bell = false;
+                            self.sync_tab_strip();
+                        }
+                    }
                 }
             }
             AppMsg::Quit => {
@@ -2086,7 +2117,13 @@ impl SimpleComponent for AppModel {
                     // split reports OSC titles too, and letting those through
                     // made the label name a pane the user is not looking at.
                     let is_selected_pane = pane_index == self.tabs[idx].active_pane;
-                    if is_selected_pane && !self.tabs[idx].custom_title && !title.is_empty() {
+                    let default = default_tab_title(
+                        idx as u32 + 1,
+                        self.tabs[idx].panes[pane_index].cwd.as_deref(),
+                    );
+                    let label =
+                        tab_label_for_osc_title(&title, &default, self.tabs[idx].custom_title);
+                    if let Some(title) = label.filter(|_| is_selected_pane) {
                         let filter = self.tab_filter.to_lowercase();
                         let was_visible = filter.is_empty()
                             || self.tabs[idx]
@@ -2111,6 +2148,32 @@ impl SimpleComponent for AppModel {
                 }
             }
             AppMsg::Bell(pane_id) => {
+                if let Some((idx, pane_index)) = self.find_pane(pane_id) {
+                    // BEL is how codex (by default) and claude (with its
+                    // terminal-bell channel) say "your turn". The usual case
+                    // is an agent in the current tab of a window the user has
+                    // left, so an inactive window badges even the current tab
+                    // and posts a rate-limited toast naming it.
+                    let window_active = self.window.is_active();
+                    let pane_is_current =
+                        idx == self.active && pane_index == self.tabs[idx].active_pane;
+                    if bell_badges_tab(window_active, pane_is_current) && !self.tabs[idx].bell {
+                        self.tabs[idx].bell = true;
+                        self.sync_tab_strip();
+                    }
+                    let now = std::time::Instant::now();
+                    let pane = &mut self.tabs[idx].panes[pane_index];
+                    if notify::bell_should_notify(window_active, pane.last_bell_toast, now) {
+                        pane.last_bell_toast = Some(now);
+                        let source = pane
+                            .foreground_process()
+                            .unwrap_or_else(|| "the shell".to_string());
+                        let label = self.tabs[idx].display_title();
+                        notify::attention(label, &format!("Bell from {source}"));
+                    }
+                }
+            }
+            AppMsg::CommandFailed(pane_id) => {
                 if let Some((idx, pane_index)) = self.find_pane(pane_id) {
                     if idx != self.active || pane_index != self.tabs[idx].active_pane {
                         self.tabs[idx].bell = true;
@@ -3063,6 +3126,37 @@ mod organism_focus_tests {
             "reparenting the same pane still hides its old surface"
         );
         assert!(!organism_focus_transfer_required(None, None, false));
+    }
+}
+
+#[cfg(test)]
+mod bell_and_title_tests {
+    use super::*;
+
+    #[test]
+    fn a_bell_in_an_inactive_window_badges_even_the_current_tab() {
+        assert!(!bell_badges_tab(true, true), "the user is looking at it");
+        assert!(bell_badges_tab(true, false), "background tab or split pane");
+        assert!(
+            bell_badges_tab(false, true),
+            "an agent left behind in the current tab of an inactive window"
+        );
+        assert!(bell_badges_tab(false, false));
+    }
+
+    #[test]
+    fn an_empty_osc_title_restores_the_cwd_label() {
+        assert_eq!(
+            tab_label_for_osc_title("", "~/src", false).as_deref(),
+            Some("~/src"),
+            "claude's exit-time `OSC 0 ;` must not leave its label behind"
+        );
+        assert_eq!(
+            tab_label_for_osc_title("✳ Claude Code", "~/src", false).as_deref(),
+            Some("✳ Claude Code")
+        );
+        assert_eq!(tab_label_for_osc_title("", "~/src", true), None);
+        assert_eq!(tab_label_for_osc_title("vim", "~/src", true), None);
     }
 }
 

@@ -795,6 +795,12 @@ fn block_css(config: &Config) -> String {
         .block-unknown {{
             border-color: rgba({fg_r},{fg_g},{fg_b},0.35);
         }}
+        /* Stopped by the user (Ctrl+C, Ctrl+Z, a closed pipe): neutral, with
+           no failure wash, so a session of interrupted TUIs is not a wall of
+           red. */
+        .block-interrupted {{
+            border-color: rgba({fg_r},{fg_g},{fg_b},0.35);
+        }}
         .block-hovered {{
             background-color: rgba({fg_r},{fg_g},{fg_b},0.05);
             /* The ring, not the stripe: recolouring three of four border sides
@@ -812,6 +818,9 @@ fn block_css(config: &Config) -> String {
         }}
         .block-unknown.block-hovered {{
             outline-color: rgba({warn_r},{warn_g},{warn_b},0.30);
+        }}
+        .block-interrupted.block-hovered {{
+            outline-color: rgba({fg_r},{fg_g},{fg_b},0.22);
         }}
         /* The inset rings are anchored to the PADDING box, which moved one pixel
            outward when the top/right/bottom border became a layout-free
@@ -969,6 +978,17 @@ fn block_css(config: &Config) -> String {
         .block-status-bad {{
             color: {err_hex};
             background-color: rgba({err_r},{err_g},{err_b},0.18);
+            border-radius: 999px;
+            min-width: 16px;
+            min-height: 16px;
+            padding: 1px 5px;
+            font-family: {font_stack};
+            font-size: 0.82em;
+            font-weight: bold;
+        }}
+        .block-status-interrupted {{
+            color: {dim_fg};
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.14);
             border-radius: 999px;
             min-width: 16px;
             min-height: 16px;
@@ -1154,6 +1174,15 @@ fn block_css(config: &Config) -> String {
             font-family: {font_stack};
             font-size: 0.78em;
             font-weight: bold;
+            padding: 1px 8px;
+        }}
+        .block-exit-interrupted {{
+            color: {dim_fg};
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.10);
+            border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.22);
+            border-radius: 999px;
+            font-family: {font_stack};
+            font-size: 0.78em;
             padding: 1px 8px;
         }}
         .block-meta-badge {{
