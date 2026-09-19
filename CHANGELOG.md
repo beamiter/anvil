@@ -643,6 +643,50 @@ versioning for tagged releases while it remains experimental.
 
 ### Fixed
 
+- **Alt shortcuts in claude, codex and kimi no longer also type their letter.**
+  libvte 0.76 sends Alt+letter and Alt+Backspace as two commits, ESC and then
+  the key. Under the kitty keyboard flags the three agents push, the lone ESC
+  was encoded as the whole chord (`CSI 98;3u`) and the `b` then went into the
+  composer as typed text; without flags the two halves left as two PTY writes,
+  which a TUI can read as a bare Esc that interrupts its turn. The live
+  surface now joins the ESC to the key's commit and sends the pair as one
+  write, encoded when the program asked for it. Alt+Enter, Alt+Tab,
+  Alt+Backspace and Alt+Space are kitty-encoded too.
+- **libvte's own reports are no longer handled as typing.** Once a program
+  enables DECSET 1004 (claude, codex and kimi all do), libvte sends a focus
+  report through the same `commit` signal as keystrokes on every Alt+Tab, and
+  its answers to DA, DSR, CPR, DECRQM and XTVERSION queries arrive the same
+  way. Each one snapped a history view back to the live card, ended a block
+  selection and counted as human input. Reports now go straight to the
+  program and nothing else, even while an Agent submission is armed. A cursor
+  position report shares its shape with Shift+F3, so it is recognised only
+  while a CPR query the live surface was left to answer is outstanding.
+- **A text selection over streaming output survives focus changes, pointer
+  motion and query replies.** The selection hold released the parked output on
+  any commit, so the focus report from switching windows, or the motion report
+  from moving the pointer over claude's fullscreen UI, repainted the selection
+  away before it could be copied. Keys, clicks and wheel notches aimed at the
+  program still release it — including the wheel reports anvil synthesizes for
+  alternate-screen programs, which bypassed the hold and left their repaint
+  parked.
+- **Kitty keyboard flags apply in a pane without shell integration.** In
+  RawFallback, a program that pushed its flags was told `CSI ?1u` and then sent
+  legacy keys, so Shift+Enter submitted codex's composer instead of inserting
+  a newline. The keys are encoded whenever the PTY reports a foreground
+  program other than the shell; an unknown owner stays on legacy keys.
+- **The first key after a click into history reaches the running agent.** The
+  key that brought focus back from a finished card was spent on the refocus,
+  so the Esc meant to interrupt claude or codex, or the first pinyin letter of
+  a message, had to be pressed twice. While a command runs, the key now goes
+  on to the live VTE through its own key controllers, input method included.
+  Unbound Ctrl/Alt chords pressed there (Ctrl+O, Ctrl+R, Ctrl+T, Alt+…) went
+  nowhere at all; they now return focus and reach the program too. Block
+  chords and selection keys keep priority.
+- **Ctrl+C and Ctrl+D in a block's filter entry or the history palette no
+  longer interrupt the running command.** The running-command rescue handled
+  them before the focused field, so copying from the filter entry sent ^C to
+  codex and Ctrl+D could quit claude. A focused editable field, or anything in
+  a popover, now keeps its own chords.
 - **A truncated command line is no longer presented as the exact one.** A
   packet carrying both `cmdline_url=<prefix>` and `cmd_truncated=1` contradicts
   itself, and anvil resolved it to `CommandTextSource::ShellReported` — the

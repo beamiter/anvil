@@ -11,6 +11,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use jterm_core::terminal_report::classify_terminal_report;
 use vte4::TerminalExt;
 
 use super::{BlockState, MouseReportingMode};
@@ -78,7 +79,16 @@ impl SelectionFeedHold {
 
     /// Selection clearing and keyboard input are early-release triggers on the
     /// live VTE itself. Explicit input paths also flush before writing.
-    pub(crate) fn install_vte_hooks(self: &Rc<Self>, vte: &vte4::Terminal) {
+    ///
+    /// `cpr_outstanding` is the pane's count of cursor position queries left
+    /// to the live VTE: only while one is open is a `CSI row;col R` commit its
+    /// answer rather than a modified F3. The caller installs this hook before
+    /// the commit handler that settles the count.
+    pub(crate) fn install_vte_hooks(
+        self: &Rc<Self>,
+        vte: &vte4::Terminal,
+        cpr_outstanding: Rc<Cell<u32>>,
+    ) {
         let weak = Rc::downgrade(self);
         vte.connect_selection_changed(move |vte| {
             if let Some(hold) = weak.upgrade() {
@@ -89,11 +99,26 @@ impl SelectionFeedHold {
         });
 
         let weak = Rc::downgrade(self);
-        vte.connect_commit(move |_, _, _| {
+        vte.connect_commit(move |_, text, _| {
             if let Some(hold) = weak.upgrade() {
-                hold.flush_now();
+                hold.on_live_commit(text.as_bytes(), cpr_outstanding.get() > 0);
             }
         });
+    }
+
+    /// One `commit` from the live VTE. Typing, a click or a wheel notch aimed
+    /// at the program is the user acting on it and releases the hold. libvte
+    /// also commits what it generates on its own — a focus report on every
+    /// Alt+Tab once the program enabled DECSET 1004 (claude, codex and kimi
+    /// all do), a motion report whenever the pointer moves under DECSET 1003,
+    /// and its answers to the program's queries. None of those is the user
+    /// letting go of the selection, so they leave the output parked.
+    fn on_live_commit(&self, commit: &[u8], cpr_outstanding: bool) {
+        let generated = classify_terminal_report(commit, cpr_outstanding)
+            .is_some_and(|report| report.is_passive() || report.is_reply());
+        if !generated {
+            self.flush_now();
+        }
     }
 
     pub(crate) fn begin_drag(&self) {
@@ -292,6 +317,59 @@ mod tests {
         hold.flush_now();
         assert!(log.borrow().is_empty());
         assert!(!hold.try_buffer(b"live"));
+    }
+
+    #[test]
+    fn libvte_generated_commits_leave_a_selection_parked() {
+        let (hold, log) = hold_with_log();
+        hold.begin_drag();
+        assert!(hold.try_buffer(b"codex redraw"));
+        hold.end_drag(true);
+        // Alt+Tab away and back under DECSET 1004, the pointer drifting under
+        // DECSET 1003, and the program's DA1/DECRQM/XTVERSION/CPR answers.
+        for commit in [
+            &b"\x1b[O"[..],
+            b"\x1b[I",
+            b"\x1b[<35;10;5M",
+            b"\x1b[?61;1;21;22c",
+            b"\x1b[?2026;4$y",
+            b"\x1bP>|VTE(7600)\x1b\\",
+        ] {
+            hold.on_live_commit(commit, false);
+            assert!(hold.try_buffer(b"."), "{commit:?} released the hold");
+        }
+        hold.on_live_commit(b"\x1b[3;1R", true);
+        assert!(hold.try_buffer(b"."), "an awaited CPR released the hold");
+        assert!(log.borrow().is_empty());
+
+        // The same shape with no CPR asked for is Shift+F3: a key.
+        hold.on_live_commit(b"\x1b[1;2R", false);
+        assert_eq!(log.borrow().len(), 1);
+    }
+
+    #[test]
+    fn typing_clicks_and_wheel_notches_still_release_the_hold() {
+        for commit in [
+            &b"a"[..],
+            b"\r",
+            b"\x1b",
+            b"\x1b[A",
+            // A press and a release aimed at the program, and a wheel notch.
+            b"\x1b[<0;4;2M",
+            b"\x1b[<0;4;2m",
+            b"\x1b[<64;4;2M",
+        ] {
+            let (hold, log) = hold_with_log();
+            hold.begin_drag();
+            assert!(hold.try_buffer(b"parked"));
+            hold.end_drag(true);
+            hold.on_live_commit(commit, false);
+            assert_eq!(
+                log.borrow().as_slice(),
+                [b"parked".to_vec()],
+                "{commit:?} must release the hold"
+            );
+        }
     }
 
     #[test]

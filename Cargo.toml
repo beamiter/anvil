@@ -49,3 +49,8 @@ opt-level = 1
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# Temporary: develop against the local jterm_core worktree (branch block-mode-agent-tuis).
+# Remove after pushing jterm_core and repinning the rev above.
+[patch."https://github.com/beamiter/jterm_core.git"]
+jterm_core = { path = "../jterm_core" }
