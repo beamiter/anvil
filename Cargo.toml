@@ -11,7 +11,7 @@ categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 # Pin the shared contract so a branch move cannot silently change a release build.
-jterm_core = { git = "https://github.com/beamiter/jterm_core.git", rev = "7a995c02b9dd6ed833071b62d576f64e6cb30912" }
+jterm_core = { git = "https://github.com/beamiter/jterm_core.git", rev = "33093dab3bbe620a1bd4bee7c33d6a37289f9f5f" }
 relm4 = { version = "0.11", features = ["libadwaita", "gnome_46"] }
 vte4 = { version = "0.10.0", features = ["v0_76"] }
 log = { version = "0.4", features = ["std"] }
@@ -49,8 +49,3 @@ opt-level = 1
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
-
-# Temporary: develop against the local jterm_core worktree (branch block-mode-agent-tuis).
-# Remove after pushing jterm_core and repinning the rev above.
-[patch."https://github.com/beamiter/jterm_core.git"]
-jterm_core = { path = "../jterm_core" }
