@@ -67,59 +67,154 @@ pub(crate) fn finished_vte_height_px(rows: i64, cell_height: i32) -> i32 {
 
 // ─── Mouse Reporting Mode ─────────────────────────────────────────────────────
 
+pub(crate) use jterm_core::parser::{MouseEncoding, MouseMode};
+
+/// The mouse reporting a program asked for, as two independent settings, the
+/// way xterm and libvte keep them: *which* events are reported (`?9`,
+/// `?1000`, `?1002`, `?1003`) and *how* they are written (`?1005`, `?1006`,
+/// `?1015`). One last-write-wins mode used to stand for both, so `?1006;1000h`
+/// (htop, ncurses' `XM`) ended on "click" and got legacy `ESC [ M` wheel bytes
+/// it reads as keys, while `?1006h` alone counted as reporting switched on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub(crate) enum MouseReportingMode {
-    /// No mouse reporting (CSI ?1000l, etc.)
-    #[default]
-    None,
-    /// Basic click reporting (CSI ?1000h)
-    Click,
-    /// Button press/release/drag (CSI ?1002h)
-    Button,
-    /// All mouse motion (CSI ?1003h)
-    Motion,
-    /// SGR-style reporting (CSI ?1006h) - modern format
-    Sgr,
+pub(crate) struct MouseReporting {
+    pub(crate) tracking: MouseMode,
+    pub(crate) encoding: MouseEncoding,
 }
 
-/// Encode a wheel-scroll event as a mouse-reporting byte sequence appropriate
-/// for `mode`. Returns `None` if the mode has no wheel reporting (e.g. `None`,
-/// or a mode where wheel deltas don't translate).
+impl MouseReporting {
+    /// Nothing reported, default encoding: the state after RIS, and the one a
+    /// prompt boundary restores.
+    pub(crate) const OFF: Self = Self {
+        tracking: MouseMode::None,
+        encoding: MouseEncoding::Default,
+    };
+
+    /// Whether the program receives mouse events at all. The encoding alone
+    /// reports nothing.
+    pub(crate) fn is_tracking(self) -> bool {
+        self.tracking != MouseMode::None
+    }
+
+    /// Apply one DEC private mode from `CSI ? … h/l`, with the same rules as
+    /// `jterm_core::parser::Parser`: a tracking mode's `l` turns tracking off
+    /// whichever mode is on, and so does an encoding's `l` for the encoding.
+    /// Other modes are ignored.
+    pub(crate) fn apply_decset(&mut self, mode: u32, set: bool) {
+        let tracking = match mode {
+            9 => Some(MouseMode::X10),
+            1000 => Some(MouseMode::Normal),
+            1002 => Some(MouseMode::ButtonEvent),
+            1003 => Some(MouseMode::AnyEvent),
+            _ => None,
+        };
+        if let Some(tracking) = tracking {
+            self.tracking = if set { tracking } else { MouseMode::None };
+            return;
+        }
+        let encoding = match mode {
+            1005 => Some(MouseEncoding::Utf8),
+            1006 => Some(MouseEncoding::Sgr),
+            1015 => Some(MouseEncoding::Urxvt),
+            _ => None,
+        };
+        if let Some(encoding) = encoding {
+            self.encoding = if set {
+                encoding
+            } else {
+                MouseEncoding::Default
+            };
+        }
+    }
+}
+
+/// `CSI ? … l` for every mouse tracking and encoding mode, plus focus
+/// reporting. Fed to a live VTE that is *not* reset at a prompt boundary
+/// (`preserve_live_scrollback`), so a program that died without switching
+/// them off cannot leave libvte turning the next shell's clicks and focus
+/// changes into reports.
+pub(crate) const MOUSE_AND_FOCUS_REPORTING_OFF: &[u8] =
+    b"\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1004l";
+
+/// Most wheel reports one scroll event may produce. A flung touchpad or a
+/// huge surface delta would otherwise queue hundreds of reports the program
+/// has to work through after the user has stopped.
+pub(crate) const MAX_WHEEL_REPORTS_PER_EVENT: i32 = 10;
+
+/// Wheel reports for one scroll event that completed `notches` whole notches
+/// (negative up, as in GTK), clamped to [`MAX_WHEEL_REPORTS_PER_EVENT`].
+pub(crate) fn wheel_reports(
+    reporting: MouseReporting,
+    notches: i32,
+    col: i64,
+    row: i64,
+) -> Vec<u8> {
+    let count = notches
+        .unsigned_abs()
+        .min(MAX_WHEEL_REPORTS_PER_EVENT as u32);
+    let Some(report) = encode_mouse_wheel(reporting, f64::from(notches.signum()), col, row) else {
+        return Vec::new();
+    };
+    report.repeat(count as usize)
+}
+
+/// Encode one wheel notch as a mouse report in the program's encoding.
+/// Returns `None` while it tracks no mouse events.
 ///
-/// `delta_y` follows the GTK convention (negative = up, positive = down).
-/// `col` / `row` are 1-based cell coordinates under the pointer; if you don't
-/// have them, pass 1/1 — pagers (less/vim) look at the button code, not the
-/// coordinate.
+/// `delta_y` follows the GTK convention (negative = up, positive = down); only
+/// its sign matters, so accumulate fractional deltas into notches first (see
+/// [`jterm_core::wheel::WheelAccumulator`]). `col` / `row` are 1-based cell
+/// coordinates under the pointer; if you don't have them, pass 1/1 — pagers
+/// (less/vim) look at the button code, not the coordinate.
 ///
-/// VTE 4 normally encodes wheel events itself, but only when it owns the PTY;
-/// forge's live VTE is fed by our own reader so we synthesize the bytes here.
+/// libvte would encode an SGR wheel report itself, but it counts every event
+/// as a whole notch and ignores the scroll unit, and it cannot send the
+/// legacy encodings at all without a PTY of its own, so anvil writes them.
 pub(crate) fn encode_mouse_wheel(
-    mode: MouseReportingMode,
+    reporting: MouseReporting,
     delta_y: f64,
     col: i64,
     row: i64,
 ) -> Option<Vec<u8>> {
-    if delta_y == 0.0 {
+    if delta_y == 0.0 || !reporting.is_tracking() {
         return None;
     }
     // Buttons per xterm: 64 = wheel up, 65 = wheel down.
     let button: u32 = if delta_y < 0.0 { 64 } else { 65 };
-    let c = col.max(1);
-    let r = row.max(1);
-    match mode {
-        MouseReportingMode::None => None,
-        MouseReportingMode::Sgr => Some(format!("\x1b[<{};{};{}M", button, c, r).into_bytes()),
-        // X10-style modes encode each field as `value + 32` in a single byte.
-        // Wheel reporting requires at least Button-event tracking (1002), but
-        // xterm's de-facto behavior also forwards wheel under plain Click
-        // (1000), so we emit for any non-None, non-SGR mode.
-        MouseReportingMode::Click | MouseReportingMode::Button | MouseReportingMode::Motion => {
-            // Clamp to the legacy 223-column limit (255 - 32).
-            let cb = (button + 32).min(255) as u8;
-            let cc = (c as u32 + 32).min(255) as u8;
-            let cr = (r as u32 + 32).min(255) as u8;
-            Some(vec![0x1b, b'[', b'M', cb, cc, cr])
+    let c = col.clamp(1, u32::MAX as i64) as u32;
+    let r = row.clamp(1, u32::MAX as i64) as u32;
+    Some(match reporting.encoding {
+        MouseEncoding::Sgr => format!("\x1b[<{button};{c};{r}M").into_bytes(),
+        MouseEncoding::Urxvt => format!("\x1b[{};{c};{r}M", button + 32).into_bytes(),
+        // `?1005`: every field is `value + 32` as a UTF-8 character, which
+        // lifts the legacy 223-cell limit to 2015.
+        MouseEncoding::Utf8 => {
+            let mut out = b"\x1b[M".to_vec();
+            for value in [button, c.min(2015), r.min(2015)] {
+                let ch = char::from_u32(value + 32).unwrap_or(' ');
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            }
+            out
         }
+        // Legacy X10 encoding: each field is one byte, `value + 32`, clamped
+        // to the 223-cell limit (255 - 32).
+        MouseEncoding::Default => {
+            let cb = (button + 32).min(255) as u8;
+            let cc = (c + 32).min(255) as u8;
+            let cr = (r + 32).min(255) as u8;
+            vec![0x1b, b'[', b'M', cb, cc, cr]
+        }
+    })
+}
+
+/// A scroll delta in wheel notches. Surface-unit deltas (Wayland touchpads in
+/// GTK 4.14 are pixels) become notches the way `EventControllerScroll` does
+/// when asked for discrete steps; a plain ±1.0 wheel notch is unchanged.
+pub(crate) fn wheel_notches(dy: f64, unit: gtk::gdk::ScrollUnit) -> f64 {
+    if unit == gtk::gdk::ScrollUnit::Surface {
+        dy / jterm_core::wheel::SURFACE_UNITS_PER_STEP
+    } else {
+        dy
     }
 }
 
@@ -263,35 +358,156 @@ fn forward_command_surface_scroll(terminal: &Terminal, dy: f64) -> bool {
 mod tests {
     use super::*;
 
+    fn reporting(tracking: MouseMode, encoding: MouseEncoding) -> MouseReporting {
+        MouseReporting { tracking, encoding }
+    }
+
     #[test]
     fn sgr_wheel_up_encodes_button_64() {
         // delta_y < 0 → wheel up → button 64 (xterm convention).
-        let seq = encode_mouse_wheel(MouseReportingMode::Sgr, -1.0, 10, 5).unwrap();
+        let seq = encode_mouse_wheel(
+            reporting(MouseMode::AnyEvent, MouseEncoding::Sgr),
+            -1.0,
+            10,
+            5,
+        )
+        .unwrap();
         assert_eq!(seq, b"\x1b[<64;10;5M");
     }
 
     #[test]
     fn sgr_wheel_down_encodes_button_65() {
-        let seq = encode_mouse_wheel(MouseReportingMode::Sgr, 1.0, 1, 1).unwrap();
+        let seq = encode_mouse_wheel(reporting(MouseMode::Normal, MouseEncoding::Sgr), 1.0, 1, 1)
+            .unwrap();
         assert_eq!(seq, b"\x1b[<65;1;1M");
     }
 
     #[test]
     fn x10_wheel_up_uses_value_plus_32() {
-        // Legacy mode: each field encoded as byte = value + 32.
-        let seq = encode_mouse_wheel(MouseReportingMode::Button, -1.0, 1, 1).unwrap();
+        // Legacy encoding: each field encoded as byte = value + 32.
+        let seq = encode_mouse_wheel(
+            reporting(MouseMode::ButtonEvent, MouseEncoding::Default),
+            -1.0,
+            1,
+            1,
+        )
+        .unwrap();
         assert_eq!(seq, vec![0x1b, b'[', b'M', 64 + 32, 1 + 32, 1 + 32]);
     }
 
     #[test]
+    fn urxvt_and_utf8_wheel_reports_use_their_own_encodings() {
+        let urxvt = encode_mouse_wheel(
+            reporting(MouseMode::Normal, MouseEncoding::Urxvt),
+            1.0,
+            3,
+            4,
+        )
+        .unwrap();
+        assert_eq!(urxvt, b"\x1b[97;3;4M");
+        // Column 300 is past the legacy limit; UTF-8 carries it.
+        let utf8 = encode_mouse_wheel(
+            reporting(MouseMode::Normal, MouseEncoding::Utf8),
+            -1.0,
+            300,
+            2,
+        )
+        .unwrap();
+        let mut expected = vec![0x1b, b'[', b'M', 96];
+        expected.extend_from_slice("\u{14c}".as_bytes()); // 300 + 32
+        expected.push(34);
+        assert_eq!(utf8, expected);
+    }
+
+    #[test]
     fn none_mode_returns_no_bytes() {
-        assert!(encode_mouse_wheel(MouseReportingMode::None, -1.0, 1, 1).is_none());
+        assert!(encode_mouse_wheel(MouseReporting::OFF, -1.0, 1, 1).is_none());
+        // An encoding without tracking reports nothing either.
+        let encoding_only = reporting(MouseMode::None, MouseEncoding::Sgr);
+        assert!(!encoding_only.is_tracking());
+        assert!(encode_mouse_wheel(encoding_only, -1.0, 1, 1).is_none());
     }
 
     #[test]
     fn zero_delta_returns_no_bytes() {
         // Spurious 0 delta from GTK shouldn't paginate the app.
-        assert!(encode_mouse_wheel(MouseReportingMode::Sgr, 0.0, 1, 1).is_none());
+        assert!(encode_mouse_wheel(
+            reporting(MouseMode::AnyEvent, MouseEncoding::Sgr),
+            0.0,
+            1,
+            1
+        )
+        .is_none());
+    }
+
+    /// Feed `bytes` through the real parser and apply its DECSET events.
+    fn reporting_after(bytes: &[u8]) -> MouseReporting {
+        let mut parser =
+            jterm_core::parser::Parser::with_config(jterm_core::parser::ParserConfig {
+                mouse_reporting: true,
+                focus_reporting: true,
+            });
+        let mut events = Vec::new();
+        parser.feed(bytes, &mut events);
+        let mut state = MouseReporting::OFF;
+        for event in events {
+            if let jterm_core::parser::ParserEvent::DecsetMode { mode, set } = event {
+                state.apply_decset(mode, set);
+            }
+        }
+        // The shadow must agree with the parser's own view of the stream.
+        assert_eq!(state.tracking, parser.mouse_mode());
+        assert_eq!(state.encoding, parser.mouse_encoding());
+        state
+    }
+
+    #[test]
+    fn tracking_and_encoding_are_separate_settings() {
+        // htop / ncurses `XM`: SGR first, then click tracking. The wheel must
+        // still be written in SGR, not as legacy `ESC [ M` key-like bytes.
+        let htop = reporting_after(b"\x1b[?1006;1000h");
+        assert_eq!(htop, reporting(MouseMode::Normal, MouseEncoding::Sgr));
+        assert_eq!(
+            encode_mouse_wheel(htop, 1.0, 7, 9).unwrap(),
+            b"\x1b[<65;7;9M"
+        );
+        // vim 9: the same, then button tracking on top.
+        let vim = reporting_after(b"\x1b[?1006;1000h\x1b[?1002h");
+        assert_eq!(vim, reporting(MouseMode::ButtonEvent, MouseEncoding::Sgr));
+        // claude's fullscreen UI and opencode end on SGR any-event tracking.
+        let claude = reporting_after(b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h");
+        assert_eq!(claude, reporting(MouseMode::AnyEvent, MouseEncoding::Sgr));
+        // Their exit turns tracking off; a stray encoding alone is not
+        // reporting.
+        let exited = reporting_after(b"\x1b[?1000h\x1b[?1003h\x1b[?1006h\x1b[?1003l\x1b[?1000l");
+        assert!(!exited.is_tracking());
+        assert_eq!(exited.encoding, MouseEncoding::Sgr);
+        assert_eq!(reporting_after(b"\x1b[?1006l"), MouseReporting::OFF);
+    }
+
+    #[test]
+    fn one_event_writes_one_report_per_notch_up_to_the_clamp() {
+        let sgr = reporting(MouseMode::AnyEvent, MouseEncoding::Sgr);
+        assert_eq!(wheel_reports(sgr, 0, 1, 1), b"");
+        assert_eq!(wheel_reports(sgr, -2, 1, 1), b"\x1b[<64;1;1M\x1b[<64;1;1M");
+        let flung = wheel_reports(sgr, 500, 1, 1);
+        assert_eq!(
+            flung.len(),
+            b"\x1b[<65;1;1M".len() * MAX_WHEEL_REPORTS_PER_EVENT as usize
+        );
+        assert!(wheel_reports(MouseReporting::OFF, 3, 1, 1).is_empty());
+    }
+
+    #[test]
+    fn surface_deltas_are_normalised_and_wheel_notches_pass_through() {
+        use gtk::gdk::ScrollUnit;
+        assert_eq!(wheel_notches(1.0, ScrollUnit::Wheel), 1.0);
+        assert_eq!(wheel_notches(-0.25, ScrollUnit::Wheel), -0.25);
+        assert_eq!(wheel_notches(25.0, ScrollUnit::Surface), 2.5);
+        // And accumulated, 25 px is two notches with half a notch carried.
+        let mut acc = jterm_core::wheel::WheelAccumulator::new();
+        assert_eq!(acc.push(25.0, true), 2);
+        assert_eq!(acc.push(5.0, true), 1);
     }
 
     #[test]
@@ -561,10 +777,11 @@ pub(crate) fn create_finished_terminal(
         // form terminal -> controller -> closure -> terminal and keep every
         // evicted finished VTE (including its scrollback grid) alive forever.
         let terminal_for_scroll = terminal.downgrade();
-        scroll.connect_scroll(move |_, _dx, dy| {
+        scroll.connect_scroll(move |controller, _dx, dy| {
             let Some(terminal_for_scroll) = terminal_for_scroll.upgrade() else {
                 return glib::Propagation::Proceed;
             };
+            let dy = wheel_notches(dy, controller.unit());
             if forward_command_surface_scroll(&terminal_for_scroll, dy) {
                 glib::Propagation::Stop
             } else {

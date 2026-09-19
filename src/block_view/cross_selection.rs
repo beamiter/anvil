@@ -27,7 +27,7 @@ use vte4::TerminalExt;
 
 use super::selection_hold::{feed_hold_eligible, SelectionFeedHold};
 use super::{
-    clear_finished_block_selection, BlockState, FinishedBlock, MouseReportingMode, SelectedBlockIds,
+    clear_finished_block_selection, BlockState, FinishedBlock, MouseReporting, SelectedBlockIds,
 };
 
 const MAX_CROSS_SELECTION_BYTES: usize = 32 * 1024 * 1024;
@@ -88,7 +88,7 @@ pub(crate) struct CrossSelection {
     /// repaints cannot clear the selection out from under the pointer.
     feed_hold: Rc<SelectionFeedHold>,
     bstate: Rc<Cell<BlockState>>,
-    mouse_reporting: Rc<Cell<MouseReportingMode>>,
+    mouse_reporting: Rc<Cell<MouseReporting>>,
 }
 
 impl CrossSelection {
@@ -102,7 +102,7 @@ impl CrossSelection {
         selection_anchor_id: Rc<Cell<Option<u64>>>,
         feed_hold: Rc<SelectionFeedHold>,
         bstate: Rc<Cell<BlockState>>,
-        mouse_reporting: Rc<Cell<MouseReportingMode>>,
+        mouse_reporting: Rc<Cell<MouseReporting>>,
     ) -> Rc<Self> {
         let this = Rc::new(Self {
             finished_blocks,
@@ -397,7 +397,7 @@ mod tests {
         use relm4::gtk;
         use vte4::TerminalExt;
 
-        use crate::block_view::{BlockState, FinishedBlock, MouseReportingMode, SelectionFeedHold};
+        use crate::block_view::{BlockState, FinishedBlock, MouseReporting, SelectionFeedHold};
         use crate::config::Config;
 
         gtk::init().expect("gtk init");
@@ -426,7 +426,7 @@ mod tests {
             claimed: Cell::new(false),
             feed_hold: SelectionFeedHold::new(),
             bstate: Rc::new(Cell::new(BlockState::AwaitingCommand)),
-            mouse_reporting: Rc::new(Cell::new(MouseReportingMode::None)),
+            mouse_reporting: Rc::new(Cell::new(MouseReporting::OFF)),
         };
 
         let pane = gtk::Box::new(gtk::Orientation::Vertical, 0);

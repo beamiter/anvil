@@ -643,6 +643,59 @@ versioning for tagged releases while it remains experimental.
 
 ### Fixed
 
+- **Entering or leaving the alternate screen no longer resizes the program.**
+  A Block card went full-bleed for an alternate-screen app, which changed the
+  winsize by a row at once and by two columns a frame later. codex answers any
+  resize by clearing the screen and replaying its whole transcript, so every
+  Ctrl+T transcript overlay or Ctrl+G editor round trip flashed the pane, and
+  the late column change left the PTY two columns wider than the grid after
+  1049l, wrapping codex's full-width lines until the pane was resized. The card
+  now only drops its border colour, ring and shadow (`.block-alt-screen`) and
+  keeps its box, so 1049h/l publish the winsize the command already had. Alt
+  apps such as `top` and `vim` give back the row and two columns full-bleed
+  gave them. Unified mode is unchanged.
+- **A winsize published before the grid settled is corrected.** The state
+  transitions' synchronous winsize push and the resize settle tick kept
+  separate memories of what the PTY had been told, so the tick never corrected
+  a size only the push had sent, and nothing re-armed the tick after a density
+  toggle. Both now share one memory, a push arms the tick, and an unchanged
+  size is not sent again.
+- **Closing codex's transcript overlay no longer pins its card to full
+  height.** An alternate-screen visit inside a running command recorded the
+  full-pane card as the command's height, and the card never shrinks within a
+  command, so the composer sat at the top of an otherwise empty pane for the
+  rest of the session. The alternate screen restores the primary screen
+  exactly, so the card now resumes from the height it had before.
+- **With `preserve_live_scrollback = true` the running card shows the running
+  command.** The grown grid is bottom-aligned on the kept scrollback, so the
+  card, clipped to the grid's top rows, showed the previous command's lines
+  while the new output, and codex's bottom-anchored viewport, drew below its
+  edge. That mode runs commands in a full-page card again, as documented.
+- **Wheel reports follow the encoding the program asked for, one per notch.**
+  Mouse tracking and encoding were a single last-write-wins mode, so htop's and
+  ncurses' `?1006;1000h` got legacy `ESC [ M` wheel bytes that read as keys,
+  while a lone `?1006h` counted as reporting switched on. They are now tracked
+  separately (legacy, SGR, urxvt and UTF-8 encodings). Touchpad and hi-res
+  wheel deltas accumulate into whole notches instead of each event scrolling
+  claude's fullscreen UI or opencode by a full one, at most ten reports per
+  event, and Wayland pixel deltas scroll the live card, the history and
+  finished cards by notches rather than by pixels.
+- **A program killed with mouse reporting on no longer leaves the pane in that
+  mode.** After claude's fullscreen UI or opencode was SIGKILLed or lost its
+  ssh session, click-to-move stayed disabled and the next pager got SGR wheel
+  reports instead of arrow keys. Mouse reporting is reset at the accepted
+  prompt and when a command ends inside the alternate screen, and a live
+  terminal that is not reset at the prompt (`preserve_live_scrollback`, Unified
+  mode) has its mouse and focus reporting switched off there too.
+- **Find while an alternate-screen app owns the pane searches its screen.**
+  Ctrl+Shift+F reported matches from the finished blocks the app had hidden and
+  never found the text on screen. It now searches the live terminal while the
+  alternate screen is up, and a Find left open moves between the screen and
+  the blocks on its next step.
+- **A background tab running a full-screen program gets the activity marker.**
+  Output in the alternate screen (opencode, claude's fullscreen UI) never
+  reached the activity subscribers, so such a tab looked idle however much it
+  drew.
 - **Alt shortcuts in claude, codex and kimi no longer also type their letter.**
   libvte 0.76 sends Alt+letter and Alt+Backspace as two commits, ESC and then
   the key. Under the kitty keyboard flags the three agents push, the lone ESC

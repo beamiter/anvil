@@ -4582,11 +4582,13 @@ impl FinishedBlock {
             let vte = self.output_vte.downgrade();
             let outer_for_vte = outer.downgrade();
             let debouncer = debouncer.clone();
-            scroll_ctrl.connect_scroll(move |_, _dx, dy| {
+            scroll_ctrl.connect_scroll(move |controller, _dx, dy| {
                 let (Some(vte), Some(outer_for_vte)) = (vte.upgrade(), outer_for_vte.upgrade())
                 else {
                     return glib::Propagation::Proceed;
                 };
+                // Pixel deltas (Wayland touchpads) scroll by notches, like a wheel.
+                let dy = super::wheel_notches(dy, controller.unit());
                 if let Some(inner_adj) = vte.vadjustment() {
                     if scroll_adjustment_by_wheel(&inner_adj, dy) {
                         return glib::Propagation::Stop;
@@ -5070,6 +5072,11 @@ impl ActiveBlock {
         self.live_cursor_high.set(0);
         if preserve_scrollback {
             self.active_vte.feed(b"\x1b[0m");
+            // Kept scrollback means no VTE reset, so a program that died
+            // with mouse or focus reporting on would leave libvte turning the
+            // shell's clicks into reports. Switch them off by hand, as the
+            // reset below does for the default path.
+            self.active_vte.feed(super::MOUSE_AND_FOCUS_REPORTING_OFF);
         } else {
             self.active_vte.reset(true, true);
             self.active_vte.feed(b"\x1b[H\x1b[2J\x1b[3J");

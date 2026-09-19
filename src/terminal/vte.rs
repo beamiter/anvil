@@ -764,27 +764,7 @@ impl Component for VteTerminal {
                         self.terminal.search_set_regex(None::<&vte4::Regex>, 0);
                         status
                     } else {
-                        let pattern = search_pattern(&query, use_regex);
-                        match vte4::Regex::for_search(
-                            &pattern,
-                            pcre2_sys::PCRE2_CASELESS | pcre2_sys::PCRE2_MULTILINE,
-                        ) {
-                            Ok(regex) => {
-                                self.terminal.search_set_regex(Some(&regex), 0);
-                                self.terminal.search_set_wrap_around(true);
-                                let found = self.terminal.search_find_next();
-                                search_status_for_vte(
-                                    compile_count_regex(&pattern).ok().as_ref(),
-                                    terminal_search_snapshot(&self.terminal),
-                                    found,
-                                    !use_regex,
-                                )
-                            }
-                            Err(error) => {
-                                self.terminal.search_set_regex(None::<&vte4::Regex>, 0);
-                                SearchStatus::Error(invalid_regex_message(error))
-                            }
-                        }
+                        search_terminal(&self.terminal, &query, use_regex)
                     };
                 let _ = sender.output(VteOutput::SearchStatus(self.search_status.clone()));
             }
@@ -805,6 +785,33 @@ impl Component for VteTerminal {
             }
             VteInput::CrossBlockSearch => {}
             VteInput::AskAiAboutSelectedBlock => {}
+        }
+    }
+}
+
+/// Install `query` as `terminal`'s native search, step to the first match
+/// and count what the bounded snapshot can see. The query must already have
+/// passed [`crate::search::oversize_query_status`].
+pub(super) fn search_terminal(terminal: &Terminal, query: &str, use_regex: bool) -> SearchStatus {
+    let pattern = search_pattern(query, use_regex);
+    match vte4::Regex::for_search(
+        &pattern,
+        pcre2_sys::PCRE2_CASELESS | pcre2_sys::PCRE2_MULTILINE,
+    ) {
+        Ok(regex) => {
+            terminal.search_set_regex(Some(&regex), 0);
+            terminal.search_set_wrap_around(true);
+            let found = terminal.search_find_next();
+            search_status_for_vte(
+                compile_count_regex(&pattern).ok().as_ref(),
+                terminal_search_snapshot(terminal),
+                found,
+                !use_regex,
+            )
+        }
+        Err(error) => {
+            terminal.search_set_regex(None::<&vte4::Regex>, 0);
+            SearchStatus::Error(invalid_regex_message(error))
         }
     }
 }
@@ -1089,5 +1096,48 @@ mod tests {
             "Terminal failed to start: flatpak-spawn missing. \
              Check the shell, remote command, or host bridge."
         );
+    }
+
+    /// A Find while an alternate-screen app owns a Block pane searches the
+    /// live terminal's own screen with this helper; the text there is what the
+    /// user sees, not the hidden cards.
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn live_screen_search_finds_text_on_the_alternate_screen() {
+        use gtk::glib;
+        use gtk::prelude::*;
+        use relm4::gtk;
+        use std::time::{Duration, Instant};
+        use vte4::{Terminal, TerminalExt};
+
+        gtk::init().expect("gtk init");
+        let terminal = Terminal::new();
+        terminal.set_size(40, 6);
+        let window = gtk::Window::new();
+        window.set_child(Some(&terminal));
+        window.present();
+        terminal.feed(b"primary-only\r\n\x1b[?1049h\x1b[H\x1b[2Jclaude transcript: needle here");
+        let context = glib::MainContext::default();
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_millis(100) {
+            while context.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        assert_eq!(
+            super::search_terminal(&terminal, "NEEDLE", false),
+            SearchStatus::results(1, 1)
+        );
+        let selected = terminal
+            .text_selected(vte4::Format::Text)
+            .map(|text| text.to_string())
+            .unwrap_or_default();
+        assert_eq!(selected, "needle");
+        assert!(matches!(
+            super::search_terminal(&terminal, "(", true),
+            SearchStatus::Error(_)
+        ));
+        window.close();
+        while context.iteration(false) {}
     }
 }

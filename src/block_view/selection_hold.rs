@@ -14,7 +14,7 @@ use std::rc::Rc;
 use jterm_core::terminal_report::classify_terminal_report;
 use vte4::TerminalExt;
 
-use super::{BlockState, MouseReportingMode};
+use super::{BlockState, MouseReporting};
 
 type FlushFn = Box<dyn Fn(Vec<u8>)>;
 type StateFn = Box<dyn Fn(bool)>;
@@ -27,7 +27,7 @@ const MAX_PARKED_BYTES: usize = 2 * 1024 * 1024;
 /// is active the child owns the drag, unless Shift forces VTE local selection.
 pub(crate) fn feed_hold_eligible(
     state: BlockState,
-    mouse: MouseReportingMode,
+    mouse: MouseReporting,
     shift_held: bool,
 ) -> bool {
     let streaming = matches!(
@@ -37,7 +37,7 @@ pub(crate) fn feed_hold_eligible(
             | BlockState::AltScreen
             | BlockState::RawFallback
     );
-    streaming && (mouse == MouseReportingMode::None || shift_held)
+    streaming && (!mouse.is_tracking() || shift_held)
 }
 
 pub(crate) struct SelectionFeedHold {
@@ -194,7 +194,7 @@ mod tests {
     use std::rc::Rc;
 
     use super::{feed_hold_eligible, SelectionFeedHold, MAX_PARKED_BYTES};
-    use crate::block_view::{BlockState, MouseReportingMode};
+    use crate::block_view::{BlockState, MouseEncoding, MouseMode, MouseReporting};
 
     type FlushLog = Rc<RefCell<Vec<Vec<u8>>>>;
 
@@ -206,48 +206,59 @@ mod tests {
         (hold, log)
     }
 
+    const SGR_ANY: MouseReporting = MouseReporting {
+        tracking: MouseMode::AnyEvent,
+        encoding: MouseEncoding::Sgr,
+    };
+
     #[test]
     fn eligibility_requires_streaming_or_shift_for_mouse_reporting() {
+        // An encoding with no tracking mode reports nothing, so VTE keeps
+        // its own local selection.
         assert!(feed_hold_eligible(
             BlockState::CollectingOutput,
-            MouseReportingMode::None,
+            MouseReporting {
+                tracking: MouseMode::None,
+                encoding: MouseEncoding::Sgr,
+            },
+            false
+        ));
+        assert!(feed_hold_eligible(
+            BlockState::CollectingOutput,
+            MouseReporting::OFF,
             false
         ));
         assert!(feed_hold_eligible(
             BlockState::AltScreen,
-            MouseReportingMode::None,
+            MouseReporting::OFF,
             false
         ));
         assert!(feed_hold_eligible(
             BlockState::RawFallback,
-            MouseReportingMode::None,
+            MouseReporting::OFF,
             false
         ));
         assert!(!feed_hold_eligible(
             BlockState::Idle,
-            MouseReportingMode::None,
+            MouseReporting::OFF,
             false
         ));
         assert!(!feed_hold_eligible(
             BlockState::AwaitingCommand,
-            MouseReportingMode::None,
+            MouseReporting::OFF,
             false
         ));
         assert!(!feed_hold_eligible(
             BlockState::CollectingOutput,
-            MouseReportingMode::Sgr,
+            SGR_ANY,
             false
         ));
         assert!(feed_hold_eligible(
             BlockState::CollectingOutput,
-            MouseReportingMode::Sgr,
+            SGR_ANY,
             true
         ));
-        assert!(!feed_hold_eligible(
-            BlockState::Idle,
-            MouseReportingMode::Sgr,
-            true
-        ));
+        assert!(!feed_hold_eligible(BlockState::Idle, SGR_ANY, true));
     }
 
     #[test]

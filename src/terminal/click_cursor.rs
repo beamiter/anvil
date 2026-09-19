@@ -25,7 +25,7 @@ use jterm_core::click_cursor as core_click;
 use relm4::gtk;
 use vte4::{Terminal, TerminalExt};
 
-use crate::block_view::{BlockState, MouseReportingMode};
+use crate::block_view::{BlockState, MouseReporting};
 use crate::pty::OwnedPty;
 
 /// Everything the handler needs from the block view's shared state.
@@ -37,7 +37,7 @@ pub(crate) struct ClickCursorCtx {
     /// same rebase decision used by reviewed submission and prompt status.
     pub(crate) prompt_anchor: Rc<dyn Fn() -> (i64, i64)>,
     pub(crate) bstate: Rc<Cell<BlockState>>,
-    pub(crate) mouse_mode: Rc<Cell<MouseReportingMode>>,
+    pub(crate) mouse_mode: Rc<Cell<MouseReporting>>,
     pub(crate) fullscreen: Rc<Cell<bool>>,
     /// The palette colour inline suggestions are painted in — ANSI colour 8,
     /// which is what both jsh and zsh-autosuggestions use. Text right of the
@@ -76,7 +76,7 @@ impl ClickCursorCtx {
     fn guards(&self) -> core_click::Guards {
         core_click::Guards {
             enabled: self.enabled,
-            mouse_reporting: self.mouse_mode.get() != MouseReportingMode::None,
+            mouse_reporting: self.mouse_mode.get().is_tracking(),
             alt_screen: self.fullscreen.get(),
             // Click and cursor are both read in absolute ring coordinates, so
             // a scrolled-back view needs no separate veto: the distance stays

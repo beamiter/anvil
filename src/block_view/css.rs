@@ -877,6 +877,19 @@ fn block_css(config: &Config) -> String {
             padding: 1px 1px 1px 0;
             box-shadow: none;
         }}
+        /* Block mode's alternate screen drops the card's decoration and keeps
+           its box. Margin, padding and border width stay exactly those of the
+           running card in either density, so entering or leaving the alternate
+           screen publishes the same winsize and sends the program no SIGWINCH;
+           codex answers even a one-row change by clearing and replaying its
+           whole transcript. `.block-fullscreen` below is Unified mode's
+           permanent full-bleed holder and must not be reused for this. */
+        .block-active.block-alt-screen {{
+            border-color: transparent;
+            outline-style: none;
+            border-radius: 0;
+            box-shadow: none;
+        }}
         .block-active.block-fullscreen {{
             border: none;
             outline-style: none;
@@ -1433,6 +1446,45 @@ mod tests {
                 "{selected_hovered} must retain its hovered outcome wash: {selected_hovered_body}"
             );
         }
+    }
+
+    /// Every property the rule body declares, by name.
+    fn declared_properties(body: &str) -> Vec<&str> {
+        body.split(';')
+            .filter_map(|decl| decl.split_once(':'))
+            .map(|(name, _)| name.trim())
+            .filter(|name| !name.is_empty() && !name.starts_with("/*"))
+            .collect()
+    }
+
+    #[test]
+    fn the_alt_screen_card_keeps_the_running_cards_box() {
+        let config = Config::safe_defaults();
+        let css = block_css(&config);
+        let body = rule_body(&css, ".block-active.block-alt-screen");
+        let properties = declared_properties(body);
+        assert!(
+            properties.contains(&"border-color") && properties.contains(&"box-shadow"),
+            "the alt-screen card must still drop the decoration: {body}"
+        );
+        // Anything that moves the content box changes the grid, and the grid
+        // is the winsize: codex replays its transcript on every change.
+        for property in &properties {
+            let moves_the_box = property.starts_with("margin")
+                || property.starts_with("padding")
+                || *property == "border"
+                || property.starts_with("border-width")
+                || (property.starts_with("border-") && property.ends_with("-width"))
+                || property.starts_with("min-")
+                || *property == "outline-offset";
+            assert!(
+                !moves_the_box,
+                "`.block-active.block-alt-screen` must not declare `{property}`: {body}"
+            );
+        }
+        // Unified's permanent full-bleed holder keeps its own rule.
+        let fullscreen = rule_body(&css, ".block-active.block-fullscreen");
+        assert!(fullscreen.contains("margin: 0") && fullscreen.contains("padding: 0"));
     }
 
     fn test_root(label: &str) -> std::path::PathBuf {

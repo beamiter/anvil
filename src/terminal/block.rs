@@ -14,7 +14,8 @@ use std::time::Duration;
 use vte4::prelude::TerminalExt;
 
 use crate::block_view::{
-    FindNavigationResult, FindProgress, FindSearchResult, RecordNavigationResult, TermView,
+    FindNavigationResult, FindProgress, FindScope, FindSearchResult, RecordNavigationResult,
+    TermView,
 };
 use crate::search::SearchStatus;
 
@@ -94,6 +95,33 @@ pub struct BlockTerminal {
     /// the query lets the adapter rebuild the pass instead of claiming the
     /// still-visible text disappeared.
     search_query: Option<(String, bool)>,
+    /// `search_status` came from the live terminal's own search, run while an
+    /// alternate-screen app owned the pane, rather than from the blocks.
+    search_live: bool,
+}
+
+/// Run a Find in the scope the pane has now: the finished blocks, or only the
+/// live screen while an alternate-screen app owns the pane and the cards are
+/// hidden (see [`FindScope`]). Returns the status and whether it searched the
+/// live screen.
+fn search_in_scope(view: &TermView, query: &str, use_regex: bool) -> (SearchStatus, bool) {
+    if view.find_scope() == FindScope::LiveScreen {
+        // Drops any block hits (and the live terminal's regex) first.
+        view.clear_find();
+        return (
+            super::vte::search_terminal(view.vte(), query, use_regex),
+            true,
+        );
+    }
+    let pattern = super::vte::search_pattern(query, use_regex);
+    let status = match validate_block_search_pattern(&pattern) {
+        Ok(_) => block_result_status(view.find_in_blocks(query, use_regex), use_regex),
+        Err(error) => {
+            view.clear_find();
+            SearchStatus::Error(error)
+        }
+    };
+    (status, false)
 }
 
 fn validate_block_search_pattern(pattern: &str) -> Result<(), String> {
@@ -491,6 +519,7 @@ impl Component for BlockTerminal {
             record_snapshot_dialog: Rc::new(RefCell::new(None)),
             search_status: SearchStatus::Idle,
             search_query: None,
+            search_live: false,
         };
         ComponentParts { model, widgets: () }
     }
@@ -619,91 +648,90 @@ impl Component for BlockTerminal {
                 let _ = sender.output(VteOutput::Notice(message));
             }
             VteInput::SearchSet(query, use_regex) => {
-                self.search_status = if let Some(status) =
-                    crate::search::oversize_query_status(&query)
-                {
-                    // Do not retain the oversized query: an invalidated Find
-                    // rebuilds from `search_query` and must not re-scan with it.
-                    self.search_query = None;
-                    view.clear_find();
-                    status
-                } else {
-                    self.search_query = Some((query.clone(), use_regex));
-                    let pattern = super::vte::search_pattern(&query, use_regex);
-                    match validate_block_search_pattern(&pattern) {
-                        Ok(_) => {
-                            block_result_status(view.find_in_blocks(&query, use_regex), use_regex)
-                        }
-                        Err(error) => {
-                            view.clear_find();
-                            SearchStatus::Error(error)
-                        }
-                    }
-                };
+                self.search_status =
+                    if let Some(status) = crate::search::oversize_query_status(&query) {
+                        // Do not retain the oversized query: an invalidated Find
+                        // rebuilds from `search_query` and must not re-scan with it.
+                        self.search_query = None;
+                        self.search_live = false;
+                        view.clear_find();
+                        status
+                    } else {
+                        let (status, live) = search_in_scope(view, &query, use_regex);
+                        self.search_query = Some((query, use_regex));
+                        self.search_live = live;
+                        status
+                    };
                 let _ = sender.output(VteOutput::SearchStatus(self.search_status.clone()));
             }
-            VteInput::SearchNext => {
-                let active = matches!(
-                    self.search_status,
-                    SearchStatus::Results { total, .. } if total > 0
-                );
-                let partial = matches!(
-                    self.search_status,
-                    SearchStatus::Results {
-                        truncated: true,
-                        ..
-                    }
-                );
-                let result = if active {
-                    view.find_next()
+            VteInput::SearchNext | VteInput::SearchPrev => {
+                let step: isize = if matches!(msg, VteInput::SearchNext) {
+                    1
                 } else {
-                    FindNavigationResult::Inactive
+                    -1
                 };
-                self.search_status = if result == FindNavigationResult::Invalidated {
-                    self.search_query.as_ref().map_or_else(
+                let live_now = view.find_scope() == FindScope::LiveScreen;
+                if self.search_live && live_now {
+                    // The alternate-screen app's screen, searched natively.
+                    let found = if step > 0 {
+                        view.vte().search_find_next()
+                    } else {
+                        view.vte().search_find_previous()
+                    };
+                    self.search_status = self.search_status.stepped(step, found);
+                } else if self.search_live {
+                    // The app left and the blocks are back: search them.
+                    self.search_status = self.search_query.as_ref().map_or_else(
                         || SearchStatus::results(0, 0),
                         |(query, use_regex)| {
-                            block_result_status(view.find_in_blocks(query, *use_regex), *use_regex)
+                            let (status, live) = search_in_scope(view, query, *use_regex);
+                            self.search_live = live;
+                            status
                         },
-                    )
+                    );
                 } else {
-                    block_navigation_status(&self.search_status, result, partial)
-                };
-                let _ = sender.output(VteOutput::SearchStatus(self.search_status.clone()));
-            }
-            VteInput::SearchPrev => {
-                let active = matches!(
-                    self.search_status,
-                    SearchStatus::Results { total, .. } if total > 0
-                );
-                let partial = matches!(
-                    self.search_status,
-                    SearchStatus::Results {
-                        truncated: true,
-                        ..
-                    }
-                );
-                let result = if active {
-                    view.find_prev()
-                } else {
-                    FindNavigationResult::Inactive
-                };
-                self.search_status = if result == FindNavigationResult::Invalidated {
-                    self.search_query.as_ref().map_or_else(
-                        || SearchStatus::results(0, 0),
-                        |(query, use_regex)| {
-                            block_result_status(view.find_in_blocks(query, *use_regex), *use_regex)
-                        },
-                    )
-                } else {
-                    block_navigation_status(&self.search_status, result, partial)
-                };
+                    let active = matches!(
+                        self.search_status,
+                        SearchStatus::Results { total, .. } if total > 0
+                    );
+                    let partial = matches!(
+                        self.search_status,
+                        SearchStatus::Results {
+                            truncated: true,
+                            ..
+                        }
+                    );
+                    let result = if !active {
+                        FindNavigationResult::Inactive
+                    } else if step > 0 {
+                        view.find_next()
+                    } else {
+                        view.find_prev()
+                    };
+                    self.search_status = if result == FindNavigationResult::Invalidated {
+                        // Rebuilt in whatever scope the pane has now, so a
+                        // Find left open when an alternate-screen app took
+                        // over moves to its screen.
+                        self.search_query.as_ref().map_or_else(
+                            || SearchStatus::results(0, 0),
+                            |(query, use_regex)| {
+                                let (status, live) = search_in_scope(view, query, *use_regex);
+                                self.search_live = live;
+                                status
+                            },
+                        )
+                    } else {
+                        block_navigation_status(&self.search_status, result, partial)
+                    };
+                }
                 let _ = sender.output(VteOutput::SearchStatus(self.search_status.clone()));
             }
             VteInput::SearchClear => {
+                // Clears the live terminal's native search too.
                 view.clear_find();
                 self.search_status = SearchStatus::Idle;
                 self.search_query = None;
+                self.search_live = false;
                 let _ = sender.output(VteOutput::SearchStatus(self.search_status.clone()));
             }
             VteInput::CrossBlockSearch => cross_block_search::toggle(

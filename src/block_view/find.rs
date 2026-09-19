@@ -15,8 +15,28 @@ use vte4::TerminalExt;
 
 use super::{
     contains_case_insensitive, replace_finished_block_selection, BackendRecordRef, BlockFilters,
-    TermView, MAX_ZONE_SNAPSHOT_BYTES,
+    BlockState, TermView, MAX_ZONE_SNAPSHOT_BYTES,
 };
+
+/// What a Find in this pane searches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FindScope {
+    /// The finished blocks (and the running command's output).
+    Blocks,
+    /// Only the screen the live terminal shows. An alternate-screen app
+    /// (claude's fullscreen UI, opencode, vim) owns the pane and every finished
+    /// card is hidden, so counting their matches reported hits the user could
+    /// not see while the text on screen was never found.
+    LiveScreen,
+}
+
+pub(crate) fn find_scope(state: BlockState) -> FindScope {
+    if state == BlockState::AltScreen {
+        FindScope::LiveScreen
+    } else {
+        FindScope::Blocks
+    }
+}
 
 fn outcome_matches_filters(
     resolved_command: &str,
@@ -1053,12 +1073,17 @@ impl TermView {
             .map(BookmarkedEmptyReason::status)
     }
 
+    /// What a Find in this pane searches now.
+    pub(crate) fn find_scope(&self) -> FindScope {
+        find_scope(self.bstate.get())
+    }
+
     /// Highlight occurrences of `query` across the finished blocks and focus
     /// the first hit. Match metadata is compressed to one count per VTE surface,
     /// and scanning stops as soon as [`FIND_MATCH_LIMIT`] is reached.
     pub(crate) fn find_in_blocks(&self, query: &str, use_regex: bool) -> FindSearchResult {
         self.clear_find();
-        if query.is_empty() {
+        if query.is_empty() || find_scope(self.bstate.get()) == FindScope::LiveScreen {
             return FindSearchResult::NoMatches;
         }
         let pattern = if use_regex {
@@ -1295,6 +1320,12 @@ impl TermView {
     }
 
     fn step_find(&self, direction: FindDirection) -> FindNavigationResult {
+        // Hits found before an alternate-screen app took the pane are on
+        // cards it hid; stepping to them would scroll to nothing.
+        if find_scope(self.bstate.get()) == FindScope::LiveScreen {
+            self.clear_find();
+            return FindNavigationResult::Invalidated;
+        }
         let (current, next, current_progress) = {
             let state = self.find_state.borrow();
             let Some(current_progress) = find_progress(&state) else {
@@ -1845,6 +1876,23 @@ pub(super) fn clear_find_state(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_alternate_screen_app_scopes_find_to_the_live_screen() {
+        use super::{find_scope, FindScope};
+        use crate::block_view::BlockState;
+        assert_eq!(find_scope(BlockState::AltScreen), FindScope::LiveScreen);
+        for state in [
+            BlockState::Idle,
+            BlockState::CollectingPrompt,
+            BlockState::AwaitingCommand,
+            BlockState::CollectingOutput,
+            BlockState::PostCommand,
+            BlockState::RawFallback,
+        ] {
+            assert_eq!(find_scope(state), FindScope::Blocks, "{state:?}");
+        }
+    }
+
     use super::{
         add_snapshot_jump_fallbacks, bookmarked_empty_reason, bounded_match_count, command_preview,
         cross_block_match_count, cross_block_pattern, cross_block_search_version, duration_matches,
