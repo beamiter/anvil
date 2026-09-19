@@ -611,6 +611,9 @@ pub struct BlockFilters {
     pub use_regex: bool,
 }
 
+/// Text of the dim row a finished card shows when its output lost its head.
+pub(crate) const OUTPUT_HEAD_DROPPED_NOTICE: &str = "Earlier output not retained";
+
 pub(crate) struct FinishedBlock {
     pub(crate) id: u64,
     /// Commandless output emitted while the shell prompt was idle.
@@ -677,6 +680,12 @@ pub(crate) struct FinishedBlock {
     pub(crate) status_icon: gtk::Image,
     /// Header chip naming an untrusted completion; hidden on a healthy record.
     lifecycle_chip: gtk::Label,
+    /// Dim "Earlier output not retained" row above the output, shown only
+    /// when the capture lost its head (see [`FinishedBlock::set_output_head_dropped`]).
+    output_notice: gtk::Label,
+    /// Whether this card's output lost its head. Read by the collapse toggle,
+    /// which hides and restores the notice with the output it describes.
+    output_head_dropped: Rc<Cell<bool>>,
     /// Column count the output VTE is sized to — needed for re-feed (filter).
     pub(crate) cols: i64,
     /// Number of rows allocated to this finished output. Kept with the widget
@@ -741,6 +750,8 @@ impl Clone for FinishedBlock {
             bookmark_star: self.bookmark_star.clone(),
             status_icon: self.status_icon.clone(),
             lifecycle_chip: self.lifecycle_chip.clone(),
+            output_notice: self.output_notice.clone(),
+            output_head_dropped: self.output_head_dropped.clone(),
             cols: self.cols,
             viewport_cap: self.viewport_cap,
             dynamic_viewport_rows: self.dynamic_viewport_rows.clone(),
@@ -1381,6 +1392,141 @@ mod tests {
         assert!(block.dynamic_viewport_rows.get() > 0);
         window.close();
         while glib::MainContext::default().iteration(false) {}
+    }
+
+    /// The finished card is a real VTE fed the replay's serialized frame, so
+    /// what it holds after VTE processes the feed is what the user reads.
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn a_finished_codex_card_keeps_the_history_inserted_above_its_viewport() {
+        use gtk::gio;
+        use gtk::gio::prelude::*;
+
+        gtk::init().expect("gtk init");
+        // Real bytes at 16 rows, then a synthetic session on a 40-row screen:
+        // taller than the card's 32-row probe grid, which is what garbled a
+        // raw feed.
+        let mut transcript = crate::block_view::replay_captured_output(
+            include_bytes!("../../tests/fixtures/codex-16rows.bin"),
+            false,
+            (120, 16),
+        )
+        .with_ansi;
+        transcript.push_str("\r\n");
+        transcript.push_str(
+            &crate::block_view::replay_captured_output(
+                &crate::block_view::tests::synth_codex_session(150, 40, 6),
+                false,
+                (120, 40),
+            )
+            .with_ansi,
+        );
+        let block = FinishedBlock::new(
+            1,
+            "$ ",
+            "codex",
+            None,
+            &transcript,
+            Some(0),
+            &Config::safe_defaults(),
+            None,
+            None,
+            None,
+            120,
+        );
+        let scrolled = gtk::ScrolledWindow::builder()
+            .min_content_width(1200)
+            .min_content_height(600)
+            .child(block.widget())
+            .build();
+        let window = gtk::Window::builder().child(&scrolled).build();
+        window.present();
+        spin_main_context_until(|| block.output_vte.is_mapped());
+        let card_text = || {
+            let stream = gio::MemoryOutputStream::new_resizable();
+            block
+                .output_vte
+                .write_contents_sync(&stream, vte4::WriteFlags::Default, gio::Cancellable::NONE)
+                .expect("VTE writes its contents");
+            stream.close(gio::Cancellable::NONE).expect("close");
+            String::from_utf8_lossy(&stream.steal_as_bytes()).into_owned()
+        };
+        spin_main_context_until(|| card_text().contains("codex resume 0199"));
+        let text = card_text();
+        let mut needles = vec![
+            "Tip: Try the Desktop app on Linux".to_string(),
+            "usage limit".to_string(),
+        ];
+        needles.extend((0..150).map(|n| format!("history line {n:03}")));
+        let mut from = 0;
+        for needle in &needles {
+            let at = text[from..]
+                .find(needle.as_str())
+                .unwrap_or_else(|| panic!("{needle:?} missing or out of order:\n{text}"));
+            from += at + needle.len();
+        }
+        assert!(
+            !text.contains("Working ("),
+            "no stale viewport rows:\n{text}"
+        );
+        window.close();
+        while glib::MainContext::default().iteration(false) {}
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn earlier_output_notice_follows_the_flag_and_the_fold() {
+        gtk::init().expect("gtk init");
+        let config = Config::safe_defaults();
+        let block = FinishedBlock::new(
+            2,
+            "$ ",
+            "codex",
+            None,
+            "tail\n",
+            Some(0),
+            &config,
+            None,
+            None,
+            None,
+            80,
+        );
+        assert!(
+            !block.output_notice.is_visible(),
+            "a whole capture says nothing"
+        );
+
+        block.set_output_head_dropped(true);
+        assert!(block.output_notice.is_visible());
+        assert_eq!(block.output_notice.text(), OUTPUT_HEAD_DROPPED_NOTICE);
+
+        (block.toggle_collapsed)();
+        assert!(!block.output_notice.is_visible(), "folds with the output");
+        (block.toggle_collapsed)();
+        assert!(block.output_notice.is_visible(), "and comes back with it");
+
+        // Pooled shells are rebuilt, but the setter must also take it back off.
+        block.set_output_head_dropped(false);
+        assert!(!block.output_notice.is_visible());
+
+        let empty = FinishedBlock::new(
+            3,
+            "$ ",
+            "true",
+            None,
+            "",
+            Some(0),
+            &config,
+            None,
+            None,
+            None,
+            80,
+        );
+        empty.set_output_head_dropped(true);
+        assert!(
+            !empty.output_notice.is_visible(),
+            "no notice over output that is not shown"
+        );
     }
 
     #[test]
@@ -3852,6 +3998,19 @@ impl FinishedBlock {
         output_box.set_measure_overlay(&output_scrollbar, false);
         output_box.set_clip_overlay(&output_scrollbar, true);
         let output_widget: gtk::Widget = output_box.clone().upcast::<gtk::Widget>();
+        // Sits directly above the text it qualifies. Hidden unless the capture
+        // lost its head; `set_output_head_dropped` decides.
+        let output_notice = gtk::Label::new(Some(OUTPUT_HEAD_DROPPED_NOTICE));
+        output_notice.add_css_class("block-output-notice");
+        output_notice.set_halign(gtk::Align::Start);
+        output_notice.set_margin_start(18);
+        output_notice.set_margin_end(8);
+        output_notice.set_tooltip_text(Some(
+            "This command wrote more than a block keeps; only its most recent output is shown",
+        ));
+        output_notice.set_visible(false);
+        content.append(&output_notice);
+        let output_head_dropped = Rc::new(Cell::new(false));
         content.append(&output_box);
 
         // Kitty graphics: append each decoded texture as a Picture under the
@@ -3941,6 +4100,8 @@ impl FinishedBlock {
         let set_collapsed: Rc<dyn Fn(bool)> = {
             let collapsed_state = collapsed_state.clone();
             let output_widget = output_widget.downgrade();
+            let output_notice = output_notice.downgrade();
+            let output_head_dropped = output_head_dropped.clone();
             let collapsed_summary = collapsed_summary.downgrade();
             let collapse_btn = collapse_btn.downgrade();
             let images_box = images_box.as_ref().map(|ib| ib.downgrade());
@@ -3956,6 +4117,9 @@ impl FinishedBlock {
                 // Image-only blocks keep their empty output VTE hidden even
                 // while expanded; only the Pictures fold and unfold.
                 output_widget.set_visible(!collapsed && has_output);
+                if let Some(notice) = output_notice.upgrade() {
+                    notice.set_visible(!collapsed && has_output && output_head_dropped.get());
+                }
                 if let Some(ib) = images_box.as_ref().and_then(|ib| ib.upgrade()) {
                     ib.set_visible(!collapsed);
                 }
@@ -4369,6 +4533,8 @@ impl FinishedBlock {
             jump_bottom_btn,
             bookmark_star,
             lifecycle_chip,
+            output_notice,
+            output_head_dropped,
             status_icon,
             cols,
             viewport_cap,
@@ -4514,6 +4680,17 @@ impl FinishedBlock {
                 self.lifecycle_chip.set_tooltip_text(None);
             }
         }
+    }
+
+    /// Say above the output that its beginning is gone: the capture ring
+    /// dropped its front, or the finish replay evicted its oldest history.
+    /// Without it the surviving tail reads as the command's whole transcript.
+    /// A collapsed card shows the notice again when it is unfolded.
+    pub(crate) fn set_output_head_dropped(&self, dropped: bool) {
+        self.output_head_dropped.set(dropped);
+        let has_output = !self.full_output.borrow().trim().is_empty();
+        self.output_notice
+            .set_visible(dropped && has_output && !self.collapsed_state.get());
     }
 
     /// Switch this card between the normal and compact densities in place and
@@ -5061,8 +5238,8 @@ impl ActiveBlock {
         }
     }
 
-    /// Snapshot the engine-owned capture for live-find. The engine reads the
-    /// same ring through `super::live_output_text` at finalize.
+    /// Snapshot the engine-owned capture for live-find. The engine replays
+    /// the same ring into the finished card at finalize.
     pub(crate) fn output_text(&self) -> String {
         super::live_output_text(&self.raw_output)
     }

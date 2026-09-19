@@ -1115,6 +1115,13 @@ fn block_css(config: &Config) -> String {
             padding: 2px 4px;
             border-radius: 5px;
         }}
+        .block-output-notice {{
+            color: {dim_fg};
+            font-family: {font_stack};
+            font-size: 0.82em;
+            font-style: italic;
+            padding: 2px 4px;
+        }}
         .block-output-summary:hover {{
             color: {accent};
             background-color: rgba({acc_r},{acc_g},{acc_b},0.12);

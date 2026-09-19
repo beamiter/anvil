@@ -643,6 +643,21 @@ versioning for tagged releases while it remains experimental.
 
 ### Fixed
 
+- **A finished codex session keeps its whole transcript.** codex inserts its
+  history above a viewport at the bottom of the pane, with absolute cursor
+  moves, a scroll region and reverse index. The finished card fed those raw
+  bytes into a grid of at most 32 rows, so history batches landed on the same
+  rows and stale "Working" rows were spliced in, and Copy output, Find, the
+  saved history and restored tabs got its repainted frames glued into
+  1,500-character lines. A stream that moves the cursor vertically is now
+  replayed by jterm_core's screen replay at the winsize codex last saw,
+  including the scrollback its scroll region produced, and both the card and
+  the block's text are built from that. Plain line output is handled as
+  before. When the output ring dropped its oldest bytes, or the replay had to
+  evict its oldest history, the card now shows a dim "Earlier output not
+  retained" line above the output instead of presenting the tail as the whole
+  transcript. After such a drop, a torn escape sequence or character at the
+  cut is skipped rather than printed.
 - **A bell from an agent in a window you left is no longer lost.** BEL is how
   codex (by default) and claude (with its terminal-bell channel) say "your
   turn", and it only badged a background tab: with the agent's tab current and

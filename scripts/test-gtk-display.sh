@@ -54,6 +54,8 @@ fi
 
 tests=(
     block_view::blocks::tests::unmapped_refit_skips_output_row_scan
+    block_view::blocks::tests::a_finished_codex_card_keeps_the_history_inserted_above_its_viewport
+    block_view::blocks::tests::earlier_output_notice_follows_the_flag_and_the_fold
     block_view::blocks::tests::only_an_untrusted_record_wears_a_lifecycle_chip
     block_view::blocks::tests::the_selection_hint_sits_on_the_spacers_left
     block_view::blocks::tests::search_reads_the_filtered_view_and_falls_back_to_the_superset

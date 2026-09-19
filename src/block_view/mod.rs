@@ -4372,6 +4372,76 @@ struct BlockRenderPayload {
     prompt: String,
     output_with_ansi: String,
     output_plain: String,
+    /// Part of the command's output is gone before the card was built: the
+    /// raw ring dropped its front, or the screen replay's cell budget evicted
+    /// its oldest history rows. The card says so instead of passing the
+    /// surviving tail off as the whole transcript.
+    output_head_dropped: bool,
+}
+
+/// What a finished block is built from, derived from the captured PTY bytes.
+struct ReplayedOutput {
+    /// Fed to the finished card's VTE and kept as its copy/filter source.
+    with_ansi: String,
+    /// `BlockData.output`: copy, find, persistence, the journal.
+    plain: String,
+    head_dropped: bool,
+}
+
+/// The winsize the replay assumes when the pane never published one: the
+/// size `OwnedPty` opens every PTY with, so it is what the child saw too.
+const UNPUBLISHED_PTY_WINSIZE: (u16, u16) = (80, 24);
+
+/// Turn one command's captured bytes into the card's ANSI text and its plain
+/// text.
+///
+/// Plain line output (SGR, CR, EL, horizontal motion) keeps the horizontal
+/// strip it always had, and the card keeps the raw bytes. A stream that
+/// addresses the screen vertically — an inline TUI such as codex, which moves
+/// the cursor absolutely, confines scrolling to a region and inserts its
+/// transcript above its viewport — only means what it meant at the winsize
+/// the CHILD saw. Fed raw into a card of a few dozen rows, codex's history
+/// batches landed on the same absolute rows and overwrote each other, and the
+/// horizontal strip glued its repainted frames into 1,500-character lines.
+/// The shared screen replay models that screen and its scrollback instead,
+/// and its serialized frame is plain rows, so the card's small probe grid no
+/// longer decides the geometry.
+///
+/// `dropped_front` says the bounded ring lost its head, so the first bytes
+/// may be the tail of an escape sequence or of a UTF-8 character; they are
+/// skipped rather than printed as text.
+fn replay_captured_output(
+    bytes: &[u8],
+    dropped_front: bool,
+    (cols, rows): (u16, u16),
+) -> ReplayedOutput {
+    let bytes = if dropped_front {
+        jterm_core::screen_replay::resync_ring_head(bytes)
+    } else {
+        bytes
+    };
+    if !jterm_core::screen_replay::stream_needs_screen_replay(bytes) {
+        let with_ansi = String::from_utf8_lossy(bytes).into_owned();
+        let plain = materialize_plain_output(&with_ansi);
+        return ReplayedOutput {
+            with_ansi,
+            plain,
+            head_dropped: dropped_front,
+        };
+    }
+    let (cols, rows) = if cols == 0 || rows == 0 {
+        UNPUBLISHED_PTY_WINSIZE
+    } else {
+        (cols, rows)
+    };
+    let mut replay = jterm_core::screen_replay::ScreenReplay::new(cols.into(), rows.into());
+    replay.feed(bytes);
+    let replay = replay.finish();
+    ReplayedOutput {
+        with_ansi: replay.to_ansi(),
+        plain: replay.to_plain(),
+        head_dropped: dropped_front || replay.head_dropped,
+    }
 }
 
 #[inline]
@@ -4418,16 +4488,26 @@ struct LazyBlockRenderPayload {
     /// Whoever materializes first consumes the ring, and the decoded text
     /// carries no trace of the bytes that fell out of its front.
     dropped_front: bool,
+    /// `(cols, rows)` the PTY was last told before the command ended — the
+    /// screen the child addressed, which the screen replay must reproduce.
+    /// `(0, 0)` when nothing was ever published.
+    pty_winsize: (u16, u16),
     materializations: Rc<Cell<usize>>,
 }
 
 impl LazyBlockRenderPayload {
-    fn new(prompt: String, output: CapturedFinalizeOutput, dropped_front: bool) -> Self {
+    fn new(
+        prompt: String,
+        output: CapturedFinalizeOutput,
+        dropped_front: bool,
+        pty_winsize: (u16, u16),
+    ) -> Self {
         Self {
             value: OnceCell::new(),
             prompt: RefCell::new(Some(prompt)),
             output: RefCell::new(Some(output)),
             dropped_front,
+            pty_winsize,
             materializations: Rc::new(Cell::new(0)),
         }
     }
@@ -4448,22 +4528,28 @@ impl BlockRenderPayloadAccessor for LazyBlockRenderPayload {
                 .borrow_mut()
                 .take()
                 .expect("a finalize payload is materialized at most once");
-            let output_with_ansi = match self
+            let replayed = match self
                 .output
                 .borrow_mut()
                 .take()
                 .expect("a finalize payload is materialized at most once")
             {
-                CapturedFinalizeOutput::Foreground(output) => live_output_text(&output),
-                CapturedFinalizeOutput::Background(mut output) => {
-                    String::from_utf8_lossy(output.make_contiguous()).into_owned()
-                }
+                CapturedFinalizeOutput::Foreground(output) => replay_captured_output(
+                    output.borrow_mut().make_contiguous(),
+                    self.dropped_front,
+                    self.pty_winsize,
+                ),
+                CapturedFinalizeOutput::Background(mut output) => replay_captured_output(
+                    output.make_contiguous(),
+                    self.dropped_front,
+                    self.pty_winsize,
+                ),
             };
-            let output_plain = materialize_plain_output(&output_with_ansi);
             BlockRenderPayload {
                 prompt,
-                output_with_ansi,
-                output_plain,
+                output_with_ansi: replayed.with_ansi,
+                output_plain: replayed.plain,
+                output_head_dropped: replayed.head_dropped,
             }
         })
     }
@@ -5456,6 +5542,10 @@ struct ReaderCtx {
     /// longer than what survives; cleared with the ring by
     /// [`ReaderCtx::clear_live_raw_output`].
     live_raw_output_dropped_rc: Rc<Cell<bool>>,
+    /// The pane's one winsize memory. Read at command end: the finish replay
+    /// must rebuild the screen the child addressed, which is the last winsize
+    /// the PTY was told, not the finished card's size.
+    pty_winsize: PtyWinsize,
     /// Every output byte this command has produced, ring or no ring. The
     /// running card's status pill reads it on a timer; it is never on the
     /// hot path except for the one add here.
@@ -6220,8 +6310,12 @@ impl ReaderCtx {
                 command_source,
                 start_mark_seen: !is_background,
             };
-            let payload =
-                LazyBlockRenderPayload::new(prompt, captured_output, output_dropped_front);
+            let payload = LazyBlockRenderPayload::new(
+                prompt,
+                captured_output,
+                output_dropped_front,
+                self.pty_winsize.sent.get(),
+            );
 
             // jsh owns the command lifecycle record. The lifecycle token its
             // accepted C minted and an enabled output consumer must both exist
@@ -8461,6 +8555,7 @@ impl RenderBackend for BlockBackend {
             record.lifecycle_health(),
             record.lifecycle_notice().as_deref(),
         );
+        finished.set_output_head_dropped(payload.output_head_dropped);
         finished
             .widget()
             .insert_before(&self.block_list_rc, Some(self.active_rc.borrow().widget()));
@@ -11851,6 +11946,7 @@ impl TermView {
                 }),
                 live_raw_output_rc: live_raw_output.clone(),
                 live_raw_output_dropped_rc: live_raw_output_dropped.clone(),
+                pty_winsize: pty_winsize.clone(),
                 live_output_bytes_rc: live_output_bytes.clone(),
                 live_extent_force_full_rc: live_extent_force_full.clone(),
                 typed_cmd_rc,
@@ -15204,7 +15300,7 @@ mod tests {
         parse_color_spec, plan_prompt_zone, pop_typed_command_shadow, process_block_id_namespace,
         prompt_anchor_for_surface, prompt_anchor_rebases_on_row_delta,
         prompt_zone_to_reopen_after_alt, prune_retired_record_bookmarks, rebase_prompt_anchor,
-        record_external_input, record_unified_zone, resolve_command_text,
+        record_external_input, record_unified_zone, replay_captured_output, resolve_command_text,
         reviewed_pre_command_bytes_are_identity_neutral, reviewed_submission_matches,
         screen_relative_cpr_row, selected_blocks_markdown, selected_command_text,
         selected_id_range, shell_argv_supports_agent_ids, shell_integration_hint,
@@ -16159,6 +16255,7 @@ mod tests {
             String::new(),
             super::CapturedFinalizeOutput::Foreground(output),
             false,
+            (0, 0),
         );
         payload.materialize();
         let snapshot = payload
@@ -16234,6 +16331,7 @@ mod tests {
             String::new(),
             super::CapturedFinalizeOutput::Foreground(output),
             true,
+            (0, 0),
         );
 
         // The journal submission runs first and consumes the ring.
@@ -16260,6 +16358,7 @@ mod tests {
             "$ ".to_string(),
             super::CapturedFinalizeOutput::Foreground(output.clone()),
             false,
+            (0, 0),
         );
 
         let snapshot = payload
@@ -16289,6 +16388,7 @@ mod tests {
             String::new(),
             super::CapturedFinalizeOutput::Background(VecDeque::new()),
             false,
+            (0, 0),
         );
         assert_eq!(empty.output_snapshot(MAX_ZONE_SNAPSHOT_BYTES), None);
     }
@@ -16307,6 +16407,199 @@ mod tests {
             materialize_plain_output("\x1b[32mok\x1b[0m"),
             materialize_plain_output_legacy("\x1b[32mok\x1b[0m")
         );
+    }
+
+    /// Real codex bytes recorded under a 16x120 PTY: its transcript is
+    /// inserted above a bottom-anchored viewport with DECSTBM + RI + CUP.
+    const CODEX_16ROWS: &[u8] = include_bytes!("../../tests/fixtures/codex-16rows.bin");
+
+    fn assert_in_order(text: &str, needles: &[&str]) {
+        let mut from = 0;
+        for needle in needles {
+            let at = text[from..]
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} missing after byte {from} in:\n{text}"));
+            from += at + needle.len();
+        }
+    }
+
+    #[test]
+    fn codex_history_inserted_above_its_viewport_survives_the_finish() {
+        let replayed = replay_captured_output(CODEX_16ROWS, false, (120, 16));
+        let needles = [
+            "OpenAI Codex",
+            "Tip: Try the Desktop app on Linux",
+            "usage limit",
+        ];
+        assert_in_order(&replayed.plain, &needles);
+        // The card's VTE is fed the serialized frame, so the same lines reach
+        // it in the same order, as whole rows rather than overwritten ones.
+        assert_in_order(&strip_ansi(&replayed.with_ansi), &needles);
+        assert!(
+            replayed
+                .plain
+                .lines()
+                .all(|line| line.chars().count() <= 120),
+            "no repainted frames glued into one line"
+        );
+        assert!(!replayed.head_dropped);
+    }
+
+    /// A codex-style inline session, after codex's `insert_history.rs`
+    /// (standard mode): a `viewport`-row live area starts under the command
+    /// line and is pushed down as history is inserted above it; once it
+    /// reaches the bottom of the `rows`-row screen, each batch goes in with
+    /// `SetScrollRegion(1..area.top)`, a move to the row above the viewport
+    /// and `\r\n` + line per history line — which a real terminal turns into
+    /// scrollback. The viewport is redrawn after each batch and cleared at
+    /// exit, before the resume hint.
+    pub(super) fn synth_codex_session(lines: usize, rows: usize, viewport: usize) -> Vec<u8> {
+        use std::fmt::Write as _;
+        let mut out = String::from("$ codex\r\n");
+        let cup = |out: &mut String, row: usize, col: usize| {
+            let _ = write!(out, "\x1b[{};{}H", row + 1, col + 1);
+        };
+        let draw_viewport = |out: &mut String, top: usize, tick: usize| {
+            for r in 0..viewport {
+                cup(out, top + r, 0);
+                out.push_str("\x1b[K");
+                match r {
+                    0 => {
+                        let _ = write!(out, "\x1b[2m• Working ({tick}s)\x1b[0m");
+                    }
+                    2 => out.push_str("› Ask Codex to do anything"),
+                    _ => {}
+                }
+            }
+            cup(out, top + 2, 2);
+        };
+        let mut area_top = 1usize;
+        draw_viewport(&mut out, area_top, 0);
+        let (mut next, mut tick) = (0, 0);
+        while next < lines {
+            let batch = (1 + tick % 3).min(lines - next);
+            let cursor_top = if area_top + viewport < rows {
+                let scroll = batch.min(rows - (area_top + viewport));
+                let _ = write!(out, "\x1b[{};{}r", area_top + 1, rows);
+                cup(&mut out, area_top, 0);
+                out.push_str(&"\x1bM".repeat(scroll));
+                out.push_str("\x1b[r");
+                let cursor_top = area_top.saturating_sub(1);
+                area_top += scroll;
+                cursor_top
+            } else {
+                area_top.saturating_sub(1)
+            };
+            let _ = write!(out, "\x1b[1;{area_top}r");
+            cup(&mut out, cursor_top, 0);
+            for _ in 0..batch {
+                let _ = write!(out, "\r\n\x1b[1mhistory\x1b[22m line {next:03}");
+                next += 1;
+            }
+            out.push_str("\x1b[r");
+            tick += 1;
+            draw_viewport(&mut out, area_top, tick);
+        }
+        cup(&mut out, area_top, 0);
+        out.push_str("\x1b[JTo continue this session, run codex resume 0199\r\n");
+        out.into_bytes()
+    }
+
+    #[test]
+    fn a_long_codex_session_keeps_every_history_line_past_the_first_screen() {
+        let lines = (0..150)
+            .map(|n| format!("history line {n:03}"))
+            .collect::<Vec<_>>();
+        let needles = lines.iter().map(String::as_str).collect::<Vec<_>>();
+        let replayed = replay_captured_output(&synth_codex_session(150, 40, 6), false, (120, 40));
+        assert_in_order(&replayed.plain, &needles);
+        assert_in_order(&strip_ansi(&replayed.with_ansi), &needles);
+        assert!(
+            !replayed.plain.contains("Working"),
+            "no stale viewport rows"
+        );
+        assert!(replayed
+            .plain
+            .trim_end()
+            .ends_with("To continue this session, run codex resume 0199"));
+    }
+
+    #[test]
+    fn plain_line_output_keeps_the_raw_bytes_and_the_horizontal_strip() {
+        let raw = "\x1b[32mok\x1b[0m\r\n50%\r\x1b[K100%\r\n";
+        let replayed = replay_captured_output(raw.as_bytes(), false, (120, 16));
+        assert_eq!(replayed.with_ansi, raw, "no replay for plain streams");
+        assert_eq!(replayed.plain, materialize_plain_output(raw));
+        assert!(!replayed.head_dropped);
+    }
+
+    #[test]
+    fn a_top_style_repaint_loop_finishes_as_its_last_frame() {
+        let mut raw = String::new();
+        for frame in 0..50 {
+            raw.push_str("\x1b[H\x1b[2J");
+            for row in 0..5 {
+                raw.push_str(&format!("frame {frame:02} row {row}\r\n"));
+            }
+        }
+        let replayed = replay_captured_output(raw.as_bytes(), false, (80, 24));
+        let expected = (0..5)
+            .map(|row| format!("frame 49 row {row}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(replayed.plain.trim(), expected);
+        assert_eq!(strip_ansi(&replayed.with_ansi).trim(), expected);
+    }
+
+    #[test]
+    fn a_cursor_up_progress_display_keeps_only_its_final_state() {
+        // docker/cargo-style multi-line progress: redraw two rows in place.
+        let mut raw = String::from("pulling\r\n");
+        for pct in [10, 50, 100] {
+            if pct != 10 {
+                raw.push_str("\x1b[2A");
+            }
+            raw.push_str(&format!("\r\x1b[Ka: {pct}%\r\n\r\x1b[Kb: {pct}%\r\n"));
+        }
+        raw.push_str("done\r\n");
+        let replayed = replay_captured_output(raw.as_bytes(), false, (80, 24));
+        assert_eq!(replayed.plain.trim(), "pulling\na: 100%\nb: 100%\ndone");
+    }
+
+    #[test]
+    fn a_wrapped_ring_resyncs_its_head_and_reports_the_loss() {
+        // The cut landed inside a CUP; its tail must not print as text.
+        let raw = b"5;1Hjunk\r\nkept\r\n\x1b[1Aover\r\n";
+        let replayed = replay_captured_output(raw, true, (80, 24));
+        assert_eq!(replayed.plain.trim(), "over");
+        assert!(
+            replayed.head_dropped,
+            "a dropped ring front is always reported"
+        );
+
+        // With neither an ESC nor a line break to resync on, only the torn
+        // UTF-8 continuation bytes go.
+        let plain = replay_captured_output(b"\x80\x80tail", true, (80, 24));
+        assert_eq!(plain.plain, "tail", "UTF-8 fragment skipped");
+        assert!(plain.head_dropped);
+
+        let intact = replay_captured_output(b"5;1Hliteral\r\n", false, (80, 24));
+        assert_eq!(intact.plain.trim(), "5;1Hliteral", "an intact head is text");
+    }
+
+    #[test]
+    fn an_unpublished_winsize_replays_at_the_ptys_opening_size() {
+        // 30 lines scrolled through a 24-row screen, then a CUP to row 1:
+        // at 80x24 the CUP lands on the 7th line, which is overwritten.
+        let mut raw = String::new();
+        for line in 0..30 {
+            raw.push_str(&format!("line {line}\r\n"));
+        }
+        raw.push_str("\x1b[1;1Hover");
+        let replayed = replay_captured_output(raw.as_bytes(), false, (0, 0));
+        assert!(replayed.plain.contains("over"));
+        assert!(!replayed.plain.contains("line 7\n"));
+        assert!(replayed.plain.contains("line 6\n"));
     }
 
     #[test]
@@ -16718,6 +17011,7 @@ mod tests {
         has_duration: bool,
         has_end_time: bool,
         is_background: bool,
+        output_head_dropped: bool,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17050,6 +17344,7 @@ mod tests {
                 has_duration: record.duration_ms.is_some(),
                 has_end_time: record.end_time_ms.is_some(),
                 is_background: record.is_background,
+                output_head_dropped: payload.output_head_dropped,
             }));
         }
 
@@ -17471,6 +17766,7 @@ mod tests {
                 }),
                 live_raw_output_rc: live_raw_output.clone(),
                 live_raw_output_dropped_rc: live_raw_output_dropped.clone(),
+                pty_winsize: super::PtyWinsize::default(),
                 live_output_bytes_rc: live_output_bytes.clone(),
                 live_extent_force_full_rc: live_extent_force_full.clone(),
                 typed_cmd_rc: typed_cmd,
@@ -17705,6 +18001,52 @@ mod tests {
             calls.contains(&DispatchCall::ResetLock) && calls.contains(&DispatchCall::MarkDirty),
             "PromptEnd at the bottom must still follow it: {calls:?}"
         );
+    }
+
+    fn finish_raw_command(harness: &ReaderHarness, output: &[u8], dropped_front: bool) {
+        harness.backend.render_row(3, "$ ");
+        harness.feed_all([
+            ParserEvent::PromptStart,
+            dispatch_bytes("$ "),
+            ParserEvent::PromptEnd,
+        ]);
+        harness.backend.render_row(3, "$ codex");
+        harness.feed(dispatch_command_start(Some("codex")));
+        harness.feed(ParserEvent::Bytes(output.to_vec()));
+        if dropped_front {
+            harness.ctx.live_raw_output_dropped_rc.set(true);
+        }
+        harness.feed(dispatch_command_end(Some(0)));
+        harness.feed(ParserEvent::PromptStart);
+    }
+
+    #[test]
+    fn finalize_replays_an_inline_tui_at_the_winsize_the_child_saw() {
+        let harness = ReaderHarness::new();
+        harness.ctx.pty_winsize.sent.set((120, 16));
+        finish_raw_command(&harness, CODEX_16ROWS, false);
+        let finalized = harness.backend.finalized();
+        let DispatchCall::Finalize(record) = &finalized[0] else {
+            unreachable!();
+        };
+        let needles = ["Tip: Try the Desktop app on Linux", "usage limit"];
+        // `output_plain` here is `BlockData.output`, as BlockBackend builds it.
+        assert_in_order(&record.output_plain, &needles);
+        assert_in_order(&strip_ansi(&record.output_with_ansi), &needles);
+        assert!(!record.output_head_dropped);
+    }
+
+    #[test]
+    fn finalize_reports_a_dropped_ring_front_to_the_card() {
+        let harness = ReaderHarness::new();
+        harness.ctx.pty_winsize.sent.set((80, 24));
+        finish_raw_command(&harness, b"9mtail\r\nlast line\r\n", true);
+        let finalized = harness.backend.finalized();
+        let DispatchCall::Finalize(record) = &finalized[0] else {
+            unreachable!();
+        };
+        assert_eq!(record.output_plain, "last line");
+        assert!(record.output_head_dropped);
     }
 
     #[test]
@@ -18965,6 +19307,7 @@ mod tests {
             "$ ".to_string(),
             super::CapturedFinalizeOutput::Background(b"disabled\r\n".iter().copied().collect()),
             false,
+            (0, 0),
         );
         assert!(super::build_journal_completion(
             Some(harness_lifecycle("execution-disabled")),
@@ -18981,6 +19324,7 @@ mod tests {
                 b"missing lifecycle\r\n".iter().copied().collect(),
             ),
             false,
+            (0, 0),
         );
         assert!(super::build_journal_completion(None, true, &missing_lifecycle, 100).is_none());
         assert_eq!(missing_lifecycle.materialization_count(), 0);
@@ -18989,6 +19333,7 @@ mod tests {
             "$ ".to_string(),
             super::CapturedFinalizeOutput::Background(b"enabled\r\n".iter().copied().collect()),
             false,
+            (0, 0),
         );
         let completion = super::build_journal_completion(
             Some(harness_lifecycle("execution-enabled")),
@@ -19668,6 +20013,7 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
                     has_duration: true,
                     has_end_time: true,
                     is_background: false,
+                    output_head_dropped: false,
                 }),
                 DispatchCall::SyncGeometry,
                 DispatchCall::MarkDirty,
@@ -19936,6 +20282,7 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
                     has_duration: false,
                     has_end_time: true,
                     is_background: true,
+                    output_head_dropped: false,
                 }),
                 DispatchCall::SyncGeometry,
                 DispatchCall::MarkDirty,
@@ -21855,6 +22202,7 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
             "$ ".to_string(),
             super::CapturedFinalizeOutput::Background(invalid.iter().copied().collect()),
             false,
+            (0, 0),
         );
         assert!(background_output_has_visible_text(&invalid));
         assert_eq!(
