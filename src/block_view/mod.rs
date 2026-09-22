@@ -2058,7 +2058,9 @@ fn route_live_commit<'a>(
     app_owns_keys: impl FnOnce() -> bool,
 ) -> LiveCommit<'a> {
     if let Some(report) = classify_terminal_report(commit, cpr_outstanding.get() > 0) {
-        if report == TerminalReport::CursorPosition {
+        // DECXCPR answers CSI ?6n, which never entered the plain CPR ledger.
+        // Settling it here would make the next ordinary answer look typed.
+        if report == TerminalReport::CursorPosition && !commit.starts_with(b"\x1b[?") {
             cpr_outstanding.set(cpr_outstanding.get().saturating_sub(1));
         }
         return LiveCommit::Report(report);
@@ -21204,6 +21206,31 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
     }
 
     #[test]
+    fn a_private_cursor_report_preserves_the_pending_plain_answer() {
+        use super::{LiveCommit, LiveKeyRecord, TerminalReport};
+
+        // The reader counted CSI 6n, but CSI ?6n is passed through without
+        // a ledger entry. VTE can answer that private query first.
+        for private in [&b"\x1b[?1;2R"[..], b"\x1b[?1;2;1R"] {
+            let keys = LiveKeyRecord::default();
+            let pressed = alt_key(super::KittyKey::Unicode('b'));
+            keys.record(pressed);
+            let cpr = Cell::new(1);
+            for reply in [private, b"\x1b[1;2R"] {
+                // Even an armed submission must forward both replies.
+                assert_eq!(
+                    super::route_live_commit(reply, &cpr, true, &keys, 1, || true),
+                    LiveCommit::Report(TerminalReport::CursorPosition)
+                );
+                assert_eq!(cpr.get(), u32::from(reply == private));
+                assert_eq!(keys.last_key.get(), Some(pressed));
+            }
+            // Once the plain answer arrives, modified F3 is a key again.
+            assert_eq!(route(b"\x1b[1;2R", &cpr, &keys, 0), typed(b"\x1b[1;2R"));
+        }
+    }
+
+    #[test]
     fn an_alt_chord_split_across_two_commits_leaves_as_one_write() {
         use super::{KittyKey, LiveCommit, LiveKeyRecord};
 
@@ -22400,12 +22427,12 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
             ]
         );
 
-        // libvte's own answers, one commit each. ReaderCtx counted the CPR
-        // it left to the live surface.
+        // libvte's own answers, one commit each. ReaderCtx counted only the
+        // plain CPR; the preceding private answer must leave that credit alone.
         routed.borrow_mut().clear();
         cpr_outstanding.set(1);
-        terminal.feed(b"\x1b[c\x1b[>c\x1b[5n\x1b[?2026$p\x1b[>0q\x1b[6n");
-        pump_until(&routed_len(6));
+        terminal.feed(b"\x1b[c\x1b[>c\x1b[5n\x1b[?2026$p\x1b[>0q\x1b[?6n\x1b[6n");
+        pump_until(&routed_len(7));
         let reports: Vec<_> = routed.borrow().iter().map(|(_, report)| *report).collect();
         assert_eq!(
             reports,
@@ -22415,6 +22442,7 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
                 Some(TerminalReport::StatusReport),
                 Some(TerminalReport::ModeReport),
                 Some(TerminalReport::ControlString),
+                Some(TerminalReport::CursorPosition),
                 Some(TerminalReport::CursorPosition),
             ],
             "{:?}",
