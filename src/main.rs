@@ -1859,6 +1859,7 @@ impl SimpleComponent for AppModel {
                 self.note_pane_launched_task_pin(pane_id);
             }
             AppMsg::PaneLaunchFailed(pane_id, message) => {
+                self.note_task_terminal_launch_failed(pane_id);
                 if let Some((source_tab_id, source_pane_id)) =
                     self.pending_split_spawns.remove(&pane_id)
                 {

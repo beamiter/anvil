@@ -725,6 +725,24 @@ impl AppModel {
         true
     }
 
+    /// A rejected spawn has no wait status or later PaneExited message.
+    /// Retire its task session now, so validation can be retried and its cwd
+    /// descriptor is not held until the user closes the diagnostic pane.
+    pub(crate) fn note_task_terminal_launch_failed(&mut self, pane_id: u64) {
+        self.pending_validation_pins.remove(&pane_id);
+        let Some(session_id) = self
+            .pane(pane_id)
+            .and_then(|pane| pane.task_session_id.clone())
+        else {
+            return;
+        };
+        self.task_manager
+            .handle_terminal_session_exit(&session_id, None);
+        if self.tasks_panel_visible.get() {
+            self.sync_tasks_panel();
+        }
+    }
+
     /// PaneLaunched releases the validation cwd pin retained for that pane.
     pub(crate) fn note_pane_launched_task_pin(&mut self, pane_id: u64) {
         self.pending_validation_pins.remove(&pane_id);
