@@ -1984,6 +1984,16 @@ fn base_keyval_in_layout(
         .map(|(_, keyval)| *keyval)
 }
 
+/// How long VTE gets to answer the cursor queries fed to it before a prompt
+/// or RIS boundary; see [`ReaderCtx::forget_unanswered_cpr_later`].
+const CPR_ANSWER_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether a boundary's deferred forget still applies: no CPR was left to VTE
+/// since, so whatever is owed belongs to the program the boundary ended.
+fn cpr_forget_applies(asked_at_boundary: u64, asked_now: u64) -> bool {
+    asked_at_boundary == asked_now
+}
+
 /// What the live VTE's key recorder hands its `commit` handler: the key press
 /// VTE is about to commit bytes for, and the ESC of an Alt chord whose key has
 /// not committed yet.
@@ -5679,9 +5689,12 @@ struct ReaderCtx {
     kitty_pusher_rc: Rc<Cell<Option<i32>>>,
     /// Cursor position queries left to the live VTE whose answer has not yet
     /// come back through its `commit`. The commit handler settles one per
-    /// matched report and the selection hold reads it; reset at an accepted
-    /// prompt and at RIS, so an unanswered query cannot linger.
+    /// matched report and the selection hold reads it. Prompt/RIS boundaries
+    /// defer forgetting unanswered queries so VTE can finish its pending feed.
     cpr_outstanding_rc: Rc<Cell<u32>>,
+    /// Total CPR queries delegated to VTE; a deferred forget cannot clear
+    /// queries issued after the boundary that scheduled it.
+    cpr_queries_rc: Rc<Cell<u64>>,
     /// Dynamic OSC 10/11/12 overrides for this pane: consulted for OSC color
     /// query replies and overlaid onto the theme for new finished blocks.
     /// Shared with `TermView` so undo-clear rebuilds and theme switches see the
@@ -5846,7 +5859,7 @@ impl ReaderCtx {
 
     fn on_hard_reset(&self) {
         self.reset_kitty_keyboard();
-        self.cpr_outstanding_rc.set(0);
+        self.forget_unanswered_cpr_later();
         // RIS invalidates the same row mapping as ED3. Record that before any
         // reset cleanup or bytes can trigger a live-surface layout.
         self.live_extent_force_full_rc.set(true);
@@ -6206,9 +6219,10 @@ impl ReaderCtx {
         // reset below (Unified's, whatever the command printed) would keep
         // turning pointer motion and wheel into reports typed at the prompt.
         self.backend.release_live_reporting();
-        // A CPR the program never saw answered belongs to its lifecycle too;
-        // left counted, the next shell's Shift+F3 would pass for its answer.
-        self.cpr_outstanding_rc.set(0);
+        // VTE may still owe a reply to bytes fed before this boundary. Keep
+        // its credit until the asynchronous answer arrives, with a deadline
+        // so an unanswered query cannot classify Shift+F3 forever.
+        self.forget_unanswered_cpr_later();
         let background_output = if state == BlockState::AwaitingCommand {
             let mut engine = self.engine.borrow_mut();
             // The marker describes exactly the bytes taken (or discarded)
@@ -7060,6 +7074,28 @@ impl ReaderCtx {
         self.dynamic_colors_rc.set(colors);
     }
 
+    /// A boundary ended whatever program asked the live VTE for its cursor.
+    /// The answers VTE still owes for queries fed before it arrive a frame or
+    /// more later and settle the ledger themselves; only what is still owed
+    /// after [`CPR_ANSWER_GRACE`], with nothing asked since, is forgotten.
+    fn forget_unanswered_cpr_later(&self) {
+        if self.cpr_outstanding_rc.get() == 0 {
+            return;
+        }
+        let ledger = self.cpr_outstanding_rc.clone();
+        let queries = self.cpr_queries_rc.clone();
+        let asked = queries.get();
+        // Only the thread that owns the main context can schedule; a test
+        // thread that cannot simply keeps the ledger, which is the safe side.
+        if let Ok(_guard) = glib::MainContext::default().acquire() {
+            glib::timeout_add_local_once(CPR_ANSWER_GRACE, move || {
+                if cpr_forget_applies(asked, queries.get()) {
+                    ledger.set(0);
+                }
+            });
+        }
+    }
+
     fn on_keyboard_protocol_query(&self, query: KeyboardProtocolQuery) {
         // The parser reports the query *and* passes its bytes through to the
         // live surface. Where that surface answers for itself, this reply
@@ -7072,6 +7108,8 @@ impl ReaderCtx {
             if matches!(query, KeyboardProtocolQuery::CursorPosition) {
                 self.cpr_outstanding_rc
                     .set(self.cpr_outstanding_rc.get().saturating_add(1));
+                self.cpr_queries_rc
+                    .set(self.cpr_queries_rc.get().wrapping_add(1));
             }
             return;
         }
@@ -12136,6 +12174,7 @@ impl TermView {
                 kitty_flags_rc: kitty_flags.clone(),
                 kitty_pusher_rc: kitty_pusher.clone(),
                 cpr_outstanding_rc: cpr_outstanding.clone(),
+                cpr_queries_rc: Rc::new(Cell::new(0)),
                 engine: RefCell::new(EngineState {
                     prev_state: BlockState::Idle,
                     osc133_depth: 0,
@@ -18161,6 +18200,7 @@ mod tests {
                 kitty_flags_rc: Rc::new(Cell::new(0)),
                 kitty_pusher_rc: Rc::new(Cell::new(None)),
                 cpr_outstanding_rc: Rc::new(Cell::new(0)),
+                cpr_queries_rc: Rc::new(Cell::new(0)),
                 dynamic_colors_rc: Rc::new(Cell::new(DynamicColors::default())),
                 config_for_cb: config.clone(),
                 parser: Rc::new(RefCell::new(crate::parser::Parser::new())),
@@ -21108,13 +21148,20 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
         ));
         assert_eq!(harness.ctx.cpr_outstanding_rc.get(), 2);
 
-        // A program that never read its answer leaves nothing behind for
-        // the next prompt's Shift+F3, and RIS forgets everything too.
+        // VTE processes fed bytes asynchronously: a prompt or RIS must not
+        // turn the answers it still owes into typing in the next lifecycle.
         harness.feed(ParserEvent::PromptStart);
-        assert_eq!(harness.ctx.cpr_outstanding_rc.get(), 0);
-        cpr(&harness);
+        assert_eq!(harness.ctx.cpr_outstanding_rc.get(), 2);
         harness.feed(ParserEvent::HardReset);
-        assert_eq!(harness.ctx.cpr_outstanding_rc.get(), 0);
+        assert_eq!(harness.ctx.cpr_outstanding_rc.get(), 2);
+        let asked = harness.ctx.cpr_queries_rc.get();
+        assert!(super::cpr_forget_applies(asked, asked));
+        cpr(&harness);
+        assert_eq!(harness.ctx.cpr_outstanding_rc.get(), 3);
+        assert!(!super::cpr_forget_applies(
+            asked,
+            harness.ctx.cpr_queries_rc.get()
+        ));
     }
 
     fn alt_key(key: super::KittyKey) -> (super::KittyKey, super::KittyModifiers) {
@@ -22356,7 +22403,9 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
 
         // Output parked behind a live selection, with the hold's hook
         // connected ahead of the commit handler as ReaderCtx::install does.
-        let cpr_outstanding = Rc::new(Cell::new(0));
+        let harness = ReaderHarness::new();
+        harness.backend.answers_queries_natively.set(true);
+        let cpr_outstanding = harness.ctx.cpr_outstanding_rc.clone();
         let hold = SelectionFeedHold::new();
         let flushed = Rc::new(Cell::new(false));
         {
@@ -22449,6 +22498,40 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
             routed.borrow()
         );
         assert_eq!(cpr_outstanding.get(), 0);
+
+        // The reader can dispatch the following prompt/RIS before VTE has
+        // processed its feed. Its delayed answer still belongs to the query,
+        // even though the reader has already ended that lifecycle.
+        for boundary in [ParserEvent::PromptStart, ParserEvent::HardReset] {
+            routed.borrow_mut().clear();
+            harness.feed(ParserEvent::KeyboardProtocolQuery(
+                KeyboardProtocolQuery::CursorPosition,
+            ));
+            terminal.feed(b"\x1b[6n");
+            assert!(routed.borrow().is_empty(), "VTE answers asynchronously");
+            harness.feed(boundary);
+            pump_until(&routed_len(1));
+            assert_eq!(
+                routed
+                    .borrow()
+                    .iter()
+                    .map(|(_, report)| *report)
+                    .collect::<Vec<_>>(),
+                [Some(TerminalReport::CursorPosition)],
+                "a delayed pre-boundary CPR must not become typing"
+            );
+            assert_eq!(cpr_outstanding.get(), 0);
+        }
+
+        // A query that never reaches VTE must eventually stop counting, so
+        // a later Shift+F3 cannot be mistaken for a reply forever.
+        harness.feed(ParserEvent::KeyboardProtocolQuery(
+            KeyboardProtocolQuery::CursorPosition,
+        ));
+        harness.feed(ParserEvent::PromptStart);
+        assert_eq!(cpr_outstanding.get(), 1);
+        pump_until(&|| cpr_outstanding.get() == 0);
+        assert_eq!(cpr_outstanding.get(), 0, "unanswered CPR must expire");
 
         // None of it was the user: the chord's key press is still recorded
         // and the selection still holds the output back.
