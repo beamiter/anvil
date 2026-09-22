@@ -431,8 +431,8 @@ pub(crate) enum BlockStatus {
     Succeeded,
     Failed(i32),
     /// The command was stopped by the user rather than going wrong: Ctrl+C
-    /// (130), a closed pipe (141), a TERM (143), or Ctrl+Z (148, suspended —
-    /// codex and claude both implement it, and `fg` resumes them). Drawn
+    /// (130), a closed pipe (141), a TERM (143), or a job-control stop
+    /// (147–150, suspended — `fg` resumes it). Drawn
     /// neutral and kept out of the Failed filter and failure navigation; the
     /// raw code stays on the badge, since a script that exits 130 by itself
     /// lands here too. See [`interrupt_signal`].
@@ -445,20 +445,20 @@ pub(crate) enum BlockStatus {
 /// at exactly the moments the user was in control: leaving `top`, ending a
 /// `tail -f`, suspending an agent TUI with Ctrl+Z. Matches forge's
 /// `BlockOutcome::interrupt_signal`.
-pub(crate) const fn interrupt_signal(exit_code: i32) -> Option<&'static str> {
-    match exit_code {
-        130 => Some("SIGINT"),
-        141 => Some("SIGPIPE"),
-        143 => Some("SIGTERM"),
-        148 => Some("SIGTSTP"),
-        _ => None,
+pub(crate) fn interrupt_signal(exit_code: i32) -> Option<&'static str> {
+    match jterm_core::exit_status::interrupt_signal(exit_code) {
+        Some(signal) => Some(signal),
+        None if jterm_core::exit_status::is_job_stop(exit_code) => {
+            jterm_core::exit_status::signal_name_for_exit(exit_code)
+        }
+        None => None,
     }
 }
 
-/// Ctrl+Z: the job is stopped, not gone, and the user brings it back with
-/// `fg`. The badge says "suspended" instead of "interrupted".
+/// A job-control stop leaves the job suspended, not gone, and `fg` resumes it.
+/// The badge says "suspended" instead of "interrupted".
 const fn is_suspension(exit_code: i32) -> bool {
-    exit_code == 148
+    jterm_core::exit_status::is_job_stop(exit_code)
 }
 
 /// Whether a finished block counts as a failure for the Failed filter,
@@ -2289,25 +2289,32 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_z_on_an_agent_is_a_suspension_not_a_failure() {
-        let suspended = block_status(Some("codex"), Some(148));
-        assert_eq!(suspended, BlockStatus::Interrupted(148));
-        assert!(!block_is_failure("codex", Some(148)));
-        assert_eq!(
-            suspended.exit_badge().as_deref(),
-            Some("exit:148 · suspended")
-        );
-        assert_eq!(
-            suspended.exit_badge_tooltip().as_deref(),
-            Some("Stopped by SIGTSTP — resume with fg")
-        );
-        assert_eq!(suspended.icon().2, "Command suspended");
-        assert_eq!(suspended.exit_badge_class(), "block-exit-interrupted");
-        assert_ne!(
-            suspended.stripe_class(),
-            block_status(Some("codex"), Some(1)).stripe_class(),
-            "a suspension is not striped like a failure"
-        );
+    fn job_control_stops_are_suspensions_not_failures() {
+        for (code, signal) in [
+            (147, "SIGSTOP"),
+            (148, "SIGTSTP"),
+            (149, "SIGTTIN"),
+            (150, "SIGTTOU"),
+        ] {
+            let suspended = block_status(Some("codex"), Some(code));
+            assert_eq!(suspended, BlockStatus::Interrupted(code));
+            assert!(!block_is_failure("codex", Some(code)));
+            assert_eq!(
+                suspended.exit_badge().as_deref(),
+                Some(format!("exit:{code} · suspended").as_str())
+            );
+            assert_eq!(
+                suspended.exit_badge_tooltip().as_deref(),
+                Some(format!("Stopped by {signal} — resume with fg").as_str())
+            );
+            assert_eq!(suspended.icon().2, "Command suspended");
+            assert_eq!(suspended.exit_badge_class(), "block-exit-interrupted");
+            assert_ne!(
+                suspended.stripe_class(),
+                block_status(Some("codex"), Some(1)).stripe_class(),
+                "a suspension is not striped like a failure"
+            );
+        }
 
         for code in [130, 141, 143] {
             assert_eq!(
@@ -2324,15 +2331,6 @@ mod tests {
         assert!(block_is_failure("make", Some(137)));
         assert!(!block_is_failure("make", Some(0)));
         assert!(!block_is_failure("make", None));
-        // The other job-control stops are not in the neutral set, but their
-        // badge must not claim the job was terminated.
-        assert_eq!(
-            block_status(Some("vim"), Some(149)),
-            BlockStatus::Failed(149)
-        );
-        assert!(block_status(Some("vim"), Some(149))
-            .exit_badge_tooltip()
-            .is_some_and(|tip| tip.contains("suspended by SIGTTIN")));
     }
 
     #[test]
