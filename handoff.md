@@ -12,6 +12,13 @@ captured, queued, written, and restored.
 
 ## Completed since the previous handoff
 
+- **Agent-task anchor hardening (upgrade round 45)**: Create-from-block and Fix
+  now call `block_agent_task_anchor_disabled_reason`, which rejects
+  `is_background` finished blocks before worktree creation even though
+  `block_agent_context_disabled_reason` still allows commandless output for
+  Shell Agent attach. Foreground blocks still require exact OSC 133 command
+  metadata. See `UPGRADE_ROUNDS.md` round 45.
+
 - **Agent CLIs in Block mode (2026-09-20, core `33093da`)**: a seven-area audit
   of how claude (fullscreen/alt-screen on this machine), codex and kimi (inline)
   and opencode (alt-screen) behave in Block mode, with each finding checked by a

@@ -143,6 +143,11 @@ evolve pass.
     last command's captured output is not abandoned when closing the window wins
     the race to the background writer. A structural regression guards the
     ordering because nothing is observable once the process has left.
+45. **Agent-task anchor hardening** — isolated worktree tasks now refuse
+    background-output blocks even when the shared block preflight still treats
+    commandless captured output as attachable evidence. Fix/Create-from-block
+    keeps requiring exact shell-reported command metadata for foreground blocks.
+    Unit tests pin the stricter gate against the shared preflight contract.
 
 Verification: `bash scripts/test-install-paths.sh`, `bash -n
 scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.

@@ -32,6 +32,26 @@ const TASKS_POLL_FAST: Duration = Duration::from_millis(120);
 /// tasks from ever waking the loop.
 const TASKS_POLL_SLOW: Duration = Duration::from_millis(2_000);
 
+/// Agent-task anchor gate, stricter than the shared block preflight.
+///
+/// [`crate::agent_task::context::block_agent_context_disabled_reason`] treats
+/// commandless captured output as attachable evidence; isolated worktree tasks
+/// must anchor on a shell-reported command instead.
+fn block_agent_task_anchor_disabled_reason(
+    evidence: &crate::block_view::BlockAgentEvidence,
+) -> Option<&'static str> {
+    if evidence.is_background {
+        return Some("Background output blocks are not shell commands");
+    }
+    crate::agent_task::context::block_agent_context_disabled_reason(
+        evidence.command.as_deref(),
+        evidence.command_exact,
+        evidence.command_truncated,
+        evidence.cwd.as_deref(),
+        Some(evidence.output_available),
+    )
+}
+
 /// Build the semantic evidence for a new task from one block snapshot.
 ///
 /// The synthetic execution id is panel-local provenance: it never crosses a
@@ -405,13 +425,7 @@ impl AppModel {
             self.show_toast("Fix tasks are available for failed command blocks");
             return;
         }
-        if let Some(reason) = crate::agent_task::context::block_agent_context_disabled_reason(
-            evidence.command.as_deref(),
-            evidence.command_exact,
-            evidence.command_truncated,
-            evidence.cwd.as_deref(),
-            Some(evidence.output_available),
-        ) {
+        if let Some(reason) = block_agent_task_anchor_disabled_reason(&evidence) {
             self.show_toast(format!("Cannot create an agent task: {reason}"));
             return;
         }
@@ -970,5 +984,61 @@ impl AppModel {
             .iter_mut()
             .flat_map(|tab| tab.panes.iter_mut())
             .find(|pane| pane.id == pane_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::block_agent_task_anchor_disabled_reason;
+    use crate::block_view::BlockAgentEvidence;
+
+    fn sample_evidence(is_background: bool, command: Option<&str>, command_exact: bool) -> BlockAgentEvidence {
+        BlockAgentEvidence {
+            block_id: 1,
+            command: command.map(str::to_string),
+            command_exact,
+            command_truncated: false,
+            cwd: Some("/tmp".to_string()),
+            exit_code: Some(0),
+            duration_ms: Some(1),
+            output_text: "ok\n".to_string(),
+            output_available: true,
+            output_truncated: false,
+            output_total_bytes: 3,
+            is_background,
+            started_at: None,
+            finished_at: None,
+        }
+    }
+
+    #[test]
+    fn agent_task_anchor_rejects_background_output_even_when_preflight_passes() {
+        let evidence = sample_evidence(true, None, false);
+        assert_eq!(
+            crate::agent_task::context::block_agent_context_disabled_reason(
+                evidence.command.as_deref(),
+                evidence.command_exact,
+                evidence.command_truncated,
+                evidence.cwd.as_deref(),
+                Some(evidence.output_available),
+            ),
+            None,
+            "shared preflight still treats commandless output as attachable"
+        );
+        assert_eq!(
+            block_agent_task_anchor_disabled_reason(&evidence),
+            Some("Background output blocks are not shell commands")
+        );
+    }
+
+    #[test]
+    fn agent_task_anchor_still_requires_exact_command_metadata() {
+        let evidence = sample_evidence(false, Some("cargo test"), false);
+        assert_eq!(
+            block_agent_task_anchor_disabled_reason(&evidence),
+            Some("Exact command metadata is required")
+        );
+        let evidence = sample_evidence(false, Some("cargo test"), true);
+        assert_eq!(block_agent_task_anchor_disabled_reason(&evidence), None);
     }
 }
