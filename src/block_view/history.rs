@@ -525,6 +525,56 @@ fn decode_record(data: &[u8], compressed: bool, max_decoded_bytes: usize) -> io:
     Ok(decoded)
 }
 
+/// Exact BlockData archive used before `output_head_dropped` was persisted.
+/// Records carry [`super::blocks::BLOCK_LIFECYCLE_SCHEMA_V3`].
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+struct LegacyBlockDataV3 {
+    id: u64,
+    prompt: String,
+    cmd: String,
+    cmd_markup: Option<String>,
+    output: String,
+    exit_code: Option<i32>,
+    lifecycle_schema: u32,
+    completion_provenance: super::CompletionProvenanceWire,
+    start_mark_seen: bool,
+    estimated_height: i32,
+    line_count: usize,
+    start_time_ms: Option<u64>,
+    end_time_ms: Option<u64>,
+    duration_ms: Option<u64>,
+    cwd: Option<String>,
+    cols: u16,
+    command_exact: bool,
+    command_truncated: bool,
+}
+
+impl From<LegacyBlockDataV3> for BlockData {
+    fn from(legacy: LegacyBlockDataV3) -> Self {
+        Self {
+            id: legacy.id,
+            prompt: legacy.prompt,
+            cmd: legacy.cmd,
+            cmd_markup: legacy.cmd_markup,
+            output: legacy.output,
+            exit_code: legacy.exit_code,
+            lifecycle_schema: super::blocks::BLOCK_LIFECYCLE_SCHEMA,
+            completion_provenance: legacy.completion_provenance,
+            start_mark_seen: legacy.start_mark_seen,
+            estimated_height: legacy.estimated_height,
+            line_count: legacy.line_count,
+            start_time_ms: legacy.start_time_ms,
+            end_time_ms: legacy.end_time_ms,
+            duration_ms: legacy.duration_ms,
+            cwd: legacy.cwd,
+            cols: legacy.cols,
+            command_exact: legacy.command_exact,
+            command_truncated: legacy.command_truncated,
+            output_head_dropped: false,
+        }
+    }
+}
+
 /// Exact BlockData archive used before completion provenance/start evidence
 /// was added. rkyv validates field layout, so serde defaults cannot recover
 /// these frames; an explicit fallback is required to preserve recent history.
@@ -574,6 +624,7 @@ impl From<LegacyBlockDataV2> for BlockData {
             // Legacy snapshots predate command-text provenance: fail closed.
             command_exact: false,
             command_truncated: false,
+            output_head_dropped: false,
         }
     }
 }
@@ -585,6 +636,14 @@ fn decode_block_record(data: &[u8], prefer_compressed: bool) -> io::Result<(Bloc
         let block = rkyv::from_bytes::<BlockData, rkyv::rancor::Error>(&decoded)
             .ok()
             .filter(|block| block.lifecycle_schema == super::blocks::BLOCK_LIFECYCLE_SCHEMA)
+            .or_else(|| {
+                rkyv::from_bytes::<LegacyBlockDataV3, rkyv::rancor::Error>(&decoded)
+                    .ok()
+                    .filter(|block| {
+                        block.lifecycle_schema == super::blocks::BLOCK_LIFECYCLE_SCHEMA_V3
+                    })
+                    .map(BlockData::from)
+            })
             .or_else(|| {
                 rkyv::from_bytes::<LegacyBlockDataV2, rkyv::rancor::Error>(&decoded)
                     .ok()
@@ -1586,6 +1645,7 @@ mod tests {
             cols: 80,
             command_exact: false,
             command_truncated: false,
+            output_head_dropped: false,
         }
     }
 
@@ -2053,6 +2113,47 @@ mod tests {
         let compressed = zstd::encode_all(&b"0123456789abcdef"[..], 1).unwrap();
         let error = decode_record(&compressed, true, 8).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn history_keeps_output_head_dropped_and_reads_the_schema_before_it() {
+        let mut block = sample_block(9, "cargo build");
+        block.output_head_dropped = true;
+        let raw = rkyv::to_bytes::<rkyv::rancor::Error>(&block).unwrap();
+        let (decoded, _) = decode_block_record(raw.as_slice(), false).unwrap();
+        assert!(decoded.output_head_dropped);
+
+        let legacy = super::LegacyBlockDataV3 {
+            id: 10,
+            prompt: "$ ".into(),
+            cmd: "make".into(),
+            cmd_markup: None,
+            output: "built".into(),
+            exit_code: Some(2),
+            lifecycle_schema: super::super::blocks::BLOCK_LIFECYCLE_SCHEMA_V3,
+            completion_provenance: super::super::CompletionProvenanceWire::Unknown,
+            start_mark_seen: true,
+            estimated_height: 20,
+            line_count: 1,
+            start_time_ms: Some(1),
+            end_time_ms: Some(3),
+            duration_ms: Some(2),
+            cwd: Some("/tmp".into()),
+            cols: 80,
+            command_exact: true,
+            command_truncated: false,
+        };
+        let encoded = rkyv::to_bytes::<rkyv::rancor::Error>(&legacy).unwrap();
+        let (decoded, _) = decode_block_record(encoded.as_slice(), false).unwrap();
+        assert_eq!(decoded.cmd, "make");
+        assert_eq!(decoded.exit_code, Some(2));
+        assert!(decoded.command_exact);
+        assert_eq!(decoded.cols, 80);
+        assert!(!decoded.output_head_dropped);
+        assert_eq!(
+            decoded.lifecycle_schema,
+            super::super::blocks::BLOCK_LIFECYCLE_SCHEMA
+        );
     }
 
     #[test]

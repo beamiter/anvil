@@ -12,6 +12,11 @@ captured, queued, written, and restored.
 
 ## Completed since the previous handoff
 
+- **Persisted "Earlier output not retained" (upgrade round 50, wave 8)**:
+  `BlockData.output_head_dropped` survives Block-history save/restore (and clear
+  undo) so the dim notice is not lost after a restart; pre-notice history frames
+  still decode with the notice off.
+
 - **Validation launch failure agent retry isolation (upgrade round 49, wave 7)**:
   validation pre-exec spawn failures do not register an agent terminal retry pin
   when both terminals are bound; regression pins the agent session stays off the
@@ -52,8 +57,7 @@ captured, queued, written, and restored.
   verified differentially against real libvte 0.76, which finished blocks now
   use so a codex session keeps its whole transcript. Display tests run headless
   with `gtk4-broadwayd` when xvfb is missing (GDK_BACKEND=broadway; the broadway
-  socket lives in XDG_RUNTIME_DIR). Left open: the "Earlier output not retained"
-  notice is not persisted in BlockData (needs a history-format field); the flaky
+  socket lives in XDG_RUNTIME_DIR).   Left open: the flaky
   parallel test-binary crash in GTK IM-module teardown predates this work.
 
 - **The ASCII organism is consumed from `jterm_core`, and anvil's persistence

@@ -202,7 +202,9 @@ pub(crate) fn estimated_live_finished_block_retained_bytes(
 
 // ─── FinishedBlock ────────────────────────────────────────────────────────────
 
-pub(crate) const BLOCK_LIFECYCLE_SCHEMA: u32 = 0x4a54_4c31;
+pub(crate) const BLOCK_LIFECYCLE_SCHEMA: u32 = 0x4a54_4c32;
+/// Schema before `output_head_dropped` was persisted; see `LegacyBlockDataV3`.
+pub(crate) const BLOCK_LIFECYCLE_SCHEMA_V3: u32 = 0x4a54_4c31;
 
 fn block_lifecycle_schema() -> u32 {
     BLOCK_LIFECYCLE_SCHEMA
@@ -253,6 +255,11 @@ pub(crate) struct BlockData {
     /// must not be treated as the command that actually ran.
     #[serde(default)]
     pub(crate) command_truncated: bool,
+    /// Capture/replay dropped earlier output; the finished card shows
+    /// [`OUTPUT_HEAD_DROPPED_NOTICE`]. Defaults to false so records saved
+    /// before this field exist rebuild without a notice.
+    #[serde(default)]
+    pub(crate) output_head_dropped: bool,
 }
 
 /// Fence long enough to contain `text`: untrusted output may itself hold a run
@@ -2131,6 +2138,7 @@ mod tests {
             cols: 80,
             command_exact: true,
             command_truncated: false,
+            output_head_dropped: false,
         }
     }
 

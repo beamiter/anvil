@@ -169,5 +169,10 @@ evolve pass.
     terminals are bound. A regression pins the agent session stays off the
     retry queue.
 
+50. **Persisted earlier-output notice** — `BlockData` now carries
+    `output_head_dropped` so the finished-card "Earlier output not retained"
+    notice survives history save/restore and clear undo. Pre-notice frames still
+    decode with the notice off.
+
 Verification: `bash scripts/test-install-paths.sh`, `bash -n
 scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.

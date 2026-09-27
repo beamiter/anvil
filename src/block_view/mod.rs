@@ -8614,7 +8614,13 @@ impl RenderBackend for BlockBackend {
             cols: cols as u16,
             command_exact: record.command_source == CommandTextSource::ShellReported,
             command_truncated: record.command_source == CommandTextSource::ScreenAfterTruncation,
+            output_head_dropped: finished_card_loses_head(
+                payload.output_head_dropped,
+                output_rows,
+                cols,
+            ),
         };
+        let output_head_dropped = block_data.output_head_dropped;
 
         let max_blocks = self.config_for_cb.borrow().max_visible_blocks as usize;
         let newest_estimated_bytes = {
@@ -8712,11 +8718,7 @@ impl RenderBackend for BlockBackend {
             record.lifecycle_health(),
             record.lifecycle_notice().as_deref(),
         );
-        finished.set_output_head_dropped(finished_card_loses_head(
-            payload.output_head_dropped,
-            output_rows,
-            cols,
-        ));
+        finished.set_output_head_dropped(output_head_dropped);
         finished
             .widget()
             .insert_before(&self.block_list_rc, Some(self.active_rc.borrow().widget()));
@@ -13527,6 +13529,7 @@ impl TermView {
                             block.lifecycle_health(),
                             block.lifecycle_notice().as_deref(),
                         );
+                        finished.set_output_head_dropped(block.output_head_dropped);
                         finished.widget().insert_before(
                             &term_view.block_list,
                             Some(term_view.active.borrow().widget()),
@@ -14663,6 +14666,22 @@ impl TermView {
         self.clear_find();
         self.active_vte.unselect_all();
 
+        // Fold the live card flag into BlockData before draining so clear/undo
+        // and a subsequent history rewrite keep the same notice bit.
+        {
+            let finished = self.finished_blocks.borrow();
+            let mut data = self.block_data.borrow_mut();
+            for block in data.iter_mut() {
+                if finished
+                    .iter()
+                    .find(|card| card.id == block.id)
+                    .is_some_and(|card| card.output_head_dropped())
+                {
+                    block.output_head_dropped = true;
+                }
+            }
+        }
+
         let cleared: Vec<BlockData> = mutate_block_data_and_redraw(
             &self.block_data,
             self.failure_marker_redraw.as_ref(),
@@ -14673,13 +14692,7 @@ impl TermView {
         // reflexive second Ctrl+Shift+K cannot destroy the undo snapshot.
         if !cleared.is_empty() {
             *self.cleared_stash.borrow_mut() = cleared;
-            *self.cleared_head_dropped.borrow_mut() = self
-                .finished_blocks
-                .borrow()
-                .iter()
-                .filter(|block| block.output_head_dropped())
-                .map(|block| block.id)
-                .collect();
+            self.cleared_head_dropped.borrow_mut().clear();
         }
 
         let widgets: Vec<gtk::Box> = self
@@ -14736,7 +14749,7 @@ impl TermView {
             return 0;
         }
         let mut stash: Vec<BlockData> = std::mem::take(&mut *self.cleared_stash.borrow_mut());
-        let head_dropped = std::mem::take(&mut *self.cleared_head_dropped.borrow_mut());
+        let _ = std::mem::take(&mut *self.cleared_head_dropped.borrow_mut());
         if stash.is_empty() {
             return 0;
         }
@@ -14820,7 +14833,7 @@ impl TermView {
                     block.lifecycle_health(),
                     block.lifecycle_notice().as_deref(),
                 );
-                finished.set_output_head_dropped(head_dropped.contains(&block.id));
+                finished.set_output_head_dropped(block.output_head_dropped);
                 finished
                     .widget()
                     .insert_before(&self.block_list, Some(&anchor));
@@ -17741,6 +17754,7 @@ mod tests {
                 command_exact: record.command_source == super::CommandTextSource::ShellReported,
                 command_truncated: record.command_source
                     == super::CommandTextSource::ScreenAfterTruncation,
+                output_head_dropped: payload.output_head_dropped,
             };
             self.block_records
                 .borrow_mut()
@@ -23748,6 +23762,7 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
             cols: 80,
             command_exact: !cmd.trim().is_empty(),
             command_truncated: false,
+            output_head_dropped: false,
         }
     }
 

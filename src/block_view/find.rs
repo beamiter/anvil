@@ -3028,6 +3028,7 @@ mod tests {
             cols: 80,
             command_exact: false,
             command_truncated: false,
+            output_head_dropped: false,
         };
         let metadata = CompletedCommandRecord {
             id: 2,
@@ -3317,6 +3318,7 @@ mod tests {
             cols: 80,
             command_exact: false,
             command_truncated: false,
+            output_head_dropped: false,
         };
         let metadata = CompletedCommandRecord {
             id: 2,
@@ -3350,6 +3352,7 @@ mod tests {
             cols: 80,
             command_exact: false,
             command_truncated: false,
+            output_head_dropped: false,
         };
         let records = || {
             [
@@ -3580,6 +3583,7 @@ mod tests {
             cols: 80,
             command_exact: false,
             command_truncated: false,
+            output_head_dropped: false,
         };
         let block_record = || [BackendRecordRef::Block(&block)];
         let hits = metadata_filter_hits(block_record(), CrossBlockSearchScope::All, 1, &filters);
