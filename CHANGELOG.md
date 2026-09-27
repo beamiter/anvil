@@ -7,6 +7,13 @@ versioning for tagged releases while it remains experimental.
 
 ### Added
 
+- **Task terminals that fail to launch update the task model by role.** A
+  validation PTY that never crossed exec is recorded as a cancelled validation
+  attempt rather than an inconclusive child exit, so the Tasks panel can schedule
+  the next attempt without treating the spawn as a mysterious disconnect. Agent
+  task terminals still record a failed launch with no exit status so the
+  existing terminal-retry path remains available.
+
 - **A workflow is findable by its tags.** The palette matched a workflow's name
   and its description/command sublabel, and rendered its tags into the
   right-hand hint, which never took part in matching — so the one field an

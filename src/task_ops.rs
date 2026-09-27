@@ -32,6 +32,24 @@ const TASKS_POLL_FAST: Duration = Duration::from_millis(120);
 /// tasks from ever waking the loop.
 const TASKS_POLL_SLOW: Duration = Duration::from_millis(2_000);
 
+/// Apply task-model effects for a terminal that never crossed exec.
+fn record_task_terminal_launch_failure(
+    manager: &mut crate::agent_task::TaskManager,
+    session_id: &str,
+    role: crate::agent_task::TaskTerminalRole,
+) {
+    match role {
+        crate::agent_task::TaskTerminalRole::Validation => {
+            // A validation PTY that never launched is a cancelled attempt, not
+            // an inconclusive exit from a child that disappeared mid-flight.
+            manager.handle_terminal_session_closed(session_id);
+        }
+        crate::agent_task::TaskTerminalRole::Agent => {
+            manager.handle_terminal_session_exit(session_id, None);
+        }
+    }
+}
+
 /// Agent-task anchor gate, stricter than the shared block preflight.
 ///
 /// [`crate::agent_task::context::block_agent_context_disabled_reason`] treats
@@ -744,14 +762,13 @@ impl AppModel {
     /// descriptor is not held until the user closes the diagnostic pane.
     pub(crate) fn note_task_terminal_launch_failed(&mut self, pane_id: u64) {
         self.pending_validation_pins.remove(&pane_id);
-        let Some(session_id) = self
+        let Some((session_id, role)) = self
             .pane(pane_id)
-            .and_then(|pane| pane.task_session_id.clone())
+            .and_then(|pane| pane.task_session_id.clone().zip(pane.task_role))
         else {
             return;
         };
-        self.task_manager
-            .handle_terminal_session_exit(&session_id, None);
+        record_task_terminal_launch_failure(&mut self.task_manager, &session_id, role);
         if self.tasks_panel_visible.get() {
             self.sync_tasks_panel();
         }
@@ -989,7 +1006,10 @@ impl AppModel {
 
 #[cfg(test)]
 mod tests {
-    use super::block_agent_task_anchor_disabled_reason;
+    use super::{block_agent_task_anchor_disabled_reason, record_task_terminal_launch_failure};
+    use crate::agent_task::{
+        NewTask, TaskManager, TaskStatus, TaskValidationStatus, TaskTerminalRole,
+    };
     use crate::block_view::BlockAgentEvidence;
 
     fn sample_evidence(is_background: bool, command: Option<&str>, command_exact: bool) -> BlockAgentEvidence {
@@ -1040,5 +1060,65 @@ mod tests {
         );
         let evidence = sample_evidence(false, Some("cargo test"), true);
         assert_eq!(block_agent_task_anchor_disabled_reason(&evidence), None);
+    }
+
+    fn sample_new_task(title: &str) -> NewTask {
+        NewTask {
+            title: title.to_string(),
+            provider: crate::agent_task::AgentProvider::Codex,
+            repo_root: std::path::PathBuf::from("/tmp/repo"),
+            worktree_path: std::path::PathBuf::from("/tmp/repo/wt"),
+            branch: "task/1".into(),
+            base_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            source_context: None,
+        }
+    }
+
+    #[test]
+    fn validation_launch_failure_is_cancelled_not_inconclusive() {
+        let mut manager = TaskManager::new();
+        let task_id = manager.create(sample_new_task("validate-me")).unwrap();
+        manager
+            .update_status(task_id, TaskStatus::ReadyForReview, None)
+            .unwrap();
+        manager
+            .bind_validation_session(task_id, "validation-launch-fail".into())
+            .unwrap();
+
+        record_task_terminal_launch_failure(
+            &mut manager,
+            "validation-launch-fail",
+            TaskTerminalRole::Validation,
+        );
+
+        let task = manager.get(task_id).unwrap();
+        assert_eq!(task.validation.status, TaskValidationStatus::Cancelled);
+        assert_eq!(
+            manager.next_validation_attempt(task_id).ok(),
+            Some(2),
+            "a cancelled validation attempt must not block the next run"
+        );
+    }
+
+    #[test]
+    fn agent_launch_failure_stays_failed_for_terminal_retry() {
+        let mut manager = TaskManager::new();
+        let task_id = manager.create(sample_new_task("agent-me")).unwrap();
+        manager
+            .bind_terminal_session(task_id, "agent-launch-fail".into())
+            .unwrap();
+
+        record_task_terminal_launch_failure(
+            &mut manager,
+            "agent-launch-fail",
+            TaskTerminalRole::Agent,
+        );
+
+        let task = manager.get(task_id).unwrap();
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(
+            manager.terminal_retry_session_id(task_id).ok(),
+            Some("agent-launch-fail")
+        );
     }
 }
