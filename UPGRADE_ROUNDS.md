@@ -149,5 +149,10 @@ evolve pass.
     keeps requiring exact shell-reported command metadata for foreground blocks.
     Unit tests pin the stricter gate against the shared preflight contract.
 
+46. **Validation launch failure bookkeeping** — a validation PTY that never
+    execs is cancelled without blocking the next attempt; a regression now pins
+    that `record_task_terminal_launch_failure` leaves validation in
+    `Cancelled` while agent launch failures remain retryable.
+
 Verification: `bash scripts/test-install-paths.sh`, `bash -n
 scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.

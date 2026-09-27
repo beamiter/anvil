@@ -1101,6 +1101,27 @@ mod tests {
     }
 
     #[test]
+    fn launch_failure_clears_validation_pin_without_waiting_for_exit() {
+        let mut manager = TaskManager::new();
+        let task_id = manager.create(sample_new_task("pin-me")).unwrap();
+        manager
+            .update_status(task_id, TaskStatus::ReadyForReview, None)
+            .unwrap();
+        manager
+            .bind_validation_session(task_id, "validation-pin".into())
+            .unwrap();
+        record_task_terminal_launch_failure(
+            &mut manager,
+            "validation-pin",
+            TaskTerminalRole::Validation,
+        );
+        assert_eq!(
+            manager.get(task_id).unwrap().validation.status,
+            TaskValidationStatus::Cancelled
+        );
+    }
+
+    #[test]
     fn agent_launch_failure_stays_failed_for_terminal_retry() {
         let mut manager = TaskManager::new();
         let task_id = manager.create(sample_new_task("agent-me")).unwrap();
