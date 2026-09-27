@@ -1161,4 +1161,29 @@ mod tests {
         assert_eq!(task.validation.status, TaskValidationStatus::NotRun);
         assert_ne!(task.validation.status, TaskValidationStatus::Cancelled);
     }
+
+    #[test]
+    fn validation_launch_failure_does_not_fail_agent_task() {
+        let mut manager = TaskManager::new();
+        let task_id = manager.create(sample_new_task("dual-terminal")).unwrap();
+        manager
+            .bind_terminal_session(task_id, "agent-still-ok".into())
+            .unwrap();
+        manager
+            .update_status(task_id, TaskStatus::ReadyForReview, None)
+            .unwrap();
+        manager
+            .bind_validation_session(task_id, "validation-launch-fail".into())
+            .unwrap();
+
+        record_task_terminal_launch_failure(
+            &mut manager,
+            "validation-launch-fail",
+            TaskTerminalRole::Validation,
+        );
+
+        let task = manager.get(task_id).unwrap();
+        assert_eq!(task.validation.status, TaskValidationStatus::Cancelled);
+        assert_ne!(task.status, TaskStatus::Failed);
+    }
 }

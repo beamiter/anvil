@@ -12,6 +12,11 @@ captured, queued, written, and restored.
 
 ## Completed since the previous handoff
 
+- **Validation launch failure isolation (upgrade round 48, wave 6)**: validation
+  pre-exec spawn failures cancel the validation attempt without marking the
+  agent task failed when both terminals are bound; regression pins independent
+  role bookkeeping.
+
 - **Launch failure role isolation (upgrade round 47, wave 5)**: agent pre-exec
   spawn failures stay retryable and leave validation at `NotRun`; regression
   pins that agent `record_task_terminal_launch_failure` does not cancel

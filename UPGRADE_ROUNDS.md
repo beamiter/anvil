@@ -159,5 +159,10 @@ evolve pass.
     pins that `record_task_terminal_launch_failure` for agent terminals leaves
     validation at `NotRun` instead of cancelling an unrelated validation attempt.
 
+48. **Validation launch failure isolation** — validation pre-exec spawn failures
+    cancel the validation attempt without marking the agent task failed when
+    both terminals are bound. A regression pins that role-specific bookkeeping
+    stays independent.
+
 Verification: `bash scripts/test-install-paths.sh`, `bash -n
 scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
