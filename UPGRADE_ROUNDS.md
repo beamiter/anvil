@@ -6,13 +6,9 @@ pass.
 Rounds 1–10 record the preceding pass; this pass's additional thirty-three rounds
 are numbered 11–43.
 
-The numbering stops at 43. Every round since — including the shared chat-store
-adoption, the 2026-08-29 shared command-correction round, and the 2026-08-29
-shared workflow-library round that made an undefaulted workflow argument
-required — recorded its work in `CHANGELOG.md` and `handoff.md` instead of
-here, so this ledger is left closed rather than retro-fitted. Do not resume the
-numbering for a single round; either the ledger comes back for a whole pass or
-it stays shut.
+The numbering stopped at 43 through 2026-08-29; later repin rounds lived in
+`CHANGELOG.md` and `handoff.md` only. Round 44 resumes the ledger for this
+evolve pass.
 
 1. **Prefix boundary** — install and uninstall reject empty, relative,
    control-bearing, or parent-traversing prefixes while retaining valid Unicode
@@ -141,6 +137,12 @@ it stays shut.
     highlights take precedence over whole-card copy and oversized aggregation
     fails atomically; generation-owned refusal timers refresh repeated status
     and can restore only the steady legend, never an older transient message.
+
+44. **Quit waits for the execution journal** — `force_quit` now pins a bounded
+    `execution_journal::flush` before `quit_allowed` and `window.close`, so the
+    last command's captured output is not abandoned when closing the window wins
+    the race to the background writer. A structural regression guards the
+    ordering because nothing is observable once the process has left.
 
 Verification: `bash scripts/test-install-paths.sh`, `bash -n
 scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.

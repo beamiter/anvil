@@ -3262,6 +3262,35 @@ mod startup_wiring_tests {
              writes to one memory file collapse and unrelated ones never do"
         );
     }
+
+    /// Completed command output reaches jsh's journal through a background writer.
+    /// `force_quit` must wait for that worker before the window closes, or the
+    /// last command's captured output is lost whenever exit wins the race.
+    #[test]
+    fn force_quit_flushes_the_execution_journal_before_the_window_closes() {
+        let source = include_str!("workspace_ops.rs");
+        let body = source
+            .split_once("pub(crate) fn force_quit(&self) {")
+            .expect("force_quit exists")
+            .1;
+        let body = &body[..body
+            .find("    /// App-level diagnostics")
+            .expect("force_quit is followed by debug_info_snapshot")];
+        let flush = "execution_journal::flush(";
+        let flush_at = body
+            .find(flush)
+            .expect("force_quit must flush the execution journal");
+        let quit_at = body
+            .find("self.quit_allowed.set(true)")
+            .expect("force_quit arms quit before closing");
+        let close_at = body
+            .find("self.window.close()")
+            .expect("force_quit closes the window");
+        assert!(
+            flush_at < quit_at && flush_at < close_at,
+            "the journal flush must finish before the UI is allowed to leave"
+        );
+    }
 }
 
 #[cfg(all(test, unix))]
