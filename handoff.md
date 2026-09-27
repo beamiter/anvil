@@ -12,6 +12,11 @@ captured, queued, written, and restored.
 
 ## Completed since the previous handoff
 
+- **Launch failure role isolation (upgrade round 47, wave 5)**: agent pre-exec
+  spawn failures stay retryable and leave validation at `NotRun`; regression
+  pins that agent `record_task_terminal_launch_failure` does not cancel
+  validation.
+
 - **Agent-task anchor hardening (upgrade round 45)**: Create-from-block and Fix
   now call `block_agent_task_anchor_disabled_reason`, which rejects
   `is_background` finished blocks before worktree creation even though
