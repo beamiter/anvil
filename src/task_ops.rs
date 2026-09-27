@@ -1185,5 +1185,10 @@ mod tests {
         let task = manager.get(task_id).unwrap();
         assert_eq!(task.validation.status, TaskValidationStatus::Cancelled);
         assert_ne!(task.status, TaskStatus::Failed);
+        assert_eq!(
+            manager.terminal_retry_session_id(task_id).ok(),
+            None,
+            "validation launch failure must not mark the agent terminal for retry"
+        );
     }
 }

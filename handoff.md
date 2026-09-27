@@ -12,6 +12,11 @@ captured, queued, written, and restored.
 
 ## Completed since the previous handoff
 
+- **Validation launch failure agent retry isolation (upgrade round 49, wave 7)**:
+  validation pre-exec spawn failures do not register an agent terminal retry pin
+  when both terminals are bound; regression pins the agent session stays off the
+  retry queue.
+
 - **Validation launch failure isolation (upgrade round 48, wave 6)**: validation
   pre-exec spawn failures cancel the validation attempt without marking the
   agent task failed when both terminals are bound; regression pins independent

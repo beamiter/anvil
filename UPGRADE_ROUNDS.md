@@ -164,5 +164,10 @@ evolve pass.
     both terminals are bound. A regression pins that role-specific bookkeeping
     stays independent.
 
+49. **Validation launch failure agent retry isolation** — validation pre-exec
+    spawn failures must not register an agent terminal retry pin when both
+    terminals are bound. A regression pins the agent session stays off the
+    retry queue.
+
 Verification: `bash scripts/test-install-paths.sh`, `bash -n
 scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
