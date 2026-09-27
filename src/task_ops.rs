@@ -1142,4 +1142,23 @@ mod tests {
             Some("agent-launch-fail")
         );
     }
+
+    #[test]
+    fn agent_launch_failure_does_not_cancel_validation() {
+        let mut manager = TaskManager::new();
+        let task_id = manager.create(sample_new_task("agent-only")).unwrap();
+        manager
+            .bind_terminal_session(task_id, "agent-only-fail".into())
+            .unwrap();
+
+        record_task_terminal_launch_failure(
+            &mut manager,
+            "agent-only-fail",
+            TaskTerminalRole::Agent,
+        );
+
+        let task = manager.get(task_id).unwrap();
+        assert_eq!(task.validation.status, TaskValidationStatus::NotRun);
+        assert_ne!(task.validation.status, TaskValidationStatus::Cancelled);
+    }
 }

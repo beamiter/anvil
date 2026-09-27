@@ -154,5 +154,10 @@ evolve pass.
     that `record_task_terminal_launch_failure` leaves validation in
     `Cancelled` while agent launch failures remain retryable.
 
+47. **Launch failure role isolation** — agent pre-exec spawn failures mark the
+    task failed and retryable without touching validation state. A regression
+    pins that `record_task_terminal_launch_failure` for agent terminals leaves
+    validation at `NotRun` instead of cancelling an unrelated validation attempt.
+
 Verification: `bash scripts/test-install-paths.sh`, `bash -n
 scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
