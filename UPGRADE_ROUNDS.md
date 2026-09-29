@@ -811,3 +811,17 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      Pairs forge 230 / core SitNear/Inspect→Unknown inside between() 93 beside
      Celebrate*/Rest→Unknown.
 
+184. **Sticky center mid-range VS / Mongolian birga labels** —
+     U+FE07 / U+1800 variants of "Save Block history" stay toast-only
+     beside rounds 179/175. Pairs forge 231.
+
+185. **CrossBlock cancel near-near-near-near-near-near-wrap bump** — palette idle
+     continuation drops MAX-6→MAX-5 generation bumps (with or without resume),
+     scheduled ahead MAX-5 vs MAX-6, and finished walks at MAX-6. Pairs forge
+     233 / core cancel edge.
+
+186. **GuardRecovery→UnknownOutcome Full-motion bridge** — Full motion animates
+     GuardRecovery→UnknownOutcome; Calm/Static snap. Pairs forge 234 / core
+     `GuardRecoveryToUnknownOutcome` beside Celebrate*/Rest/SitNear/Inspect→
+     Unknown inside between() 93.
+
