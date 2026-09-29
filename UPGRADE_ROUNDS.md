@@ -605,17 +605,17 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
 
 137. **Sticky near-miss Ogham/MVS/CGJ/VS/Khmer labels** — U+1680 / U+180E /
      U+034F / U+FE00 / U+FE0E / U+FE0F / U+17B4 / U+17B5 variants of
-      stay toast-only beside rounds 133/131. Pairs forge
+     "Save Block history" stay toast-only beside rounds 133/131. Pairs forge
      175.
 
 138. **Find All-scope whitespace-query QueryMismatch + stale** —
-     whitespace-only  under All stays QueryMismatch when stale ids
+     whitespace-only `" \t "` under All stays QueryMismatch when stale ids
      remain (Command/Output whitespace already pinned). Pairs forge 176.
 
 139. **Guard*→Celebrate* Full-motion None** — Full motion pins
      GuardFailure/Stuck/Recovery/Cautious→Celebrate{,Big} intentional None.
-     Pairs forge 178 / core .
+     Pairs forge 178 / core `repo_vigil_guards_never_bridge_to_celebrate`.
 
 140. **Celebrate*→Watch* Full-motion None** — Full motion pins
      Celebrate{,Big}→WatchCommand/Agent/Settled intentional None. Pairs forge
-     179 / core .
+     179 / core `celebrate_holds_never_bridge_to_watch_poses`.
