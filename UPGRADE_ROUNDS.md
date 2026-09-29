@@ -395,8 +395,9 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
 
 89. **Celebrate*/Rest/GuardRecovery hold-overwrite UI contract** — Full motion
     mirrors core Celebrate*/RestAfterPush/GuardRecovery finish overwrites
-    (`between()` 76→90). Rest/GuardRecovery→Watch* stay None. Pairs forge
-    round 123; core hold-overwrite survey wave.
+    (`between()` 76→90). STAGE docs round 88 stays membership-only (len 67);
+    the 76 count was round 86, this round catches 90. Rest/GuardRecovery→Watch*
+    stay None. Pairs forge round 123; core hold-overwrite survey wave.
 
 90. **Find bookmark empty-query browser pin** — Bookmarked empty-reason stays
     `None` when an empty query still has eligible scoped text (browser, not
@@ -415,3 +416,12 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
     PIPE-only `unshare`/`nsenter`. Cargo manifests stay on the published pin
     (pending push/repin). Pairs forge round 126.
 
+
+93. **Find stale-bookmark empty-reason pin** — bookmark ids absent from the
+    current retained records list are `NoRetainedBookmarks`, matching forge
+    round 124's identity. Pairs forge round 127 (dedicated empty-query browser
+    pin).
+
+94. **Error/unknown→Watch* None UI** — Full motion pins Inspect/SitNear/
+    Unknown→Watch* as None beside Celebrate*/Rest/Recovery→Watch*. Pairs forge
+    round 128; core `error_and_unknown_holds_never_bridge_to_watch_poses`.
