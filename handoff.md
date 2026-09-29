@@ -1,5 +1,18 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (invisible sticky + FS/find/ambient→Watch* pins)
+
+## 2026-09-29 (invisible sticky + FS/find/ambient→Watch*)
+
+- **Round 101**: ZWSP/BOM/VT near-miss `"Save Block history"` stay toast-only
+  beside round 100 (pairs forge 135).
+- **Round 102**: user-facing FS Permission ≠ Missing (pairs forge 134/136).
+- **Round 103**: Find MetadataMismatch with stale bookmark extras (pairs
+  forge 137).
+- **Round 104**: Ambient→Watch* Full-motion None (pairs forge 138).
+  STAGE 70 tip already ledgered at round 97 (pairs forge 130). Core/jagent
+  tips still **pending push/repin**.
+
 Updated: 2026-09-29 (sticky near-miss whitespace + STAGE 70 docs present)
 
 ## 2026-09-29 (sticky near-miss whitespace)
