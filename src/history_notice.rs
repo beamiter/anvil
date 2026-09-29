@@ -230,6 +230,13 @@ mod tests {
             "Save Block\u{2061}history",
             "Save Block\u{3000}history",
             "Save Block history\u{0085}",
+            // Punctuation / thin / hair spaces + ALM / bidi isolates stay
+            // toast-only beside the ZWJ/ideo wave.
+            "Save Block\u{2008}history",
+            "Save Block\u{2009}history",
+            "Save Block\u{200a}history",
+            "Save\u{061c} Block history",
+            "\u{2066}Save Block history\u{2069}",
             "Block history",
         ] {
             assert_eq!(
