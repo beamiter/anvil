@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (sticky 1801 + MAX-7 cancel + GuardRecovery UI sync)
+
+## 2026-09-29 (sticky/find/organism edges — rounds 188–190)
+
+- Sticky Mongolian ellipsis (U+1801) beside FE07/birga, CrossBlock
+  near-near-near-near-near-near-near-wrap (MAX-7→MAX-6) cancel, and
+  GuardRecovery→UnknownOutcome Full-motion UI bridge membership sync
+  (semantic_bridges + Calm/Static snaps) beside rounds 184–187. Unique rounds
+  **188–190**. Pairs forge 236–239 / core cancel. STAGE **71** / between()
+  **93** unchanged (GuardRecovery→Unknown already inside the 93).
+
 Updated: 2026-09-29 (FE06 find beside rounds 184–186)
 
 ## 2026-09-29 (sticky/find/organism edges — round 187)
