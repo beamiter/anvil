@@ -4314,26 +4314,27 @@ mod tests {
             assert_eq!(VisualTransition::between(from, to), None);
         }
         // Typing is SurfaceMode → WatchCommand; entering from an ambient pose
-        // snaps without a Typing-named VisualTransition variant.
+        // snaps without a Typing-named VisualTransition variant. WatchAgent /
+        // WatchSettled entries from ambient poses stay None the same way —
+        // Watch*→Idle animates, but Idle/ambient→Watch* never invents a bridge.
         for from in [
             Behavior::Idle,
             Behavior::Explore,
             Behavior::Sleep,
             Behavior::Approach,
         ] {
-            assert_eq!(
-                visual_transition_for_motion(
-                    OrganismMotion::Full,
-                    from,
-                    Behavior::WatchCommand,
-                ),
-                None,
-                "Full {from:?}→WatchCommand (Typing surface)"
-            );
-            assert_eq!(
-                VisualTransition::between(from, Behavior::WatchCommand),
-                None
-            );
+            for to in [
+                Behavior::WatchCommand,
+                Behavior::WatchAgent,
+                Behavior::WatchSettled,
+            ] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?} (ambient→Watch*)"
+                );
+                assert_eq!(VisualTransition::between(from, to), None);
+            }
         }
     }
 
