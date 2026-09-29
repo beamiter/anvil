@@ -53,6 +53,7 @@ pub(crate) use cross_selection::*;
 pub(crate) use css::*;
 pub(crate) use export::SessionExportFormat;
 pub(crate) use find::*;
+pub(crate) use history::BLOCK_HISTORY_PERSIST_OPERATION;
 use onboarding::BlockOnboarding;
 #[allow(unused_imports)]
 pub(crate) use palette::*;

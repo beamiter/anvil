@@ -16,6 +16,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -34,6 +35,60 @@ const HISTORY_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(5);
 const HISTORY_LOAD_TRANSIENT_ESTIMATED_BYTES: usize = 64 * 1024 * 1024;
 const CLEAR_TOMBSTONE_MAGIC: &[u8] = b"ANVIL-BLOCK-HISTORY-CLEAR-V1\0";
 const CLEAR_TOMBSTONE_FRAME_BYTES: usize = 4 + CLEAR_TOMBSTONE_MAGIC.len() + 16;
+
+/// Persistence-worker / failure-surface label for a Block-history save.
+///
+/// Named rather than inline so the window can route this one operation to a
+/// sticky Retry bar instead of the ordinary toast cooldown: its failures are
+/// fail-closed states that stay stuck until somebody acts. Forge enqueues
+/// under this same string; anvil still saves synchronously today, but the
+/// label and retry APIs must exist before a sticky surface can light up.
+pub(crate) const BLOCK_HISTORY_PERSIST_OPERATION: &str = "Save Block history";
+
+/// What answering the Block-history failure bar has to do for one pane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HistoryRetryAction {
+    /// The load failed, so the save is refusing on purpose. Saving again would
+    /// refuse again — and must, or an unreadable file would become a licence to
+    /// overwrite whatever is really on disk. Restart the load; the ordinary
+    /// save path resumes from its result.
+    ReloadFirst,
+    /// A full volume, a permission change, a lock that never cleared, a
+    /// revision that moved: a save that can simply be attempted again.
+    SaveAgain,
+}
+
+/// Sync-path observation of this pane's last Block-history load attempt.
+///
+/// Forge keeps a richer async `Loaded(Arc<LoadedHistory>)` payload for the
+/// persistence worker. Anvil's load is still synchronous on the GTK thread, so
+/// `Loaded` is a unit marker until labeled async save lands — Retry and
+/// refuse-to-overwrite only need to know whether the load *Failed*.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum HistoryLoadOutcome {
+    Idle,
+    Pending,
+    Loaded,
+    Failed {
+        kind: io::ErrorKind,
+        message: Arc<str>,
+    },
+}
+
+impl Default for HistoryLoadOutcome {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
+pub(crate) fn history_retry_action(outcome: &HistoryLoadOutcome) -> HistoryRetryAction {
+    match outcome {
+        HistoryLoadOutcome::Failed { .. } => HistoryRetryAction::ReloadFirst,
+        HistoryLoadOutcome::Idle | HistoryLoadOutcome::Pending | HistoryLoadOutcome::Loaded => {
+            HistoryRetryAction::SaveAgain
+        }
+    }
+}
 
 fn encode_clear_tombstone(token: u128) -> Vec<u8> {
     let mut frame = Vec::with_capacity(CLEAR_TOMBSTONE_MAGIC.len() + 16);
@@ -1579,8 +1634,9 @@ mod tests {
         read_history_records, read_history_records_reserved,
         read_history_records_with_retained_budget, replace_history_baseline,
         replace_reserved_history_ids, save_history_snapshot, save_history_snapshot_with_intent,
-        validate_history_progress, HistoryFileLock, HistoryRevision, HistoryTarget, SaveIntent,
-        UndecodablePolicy, CLEAR_TOMBSTONE_FRAME_BYTES, MAX_HISTORY_DECODE_DURATION,
+        validate_history_progress, history_retry_action, HistoryFileLock, HistoryLoadOutcome,
+        HistoryRetryAction, HistoryRevision, HistoryTarget, SaveIntent, UndecodablePolicy,
+        BLOCK_HISTORY_PERSIST_OPERATION, CLEAR_TOMBSTONE_FRAME_BYTES, MAX_HISTORY_DECODE_DURATION,
         MAX_HISTORY_FILE_BYTES, MAX_HISTORY_FRAMES,
     };
     use crate::block_view::BlockData;
@@ -2650,5 +2706,32 @@ mod tests {
         .unwrap();
         assert_eq!(loaded.seen_ids, Some(HashSet::from([2])));
         assert_eq!(loaded.blocks.front().map(|block| block.id), Some(2));
+    }
+
+    /// The failure bar's Retry has to do different things for different
+    /// fail-closed states. A save refusing because the load failed is the
+    /// refusal working as designed — saving again just refuses again — so that
+    /// pane reloads instead. Everything else is a save worth re-attempting.
+    #[test]
+    fn retrying_a_stuck_pane_reloads_only_when_the_load_is_what_failed() {
+        assert_eq!(
+            history_retry_action(&HistoryLoadOutcome::Failed {
+                kind: io::ErrorKind::InvalidData,
+                message: Arc::from("history frame is corrupt"),
+            }),
+            HistoryRetryAction::ReloadFirst
+        );
+        for (label, resumable) in [
+            ("idle", HistoryLoadOutcome::Idle),
+            ("pending", HistoryLoadOutcome::Pending),
+            ("loaded", HistoryLoadOutcome::Loaded),
+        ] {
+            assert_eq!(
+                history_retry_action(&resumable),
+                HistoryRetryAction::SaveAgain,
+                "{label}"
+            );
+        }
+        assert_eq!(BLOCK_HISTORY_PERSIST_OPERATION, "Save Block history");
     }
 }
