@@ -1,5 +1,18 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (CelebrateBig finish arcs + output_notice schema + Find Hit converge)
+
+## 2026-09-29 (CelebrateBig finish arcs + output_notice + Find Hit)
+
+- **Round 108**: Full-motion CelebrateBig finish arcs (15 Some + WatchAgent
+  None). Pairs forge 142 / core tip.
+- **Round 109**: anvil disk schema stays Earlier-only bool; Truncated/Partly
+  remain forge Option<String> (pairs forge 143).
+- **Round 110**: Find Hit optional chrome converge note — forge carries
+  exit_code/duration/cwd + outcome suffix (pairs forge 144). Core/jagent tips
+  still **pending push/repin**.
+
+
 Updated: 2026-09-29 (ambient→vigil/celebrate + find text-scope + sticky format)
 
 ## 2026-09-29 (ambient→vigil/celebrate + find Output stale + sticky format)
