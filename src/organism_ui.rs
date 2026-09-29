@@ -4163,6 +4163,25 @@ mod tests {
                 assert_eq!(VisualTransition::between(from, to), None);
             }
         }
+        // Error/unknown holds never bridge to Watch* (same new-command snap).
+        for from in [
+            Behavior::InspectError,
+            Behavior::SitNearError,
+            Behavior::UnknownOutcome,
+        ] {
+            for to in [
+                Behavior::WatchCommand,
+                Behavior::WatchAgent,
+                Behavior::WatchSettled,
+            ] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?}"
+                );
+                assert_eq!(VisualTransition::between(from, to), None);
+            }
+        }
         // Rest/GuardRecovery never bridge to Watch* (same new-command snap).
         for from in [Behavior::RestAfterPush, Behavior::GuardRecovery] {
             for to in [
