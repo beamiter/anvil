@@ -5040,6 +5040,39 @@ mod tests {
         }
     }
 
+
+    /// GuardRecovery→UnknownOutcome animates under Full motion (unknown
+    /// overwrite from a recovery vigil) and snaps under Calm/Static. Pairs core
+    /// `GuardRecoveryToUnknownOutcome` inside between() 93 beside
+    /// Celebrate*/Rest/SitNear/Inspect→Unknown.
+    #[test]
+    fn guard_recovery_bridges_to_unknown_outcome_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::GuardRecovery,
+                Behavior::UnknownOutcome,
+            )
+            .is_some(),
+            "Full GuardRecovery→UnknownOutcome"
+        );
+        assert!(
+            VisualTransition::between(Behavior::GuardRecovery, Behavior::UnknownOutcome).is_some(),
+            "core GuardRecovery→UnknownOutcome"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::GuardRecovery,
+                    Behavior::UnknownOutcome,
+                ),
+                None,
+                "{motion:?} GuardRecovery→UnknownOutcome"
+            );
+        }
+    }
+
     #[test]
     fn ambient_and_typing_surfaces_skip_visual_transition_arcs() {
         // Ambient utility poses (Explore/Sleep/Approach/Idle) display through
