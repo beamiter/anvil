@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (Failure/Stuck/Cautious→Celebrate Full-motion survey)
+
+## 2026-09-29 (Failure/Stuck/Cautious→Celebrate Full-motion survey)
+
+- **Round 160**: GuardFailure/Stuck/Cautious→Celebrate{,Big} Full-motion None
+  pairs core `failure_stuck_cautious_never_bridge_to_celebrate_holds`
+  (Recovery→Celebrate already in round 139). Unique beside CrossBlock
+  near-wrap 158–159 / forge 202. STAGE 71 / between() **93** unchanged.
+  Core/jagent tips still **pending push/repin**.
+
+
 Updated: 2026-09-29 (CrossBlock near-wrap + scheduled-ahead cancel)
 
 ## 2026-09-29 (CrossBlock near-wrap + scheduled-ahead cancel)
