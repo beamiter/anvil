@@ -321,6 +321,8 @@ mod tests {
             "Save Block\u{1800}history",
             // Mongolian ellipsis stays toast-only beside FE07/birga (one edge).
             "Save Block\u{1801}history",
+            // Mongolian comma stays toast-only beside ellipsis (one edge).
+            "Save Block\u{1802}history",
             "Block history",
         ] {
             assert_eq!(
