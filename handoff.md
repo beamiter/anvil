@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (upgrade round 67: Block-history sticky failure surface deferred)
+Updated: 2026-09-29 (upgrade round 68: FindScanBudget constructor semantic pin)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,13 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **FindScanBudget constructor semantic pin (upgrade round 68)** —
+  `FindScanBudget::for_cross_block` stays on shared `CROSS_BLOCK_SCAN_*`
+  (8 MiB / 48 ms); `FindScanBudget::new` stays on `FIND_OVERLAY_SCAN_*`
+  (4 MiB / 12 ms). Regression
+  `find_scan_budget_constructors_split_overlay_and_cross_block_caps` pins both
+  (pairs forge round 107).
 
 - **Block-history sticky failure surface (upgrade round 67, deferred)**: forge
   routes `Save Block history` through `ui/history_notice.rs` to a persistent

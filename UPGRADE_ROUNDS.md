@@ -247,3 +247,13 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
     `history_notice` Retry bar is not mirrored yet. Anvil stays toast-only
     until Relm4 gains `retry_history_persistence` + a sticky Banner; see
     handoff round 67.
+
+68. **FindScanBudget constructor semantic pin** — palette
+    `FindScanBudget::for_cross_block` uses shared `CROSS_BLOCK_SCAN_*`
+    (8 MiB / 48 ms); live overlay `FindScanBudget::new` uses
+    `FIND_OVERLAY_SCAN_*` (4 MiB / 12 ms). Unit test pins both constructors
+    (pairs forge round 107).
+
+    mirrors every core `VisualTransition::between` pair (64 bridges), closing
+    gaps left by the staged UnknownOutcome / Watch* / vigil rounds (pairs
+    forge round 108).
