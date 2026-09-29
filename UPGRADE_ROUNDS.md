@@ -701,3 +701,8 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
 159. **CrossBlock cancel scheduled-ahead near-wrap** — scheduled MAX vs live
      MAX-1 cancels with or without resume (speculative gen / rewound live
      beside the MAX-1→MAX bump). Pairs forge 201 / core cancel edge.
+
+160. **GuardFailure/Stuck/Cautious→Celebrate* Full-motion None** — Full motion
+     pins those vigil poses→Celebrate{,Big} intentional None (success finishes
+     via Watch*; Recovery→Celebrate already covered in round 139). Pairs forge
+     202 / core `failure_stuck_cautious_never_bridge_to_celebrate_holds`.
