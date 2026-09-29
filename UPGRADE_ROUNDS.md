@@ -666,3 +666,17 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      animates). Pairs forge 191 / core
      `failure_stuck_cautious_never_bridge_to_error_or_unknown_holds`.
 
+
+152. **Sticky near-miss bidi embeddings / deprecated format labels** —
+     U+202A–U+202E / U+206B–U+206E variants of "Save Block history" stay
+     toast-only beside rounds 146/137. Pairs forge 192.
+
+153. **Find WJ/figure/soft-hyphen/bidi-query QueryMismatch + stale** —
+     U+2060 / U+2007 / U+00AD / U+202A / U+202E-only queries stay
+     QueryMismatch under Command/Output/All when stale ids remain (NBSP/ZWSP
+     already pinned). Pairs forge 194.
+
+154. **Ambient disposition exchange Full-motion None completeness** — Full
+     motion pins Idle↔Sleep/Approach, Explore↔Approach, Approach↔Sleep
+     intentional None beside the partial ambient table. Pairs forge 195 /
+     core `ambient_disposition_exchanges_have_no_visual_transition`.
