@@ -1,5 +1,17 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (sticky FE03 + find FVS + near-near-wrap + sticky Retry edges)
+
+## 2026-09-29 (sticky/find/organism/Retry edges — rounds 165–170)
+
+- Sticky closer mid-range VS (FE03/FE0B) + Mongolian Todo soft hyphen, FVS/MVS/
+  VS/Khmer/CGJ find QueryMismatch + stale, CrossBlock near-near-wrap cancel,
+  sticky Retry skip-missing TermView + hide-before-walk Ok-quiet, and
+  SitNear/Celebrate tier overwrite Full-motion Nones. Unique rounds **165–170**.
+  Pairs forge 208–214 / core GlanceAside ambient + setsid deepen + cancel.
+  STAGE **71** / between() **93** unchanged.
+
+
 Updated: 2026-09-29 (sticky FE02/nirugu + Hangul find + Watch* Unknown + near-wrap finished)
 
 ## 2026-09-29 (sticky/find/organism edges — rounds 161–164)
