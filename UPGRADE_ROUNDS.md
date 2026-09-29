@@ -551,3 +551,13 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      teaches kbd `openvt` VT launcher peels (`-c`/`--console` meta) plus
      timeout/nice nest classify; Inspect/Sit→Unknown `between()` **93** already
      ledgered. Manifests stay on published pins. Pairs forge 160.
+
+126. **Sticky near-miss punct/thin/hair/ALM/bidi-isolate labels** — U+2008 /
+     U+2009 / U+200A / U+061C / U+2066–U+2069 variants of `"Save Block history"`
+     stay toast-only beside rounds 122/120. Pairs forge 161.
+
+127. **Find Command/Output empty-query browser + stale** — empty query under
+     Command and Output scopes stays `None` (browser) when stale ids remain
+     beside a live scoped bookmark (All-scope empty-query already pinned).
+     Pairs forge 162.
+
