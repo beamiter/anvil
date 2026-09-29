@@ -1,6 +1,30 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (error/unknown Rest + Watch Idle UI, between 76)
+Updated: 2026-09-29 (Celebrate/Rest/Recovery hold overwrites UI, between 90)
+
+## 2026-09-29 (Celebrate*/Rest/GuardRecovery hold-overwrite UI contract)
+
+- **Round 89**: Full-motion `semantic_bridges` mirrors core tip 76→**90** —
+  Celebrate*/RestAfterPush finish overwrites and GuardRecovery→Inspect/Sit/
+  Unknown. Rest/GuardRecovery→Watch* stay None. Pairs forge 123.
+
+Updated: 2026-09-29 (Find bookmark empty-query browser pin)
+
+## 2026-09-29 (Find bookmark empty-query browser pin)
+
+- **Round 90**: `bookmarked_empty_reason` stays `None` for an empty query
+  when a live bookmark still has scoped text. Pairs forge 124.
+
+Updated: 2026-09-29 (core tip STAGE_PREFIXES daemonize/setlock/s6-setuidgid len 67)
+
+## 2026-09-29 (core tip STAGE_PREFIXES daemonize/setlock/s6-setuidgid)
+
+- **STAGE_PREFIXES len 64→67** on path-patched local core tip (`3003434`) —
+  `daemonize` / `setlock` / `s6-setuidgid` peel + `classify_command`
+  see-through (including `--` before the s6 account). Leftover pin keeps
+  `s6-envdir` / `s6-log` / runit helpers out. Cargo manifests stay on
+  published `33093da` (pending push/repin). Upgrade round 88 (pairs forge
+  122). `between()` 76 and Find continue bookmark-empty stay rounds 86–87.
 
 ## 2026-09-29 (error/unknown→Rest + Watch*→Idle UI contract)
 
