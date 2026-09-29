@@ -723,3 +723,30 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
 164. **CrossBlock cancel finished at near-wrap gen** — palette idle continuation
      drops MAX-1,MAX-1 finished walks (no resume) beside the MAX-1→MAX bump.
      Pairs forge 207 / core `continue_idle_resume_edges_drop_stale_or_finished_walks`.
+
+165. **Sticky closer mid-range VS / Mongolian Todo soft-hyphen labels** —
+     U+FE03 / U+FE0B / U+1806 variants of "Save Block history" stay toast-only
+     beside rounds 161/155. Pairs forge 208.
+
+166. **Find FVS/MVS/VS/Khmer/CGJ-query QueryMismatch + stale** —
+     U+180B / U+180E / U+FE00 / U+17B4 / U+034F-only queries stay
+     QueryMismatch under Command/Output/All when stale ids remain (Hangul/
+     ideo/Ogham already pinned). Pairs forge 210.
+
+167. **CrossBlock cancel near-near-wrap bump** — palette idle continuation
+     drops MAX-2→MAX-1 generation bumps (with or without resume), scheduled
+     ahead MAX-1 vs MAX-2, and finished walks at MAX-2. Pairs forge 211 /
+     core cancel edge.
+
+168. **Sticky Retry skips missing TermView without aborting** — `continue`
+     past panes without a Block TermView so non-Block chrome cannot starve
+     later panes of `retry_history_persistence`. Pairs forge 212.
+
+169. **Sticky Retry hides before walk / stays quiet on Ok** — optimistic
+     `set_visible(false)` precedes the pane walk; only Err re-raises via
+     `show_block_history_failure`. Pairs forge 213.
+
+170. **SitNear/Celebrate tier overwrite Full-motion None** — Full motion pins
+     SitNear→Inspect and Celebrate↔CelebrateBig intentional None. Pairs forge
+     214 / core `sit_near_and_celebrate_tier_overwrites_stay_none`.
+
