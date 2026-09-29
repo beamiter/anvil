@@ -3898,6 +3898,9 @@ mod tests {
             (Behavior::SitNearError, Behavior::GuardFailure),
             (Behavior::GuardFailure, Behavior::GuardStuck),
             (Behavior::GuardRecovery, Behavior::GuardCautious),
+            (Behavior::GuardRecovery, Behavior::GuardFailure),
+            (Behavior::GuardCautious, Behavior::GuardStuck),
+            (Behavior::GuardStuck, Behavior::GuardFailure),
         ] {
             assert_eq!(
                 visual_transition_for_motion(OrganismMotion::Full, from, to),
