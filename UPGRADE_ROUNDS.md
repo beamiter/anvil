@@ -451,3 +451,14 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
 100. **Sticky near-miss whitespace labels** — tab / CR / NBSP variants of
      `"Save Block history"` stay on the toast surface beside round 95's
      padded/cased/truncated pin. Pairs forge round 134 file-tree leftover.
+
+101. **Sticky near-miss invisible labels** — ZWSP / BOM / VT variants of
+     `"Save Block history"` stay toast-only beside round 100 whitespace.
+     Pairs forge 135.
+102. **FS permission vs missing public copy** — `user_facing_fs_error` keeps
+     PermissionDenied distinct from NotFound (pairs forge 134/136).
+103. **Find MetadataMismatch with stale extras** — live bookmark failing
+     metadata filters stays MetadataMismatch when stale ids remain. Pairs
+     forge 137.
+104. **Ambient→Watch* None UI** — Idle/Explore/Sleep/Approach never bridge to
+     WatchCommand/Agent/Settled under Full motion. Pairs forge 138.
