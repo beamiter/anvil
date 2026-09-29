@@ -5222,6 +5222,14 @@ mod tests {
             assert!(!user_facing_fs_error(&error).contains("hunter2"));
         }
 
+        // Directory-scan toast/status copy must keep permission distinct from
+        // missing (pairs forge round 134 public Error-row split).
+        let permission = user_facing_fs_error(&io::Error::from(io::ErrorKind::PermissionDenied));
+        let missing = user_facing_fs_error(&io::Error::from(io::ErrorKind::NotFound));
+        assert_eq!(permission, "Permission was denied.");
+        assert_eq!(missing, "The path no longer exists or is unavailable.");
+        assert_ne!(permission, missing);
+
         let display = batch_display_name(Path::new("/tmp/report\u{202e}\u{1b}[31m.txt"));
         assert!(!display.contains('\u{202e}'));
         assert!(!display.chars().any(char::is_control));
