@@ -198,6 +198,10 @@ mod tests {
             "Save block history",
             "Save Block histor",
             "Save Block history\n",
+            "Save Block history\t",
+            "Save Block history\r",
+            "Save\tBlock history",
+            "Save Block\u{00a0}history",
             "Block history",
         ] {
             assert_eq!(
