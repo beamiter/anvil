@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (FE05 find + SitNear/Inspect→Unknown beside rounds 179–181)
+
+## 2026-09-29 (sticky/find/organism edges — rounds 182–183)
+
+- FE05/Manchu-comma find QueryMismatch + stale and SitNearError/InspectError→
+  UnknownOutcome Full-motion bridges (Calm/Static snap) beside rounds 179–181
+  sticky FE06/MAX-5/Celebrate-Rest verify. Unique rounds **182–183**. Pairs forge
+  229–230 / core cancel. STAGE **71** / between() **93** unchanged.
+
+
 Updated: 2026-09-29 (sticky FE06/Manchu-full-stop + MAX-5 cancel + Celebrate/Rest→Unknown verify)
 
 ## 2026-09-29 (sticky/find/organism edges — rounds 179–181)
