@@ -386,3 +386,19 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
     that added no hits keeps the bookmark-empty copy instead of generic
     "No matches." Pairs forge round 121.
 
+88. **Core tip STAGE_PREFIXES daemonize/setlock/s6-setuidgid (len 67)** —
+    path-patched local `jterm_core` peels `daemonize` / `setlock` /
+    `s6-setuidgid` (STAGE_PREFIXES 64→67) with `classify_command` see-through
+    (including `--` before the s6 account) and leftover pin for `s6-envdir` /
+    `s6-log` / runit helpers; Cargo manifests stay on the published pin
+    (pending push/repin). Pairs forge round 122.
+
+89. **Celebrate*/Rest/GuardRecovery hold-overwrite UI contract** — Full motion
+    mirrors core Celebrate*/RestAfterPush/GuardRecovery finish overwrites
+    (`between()` 76→90). Rest/GuardRecovery→Watch* stay None. Pairs forge
+    round 123; core hold-overwrite survey wave.
+
+90. **Find bookmark empty-query browser pin** — Bookmarked empty-reason stays
+    `None` when an empty query still has eligible scoped text (browser, not
+    QueryMismatch). Pairs forge round 124 (stale bookmark ids).
+
