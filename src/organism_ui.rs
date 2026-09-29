@@ -3909,6 +3909,7 @@ mod tests {
             (Behavior::InspectError, Behavior::GuardStuck),
             (Behavior::InspectError, Behavior::Celebrate),
             (Behavior::InspectError, Behavior::CelebrateBig),
+            (Behavior::InspectError, Behavior::SitNearError),
             (Behavior::InspectError, Behavior::Idle),
             (Behavior::InspectError, Behavior::RestAfterPush),
             (Behavior::Celebrate, Behavior::GuardRecovery),
@@ -4182,8 +4183,15 @@ mod tests {
                 assert_eq!(VisualTransition::between(from, to), None);
             }
         }
-        // Rest/GuardRecovery never bridge to Watch* (same new-command snap).
-        for from in [Behavior::RestAfterPush, Behavior::GuardRecovery] {
+        // Rest/Guard* never bridge to Watch* (same new-command snap;
+        // Failure/Stuck/Cautious join Recovery — idle vigil before start).
+        for from in [
+            Behavior::RestAfterPush,
+            Behavior::GuardRecovery,
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardCautious,
+        ] {
             for to in [
                 Behavior::WatchCommand,
                 Behavior::WatchAgent,
@@ -4212,6 +4220,31 @@ mod tests {
                 );
                 assert_eq!(VisualTransition::between(from, to), None);
             }
+        }
+        // SitNear→Inspect and Celebrate↔CelebrateBig stay None (Inspect→SitNear
+        // animates; reverse/tier swaps have no reducer story).
+        assert_eq!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::SitNearError,
+                Behavior::InspectError,
+            ),
+            None
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::SitNearError, Behavior::InspectError),
+            None
+        );
+        for (from, to) in [
+            (Behavior::Celebrate, Behavior::CelebrateBig),
+            (Behavior::CelebrateBig, Behavior::Celebrate),
+        ] {
+            assert_eq!(
+                visual_transition_for_motion(OrganismMotion::Full, from, to),
+                None,
+                "Full {from:?}→{to:?}"
+            );
+            assert_eq!(VisualTransition::between(from, to), None);
         }
         // GlanceAside is never a bridge source or target under Full motion.
         for other in [
