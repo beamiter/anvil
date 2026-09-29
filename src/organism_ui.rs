@@ -4025,6 +4025,39 @@ mod tests {
             VisualTransition::between(Behavior::WatchAgent, Behavior::CelebrateBig),
             None
         );
+        // WatchAgent→UnknownOutcome stays None: agent finishes never land on
+        // the unknown-hold pose. Pin Full so a core bridge cannot appear silently.
+        assert_eq!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchAgent,
+                Behavior::UnknownOutcome,
+            ),
+            None
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::WatchAgent, Behavior::UnknownOutcome),
+            None
+        );
+    }
+
+    #[test]
+    fn agent_driven_passes_stay_on_celebrate_not_celebrate_big() {
+        // Mirrors core `agent_commands_get_quiet_nods_and_the_big_celebrations_stay_human`
+        // at the UI contract layer: agent recovery is Celebrate, never CelebrateBig.
+        let mut organism = NativeOrganism::default();
+        organism.set_agent_command(true);
+        let started = organism.command_started(CommandKind::BuildOrTest);
+        assert_eq!(started.behavior, Behavior::WatchAgent);
+        organism.restore_repo_context(3, false, 0, 3);
+        organism.set_agent_command(true);
+        let recovery = organism.command_finished(CommandKind::BuildOrTest, Some(0), None);
+        assert_eq!(recovery.behavior, Behavior::Celebrate);
+        assert_ne!(recovery.behavior, Behavior::CelebrateBig);
+        assert_eq!(
+            VisualTransition::between(Behavior::WatchAgent, Behavior::CelebrateBig),
+            None
+        );
     }
 
     #[test]
