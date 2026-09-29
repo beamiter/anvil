@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (sticky FF1A + MAX-12 cancel + Unknown→Idle)
+
+## 2026-09-30 (sticky/find/organism edges — rounds 208–210)
+
+- Sticky fullwidth colon (U+FF1A) beside Mongolian four dots, CrossBlock
+  near-near-near-near-near-near-near-near-near-near-near-near-wrap (MAX-12→MAX-11) cancel, and
+  UnknownOutcome→Idle Full-motion bridge + UI membership sync
+  (semantic_bridges + Calm/Static snaps). Unknown→GuardFailure already synced
+  (round 206). Unique rounds **208–210**. Pairs forge 261–264 / core cancel.
+  STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-09-30 (1804 find beside rounds 204–206)
 
 ## 2026-09-30 (sticky/find/organism edges — round 207)
