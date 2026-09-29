@@ -5157,6 +5157,14 @@ mod tests {
         assert!(cross_block_search_continue_is_current(
             u64::MAX, u64::MAX, true
         ));
+        // Scheduled ahead at the near-wrap boundary (MAX vs MAX-1) cancels —
+        // pairs core cancel edge beside the MAX-1→MAX bump.
+        assert!(!cross_block_search_continue_is_current(
+            u64::MAX, near_wrap, true
+        ));
+        assert!(!cross_block_search_continue_is_current(
+            u64::MAX, near_wrap, false
+        ));
     }
 
     #[test]
