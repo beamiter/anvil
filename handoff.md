@@ -1,5 +1,19 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (sticky Retry + CelebrateBig 91 lockstep + find/history edges)
+
+## 2026-09-29 (sticky Retry + CelebrateBig 91 lockstep + find/history edges)
+
+- **Round 111**: sticky Retry re-shows on sync `retry_history_persistence` Err.
+- **Round 112**: Find Hit optional chrome comment converge.
+- **Round 113**: `semantic_bridges` len == 91 + CelebrateBig fifteen lockstep
+  + Celebrate↔CelebrateBig None (pairs forge 147 / core between() 91).
+- **Round 114**: Ambient→Inspect/Sit/Unknown/Rest Full-motion None.
+- **Round 115**: Find Command-scope NoRetainedTextInScope with stale extras.
+- **Round 116**: sticky U+2028/U+2029 near-miss labels.
+  STAGE 70 tip already ledgered at round 97. Core/jagent tips still
+  **pending push/repin**.
+
 Updated: 2026-09-29 (CelebrateBig finish arcs + output_notice schema + Find Hit converge)
 
 ## 2026-09-29 (CelebrateBig finish arcs + output_notice + Find Hit)
