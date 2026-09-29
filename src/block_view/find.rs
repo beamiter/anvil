@@ -4673,6 +4673,10 @@ mod tests {
         assert!(!cross_block_search_continue_is_current(u64::MAX, 0, true));
         // Scheduled ahead of live (speculative gen / rewound live) cancels.
         assert!(!cross_block_search_continue_is_current(5, 4, true));
+        // Same ahead/rewind cancel without a resume still drops the idle slice.
+        assert!(!cross_block_search_continue_is_current(5, 4, false));
+        // Wrapping MAX→0 bump with a finished cursor cancels like any empty resume.
+        assert!(!cross_block_search_continue_is_current(u64::MAX, 0, false));
         // Gen-0 finished walk (no resume) cancels like any empty cursor.
         assert!(!cross_block_search_continue_is_current(0, 0, false));
     }
