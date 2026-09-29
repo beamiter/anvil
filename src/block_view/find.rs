@@ -3600,6 +3600,44 @@ mod tests {
         );
     }
 
+    /// Empty Bookmarked query with an eligible scoped record is a browser, not
+    /// a miss — the caller only uses this helper after zero hits, so this
+    /// branch must stay `None` rather than inventing QueryMismatch copy.
+    #[test]
+    fn bookmarked_empty_reason_stays_none_for_empty_query_with_scoped_text() {
+        let record = CompletedCommandRecord {
+            id: 2,
+            cmd: "echo retained".to_string(),
+            exit_code: Some(0),
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: Some(20),
+            cwd: None,
+            is_background: false,
+            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            start_mark_seen: true,
+            command_source: crate::block_view::CommandTextSource::Screen,
+        };
+        let records = [BackendRecordRef::Metadata {
+            record: &record,
+            snapshot: None,
+        }];
+        assert_eq!(
+            bookmarked_empty_reason(
+                records,
+                &HashSet::from([2]),
+                CrossBlockSearchScope::All,
+                &BlockFilters {
+                    bookmarked_only: true,
+                    ..Default::default()
+                },
+                "",
+            ),
+            None,
+            "eligible scoped text with an empty query is a browser, not a miss"
+        );
+    }
+
     #[test]
     fn background_filter_composes_before_cap_and_uses_only_real_scoped_text() {
         let record = |id, cmd: &str, duration_ms, is_background| CompletedCommandRecord {
