@@ -462,3 +462,13 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      forge 137.
 104. **Ambient→Watch* None UI** — Idle/Explore/Sleep/Approach never bridge to
      WatchCommand/Agent/Settled under Full motion. Pairs forge 138.
+
+105. **Ambient→Guard*/Celebrate* None UI** — Explore/Sleep/Approach never
+     bridge to GuardFailure/Stuck/Recovery/Cautious or Celebrate/CelebrateBig
+     under Full motion (Idle/Rest→Guard* already pinned). Pairs forge 139.
+106. **Find NoRetainedTextInScope with stale extras** — Output-scope live
+     bookmark without retained output stays NoRetainedTextInScope when stale
+     ids remain. Pairs forge 140.
+107. **Sticky near-miss soft-hyphen/WJ/bidi labels** — soft hyphen / word
+     joiner / LRM / ZWNJ / figure-space variants of `"Save Block history"`
+     stay toast-only beside rounds 100–101. Pairs forge 141.
