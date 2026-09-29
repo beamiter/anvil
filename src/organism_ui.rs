@@ -4053,6 +4053,130 @@ mod tests {
             VisualTransition::between(Behavior::WatchCommand, Behavior::UnknownOutcome),
             None
         );
+        // WatchSettled→UnknownOutcome stays None: long-watch missing exit snaps.
+        assert_eq!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchSettled,
+                Behavior::UnknownOutcome,
+            ),
+            None
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::WatchSettled, Behavior::UnknownOutcome),
+            None
+        );
+        // Watch* never bridges to Guard* (finishes do not skip into repo vigil).
+        for from in [
+            Behavior::WatchCommand,
+            Behavior::WatchAgent,
+            Behavior::WatchSettled,
+        ] {
+            for to in [
+                Behavior::GuardFailure,
+                Behavior::GuardStuck,
+                Behavior::GuardRecovery,
+                Behavior::GuardCautious,
+            ] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?}"
+                );
+                assert_eq!(VisualTransition::between(from, to), None);
+            }
+        }
+        // Guard* never bridges to Celebrate* (vigil does not celebrate).
+        for from in [
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardRecovery,
+            Behavior::GuardCautious,
+        ] {
+            for to in [Behavior::Celebrate, Behavior::CelebrateBig] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?}"
+                );
+                assert_eq!(VisualTransition::between(from, to), None);
+            }
+        }
+        // Celebrate* never bridges to Watch* (new command mid-hold snaps).
+        for from in [Behavior::Celebrate, Behavior::CelebrateBig] {
+            for to in [
+                Behavior::WatchCommand,
+                Behavior::WatchAgent,
+                Behavior::WatchSettled,
+            ] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?}"
+                );
+                assert_eq!(VisualTransition::between(from, to), None);
+            }
+        }
+        // Idle/Rest never bridges to Guard* (open vigil appearing snaps).
+        for from in [Behavior::Idle, Behavior::RestAfterPush] {
+            for to in [
+                Behavior::GuardFailure,
+                Behavior::GuardStuck,
+                Behavior::GuardRecovery,
+                Behavior::GuardCautious,
+            ] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?}"
+                );
+                assert_eq!(VisualTransition::between(from, to), None);
+            }
+        }
+        // GlanceAside is never a bridge source or target under Full motion.
+        for other in [
+            Behavior::Idle,
+            Behavior::Celebrate,
+            Behavior::CelebrateBig,
+            Behavior::InspectError,
+            Behavior::SitNearError,
+            Behavior::RestAfterPush,
+            Behavior::UnknownOutcome,
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardRecovery,
+            Behavior::GuardCautious,
+            Behavior::WatchCommand,
+            Behavior::WatchAgent,
+            Behavior::WatchSettled,
+        ] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    OrganismMotion::Full,
+                    Behavior::GlanceAside,
+                    other,
+                ),
+                None,
+                "Full GlanceAside→{other:?}"
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    OrganismMotion::Full,
+                    other,
+                    Behavior::GlanceAside,
+                ),
+                None,
+                "Full {other:?}→GlanceAside"
+            );
+            assert_eq!(
+                VisualTransition::between(Behavior::GlanceAside, other),
+                None
+            );
+            assert_eq!(
+                VisualTransition::between(other, Behavior::GlanceAside),
+                None
+            );
+        }
     }
 
     #[test]
