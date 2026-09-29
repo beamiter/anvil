@@ -217,6 +217,12 @@ mod tests {
             "Save Block history\u{2028}",
             "Save Block history\u{2029}",
             "Save Block\u{2028}history",
+            // Narrow NBSP / MMSP / invisible math separators stay toast-only.
+            "Save Block\u{202f}history",
+            "Save Block\u{205f}history",
+            "Save Block\u{2062}history",
+            "Save Block\u{2063}history",
+            "Save Block\u{2064}history",
             "Block history",
         ] {
             assert_eq!(
