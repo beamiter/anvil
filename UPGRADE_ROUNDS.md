@@ -202,6 +202,10 @@ evolve pass.
 57. **Organism celebrate-hold push UI contract** — Full motion mirrors
     Celebrate/CelebrateBig→RestAfterPush once core recognizes those bridges
     (pending push/repin). Calm/Static still snap.
+58. **Organism WatchSettled fail + idle settles UI contract** — Full motion
+    mirrors WatchSettled→Inspect/SitNear and
+    Celebrate{,Big}/RestAfterPush→Idle once core recognizes those bridges
+    (pending push/repin). Calm/Static still snap.
 
 Verification: `bash scripts/test-install-paths.sh`, `bash -n
 scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
