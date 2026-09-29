@@ -4237,6 +4237,52 @@ mod tests {
         }
     }
 
+    /// Inner mid-range VS / Mongolian syllable-boundary-only queries are
+    /// non-empty but match no retained scoped text — still `QueryMismatch`
+    /// under Command/Output/All with stale extras (FE03/Todo already pinned).
+    #[test]
+    fn bookmarked_empty_reason_keeps_fe04_syllable_boundary_query_mismatch_with_stale() {
+        let retained = CompletedCommandRecord {
+            id: 1,
+            cmd: "echo retained".to_string(),
+            exit_code: Some(0),
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: Some(20),
+            cwd: None,
+            is_background: false,
+            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            start_mark_seen: true,
+            command_source: crate::block_view::CommandTextSource::Screen,
+        };
+        let retained_output = ZoneOutputSnapshot {
+            plain: "noise line\n".to_string(),
+            truncated: false,
+        };
+        let records = [BackendRecordRef::Metadata {
+            record: &retained,
+            snapshot: Some(&retained_output),
+        }];
+        let ids = HashSet::from([1, 99, 100]);
+        let filters = BlockFilters {
+            bookmarked_only: true,
+            ..Default::default()
+        };
+        for query in ["\u{fe04}", "\u{fe0a}", "\u{1807}"] {
+            for scope in [
+                CrossBlockSearchScope::Command,
+                CrossBlockSearchScope::Output,
+                CrossBlockSearchScope::All,
+            ] {
+                assert_eq!(
+                    bookmarked_empty_reason(records, &ids, scope, &filters, query),
+                    Some(BookmarkedEmptyReason::QueryMismatch),
+                    "{query:?} {scope:?} must stay a mismatch beside stale"
+                );
+            }
+        }
+    }
+
     /// Bookmark ids that survived from a previous retention window but are
     /// absent from the current records list are missing retained identity, not
     /// a metadata or query miss.
