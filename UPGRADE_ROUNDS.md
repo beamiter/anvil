@@ -402,3 +402,7 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
     `None` when an empty query still has eligible scoped text (browser, not
     QueryMismatch). Pairs forge round 124 (stale bookmark ids).
 
+91. **GuardFailure/Stuck/Cautious→error-hold None UI** — Full motion pins
+    Failure/Stuck/Cautious→Inspect/Sit/Unknown as None beside Recovery's
+    finish-overwrite bridges. Pairs forge round 125.
+
