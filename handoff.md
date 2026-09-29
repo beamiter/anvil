@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (FE07 find beside rounds 188–190)
+
+## 2026-09-29 (sticky/find/organism edges — round 191)
+
+- FE07/birga find QueryMismatch + stale beside rounds 188–190 sticky 1801 /
+  MAX-7 / GuardRecovery UI sync. Unique round **191**. Pairs forge 240 /
+  core cancel. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-09-29 (sticky 1801 + MAX-7 cancel + GuardRecovery UI sync)
 
 ## 2026-09-29 (sticky/find/organism edges — rounds 188–190)
