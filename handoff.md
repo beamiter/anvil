@@ -1,5 +1,23 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (Find stale bookmark + error→Watch None UI)
+
+## 2026-09-29 (Find stale-bookmark + error/unknown→Watch* None)
+
+- **Round 93**: stale bookmark ids → `NoRetainedBookmarks` (pairs forge 127
+  empty-query browser dedicated pin).
+- **Round 94**: Full motion pins Inspect/SitNear/Unknown→Watch* as None.
+  Tip 89 now notes STAGE round 88 membership-only vs `between()` 90 catch-up.
+  Pairs forge 128.
+
+Updated: 2026-09-29 (between() 90 ledger note on tip 89)
+
+## 2026-09-29 (between() 90 ledger completeness)
+
+- Tip **89** now records that STAGE docs round 88 stayed membership-only
+  (len 67) while this round caught `between()` 76→90 — same catch-up shape as
+  tip 86 for 70→76.
+
 Updated: 2026-09-29 (core tip fail-closed deepen STAGE nest + transparency)
 
 ## 2026-09-29 (core tip fail-closed deepen STAGE nest + transparency)
