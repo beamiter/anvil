@@ -844,3 +844,8 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      Celebrate*/Rest pins (dedicated Full-motion hold already at round 186).
      Pairs forge 239 / core `GuardRecoveryToUnknownOutcome` inside between() 93.
 
+191. **Find FE07/birga-query QueryMismatch + stale** —
+     U+FE07 / U+1800-only queries stay QueryMismatch under
+     Command/Output/All when stale ids remain (FE06/Manchu-full-stop already pinned).
+     Pairs forge 240.
+
