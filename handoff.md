@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (core tip fail-closed deepen STAGE nest + transparency)
+
+## 2026-09-29 (core tip fail-closed deepen STAGE nest + transparency)
+
+- **Round 92**: path-patched core/jagent — timeout/nice nests, setuidgid `--`
+  peel, membership/DISPATCHES `len == 68` (wave-23 triple +
+  `gnome-session-inhibit`), transparency partition (PIPE-only
+  `unshare`/`nsenter`). Manifests stay on published `33093da` (pending
+  push/repin). Pairs forge 126.
+
 Updated: 2026-09-29 (GuardFailure/Stuck/Cautious error-hold None UI)
 
 ## 2026-09-29 (GuardFailure/Stuck/Cautious→error-hold None UI)
