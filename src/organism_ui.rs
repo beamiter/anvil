@@ -4547,6 +4547,58 @@ mod tests {
         }
     }
 
+    /// Guard*→Celebrate* stays None under Full motion — repo vigils push or
+    /// escalate among themselves; celebrations come from command-finish on
+    /// error holds. Pairs core `repo_vigil_guards_never_bridge_to_celebrate`.
+    /// between() stays 93.
+    #[test]
+    fn repo_vigil_guards_never_bridge_to_celebrate_under_full_motion() {
+        for from in [
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardRecovery,
+            Behavior::GuardCautious,
+        ] {
+            for to in [Behavior::Celebrate, Behavior::CelebrateBig] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?}"
+                );
+                assert_eq!(
+                    VisualTransition::between(from, to),
+                    None,
+                    "core {from:?}→{to:?}"
+                );
+            }
+        }
+    }
+
+    /// Celebrate*→Watch* stays None under Full motion — a new command mid-hold
+    /// snaps into Watch* without bridge frames. Pairs core
+    /// `celebrate_holds_never_bridge_to_watch_poses`. between() stays 93.
+    #[test]
+    fn celebrate_holds_never_bridge_to_watch_under_full_motion() {
+        for from in [Behavior::Celebrate, Behavior::CelebrateBig] {
+            for to in [
+                Behavior::WatchCommand,
+                Behavior::WatchAgent,
+                Behavior::WatchSettled,
+            ] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?}"
+                );
+                assert_eq!(
+                    VisualTransition::between(from, to),
+                    None,
+                    "core {from:?}→{to:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn ambient_and_typing_surfaces_skip_visual_transition_arcs() {
         // Ambient utility poses (Explore/Sleep/Approach/Idle) display through
