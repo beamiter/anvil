@@ -4336,6 +4336,31 @@ mod tests {
                 assert_eq!(VisualTransition::between(from, to), None);
             }
         }
+        // Ambient utility poses also never bridge into repo vigil or Celebrate
+        // holds under Full motion (open vigil / success finish land via Watch*
+        // or Idle snap). Idle/Rest→Guard* is pinned in semantic_bridges; pin
+        // Explore/Sleep/Approach the same way.
+        for from in [
+            Behavior::Explore,
+            Behavior::Sleep,
+            Behavior::Approach,
+        ] {
+            for to in [
+                Behavior::GuardFailure,
+                Behavior::GuardStuck,
+                Behavior::GuardRecovery,
+                Behavior::GuardCautious,
+                Behavior::Celebrate,
+                Behavior::CelebrateBig,
+            ] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?} (ambient→vigil/celebrate)"
+                );
+                assert_eq!(VisualTransition::between(from, to), None);
+            }
+        }
     }
 
     #[test]
