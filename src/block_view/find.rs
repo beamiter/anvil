@@ -284,6 +284,10 @@ impl FindScanBudget {
         }
     }
 
+    /// Palette cross-block walks use the shared
+    /// [`CROSS_BLOCK_SCAN_BYTE_LIMIT`] / [`CROSS_BLOCK_SCAN_TIME_LIMIT`] from
+    /// `jterm_core::cross_block_search` so anvil and forge cannot drift. Live
+    /// Find overlay keeps the tighter local [`FIND_SCAN_*`] caps via [`Self::new`].
     fn for_cross_block() -> Self {
         Self {
             remaining_bytes: CROSS_BLOCK_SCAN_BYTE_LIMIT,
