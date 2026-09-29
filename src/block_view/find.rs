@@ -2517,7 +2517,7 @@ mod tests {
         let mut budget = FindScanBudget {
             remaining_bytes: 5,
             started: Instant::now(),
-            time_limit: Duration::from_secs(5),
+            time_limit: FIND_OVERLAY_SCAN_TIME_LIMIT,
         };
         let first = budget.take_prefix("abc");
         assert_eq!(first.text, "abc");
