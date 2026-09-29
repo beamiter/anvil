@@ -416,4 +416,55 @@ mod tests {
         );
     }
 
+
+    /// Sticky Retry must `continue` past panes without a Block TermView instead
+    /// of aborting — non-Block chrome must not starve later Block panes of
+    /// `retry_history_persistence` (pairs forge leaf `continue`).
+    #[test]
+    fn retry_block_history_skips_missing_term_views_without_aborting() {
+        let source = include_str!("workspace_ops.rs");
+        let retry = source
+            .split("pub(crate) fn retry_block_history(&self) {")
+            .nth(1)
+            .expect("retry_block_history")
+            .split("\n    pub(crate) fn persist_config")
+            .next()
+            .expect("retry closes before persist_config");
+        assert!(
+            retry.contains("term_view()") && retry.contains("continue;"),
+            "missing TermView must continue the pane walk"
+        );
+        assert!(
+            !retry.contains("break;") && !retry.contains("return;"),
+            "missing TermView must not abort Retry"
+        );
+    }
+
+    /// Optimistic hide must precede the pane walk so a prior failure bar never
+    /// stays visible while Retry is in flight; Ok results must not call
+    /// `show_block_history_failure` (only Err re-raises).
+    #[test]
+    fn retry_block_history_hides_before_walk_and_stays_quiet_on_ok() {
+        let source = include_str!("workspace_ops.rs");
+        let retry = source
+            .split("pub(crate) fn retry_block_history(&self) {")
+            .nth(1)
+            .expect("retry_block_history")
+            .split("\n    pub(crate) fn persist_config")
+            .next()
+            .expect("retry closes before persist_config");
+        let hide = retry
+            .find("set_visible(false)")
+            .expect("optimistic hide");
+        let walk = retry.find("for tab in").expect("tab walk");
+        assert!(hide < walk, "hide must run before the pane walk");
+        assert!(
+            retry.contains("if let Err(error) = view.retry_history_persistence()"),
+            "only Err must re-raise the sticky bar"
+        );
+        assert!(
+            !retry.contains("if let Ok"),
+            "Ok path must stay quiet (no show on success)"
+        );
+    }
 }
