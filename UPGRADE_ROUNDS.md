@@ -472,3 +472,18 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
 107. **Sticky near-miss soft-hyphen/WJ/bidi labels** — soft hyphen / word
      joiner / LRM / ZWNJ / figure-space variants of `"Save Block history"`
      stay toast-only beside rounds 100–101. Pairs forge 141.
+
+108. **CelebrateBig finish arcs Full-motion UI** — Full motion pins all fifteen
+     CelebrateBig inbound/outbound Some bridges and WatchAgent→CelebrateBig
+     None (pairs core `celebrate_big_finish_arcs_mirror_celebrate_except_watch_agent`
+     and forge round 142).
+
+109. **output_notice Earlier-only disk schema pin** — Truncated/Partly stay in
+     the shared known set for forge's `Option<String>` persistence; anvil
+     BlockData keeps bool `output_head_dropped` only. Pairs forge round 143
+     Truncated/Partly history round-trip.
+
+110. **Find Hit optional chrome converge note** — forge gained optional
+     exit_code/duration/cwd on `CrossBlockHit` plus palette outcome suffix;
+     anvil comment/report docs stop calling the fields anvil-only. Pairs forge
+     round 144; core Hit pin retargeted.
