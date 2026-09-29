@@ -4128,6 +4128,26 @@ mod tests {
                 assert_eq!(VisualTransition::between(from, to), None);
             }
         }
+        // Failure/Stuck/Cautious never skip Watch into Inspect/Sit/Unknown
+        // (Recovery does, as a finish-overwrite).
+        for from in [
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardCautious,
+        ] {
+            for to in [
+                Behavior::InspectError,
+                Behavior::SitNearError,
+                Behavior::UnknownOutcome,
+            ] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?}"
+                );
+                assert_eq!(VisualTransition::between(from, to), None);
+            }
+        }
         // Celebrate* never bridges to Watch* (new command mid-hold snaps).
         for from in [Behavior::Celebrate, Behavior::CelebrateBig] {
             for to in [
