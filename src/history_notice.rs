@@ -223,6 +223,13 @@ mod tests {
             "Save Block\u{2062}history",
             "Save Block\u{2063}history",
             "Save Block\u{2064}history",
+            // ZWJ / RLM / function-application / ideographic space / NEL stay
+            // toast-only beside the NNBSP/math wave.
+            "Save Block\u{200d}history",
+            "Save\u{200f} Block history",
+            "Save Block\u{2061}history",
+            "Save Block\u{3000}history",
+            "Save Block history\u{0085}",
             "Block history",
         ] {
             assert_eq!(
