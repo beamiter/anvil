@@ -63,11 +63,10 @@ fn outcome_matches_filters(
 /// contain exactly this many hits: proving equality would require scanning the
 /// remainder, defeating the early-stop guarantee.
 pub(crate) const FIND_MATCH_LIMIT: usize = 10_000;
-const FIND_SCAN_BYTE_LIMIT: usize = 4 * 1024 * 1024;
-const FIND_SCAN_TIME_LIMIT: Duration = Duration::from_millis(12);
 pub(crate) use jterm_core::cross_block_search::{
     cross_block_search_continue_is_current, CrossBlockSearchCursor, CrossBlockSearchMidRecord,
     CROSS_BLOCK_REGEX_SIZE_LIMIT, CROSS_BLOCK_SCAN_BYTE_LIMIT, CROSS_BLOCK_SCAN_TIME_LIMIT,
+    FIND_OVERLAY_SCAN_BYTE_LIMIT, FIND_OVERLAY_SCAN_TIME_LIMIT,
 };
 /// VTE uses PCRE2 while match counting uses Rust's Unicode-aware regex engine.
 /// UTF validates/decodes the subject as Unicode and UCP makes shorthand classes
@@ -278,16 +277,16 @@ struct FindScanBudget {
 impl FindScanBudget {
     fn new() -> Self {
         Self {
-            remaining_bytes: FIND_SCAN_BYTE_LIMIT,
+            remaining_bytes: FIND_OVERLAY_SCAN_BYTE_LIMIT,
             started: Instant::now(),
-            time_limit: FIND_SCAN_TIME_LIMIT,
+            time_limit: FIND_OVERLAY_SCAN_TIME_LIMIT,
         }
     }
 
     /// Palette cross-block walks use the shared
     /// [`CROSS_BLOCK_SCAN_BYTE_LIMIT`] / [`CROSS_BLOCK_SCAN_TIME_LIMIT`] from
     /// `jterm_core::cross_block_search` so anvil and forge cannot drift. Live
-    /// Find overlay keeps the tighter local [`FIND_SCAN_*`] caps via [`Self::new`].
+    /// Find overlay keeps the tighter shared [`FIND_OVERLAY_SCAN_*`] caps via [`Self::new`].
     fn for_cross_block() -> Self {
         Self {
             remaining_bytes: CROSS_BLOCK_SCAN_BYTE_LIMIT,
