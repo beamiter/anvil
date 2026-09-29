@@ -329,6 +329,8 @@ mod tests {
             "Save Block\u{1804}history",
             // Mongolian four dots stays toast-only beside colon (one edge).
             "Save Block\u{1805}history",
+            // Fullwidth colon stays toast-only beside Mongolian four dots (one edge).
+            "Save Block\u{ff1a}history",
             "Block history",
         ] {
             assert_eq!(
