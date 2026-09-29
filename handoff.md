@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (organism vigil-tier continuity + card-mount parity)
+Updated: 2026-09-29 (family pin align: transitive jagent `628811b`; organism pending push)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,11 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **Family pin align (2026-09-29)**: path-patched local `jterm_core` pulls
+  `jagent` `628811b`; `flake.nix` outputHashes comment/hash updated to match.
+  Manifest still names published `jterm_core` `33093da`. Organism vigil
+  `fbfcafa`/`99e24c0` remain **pending push/repin**.
 
 - **Organism vigil-tier transition continuity (2026-09-29, core `fbfcafa`,
   pending push/repin)**: `jterm_core` adds Full-motion bridges for the middle
