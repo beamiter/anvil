@@ -487,3 +487,29 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      exit_code/duration/cwd on `CrossBlockHit` plus palette outcome suffix;
      anvil comment/report docs stop calling the fields anvil-only. Pairs forge
      round 144; core Hit pin retargeted.
+
+111. **Sticky Retry sync-refusal reopen** — `retry_block_history` hides the
+     bar optimistically then re-raises via `show_block_history_failure` when
+     `retry_history_persistence` returns Err. Pairs forge 145 ReloadFirst
+     labeled-save chain.
+
+112. **Find Hit optional chrome comment converge** — report/docs treat
+     exit_code/duration/cwd as optional shared chrome (not anvil-only) after
+     forge round 144. Pairs forge 146.
+
+113. **semantic_bridges list len == 91 + CelebrateBig fifteen lockstep** —
+     Full-motion contract list asserts length against core `between()` 91;
+     CelebrateBig Some arcs stay fifteen; Celebrate↔CelebrateBig Nones join
+     the finish-arc UI pin. Pairs forge 147.
+
+114. **Ambient→Inspect/Sit/Unknown/Rest None UI** — Explore/Sleep/Approach
+     never bridge to error/unknown holds or RestAfterPush under Full motion.
+     Pairs forge 148 / core ambient hold/rest pin (`between()` stays 91).
+
+115. **Find Command-scope NoRetainedTextInScope + stale** — whitespace-only
+     command with retained output stays NoRetainedTextInScope under Command
+     scope when stale ids remain. Pairs forge 149.
+
+116. **Sticky near-miss line/paragraph separators** — U+2028 / U+2029 variants
+     of `"Save Block history"` stay toast-only beside rounds 107/100. Pairs
+     forge 150.
