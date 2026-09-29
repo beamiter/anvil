@@ -767,3 +767,22 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
 174. **Celebrate*→UnknownOutcome Full-motion bridges** — Full motion animates
      Celebrate{,Big}→UnknownOutcome; Calm/Static snap. Pairs forge 219 / core
      `CelebrateToUnknownOutcome` / `CelebrateBigToUnknownOutcome`.
+
+175. **Sticky nesting mid-range VS / Mongolian Manchu-comma labels** —
+     U+FE05 / U+FE09 / U+1808 variants of "Save Block history" stay toast-only
+     beside rounds 171/165. Pairs forge 220.
+
+176. **Find FE04/syllable-boundary-query QueryMismatch + stale** —
+     U+FE04 / U+FE0A / U+1807-only queries stay QueryMismatch under
+     Command/Output/All when stale ids remain (FE03/Todo already pinned).
+     Pairs forge 222.
+
+177. **CrossBlock cancel near-near-near-near-wrap bump** — palette idle
+     continuation drops MAX-4→MAX-3 generation bumps (with or without resume),
+     scheduled ahead MAX-3 vs MAX-4, and finished walks at MAX-4. Pairs forge
+     223 / core cancel edge.
+
+178. **RestAfterPush→UnknownOutcome Full-motion bridge** — Full motion animates
+     RestAfterPush→UnknownOutcome; Calm/Static snap. Pairs forge 224 / core
+     `RestAfterPushToUnknownOutcome` beside Celebrate*→Unknown inside between()
+     93.
