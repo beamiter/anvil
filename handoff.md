@@ -1,5 +1,23 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (Block-history sticky chrome stub)
+
+## 2026-09-29 (Block-history sticky chrome stub)
+
+- **Round 78**: AppModel sticky Retry bar under the top bar drains parked
+  sync Block-history failures (and would drain worker `"Save Block history"`
+  failures). Retry walks every Block `TermView`. Still open: labeled async
+  `persistence::enqueue` for Save Block history.
+
+Updated: 2026-09-29 (organism Guard*/Watch*/Celebrate*/Glance None pins)
+
+## 2026-09-29 (organism Guard*/Watch*/Celebrate*/Glance None pins)
+
+- Full-motion UI pins the core intentional-None arcs from the audit wave:
+  WatchSettled→UnknownOutcome, Watch*→Guard*, Guard*→Celebrate*,
+  Celebrate*→Watch*, Idle/Rest→Guard*, GlanceAside as source **and** target.
+- Upgrade round 77 (pairs forge 113).
+
 Updated: 2026-09-29 (FindScanBudget / Options / Report from core)
 
 ## 2026-09-29 (FindScanBudget + Options/Scope + generic Report)
@@ -11,21 +29,21 @@ Updated: 2026-09-29 (FindScanBudget / Options / Report from core)
   palette chrome (forge omits them); core pin
   `cross_block_hit_schema_divergence_keeps_rows_app_owned` documents why.
 - GTK idle scheduling stays here. Pairs forge companion commit.
+- Upgrade round 76 (pairs forge 112).
 
 
 Updated: 2026-09-29 (Block-history sticky Retry foundation)
 
 ## 2026-09-29 (Block-history sticky Retry foundation)
 
-- **Round 72 unblock foundation** (no sticky `gtk::Box` yet):
+- **Round 72 unblock foundation** (sticky `gtk::Box` in round 78):
   1. `HistoryLoadOutcome` / `HistoryRetryAction` / `BLOCK_HISTORY_PERSIST_OPERATION`
      plus `history_retry_action` tests.
   2. Pane-local Failed-load tracking; ordinary `save_history` refuses overwrite.
   3. `TermView::retry_history_persistence` (ReloadFirst revalidates without
      reinstalling cards; SaveAgain saves) and `history_notice` routing +
-     sync-failure parking for a later sticky bar.
-  Still deferred: labeled async `persistence::enqueue` for Block history, and
-  AppModel sticky chrome that drains parked / worker failures.
+     sync-failure parking for the sticky bar.
+  Still deferred: labeled async `persistence::enqueue` for Block history.
 
 Updated: 2026-09-29 (core tip STAGE_PREFIXES strace/scriptlive len 60)
 
@@ -50,7 +68,7 @@ Updated: 2026-09-29 (Block-history sticky unblock criteria)
 
 - **Round 72** documented why forge’s sticky Retry bar was deferred and what
   APIs unblock it (not Relm4 Banner). Round 75 lands the foundation APIs;
-  sticky chrome still deferred.
+  round 78 lands the AppModel sticky chrome stub.
 
 ## 2026-09-29 (organism intentional None + agent Celebrate)
 
@@ -68,22 +86,19 @@ captured, queued, written, and restored.
 
 ## Completed since the previous handoff
 
+- **Block-history sticky chrome stub (upgrade round 78)**: AppModel hosts the
+  forge-shaped sticky Retry bar; `report_persistence_failures` drains parked
+  sync refusals onto it and routes `"Save Block history"` off toast cooldown;
+  Retry walks every Block `TermView`. Remaining gap before full forge parity:
+  labeled async `persistence::enqueue` for Block-history saves (still sync
+  GTK-thread I/O + parking). Pairs forge round 78.
+
 - **Block-history sticky failure surface — concrete unblock (upgrade round 72,
   foundation landed in round 75)**: surveyed forge `ui/history_notice.rs` and
   `BlockView::retry_history_persistence`. Relm4 can host the same sticky
   `gtk::Box` chrome forge uses; there is no missing Relm4 Banner widget API.
   Round 75 added Failed-load outcome + refuse, `retry_history_persistence`,
-  and sync-failure parking. Remaining gaps before the bar can light up:
-
-  1. Anvil still does not enqueue Block-history saves as `"Save Block history"`
-     on the persistence worker — `save_history` is sync GTK-thread I/O (failures
-     now also park in `history_notice` for a future drain).
-  2. Sticky bar in `AppModel` + route that operation away from toast cooldown,
-     Retry walks every Block `TermView`.
-
-  Until then toast/log-only stays intentional for the visible surface (pairs
-  forge round 78). Round 67’s “Relm4 Banner” wording was imprecise — corrected
-  in round 72.
+  and sync-failure parking. Round 78 added the AppModel bar + drain/Retry.
 
 - **Full-motion semantic_bridges catch-up (upgrade round 69)** — the Full-motion
   UI contract list now includes every `VisualTransition::between` pair from the

@@ -312,3 +312,22 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
     `persistence_failure_surface` + sync-failure parking. Still open:
     labeled async enqueue of Save Block history, and AppModel sticky bar
     that drains parked/worker failures and calls Retry. Pairs forge round 78.
+
+76. **FindScanBudget / Options / Report from core** — re-export
+    `FindScanBudget`, `CrossBlockSearchOptions` / `CrossBlockSearchScope`, and
+    hit-generic `CrossBlockSearchReport<CrossBlockHit>` from path-patched
+    core; `CrossBlockHit` stays local (exit_code / duration_ms / cwd). GTK
+    idle stays here. Pairs forge round 112.
+
+77. **Guard*/Watch*/Celebrate*/Glance intentional None UI** — Full motion
+    pins WatchSettled→UnknownOutcome, Watch*→Guard*, Guard*→Celebrate*,
+    Celebrate*→Watch*, Idle/Rest→Guard*, and GlanceAside as source/target
+    (pairs forge round 113; core audit wave).
+
+78. **Block-history sticky chrome stub** — AppModel hosts forge-shaped sticky
+    Retry bar under the top bar (`history_notice::build_block_history_notice`).
+    `report_persistence_failures` routes `"Save Block history"` off toast
+    cooldown onto the bar and drains parked sync refusals; Retry walks every
+    Block `TermView::retry_history_persistence`. Still open: labeled async
+    `persistence::enqueue` for Save Block history (sync GTK-thread save +
+    parking remains the production path). Pairs forge round 78.
