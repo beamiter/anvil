@@ -331,3 +331,9 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
     Block `TermView::retry_history_persistence`. Still open: labeled async
     `persistence::enqueue` for Save Block history (sync GTK-thread save +
     parking remains the production path). Pairs forge round 78.
+
+79. **Core tip STAGE_PREFIXES systemd-cat/aa-exec (len 62)** — path-patched
+    local `jterm_core` peels `systemd-cat` / `aa-exec` (STAGE_PREFIXES 60→62)
+    with `classify_command` see-through (and full STAGE membership pin);
+    Cargo manifests stay on the published pin (pending push/repin). Pairs
+    forge round 114.

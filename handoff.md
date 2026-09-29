@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (core tip STAGE_PREFIXES systemd-cat/aa-exec len 62)
+
+## 2026-09-29 (core tip STAGE_PREFIXES systemd-cat/aa-exec)
+
+- **STAGE_PREFIXES len 60→62** on path-patched local core tip () —
+   /  peel +  see-through (jagent
+  ). Cargo manifests stay on published  (pending
+  push/repin). Upgrade round 79 (pairs forge 114).
+
 Updated: 2026-09-29 (Block-history sticky chrome stub)
 
 ## 2026-09-29 (Block-history sticky chrome stub)
