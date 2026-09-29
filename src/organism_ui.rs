@@ -3993,6 +3993,20 @@ mod tests {
                 None
             );
         }
+        // WatchAgent→CelebrateBig stays None by design (agent passes never
+        // CelebrateBig). Pin Full so a core bridge cannot appear silently.
+        assert_eq!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchAgent,
+                Behavior::CelebrateBig,
+            ),
+            None
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::WatchAgent, Behavior::CelebrateBig),
+            None
+        );
     }
 
     #[test]
