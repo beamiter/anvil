@@ -244,9 +244,8 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
     literals in `find.rs`).
 
 67. **Block-history sticky failure surface deferred** — forge’s
-    `history_notice` Retry bar is not mirrored yet. Anvil stays toast-only
-    until Relm4 gains `retry_history_persistence` + a sticky Banner; see
-    handoff round 67.
+    `history_notice` Retry bar is not mirrored yet. Anvil stays log/toast-only;
+    Relm4 chrome is not the blocker — see round 72 for concrete unblock APIs.
 
 68. **FindScanBudget constructor semantic pin** — palette
     `FindScanBudget::for_cross_block` uses shared `CROSS_BLOCK_SCAN_*`
@@ -270,3 +269,28 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
     pins WatchAgent→UnknownOutcome as None; agent-driven recovery stays
     Celebrate (never CelebrateBig), matching core quiet-nod contract
     (pairs forge round 109).
+
+72. **Block-history sticky surface — concrete unblock (still deferred)** —
+    Survey of forge `ui/history_notice.rs` + `retry_history_persistence`
+    against anvil shows Relm4 is fine for a minimal sticky bar (plain
+    `gtk::Box` under the top bar, same shape as forge — no missing Relm4
+    Banner API). What is missing, and blocks a non-heroic port:
+
+    1. **Worker-labeled Save Block history.** Forge enqueues saves as
+       `BLOCK_HISTORY_PERSIST_OPERATION` (`"Save Block history"`) so
+       `drain_failures` → `persistence_failure_surface` can raise the bar.
+       Anvil’s `TermView::save_history` is still synchronous on the GTK
+       thread; failures only `log::warn` at Drop/clear/undo. A sticky bar
+       wired only to `report_persistence_failures` would never light up.
+
+    2. **`HistoryLoadOutcome` + `retry_history_persistence`.** Forge Retry
+       is ReloadFirst when load Failed (saving again would refuse and must),
+       else SaveAgain. Anvil has revision/baseline sync load/save but no
+       Failed-load outcome that refuse-to-overwrite rides on, so Retry
+       cannot choose correctly.
+
+    Unblock when both exist (or an intentional SaveAgain-only interim with
+    sync-error promotion into the same surface). Then: sticky bar in
+    `AppModel` view!, route that operation off toast cooldown, Retry walks
+    every Block `TermView`. Pairs forge round 78; toast-only stays
+    intentional until then.

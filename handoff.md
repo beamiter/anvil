@@ -1,6 +1,11 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (organism WatchAgent→UnknownOutcome None + agent Celebrate pin)
+Updated: 2026-09-29 (Block-history sticky unblock criteria)
+
+## 2026-09-29 (Block-history sticky — concrete unblock)
+
+- **Round 72** documents why forge’s sticky Retry bar is still deferred and
+  what APIs unblock it (not Relm4 Banner — see below). No behavior change.
 
 ## 2026-09-29 (organism intentional None + agent Celebrate)
 
@@ -18,6 +23,29 @@ captured, queued, written, and restored.
 
 ## Completed since the previous handoff
 
+- **Block-history sticky failure surface — concrete unblock (upgrade round 72,
+  still deferred)**: surveyed forge `ui/history_notice.rs` and
+  `BlockView::retry_history_persistence`. Relm4 can host the same sticky
+  `gtk::Box` chrome forge uses (label + Retry + dismiss under the top bar);
+  there is no missing Relm4 Banner widget API. The real gaps:
+
+  1. Anvil never enqueues Block-history saves as `"Save Block history"` on
+     the persistence worker — `save_history` is sync GTK-thread I/O and
+     failures only `log::warn` (Drop/clear/undo). Forge’s
+     `drain_failures` → `persistence_failure_surface(BlockHistoryBar)` path
+     therefore has nothing to show here.
+  2. Anvil has no `HistoryLoadOutcome::Failed` that refuse-to-overwrite
+     rides on, so Retry cannot choose ReloadFirst vs SaveAgain the way
+     forge’s `history_retry_action` does.
+
+  Next implementable step: (a) move/label Block-history save onto
+  `persistence::enqueue` with a stable operation string, recording Failed
+  loads so a later save refuses; (b) add `retry_history_persistence` on
+  `TermView`; (c) sticky bar in `AppModel` + route that operation away from
+  toast cooldown. Until then toast/log-only stays intentional (pairs forge
+  round 78). Round 67’s “Relm4 Banner” wording was imprecise — corrected
+  here / in UPGRADE_ROUNDS 72.
+
 - **Full-motion semantic_bridges catch-up (upgrade round 69)** — the Full-motion
   UI contract list now includes every `VisualTransition::between` pair from the
   local core tip (64 bridges), pairing forge round 108 (InspectError /
@@ -30,14 +58,8 @@ captured, queued, written, and restored.
   `find_scan_budget_constructors_split_overlay_and_cross_block_caps` pins both
   (pairs forge round 107).
 
-- **Block-history sticky failure surface (upgrade round 67, deferred)**: forge
-  routes `Save Block history` through `ui/history_notice.rs` to a persistent
-  Retry bar (`persistence_failure_surface` → `BlockHistoryBar`). Anvil still
-  surfaces every persistence failure as a rate-limited toast
-  (`report_persistence_failures` → `show_toast`). Full parity needs a Relm4
-  Banner plus `retry_history_persistence` (reload-first when load failed, else
-  save-again) that forge already has on `BlockView`; porting that path is out
-  of this docs-only round so toast-only remains intentional until then.
+- **Block-history sticky failure surface (upgrade round 67, deferred)**: see
+  round 72 for the concrete API gap; Relm4 chrome alone is not the blocker.
 
 - **AmbientBehavior Full-motion bridges (upgrade round 66 probe, N/A)**: UI
   ambient pose (Explore/Sleep/Approach/Idle) does not route through
