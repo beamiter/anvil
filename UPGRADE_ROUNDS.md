@@ -406,3 +406,12 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
     Failure/Stuck/Cautious→Inspect/Sit/Unknown as None beside Recovery's
     finish-overwrite bridges. Pairs forge round 125.
 
+92. **Core tip fail-closed deepen (STAGE nest + transparency; len 68)** —
+    path-patched local `jterm_core` / `jagent`: timeout/nice nests around
+    `daemonize`/`setlock`/`s6-setuidgid`, jagent peels optional `--` before
+    the setuidgid account, membership + DISPATCHES pin `len == 68` (wave-23
+    triple + `gnome-session-inhibit`), and transparency partition documents
+    STAGE names outside `select_execution_wrappers_mode` plus intentional
+    PIPE-only `unshare`/`nsenter`. Cargo manifests stay on the published pin
+    (pending push/repin). Pairs forge round 126.
+
