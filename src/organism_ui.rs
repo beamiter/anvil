@@ -3894,7 +3894,7 @@ mod tests {
         // vigil-tier arcs (SitNearError→GuardFailure, Failure→Stuck,
         // Recovery→Cautious). On an older pin `between` is None and Full stays
         // None; after core fbfcafa both sides become Some together.
-        for (from, to) in [
+        let semantic_bridges: &[(Behavior, Behavior)] = &[
             (Behavior::SitNearError, Behavior::GuardFailure),
             (Behavior::SitNearError, Behavior::GuardStuck),
             (Behavior::SitNearError, Behavior::GuardRecovery),
@@ -3986,7 +3986,13 @@ mod tests {
             (Behavior::GuardCautious, Behavior::GuardRecovery),
             (Behavior::GuardCautious, Behavior::RestAfterPush),
             (Behavior::GuardCautious, Behavior::Idle),
-        ] {
+        ];
+        assert_eq!(
+            semantic_bridges.len(),
+            91,
+            "semantic_bridges list must match core visual_transition_between_recognizes_ninety_one_intentional_arcs"
+        );
+        for &(from, to) in semantic_bridges {
             assert_eq!(
                 visual_transition_for_motion(OrganismMotion::Full, from, to),
                 VisualTransition::between(from, to)
@@ -4359,6 +4365,79 @@ mod tests {
             VisualTransition::between(Behavior::WatchAgent, Behavior::CelebrateBig),
             None
         );
+        // Tier overwrite stays intentional None (pairs core finish-arc pin).
+        assert_eq!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::Celebrate,
+                Behavior::CelebrateBig,
+            ),
+            None
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::Celebrate, Behavior::CelebrateBig),
+            None
+        );
+        assert_eq!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::CelebrateBig,
+                Behavior::Celebrate,
+            ),
+            None
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::CelebrateBig, Behavior::Celebrate),
+            None
+        );
+    }
+
+    /// Tip lockstep: CelebrateBig still owns exactly fifteen Some arcs inside
+    /// the core `between()` recount of 91. If a new CelebrateBig bridge lands,
+    /// bump both this pin and `visual_transition_between_recognizes_ninety_one_*`.
+    #[test]
+    fn celebrate_big_some_arcs_stay_fifteen_beside_between_ninety_one() {
+        let behaviors = [
+            Behavior::Idle,
+            Behavior::WatchCommand,
+            Behavior::WatchAgent,
+            Behavior::WatchSettled,
+            Behavior::InspectError,
+            Behavior::SitNearError,
+            Behavior::Celebrate,
+            Behavior::CelebrateBig,
+            Behavior::RestAfterPush,
+            Behavior::UnknownOutcome,
+            Behavior::GlanceAside,
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardRecovery,
+            Behavior::GuardCautious,
+            Behavior::Sleep,
+            Behavior::Explore,
+            Behavior::Approach,
+        ];
+        let mut total = 0usize;
+        let mut celebrate_big = 0usize;
+        for &from in &behaviors {
+            for &to in &behaviors {
+                if VisualTransition::between(from, to).is_some() {
+                    total += 1;
+                    if from == Behavior::CelebrateBig || to == Behavior::CelebrateBig {
+                        celebrate_big += 1;
+                        assert!(
+                            visual_transition_for_motion(OrganismMotion::Full, from, to).is_some(),
+                            "Full must mirror core CelebrateBig arc {from:?}→{to:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(total, 91, "between() Some count drifted; sync UI contracts");
+        assert_eq!(
+            celebrate_big, 15,
+            "CelebrateBig Some arcs drifted; sync finish-arc UI table"
+        );
     }
 
     #[test]
@@ -4426,6 +4505,27 @@ mod tests {
                     visual_transition_for_motion(OrganismMotion::Full, from, to),
                     None,
                     "Full {from:?}→{to:?} (ambient→vigil/celebrate)"
+                );
+                assert_eq!(VisualTransition::between(from, to), None);
+            }
+        }
+        // Ambient→Inspect/Sit/Unknown/Rest stays None under Full motion too
+        // (holds/rest arrive from finish/push reducers). between() stays 91.
+        for from in [
+            Behavior::Explore,
+            Behavior::Sleep,
+            Behavior::Approach,
+        ] {
+            for to in [
+                Behavior::InspectError,
+                Behavior::SitNearError,
+                Behavior::UnknownOutcome,
+                Behavior::RestAfterPush,
+            ] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?} (ambient→hold/rest)"
                 );
                 assert_eq!(VisualTransition::between(from, to), None);
             }
