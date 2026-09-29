@@ -4002,6 +4002,10 @@ pub struct TermView {
     /// Per-path load/save observations move with the pane and never depend on
     /// a transient allocation address.
     history_baselines: RefCell<HashMap<std::path::PathBuf, history::HistoryBaseline>>,
+    /// Last Block-history load attempt for this pane. `Failed` makes ordinary
+    /// saves refuse so an unreadable file cannot be overwritten; Retry reads
+    /// this to choose ReloadFirst vs SaveAgain (pairs forge `history_load`).
+    history_load_outcome: RefCell<history::HistoryLoadOutcome>,
     /// Clear Blocks deletion authorities bound to resolved paths and codecs.
     /// Keep each ordered target armed until that exact replacement succeeds.
     history_explicit_replace_pending: RefCell<VecDeque<history::HistoryTarget>>,
@@ -13465,6 +13469,7 @@ impl TermView {
             cleared_stash: RefCell::new(Vec::new()),
             cleared_head_dropped: RefCell::new(std::collections::HashSet::new()),
             history_baselines: RefCell::new(HashMap::new()),
+            history_load_outcome: RefCell::new(history::HistoryLoadOutcome::Idle),
             history_explicit_replace_pending: RefCell::new(VecDeque::new()),
             unread_count,
             jump_fab,

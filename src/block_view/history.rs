@@ -90,6 +90,17 @@ pub(crate) fn history_retry_action(outcome: &HistoryLoadOutcome) -> HistoryRetry
     }
 }
 
+/// Ordinary saves must not replace an unreadable Block-history file.
+fn refuse_save_for_failed_load(outcome: &HistoryLoadOutcome) -> Option<io::Error> {
+    match outcome {
+        HistoryLoadOutcome::Failed { kind, message } => Some(io::Error::new(
+            *kind,
+            format!("refusing to overwrite Block history that failed to load: {message}"),
+        )),
+        HistoryLoadOutcome::Idle | HistoryLoadOutcome::Pending | HistoryLoadOutcome::Loaded => None,
+    }
+}
+
 fn encode_clear_tombstone(token: u128) -> Vec<u8> {
     let mut frame = Vec::with_capacity(CLEAR_TOMBSTONE_MAGIC.len() + 16);
     frame.extend_from_slice(CLEAR_TOMBSTONE_MAGIC);
@@ -1508,6 +1519,9 @@ impl TermView {
         if !self.render_backend.persists_block_history() {
             return self.save_zone_history();
         }
+        if let Some(error) = refuse_save_for_failed_load(&self.history_load_outcome.borrow()) {
+            return Err(error);
+        }
         let configured = {
             let config = self.config.borrow();
             configured_history_target(
@@ -1558,6 +1572,7 @@ impl TermView {
         };
         let Some(target) = target else {
             self.reserved_history_block_ids.borrow_mut().clear();
+            *self.history_load_outcome.borrow_mut() = HistoryLoadOutcome::Idle;
             return Ok(());
         };
 
@@ -1566,7 +1581,16 @@ impl TermView {
         // the bytes it retains, and a pressured budget narrows this load
         // instead of starving a queued save.
         let (loaded, _reservation) =
-            read_history_records_reserved(&target.path, target.compress, load_limit)?;
+            match read_history_records_reserved(&target.path, target.compress, load_limit) {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    *self.history_load_outcome.borrow_mut() = HistoryLoadOutcome::Failed {
+                        kind: error.kind(),
+                        message: Arc::from(error.to_string()),
+                    };
+                    return Err(error);
+                }
+            };
         let LoadedRecords {
             blocks: recent_blocks,
             total_loaded,
@@ -1620,6 +1644,7 @@ impl TermView {
                 }
             },
         );
+        *self.history_load_outcome.borrow_mut() = HistoryLoadOutcome::Loaded;
         Ok(())
     }
 }
@@ -1634,10 +1659,11 @@ mod tests {
         read_history_records, read_history_records_reserved,
         read_history_records_with_retained_budget, replace_history_baseline,
         replace_reserved_history_ids, save_history_snapshot, save_history_snapshot_with_intent,
-        validate_history_progress, history_retry_action, HistoryFileLock, HistoryLoadOutcome,
-        HistoryRetryAction, HistoryRevision, HistoryTarget, SaveIntent, UndecodablePolicy,
-        BLOCK_HISTORY_PERSIST_OPERATION, CLEAR_TOMBSTONE_FRAME_BYTES, MAX_HISTORY_DECODE_DURATION,
-        MAX_HISTORY_FILE_BYTES, MAX_HISTORY_FRAMES,
+        validate_history_progress, history_retry_action, refuse_save_for_failed_load,
+        HistoryFileLock, HistoryLoadOutcome, HistoryRetryAction, HistoryRevision, HistoryTarget,
+        SaveIntent, UndecodablePolicy, BLOCK_HISTORY_PERSIST_OPERATION,
+        CLEAR_TOMBSTONE_FRAME_BYTES, MAX_HISTORY_DECODE_DURATION, MAX_HISTORY_FILE_BYTES,
+        MAX_HISTORY_FRAMES,
     };
     use crate::block_view::BlockData;
     use std::cell::RefCell;
@@ -2733,5 +2759,26 @@ mod tests {
             );
         }
         assert_eq!(BLOCK_HISTORY_PERSIST_OPERATION, "Save Block history");
+    }
+
+    #[test]
+    fn a_failed_load_blocks_ordinary_saves_until_retry_reloads() {
+        let failed = HistoryLoadOutcome::Failed {
+            kind: io::ErrorKind::PermissionDenied,
+            message: Arc::from("permission denied"),
+        };
+        let error = refuse_save_for_failed_load(&failed).expect("must refuse");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("refusing to overwrite"));
+        for resumable in [
+            HistoryLoadOutcome::Idle,
+            HistoryLoadOutcome::Pending,
+            HistoryLoadOutcome::Loaded,
+        ] {
+            assert!(
+                refuse_save_for_failed_load(&resumable).is_none(),
+                "{resumable:?}"
+            );
+        }
     }
 }
