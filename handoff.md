@@ -1,5 +1,18 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (FindScanBudget / Options / Report from core)
+
+## 2026-09-29 (FindScanBudget + Options/Scope + generic Report)
+
+- Re-exports `FindScanBudget`, `CrossBlockSearchOptions` /
+  `CrossBlockSearchScope`, and hit-generic `CrossBlockSearchReport<CrossBlockHit>`
+  from `jterm_core::cross_block_search` (path-patched tip; pending push/repin).
+- `CrossBlockHit` stays local — anvil keeps exit_code / duration_ms / cwd for
+  palette chrome (forge omits them); core pin
+  `cross_block_hit_schema_divergence_keeps_rows_app_owned` documents why.
+- GTK idle scheduling stays here. Pairs forge companion commit.
+
+
 Updated: 2026-09-29 (Block-history sticky Retry foundation)
 
 ## 2026-09-29 (Block-history sticky Retry foundation)
