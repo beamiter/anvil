@@ -3845,6 +3845,48 @@ mod tests {
         );
     }
 
+    /// Stale ids beside a live bookmark that has neither meaningful command nor
+    /// output must still surface NoRetainedTextInScope under All scope — never
+    /// collapse to NoRetainedBookmarks or invent QueryMismatch.
+    #[test]
+    fn bookmarked_empty_reason_keeps_all_scope_no_text_when_stale_ids_remain() {
+        let retained = CompletedCommandRecord {
+            id: 1,
+            cmd: "   \n\t  ".to_string(),
+            exit_code: Some(0),
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: Some(20),
+            cwd: None,
+            is_background: false,
+            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            start_mark_seen: true,
+            command_source: crate::block_view::CommandTextSource::Screen,
+        };
+        let blank_output = ZoneOutputSnapshot {
+            plain: " \n\t\n ".to_string(),
+            truncated: false,
+        };
+        let records = [BackendRecordRef::Metadata {
+            record: &retained,
+            snapshot: Some(&blank_output),
+        }];
+        assert_eq!(
+            bookmarked_empty_reason(
+                records,
+                &HashSet::from([1, 99, 100]),
+                CrossBlockSearchScope::All,
+                &BlockFilters {
+                    bookmarked_only: true,
+                    ..Default::default()
+                },
+                "noise",
+            ),
+            Some(BookmarkedEmptyReason::NoRetainedTextInScope),
+            "stale extras must not mask a live All-scope text miss"
+        );
+    }
+
     #[test]
     fn background_filter_composes_before_cap_and_uses_only_real_scoped_text() {
         let record = |id, cmd: &str, duration_ms, is_background| CompletedCommandRecord {
@@ -4574,6 +4616,10 @@ mod tests {
             true
         ));
         assert!(!cross_block_search_continue_is_current(u64::MAX, 0, true));
+        // Scheduled ahead of live (speculative gen / rewound live) cancels.
+        assert!(!cross_block_search_continue_is_current(5, 4, true));
+        // Gen-0 finished walk (no resume) cancels like any empty cursor.
+        assert!(!cross_block_search_continue_is_current(0, 0, false));
     }
 
     #[test]
