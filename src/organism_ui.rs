@@ -4442,6 +4442,49 @@ mod tests {
         );
     }
 
+    /// WatchSettled finish arcs under Full motion: six Some bridges
+    /// (Celebrate{,Big}/Inspect/Sit/Rest/Idle). Unknown stays intentional
+    /// snap. Pairs core `watch_settled_finish_arcs_cover_pass_fail_rest_and_idle`.
+    #[test]
+    fn watch_settled_finish_arcs_run_under_full_motion() {
+        let arcs = [
+            Behavior::Celebrate,
+            Behavior::CelebrateBig,
+            Behavior::InspectError,
+            Behavior::SitNearError,
+            Behavior::RestAfterPush,
+            Behavior::Idle,
+        ];
+        for to in arcs {
+            assert!(
+                visual_transition_for_motion(
+                    OrganismMotion::Full,
+                    Behavior::WatchSettled,
+                    to,
+                )
+                .is_some(),
+                "Full WatchSettled→{to:?}"
+            );
+            assert!(
+                VisualTransition::between(Behavior::WatchSettled, to).is_some(),
+                "core WatchSettled→{to:?}"
+            );
+        }
+        assert_eq!(arcs.len(), 6);
+        assert_eq!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchSettled,
+                Behavior::UnknownOutcome,
+            ),
+            None
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::WatchSettled, Behavior::UnknownOutcome),
+            None
+        );
+    }
+
     #[test]
     fn ambient_and_typing_surfaces_skip_visual_transition_arcs() {
         // Ambient utility poses (Explore/Sleep/Approach/Idle) display through
