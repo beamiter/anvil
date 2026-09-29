@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (sticky FE06/Manchu-full-stop + MAX-5 cancel + Celebrate/Rest→Unknown verify)
+
+## 2026-09-29 (sticky/find/organism edges — rounds 179–181)
+
+- Sticky deeper nesting mid-range VS (FE06/FE08) + Mongolian Manchu full stop
+  (U+1809), CrossBlock near-near-near-near-near-wrap (MAX-5→MAX-4) cancel, and
+  Celebrate{,Big}/RestAfterPush→UnknownOutcome membership in semantic_bridges
+  len 93 with Calm/Static snaps in the Full-motion bridge loop. Unique rounds
+  **179–181**. Pairs forge 225–228 / core cancel. STAGE **71** / between() **93**
+  unchanged (Celebrate→Unknown and Rest→Unknown already inside the 93).
+
 Updated: 2026-09-29 (sticky FE05/Manchu + FE04 find + MAX-4 cancel + Rest→Unknown)
 
 ## 2026-09-29 (sticky/find/organism edges — rounds 175–178)
