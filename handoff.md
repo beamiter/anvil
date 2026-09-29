@@ -1,5 +1,17 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (Idle/Rest Guard + hold→Watch + Failure→holds Full-motion)
+
+## 2026-09-29 (Idle/Rest Guard + hold→Watch + Failure→holds Full-motion)
+
+- **Round 148**: Idle/Rest→Guard* Full-motion None (pairs core idle/rest vigil snap; shipped beside hold/ambient pin).
+- **Round 149**: Rest/Guard*→Watch* Full-motion None (pairs core rest/vigil→Watch snap).
+- **Round 150**: Inspect/Sit/Unknown→Watch* Full-motion None (pairs core error/unknown→Watch).
+- **Round 151**: GuardFailure/Stuck/Cautious→Inspect/Sit/Unknown Full-motion None (pairs core Failure→holds).
+  Rounds 141–147 (hold/ambient/Watch mode + CrossBlock + Retry + FVS sticky + NBSP find) sit beside.
+  STAGE 71 / between() **93** unchanged. Core/jagent tips still **pending push/repin**.
+
+
 Updated: 2026-09-29 (hold/ambient/Watch mode + CrossBlock wrap + Sticky Retry)
 
 ## 2026-09-29 (hold/ambient/Watch mode + CrossBlock wrap + Sticky Retry)
