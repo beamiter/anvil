@@ -3638,6 +3638,61 @@ mod tests {
         );
     }
 
+    /// Empty query under Command/Output with stale extras beside a live
+    /// scoped bookmark stays a browser (`None`) — never invent QueryMismatch
+    /// or collapse to NoRetainedBookmarks (All-scope empty-query already pinned).
+    #[test]
+    fn bookmarked_empty_reason_stays_none_for_empty_query_under_command_and_output_with_stale() {
+        let retained = CompletedCommandRecord {
+            id: 1,
+            cmd: "echo retained".to_string(),
+            exit_code: Some(0),
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: Some(20),
+            cwd: None,
+            is_background: false,
+            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            start_mark_seen: true,
+            command_source: crate::block_view::CommandTextSource::Screen,
+        };
+        let retained_output = ZoneOutputSnapshot {
+            plain: "noise line\n".to_string(),
+            truncated: false,
+        };
+        let records = [BackendRecordRef::Metadata {
+            record: &retained,
+            snapshot: Some(&retained_output),
+        }];
+        let ids = HashSet::from([1, 99, 100]);
+        let filters = BlockFilters {
+            bookmarked_only: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            bookmarked_empty_reason(
+                records,
+                &ids,
+                CrossBlockSearchScope::Command,
+                &filters,
+                "",
+            ),
+            None,
+            "stale extras must not turn an empty Command-scope query into a miss"
+        );
+        assert_eq!(
+            bookmarked_empty_reason(
+                records,
+                &ids,
+                CrossBlockSearchScope::Output,
+                &filters,
+                "",
+            ),
+            None,
+            "stale extras must not turn an empty Output-scope query into a miss"
+        );
+    }
+
     /// Bookmark ids that survived from a previous retention window but are
     /// absent from the current records list are missing retained identity, not
     /// a metadata or query miss.
@@ -4679,6 +4734,11 @@ mod tests {
         assert!(!cross_block_search_continue_is_current(u64::MAX, 0, false));
         // Gen-0 finished walk (no resume) cancels like any empty cursor.
         assert!(!cross_block_search_continue_is_current(0, 0, false));
+        // Live wrapping ahead of scheduled (0 vs MAX) cancels with a resume —
+        // reverse of the MAX→0 schedule bump (pairs core cancel edge).
+        assert!(!cross_block_search_continue_is_current(0, u64::MAX, true));
+        // Same reverse-wrap cancel without a resume still drops the idle slice.
+        assert!(!cross_block_search_continue_is_current(0, u64::MAX, false));
     }
 
     #[test]
