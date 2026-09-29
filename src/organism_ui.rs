@@ -4818,6 +4818,14 @@ mod tests {
             (Behavior::Approach, Behavior::Idle),
             (Behavior::Explore, Behavior::Idle),
             (Behavior::Sleep, Behavior::Idle),
+            // Complete ambient disposition exchange table (pairs core
+            // `ambient_disposition_exchanges_have_no_visual_transition`).
+            (Behavior::Idle, Behavior::Sleep),
+            (Behavior::Idle, Behavior::Approach),
+            (Behavior::Explore, Behavior::Approach),
+            (Behavior::Approach, Behavior::Explore),
+            (Behavior::Approach, Behavior::Sleep),
+            (Behavior::Sleep, Behavior::Explore),
         ] {
             assert_eq!(
                 visual_transition_for_motion(OrganismMotion::Full, from, to),
