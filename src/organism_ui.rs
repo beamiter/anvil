@@ -3914,6 +3914,14 @@ mod tests {
             (Behavior::RestAfterPush, Behavior::Idle),
             (Behavior::WatchSettled, Behavior::InspectError),
             (Behavior::WatchSettled, Behavior::SitNearError),
+            (Behavior::WatchCommand, Behavior::Celebrate),
+            (Behavior::WatchCommand, Behavior::CelebrateBig),
+            (Behavior::WatchCommand, Behavior::InspectError),
+            (Behavior::WatchCommand, Behavior::SitNearError),
+            (Behavior::WatchCommand, Behavior::RestAfterPush),
+            (Behavior::WatchAgent, Behavior::Celebrate),
+            (Behavior::WatchAgent, Behavior::InspectError),
+            (Behavior::WatchAgent, Behavior::SitNearError),
             (Behavior::GuardFailure, Behavior::GuardStuck),
             (Behavior::GuardFailure, Behavior::RestAfterPush),
             (Behavior::GuardStuck, Behavior::RestAfterPush),
@@ -3938,6 +3946,14 @@ mod tests {
                     motion,
                     Behavior::SitNearError,
                     Behavior::GuardFailure,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::WatchCommand,
+                    Behavior::Celebrate,
                 ),
                 None
             );

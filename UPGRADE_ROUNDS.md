@@ -206,6 +206,10 @@ evolve pass.
     mirrors WatchSettled→Inspect/SitNear and
     Celebrate{,Big}/RestAfterPush→Idle once core recognizes those bridges
     (pending push/repin). Calm/Static still snap.
+59. **Organism WatchCommand/WatchAgent finish UI contract** — Full motion
+    mirrors WatchCommand→Celebrate{,Big}/Inspect/SitNear/RestAfterPush and
+    WatchAgent→Celebrate/Inspect/SitNear once core recognizes those bridges
+    (pending push/repin). Calm/Static still snap.
 
 Verification: `bash scripts/test-install-paths.sh`, `bash -n
 scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.

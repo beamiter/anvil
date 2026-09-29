@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (upgrade round 58: WatchSettled fail + idle settles)
+Updated: 2026-09-29 (upgrade round 59: WatchCommand/WatchAgent finish)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,11 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **Organism WatchCommand/WatchAgent finish UI contract (upgrade round 59,
+  pending core push/repin)**: Full motion mirrors
+  WatchCommand→Celebrate{,Big}/Inspect/SitNear/RestAfterPush and
+  WatchAgent→Celebrate/Inspect/SitNear once core recognizes those bridges.
 
 - **Organism WatchSettled fail + idle settles UI contract (upgrade round 58,
   pending core push/repin)**: Full motion mirrors
