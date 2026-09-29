@@ -801,3 +801,13 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      RestAfterPush→UnknownOutcome beside core between() 93; Calm/Static snap in
      the Full-motion bridge loop. Pairs forge 228.
 
+182. **Find FE05/Manchu-comma-query QueryMismatch + stale** —
+     U+FE05 / U+FE09 / U+1808-only queries stay QueryMismatch under
+     Command/Output/All when stale ids remain (FE04/syllable already pinned).
+     Pairs forge 229.
+
+183. **SitNear/Inspect→UnknownOutcome Full-motion bridges** — Full motion
+     animates SitNearError/InspectError→UnknownOutcome; Calm/Static snap.
+     Pairs forge 230 / core SitNear/Inspect→Unknown inside between() 93 beside
+     Celebrate*/Rest→Unknown.
+
