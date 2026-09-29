@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (upgrade round 64: UnknownOutcome→Guard* vigil settles)
+Updated: 2026-09-29 (upgrade round 65: forge numbering parity note)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,12 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **Forge round-numbering parity note (upgrade round 65)**: anvil and forge
+  keep independent counters. Shared-feature catch-up maps forge 89–103 ↔ anvil
+  50–64 (vigil-tier through UnknownOutcome→Guard* + Find overlay scan caps).
+  No new behavior — documents that forge-ahead numbering does not mean anvil
+  is missing those features.
 
 - **Organism UnknownOutcome→Guard* vigil settle UI contract (upgrade round 64,
   pending core push/repin)**: Full motion mirrors UnknownOutcome→GuardFailure/

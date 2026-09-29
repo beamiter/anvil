@@ -231,3 +231,9 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
     UnknownOutcome→GuardFailure/Stuck/Recovery/Cautious vigil settles once core
     recognizes those bridges; Find overlay scan caps come from core
     `FIND_OVERLAY_SCAN_*`.
+
+65. **Forge round-numbering parity note** — anvil and forge keep independent
+    upgrade counters. Shared-feature catch-up for this evolve pass maps forge
+    rounds 89–103 onto anvil 50–64 (same titles: vigil-tier through
+    UnknownOutcome→Guard* + Find overlay scan caps). No new behavior; ledger
+    only, so a forge-ahead number does not imply anvil is missing the feature.
