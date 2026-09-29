@@ -447,3 +447,7 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
 99. **Failure/Stuck/Cautious→Watch* + tier overwrite None UI** — Full motion
     pins Failure/Stuck/Cautious→Watch* beside Rest/Recovery→Watch*, and
     SitNear→Inspect / Celebrate↔CelebrateBig as None. Pairs forge round 133.
+
+100. **Sticky near-miss whitespace labels** — tab / CR / NBSP variants of
+     `"Save Block history"` stay on the toast surface beside round 95's
+     padded/cased/truncated pin. Pairs forge round 134 file-tree leftover.
