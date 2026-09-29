@@ -354,3 +354,9 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
     the Failed-load overwrite refuse and lifts Failed→Idle (forge
     ExplicitReplace contract), so Clear no longer parks a sticky refusal
     instead of writing the tombstone. Pairs forge round 78 / 115 note.
+
+82. **Ambient / Typing VisualTransition N/A pin** — Full-motion UI pins that
+    Idle/Explore/Sleep/Approach disposition exchanges and Typing-surface entry
+    onto WatchCommand stay `VisualTransition::between` None (pairs core ambient
+    N/A pin and forge round 116). Round 66 documented Ambient N/A; this lands
+    the regression.
