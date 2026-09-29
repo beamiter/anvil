@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (sticky near-miss + find mixed stale + STAGE 70 tip)
+
+## 2026-09-29 (sticky near-miss + find mixed stale + STAGE 70)
+
+- **Round 95**: near-miss `"Save Block history"` labels stay toast-only.
+- **Round 96**: mixed stale+live bookmark empty-reason (pairs forge 129).
+- **Round 97**: path-patched core tip STAGE 70 (`uclampset`/`gamemoderun`) +
+  Guard*→Celebrate* None survey; `between()` stays 90. Pairs forge 130.
+  Core/jagent tips still **pending push/repin**.
+
 Updated: 2026-09-29 (Find stale bookmark + error→Watch None UI)
 
 ## 2026-09-29 (Find stale-bookmark + error/unknown→Watch* None)
