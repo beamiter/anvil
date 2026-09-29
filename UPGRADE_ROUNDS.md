@@ -190,6 +190,11 @@ evolve pass.
 54. **Organism celebrate-hold relapse UI contract** — Full motion mirrors
     Celebrate/CelebrateBig→Failure/Stuck once core recognizes those bridges
     (pending push/repin). Calm/Static still snap.
+55. **Resumable cross-block search idle continuation** — budget stops return a
+    `CrossBlockSearchCursor`; the dialog runs `glib::idle_add_local` slices
+    cancelled by search generation (parity with forge round 91). Unit
+    regressions pin resume cursors, hit-cap vs `scan_incomplete`, and status
+    copy for budget-stopped scans.
 
 Verification: `bash scripts/test-install-paths.sh`, `bash -n
 scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.

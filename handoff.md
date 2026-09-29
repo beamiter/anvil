@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (organism celebrate-hold relapse UI contract)
+Updated: 2026-09-29 (upgrade round 55: resumable cross-block search idle)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,12 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **Resumable cross-block search idle continuation (upgrade round 55)**:
+  budget-stopped scans return a `CrossBlockSearchCursor`; the dialog schedules
+  `glib::idle_add_local` slices cancelled by search generation (parity with
+  forge round 91). Status discloses `scan_incomplete`; rebuild / refresh /
+  close cancel pending continue sources. Core tip still **pending push/repin**.
 
 - **Organism celebrate-hold relapse UI contract (upgrade round 54, pending core
   push/repin)**: Full motion mirrors Celebrate/CelebrateBig → Failure/Stuck

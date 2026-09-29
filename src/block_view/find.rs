@@ -65,6 +65,11 @@ fn outcome_matches_filters(
 pub(crate) const FIND_MATCH_LIMIT: usize = 10_000;
 const FIND_SCAN_BYTE_LIMIT: usize = 4 * 1024 * 1024;
 const FIND_SCAN_TIME_LIMIT: Duration = Duration::from_millis(12);
+/// Cross-block palette search is user-initiated and may walk retained history;
+/// give it a wider budget than the live Find overlay, but still fail visibly
+/// when the walk stops early (never silent truncation).
+const CROSS_BLOCK_SCAN_BYTE_LIMIT: usize = 8 * 1024 * 1024;
+const CROSS_BLOCK_SCAN_TIME_LIMIT: Duration = Duration::from_millis(48);
 const CROSS_BLOCK_REGEX_SIZE_LIMIT: usize = 2 * 1024 * 1024;
 /// VTE uses PCRE2 while match counting uses Rust's Unicode-aware regex engine.
 /// UTF validates/decodes the subject as Unicode and UCP makes shorthand classes
@@ -269,6 +274,7 @@ struct ScanPrefix<'a> {
 struct FindScanBudget {
     remaining_bytes: usize,
     started: Instant,
+    time_limit: Duration,
 }
 
 impl FindScanBudget {
@@ -276,7 +282,20 @@ impl FindScanBudget {
         Self {
             remaining_bytes: FIND_SCAN_BYTE_LIMIT,
             started: Instant::now(),
+            time_limit: FIND_SCAN_TIME_LIMIT,
         }
+    }
+
+    fn for_cross_block() -> Self {
+        Self {
+            remaining_bytes: CROSS_BLOCK_SCAN_BYTE_LIMIT,
+            started: Instant::now(),
+            time_limit: CROSS_BLOCK_SCAN_TIME_LIMIT,
+        }
+    }
+
+    fn exhausted(&self) -> bool {
+        self.time_exhausted() || self.remaining_bytes == 0
     }
 
     fn take_prefix<'a>(&mut self, text: &'a str) -> ScanPrefix<'a> {
@@ -295,7 +314,7 @@ impl FindScanBudget {
     }
 
     fn time_exhausted(&self) -> bool {
-        self.started.elapsed() >= FIND_SCAN_TIME_LIMIT
+        self.started.elapsed() >= self.time_limit
     }
 
     fn remaining_bytes(&self) -> usize {
@@ -786,6 +805,70 @@ pub struct CrossBlockHit {
     pub occurrence: usize,
 }
 
+/// Mid-record resume point for a pattern scan that stopped inside one record's
+/// command or output lines. Metadata browse never sets this.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CrossBlockSearchMidRecord {
+    /// True when the next line to examine is on the output surface.
+    pub on_output: bool,
+    /// Next line index within that surface (0-based).
+    pub next_line: usize,
+    /// Match-occurrence counter for the current surface, carried so VTE jump
+    /// stepping stays aligned across idle slices.
+    pub occurrence: usize,
+}
+
+/// Where a budget-stopped cross-block scan should resume on the next idle slice.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CrossBlockSearchCursor {
+    /// Next record index in the current records list.
+    pub record_index: usize,
+    /// Present when the previous slice stopped mid-record on a pattern scan.
+    pub mid: Option<CrossBlockSearchMidRecord>,
+}
+
+/// Outcome of a cross-block palette scan. `scan_incomplete` is true when the
+/// byte/time budget stopped the walk before every eligible record was
+/// examined — distinct from hitting `max_hits`, which is a result cap the
+/// status line already discloses as "(capped)". When incomplete, `resume`
+/// names the next idle continuation point; it is always `None` when the walk
+/// finished or stopped at the hit cap.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CrossBlockSearchReport {
+    pub hits: Vec<CrossBlockHit>,
+    pub scan_incomplete: bool,
+    pub resume: Option<CrossBlockSearchCursor>,
+}
+
+impl CrossBlockSearchReport {
+    fn finished(hits: Vec<CrossBlockHit>) -> Self {
+        Self {
+            hits,
+            scan_incomplete: false,
+            resume: None,
+        }
+    }
+
+    fn budget_stopped(hits: Vec<CrossBlockHit>, resume: CrossBlockSearchCursor) -> Self {
+        Self {
+            hits,
+            scan_incomplete: true,
+            resume: Some(resume),
+        }
+    }
+}
+
+/// Whether a dialog idle continuation still owns the live search generation
+/// and should apply another budget slice. Stale generations are dropped so a
+/// newer keystroke / filter change cancels in-flight walks.
+pub(crate) fn cross_block_search_continue_is_current(
+    scheduled_generation: u64,
+    live_generation: u64,
+    has_resume: bool,
+) -> bool {
+    has_resume && scheduled_generation == live_generation
+}
+
 /// Bound native VTE cursor work performed by one palette activation.
 fn bounded_occurrence_steps(occurrence: usize) -> Option<usize> {
     const MAX_JUMP_STEPS: usize = 4_096;
@@ -1033,14 +1116,251 @@ fn metadata_filter_hits_with_bookmarks<'a>(
     filters: &BlockFilters,
     bookmarks: &HashSet<u64>,
 ) -> Vec<CrossBlockHit> {
-    records
-        .into_iter()
-        .filter(|record| {
-            record_matches_filters_with_bookmark(*record, filters, bookmarks.contains(&record.id()))
-        })
-        .filter_map(|record| metadata_filter_hit(record, scope))
-        .take(max_hits)
-        .collect()
+    metadata_filter_hits_with_budget(
+        records,
+        scope,
+        max_hits,
+        filters,
+        bookmarks,
+        &mut FindScanBudget::for_cross_block(),
+        0,
+    )
+    .0
+}
+
+fn metadata_filter_hits_with_budget<'a>(
+    records: impl IntoIterator<Item = BackendRecordRef<'a>>,
+    scope: CrossBlockSearchScope,
+    max_hits: usize,
+    filters: &BlockFilters,
+    bookmarks: &HashSet<u64>,
+    scan_budget: &mut FindScanBudget,
+    start_index: usize,
+) -> (Vec<CrossBlockHit>, Option<CrossBlockSearchCursor>) {
+    let mut hits = Vec::new();
+    for (index, record) in records.into_iter().enumerate().skip(start_index) {
+        if hits.len() >= max_hits {
+            break;
+        }
+        if scan_budget.exhausted() {
+            return (
+                hits,
+                Some(CrossBlockSearchCursor {
+                    record_index: index,
+                    mid: None,
+                }),
+            );
+        }
+        scan_budget.consume_bytes(record.command().len());
+        if scope.includes_output() {
+            scan_budget.consume_bytes(record.output().unwrap_or("").len());
+        }
+        let budget_stopped = scan_budget.exhausted();
+        if !record_matches_filters_with_bookmark(
+            record,
+            filters,
+            bookmarks.contains(&record.id()),
+        ) {
+            if budget_stopped {
+                return (
+                    hits,
+                    Some(CrossBlockSearchCursor {
+                        record_index: index + 1,
+                        mid: None,
+                    }),
+                );
+            }
+            continue;
+        }
+        if let Some(hit) = metadata_filter_hit(record, scope) {
+            hits.push(hit);
+        }
+        if budget_stopped {
+            return (
+                hits,
+                Some(CrossBlockSearchCursor {
+                    record_index: index + 1,
+                    mid: None,
+                }),
+            );
+        }
+    }
+    (hits, None)
+}
+
+/// Pattern-search one budget slice starting at `resume` (or the first record).
+/// Returns new hits for this slice plus an optional cursor when the shared
+/// byte/time budget stopped the walk early.
+fn pattern_search_hits_with_budget<'a>(
+    records: impl IntoIterator<Item = BackendRecordRef<'a>>,
+    re: &regex::Regex,
+    options: CrossBlockSearchOptions,
+    scope: CrossBlockSearchScope,
+    max_hits: usize,
+    filters: &BlockFilters,
+    bookmarks: &HashSet<u64>,
+    scan_budget: &mut FindScanBudget,
+    resume: Option<&CrossBlockSearchCursor>,
+) -> (Vec<CrossBlockHit>, Option<CrossBlockSearchCursor>) {
+    let start_index = resume.map(|cursor| cursor.record_index).unwrap_or(0);
+    let mut mid = resume.and_then(|cursor| cursor.mid.clone());
+    let mut hits: Vec<CrossBlockHit> = Vec::new();
+
+    for (index, record) in records.into_iter().enumerate().skip(start_index) {
+        if hits.len() >= max_hits {
+            break;
+        }
+        if scan_budget.exhausted() {
+            return (
+                hits,
+                Some(CrossBlockSearchCursor {
+                    record_index: index,
+                    mid,
+                }),
+            );
+        }
+
+        let resume_mid = mid.take();
+        // Metadata predicates run before this record contributes any
+        // command/output *hit*, so an excluded record cannot spend the
+        // bounded result budget and starve a later eligible record.
+        // Excluded records still spend the scan *byte* budget, matching
+        // metadata browse: a long filtered walk must disclose truncation
+        // instead of examining unbounded history for free.
+        // A mid-record resume always belongs to a previously eligible
+        // record; skip the filter gate so occurrence counters stay aligned.
+        if resume_mid.is_none()
+            && !record_matches_filters_with_bookmark(
+                record,
+                filters,
+                bookmarks.contains(&record.id()),
+            )
+        {
+            scan_budget.consume_bytes(record.command().len());
+            if scope.includes_output() {
+                scan_budget.consume_bytes(record.output().unwrap_or("").len());
+            }
+            if scan_budget.exhausted() {
+                return (
+                    hits,
+                    Some(CrossBlockSearchCursor {
+                        record_index: index + 1,
+                        mid: None,
+                    }),
+                );
+            }
+            continue;
+        }
+
+        let command = record.command();
+        let cmd_preview = command_preview(command);
+        let exit_code = record.exit_code();
+        let duration_ms = record.duration_ms();
+        let cwd = record.cwd().map(str::to_string);
+        let (skip_command, start_line, mut occurrence) = match resume_mid {
+            Some(CrossBlockSearchMidRecord {
+                on_output: true,
+                next_line,
+                occurrence,
+            }) => (true, next_line, occurrence),
+            Some(CrossBlockSearchMidRecord {
+                on_output: false,
+                next_line,
+                occurrence,
+            }) => (false, next_line, occurrence),
+            None => (false, 0, 0usize),
+        };
+
+        // Cmd surface — usually 1 line, but multiline commands exist.
+        // `occurrence` counts matches, not matching lines, because that is
+        // the unit VTE's search cursor advances by.
+        if !skip_command && scope.includes_command() {
+            for (ln_idx, line) in command.lines().enumerate().skip(start_line) {
+                if hits.len() >= max_hits {
+                    return (hits, None);
+                }
+                if scan_budget.exhausted() {
+                    return (
+                        hits,
+                        Some(CrossBlockSearchCursor {
+                            record_index: index,
+                            mid: Some(CrossBlockSearchMidRecord {
+                                on_output: false,
+                                next_line: ln_idx,
+                                occurrence,
+                            }),
+                        }),
+                    );
+                }
+                scan_budget.consume_bytes(line.len());
+                let matches = cross_block_match_count(re, line, options.whole_word);
+                if matches > 0 {
+                    hits.push(CrossBlockHit {
+                        block_id: record.id(),
+                        is_output: false,
+                        line_no: ln_idx + 1,
+                        line_text: snippet(line),
+                        cmd_preview: cmd_preview.clone(),
+                        exit_code,
+                        duration_ms,
+                        cwd: cwd.clone(),
+                        occurrence,
+                    });
+                }
+                occurrence = occurrence.saturating_add(matches);
+            }
+        }
+
+        if hits.len() >= max_hits {
+            break;
+        }
+
+        if scope.includes_output() {
+            let output_start = if skip_command { start_line } else { 0 };
+            let mut occurrence = if skip_command { occurrence } else { 0usize };
+            for (ln_idx, line) in record
+                .output()
+                .unwrap_or("")
+                .lines()
+                .enumerate()
+                .skip(output_start)
+            {
+                if hits.len() >= max_hits {
+                    return (hits, None);
+                }
+                if scan_budget.exhausted() {
+                    return (
+                        hits,
+                        Some(CrossBlockSearchCursor {
+                            record_index: index,
+                            mid: Some(CrossBlockSearchMidRecord {
+                                on_output: true,
+                                next_line: ln_idx,
+                                occurrence,
+                            }),
+                        }),
+                    );
+                }
+                scan_budget.consume_bytes(line.len());
+                let matches = cross_block_match_count(re, line, options.whole_word);
+                if matches > 0 {
+                    hits.push(CrossBlockHit {
+                        block_id: record.id(),
+                        is_output: true,
+                        line_no: ln_idx + 1,
+                        line_text: snippet(line),
+                        cmd_preview: cmd_preview.clone(),
+                        exit_code,
+                        duration_ms,
+                        cwd: cwd.clone(),
+                        occurrence,
+                    });
+                }
+                occurrence = occurrence.saturating_add(matches);
+            }
+        }
+    }
+    (hits, None)
 }
 
 #[cfg(test)]
@@ -1631,11 +1951,10 @@ impl TermView {
     /// enough context (line number + the raw line + cmd preview) to drive a
     /// palette UI that lets the user pick one and jump to it.
     ///
-    /// Errors only on invalid regex. An empty pattern returns one representative
-    /// row per eligible record when metadata filters are active, otherwise no
-    /// rows.
-    /// Scan every retained record for `pattern`, honoring the same outcome and
-    /// duration predicates the block filters use.
+    /// Errors only on invalid regex; an empty pattern returns an empty report
+    /// so the caller can clear results without a special branch. When the
+    /// scan budget stops the walk early, `scan_incomplete` is set so the UI
+    /// can disclose that later records were not examined.
     ///
     /// `filters` is applied per record, before its lines are scanned: the
     /// predicates already existed and had no surface that could reach them, so
@@ -1647,7 +1966,7 @@ impl TermView {
         options: CrossBlockSearchOptions,
         max_hits: usize,
         filters: &BlockFilters,
-    ) -> Result<Vec<CrossBlockHit>, String> {
+    ) -> Result<CrossBlockSearchReport, String> {
         self.cross_block_search_in_scope(
             pattern,
             options,
@@ -1665,20 +1984,45 @@ impl TermView {
         scope: CrossBlockSearchScope,
         max_hits: usize,
         filters: &BlockFilters,
-    ) -> Result<Vec<CrossBlockHit>, String> {
+    ) -> Result<CrossBlockSearchReport, String> {
+        self.cross_block_search_in_scope_from(pattern, options, scope, max_hits, filters, None)
+    }
+
+    /// Resume a budget-stopped cross-block scan from `resume`, or start fresh
+    /// when `resume` is `None`. Each call consumes one fresh
+    /// [`FindScanBudget::for_cross_block`] slice so the GTK idle loop can keep
+    /// walking large histories without holding the main thread for the full
+    /// walk. `scan_incomplete` / `resume` semantics match a from-start scan.
+    pub fn cross_block_search_in_scope_from(
+        &self,
+        pattern: &str,
+        options: CrossBlockSearchOptions,
+        scope: CrossBlockSearchScope,
+        max_hits: usize,
+        filters: &BlockFilters,
+        resume: Option<&CrossBlockSearchCursor>,
+    ) -> Result<CrossBlockSearchReport, String> {
         if pattern.is_empty() {
             if !has_metadata_filters(filters) {
-                return Ok(Vec::new());
+                return Ok(CrossBlockSearchReport::finished(Vec::new()));
             }
+            let start_index = resume.map(|cursor| cursor.record_index).unwrap_or(0);
             let bookmarks = self.bookmarks.snapshot();
             let records = self.render_backend.records();
-            return Ok(metadata_filter_hits_with_bookmarks(
+            let mut scan_budget = FindScanBudget::for_cross_block();
+            let (hits, resume) = metadata_filter_hits_with_budget(
                 records.iter(),
                 scope,
                 max_hits,
                 filters,
                 &bookmarks,
-            ));
+                &mut scan_budget,
+                start_index,
+            );
+            return Ok(match resume {
+                Some(cursor) => CrossBlockSearchReport::budget_stopped(hits, cursor),
+                None => CrossBlockSearchReport::finished(hits),
+            });
         }
 
         let compiled_pattern = cross_block_pattern(pattern, options);
@@ -1691,80 +2035,22 @@ impl TermView {
 
         let bookmarks = self.bookmarks.snapshot();
         let records = self.render_backend.records();
-        let mut hits: Vec<CrossBlockHit> = Vec::new();
-
-        for record in records.iter() {
-            if hits.len() >= max_hits {
-                break;
-            }
-            // Metadata predicates run before this record contributes any
-            // command/output hit, so an excluded record cannot spend the
-            // bounded result budget and starve a later eligible record.
-            if !record_matches_filters_with_bookmark(
-                record,
-                filters,
-                bookmarks.contains(&record.id()),
-            ) {
-                continue;
-            }
-            let command = record.command();
-            let cmd_preview = command_preview(command);
-            let exit_code = record.exit_code();
-            let duration_ms = record.duration_ms();
-            let cwd = record.cwd().map(str::to_string);
-
-            // Cmd surface — usually one line, but multiline commands exist.
-            // Count matches rather than matching lines because that is VTE's
-            // native cursor unit.
-            if scope.includes_command() {
-                let mut occurrence = 0usize;
-                for (ln_idx, line) in command.lines().enumerate() {
-                    if hits.len() >= max_hits {
-                        break;
-                    }
-                    let matches = cross_block_match_count(&re, line, options.whole_word);
-                    if matches > 0 {
-                        hits.push(CrossBlockHit {
-                            block_id: record.id(),
-                            is_output: false,
-                            line_no: ln_idx + 1,
-                            line_text: snippet(line),
-                            cmd_preview: cmd_preview.clone(),
-                            exit_code,
-                            duration_ms,
-                            cwd: cwd.clone(),
-                            occurrence,
-                        });
-                    }
-                    occurrence = occurrence.saturating_add(matches);
-                }
-            }
-
-            if scope.includes_output() {
-                let mut occurrence = 0usize;
-                for (ln_idx, line) in record.output().unwrap_or("").lines().enumerate() {
-                    if hits.len() >= max_hits {
-                        break;
-                    }
-                    let matches = cross_block_match_count(&re, line, options.whole_word);
-                    if matches > 0 {
-                        hits.push(CrossBlockHit {
-                            block_id: record.id(),
-                            is_output: true,
-                            line_no: ln_idx + 1,
-                            line_text: snippet(line),
-                            cmd_preview: cmd_preview.clone(),
-                            exit_code,
-                            duration_ms,
-                            cwd: cwd.clone(),
-                            occurrence,
-                        });
-                    }
-                    occurrence = occurrence.saturating_add(matches);
-                }
-            }
-        }
-        Ok(hits)
+        let mut scan_budget = FindScanBudget::for_cross_block();
+        let (hits, resume) = pattern_search_hits_with_budget(
+            records.iter(),
+            &re,
+            options,
+            scope,
+            max_hits,
+            filters,
+            &bookmarks,
+            &mut scan_budget,
+            resume,
+        );
+        Ok(match resume {
+            Some(cursor) => CrossBlockSearchReport::budget_stopped(hits, cursor),
+            None => CrossBlockSearchReport::finished(hits),
+        })
     }
 
     /// Whether activating this hit would show the user anything: a per-record
@@ -2039,23 +2325,24 @@ mod tests {
 
     use super::{
         add_snapshot_jump_fallbacks, bookmarked_empty_reason, bounded_match_count, command_preview,
-        cross_block_match_count, cross_block_pattern, cross_block_search_version, duration_matches,
-        focus_one_native_forward_match, has_metadata_filters, matching_record_ids,
-        matching_record_ids_with_bookmarks, metadata_filter_hits,
-        metadata_filter_hits_with_bookmarks, native_cursor_action, outcome_matches_filters,
-        plan_matching_windows, record_matches_filters, regex_consumption, snippet,
-        step_compressed_cursor, unresolved_record_target_result, utf8_prefix,
-        vte_cross_block_pattern, BookmarkedEmptyReason, CrossBlockSearchOptions,
-        CrossBlockSearchScope, FindCursor, FindDirection, FindScanBudget, FindSurface,
-        NativeCursorAction, RecordNavigationResult, RecordSnapshotView, RegexConsumption,
-        VTE_SEARCH_FLAGS,
+        cross_block_match_count, cross_block_pattern, cross_block_search_continue_is_current,
+        cross_block_search_version, duration_matches, focus_one_native_forward_match,
+        has_metadata_filters, matching_record_ids, matching_record_ids_with_bookmarks,
+        metadata_filter_hits, metadata_filter_hits_with_bookmarks,
+        metadata_filter_hits_with_budget, native_cursor_action, outcome_matches_filters,
+        pattern_search_hits_with_budget, plan_matching_windows, record_matches_filters,
+        regex_consumption, snippet, step_compressed_cursor, unresolved_record_target_result,
+        utf8_prefix, vte_cross_block_pattern, BookmarkedEmptyReason, CrossBlockSearchOptions,
+        CrossBlockSearchScope, FindCursor, FindDirection, FindScanBudget,
+        FindSurface, NativeCursorAction, RecordNavigationResult, RecordSnapshotView,
+        RegexConsumption, VTE_SEARCH_FLAGS,
     };
     use crate::block_view::{
         BackendRecordRef, BackendSearchWindow, BlockData, BlockFilters, CompletedCommandRecord,
         ZoneOutputSnapshot,
     };
     use std::collections::HashSet;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     fn surface(count: usize, complete: bool) -> FindSurface {
         FindSurface {
@@ -2400,6 +2687,7 @@ mod tests {
         let mut budget = FindScanBudget {
             remaining_bytes: 5,
             started: Instant::now(),
+            time_limit: Duration::from_secs(5),
         };
         let first = budget.take_prefix("abc");
         assert_eq!(first.text, "abc");
@@ -3847,5 +4135,361 @@ mod tests {
         assert_eq!(preview.chars().count(), 241);
         assert!(preview.ends_with('…'));
         assert!(!preview.contains("ignored second line"));
+    }
+
+    fn metadata_record(id: u64, cmd: String, exit_code: Option<i32>) -> CompletedCommandRecord {
+        CompletedCommandRecord {
+            id,
+            cmd,
+            exit_code,
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: None,
+            cwd: None,
+            is_background: false,
+            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            command_source: super::super::CommandTextSource::Screen,
+            start_mark_seen: true,
+        }
+    }
+
+    #[test]
+    fn metadata_filter_browse_reports_scan_incomplete_when_budget_stops() {
+        let record = metadata_record(1, "x".repeat(9 * 1024 * 1024), Some(7));
+        let filters = BlockFilters {
+            failed_only: true,
+            ..Default::default()
+        };
+        let records = [BackendRecordRef::Metadata {
+            record: &record,
+            snapshot: None,
+        }];
+        let mut budget = FindScanBudget::for_cross_block();
+        let (_, resume) = metadata_filter_hits_with_budget(
+            records.iter().copied(),
+            CrossBlockSearchScope::All,
+            10,
+            &filters,
+            &HashSet::new(),
+            &mut budget,
+            0,
+        );
+        assert!(resume.is_some());
+    }
+
+    #[test]
+    fn cross_block_pattern_search_reports_scan_incomplete_when_budget_stops() {
+        let record = metadata_record(
+            1,
+            format!("needle\n{}", "x".repeat(9 * 1024 * 1024)),
+            Some(0),
+        );
+        let records = [BackendRecordRef::Metadata {
+            record: &record,
+            snapshot: None,
+        }];
+        let mut budget = FindScanBudget::for_cross_block();
+        budget.consume_bytes(super::CROSS_BLOCK_SCAN_BYTE_LIMIT - 1);
+        let re = regex::Regex::new("needle").unwrap();
+        let options = CrossBlockSearchOptions::default();
+        let mut scan_incomplete = false;
+        for record in records.iter().copied() {
+            for line in record.command().lines() {
+                if budget.exhausted() {
+                    scan_incomplete = true;
+                    break;
+                }
+                budget.consume_bytes(line.len());
+                let _matches = cross_block_match_count(&re, line, options.whole_word);
+            }
+            if scan_incomplete {
+                break;
+            }
+        }
+        assert!(scan_incomplete);
+    }
+
+    #[test]
+    fn cross_block_hit_cap_does_not_imply_scan_incomplete() {
+        let records: Vec<CompletedCommandRecord> = (0..3)
+            .map(|id| metadata_record(id, format!("needle-{id}"), Some(0)))
+            .collect();
+        let backend_records: Vec<BackendRecordRef<'_>> = records
+            .iter()
+            .map(|record| BackendRecordRef::Metadata {
+                record,
+                snapshot: None,
+            })
+            .collect();
+        let mut budget = FindScanBudget::for_cross_block();
+        let re = regex::Regex::new("needle").unwrap();
+        let options = CrossBlockSearchOptions::default();
+        let mut hits = 0usize;
+        let max_hits = 2usize;
+        let mut scan_incomplete = false;
+        for record in backend_records.iter().copied() {
+            if hits >= max_hits {
+                break;
+            }
+            for line in record.command().lines() {
+                if hits >= max_hits {
+                    break;
+                }
+                if budget.exhausted() {
+                    scan_incomplete = true;
+                    break;
+                }
+                budget.consume_bytes(line.len());
+                hits += cross_block_match_count(&re, line, options.whole_word);
+            }
+            if scan_incomplete {
+                break;
+            }
+        }
+        assert_eq!(hits, max_hits);
+        assert!(
+            !scan_incomplete,
+            "stopping at max_hits must not mark the palette scan incomplete"
+        );
+    }
+
+    #[test]
+    fn cross_block_pattern_search_shares_hit_cap_across_command_and_output() {
+        let block = BlockData {
+            id: 1,
+            prompt: String::new(),
+            cmd: "needle-cmd".to_string(),
+            cmd_markup: None,
+            output: "needle-out".to_string(),
+            exit_code: Some(0),
+            lifecycle_schema: crate::block_view::blocks::BLOCK_LIFECYCLE_SCHEMA,
+            completion_provenance: super::super::CompletionProvenance::ShellReported.into(),
+            start_mark_seen: true,
+            estimated_height: 1,
+            line_count: 1,
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: None,
+            cwd: None,
+            cols: 80,
+            command_exact: false,
+            command_truncated: false,
+            output_head_dropped: false,
+        };
+        let backend_record = BackendRecordRef::Block(&block);
+        let re = regex::Regex::new("needle").unwrap();
+        let options = CrossBlockSearchOptions::default();
+        let (hits, resume) = pattern_search_hits_with_budget(
+            [backend_record],
+            &re,
+            options,
+            CrossBlockSearchScope::All,
+            1,
+            &BlockFilters::default(),
+            &HashSet::new(),
+            &mut FindScanBudget::for_cross_block(),
+            None,
+        );
+        assert_eq!(hits.len(), 1);
+        assert!(!hits[0].is_output);
+        assert!(
+            resume.is_none(),
+            "hit cap alone must not leave a resume cursor"
+        );
+    }
+
+    #[test]
+    fn cross_block_pattern_search_excluded_records_consume_scan_budget() {
+        let records: Vec<CompletedCommandRecord> = (0..3)
+            .map(|id| metadata_record(id, format!("needle-{id}-{}", "x".repeat(64)), Some(0)))
+            .collect();
+        let backend_records: Vec<BackendRecordRef<'_>> = records
+            .iter()
+            .map(|record| BackendRecordRef::Metadata {
+                record,
+                snapshot: None,
+            })
+            .collect();
+        // Only the last record is bookmarked; the first two are excluded but
+        // must still spend the scan budget.
+        let bookmarks = HashSet::from([2u64]);
+        let filters = BlockFilters {
+            bookmarked_only: true,
+            ..BlockFilters::default()
+        };
+        let re = regex::Regex::new("needle").unwrap();
+        let options = CrossBlockSearchOptions::default();
+        let mut scan_budget = FindScanBudget {
+            remaining_bytes: 100,
+            started: Instant::now(),
+            time_limit: Duration::from_secs(5),
+        };
+        let (hits, resume) = pattern_search_hits_with_budget(
+            backend_records.iter().copied(),
+            &re,
+            options,
+            CrossBlockSearchScope::All,
+            8,
+            &filters,
+            &bookmarks,
+            &mut scan_budget,
+            None,
+        );
+        assert!(
+            hits.is_empty(),
+            "budget must stop on excluded records before the bookmarked match"
+        );
+        assert!(
+            resume.is_some(),
+            "excluded records must spend the scan budget so truncation is disclosed"
+        );
+    }
+
+    #[test]
+    fn metadata_filter_hit_cap_does_not_imply_scan_incomplete() {
+        let records: Vec<CompletedCommandRecord> = (0..4)
+            .map(|id| metadata_record(id, format!("needle-{id}"), Some(0)))
+            .collect();
+        let backend_records: Vec<BackendRecordRef<'_>> = records
+            .iter()
+            .map(|record| BackendRecordRef::Metadata {
+                record,
+                snapshot: None,
+            })
+            .collect();
+        let (hits, resume) = metadata_filter_hits_with_budget(
+            backend_records,
+            CrossBlockSearchScope::Command,
+            2,
+            &BlockFilters::default(),
+            &HashSet::new(),
+            &mut FindScanBudget::for_cross_block(),
+            0,
+        );
+        assert_eq!(hits.len(), 2);
+        assert!(
+            resume.is_none(),
+            "metadata filter hit cap must not set scan_incomplete"
+        );
+    }
+
+    #[test]
+    fn pattern_search_idle_slices_resume_from_budget_cursor() {
+        // Three short records: a tight byte budget stops after the first hit;
+        // the next slice must pick up at the resume cursor and find the rest.
+        let records: Vec<CompletedCommandRecord> = (0..3)
+            .map(|id| metadata_record(id, format!("needle-{id}"), Some(0)))
+            .collect();
+        let backend_records: Vec<BackendRecordRef<'_>> = records
+            .iter()
+            .map(|record| BackendRecordRef::Metadata {
+                record,
+                snapshot: None,
+            })
+            .collect();
+        let re = regex::Regex::new("needle").unwrap();
+        let options = CrossBlockSearchOptions::default();
+        let mut first_budget = FindScanBudget {
+            remaining_bytes: 8,
+            started: Instant::now(),
+            time_limit: Duration::from_secs(5),
+        };
+        let (first_hits, first_resume) = pattern_search_hits_with_budget(
+            backend_records.iter().copied(),
+            &re,
+            options,
+            CrossBlockSearchScope::Command,
+            8,
+            &BlockFilters::default(),
+            &HashSet::new(),
+            &mut first_budget,
+            None,
+        );
+        assert_eq!(first_hits.len(), 1);
+        assert_eq!(first_hits[0].block_id, 0);
+        let resume = first_resume.expect("budget must stop with a resume cursor");
+        assert_eq!(resume.record_index, 1);
+
+        let mut second_budget = FindScanBudget {
+            remaining_bytes: 1024,
+            started: Instant::now(),
+            time_limit: Duration::from_secs(5),
+        };
+        let (rest_hits, rest_resume) = pattern_search_hits_with_budget(
+            backend_records.iter().copied(),
+            &re,
+            options,
+            CrossBlockSearchScope::Command,
+            8,
+            &BlockFilters::default(),
+            &HashSet::new(),
+            &mut second_budget,
+            Some(&resume),
+        );
+        assert!(rest_resume.is_none());
+        assert_eq!(rest_hits.len(), 2);
+        assert_eq!(rest_hits[0].block_id, 1);
+        assert_eq!(rest_hits[1].block_id, 2);
+    }
+
+    #[test]
+    fn metadata_browse_idle_slices_resume_from_budget_cursor() {
+        let records: Vec<CompletedCommandRecord> = (0..3)
+            .map(|id| metadata_record(id, format!("cmd-{id}"), Some(1)))
+            .collect();
+        let backend_records: Vec<BackendRecordRef<'_>> = records
+            .iter()
+            .map(|record| BackendRecordRef::Metadata {
+                record,
+                snapshot: None,
+            })
+            .collect();
+        let filters = BlockFilters {
+            failed_only: true,
+            ..BlockFilters::default()
+        };
+        let mut first_budget = FindScanBudget {
+            remaining_bytes: 5,
+            started: Instant::now(),
+            time_limit: Duration::from_secs(5),
+        };
+        let (first_hits, first_resume) = metadata_filter_hits_with_budget(
+            backend_records.iter().copied(),
+            CrossBlockSearchScope::Command,
+            8,
+            &filters,
+            &HashSet::new(),
+            &mut first_budget,
+            0,
+        );
+        assert_eq!(first_hits.len(), 1);
+        let resume = first_resume.expect("budget must stop with a resume cursor");
+        assert!(resume.record_index >= 1);
+
+        let mut second_budget = FindScanBudget {
+            remaining_bytes: 1024,
+            started: Instant::now(),
+            time_limit: Duration::from_secs(5),
+        };
+        let (rest_hits, rest_resume) = metadata_filter_hits_with_budget(
+            backend_records.iter().copied(),
+            CrossBlockSearchScope::Command,
+            8,
+            &filters,
+            &HashSet::new(),
+            &mut second_budget,
+            resume.record_index,
+        );
+        assert!(rest_resume.is_none());
+        assert_eq!(first_hits.len() + rest_hits.len(), 3);
+    }
+
+    #[test]
+    fn cross_block_search_continue_respects_search_generation() {
+        // Structural cancel contract used by the dialog idle continuation:
+        // a bumped generation must drop a pending resume without applying it.
+        assert!(cross_block_search_continue_is_current(7, 7, true));
+        assert!(!cross_block_search_continue_is_current(7, 8, true));
+        assert!(!cross_block_search_continue_is_current(7, 7, false));
     }
 }

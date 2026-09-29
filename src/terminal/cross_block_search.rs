@@ -359,19 +359,28 @@ fn dialog_toggle_plan<T: Clone>(claimed: &Option<T>) -> DialogTogglePlan<T> {
     }
 }
 
-fn search_status(total: usize, selected: Option<usize>) -> String {
+fn search_status(total: usize, selected: Option<usize>, scan_incomplete: bool) -> String {
     if total == 0 {
-        return "No matches.".to_string();
-    }
-    let noun = if total == 1 { "match" } else { "matches" };
-    let position = selected
-        .filter(|index| *index < total)
-        .map(|index| format!("{} of ", index + 1))
-        .unwrap_or_default();
-    if total == CROSS_BLOCK_SEARCH_LIMIT {
-        format!("{position}{total} {noun} (capped) — refine your query.")
+        if scan_incomplete {
+            "No matches in the scanned prefix — history scan budget reached; narrow the scope or refine the query.".to_string()
+        } else {
+            "No matches.".to_string()
+        }
     } else {
-        format!("{position}{total} {noun}")
+        let noun = if total == 1 { "match" } else { "matches" };
+        let position = selected
+            .filter(|index| *index < total)
+            .map(|index| format!("{} of ", index + 1))
+            .unwrap_or_default();
+        if total == CROSS_BLOCK_SEARCH_LIMIT {
+            format!("{position}{total} {noun} (capped) — refine your query.")
+        } else if scan_incomplete {
+            format!(
+                "{position}{total} {noun} (scan budget reached — later blocks not examined)"
+            )
+        } else {
+            format!("{position}{total} {noun}")
+        }
     }
 }
 
@@ -521,6 +530,96 @@ fn scroll_row_into_view(scrolled: &gtk::ScrolledWindow, row: &impl IsA<gtk::Widg
 
 fn jump_unavailable_status() -> &'static str {
     "This result is searchable, but it has no terminal location and no retained output."
+}
+
+fn append_hit_row(
+    list_box: &gtk::ListBox,
+    view: &Rc<TermView>,
+    hit: &CrossBlockHit,
+    jumpable: &std::collections::HashSet<(u64, bool)>,
+    row_bookmark_buttons: &Rc<RefCell<Vec<(u64, gtk::ToggleButton)>>>,
+    status_label: &gtk::Label,
+    filter_entry: &gtk::SearchEntry,
+    bookmark_changed: &BookmarkChangedCallback,
+    bookmarked_filter: &gtk::ToggleButton,
+) {
+    let surface = if hit.is_output { "out" } else { "cmd" };
+    // A hit whose record has no location and no retained
+    // output says so before the user activates it.
+    let unreachable = if jumpable.contains(&(hit.block_id, hit.is_output)) {
+        ""
+    } else {
+        " — location unavailable"
+    };
+    let subtitle = format!(
+        "{surface} L{}: {}{unreachable}",
+        hit.line_no,
+        gtk::glib::markup_escape_text(&hit.line_text)
+    );
+    let title = gtk::glib::markup_escape_text(&hit.cmd_preview);
+    let row = adw::ActionRow::builder()
+        .title(title.as_str())
+        .subtitle(&subtitle)
+        .activatable(true)
+        .build();
+    let bookmark_button = gtk::ToggleButton::builder()
+        .icon_name("user-bookmarks-symbolic")
+        .valign(gtk::Align::Center)
+        .build();
+    bookmark_button.add_css_class("flat");
+    sync_bookmark_button(
+        &bookmark_button,
+        view.is_record_bookmarked(hit.block_id),
+    );
+    let record_id = hit.block_id;
+    let view_for_bookmark = view.clone();
+    let buttons_for_bookmark = row_bookmark_buttons.clone();
+    let status_for_bookmark = status_label.clone();
+    let entry_for_bookmark = filter_entry.clone();
+    let bookmark_changed = bookmark_changed.clone();
+    let bookmarked_filter = bookmarked_filter.clone();
+    bookmark_button.connect_clicked(move |button| {
+        let requested = button.is_active();
+        let authoritative =
+            match view_for_bookmark.set_record_bookmarked(record_id, requested) {
+                Some(authoritative) => {
+                    for (id, sibling) in buttons_for_bookmark.borrow().iter() {
+                        if *id == record_id {
+                            sync_bookmark_button(sibling, authoritative);
+                        }
+                    }
+                    Some(authoritative)
+                }
+                None => {
+                    sync_bookmark_button(button, false);
+                    set_announced_status(
+                        &status_for_bookmark,
+                        "That block is no longer retained.",
+                    );
+                    None
+                }
+            };
+        if let Some(authoritative) = authoritative {
+            let callback = bookmark_changed.borrow().as_ref().and_then(Weak::upgrade);
+            if let Some(callback) = callback {
+                callback(authoritative, bookmarked_filter.is_active());
+            }
+        }
+        entry_for_bookmark.grab_focus();
+    });
+    row.add_suffix(&bookmark_button);
+    row_bookmark_buttons
+        .borrow_mut()
+        .push((record_id, bookmark_button));
+    // Outcome at a glance: telling the failing `cargo build`
+    // from the passing ones should not require visiting each.
+    if let Some(outcome) = hit_outcome_label(hit) {
+        let label = gtk::Label::new(Some(&outcome));
+        label.add_css_class(hit_outcome_class(hit.exit_code));
+        label.set_valign(gtk::Align::Center);
+        row.add_suffix(&label);
+    }
+    list_box.append(&row);
 }
 
 pub(super) fn toggle(
@@ -679,10 +778,13 @@ pub(super) fn toggle(
     dialog.set_child(Some(&toolbar_view));
 
     let hits: Rc<RefCell<Vec<CrossBlockHit>>> = Rc::new(RefCell::new(Vec::new()));
+    let scan_incomplete = Rc::new(Cell::new(false));
     let row_bookmark_buttons: Rc<RefCell<Vec<(u64, gtk::ToggleButton)>>> =
         Rc::new(RefCell::new(Vec::new()));
     let retained_hit: Rc<RefCell<Option<SelectionAnchor>>> = Rc::new(RefCell::new(None));
     let pending_rebuild: Rc<RefCell<Option<gtk::glib::SourceId>>> = Rc::new(RefCell::new(None));
+    let pending_scan_continue: Rc<RefCell<Option<gtk::glib::SourceId>>> =
+        Rc::new(RefCell::new(None));
     let pending_refresh_tick = Rc::new(RefCell::new(
         RefreshTickSlot::<gtk::TickCallbackId>::default(),
     ));
@@ -691,11 +793,13 @@ pub(super) fn toggle(
     let bookmark_changed: BookmarkChangedCallback = Rc::new(RefCell::new(None));
     {
         let hits = hits.clone();
+        let scan_incomplete = scan_incomplete.clone();
         let status_label = status_label.clone();
         list_box.connect_row_selected(move |_, row| {
             status_label.set_text(&search_status(
                 hits.borrow().len(),
                 row.map(|row| row.index() as usize),
+                scan_incomplete.get(),
             ));
         });
     }
@@ -707,6 +811,7 @@ pub(super) fn toggle(
         let background_toggle = background_toggle.clone();
         let list_box = list_box.clone();
         let hits = hits.clone();
+        let scan_incomplete = scan_incomplete.clone();
         let status_label = status_label.clone();
         let filter_entry = filter_entry.clone();
         let regex_toggle = regex_toggle.clone();
@@ -717,7 +822,13 @@ pub(super) fn toggle(
         let row_bookmark_buttons = row_bookmark_buttons.clone();
         let bookmark_changed = bookmark_changed.clone();
         let bookmarked_filter = bookmarked_toggle.clone();
+        let search_generation = search_generation.clone();
+        let pending_scan_continue = pending_scan_continue.clone();
         Rc::new(move || {
+            if let Some(source) = pending_scan_continue.borrow_mut().take() {
+                source.remove();
+            }
+            let generation = search_generation.get();
             let query = filter_entry.text().to_string();
             // The stale rows remain navigable during the refresh debounce.
             // Capture again when the rebuild actually executes so a key move
@@ -750,6 +861,7 @@ pub(super) fn toggle(
             while let Some(child) = list_box.first_child() {
                 list_box.remove(&child);
             }
+            row_bookmark_buttons.borrow_mut().clear();
             if !has_search_intent(
                 &query,
                 filters.failed_only,
@@ -758,13 +870,13 @@ pub(super) fn toggle(
                 filters.background_only,
             ) {
                 hits.borrow_mut().clear();
-                row_bookmark_buttons.borrow_mut().clear();
+                scan_incomplete.set(false);
                 status_label.set_text(idle_status());
                 return;
             }
             if let Some(message) = query_error(&query) {
                 hits.borrow_mut().clear();
-                row_bookmark_buttons.borrow_mut().clear();
+                scan_incomplete.set(false);
                 status_label.set_text(message);
                 return;
             }
@@ -778,106 +890,131 @@ pub(super) fn toggle(
                 CROSS_BLOCK_SEARCH_LIMIT,
                 &filters,
             ) {
-                Ok(results) => {
+                Ok(report) => {
+                    let resume = report.resume.clone();
+                    let results = report.hits;
+                    scan_incomplete.set(report.scan_incomplete);
                     let total = results.len();
-                    let status = if total == 0 && filters.bookmarked_only {
+                    let status = if total == 0 && !report.scan_incomplete && filters.bookmarked_only
+                    {
                         view.bookmarked_empty_search_status(&query, scope, &filters)
                             .unwrap_or("No matches.")
                             .to_string()
                     } else {
-                        search_status(total, None)
+                        search_status(total, None, report.scan_incomplete)
                     };
                     status_label.set_text(&status);
                     let jumpable = view.jumpable_search_hits(&results);
-                    row_bookmark_buttons.borrow_mut().clear();
                     for hit in &results {
-                        let surface = if hit.is_output { "out" } else { "cmd" };
-                        // A hit whose record has no location and no retained
-                        // output says so before the user activates it.
-                        let unreachable = if jumpable.contains(&(hit.block_id, hit.is_output)) {
-                            ""
-                        } else {
-                            " — location unavailable"
-                        };
-                        let subtitle = format!(
-                            "{surface} L{}: {}{unreachable}",
-                            hit.line_no,
-                            gtk::glib::markup_escape_text(&hit.line_text)
+                        append_hit_row(
+                            &list_box,
+                            &view,
+                            hit,
+                            &jumpable,
+                            &row_bookmark_buttons,
+                            &status_label,
+                            &filter_entry,
+                            &bookmark_changed,
+                            &bookmarked_filter,
                         );
-                        let title = gtk::glib::markup_escape_text(&hit.cmd_preview);
-                        let row = adw::ActionRow::builder()
-                            .title(title.as_str())
-                            .subtitle(&subtitle)
-                            .activatable(true)
-                            .build();
-                        let bookmark_button = gtk::ToggleButton::builder()
-                            .icon_name("user-bookmarks-symbolic")
-                            .valign(gtk::Align::Center)
-                            .build();
-                        bookmark_button.add_css_class("flat");
-                        sync_bookmark_button(
-                            &bookmark_button,
-                            view.is_record_bookmarked(hit.block_id),
-                        );
-                        let record_id = hit.block_id;
-                        let view_for_bookmark = view.clone();
-                        let buttons_for_bookmark = row_bookmark_buttons.clone();
-                        let status_for_bookmark = status_label.clone();
-                        let entry_for_bookmark = filter_entry.clone();
-                        let bookmark_changed = bookmark_changed.clone();
-                        let bookmarked_filter = bookmarked_filter.clone();
-                        bookmark_button.connect_clicked(move |button| {
-                            let requested = button.is_active();
-                            let authoritative = match view_for_bookmark
-                                .set_record_bookmarked(record_id, requested)
-                            {
-                                Some(authoritative) => {
-                                    for (id, sibling) in buttons_for_bookmark.borrow().iter() {
-                                        if *id == record_id {
-                                            sync_bookmark_button(sibling, authoritative);
-                                        }
-                                    }
-                                    Some(authoritative)
-                                }
-                                None => {
-                                    sync_bookmark_button(button, false);
-                                    set_announced_status(
-                                        &status_for_bookmark,
-                                        "That block is no longer retained.",
-                                    );
-                                    None
-                                }
-                            };
-                            if let Some(authoritative) = authoritative {
-                                let callback =
-                                    bookmark_changed.borrow().as_ref().and_then(Weak::upgrade);
-                                if let Some(callback) = callback {
-                                    callback(authoritative, bookmarked_filter.is_active());
-                                }
-                            }
-                            entry_for_bookmark.grab_focus();
-                        });
-                        row.add_suffix(&bookmark_button);
-                        row_bookmark_buttons
-                            .borrow_mut()
-                            .push((record_id, bookmark_button));
-                        // Outcome at a glance: telling the failing `cargo build`
-                        // from the passing ones should not require visiting each.
-                        if let Some(outcome) = hit_outcome_label(hit) {
-                            let label = gtk::Label::new(Some(&outcome));
-                            label.add_css_class(hit_outcome_class(hit.exit_code));
-                            label.set_valign(gtk::Align::Center);
-                            row.add_suffix(&label);
-                        }
-                        list_box.append(&row);
                     }
                     let selected = refresh_selection_index(&results, retained_hit.as_ref());
                     *hits.borrow_mut() = results;
                     list_box.select_row(list_box.row_at_index(selected as i32).as_ref());
+
+                    if let Some(initial_resume) = resume {
+                        let cursor = Rc::new(RefCell::new(Some(initial_resume)));
+                        let view = view.clone();
+                        let list_box = list_box.clone();
+                        let hits = hits.clone();
+                        let scan_incomplete = scan_incomplete.clone();
+                        let status_label = status_label.clone();
+                        let search_generation = search_generation.clone();
+                        let pending_scan_continue = pending_scan_continue.clone();
+                        let row_bookmark_buttons = row_bookmark_buttons.clone();
+                        let filter_entry = filter_entry.clone();
+                        let bookmark_changed = bookmark_changed.clone();
+                        let bookmarked_filter = bookmarked_filter.clone();
+                        let query = query.clone();
+                        let pending_scan_continue_idle = pending_scan_continue.clone();
+                        let source = gtk::glib::idle_add_local(move || {
+                            if !crate::block_view::cross_block_search_continue_is_current(
+                                generation,
+                                search_generation.get(),
+                                cursor.borrow().is_some(),
+                            ) {
+                                pending_scan_continue_idle.borrow_mut().take();
+                                return gtk::glib::ControlFlow::Break;
+                            }
+                            let Some(resume) = cursor.borrow().clone() else {
+                                pending_scan_continue_idle.borrow_mut().take();
+                                return gtk::glib::ControlFlow::Break;
+                            };
+                            let already = hits.borrow().len();
+                            if already >= CROSS_BLOCK_SEARCH_LIMIT {
+                                scan_incomplete.set(false);
+                                status_label.set_text(&search_status(
+                                    already,
+                                    list_box.selected_row().map(|row| row.index() as usize),
+                                    false,
+                                ));
+                                pending_scan_continue_idle.borrow_mut().take();
+                                return gtk::glib::ControlFlow::Break;
+                            }
+                            let remaining = CROSS_BLOCK_SEARCH_LIMIT - already;
+                            match view.cross_block_search_in_scope_from(
+                                &query,
+                                options,
+                                scope,
+                                remaining,
+                                &filters,
+                                Some(&resume),
+                            ) {
+                                Ok(more) => {
+                                    let jumpable = view.jumpable_search_hits(&more.hits);
+                                    for hit in more.hits.iter() {
+                                        append_hit_row(
+                                            &list_box,
+                                            &view,
+                                            hit,
+                                            &jumpable,
+                                            &row_bookmark_buttons,
+                                            &status_label,
+                                            &filter_entry,
+                                            &bookmark_changed,
+                                            &bookmarked_filter,
+                                        );
+                                    }
+                                    hits.borrow_mut().extend(more.hits.iter().cloned());
+                                    let total = hits.borrow().len();
+                                    scan_incomplete.set(more.scan_incomplete);
+                                    status_label.set_text(&search_status(
+                                        total,
+                                        list_box
+                                            .selected_row()
+                                            .map(|row| row.index() as usize),
+                                        more.scan_incomplete,
+                                    ));
+                                    *cursor.borrow_mut() = more.resume;
+                                    if cursor.borrow().is_some() {
+                                        gtk::glib::ControlFlow::Continue
+                                    } else {
+                                        pending_scan_continue_idle.borrow_mut().take();
+                                        gtk::glib::ControlFlow::Break
+                                    }
+                                }
+                                Err(_) => {
+                                    pending_scan_continue_idle.borrow_mut().take();
+                                    gtk::glib::ControlFlow::Break
+                                }
+                            }
+                        });
+                        *pending_scan_continue.borrow_mut() = Some(source);
+                    }
                 }
                 Err(error) => {
                     hits.borrow_mut().clear();
-                    row_bookmark_buttons.borrow_mut().clear();
+                    scan_incomplete.set(false);
                     status_label.set_text(&format!("Bad regex: {error}"));
                 }
             }
@@ -886,10 +1023,12 @@ pub(super) fn toggle(
 
     let schedule_rebuild = {
         let pending_rebuild = pending_rebuild.clone();
+        let pending_scan_continue = pending_scan_continue.clone();
         let pending_refresh_tick = pending_refresh_tick.clone();
         let search_generation = search_generation.clone();
         let rebuild = rebuild.clone();
         let hits = hits.clone();
+        let scan_incomplete = scan_incomplete.clone();
         let row_bookmark_buttons = row_bookmark_buttons.clone();
         let list_box = list_box.clone();
         let status_label = status_label.clone();
@@ -904,6 +1043,9 @@ pub(super) fn toggle(
             let generation = search_generation.get().wrapping_add(1);
             search_generation.set(generation);
             if let Some(source) = pending_rebuild.borrow_mut().take() {
+                source.remove();
+            }
+            if let Some(source) = pending_scan_continue.borrow_mut().take() {
                 source.remove();
             }
 
@@ -930,6 +1072,7 @@ pub(super) fn toggle(
                 }
                 hits.borrow_mut().clear();
                 row_bookmark_buttons.borrow_mut().clear();
+                scan_incomplete.set(false);
                 status_label.set_text(idle_status());
                 return;
             }
@@ -939,6 +1082,7 @@ pub(super) fn toggle(
                 }
                 hits.borrow_mut().clear();
                 row_bookmark_buttons.borrow_mut().clear();
+                scan_incomplete.set(false);
                 status_label.set_text(message);
                 return;
             }
@@ -1090,6 +1234,7 @@ pub(super) fn toggle(
         let view = view.clone();
         let observed_version = observed_version.clone();
         let pending_rebuild = pending_rebuild.clone();
+        let pending_scan_continue = pending_scan_continue.clone();
         let pending_refresh_tick = pending_refresh_tick.clone();
         let search_generation = search_generation.clone();
         let retained_hit = retained_hit.clone();
@@ -1110,6 +1255,9 @@ pub(super) fn toggle(
             let generation = search_generation.get().wrapping_add(1);
             search_generation.set(generation);
             if let Some(source) = pending_rebuild.borrow_mut().take() {
+                source.remove();
+            }
+            if let Some(source) = pending_scan_continue.borrow_mut().take() {
                 source.remove();
             }
             *retained_hit.borrow_mut() = list_box.selected_row().and_then(|row| {
@@ -1424,6 +1572,7 @@ pub(super) fn toggle(
     {
         let dialog_slot = dialog_slot.clone();
         let pending_rebuild = pending_rebuild.clone();
+        let pending_scan_continue = pending_scan_continue.clone();
         let pending_refresh_tick = pending_refresh_tick.clone();
         let refresh_source = refresh_source.clone();
         let search_generation = search_generation.clone();
@@ -1447,6 +1596,9 @@ pub(super) fn toggle(
                 source.remove();
             }
             if let Some(source) = pending_rebuild.borrow_mut().take() {
+                source.remove();
+            }
+            if let Some(source) = pending_scan_continue.borrow_mut().take() {
                 source.remove();
             }
             *memory_slot.borrow_mut() = memory(
@@ -1969,12 +2121,13 @@ mod tests {
     fn search_status_and_navigation_report_position_and_stay_bounded() {
         use SelectionMove as Move;
 
-        assert_eq!(search_status(0, None), "No matches.");
-        assert_eq!(search_status(1, Some(0)), "1 of 1 match");
+        assert_eq!(search_status(0, None, false), "No matches.");
+        assert_eq!(search_status(1, Some(0), false), "1 of 1 match");
         assert_eq!(
-            search_status(CROSS_BLOCK_SEARCH_LIMIT, Some(36)),
+            search_status(CROSS_BLOCK_SEARCH_LIMIT, Some(36), false),
             "37 of 500 matches (capped) — refine your query."
         );
+        assert!(search_status(3, None, true).contains("scan budget reached"));
         assert_eq!(selection_index(None, 0, Move::Next), None);
         assert_eq!(selection_index(None, 37, Move::Previous), Some(36));
         assert_eq!(selection_index(Some(36), 37, Move::Next), Some(0));
