@@ -267,6 +267,14 @@ mod tests {
             "Save Block\u{fe0f}history",
             "Save Block\u{17b4}history",
             "Save Block\u{17b5}history",
+            // Mongolian FVS / mid-string ZWNBSP / interlinear annotation
+            // anchors stay toast-only beside the Ogham/MVS wave.
+            "Save Block\u{180b}history",
+            "Save Block\u{180c}history",
+            "Save Block\u{180d}history",
+            "Save Block\u{feff}history",
+            "\u{fff9}Save Block history\u{fffb}",
+            "Save\u{fffa} Block history",
             "Block history",
         ] {
             assert_eq!(
@@ -357,6 +365,29 @@ mod tests {
                 && retry.contains("retry_history_persistence()")
                 && retry.contains("show_block_history_failure"),
             "optimistic hide must re-show on sync refusal"
+        );
+    }
+
+    /// Sticky Retry must walk every Block TermView even after a synchronous
+    /// refusal — one pane's Err re-shows the bar but must not `break` /
+    /// `return` before later panes also get `retry_history_persistence`.
+    #[test]
+    fn retry_block_history_continues_after_sync_refusal() {
+        let source = include_str!("workspace_ops.rs");
+        let retry = source
+            .split("pub(crate) fn retry_block_history(&self) {")
+            .nth(1)
+            .expect("retry_block_history")
+            .split("\n    pub(crate) fn persist_config")
+            .next()
+            .expect("retry closes before persist_config");
+        assert!(
+            !retry.contains("break;") && !retry.contains("return;"),
+            "sync refusal must not short-circuit the pane walk"
+        );
+        assert!(
+            retry.contains("for tab in") && retry.contains("for pane in"),
+            "Retry must walk every tab/pane TermView"
         );
     }
 }
