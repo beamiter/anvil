@@ -284,4 +284,25 @@ mod tests {
         assert_eq!(drained[0].error, "second");
         assert!(drain_sync_block_history_failures().is_empty());
     }
+
+    /// Sticky Retry hides the bar optimistically; a synchronous
+    /// `retry_history_persistence` Err must raise it again immediately so an
+    /// empty bar never implies the retry was accepted.
+    #[test]
+    fn retry_block_history_reopens_bar_on_sync_refusal() {
+        let source = include_str!("workspace_ops.rs");
+        let retry = source
+            .split("pub(crate) fn retry_block_history(&self) {")
+            .nth(1)
+            .expect("retry_block_history")
+            .split("\n    pub(crate) fn persist_config")
+            .next()
+            .expect("retry closes before persist_config");
+        assert!(
+            retry.contains("set_visible(false)")
+                && retry.contains("retry_history_persistence()")
+                && retry.contains("show_block_history_failure"),
+            "optimistic hide must re-show on sync refusal"
+        );
+    }
 }
