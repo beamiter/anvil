@@ -257,6 +257,16 @@ mod tests {
             "Save Block\u{2800}history",
             "Save Block\u{206a}history",
             "Save Block\u{206f}history",
+            // Ogham space / Mongolian vowel separator / CGJ / variation
+            // selectors / Khmer inherents stay toast-only beside Hangul.
+            "Save Block\u{1680}history",
+            "Save Block\u{180e}history",
+            "Save Block\u{034f}history",
+            "Save Block\u{fe00}history",
+            "Save Block\u{fe0e}history",
+            "Save Block\u{fe0f}history",
+            "Save Block\u{17b4}history",
+            "Save Block\u{17b5}history",
             "Block history",
         ] {
             assert_eq!(
