@@ -221,6 +221,9 @@ evolve pass.
 62. **Organism UnknownOutcome success/sit overwrite UI contract** — Full motion
     mirrors UnknownOutcome→Celebrate{,Big} and UnknownOutcome→SitNearError once
     core recognizes those bridges (pending push/repin). Calm/Static still snap.
+63. **Organism WatchAgent/WatchSettled→RestAfterPush UI contract** — Full motion
+    mirrors WatchAgent→RestAfterPush and WatchSettled→RestAfterPush once core
+    recognizes those bridges (pending push/repin). Calm/Static still snap.
 
 Verification: `bash scripts/test-install-paths.sh`, `bash -n
 scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
