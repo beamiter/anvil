@@ -897,4 +897,6 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      UnknownOutcome→GuardStuck; Calm/Static snap + semantic_bridges
      membership sync. Unknown→GuardCautious already synced in round 198.
      Pairs forge 254 / core `UnknownOutcomeToGuardStuck` inside between() 93.
-
+203. **Find 1803/full-stop-query QueryMismatch + stale** —
+     U+1803-only queries stay QueryMismatch under Command/Output/All when stale
+     ids remain (1802/comma already pinned). Pairs forge 255.
