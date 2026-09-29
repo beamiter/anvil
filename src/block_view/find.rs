@@ -4322,4 +4322,161 @@ mod tests {
         assert!(!cross_block_search_continue_is_current(7, 8, true));
         assert!(!cross_block_search_continue_is_current(7, 7, false));
     }
+
+    #[test]
+    fn pattern_search_mid_record_resume_keeps_occurrence_and_skips_filter_gate() {
+        // One multi-line command: a tight budget stops mid-command with a
+        // mid-record cursor; the next slice must resume at that line and keep
+        // the occurrence counter aligned for VTE jump stepping.
+        let block = BlockData {
+            id: 1,
+            prompt: String::new(),
+            cmd: "needle-a\nnoise\nneedle-b".to_string(),
+            cmd_markup: None,
+            output: String::new(),
+            exit_code: Some(1),
+            lifecycle_schema: crate::block_view::blocks::BLOCK_LIFECYCLE_SCHEMA,
+            completion_provenance: super::super::CompletionProvenance::ShellReported.into(),
+            start_mark_seen: true,
+            estimated_height: 1,
+            line_count: 3,
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: None,
+            cwd: None,
+            cols: 80,
+            command_exact: false,
+            command_truncated: false,
+            output_head_dropped: false,
+        };
+        let backend = [BackendRecordRef::Block(&block)];
+        let re = regex::Regex::new("needle").unwrap();
+        let options = CrossBlockSearchOptions::default();
+        let mut first_budget = FindScanBudget {
+            remaining_bytes: "needle-a".len(),
+            started: Instant::now(),
+            time_limit: Duration::from_secs(5),
+        };
+        let (first_hits, first_resume) = pattern_search_hits_with_budget(
+            backend.iter().copied(),
+            &re,
+            options,
+            CrossBlockSearchScope::Command,
+            8,
+            &BlockFilters::default(),
+            &HashSet::new(),
+            &mut first_budget,
+            None,
+        );
+        assert_eq!(first_hits.len(), 1);
+        assert_eq!(first_hits[0].line_no, 1);
+        assert_eq!(first_hits[0].occurrence, 0);
+        let resume = first_resume.expect("budget must stop mid-record");
+        assert_eq!(resume.record_index, 0);
+        let mid = resume.mid.as_ref().expect("mid-command stop sets mid");
+        assert!(!mid.on_output);
+        assert_eq!(mid.next_line, 1);
+        assert_eq!(mid.occurrence, 1, "one match already counted on line 1");
+
+        // bookmarked_only with empty bookmarks would exclude this record on a
+        // fresh start; mid-record resume must skip that gate.
+        let filters = BlockFilters {
+            bookmarked_only: true,
+            ..BlockFilters::default()
+        };
+        let mut second_budget = FindScanBudget {
+            remaining_bytes: 1024,
+            started: Instant::now(),
+            time_limit: Duration::from_secs(5),
+        };
+        let (rest_hits, rest_resume) = pattern_search_hits_with_budget(
+            backend.iter().copied(),
+            &re,
+            options,
+            CrossBlockSearchScope::Command,
+            8,
+            &filters,
+            &HashSet::new(),
+            &mut second_budget,
+            Some(&resume),
+        );
+        assert!(rest_resume.is_none());
+        assert_eq!(rest_hits.len(), 1, "mid-resume skips filter gate");
+        assert_eq!(rest_hits[0].line_no, 3);
+        assert_eq!(rest_hits[0].occurrence, 1);
+    }
+
+    #[test]
+    fn pattern_search_mid_record_resume_continues_on_output_surface() {
+        let block = BlockData {
+            id: 9,
+            prompt: String::new(),
+            cmd: "echo".to_string(),
+            cmd_markup: None,
+            output: "out-a\nneedle-out\nout-b".to_string(),
+            exit_code: Some(0),
+            lifecycle_schema: crate::block_view::blocks::BLOCK_LIFECYCLE_SCHEMA,
+            completion_provenance: super::super::CompletionProvenance::ShellReported.into(),
+            start_mark_seen: true,
+            estimated_height: 1,
+            line_count: 3,
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: None,
+            cwd: None,
+            cols: 80,
+            command_exact: false,
+            command_truncated: false,
+            output_head_dropped: false,
+        };
+        let backend = [BackendRecordRef::Block(&block)];
+        let re = regex::Regex::new("needle").unwrap();
+        let options = CrossBlockSearchOptions::default();
+        // Spend the whole command surface, then stop before the output needle.
+        let mut first_budget = FindScanBudget {
+            remaining_bytes: "echo".len() + "out-a".len(),
+            started: Instant::now(),
+            time_limit: Duration::from_secs(5),
+        };
+        let (first_hits, first_resume) = pattern_search_hits_with_budget(
+            backend.iter().copied(),
+            &re,
+            options,
+            CrossBlockSearchScope::All,
+            8,
+            &BlockFilters::default(),
+            &HashSet::new(),
+            &mut first_budget,
+            None,
+        );
+        assert!(first_hits.is_empty());
+        let resume = first_resume.expect("budget stops on output surface");
+        assert_eq!(resume.record_index, 0);
+        let mid = resume.mid.as_ref().expect("output mid cursor");
+        assert!(mid.on_output);
+        assert_eq!(mid.next_line, 1);
+        assert_eq!(mid.occurrence, 0);
+
+        let mut second_budget = FindScanBudget {
+            remaining_bytes: 1024,
+            started: Instant::now(),
+            time_limit: Duration::from_secs(5),
+        };
+        let (rest_hits, rest_resume) = pattern_search_hits_with_budget(
+            backend.iter().copied(),
+            &re,
+            options,
+            CrossBlockSearchScope::All,
+            8,
+            &BlockFilters::default(),
+            &HashSet::new(),
+            &mut second_budget,
+            Some(&resume),
+        );
+        assert!(rest_resume.is_none());
+        assert_eq!(rest_hits.len(), 1);
+        assert!(rest_hits[0].is_output);
+        assert_eq!(rest_hits[0].line_no, 2);
+        assert_eq!(rest_hits[0].occurrence, 0);
+    }
 }
