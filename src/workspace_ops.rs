@@ -1182,13 +1182,33 @@ impl AppModel {
     /// by target until they are drained or a later save succeeds; the UI adds
     /// a short per-operation cooldown so a continuously failing mount does not
     /// make the application unusable with repeated notifications.
+    ///
+    /// Block-history failures are fail-closed: they raise the sticky bar under
+    /// the top bar instead of a toast. Sync GTK-thread saves park into
+    /// `history_notice` (they never reach the worker queue); drain both here.
     pub(crate) fn report_persistence_failures(&mut self) {
-        let failures = crate::persistence::drain_failures();
+        let mut failures = crate::persistence::drain_failures();
+        failures.extend(crate::history_notice::drain_sync_block_history_failures());
         if failures.is_empty() {
             return;
         }
+
+        let mut toast_failures = Vec::new();
+        for failure in failures {
+            match crate::history_notice::persistence_failure_surface(&failure.operation) {
+                crate::history_notice::PersistenceFailureSurface::BlockHistoryBar => {
+                    self.show_block_history_failure(&failure.error);
+                }
+                crate::history_notice::PersistenceFailureSurface::Toast => {
+                    toast_failures.push(failure);
+                }
+            }
+        }
+        if toast_failures.is_empty() {
+            return;
+        }
         let Some(message) = persistence_failure_notice(
-            failures,
+            toast_failures,
             &mut self.persistence_failure_notices,
             std::time::Instant::now(),
         ) else {
@@ -1196,6 +1216,31 @@ impl AppModel {
         };
         let message = crate::review_input::safe_inline_display(&message, 1024);
         self.show_toast(message);
+    }
+
+    /// Raise the sticky Block-history failure bar (newest reason wins).
+    pub(crate) fn show_block_history_failure(&self, reason: &str) {
+        crate::history_notice::reveal_block_history_failure(
+            &self.block_history_notice,
+            &self.block_history_notice_label,
+            reason,
+        );
+    }
+
+    /// Answer the sticky bar: ask every Block `TermView` to retry. Hide
+    /// optimistically; a synchronous refusal raises the bar again.
+    pub(crate) fn retry_block_history(&self) {
+        self.block_history_notice.set_visible(false);
+        for tab in &self.tabs {
+            for pane in &tab.panes {
+                let Some(view) = pane.terminal.term_view() else {
+                    continue;
+                };
+                if let Err(error) = view.retry_history_persistence() {
+                    self.show_block_history_failure(&error.to_string());
+                }
+            }
+        }
     }
 
     pub(crate) fn persist_config(&self) {
