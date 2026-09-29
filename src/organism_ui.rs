@@ -3917,13 +3917,24 @@ mod tests {
             (Behavior::Celebrate, Behavior::GuardStuck),
             (Behavior::Celebrate, Behavior::RestAfterPush),
             (Behavior::Celebrate, Behavior::Idle),
+            (Behavior::Celebrate, Behavior::InspectError),
+            (Behavior::Celebrate, Behavior::SitNearError),
+            (Behavior::Celebrate, Behavior::UnknownOutcome),
             (Behavior::CelebrateBig, Behavior::GuardRecovery),
             (Behavior::CelebrateBig, Behavior::GuardCautious),
             (Behavior::CelebrateBig, Behavior::GuardFailure),
             (Behavior::CelebrateBig, Behavior::GuardStuck),
             (Behavior::CelebrateBig, Behavior::RestAfterPush),
             (Behavior::CelebrateBig, Behavior::Idle),
+            (Behavior::CelebrateBig, Behavior::InspectError),
+            (Behavior::CelebrateBig, Behavior::SitNearError),
+            (Behavior::CelebrateBig, Behavior::UnknownOutcome),
             (Behavior::RestAfterPush, Behavior::Idle),
+            (Behavior::RestAfterPush, Behavior::InspectError),
+            (Behavior::RestAfterPush, Behavior::SitNearError),
+            (Behavior::RestAfterPush, Behavior::UnknownOutcome),
+            (Behavior::RestAfterPush, Behavior::Celebrate),
+            (Behavior::RestAfterPush, Behavior::CelebrateBig),
             (Behavior::WatchSettled, Behavior::Celebrate),
             (Behavior::WatchSettled, Behavior::CelebrateBig),
             (Behavior::WatchSettled, Behavior::InspectError),
@@ -3966,6 +3977,9 @@ mod tests {
             (Behavior::GuardRecovery, Behavior::GuardCautious),
             (Behavior::GuardRecovery, Behavior::RestAfterPush),
             (Behavior::GuardRecovery, Behavior::Idle),
+            (Behavior::GuardRecovery, Behavior::InspectError),
+            (Behavior::GuardRecovery, Behavior::SitNearError),
+            (Behavior::GuardRecovery, Behavior::UnknownOutcome),
             (Behavior::GuardCautious, Behavior::GuardFailure),
             (Behavior::GuardCautious, Behavior::GuardStuck),
             (Behavior::GuardCautious, Behavior::GuardRecovery),
@@ -4116,6 +4130,21 @@ mod tests {
         }
         // Celebrate* never bridges to Watch* (new command mid-hold snaps).
         for from in [Behavior::Celebrate, Behavior::CelebrateBig] {
+            for to in [
+                Behavior::WatchCommand,
+                Behavior::WatchAgent,
+                Behavior::WatchSettled,
+            ] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?}"
+                );
+                assert_eq!(VisualTransition::between(from, to), None);
+            }
+        }
+        // Rest/GuardRecovery never bridge to Watch* (same new-command snap).
+        for from in [Behavior::RestAfterPush, Behavior::GuardRecovery] {
             for to in [
                 Behavior::WatchCommand,
                 Behavior::WatchAgent,
@@ -5859,5 +5888,31 @@ mod tests {
         assert!(idle_right.x > idle_left.x);
         assert_eq!(typing.x, idle_right.x);
         assert!(typing.y < idle_left.y);
+    }
+
+    #[test]
+    fn classify_command_peels_daemonize_setlock_and_s6_setuidgid() {
+        // Pane finish path uses classify_command on the raw argv; STAGE 67
+        // wrappers must not hide cargo/git from the work loop.
+        for command in [
+            "daemonize cargo test",
+            "daemonize -a -v cargo check",
+            "daemonize -c /tmp -u nobody cargo nextest run",
+            "setlock /tmp/x.lock cargo test",
+            "setlock -n /var/lock/x -- cargo check",
+            "s6-setuidgid nobody cargo test",
+            "s6-setuidgid -- nobody cargo check",
+            "daemonize setlock /tmp/x.lock s6-setuidgid nobody cargo test",
+        ] {
+            assert_eq!(
+                classify_command(command),
+                CommandKind::BuildOrTest,
+                "{command}"
+            );
+        }
+        assert_eq!(
+            classify_command("daemonize -p /run/x.pid setlock /tmp/x.lock rm -rf /"),
+            CommandKind::Other
+        );
     }
 }
