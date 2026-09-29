@@ -325,6 +325,8 @@ mod tests {
             "Save Block\u{1802}history",
             // Mongolian full stop stays toast-only beside comma (one edge).
             "Save Block\u{1803}history",
+            // Mongolian colon stays toast-only beside full stop (one edge).
+            "Save Block\u{1804}history",
             "Block history",
         ] {
             assert_eq!(
