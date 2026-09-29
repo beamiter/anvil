@@ -680,3 +680,16 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      motion pins Idle↔Sleep/Approach, Explore↔Approach, Approach↔Sleep
      intentional None beside the partial ambient table. Pairs forge 195 /
      core `ambient_disposition_exchanges_have_no_visual_transition`.
+
+155. **Sticky near-miss mid-range VS / Mongolian FVS4 labels** —
+     U+FE01 / U+FE0D / U+180F variants of "Save Block history" stay toast-only
+     beside rounds 152/146. Pairs forge 196.
+
+156. **Find ZWNJ/ZWJ/LRM/RLM/ALM-query QueryMismatch + stale** —
+     U+200C / U+200D / U+200E / U+200F / U+061C-only queries stay
+     QueryMismatch under Command/Output/All when stale ids remain (WJ/figure/
+     bidi already pinned). Pairs forge 198.
+
+157. **GlanceAside↔ambient Full-motion None completeness** — Full motion pins
+     GlanceAside↔Explore/Sleep/Approach intentional None beside the prior
+     GlanceAside overwrite table. Pairs forge 199 / between() 93.
