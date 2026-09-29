@@ -318,3 +318,7 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
     hit-generic `CrossBlockSearchReport<CrossBlockHit>` from path-patched
     core; `CrossBlockHit` stays local (exit_code / duration_ms / cwd). GTK
     idle stays here. Pairs forge round 112.
+77. **Guard*/Watch*/Celebrate*/Glance intentional None UI** — Full motion
+    pins WatchSettled→UnknownOutcome, Watch*→Guard*, Guard*→Celebrate*,
+    Celebrate*→Watch*, Idle/Rest→Guard*, and GlanceAside as source/target
+    (pairs forge round 113; core audit wave).
