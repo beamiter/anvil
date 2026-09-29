@@ -3938,6 +3938,9 @@ mod tests {
             (Behavior::RestAfterPush, Behavior::UnknownOutcome),
             (Behavior::RestAfterPush, Behavior::Celebrate),
             (Behavior::RestAfterPush, Behavior::CelebrateBig),
+            // WatchSettled finish arcs (6 Some) — pairs core
+            // `watch_settled_finish_arcs_cover_pass_fail_rest_and_idle`; counted
+            // inside between() 93 (no new Some after that pin).
             (Behavior::WatchSettled, Behavior::Celebrate),
             (Behavior::WatchSettled, Behavior::CelebrateBig),
             (Behavior::WatchSettled, Behavior::InspectError),
@@ -4483,6 +4486,65 @@ mod tests {
             VisualTransition::between(Behavior::WatchSettled, Behavior::UnknownOutcome),
             None
         );
+    }
+
+    /// Watch*→Guard* stays None under Full motion — finishes resolve to
+    /// Celebrate/Inspect/Sit/Rest (or Unknown snap), never skip into a repo
+    /// vigil. Pairs core `watch_poses_never_bridge_to_repo_vigil_guards`.
+    #[test]
+    fn watch_poses_never_bridge_to_repo_vigil_under_full_motion() {
+        for from in [
+            Behavior::WatchCommand,
+            Behavior::WatchAgent,
+            Behavior::WatchSettled,
+        ] {
+            for to in [
+                Behavior::GuardFailure,
+                Behavior::GuardStuck,
+                Behavior::GuardRecovery,
+                Behavior::GuardCautious,
+            ] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?}"
+                );
+                assert_eq!(
+                    VisualTransition::between(from, to),
+                    None,
+                    "core {from:?}→{to:?}"
+                );
+            }
+        }
+    }
+
+    /// Watch*→Explore/Sleep/Approach stays None under Full motion — ambient
+    /// utility arrives from mind rescoring, not from a Watch finish. Pairs
+    /// core `watch_poses_never_bridge_to_ambient_utility`. between() stays 93.
+    #[test]
+    fn watch_poses_never_bridge_to_ambient_under_full_motion() {
+        for from in [
+            Behavior::WatchCommand,
+            Behavior::WatchAgent,
+            Behavior::WatchSettled,
+        ] {
+            for to in [
+                Behavior::Explore,
+                Behavior::Sleep,
+                Behavior::Approach,
+            ] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?}"
+                );
+                assert_eq!(
+                    VisualTransition::between(from, to),
+                    None,
+                    "core {from:?}→{to:?}"
+                );
+            }
+        }
     }
 
     #[test]
