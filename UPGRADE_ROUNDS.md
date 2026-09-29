@@ -919,3 +919,17 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      U+1804-only queries stay QueryMismatch under Command/Output/All when stale
      ids remain (1803/full-stop already pinned). Pairs forge 260.
 
+208. **Sticky fullwidth colon label** —
+     U+FF1A variant of "Save Block history" stays toast-only beside Mongolian
+     four dots (round 204). Pairs forge 261.
+
+209. **CrossBlock cancel near-near-near-near-near-near-near-near-near-near-near-near-wrap bump** — palette idle
+     continuation drops MAX-12→MAX-11 generation bumps (with or without resume),
+     scheduled ahead MAX-11 vs MAX-12, and finished walks at MAX-12. Pairs forge
+     263 / core cancel edge.
+
+210. **UnknownOutcome→Idle Full-motion bridge** — Full motion animates
+     UnknownOutcome→Idle; Calm/Static snap + semantic_bridges membership sync.
+     Unknown→GuardFailure already synced in round 206. Pairs forge 264 / core
+     `UnknownOutcomeToIdle` inside between() 93.
+
