@@ -290,6 +290,11 @@ mod tests {
             "Save Block\u{fe01}history",
             "Save Block\u{fe0d}history",
             "Save Block\u{180f}history",
+            // Interior mid-range VS (FE02/FE0C) + Mongolian nirugu stay toast-only
+            // beside FE01/FE0D/FVS4 (FE00/FE0E/FE0F + FVS1–3 already pinned).
+            "Save Block\u{fe02}history",
+            "Save Block\u{fe0c}history",
+            "Save Block\u{180a}history",
             "Block history",
         ] {
             assert_eq!(
