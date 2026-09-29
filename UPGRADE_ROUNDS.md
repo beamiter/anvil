@@ -619,3 +619,31 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
 140. **Celebrate*→Watch* Full-motion None** — Full motion pins
      Celebrate{,Big}→WatchCommand/Agent/Settled intentional None. Pairs forge
      179 / core `celebrate_holds_never_bridge_to_watch_poses`.
+
+141. **Hold/rest→ambient Full-motion None** — Full motion pins Celebrate{,Big}/
+     Inspect/Sit/Unknown/Rest→Explore/Sleep/Approach intentional None. Pairs
+     forge 180 / core `hold_and_rest_poses_never_bridge_to_ambient_utility`.
+
+142. **Guard*→ambient Full-motion None** — Full motion pins
+     GuardFailure/Stuck/Recovery/Cautious→Explore/Sleep/Approach intentional
+     None. Pairs forge 181 / core `repo_vigil_guards_never_bridge_to_ambient_utility`.
+
+143. **Watch* mode-switch Full-motion None** — Full motion pins
+     WatchCommand↔WatchAgent↔WatchSettled intentional None (live SurfaceMode
+     remaps). Pairs forge 182 / core `watch_pose_mode_switches_have_no_visual_transition`.
+
+144. **CrossBlock cancel finished at wrap gen** — palette idle continuation
+     drops `MAX,MAX` finished walks (no resume) beside MAX→0 schedule bump.
+     Pairs forge 183 / core cancel edge.
+
+145. **Sticky Retry continues after sync refusal** — `retry_block_history`
+     re-shows on Err but does not break/return before later panes retry.
+     Pairs forge 184.
+
+146. **Sticky near-miss Mongolian FVS / mid ZWNBSP / interlinear labels** —
+     U+180B–U+180D / mid U+FEFF / U+FFF9–U+FFFB variants of "Save Block history"
+     stay toast-only beside rounds 137/133. Pairs forge 185.
+
+147. **Find Command/Output/All NBSP/ZWSP-query QueryMismatch + stale** —
+     NBSP / ZWSP-only queries stay QueryMismatch when stale ids remain (ASCII
+     whitespace already pinned). Pairs forge 186.
