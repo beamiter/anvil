@@ -218,6 +218,9 @@ evolve pass.
     mirrors UnknownOutcome→Idle and UnknownOutcome→InspectError once core
     recognizes those bridges (pending push/repin). GlanceAside stays live-only.
     Calm/Static still snap.
+62. **Organism UnknownOutcome success/sit overwrite UI contract** — Full motion
+    mirrors UnknownOutcome→Celebrate{,Big} and UnknownOutcome→SitNearError once
+    core recognizes those bridges (pending push/repin). Calm/Static still snap.
 
 Verification: `bash scripts/test-install-paths.sh`, `bash -n
 scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.

@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (upgrade round 61: UnknownOutcome settle/overwrite)
+Updated: 2026-09-29 (upgrade round 62: UnknownOutcome success/sit overwrites)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -12,16 +12,20 @@ captured, queued, written, and restored.
 
 ## Completed since the previous handoff
 
+- **Organism UnknownOutcome success/sit overwrite UI contract (upgrade round 62,
+  pending core push/repin)**: Full motion mirrors UnknownOutcome→Celebrate{,Big}
+  and UnknownOutcome→SitNearError once core recognizes those bridges.
+  Idle/Inspect overwrites already covered in round 61.
+
 - **Organism UnknownOutcome settle/overwrite UI contract (upgrade round 61,
   pending core push/repin)**: Full motion mirrors UnknownOutcome→Idle and
   UnknownOutcome→InspectError once core recognizes those bridges. GlanceAside
   stays live-only.
 
-- **Local core tip `7199b4c` still pending push/repin** (clarification): path
-  patches already see shared `cross_block_search` (`36675b0`) and
-  `output_notice` plus later organism/STAGE_PREFIXES/UnknownOutcome waves;
-  Cargo manifests stay on published `33093da` until a pusher publishes the tip
-  cohort.
+- **Local core tip still pending push/repin** (clarification): path patches
+  already see shared `cross_block_search` (`36675b0`) and `output_notice` plus
+  later organism/STAGE_PREFIXES/UnknownOutcome waves; Cargo manifests stay on
+  published `33093da` until a pusher publishes the tip cohort.
 
 - **Shared CrossBlockSearchCursor (upgrade round 60, pending core push/repin)**:
   resume cursor, mid-record point, generation-current predicate, and
