@@ -2307,7 +2307,9 @@ mod tests {
         utf8_prefix, vte_cross_block_pattern, BookmarkedEmptyReason, CrossBlockSearchOptions,
         CrossBlockSearchScope, FindCursor, FindDirection, FindScanBudget,
         FindSurface, NativeCursorAction, RecordNavigationResult, RecordSnapshotView,
-        RegexConsumption, VTE_SEARCH_FLAGS,
+        RegexConsumption, VTE_SEARCH_FLAGS, CROSS_BLOCK_SCAN_BYTE_LIMIT,
+        CROSS_BLOCK_SCAN_TIME_LIMIT, FIND_OVERLAY_SCAN_BYTE_LIMIT,
+        FIND_OVERLAY_SCAN_TIME_LIMIT,
     };
     use crate::block_view::{
         BackendRecordRef, BackendSearchWindow, BlockData, BlockFilters, CompletedCommandRecord,
@@ -2652,6 +2654,20 @@ mod tests {
         assert_eq!(utf8_prefix("ab界cd", 4), "ab");
         assert_eq!(utf8_prefix("ab界cd", 5), "ab界");
         assert_eq!(utf8_prefix("ab界cd", usize::MAX), "ab界cd");
+    }
+
+    #[test]
+    fn find_scan_budget_constructors_split_overlay_and_cross_block_caps() {
+        let overlay = FindScanBudget::new();
+        assert_eq!(overlay.remaining_bytes(), FIND_OVERLAY_SCAN_BYTE_LIMIT);
+        assert_eq!(overlay.time_limit, FIND_OVERLAY_SCAN_TIME_LIMIT);
+
+        let cross_block = FindScanBudget::for_cross_block();
+        assert_eq!(cross_block.remaining_bytes(), CROSS_BLOCK_SCAN_BYTE_LIMIT);
+        assert_eq!(cross_block.time_limit, CROSS_BLOCK_SCAN_TIME_LIMIT);
+
+        assert!(CROSS_BLOCK_SCAN_BYTE_LIMIT > FIND_OVERLAY_SCAN_BYTE_LIMIT);
+        assert!(CROSS_BLOCK_SCAN_TIME_LIMIT > FIND_OVERLAY_SCAN_TIME_LIMIT);
     }
 
     #[test]
