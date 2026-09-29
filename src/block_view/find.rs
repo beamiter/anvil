@@ -3638,6 +3638,43 @@ mod tests {
         );
     }
 
+    /// Bookmark ids that survived from a previous retention window but are
+    /// absent from the current records list are missing retained identity, not
+    /// a metadata or query miss.
+    #[test]
+    fn bookmarked_empty_reason_treats_stale_bookmark_ids_as_no_retained() {
+        let retained = CompletedCommandRecord {
+            id: 1,
+            cmd: "echo retained".to_string(),
+            exit_code: Some(0),
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: Some(20),
+            cwd: None,
+            is_background: false,
+            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            start_mark_seen: true,
+            command_source: crate::block_view::CommandTextSource::Screen,
+        };
+        let records = [BackendRecordRef::Metadata {
+            record: &retained,
+            snapshot: None,
+        }];
+        assert_eq!(
+            bookmarked_empty_reason(
+                records,
+                &HashSet::from([99]),
+                CrossBlockSearchScope::All,
+                &BlockFilters {
+                    bookmarked_only: true,
+                    ..Default::default()
+                },
+                "",
+            ),
+            Some(BookmarkedEmptyReason::NoRetainedBookmarks)
+        );
+    }
+
     #[test]
     fn background_filter_composes_before_cap_and_uses_only_real_scoped_text() {
         let record = |id, cmd: &str, duration_ms, is_background| CompletedCommandRecord {
