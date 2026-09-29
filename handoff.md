@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (1801 find beside rounds 192–194)
+
+## 2026-09-29 (sticky/find/organism edges — round 195)
+
+- 1801/ellipsis find QueryMismatch + stale beside rounds 192–194 sticky 1802 /
+  MAX-8 / Unknown→GuardRecovery. Unique round **195**. Pairs forge 245 /
+  core cancel. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-09-29 (sticky 1802 + MAX-8 cancel + Unknown→GuardRecovery)
 
 ## 2026-09-29 (sticky/find/organism edges — rounds 192–194)
