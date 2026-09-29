@@ -3997,6 +3997,22 @@ mod tests {
             93,
             "semantic_bridges list must match core visual_transition_between_recognizes_ninety_three_intentional_arcs"
         );
+        // Celebrate{,Big}→UnknownOutcome and RestAfterPush→UnknownOutcome stay
+        // inside between() 93 and this UI bridge list (no len bump).
+        for pair in [
+            (Behavior::Celebrate, Behavior::UnknownOutcome),
+            (Behavior::CelebrateBig, Behavior::UnknownOutcome),
+            (Behavior::RestAfterPush, Behavior::UnknownOutcome),
+        ] {
+            assert!(
+                semantic_bridges.contains(&pair),
+                "UI bridges must list {pair:?} beside core between() 93"
+            );
+            assert!(
+                VisualTransition::between(pair.0, pair.1).is_some(),
+                "core between() must keep {pair:?}"
+            );
+        }
         for &(from, to) in semantic_bridges {
             assert_eq!(
                 visual_transition_for_motion(OrganismMotion::Full, from, to),
@@ -4045,6 +4061,32 @@ mod tests {
                     motion,
                     Behavior::UnknownOutcome,
                     Behavior::GuardFailure,
+                ),
+                None
+            );
+            // Celebrate*/Rest→UnknownOutcome snaps under Calm/Static (Full
+            // animates; dedicated hold pins cover the same arcs).
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::Celebrate,
+                    Behavior::UnknownOutcome,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::CelebrateBig,
+                    Behavior::UnknownOutcome,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::RestAfterPush,
+                    Behavior::UnknownOutcome,
                 ),
                 None
             );
@@ -4965,6 +5007,36 @@ mod tests {
                 None,
                 "{motion:?} RestAfterPush→UnknownOutcome"
             );
+        }
+    }
+
+    /// SitNearError/InspectError→UnknownOutcome animates under Full motion
+    /// (unknown overwrite from a vigil/inspect hold) and snaps under Calm/Static.
+    /// Pairs core SitNear/Inspect→Unknown bridges inside between() 93 beside
+    /// Celebrate*/Rest→Unknown.
+    #[test]
+    fn sit_near_and_inspect_bridge_to_unknown_outcome_under_full_motion_only() {
+        for from in [Behavior::SitNearError, Behavior::InspectError] {
+            assert!(
+                visual_transition_for_motion(
+                    OrganismMotion::Full,
+                    from,
+                    Behavior::UnknownOutcome,
+                )
+                .is_some(),
+                "Full {from:?}→UnknownOutcome"
+            );
+            assert!(
+                VisualTransition::between(from, Behavior::UnknownOutcome).is_some(),
+                "core {from:?}→UnknownOutcome"
+            );
+            for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+                assert_eq!(
+                    visual_transition_for_motion(motion, from, Behavior::UnknownOutcome),
+                    None,
+                    "{motion:?} {from:?}→UnknownOutcome"
+                );
+            }
         }
     }
 
