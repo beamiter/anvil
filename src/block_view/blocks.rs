@@ -642,6 +642,12 @@ pub struct BlockFilters {
 pub(crate) const OUTPUT_HEAD_DROPPED_NOTICE: &str =
     jterm_core::output_notice::EARLIER_OUTPUT_NOT_RETAINED;
 
+/// Tooltip for [`OUTPUT_HEAD_DROPPED_NOTICE`], from the family contract.
+pub(crate) fn output_head_dropped_tooltip() -> &'static str {
+    jterm_core::output_notice::output_notice_tooltip(OUTPUT_HEAD_DROPPED_NOTICE)
+        .expect("OUTPUT_HEAD_DROPPED_NOTICE is a known family notice")
+}
+
 pub(crate) struct FinishedBlock {
     pub(crate) id: u64,
     /// Commandless output emitted while the shell prompt was idle.
@@ -1281,6 +1287,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn finished_output_notice_pins_shared_earlier_output_string_and_tooltip() {
+        assert_eq!(
+            OUTPUT_HEAD_DROPPED_NOTICE,
+            jterm_core::output_notice::EARLIER_OUTPUT_NOT_RETAINED
+        );
+        assert_eq!(
+            output_head_dropped_tooltip(),
+            jterm_core::output_notice::FinishedOutputNotice::EarlierNotRetained.tooltip()
+        );
+        assert_eq!(
+            jterm_core::output_notice::known_output_notice(OUTPUT_HEAD_DROPPED_NOTICE),
+            Some(OUTPUT_HEAD_DROPPED_NOTICE)
+        );
+        assert!(jterm_core::output_notice::known_output_notice("<b>forged</b>").is_none());
+    }
+
+    #[test]
     fn a_recycled_card_shell_drops_every_status_stripe() {
         for status in [
             BlockStatus::Background,
@@ -1580,6 +1603,10 @@ mod tests {
         block.set_output_head_dropped(true);
         assert!(block.output_notice.is_visible());
         assert_eq!(block.output_notice.text(), OUTPUT_HEAD_DROPPED_NOTICE);
+        assert_eq!(
+            block.output_notice.tooltip_text().as_deref(),
+            Some(output_head_dropped_tooltip())
+        );
 
         (block.toggle_collapsed)();
         assert!(!block.output_notice.is_visible(), "folds with the output");
@@ -4085,9 +4112,7 @@ impl FinishedBlock {
         output_notice.set_halign(gtk::Align::Start);
         output_notice.set_margin_start(18);
         output_notice.set_margin_end(8);
-        output_notice.set_tooltip_text(Some(
-            "This command wrote more than a block keeps; only its most recent output is shown",
-        ));
+        output_notice.set_tooltip_text(Some(output_head_dropped_tooltip()));
         output_notice.set_visible(false);
         content.append(&output_notice);
         let output_head_dropped = Rc::new(Cell::new(false));
