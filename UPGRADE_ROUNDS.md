@@ -786,3 +786,18 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      RestAfterPush→UnknownOutcome; Calm/Static snap. Pairs forge 224 / core
      `RestAfterPushToUnknownOutcome` beside Celebrate*→Unknown inside between()
      93.
+
+179. **Sticky deeper nesting mid-range VS / Mongolian Manchu full-stop labels** —
+     U+FE06 / U+FE08 / U+1809 variants of "Save Block history" stay toast-only
+     beside rounds 175/171. Pairs forge 225.
+
+180. **CrossBlock cancel near-near-near-near-near-wrap bump** — palette idle
+     continuation drops MAX-5→MAX-4 generation bumps (with or without resume),
+     scheduled ahead MAX-4 vs MAX-5, and finished walks at MAX-5. Pairs forge
+     227 / core cancel edge.
+
+181. **Celebrate/Rest→UnknownOutcome UI-bridge membership + Calm/Static snaps** —
+     semantic_bridges len 93 lists Celebrate{,Big}→UnknownOutcome and
+     RestAfterPush→UnknownOutcome beside core between() 93; Calm/Static snap in
+     the Full-motion bridge loop. Pairs forge 228.
+
