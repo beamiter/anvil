@@ -202,6 +202,10 @@ mod tests {
             "Save Block history\r",
             "Save\tBlock history",
             "Save Block\u{00a0}history",
+            // Invisible / format-control near-misses beside tab/CR/NBSP.
+            "Save Block\u{200b}history",
+            "\u{feff}Save Block history",
+            "Save Block history\u{000b}",
             "Block history",
         ] {
             assert_eq!(
