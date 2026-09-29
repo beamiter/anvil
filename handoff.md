@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (sticky near-miss whitespace + STAGE 70 docs present)
+
+## 2026-09-29 (sticky near-miss whitespace)
+
+- **Round 100**: tab / CR / NBSP near-miss `"Save Block history"` labels stay
+  toast-only beside round 95. STAGE 70 tip already ledgered at round 97
+  (pairs forge 130); no extra STAGE docs needed. Pairs forge 134 file-tree
+  leftover close. Core/jagent tips still **pending push/repin**.
+
 Updated: 2026-09-29 (Inspect→SitNear 91 + vigil→Watch None)
 
 ## 2026-09-29 (Inspect→SitNear 91 + vigil→Watch None)
