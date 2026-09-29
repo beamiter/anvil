@@ -750,3 +750,20 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      SitNear→Inspect and Celebrate↔CelebrateBig intentional None. Pairs forge
      214 / core `sit_near_and_celebrate_tier_overwrites_stay_none`.
 
+171. **Sticky inner mid-range VS / Mongolian syllable-boundary labels** —
+     U+FE04 / U+FE0A / U+1807 variants of "Save Block history" stay toast-only
+     beside rounds 165/161. Pairs forge 215.
+
+172. **Find FE03/Todo soft-hyphen-query QueryMismatch + stale** —
+     U+FE03 / U+FE0B / U+1806-only queries stay QueryMismatch under
+     Command/Output/All when stale ids remain (FVS/Khmer already pinned).
+     Pairs forge 217.
+
+173. **CrossBlock cancel near-near-near-wrap bump** — palette idle continuation
+     drops MAX-3→MAX-2 generation bumps (with or without resume), scheduled
+     ahead MAX-2 vs MAX-3, and finished walks at MAX-3. Pairs forge 218 /
+     core cancel edge.
+
+174. **Celebrate*→UnknownOutcome Full-motion bridges** — Full motion animates
+     Celebrate{,Big}→UnknownOutcome; Calm/Static snap. Pairs forge 219 / core
+     `CelebrateToUnknownOutcome` / `CelebrateBigToUnknownOutcome`.
