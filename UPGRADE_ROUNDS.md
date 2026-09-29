@@ -534,3 +534,20 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
 121. **Find All-scope NoRetainedTextInScope + stale** — whitespace-only command
      and output stay NoRetainedTextInScope under All scope when stale ids remain.
      Pairs forge 155.
+
+122. **Sticky near-miss ZWJ/RLM/FA/ideo/NEL labels** — U+200D / U+200F /
+     U+2061 / U+3000 / U+0085 variants of  stay toast-only
+     beside rounds 120/116. Pairs forge 156.
+
+123. **Find Command/Output-scope QueryMismatch + stale** — live bookmark whose
+     scoped text misses the query stays QueryMismatch under Command and Output
+     when stale ids remain (All-scope query miss already pinned). Pairs forge 157.
+
+124. **CrossBlock cancel ahead-without-resume + wrapping finished** — scheduled
+     generation ahead of live cancels even with an empty resume; wrapping
+     MAX→0 bump with a finished cursor cancels the same way. Pairs forge 158.
+
+125. **Core tip STAGE_PREFIXES openvt (len 71)** — path-patched local core
+     teaches kbd  VT launcher peels (/ meta) plus
+     timeout/nice nest classify; Inspect/Sit→Unknown  **93** already
+     ledgered. Manifests stay on published pins. Pairs forge 160.
