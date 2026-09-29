@@ -4937,6 +4937,37 @@ mod tests {
         }
     }
 
+    /// RestAfterPush→UnknownOutcome animates under Full motion (unknown
+    /// overwrite from a rest hold) and snaps under Calm/Static. Pairs core
+    /// `RestAfterPushToUnknownOutcome` inside between() 93 beside Celebrate*.
+    #[test]
+    fn rest_hold_bridges_to_unknown_outcome_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::RestAfterPush,
+                Behavior::UnknownOutcome,
+            )
+            .is_some(),
+            "Full RestAfterPush→UnknownOutcome"
+        );
+        assert!(
+            VisualTransition::between(Behavior::RestAfterPush, Behavior::UnknownOutcome).is_some(),
+            "core RestAfterPush→UnknownOutcome"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::RestAfterPush,
+                    Behavior::UnknownOutcome,
+                ),
+                None,
+                "{motion:?} RestAfterPush→UnknownOutcome"
+            );
+        }
+    }
+
     #[test]
     fn ambient_and_typing_surfaces_skip_visual_transition_arcs() {
         // Ambient utility poses (Explore/Sleep/Approach/Idle) display through
