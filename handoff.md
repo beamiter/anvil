@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (core tip STAGE_PREFIXES strace/scriptlive len 60)
+
+## 2026-09-29 (core tip STAGE_PREFIXES strace/scriptlive)
+
+- **STAGE_PREFIXES len 58→60** on path-patched local core tip (`2e867b8`) —
+  `strace` / `scriptlive` peel + `classify_command` see-through (jagent
+  `17a89b7`). Cargo manifests stay on published `33093da` (pending
+  push/repin). Upgrade round 74 (pairs forge 111).
+
 Updated: 2026-09-29 (organism WatchCommand→UnknownOutcome None pin)
 
 ## 2026-09-29 (organism WatchCommand→UnknownOutcome None)
