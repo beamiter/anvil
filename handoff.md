@@ -7,8 +7,8 @@ Updated: 2026-09-29 (sticky ZWJ + find query scopes + cancel deepen + STAGE 71 t
 - **Round 122**: sticky U+200D/U+200F/U+2061/U+3000/U+0085 near-miss labels stay toast-only.
 - **Round 123**: Find Command/Output-scope QueryMismatch with stale extras.
 - **Round 124**: CrossBlock continue cancel ahead-without-resume + wrapping finished.
-- **Round 125**: path-patched core tip STAGE 71 () + timeout/nice nest;
-  Inspect/Sit→Unknown  93 already ledgered at rounds 117–119.
+- **Round 125**: path-patched core tip STAGE 71 (`openvt`) + timeout/nice nest;
+  Inspect/Sit→Unknown `between()` 93 already ledgered at rounds 117–119.
   Core/jagent tips still **pending push/repin**.
 
 
