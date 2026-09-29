@@ -647,3 +647,22 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
 147. **Find Command/Output/All NBSP/ZWSP-query QueryMismatch + stale** —
      NBSP / ZWSP-only queries stay QueryMismatch when stale ids remain (ASCII
      whitespace already pinned). Pairs forge 186.
+
+148. **Idle/Rest→Guard* Full-motion None** — Full motion pins Idle/RestAfterPush→
+     GuardFailure/Stuck/Recovery/Cautious intentional None (shipped beside
+     hold/ambient pins). Pairs forge 188 / core
+     `idle_and_rest_never_bridge_to_repo_vigil_guards`.
+
+149. **Rest/Guard*→Watch* Full-motion None** — Full motion pins RestAfterPush/
+     Guard*→WatchCommand/Agent/Settled intentional None. Pairs forge 189 / core
+     `rest_and_repo_vigil_never_bridge_to_watch_poses`.
+
+150. **Inspect/Sit/Unknown→Watch* Full-motion None** — Full motion pins
+     InspectError/SitNearError/UnknownOutcome→Watch* intentional None. Pairs
+     forge 190 / core `error_and_unknown_holds_never_bridge_to_watch_poses`.
+
+151. **GuardFailure/Stuck/Cautious→holds Full-motion None** — Full motion pins
+     those vigil poses→Inspect/Sit/Unknown intentional None (Recovery alone
+     animates). Pairs forge 191 / core
+     `failure_stuck_cautious_never_bridge_to_error_or_unknown_holds`.
+
