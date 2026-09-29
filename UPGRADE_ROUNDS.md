@@ -425,3 +425,17 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
 94. **Error/unknown→Watch* None UI** — Full motion pins Inspect/SitNear/
     Unknown→Watch* as None beside Celebrate*/Rest/Recovery→Watch*. Pairs forge
     round 128; core `error_and_unknown_holds_never_bridge_to_watch_poses`.
+
+95. **Sticky near-miss operation labels** — padded / cased / truncated
+    `"Save Block history"` strings stay on the toast surface; only the exact
+    worker label raises the sticky bar. Pin
+    `near_miss_operation_labels_stay_on_the_toast_surface`.
+
+96. **Find mixed stale+live bookmark empty-reason** — stale ids beside a live
+    bookmark do not collapse to `NoRetainedBookmarks`; empty query stays a
+    browser and a live query miss stays `QueryMismatch`. Pairs forge round 129.
+
+97. **Core tip STAGE_PREFIXES uclampset/gamemoderun (len 70)** — path-patched
+    local core teaches util-linux util clamp + GameMode env launcher peels;
+    GuardFailure/Stuck/Cautious→Celebrate* None survey pin; `between()` stays
+    90. Manifests stay on published pins. Pairs forge round 130.
