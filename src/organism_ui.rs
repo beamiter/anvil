@@ -4039,6 +4039,20 @@ mod tests {
             VisualTransition::between(Behavior::WatchAgent, Behavior::UnknownOutcome),
             None
         );
+        // WatchCommand→UnknownOutcome stays None: missing exit status snaps
+        // (no bridge frames), beside the WatchAgent None pin.
+        assert_eq!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchCommand,
+                Behavior::UnknownOutcome,
+            ),
+            None
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::WatchCommand, Behavior::UnknownOutcome),
+            None
+        );
     }
 
     #[test]
