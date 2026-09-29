@@ -3737,6 +3737,63 @@ mod tests {
         );
     }
 
+    /// Whitespace-only query under Command/Output with stale extras beside a
+    /// live scoped bookmark is still a miss (`QueryMismatch`) — `is_empty` is
+    /// false for `" \t "`, so this must not collapse to the empty-query browser
+    /// (`None`) or to NoRetainedBookmarks.
+    #[test]
+    fn bookmarked_empty_reason_keeps_whitespace_query_mismatch_under_command_and_output_with_stale()
+    {
+        let retained = CompletedCommandRecord {
+            id: 1,
+            cmd: "echo retained".to_string(),
+            exit_code: Some(0),
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: Some(20),
+            cwd: None,
+            is_background: false,
+            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            start_mark_seen: true,
+            command_source: crate::block_view::CommandTextSource::Screen,
+        };
+        let retained_output = ZoneOutputSnapshot {
+            plain: "noise line\n".to_string(),
+            truncated: false,
+        };
+        let records = [BackendRecordRef::Metadata {
+            record: &retained,
+            snapshot: Some(&retained_output),
+        }];
+        let ids = HashSet::from([1, 99, 100]);
+        let filters = BlockFilters {
+            bookmarked_only: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            bookmarked_empty_reason(
+                records,
+                &ids,
+                CrossBlockSearchScope::Command,
+                &filters,
+                " \t ",
+            ),
+            Some(BookmarkedEmptyReason::QueryMismatch),
+            "whitespace-only Command-scope query must stay a mismatch beside stale"
+        );
+        assert_eq!(
+            bookmarked_empty_reason(
+                records,
+                &ids,
+                CrossBlockSearchScope::Output,
+                &filters,
+                " \t ",
+            ),
+            Some(BookmarkedEmptyReason::QueryMismatch),
+            "whitespace-only Output-scope query must stay a mismatch beside stale"
+        );
+    }
+
     /// Bookmark ids that survived from a previous retention window but are
     /// absent from the current records list are missing retained identity, not
     /// a metadata or query miss.
