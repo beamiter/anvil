@@ -237,6 +237,17 @@ mod tests {
             "Save Block\u{200a}history",
             "Save\u{061c} Block history",
             "\u{2066}Save Block history\u{2069}",
+            // En/em/three/four/six-per-em spaces + RLI/FSI stay toast-only
+            // beside the punct/thin/hair/ALM wave (figure space already pinned).
+            "Save Block\u{2000}history",
+            "Save Block\u{2001}history",
+            "Save Block\u{2002}history",
+            "Save Block\u{2003}history",
+            "Save Block\u{2004}history",
+            "Save Block\u{2005}history",
+            "Save Block\u{2006}history",
+            "\u{2067}Save Block history\u{2069}",
+            "\u{2068}Save Block history\u{2069}",
             "Block history",
         ] {
             assert_eq!(
