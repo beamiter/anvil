@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (upgrade round 55: resumable cross-block search idle)
+Updated: 2026-09-29 (upgrade round 56: failure-push + error-hold success bridges)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,11 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **Organism failure-push + error-hold success UI contract (upgrade round 56,
+  pending core push/repin)**: Full motion mirrors
+  GuardFailure/Stuck→RestAfterPush and Inspect/SitNear→Celebrate{,Big} once
+  core recognizes those bridges.
 
 - **Resumable cross-block search idle continuation (upgrade round 55)**:
   budget-stopped scans return a `CrossBlockSearchCursor`; the dialog schedules

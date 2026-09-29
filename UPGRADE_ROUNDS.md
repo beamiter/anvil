@@ -195,6 +195,10 @@ evolve pass.
     cancelled by search generation (parity with forge round 91). Unit
     regressions pin resume cursors, hit-cap vs `scan_incomplete`, and status
     copy for budget-stopped scans.
+56. **Organism failure-push + error-hold success UI contract** — Full motion
+    mirrors GuardFailure/Stuck→RestAfterPush and
+    Inspect/SitNear→Celebrate{,Big} once core recognizes those bridges
+    (pending push/repin). Calm/Static still snap.
 
 Verification: `bash scripts/test-install-paths.sh`, `bash -n
 scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
