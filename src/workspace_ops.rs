@@ -1194,16 +1194,10 @@ impl AppModel {
             return;
         }
 
-        let mut toast_failures = Vec::new();
-        for failure in failures {
-            match crate::history_notice::persistence_failure_surface(&failure.operation) {
-                crate::history_notice::PersistenceFailureSurface::BlockHistoryBar => {
-                    self.show_block_history_failure(&failure.error);
-                }
-                crate::history_notice::PersistenceFailureSurface::Toast => {
-                    toast_failures.push(failure);
-                }
-            }
+        let (bar_failures, toast_failures) =
+            crate::history_notice::partition_persistence_failures(failures);
+        for failure in bar_failures {
+            self.show_block_history_failure(&failure.error);
         }
         if toast_failures.is_empty() {
             return;

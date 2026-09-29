@@ -10,8 +10,11 @@
 //!
 //! Production saves enqueue under `"Save Block history"` so worker I/O
 //! refusals reach `persistence::drain_failures` and raise this bar. Failed-load
-//! / admission refusals that never leave the GTK thread are parked here too;
-//! `AppModel` drains both onto the sticky chrome.
+//! overwrite refusals and enqueue admission errors that never leave the GTK
+//! thread are parked here too; `AppModel` drains both onto the sticky chrome
+//! via [`partition_persistence_failures`] so Block-history never falls through
+//! to the toast cooldown. Explicit Clear answers a Failed load (forge
+//! ExplicitReplace bypass) and must not park the ordinary overwrite refusal.
 
 use gtk::prelude::*;
 use relm4::gtk;
@@ -37,6 +40,25 @@ pub(crate) fn persistence_failure_surface(operation: &str) -> PersistenceFailure
     } else {
         PersistenceFailureSurface::Toast
     }
+}
+
+/// Split drained persistence failures into sticky-bar vs toast buckets.
+///
+/// Block-history must never fall through to the eight-second toast cooldown
+/// even when mixed with routine failures in the same drain — the sticky bar is
+/// the only surface that waits for an answer.
+pub(crate) fn partition_persistence_failures(
+    failures: impl IntoIterator<Item = PersistenceFailure>,
+) -> (Vec<PersistenceFailure>, Vec<PersistenceFailure>) {
+    let mut bar = Vec::new();
+    let mut toast = Vec::new();
+    for failure in failures {
+        match persistence_failure_surface(&failure.operation) {
+            PersistenceFailureSurface::BlockHistoryBar => bar.push(failure),
+            PersistenceFailureSurface::Toast => toast.push(failure),
+        }
+    }
+    (bar, toast)
 }
 
 static SYNC_BLOCK_HISTORY_FAILURES: Mutex<Vec<PersistenceFailure>> = Mutex::new(Vec::new());
@@ -138,9 +160,10 @@ pub(crate) fn reveal_block_history_failure(
 mod tests {
     use super::{
         drain_sync_block_history_failures, park_sync_block_history_failure,
-        persistence_failure_surface, PersistenceFailureSurface,
+        partition_persistence_failures, persistence_failure_surface, PersistenceFailureSurface,
     };
     use crate::block_view::BLOCK_HISTORY_PERSIST_OPERATION;
+    use crate::persistence::PersistenceFailure;
     use std::io;
 
     #[test]
@@ -161,6 +184,38 @@ mod tests {
                 "{routine}"
             );
         }
+    }
+
+    #[test]
+    fn partition_keeps_block_history_off_the_toast_cooldown() {
+        let mixed = vec![
+            PersistenceFailure {
+                operation: "Save window session".to_string(),
+                error: "disk full".to_string(),
+            },
+            PersistenceFailure {
+                operation: BLOCK_HISTORY_PERSIST_OPERATION.to_string(),
+                error: "revision moved".to_string(),
+            },
+            PersistenceFailure {
+                operation: "Save AI conversation".to_string(),
+                error: "permission denied".to_string(),
+            },
+            PersistenceFailure {
+                operation: BLOCK_HISTORY_PERSIST_OPERATION.to_string(),
+                error: "volume full".to_string(),
+            },
+        ];
+        let (bar, toast) = partition_persistence_failures(mixed);
+        assert_eq!(bar.len(), 2);
+        assert!(bar.iter().all(|f| f.operation == BLOCK_HISTORY_PERSIST_OPERATION));
+        assert_eq!(toast.len(), 2);
+        assert!(toast
+            .iter()
+            .all(|f| persistence_failure_surface(&f.operation)
+                == PersistenceFailureSurface::Toast));
+        // Newest Block-history reason is preserved in order for the bar.
+        assert_eq!(bar[1].error, "volume full");
     }
 
     #[test]

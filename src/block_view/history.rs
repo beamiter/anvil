@@ -1582,8 +1582,10 @@ impl TermView {
     /// without reinstalling cards (live blocks may already exist), then save.
     /// Every other failure is a save that can simply be tried again.
     ///
-    /// Callable today so AppModel sticky Retry can walk every Block `TermView`
-    /// once the surface lands; sync save failures are also parked for that bar.
+    /// ReloadFirst is sync (anvil has no background history load): probe the
+    /// file, update baselines / reserved ids, flip the outcome to Loaded, and
+    /// only then enqueue a labeled save. Forge's ReloadFirst starts an async
+    /// load and returns; the ordinary save path picks up from its result.
     pub(crate) fn retry_history_persistence(&self) -> io::Result<()> {
         match history_retry_action(&self.history_load_outcome.borrow()) {
             HistoryRetryAction::ReloadFirst => {
@@ -1595,6 +1597,11 @@ impl TermView {
     }
 
     /// Lift a Failed load by probing the file again without push_back restore.
+    ///
+    /// Cards already on screen stay put: Retry must not resurrect a corrupt
+    /// snapshot under live blocks the user is looking at. Baselines and
+    /// reserved ids still refresh so the following save has current revision /
+    /// tombstone authority.
     fn revalidate_failed_history_load(&self) -> io::Result<()> {
         if !self.render_backend.persists_block_history() {
             *self.history_load_outcome.borrow_mut() = HistoryLoadOutcome::Idle;
@@ -1654,17 +1661,18 @@ impl TermView {
     ///
     /// Snapshots live blocks on the GTK thread, then enqueues the write under
     /// [`BLOCK_HISTORY_PERSIST_OPERATION`] so worker refusals drain onto the
-    /// sticky Block-history bar. Admission / Failed-load refusals still return
-    /// synchronously for callers that park them.
+    /// sticky Block-history bar. Admission refusals and ordinary Failed-load
+    /// overwrite refusals still return synchronously for callers that park
+    /// them. An armed Explicit Clear is the user's answer to a Failed load
+    /// (matching forge's ExplicitReplace bypass), so it is not refused — and
+    /// the Failed outcome is lifted to Idle so Retry becomes SaveAgain once
+    /// the replacement is queued.
     pub fn save_history(&self) -> io::Result<()> {
         // A backend that does not own the Block card document persists its own
         // bounded zone document instead, on a sibling path, so neither
         // representation can overwrite the other.
         if !self.render_backend.persists_block_history() {
             return self.save_zone_history();
-        }
-        if let Some(error) = refuse_save_for_failed_load(&self.history_load_outcome.borrow()) {
-            return Err(error);
         }
         let configured = {
             let config = self.config.borrow();
@@ -1673,15 +1681,31 @@ impl TermView {
                 config.block_history_compress,
             )
         };
-        let saves = {
+        let (saves, has_pending_clear) = {
             let pending = self
                 .history_explicit_replace_pending
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            plan_history_saves(&pending, configured)
+            let has_pending_clear = !pending.is_empty();
+            (plan_history_saves(&pending, configured), has_pending_clear)
         };
         if saves.is_empty() {
             return Ok(());
+        }
+        if has_pending_clear {
+            // Clear answers the fail-closed load. Lift before enqueue so a
+            // later Retry / ordinary save is not stuck on the old refusal
+            // while the ExplicitReplace job is already in flight.
+            if matches!(
+                *self.history_load_outcome.borrow(),
+                HistoryLoadOutcome::Failed { .. }
+            ) {
+                *self.history_load_outcome.borrow_mut() = HistoryLoadOutcome::Idle;
+            }
+        } else if let Some(error) =
+            refuse_save_for_failed_load(&self.history_load_outcome.borrow())
+        {
+            return Err(error);
         }
 
         let records = self.render_backend.records();
@@ -2929,6 +2953,86 @@ mod tests {
                 "{resumable:?}"
             );
         }
+    }
+
+    /// Explicit Clear is the user's answer to a Failed load (forge
+    /// ExplicitReplace bypass). Planning a pending Clear must keep the
+    /// replacement save, and `save_history` must not apply the ordinary
+    /// refuse gate while Clears are armed — otherwise Clear parks a sticky
+    /// refusal and never writes the tombstone.
+    #[test]
+    fn armed_clear_keeps_explicit_replace_when_load_failed() {
+        let target = HistoryTarget {
+            path: PathBuf::from("/tmp/anvil-clear-failed-load.bin"),
+            compress: false,
+        };
+        let pending = VecDeque::from([target.clone()]);
+        let saves = plan_history_saves(&pending, Some(target));
+        assert_eq!(saves.len(), 1);
+        assert!(saves[0].explicit_replace);
+        // Ordinary refuse still describes Failed; Clear skips that gate.
+        assert!(refuse_save_for_failed_load(&HistoryLoadOutcome::Failed {
+            kind: io::ErrorKind::InvalidData,
+            message: Arc::from("corrupt"),
+        })
+        .is_some());
+    }
+
+    /// ReloadFirst must revalidate without reinstalling cards, then save.
+    /// The revalidate body probes via read_history_records_reserved and
+    /// updates baselines — it must never push_back into the live document.
+    #[test]
+    fn reload_first_revalidate_does_not_reinstall_cards() {
+        let source = include_str!("history.rs");
+        let revalidate = source
+            .split("fn revalidate_failed_history_load(&self) -> io::Result<()> {")
+            .nth(1)
+            .expect("revalidate_failed_history_load")
+            .split("\n    /// Save block history without risking")
+            .next()
+            .expect("revalidate closes before save_history docs");
+        assert!(
+            revalidate.contains("read_history_records_reserved"),
+            "ReloadFirst must probe the file again"
+        );
+        assert!(
+            !revalidate.contains("push_back")
+                && !revalidate.contains("mutate_block_data_and_redraw"),
+            "ReloadFirst must not reinstall cards under live blocks"
+        );
+        let retry = source
+            .split("pub(crate) fn retry_history_persistence(&self) -> io::Result<()> {")
+            .nth(1)
+            .expect("retry_history_persistence")
+            .split("\n    /// Lift a Failed load")
+            .next()
+            .expect("retry closes before revalidate docs");
+        assert!(
+            retry.contains("HistoryRetryAction::ReloadFirst")
+                && retry.contains("revalidate_failed_history_load()?")
+                && retry.contains("self.save_history()"),
+            "ReloadFirst must revalidate then save"
+        );
+    }
+
+    /// `save_history` skips the Failed-load refuse while Clears are armed and
+    /// lifts Failed → Idle so Retry becomes SaveAgain after the replacement.
+    #[test]
+    fn save_history_lifts_failed_load_when_clear_is_armed() {
+        let source = include_str!("history.rs");
+        let save = source
+            .split("pub fn save_history(&self) -> io::Result<()> {")
+            .nth(1)
+            .expect("save_history")
+            .split("\n    pub fn load_history")
+            .next()
+            .expect("save_history closes before load_history");
+        assert!(
+            save.contains("has_pending_clear")
+                && save.contains("HistoryLoadOutcome::Idle")
+                && save.contains("refuse_save_for_failed_load"),
+            "armed Clear must lift Failed and skip the ordinary refuse gate"
+        );
     }
 
     #[test]
