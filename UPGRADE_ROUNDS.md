@@ -375,3 +375,14 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
     core Inspect/SitNear→Idle and Guard*→Idle bridges (`between()` 64→70).
     Pairs forge round 119; core clear-vigil Idle survey wave.
 
+86. **Error-hold/Unknown→Rest + Watch*→Idle UI contract** — Full motion
+    mirrors core Inspect/SitNear/Unknown→RestAfterPush and Watch*→Idle
+    (`between()` 70→76). STAGE docs rounds 83–84 stay membership-only
+    (len 63/64); the 70 count was round 85, this round catches 76.
+    Pairs forge round 120.
+
+87. **Find overlay continue bookmark-empty status** — `pending_scan_continue`
+    idle slices reuse `overlay_scan_status` so a finished Bookmarked scan
+    that added no hits keeps the bookmark-empty copy instead of generic
+    "No matches." Pairs forge round 121.
+
