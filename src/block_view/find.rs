@@ -3675,6 +3675,58 @@ mod tests {
         );
     }
 
+    /// Stale ids beside a live bookmark must not collapse the empty-reason to
+    /// NoRetainedBookmarks — continue/rebuild status still keys off the live
+    /// retained identity (empty query stays a browser).
+    #[test]
+    fn bookmarked_empty_reason_ignores_stale_ids_when_a_live_bookmark_remains() {
+        let retained = CompletedCommandRecord {
+            id: 1,
+            cmd: "echo retained".to_string(),
+            exit_code: Some(0),
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: Some(20),
+            cwd: None,
+            is_background: false,
+            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            start_mark_seen: true,
+            command_source: crate::block_view::CommandTextSource::Screen,
+        };
+        let records = [BackendRecordRef::Metadata {
+            record: &retained,
+            snapshot: None,
+        }];
+        assert_eq!(
+            bookmarked_empty_reason(
+                records,
+                &HashSet::from([1, 99, 100]),
+                CrossBlockSearchScope::All,
+                &BlockFilters {
+                    bookmarked_only: true,
+                    ..Default::default()
+                },
+                "",
+            ),
+            None,
+            "live bookmark + scoped text with empty query stays a browser"
+        );
+        assert_eq!(
+            bookmarked_empty_reason(
+                records,
+                &HashSet::from([1, 99]),
+                CrossBlockSearchScope::All,
+                &BlockFilters {
+                    bookmarked_only: true,
+                    ..Default::default()
+                },
+                "nope",
+            ),
+            Some(BookmarkedEmptyReason::QueryMismatch),
+            "stale extras must not mask a live query miss"
+        );
+    }
+
     #[test]
     fn background_filter_composes_before_cap_and_uses_only_real_scoped_text() {
         let record = |id, cmd: &str, duration_ms, is_background| CompletedCommandRecord {
