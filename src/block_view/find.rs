@@ -3803,6 +3803,48 @@ mod tests {
         );
     }
 
+    /// Stale ids beside a live bookmark that has output but no meaningful
+    /// command text must still surface NoRetainedTextInScope under Command
+    /// scope — never collapse to NoRetainedBookmarks or invent QueryMismatch.
+    #[test]
+    fn bookmarked_empty_reason_keeps_command_scope_no_text_when_stale_ids_remain() {
+        let retained = CompletedCommandRecord {
+            id: 1,
+            cmd: "   \n\t  ".to_string(),
+            exit_code: Some(0),
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: Some(20),
+            cwd: None,
+            is_background: false,
+            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            start_mark_seen: true,
+            command_source: crate::block_view::CommandTextSource::Screen,
+        };
+        let retained_output = ZoneOutputSnapshot {
+            plain: "noise line\n".to_string(),
+            truncated: false,
+        };
+        let records = [BackendRecordRef::Metadata {
+            record: &retained,
+            snapshot: Some(&retained_output),
+        }];
+        assert_eq!(
+            bookmarked_empty_reason(
+                records,
+                &HashSet::from([1, 99, 100]),
+                CrossBlockSearchScope::Command,
+                &BlockFilters {
+                    bookmarked_only: true,
+                    ..Default::default()
+                },
+                "noise",
+            ),
+            Some(BookmarkedEmptyReason::NoRetainedTextInScope),
+            "stale extras must not mask a live Command-scope text miss"
+        );
+    }
+
     #[test]
     fn background_filter_composes_before_cap_and_uses_only_real_scoped_text() {
         let record = |id, cmd: &str, duration_ms, is_background| CompletedCommandRecord {
@@ -4692,7 +4734,7 @@ mod tests {
     }
 
     /// After the core lift, the local alias must stay generic over anvil's
-    /// palette-chrome hit row (9 fields = 6 shared nav + 3 anvil-only).
+    /// palette-chrome hit row (9 fields = 6 shared nav + 3 optional chrome).
     #[test]
     fn cross_block_search_report_alias_stays_hit_generic_after_lift() {
         use super::{CrossBlockHit, CrossBlockSearchReport};
