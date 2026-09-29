@@ -213,6 +213,10 @@ mod tests {
             "Save\u{200e} Block history",
             "Save Block\u{200c}history",
             "Save Block\u{2007}history",
+            // Line / paragraph separators stay toast-only beside soft-hyphen/WJ.
+            "Save Block history\u{2028}",
+            "Save Block history\u{2029}",
+            "Save Block\u{2028}history",
             "Block history",
         ] {
             assert_eq!(
