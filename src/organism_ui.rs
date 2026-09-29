@@ -3922,6 +3922,8 @@ mod tests {
             (Behavior::WatchAgent, Behavior::Celebrate),
             (Behavior::WatchAgent, Behavior::InspectError),
             (Behavior::WatchAgent, Behavior::SitNearError),
+            (Behavior::UnknownOutcome, Behavior::Idle),
+            (Behavior::UnknownOutcome, Behavior::InspectError),
             (Behavior::GuardFailure, Behavior::GuardStuck),
             (Behavior::GuardFailure, Behavior::RestAfterPush),
             (Behavior::GuardStuck, Behavior::RestAfterPush),

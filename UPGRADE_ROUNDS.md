@@ -214,6 +214,10 @@ evolve pass.
     generation-current predicate / cross-block budget constants come from
     `jterm_core::cross_block_search` (pending core push/repin). GTK idle and
     `CrossBlockSearchReport`/`FindScanBudget` stay local.
+61. **Organism UnknownOutcome settle/overwrite UI contract** — Full motion
+    mirrors UnknownOutcome→Idle and UnknownOutcome→InspectError once core
+    recognizes those bridges (pending push/repin). GlanceAside stays live-only.
+    Calm/Static still snap.
 
 Verification: `bash scripts/test-install-paths.sh`, `bash -n
 scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
