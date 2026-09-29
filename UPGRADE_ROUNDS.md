@@ -439,3 +439,11 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
     local core teaches util-linux util clamp + GameMode env launcher peels;
     GuardFailure/Stuck/Cautious→Celebrate* None survey pin; `between()` stays
     90. Manifests stay on published pins. Pairs forge round 130.
+
+98. **InspectError→SitNearError Full-motion (90→91)** — Full-motion
+    `semantic_bridges` mirrors core Inspect hold second-failure overwrite.
+    Pairs forge round 132.
+
+99. **Failure/Stuck/Cautious→Watch* + tier overwrite None UI** — Full motion
+    pins Failure/Stuck/Cautious→Watch* beside Rest/Recovery→Watch*, and
+    SitNear→Inspect / Celebrate↔CelebrateBig as None. Pairs forge round 133.
