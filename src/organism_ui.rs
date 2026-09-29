@@ -4180,6 +4180,51 @@ mod tests {
     }
 
     #[test]
+    fn ambient_and_typing_surfaces_skip_visual_transition_arcs() {
+        // Ambient utility poses (Explore/Sleep/Approach/Idle) display through
+        // AmbientBehavior → Behavior::display, but disposition exchanges do
+        // not invent VisualTransition bridges (pairs core ambient N/A pin and
+        // forge/anvil upgrade Ambient VisualTransition N/A probes).
+        for (from, to) in [
+            (Behavior::Idle, Behavior::Explore),
+            (Behavior::Explore, Behavior::Sleep),
+            (Behavior::Sleep, Behavior::Approach),
+            (Behavior::Approach, Behavior::Idle),
+            (Behavior::Explore, Behavior::Idle),
+            (Behavior::Sleep, Behavior::Idle),
+        ] {
+            assert_eq!(
+                visual_transition_for_motion(OrganismMotion::Full, from, to),
+                None,
+                "Full ambient {from:?}→{to:?}"
+            );
+            assert_eq!(VisualTransition::between(from, to), None);
+        }
+        // Typing is SurfaceMode → WatchCommand; entering from an ambient pose
+        // snaps without a Typing-named VisualTransition variant.
+        for from in [
+            Behavior::Idle,
+            Behavior::Explore,
+            Behavior::Sleep,
+            Behavior::Approach,
+        ] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    OrganismMotion::Full,
+                    from,
+                    Behavior::WatchCommand,
+                ),
+                None,
+                "Full {from:?}→WatchCommand (Typing surface)"
+            );
+            assert_eq!(
+                VisualTransition::between(from, Behavior::WatchCommand),
+                None
+            );
+        }
+    }
+
+    #[test]
     fn agent_driven_passes_stay_on_celebrate_not_celebrate_big() {
         // Mirrors core `agent_commands_get_quiet_nods_and_the_big_celebrations_stay_human`
         // at the UI contract layer: agent recovery is Celebrate, never CelebrateBig.
