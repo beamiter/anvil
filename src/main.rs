@@ -348,8 +348,9 @@ struct AppModel {
     /// queueing one toast every second while autosave continues.
     persistence_failure_notices: std::collections::HashMap<String, std::time::Instant>,
     /// Sticky Block-history failure bar under the top bar (forge history_notice).
-    /// Starts hidden; `report_persistence_failures` reveals it for parked sync
-    /// refusals and for any future worker `"Save Block history"` failures.
+    /// Starts hidden; `report_persistence_failures` reveals it for parked
+    /// Failed-load/admission refusals and for worker `"Save Block history"`
+    /// failures.
     block_history_notice: gtk::Box,
     block_history_notice_label: gtk::Label,
     safe_mode: bool,

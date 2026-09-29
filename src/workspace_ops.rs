@@ -1184,8 +1184,9 @@ impl AppModel {
     /// make the application unusable with repeated notifications.
     ///
     /// Block-history failures are fail-closed: they raise the sticky bar under
-    /// the top bar instead of a toast. Sync GTK-thread saves park into
-    /// `history_notice` (they never reach the worker queue); drain both here.
+    /// the top bar instead of a toast. Worker `"Save Block history"` failures
+    /// arrive via `persistence::drain_failures`; GTK-thread Failed-load /
+    /// admission refusals park into `history_notice`. Drain both here.
     pub(crate) fn report_persistence_failures(&mut self) {
         let mut failures = crate::persistence::drain_failures();
         failures.extend(crate::history_notice::drain_sync_block_history_failures());
@@ -1228,7 +1229,8 @@ impl AppModel {
     }
 
     /// Answer the sticky bar: ask every Block `TermView` to retry. Hide
-    /// optimistically; a synchronous refusal raises the bar again.
+    /// optimistically; a Failed-load/admission refusal raises the bar again,
+    /// and a later worker failure re-raises on the next persistence poll.
     pub(crate) fn retry_block_history(&self) {
         self.block_history_notice.set_visible(false);
         for tab in &self.tabs {

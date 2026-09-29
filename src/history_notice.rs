@@ -8,10 +8,10 @@
 //! This bar stays until it is answered, and it carries the answer — matching
 //! forge's `ui/history_notice.rs`.
 //!
-//! Anvil's `TermView::save_history` is still synchronous on the GTK thread, so
-//! those refusals never reach `persistence::drain_failures`. Callers park them
-//! here; `AppModel` drains the lot (and any future worker failures labeled
-//! `"Save Block history"`) onto this sticky chrome.
+//! Production saves enqueue under `"Save Block history"` so worker I/O
+//! refusals reach `persistence::drain_failures` and raise this bar. Failed-load
+//! / admission refusals that never leave the GTK thread are parked here too;
+//! `AppModel` drains both onto the sticky chrome.
 
 use gtk::prelude::*;
 use relm4::gtk;
@@ -41,11 +41,12 @@ pub(crate) fn persistence_failure_surface(operation: &str) -> PersistenceFailure
 
 static SYNC_BLOCK_HISTORY_FAILURES: Mutex<Vec<PersistenceFailure>> = Mutex::new(Vec::new());
 
-/// Park a synchronous Block-history save/retry refusal for the sticky bar.
+/// Park a Block-history refusal that never reached the persistence worker.
 ///
-/// Anvil's `TermView::save_history` still runs on the GTK thread, so these
-/// never appear in `persistence::drain_failures`. The newest reason replaces
-/// older ones for the same operation string: one window, one file family.
+/// Failed-load overwrite refusals and enqueue admission errors still return on
+/// the GTK thread, so they never appear in `persistence::drain_failures`. The
+/// newest reason replaces older ones for the same operation string: one window,
+/// one file family.
 pub(crate) fn park_sync_block_history_failure(error: &std::io::Error) {
     let failure = PersistenceFailure {
         operation: BLOCK_HISTORY_PERSIST_OPERATION.to_string(),
