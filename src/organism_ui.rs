@@ -3998,8 +3998,8 @@ mod tests {
             "semantic_bridges list must match core visual_transition_between_recognizes_ninety_three_intentional_arcs"
         );
         // Celebrate{,Big}/RestAfterPush/GuardRecovery↔UnknownOutcome /
-        // Unknown→GuardCautious stay inside between() 93 and this UI bridge
-        // list (no len bump; already counted in the 93).
+        // Unknown→GuardCautious / Unknown→GuardStuck stay inside between() 93
+        // and this UI bridge list (no len bump; already counted in the 93).
         for pair in [
             (Behavior::Celebrate, Behavior::UnknownOutcome),
             (Behavior::CelebrateBig, Behavior::UnknownOutcome),
@@ -4007,6 +4007,7 @@ mod tests {
             (Behavior::GuardRecovery, Behavior::UnknownOutcome),
             (Behavior::UnknownOutcome, Behavior::GuardRecovery),
             (Behavior::UnknownOutcome, Behavior::GuardCautious),
+            (Behavior::UnknownOutcome, Behavior::GuardStuck),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
@@ -4068,9 +4069,9 @@ mod tests {
                 ),
                 None
             );
-            // Celebrate*/Rest/GuardRecovery↔Unknown / Unknown→GuardCautious
-            // snaps under Calm/Static (Full animates; dedicated hold pins cover
-            // the same arcs).
+            // Celebrate*/Rest/GuardRecovery↔Unknown / Unknown→GuardCautious /
+            // Unknown→GuardStuck snaps under Calm/Static (Full animates;
+            // dedicated hold pins cover the same arcs).
             assert_eq!(
                 visual_transition_for_motion(
                     motion,
@@ -4116,6 +4117,14 @@ mod tests {
                     motion,
                     Behavior::UnknownOutcome,
                     Behavior::GuardCautious,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::UnknownOutcome,
+                    Behavior::GuardStuck,
                 ),
                 None
             );
@@ -5157,6 +5166,36 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn unknown_outcome_bridges_to_guard_stuck_under_full_motion_only() {
+        assert!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::UnknownOutcome,
+                Behavior::GuardStuck,
+            )
+            .is_some(),
+            "Full UnknownOutcome→GuardStuck"
+        );
+        assert!(
+            VisualTransition::between(Behavior::UnknownOutcome, Behavior::GuardStuck).is_some(),
+            "core UnknownOutcome→GuardStuck"
+        );
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::UnknownOutcome,
+                    Behavior::GuardStuck,
+                ),
+                None,
+                "{motion:?} UnknownOutcome→GuardStuck"
+            );
+        }
+    }
+
+
 
 
 
