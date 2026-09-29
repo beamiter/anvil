@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (Hangul sticky + whitespace find + Watch*→Guard/ambient)
+
+## 2026-09-29 (Hangul sticky + whitespace find + Watch*→Guard/ambient)
+
+- **Round 133**: sticky U+115F/U+1160/U+3164/U+FFA0/U+2800/U+206A/U+206F near-miss labels stay toast-only.
+- **Round 134**: Find Command/Output whitespace-only query stays QueryMismatch with stale extras.
+- **Round 135**: Watch*→Guard* Full-motion None (pairs core vigil pin).
+- **Round 136**: Watch*→ambient Full-motion None + semantic_bridges WatchSettled finish note (between() **93**).
+  Rounds 131–132 (quad-space sticky + All empty+stale) sit beside. Core/jagent tips still **pending push/repin**.
+
+
 Updated: 2026-09-29 (sticky quad-space/RLI/FSI + find All empty+stale)
 
 ## 2026-09-29 (sticky quad-space/RLI/FSI + find All empty+stale)
