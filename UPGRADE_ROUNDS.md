@@ -552,6 +552,21 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      timeout/nice nest classify; Inspect/Sit→Unknown `between()` **93** already
      ledgered. Manifests stay on published pins. Pairs forge 160.
 
+126. **WatchSettled finish arcs Full-motion (6 Some)** — Full motion pins all
+     six WatchSettled→Celebrate{,Big}/Inspect/Sit/Rest/Idle bridges and keeps
+     UnknownOutcome intentional None. Pairs forge 161 / core
+     `watch_settled_finish_arcs_cover_pass_fail_rest_and_idle`.
+
+127. **CrossBlock cancel live wrapping ahead of scheduled** — live generation
+     wrapping ahead of scheduled (`0` vs `u64::MAX`) cancels with or without a
+     resume — reverse of the MAX→0 schedule bump. Pairs forge 162 / core cancel
+     edge.
+
+128. **Core tip PATH wave-30 ctl/notify leftovers** — path-patched local core
+     keeps `systemctl` / `busctl` / `journalctl` / `timedatectl` / `resolvectl`
+     / `systemd-notify` / `systemd-mount` / `chvt` / `aa-status` out of STAGE
+     beside openvt 71. Manifests stay on published pins. Pairs forge 163.
+
 129. **Sticky near-miss punct/thin/hair/ALM/bidi-isolate labels** — U+2008 /
      U+2009 / U+200A / U+061C / U+2066–U+2069 variants of `"Save Block history"`
      stay toast-only beside rounds 122/120. Pairs forge 164. Leaves 126–128 for
