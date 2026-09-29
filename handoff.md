@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (organism error-hold heal settle UI contract)
+Updated: 2026-09-29 (shared output_notice from jterm_core)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,11 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **Shared finished-block output notice (upgrade round 53, pending core
+  push/repin)**: `OUTPUT_HEAD_DROPPED_NOTICE` is
+  `jterm_core::output_notice::EARLIER_OUTPUT_NOT_RETAINED`. Persistence stays a
+  bool; the display string is the family contract.
 
 - **Organism error-hold heal settle UI contract (upgrade round 52, pending core
   push/repin)**: Full-motion tests also mirror SitNearError/InspectError →

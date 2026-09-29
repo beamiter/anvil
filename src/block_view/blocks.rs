@@ -638,7 +638,9 @@ pub struct BlockFilters {
 }
 
 /// Text of the dim row a finished card shows when its output lost its head.
-pub(crate) const OUTPUT_HEAD_DROPPED_NOTICE: &str = "Earlier output not retained";
+/// Shared with forge via [`jterm_core::output_notice`].
+pub(crate) const OUTPUT_HEAD_DROPPED_NOTICE: &str =
+    jterm_core::output_notice::EARLIER_OUTPUT_NOT_RETAINED;
 
 pub(crate) struct FinishedBlock {
     pub(crate) id: u64,
