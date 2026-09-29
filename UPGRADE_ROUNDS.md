@@ -370,3 +370,8 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
     local `jterm_core` peels `systemd-socket-activate` (STAGE_PREFIXES 63→64)
     with `classify_command` see-through and membership pin; Cargo manifests
     stay on the published pin (pending push/repin). Pairs forge round 118.
+
+83. **Clear-vigil Idle Full-motion UI contract** — Full motion mirrors
+    core Inspect/SitNear→Idle and Guard*→Idle bridges (`between()` 64→70).
+    Pairs forge round 117; core clear-vigil Idle survey wave.
+
