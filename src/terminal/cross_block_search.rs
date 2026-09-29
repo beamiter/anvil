@@ -384,6 +384,23 @@ fn search_status(total: usize, selected: Option<usize>, scan_incomplete: bool) -
     }
 }
 
+/// Continue slices share the same empty-state copy as the first rebuild so a
+/// bookmarked-only scan that finds nothing after idle resume does not fall
+/// back to generic "No matches."
+fn overlay_scan_status(
+    total: usize,
+    selected: Option<usize>,
+    scan_incomplete: bool,
+    bookmarked_empty: Option<&str>,
+) -> String {
+    if total == 0 && !scan_incomplete {
+        if let Some(message) = bookmarked_empty {
+            return message.to_string();
+        }
+    }
+    search_status(total, selected, scan_incomplete)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SelectionMove {
     First,
@@ -895,14 +912,16 @@ pub(super) fn toggle(
                     let results = report.hits;
                     scan_incomplete.set(report.scan_incomplete);
                     let total = results.len();
-                    let status = if total == 0 && !report.scan_incomplete && filters.bookmarked_only
-                    {
-                        view.bookmarked_empty_search_status(&query, scope, &filters)
-                            .unwrap_or("No matches.")
-                            .to_string()
-                    } else {
-                        search_status(total, None, report.scan_incomplete)
-                    };
+                    let status = overlay_scan_status(
+                        total,
+                        None,
+                        report.scan_incomplete,
+                        if filters.bookmarked_only {
+                            view.bookmarked_empty_search_status(&query, scope, &filters)
+                        } else {
+                            None
+                        },
+                    );
                     status_label.set_text(&status);
                     let jumpable = view.jumpable_search_hits(&results);
                     for hit in &results {
@@ -988,12 +1007,20 @@ pub(super) fn toggle(
                                     hits.borrow_mut().extend(more.hits.iter().cloned());
                                     let total = hits.borrow().len();
                                     scan_incomplete.set(more.scan_incomplete);
-                                    status_label.set_text(&search_status(
+                                    let bookmarked_empty = if filters.bookmarked_only {
+                                        view.bookmarked_empty_search_status(
+                                            &query, scope, &filters,
+                                        )
+                                    } else {
+                                        None
+                                    };
+                                    status_label.set_text(&overlay_scan_status(
                                         total,
                                         list_box
                                             .selected_row()
                                             .map(|row| row.index() as usize),
                                         more.scan_incomplete,
+                                        bookmarked_empty,
                                     ));
                                     *cursor.borrow_mut() = more.resume;
                                     if cursor.borrow().is_some() {
@@ -1639,11 +1666,12 @@ mod tests {
         bookmark_action_label, bookmark_change_status, dialog_toggle_plan, enter_key_route,
         focus_confirms_result, has_search_intent, hit_outcome_class, hit_outcome_label,
         idle_status, is_plain_refresh_key, is_selected_bookmark_key, jump_outcome, memory,
-        query_error, refresh_selection_index, refresh_status, search_status, selection_index,
-        should_step, BookmarkKeyLatch, BookmarkKeyPress, CrossBlockHit, DialogTogglePlan,
-        EnterKeyRoute, JumpOutcome, RecordNavigationResult, RefreshKeyLatch, RefreshKeyPress,
-        RefreshTickSlot, SelectionAnchor, SelectionMove, CROSS_BLOCK_SEARCH_DEBOUNCE,
-        CROSS_BLOCK_SEARCH_LIMIT, CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
+        overlay_scan_status, query_error, refresh_selection_index, refresh_status, search_status,
+        selection_index, should_step, BookmarkKeyLatch, BookmarkKeyPress, CrossBlockHit,
+        DialogTogglePlan, EnterKeyRoute, JumpOutcome, RecordNavigationResult, RefreshKeyLatch,
+        RefreshKeyPress, RefreshTickSlot, SelectionAnchor, SelectionMove,
+        CROSS_BLOCK_SEARCH_DEBOUNCE, CROSS_BLOCK_SEARCH_LIMIT,
+        CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
     };
     use crate::block_view::{CrossBlockSearchOptions, CrossBlockSearchScope};
 
@@ -2122,6 +2150,19 @@ mod tests {
         use SelectionMove as Move;
 
         assert_eq!(search_status(0, None, false), "No matches.");
+        assert_eq!(
+            overlay_scan_status(0, None, false, Some("No bookmarked blocks in retained history.")),
+            "No bookmarked blocks in retained history."
+        );
+        assert_eq!(
+            overlay_scan_status(0, None, true, Some("No bookmarked blocks in retained history.")),
+            search_status(0, None, true),
+            "an incomplete scan keeps the budget copy even under Bookmarked"
+        );
+        assert_eq!(
+            overlay_scan_status(1, Some(0), false, Some("No bookmarked blocks in retained history.")),
+            "1 of 1 match"
+        );
         assert_eq!(search_status(1, Some(0), false), "1 of 1 match");
         assert_eq!(
             search_status(CROSS_BLOCK_SEARCH_LIMIT, Some(36), false),
