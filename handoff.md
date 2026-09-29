@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (sticky FE04/syllable + FE03 find + MAX-3 cancel + Celebrate→Unknown)
+
+## 2026-09-29 (sticky/find/organism edges — rounds 171–174)
+
+- Sticky inner mid-range VS (FE04/FE0A) + Mongolian syllable boundary (U+1807),
+  FE03/Todo soft-hyphen find QueryMismatch + stale, CrossBlock near-near-near-wrap
+  (MAX-3→MAX-2) cancel, and Celebrate{,Big}→UnknownOutcome Full-motion bridges
+  (Calm/Static snap). Unique rounds **171–174**. Pairs forge 215–219 / core
+  cancel. STAGE **71** / between() **93** unchanged.
+
+
 Updated: 2026-09-29 (sticky FE03 + find FVS + near-near-wrap + sticky Retry edges)
 
 ## 2026-09-29 (sticky/find/organism/Retry edges — rounds 165–170)
