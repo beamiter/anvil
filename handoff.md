@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (1804 find beside rounds 204–206)
+
+## 2026-09-30 (sticky/find/organism edges — round 207)
+
+- 1804/colon find QueryMismatch + stale beside rounds 204–206 sticky 1805 /
+  MAX-11 / Unknown→GuardFailure. Unique round **207**. Pairs forge 260 /
+  core cancel. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-09-30 (sticky 1805 + MAX-11 cancel + Unknown→GuardFailure)
 
 ## 2026-09-30 (sticky/find/organism edges — rounds 204–206)
