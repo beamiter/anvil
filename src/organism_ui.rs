@@ -4907,6 +4907,36 @@ mod tests {
         }
     }
 
+
+    /// Celebrate{,Big}→UnknownOutcome animates under Full motion (unknown
+    /// overwrite from a celebrate hold) and snaps under Calm/Static. Pairs core
+    /// celebrate→unknown bridges inside between() 93.
+    #[test]
+    fn celebrate_holds_bridge_to_unknown_outcome_under_full_motion_only() {
+        for from in [Behavior::Celebrate, Behavior::CelebrateBig] {
+            assert!(
+                visual_transition_for_motion(
+                    OrganismMotion::Full,
+                    from,
+                    Behavior::UnknownOutcome,
+                )
+                .is_some(),
+                "Full {from:?}→UnknownOutcome"
+            );
+            assert!(
+                VisualTransition::between(from, Behavior::UnknownOutcome).is_some(),
+                "core {from:?}→UnknownOutcome"
+            );
+            for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+                assert_eq!(
+                    visual_transition_for_motion(motion, from, Behavior::UnknownOutcome),
+                    None,
+                    "{motion:?} {from:?}→UnknownOutcome"
+                );
+            }
+        }
+    }
+
     #[test]
     fn ambient_and_typing_surfaces_skip_visual_transition_arcs() {
         // Ambient utility poses (Explore/Sleep/Approach/Idle) display through
