@@ -285,6 +285,11 @@ mod tests {
             "Save Block\u{206c}history",
             "Save Block\u{206d}history",
             "Save Block\u{206e}history",
+            // Mid-range VS (FE01/FE0D) + Mongolian FVS4 stay toast-only beside
+            // the bidi/deprecated wave (FE00/FE0E/FE0F + FVS1–3 already pinned).
+            "Save Block\u{fe01}history",
+            "Save Block\u{fe0d}history",
+            "Save Block\u{180f}history",
             "Block history",
         ] {
             assert_eq!(
