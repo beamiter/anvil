@@ -265,3 +265,8 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
     overlay literal probe) plus forge-only ledger for the idle TODO already
     closed in anvil's round-60/68 CrossBlock form. No missing anvil behavior;
     numbering only so a forge-ahead counter does not imply a feature gap.
+
+71. **WatchAgent→UnknownOutcome None + agent Celebrate UI** — Full motion
+    pins WatchAgent→UnknownOutcome as None; agent-driven recovery stays
+    Celebrate (never CelebrateBig), matching core quiet-nod contract
+    (pairs forge round 109).
