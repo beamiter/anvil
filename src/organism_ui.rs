@@ -4884,6 +4884,29 @@ mod tests {
         }
     }
 
+    /// SitNear↔Inspect and Celebrate↔CelebrateBig stay None under Full motion —
+    /// tier overwrites snap without inventing bridges. Pairs core
+    /// `sit_near_and_celebrate_tier_overwrites_stay_none`. between() stays 93.
+    #[test]
+    fn sit_near_and_celebrate_tier_overwrites_stay_none_under_full_motion() {
+        for (from, to) in [
+            (Behavior::SitNearError, Behavior::InspectError),
+            (Behavior::Celebrate, Behavior::CelebrateBig),
+            (Behavior::CelebrateBig, Behavior::Celebrate),
+        ] {
+            assert_eq!(
+                visual_transition_for_motion(OrganismMotion::Full, from, to),
+                None,
+                "Full {from:?}→{to:?}"
+            );
+            assert_eq!(
+                VisualTransition::between(from, to),
+                None,
+                "core {from:?}→{to:?}"
+            );
+        }
+    }
+
     #[test]
     fn ambient_and_typing_surfaces_skip_visual_transition_arcs() {
         // Ambient utility poses (Explore/Sleep/Approach/Idle) display through
