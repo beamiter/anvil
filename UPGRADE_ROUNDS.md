@@ -706,3 +706,20 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      pins those vigil poses→Celebrate{,Big} intentional None (success finishes
      via Watch*; Recovery→Celebrate already covered in round 139). Pairs forge
      202 / core `failure_stuck_cautious_never_bridge_to_celebrate_holds`.
+
+161. **Sticky interior mid-range VS / Mongolian nirugu labels** —
+     U+FE02 / U+FE0C / U+180A variants of "Save Block history" stay toast-only
+     beside rounds 155/152. Pairs forge 203.
+
+162. **Find Hangul/Braille/ideo/Ogham-query QueryMismatch + stale** —
+     U+115F / U+3164 / U+2800 / U+3000 / U+1680-only queries stay
+     QueryMismatch under Command/Output/All when stale ids remain (marks/WJ
+     already pinned). Pairs forge 205.
+
+163. **WatchAgent→CelebrateBig + Watch*→Unknown Full-motion None** — Full
+     motion pins WatchAgent→CelebrateBig and WatchCommand/Agent/Settled→
+     UnknownOutcome intentional None. Pairs forge 206 / core watch_* None pins.
+
+164. **CrossBlock cancel finished at near-wrap gen** — palette idle continuation
+     drops MAX-1,MAX-1 finished walks (no resume) beside the MAX-1→MAX bump.
+     Pairs forge 207 / core cancel edge.
