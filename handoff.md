@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (sticky punct/thin/hair + find empty-query scopes)
+
+## 2026-09-29 (sticky punct/thin/hair + find empty-query scopes)
+
+- **Round 126**: sticky U+2008/U+2009/U+200A/U+061C/U+2066–U+2069 near-miss labels stay toast-only.
+- **Round 127**: Find Command/Output-scope empty query stays None with stale extras.
+  Rounds 122–125 (ZWJ sticky, QueryMismatch scopes, cancel deepen, STAGE 71 tip) sit beside.
+  Core/jagent tips still **pending push/repin**.
+
+
 Updated: 2026-09-29 (sticky ZWJ + find query scopes + cancel deepen + STAGE 71 tip)
 
 ## 2026-09-29 (sticky ZWJ + find query scopes + cancel deepen + STAGE 71)
