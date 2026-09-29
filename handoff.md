@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (sticky FE07/birga + MAX-6 cancel + GuardRecovery→Unknown)
+
+## 2026-09-29 (sticky/find/organism edges — rounds 184–186)
+
+- Sticky center mid-range VS (FE07) + Mongolian birga (U+1800), CrossBlock
+  near-near-near-near-near-near-wrap (MAX-6→MAX-5) cancel, and
+  GuardRecovery→UnknownOutcome Full-motion bridges (Calm/Static snap) beside
+  rounds 182–183 FE05 find / SitNear-Inspect. Unique rounds **184–186**. Pairs
+  forge 231–234 / core cancel. STAGE **71** / between() **93** unchanged
+  (GuardRecovery→Unknown already inside the 93).
+
 Updated: 2026-09-29 (FE05 find + SitNear/Inspect→Unknown beside rounds 179–181)
 
 ## 2026-09-29 (sticky/find/organism edges — rounds 182–183)
