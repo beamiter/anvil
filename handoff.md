@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (FE06 find beside rounds 184–186)
+
+## 2026-09-29 (sticky/find/organism edges — round 187)
+
+- FE06/Manchu-full-stop find QueryMismatch + stale beside rounds 184–186 sticky
+  FE07/MAX-6/GuardRecovery→Unknown. Unique round **187**. Pairs forge 235 /
+  core cancel. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-09-29 (sticky FE07/birga + MAX-6 cancel + GuardRecovery→Unknown)
 
 ## 2026-09-29 (sticky/find/organism edges — rounds 184–186)
