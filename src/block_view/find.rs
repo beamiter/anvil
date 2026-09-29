@@ -65,12 +65,10 @@ fn outcome_matches_filters(
 pub(crate) const FIND_MATCH_LIMIT: usize = 10_000;
 const FIND_SCAN_BYTE_LIMIT: usize = 4 * 1024 * 1024;
 const FIND_SCAN_TIME_LIMIT: Duration = Duration::from_millis(12);
-/// Cross-block palette search is user-initiated and may walk retained history;
-/// give it a wider budget than the live Find overlay, but still fail visibly
-/// when the walk stops early (never silent truncation).
-const CROSS_BLOCK_SCAN_BYTE_LIMIT: usize = 8 * 1024 * 1024;
-const CROSS_BLOCK_SCAN_TIME_LIMIT: Duration = Duration::from_millis(48);
-const CROSS_BLOCK_REGEX_SIZE_LIMIT: usize = 2 * 1024 * 1024;
+pub(crate) use jterm_core::cross_block_search::{
+    cross_block_search_continue_is_current, CrossBlockSearchCursor, CrossBlockSearchMidRecord,
+    CROSS_BLOCK_REGEX_SIZE_LIMIT, CROSS_BLOCK_SCAN_BYTE_LIMIT, CROSS_BLOCK_SCAN_TIME_LIMIT,
+};
 /// VTE uses PCRE2 while match counting uses Rust's Unicode-aware regex engine.
 /// UTF validates/decodes the subject as Unicode and UCP makes shorthand classes
 /// such as `\d`, `\s`, and `\w` use Unicode properties on the VTE side too.
@@ -805,34 +803,16 @@ pub struct CrossBlockHit {
     pub occurrence: usize,
 }
 
-/// Mid-record resume point for a pattern scan that stopped inside one record's
-/// command or output lines. Metadata browse never sets this.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CrossBlockSearchMidRecord {
-    /// True when the next line to examine is on the output surface.
-    pub on_output: bool,
-    /// Next line index within that surface (0-based).
-    pub next_line: usize,
-    /// Match-occurrence counter for the current surface, carried so VTE jump
-    /// stepping stays aligned across idle slices.
-    pub occurrence: usize,
-}
-
-/// Where a budget-stopped cross-block scan should resume on the next idle slice.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CrossBlockSearchCursor {
-    /// Next record index in the current records list.
-    pub record_index: usize,
-    /// Present when the previous slice stopped mid-record on a pattern scan.
-    pub mid: Option<CrossBlockSearchMidRecord>,
-}
-
 /// Outcome of a cross-block palette scan. `scan_incomplete` is true when the
 /// byte/time budget stopped the walk before every eligible record was
 /// examined — distinct from hitting `max_hits`, which is a result cap the
 /// status line already discloses as "(capped)". When incomplete, `resume`
 /// names the next idle continuation point; it is always `None` when the walk
 /// finished or stopped at the hit cap.
+///
+/// Hit rows stay app-owned ([`CrossBlockHit`] differs across frontends); the
+/// resume cursor and generation predicate live in
+/// [`jterm_core::cross_block_search`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CrossBlockSearchReport {
     pub hits: Vec<CrossBlockHit>,
@@ -856,17 +836,6 @@ impl CrossBlockSearchReport {
             resume: Some(resume),
         }
     }
-}
-
-/// Whether a dialog idle continuation still owns the live search generation
-/// and should apply another budget slice. Stale generations are dropped so a
-/// newer keystroke / filter change cancels in-flight walks.
-pub(crate) fn cross_block_search_continue_is_current(
-    scheduled_generation: u64,
-    live_generation: u64,
-    has_resume: bool,
-) -> bool {
-    has_resume && scheduled_generation == live_generation
 }
 
 /// Bound native VTE cursor work performed by one palette activation.

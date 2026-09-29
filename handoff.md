@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (upgrade round 59: WatchCommand/WatchAgent finish)
+Updated: 2026-09-29 (upgrade round 60: shared CrossBlockSearchCursor)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,12 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **Shared CrossBlockSearchCursor (upgrade round 60, pending core push/repin)**:
+  resume cursor, mid-record point, generation-current predicate, and
+  cross-block scan budget constants re-export `jterm_core::cross_block_search`.
+  GTK idle scheduling and `CrossBlockSearchReport`/`FindScanBudget` stay local
+  (hit rows differ; Find overlay shares the budget type).
 
 - **Organism WatchCommand/WatchAgent finish UI contract (upgrade round 59,
   pending core push/repin)**: Full motion mirrors
