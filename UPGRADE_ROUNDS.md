@@ -371,7 +371,7 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
     with `classify_command` see-through and membership pin; Cargo manifests
     stay on the published pin (pending push/repin). Pairs forge round 118.
 
-83. **Clear-vigil Idle Full-motion UI contract** — Full motion mirrors
+85. **Clear-vigil Idle Full-motion UI contract** — Full motion mirrors
     core Inspect/SitNear→Idle and Guard*→Idle bridges (`between()` 64→70).
-    Pairs forge round 117; core clear-vigil Idle survey wave.
+    Pairs forge round 119; core clear-vigil Idle survey wave.
 
