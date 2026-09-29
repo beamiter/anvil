@@ -933,3 +933,7 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      Unknown→GuardFailure already synced in round 206. Pairs forge 264 / core
      `UnknownOutcomeToIdle` inside between() 93.
 
+211. **Find 1805/four-dots-query QueryMismatch + stale** —
+     U+1805-only queries stay QueryMismatch under Command/Output/All when stale
+     ids remain (1804/colon already pinned). Pairs forge 265.
+
