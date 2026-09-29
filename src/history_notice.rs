@@ -315,6 +315,10 @@ mod tests {
             "Save Block\u{fe06}history",
             "Save Block\u{fe08}history",
             "Save Block\u{1809}history",
+            // Center mid-range VS (FE07) + Mongolian birga stay toast-only
+            // beside FE06/FE08/Manchu full stop.
+            "Save Block\u{fe07}history",
+            "Save Block\u{1800}history",
             "Block history",
         ] {
             assert_eq!(
