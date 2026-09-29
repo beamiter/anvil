@@ -1,5 +1,17 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (Ogham sticky + All whitespace find + Guard/Celebrate Full-motion)
+
+## 2026-09-29 (Ogham sticky + All whitespace find + Guard/Celebrate Full-motion)
+
+- **Round 137**: sticky U+1680/U+180E/U+034F/U+FE00/U+FE0E/U+FE0F/U+17B4/U+17B5 near-miss labels stay toast-only.
+- **Round 138**: Find All-scope whitespace-only query stays QueryMismatch with stale extras.
+- **Round 139**: Guard*→Celebrate* Full-motion None (pairs core vigil pin).
+- **Round 140**: Celebrate*→Watch* Full-motion None (pairs core celebrate-hold pin).
+  Rounds 133–136 (Hangul sticky + C/O whitespace + Watch* Full-motion) sit beside.
+  STAGE 71 / between() 93 unchanged. Core/jagent tips still **pending push/repin**.
+
+
 Updated: 2026-09-29 (Hangul sticky + whitespace find + Watch*→Guard/ambient)
 
 ## 2026-09-29 (Hangul sticky + whitespace find + Watch*→Guard/ambient)
