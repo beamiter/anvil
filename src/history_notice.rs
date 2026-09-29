@@ -275,6 +275,16 @@ mod tests {
             "Save Block\u{feff}history",
             "\u{fff9}Save Block history\u{fffb}",
             "Save\u{fffa} Block history",
+            // Bidi embeddings/overrides + remaining deprecated format controls
+            // stay toast-only beside FVS/interlinear (206A/206F already pinned).
+            "\u{202a}Save Block history\u{202c}",
+            "\u{202b}Save Block history\u{202c}",
+            "\u{202d}Save Block history\u{202c}",
+            "\u{202e}Save Block history\u{202c}",
+            "Save Block\u{206b}history",
+            "Save Block\u{206c}history",
+            "Save Block\u{206d}history",
+            "Save Block\u{206e}history",
             "Block history",
         ] {
             assert_eq!(
