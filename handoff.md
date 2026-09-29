@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (sticky FE02/nirugu + Hangul find + Watch* Unknown + near-wrap finished)
+
+## 2026-09-29 (sticky/find/organism edges — rounds 161–164)
+
+- Sticky interior mid-range VS (FE02/FE0C) + Mongolian nirugu, Hangul/Braille/
+  ideo/Ogham find QueryMismatch + stale, WatchAgent→CelebrateBig and
+  Watch*→UnknownOutcome Full-motion Nones, and CrossBlock finished near-wrap
+  cancel. Unique rounds **161–164**. Pairs forge 203–207 / core cancel.
+  STAGE **71** / between() **93** unchanged.
+
+
 Updated: 2026-09-29 (Failure/Stuck/Cautious→Celebrate Full-motion survey)
 
 ## 2026-09-29 (Failure/Stuck/Cautious→Celebrate Full-motion survey)
