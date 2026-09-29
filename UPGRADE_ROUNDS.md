@@ -830,3 +830,17 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      Command/Output/All when stale ids remain (FE05/Manchu-comma already pinned).
      Pairs forge 235.
 
+188. **Sticky Mongolian ellipsis label** —
+     U+1801 variant of "Save Block history" stays toast-only beside FE07/birga
+     (round 184). Pairs forge 236.
+
+189. **CrossBlock cancel near-near-near-near-near-near-near-wrap bump** — palette idle
+     continuation drops MAX-7→MAX-6 generation bumps (with or without resume),
+     scheduled ahead MAX-6 vs MAX-7, and finished walks at MAX-7. Pairs forge
+     238 / core cancel edge.
+
+190. **GuardRecovery→UnknownOutcome Full-motion UI bridge sync** — semantic_bridges
+     membership + Calm/Static snaps list GuardRecovery→Unknown beside
+     Celebrate*/Rest pins (dedicated Full-motion hold already at round 186).
+     Pairs forge 239 / core `GuardRecoveryToUnknownOutcome` inside between() 93.
+
