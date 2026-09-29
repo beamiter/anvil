@@ -4292,6 +4292,75 @@ mod tests {
         }
     }
 
+    /// CelebrateBig finish arcs under Full motion: fifteen Some bridges mirror
+    /// Celebrate except WatchAgent (quiet nod). Pairs core
+    /// `celebrate_big_finish_arcs_mirror_celebrate_except_watch_agent`.
+    #[test]
+    fn celebrate_big_finish_arcs_run_under_full_motion() {
+        let inbound = [
+            Behavior::WatchSettled,
+            Behavior::WatchCommand,
+            Behavior::InspectError,
+            Behavior::SitNearError,
+            Behavior::UnknownOutcome,
+            Behavior::RestAfterPush,
+        ];
+        for from in inbound {
+            assert!(
+                visual_transition_for_motion(
+                    OrganismMotion::Full,
+                    from,
+                    Behavior::CelebrateBig,
+                )
+                .is_some(),
+                "Full {from:?}→CelebrateBig"
+            );
+            assert!(
+                VisualTransition::between(from, Behavior::CelebrateBig).is_some(),
+                "core {from:?}→CelebrateBig"
+            );
+        }
+        let outbound = [
+            Behavior::GuardRecovery,
+            Behavior::GuardCautious,
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::RestAfterPush,
+            Behavior::Idle,
+            Behavior::InspectError,
+            Behavior::SitNearError,
+            Behavior::UnknownOutcome,
+        ];
+        for to in outbound {
+            assert!(
+                visual_transition_for_motion(
+                    OrganismMotion::Full,
+                    Behavior::CelebrateBig,
+                    to,
+                )
+                .is_some(),
+                "Full CelebrateBig→{to:?}"
+            );
+            assert!(
+                VisualTransition::between(Behavior::CelebrateBig, to).is_some(),
+                "core CelebrateBig→{to:?}"
+            );
+        }
+        assert_eq!(inbound.len() + outbound.len(), 15);
+        assert_eq!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchAgent,
+                Behavior::CelebrateBig,
+            ),
+            None
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::WatchAgent, Behavior::CelebrateBig),
+            None
+        );
+    }
+
     #[test]
     fn ambient_and_typing_surfaces_skip_visual_transition_arcs() {
         // Ambient utility poses (Explore/Sleep/Approach/Idle) display through

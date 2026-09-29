@@ -675,8 +675,8 @@ pub struct CrossBlockHit {
 }
 
 /// Outcome of a cross-block palette scan. Hit rows stay app-owned
-/// ([`CrossBlockHit`] differs across frontends — anvil carries exit_code /
-/// duration_ms / cwd for palette chrome); the shared report shell lives in
+/// ([`CrossBlockHit`] carries optional exit_code / duration_ms / cwd for
+/// palette chrome; forge now matches); the shared report shell lives in
 /// [`jterm_core::cross_block_search`].
 pub type CrossBlockSearchReport =
     jterm_core::cross_block_search::CrossBlockSearchReport<CrossBlockHit>;

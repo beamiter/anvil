@@ -1303,6 +1303,27 @@ mod tests {
         assert!(jterm_core::output_notice::known_output_notice("<b>forged</b>").is_none());
     }
 
+    /// Anvil's disk schema is the bool `output_head_dropped` (Earlier only).
+    /// Truncated / PartlyRetained stay in the shared known set for forge's
+    /// `Option<String>` persistence, but BlockData must not grow a string
+    /// notice column — closing the remaining output_notice schema gap by
+    /// pinning the intentional asymmetry.
+    #[test]
+    fn anvil_disk_schema_keeps_earlier_only_while_core_knows_all_three() {
+        assert!(jterm_core::output_notice::known_output_notice(
+            jterm_core::output_notice::OUTPUT_TEXT_TRUNCATED
+        )
+        .is_some());
+        assert!(jterm_core::output_notice::known_output_notice(
+            jterm_core::output_notice::OUTPUT_PARTLY_RETAINED
+        )
+        .is_some());
+        let block = finished_block(Some(0));
+        assert!(!block.output_head_dropped);
+        // Compile-time shape: the bool field is the persistence API.
+        let _: bool = block.output_head_dropped;
+    }
+
     #[test]
     fn a_recycled_card_shell_drops_every_status_stripe() {
         for status in [
