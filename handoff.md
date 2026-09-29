@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (upgrade round 65: forge numbering parity note)
+Updated: 2026-09-29 (upgrade round 66: ambient VisualTransition N/A + FIND probe)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,16 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **AmbientBehavior Full-motion bridges (upgrade round 66 probe, N/A)**: UI
+  ambient pose (Explore/Sleep/Approach/Idle) does not route through
+  `VisualTransition::between` — that helper is Behavior-only under Full motion.
+  No ambient snap bridges to add.
+
+- **Find overlay scan budget literals (upgrade round 66 probe)**: production
+  `FindScanBudget::new` already uses `FIND_OVERLAY_SCAN_*`; no leftover
+  `8 * 1024 * 1024` / `48ms` overlay literals in `find.rs` (those budgets are
+  CROSS_BLOCK_* for palette walks). Forge companion pins test literals.
 
 - **Forge round-numbering parity note (upgrade round 65)**: anvil and forge
   keep independent counters. Shared-feature catch-up maps forge 89–103 ↔ anvil
