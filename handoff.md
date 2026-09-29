@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (bidi sticky/find + ambient disposition completeness)
+
+## 2026-09-29 (bidi sticky/find + ambient disposition completeness)
+
+- **Round 152**: sticky U+202A–U+202E / U+206B–U+206E near-miss labels stay toast-only.
+- **Round 153**: find WJ / figure-space / soft-hyphen / bidi-embedding-only queries stay QueryMismatch with stale ids (Command/Output/All).
+- **Round 154**: ambient disposition exchange table completes Idle↔Sleep/Approach + Explore↔Approach + Approach↔Sleep Full-motion Nones (pairs core ambient pin).
+  Rounds 148–151 (Idle/Rest Guard + hold→Watch + Failure→holds) sit beside.
+  STAGE 71 / between() **93** unchanged. Core/jagent tips still **pending push/repin**.
+
+
 Updated: 2026-09-29 (Idle/Rest Guard + hold→Watch + Failure→holds Full-motion)
 
 ## 2026-09-29 (Idle/Rest Guard + hold→Watch + Failure→holds Full-motion)
