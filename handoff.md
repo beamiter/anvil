@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (upgrade round 63: WatchAgent/WatchSettled→RestAfterPush)
+Updated: 2026-09-29 (upgrade round 64: UnknownOutcome→Guard* vigil settles)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,15 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **Organism UnknownOutcome→Guard* vigil settle UI contract (upgrade round 64,
+  pending core push/repin)**: Full motion mirrors UnknownOutcome→GuardFailure/
+  Stuck/Recovery/Cautious once core recognizes those bridges (pairs with
+  clear-vigil Idle and overwrite arcs from rounds 61–62).
+
+- **Find overlay scan budgets from core (upgrade round 64 companion)**:
+  `FindScanBudget::new` uses `FIND_OVERLAY_SCAN_{BYTE,TIME}_LIMIT` from
+  `jterm_core::cross_block_search` instead of local 4 MiB / 12 ms duplicates.
 
 - **Organism WatchAgent/WatchSettled→RestAfterPush UI contract (upgrade round 63,
   pending core push/repin)**: Full motion mirrors WatchAgent→RestAfterPush and

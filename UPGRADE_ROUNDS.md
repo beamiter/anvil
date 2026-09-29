@@ -227,3 +227,7 @@ evolve pass.
 
 Verification: `bash scripts/test-install-paths.sh`, `bash -n
 scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
+64. **UnknownOutcome→Guard* Full-motion UI** — Full motion mirrors
+    UnknownOutcome→GuardFailure/Stuck/Recovery/Cautious vigil settles once core
+    recognizes those bridges; Find overlay scan caps come from core
+    `FIND_OVERLAY_SCAN_*`.
