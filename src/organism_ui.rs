@@ -4836,6 +4836,54 @@ mod tests {
         }
     }
 
+    /// WatchAgent→CelebrateBig stays None under Full motion — agent passes never
+    /// CelebrateBig (quiet nod only). Pairs core
+    /// `watch_agent_never_bridges_to_celebrate_big`. between() stays 93.
+    #[test]
+    fn watch_agent_never_bridges_to_celebrate_big_under_full_motion() {
+        assert_eq!(
+            visual_transition_for_motion(
+                OrganismMotion::Full,
+                Behavior::WatchAgent,
+                Behavior::CelebrateBig,
+            ),
+            None,
+            "Full WatchAgent→CelebrateBig"
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::WatchAgent, Behavior::CelebrateBig),
+            None,
+            "core WatchAgent→CelebrateBig"
+        );
+    }
+
+    /// Watch*→UnknownOutcome stays None under Full motion — missing exit snaps
+    /// without inventing an unknown-hold bridge. Pairs core
+    /// `watch_*_never_bridges_to_unknown_outcome`. between() stays 93.
+    #[test]
+    fn watch_poses_never_bridge_to_unknown_outcome_under_full_motion() {
+        for from in [
+            Behavior::WatchCommand,
+            Behavior::WatchAgent,
+            Behavior::WatchSettled,
+        ] {
+            assert_eq!(
+                visual_transition_for_motion(
+                    OrganismMotion::Full,
+                    from,
+                    Behavior::UnknownOutcome,
+                ),
+                None,
+                "Full {from:?}→UnknownOutcome"
+            );
+            assert_eq!(
+                VisualTransition::between(from, Behavior::UnknownOutcome),
+                None,
+                "core {from:?}→UnknownOutcome"
+            );
+        }
+    }
+
     #[test]
     fn ambient_and_typing_surfaces_skip_visual_transition_arcs() {
         // Ambient utility poses (Explore/Sleep/Approach/Idle) display through
