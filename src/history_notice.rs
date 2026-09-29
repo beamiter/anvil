@@ -305,6 +305,11 @@ mod tests {
             "Save Block\u{fe04}history",
             "Save Block\u{fe0a}history",
             "Save Block\u{1807}history",
+            // Nesting mid-range VS (FE05/FE09) + Mongolian Manchu comma stay
+            // toast-only beside FE04/FE0A/syllable boundary.
+            "Save Block\u{fe05}history",
+            "Save Block\u{fe09}history",
+            "Save Block\u{1808}history",
             "Block history",
         ] {
             assert_eq!(
