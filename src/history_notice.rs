@@ -1,21 +1,30 @@
-//! Routing for Block-history fail-closed persistence failures.
+//! Persistent surface for Block-history fail-closed states.
 //!
-//! Forge keeps a sticky Retry bar under the top bar. Anvil does not host that
-//! chrome yet, but the window still needs (1) a stable way to recognize the
-//! `"Save Block history"` operation and (2) a drainable parking lot for the
-//! sync GTK-thread save failures that never reach `persistence::drain_failures`
-//! today. Sticky Retry binds to both later; until then callers keep log/toast
-//! behavior and also park here so the bar has something to show on day one.
+//! A Block-history save can refuse for reasons that stay true until somebody
+//! acts: the file's revision moved under this window, the load it must not
+//! overwrite failed, the volume is full. Those used to arrive as the same
+//! eight-second toast every other persistence failure gets, so the one class
+//! of failure that *needs* a decision was the class most likely to be missed.
+//! This bar stays until it is answered, and it carries the answer — matching
+//! forge's `ui/history_notice.rs`.
+//!
+//! Anvil's `TermView::save_history` is still synchronous on the GTK thread, so
+//! those refusals never reach `persistence::drain_failures`. Callers park them
+//! here; `AppModel` drains the lot (and any future worker failures labeled
+//! `"Save Block history"`) onto this sticky chrome.
+
+use gtk::prelude::*;
+use relm4::gtk;
+use std::sync::Mutex;
 
 use crate::block_view::BLOCK_HISTORY_PERSIST_OPERATION;
 use crate::persistence::PersistenceFailure;
-use std::sync::Mutex;
 
-/// Where a persistence failure should be shown once the UI surface exists.
+/// Where a persistence failure should be shown.
 ///
 /// Most operations keep the ordinary toast. Block-history saves are fail-closed
-/// and stay wrong until somebody acts, so they get a sticky bar (forge's
-/// `history_notice`) rather than an eight-second toast.
+/// and stay wrong until somebody acts, so they get a sticky bar rather than an
+/// eight-second toast.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PersistenceFailureSurface {
     BlockHistoryBar,
@@ -54,6 +63,74 @@ pub(crate) fn drain_sync_block_history_failures() -> Vec<PersistenceFailure> {
         .lock()
         .map(|mut parked| std::mem::take(&mut *parked))
         .unwrap_or_default()
+}
+
+/// Sticky Retry bar chrome under the top bar (forge `build_block_history_notice`).
+///
+/// The caller places `bar` in the window layout and wires `retry` / `dismiss`.
+/// Label text and visibility are updated through [`reveal_block_history_failure`].
+pub(crate) struct BlockHistoryNoticeChrome {
+    pub bar: gtk::Box,
+    pub label: gtk::Label,
+    pub retry: gtk::Button,
+    pub dismiss: gtk::Button,
+}
+
+/// Build the (initially hidden) Block-history failure bar.
+pub(crate) fn build_block_history_notice() -> BlockHistoryNoticeChrome {
+    let bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    bar.add_css_class("toolbar");
+    bar.add_css_class("error");
+    bar.set_margin_start(6);
+    bar.set_margin_end(6);
+    bar.set_margin_top(2);
+    bar.set_margin_bottom(2);
+    bar.set_visible(false);
+
+    let label = gtk::Label::new(None);
+    label.set_halign(gtk::Align::Start);
+    label.set_hexpand(true);
+    // One line, shortened in the middle: a notice bar must not grow the
+    // header when the window is narrow. The whole reason is in the log.
+    label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    label.set_xalign(0.0);
+    bar.append(&label);
+
+    let retry = gtk::Button::with_label("Retry");
+    retry.add_css_class("suggested-action");
+    retry.set_tooltip_text(Some("Reload and save this window's Block history again"));
+    bar.append(&retry);
+
+    let dismiss = gtk::Button::from_icon_name("window-close-symbolic");
+    dismiss.add_css_class("flat");
+    dismiss.set_tooltip_text(Some("Hide until the next failure"));
+    dismiss.update_property(&[gtk::accessible::Property::Label(
+        "Hide Block history failure notice",
+    )]);
+    bar.append(&dismiss);
+
+    BlockHistoryNoticeChrome {
+        bar,
+        label,
+        retry,
+        dismiss,
+    }
+}
+
+/// Raise the bar for a Block-history persistence failure.
+///
+/// The newest reason replaces an older one rather than queueing behind it:
+/// every pane in this window shares one file family, and a stale reason would
+/// send the user after a problem that has already been superseded.
+pub(crate) fn reveal_block_history_failure(
+    bar: &gtk::Box,
+    label: &gtk::Label,
+    reason: &str,
+) {
+    let reason = crate::review_input::safe_inline_display(reason, 2 * 1024);
+    log::error!("Block history is not being saved: {reason}");
+    label.set_text(&format!("Block history was not saved: {reason}"));
+    bar.set_visible(true);
 }
 
 #[cfg(test)]
