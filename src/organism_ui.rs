@@ -4257,7 +4257,9 @@ mod tests {
             );
             assert_eq!(VisualTransition::between(from, to), None);
         }
-        // GlanceAside is never a bridge source or target under Full motion.
+        // GlanceAside is never a bridge source or target under Full motion
+        // (ambient Explore/Sleep/Approach join the common overwrite set —
+        // live cue overlays without inventing GlanceAside↔ambient bridges).
         for other in [
             Behavior::Idle,
             Behavior::Celebrate,
@@ -4273,6 +4275,9 @@ mod tests {
             Behavior::WatchCommand,
             Behavior::WatchAgent,
             Behavior::WatchSettled,
+            Behavior::Explore,
+            Behavior::Sleep,
+            Behavior::Approach,
         ] {
             assert_eq!(
                 visual_transition_for_motion(
@@ -4795,6 +4800,32 @@ mod tests {
                     visual_transition_for_motion(OrganismMotion::Full, from, to),
                     None,
                     "Full {from:?}→{to:?}"
+                );
+                assert_eq!(
+                    VisualTransition::between(from, to),
+                    None,
+                    "core {from:?}→{to:?}"
+                );
+            }
+        }
+    }
+
+    /// GuardFailure/Stuck/Cautious→Celebrate* stays None under Full motion —
+    /// success finishes reach Celebrate through Watch*, and vigil→Watch is
+    /// already intentional None. Pairs core
+    /// `failure_stuck_cautious_never_bridge_to_celebrate_holds`. between() stays 93.
+    #[test]
+    fn failure_stuck_cautious_never_bridge_to_celebrate_under_full_motion() {
+        for from in [
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardCautious,
+        ] {
+            for to in [Behavior::Celebrate, Behavior::CelebrateBig] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?} (success finishes via Watch*)"
                 );
                 assert_eq!(
                     VisualTransition::between(from, to),
