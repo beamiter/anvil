@@ -722,4 +722,4 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
 
 164. **CrossBlock cancel finished at near-wrap gen** — palette idle continuation
      drops MAX-1,MAX-1 finished walks (no resume) beside the MAX-1→MAX bump.
-     Pairs forge 207 / core cancel edge.
+     Pairs forge 207 / core `continue_idle_resume_edges_drop_stale_or_finished_walks`.
