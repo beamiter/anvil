@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (Block-history sticky gap close)
+
+## 2026-09-29 (Block-history sticky gap close)
+
+- **Round 81**: closes remaining sticky gaps after round-80 enqueue —
+  `partition_persistence_failures` keeps Block-history off toast cooldown;
+  ReloadFirst revalidate-without-reinstall + save pinned; armed Explicit Clear
+  bypasses Failed-load refuse and lifts Failed→Idle (forge ExplicitReplace).
+  Pairs forge 78 / round-115 note.
+
 Updated: 2026-09-29 (labeled Save Block history enqueue)
 
 ## 2026-09-29 (labeled Save Block history enqueue)
@@ -104,6 +114,11 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **Block-history sticky gap close (upgrade round 81)**: toast routing via
+  `partition_persistence_failures`; ReloadFirst revalidate-without-reinstall
+  pins; Explicit Clear bypasses Failed-load refuse + lifts Failed→Idle so
+  Clear parking no longer blocks the tombstone write (pairs forge 78 / 115).
 
 - **Labeled Save Block history enqueue (upgrade round 80)**:
   `TermView::save_history` snapshots on GTK then

@@ -345,3 +345,12 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
     tombstone authority; worker refusals drain onto the round-78 sticky bar
     via `report_persistence_failures`. Failed-load / admission refusals still
     park sync. Pairs forge round 78 (closes the round-72 worker-label gap).
+
+81. **Block-history sticky gap close** — survey against forge sticky/Retry:
+    (1) toast routing completeness via `partition_persistence_failures` so
+    `"Save Block history"` never enters toast cooldown even when mixed with
+    routine drains; (2) ReloadFirst UX pins — revalidate without reinstalling
+    cards, then labeled save; (3) Clear parking — armed Explicit Clear bypasses
+    the Failed-load overwrite refuse and lifts Failed→Idle (forge
+    ExplicitReplace contract), so Clear no longer parks a sticky refusal
+    instead of writing the tombstone. Pairs forge round 78 / 115 note.
