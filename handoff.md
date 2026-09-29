@@ -1,5 +1,17 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (sticky FE05/Manchu + FE04 find + MAX-4 cancel + Rest→Unknown)
+
+## 2026-09-29 (sticky/find/organism edges — rounds 175–178)
+
+- Sticky nesting mid-range VS (FE05/FE09) + Mongolian Manchu comma (U+1808),
+  FE04/syllable-boundary find QueryMismatch + stale, CrossBlock near-near-near-
+  near-wrap (MAX-4→MAX-3) cancel, and RestAfterPush→UnknownOutcome Full-motion
+  bridges (Calm/Static snap). Unique rounds **175–178**. Pairs forge 220–224 /
+  core cancel. STAGE **71** / between() **93** unchanged (Celebrate→Unknown
+  already inside the 93; semantic_bridges len held).
+
+
 Updated: 2026-09-29 (sticky FE04/syllable + FE03 find + MAX-3 cancel + Celebrate→Unknown)
 
 ## 2026-09-29 (sticky/find/organism edges — rounds 171–174)
