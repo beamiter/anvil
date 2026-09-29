@@ -304,3 +304,11 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
     local `jterm_core` peels `strace` / `scriptlive` (STAGE_PREFIXES 58→60)
     with `classify_command` see-through; Cargo manifests stay on the
     published pin (pending push/repin). Pairs forge round 111.
+
+75. **Block-history sticky Retry foundation** — landed the round-72 APIs
+    without sticky chrome yet: `HistoryLoadOutcome` / `HistoryRetryAction` /
+    `BLOCK_HISTORY_PERSIST_OPERATION`, Failed-load refuse-to-overwrite,
+    `TermView::retry_history_persistence`, and `history_notice`
+    `persistence_failure_surface` + sync-failure parking. Still open:
+    labeled async enqueue of Save Block history, and AppModel sticky bar
+    that drains parked/worker failures and calls Retry. Pairs forge round 78.
