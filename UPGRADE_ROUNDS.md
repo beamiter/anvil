@@ -258,3 +258,10 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
     mirrors every core `VisualTransition::between` pair (64 bridges), closing
     gaps left by the staged UnknownOutcome / Watch* / vigil rounds (pairs
     forge round 108).
+
+70. **Forge 104–106 catch-up note** — forge rounds 104 (Find-overlay /
+    finished-output test pins), 105 (Ambient VisualTransition N/A), and 106
+    (idle cross-block continue TODO close) map onto anvil 66 (Ambient + FIND
+    overlay literal probe) plus forge-only ledger for the idle TODO already
+    closed in anvil's round-60/68 CrossBlock form. No missing anvil behavior;
+    numbering only so a forge-ahead counter does not imply a feature gap.
