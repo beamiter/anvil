@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (CrossBlock near-wrap + scheduled-ahead cancel)
+
+## 2026-09-29 (CrossBlock near-wrap + scheduled-ahead cancel)
+
+- **Round 158**: CrossBlock cancel near-wrap bump (MAX-1→MAX) with/without
+  resume; matching MAX resume stays current.
+- **Round 159**: CrossBlock cancel scheduled-ahead near-wrap (MAX vs MAX-1).
+  Pairs core cancel deepen + forge 200–201. STAGE 71 / between() **93**
+  unchanged. Core/jagent tips still **pending push/repin**.
+
+
 Updated: 2026-09-29 (sticky VS/FVS4 + find marks + GlanceAside ambient pins)
 
 ## 2026-09-29 (sticky VS/FVS4 + find marks + GlanceAside ambient)
