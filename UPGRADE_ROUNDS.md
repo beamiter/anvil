@@ -174,5 +174,12 @@ evolve pass.
     notice survives history save/restore and clear undo. Pre-notice frames still
     decode with the notice off.
 
+51. **Organism vigil-tier UI contract** — Full-motion bridge selection mirrors
+    `VisualTransition::between` for the vigil-tier arcs (second-failure settle
+    and idle Failure→Stuck / Recovery→Cautious); Calm/Static still snap. Attach
+    discloses when the inline organism card cannot mount so Unified panes do not
+    look like a silent organism failure. Behavior itself lands with core
+    `fbfcafa` (pending push/repin from `33093da`).
+
 Verification: `bash scripts/test-install-paths.sh`, `bash -n
 scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.

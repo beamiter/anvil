@@ -2942,7 +2942,16 @@ impl OrganismHub {
             persistent,
         );
         self.organism_presence.bind(presence_token, view, &runtime);
-        view.insert_inline_notice(&runtime.card);
+        // Two surfaces, deliberately: the card is the organism's home in the
+        // block conversation, the live body below is its home on the terminal
+        // surface itself. A pane that cannot host inline cards keeps only the
+        // overlay — which is also why that overlay must be suppressed for
+        // alt-screen apps there.
+        if !view.insert_inline_notice(&runtime.card) {
+            log::debug!(
+                "organism card not mounted in this pane; the live-surface body is its only home"
+            );
+        }
         if motion != OrganismMotion::Static {
             if !view.put_live_organism_body(runtime.live_body.upcast_ref(), 0.0, 0.0) {
                 log::warn!("could not attach ASCII organism to the live terminal surface");
@@ -3881,9 +3890,31 @@ mod tests {
             ),
             VisualTransition::between(Behavior::Celebrate, Behavior::GuardRecovery)
         );
+        // Full motion must mirror every bridge core recognizes — including the
+        // vigil-tier arcs (SitNearError→GuardFailure, Failure→Stuck,
+        // Recovery→Cautious). On an older pin `between` is None and Full stays
+        // None; after core fbfcafa both sides become Some together.
+        for (from, to) in [
+            (Behavior::SitNearError, Behavior::GuardFailure),
+            (Behavior::GuardFailure, Behavior::GuardStuck),
+            (Behavior::GuardRecovery, Behavior::GuardCautious),
+        ] {
+            assert_eq!(
+                visual_transition_for_motion(OrganismMotion::Full, from, to),
+                VisualTransition::between(from, to)
+            );
+        }
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
                 visual_transition_for_motion(motion, Behavior::Celebrate, Behavior::GuardRecovery,),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::SitNearError,
+                    Behavior::GuardFailure,
+                ),
                 None
             );
         }

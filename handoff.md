@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-09-06 (Organism subsystem adopted from core)
+Updated: 2026-09-29 (organism vigil-tier continuity + card-mount parity)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,16 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **Organism vigil-tier transition continuity (2026-09-29, core `fbfcafa`,
+  pending push/repin)**: `jterm_core` adds Full-motion bridges for the middle
+  vigil settle (`SitNearError→GuardFailure`) and idle escalations
+  (`GuardFailure→GuardStuck`, `GuardRecovery→GuardCautious`) so the second open
+  failure no longer snaps while 1-failure and 3+-failure settles animate. Anvil
+  UI tests assert Full motion mirrors whatever `VisualTransition::between`
+  recognizes (None on the current `33093da` pin; Some after repin). Attach also
+  logs when the inline organism card cannot mount, matching forge — Unified
+  panes keep the live-surface body as the only home.
 
 - **Persisted "Earlier output not retained" (upgrade round 50, wave 8)**:
   `BlockData.output_head_dropped` survives Block-history save/restore (and clear

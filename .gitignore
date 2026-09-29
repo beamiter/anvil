@@ -8,3 +8,4 @@
 
 # Nix build output
 /result
+.cargo/config.toml
