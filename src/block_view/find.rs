@@ -10,7 +10,6 @@ use gtk::glib;
 use gtk::prelude::*;
 use relm4::gtk;
 use std::collections::HashSet;
-use std::time::{Duration, Instant};
 use vte4::TerminalExt;
 
 use super::{
@@ -65,8 +64,7 @@ fn outcome_matches_filters(
 pub(crate) const FIND_MATCH_LIMIT: usize = 10_000;
 pub(crate) use jterm_core::cross_block_search::{
     cross_block_search_continue_is_current, CrossBlockSearchCursor, CrossBlockSearchMidRecord,
-    CROSS_BLOCK_REGEX_SIZE_LIMIT, CROSS_BLOCK_SCAN_BYTE_LIMIT, CROSS_BLOCK_SCAN_TIME_LIMIT,
-    FIND_OVERLAY_SCAN_BYTE_LIMIT, FIND_OVERLAY_SCAN_TIME_LIMIT,
+    CrossBlockSearchOptions, CrossBlockSearchScope, FindScanBudget, CROSS_BLOCK_REGEX_SIZE_LIMIT,
 };
 /// VTE uses PCRE2 while match counting uses Rust's Unicode-aware regex engine.
 /// UTF validates/decodes the subject as Unicode and UCP makes shorthand classes
@@ -260,82 +258,6 @@ struct WindowMatchPlan {
     incomplete: bool,
     initial_wrap: bool,
     wrap_before: Option<usize>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ScanPrefix<'a> {
-    text: &'a str,
-    incomplete: bool,
-}
-
-struct FindScanBudget {
-    remaining_bytes: usize,
-    started: Instant,
-    time_limit: Duration,
-}
-
-impl FindScanBudget {
-    fn new() -> Self {
-        Self {
-            remaining_bytes: FIND_OVERLAY_SCAN_BYTE_LIMIT,
-            started: Instant::now(),
-            time_limit: FIND_OVERLAY_SCAN_TIME_LIMIT,
-        }
-    }
-
-    /// Palette cross-block walks use the shared
-    /// [`CROSS_BLOCK_SCAN_BYTE_LIMIT`] / [`CROSS_BLOCK_SCAN_TIME_LIMIT`] from
-    /// `jterm_core::cross_block_search` so anvil and forge cannot drift. Live
-    /// Find overlay keeps the tighter shared [`FIND_OVERLAY_SCAN_*`] caps via [`Self::new`].
-    fn for_cross_block() -> Self {
-        Self {
-            remaining_bytes: CROSS_BLOCK_SCAN_BYTE_LIMIT,
-            started: Instant::now(),
-            time_limit: CROSS_BLOCK_SCAN_TIME_LIMIT,
-        }
-    }
-
-    fn exhausted(&self) -> bool {
-        self.time_exhausted() || self.remaining_bytes == 0
-    }
-
-    fn take_prefix<'a>(&mut self, text: &'a str) -> ScanPrefix<'a> {
-        if self.time_exhausted() || self.remaining_bytes == 0 {
-            return ScanPrefix {
-                text: "",
-                incomplete: !text.is_empty(),
-            };
-        }
-        let prefix = utf8_prefix(text, self.remaining_bytes);
-        self.remaining_bytes = self.remaining_bytes.saturating_sub(prefix.len());
-        ScanPrefix {
-            text: prefix,
-            incomplete: prefix.len() < text.len(),
-        }
-    }
-
-    fn time_exhausted(&self) -> bool {
-        self.started.elapsed() >= self.time_limit
-    }
-
-    fn remaining_bytes(&self) -> usize {
-        self.remaining_bytes
-    }
-
-    fn consume_bytes(&mut self, bytes: usize) {
-        self.remaining_bytes = self.remaining_bytes.saturating_sub(bytes);
-    }
-}
-
-fn utf8_prefix(text: &str, max_bytes: usize) -> &str {
-    if text.len() <= max_bytes {
-        return text;
-    }
-    let mut end = max_bytes.min(text.len());
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -664,60 +586,6 @@ fn find_progress(state: &FindState) -> Option<FindProgress> {
     })
 }
 
-/// Matching controls for the cross-block result picker. Keeping this as one
-/// value prevents the scan and the VTE jump highlighter from interpreting the
-/// same query differently.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct CrossBlockSearchOptions {
-    pub case_sensitive: bool,
-    pub regex: bool,
-    pub whole_word: bool,
-}
-
-/// Text surfaces included in a cross-block scan. Scope is applied before the
-/// hit cap so a command-heavy history cannot hide output-only results.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum CrossBlockSearchScope {
-    #[default]
-    All,
-    Command,
-    Output,
-}
-
-impl CrossBlockSearchScope {
-    pub fn includes_command(self) -> bool {
-        matches!(self, Self::All | Self::Command)
-    }
-
-    pub fn includes_output(self) -> bool {
-        matches!(self, Self::All | Self::Output)
-    }
-
-    pub fn from_index(index: u32) -> Self {
-        match index {
-            1 => Self::Command,
-            2 => Self::Output,
-            _ => Self::All,
-        }
-    }
-
-    pub fn index(self) -> u32 {
-        match self {
-            Self::All => 0,
-            Self::Command => 1,
-            Self::Output => 2,
-        }
-    }
-
-    pub fn cycled(self) -> Self {
-        match self {
-            Self::All => Self::Command,
-            Self::Command => Self::Output,
-            Self::Output => Self::All,
-        }
-    }
-}
-
 /// Finalized-record identity observed by an open cross-block picker. Length
 /// alone is insufficient because retention can evict one old record while a
 /// new one arrives in the same update.
@@ -806,40 +674,12 @@ pub struct CrossBlockHit {
     pub occurrence: usize,
 }
 
-/// Outcome of a cross-block palette scan. `scan_incomplete` is true when the
-/// byte/time budget stopped the walk before every eligible record was
-/// examined — distinct from hitting `max_hits`, which is a result cap the
-/// status line already discloses as "(capped)". When incomplete, `resume`
-/// names the next idle continuation point; it is always `None` when the walk
-/// finished or stopped at the hit cap.
-///
-/// Hit rows stay app-owned ([`CrossBlockHit`] differs across frontends); the
-/// resume cursor and generation predicate live in
+/// Outcome of a cross-block palette scan. Hit rows stay app-owned
+/// ([`CrossBlockHit`] differs across frontends — anvil carries exit_code /
+/// duration_ms / cwd for palette chrome); the shared report shell lives in
 /// [`jterm_core::cross_block_search`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CrossBlockSearchReport {
-    pub hits: Vec<CrossBlockHit>,
-    pub scan_incomplete: bool,
-    pub resume: Option<CrossBlockSearchCursor>,
-}
-
-impl CrossBlockSearchReport {
-    fn finished(hits: Vec<CrossBlockHit>) -> Self {
-        Self {
-            hits,
-            scan_incomplete: false,
-            resume: None,
-        }
-    }
-
-    fn budget_stopped(hits: Vec<CrossBlockHit>, resume: CrossBlockSearchCursor) -> Self {
-        Self {
-            hits,
-            scan_incomplete: true,
-            resume: Some(resume),
-        }
-    }
-}
+pub type CrossBlockSearchReport =
+    jterm_core::cross_block_search::CrossBlockSearchReport<CrossBlockHit>;
 
 /// Bound native VTE cursor work performed by one palette activation.
 fn bounded_occurrence_steps(occurrence: usize) -> Option<usize> {
@@ -2304,12 +2144,14 @@ mod tests {
         metadata_filter_hits_with_budget, native_cursor_action, outcome_matches_filters,
         pattern_search_hits_with_budget, plan_matching_windows, record_matches_filters,
         regex_consumption, snippet, step_compressed_cursor, unresolved_record_target_result,
-        utf8_prefix, vte_cross_block_pattern, BookmarkedEmptyReason, CrossBlockSearchOptions,
+        vte_cross_block_pattern, BookmarkedEmptyReason, CrossBlockSearchOptions,
         CrossBlockSearchScope, FindCursor, FindDirection, FindScanBudget,
         FindSurface, NativeCursorAction, RecordNavigationResult, RecordSnapshotView,
-        RegexConsumption, VTE_SEARCH_FLAGS, CROSS_BLOCK_SCAN_BYTE_LIMIT,
-        CROSS_BLOCK_SCAN_TIME_LIMIT, FIND_OVERLAY_SCAN_BYTE_LIMIT,
-        FIND_OVERLAY_SCAN_TIME_LIMIT,
+        RegexConsumption, VTE_SEARCH_FLAGS,
+    };
+    use jterm_core::cross_block_search::{
+        utf8_prefix, CROSS_BLOCK_SCAN_BYTE_LIMIT, CROSS_BLOCK_SCAN_TIME_LIMIT,
+        FIND_OVERLAY_SCAN_BYTE_LIMIT, FIND_OVERLAY_SCAN_TIME_LIMIT,
     };
     use crate::block_view::{
         BackendRecordRef, BackendSearchWindow, BlockData, BlockFilters, CompletedCommandRecord,
@@ -4177,7 +4019,7 @@ mod tests {
             snapshot: None,
         }];
         let mut budget = FindScanBudget::for_cross_block();
-        budget.consume_bytes(super::CROSS_BLOCK_SCAN_BYTE_LIMIT - 1);
+        budget.consume_bytes(CROSS_BLOCK_SCAN_BYTE_LIMIT - 1);
         let re = regex::Regex::new("needle").unwrap();
         let options = CrossBlockSearchOptions::default();
         let mut scan_incomplete = false;
