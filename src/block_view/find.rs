@@ -4503,6 +4503,7 @@ mod tests {
 
 
 
+
     /// Bookmark ids that survived from a previous retention window but are
     /// absent from the current records list are missing retained identity, not
     /// a metadata or query miss.
@@ -5769,6 +5770,31 @@ mod tests {
         // Finished walk at the near-near-near-near-near-near-near-near-near-wrap generation itself.
         assert!(!cross_block_search_continue_is_current(
             near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_wrap, false
+        ));
+
+        // Near-near-near-near-near-near-near-near-near-near-wrap bump (MAX-10→MAX-9) cancels with a
+        // resume — one step earlier than the MAX-9→MAX-8 sibling.
+        let near_near_near_near_near_near_near_near_near_near_wrap = near_near_near_near_near_near_near_near_near_wrap.wrapping_sub(1);
+        assert!(cross_block_search_continue_is_current(
+            near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_wrap, true
+        ));
+        assert!(!cross_block_search_continue_is_current(
+            near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_wrap, true
+        ));
+        assert!(!cross_block_search_continue_is_current(
+            near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_wrap, false
+        ));
+        // Scheduled ahead at the near-near-near-near-near-near-near-near-near-near-wrap boundary
+        // (MAX-9 vs MAX-10).
+        assert!(!cross_block_search_continue_is_current(
+            near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_wrap, true
+        ));
+        assert!(!cross_block_search_continue_is_current(
+            near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_wrap, false
+        ));
+        // Finished walk at the near-near-near-near-near-near-near-near-near-near-wrap generation itself.
+        assert!(!cross_block_search_continue_is_current(
+            near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_wrap, false
         ));
     }
 
