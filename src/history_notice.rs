@@ -310,6 +310,11 @@ mod tests {
             "Save Block\u{fe05}history",
             "Save Block\u{fe09}history",
             "Save Block\u{1808}history",
+            // Deeper nesting mid-range VS (FE06/FE08) + Mongolian Manchu full
+            // stop stay toast-only beside FE05/FE09/Manchu comma.
+            "Save Block\u{fe06}history",
+            "Save Block\u{fe08}history",
+            "Save Block\u{1809}history",
             "Block history",
         ] {
             assert_eq!(
