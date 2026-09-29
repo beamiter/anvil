@@ -577,3 +577,11 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      beside a live scoped bookmark (All-scope empty-query already pinned).
      Pairs forge 165.
 
+131. **Sticky near-miss en/em/quad-space + RLI/FSI labels** — U+2000–U+2006 /
+     U+2067 / U+2068 variants of `"Save Block history"` stay toast-only beside
+     rounds 129/122. Pairs forge 167.
+
+132. **Find All-scope empty-query browser + stale** — empty query under All
+     scope stays `None` (browser) when stale ids remain beside a live scoped
+     bookmark (Command/Output empty+stale already pinned). Pairs forge 168.
+
