@@ -1,5 +1,17 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (sticky VS/FVS4 + find marks + GlanceAside ambient pins)
+
+## 2026-09-29 (sticky VS/FVS4 + find marks + GlanceAside ambient)
+
+- Sticky mid-range VS (U+FE01/U+FE0D) + Mongolian FVS4 (U+180F) near-misses
+  stay toast-only beside bidi/deprecated pins.
+- Find ZWNJ/ZWJ/LRM/RLM/ALM-only queries stay QueryMismatch under
+  Command/Output/All with stale ids beside WJ/figure/bidi.
+- GlanceAside↔Explore/Sleep/Approach Full-motion None completes the live-cue
+  ambient overwrite set (between() stays 93). Unique rounds 155–157.
+
+
 Updated: 2026-09-29 (bidi sticky/find + ambient disposition completeness)
 
 ## 2026-09-29 (bidi sticky/find + ambient disposition completeness)
