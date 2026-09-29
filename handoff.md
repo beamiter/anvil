@@ -1,5 +1,23 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (core tip STAGE_PREFIXES systemd-socket-activate len 64)
+
+## 2026-09-29 (core tip STAGE_PREFIXES systemd-socket-activate)
+
+- **STAGE_PREFIXES len 63→64** on path-patched local core tip (`1391c88`) —
+  `systemd-socket-activate` peel + `classify_command` see-through (jagent
+  `af4f101`). Cargo manifests stay on published `33093da` (pending
+  push/repin). Upgrade round 84 (pairs forge 118).
+
+Updated: 2026-09-29 (core tip STAGE_PREFIXES systemd-inhibit len 63)
+
+## 2026-09-29 (core tip STAGE_PREFIXES systemd-inhibit)
+
+- **STAGE_PREFIXES len 62→63** on path-patched local core tip (`81c4679`) —
+  `systemd-inhibit` peel + `classify_command` see-through (jagent `c4e71a2`).
+  Cargo manifests stay on published `33093da` (pending push/repin). Upgrade
+  round 83 catch-up (pairs forge 117).
+
 Updated: 2026-09-29 (Ambient / Typing VisualTransition N/A pin)
 
 ## 2026-09-29 (Ambient / Typing VisualTransition N/A pin)
