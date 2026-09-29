@@ -1,12 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (organism WatchAgent→UnknownOutcome None + agent Celebrate pin)
+
 ## 2026-09-29 (organism intentional None + agent Celebrate)
 
 - **WatchAgent→UnknownOutcome** pinned None in Full-motion UI (and core).
 - **Agent CelebrateBig** — UI test that agent recovery stays Celebrate,
   never CelebrateBig (pairs core quiet-nod contract).
-
-Updated: 2026-09-29 (organism WatchAgent→UnknownOutcome None + agent Celebrate pin)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
