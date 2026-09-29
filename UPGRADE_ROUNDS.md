@@ -915,3 +915,7 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      membership sync. Unknown→GuardStuck already synced in round 202.
      Pairs forge 259 / core `UnknownOutcomeToGuardFailure` inside between() 93.
 
+207. **Find 1804/colon-query QueryMismatch + stale** —
+     U+1804-only queries stay QueryMismatch under Command/Output/All when stale
+     ids remain (1803/full-stop already pinned). Pairs forge 260.
+
