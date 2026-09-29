@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (upgrade round 68: FindScanBudget constructor semantic pin)
+Updated: 2026-09-29 (upgrade round 69: Full-motion semantic_bridges covers all core between pairs)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,11 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **Full-motion semantic_bridges catch-up (upgrade round 69)** — the Full-motion
+  UI contract list now includes every `VisualTransition::between` pair from the
+  local core tip (64 bridges), pairing forge round 108 (InspectError /
+  SitNearError / Celebrate{,Big} / WatchSettled / Guard* RestAfterPush gaps).
 
 - **FindScanBudget constructor semantic pin (upgrade round 68)** —
   `FindScanBudget::for_cross_block` stays on shared `CROSS_BLOCK_SCAN_*`

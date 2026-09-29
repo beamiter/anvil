@@ -254,6 +254,7 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
     `FIND_OVERLAY_SCAN_*` (4 MiB / 12 ms). Unit test pins both constructors
     (pairs forge round 107).
 
+69. **Full-motion semantic_bridges catch-up** — Full-motion UI contract list
     mirrors every core `VisualTransition::between` pair (64 bridges), closing
     gaps left by the staged UnknownOutcome / Watch* / vigil rounds (pairs
     forge round 108).
