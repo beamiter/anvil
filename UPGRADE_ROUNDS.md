@@ -825,3 +825,8 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      `GuardRecoveryToUnknownOutcome` beside Celebrate*/Rest/SitNear/Inspect→
      Unknown inside between() 93.
 
+187. **Find FE06/Manchu-full-stop-query QueryMismatch + stale** —
+     U+FE06 / U+FE08 / U+1809-only queries stay QueryMismatch under
+     Command/Output/All when stale ids remain (FE05/Manchu-comma already pinned).
+     Pairs forge 235.
+
