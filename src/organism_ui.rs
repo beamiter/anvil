@@ -4746,6 +4746,65 @@ mod tests {
         }
     }
 
+    /// Inspect/Sit/Unknown→Watch* stays None under Full motion — a new command
+    /// mid-hold snaps into Watch* without bridge frames. Pairs core
+    /// `error_and_unknown_holds_never_bridge_to_watch_poses`. between() stays 93.
+    #[test]
+    fn error_and_unknown_holds_never_bridge_to_watch_under_full_motion() {
+        for from in [
+            Behavior::InspectError,
+            Behavior::SitNearError,
+            Behavior::UnknownOutcome,
+        ] {
+            for to in [
+                Behavior::WatchCommand,
+                Behavior::WatchAgent,
+                Behavior::WatchSettled,
+            ] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?}"
+                );
+                assert_eq!(
+                    VisualTransition::between(from, to),
+                    None,
+                    "core {from:?}→{to:?}"
+                );
+            }
+        }
+    }
+
+    /// GuardFailure/Stuck/Cautious→Inspect/Sit/Unknown stays None under Full
+    /// motion — only GuardRecovery animates those overwrites. Pairs core
+    /// `failure_stuck_cautious_never_bridge_to_error_or_unknown_holds`.
+    /// between() stays 93.
+    #[test]
+    fn failure_stuck_cautious_never_bridge_to_error_holds_under_full_motion() {
+        for from in [
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardCautious,
+        ] {
+            for to in [
+                Behavior::InspectError,
+                Behavior::SitNearError,
+                Behavior::UnknownOutcome,
+            ] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?}"
+                );
+                assert_eq!(
+                    VisualTransition::between(from, to),
+                    None,
+                    "core {from:?}→{to:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn ambient_and_typing_surfaces_skip_visual_transition_arcs() {
         // Ambient utility poses (Explore/Sleep/Approach/Idle) display through
