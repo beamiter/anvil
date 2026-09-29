@@ -3997,12 +3997,14 @@ mod tests {
             93,
             "semantic_bridges list must match core visual_transition_between_recognizes_ninety_three_intentional_arcs"
         );
-        // Celebrate{,Big}→UnknownOutcome and RestAfterPush→UnknownOutcome stay
-        // inside between() 93 and this UI bridge list (no len bump).
+        // Celebrate{,Big}/RestAfterPush/GuardRecovery→UnknownOutcome stay
+        // inside between() 93 and this UI bridge list (no len bump;
+        // GuardRecovery→Unknown already counted in the 93).
         for pair in [
             (Behavior::Celebrate, Behavior::UnknownOutcome),
             (Behavior::CelebrateBig, Behavior::UnknownOutcome),
             (Behavior::RestAfterPush, Behavior::UnknownOutcome),
+            (Behavior::GuardRecovery, Behavior::UnknownOutcome),
         ] {
             assert!(
                 semantic_bridges.contains(&pair),
@@ -4064,8 +4066,8 @@ mod tests {
                 ),
                 None
             );
-            // Celebrate*/Rest→UnknownOutcome snaps under Calm/Static (Full
-            // animates; dedicated hold pins cover the same arcs).
+            // Celebrate*/Rest/GuardRecovery→UnknownOutcome snaps under Calm/Static
+            // (Full animates; dedicated hold pins cover the same arcs).
             assert_eq!(
                 visual_transition_for_motion(
                     motion,
@@ -4086,6 +4088,14 @@ mod tests {
                 visual_transition_for_motion(
                     motion,
                     Behavior::RestAfterPush,
+                    Behavior::UnknownOutcome,
+                ),
+                None
+            );
+            assert_eq!(
+                visual_transition_for_motion(
+                    motion,
+                    Behavior::GuardRecovery,
                     Behavior::UnknownOutcome,
                 ),
                 None
