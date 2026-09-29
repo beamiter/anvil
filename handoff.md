@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (labeled Save Block history enqueue)
+
+## 2026-09-29 (labeled Save Block history enqueue)
+
+- **Round 80**: `TermView::save_history` enqueues under
+  `BLOCK_HISTORY_PERSIST_OPERATION` (`"Save Block history"`) so worker I/O
+  refusals drain onto the round-78 sticky Retry bar. Baselines / pending
+  Clears are `Arc<Mutex<_>>` for worker-side revision commits. Failed-load
+  and admission refusals still park sync. Closes the round-72 worker-label
+  gap (pairs forge 78).
+
 Updated: 2026-09-29 (core tip STAGE_PREFIXES systemd-cat/aa-exec len 62)
 
 ## 2026-09-29 (core tip STAGE_PREFIXES systemd-cat/aa-exec)
@@ -14,9 +25,8 @@ Updated: 2026-09-29 (Block-history sticky chrome stub)
 ## 2026-09-29 (Block-history sticky chrome stub)
 
 - **Round 78**: AppModel sticky Retry bar under the top bar drains parked
-  sync Block-history failures (and would drain worker `"Save Block history"`
-  failures). Retry walks every Block `TermView`. Still open: labeled async
-  `persistence::enqueue` for Save Block history.
+  sync Block-history failures and worker `"Save Block history"` failures.
+  Retry walks every Block `TermView`. Round 80 lands the labeled async enqueue.
 
 Updated: 2026-09-29 (organism Guard*/Watch*/Celebrate*/Glance None pins)
 
@@ -52,7 +62,7 @@ Updated: 2026-09-29 (Block-history sticky Retry foundation)
   3. `TermView::retry_history_persistence` (ReloadFirst revalidates without
      reinstalling cards; SaveAgain saves) and `history_notice` routing +
      sync-failure parking for the sticky bar.
-  Still deferred: labeled async `persistence::enqueue` for Block history.
+  Round 80 lands labeled async `persistence::enqueue` for Block history.
 
 Updated: 2026-09-29 (core tip STAGE_PREFIXES strace/scriptlive len 60)
 
@@ -95,12 +105,19 @@ captured, queued, written, and restored.
 
 ## Completed since the previous handoff
 
+- **Labeled Save Block history enqueue (upgrade round 80)**:
+  `TermView::save_history` snapshots on GTK then
+  `persistence::enqueue_weighted` under `BLOCK_HISTORY_PERSIST_OPERATION`;
+  baselines / pending Clears are `Arc<Mutex<_>>` for worker revision commits;
+  worker refusals drain onto the round-78 sticky bar. Failed-load / admission
+  refusals still park sync. Closes the round-72 worker-label gap (pairs forge
+  78).
+
 - **Block-history sticky chrome stub (upgrade round 78)**: AppModel hosts the
   forge-shaped sticky Retry bar; `report_persistence_failures` drains parked
-  sync refusals onto it and routes `"Save Block history"` off toast cooldown;
-  Retry walks every Block `TermView`. Remaining gap before full forge parity:
-  labeled async `persistence::enqueue` for Block-history saves (still sync
-  GTK-thread I/O + parking). Pairs forge round 78.
+  sync refusals and worker `"Save Block history"` failures onto it and routes
+  that operation off toast cooldown; Retry walks every Block `TermView`.
+  Round 80 lands the labeled async enqueue. Pairs forge round 78.
 
 - **Block-history sticky failure surface — concrete unblock (upgrade round 72,
   foundation landed in round 75)**: surveyed forge `ui/history_notice.rs` and
@@ -108,6 +125,7 @@ captured, queued, written, and restored.
   `gtk::Box` chrome forge uses; there is no missing Relm4 Banner widget API.
   Round 75 added Failed-load outcome + refuse, `retry_history_persistence`,
   and sync-failure parking. Round 78 added the AppModel bar + drain/Retry.
+  Round 80 added labeled async Save Block history enqueue.
 
 - **Full-motion semantic_bridges catch-up (upgrade round 69)** — the Full-motion
   UI contract list now includes every `VisualTransition::between` pair from the

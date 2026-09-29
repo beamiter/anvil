@@ -337,3 +337,11 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
     with `classify_command` see-through (and full STAGE membership pin);
     Cargo manifests stay on the published pin (pending push/repin). Pairs
     forge round 114.
+
+80. **Labeled Save Block history enqueue** — `TermView::save_history` snapshots
+    on the GTK thread then `persistence::enqueue_weighted` under
+    `BLOCK_HISTORY_PERSIST_OPERATION` (`"Save Block history"`). Baselines and
+    pending Clears are `Arc<Mutex<_>>` so the worker can commit revision /
+    tombstone authority; worker refusals drain onto the round-78 sticky bar
+    via `report_persistence_failures`. Failed-load / admission refusals still
+    park sync. Pairs forge round 78 (closes the round-72 worker-label gap).
