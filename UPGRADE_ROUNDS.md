@@ -863,3 +863,7 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      membership sync. Pairs forge 244 / core `UnknownOutcomeToGuardRecovery`
      reverse of GuardRecovery→Unknown inside between() 93.
 
+195. **Find 1801/ellipsis-query QueryMismatch + stale** —
+     U+1801-only queries stay QueryMismatch under Command/Output/All when stale
+     ids remain (FE07/birga already pinned). Pairs forge 245.
+
