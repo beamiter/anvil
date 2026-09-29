@@ -347,6 +347,11 @@ struct AppModel {
     /// remain logged immediately; this map prevents a failing mount from
     /// queueing one toast every second while autosave continues.
     persistence_failure_notices: std::collections::HashMap<String, std::time::Instant>,
+    /// Sticky Block-history failure bar under the top bar (forge history_notice).
+    /// Starts hidden; `report_persistence_failures` reveals it for parked sync
+    /// refusals and for any future worker `"Save Block history"` failures.
+    block_history_notice: gtk::Box,
+    block_history_notice_label: gtk::Label,
     safe_mode: bool,
     dyn_css: gtk::CssProvider,
     search: Controller<search::SearchModel>,
@@ -748,6 +753,9 @@ impl SimpleComponent for AppModel {
 
                     #[local_ref]
                     top_bar_handle -> gtk::WindowHandle {},
+
+                    #[local_ref]
+                    block_history_notice -> gtk::Box {},
 
                     #[local_ref]
                     search_bar -> gtk::SearchBar {},
@@ -1239,6 +1247,21 @@ impl SimpleComponent for AppModel {
         let toast_overlay = adw::ToastOverlay::new();
         let quit_allowed = Rc::new(std::cell::Cell::new(false));
         let tab_drag_coordinator = Rc::new(tab_strip::TabDragCoordinator::default());
+        // Block-history failures stay wrong until answered; the sticky bar
+        // under the top bar is forge's history_notice shape. Starts hidden.
+        let history_notice = history_notice::build_block_history_notice();
+        {
+            let bar = history_notice.bar.clone();
+            history_notice
+                .dismiss
+                .connect_clicked(move |_| bar.set_visible(false));
+        }
+        {
+            let retry_sender = sender.clone();
+            history_notice.retry.connect_clicked(move |_| {
+                retry_sender.input(AppMsg::RetryBlockHistory);
+            });
+        }
         let mut model = AppModel {
             config,
             organism_hub,
@@ -1271,6 +1294,8 @@ impl SimpleComponent for AppModel {
             quit_allowed: quit_allowed.clone(),
             session_persistence,
             persistence_failure_notices: std::collections::HashMap::new(),
+            block_history_notice: history_notice.bar,
+            block_history_notice_label: history_notice.label,
             safe_mode: init.safe_mode,
             dyn_css,
             search,
@@ -1394,6 +1419,7 @@ impl SimpleComponent for AppModel {
         let top_bar_handle = gtk::WindowHandle::new();
         top_bar_handle.set_child(Some(top_bar));
         let toast_overlay = &model.toast_overlay;
+        let block_history_notice = &model.block_history_notice;
         let widgets = view_output!();
         let cross_block_search_key_latch =
             Rc::new(RefCell::new(CrossBlockSearchKeyLatch::default()));
@@ -1796,6 +1822,7 @@ impl SimpleComponent for AppModel {
             }
             AppMsg::ForceQuit => self.force_quit(),
             AppMsg::Toast(message) => self.show_toast(message),
+            AppMsg::RetryBlockHistory => self.retry_block_history(),
             AppMsg::ToastWithUndo {
                 pane_id,
                 message,
