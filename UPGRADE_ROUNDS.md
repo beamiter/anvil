@@ -237,3 +237,13 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
     rounds 89–103 onto anvil 50–64 (same titles: vigil-tier through
     UnknownOutcome→Guard* + Find overlay scan caps). No new behavior; ledger
     only, so a forge-ahead number does not imply anvil is missing the feature.
+
+66. **Ambient VisualTransition N/A + FIND overlay literal probe** — ambient
+    poses do not route through `VisualTransition::between`; Find overlay
+    production already uses `FIND_OVERLAY_SCAN_*` (no leftover CROSS_BLOCK_*
+    literals in `find.rs`).
+
+67. **Block-history sticky failure surface deferred** — forge’s
+    `history_notice` Retry bar is not mirrored yet. Anvil stays toast-only
+    until Relm4 gains `retry_history_persistence` + a sticky Banner; see
+    handoff round 67.

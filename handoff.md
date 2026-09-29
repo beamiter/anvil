@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (upgrade round 66: ambient VisualTransition N/A + FIND probe)
+Updated: 2026-09-29 (upgrade round 67: Block-history sticky failure surface deferred)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,15 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **Block-history sticky failure surface (upgrade round 67, deferred)**: forge
+  routes `Save Block history` through `ui/history_notice.rs` to a persistent
+  Retry bar (`persistence_failure_surface` → `BlockHistoryBar`). Anvil still
+  surfaces every persistence failure as a rate-limited toast
+  (`report_persistence_failures` → `show_toast`). Full parity needs a Relm4
+  Banner plus `retry_history_persistence` (reload-first when load failed, else
+  save-again) that forge already has on `BlockView`; porting that path is out
+  of this docs-only round so toast-only remains intentional until then.
 
 - **AmbientBehavior Full-motion bridges (upgrade round 66 probe, N/A)**: UI
   ambient pose (Explore/Sleep/Approach/Idle) does not route through
