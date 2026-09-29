@@ -180,6 +180,10 @@ evolve pass.
     discloses when the inline organism card cannot mount so Unified panes do not
     look like a silent organism failure. Behavior itself lands with core
     `fbfcafa` (pending push/repin from `33093da`).
+52. **Organism error-hold heal settle UI contract** — Full motion also mirrors
+    SitNearError/InspectError→Recovery/Cautious/Stuck and Cautious→Recovery
+    once core recognizes those bridges (pending push/repin). Calm/Static still
+    snap.
 
 Verification: `bash scripts/test-install-paths.sh`, `bash -n
 scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.

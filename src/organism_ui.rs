@@ -3896,10 +3896,15 @@ mod tests {
         // None; after core fbfcafa both sides become Some together.
         for (from, to) in [
             (Behavior::SitNearError, Behavior::GuardFailure),
+            (Behavior::SitNearError, Behavior::GuardRecovery),
+            (Behavior::SitNearError, Behavior::GuardCautious),
+            (Behavior::InspectError, Behavior::GuardRecovery),
+            (Behavior::InspectError, Behavior::GuardStuck),
             (Behavior::GuardFailure, Behavior::GuardStuck),
             (Behavior::GuardRecovery, Behavior::GuardCautious),
             (Behavior::GuardRecovery, Behavior::GuardFailure),
             (Behavior::GuardCautious, Behavior::GuardStuck),
+            (Behavior::GuardCautious, Behavior::GuardRecovery),
             (Behavior::GuardStuck, Behavior::GuardFailure),
         ] {
             assert_eq!(

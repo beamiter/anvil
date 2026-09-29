@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (family pin align: transitive jagent `628811b`; organism pending push)
+Updated: 2026-09-29 (organism error-hold heal settle UI contract)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,11 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **Organism error-hold heal settle UI contract (upgrade round 52, pending core
+  push/repin)**: Full-motion tests also mirror SitNearError/InspectError →
+  Recovery/Cautious/Stuck and Cautious→Recovery once core recognizes those
+  bridges.
 
 - **Family pin align (2026-09-29)**: path-patched local `jterm_core` pulls
   `jagent` `628811b`; `flake.nix` outputHashes comment/hash updated to match.
