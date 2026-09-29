@@ -23,6 +23,7 @@ mod file_tree;
 mod file_tree_ops;
 mod font;
 mod git_meta_ui;
+mod history_notice;
 use jterm_core::{child_env, command_history, notify, parser, pty_input, review_input};
 
 mod host {

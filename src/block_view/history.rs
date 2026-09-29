@@ -1511,6 +1511,81 @@ impl TermView {
         log::debug!("restored {restored} zones from {}", path.display());
     }
 
+    /// Re-attempt whatever this pane's Block history is stuck on.
+    ///
+    /// A save that refused because the *load* failed cannot be fixed by saving
+    /// again — that refusal is the whole point. Those panes revalidate the load
+    /// without reinstalling cards (live blocks may already exist), then save.
+    /// Every other failure is a save that can simply be tried again.
+    ///
+    /// Callable today so AppModel sticky Retry can walk every Block `TermView`
+    /// once the surface lands; sync save failures are also parked for that bar.
+    pub(crate) fn retry_history_persistence(&self) -> io::Result<()> {
+        match history_retry_action(&self.history_load_outcome.borrow()) {
+            HistoryRetryAction::ReloadFirst => {
+                self.revalidate_failed_history_load()?;
+                self.save_history()
+            }
+            HistoryRetryAction::SaveAgain => self.save_history(),
+        }
+    }
+
+    /// Lift a Failed load by probing the file again without push_back restore.
+    fn revalidate_failed_history_load(&self) -> io::Result<()> {
+        if !self.render_backend.persists_block_history() {
+            *self.history_load_outcome.borrow_mut() = HistoryLoadOutcome::Idle;
+            return Ok(());
+        }
+        let (target, load_limit) = {
+            let config = self.config.borrow();
+            (
+                configured_history_target(
+                    config.block_history_path.as_deref(),
+                    config.block_history_compress,
+                ),
+                (config.lazy_load_threshold as usize).min(config.max_visible_blocks as usize),
+            )
+        };
+        let Some(target) = target else {
+            self.reserved_history_block_ids.borrow_mut().clear();
+            *self.history_load_outcome.borrow_mut() = HistoryLoadOutcome::Idle;
+            return Ok(());
+        };
+        let (loaded, _reservation) =
+            match read_history_records_reserved(&target.path, target.compress, load_limit) {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    *self.history_load_outcome.borrow_mut() = HistoryLoadOutcome::Failed {
+                        kind: error.kind(),
+                        message: Arc::from(error.to_string()),
+                    };
+                    return Err(error);
+                }
+            };
+        let LoadedRecords {
+            revision,
+            fully_decoded,
+            fully_retained,
+            retained_estimated_bytes,
+            seen_ids,
+            clear_tombstone,
+            ..
+        } = loaded;
+        debug_assert_eq!(_reservation.estimated_bytes(), retained_estimated_bytes);
+        replace_reserved_history_ids(
+            &self.reserved_history_block_ids,
+            seen_ids.unwrap_or_default(),
+        );
+        replace_history_baseline(
+            &self.history_baselines,
+            target.path,
+            (fully_decoded && fully_retained).then_some(revision),
+            clear_tombstone,
+        );
+        *self.history_load_outcome.borrow_mut() = HistoryLoadOutcome::Loaded;
+        Ok(())
+    }
+
     /// Save block history without risking truncation of the last good snapshot.
     pub fn save_history(&self) -> io::Result<()> {
         // A backend that does not own the Block card document persists its own
@@ -1655,15 +1730,14 @@ mod tests {
         atomic_write, baseline_observation, consume_succeeded_pending, decode_block_record,
         decode_clear_tombstone, decode_record, encode_clear_tombstone,
         encode_history_frames_bounded, enqueue_pending_clear, execute_history_saves,
-        expand_home_prefix_with, lock_file_name, plan_history_saves, push_bounded_back,
-        read_history_records, read_history_records_reserved,
-        read_history_records_with_retained_budget, replace_history_baseline,
-        replace_reserved_history_ids, save_history_snapshot, save_history_snapshot_with_intent,
-        validate_history_progress, history_retry_action, refuse_save_for_failed_load,
-        HistoryFileLock, HistoryLoadOutcome, HistoryRetryAction, HistoryRevision, HistoryTarget,
-        SaveIntent, UndecodablePolicy, BLOCK_HISTORY_PERSIST_OPERATION,
-        CLEAR_TOMBSTONE_FRAME_BYTES, MAX_HISTORY_DECODE_DURATION, MAX_HISTORY_FILE_BYTES,
-        MAX_HISTORY_FRAMES,
+        expand_home_prefix_with, history_retry_action, lock_file_name, plan_history_saves,
+        push_bounded_back, read_history_records, read_history_records_reserved,
+        read_history_records_with_retained_budget, refuse_save_for_failed_load,
+        replace_history_baseline, replace_reserved_history_ids, save_history_snapshot,
+        save_history_snapshot_with_intent, validate_history_progress, HistoryFileLock,
+        HistoryLoadOutcome, HistoryRetryAction, HistoryRevision, HistoryTarget, SaveIntent,
+        UndecodablePolicy, BLOCK_HISTORY_PERSIST_OPERATION, CLEAR_TOMBSTONE_FRAME_BYTES,
+        MAX_HISTORY_DECODE_DURATION, MAX_HISTORY_FILE_BYTES, MAX_HISTORY_FRAMES,
     };
     use crate::block_view::BlockData;
     use std::cell::RefCell;

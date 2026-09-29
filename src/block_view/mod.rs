@@ -4067,6 +4067,7 @@ impl Drop for TermView {
     fn drop(&mut self) {
         if let Err(err) = self.save_history() {
             log::warn!("save block history on close: {err}");
+            crate::history_notice::park_sync_block_history_failure(&err);
         }
         // Outer gesture controllers capture pane-owned Rc state, while child
         // buttons/VTEs own their signal closures. Explicitly sever both sides
@@ -14741,6 +14742,7 @@ impl TermView {
         }
         if let Err(err) = self.save_history() {
             log::warn!("save cleared block history: {err}");
+            crate::history_notice::park_sync_block_history_failure(&err);
         }
         cleared_count
     }
@@ -14793,6 +14795,7 @@ impl TermView {
         if restored_count == 0 {
             if let Err(err) = self.save_history() {
                 log::warn!("save byte-pruned undo state: {err}");
+                crate::history_notice::park_sync_block_history_failure(&err);
             }
             return 0;
         }
@@ -14891,6 +14894,7 @@ impl TermView {
         self.block_list.queue_allocate();
         if let Err(err) = self.save_history() {
             log::warn!("save restored block history: {err}");
+            crate::history_notice::park_sync_block_history_failure(&err);
         }
         restored_count
     }
