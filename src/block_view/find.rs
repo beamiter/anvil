@@ -3887,6 +3887,61 @@ mod tests {
         );
     }
 
+    /// Stale ids beside a live bookmark whose scoped text misses the query must
+    /// still surface QueryMismatch under Command and Output scopes — never
+    /// collapse to NoRetainedBookmarks (All-scope query miss already pinned).
+    #[test]
+    fn bookmarked_empty_reason_keeps_command_and_output_query_mismatch_when_stale_ids_remain() {
+        let retained = CompletedCommandRecord {
+            id: 1,
+            cmd: "echo retained".to_string(),
+            exit_code: Some(0),
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: Some(20),
+            cwd: None,
+            is_background: false,
+            completion_provenance: super::super::CompletionProvenance::ShellReported,
+            start_mark_seen: true,
+            command_source: crate::block_view::CommandTextSource::Screen,
+        };
+        let retained_output = ZoneOutputSnapshot {
+            plain: "noise line\n".to_string(),
+            truncated: false,
+        };
+        let records = [BackendRecordRef::Metadata {
+            record: &retained,
+            snapshot: Some(&retained_output),
+        }];
+        let ids = HashSet::from([1, 99, 100]);
+        let filters = BlockFilters {
+            bookmarked_only: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            bookmarked_empty_reason(
+                records,
+                &ids,
+                CrossBlockSearchScope::Command,
+                &filters,
+                "nope",
+            ),
+            Some(BookmarkedEmptyReason::QueryMismatch),
+            "stale extras must not mask a live Command-scope query miss"
+        );
+        assert_eq!(
+            bookmarked_empty_reason(
+                records,
+                &ids,
+                CrossBlockSearchScope::Output,
+                &filters,
+                "nope",
+            ),
+            Some(BookmarkedEmptyReason::QueryMismatch),
+            "stale extras must not mask a live Output-scope query miss"
+        );
+    }
+
     #[test]
     fn background_filter_composes_before_cap_and_uses_only_real_scoped_text() {
         let record = |id, cmd: &str, duration_ms, is_background| CompletedCommandRecord {
