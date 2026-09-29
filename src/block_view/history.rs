@@ -5,7 +5,7 @@
 
 use super::zone_history;
 use super::{mutate_block_data_and_redraw, BlockData, TermView};
-use crate::persistence;
+use crate::persistence::{self, PersistenceKey};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
@@ -16,7 +16,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -40,9 +40,9 @@ const CLEAR_TOMBSTONE_FRAME_BYTES: usize = 4 + CLEAR_TOMBSTONE_MAGIC.len() + 16;
 ///
 /// Named rather than inline so the window can route this one operation to a
 /// sticky Retry bar instead of the ordinary toast cooldown: its failures are
-/// fail-closed states that stay stuck until somebody acts. Forge enqueues
-/// under this same string; anvil still saves synchronously today, but the
-/// label and retry APIs must exist before a sticky surface can light up.
+/// fail-closed states that stay stuck until somebody acts. Forge and anvil
+/// both enqueue under this same string so `drain_failures` →
+/// `persistence_failure_surface` can raise the bar for worker I/O refusals.
 pub(crate) const BLOCK_HISTORY_PERSIST_OPERATION: &str = "Save Block history";
 
 /// What answering the Block-history failure bar has to do for one pane.
@@ -58,12 +58,14 @@ pub(crate) enum HistoryRetryAction {
     SaveAgain,
 }
 
-/// Sync-path observation of this pane's last Block-history load attempt.
+/// Observation of this pane's last Block-history load attempt.
 ///
 /// Forge keeps a richer async `Loaded(Arc<LoadedHistory>)` payload for the
 /// persistence worker. Anvil's load is still synchronous on the GTK thread, so
-/// `Loaded` is a unit marker until labeled async save lands — Retry and
-/// refuse-to-overwrite only need to know whether the load *Failed*.
+/// `Loaded` is a unit marker — Retry and refuse-to-overwrite only need to know
+/// whether the load *Failed*. Saves enqueue under
+/// [`BLOCK_HISTORY_PERSIST_OPERATION`] with the revision intent snapshotted
+/// from this pane's baselines.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum HistoryLoadOutcome {
     Idle,
@@ -183,18 +185,21 @@ fn baseline_observation(
 }
 
 fn replace_history_baseline(
-    baselines: &RefCell<HashMap<PathBuf, HistoryBaseline>>,
+    baselines: &Mutex<HashMap<PathBuf, HistoryBaseline>>,
     path: PathBuf,
     revision: Option<HistoryRevision>,
     clear_tombstone: Option<u128>,
 ) {
-    baselines.borrow_mut().insert(
-        path,
-        HistoryBaseline {
-            revision,
-            clear_tombstone,
-        },
-    );
+    baselines
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            path,
+            HistoryBaseline {
+                revision,
+                clear_tombstone,
+            },
+        );
 }
 
 /// Armed Clears are always first and retain user order. Once all succeed, a
@@ -222,29 +227,51 @@ fn plan_history_saves(
 }
 
 fn enqueue_pending_clear(
-    pending: &RefCell<VecDeque<HistoryTarget>>,
+    pending: &Mutex<VecDeque<HistoryTarget>>,
     target: Option<HistoryTarget>,
 ) {
     let Some(target) = target else {
         return;
     };
-    let mut pending = pending.borrow_mut();
+    let mut pending = pending
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if !pending.contains(&target) {
         pending.push_back(target);
     }
 }
 
 fn consume_succeeded_pending(
-    pending: &RefCell<VecDeque<HistoryTarget>>,
+    pending: &Mutex<VecDeque<HistoryTarget>>,
     succeeded: &HistoryTarget,
 ) -> bool {
-    let mut pending = pending.borrow_mut();
+    let mut pending = pending
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if pending.front() == Some(succeeded) {
         pending.pop_front();
         true
     } else {
         false
     }
+}
+
+/// Conservative retained-byte charge for a Block-history snapshot handed to the
+/// persistence worker. Capacities (not lengths) so admission never undercounts
+/// memory the closure already owns.
+fn estimated_snapshot_retained_bytes(blocks: &[BlockData], capacity: usize) -> usize {
+    let inline = capacity.saturating_mul(std::mem::size_of::<BlockData>());
+    blocks.iter().fold(
+        std::mem::size_of::<Vec<BlockData>>().saturating_add(inline),
+        |total, block| {
+            total
+                .saturating_add(block.prompt.capacity())
+                .saturating_add(block.cmd.capacity())
+                .saturating_add(block.cmd_markup.as_ref().map_or(0, String::capacity))
+                .saturating_add(block.output.capacity())
+                .saturating_add(block.cwd.as_ref().map_or(0, String::capacity))
+        },
+    )
 }
 
 fn replace_reserved_history_ids(reserved: &RefCell<HashSet<u64>>, seen_ids: HashSet<u64>) {
@@ -1384,8 +1411,8 @@ fn save_history_snapshot_with_intent(
 }
 
 fn execute_history_saves(
-    baselines: &RefCell<HashMap<PathBuf, HistoryBaseline>>,
-    pending: &RefCell<VecDeque<HistoryTarget>>,
+    baselines: &Mutex<HashMap<PathBuf, HistoryBaseline>>,
+    pending: &Mutex<VecDeque<HistoryTarget>>,
     blocks: &[BlockData],
     saves: Vec<PlannedHistorySave>,
 ) -> io::Result<()> {
@@ -1394,7 +1421,9 @@ fn execute_history_saves(
             SaveIntent::ExplicitReplace
         } else {
             let (expected_revision, observed_clear_tombstone) = {
-                let baselines = baselines.borrow();
+                let baselines = baselines
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 baseline_observation(&baselines, &save.target.path)
             };
             SaveIntent::Revision {
@@ -1428,6 +1457,41 @@ fn execute_history_saves(
         }
     }
     Ok(())
+}
+
+/// Hand a planned Block-history save batch to the shared persistence worker
+/// under [`BLOCK_HISTORY_PERSIST_OPERATION`], matching forge's labeled enqueue
+/// so worker failures reach the sticky Retry bar via `drain_failures`.
+///
+/// Baselines and pending Clears are `Arc<Mutex<_>>` so the worker can commit
+/// revision / tombstone authority after a successful write without bouncing
+/// back through the GTK thread. One job runs the whole planned batch in order
+/// (Clear-queue stop-on-first-error). Coalescing keys on the last target path
+/// so a newer `save_history` replaces an older pending batch for that file
+/// family.
+fn enqueue_history_saves(
+    baselines: Arc<Mutex<HashMap<PathBuf, HistoryBaseline>>>,
+    pending: Arc<Mutex<VecDeque<HistoryTarget>>>,
+    blocks: Vec<BlockData>,
+    saves: Vec<PlannedHistorySave>,
+) -> io::Result<()> {
+    if saves.is_empty() {
+        return Ok(());
+    }
+    let key_path = saves
+        .last()
+        .expect("non-empty saves")
+        .target
+        .path
+        .clone();
+    let key = PersistenceKey::for_path("block-history", &key_path);
+    let estimated_bytes = estimated_snapshot_retained_bytes(&blocks, blocks.capacity());
+    persistence::enqueue_weighted(
+        key,
+        BLOCK_HISTORY_PERSIST_OPERATION,
+        estimated_bytes,
+        move || execute_history_saves(&baselines, &pending, &blocks, saves),
+    )
 }
 
 #[allow(dead_code)]
@@ -1587,6 +1651,11 @@ impl TermView {
     }
 
     /// Save block history without risking truncation of the last good snapshot.
+    ///
+    /// Snapshots live blocks on the GTK thread, then enqueues the write under
+    /// [`BLOCK_HISTORY_PERSIST_OPERATION`] so worker refusals drain onto the
+    /// sticky Block-history bar. Admission / Failed-load refusals still return
+    /// synchronously for callers that park them.
     pub fn save_history(&self) -> io::Result<()> {
         // A backend that does not own the Block card document persists its own
         // bounded zone document instead, on a sibling path, so neither
@@ -1605,7 +1674,10 @@ impl TermView {
             )
         };
         let saves = {
-            let pending = self.history_explicit_replace_pending.borrow();
+            let pending = self
+                .history_explicit_replace_pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             plan_history_saves(&pending, configured)
         };
         if saves.is_empty() {
@@ -1617,10 +1689,10 @@ impl TermView {
             return Ok(());
         };
         let blocks = block_data.iter().cloned().collect::<Vec<_>>();
-        execute_history_saves(
-            &self.history_baselines,
-            &self.history_explicit_replace_pending,
-            &blocks,
+        enqueue_history_saves(
+            Arc::clone(&self.history_baselines),
+            Arc::clone(&self.history_explicit_replace_pending),
+            blocks,
             saves,
         )
     }
@@ -1729,9 +1801,9 @@ mod tests {
     use super::{
         atomic_write, baseline_observation, consume_succeeded_pending, decode_block_record,
         decode_clear_tombstone, decode_record, encode_clear_tombstone,
-        encode_history_frames_bounded, enqueue_pending_clear, execute_history_saves,
-        expand_home_prefix_with, history_retry_action, lock_file_name, plan_history_saves,
-        push_bounded_back, read_history_records, read_history_records_reserved,
+        encode_history_frames_bounded, enqueue_history_saves, enqueue_pending_clear,
+        execute_history_saves, expand_home_prefix_with, history_retry_action, lock_file_name,
+        plan_history_saves, push_bounded_back, read_history_records, read_history_records_reserved,
         read_history_records_with_retained_budget, refuse_save_for_failed_load,
         replace_history_baseline, replace_reserved_history_ids, save_history_snapshot,
         save_history_snapshot_with_intent, validate_history_progress, HistoryFileLock,
@@ -1740,6 +1812,9 @@ mod tests {
         MAX_HISTORY_DECODE_DURATION, MAX_HISTORY_FILE_BYTES, MAX_HISTORY_FRAMES,
     };
     use crate::block_view::BlockData;
+    use crate::history_notice::persistence_failure_surface;
+    use crate::history_notice::PersistenceFailureSurface;
+    use crate::persistence;
     use std::cell::RefCell;
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::ffi::CString;
@@ -1749,7 +1824,7 @@ mod tests {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::path::{Path, PathBuf};
-    use std::sync::{Arc, Barrier};
+    use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -2578,7 +2653,7 @@ mod tests {
 
     #[test]
     fn history_baselines_move_with_the_owner_and_remain_path_keyed() {
-        let baselines = RefCell::new(HashMap::new());
+        let baselines = Mutex::new(HashMap::new());
         let first = PathBuf::from("/tmp/anvil-history-first");
         let second = PathBuf::from("/tmp/anvil-history-second");
         replace_history_baseline(
@@ -2593,17 +2668,17 @@ mod tests {
 
         // Moving the owning value cannot change lookup identity; no address is
         // present in either the state or its key.
-        let moved = RefCell::new(baselines.into_inner());
+        let moved = Mutex::new(baselines.into_inner().unwrap());
         assert_eq!(
-            baseline_observation(&moved.borrow(), &first),
+            baseline_observation(&moved.lock().unwrap(), &first),
             (Some(HistoryRevision::Missing), Some(11))
         );
         assert_eq!(
-            baseline_observation(&moved.borrow(), &second),
+            baseline_observation(&moved.lock().unwrap(), &second),
             (None, Some(22))
         );
         assert_eq!(
-            baseline_observation(&moved.borrow(), Path::new("/tmp/unobserved")),
+            baseline_observation(&moved.lock().unwrap(), Path::new("/tmp/unobserved")),
             (None, None)
         );
     }
@@ -2618,8 +2693,8 @@ mod tests {
             path: PathBuf::from("/tmp/new-history"),
             compress: true,
         };
-        let pending = RefCell::new(VecDeque::from([original.clone()]));
-        let saves = plan_history_saves(&pending.borrow(), Some(configured.clone()));
+        let pending = Mutex::new(VecDeque::from([original.clone()]));
+        let saves = plan_history_saves(&pending.lock().unwrap(), Some(configured.clone()));
         assert_eq!(
             saves,
             [
@@ -2634,9 +2709,9 @@ mod tests {
             ]
         );
         assert!(!consume_succeeded_pending(&pending, &configured));
-        assert_eq!(pending.borrow().front(), Some(&original));
+        assert_eq!(pending.lock().unwrap().front(), Some(&original));
         assert!(consume_succeeded_pending(&pending, &original));
-        assert!(pending.borrow().is_empty());
+        assert!(pending.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -2658,35 +2733,35 @@ mod tests {
         )
         .unwrap();
 
-        let pending = RefCell::new(VecDeque::new());
+        let pending = Mutex::new(VecDeque::new());
         enqueue_pending_clear(&pending, Some(original.clone()));
         enqueue_pending_clear(&pending, Some(original.clone()));
         enqueue_pending_clear(&pending, Some(configured.clone()));
         assert_eq!(
-            pending.borrow().iter().cloned().collect::<Vec<_>>(),
+            pending.lock().unwrap().iter().cloned().collect::<Vec<_>>(),
             [original.clone(), configured.clone()]
         );
-        let baselines = RefCell::new(HashMap::new());
+        let baselines = Mutex::new(HashMap::new());
         let guard = HistoryFileLock::acquire(&original.path).unwrap();
-        let first_attempt = plan_history_saves(&pending.borrow(), Some(configured.clone()));
+        let first_attempt = plan_history_saves(&pending.lock().unwrap(), Some(configured.clone()));
         assert!(first_attempt.iter().all(|save| save.explicit_replace));
         let error = execute_history_saves(&baselines, &pending, &[], first_attempt).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert_eq!(
-            pending.borrow().iter().cloned().collect::<Vec<_>>(),
+            pending.lock().unwrap().iter().cloned().collect::<Vec<_>>(),
             [original.clone(), configured.clone()]
         );
-        assert!(baselines.borrow().is_empty());
+        assert!(baselines.lock().unwrap().is_empty());
         drop(guard);
 
         // A Drop/Undo retry executes A successfully, then stops at B. Only A
         // is consumed; the failed target and every later target stay queued.
         let configured_guard = HistoryFileLock::acquire(&configured.path).unwrap();
-        let retry = plan_history_saves(&pending.borrow(), Some(configured.clone()));
+        let retry = plan_history_saves(&pending.lock().unwrap(), Some(configured.clone()));
         let error = execute_history_saves(&baselines, &pending, &[], retry).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        assert_eq!(pending.borrow().front(), Some(&configured));
-        assert_eq!(pending.borrow().len(), 1);
+        assert_eq!(pending.lock().unwrap().front(), Some(&configured));
+        assert_eq!(pending.lock().unwrap().len(), 1);
         let cleared =
             read_history_records(&original.path, false, usize::MAX, UndecodablePolicy::Reject)
                 .unwrap();
@@ -2706,9 +2781,9 @@ mod tests {
         );
         drop(configured_guard);
 
-        let final_retry = plan_history_saves(&pending.borrow(), Some(configured.clone()));
+        let final_retry = plan_history_saves(&pending.lock().unwrap(), Some(configured.clone()));
         execute_history_saves(&baselines, &pending, &[], final_retry).unwrap();
-        assert!(pending.borrow().is_empty());
+        assert!(pending.lock().unwrap().is_empty());
         let also_cleared = read_history_records(
             &configured.path,
             true,
@@ -2731,9 +2806,9 @@ mod tests {
             path: original.path.clone(),
             compress: true,
         };
-        let pending = RefCell::new(VecDeque::from([original]));
-        let baselines = RefCell::new(HashMap::new());
-        let saves = plan_history_saves(&pending.borrow(), Some(configured.clone()));
+        let pending = Mutex::new(VecDeque::from([original]));
+        let baselines = Mutex::new(HashMap::new());
+        let saves = plan_history_saves(&pending.lock().unwrap(), Some(configured.clone()));
         assert_eq!(saves.len(), 2);
         execute_history_saves(
             &baselines,
@@ -2742,7 +2817,7 @@ mod tests {
             saves,
         )
         .unwrap();
-        assert!(pending.borrow().is_empty());
+        assert!(pending.lock().unwrap().is_empty());
         let loaded = read_history_records(
             &configured.path,
             true,
@@ -2854,5 +2929,124 @@ mod tests {
                 "{resumable:?}"
             );
         }
+    }
+
+    #[test]
+    fn save_history_enqueues_under_the_labeled_block_history_operation() {
+        let source = include_str!("history.rs");
+        let save = source
+            .split("pub fn save_history(&self) -> io::Result<()> {")
+            .nth(1)
+            .expect("save_history")
+            .split("\n    pub fn load_history")
+            .next()
+            .expect("save_history closes before load_history");
+        assert!(
+            save.contains("enqueue_history_saves("),
+            "save_history must hand the write to the persistence worker"
+        );
+        assert!(
+            !save.contains("execute_history_saves("),
+            "save_history must not keep the sync GTK-thread write path"
+        );
+        assert!(
+            source.contains("persistence::enqueue_weighted(")
+                && source.contains("BLOCK_HISTORY_PERSIST_OPERATION"),
+            "enqueue_history_saves must label the job Save Block history"
+        );
+    }
+
+    #[test]
+    fn labeled_enqueue_failure_drains_onto_the_sticky_surface() {
+        let dir = TestDir::new("labeled-enqueue-fail");
+        let path = dir.path().join("history.bin");
+        let guard = HistoryFileLock::acquire(&path).unwrap();
+        let baselines = Arc::new(Mutex::new(HashMap::new()));
+        let pending = Arc::new(Mutex::new(VecDeque::new()));
+        let saves = vec![super::PlannedHistorySave {
+            target: HistoryTarget {
+                path: path.clone(),
+                compress: false,
+            },
+            explicit_replace: false,
+        }];
+        // Drain any leftover global-worker failures from earlier tests.
+        let _ = persistence::drain_failures();
+        enqueue_history_saves(
+            Arc::clone(&baselines),
+            Arc::clone(&pending),
+            vec![sample_block(1, "blocked")],
+            saves,
+        )
+        .expect("admission must succeed; the lock only fails the write");
+
+        let mut failures = Vec::new();
+        for _ in 0..100 {
+            failures = persistence::drain_failures();
+            if !failures.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        drop(guard);
+        assert!(
+            failures.iter().any(|failure| {
+                failure.operation == BLOCK_HISTORY_PERSIST_OPERATION
+                    && persistence_failure_surface(&failure.operation)
+                        == PersistenceFailureSurface::BlockHistoryBar
+            }),
+            "expected Sticky-labeled failure, got {failures:?}"
+        );
+        assert!(baselines.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn labeled_enqueue_success_commits_baseline_from_the_worker() {
+        let dir = TestDir::new("labeled-enqueue-ok");
+        let path = dir.path().join("history.bin");
+        let baselines = Arc::new(Mutex::new(HashMap::new()));
+        // Seed Missing so the worker's first write is authoritative and grants
+        // revision deletion authority (empty observation would only stale-merge).
+        replace_history_baseline(
+            &baselines,
+            path.clone(),
+            Some(HistoryRevision::Missing),
+            None,
+        );
+        let pending = Arc::new(Mutex::new(VecDeque::new()));
+        let saves = vec![super::PlannedHistorySave {
+            target: HistoryTarget {
+                path: path.clone(),
+                compress: false,
+            },
+            explicit_replace: false,
+        }];
+        let _ = persistence::drain_failures();
+        enqueue_history_saves(
+            Arc::clone(&baselines),
+            Arc::clone(&pending),
+            vec![sample_block(3, "async-ok")],
+            saves,
+        )
+        .unwrap();
+
+        let mut saw_present_revision = false;
+        for _ in 0..100 {
+            if baselines.lock().unwrap().get(&path).is_some_and(|baseline| {
+                matches!(baseline.revision, Some(HistoryRevision::Present { .. }))
+            }) {
+                saw_present_revision = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            saw_present_revision,
+            "worker must commit Present revision authority after an authoritative write"
+        );
+        assert!(persistence::drain_failures().is_empty());
+        let loaded =
+            read_history_records(&path, false, usize::MAX, UndecodablePolicy::Reject).unwrap();
+        assert_eq!(loaded.blocks.front().map(|block| block.id), Some(3));
     }
 }
