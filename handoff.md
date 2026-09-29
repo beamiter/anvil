@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (shared output_notice from jterm_core)
+Updated: 2026-09-29 (organism celebrate-hold relapse UI contract)
 
 This baseline exact-pins the hardened shared core and jagent revisions and now
 keeps session persistence plus Palette workflow/history reads off the GTK
@@ -11,6 +11,10 @@ the session epoch; workspace snapshots enforce the same budgets while being
 captured, queued, written, and restored.
 
 ## Completed since the previous handoff
+
+- **Organism celebrate-hold relapse UI contract (upgrade round 54, pending core
+  push/repin)**: Full motion mirrors Celebrate/CelebrateBig → Failure/Stuck
+  once core recognizes those bridges.
 
 - **Shared finished-block output notice (upgrade round 53, pending core
   push/repin)**: `OUTPUT_HEAD_DROPPED_NOTICE` is

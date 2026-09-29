@@ -187,6 +187,9 @@ evolve pass.
 53. **Shared finished-block output notice** — the earlier-output display string
     comes from `jterm_core::output_notice` (pending core push/repin). Disk
     schema stays the bool `output_head_dropped`.
+54. **Organism celebrate-hold relapse UI contract** — Full motion mirrors
+    Celebrate/CelebrateBig→Failure/Stuck once core recognizes those bridges
+    (pending push/repin). Calm/Static still snap.
 
 Verification: `bash scripts/test-install-paths.sh`, `bash -n
 scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
