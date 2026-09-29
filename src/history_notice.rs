@@ -206,6 +206,13 @@ mod tests {
             "Save Block\u{200b}history",
             "\u{feff}Save Block history",
             "Save Block history\u{000b}",
+            // Soft hyphen / word joiner / bidi / ZWNJ near-misses beside the
+            // ZWSP/BOM/VT wave — still toast-only, never sticky.
+            "Save Block\u{00ad}history",
+            "Save Block\u{2060}history",
+            "Save\u{200e} Block history",
+            "Save Block\u{200c}history",
+            "Save Block\u{2007}history",
             "Block history",
         ] {
             assert_eq!(
