@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (organism WatchCommand→UnknownOutcome None pin)
+
+## 2026-09-29 (organism WatchCommand→UnknownOutcome None)
+
+- **WatchCommand→UnknownOutcome** pinned None in Full-motion UI (and core),
+  beside WatchAgent→UnknownOutcome — missing exit status snaps.
+
+
 Updated: 2026-09-29 (Block-history sticky unblock criteria)
 
 ## 2026-09-29 (Block-history sticky — concrete unblock)

@@ -294,3 +294,8 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
     `AppModel` view!, route that operation off toast cooldown, Retry walks
     every Block `TermView`. Pairs forge round 78; toast-only stays
     intentional until then.
+
+73. **WatchCommand→UnknownOutcome None UI** — Full motion pins
+    WatchCommand→UnknownOutcome as None (missing exit status snaps), pairing
+    core intentional None beside WatchAgent→UnknownOutcome (pairs forge
+    round 110).
