@@ -248,6 +248,15 @@ mod tests {
             "Save Block\u{2006}history",
             "\u{2067}Save Block history\u{2069}",
             "\u{2068}Save Block history\u{2069}",
+            // Hangul fillers / Braille blank / deprecated format controls stay
+            // toast-only beside the en/em/RLI wave.
+            "Save Block\u{115f}history",
+            "Save Block\u{1160}history",
+            "Save Block\u{3164}history",
+            "Save Block\u{ffa0}history",
+            "Save Block\u{2800}history",
+            "Save Block\u{206a}history",
+            "Save Block\u{206f}history",
             "Block history",
         ] {
             assert_eq!(
