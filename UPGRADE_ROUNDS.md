@@ -867,3 +867,16 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      U+1801-only queries stay QueryMismatch under Command/Output/All when stale
      ids remain (FE07/birga already pinned). Pairs forge 245.
 
+196. **Sticky Mongolian full stop label** —
+     U+1803 variant of "Save Block history" stays toast-only beside comma
+     (round 192). Pairs forge 246.
+
+197. **CrossBlock cancel near-near-near-near-near-near-near-near-near-wrap bump** — palette idle
+     continuation drops MAX-9→MAX-8 generation bumps (with or without resume),
+     scheduled ahead MAX-8 vs MAX-9, and finished walks at MAX-9. Pairs forge
+     248 / core cancel edge.
+
+198. **UnknownOutcome→GuardCautious Full-motion bridge** — Full motion animates
+     UnknownOutcome→GuardCautious; Calm/Static snap + semantic_bridges
+     membership sync. Unknown↔GuardRecovery already synced in rounds 190/194.
+     Pairs forge 249 / core `UnknownOutcomeToGuardCautious` inside between() 93.
