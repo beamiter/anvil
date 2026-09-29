@@ -4599,6 +4599,153 @@ mod tests {
         }
     }
 
+    /// Hold/rest→Explore/Sleep/Approach stays None under Full motion — ambient
+    /// utility arrives from mind rescoring after clear-vigil, not from a hold
+    /// finish. Pairs core `hold_and_rest_poses_never_bridge_to_ambient_utility`.
+    /// between() stays 93.
+    #[test]
+    fn hold_and_rest_never_bridge_to_ambient_under_full_motion() {
+        for from in [
+            Behavior::Celebrate,
+            Behavior::CelebrateBig,
+            Behavior::InspectError,
+            Behavior::SitNearError,
+            Behavior::UnknownOutcome,
+            Behavior::RestAfterPush,
+        ] {
+            for to in [
+                Behavior::Explore,
+                Behavior::Sleep,
+                Behavior::Approach,
+            ] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?}"
+                );
+                assert_eq!(
+                    VisualTransition::between(from, to),
+                    None,
+                    "core {from:?}→{to:?}"
+                );
+            }
+        }
+    }
+
+    /// Guard*→Explore/Sleep/Approach stays None under Full motion — ambient
+    /// utility arrives from mind after clear-vigil Idle. Pairs core
+    /// `repo_vigil_guards_never_bridge_to_ambient_utility`. between() stays 93.
+    #[test]
+    fn repo_vigil_guards_never_bridge_to_ambient_under_full_motion() {
+        for from in [
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardRecovery,
+            Behavior::GuardCautious,
+        ] {
+            for to in [
+                Behavior::Explore,
+                Behavior::Sleep,
+                Behavior::Approach,
+            ] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?}"
+                );
+                assert_eq!(
+                    VisualTransition::between(from, to),
+                    None,
+                    "core {from:?}→{to:?}"
+                );
+            }
+        }
+    }
+
+    /// WatchCommand↔WatchAgent↔WatchSettled stays None under Full motion —
+    /// elapsed-onset settled vigil and agent crouch are live SurfaceMode remaps,
+    /// not reducer bridges. Pairs core
+    /// `watch_pose_mode_switches_have_no_visual_transition`. between() stays 93.
+    #[test]
+    fn watch_pose_mode_switches_have_no_visual_transition_under_full_motion() {
+        for (from, to) in [
+            (Behavior::WatchCommand, Behavior::WatchAgent),
+            (Behavior::WatchCommand, Behavior::WatchSettled),
+            (Behavior::WatchAgent, Behavior::WatchCommand),
+            (Behavior::WatchAgent, Behavior::WatchSettled),
+            (Behavior::WatchSettled, Behavior::WatchCommand),
+            (Behavior::WatchSettled, Behavior::WatchAgent),
+        ] {
+            assert_eq!(
+                visual_transition_for_motion(OrganismMotion::Full, from, to),
+                None,
+                "Full {from:?}→{to:?}"
+            );
+            assert_eq!(
+                VisualTransition::between(from, to),
+                None,
+                "core {from:?}→{to:?}"
+            );
+        }
+    }
+
+    /// Idle/Rest→Guard* stays None under Full motion — open vigil snaps from
+    /// idle/rest without bridge frames. Pairs core
+    /// `idle_and_rest_never_bridge_to_repo_vigil_guards`. between() stays 93.
+    #[test]
+    fn idle_and_rest_never_bridge_to_repo_vigil_under_full_motion() {
+        for from in [Behavior::Idle, Behavior::RestAfterPush] {
+            for to in [
+                Behavior::GuardFailure,
+                Behavior::GuardStuck,
+                Behavior::GuardRecovery,
+                Behavior::GuardCautious,
+            ] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?}"
+                );
+                assert_eq!(
+                    VisualTransition::between(from, to),
+                    None,
+                    "core {from:?}→{to:?}"
+                );
+            }
+        }
+    }
+
+    /// Rest/Guard*→Watch* stays None under Full motion — a new command mid-rest
+    /// or mid-vigil snaps into Watch* without bridge frames. Pairs core
+    /// `rest_and_repo_vigil_never_bridge_to_watch_poses`. between() stays 93.
+    #[test]
+    fn rest_and_repo_vigil_never_bridge_to_watch_under_full_motion() {
+        for from in [
+            Behavior::RestAfterPush,
+            Behavior::GuardRecovery,
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardCautious,
+        ] {
+            for to in [
+                Behavior::WatchCommand,
+                Behavior::WatchAgent,
+                Behavior::WatchSettled,
+            ] {
+                assert_eq!(
+                    visual_transition_for_motion(OrganismMotion::Full, from, to),
+                    None,
+                    "Full {from:?}→{to:?}"
+                );
+                assert_eq!(
+                    VisualTransition::between(from, to),
+                    None,
+                    "core {from:?}→{to:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn ambient_and_typing_surfaces_skip_visual_transition_arcs() {
         // Ambient utility poses (Explore/Sleep/Approach/Idle) display through
