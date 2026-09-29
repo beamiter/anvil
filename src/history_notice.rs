@@ -300,6 +300,11 @@ mod tests {
             "Save Block\u{fe03}history",
             "Save Block\u{fe0b}history",
             "Save Block\u{1806}history",
+            // Inner mid-range VS (FE04/FE0A) + Mongolian syllable boundary stay
+            // toast-only beside FE03/FE0B/Todo soft hyphen.
+            "Save Block\u{fe04}history",
+            "Save Block\u{fe0a}history",
+            "Save Block\u{1807}history",
             "Block history",
         ] {
             assert_eq!(
