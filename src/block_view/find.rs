@@ -5404,6 +5404,29 @@ mod tests {
         assert!(!cross_block_search_continue_is_current(
             near_near_near_wrap, near_near_near_wrap, false
         ));
+        // Near-near-near-near-wrap bump (MAX-4→MAX-3) cancels with a resume —
+        // one step earlier than the MAX-3→MAX-2 sibling.
+        let near_near_near_near_wrap = near_near_near_wrap.wrapping_sub(1);
+        assert!(cross_block_search_continue_is_current(
+            near_near_near_near_wrap, near_near_near_near_wrap, true
+        ));
+        assert!(!cross_block_search_continue_is_current(
+            near_near_near_near_wrap, near_near_near_wrap, true
+        ));
+        assert!(!cross_block_search_continue_is_current(
+            near_near_near_near_wrap, near_near_near_wrap, false
+        ));
+        // Scheduled ahead at the near-near-near-near-wrap boundary (MAX-3 vs MAX-4).
+        assert!(!cross_block_search_continue_is_current(
+            near_near_near_wrap, near_near_near_near_wrap, true
+        ));
+        assert!(!cross_block_search_continue_is_current(
+            near_near_near_wrap, near_near_near_near_wrap, false
+        ));
+        // Finished walk at the near-near-near-near-wrap generation itself.
+        assert!(!cross_block_search_continue_is_current(
+            near_near_near_near_wrap, near_near_near_near_wrap, false
+        ));
     }
 
 
