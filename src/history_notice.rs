@@ -186,6 +186,46 @@ mod tests {
         }
     }
 
+    /// Near-miss labels must not raise the sticky bar — the surface is keyed
+    /// on the exact `"Save Block history"` operation string workers enqueue.
+    #[test]
+    fn near_miss_operation_labels_stay_on_the_toast_surface() {
+        for near_miss in [
+            "Save Block history ",
+            " Save Block history",
+            "save Block history",
+            "Save Block History",
+            "Save block history",
+            "Save Block histor",
+            "Save Block history\n",
+            "Block history",
+        ] {
+            assert_eq!(
+                persistence_failure_surface(near_miss),
+                PersistenceFailureSurface::Toast,
+                "{near_miss:?}"
+            );
+        }
+        let mixed = vec![
+            PersistenceFailure {
+                operation: "Save Block history ".to_string(),
+                error: "padded".to_string(),
+            },
+            PersistenceFailure {
+                operation: BLOCK_HISTORY_PERSIST_OPERATION.to_string(),
+                error: "real".to_string(),
+            },
+            PersistenceFailure {
+                operation: "save Block history".to_string(),
+                error: "cased".to_string(),
+            },
+        ];
+        let (bar, toast) = partition_persistence_failures(mixed);
+        assert_eq!(bar.len(), 1);
+        assert_eq!(bar[0].error, "real");
+        assert_eq!(toast.len(), 2);
+    }
+
     #[test]
     fn partition_keeps_block_history_off_the_toast_cooldown() {
         let mixed = vec![
