@@ -585,3 +585,21 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      scope stays `None` (browser) when stale ids remain beside a live scoped
      bookmark (Command/Output empty+stale already pinned). Pairs forge 168.
 
+133. **Sticky near-miss Hangul-filler/Braille/format-control labels** — U+115F /
+     U+1160 / U+3164 / U+FFA0 / U+2800 / U+206A / U+206F variants of
+     `"Save Block history"` stay toast-only beside rounds 131/129. Pairs forge
+     170.
+
+134. **Find Command/Output whitespace-query QueryMismatch + stale** —
+     whitespace-only `" \t "` under Command and Output stays QueryMismatch when
+     stale ids remain (empty-query browser already pinned). Pairs forge 171.
+
+135. **Watch*→Guard* Full-motion None** — Full motion pins WatchCommand/Agent/
+     Settled→Guard* intentional None beside WatchSettled finish Somes. Pairs
+     forge 173 / core `watch_poses_never_bridge_to_repo_vigil_guards`.
+
+136. **Watch*→ambient Full-motion None + semantic_bridges WatchSettled note** —
+     Full motion pins Watch*→Explore/Sleep/Approach None; `semantic_bridges`
+     comment notes WatchSettled finish six sit inside between() **93**. Pairs
+     forge 174 / core `watch_poses_never_bridge_to_ambient_utility`.
+
