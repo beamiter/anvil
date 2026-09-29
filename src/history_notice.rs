@@ -323,6 +323,8 @@ mod tests {
             "Save Block\u{1801}history",
             // Mongolian comma stays toast-only beside ellipsis (one edge).
             "Save Block\u{1802}history",
+            // Mongolian full stop stays toast-only beside comma (one edge).
+            "Save Block\u{1803}history",
             "Block history",
         ] {
             assert_eq!(
