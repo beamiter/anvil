@@ -721,7 +721,12 @@ fn selection_owns_key(has_selection: bool, keyval: gtk::gdk::Key) -> bool {
     has_selection
         && matches!(
             keyval,
-            Key::Return | Key::KP_Enter | Key::ISO_Enter | Key::Escape
+            Key::Return
+                | Key::KP_Enter
+                | Key::ISO_Enter
+                | Key::Escape
+                | Key::Delete
+                | Key::KP_Delete
         )
 }
 
@@ -2145,9 +2150,9 @@ fn raw_fallback_shell_is_foreground(
 
 type SelectedBlockIds = Rc<RefCell<std::collections::HashSet<u64>>>;
 
-const SELECTION_HINT_RUN: &str = "Esc cancel  ·  ↵ recall  ·  Ctrl+↵ run";
-const SELECTION_HINT_RECALL: &str = "Esc cancel  ·  ↵ recall";
-const SELECTION_HINT_CANCEL: &str = "Esc cancel";
+const SELECTION_HINT_RUN: &str = "Esc cancel  ·  Del  ·  ↵ recall  ·  Ctrl+↵ run";
+const SELECTION_HINT_RECALL: &str = "Esc cancel  ·  Del  ·  ↵ recall";
+const SELECTION_HINT_CANCEL: &str = "Esc cancel  ·  Del";
 const SELECTION_HINT_MIN_CHARS: i32 = 14;
 const SELECTION_HINT_MAX_CHARS: i32 = 52;
 const SELECTION_REFUSAL_VISIBLE_FOR: Duration = Duration::from_millis(1_600);
@@ -2163,13 +2168,22 @@ fn finished_selection_hint(
     if selected_count == 1 && can_recall && active_command_is_rerunnable {
         SELECTION_HINT_RUN.to_string()
     } else if selected_count > 1 && can_recall {
-        format!("Esc cancel  ·  {selected_count} selected  ·  ↵ recall all")
+        format!("Esc cancel  ·  Del  ·  {selected_count} selected  ·  ↵ recall all")
     } else if can_recall {
         SELECTION_HINT_RECALL.to_string()
     } else if selected_count > 1 {
-        format!("Esc cancel  ·  {selected_count} selected")
+        format!("Esc cancel  ·  Del  ·  {selected_count} selected")
     } else {
         SELECTION_HINT_CANCEL.to_string()
+    }
+}
+
+/// Put previously removed items back at the document indices they occupied.
+/// Insertion is in increasing index order so later originals stay valid.
+fn insert_items_at_original_indices<T>(live: &mut Vec<T>, items: Vec<(usize, T)>) {
+    for (index, item) in items {
+        let at = index.min(live.len());
+        live.insert(at, item);
     }
 }
 
@@ -3240,6 +3254,9 @@ type BlockContextCallbacks =
 /// No-payload menu callbacks: the app re-derives authoritative block evidence
 /// from the emitting pane rather than trusting renderer-built payloads.
 type FixBlockWithAgentCallbacks = Rc<RefCell<Vec<Box<dyn Fn()>>>>;
+/// Menu and selection-owned Delete: Relm4 emits `DeleteSelectedBlocks` so the
+/// toast that carries Undo is raised around the mutation, not by the view.
+type DeleteSelectedCallbacks = Rc<RefCell<Vec<Box<dyn Fn()>>>>;
 type CwdCallbacks = Rc<RefCell<Vec<Box<dyn Fn(&str, bool)>>>>;
 type AgentExecutionLostCallbacks =
     Rc<RefCell<Vec<Box<dyn Fn(crate::agent::AgentExecutionRef, &'static str)>>>>;
@@ -3961,6 +3978,7 @@ pub struct TermView {
     block_finished_callbacks: BlockFinishedCallbacks,
     ask_ai_about_block_callbacks: BlockContextCallbacks,
     fix_block_with_agent_callbacks: FixBlockWithAgentCallbacks,
+    delete_selected_callbacks: DeleteSelectedCallbacks,
     mouse_reporting_mode: Rc<Cell<MouseReporting>>,
     /// Whether the shell has enabled DECSET 2004. Clipboard input is written
     /// directly to our PTY, so block mode must apply this wrapper itself.
@@ -3995,6 +4013,10 @@ pub struct TermView {
     /// explicit undo can rebuild their widgets. Single-level: a later clear
     /// with content replaces it; cleared again only when consumed by undo.
     cleared_stash: RefCell<Vec<BlockData>>,
+    /// Blocks removed by the most recent grouped Delete, with the document
+    /// index each occupied so undo can reopen the same gaps. Exclusive with
+    /// `cleared_stash`: the later of Clear or Delete owns the one-level undo.
+    deleted_stash: RefCell<Vec<(usize, BlockData)>>,
     /// Ids in `cleared_stash` whose cards said their output's beginning was
     /// lost. `BlockData` does not carry that, so the rebuilt cards would
     /// otherwise pass the surviving tail off as the whole transcript.
@@ -4986,6 +5008,9 @@ struct BlockBackend {
     /// Menu-only ("Fix with Agent" on a failed block). Carries no payload: the
     /// app re-derives the evidence from the emitting pane's live selection.
     fix_block_with_agent_cbs: FixBlockWithAgentCallbacks,
+    /// Menu and selection-owned Delete: the Relm4 adapter emits the input that
+    /// mutates through `TermView` and raises the Undo toast.
+    delete_selected_cbs: DeleteSelectedCallbacks,
     /// Same shared cell as the `ReaderCtx` clone: the latest OSC 7 cwd report,
     /// read by the failed-block Retry guard as its self-reported leg ("" when
     /// nothing was ever reported).
@@ -7439,7 +7464,6 @@ impl RenderBackend for BlockBackend {
     ) {
         let block_data_for_export = self.block_data_for_cb.clone();
         let finished_blocks_for_menu = self.finished_blocks_for_cb.clone();
-        let block_list_for_menu = self.block_list_rc.clone();
         let vte_for_copy = self.active_vte.clone();
         let bracketed_paste_for_rerun_menu = self.bracketed_paste_rc.clone();
         let verified_submission_for_rerun_menu = self.verified_submission.clone();
@@ -7449,14 +7473,10 @@ impl RenderBackend for BlockBackend {
         let anchor_for_menu = self.selection_anchor_id_rc.clone();
         let bookmarks_for_menu = self.bookmarks_rc.clone();
         let block_scroll_for_menu = self.block_scroll_rc.clone();
-        let visible_for_menu = self.visible_indices_rc.clone();
-        let widget_pool_for_menu = self.widget_pool_for_cb.clone();
         let ask_ai_cbs_for_menu = self.ask_ai_about_block_cbs.clone();
         let fix_block_cbs_for_menu = self.fix_block_with_agent_cbs.clone();
+        let delete_selected_cbs_for_menu = self.delete_selected_cbs.clone();
         let current_cwd_for_menu = self.current_cwd_for_menu.clone();
-        let failure_marker_redraw_for_menu = self.failure_marker_redraw.clone();
-        let unread_for_menu = self.unread_count_rc.clone();
-        let jump_fab_for_menu = self.jump_fab.clone();
         let cross_selection_for_menu = self.cross_selection_slot.clone();
 
         let right_click = gtk::GestureClick::new();
@@ -8039,8 +8059,9 @@ impl RenderBackend for BlockBackend {
             }
 
             {
-                // Every sibling item already pluralizes with the selection;
-                // this one silently deleted one of five.
+                // Every sibling item already pluralizes with the selection.
+                // Mutation itself lives on TermView so persist, find cleanup,
+                // viewport, and the Undo toast stay on one path.
                 let delete_label = if selected_count > 1 {
                     format!("Delete {selected_count} Blocks")
                 } else {
@@ -8048,84 +8069,12 @@ impl RenderBackend for BlockBackend {
                 };
                 let item = make_item(&delete_label);
                 let popover_c = popover.clone();
-                let finished_blocks_for_delete = finished_blocks_for_menu.clone();
-                let block_list_for_delete = block_list_for_menu.clone();
-                let block_data_for_delete = block_data_for_export.clone();
-                let selected_ids_for_delete = selected_ids_for_menu.clone();
-                let selected_for_delete = selected_for_menu.clone();
-                let anchor_for_delete = anchor_for_menu.clone();
-                let bookmarks_for_delete = bookmarks_for_menu.clone();
-                let visible_for_delete = visible_for_menu.clone();
-                let widget_pool_for_delete = widget_pool_for_menu.clone();
-                let failure_marker_redraw_for_delete = failure_marker_redraw_for_menu.clone();
-                let unread_for_delete = unread_for_menu.clone();
-                let jump_fab_for_delete = jump_fab_for_menu.clone();
-                let block_id_del = block_id;
+                let delete_selected_cbs_for_delete = delete_selected_cbs_for_menu.clone();
                 item.connect_clicked(move |_| {
                     popover_c.popdown();
-                    // Opening this menu already folded the clicked card into
-                    // the selection, so "what is highlighted" is the honest
-                    // target set. Collected in document order and removed from
-                    // the back, so each removal cannot shift the next index.
-                    let targets: Vec<u64> = {
-                        let selected = selected_ids_for_delete.borrow();
-                        if selected.is_empty() {
-                            vec![block_id_del]
-                        } else {
-                            finished_blocks_for_delete
-                                .borrow()
-                                .iter()
-                                .filter(|block| selected.contains(&block.id))
-                                .map(|block| block.id)
-                                .collect()
-                        }
-                    };
-                    for target in targets.into_iter().rev() {
-                        let mut blocks = finished_blocks_for_delete.borrow_mut();
-                        let removed_pos = blocks.iter().position(|block| block.id == target);
-                        if let Some(pos) = removed_pos {
-                            let unread = unread_after_index_removal(
-                                blocks.len(),
-                                unread_for_delete.get(),
-                                pos,
-                            );
-                            unread_for_delete.set(unread);
-                            set_jump_fab_label(&jump_fab_for_delete, unread);
-                            let block = blocks.remove(pos);
-                            let widget = block.widget().clone();
-                            block_list_for_delete.remove(&widget);
-                            widget_pool_for_delete.borrow_mut().release(widget);
-                        }
-                        remove_finished_block_from_selection(
-                            &blocks,
-                            &selected_ids_for_delete,
-                            &selected_for_delete,
-                            &anchor_for_delete,
-                            target,
-                        );
-                        drop(blocks);
-                        // Keep block_data in lockstep with the widget list.
-                        mutate_block_data_and_redraw(
-                            &block_data_for_delete,
-                            failure_marker_redraw_for_delete.as_ref(),
-                            |blocks| {
-                                if let Some(pos) = removed_pos {
-                                    let removed = blocks.remove(pos);
-                                    debug_assert_eq!(
-                                        removed.as_ref().map(|block| block.id),
-                                        Some(target),
-                                    );
-                                }
-                            },
-                        );
-                        bookmarks_for_delete.remove(target);
+                    for callback in delete_selected_cbs_for_delete.borrow().iter() {
+                        callback();
                     }
-                    // Index-based virtualization must be recalculated after
-                    // any removal; retaining the old set can hide the block
-                    // that shifted into this slot until the next full scroll.
-                    // Once, after the whole batch.
-                    visible_for_delete.borrow_mut().clear();
-                    block_list_for_delete.queue_allocate();
                 });
                 vbox.append(&item);
             }
@@ -10401,6 +10350,7 @@ struct KeyCtx {
     /// read, but the next Enter goes to the program. See
     /// [`selection_release_is_due`].
     selection_release_for_key: Rc<Cell<Option<(u64, u64)>>>,
+    delete_selected_for_key: DeleteSelectedCallbacks,
 }
 
 /// Whether a pending release (see `KeyCtx::selection_release_for_key`) takes
@@ -10441,6 +10391,7 @@ impl KeyCtx {
             verified_submission_for_key,
             human_input_for_key,
             selection_release_for_key,
+            delete_selected_for_key,
         } = self;
         key_ctrl.connect_key_pressed(move |controller, keyval, keycode, modifiers| {
             use gtk::gdk::Key;
@@ -10886,6 +10837,22 @@ impl KeyCtx {
                     return glib::Propagation::Stop;
                 }
                 return glib::Propagation::Proceed;
+            }
+
+            // Delete removes the selected cards through the same Relm4 input
+            // the context menu uses, so Undo lands on the toast rather than a
+            // silent in-view mutation. A running program already took Delete
+            // above via `selection_yields_to_running_app`.
+            if !ctrl
+                && !shift
+                && !alt
+                && matches!(keyval, Key::Delete | Key::KP_Delete)
+                && selected_block_id_for_key.get().is_some()
+            {
+                for callback in delete_selected_for_key.borrow().iter() {
+                    callback();
+                }
+                return glib::Propagation::Stop;
             }
 
             // Linux Warp toggles the output filter editor with Alt+Shift+F. Target
@@ -11853,6 +11820,7 @@ impl TermView {
         let ask_ai_about_block_callbacks: BlockContextCallbacks = Rc::new(RefCell::new(vec![]));
         let fix_block_with_agent_callbacks: FixBlockWithAgentCallbacks =
             Rc::new(RefCell::new(vec![]));
+        let delete_selected_callbacks: DeleteSelectedCallbacks = Rc::new(RefCell::new(vec![]));
         let mouse_reporting_mode: Rc<Cell<MouseReporting>> =
             Rc::new(Cell::new(MouseReporting::OFF));
         // Unlike a regular VTE terminal, block mode owns the shell PTY. Keep
@@ -12166,6 +12134,7 @@ impl TermView {
                     pty_winsize: pty_winsize.clone(),
                     ask_ai_about_block_cbs: ask_ai_about_block_callbacks.clone(),
                     fix_block_with_agent_cbs: fix_block_with_agent_callbacks.clone(),
+                    delete_selected_cbs: delete_selected_callbacks.clone(),
                     current_cwd_for_menu: current_cwd.clone(),
                     bstate_rc: bstate_rc.clone(),
                     typed_cmd_rc: typed_cmd_rc.clone(),
@@ -13096,6 +13065,7 @@ impl TermView {
                 verified_submission_for_key: verified_submission.clone(),
                 human_input_for_key: human_input_callbacks.clone(),
                 selection_release_for_key: Rc::new(Cell::new(None)),
+                delete_selected_for_key: delete_selected_callbacks.clone(),
             };
 
             // Root fallback is added after the stranded-focus recovery
@@ -13454,6 +13424,7 @@ impl TermView {
             block_finished_callbacks,
             ask_ai_about_block_callbacks,
             fix_block_with_agent_callbacks,
+            delete_selected_callbacks,
             mouse_reporting_mode,
             bracketed_paste,
             dynamic_colors,
@@ -13474,6 +13445,7 @@ impl TermView {
             selection_anchor_id,
             bookmarks: block_bookmarks,
             cleared_stash: RefCell::new(Vec::new()),
+            deleted_stash: RefCell::new(Vec::new()),
             cleared_head_dropped: RefCell::new(std::collections::HashSet::new()),
             history_baselines: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             history_load_outcome: RefCell::new(history::HistoryLoadOutcome::Idle),
@@ -14572,6 +14544,13 @@ impl TermView {
             .push(Box::new(f));
     }
 
+    pub fn connect_delete_selected_blocks<F>(&self, f: F)
+    where
+        F: Fn() + 'static,
+    {
+        self.delete_selected_callbacks.borrow_mut().push(Box::new(f));
+    }
+
     pub fn scroll_lines(&self, lines: i32) {
         if self.render_backend.scroll_surface_lines(lines) {
             return;
@@ -14708,6 +14687,7 @@ impl TermView {
         if !cleared.is_empty() {
             *self.cleared_stash.borrow_mut() = cleared;
             self.cleared_head_dropped.borrow_mut().clear();
+            self.deleted_stash.borrow_mut().clear();
         }
 
         let widgets: Vec<gtk::Box> = self
@@ -14759,6 +14739,9 @@ impl TermView {
     /// older than anything created since, so they are reinserted above the
     /// current finished blocks. Returns how many blocks were restored.
     pub fn undo_clear_blocks(&self) -> usize {
+        if !self.deleted_stash.borrow().is_empty() {
+            return self.undo_deleted_blocks();
+        }
         if self.fullscreen.get() {
             // An alt-screen app owns the viewport and history widgets are
             // hidden; keep the stash so undo still works after it exits.
@@ -14902,6 +14885,206 @@ impl TermView {
         self.block_list.queue_allocate();
         if let Err(err) = self.save_history() {
             log::warn!("save restored block history: {err}");
+            crate::history_notice::park_sync_block_history_failure(&err);
+        }
+        restored_count
+    }
+
+    /// Remove the currently selected finished cards. Returns how many were
+    /// taken; they are stashed so `undo_clear_blocks` can reopen the same gaps.
+    pub fn delete_selected_blocks(&self) -> usize {
+        if !self.render_backend.supports_block_mutation() {
+            log::debug!("render backend has no Block document to mutate");
+            return 0;
+        }
+        if self.fullscreen.get() {
+            return 0;
+        }
+        let targets: Vec<u64> = {
+            let selected = self.selected_block_ids.borrow();
+            self.finished_blocks
+                .borrow()
+                .iter()
+                .filter(|block| selected.contains(&block.id))
+                .map(|block| block.id)
+                .collect()
+        };
+        if targets.is_empty() {
+            return 0;
+        }
+        self.arm_history_explicit_replace();
+        self.clear_find();
+        {
+            let finished = self.finished_blocks.borrow();
+            let mut data = self.block_data.borrow_mut();
+            for block in data.iter_mut() {
+                if finished
+                    .iter()
+                    .find(|card| card.id == block.id)
+                    .is_some_and(|card| card.output_head_dropped())
+                {
+                    block.output_head_dropped = true;
+                }
+            }
+        }
+        let mut stash: Vec<(usize, BlockData)> = Vec::with_capacity(targets.len());
+        for target in targets.into_iter().rev() {
+            if let Some(taken) = self.take_finished_block(target) {
+                stash.push(taken);
+            }
+        }
+        stash.reverse();
+        let deleted_count = stash.len();
+        if deleted_count == 0 {
+            return 0;
+        }
+        *self.deleted_stash.borrow_mut() = stash;
+        self.cleared_stash.borrow_mut().clear();
+        self.cleared_head_dropped.borrow_mut().clear();
+        self.visible_indices.borrow_mut().clear();
+        self.update_viewport();
+        self.update_block_visibility();
+        self.block_list.queue_allocate();
+        if let Err(err) = self.save_history() {
+            log::warn!("save deleted block history: {err}");
+            crate::history_notice::park_sync_block_history_failure(&err);
+        }
+        deleted_count
+    }
+
+    fn take_finished_block(&self, block_id: u64) -> Option<(usize, BlockData)> {
+        let mut finished = self.finished_blocks.borrow_mut();
+        let pos = finished.iter().position(|block| block.id == block_id)?;
+        let unread = unread_after_index_removal(finished.len(), self.unread_count.get(), pos);
+        self.unread_count.set(unread);
+        set_jump_fab_label(&self.jump_fab, unread);
+        let block_to_remove = finished.remove(pos);
+        let widget_to_release = block_to_remove.widget().clone();
+        self.block_list.remove(&widget_to_release);
+        self.widget_pool.borrow_mut().release(widget_to_release);
+        remove_finished_block_from_selection(
+            &finished,
+            &self.selected_block_ids,
+            &self.selected_block_id,
+            &self.selection_anchor_id,
+            block_id,
+        );
+        drop(finished);
+        let data = mutate_block_data_and_redraw(
+            &self.block_data,
+            self.failure_marker_redraw.as_ref(),
+            |blocks| blocks.remove(pos),
+        )?;
+        debug_assert_eq!(data.id, block_id);
+        self.bookmarks.remove(block_id);
+        Some((pos, data))
+    }
+
+    fn undo_deleted_blocks(&self) -> usize {
+        if self.fullscreen.get() {
+            return 0;
+        }
+        let stash: Vec<(usize, BlockData)> = std::mem::take(&mut *self.deleted_stash.borrow_mut());
+        if stash.is_empty() {
+            return 0;
+        }
+        self.clear_find();
+        let restored_count = stash.len();
+        {
+            let config = finished_block_config(&self.dynamic_colors, &self.config.borrow());
+            let fallback_cols =
+                bounded_finished_vte_columns(self.active.borrow().grid_cols() as i64);
+            for (index, mut block) in stash {
+                let at = index.min(self.finished_blocks.borrow().len());
+                let cols = bounded_finished_vte_columns(if block.cols > 0 {
+                    block.cols as i64
+                } else {
+                    fallback_cols
+                });
+                block.estimated_height =
+                    estimated_finished_block_height_for_text(&config, &block.output, cols);
+                let finished = FinishedBlock::new(
+                    block.id,
+                    &block.prompt,
+                    &block.cmd,
+                    block.cmd_markup.as_deref(),
+                    &block.output,
+                    block.exit_code,
+                    &config,
+                    block.duration_ms,
+                    block.end_time_ms,
+                    block.cwd.as_deref(),
+                    cols,
+                );
+                finished.set_lifecycle(
+                    block.lifecycle_health(),
+                    block.lifecycle_notice().as_deref(),
+                );
+                finished.set_output_head_dropped(block.output_head_dropped);
+                let anchor: gtk::Widget = self
+                    .finished_blocks
+                    .borrow()
+                    .get(at)
+                    .map(|card| card.widget().clone().upcast())
+                    .unwrap_or_else(|| self.active.borrow().widget().clone().upcast());
+                finished
+                    .widget()
+                    .insert_before(&self.block_list, Some(&anchor));
+                finished.connect_actions(
+                    &self.active_vte,
+                    &self.verified_submission,
+                    &self.bracketed_paste,
+                    &self.active,
+                );
+                finished.connect_scroll_forwarding(&self.block_scroll, &self.scroll_debouncer);
+                install_finished_block_selection(
+                    &finished,
+                    &self.active,
+                    &self.finished_blocks,
+                    &self.selected_block_ids,
+                    &self.selected_block_id,
+                    &self.selection_anchor_id,
+                );
+                self.render_backend.install_finished_block_context_menu(
+                    finished.widget().clone(),
+                    finished.clone(),
+                    finished.id,
+                );
+                self.finished_blocks.borrow_mut().insert(at, finished);
+                mutate_block_data_and_redraw(
+                    &self.block_data,
+                    self.failure_marker_redraw.as_ref(),
+                    |data| data.insert(at, block),
+                );
+            }
+        }
+        let max_blocks = self.config.borrow().max_visible_blocks as usize;
+        let overflow = self.finished_blocks.borrow().len().saturating_sub(max_blocks);
+        if overflow > 0 {
+            evict_finished_block_prefix(
+                overflow,
+                &self.finished_blocks,
+                &self.block_data,
+                &self.block_list,
+                &self.widget_pool,
+                BlockRemovalRefs {
+                    selected_ids: &self.selected_block_ids,
+                    selected: &self.selected_block_id,
+                    anchor: &self.selection_anchor_id,
+                    bookmarks: &self.bookmarks,
+                    visible_indices: &self.visible_indices,
+                    failure_marker_redraw: self.failure_marker_redraw.as_ref(),
+                    unread_count: &self.unread_count,
+                    jump_fab: &self.jump_fab,
+                },
+            );
+        }
+        self.visible_indices.borrow_mut().clear();
+        self.update_viewport();
+        self.update_block_visibility();
+        self.block_list.queue_allocate();
+        if let Err(err) = self.save_history() {
+            log::warn!("save restored deleted block history: {err}");
             crate::history_notice::park_sync_block_history_failure(&err);
         }
         restored_count
@@ -15447,48 +15630,6 @@ impl TermView {
                 }
             });
         }
-    }
-
-    /// Delete a block by ID (for right-click menu).
-    pub fn delete_block_by_id(&self, block_id: u64) {
-        let mut finished = self.finished_blocks.borrow_mut();
-        let Some(pos) = finished.iter().position(|b| b.id == block_id) else {
-            return;
-        };
-        let unread = unread_after_index_removal(finished.len(), self.unread_count.get(), pos);
-        self.unread_count.set(unread);
-        set_jump_fab_label(&self.jump_fab, unread);
-        let block_to_remove = finished.remove(pos);
-        let widget_to_release = block_to_remove.widget().clone();
-        self.block_list.remove(&widget_to_release);
-        // Return widget to pool for potential reuse
-        self.widget_pool.borrow_mut().release(widget_to_release);
-        remove_finished_block_from_selection(
-            &finished,
-            &self.selected_block_ids,
-            &self.selected_block_id,
-            &self.selection_anchor_id,
-            block_id,
-        );
-        drop(finished);
-
-        // Keep the serializable record list in lockstep with the widget list;
-        // otherwise the two desync and count-based eviction / id lookups drift.
-        mutate_block_data_and_redraw(
-            &self.block_data,
-            self.failure_marker_redraw.as_ref(),
-            |blocks| {
-                let removed = blocks.remove(pos);
-                debug_assert_eq!(removed.as_ref().map(|block| block.id), Some(block_id));
-            },
-        );
-        self.bookmarks.remove(block_id);
-        // Stored indices no longer identify the same widgets after removal.
-        // Recompute them on the next viewport update rather than retaining a
-        // stale set that can keep an unrelated block hidden.
-        self.visible_indices.borrow_mut().clear();
-        self.update_viewport();
-        self.update_block_visibility();
     }
 
     /// Most-recent-first deduplicated list of finished-block command lines.
@@ -22326,7 +22467,7 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
         use gtk::gdk::{Key, ModifierType};
         use relm4::gtk;
 
-        for key in [Key::Return, Key::KP_Enter, Key::ISO_Enter, Key::Escape] {
+        for key in [Key::Return, Key::KP_Enter, Key::ISO_Enter, Key::Escape, Key::Delete, Key::KP_Delete] {
             assert!(super::selection_owns_key(true, key));
             assert!(!super::selection_owns_key(false, key));
             assert!(stranded_focus_key_recovers(key, ModifierType::empty()));
@@ -22336,8 +22477,8 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
             assert!(!stranded_focus_key_recovers(key, ModifierType::empty()));
         }
         assert!(
-            !super::SELECTION_HINT_RUN.contains("Del"),
-            "Delete is not advertised until grouped removal and undo exist"
+            super::SELECTION_HINT_RUN.contains("Del"),
+            "Delete is advertised once grouped removal has matching undo"
         );
     }
 
@@ -22615,7 +22756,7 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
         super::sync_finished_block_selection(&finished.borrow(), &selected, &active);
         assert_eq!(
             finished.borrow()[1].selection_hint.text(),
-            "Esc cancel  ·  2 selected  ·  ↵ recall all",
+            "Esc cancel  ·  Del  ·  2 selected  ·  ↵ recall all",
             "multi-selection must not advertise direct execution"
         );
 
@@ -23214,8 +23355,8 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
         );
         assert_eq!(
             super::finished_selection_hint(2, true, true),
-            "Esc cancel  ·  2 selected  ·  ↵ recall all",
-            "multi-selection is insert-only"
+            "Esc cancel  ·  Del  ·  2 selected  ·  ↵ recall all",
+            "multi-selection is insert-only besides grouped delete"
         );
         assert_eq!(
             super::finished_selection_hint(1, true, false),
@@ -23225,9 +23366,9 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
         assert_eq!(
             super::finished_selection_hint(1, false, false),
             super::SELECTION_HINT_CANCEL,
-            "a background/empty card can only leave selection mode"
+            "a background/empty card can leave selection mode or delete"
         );
-        assert!(!super::SELECTION_HINT_RUN.contains("Del"));
+        assert!(super::SELECTION_HINT_RUN.contains("Del"));
         assert!(!super::SELECTION_HINT_RUN.contains("Prompt ready"));
         assert_eq!(
             super::selection_refusal_hint(
@@ -23243,6 +23384,16 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
             ),
             "Esc cancel  ·  Command running  ·  nothing recalled"
         );
+    }
+
+    #[test]
+    fn deleted_blocks_restore_into_their_original_gaps() {
+        let mut live = vec!['a', 'b', 'd', 'e', 'g'];
+        super::insert_items_at_original_indices(&mut live, vec![(2, 'c'), (5, 'f')]);
+        assert_eq!(live, vec!['a', 'b', 'c', 'd', 'e', 'f', 'g']);
+        let mut prefix = vec!['x', 'y'];
+        super::insert_items_at_original_indices(&mut prefix, vec![(0, 'a'), (1, 'b'), (2, 'c')]);
+        assert_eq!(prefix, vec!['a', 'b', 'c', 'x', 'y']);
     }
 
     #[test]

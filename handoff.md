@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-10-03 (grouped Block delete with in-place undo — round 212)
+
+## 2026-10-03 (grouped Block delete — round 212)
+
+- Menu and selection-owned Delete persist history, clear find, update the
+  viewport, and raise the pane-bound Undo toast. Recovery reopens original
+  gaps (`deleted_stash` of `(index, BlockData)`). Unique round **212**.
+  Keyboard Delete is advertised; a running program still owns the key.
+
 Updated: 2026-09-30 (1805 find beside rounds 208–210)
 
 ## 2026-09-30 (sticky/find/organism edges — round 211)

@@ -937,3 +937,10 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      U+1805-only queries stay QueryMismatch under Command/Output/All when stale
      ids remain (1804/colon already pinned). Pairs forge 265.
 
+212. **Grouped Block delete with in-place undo** —
+     Menu and selection-owned Delete persist, clear find, update the
+     viewport, and share Clear Blocks' pane-bound Undo toast. Recovery
+     reopens the original document gaps. Delete is advertised on the
+     selection hint; a running program still takes the key.
+
+

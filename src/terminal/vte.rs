@@ -445,6 +445,8 @@ pub enum VteInput {
     ClearBlocks,
     /// Block-view only: restore the blocks removed by the last ClearBlocks.
     UndoClearBlocks,
+    /// Block-view only: delete the currently selected finished cards.
+    DeleteSelectedBlocks,
     /// Block-view only: fold / unfold every finished block's output at once.
     CollapseAllBlocks,
     ExpandAllBlocks,
@@ -757,6 +759,7 @@ impl Component for VteTerminal {
             | VteInput::SelectAllBlocks
             | VteInput::ClearBlocks
             | VteInput::UndoClearBlocks
+            | VteInput::DeleteSelectedBlocks
             | VteInput::CollapseAllBlocks
             | VteInput::ExpandAllBlocks
             | VteInput::ToggleBlockCollapsed

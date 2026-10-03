@@ -513,6 +513,11 @@ Block mode also has context-sensitive navigation:
   rendering, and sends CR only in the second phase. The
   active card's hint omits the action whenever the selection itself is not
   eligible.
+- `Delete` removes the selected finished cards (or the right-clicked set from
+  `Delete Block` / `Delete N Blocks`). Removal persists immediately, clears
+  find, and raises the same pane-bound Undo toast Clear Blocks uses, so a
+  crash cannot resurrect the cards and the gaps reopen in place. While a
+  command is running, Delete still belongs to that program.
 
 Every history-recall entry point, including card actions and contextual insert,
 uses the same verified empty-prompt guard, so it cannot erase or splice into an

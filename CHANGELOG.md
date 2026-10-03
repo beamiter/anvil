@@ -7,6 +7,14 @@ versioning for tagged releases while it remains experimental.
 
 ### Added
 
+- **Grouped Block delete is a real document operation.** Selecting cards and
+  pressing `Delete`, or using `Delete Block` / `Delete N Blocks` on the card
+  menu, now persists immediately, clears find, updates the viewport, and
+  raises a pane-bound Undo toast. Recovery reopens the original gaps rather
+  than stacking the cards at the top. A running program still owns Delete;
+  the previous in-menu removal could neither undo nor survive a crash without
+  resurrecting the cards.
+
 - **Task terminals that fail to launch update the task model by role.** A
   validation PTY that never crossed exec is recorded as a cancelled validation
   attempt rather than an inconclusive child exit, so the Tasks panel can schedule

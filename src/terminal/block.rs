@@ -466,6 +466,12 @@ fn connect_view_outputs(
             let _ = sender.output(VteOutput::FixBlockWithAgent);
         }
     });
+    view.connect_delete_selected_blocks({
+        let sender = sender.clone();
+        move || {
+            sender.input(VteInput::DeleteSelectedBlocks);
+        }
+    });
 }
 
 impl Component for BlockTerminal {
@@ -650,6 +656,17 @@ impl Component for BlockTerminal {
                     "No cleared blocks to restore.".to_string()
                 };
                 let _ = sender.output(VteOutput::Notice(message));
+            }
+            VteInput::DeleteSelectedBlocks => {
+                let deleted = view.delete_selected_blocks();
+                if deleted > 0 {
+                    let plural = if deleted == 1 { "" } else { "s" };
+                    let _ = sender.output(VteOutput::NoticeWithUndo {
+                        message: format!("Deleted {deleted} block{plural}."),
+                        button: "Undo".to_string(),
+                        undo: crate::terminal::NoticeUndo::ClearBlocks,
+                    });
+                }
             }
             VteInput::CollapseAllBlocks | VteInput::ExpandAllBlocks => {
                 let collapse = matches!(msg, VteInput::CollapseAllBlocks);
