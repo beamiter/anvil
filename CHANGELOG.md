@@ -41,6 +41,10 @@ versioning for tagged releases while it remains experimental.
   `[keybindings]` reaches the same undoable removal; an empty selection
   says so instead of doing nothing.
 
+- **Session export on a live VTE pane explains itself.** Markdown/JSON
+  export still reached classic VTE and wrote nothing. It now says the
+  feature needs Block mode.
+
 - **Cross-block search on a live VTE pane explains itself.** The shortcut
   still reached the classic terminal because it shares the term-view
   path, then did nothing. It now says the feature needs Block mode.

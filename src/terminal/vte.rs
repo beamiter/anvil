@@ -772,9 +772,12 @@ impl Component for VteTerminal {
             | VteInput::JumpToPrevPinned
             | VteInput::JumpToNextPinned
             | VteInput::JumpToPrevFailed
-            | VteInput::JumpToNextFailed
-            | VteInput::ExportSessionMarkdown
-            | VteInput::ExportSessionJson => {}
+            | VteInput::JumpToNextFailed => {}
+            VteInput::ExportSessionMarkdown | VteInput::ExportSessionJson => {
+                let _ = sender.output(VteOutput::Notice(vte_block_mode_only_notice(
+                    "Session export",
+                )));
+            }
             VteInput::SearchSet(query, use_regex, case_sensitive) => {
                 self.search_status =
                     if let Some(status) = crate::search::oversize_query_status(&query) {
@@ -1022,6 +1025,14 @@ mod tests {
         assert_eq!(
             vte_block_mode_only_notice("Cross-block search"),
             "Cross-block search is available only in a Block-mode pane."
+        );
+    }
+
+    #[test]
+    fn session_export_on_live_vte_explains_block_mode() {
+        assert_eq!(
+            vte_block_mode_only_notice("Session export"),
+            "Session export is available only in a Block-mode pane."
         );
     }
 

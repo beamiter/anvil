@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (session-export VTE toast — round 244)
+
+## 2026-10-04 (session export on VTE — round 244)
+
+- Session Markdown/JSON export in a live VTE pane toasts Block-mode-only.
+  Unique round **244**. Heartbeat 20s.
+
 Updated: 2026-10-04 (cross-block VTE toast — round 243)
 
 ## 2026-10-04 (cross-block search on VTE — round 243)

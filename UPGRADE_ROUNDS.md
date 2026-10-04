@@ -1095,5 +1095,8 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      the action to classic VTE, which ignored it. Same Block-mode-only copy
      as notebooks.
 
+244. **Session export on live VTE toasts** — Markdown/JSON export used the
+     same silent VTE no-op. Copy matches the Block-mode-only notebook path.
+
 
 
