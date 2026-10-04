@@ -614,8 +614,18 @@ impl Component for BlockTerminal {
             }
             VteInput::Resize(cols, rows) => view.resize(cols, rows),
             VteInput::GrabFocus => view.grab_focus(),
-            VteInput::Copy => view.copy_to_clipboard(),
-            VteInput::CopyOutputOnly => view.copy_to_clipboard_with_modifier(true),
+            VteInput::Copy => {
+                if let Some(message) = super::vte::copy_empty_notice(view.copy_to_clipboard()) {
+                    let _ = sender.output(VteOutput::Notice(message.to_string()));
+                }
+            }
+            VteInput::CopyOutputOnly => {
+                if let Some(message) =
+                    super::vte::copy_empty_notice(view.copy_to_clipboard_with_modifier(true))
+                {
+                    let _ = sender.output(VteOutput::Notice(message.to_string()));
+                }
+            }
             VteInput::Paste => view.paste_from_clipboard(),
             VteInput::SetFontScale(scale) => view.set_font_scale(scale),
             VteInput::SetFont(desc) => view.set_font(&desc),

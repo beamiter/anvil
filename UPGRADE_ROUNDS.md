@@ -990,5 +990,11 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      while a split spawn was still launching). They now toast the reason
      instead of doing nothing.
 
+222. **Copy with no selection explains itself** —
+     The context menu greys out Copy, but Ctrl+Shift+C still ran and looked
+     like a broken clipboard. VTE and Block now toast when there is no
+     visible text or whole-card selection. An oversized copy still uses the
+     existing failure dialog rather than this empty-selection message.
+
 
 

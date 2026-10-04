@@ -41,6 +41,11 @@ versioning for tagged releases while it remains experimental.
   `[keybindings]` reaches the same undoable removal; an empty selection
   says so instead of doing nothing.
 
+- **Copy with nothing selected says so.** The context menu already greys out
+  Copy, but Ctrl+Shift+C still ran. VTE and Block now toast instead of
+  looking like a broken clipboard. An oversized selection still uses the
+  existing Copy failed dialog.
+
 - **Swap, equalize, and zoom explain a single-pane tab.** The palette listed
   them, but a tab with one pane (or a split still launching) did nothing.
   Each action now says why it cannot run.

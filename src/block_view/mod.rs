@@ -14034,9 +14034,10 @@ impl TermView {
 
     /// Copy selected text to clipboard. A visible native/cross-VTE highlight
     /// wins over whole-card selection, because it is the narrower selection
-    /// the user can still see on screen.
-    pub fn copy_to_clipboard(&self) {
-        self.copy_to_clipboard_with_modifier(false);
+    /// the user can still see on screen. Returns whether anything was copied
+    /// or a copy failure was already shown.
+    pub fn copy_to_clipboard(&self) -> bool {
+        self.copy_to_clipboard_with_modifier(false)
     }
 
     /// Whether the copy ladder would find anything, without touching the
@@ -14316,7 +14317,7 @@ impl TermView {
 
     /// Same as `copy_to_clipboard` but also honors the Warp "copy block output
     /// only" modifier (Alt+Ctrl+Shift+C) when a whole block is selected.
-    pub fn copy_to_clipboard_with_modifier(&self, alt_held: bool) {
+    pub fn copy_to_clipboard_with_modifier(&self, alt_held: bool) -> bool {
         log::debug!(">>> TermView::copy_to_clipboard called (alt={})", alt_held);
 
         // A visible native or cross-widget text selection is more specific
@@ -14330,13 +14331,13 @@ impl TermView {
                 );
                 self.active_vte.clipboard().set_text(&text);
                 self.selection_feed_hold.flush_now();
-                return;
+                return true;
             }
             Err(error) => {
                 log::warn!("refused oversized VTE selection copy: {error}");
                 show_clipboard_failure(&self.active_vte, &format!("{error}. Nothing was copied."));
                 self.selection_feed_hold.flush_now();
-                return;
+                return true;
             }
             Ok(None) => {}
         }
@@ -14362,7 +14363,7 @@ impl TermView {
                     );
                     self.active_vte.clipboard().set_text(&text);
                     self.selection_feed_hold.flush_now();
-                    return;
+                    return true;
                 }
             }
         }
@@ -14371,6 +14372,7 @@ impl TermView {
         // it is unreliable on Wayland and can copy text that is no longer shown
         // as selected.
         log::debug!(">>> TermView copy: no selection found, nothing to copy");
+        false
     }
 
     /// Paste clipboard text as one ordered write to block mode's shell PTY.

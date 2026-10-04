@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (empty copy toast — round 222)
+
+## 2026-10-04 (empty copy toast — round 222)
+
+- Ctrl+Shift+C with no selection toasts `Nothing selected to copy.` Unique
+  round **222**.
+
 Updated: 2026-10-04 (split-layout empty toasts — round 221)
 
 ## 2026-10-04 (split-layout toasts — round 221)

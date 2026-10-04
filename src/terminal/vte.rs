@@ -712,7 +712,11 @@ impl Component for VteTerminal {
                 });
             }
             VteInput::Copy | VteInput::CopyOutputOnly => {
-                self.terminal.copy_clipboard_format(vte4::Format::Text)
+                if let Some(message) = copy_empty_notice(self.terminal.has_selection()) {
+                    let _ = sender.output(VteOutput::Notice(message.to_string()));
+                } else {
+                    self.terminal.copy_clipboard_format(vte4::Format::Text);
+                }
             }
             VteInput::Paste => self.terminal.paste_clipboard(),
             VteInput::SetFontScale(scale) => self.terminal.set_font_scale(scale),
@@ -800,6 +804,12 @@ impl Component for VteTerminal {
             VteInput::AskAiAboutSelectedBlock => {}
         }
     }
+}
+
+/// Keyboard Copy with nothing selected. The context menu greys out Copy, but
+/// Ctrl+Shift+C still fires and used to look like a broken clipboard.
+pub(crate) fn copy_empty_notice(has_copyable: bool) -> Option<&'static str> {
+    (!has_copyable).then_some("Nothing selected to copy.")
 }
 
 /// Install `query` as `terminal`'s native search, step to the first match
@@ -964,13 +974,22 @@ fn search_status_for_vte(
 #[cfg(test)]
 mod tests {
     use super::{
-        compile_count_regex, launch_failure_message, search_pattern, search_pcre2_flags,
+        compile_count_regex, copy_empty_notice, launch_failure_message, search_pattern, search_pcre2_flags,
         search_status_for_vte, InitialCommands, TerminalSearchSnapshot,
     };
     use crate::search::SearchStatus;
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn copy_with_no_selection_explains_itself() {
+        assert_eq!(
+            copy_empty_notice(false),
+            Some("Nothing selected to copy.")
+        );
+        assert_eq!(copy_empty_notice(true), None);
     }
 
     #[test]
