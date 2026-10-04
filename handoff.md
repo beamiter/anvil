@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (split-layout empty toasts — round 221)
+
+## 2026-10-04 (split-layout toasts — round 221)
+
+- Swap/equalize/zoom toast when a tab has one pane or a split is still
+  spawning. Unique round **221**.
+
 Updated: 2026-10-04 (parenthesized URL clip — round 220)
 
 ## 2026-10-04 (parenthesized URLs — round 220)

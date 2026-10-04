@@ -985,5 +985,10 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      dangling `:`) are clipped first. Double-click shares that trail trim
      so `https://example.com:` no longer copies the colon; `:8443` stays.
 
+221. **Swap / equalize / zoom say when a tab has one pane** —
+     Those actions were palette-discoverable no-ops on a single pane (and
+     while a split spawn was still launching). They now toast the reason
+     instead of doing nothing.
+
 
 

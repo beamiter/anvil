@@ -41,6 +41,10 @@ versioning for tagged releases while it remains experimental.
   `[keybindings]` reaches the same undoable removal; an empty selection
   says so instead of doing nothing.
 
+- **Swap, equalize, and zoom explain a single-pane tab.** The palette listed
+  them, but a tab with one pane (or a split still launching) did nothing.
+  Each action now says why it cannot run.
+
 - **Parenthesized and quoted URLs stay clickable.** Ctrl+click and hover
   took the whole whitespace token, so `(https://example.com)` failed the
   opener and was not underlined. Wrapping `([{<"'` and dangling sentence

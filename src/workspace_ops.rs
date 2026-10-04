@@ -327,6 +327,44 @@ fn swap_target_in_visual_order(order: &[usize], active: usize) -> Option<usize> 
     (next != active).then_some(next)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SplitLayoutKind {
+    Swap,
+    Equalize,
+    Zoom,
+}
+
+/// Why a palette/keybinding split-layout action cannot run. `None` means the
+/// existing layout path should proceed.
+fn split_layout_reason(
+    pane_count: usize,
+    pending_spawn: bool,
+    already_zoomed: bool,
+    kind: SplitLayoutKind,
+) -> Option<&'static str> {
+    match kind {
+        SplitLayoutKind::Swap => (pane_count < 2).then_some("Need at least two panes to swap."),
+        SplitLayoutKind::Equalize => {
+            if pending_spawn {
+                Some("Wait for the new pane to finish launching.")
+            } else if pane_count < 2 {
+                Some("Need at least two panes to equalize.")
+            } else {
+                None
+            }
+        }
+        SplitLayoutKind::Zoom => {
+            if pending_spawn {
+                Some("Wait for the new pane to finish launching.")
+            } else if !already_zoomed && pane_count < 2 {
+                Some("Need at least two panes to zoom.")
+            } else {
+                None
+            }
+        }
+    }
+}
+
 /// Working directory with `$HOME` collapsed to `~`, for the pane header.
 fn abbreviate_home(path: &str) -> String {
     match std::env::var_os("HOME") {
@@ -1950,6 +1988,15 @@ impl AppModel {
         let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
+        if let Some(reason) = split_layout_reason(
+            tab.panes.len(),
+            false,
+            false,
+            SplitLayoutKind::Swap,
+        ) {
+            self.show_toast(reason);
+            return;
+        }
         let Some(target) = swap_target_in_visual_order(&visual_pane_order(tab), tab.active_pane)
         else {
             return;
@@ -2657,12 +2704,17 @@ impl AppModel {
         let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
-        if tab.panes.len() <= 1
-            || tab
-                .panes
-                .iter()
-                .any(|pane| self.pending_split_spawns.contains_key(&pane.id))
-        {
+        let pending_spawn = tab
+            .panes
+            .iter()
+            .any(|pane| self.pending_split_spawns.contains_key(&pane.id));
+        if let Some(reason) = split_layout_reason(
+            tab.panes.len(),
+            pending_spawn,
+            false,
+            SplitLayoutKind::Equalize,
+        ) {
+            self.show_toast(reason);
             return;
         }
         // The real tree is detached while pane-zoomed; restore it first so the
@@ -2680,12 +2732,17 @@ impl AppModel {
         let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
-        if tab
+        let pending_spawn = tab
             .panes
             .iter()
-            .any(|pane| self.pending_split_spawns.contains_key(&pane.id))
-            || (tab.zoom.is_none() && tab.panes.len() <= 1)
-        {
+            .any(|pane| self.pending_split_spawns.contains_key(&pane.id));
+        if let Some(reason) = split_layout_reason(
+            tab.panes.len(),
+            pending_spawn,
+            tab.zoom.is_some(),
+            SplitLayoutKind::Zoom,
+        ) {
+            self.show_toast(reason);
             return;
         }
         let next_pane = self.active_pane_id();
@@ -2951,7 +3008,8 @@ mod pane_tree_tests {
         plan_pane_into_tab, plan_tab_into_pane, prepare_then_commit, reconnect_target_is_valid,
         replay_argv_for_unmanaged_leaf, restored_leaf_mode, snapshot_restorable_command,
         swap_target_in_visual_order, tab_drop_preview_is_valid, DropTabIdentity, LeafSlot,
-        PaneIntoTabPlan, TabIntoPanePlan, PERSISTENCE_FAILURE_NOTICE_COOLDOWN,
+        PaneIntoTabPlan, TabIntoPanePlan, PERSISTENCE_FAILURE_NOTICE_COOLDOWN, SplitLayoutKind,
+        split_layout_reason,
     };
     use crate::config::TerminalMode;
     use crate::workspace::ConnStatus;
@@ -3157,6 +3215,38 @@ mod pane_tree_tests {
         assert_eq!(swap_target_in_visual_order(&[1], 1), None);
         // A pane missing from the order cannot be swapped at all.
         assert_eq!(swap_target_in_visual_order(&[0, 1], 2), None);
+    }
+
+    #[test]
+    fn split_layout_actions_explain_a_single_pane_or_pending_spawn() {
+        assert_eq!(
+            split_layout_reason(1, false, false, SplitLayoutKind::Swap),
+            Some("Need at least two panes to swap.")
+        );
+        assert_eq!(
+            split_layout_reason(2, false, false, SplitLayoutKind::Swap),
+            None
+        );
+        assert_eq!(
+            split_layout_reason(1, false, false, SplitLayoutKind::Equalize),
+            Some("Need at least two panes to equalize.")
+        );
+        assert_eq!(
+            split_layout_reason(2, true, false, SplitLayoutKind::Equalize),
+            Some("Wait for the new pane to finish launching.")
+        );
+        assert_eq!(
+            split_layout_reason(1, false, false, SplitLayoutKind::Zoom),
+            Some("Need at least two panes to zoom.")
+        );
+        assert_eq!(
+            split_layout_reason(1, false, true, SplitLayoutKind::Zoom),
+            None
+        );
+        assert_eq!(
+            split_layout_reason(2, true, false, SplitLayoutKind::Zoom),
+            Some("Wait for the new pane to finish launching.")
+        );
     }
 
     #[test]
