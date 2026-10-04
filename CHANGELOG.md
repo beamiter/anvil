@@ -41,6 +41,10 @@ versioning for tagged releases while it remains experimental.
   `[keybindings]` reaches the same undoable removal; an empty selection
   says so instead of doing nothing.
 
+- **Previous/next tab says when no tabs exist.** Ctrl+PageUp/PageDown on
+  an empty window used to do nothing. They now toast that there are no
+  tabs to switch to, matching Ctrl+1…9.
+
 - **Scroll shortcuts say when no terminal is open.** Scroll up/down with
   an empty window used to do nothing. They now toast that there is no
   active terminal pane.

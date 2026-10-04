@@ -1128,5 +1128,8 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
 253. **Scroll with no terminal toasts** — ScrollUp/ScrollDown on an empty
      window was silent. Same "No active terminal pane." copy as Agent.
 
+254. **Prev/next tab with no tabs toasts** — `switch_tab` on an empty window
+     was silent. Same "No tabs to switch to." copy as Ctrl+1…9.
+
 
 

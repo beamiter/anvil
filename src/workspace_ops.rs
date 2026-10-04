@@ -381,6 +381,10 @@ fn close_marked_tabs_notice(marked_count: usize) -> Option<&'static str> {
     (marked_count == 0).then_some("Mark one or more tabs first.")
 }
 
+fn switch_tab_empty_notice() -> &'static str {
+    "No tabs to switch to."
+}
+
 /// Working directory with `$HOME` collapsed to `~`, for the pane header.
 fn abbreviate_home(path: &str) -> String {
     match std::env::var_os("HOME") {
@@ -2181,6 +2185,7 @@ impl AppModel {
 
     pub(crate) fn switch_tab(&mut self, delta: i32, sender: &ComponentSender<AppModel>) {
         if self.tabs.is_empty() {
+            self.show_toast(switch_tab_empty_notice());
             return;
         }
         let len = self.tabs.len() as i32;
@@ -3039,7 +3044,7 @@ mod pane_tree_tests {
         replay_argv_for_unmanaged_leaf, restored_leaf_mode, snapshot_restorable_command,
         swap_target_in_visual_order, tab_drop_preview_is_valid, DropTabIdentity, LeafSlot,
         PaneIntoTabPlan, TabIntoPanePlan, PERSISTENCE_FAILURE_NOTICE_COOLDOWN, SplitLayoutKind,
-        split_layout_reason, close_marked_tabs_notice,
+        split_layout_reason, close_marked_tabs_notice, switch_tab_empty_notice,
     };
     use crate::config::TerminalMode;
     use crate::workspace::ConnStatus;
@@ -3303,6 +3308,11 @@ mod pane_tree_tests {
         );
         assert_eq!(close_marked_tabs_notice(1), None);
         assert_eq!(close_marked_tabs_notice(3), None);
+    }
+
+    #[test]
+    fn cycling_tabs_with_none_open_explains_itself() {
+        assert_eq!(switch_tab_empty_notice(), "No tabs to switch to.");
     }
 
     #[test]

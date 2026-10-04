@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (prev/next tab empty toast — round 254)
+
+## 2026-10-04 (cycle tabs with none open — round 254)
+
+- Prev/next tab with no tabs toasts instead of doing nothing. Unique round
+  **254**. Heartbeat 20s.
+
 Updated: 2026-10-04 (scroll empty toast — round 253)
 
 ## 2026-10-04 (scroll with no terminal — round 253)
