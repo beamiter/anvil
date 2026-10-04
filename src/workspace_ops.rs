@@ -377,6 +377,10 @@ fn split_layout_reason(
     }
 }
 
+fn close_marked_tabs_notice(marked_count: usize) -> Option<&'static str> {
+    (marked_count == 0).then_some("Mark one or more tabs first.")
+}
+
 /// Working directory with `$HOME` collapsed to `~`, for the pane header.
 fn abbreviate_home(path: &str) -> String {
     match std::env::var_os("HOME") {
@@ -2270,6 +2274,9 @@ impl AppModel {
             .map(|t| t.id)
             .collect();
         if ids.is_empty() {
+            if let Some(reason) = close_marked_tabs_notice(0) {
+                self.show_toast(reason);
+            }
             return;
         }
         let selected: std::collections::HashSet<u64> = ids.iter().copied().collect();
@@ -3032,7 +3039,7 @@ mod pane_tree_tests {
         replay_argv_for_unmanaged_leaf, restored_leaf_mode, snapshot_restorable_command,
         swap_target_in_visual_order, tab_drop_preview_is_valid, DropTabIdentity, LeafSlot,
         PaneIntoTabPlan, TabIntoPanePlan, PERSISTENCE_FAILURE_NOTICE_COOLDOWN, SplitLayoutKind,
-        split_layout_reason,
+        split_layout_reason, close_marked_tabs_notice,
     };
     use crate::config::TerminalMode;
     use crate::workspace::ConnStatus;
@@ -3286,6 +3293,16 @@ mod pane_tree_tests {
             split_layout_reason(2, false, false, SplitLayoutKind::MoveToTab),
             None
         );
+    }
+
+    #[test]
+    fn closing_marked_tabs_explains_an_empty_selection() {
+        assert_eq!(
+            close_marked_tabs_notice(0),
+            Some("Mark one or more tabs first.")
+        );
+        assert_eq!(close_marked_tabs_notice(1), None);
+        assert_eq!(close_marked_tabs_notice(3), None);
     }
 
     #[test]

@@ -1035,5 +1035,10 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      were silent. They now say there is nothing to collapse, expand, or
      fold (including fullscreen and Unified).
 
+230. **Close marked tabs says when none are marked** —
+     Marking is the tab multi-select model. The palette action closed
+     nothing when the set was empty. It now tells the user to mark tabs
+     first.
+
 
 

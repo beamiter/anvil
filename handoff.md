@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (close marked tabs empty toast — round 230)
+
+## 2026-10-04 (close marked tabs — round 230)
+
+- Close selected/marked tabs toasts when none are marked. Unique round
+  **230**.
+
 Updated: 2026-10-04 (fold empty-document toasts — round 229)
 
 ## 2026-10-04 (fold empty document — round 229)
