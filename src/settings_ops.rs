@@ -59,6 +59,7 @@ impl AppModel {
     /// config file on every notch.
     pub(crate) fn apply_font_scale_step(&mut self, scale: f64, sender: &ComponentSender<AppModel>) {
         self.stage_font_scale(scale);
+        self.show_font_toast();
         let generation = self.font_persist_generation.get().wrapping_add(1);
         self.font_persist_generation.set(generation);
         let token = Rc::clone(&self.font_persist_generation);

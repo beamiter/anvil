@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (font-scale toast — round 224)
+
+## 2026-10-04 (font-scale toast — round 224)
+
+- Ctrl+=/-/0 and Ctrl+wheel show an in-place `Font: N%` toast. Unique
+  round **224**.
+
 Updated: 2026-10-04 (move-pane-to-tab toast — round 223)
 
 ## 2026-10-04 (move pane to tab toast — round 223)

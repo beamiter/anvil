@@ -39,6 +39,24 @@ impl AppModel {
         self.toast_overlay.add_toast(toast);
     }
 
+    /// Hotkey / Ctrl+wheel feedback: show the current font scale as a
+    /// percentage. Repeat presses update the toast in place, like opacity.
+    pub(crate) fn show_font_toast(&self) {
+        let message = font_scale_toast_title(self.font_scale);
+        if let Some(toast) = self.font_toast.borrow().as_ref() {
+            toast.set_title(&message);
+            return;
+        }
+        let toast = adw::Toast::new(&message);
+        toast.set_timeout(2);
+        let slot = Rc::clone(&self.font_toast);
+        toast.connect_dismissed(move |_| {
+            slot.borrow_mut().take();
+        });
+        *self.font_toast.borrow_mut() = Some(toast.clone());
+        self.toast_overlay.add_toast(toast);
+    }
+
     pub(crate) fn toggle_search(&mut self) {
         self.search.emit(search::SearchMsg::Toggle);
     }
@@ -467,5 +485,21 @@ impl AppModel {
                 self.emit_block_action(VteInput::CrossBlockSearch, "Cross-block search");
             }
         }
+    }
+}
+
+pub(crate) fn font_scale_toast_title(scale: f64) -> String {
+    format!("Font: {:.0}%", scale * 100.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::font_scale_toast_title;
+
+    #[test]
+    fn font_scale_toast_reads_as_a_percent() {
+        assert_eq!(font_scale_toast_title(1.0), "Font: 100%");
+        assert_eq!(font_scale_toast_title(1.25), "Font: 125%");
+        assert_eq!(font_scale_toast_title(0.5), "Font: 50%");
     }
 }

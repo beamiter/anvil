@@ -41,6 +41,11 @@ versioning for tagged releases while it remains experimental.
   `[keybindings]` reaches the same undoable removal; an empty selection
   says so instead of doing nothing.
 
+- **Font zoom shows the current size.** Opacity already had an in-place
+  percent toast; Ctrl+= / Ctrl+- / Ctrl+0 and Ctrl+wheel changed the
+  scale silently. Repeat steps update one `Font: N%` toast. The settings
+  slider does not toast.
+
 - **Move pane to new tab explains why it cannot run.** A single-pane tab,
   a zoomed split, or a split still launching used to ignore Ctrl+Shift+!.
   The toast matches swap/equalize/zoom.

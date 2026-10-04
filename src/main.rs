@@ -341,6 +341,8 @@ struct AppModel {
     /// Ctrl+Alt+=/- presses update one toast in place instead of queueing a
     /// separate toast per step.
     opacity_toast: Rc<RefCell<Option<adw::Toast>>>,
+    /// Same in-place slot for Ctrl+=/-/0 and Ctrl+wheel font steps.
+    font_toast: Rc<RefCell<Option<adw::Toast>>>,
     quit_allowed: Rc<std::cell::Cell<bool>>,
     session_persistence: bool,
     /// Last user-visible background-save warning per operation. Worker errors
@@ -1298,6 +1300,7 @@ impl SimpleComponent for AppModel {
             window: root.clone(),
             toast_overlay: toast_overlay.clone(),
             opacity_toast: Rc::new(RefCell::new(None)),
+            font_toast: Rc::new(RefCell::new(None)),
             quit_allowed: quit_allowed.clone(),
             session_persistence,
             persistence_failure_notices: std::collections::HashMap::new(),

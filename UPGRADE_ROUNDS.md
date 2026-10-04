@@ -1001,5 +1001,11 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      while zoomed, or while a split was still launching. They now toast the
      same class of reason as swap/equalize/zoom.
 
+224. **Font zoom shows the current size** —
+     Opacity hotkeys already update an in-place toast; Ctrl+= / Ctrl+- /
+     Ctrl+0 and Ctrl+wheel changed the scale with no visible percent.
+     Repeat steps rewrite one toast, like opacity. The settings slider
+     still stays quiet.
+
 
 
