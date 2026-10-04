@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (move-tab edge toast — round 256)
+
+## 2026-10-04 (move tab at strip edge — round 256)
+
+- Move tab past the first/last slot toasts instead of doing nothing. Unique
+  round **256**. Heartbeat 20s.
+
 Updated: 2026-10-04 (move-tab need-two toast — round 255)
 
 ## 2026-10-04 (move tab with one tab — round 255)

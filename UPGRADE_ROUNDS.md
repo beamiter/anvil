@@ -1134,5 +1134,8 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
 255. **Move-tab with fewer than two tabs toasts** — left/right reorder of a
      lone or empty tab strip was silent.
 
+256. **Move-tab at the strip edge toasts** — moving the first tab further
+     left or the last tab further right was silent.
+
 
 

@@ -41,6 +41,10 @@ versioning for tagged releases while it remains experimental.
   `[keybindings]` reaches the same undoable removal; an empty selection
   says so instead of doing nothing.
 
+- **Move tab left/right says when the tab is already at that edge.**
+  Nudging the first tab further left (or the last tab further right) used
+  to do nothing. It now says the tab is already at that end.
+
 - **Move tab left/right says when there is only one tab.** Reordering a
   lone tab used to do nothing. It now toasts that two tabs are needed.
 

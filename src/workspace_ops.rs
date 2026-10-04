@@ -389,6 +389,14 @@ fn move_tab_need_two_notice() -> &'static str {
     "Need two tabs to reorder them."
 }
 
+fn move_tab_edge_notice(delta: i32) -> &'static str {
+    if delta < 0 {
+        "Already the leftmost tab."
+    } else {
+        "Already the rightmost tab."
+    }
+}
+
 /// Working directory with `$HOME` collapsed to `~`, for the pane header.
 fn abbreviate_home(path: &str) -> String {
     match std::env::var_os("HOME") {
@@ -2207,6 +2215,7 @@ impl AppModel {
         let from = self.active as i32;
         let to = from + delta;
         if to < 0 || to >= self.tabs.len() as i32 {
+            self.show_toast(move_tab_edge_notice(delta));
             return;
         }
         let Some(id) = self.tabs.get(self.active).map(|tab| tab.id) else {
@@ -3050,7 +3059,7 @@ mod pane_tree_tests {
         swap_target_in_visual_order, tab_drop_preview_is_valid, DropTabIdentity, LeafSlot,
         PaneIntoTabPlan, TabIntoPanePlan, PERSISTENCE_FAILURE_NOTICE_COOLDOWN, SplitLayoutKind,
         split_layout_reason, close_marked_tabs_notice, switch_tab_empty_notice,
-        move_tab_need_two_notice,
+        move_tab_need_two_notice, move_tab_edge_notice,
     };
     use crate::config::TerminalMode;
     use crate::workspace::ConnStatus;
@@ -3327,6 +3336,12 @@ mod pane_tree_tests {
             move_tab_need_two_notice(),
             "Need two tabs to reorder them."
         );
+    }
+
+    #[test]
+    fn moving_a_tab_past_the_end_explains_itself() {
+        assert_eq!(move_tab_edge_notice(-1), "Already the leftmost tab.");
+        assert_eq!(move_tab_edge_notice(1), "Already the rightmost tab.");
     }
 
     #[test]
