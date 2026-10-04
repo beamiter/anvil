@@ -849,7 +849,13 @@ impl SimpleComponent for AppModel {
             search::SearchModel::builder()
                 .launch(())
                 .forward(sender.input_sender(), |output| match output {
-                    search::SearchOutput::Changed(query) => AppMsg::SearchChanged(query),
+                    search::SearchOutput::Changed {
+                        query,
+                        case_sensitive,
+                    } => AppMsg::SearchChanged {
+                        text: query,
+                        case_sensitive,
+                    },
                     search::SearchOutput::Next => AppMsg::SearchNext,
                     search::SearchOutput::Previous => AppMsg::SearchPrev,
                     search::SearchOutput::Closed => AppMsg::SearchClose,
@@ -2276,13 +2282,16 @@ impl SimpleComponent for AppModel {
                 self.apply_settings_remote_clipboard(enabled)
             }
             AppMsg::SettingsRemoteHosts(hosts) => self.apply_settings_remote_hosts(hosts, &sender),
-            AppMsg::SearchChanged(text) => {
+            AppMsg::SearchChanged {
+                text,
+                case_sensitive,
+            } => {
                 if let Some(t) = self.active_terminal() {
                     if text.is_empty() {
                         t.emit(VteInput::SearchClear);
                     } else {
                         let (query, use_regex) = Self::search_query(&text);
-                        t.emit(VteInput::SearchSet(query, use_regex));
+                        t.emit(VteInput::SearchSet(query, use_regex, case_sensitive));
                     }
                 }
             }

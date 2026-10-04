@@ -24,9 +24,9 @@ restoration as the only copy of work in progress.
 - Command palette, command-history picker, parameterized TOML/YAML workflows, and
   fuzzy search
 - Search within terminal output with match counts (inexact VTE totals marked
-  `+`), previous/next controls and visible regex errors, plus block selection,
-  output filtering, bookmarks, copy/rerun controls, and long-command
-  notifications
+  `+`), previous/next, a regex badge for `/pattern/`, an `Aa` match-case
+  toggle, visible regex errors, plus block selection, output filtering,
+  bookmarks, copy/rerun controls, and long-command notifications
 - SSH host picker, connection status, multiplexing, and reconnect support
 - Optional persistent multi-chat AI workspace, inline command generation,
   review-first correction, and a multi-turn Shell Agent with explicit approval

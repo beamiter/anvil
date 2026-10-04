@@ -465,8 +465,9 @@ pub enum VteInput {
     ExportSessionMarkdown,
     ExportSessionJson,
     /// Search: set the query and jump to the first match. `use_regex` treats the
-    /// query as a regex; otherwise it is matched literally (case-insensitive).
-    SearchSet(String, bool),
+    /// query as a regex; otherwise it is matched literally. `case_sensitive`
+    /// is off by default (`Aa` in the find bar).
+    SearchSet(String, bool, bool),
     SearchNext,
     SearchPrev,
     SearchClear,
@@ -770,13 +771,13 @@ impl Component for VteTerminal {
             | VteInput::JumpToNextFailed
             | VteInput::ExportSessionMarkdown
             | VteInput::ExportSessionJson => {}
-            VteInput::SearchSet(query, use_regex) => {
+            VteInput::SearchSet(query, use_regex, case_sensitive) => {
                 self.search_status =
                     if let Some(status) = crate::search::oversize_query_status(&query) {
                         self.terminal.search_set_regex(None::<&vte4::Regex>, 0);
                         status
                     } else {
-                        search_terminal(&self.terminal, &query, use_regex)
+                        search_terminal(&self.terminal, &query, use_regex, case_sensitive)
                     };
                 let _ = sender.output(VteOutput::SearchStatus(self.search_status.clone()));
             }
@@ -804,18 +805,28 @@ impl Component for VteTerminal {
 /// Install `query` as `terminal`'s native search, step to the first match
 /// and count what the bounded snapshot can see. The query must already have
 /// passed [`crate::search::oversize_query_status`].
-pub(super) fn search_terminal(terminal: &Terminal, query: &str, use_regex: bool) -> SearchStatus {
+pub(super) fn search_pcre2_flags(case_sensitive: bool) -> u32 {
+    let mut flags = pcre2_sys::PCRE2_MULTILINE;
+    if !case_sensitive {
+        flags |= pcre2_sys::PCRE2_CASELESS;
+    }
+    flags
+}
+
+pub(super) fn search_terminal(
+    terminal: &Terminal,
+    query: &str,
+    use_regex: bool,
+    case_sensitive: bool,
+) -> SearchStatus {
     let pattern = search_pattern(query, use_regex);
-    match vte4::Regex::for_search(
-        &pattern,
-        pcre2_sys::PCRE2_CASELESS | pcre2_sys::PCRE2_MULTILINE,
-    ) {
+    match vte4::Regex::for_search(&pattern, search_pcre2_flags(case_sensitive)) {
         Ok(regex) => {
             terminal.search_set_regex(Some(&regex), 0);
             terminal.search_set_wrap_around(true);
             let found = terminal.search_find_next();
             search_status_for_vte(
-                compile_count_regex(&pattern).ok().as_ref(),
+                compile_count_regex(&pattern, case_sensitive).ok().as_ref(),
                 terminal_search_snapshot(terminal),
                 found,
                 !use_regex,
@@ -840,9 +851,12 @@ pub(super) fn search_pattern(query: &str, use_regex: bool) -> String {
 /// counting. VTE installs its native PCRE2 regex first: a PCRE2 feature such as
 /// look-around may be uncountable here, but it remains searchable and is shown
 /// with an explicitly inexact `+` total instead of being rejected.
-pub(super) fn compile_count_regex(pattern: &str) -> Result<regex::Regex, String> {
+pub(super) fn compile_count_regex(
+    pattern: &str,
+    case_sensitive: bool,
+) -> Result<regex::Regex, String> {
     regex::RegexBuilder::new(pattern)
-        .case_insensitive(true)
+        .case_insensitive(!case_sensitive)
         // Native terminal search uses PCRE2_MULTILINE. Keep anchors aligned in
         // the mirror counter; regex totals remain marked approximate because
         // the two engines still differ in other grammar and semantics.
@@ -950,8 +964,8 @@ fn search_status_for_vte(
 #[cfg(test)]
 mod tests {
     use super::{
-        compile_count_regex, launch_failure_message, search_pattern, search_status_for_vte,
-        InitialCommands, TerminalSearchSnapshot,
+        compile_count_regex, launch_failure_message, search_pattern, search_pcre2_flags,
+        search_status_for_vte, InitialCommands, TerminalSearchSnapshot,
     };
     use crate::search::SearchStatus;
 
@@ -970,20 +984,30 @@ mod tests {
 
     #[test]
     fn search_query_compilation_is_literal_by_default_and_reports_bad_block_regex() {
-        let literal = compile_count_regex(&search_pattern("a+b", false)).unwrap();
+        let literal = compile_count_regex(&search_pattern("a+b", false), false).unwrap();
         assert_eq!(literal.find_iter("A+B aab").count(), 1);
 
-        let regex = compile_count_regex(&search_pattern("a+b", true)).unwrap();
+        let regex = compile_count_regex(&search_pattern("a+b", true), false).unwrap();
         assert_eq!(regex.find_iter("A+B aab").count(), 1);
 
-        let error = compile_count_regex(&search_pattern("(", true)).unwrap_err();
+        let error = compile_count_regex(&search_pattern("(", true), false).unwrap_err();
         assert!(error.starts_with("Invalid regex:"));
         assert!(!error.contains('\n'));
+
+        let sensitive = compile_count_regex("Ab", true).unwrap();
+        assert_eq!(sensitive.find_iter("ab AB Ab").count(), 1);
+        let insensitive = compile_count_regex("Ab", false).unwrap();
+        assert_eq!(insensitive.find_iter("ab AB Ab").count(), 3);
+        assert_ne!(
+            search_pcre2_flags(false) & pcre2_sys::PCRE2_CASELESS,
+            0
+        );
+        assert_eq!(search_pcre2_flags(true) & pcre2_sys::PCRE2_CASELESS, 0);
     }
 
     #[test]
     fn bounded_or_pcre_only_counts_are_explicitly_inexact() {
-        let counter = compile_count_regex("hit").unwrap();
+        let counter = compile_count_regex("hit", false).unwrap();
         assert_eq!(
             search_status_for_vte(
                 Some(&counter),
@@ -1009,7 +1033,7 @@ mod tests {
 
         // Look-ahead is valid PCRE2 but deliberately outside Rust regex. VTE
         // accepts it natively; lack of a mirror counter must not become an error.
-        assert!(compile_count_regex("(?=hit)").is_err());
+        assert!(compile_count_regex("(?=hit)", false).is_err());
         assert!(vte4::Regex::for_search("(?=hit)", pcre2_sys::PCRE2_CASELESS).is_ok());
         assert_eq!(
             search_status_for_vte(
@@ -1040,7 +1064,7 @@ mod tests {
     #[test]
     fn regex_counts_are_partial_even_when_both_engines_compile() {
         let pattern = "[a&&a]";
-        let counter = compile_count_regex(pattern).unwrap();
+        let counter = compile_count_regex(pattern, false).unwrap();
         assert!(vte4::Regex::for_search(
             pattern,
             pcre2_sys::PCRE2_CASELESS | pcre2_sys::PCRE2_MULTILINE,
@@ -1062,7 +1086,7 @@ mod tests {
 
     #[test]
     fn mirror_counter_uses_the_native_multiline_anchor_mode() {
-        let counter = compile_count_regex("^hit$").unwrap();
+        let counter = compile_count_regex("^hit$", false).unwrap();
         assert_eq!(counter.find_iter("miss\nhit\ntail").count(), 1);
     }
 
@@ -1137,7 +1161,7 @@ mod tests {
         }
 
         assert_eq!(
-            super::search_terminal(&terminal, "NEEDLE", false),
+            super::search_terminal(&terminal, "NEEDLE", false, false),
             SearchStatus::results(1, 1)
         );
         let selected = terminal
@@ -1146,7 +1170,7 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(selected, "needle");
         assert!(matches!(
-            super::search_terminal(&terminal, "(", true),
+            super::search_terminal(&terminal, "(", true, false),
             SearchStatus::Error(_)
         ));
         window.close();

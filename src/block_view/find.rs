@@ -1318,7 +1318,12 @@ impl TermView {
     /// Highlight occurrences of `query` across the finished blocks and focus
     /// the first hit. Match metadata is compressed to one count per VTE surface,
     /// and scanning stops as soon as [`FIND_MATCH_LIMIT`] is reached.
-    pub(crate) fn find_in_blocks(&self, query: &str, use_regex: bool) -> FindSearchResult {
+    pub(crate) fn find_in_blocks(
+        &self,
+        query: &str,
+        use_regex: bool,
+        case_sensitive: bool,
+    ) -> FindSearchResult {
         self.clear_find();
         if query.is_empty() || find_scope(self.bstate.get()) == FindScope::LiveScreen {
             return FindSearchResult::NoMatches;
@@ -1336,7 +1341,7 @@ impl TermView {
             }
         }
         let re = match regex::RegexBuilder::new(&pattern)
-            .case_insensitive(true)
+            .case_insensitive(!case_sensitive)
             .multi_line(true)
             .build()
         {
@@ -1346,7 +1351,12 @@ impl TermView {
 
         // Compile the same pattern for VTE (PCRE2) so its native highlighter
         // paints every hit and its search cursor can step within each block.
-        let vte_re = match vte4::Regex::for_search(&pattern, VTE_SEARCH_FLAGS) {
+        let flags = if case_sensitive {
+            VTE_SEARCH_FLAGS & !pcre2_sys::PCRE2_CASELESS
+        } else {
+            VTE_SEARCH_FLAGS
+        };
+        let vte_re = match vte4::Regex::for_search(&pattern, flags) {
             Ok(r) => r,
             Err(_) => return FindSearchResult::InvalidRegex,
         };

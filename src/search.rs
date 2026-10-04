@@ -133,6 +133,8 @@ pub(crate) fn invalid_regex_message(error: impl std::fmt::Display) -> String {
 pub(crate) enum SearchMsg {
     Toggle,
     Changed(String),
+    /// `Aa` in the find bar: match the query's exact case.
+    CaseSensitive(bool),
     /// The visible terminal changed while the find bar may still be open.
     /// Rebind the current query to the new pane instead of displaying the
     /// previous pane's result count.
@@ -145,13 +147,18 @@ pub(crate) enum SearchMsg {
 
 #[derive(Debug)]
 pub(crate) enum SearchOutput {
-    Changed(String),
+    Changed {
+        query: String,
+        case_sensitive: bool,
+    },
     Next,
     Previous,
     Closed,
 }
 
-pub(crate) struct SearchModel;
+pub(crate) struct SearchModel {
+    case_sensitive: bool,
+}
 
 #[relm4::component(pub(crate))]
 impl Component for SearchModel {
@@ -219,6 +226,19 @@ impl Component for SearchModel {
                     ],
                 },
 
+                #[name(case_mode)]
+                gtk::ToggleButton {
+                    set_label: "Aa",
+                    add_css_class: "flat",
+                    set_tooltip_text: Some("Match case"),
+                    update_property: &[
+                        gtk::accessible::Property::Label("Match case"),
+                    ],
+                    connect_toggled[sender] => move |button| {
+                        sender.input(SearchMsg::CaseSensitive(button.is_active()));
+                    },
+                },
+
                 #[name(status_label)]
                 gtk::Label {
                     set_width_chars: 14,
@@ -273,7 +293,9 @@ impl Component for SearchModel {
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
-        let model = Self;
+        let model = Self {
+            case_sensitive: false,
+        };
         let widgets = view_output!();
         ComponentParts { model, widgets }
     }
@@ -295,7 +317,7 @@ impl Component for SearchModel {
                     sync_regex_mode(widgets, &query);
                     if !query.is_empty() {
                         apply_status(widgets, &SearchStatus::Searching);
-                        let _ = sender.output(SearchOutput::Changed(query));
+                        emit_changed(&sender, query, self.case_sensitive);
                     }
                 } else {
                     apply_status(widgets, &SearchStatus::Idle);
@@ -312,7 +334,18 @@ impl Component for SearchModel {
                         &SearchStatus::Searching
                     },
                 );
-                let _ = sender.output(SearchOutput::Changed(query));
+                emit_changed(&sender, query, self.case_sensitive);
+            }
+            SearchMsg::CaseSensitive(case_sensitive) => {
+                if self.case_sensitive == case_sensitive {
+                    return;
+                }
+                self.case_sensitive = case_sensitive;
+                let query = widgets.entry.text().to_string();
+                if !query.is_empty() {
+                    apply_status(widgets, &SearchStatus::Searching);
+                    emit_changed(&sender, query, case_sensitive);
+                }
             }
             SearchMsg::ActivePaneChanged => {
                 let query = widgets.entry.text().to_string();
@@ -320,7 +353,7 @@ impl Component for SearchModel {
                 sync_regex_mode(widgets, &query);
                 apply_status(widgets, &status);
                 if let Some(query) = replay {
-                    let _ = sender.output(SearchOutput::Changed(query));
+                    emit_changed(&sender, query, self.case_sensitive);
                 }
             }
             SearchMsg::Status(status) => apply_status(widgets, &status),
@@ -341,6 +374,17 @@ impl Component for SearchModel {
 
 fn sync_regex_mode(widgets: &SearchModelWidgets, query: &str) {
     widgets.regex_mode.set_visible(parse_find_query(query).1);
+}
+
+fn emit_changed(
+    sender: &ComponentSender<SearchModel>,
+    query: String,
+    case_sensitive: bool,
+) {
+    let _ = sender.output(SearchOutput::Changed {
+        query,
+        case_sensitive,
+    });
 }
 
 /// Decide how the search component follows a newly active pane. Keeping this

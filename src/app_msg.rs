@@ -143,7 +143,10 @@ pub(crate) enum AppMsg {
     SettingsNotifications(bool),
     SettingsRemoteClipboard(bool),
     SettingsRemoteHosts(Vec<crate::config::RemoteHost>),
-    SearchChanged(String),
+    SearchChanged {
+        text: String,
+        case_sensitive: bool,
+    },
     SearchNext,
     SearchPrev,
     SearchClose,

@@ -973,5 +973,10 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      slash-wrapped non-empty pattern. `/foo`, `//`, and bare text stay
      literal. Parsing lives in one helper shared with the backend dispatch.
 
+219. **Find bar can match case** —
+     Window Find was always PCRE2/Rust case-insensitive, unlike the
+     cross-block `Aa` toggle. An `Aa` button now re-runs the live and block
+     backends with caseless flags dropped. Off by default, same as before.
+
 
 

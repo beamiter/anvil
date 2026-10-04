@@ -41,6 +41,11 @@ versioning for tagged releases while it remains experimental.
   `[keybindings]` reaches the same undoable removal; an empty selection
   says so instead of doing nothing.
 
+- **The find bar can match case.** Find was always case-insensitive, even
+  though the cross-block palette already had `Aa`. The same toggle now
+  drives live VTE search, the block highlighter, and the match counter.
+  Off by default, so existing `/pattern/` workflows are unchanged.
+
 - **The find bar shows when a query is a regular expression.** `/pattern/`
   already switched engines, but the only hint was the placeholder. A
   `regex` badge now appears for a non-empty slash-wrapped pattern.

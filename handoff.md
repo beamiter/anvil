@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (find-bar match case — round 219)
+
+## 2026-10-04 (find match case — round 219)
+
+- Find bar `Aa` toggles case-sensitive search for VTE and block Find.
+  Unique round **219**.
+
 Updated: 2026-10-04 (find-bar regex badge — round 218)
 
 ## 2026-10-04 (find regex badge — round 218)

@@ -101,7 +101,7 @@ pub struct BlockTerminal {
     /// invalidate VTE's native cursor between Next/Previous actions; retaining
     /// the query lets the adapter rebuild the pass instead of claiming the
     /// still-visible text disappeared.
-    search_query: Option<(String, bool)>,
+    search_query: Option<(String, bool, bool)>,
     /// `search_status` came from the live terminal's own search, run while an
     /// alternate-screen app owned the pane, rather than from the blocks.
     search_live: bool,
@@ -111,18 +111,26 @@ pub struct BlockTerminal {
 /// live screen while an alternate-screen app owns the pane and the cards are
 /// hidden (see [`FindScope`]). Returns the status and whether it searched the
 /// live screen.
-fn search_in_scope(view: &TermView, query: &str, use_regex: bool) -> (SearchStatus, bool) {
+fn search_in_scope(
+    view: &TermView,
+    query: &str,
+    use_regex: bool,
+    case_sensitive: bool,
+) -> (SearchStatus, bool) {
     if view.find_scope() == FindScope::LiveScreen {
         // Drops any block hits (and the live terminal's regex) first.
         view.clear_find();
         return (
-            super::vte::search_terminal(view.vte(), query, use_regex),
+            super::vte::search_terminal(view.vte(), query, use_regex, case_sensitive),
             true,
         );
     }
     let pattern = super::vte::search_pattern(query, use_regex);
-    let status = match validate_block_search_pattern(&pattern) {
-        Ok(_) => block_result_status(view.find_in_blocks(query, use_regex), use_regex),
+    let status = match validate_block_search_pattern(&pattern, case_sensitive) {
+        Ok(_) => block_result_status(
+            view.find_in_blocks(query, use_regex, case_sensitive),
+            use_regex,
+        ),
         Err(error) => {
             view.clear_find();
             SearchStatus::Error(error)
@@ -131,14 +139,14 @@ fn search_in_scope(view: &TermView, query: &str, use_regex: bool) -> (SearchStat
     (status, false)
 }
 
-fn validate_block_search_pattern(pattern: &str) -> Result<(), String> {
-    super::vte::compile_count_regex(pattern)?;
-    vte4::Regex::for_search(
-        pattern,
-        pcre2_sys::PCRE2_CASELESS | pcre2_sys::PCRE2_MULTILINE,
-    )
-    .map(|_| ())
-    .map_err(crate::search::invalid_regex_message)
+fn validate_block_search_pattern(
+    pattern: &str,
+    case_sensitive: bool,
+) -> Result<(), String> {
+    super::vte::compile_count_regex(pattern, case_sensitive)?;
+    vte4::Regex::for_search(pattern, super::vte::search_pcre2_flags(case_sensitive))
+        .map(|_| ())
+        .map_err(crate::search::invalid_regex_message)
 }
 
 fn progress_status(progress: FindProgress, use_regex: bool) -> SearchStatus {
@@ -710,7 +718,7 @@ impl Component for BlockTerminal {
                 );
                 let _ = sender.output(VteOutput::Notice(message));
             }
-            VteInput::SearchSet(query, use_regex) => {
+            VteInput::SearchSet(query, use_regex, case_sensitive) => {
                 self.search_status =
                     if let Some(status) = crate::search::oversize_query_status(&query) {
                         // Do not retain the oversized query: an invalidated Find
@@ -720,8 +728,9 @@ impl Component for BlockTerminal {
                         view.clear_find();
                         status
                     } else {
-                        let (status, live) = search_in_scope(view, &query, use_regex);
-                        self.search_query = Some((query, use_regex));
+                        let (status, live) =
+                            search_in_scope(view, &query, use_regex, case_sensitive);
+                        self.search_query = Some((query, use_regex, case_sensitive));
                         self.search_live = live;
                         status
                     };
@@ -757,8 +766,9 @@ impl Component for BlockTerminal {
                     // the blocks had nothing to step: search the pane's scope.
                     self.search_status = self.search_query.as_ref().map_or_else(
                         || SearchStatus::results(0, 0),
-                        |(query, use_regex)| {
-                            let (status, live) = search_in_scope(view, query, *use_regex);
+                        |(query, use_regex, case_sensitive)| {
+                            let (status, live) =
+                                search_in_scope(view, query, *use_regex, *case_sensitive);
                             self.search_live = live;
                             status
                         },
@@ -784,8 +794,9 @@ impl Component for BlockTerminal {
                         // over moves to its screen.
                         self.search_query.as_ref().map_or_else(
                             || SearchStatus::results(0, 0),
-                            |(query, use_regex)| {
-                                let (status, live) = search_in_scope(view, query, *use_regex);
+                            |(query, use_regex, case_sensitive)| {
+                                let (status, live) =
+                                    search_in_scope(view, query, *use_regex, *case_sensitive);
                                 self.search_live = live;
                                 status
                             },
@@ -951,8 +962,8 @@ mod tests {
     fn block_search_validates_the_native_pcre_pattern_too() {
         // Rust regex permits locally disabling Unicode for an ASCII-only
         // subexpression; PCRE2 does not recognize that inline `u` flag.
-        assert!(super::super::vte::compile_count_regex("(?-u:a)").is_ok());
-        let error = validate_block_search_pattern("(?-u:a)").unwrap_err();
+        assert!(super::super::vte::compile_count_regex("(?-u:a)", false).is_ok());
+        let error = validate_block_search_pattern("(?-u:a)", false).unwrap_err();
         assert!(error.starts_with("Invalid regex:"));
     }
 }
