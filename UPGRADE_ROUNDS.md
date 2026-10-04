@@ -1131,5 +1131,8 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
 254. **Prev/next tab with no tabs toasts** — `switch_tab` on an empty window
      was silent. Same "No tabs to switch to." copy as Ctrl+1…9.
 
+255. **Move-tab with fewer than two tabs toasts** — left/right reorder of a
+     lone or empty tab strip was silent.
+
 
 

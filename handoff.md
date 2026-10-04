@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (move-tab need-two toast — round 255)
+
+## 2026-10-04 (move tab with one tab — round 255)
+
+- Move tab left/right with fewer than two tabs toasts. Unique round **255**.
+  Heartbeat 20s.
+
 Updated: 2026-10-04 (prev/next tab empty toast — round 254)
 
 ## 2026-10-04 (cycle tabs with none open — round 254)

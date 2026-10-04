@@ -385,6 +385,10 @@ fn switch_tab_empty_notice() -> &'static str {
     "No tabs to switch to."
 }
 
+fn move_tab_need_two_notice() -> &'static str {
+    "Need two tabs to reorder them."
+}
+
 /// Working directory with `$HOME` collapsed to `~`, for the pane header.
 fn abbreviate_home(path: &str) -> String {
     match std::env::var_os("HOME") {
@@ -2197,6 +2201,7 @@ impl AppModel {
     /// Reorder the active tab one slot left (-1) or right (+1) and keep it active.
     pub(crate) fn move_tab(&mut self, delta: i32, sender: &ComponentSender<AppModel>) {
         if self.tabs.len() < 2 {
+            self.show_toast(move_tab_need_two_notice());
             return;
         }
         let from = self.active as i32;
@@ -3045,6 +3050,7 @@ mod pane_tree_tests {
         swap_target_in_visual_order, tab_drop_preview_is_valid, DropTabIdentity, LeafSlot,
         PaneIntoTabPlan, TabIntoPanePlan, PERSISTENCE_FAILURE_NOTICE_COOLDOWN, SplitLayoutKind,
         split_layout_reason, close_marked_tabs_notice, switch_tab_empty_notice,
+        move_tab_need_two_notice,
     };
     use crate::config::TerminalMode;
     use crate::workspace::ConnStatus;
@@ -3313,6 +3319,14 @@ mod pane_tree_tests {
     #[test]
     fn cycling_tabs_with_none_open_explains_itself() {
         assert_eq!(switch_tab_empty_notice(), "No tabs to switch to.");
+    }
+
+    #[test]
+    fn moving_a_lone_tab_explains_itself() {
+        assert_eq!(
+            move_tab_need_two_notice(),
+            "Need two tabs to reorder them."
+        );
     }
 
     #[test]
