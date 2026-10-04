@@ -1085,5 +1085,8 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      `us`/`µs`) were split after the number. Minutes/hours stay unclaimed
      so “1 more” is not a duration.
 
+241. **Smart-select keeps byte-size suffixes** — `512Mi`, `1GiB`, `1.5GB`
+     (Ki/Mi/Gi/Ti/Pi/Ei and SI `KB`…`EB`) were split after the digits.
+
 
 

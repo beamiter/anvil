@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (byte-size smart-select — round 241)
+
+## 2026-10-04 (byte-size double-click — round 241)
+
+- Double-click `512Mi` or `1.5GB` selects the number and suffix. Unique
+  round **241**. Heartbeat 20s.
+
 Updated: 2026-10-04 (duration smart-select — round 240)
 
 ## 2026-10-04 (duration double-click — round 240)

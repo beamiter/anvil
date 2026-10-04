@@ -2,7 +2,7 @@
 //!
 //! GTK's default double-click selects a plain alnum word. This detects the
 //! semantic token under the cursor — URL, path, file:line:col, IPv4, IPv6,
-//! MAC, ISO-8601 timestamp, semver, duration, percent, git SHA, key=value, quoted string, … — so one double-click grabs the whole unit.
+//! MAC, ISO-8601 timestamp, semver, duration, byte size, percent, git SHA, key=value, quoted string, … — so one double-click grabs the whole unit.
 //! Ported from forge's `block_view/select.rs`.
 
 use gtk::prelude::*;
@@ -64,6 +64,7 @@ static PATTERNS: LazyLock<Vec<Pat>> = LazyLock::new(|| {
         p(r#"(\b[0-9a-f]{7,40}\b)"#, 1),
         p(r#"(\b0x[0-9a-fA-F]+\b)"#, 1),
         p(r#"(\b\d+(?:\.\d+)?(?:ns|us|µs|ms|s)\b)"#, 1),
+        p(r#"(\b\d+(?:\.\d+)?(?:[KMGTPE]iB?|[KMGTPE]B)\b)"#, 1),
         p(r#"(\b\d+(?:\.\d+)?%)"#, 1),
         p(r#"(\b\d+(?:\.\d+)?\b)"#, 1),
         p(r#"([\w@.+-]+)"#, 1),
@@ -272,6 +273,9 @@ mod tests {
         assert_eq!(token("took 12ms later", 6).as_deref(), Some("12ms"));
         assert_eq!(token("wait 1.5s end", 6).as_deref(), Some("1.5s"));
         assert_eq!(token("spin 100ns x", 6).as_deref(), Some("100ns"));
+        assert_eq!(token("mem 512Mi used", 5).as_deref(), Some("512Mi"));
+        assert_eq!(token("disk 1.5GB free", 6).as_deref(), Some("1.5GB"));
+        assert_eq!(token("cap 1GiB x", 5).as_deref(), Some("1GiB"));
     }
 
     #[test]
@@ -332,5 +336,6 @@ mod tests {
         assert_eq!(token("ver v1.2.3.", 4).as_deref(), Some("v1.2.3"));
         assert_eq!(token("cpu 80%.", 4).as_deref(), Some("80%"));
         assert_eq!(token("took 12ms.", 6).as_deref(), Some("12ms"));
+        assert_eq!(token("mem 512Mi.", 5).as_deref(), Some("512Mi"));
     }
 }

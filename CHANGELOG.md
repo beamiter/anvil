@@ -41,6 +41,9 @@ versioning for tagged releases while it remains experimental.
   `[keybindings]` reaches the same undoable removal; an empty selection
   says so instead of doing nothing.
 
+- **Double-click selects byte sizes.** `512Mi`, `1GiB`, and `1.5GB`
+  keep the binary or SI suffix instead of stopping at the number.
+
 - **Double-click selects durations with units.** `12ms`, `1.5s`, and
   `100ns` keep the unit. Bare `m`/`h` are left alone so “1 more” is
   unchanged.
