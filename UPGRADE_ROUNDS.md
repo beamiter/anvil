@@ -1013,5 +1013,11 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      say `No matching block.` Location-unavailable and snapshot-view
      answers are unchanged.
 
+226. **Reinput selected commands explains a refusal** —
+     Ctrl+Shift+I and the palette action could refuse (no selection, a
+     running/fullscreen program, or a multiline recall without bracketed
+     paste) with no toast. Card Enter already flashed a reason; the
+     window action now uses the same cases.
+
 
 

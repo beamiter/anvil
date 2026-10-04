@@ -706,7 +706,11 @@ impl Component for BlockTerminal {
             VteInput::ToggleBlockCollapsed => {
                 view.toggle_selected_block_collapsed();
             }
-            VteInput::ReinputSelectedCommands => view.reinput_selected_commands(),
+            VteInput::ReinputSelectedCommands => {
+                if let Some(message) = view.reinput_selected_commands() {
+                    let _ = sender.output(VteOutput::Notice(message.to_string()));
+                }
+            }
             VteInput::JumpToPrevPinned => {
                 report_record_navigation(&sender, view, &snapshot_dialog, view.jump_to_pinned(-1))
             }

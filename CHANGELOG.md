@@ -41,6 +41,11 @@ versioning for tagged releases while it remains experimental.
   `[keybindings]` reaches the same undoable removal; an empty selection
   says so instead of doing nothing.
 
+- **Reinput selected commands explains a refusal.** Card Enter already
+  flashed why a recall was unsafe; Ctrl+Shift+I and the palette stayed
+  silent. Empty selection, fullscreen, a busy prompt, or multiline
+  recall without bracketed paste now toast.
+
 - **Jumping to a failed, slow, or pinned block says when none exist.**
   Failed and slow navigation already knew there was no match; pinned
   jumps did nothing. All three now toast `No matching block.`

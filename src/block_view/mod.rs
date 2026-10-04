@@ -1636,25 +1636,53 @@ where
     output
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SelectedRecall {
+    Recalled,
+    Empty,
+    WouldDropLines,
+    NotAtPrompt,
+}
+
+pub(crate) fn selected_recall_notice(result: SelectedRecall) -> Option<&'static str> {
+    match result {
+        SelectedRecall::Recalled => None,
+        SelectedRecall::Empty => Some("Select one or more finished blocks first."),
+        SelectedRecall::WouldDropLines => {
+            Some("Bracketed paste is required to preserve every command line.")
+        }
+        SelectedRecall::NotAtPrompt => {
+            Some("Wait for a ready prompt before reinputting commands.")
+        }
+    }
+}
+
 fn recall_selected_commands_at_prompt(
     submission: &VerifiedSubmissionCtx,
     finished: &[FinishedBlock],
     selected: &HashSet<u64>,
     bracketed_paste: bool,
-) -> bool {
+) -> SelectedRecall {
     let command = selected_command_text(
         finished
             .iter()
             .map(|block| (block.id, block.cmd_text.as_str())),
         selected,
     );
+    if command.is_empty() {
+        return SelectedRecall::Empty;
+    }
     // Without bracketed paste, the generic recall encoder deliberately keeps
     // only the first line. Never apply that fallback to a multi-card selection:
     // silently dropping selected commands is worse than refusing the action.
     if !selected_command_recall_is_lossless(&command, bracketed_paste) {
-        return false;
+        return SelectedRecall::WouldDropLines;
     }
-    submission.try_recall_command(&command, bracketed_paste)
+    if submission.try_recall_command(&command, bracketed_paste) {
+        SelectedRecall::Recalled
+    } else {
+        SelectedRecall::NotAtPrompt
+    }
 }
 
 fn selected_command_recall_is_lossless(command: &str, bracketed_paste: bool) -> bool {
@@ -8027,7 +8055,7 @@ impl RenderBackend for BlockBackend {
                             bracketed_paste_for_action.get(),
                         )
                     };
-                    if recalled {
+                    if recalled == SelectedRecall::Recalled {
                         clear_finished_block_selection(
                             &finished,
                             &selected_ids_for_rerun,
@@ -10735,7 +10763,7 @@ impl KeyCtx {
                             bracketed_paste_for_key.get(),
                         )
                     };
-                    if recalled {
+                    if recalled == SelectedRecall::Recalled {
                         clear_finished_block_selection(
                             &finished,
                             &selected_block_ids_for_key,
@@ -14619,9 +14647,9 @@ impl TermView {
     /// Recall every selected command, in terminal order, into the editable live
     /// prompt. Bracketed paste keeps a multi-selection as a multiline buffer; on
     /// shells without it the existing safe first-line fallback still applies.
-    pub fn reinput_selected_commands(&self) {
+    pub fn reinput_selected_commands(&self) -> Option<&'static str> {
         if self.fullscreen.get() {
-            return;
+            return Some("Exit the fullscreen program before reinputting commands.");
         }
         let finished = self.finished_blocks.borrow();
         let recalled = {
@@ -14633,7 +14661,7 @@ impl TermView {
                 self.bracketed_paste.get(),
             )
         };
-        if recalled {
+        if recalled == SelectedRecall::Recalled {
             clear_finished_block_selection(
                 &finished,
                 &self.selected_block_ids,
@@ -14642,6 +14670,7 @@ impl TermView {
             );
             self.active.borrow().grab_focus();
         }
+        selected_recall_notice(recalled)
     }
 
     /// Remove all completed blocks and all state indexed by those blocks. This
@@ -23717,6 +23746,22 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
         assert!(super::selected_command_recall_is_lossless(
             "printf a", false,
         ));
+        assert_eq!(
+            super::selected_recall_notice(super::SelectedRecall::Empty),
+            Some("Select one or more finished blocks first.")
+        );
+        assert_eq!(
+            super::selected_recall_notice(super::SelectedRecall::WouldDropLines),
+            Some("Bracketed paste is required to preserve every command line.")
+        );
+        assert_eq!(
+            super::selected_recall_notice(super::SelectedRecall::NotAtPrompt),
+            Some("Wait for a ready prompt before reinputting commands.")
+        );
+        assert_eq!(
+            super::selected_recall_notice(super::SelectedRecall::Recalled),
+            None
+        );
     }
 
     /// Was `single_line_recall_does_not_add_paste_markers`. The shared encoder

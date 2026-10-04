@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (reinput refusal toast — round 226)
+
+## 2026-10-04 (reinput refusal — round 226)
+
+- Reinput selected commands toasts empty selection, fullscreen, lossy
+  multiline, or a busy prompt. Unique round **226**.
+
 Updated: 2026-10-04 (no-matching-block toast — round 225)
 
 ## 2026-10-04 (no matching block — round 225)
