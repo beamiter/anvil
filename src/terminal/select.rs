@@ -34,6 +34,7 @@ static PATTERNS: LazyLock<Vec<Pat>> = LazyLock::new(|| {
         ),
         p(r#"(\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?)"#, 1),
         p(r#"([\w.-]+=[^\s'"]+)"#, 1),
+        p(r#"(#[0-9a-fA-F]{3,8})\b"#, 1),
         p(r#"(\b[0-9a-f]{7,40}\b)"#, 1),
         p(r#"(\b0x[0-9a-fA-F]+\b)"#, 1),
         p(r#"(\b\d+(?:\.\d+)?\b)"#, 1),
@@ -144,6 +145,15 @@ mod tests {
             Some("deadbeef0123abc")
         );
         assert_eq!(token("ip 10.0.0.8:22 ok", 4).as_deref(), Some("10.0.0.8:22"));
+        assert_eq!(
+            token("color #ff00aa in css", 8).as_deref(),
+            Some("#ff00aa")
+        );
+        assert_eq!(token("short #fff end", 8).as_deref(), Some("#fff"));
+        assert_eq!(
+            token("alpha #11223344 done", 8).as_deref(),
+            Some("#11223344")
+        );
     }
 
     #[test]

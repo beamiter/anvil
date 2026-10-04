@@ -1,5 +1,11 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (hex-color smart-select — round 231)
+
+## 2026-10-04 (hex color double-click — round 231)
+
+- Double-click `#ff00aa` selects the hash and digits. Unique round **231**.
+
 Updated: 2026-10-04 (close marked tabs empty toast — round 230)
 
 ## 2026-10-04 (close marked tabs — round 230)

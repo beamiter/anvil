@@ -1040,5 +1040,11 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      nothing when the set was empty. It now tells the user to mark tabs
      first.
 
+231. **Smart-select grabs CSS/hex colors** —
+     Double-click on `#ff00aa` selected the word `ff00aa` without the
+     hash, because `#` is not alphanumeric. A `#` plus 3–8 hex digits is
+     now one token, ahead of git SHA matching so `#11223344` keeps the
+     hash.
+
 
 

@@ -41,6 +41,9 @@ versioning for tagged releases while it remains experimental.
   `[keybindings]` reaches the same undoable removal; an empty selection
   says so instead of doing nothing.
 
+- **Double-click selects CSS hex colors.** `#ff00aa` used to select
+  `ff00aa` without the hash. A `#` plus 3–8 hex digits is now one token.
+
 - **Close marked tabs says when none are marked.** Marking is how anvil
   multi-selects tabs. The command did nothing on an empty set; it now
   asks the user to mark tabs first.
