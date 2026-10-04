@@ -1105,5 +1105,8 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      failure navigation used the silent VTE no-op. Copy matches
      `emit_block_action`.
 
+247. **Block filters on live VTE toast** — failed/slow/pinned filters and
+     clear-filter used the silent VTE no-op. Copy matches `emit_block_action`.
+
 
 

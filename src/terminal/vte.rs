@@ -757,15 +757,31 @@ impl Component for VteTerminal {
                 }
             }
             // Block-view only; no-op for the bare VTE backend.
-            VteInput::FilterFailedBlocks
-            | VteInput::FilterSlowBlocks
-            | VteInput::FilterPinnedBlocks
-            | VteInput::ClearBlockFilter
-            | VteInput::SelectAllBlocks
+            VteInput::SelectAllBlocks
             | VteInput::ClearBlocks
             | VteInput::UndoClearBlocks
             | VteInput::DeleteSelectedBlocks
             | VteInput::ReinputSelectedCommands => {}
+            VteInput::FilterFailedBlocks => {
+                let _ = sender.output(VteOutput::Notice(vte_block_mode_only_notice(
+                    "Failed-block navigation",
+                )));
+            }
+            VteInput::FilterSlowBlocks => {
+                let _ = sender.output(VteOutput::Notice(vte_block_mode_only_notice(
+                    "Slow-block navigation",
+                )));
+            }
+            VteInput::FilterPinnedBlocks => {
+                let _ = sender.output(VteOutput::Notice(vte_block_mode_only_notice(
+                    "Bookmarked-block navigation",
+                )));
+            }
+            VteInput::ClearBlockFilter => {
+                let _ = sender.output(VteOutput::Notice(vte_block_mode_only_notice(
+                    "Block navigation",
+                )));
+            }
             VteInput::JumpToPrevPinned | VteInput::JumpToNextPinned => {
                 let _ = sender.output(VteOutput::Notice(vte_block_mode_only_notice(
                     "Bookmarked-block navigation",
@@ -1063,6 +1079,18 @@ mod tests {
         assert_eq!(
             vte_block_mode_only_notice("Failed-block navigation"),
             "Failed-block navigation is available only in a Block-mode pane."
+        );
+    }
+
+    #[test]
+    fn block_filter_on_live_vte_explains_block_mode() {
+        assert_eq!(
+            vte_block_mode_only_notice("Slow-block navigation"),
+            "Slow-block navigation is available only in a Block-mode pane."
+        );
+        assert_eq!(
+            vte_block_mode_only_notice("Block navigation"),
+            "Block navigation is available only in a Block-mode pane."
         );
     }
 

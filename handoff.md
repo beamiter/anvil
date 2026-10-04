@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (block-filter VTE toast — round 247)
+
+## 2026-10-04 (block filter on VTE — round 247)
+
+- Failed/slow/pinned filters and clear-filter in a live VTE pane toast
+  Block-mode-only. Unique round **247**. Heartbeat 20s.
+
 Updated: 2026-10-04 (block-jump VTE toast — round 246)
 
 ## 2026-10-04 (pinned/failed jump on VTE — round 246)
