@@ -32,7 +32,9 @@ restoration as the only copy of work in progress.
   before execution
 - Optional local, no-LLM ASCII organism with durable bounded memory and
   desktop-aware motion modes
-- Runnable Markdown notebooks (`.jtnb.md`) with isolated multi-shell cells
+- Runnable Markdown notebooks (`.jtnb.md`) with isolated multi-shell cells.
+  The viewer is read-only: Python and other non-shell fences are preview-only,
+  and Open in Editor hands the file to the desktop default.
 - Live appearance settings and a hot-reloaded TOML configuration
 
 ## Requirements
@@ -1227,8 +1229,11 @@ a pending queue, while durable `[!]`, `[!!]`, `[ok]`, and `[?]` facts remain.
 ### Notebooks
 
 Activating a `.jtnb.md` file in the sidebar opens the notebook viewer. Markdown
-is intentionally minimal. Unlabelled, `shell`, `bash`, `sh`, `zsh`, `fish`,
-`pwsh`, and `powershell` code fences get Run, Stop, and Copy controls. Unlabelled
+is intentionally minimal. The viewer does not edit or save cells; **Open in
+Editor** hands the file to the desktop's default application. Unlabelled,
+`shell`, `bash`, `sh`, `zsh`, `fish`, `pwsh`, and `powershell` code fences get
+Run, Stop, and Copy controls. Other languages (including `python`) are
+preview-only: they keep Copy and never show a dead Run button. Unlabelled
 and `shell` cells use anvil's configured shell (with the same safe fallback as
 new terminal panes); explicit fences use the named interpreter. Run All executes
 runnable cells sequentially, while Stop All
@@ -1240,7 +1245,7 @@ the active terminal but not sandboxed from the system.
 Notebook files are regular UTF-8 files capped at 1 MiB; segment and executable
 cell counts are capped independently. A cell larger than 256 KiB or containing
 hidden/bidirectional or unsafe control characters remains visible (with unsafe
-characters marked) and copyable, but its Run action is disabled.
+characters marked) and copyable, but has no Run action.
 
 The installer provides a walkthrough at:
 

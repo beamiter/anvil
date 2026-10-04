@@ -943,4 +943,10 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      reopens the original document gaps. Delete is advertised on the
      selection hint; a running program still takes the key.
 
+213. **Notebook viewer is honest about non-shell fences** —
+     Python and other non-executable fences are preview-only (Copy, no Run).
+     Open in Editor launches the file with the desktop default; the dialog
+     still does not edit or save.
+
+
 

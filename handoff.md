@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (notebook preview-only + Open in Editor — round 213)
+
+## 2026-10-04 (notebook viewer honesty — round 213)
+
+- Non-shell fences drop the dead Run/Stop controls and stay preview-only.
+  Open in Editor uses GTK FileLauncher. Unique round **213**.
+
 Updated: 2026-10-03 (grouped Block delete with in-place undo — round 212)
 
 ## 2026-10-03 (grouped Block delete — round 212)

@@ -28,6 +28,7 @@ use std::time::Duration;
 use adw::prelude::*;
 use relm4::adw;
 use relm4::gtk;
+use relm4::gtk::gio;
 use relm4::prelude::*;
 
 #[cfg(unix)]
@@ -159,6 +160,34 @@ fn shell_argv_for_info(info: &str, configured_shell: &[String]) -> Option<Vec<St
         ]),
         _ => None,
     }
+}
+
+/// Why a fence is shown without Run/Stop. `None` means the cell can execute.
+fn notebook_preview_reason<'a>(
+    info: &str,
+    configured_shell: &[String],
+    source: &'a str,
+) -> Option<&'a str> {
+    if let Some(issue) = notebook_cell_issue(source) {
+        return Some(issue);
+    }
+    shell_argv_for_info(info, configured_shell).is_none().then_some(
+        "Only shell fences are executable; this cell is preview-only. Open the file in an editor to change it.",
+    )
+}
+
+fn launch_notebook_in_editor(path: &Path, parent: &adw::ApplicationWindow) {
+    let file = gio::File::for_path(path);
+    let launcher = gtk::FileLauncher::new(Some(&file));
+    let parent = parent.clone();
+    launcher.launch(Some(&parent), gio::Cancellable::NONE, |result| {
+        if let Err(err) = result {
+            log::warn!(
+                "notebook: open in editor failed: {}",
+                crate::review_input::safe_inline_display(&err.to_string(), 1024)
+            );
+        }
+    });
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -635,14 +664,28 @@ impl Component for NotebookModel {
                 run_all_status.set_hexpand(true);
                 run_all_status.add_css_class("dim-label");
                 run_all_status.set_visible(false);
+                let open_button = gtk::Button::with_label("Open in Editor");
+                open_button.add_css_class("flat");
+                open_button.set_tooltip_text(Some(
+                    "Opens this notebook in the desktop's default editor. The viewer does not edit or save cells.",
+                ));
                 let stop_all_button = gtk::Button::with_label("Stop All");
                 stop_all_button.set_sensitive(false);
                 let run_all_button = gtk::Button::with_label("Run All");
                 run_all_button.add_css_class("suggested-action");
                 actions.append(&run_all_status);
+                actions.append(&open_button);
                 actions.append(&stop_all_button);
                 actions.append(&run_all_button);
                 widgets.content.append(&actions);
+
+                let intro = gtk::Label::new(Some(
+                    "Read-only viewer. Shell fences (unlabelled, shell, bash, sh, zsh, fish, pwsh, powershell) run in isolated processes. Other languages are preview-only — copy them or open the file to edit.",
+                ));
+                intro.set_wrap(true);
+                intro.set_xalign(0.0);
+                intro.add_css_class("dim-label");
+                widgets.content.append(&intro);
 
                 let segments = parse_segments(&text);
                 let mut content_truncated = segments.len() > MAX_NOTEBOOK_SEGMENTS;
@@ -713,6 +756,17 @@ impl Component for NotebookModel {
                     status: run_all_status,
                 });
                 run_all_button.set_sensitive(runtime.cells.iter().any(|cell| cell.runnable()));
+                if !run_all_button.is_sensitive() {
+                    run_all_button.set_tooltip_text(Some(
+                        "No executable shell fences in this notebook",
+                    ));
+                }
+
+                let parent_for_open = self.parent.clone();
+                let path_for_open = path.clone();
+                open_button.connect_clicked(move |_| {
+                    launch_notebook_in_editor(&path_for_open, &parent_for_open);
+                });
 
                 let weak_runtime = Rc::downgrade(&runtime);
                 run_all_button.connect_clicked(move |_| {
@@ -865,21 +919,17 @@ impl CellController {
         let run_button = gtk::Button::with_label("Run");
         let stop_button = gtk::Button::with_label("Stop");
         stop_button.set_sensitive(false);
+        let preview_reason = notebook_preview_reason(info, configured_shell, source);
         if command.is_some() {
             run_button.add_css_class("suggested-action");
-        } else if let Some(issue) = source_issue {
-            run_button.set_sensitive(false);
-            run_button.set_tooltip_text(Some(issue));
-            language_label.add_css_class("error");
+            toolbar.append(&run_button);
+            toolbar.append(&stop_button);
+        } else if let Some(issue) = preview_reason {
+            if source_issue.is_some() {
+                language_label.add_css_class("error");
+            }
             language_label.set_tooltip_text(Some(issue));
-        } else {
-            run_button.set_sensitive(false);
-            run_button.set_tooltip_text(Some(
-                "Only shell fences are executable; use bash, sh, zsh, fish, pwsh, powershell, shell, or no label",
-            ));
         }
-        toolbar.append(&run_button);
-        toolbar.append(&stop_button);
         body.append(&toolbar);
 
         let source_buffer = gtk::TextBuffer::new(None);
@@ -1370,6 +1420,9 @@ mod tests {
         );
         assert_eq!(shell_argv_for_info("python", &configured), None);
         assert_eq!(shell_argv_for_info("shell", &[]), None);
+        assert!(notebook_preview_reason("python", &configured, "print(1)").is_some());
+        assert!(notebook_preview_reason("bash", &configured, "echo ok").is_none());
+        assert!(notebook_preview_reason("bash", &configured, "echo safe\u{202e}txt").is_some());
     }
 
     #[test]

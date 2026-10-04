@@ -15,6 +15,11 @@ versioning for tagged releases while it remains experimental.
   the previous in-menu removal could neither undo nor survive a crash without
   resurrecting the cards.
 
+- **Notebooks no longer pretend Python (and other non-shell) fences can run.**
+  Those cells keep Copy and drop the dead Run/Stop buttons. The viewer states
+  it is read-only and offers **Open in Editor** so changing a cell happens in
+  a real editor rather than a dialog that cannot save.
+
 - **Task terminals that fail to launch update the task model by role.** A
   validation PTY that never crossed exec is recorded as a cancelled validation
   attempt rather than an inconclusive child exit, so the Tasks panel can schedule
