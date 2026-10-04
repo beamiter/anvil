@@ -41,6 +41,10 @@ versioning for tagged releases while it remains experimental.
   `[keybindings]` reaches the same undoable removal; an empty selection
   says so instead of doing nothing.
 
+- **Double-click selects IPv6 addresses.** `::1`, compressed forms like
+  `2001:db8::1`, the 8-hextet spelling, and `[::1]:8080` stay one token.
+  `file:line` locations with two colons are unchanged.
+
 - **Double-click selects container image tags.** `nginx:1.27-alpine`
   used to stop at `nginx:1` because that looked like `file:line`. Line
   numbers now refuse a following `.digit`; `name:tag` stays whole.

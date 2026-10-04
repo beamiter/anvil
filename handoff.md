@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (IPv6 smart-select — round 235)
+
+## 2026-10-04 (IPv6 double-click — round 235)
+
+- Double-click `::1` or `[::1]:8080` selects the whole address. Unique round
+  **235**.
+
 Updated: 2026-10-04 (image-tag smart-select — round 234)
 
 ## 2026-10-04 (image tag double-click — round 234)

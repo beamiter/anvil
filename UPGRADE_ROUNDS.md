@@ -1061,5 +1061,10 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      first digits. Line numbers now refuse a following `.digit`, and a
      `name:tag` token takes `nginx:1.27-alpine` and `ghcr.io/org/app:v2.1.0`.
 
+235. **Smart-select grabs IPv6 addresses** — `::1`, `2001:db8::1`, a full
+     8-hextet form, and `[::1]:8080` were split on colons or stole a
+     `file:line` suffix. They are now one token, ahead of `file:line`.
+     `src/main.rs:12:3` still wins on the path; trailing `.` is dropped.
+
 
 

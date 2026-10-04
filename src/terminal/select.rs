@@ -1,7 +1,8 @@
 //! Semantic ("smart") double-click selection for finished-block text views.
 //!
 //! GTK's default double-click selects a plain alnum word. This detects the
-//! semantic token under the cursor — URL, path, file:line:col, IPv4, git SHA,
+//! semantic token under the cursor — URL, path, file:line:col, IPv4, IPv6,
+//! git SHA, key=value, quoted string, … — so one double-click grabs the whole unit.
 //! key=value, quoted string, … — so one double-click grabs the whole unit.
 //! Ported from forge's `block_view/select.rs`.
 
@@ -29,6 +30,11 @@ static PATTERNS: LazyLock<Vec<Pat>> = LazyLock::new(|| {
         p(r#"([\w.+-]+@[\w-]+(?:\.[\w-]+)+)"#, 1),
         p(
             r#"(\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9]+)"#,
+            1,
+        ),
+        p(r#"(\[[0-9a-fA-F:.]{2,}\](?::\d+)?)"#, 1),
+        p(
+            r#"((?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|[0-9a-fA-F]{0,4}(?::[0-9a-fA-F]{0,4})*::(?:[0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{0,4})"#,
             1,
         ),
         p(r#"((?:[~.]?[\w./+-]*\w):\d+(?::\d+)?)"#, 1),
@@ -108,7 +114,11 @@ fn trim_semantic_end(line: &str, start: usize, end: usize) -> usize {
     if token.contains("://") || token.contains('@') {
         return start + trim_link_trail(token).len();
     }
-    if token.contains('/') || token.contains('.') || token.contains('=') {
+    if token.contains('/')
+        || token.contains('.')
+        || token.contains('=')
+        || token.matches(':').count() >= 2
+    {
         return start + trim_path_trail(token).len();
     }
     end
@@ -196,6 +206,19 @@ mod tests {
             token("run ghcr.io/org/app:v2.1.0 now", 10).as_deref(),
             Some("ghcr.io/org/app:v2.1.0")
         );
+        assert_eq!(token("ping ::1 ok", 6).as_deref(), Some("::1"));
+        assert_eq!(
+            token("addr 2001:db8::1 here", 8).as_deref(),
+            Some("2001:db8::1")
+        );
+        assert_eq!(
+            token("listen [::1]:8080 now", 8).as_deref(),
+            Some("[::1]:8080")
+        );
+        assert_eq!(
+            token("full 2001:0db8:85a3:0000:0000:8a2e:0370:7334 x", 7).as_deref(),
+            Some("2001:0db8:85a3:0000:0000:8a2e:0370:7334")
+        );
     }
 
     #[test]
@@ -240,5 +263,6 @@ mod tests {
             token("retry COUNT=3;", 8).as_deref(),
             Some("COUNT=3")
         );
+        assert_eq!(token("ping ::1.", 6).as_deref(), Some("::1"));
     }
 }
