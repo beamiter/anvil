@@ -1081,5 +1081,9 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
 239. **Smart-select keeps the percent sign** — `80%` and `12.5%` used to
      stop at the digits because `%` is a word boundary.
 
+240. **Smart-select keeps duration units** — `12ms`, `1.5s`, `100ns` (and
+     `us`/`µs`) were split after the number. Minutes/hours stay unclaimed
+     so “1 more” is not a duration.
+
 
 

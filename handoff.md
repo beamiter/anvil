@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (duration smart-select — round 240)
+
+## 2026-10-04 (duration double-click — round 240)
+
+- Double-click `12ms` or `1.5s` selects the number and unit. Unique round
+  **240**. Heartbeat 20s.
+
 Updated: 2026-10-04 (percent smart-select — round 239)
 
 ## 2026-10-04 (percent double-click — round 239)
