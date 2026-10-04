@@ -1125,5 +1125,8 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
 252. **Quick-switch with no tabs toasts** — Ctrl+1…9 / Ctrl+9 on an empty
      window was silent. Same honesty as other pane-bound shortcuts.
 
+253. **Scroll with no terminal toasts** — ScrollUp/ScrollDown on an empty
+     window was silent. Same "No active terminal pane." copy as Agent.
+
 
 

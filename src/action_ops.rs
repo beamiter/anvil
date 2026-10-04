@@ -338,11 +338,15 @@ impl AppModel {
             Action::ScrollUp => {
                 if let Some(t) = self.active_terminal() {
                     t.emit(VteInput::ScrollLines(-3));
+                } else {
+                    self.show_toast(scroll_empty_notice());
                 }
             }
             Action::ScrollDown => {
                 if let Some(t) = self.active_terminal() {
                     t.emit(VteInput::ScrollLines(3));
+                } else {
+                    self.show_toast(scroll_empty_notice());
                 }
             }
             Action::FilterFailedBlocks => {
@@ -499,9 +503,14 @@ pub(crate) fn quick_switch_empty_notice() -> &'static str {
     "No tabs to switch to."
 }
 
+/// Shift+PageUp/PageDown (or the bound scroll actions) with no terminal pane.
+pub(crate) fn scroll_empty_notice() -> &'static str {
+    "No active terminal pane."
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{font_scale_toast_title, quick_switch_empty_notice};
+    use super::{font_scale_toast_title, quick_switch_empty_notice, scroll_empty_notice};
 
     #[test]
     fn font_scale_toast_reads_as_a_percent() {
@@ -513,5 +522,10 @@ mod tests {
     #[test]
     fn quick_switch_with_no_tabs_explains_itself() {
         assert_eq!(quick_switch_empty_notice(), "No tabs to switch to.");
+    }
+
+    #[test]
+    fn scroll_with_no_terminal_explains_itself() {
+        assert_eq!(scroll_empty_notice(), "No active terminal pane.");
     }
 }

@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (scroll empty toast — round 253)
+
+## 2026-10-04 (scroll with no terminal — round 253)
+
+- Scroll up/down with no pane toasts instead of doing nothing. Unique round
+  **253**. Heartbeat 20s.
+
 Updated: 2026-10-04 (quick-switch empty toast — round 252)
 
 ## 2026-10-04 (Ctrl+N with no tabs — round 252)
