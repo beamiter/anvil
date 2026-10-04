@@ -41,6 +41,9 @@ versioning for tagged releases while it remains experimental.
   `[keybindings]` reaches the same undoable removal; an empty selection
   says so instead of doing nothing.
 
+- **Double-click selects percentages.** `80%` and `12.5%` keep the
+  percent sign instead of stopping at the number.
+
 - **Double-click selects semantic versions.** `v1.2.3`, `1.2.3-rc.1`, and
   `1.2.3+meta.4` stay one token. IPv4 with four octets still matches first.
 

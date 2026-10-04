@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (percent smart-select — round 239)
+
+## 2026-10-04 (percent double-click — round 239)
+
+- Double-click `80%` or `12.5%` selects the number and the sign. Unique
+  round **239**. Heartbeat 20s.
+
 Updated: 2026-10-04 (semver smart-select — round 238)
 
 ## 2026-10-04 (semver double-click — round 238)

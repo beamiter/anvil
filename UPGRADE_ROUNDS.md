@@ -1078,5 +1078,8 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      and build `1.2.3+meta.4` were split after the second numeric component.
      IPv4 (`10.0.0.8`) still matches first.
 
+239. **Smart-select keeps the percent sign** — `80%` and `12.5%` used to
+     stop at the digits because `%` is a word boundary.
+
 
 
