@@ -41,6 +41,13 @@ versioning for tagged releases while it remains experimental.
   `[keybindings]` reaches the same undoable removal; an empty selection
   says so instead of doing nothing.
 
+- **Parenthesized and quoted URLs stay clickable.** Ctrl+click and hover
+  took the whole whitespace token, so `(https://example.com)` failed the
+  opener and was not underlined. Wrapping `([{<"'` and dangling sentence
+  punctuation (including `:`) are clipped first; a port like `:8443` is
+  kept. Double-click uses the same trailing trim, so copying
+  `https://example.com:` no longer includes the colon.
+
 - **The find bar can match case.** Find was always case-insensitive, even
   though the cross-block palette already had `Aa`. The same toggle now
   drives live VTE search, the block highlighter, and the match counter.

@@ -978,5 +978,12 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      cross-block `Aa` toggle. An `Aa` button now re-runs the live and block
      backends with caseless flags dropped. Off by default, same as before.
 
+220. **Parenthesized URLs stay clickable and selectable** —
+     Ctrl+click / hover used the whitespace token as-is, so `(https://…)`
+     failed the opener and was not underlined. Wrapping `([{<"'` and the
+     same trailing punctuation the opener already dropped (including a
+     dangling `:`) are clipped first. Double-click shares that trail trim
+     so `https://example.com:` no longer copies the colon; `:8443` stays.
+
 
 

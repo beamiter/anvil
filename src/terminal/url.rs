@@ -11,7 +11,7 @@ use gtk::prelude::*;
 use gtk::TextBuffer;
 use relm4::gtk;
 
-use super::select::get_semantic_bounds_at_position;
+use super::select::{get_semantic_bounds_at_position, strip_link_wrappers, trim_link_trail};
 
 pub(crate) const OSC8_URI_DATA_KEY: &str = "anvil-osc8-uri";
 
@@ -31,13 +31,15 @@ pub fn is_openable_url(text: &str) -> bool {
     jterm_core::link::is_openable_url(text)
 }
 
-fn trim_trailing(text: &str) -> &str {
-    text.trim_end_matches(|c| {
-        matches!(
-            c,
-            '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '>' | '\'' | '"'
-        )
-    })
+/// Strip wrapping openers and trailing punctuation so `(https://example.com).`
+/// is the same openable URL as the bare form.
+fn clip_plain_url(raw: &str) -> Option<(usize, usize, &str)> {
+    let inner = strip_link_wrappers(raw);
+    let start = raw.len() - inner.len();
+    let trimmed = trim_link_trail(inner);
+    let end = start + trimmed.len();
+    let candidate = &raw[start..end];
+    is_openable_url(candidate).then_some((start, end, candidate))
 }
 
 pub fn open_uri(uri: &str) {
@@ -125,8 +127,9 @@ pub(crate) fn osc8_uri(tag: &gtk::TextTag) -> Option<String> {
     }
 }
 
-/// Find the URL surrounding `iter` (whitespace/`<>`-delimited), trimming trailing
-/// sentence punctuation. Returns the adjusted bounds and the URL text.
+/// Find the URL surrounding `iter` (whitespace/`<>`-delimited), stripping
+/// wrapping quotes/brackets and trailing sentence punctuation. Returns the
+/// adjusted bounds and the URL text.
 pub fn get_url_bounds_at_position(
     buffer: &TextBuffer,
     iter: &gtk::TextIter,
@@ -160,16 +163,19 @@ pub fn get_url_bounds_at_position(
     }
 
     let raw = buffer.text(&start, &end, false).to_string();
-    let trimmed = trim_trailing(&raw);
-    if !is_openable_url(trimmed) {
-        return None;
+    let (byte_start, byte_end, url) = clip_plain_url(&raw)?;
+    let prefix = raw[..byte_start].chars().count();
+    let suffix = raw[byte_end..].chars().count();
+    for _ in 0..prefix {
+        start.forward_char();
     }
-    let trimmed_chars = trimmed.chars().count();
-    let raw_chars = raw.chars().count();
-    for _ in 0..(raw_chars - trimmed_chars) {
+    for _ in 0..suffix {
         end.backward_char();
     }
-    Some((start, end, trimmed.to_string()))
+    if start.offset() >= end.offset() {
+        return None;
+    }
+    Some((start, end, url.to_string()))
 }
 
 /// URL at `iter`: prefer a validated OSC 8 tag, else plain-text detection.
@@ -297,7 +303,44 @@ pub fn attach_url_handlers(view: &gtk::TextView) {
 
 #[cfg(test)]
 mod tests {
-    use super::{first_openable_link, is_openable_url, link_to_open};
+    use super::{clip_plain_url, first_openable_link, is_openable_url, link_to_open};
+
+    #[test]
+    fn wrapping_punctuation_does_not_hide_an_openable_url() {
+        let clip = |raw: &str| {
+            clip_plain_url(raw).map(|(_, _, url)| url.to_string())
+        };
+        assert_eq!(
+            clip("https://example.com").as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(
+            clip("(https://example.com)").as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(
+            clip("(https://example.com).").as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(
+            clip("\"https://example.com\"").as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(
+            clip("[https://example.com]").as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(
+            clip("https://example.com:").as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(
+            clip("https://example.com:8443").as_deref(),
+            Some("https://example.com:8443")
+        );
+        assert_eq!(clip("(file:///etc/passwd)"), None);
+        assert_eq!(clip("not a url"), None);
+    }
 
     #[test]
     fn a_click_opens_the_first_link_the_policy_accepts() {

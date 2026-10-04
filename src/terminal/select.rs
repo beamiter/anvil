@@ -66,17 +66,30 @@ fn semantic_span(line: &str, click_char: usize) -> Option<(usize, usize)> {
     None
 }
 
-/// Sentence punctuation is not part of a URL or email, even when the greedy
-/// URI regex swallowed it. Colon stays: `https://host:8443` is one token.
+/// Sentence punctuation and wrapping closers are not part of a URL or email,
+/// even when the greedy URI regex swallowed them. A port stays:
+/// `https://host:8443` does not end with `:`.
+pub(crate) fn trim_link_trail(text: &str) -> &str {
+    text.trim_end_matches(|c| {
+        matches!(
+            c,
+            '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '>' | '\'' | '"'
+        )
+    })
+}
+
+/// Opening wrappers around a whitespace-delimited URL token (`(https://…)`,
+/// `"https://…"`). Closers are handled by [`trim_link_trail`].
+pub(crate) fn strip_link_wrappers(text: &str) -> &str {
+    text.trim_start_matches(|c| matches!(c, '(' | '[' | '{' | '<' | '"' | '\''))
+}
+
 fn trim_semantic_end(line: &str, start: usize, end: usize) -> usize {
     let token = &line[start..end];
     if !(token.contains("://") || token.contains('@')) {
         return end;
     }
-    start
-        + token
-            .trim_end_matches(|c| matches!(c, '.' | ',' | ';' | '!' | '?'))
-            .len()
+    start + trim_link_trail(token).len()
 }
 
 /// Resolve the semantic token at `iter` to a pair of buffer iters to select.
@@ -137,6 +150,14 @@ mod tests {
         assert_eq!(
             token("https://example.com:8443/x", 2).as_deref(),
             Some("https://example.com:8443/x")
+        );
+        assert_eq!(
+            token("see https://example.com:", 6).as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(
+            token("https://example.com:8443:", 2).as_deref(),
+            Some("https://example.com:8443")
         );
     }
 }

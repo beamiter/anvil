@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (parenthesized URL clip — round 220)
+
+## 2026-10-04 (parenthesized URLs — round 220)
+
+- Ctrl+click/hover clip wrapping punctuation; smart-select drops dangling `:`.
+  Unique round **220**.
+
 Updated: 2026-10-04 (find-bar match case — round 219)
 
 ## 2026-10-04 (find match case — round 219)
