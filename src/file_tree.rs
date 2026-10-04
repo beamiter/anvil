@@ -1,6 +1,8 @@
 //! Sidebar file browser: a lazy-loading `TreeView` rooted at the active tab's
 //! working directory (falling back to `$HOME`). Directories expand on demand;
-//! activating a file inserts its shell-quoted path into the active terminal.
+//! activating a regular file inserts its shell-quoted path into the active
+//! terminal, while a `.jtnb.md` notebook opens the viewer (right-click still
+//! offers Insert Path in Terminal).
 //! Ports forge's `ui/file_tree.rs` to anvil's relm4 structure.
 //!
 //! GTK4 deprecated the TreeView/TreeStore family in 4.10 in favor of the new
@@ -1447,7 +1449,16 @@ fn push_valid_display(display: &mut String, valid: &str) {
 }
 
 pub(crate) fn is_notebook_path(path: &Path) -> bool {
-    path.as_os_str().as_bytes().ends_with(b".jtnb.md")
+    path_has_ascii_suffix_ignore_case(path, b".jtnb.md")
+}
+
+fn path_has_ascii_suffix_ignore_case(path: &Path, suffix: &[u8]) -> bool {
+    let bytes = path.as_os_str().as_bytes();
+    bytes.len() >= suffix.len()
+        && bytes[bytes.len() - suffix.len()..]
+            .iter()
+            .zip(suffix)
+            .all(|(a, b)| a.to_ascii_lowercase() == *b)
 }
 
 /// The launch authority behind the file-tree header's terminal button.
@@ -3123,6 +3134,17 @@ pub(crate) fn directory_navigation_path_is_allowed(root: &Path, target: &Path) -
 mod tests {
     use super::*;
     use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn notebook_paths_match_the_jtnb_suffix_case_insensitively() {
+        assert!(is_notebook_path(Path::new("welcome.jtnb.md")));
+        assert!(is_notebook_path(Path::new("/tmp/Demo.JTNB.MD")));
+        assert!(!is_notebook_path(Path::new("welcome.md")));
+        assert!(!is_notebook_path(Path::new("welcome.jtnb.md.bak")));
+        assert!(!is_notebook_path(Path::new("jtnb.md")));
+        let non_utf8 = PathBuf::from(OsString::from_vec(b"/tmp/\xff.jtnb.md".to_vec()));
+        assert!(is_notebook_path(&non_utf8));
+    }
 
     #[test]
     fn directory_status_retains_each_failure_and_distinguishes_refreshing() {

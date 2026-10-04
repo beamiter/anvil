@@ -30,6 +30,11 @@ versioning for tagged releases while it remains experimental.
   hover looked like a precise index with a plus sign. The tooltip and
   accessible description now say the total is a snapshot/engine estimate.
 
+- **Notebook files in the sidebar can still be dropped onto the prompt.**
+  Left-click opens the viewer, which made the quoted path unreachable.
+  Right-click now offers Insert Path in Terminal and Open Notebook, and
+  `.jtnb.md` is recognised without regard to ASCII case.
+
 - **Task terminals that fail to launch update the task model by role.** A
   validation PTY that never crossed exec is recorded as a cancelled validation
   attempt rather than an inconclusive child exit, so the Tasks panel can schedule

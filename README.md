@@ -1229,7 +1229,11 @@ a pending queue, while durable `[!]`, `[!!]`, `[ok]`, and `[?]` facts remain.
 
 ### Notebooks
 
-Activating a `.jtnb.md` file in the sidebar opens the notebook viewer. Markdown
+Activating a `.jtnb.md` file in the sidebar opens the notebook viewer. The
+suffix is matched case-insensitively (`Demo.JTNB.MD` counts). Ordinary files
+still insert a quoted path on left-click; a notebook's path can be inserted
+from **Insert Path in Terminal** on the tree's context menu, which also
+offers **Open Notebook**. Markdown
 is intentionally minimal. The viewer does not edit or save cells; **Open in
 Editor** hands the file to the desktop's default application. Unlabelled,
 `shell`, `bash`, `sh`, `zsh`, `fish`, `pwsh`, and `powershell` code fences get

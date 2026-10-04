@@ -757,6 +757,52 @@ fn show_file_tree_context_menu(
             });
             menu.append(&button);
         }
+        {
+            let insert_label = if multi {
+                format!("Insert {} Paths in Terminal", targets.len())
+            } else {
+                "Insert Path in Terminal".to_string()
+            };
+            let button = file_menu_button(&insert_label);
+            button.set_tooltip_text(Some(
+                "Inserts each path at the prompt, shell-quoted, the same way a left-click does for ordinary files.",
+            ));
+            let popover = popover.clone();
+            let sender = sender.clone();
+            let paths: Vec<std::path::PathBuf> =
+                targets.iter().map(|(path, _)| path.clone()).collect();
+            button.connect_clicked(move |_| {
+                popover.popdown();
+                for path in &paths {
+                    sender.input(AppMsg::FileTreeActivateFile(path.clone()));
+                }
+            });
+            menu.append(&button);
+        }
+        {
+            let notebooks: Vec<std::path::PathBuf> = targets
+                .iter()
+                .filter(|(path, is_dir)| !*is_dir && file_tree::is_notebook_path(path))
+                .map(|(path, _)| path.clone())
+                .collect();
+            if !notebooks.is_empty() {
+                let open_label = if notebooks.len() > 1 {
+                    format!("Open {} Notebooks", notebooks.len())
+                } else {
+                    "Open Notebook".to_string()
+                };
+                let button = file_menu_button(&open_label);
+                let popover = popover.clone();
+                let sender = sender.clone();
+                button.connect_clicked(move |_| {
+                    popover.popdown();
+                    for path in &notebooks {
+                        sender.input(AppMsg::OpenNotebook(path.clone()));
+                    }
+                });
+                menu.append(&button);
+            }
+        }
     }
     {
         let button = file_menu_button(&paste_label);

@@ -958,5 +958,10 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      from a bounded snapshot or a different regex engine, and that `?`
      means the current hit is outside that counted range.
 
+216. **File-tree notebooks stay openable and insertable** —
+     Left-click still opens the viewer. Right-click gains Insert Path in
+     Terminal (quoted, including directories) and Open Notebook. `.jtnb.md`
+     is recognised case-insensitively, including a non-UTF-8 prefix.
+
 
 

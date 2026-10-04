@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (file-tree notebook insert/open — round 216)
+
+## 2026-10-04 (file-tree notebooks — round 216)
+
+- Context menu Insert Path in Terminal + Open Notebook; `.jtnb.md` suffix is
+  case-insensitive. Unique round **216**.
+
 Updated: 2026-10-04 (VTE find inexact-count tooltip — round 215)
 
 ## 2026-10-04 (VTE find count honesty — round 215)
