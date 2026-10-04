@@ -41,6 +41,10 @@ versioning for tagged releases while it remains experimental.
   `[keybindings]` reaches the same undoable removal; an empty selection
   says so instead of doing nothing.
 
+- **Shell Agent says when no pane is open.** Starting the Agent with no
+  tab used to only reset the toolbar toggle. It now toasts that there is
+  no active terminal pane, same as other pane-bound actions.
+
 - **Reinput selected commands on a live VTE pane explains itself.**
   Ctrl+Shift+I still reached classic VTE and inserted nothing. It now
   says the feature needs Block mode.

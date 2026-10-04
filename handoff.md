@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (agent missing-pane toast — round 251)
+
+## 2026-10-04 (Shell Agent with no pane — round 251)
+
+- Opening Shell Agent with no tab/pane toasts instead of only resetting the
+  toggle. Unique round **251**. Heartbeat 20s.
+
 Updated: 2026-10-04 (reinput VTE toast — round 250)
 
 ## 2026-10-04 (reinput on VTE — round 250)

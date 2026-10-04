@@ -24,6 +24,11 @@ fn should_publish_reply_activity(result: &Result<bool, agent::SessionError>) -> 
     !matches!(result, Ok(false))
 }
 
+/// Shell Agent with no tab/pane used to only reset the toolbar toggle.
+pub(crate) fn agent_missing_pane_notice() -> &'static str {
+    "No active terminal pane."
+}
+
 #[cfg(test)]
 fn read_agent_snapshot(path: &Path) -> Option<AgentSessionSnapshot> {
     let _parent_lock = crate::config_store::PrivateParentLock::acquire(path).ok()?;
@@ -205,10 +210,12 @@ impl AppModel {
         drop(cfg);
 
         let Some(tab) = self.tabs.get(self.active) else {
+            self.show_toast(agent_missing_pane_notice());
             self.sync_agent_toggle();
             return;
         };
         let Some(pane) = tab.panes.get(tab.active_pane) else {
+            self.show_toast(agent_missing_pane_notice());
             self.sync_agent_toggle();
             return;
         };
@@ -1298,6 +1305,11 @@ mod snapshot_tests {
 
         let stale = Ok(false);
         assert!(!should_publish_reply_activity(&stale));
+    }
+
+    #[test]
+    fn opening_agent_without_a_pane_explains_itself() {
+        assert_eq!(agent_missing_pane_notice(), "No active terminal pane.");
     }
 
     fn test_directory(label: &str) -> std::path::PathBuf {

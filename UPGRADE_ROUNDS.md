@@ -1118,5 +1118,9 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
 250. **Reinput on live VTE toasts** — selected-command recall used the last
      silent VTE no-op. Copy matches `emit_block_action`.
 
+251. **Shell Agent empty-window toast** — Open Agent with no tab/pane only
+     reset the toolbar toggle. Same "No active terminal pane." copy as other
+     pane-bound actions.
+
 
 
