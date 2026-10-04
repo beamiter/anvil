@@ -41,6 +41,11 @@ versioning for tagged releases while it remains experimental.
   `[keybindings]` reaches the same undoable removal; an empty selection
   says so instead of doing nothing.
 
+- **Double-click paths drop trailing sentence punctuation.** `src/main.rs.`
+  used to copy the period because `.` is legal in a filename. Paths and
+  `file:line` now trim `. , ; ! ?` the way URLs already did; `:12:3`
+  stays.
+
 - **Reinput selected commands explains a refusal.** Card Enter already
   flashed why a recall was unsafe; Ctrl+Shift+I and the palette stayed
   silent. Empty selection, fullscreen, a busy prompt, or multiline

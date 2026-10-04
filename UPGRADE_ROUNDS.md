@@ -1019,5 +1019,11 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      paste) with no toast. Card Enter already flashed a reason; the
      window action now uses the same cases.
 
+227. **Smart-select drops trailing punctuation on paths** —
+     URL/email tokens already lost sentence `. , ; ! ?` (and a dangling
+     `:`). `see src/main.rs.` still copied the period because the path
+     regex allows `.` in names. Paths and `file:line` now share a trail
+     trim that keeps `:12:3`.
+
 
 

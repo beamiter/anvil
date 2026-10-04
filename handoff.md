@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (path smart-select trail — round 227)
+
+## 2026-10-04 (path trailing punctuation — round 227)
+
+- Double-click `src/main.rs.` no longer includes the period. Unique round
+  **227**.
+
 Updated: 2026-10-04 (reinput refusal toast — round 226)
 
 ## 2026-10-04 (reinput refusal — round 226)

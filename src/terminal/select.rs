@@ -84,12 +84,21 @@ pub(crate) fn strip_link_wrappers(text: &str) -> &str {
     text.trim_start_matches(|c| matches!(c, '(' | '[' | '{' | '<' | '"' | '\''))
 }
 
+/// Sentence punctuation is not part of a path or `file:line` token. Colon
+/// stays: `src/main.rs:12` is one token.
+pub(crate) fn trim_path_trail(text: &str) -> &str {
+    text.trim_end_matches(|c| matches!(c, '.' | ',' | ';' | '!' | '?'))
+}
+
 fn trim_semantic_end(line: &str, start: usize, end: usize) -> usize {
     let token = &line[start..end];
-    if !(token.contains("://") || token.contains('@')) {
-        return end;
+    if token.contains("://") || token.contains('@') {
+        return start + trim_link_trail(token).len();
     }
-    start + trim_link_trail(token).len()
+    if token.contains('/') || token.contains('.') {
+        return start + trim_path_trail(token).len();
+    }
+    end
 }
 
 /// Resolve the semantic token at `iter` to a pair of buffer iters to select.
@@ -158,6 +167,18 @@ mod tests {
         assert_eq!(
             token("https://example.com:8443:", 2).as_deref(),
             Some("https://example.com:8443")
+        );
+        assert_eq!(
+            token("see src/main.rs.", 6).as_deref(),
+            Some("src/main.rs")
+        );
+        assert_eq!(
+            token("open ./foo/bar, please", 6).as_deref(),
+            Some("./foo/bar")
+        );
+        assert_eq!(
+            token("log src/main.rs:12:3.", 6).as_deref(),
+            Some("src/main.rs:12:3")
         );
     }
 }
