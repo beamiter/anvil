@@ -765,14 +765,18 @@ impl Component for VteTerminal {
             | VteInput::ClearBlocks
             | VteInput::UndoClearBlocks
             | VteInput::DeleteSelectedBlocks
-            | VteInput::CollapseAllBlocks
-            | VteInput::ExpandAllBlocks
-            | VteInput::ToggleBlockCollapsed
             | VteInput::ReinputSelectedCommands
             | VteInput::JumpToPrevPinned
             | VteInput::JumpToNextPinned
             | VteInput::JumpToPrevFailed
             | VteInput::JumpToNextFailed => {}
+            VteInput::CollapseAllBlocks
+            | VteInput::ExpandAllBlocks
+            | VteInput::ToggleBlockCollapsed => {
+                let _ = sender.output(VteOutput::Notice(vte_block_mode_only_notice(
+                    "Block folding",
+                )));
+            }
             VteInput::ExportSessionMarkdown | VteInput::ExportSessionJson => {
                 let _ = sender.output(VteOutput::Notice(vte_block_mode_only_notice(
                     "Session export",
@@ -1033,6 +1037,14 @@ mod tests {
         assert_eq!(
             vte_block_mode_only_notice("Session export"),
             "Session export is available only in a Block-mode pane."
+        );
+    }
+
+    #[test]
+    fn block_folding_on_live_vte_explains_block_mode() {
+        assert_eq!(
+            vte_block_mode_only_notice("Block folding"),
+            "Block folding is available only in a Block-mode pane."
         );
     }
 

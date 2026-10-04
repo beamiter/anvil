@@ -41,6 +41,10 @@ versioning for tagged releases while it remains experimental.
   `[keybindings]` reaches the same undoable removal; an empty selection
   says so instead of doing nothing.
 
+- **Block folding on a live VTE pane explains itself.** Collapse, expand,
+  and toggle still reached classic VTE and changed nothing. They now say
+  the feature needs Block mode.
+
 - **Session export on a live VTE pane explains itself.** Markdown/JSON
   export still reached classic VTE and wrote nothing. It now says the
   feature needs Block mode.

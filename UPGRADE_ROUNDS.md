@@ -1098,5 +1098,8 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
 244. **Session export on live VTE toasts** — Markdown/JSON export used the
      same silent VTE no-op. Copy matches the Block-mode-only notebook path.
 
+245. **Block folding on live VTE toasts** — collapse/expand/toggle used the
+     same silent VTE no-op. Copy matches `emit_block_action`'s "Block folding".
+
 
 

@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (block-folding VTE toast — round 245)
+
+## 2026-10-04 (block folding on VTE — round 245)
+
+- Collapse/expand/toggle in a live VTE pane toasts Block-mode-only. Unique
+  round **245**. Heartbeat 20s.
+
 Updated: 2026-10-04 (session-export VTE toast — round 244)
 
 ## 2026-10-04 (session export on VTE — round 244)
