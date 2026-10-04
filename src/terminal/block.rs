@@ -859,6 +859,10 @@ impl Component for BlockTerminal {
                         context,
                         crate::ai::BlockAiIntent::Ask,
                     ));
+                } else {
+                    let _ = sender.output(VteOutput::Notice(
+                        super::vte::ask_ai_empty_notice().to_string(),
+                    ));
                 }
             }
         }

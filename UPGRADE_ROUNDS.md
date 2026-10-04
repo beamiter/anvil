@@ -1088,5 +1088,8 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
 241. **Smart-select keeps byte-size suffixes** — `512Mi`, `1GiB`, `1.5GB`
      (Ki/Mi/Gi/Ti/Pi/Ei and SI `KB`…`EB`) were split after the digits.
 
+242. **Ask AI empty selection toasts** — Ctrl+Shift+Q with no finished
+     block (live prompt or VTE pane) was silent. Same copy on both backends.
+
 
 

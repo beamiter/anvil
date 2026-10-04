@@ -801,7 +801,9 @@ impl Component for VteTerminal {
                 let _ = sender.output(VteOutput::SearchStatus(SearchStatus::Idle));
             }
             VteInput::CrossBlockSearch => {}
-            VteInput::AskAiAboutSelectedBlock => {}
+            VteInput::AskAiAboutSelectedBlock => {
+                let _ = sender.output(VteOutput::Notice(ask_ai_empty_notice().to_string()));
+            }
         }
     }
 }
@@ -810,6 +812,12 @@ impl Component for VteTerminal {
 /// Ctrl+Shift+C still fires and used to look like a broken clipboard.
 pub(crate) fn copy_empty_notice(has_copyable: bool) -> Option<&'static str> {
     (!has_copyable).then_some("Nothing selected to copy.")
+}
+
+/// Ctrl+Shift+Q / Ask AI about selected block with no finished card selected
+/// (live prompt, empty pane). Used to look like a dead shortcut.
+pub(crate) fn ask_ai_empty_notice() -> &'static str {
+    "Select a finished block to ask AI about."
 }
 
 /// Install `query` as `terminal`'s native search, step to the first match
@@ -974,7 +982,8 @@ fn search_status_for_vte(
 #[cfg(test)]
 mod tests {
     use super::{
-        compile_count_regex, copy_empty_notice, launch_failure_message, search_pattern, search_pcre2_flags,
+        compile_count_regex, copy_empty_notice, ask_ai_empty_notice, launch_failure_message,
+        search_pattern, search_pcre2_flags,
         search_status_for_vte, InitialCommands, TerminalSearchSnapshot,
     };
     use crate::search::SearchStatus;
@@ -990,6 +999,11 @@ mod tests {
             Some("Nothing selected to copy.")
         );
         assert_eq!(copy_empty_notice(true), None);
+    }
+
+    #[test]
+    fn ask_ai_without_a_finished_block_explains_itself() {
+        assert!(ask_ai_empty_notice().contains("finished block"));
     }
 
     #[test]

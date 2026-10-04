@@ -41,6 +41,10 @@ versioning for tagged releases while it remains experimental.
   `[keybindings]` reaches the same undoable removal; an empty selection
   says so instead of doing nothing.
 
+- **Ask AI about selected block says when nothing is selected.**
+  Ctrl+Shift+Q from the live prompt or an empty pane used to do nothing.
+  It now toasts to select a finished block first.
+
 - **Double-click selects byte sizes.** `512Mi`, `1GiB`, and `1.5GB`
   keep the binary or SI suffix instead of stopping at the number.
 

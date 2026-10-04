@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (Ask-AI empty toast — round 242)
+
+## 2026-10-04 (Ask AI empty selection — round 242)
+
+- Ctrl+Shift+Q with no finished block toasts instead of doing nothing.
+  Unique round **242**. Heartbeat 20s.
+
 Updated: 2026-10-04 (byte-size smart-select — round 241)
 
 ## 2026-10-04 (byte-size double-click — round 241)
