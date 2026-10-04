@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (ISO-8601 smart-select — round 237)
+
+## 2026-10-04 (timestamp double-click — round 237)
+
+- Double-click `2026-10-04T10:59:48Z` selects the whole timestamp. Unique
+  round **237**. Heartbeat interval is 20s.
+
 Updated: 2026-10-04 (MAC smart-select — round 236)
 
 ## 2026-10-04 (MAC double-click — round 236)

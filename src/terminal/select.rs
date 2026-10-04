@@ -2,7 +2,7 @@
 //!
 //! GTK's default double-click selects a plain alnum word. This detects the
 //! semantic token under the cursor — URL, path, file:line:col, IPv4, IPv6,
-//! MAC, git SHA, key=value, quoted string, … — so one double-click grabs the whole unit.
+//! MAC, ISO-8601 timestamp, git SHA, key=value, quoted string, … — so one double-click grabs the whole unit.
 //! Ported from forge's `block_view/select.rs`.
 
 use gtk::prelude::*;
@@ -29,6 +29,10 @@ static PATTERNS: LazyLock<Vec<Pat>> = LazyLock::new(|| {
         p(r#"([\w.+-]+@[\w-]+(?:\.[\w-]+)+)"#, 1),
         p(
             r#"(\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9]+)"#,
+            1,
+        ),
+        p(
+            r#"(\b\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:?\d{2})?)?)"#,
             1,
         ),
         p(r#"(\[[0-9a-fA-F:.]{2,}\](?::\d+)?)"#, 1),
@@ -121,7 +125,7 @@ fn trim_semantic_end(line: &str, start: usize, end: usize) -> usize {
         || token.contains('.')
         || token.contains('=')
         || token.matches(':').count() >= 2
-        || token.matches('-').count() >= 5
+        || token.matches('-').count() >= 2
     {
         return start + trim_path_trail(token).len();
     }
@@ -231,6 +235,22 @@ mod tests {
             token("hw 00-1A-2B-3C-4D-5E nic", 4).as_deref(),
             Some("00-1A-2B-3C-4D-5E")
         );
+        assert_eq!(
+            token("at 2026-10-04T10:59:48Z x", 4).as_deref(),
+            Some("2026-10-04T10:59:48Z")
+        );
+        assert_eq!(
+            token("day 2026-10-04 end", 5).as_deref(),
+            Some("2026-10-04")
+        );
+        assert_eq!(
+            token("ts 2026-10-04 10:59:48 x", 4).as_deref(),
+            Some("2026-10-04 10:59:48")
+        );
+        assert_eq!(
+            token("off 2026-10-04T10:59:48+08:00 x", 5).as_deref(),
+            Some("2026-10-04T10:59:48+08:00")
+        );
     }
 
     #[test]
@@ -283,6 +303,10 @@ mod tests {
         assert_eq!(
             token("hw 00-1A-2B-3C-4D-5E.", 4).as_deref(),
             Some("00-1A-2B-3C-4D-5E")
+        );
+        assert_eq!(
+            token("at 2026-10-04T10:59:48Z.", 4).as_deref(),
+            Some("2026-10-04T10:59:48Z")
         );
     }
 }

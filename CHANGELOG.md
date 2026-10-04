@@ -41,6 +41,10 @@ versioning for tagged releases while it remains experimental.
   `[keybindings]` reaches the same undoable removal; an empty selection
   says so instead of doing nothing.
 
+- **Double-click selects ISO-8601 timestamps.** `2026-10-04`,
+  `2026-10-04T10:59:48Z`, a space-separated datetime, and `+08:00`
+  offsets stay one token instead of splitting on `-` and `:`.
+
 - **Double-click selects MAC addresses.** IEEE colon and hyphen forms
   (`aa:bb:cc:dd:ee:ff`, `00-1A-2B-3C-4D-5E`) are one token. IPv6 with
   `::` still matches first.

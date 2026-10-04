@@ -1070,5 +1070,9 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      (`aa:bb:cc:dd:ee:ff`, `00-1A-2B-3C-4D-5E`) were six tiny words.
      They match after IPv6 so compressed addresses keep `::`.
 
+237. **Smart-select grabs ISO-8601 timestamps** — `2026-10-04`,
+     `2026-10-04T10:59:48Z`, space-separated datetime, and `+08:00`
+     offsets were split on `-`/`:`. Matched before IPv6.
+
 
 
