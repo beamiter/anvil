@@ -488,8 +488,9 @@ Block mode also has context-sensitive navigation:
   being typed.
 - With one or more blocks selected, `Up` / `Down` moves the active edge,
   `Shift+Up/Down` extends the range, `Home` / `End` moves the selection to the
-  oldest / newest block, `Enter` recalls every selected command in terminal
-  order without running it, and `Escape` clears the selection. These keys keep
+  oldest / newest block, `Delete` removes the selection (with Undo), `Enter` recalls every selected command in terminal
+  order without running it, and `Escape` clears the selection. While a command
+  runs, `Delete` still belongs to that program. These keys keep
   working after a finished command/output surface or card header takes focus;
   ordinary typing still returns safely to the live prompt through its IME.
 - The selection hint reports how many cards are selected and distinguishes

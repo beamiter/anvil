@@ -86,6 +86,10 @@ pub(crate) enum Action {
     ClearBlocks,
     /// Restore the blocks removed by the most recent Clear Blocks.
     UndoClearBlocks,
+    /// Remove the currently selected finished blocks. Delete is selection-
+    /// owned in the pane and unbound by default so a running program keeps
+    /// the key; the palette still exposes the action.
+    DeleteSelectedBlocks,
     /// Fold every finished block's output away.
     CollapseAllBlocks,
     /// Unfold every finished block's output.
@@ -220,6 +224,7 @@ impl Action {
             Action::SelectAllBlocks => "Select all blocks",
             Action::ClearBlocks => "Clear blocks",
             Action::UndoClearBlocks => "Undo clear blocks",
+            Action::DeleteSelectedBlocks => "Delete selected blocks",
             Action::CollapseAllBlocks => "Collapse all blocks",
             Action::ExpandAllBlocks => "Expand all blocks",
             Action::ToggleBlockCollapsed => "Collapse or expand block",
@@ -312,6 +317,7 @@ impl Action {
             Action::SelectAllBlocks => Some("select_all_blocks"),
             Action::ClearBlocks => Some("clear_blocks"),
             Action::UndoClearBlocks => Some("undo_clear_blocks"),
+            Action::DeleteSelectedBlocks => Some("delete_selected_blocks"),
             Action::CollapseAllBlocks => Some("collapse_all_blocks"),
             Action::ExpandAllBlocks => Some("expand_all_blocks"),
             Action::ToggleBlockCollapsed => Some("toggle_block_collapsed"),
@@ -411,6 +417,7 @@ impl Action {
             Action::SelectAllBlocks,
             Action::ClearBlocks,
             Action::UndoClearBlocks,
+            Action::DeleteSelectedBlocks,
             Action::CollapseAllBlocks,
             Action::ExpandAllBlocks,
             Action::ToggleBlockCollapsed,
@@ -1253,6 +1260,9 @@ history_palette = "F10"
         assert!(map.binding_display(&Action::JumpToNextPinned).is_empty());
         assert!(map.binding_display(&Action::JumpToPrevFailed).is_empty());
         assert!(map.binding_display(&Action::UndoClearBlocks).is_empty());
+        assert!(map
+            .binding_display(&Action::DeleteSelectedBlocks)
+            .is_empty());
         assert!(map.binding_display(&Action::CollapseAllBlocks).is_empty());
         assert!(map.binding_display(&Action::ExpandAllBlocks).is_empty());
         assert!(map
@@ -1297,6 +1307,26 @@ toggle_block_collapsed = "F10"
         assert_eq!(
             map.lookup(&parse("F10").unwrap()),
             Some(Action::ToggleBlockCollapsed)
+        );
+    }
+
+    #[test]
+    fn delete_selected_blocks_is_palette_only_by_default_but_bindable() {
+        let mut map = KeybindingMap::from_defaults();
+        assert!(map
+            .binding_display(&Action::DeleteSelectedBlocks)
+            .is_empty());
+        assert!(map
+            .all_bound_actions()
+            .iter()
+            .any(|(action, _)| *action == Action::DeleteSelectedBlocks));
+        let table = r#"delete_selected_blocks = "F7""#
+            .parse::<toml::Table>()
+            .unwrap();
+        map.apply_user_overrides(&table).unwrap();
+        assert_eq!(
+            map.lookup(&parse("F7").unwrap()),
+            Some(Action::DeleteSelectedBlocks)
         );
     }
 

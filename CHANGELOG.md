@@ -35,6 +35,12 @@ versioning for tagged releases while it remains experimental.
   Right-click now offers Insert Path in Terminal and Open Notebook, and
   `.jtnb.md` is recognised without regard to ASCII case.
 
+- **Delete selected blocks is in the command palette.** Delete stays
+  selection-owned and unbound by default so a running program keeps the
+  key. Searching the palette or setting `delete_selected_blocks` in
+  `[keybindings]` reaches the same undoable removal; an empty selection
+  says so instead of doing nothing.
+
 - **Task terminals that fail to launch update the task model by role.** A
   validation PTY that never crossed exec is recorded as a cancelled validation
   attempt rather than an inconclusive child exit, so the Tasks panel can schedule

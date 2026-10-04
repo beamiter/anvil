@@ -666,6 +666,14 @@ impl Component for BlockTerminal {
                         button: "Undo".to_string(),
                         undo: crate::terminal::NoticeUndo::ClearBlocks,
                     });
+                } else if view.is_unified() {
+                    let _ = sender.output(VteOutput::Notice(
+                        "Unified mode keeps no block cards to delete.".to_string(),
+                    ));
+                } else {
+                    let _ = sender.output(VteOutput::Notice(
+                        "Select one or more finished blocks first.".to_string(),
+                    ));
                 }
             }
             VteInput::CollapseAllBlocks | VteInput::ExpandAllBlocks => {

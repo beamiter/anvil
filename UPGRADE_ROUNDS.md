@@ -963,5 +963,10 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      Terminal (quoted, including directories) and Open Notebook. `.jtnb.md`
      is recognised case-insensitively, including a non-UTF-8 prefix.
 
+217. **Delete selected blocks is palette-discoverable** —
+     The action is unbound by default so a running program keeps Delete, but
+     the command palette lists it and `[keybindings] delete_selected_blocks`
+     can bind it. An empty selection explains itself instead of going silent.
+
 
 

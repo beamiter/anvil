@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (palette delete selected blocks — round 217)
+
+## 2026-10-04 (palette delete selected — round 217)
+
+- `Delete selected blocks` is in the palette, unbound by default, bindable
+  as `delete_selected_blocks`. Empty selection toasts a reason. Unique
+  round **217**.
+
 Updated: 2026-10-04 (file-tree notebook insert/open — round 216)
 
 ## 2026-10-04 (file-tree notebooks — round 216)

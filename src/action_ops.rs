@@ -370,6 +370,12 @@ impl AppModel {
             Action::UndoClearBlocks => {
                 self.emit_block_action(VteInput::UndoClearBlocks, "Restoring cleared blocks");
             }
+            Action::DeleteSelectedBlocks => {
+                self.emit_block_action(
+                    VteInput::DeleteSelectedBlocks,
+                    "Deleting selected blocks",
+                );
+            }
             Action::CollapseAllBlocks => {
                 self.emit_block_action(VteInput::CollapseAllBlocks, "Block folding");
             }

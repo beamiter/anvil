@@ -540,6 +540,27 @@ mod tests {
     }
 
     #[test]
+    fn delete_selected_blocks_reaches_the_palette() {
+        let bindings = KeybindingMap::from_defaults();
+        let entries = gather(
+            &Query {
+                mode: PaletteMode::Commands,
+                text: "delete selected".to_string(),
+            },
+            &bindings,
+            &[],
+            &[],
+            100,
+        );
+        assert!(entries.iter().any(|entry| {
+            matches!(
+                &entry.accept,
+                Accept::Action(Action::DeleteSelectedBlocks)
+            )
+        }));
+    }
+
+    #[test]
     fn workflows_appear_under_colon_prefix() {
         let kbmap = KeybindingMap::from_defaults();
         let wf = Workflow {
