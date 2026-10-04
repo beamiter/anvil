@@ -1111,5 +1111,9 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
 248. **Clear/undo-clear on live VTE toast** — clearing finished blocks and
      restoring them used the silent VTE no-op. Copy matches `emit_block_action`.
 
+249. **Select-all/delete on live VTE toast** — selecting every block and
+     deleting the selection used the silent VTE no-op. Copy matches
+     `emit_block_action`.
+
 
 

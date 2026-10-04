@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (block-selection VTE toast — round 249)
+
+## 2026-10-04 (select/delete blocks on VTE — round 249)
+
+- Select-all and delete-selected in a live VTE pane toast Block-mode-only.
+  Unique round **249**. Heartbeat 20s. Remaining VTE no-op: reinput.
+
 Updated: 2026-10-04 (clear-blocks VTE toast — round 248)
 
 ## 2026-10-04 (clear/undo-clear on VTE — round 248)

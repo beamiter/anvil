@@ -757,9 +757,17 @@ impl Component for VteTerminal {
                 }
             }
             // Block-view only; no-op for the bare VTE backend.
-            VteInput::SelectAllBlocks
-            | VteInput::DeleteSelectedBlocks
-            | VteInput::ReinputSelectedCommands => {}
+            VteInput::ReinputSelectedCommands => {}
+            VteInput::SelectAllBlocks => {
+                let _ = sender.output(VteOutput::Notice(vte_block_mode_only_notice(
+                    "Block selection",
+                )));
+            }
+            VteInput::DeleteSelectedBlocks => {
+                let _ = sender.output(VteOutput::Notice(vte_block_mode_only_notice(
+                    "Deleting selected blocks",
+                )));
+            }
             VteInput::ClearBlocks => {
                 let _ = sender.output(VteOutput::Notice(vte_block_mode_only_notice(
                     "Clearing finished blocks",
@@ -1111,6 +1119,18 @@ mod tests {
         assert_eq!(
             vte_block_mode_only_notice("Restoring cleared blocks"),
             "Restoring cleared blocks is available only in a Block-mode pane."
+        );
+    }
+
+    #[test]
+    fn block_selection_on_live_vte_explains_block_mode() {
+        assert_eq!(
+            vte_block_mode_only_notice("Block selection"),
+            "Block selection is available only in a Block-mode pane."
+        );
+        assert_eq!(
+            vte_block_mode_only_notice("Deleting selected blocks"),
+            "Deleting selected blocks is available only in a Block-mode pane."
         );
     }
 
