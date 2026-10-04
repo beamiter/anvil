@@ -161,17 +161,19 @@ pub(crate) fn visible_bounded(text: &str, max_bytes: usize) -> String {
     let mut visible = String::with_capacity(text.len().min(max_bytes));
     let mut truncated = false;
     for character in text.chars() {
+        if !character.is_control() && !is_visual_spoofing_character(character) {
+            if character.len_utf8() > max_bytes.saturating_sub(visible.len()) {
+                truncated = true;
+                break;
+            }
+            visible.push(character);
+            continue;
+        }
         let replacement = match character {
             '\n' => "\\n".to_string(),
             '\r' => "\\r".to_string(),
             '\t' => "\\t".to_string(),
-            unsafe_character
-                if unsafe_character.is_control()
-                    || is_visual_spoofing_character(unsafe_character) =>
-            {
-                format!("\\u{{{:X}}}", unsafe_character as u32)
-            }
-            safe => safe.to_string(),
+            unsafe_character => format!("\\u{{{:X}}}", unsafe_character as u32),
         };
         if replacement.len() > max_bytes.saturating_sub(visible.len()) {
             truncated = true;
