@@ -765,11 +765,17 @@ impl Component for VteTerminal {
             | VteInput::ClearBlocks
             | VteInput::UndoClearBlocks
             | VteInput::DeleteSelectedBlocks
-            | VteInput::ReinputSelectedCommands
-            | VteInput::JumpToPrevPinned
-            | VteInput::JumpToNextPinned
-            | VteInput::JumpToPrevFailed
-            | VteInput::JumpToNextFailed => {}
+            | VteInput::ReinputSelectedCommands => {}
+            VteInput::JumpToPrevPinned | VteInput::JumpToNextPinned => {
+                let _ = sender.output(VteOutput::Notice(vte_block_mode_only_notice(
+                    "Bookmarked-block navigation",
+                )));
+            }
+            VteInput::JumpToPrevFailed | VteInput::JumpToNextFailed => {
+                let _ = sender.output(VteOutput::Notice(vte_block_mode_only_notice(
+                    "Failed-block navigation",
+                )));
+            }
             VteInput::CollapseAllBlocks
             | VteInput::ExpandAllBlocks
             | VteInput::ToggleBlockCollapsed => {
@@ -1045,6 +1051,18 @@ mod tests {
         assert_eq!(
             vte_block_mode_only_notice("Block folding"),
             "Block folding is available only in a Block-mode pane."
+        );
+    }
+
+    #[test]
+    fn block_jump_on_live_vte_explains_block_mode() {
+        assert_eq!(
+            vte_block_mode_only_notice("Bookmarked-block navigation"),
+            "Bookmarked-block navigation is available only in a Block-mode pane."
+        );
+        assert_eq!(
+            vte_block_mode_only_notice("Failed-block navigation"),
+            "Failed-block navigation is available only in a Block-mode pane."
         );
     }
 

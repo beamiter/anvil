@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (block-jump VTE toast — round 246)
+
+## 2026-10-04 (pinned/failed jump on VTE — round 246)
+
+- Jump to pinned or failed blocks in a live VTE pane toasts Block-mode-only.
+  Unique round **246**. Heartbeat 20s.
+
 Updated: 2026-10-04 (block-folding VTE toast — round 245)
 
 ## 2026-10-04 (block folding on VTE — round 245)

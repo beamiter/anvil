@@ -1101,5 +1101,9 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
 245. **Block folding on live VTE toasts** — collapse/expand/toggle used the
      same silent VTE no-op. Copy matches `emit_block_action`'s "Block folding".
 
+246. **Pinned/failed jumps on live VTE toast** — prev/next bookmark and
+     failure navigation used the silent VTE no-op. Copy matches
+     `emit_block_action`.
+
 
 

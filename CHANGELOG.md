@@ -41,6 +41,10 @@ versioning for tagged releases while it remains experimental.
   `[keybindings]` reaches the same undoable removal; an empty selection
   says so instead of doing nothing.
 
+- **Pinned and failed-block jumps on a live VTE pane explain themselves.**
+  Previous/next bookmark and failure shortcuts still reached classic VTE
+  and moved nowhere. They now say the feature needs Block mode.
+
 - **Block folding on a live VTE pane explains itself.** Collapse, expand,
   and toggle still reached classic VTE and changed nothing. They now say
   the feature needs Block mode.
