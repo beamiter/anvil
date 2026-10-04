@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (clear-blocks VTE toast — round 248)
+
+## 2026-10-04 (clear/undo-clear on VTE — round 248)
+
+- Clear and restore finished blocks in a live VTE pane toast Block-mode-only.
+  Unique round **248**. Heartbeat 20s.
+
 Updated: 2026-10-04 (block-filter VTE toast — round 247)
 
 ## 2026-10-04 (block filter on VTE — round 247)

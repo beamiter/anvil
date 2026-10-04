@@ -1108,5 +1108,8 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
 247. **Block filters on live VTE toast** — failed/slow/pinned filters and
      clear-filter used the silent VTE no-op. Copy matches `emit_block_action`.
 
+248. **Clear/undo-clear on live VTE toast** — clearing finished blocks and
+     restoring them used the silent VTE no-op. Copy matches `emit_block_action`.
+
 
 

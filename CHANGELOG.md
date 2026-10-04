@@ -41,6 +41,10 @@ versioning for tagged releases while it remains experimental.
   `[keybindings]` reaches the same undoable removal; an empty selection
   says so instead of doing nothing.
 
+- **Clearing finished blocks on a live VTE pane explains itself.** Clear
+  and undo-clear still reached classic VTE and changed nothing. They now
+  say the feature needs Block mode.
+
 - **Block filters on a live VTE pane explain themselves.** Failed, slow,
   and bookmarked filters plus clear-filter still reached classic VTE and
   changed nothing. They now say the feature needs Block mode.
