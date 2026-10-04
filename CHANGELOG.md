@@ -41,6 +41,10 @@ versioning for tagged releases while it remains experimental.
   `[keybindings]` reaches the same undoable removal; an empty selection
   says so instead of doing nothing.
 
+- **Double-click selects container image tags.** `nginx:1.27-alpine`
+  used to stop at `nginx:1` because that looked like `file:line`. Line
+  numbers now refuse a following `.digit`; `name:tag` stays whole.
+
 - **Double-click selects a UUID as one token.** The first 8 hex digits
   used to match as a git SHA because `-` is a word boundary. Canonical
   `8-4-4-4-12` UUIDs now stay whole.

@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (image-tag smart-select — round 234)
+
+## 2026-10-04 (image tag double-click — round 234)
+
+- Double-click `nginx:1.27-alpine` selects the whole tag. Unique round
+  **234**.
+
 Updated: 2026-10-04 (UUID smart-select — round 233)
 
 ## 2026-10-04 (UUID double-click — round 233)

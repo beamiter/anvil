@@ -32,6 +32,7 @@ static PATTERNS: LazyLock<Vec<Pat>> = LazyLock::new(|| {
             1,
         ),
         p(r#"((?:[~.]?[\w./+-]*\w):\d+(?::\d+)?)"#, 1),
+        p(r#"([\w./-]+:[A-Za-z0-9][\w.-]*)"#, 1),
         p(
             r#"((?:~|\.{1,2})?(?:/[\w.+@~-]+)+/?|(?:[\w.+-]+/)+[\w.+-]*)"#,
             1,
@@ -61,6 +62,9 @@ fn semantic_span(line: &str, click_char: usize) -> Option<(usize, usize)> {
         for caps in pat.re.captures_iter(line) {
             if let Some(m) = caps.get(pat.group) {
                 if m.start() <= click_byte && click_byte < m.end() {
+                    if file_line_is_semver_prefix(line, m.start(), m.end()) {
+                        continue;
+                    }
                     let end_byte = trim_semantic_end(line, m.start(), m.end());
                     if click_byte >= end_byte {
                         continue;
@@ -108,6 +112,21 @@ fn trim_semantic_end(line: &str, start: usize, end: usize) -> usize {
         return start + trim_path_trail(token).len();
     }
     end
+}
+
+/// `nginx:1.27` matches `file:line` as `nginx:1` because the line number
+/// stops at digits. A following `.digit` means this is a version tag, not a
+/// location.
+fn file_line_is_semver_prefix(line: &str, start: usize, end: usize) -> bool {
+    let token = &line[start..end];
+    let Some((_, line_no)) = token.rsplit_once(':') else {
+        return false;
+    };
+    if !line_no.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    matches!(line.as_bytes().get(end), Some(b'.'))
+        && matches!(line.as_bytes().get(end + 1), Some(b'0'..=b'9'))
 }
 
 /// Resolve the semantic token at `iter` to a pair of buffer iters to select.
@@ -168,6 +187,14 @@ mod tests {
         assert_eq!(
             token("id 550e8400-e29b-41d4-a716-446655440000 ok", 8).as_deref(),
             Some("550e8400-e29b-41d4-a716-446655440000")
+        );
+        assert_eq!(
+            token("image nginx:1.27-alpine pull", 8).as_deref(),
+            Some("nginx:1.27-alpine")
+        );
+        assert_eq!(
+            token("run ghcr.io/org/app:v2.1.0 now", 10).as_deref(),
+            Some("ghcr.io/org/app:v2.1.0")
         );
     }
 

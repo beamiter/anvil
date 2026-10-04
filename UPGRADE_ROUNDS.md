@@ -1056,5 +1056,10 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      8 hex as a git SHA because a hyphen is a word boundary. A canonical
      8-4-4-4-12 UUID is now one token, ahead of SHA matching.
 
+234. **Smart-select grabs image tags like `nginx:1.27-alpine`** —
+     `file:line` treated `nginx:1` as a location because it stops at the
+     first digits. Line numbers now refuse a following `.digit`, and a
+     `name:tag` token takes `nginx:1.27-alpine` and `ghcr.io/org/app:v2.1.0`.
+
 
 
