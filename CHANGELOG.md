@@ -41,6 +41,10 @@ versioning for tagged releases while it remains experimental.
   `[keybindings]` reaches the same undoable removal; an empty selection
   says so instead of doing nothing.
 
+- **Cross-block search on a live VTE pane explains itself.** The shortcut
+  still reached the classic terminal because it shares the term-view
+  path, then did nothing. It now says the feature needs Block mode.
+
 - **Ask AI about selected block says when nothing is selected.**
   Ctrl+Shift+Q from the live prompt or an empty pane used to do nothing.
   It now toasts to select a finished block first.

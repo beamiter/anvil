@@ -1091,5 +1091,9 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
 242. **Ask AI empty selection toasts** — Ctrl+Shift+Q with no finished
      block (live prompt or VTE pane) was silent. Same copy on both backends.
 
+243. **Cross-block search on live VTE toasts** — `uses_term_view()` delivered
+     the action to classic VTE, which ignored it. Same Block-mode-only copy
+     as notebooks.
+
 
 

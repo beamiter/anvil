@@ -800,7 +800,11 @@ impl Component for VteTerminal {
                 self.search_status = SearchStatus::Idle;
                 let _ = sender.output(VteOutput::SearchStatus(SearchStatus::Idle));
             }
-            VteInput::CrossBlockSearch => {}
+            VteInput::CrossBlockSearch => {
+                let _ = sender.output(VteOutput::Notice(
+                    vte_block_mode_only_notice("Cross-block search"),
+                ));
+            }
             VteInput::AskAiAboutSelectedBlock => {
                 let _ = sender.output(VteOutput::Notice(ask_ai_empty_notice().to_string()));
             }
@@ -818,6 +822,12 @@ pub(crate) fn copy_empty_notice(has_copyable: bool) -> Option<&'static str> {
 /// (live prompt, empty pane). Used to look like a dead shortcut.
 pub(crate) fn ask_ai_empty_notice() -> &'static str {
     "Select a finished block to ask AI about."
+}
+
+/// Block-document actions that still reach the live VTE through
+/// `uses_term_view()` used to look like a dead shortcut.
+pub(crate) fn vte_block_mode_only_notice(feature: &str) -> String {
+    format!("{feature} is available only in a Block-mode pane.")
 }
 
 /// Install `query` as `terminal`'s native search, step to the first match
@@ -982,7 +992,8 @@ fn search_status_for_vte(
 #[cfg(test)]
 mod tests {
     use super::{
-        compile_count_regex, copy_empty_notice, ask_ai_empty_notice, launch_failure_message,
+        compile_count_regex, copy_empty_notice, ask_ai_empty_notice, vte_block_mode_only_notice,
+        launch_failure_message,
         search_pattern, search_pcre2_flags,
         search_status_for_vte, InitialCommands, TerminalSearchSnapshot,
     };
@@ -1004,6 +1015,14 @@ mod tests {
     #[test]
     fn ask_ai_without_a_finished_block_explains_itself() {
         assert!(ask_ai_empty_notice().contains("finished block"));
+    }
+
+    #[test]
+    fn cross_block_search_on_live_vte_explains_block_mode() {
+        assert_eq!(
+            vte_block_mode_only_notice("Cross-block search"),
+            "Cross-block search is available only in a Block-mode pane."
+        );
     }
 
     #[test]

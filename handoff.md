@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (cross-block VTE toast — round 243)
+
+## 2026-10-04 (cross-block search on VTE — round 243)
+
+- Cross-block search in a live VTE pane toasts Block-mode-only. Unique
+  round **243**. Heartbeat 20s.
+
 Updated: 2026-10-04 (Ask-AI empty toast — round 242)
 
 ## 2026-10-04 (Ask AI empty selection — round 242)
