@@ -332,6 +332,7 @@ enum SplitLayoutKind {
     Swap,
     Equalize,
     Zoom,
+    MoveToTab,
 }
 
 /// Why a palette/keybinding split-layout action cannot run. `None` means the
@@ -358,6 +359,17 @@ fn split_layout_reason(
                 Some("Wait for the new pane to finish launching.")
             } else if !already_zoomed && pane_count < 2 {
                 Some("Need at least two panes to zoom.")
+            } else {
+                None
+            }
+        }
+        SplitLayoutKind::MoveToTab => {
+            if pending_spawn {
+                Some("Wait for the new pane to finish launching.")
+            } else if already_zoomed {
+                Some("Exit pane zoom before moving a pane to a new tab.")
+            } else if pane_count < 2 {
+                Some("Need at least two panes to move one to a new tab.")
             } else {
                 None
             }
@@ -2810,12 +2822,23 @@ impl AppModel {
 
     /// Detach the active pane from a split tab and host it in a brand-new tab.
     pub(crate) fn move_pane_to_new_tab(&mut self, sender: &ComponentSender<AppModel>) {
-        let Some(pane_id) = self
-            .tabs
-            .get(self.active)
-            .and_then(|tab| tab.panes.get(tab.active_pane))
-            .map(|pane| pane.id)
-        else {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let pending_spawn = tab
+            .panes
+            .iter()
+            .any(|pane| self.pending_split_spawns.contains_key(&pane.id));
+        if let Some(reason) = split_layout_reason(
+            tab.panes.len(),
+            pending_spawn,
+            tab.zoom.is_some(),
+            SplitLayoutKind::MoveToTab,
+        ) {
+            self.show_toast(reason);
+            return;
+        }
+        let Some(pane_id) = tab.panes.get(tab.active_pane).map(|pane| pane.id) else {
             return;
         };
         self.promote_pane_to_tab(pane_id, None, true, sender);
@@ -3246,6 +3269,22 @@ mod pane_tree_tests {
         assert_eq!(
             split_layout_reason(2, true, false, SplitLayoutKind::Zoom),
             Some("Wait for the new pane to finish launching.")
+        );
+        assert_eq!(
+            split_layout_reason(1, false, false, SplitLayoutKind::MoveToTab),
+            Some("Need at least two panes to move one to a new tab.")
+        );
+        assert_eq!(
+            split_layout_reason(2, false, true, SplitLayoutKind::MoveToTab),
+            Some("Exit pane zoom before moving a pane to a new tab.")
+        );
+        assert_eq!(
+            split_layout_reason(2, true, false, SplitLayoutKind::MoveToTab),
+            Some("Wait for the new pane to finish launching.")
+        );
+        assert_eq!(
+            split_layout_reason(2, false, false, SplitLayoutKind::MoveToTab),
+            None
         );
     }
 

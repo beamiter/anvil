@@ -41,6 +41,10 @@ versioning for tagged releases while it remains experimental.
   `[keybindings]` reaches the same undoable removal; an empty selection
   says so instead of doing nothing.
 
+- **Move pane to new tab explains why it cannot run.** A single-pane tab,
+  a zoomed split, or a split still launching used to ignore Ctrl+Shift+!.
+  The toast matches swap/equalize/zoom.
+
 - **Copy with nothing selected says so.** The context menu already greys out
   Copy, but Ctrl+Shift+C still ran. VTE and Block now toast instead of
   looking like a broken clipboard. An oversized selection still uses the

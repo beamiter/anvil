@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (move-pane-to-tab toast — round 223)
+
+## 2026-10-04 (move pane to tab toast — round 223)
+
+- Move pane to new tab toasts on one pane, zoom, or a pending split spawn.
+  Unique round **223**.
+
 Updated: 2026-10-04 (empty copy toast — round 222)
 
 ## 2026-10-04 (empty copy toast — round 222)

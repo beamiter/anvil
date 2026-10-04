@@ -996,5 +996,10 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      visible text or whole-card selection. An oversized copy still uses the
      existing failure dialog rather than this empty-selection message.
 
+223. **Move pane to new tab says when it cannot run** —
+     Ctrl+Shift+! and the palette action were silent on a single-pane tab,
+     while zoomed, or while a split was still launching. They now toast the
+     same class of reason as swap/equalize/zoom.
+
 
 
