@@ -2,7 +2,7 @@
 //!
 //! GTK's default double-click selects a plain alnum word. This detects the
 //! semantic token under the cursor — URL, path, file:line:col, IPv4, IPv6,
-//! MAC, ISO-8601 timestamp, git SHA, key=value, quoted string, … — so one double-click grabs the whole unit.
+//! MAC, ISO-8601 timestamp, semver, git SHA, key=value, quoted string, … — so one double-click grabs the whole unit.
 //! Ported from forge's `block_view/select.rs`.
 
 use gtk::prelude::*;
@@ -51,6 +51,10 @@ static PATTERNS: LazyLock<Vec<Pat>> = LazyLock::new(|| {
             1,
         ),
         p(r#"(\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?)"#, 1),
+        p(
+            r#"(\bv?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)"#,
+            1,
+        ),
         p(r#"([\w.-]+=[^\s'"]+)"#, 1),
         p(r#"(#[0-9a-fA-F]{3,8})\b"#, 1),
         p(
@@ -251,6 +255,16 @@ mod tests {
             token("off 2026-10-04T10:59:48+08:00 x", 5).as_deref(),
             Some("2026-10-04T10:59:48+08:00")
         );
+        assert_eq!(token("ver v1.2.3 ok", 4).as_deref(), Some("v1.2.3"));
+        assert_eq!(
+            token("rel 1.2.3-rc.1 x", 4).as_deref(),
+            Some("1.2.3-rc.1")
+        );
+        assert_eq!(
+            token("build 1.2.3+meta.4 x", 7).as_deref(),
+            Some("1.2.3+meta.4")
+        );
+        assert_eq!(token("ip 10.0.0.8:22 ok", 4).as_deref(), Some("10.0.0.8:22"));
     }
 
     #[test]
@@ -308,5 +322,6 @@ mod tests {
             token("at 2026-10-04T10:59:48Z.", 4).as_deref(),
             Some("2026-10-04T10:59:48Z")
         );
+        assert_eq!(token("ver v1.2.3.", 4).as_deref(), Some("v1.2.3"));
     }
 }

@@ -41,6 +41,9 @@ versioning for tagged releases while it remains experimental.
   `[keybindings]` reaches the same undoable removal; an empty selection
   says so instead of doing nothing.
 
+- **Double-click selects semantic versions.** `v1.2.3`, `1.2.3-rc.1`, and
+  `1.2.3+meta.4` stay one token. IPv4 with four octets still matches first.
+
 - **Double-click selects ISO-8601 timestamps.** `2026-10-04`,
   `2026-10-04T10:59:48Z`, a space-separated datetime, and `+08:00`
   offsets stay one token instead of splitting on `-` and `:`.

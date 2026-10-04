@@ -1074,5 +1074,9 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      `2026-10-04T10:59:48Z`, space-separated datetime, and `+08:00`
      offsets were split on `-`/`:`. Matched before IPv6.
 
+238. **Smart-select grabs semver tags** — `v1.2.3`, prerelease `1.2.3-rc.1`,
+     and build `1.2.3+meta.4` were split after the second numeric component.
+     IPv4 (`10.0.0.8`) still matches first.
+
 
 

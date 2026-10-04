@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (semver smart-select — round 238)
+
+## 2026-10-04 (semver double-click — round 238)
+
+- Double-click `v1.2.3` or `1.2.3-rc.1` selects the whole version. Unique
+  round **238**. Heartbeat 20s.
+
 Updated: 2026-10-04 (ISO-8601 smart-select — round 237)
 
 ## 2026-10-04 (timestamp double-click — round 237)
