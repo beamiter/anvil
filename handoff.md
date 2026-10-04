@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (quick-switch empty toast — round 252)
+
+## 2026-10-04 (Ctrl+N with no tabs — round 252)
+
+- Quick-switch with no tabs toasts instead of doing nothing. Unique round
+  **252**. Heartbeat 20s.
+
 Updated: 2026-10-04 (agent missing-pane toast — round 251)
 
 ## 2026-10-04 (Shell Agent with no pane — round 251)

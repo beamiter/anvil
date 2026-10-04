@@ -1122,5 +1122,8 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      reset the toolbar toggle. Same "No active terminal pane." copy as other
      pane-bound actions.
 
+252. **Quick-switch with no tabs toasts** — Ctrl+1…9 / Ctrl+9 on an empty
+     window was silent. Same honesty as other pane-bound shortcuts.
+
 
 

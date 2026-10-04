@@ -406,12 +406,14 @@ impl AppModel {
                 );
             }
             Action::QuickSwitchTab(n) => {
-                if !self.tabs.is_empty() {
-                    let last = self.tabs.len() - 1;
-                    let target = if n == 9 { last } else { (n as usize).min(last) };
-                    let id = self.tabs[target].id;
-                    self.select_tab(id, sender);
+                if self.tabs.is_empty() {
+                    self.show_toast(quick_switch_empty_notice());
+                    return;
                 }
+                let last = self.tabs.len() - 1;
+                let target = if n == 9 { last } else { (n as usize).min(last) };
+                let id = self.tabs[target].id;
+                self.select_tab(id, sender);
             }
             Action::ShowRemotePicker => {
                 if self.safe_mode {
@@ -492,14 +494,24 @@ pub(crate) fn font_scale_toast_title(scale: f64) -> String {
     format!("Font: {:.0}%", scale * 100.0)
 }
 
+/// Ctrl+1…9 / Ctrl+9 with no window tabs used to look like a dead shortcut.
+pub(crate) fn quick_switch_empty_notice() -> &'static str {
+    "No tabs to switch to."
+}
+
 #[cfg(test)]
 mod tests {
-    use super::font_scale_toast_title;
+    use super::{font_scale_toast_title, quick_switch_empty_notice};
 
     #[test]
     fn font_scale_toast_reads_as_a_percent() {
         assert_eq!(font_scale_toast_title(1.0), "Font: 100%");
         assert_eq!(font_scale_toast_title(1.25), "Font: 125%");
         assert_eq!(font_scale_toast_title(0.5), "Font: 50%");
+    }
+
+    #[test]
+    fn quick_switch_with_no_tabs_explains_itself() {
+        assert_eq!(quick_switch_empty_notice(), "No tabs to switch to.");
     }
 }
