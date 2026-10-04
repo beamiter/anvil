@@ -41,6 +41,10 @@ versioning for tagged releases while it remains experimental.
   `[keybindings]` reaches the same undoable removal; an empty selection
   says so instead of doing nothing.
 
+- **Double-click selects MAC addresses.** IEEE colon and hyphen forms
+  (`aa:bb:cc:dd:ee:ff`, `00-1A-2B-3C-4D-5E`) are one token. IPv6 with
+  `::` still matches first.
+
 - **Double-click selects IPv6 addresses.** `::1`, compressed forms like
   `2001:db8::1`, the 8-hextet spelling, and `[::1]:8080` stay one token.
   `file:line` locations with two colons are unchanged.

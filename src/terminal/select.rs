@@ -2,8 +2,7 @@
 //!
 //! GTK's default double-click selects a plain alnum word. This detects the
 //! semantic token under the cursor — URL, path, file:line:col, IPv4, IPv6,
-//! git SHA, key=value, quoted string, … — so one double-click grabs the whole unit.
-//! key=value, quoted string, … — so one double-click grabs the whole unit.
+//! MAC, git SHA, key=value, quoted string, … — so one double-click grabs the whole unit.
 //! Ported from forge's `block_view/select.rs`.
 
 use gtk::prelude::*;
@@ -35,6 +34,10 @@ static PATTERNS: LazyLock<Vec<Pat>> = LazyLock::new(|| {
         p(r#"(\[[0-9a-fA-F:.]{2,}\](?::\d+)?)"#, 1),
         p(
             r#"((?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|[0-9a-fA-F]{0,4}(?::[0-9a-fA-F]{0,4})*::(?:[0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{0,4})"#,
+            1,
+        ),
+        p(
+            r#"(\b[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}\b|\b[0-9a-fA-F]{2}(?:-[0-9a-fA-F]{2}){5}\b)"#,
             1,
         ),
         p(r#"((?:[~.]?[\w./+-]*\w):\d+(?::\d+)?)"#, 1),
@@ -118,6 +121,7 @@ fn trim_semantic_end(line: &str, start: usize, end: usize) -> usize {
         || token.contains('.')
         || token.contains('=')
         || token.matches(':').count() >= 2
+        || token.matches('-').count() >= 5
     {
         return start + trim_path_trail(token).len();
     }
@@ -219,6 +223,14 @@ mod tests {
             token("full 2001:0db8:85a3:0000:0000:8a2e:0370:7334 x", 7).as_deref(),
             Some("2001:0db8:85a3:0000:0000:8a2e:0370:7334")
         );
+        assert_eq!(
+            token("ether aa:bb:cc:dd:ee:ff up", 6).as_deref(),
+            Some("aa:bb:cc:dd:ee:ff")
+        );
+        assert_eq!(
+            token("hw 00-1A-2B-3C-4D-5E nic", 4).as_deref(),
+            Some("00-1A-2B-3C-4D-5E")
+        );
     }
 
     #[test]
@@ -264,5 +276,13 @@ mod tests {
             Some("COUNT=3")
         );
         assert_eq!(token("ping ::1.", 6).as_deref(), Some("::1"));
+        assert_eq!(
+            token("ether aa:bb:cc:dd:ee:ff.", 6).as_deref(),
+            Some("aa:bb:cc:dd:ee:ff")
+        );
+        assert_eq!(
+            token("hw 00-1A-2B-3C-4D-5E.", 4).as_deref(),
+            Some("00-1A-2B-3C-4D-5E")
+        );
     }
 }

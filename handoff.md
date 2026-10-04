@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (MAC smart-select — round 236)
+
+## 2026-10-04 (MAC double-click — round 236)
+
+- Double-click `aa:bb:cc:dd:ee:ff` or `00-1A-2B-3C-4D-5E` selects the whole
+  address. Unique round **236**.
+
 Updated: 2026-10-04 (IPv6 smart-select — round 235)
 
 ## 2026-10-04 (IPv6 double-click — round 235)

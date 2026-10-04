@@ -1066,5 +1066,9 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      `file:line` suffix. They are now one token, ahead of `file:line`.
      `src/main.rs:12:3` still wins on the path; trailing `.` is dropped.
 
+236. **Smart-select grabs MAC addresses** — colon and hyphen IEEE forms
+     (`aa:bb:cc:dd:ee:ff`, `00-1A-2B-3C-4D-5E`) were six tiny words.
+     They match after IPv6 so compressed addresses keep `::`.
+
 
 
