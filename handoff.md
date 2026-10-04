@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (VTE find inexact-count tooltip — round 215)
+
+## 2026-10-04 (VTE find count honesty — round 215)
+
+- Truncated/`?` search status keeps the short `N+` label and explains the
+  bound on hover and via accessible Description. Unique round **215**.
+
 Updated: 2026-10-04 (smart-select trailing punctuation — round 214)
 
 ## 2026-10-04 (smart double-click punctuation — round 214)

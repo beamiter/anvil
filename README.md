@@ -23,9 +23,10 @@ restoration as the only copy of work in progress.
   non-UTF-8 path is shown unambiguously and never rewritten into another name
 - Command palette, command-history picker, parameterized TOML/YAML workflows, and
   fuzzy search
-- Search within terminal output with match counts, previous/next controls and
-  visible regex errors, plus block selection, output filtering, bookmarks,
-  copy/rerun controls, and long-command notifications
+- Search within terminal output with match counts (inexact VTE totals marked
+  `+`), previous/next controls and visible regex errors, plus block selection,
+  output filtering, bookmarks, copy/rerun controls, and long-command
+  notifications
 - SSH host picker, connection status, multiplexing, and reconnect support
 - Optional persistent multi-chat AI workspace, inline command generation,
   review-first correction, and a multi-turn Shell Agent with explicit approval
@@ -457,7 +458,7 @@ are currently active.
 | `Ctrl+9` | Last tab |
 | `Ctrl+Shift+P` | Unified command palette (actions, history, workflows, AI) |
 | `Ctrl+Shift+H` | History palette; `Ctrl+R` and `Ctrl+P` remain available to the shell |
-| `Ctrl+Shift+F` | Search terminal output with result count and previous/next controls (`/pattern/` enables regex) |
+| `Ctrl+Shift+F` | Search terminal output with result count and previous/next controls (`/pattern/` enables regex). A trailing `+` means the count is from a bounded snapshot or a different regex engine than VTE. |
 | `Ctrl+Shift+G` | In block mode, search command and output lines across all finished blocks |
 | `Ctrl+Shift+O` | Settings |
 | `Ctrl+Shift+R` | Reload configuration |

@@ -24,6 +24,12 @@ versioning for tagged releases while it remains experimental.
   `https://example.com.` used to select the period too, so a paste included
   punctuation the opener would refuse. Ports in the authority stay (`:8443`).
 
+- **Inexact VTE find counts explain themselves.** The bar already marked a
+  bounded or cross-engine total as `3 of 200+` (and `?` when the ordinal
+  walked off that range), but the tooltip repeated the same short text, so
+  hover looked like a precise index with a plus sign. The tooltip and
+  accessible description now say the total is a snapshot/engine estimate.
+
 - **Task terminals that fail to launch update the task model by role.** A
   validation PTY that never crossed exec is recorded as a cancelled validation
   attempt rather than an inconclusive child exit, so the Tasks panel can schedule

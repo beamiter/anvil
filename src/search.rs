@@ -335,19 +335,27 @@ pub(crate) fn active_pane_changed(previous: Option<u64>, next: Option<u64>) -> b
 #[derive(Debug, PartialEq, Eq)]
 struct SearchPresentation {
     text: String,
+    /// Longer explanation for hover and assistive tech. Empty means reuse
+    /// `text`, which is already the whole story (exact counts, errors).
+    tooltip: String,
     error: bool,
     navigable: bool,
 }
+
+const TRUNCATED_COUNT_HINT: &str = "Counted from a bounded scrollback snapshot or a regex engine different from VTE. Native search may have more matches.";
+const UNKNOWN_ORDINAL_HINT: &str = "This hit is outside the counted range, so its position is unknown.";
 
 fn presentation(status: &SearchStatus) -> SearchPresentation {
     match status {
         SearchStatus::Idle => SearchPresentation {
             text: String::new(),
+            tooltip: String::new(),
             error: false,
             navigable: false,
         },
         SearchStatus::Searching => SearchPresentation {
             text: "Searching…".to_string(),
+            tooltip: String::new(),
             error: false,
             navigable: false,
         },
@@ -357,6 +365,7 @@ fn presentation(status: &SearchStatus) -> SearchPresentation {
             ..
         } => SearchPresentation {
             text: "No results".to_string(),
+            tooltip: String::new(),
             error: false,
             navigable: false,
         },
@@ -364,26 +373,37 @@ fn presentation(status: &SearchStatus) -> SearchPresentation {
             current,
             total,
             truncated: true,
-        } => SearchPresentation {
-            text: if *current == 0 {
+        } => {
+            let text = if *current == 0 {
                 format!("? of {total}+")
             } else {
                 format!("{current} of {total}+")
-            },
-            error: false,
-            navigable: *total > 0,
-        },
+            };
+            let tooltip = if *current == 0 {
+                format!("{UNKNOWN_ORDINAL_HINT} {TRUNCATED_COUNT_HINT}")
+            } else {
+                TRUNCATED_COUNT_HINT.to_string()
+            };
+            SearchPresentation {
+                text,
+                tooltip,
+                error: false,
+                navigable: *total > 0,
+            }
+        }
         SearchStatus::Results {
             current,
             total,
             truncated: false,
         } => SearchPresentation {
             text: format!("{current} of {total}"),
+            tooltip: String::new(),
             error: false,
             navigable: true,
         },
         SearchStatus::Error(error) => SearchPresentation {
             text: error.clone(),
+            tooltip: String::new(),
             error: true,
             navigable: false,
         },
@@ -393,9 +413,17 @@ fn presentation(status: &SearchStatus) -> SearchPresentation {
 fn apply_status(widgets: &SearchModelWidgets, status: &SearchStatus) {
     let presentation = presentation(status);
     widgets.status_label.set_label(&presentation.text);
-    widgets
-        .status_label
-        .set_tooltip_text((!presentation.text.is_empty()).then_some(presentation.text.as_str()));
+    let hover = if presentation.tooltip.is_empty() {
+        (!presentation.text.is_empty()).then_some(presentation.text.as_str())
+    } else {
+        Some(presentation.tooltip.as_str())
+    };
+    widgets.status_label.set_tooltip_text(hover);
+    if let Some(description) = hover {
+        widgets
+            .status_label
+            .update_property(&[gtk::accessible::Property::Description(description)]);
+    }
     if presentation.error {
         widgets.status_label.add_css_class("error");
         widgets.status_label.remove_css_class("dim-label");
@@ -435,6 +463,7 @@ mod tests {
             presentation(&SearchStatus::Idle),
             SearchPresentation {
                 text: String::new(),
+                tooltip: String::new(),
                 error: false,
                 navigable: false,
             }
@@ -446,12 +475,15 @@ mod tests {
         );
         let matches = presentation(&SearchStatus::results(3, 18));
         assert_eq!(matches.text, "3 of 18");
+        assert!(matches.tooltip.is_empty());
         assert!(matches.navigable);
         let partial = presentation(&SearchStatus::partial_results(3, 200));
         assert_eq!(partial.text, "3 of 200+");
+        assert!(partial.tooltip.contains("bounded scrollback"));
         assert!(partial.navigable);
         let unknown_zero = presentation(&SearchStatus::partial_results(0, 0));
         assert_eq!(unknown_zero.text, "? of 0+");
+        assert!(unknown_zero.tooltip.contains("position is unknown"));
         assert!(!unknown_zero.navigable);
 
         let error = presentation(&SearchStatus::Error("Invalid regex: unclosed group".into()));

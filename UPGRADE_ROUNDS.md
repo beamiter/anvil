@@ -952,5 +952,11 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      Sentence `. , ; ! ?` after a `://` or `@` token is no longer part of the
      selection; `host:port` remains one token. First tests for `semantic_span`.
 
+215. **VTE find counts explain their `+`** —
+     The bar still shows `3 of 200+` / `? of N+` so it cannot look like an
+     exact index. Hover and the accessible description say the total came
+     from a bounded snapshot or a different regex engine, and that `?`
+     means the current hit is outside that counted range.
+
 
 
