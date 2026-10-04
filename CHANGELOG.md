@@ -20,6 +20,10 @@ versioning for tagged releases while it remains experimental.
   it is read-only and offers **Open in Editor** so changing a cell happens in
   a real editor rather than a dialog that cannot save.
 
+- **Double-click URL/email selection drops trailing sentence punctuation.**
+  `https://example.com.` used to select the period too, so a paste included
+  punctuation the opener would refuse. Ports in the authority stay (`:8443`).
+
 - **Task terminals that fail to launch update the task model by role.** A
   validation PTY that never crossed exec is recorded as a cancelled validation
   attempt rather than an inconclusive child exit, so the Tasks panel can schedule

@@ -948,5 +948,9 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      Open in Editor launches the file with the desktop default; the dialog
      still does not edit or save.
 
+214. **Smart double-click drops trailing URL/email punctuation** —
+     Sentence `. , ; ! ?` after a `://` or `@` token is no longer part of the
+     selection; `host:port` remains one token. First tests for `semantic_span`.
+
 
 

@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (smart-select trailing punctuation — round 214)
+
+## 2026-10-04 (smart double-click punctuation — round 214)
+
+- URL/email double-click no longer includes trailing sentence punctuation.
+  Unique round **214**.
+
 Updated: 2026-10-04 (notebook preview-only + Open in Editor — round 213)
 
 ## 2026-10-04 (notebook viewer honesty — round 213)

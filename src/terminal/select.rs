@@ -52,14 +52,31 @@ fn semantic_span(line: &str, click_char: usize) -> Option<(usize, usize)> {
         for caps in pat.re.captures_iter(line) {
             if let Some(m) = caps.get(pat.group) {
                 if m.start() <= click_byte && click_byte < m.end() {
+                    let end_byte = trim_semantic_end(line, m.start(), m.end());
+                    if click_byte >= end_byte {
+                        continue;
+                    }
                     let s = line[..m.start()].chars().count();
-                    let e = line[..m.end()].chars().count();
+                    let e = line[..end_byte].chars().count();
                     return Some((s, e));
                 }
             }
         }
     }
     None
+}
+
+/// Sentence punctuation is not part of a URL or email, even when the greedy
+/// URI regex swallowed it. Colon stays: `https://host:8443` is one token.
+fn trim_semantic_end(line: &str, start: usize, end: usize) -> usize {
+    let token = &line[start..end];
+    if !(token.contains("://") || token.contains('@')) {
+        return end;
+    }
+    start
+        + token
+            .trim_end_matches(|c| matches!(c, '.' | ',' | ';' | '!' | '?'))
+            .len()
 }
 
 /// Resolve the semantic token at `iter` to a pair of buffer iters to select.
@@ -83,4 +100,43 @@ pub fn get_semantic_bounds_at_position(
     let mut sel_end = line_start;
     sel_end.forward_chars(e as i32);
     Some((sel_start, sel_end))
+}
+
+#[cfg(test)]
+mod tests {
+    fn token(line: &str, click: usize) -> Option<String> {
+        let (start, end) = super::semantic_span(line, click)?;
+        Some(line.chars().take(end).skip(start).collect())
+    }
+
+    #[test]
+    fn double_click_grabs_urls_paths_and_shas() {
+        let url = "see https://example.com/a for details";
+        assert_eq!(token(url, 6).as_deref(), Some("https://example.com/a"));
+        assert_eq!(
+            token("log src/main.rs:12:3 here", 6).as_deref(),
+            Some("src/main.rs:12:3")
+        );
+        assert_eq!(
+            token("commit deadbeef0123abc", 8).as_deref(),
+            Some("deadbeef0123abc")
+        );
+        assert_eq!(token("ip 10.0.0.8:22 ok", 4).as_deref(), Some("10.0.0.8:22"));
+    }
+
+    #[test]
+    fn trailing_sentence_punctuation_is_not_part_of_a_url_or_email() {
+        assert_eq!(
+            token("see https://example.com.", 6).as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(
+            token("mail user@example.com, please", 6).as_deref(),
+            Some("user@example.com")
+        );
+        assert_eq!(
+            token("https://example.com:8443/x", 2).as_deref(),
+            Some("https://example.com:8443/x")
+        );
+    }
 }
