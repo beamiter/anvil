@@ -53,10 +53,9 @@ fn record_navigation_notice(result: RecordNavigationResult) -> Option<&'static s
         RecordNavigationResult::LocationUnavailable => {
             Some("This record has no exact terminal location and no retained output snapshot.")
         }
+        RecordNavigationResult::NoMatchingRecord => Some("No matching block."),
         // SnapshotView opens the read-only view instead of reporting anything.
-        RecordNavigationResult::Navigated
-        | RecordNavigationResult::NoMatchingRecord
-        | RecordNavigationResult::SnapshotView { .. } => None,
+        RecordNavigationResult::Navigated | RecordNavigationResult::SnapshotView { .. } => None,
     }
 }
 
@@ -708,8 +707,12 @@ impl Component for BlockTerminal {
                 view.toggle_selected_block_collapsed();
             }
             VteInput::ReinputSelectedCommands => view.reinput_selected_commands(),
-            VteInput::JumpToPrevPinned => view.jump_to_pinned(-1),
-            VteInput::JumpToNextPinned => view.jump_to_pinned(1),
+            VteInput::JumpToPrevPinned => {
+                report_record_navigation(&sender, view, &snapshot_dialog, view.jump_to_pinned(-1))
+            }
+            VteInput::JumpToNextPinned => {
+                report_record_navigation(&sender, view, &snapshot_dialog, view.jump_to_pinned(1))
+            }
             VteInput::JumpToPrevFailed => {
                 report_record_navigation(&sender, view, &snapshot_dialog, view.jump_to_failed(-1))
             }
@@ -927,7 +930,7 @@ mod tests {
         );
         assert_eq!(
             record_navigation_notice(RecordNavigationResult::NoMatchingRecord),
-            None
+            Some("No matching block.")
         );
         assert_eq!(
             record_navigation_notice(RecordNavigationResult::SnapshotView { record_id: 7 }),

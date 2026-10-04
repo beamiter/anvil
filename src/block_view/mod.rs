@@ -15272,7 +15272,7 @@ impl TermView {
         self.scroll_to_block(0);
     }
 
-    pub fn jump_to_pinned(&self, direction: i32) {
+    pub fn jump_to_pinned(&self, direction: i32) -> RecordNavigationResult {
         let marked: Vec<usize> = {
             let finished = self.finished_blocks.borrow();
             let bookmarks = self.bookmarks.snapshot();
@@ -15283,7 +15283,7 @@ impl TermView {
                 .map(|(idx, _)| idx)
                 .collect()
         };
-        self.jump_to_marked_index(&marked, direction);
+        self.jump_to_marked_index(&marked, direction)
     }
 
     /// Jump to the previous / next failed (non-zero exit) block, wrapping to
@@ -15313,7 +15313,10 @@ impl TermView {
 
     /// Shared stepping for pinned/failed navigation: `marked` is an ascending
     /// index list into the finished blocks.
-    fn jump_to_marked_index(&self, marked: &[usize], direction: i32) {
+    fn jump_to_marked_index(&self, marked: &[usize], direction: i32) -> RecordNavigationResult {
+        if marked.is_empty() {
+            return RecordNavigationResult::NoMatchingRecord;
+        }
         let cur = self.selected_block_id.get().and_then(|id| {
             self.finished_blocks
                 .borrow()
@@ -15322,6 +15325,9 @@ impl TermView {
         });
         if let Some(idx) = step_marked_indices(marked, cur, direction) {
             self.scroll_to_block(idx);
+            RecordNavigationResult::Navigated
+        } else {
+            RecordNavigationResult::NoMatchingRecord
         }
     }
 

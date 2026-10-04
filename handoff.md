@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (no-matching-block toast — round 225)
+
+## 2026-10-04 (no matching block — round 225)
+
+- Failed/slow/pinned jumps toast when there is nothing to land on. Unique
+  round **225**.
+
 Updated: 2026-10-04 (font-scale toast — round 224)
 
 ## 2026-10-04 (font-scale toast — round 224)

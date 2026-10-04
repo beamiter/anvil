@@ -1007,5 +1007,11 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      Repeat steps rewrite one toast, like opacity. The settings slider
      still stays quiet.
 
+225. **Jump/filter with no matching block explains itself** —
+     Failed and slow record navigation already returned `NoMatchingRecord`
+     without a toast, and pinned jumps were a silent no-op. All three now
+     say `No matching block.` Location-unavailable and snapshot-view
+     answers are unchanged.
+
 
 

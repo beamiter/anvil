@@ -41,6 +41,10 @@ versioning for tagged releases while it remains experimental.
   `[keybindings]` reaches the same undoable removal; an empty selection
   says so instead of doing nothing.
 
+- **Jumping to a failed, slow, or pinned block says when none exist.**
+  Failed and slow navigation already knew there was no match; pinned
+  jumps did nothing. All three now toast `No matching block.`
+
 - **Font zoom shows the current size.** Opacity already had an in-place
   percent toast; Ctrl+= / Ctrl+- / Ctrl+0 and Ctrl+wheel changed the
   scale silently. Repeat steps update one `Font: N%` toast. The settings
