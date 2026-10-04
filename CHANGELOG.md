@@ -41,6 +41,10 @@ versioning for tagged releases while it remains experimental.
   `[keybindings]` reaches the same undoable removal; an empty selection
   says so instead of doing nothing.
 
+- **Double-click selects a UUID as one token.** The first 8 hex digits
+  used to match as a git SHA because `-` is a word boundary. Canonical
+  `8-4-4-4-12` UUIDs now stay whole.
+
 - **Double-click selects shell variables.** `$HOME` used to select `HOME`
   without the dollar. `$NAME`, `${NAME}`, and `$1` are one token, even
   before a following `/bin`.

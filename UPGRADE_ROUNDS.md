@@ -1051,5 +1051,10 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      `${NAME}`, and `$1` are now one token, ahead of path matching so
      `$HOME/bin` keeps the dollar on the variable.
 
+233. **Smart-select grabs UUIDs whole** —
+     `550e8400-e29b-41d4-a716-446655440000` used to select the first
+     8 hex as a git SHA because a hyphen is a word boundary. A canonical
+     8-4-4-4-12 UUID is now one token, ahead of SHA matching.
+
 
 

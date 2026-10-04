@@ -39,6 +39,10 @@ static PATTERNS: LazyLock<Vec<Pat>> = LazyLock::new(|| {
         p(r#"(\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?)"#, 1),
         p(r#"([\w.-]+=[^\s'"]+)"#, 1),
         p(r#"(#[0-9a-fA-F]{3,8})\b"#, 1),
+        p(
+            r#"(\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b)"#,
+            1,
+        ),
         p(r#"(\b[0-9a-f]{7,40}\b)"#, 1),
         p(r#"(\b0x[0-9a-fA-F]+\b)"#, 1),
         p(r#"(\b\d+(?:\.\d+)?\b)"#, 1),
@@ -161,6 +165,10 @@ mod tests {
         assert_eq!(token("echo $HOME/bin", 6).as_deref(), Some("$HOME"));
         assert_eq!(token("use ${PATH} here", 6).as_deref(), Some("${PATH}"));
         assert_eq!(token("arg $1 remaining", 5).as_deref(), Some("$1"));
+        assert_eq!(
+            token("id 550e8400-e29b-41d4-a716-446655440000 ok", 8).as_deref(),
+            Some("550e8400-e29b-41d4-a716-446655440000")
+        );
     }
 
     #[test]

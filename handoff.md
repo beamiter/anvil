@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (UUID smart-select — round 233)
+
+## 2026-10-04 (UUID double-click — round 233)
+
+- Double-click a canonical UUID selects all 36 characters. Unique round
+  **233**.
+
 Updated: 2026-10-04 (shell-variable smart-select — round 232)
 
 ## 2026-10-04 (shell variable double-click — round 232)
