@@ -27,6 +27,10 @@ static PATTERNS: LazyLock<Vec<Pat>> = LazyLock::new(|| {
         p(r#"`([^`\n]*)`"#, 1),
         p(r#"((?:https?|ftp|file)://[^\s<>"'`)\]}]+)"#, 1),
         p(r#"([\w.+-]+@[\w-]+(?:\.[\w-]+)+)"#, 1),
+        p(
+            r#"(\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9]+)"#,
+            1,
+        ),
         p(r#"((?:[~.]?[\w./+-]*\w):\d+(?::\d+)?)"#, 1),
         p(
             r#"((?:~|\.{1,2})?(?:/[\w.+@~-]+)+/?|(?:[\w.+-]+/)+[\w.+-]*)"#,
@@ -154,6 +158,9 @@ mod tests {
             token("alpha #11223344 done", 8).as_deref(),
             Some("#11223344")
         );
+        assert_eq!(token("echo $HOME/bin", 6).as_deref(), Some("$HOME"));
+        assert_eq!(token("use ${PATH} here", 6).as_deref(), Some("${PATH}"));
+        assert_eq!(token("arg $1 remaining", 5).as_deref(), Some("$1"));
     }
 
     #[test]

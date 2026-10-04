@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (shell-variable smart-select — round 232)
+
+## 2026-10-04 (shell variable double-click — round 232)
+
+- Double-click `$HOME` / `${PATH}` / `$1` selects the `$`. Unique round
+  **232**.
+
 Updated: 2026-10-04 (hex-color smart-select — round 231)
 
 ## 2026-10-04 (hex color double-click — round 231)

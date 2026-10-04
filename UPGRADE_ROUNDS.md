@@ -1046,5 +1046,10 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      now one token, ahead of git SHA matching so `#11223344` keeps the
      hash.
 
+232. **Smart-select grabs shell variables** —
+     Double-click on `$HOME` selected `HOME` without the `$`. `$NAME`,
+     `${NAME}`, and `$1` are now one token, ahead of path matching so
+     `$HOME/bin` keeps the dollar on the variable.
+
 
 

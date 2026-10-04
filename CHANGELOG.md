@@ -41,6 +41,10 @@ versioning for tagged releases while it remains experimental.
   `[keybindings]` reaches the same undoable removal; an empty selection
   says so instead of doing nothing.
 
+- **Double-click selects shell variables.** `$HOME` used to select `HOME`
+  without the dollar. `$NAME`, `${NAME}`, and `$1` are one token, even
+  before a following `/bin`.
+
 - **Double-click selects CSS hex colors.** `#ff00aa` used to select
   `ff00aa` without the hash. A `#` plus 3–8 hex digits is now one token.
 
