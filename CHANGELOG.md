@@ -41,6 +41,10 @@ versioning for tagged releases while it remains experimental.
   `[keybindings]` reaches the same undoable removal; an empty selection
   says so instead of doing nothing.
 
+- **Collapse and expand explain an empty document.** Fold-all already
+  toasted a count; zero changes and Toggle fold did nothing. They now
+  say there is nothing to collapse, expand, or fold.
+
 - **Double-click `key=value` drops trailing sentence punctuation.**
   `FOO=bar,` used to copy the comma because the assignment regex only
   stops at whitespace. It now trims `. , ; ! ?` like paths.

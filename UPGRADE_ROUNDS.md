@@ -1030,5 +1030,10 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      only at whitespace. The same `. , ; ! ?` trail trim paths use now
      applies when the token contains `=`.
 
+229. **Collapse / expand shortcuts explain an empty document** —
+     Fold-all already toasted a count, but zero changes and Toggle fold
+     were silent. They now say there is nothing to collapse, expand, or
+     fold (including fullscreen and Unified).
+
 
 

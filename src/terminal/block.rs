@@ -40,6 +40,22 @@ fn command_finished_output(exit_code: Option<i32>) -> VteOutput {
     )
 }
 
+fn fold_all_notice(collapse: bool, folded: usize) -> String {
+    if folded > 0 {
+        let plural = if folded == 1 { "" } else { "s" };
+        let verb = if collapse { "Collapsed" } else { "Expanded" };
+        format!("{verb} {folded} block{plural}.")
+    } else if collapse {
+        "No blocks to collapse.".to_string()
+    } else {
+        "No blocks to expand.".to_string()
+    }
+}
+
+fn toggle_collapsed_notice(changed: bool) -> Option<&'static str> {
+    (!changed).then_some("No finished block to fold.")
+}
+
 /// Toast text for a session-export attempt.
 fn export_notice(result: std::io::Result<std::path::PathBuf>) -> String {
     match result {
@@ -696,15 +712,14 @@ impl Component for BlockTerminal {
             VteInput::CollapseAllBlocks | VteInput::ExpandAllBlocks => {
                 let collapse = matches!(msg, VteInput::CollapseAllBlocks);
                 let folded = view.set_all_blocks_collapsed(collapse);
-                if folded > 0 {
-                    let plural = if folded == 1 { "" } else { "s" };
-                    let verb = if collapse { "Collapsed" } else { "Expanded" };
-                    let _ =
-                        sender.output(VteOutput::Notice(format!("{verb} {folded} block{plural}.")));
-                }
+                let _ = sender.output(VteOutput::Notice(fold_all_notice(collapse, folded)));
             }
             VteInput::ToggleBlockCollapsed => {
-                view.toggle_selected_block_collapsed();
+                if let Some(message) =
+                    toggle_collapsed_notice(view.toggle_selected_block_collapsed())
+                {
+                    let _ = sender.output(VteOutput::Notice(message.to_string()));
+                }
             }
             VteInput::ReinputSelectedCommands => {
                 if let Some(message) = view.reinput_selected_commands() {
@@ -858,8 +873,9 @@ impl Component for BlockTerminal {
 mod tests {
     use super::{
         block_navigation_status, block_result_status, command_finished_output, find_step,
-        record_navigation_notice, validate_block_search_pattern, FindNavigationResult,
-        FindProgress, FindSearchResult, FindStep, RecordNavigationResult, VteOutput,
+        fold_all_notice, record_navigation_notice, toggle_collapsed_notice,
+        validate_block_search_pattern, FindNavigationResult, FindProgress, FindSearchResult,
+        FindStep, RecordNavigationResult, VteOutput,
     };
     use crate::search::SearchStatus;
 
@@ -941,6 +957,19 @@ mod tests {
             None,
             "the snapshot view, not a notice, answers this result"
         );
+    }
+
+    #[test]
+    fn fold_shortcuts_explain_an_empty_or_unchanged_document() {
+        assert_eq!(fold_all_notice(true, 3), "Collapsed 3 blocks.");
+        assert_eq!(fold_all_notice(false, 1), "Expanded 1 block.");
+        assert_eq!(fold_all_notice(true, 0), "No blocks to collapse.");
+        assert_eq!(fold_all_notice(false, 0), "No blocks to expand.");
+        assert_eq!(
+            toggle_collapsed_notice(false),
+            Some("No finished block to fold.")
+        );
+        assert_eq!(toggle_collapsed_notice(true), None);
     }
 
     #[test]

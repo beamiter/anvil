@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (fold empty-document toasts — round 229)
+
+## 2026-10-04 (fold empty document — round 229)
+
+- Collapse/expand all and toggle-fold toast when nothing changed. Unique
+  round **229**.
+
 Updated: 2026-10-04 (key=value smart-select trail — round 228)
 
 ## 2026-10-04 (key=value trailing punctuation — round 228)
