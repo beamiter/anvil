@@ -756,8 +756,11 @@ impl Component for VteTerminal {
                     }
                 }
             }
-            // Block-view only; no-op for the bare VTE backend.
-            VteInput::ReinputSelectedCommands => {}
+            VteInput::ReinputSelectedCommands => {
+                let _ = sender.output(VteOutput::Notice(vte_block_mode_only_notice(
+                    "Selected-command recall",
+                )));
+            }
             VteInput::SelectAllBlocks => {
                 let _ = sender.output(VteOutput::Notice(vte_block_mode_only_notice(
                     "Block selection",
@@ -1131,6 +1134,14 @@ mod tests {
         assert_eq!(
             vte_block_mode_only_notice("Deleting selected blocks"),
             "Deleting selected blocks is available only in a Block-mode pane."
+        );
+    }
+
+    #[test]
+    fn reinput_on_live_vte_explains_block_mode() {
+        assert_eq!(
+            vte_block_mode_only_notice("Selected-command recall"),
+            "Selected-command recall is available only in a Block-mode pane."
         );
     }
 

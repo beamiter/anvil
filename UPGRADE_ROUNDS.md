@@ -1115,5 +1115,8 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      deleting the selection used the silent VTE no-op. Copy matches
      `emit_block_action`.
 
+250. **Reinput on live VTE toasts** — selected-command recall used the last
+     silent VTE no-op. Copy matches `emit_block_action`.
+
 
 

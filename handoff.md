@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (reinput VTE toast — round 250)
+
+## 2026-10-04 (reinput on VTE — round 250)
+
+- Selected-command recall in a live VTE pane toasts Block-mode-only. Unique
+  round **250**. Heartbeat 20s. Classic VTE block-document shortcuts now
+  all explain themselves.
+
 Updated: 2026-10-04 (block-selection VTE toast — round 249)
 
 ## 2026-10-04 (select/delete blocks on VTE — round 249)

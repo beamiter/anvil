@@ -41,6 +41,10 @@ versioning for tagged releases while it remains experimental.
   `[keybindings]` reaches the same undoable removal; an empty selection
   says so instead of doing nothing.
 
+- **Reinput selected commands on a live VTE pane explains itself.**
+  Ctrl+Shift+I still reached classic VTE and inserted nothing. It now
+  says the feature needs Block mode.
+
 - **Selecting or deleting blocks on a live VTE pane explains itself.**
   Select-all and delete-selected still reached classic VTE and changed
   nothing. They now say the feature needs Block mode.
