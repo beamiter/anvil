@@ -1,5 +1,11 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (key=value smart-select trail — round 228)
+
+## 2026-10-04 (key=value trailing punctuation — round 228)
+
+- Double-click `FOO=bar,` no longer includes the comma. Unique round **228**.
+
 Updated: 2026-10-04 (path smart-select trail — round 227)
 
 ## 2026-10-04 (path trailing punctuation — round 227)

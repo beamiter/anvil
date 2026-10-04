@@ -1025,5 +1025,10 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      regex allows `.` in names. Paths and `file:line` now share a trail
      trim that keeps `:12:3`.
 
+228. **Smart-select drops trailing punctuation on `key=value`** —
+     `export FOO=bar,` kept the comma because the assignment regex stops
+     only at whitespace. The same `. , ; ! ?` trail trim paths use now
+     applies when the token contains `=`.
+
 
 

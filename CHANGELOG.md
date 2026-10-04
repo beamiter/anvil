@@ -41,6 +41,10 @@ versioning for tagged releases while it remains experimental.
   `[keybindings]` reaches the same undoable removal; an empty selection
   says so instead of doing nothing.
 
+- **Double-click `key=value` drops trailing sentence punctuation.**
+  `FOO=bar,` used to copy the comma because the assignment regex only
+  stops at whitespace. It now trims `. , ; ! ?` like paths.
+
 - **Double-click paths drop trailing sentence punctuation.** `src/main.rs.`
   used to copy the period because `.` is legal in a filename. Paths and
   `file:line` now trim `. , ; ! ?` the way URLs already did; `:12:3`
