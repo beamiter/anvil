@@ -1,5 +1,11 @@
 # Engineering handoff
 
+Updated: 2026-10-04 (find-bar regex badge — round 218)
+
+## 2026-10-04 (find regex badge — round 218)
+
+- Slash-wrapped find queries show a `regex` badge. Unique round **218**.
+
 Updated: 2026-10-04 (palette delete selected blocks — round 217)
 
 ## 2026-10-04 (palette delete selected — round 217)

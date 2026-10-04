@@ -968,5 +968,10 @@ scripts/{install,uninstall,test-install-paths}.sh`, plus the full Cargo gates.
      the command palette lists it and `[keybindings] delete_selected_blocks`
      can bind it. An empty selection explains itself instead of going silent.
 
+218. **Find bar shows when `/pattern/` is regex** —
+     A visible `regex` badge (and accessible label) appears only for a
+     slash-wrapped non-empty pattern. `/foo`, `//`, and bare text stay
+     literal. Parsing lives in one helper shared with the backend dispatch.
+
 
 

@@ -68,11 +68,7 @@ impl AppModel {
 
     /// Parse the find-bar text: `/pattern/` means regex, anything else literal.
     pub(crate) fn search_query(text: &str) -> (String, bool) {
-        if text.starts_with('/') && text.ends_with('/') && text.len() > 2 {
-            (text[1..text.len() - 1].to_string(), true)
-        } else {
-            (text.to_string(), false)
-        }
+        crate::search::parse_find_query(text)
     }
 
     pub(crate) fn execute_action(&mut self, action: Action, sender: &ComponentSender<AppModel>) {

@@ -20,6 +20,20 @@ pub(crate) fn oversize_query_status(query: &str) -> Option<SearchStatus> {
     })
 }
 
+/// `/pattern/` with a non-empty inner pattern is regex. Bare `/`, `//`, and
+/// an unclosed `/foo` stay literal, including the slashes.
+pub(crate) fn parse_find_query(text: &str) -> (String, bool) {
+    if let Some(inner) = text
+        .strip_prefix('/')
+        .and_then(|rest| rest.strip_suffix('/'))
+    {
+        if !inner.is_empty() {
+            return (inner.to_string(), true);
+        }
+    }
+    (text.to_string(), false)
+}
+
 /// Backend-neutral state for the window search bar. `Searching` is a short
 /// UI-only transition while a pane computes its answer; terminal backends
 /// return `Idle`, `Results`, or `Error` through `VteOutput::SearchStatus`.
@@ -194,6 +208,17 @@ impl Component for SearchModel {
                     },
                 },
 
+                #[name(regex_mode)]
+                gtk::Label {
+                    set_text: "regex",
+                    set_visible: false,
+                    add_css_class: "dim-label",
+                    set_tooltip_text: Some("Wrapped in /slashes/: this query is a regular expression"),
+                    update_property: &[
+                        gtk::accessible::Property::Label("Regular expression mode"),
+                    ],
+                },
+
                 #[name(status_label)]
                 gtk::Label {
                     set_width_chars: 14,
@@ -267,6 +292,7 @@ impl Component for SearchModel {
                 if open {
                     widgets.entry.grab_focus();
                     let query = widgets.entry.text().to_string();
+                    sync_regex_mode(widgets, &query);
                     if !query.is_empty() {
                         apply_status(widgets, &SearchStatus::Searching);
                         let _ = sender.output(SearchOutput::Changed(query));
@@ -277,6 +303,7 @@ impl Component for SearchModel {
                 }
             }
             SearchMsg::Changed(query) => {
+                sync_regex_mode(widgets, &query);
                 apply_status(
                     widgets,
                     if query.is_empty() {
@@ -290,6 +317,7 @@ impl Component for SearchModel {
             SearchMsg::ActivePaneChanged => {
                 let query = widgets.entry.text().to_string();
                 let (status, replay) = pane_transition(root.is_search_mode(), &query);
+                sync_regex_mode(widgets, &query);
                 apply_status(widgets, &status);
                 if let Some(query) = replay {
                     let _ = sender.output(SearchOutput::Changed(query));
@@ -309,6 +337,10 @@ impl Component for SearchModel {
             }
         }
     }
+}
+
+fn sync_regex_mode(widgets: &SearchModelWidgets, query: &str) {
+    widgets.regex_mode.set_visible(parse_find_query(query).1);
 }
 
 /// Decide how the search component follows a newly active pane. Keeping this
@@ -441,7 +473,7 @@ fn apply_status(widgets: &SearchModelWidgets, status: &SearchStatus) {
 mod tests {
     use super::{
         active_pane_changed, invalid_regex_message, oversize_query_status, pane_transition,
-        presentation, SearchPresentation, SearchStatus, SEARCH_QUERY_BYTE_LIMIT,
+        presentation, parse_find_query, SearchPresentation, SearchStatus, SEARCH_QUERY_BYTE_LIMIT,
     };
 
     #[test]
@@ -455,6 +487,16 @@ mod tests {
             }
             other => panic!("expected an oversized-query error status, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn slash_wrapped_find_text_is_regex_and_everything_else_is_literal() {
+        assert_eq!(parse_find_query("/a+/"), ("a+".to_string(), true));
+        assert_eq!(parse_find_query("a+"), ("a+".to_string(), false));
+        assert_eq!(parse_find_query("/a+"), ("/a+".to_string(), false));
+        assert_eq!(parse_find_query("//"), ("//".to_string(), false));
+        assert_eq!(parse_find_query("/"), ("/".to_string(), false));
+        assert_eq!(parse_find_query("///"), ("/".to_string(), true));
     }
 
     #[test]

@@ -41,6 +41,10 @@ versioning for tagged releases while it remains experimental.
   `[keybindings]` reaches the same undoable removal; an empty selection
   says so instead of doing nothing.
 
+- **The find bar shows when a query is a regular expression.** `/pattern/`
+  already switched engines, but the only hint was the placeholder. A
+  `regex` badge now appears for a non-empty slash-wrapped pattern.
+
 - **Task terminals that fail to launch update the task model by role.** A
   validation PTY that never crossed exec is recorded as a cancelled validation
   attempt rather than an inconclusive child exit, so the Tasks panel can schedule
