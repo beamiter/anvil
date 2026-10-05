@@ -114,13 +114,13 @@ pub(crate) fn trim_link_trail(text: &str) -> &str {
 /// Opening wrappers around a whitespace-delimited URL token (`(https://…)`,
 /// `"https://…"`). Closers are handled by [`trim_link_trail`].
 pub(crate) fn strip_link_wrappers(text: &str) -> &str {
-    text.trim_start_matches(|c| matches!(c, '(' | '[' | '{' | '<' | '"' | '\''))
+    text.trim_start_matches(['(', '[', '{', '<', '"', '\''])
 }
 
 /// Sentence punctuation is not part of a path, `file:line`, or `key=value`
 /// token. Colon stays: `src/main.rs:12` is one token.
 pub(crate) fn trim_path_trail(text: &str) -> &str {
-    text.trim_end_matches(|c| matches!(c, '.' | ',' | ';' | '!' | '?'))
+    text.trim_end_matches(['.', ',', ';', '!', '?'])
 }
 
 fn trim_semantic_end(line: &str, start: usize, end: usize) -> usize {
@@ -196,11 +196,11 @@ mod tests {
             token("commit deadbeef0123abc", 8).as_deref(),
             Some("deadbeef0123abc")
         );
-        assert_eq!(token("ip 10.0.0.8:22 ok", 4).as_deref(), Some("10.0.0.8:22"));
         assert_eq!(
-            token("color #ff00aa in css", 8).as_deref(),
-            Some("#ff00aa")
+            token("ip 10.0.0.8:22 ok", 4).as_deref(),
+            Some("10.0.0.8:22")
         );
+        assert_eq!(token("color #ff00aa in css", 8).as_deref(), Some("#ff00aa"));
         assert_eq!(token("short #fff end", 8).as_deref(), Some("#fff"));
         assert_eq!(
             token("alpha #11223344 done", 8).as_deref(),
@@ -259,15 +259,15 @@ mod tests {
             Some("2026-10-04T10:59:48+08:00")
         );
         assert_eq!(token("ver v1.2.3 ok", 4).as_deref(), Some("v1.2.3"));
-        assert_eq!(
-            token("rel 1.2.3-rc.1 x", 4).as_deref(),
-            Some("1.2.3-rc.1")
-        );
+        assert_eq!(token("rel 1.2.3-rc.1 x", 4).as_deref(), Some("1.2.3-rc.1"));
         assert_eq!(
             token("build 1.2.3+meta.4 x", 7).as_deref(),
             Some("1.2.3+meta.4")
         );
-        assert_eq!(token("ip 10.0.0.8:22 ok", 4).as_deref(), Some("10.0.0.8:22"));
+        assert_eq!(
+            token("ip 10.0.0.8:22 ok", 4).as_deref(),
+            Some("10.0.0.8:22")
+        );
         assert_eq!(token("cpu 80% idle", 4).as_deref(), Some("80%"));
         assert_eq!(token("load 12.5% now", 6).as_deref(), Some("12.5%"));
         assert_eq!(token("took 12ms later", 6).as_deref(), Some("12ms"));
@@ -300,10 +300,7 @@ mod tests {
             token("https://example.com:8443:", 2).as_deref(),
             Some("https://example.com:8443")
         );
-        assert_eq!(
-            token("see src/main.rs.", 6).as_deref(),
-            Some("src/main.rs")
-        );
+        assert_eq!(token("see src/main.rs.", 6).as_deref(), Some("src/main.rs"));
         assert_eq!(
             token("open ./foo/bar, please", 6).as_deref(),
             Some("./foo/bar")
@@ -316,10 +313,7 @@ mod tests {
             token("export FOO=bar, please", 10).as_deref(),
             Some("FOO=bar")
         );
-        assert_eq!(
-            token("retry COUNT=3;", 8).as_deref(),
-            Some("COUNT=3")
-        );
+        assert_eq!(token("retry COUNT=3;", 8).as_deref(), Some("COUNT=3"));
         assert_eq!(token("ping ::1.", 6).as_deref(), Some("::1"));
         assert_eq!(
             token("ether aa:bb:cc:dd:ee:ff.", 6).as_deref(),

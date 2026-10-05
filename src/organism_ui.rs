@@ -4041,19 +4041,11 @@ mod tests {
                 None
             );
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::WatchCommand,
-                    Behavior::Celebrate,
-                ),
+                visual_transition_for_motion(motion, Behavior::WatchCommand, Behavior::Celebrate,),
                 None
             );
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::WatchAgent,
-                    Behavior::RestAfterPush,
-                ),
+                visual_transition_for_motion(motion, Behavior::WatchAgent, Behavior::RestAfterPush,),
                 None
             );
             assert_eq!(
@@ -4077,11 +4069,7 @@ mod tests {
             // under Calm/Static (Full animates; dedicated hold pins cover the
             // same arcs).
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::Celebrate,
-                    Behavior::UnknownOutcome,
-                ),
+                visual_transition_for_motion(motion, Behavior::Celebrate, Behavior::UnknownOutcome,),
                 None
             );
             assert_eq!(
@@ -4141,11 +4129,7 @@ mod tests {
                 None
             );
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::UnknownOutcome,
-                    Behavior::Idle,
-                ),
+                visual_transition_for_motion(motion, Behavior::UnknownOutcome, Behavior::Idle,),
                 None
             );
         }
@@ -4380,20 +4364,12 @@ mod tests {
             Behavior::Approach,
         ] {
             assert_eq!(
-                visual_transition_for_motion(
-                    OrganismMotion::Full,
-                    Behavior::GlanceAside,
-                    other,
-                ),
+                visual_transition_for_motion(OrganismMotion::Full, Behavior::GlanceAside, other,),
                 None,
                 "Full GlanceAside→{other:?}"
             );
             assert_eq!(
-                visual_transition_for_motion(
-                    OrganismMotion::Full,
-                    other,
-                    Behavior::GlanceAside,
-                ),
+                visual_transition_for_motion(OrganismMotion::Full, other, Behavior::GlanceAside,),
                 None,
                 "Full {other:?}→GlanceAside"
             );
@@ -4423,12 +4399,8 @@ mod tests {
         ];
         for from in inbound {
             assert!(
-                visual_transition_for_motion(
-                    OrganismMotion::Full,
-                    from,
-                    Behavior::CelebrateBig,
-                )
-                .is_some(),
+                visual_transition_for_motion(OrganismMotion::Full, from, Behavior::CelebrateBig,)
+                    .is_some(),
                 "Full {from:?}→CelebrateBig"
             );
             assert!(
@@ -4449,12 +4421,8 @@ mod tests {
         ];
         for to in outbound {
             assert!(
-                visual_transition_for_motion(
-                    OrganismMotion::Full,
-                    Behavior::CelebrateBig,
-                    to,
-                )
-                .is_some(),
+                visual_transition_for_motion(OrganismMotion::Full, Behavior::CelebrateBig, to,)
+                    .is_some(),
                 "Full CelebrateBig→{to:?}"
             );
             assert!(
@@ -4565,12 +4533,8 @@ mod tests {
         ];
         for to in arcs {
             assert!(
-                visual_transition_for_motion(
-                    OrganismMotion::Full,
-                    Behavior::WatchSettled,
-                    to,
-                )
-                .is_some(),
+                visual_transition_for_motion(OrganismMotion::Full, Behavior::WatchSettled, to,)
+                    .is_some(),
                 "Full WatchSettled→{to:?}"
             );
             assert!(
@@ -4633,11 +4597,7 @@ mod tests {
             Behavior::WatchAgent,
             Behavior::WatchSettled,
         ] {
-            for to in [
-                Behavior::Explore,
-                Behavior::Sleep,
-                Behavior::Approach,
-            ] {
+            for to in [Behavior::Explore, Behavior::Sleep, Behavior::Approach] {
                 assert_eq!(
                     visual_transition_for_motion(OrganismMotion::Full, from, to),
                     None,
@@ -4718,11 +4678,7 @@ mod tests {
             Behavior::UnknownOutcome,
             Behavior::RestAfterPush,
         ] {
-            for to in [
-                Behavior::Explore,
-                Behavior::Sleep,
-                Behavior::Approach,
-            ] {
+            for to in [Behavior::Explore, Behavior::Sleep, Behavior::Approach] {
                 assert_eq!(
                     visual_transition_for_motion(OrganismMotion::Full, from, to),
                     None,
@@ -4748,11 +4704,7 @@ mod tests {
             Behavior::GuardRecovery,
             Behavior::GuardCautious,
         ] {
-            for to in [
-                Behavior::Explore,
-                Behavior::Sleep,
-                Behavior::Approach,
-            ] {
+            for to in [Behavior::Explore, Behavior::Sleep, Behavior::Approach] {
                 assert_eq!(
                     visual_transition_for_motion(OrganismMotion::Full, from, to),
                     None,
@@ -4968,11 +4920,7 @@ mod tests {
             Behavior::WatchSettled,
         ] {
             assert_eq!(
-                visual_transition_for_motion(
-                    OrganismMotion::Full,
-                    from,
-                    Behavior::UnknownOutcome,
-                ),
+                visual_transition_for_motion(OrganismMotion::Full, from, Behavior::UnknownOutcome,),
                 None,
                 "Full {from:?}→UnknownOutcome"
             );
@@ -5007,7 +4955,6 @@ mod tests {
         }
     }
 
-
     /// Celebrate{,Big}→UnknownOutcome animates under Full motion (unknown
     /// overwrite from a celebrate hold) and snaps under Calm/Static. Pairs core
     /// celebrate→unknown bridges inside between() 93.
@@ -5015,12 +4962,8 @@ mod tests {
     fn celebrate_holds_bridge_to_unknown_outcome_under_full_motion_only() {
         for from in [Behavior::Celebrate, Behavior::CelebrateBig] {
             assert!(
-                visual_transition_for_motion(
-                    OrganismMotion::Full,
-                    from,
-                    Behavior::UnknownOutcome,
-                )
-                .is_some(),
+                visual_transition_for_motion(OrganismMotion::Full, from, Behavior::UnknownOutcome,)
+                    .is_some(),
                 "Full {from:?}→UnknownOutcome"
             );
             assert!(
@@ -5076,12 +5019,8 @@ mod tests {
     fn sit_near_and_inspect_bridge_to_unknown_outcome_under_full_motion_only() {
         for from in [Behavior::SitNearError, Behavior::InspectError] {
             assert!(
-                visual_transition_for_motion(
-                    OrganismMotion::Full,
-                    from,
-                    Behavior::UnknownOutcome,
-                )
-                .is_some(),
+                visual_transition_for_motion(OrganismMotion::Full, from, Behavior::UnknownOutcome,)
+                    .is_some(),
                 "Full {from:?}→UnknownOutcome"
             );
             assert!(
@@ -5097,7 +5036,6 @@ mod tests {
             }
         }
     }
-
 
     /// GuardRecovery→UnknownOutcome animates under Full motion (unknown
     /// overwrite from a recovery vigil) and snaps under Calm/Static. Pairs core
@@ -5260,25 +5198,12 @@ mod tests {
         );
         for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
             assert_eq!(
-                visual_transition_for_motion(
-                    motion,
-                    Behavior::UnknownOutcome,
-                    Behavior::Idle,
-                ),
+                visual_transition_for_motion(motion, Behavior::UnknownOutcome, Behavior::Idle,),
                 None,
                 "{motion:?} UnknownOutcome→Idle"
             );
         }
     }
-
-
-
-
-
-
-
-
-
 
     #[test]
     fn ambient_and_typing_surfaces_skip_visual_transition_arcs() {
@@ -5336,11 +5261,7 @@ mod tests {
         // holds under Full motion (open vigil / success finish land via Watch*
         // or Idle snap). Idle/Rest→Guard* is pinned in semantic_bridges; pin
         // Explore/Sleep/Approach the same way.
-        for from in [
-            Behavior::Explore,
-            Behavior::Sleep,
-            Behavior::Approach,
-        ] {
+        for from in [Behavior::Explore, Behavior::Sleep, Behavior::Approach] {
             for to in [
                 Behavior::GuardFailure,
                 Behavior::GuardStuck,
@@ -5359,11 +5280,7 @@ mod tests {
         }
         // Ambient→Inspect/Sit/Unknown/Rest stays None under Full motion too
         // (holds/rest arrive from finish/push reducers). between() stays 93.
-        for from in [
-            Behavior::Explore,
-            Behavior::Sleep,
-            Behavior::Approach,
-        ] {
+        for from in [Behavior::Explore, Behavior::Sleep, Behavior::Approach] {
             for to in [
                 Behavior::InspectError,
                 Behavior::SitNearError,

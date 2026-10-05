@@ -757,9 +757,8 @@ impl Component for NotebookModel {
                 });
                 run_all_button.set_sensitive(runtime.cells.iter().any(|cell| cell.runnable()));
                 if !run_all_button.is_sensitive() {
-                    run_all_button.set_tooltip_text(Some(
-                        "No executable shell fences in this notebook",
-                    ));
+                    run_all_button
+                        .set_tooltip_text(Some("No executable shell fences in this notebook"));
                 }
 
                 let parent_for_open = self.parent.clone();

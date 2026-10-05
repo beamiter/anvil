@@ -2020,12 +2020,9 @@ impl AppModel {
         let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
-        if let Some(reason) = split_layout_reason(
-            tab.panes.len(),
-            false,
-            false,
-            SplitLayoutKind::Swap,
-        ) {
+        if let Some(reason) =
+            split_layout_reason(tab.panes.len(), false, false, SplitLayoutKind::Swap)
+        {
             self.show_toast(reason);
             return;
         }
@@ -3051,15 +3048,15 @@ fn persistence_failure_notice(
 #[cfg(test)]
 mod pane_tree_tests {
     use super::{
-        abbreviate_prefix, active_index_after_remove, balanced_split_position, combined_axis_span,
-        detach_leaf_and_promote, equalize_pane_tree, format_running_process_summary,
+        abbreviate_prefix, active_index_after_remove, balanced_split_position,
+        close_marked_tabs_notice, combined_axis_span, detach_leaf_and_promote, equalize_pane_tree,
+        format_running_process_summary, move_tab_edge_notice, move_tab_need_two_notice,
         pane_header_title, persistence_failure_notice, pinned_reorder_destination,
         plan_pane_into_tab, plan_tab_into_pane, prepare_then_commit, reconnect_target_is_valid,
         replay_argv_for_unmanaged_leaf, restored_leaf_mode, snapshot_restorable_command,
-        swap_target_in_visual_order, tab_drop_preview_is_valid, DropTabIdentity, LeafSlot,
-        PaneIntoTabPlan, TabIntoPanePlan, PERSISTENCE_FAILURE_NOTICE_COOLDOWN, SplitLayoutKind,
-        split_layout_reason, close_marked_tabs_notice, switch_tab_empty_notice,
-        move_tab_need_two_notice, move_tab_edge_notice,
+        split_layout_reason, swap_target_in_visual_order, switch_tab_empty_notice,
+        tab_drop_preview_is_valid, DropTabIdentity, LeafSlot, PaneIntoTabPlan, SplitLayoutKind,
+        TabIntoPanePlan, PERSISTENCE_FAILURE_NOTICE_COOLDOWN,
     };
     use crate::config::TerminalMode;
     use crate::workspace::ConnStatus;
@@ -3332,10 +3329,7 @@ mod pane_tree_tests {
 
     #[test]
     fn moving_a_lone_tab_explains_itself() {
-        assert_eq!(
-            move_tab_need_two_notice(),
-            "Need two tabs to reorder them."
-        );
+        assert_eq!(move_tab_need_two_notice(), "Need two tabs to reorder them.");
     }
 
     #[test]

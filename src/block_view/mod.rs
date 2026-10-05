@@ -1651,9 +1651,7 @@ pub(crate) fn selected_recall_notice(result: SelectedRecall) -> Option<&'static 
         SelectedRecall::WouldDropLines => {
             Some("Bracketed paste is required to preserve every command line.")
         }
-        SelectedRecall::NotAtPrompt => {
-            Some("Wait for a ready prompt before reinputting commands.")
-        }
+        SelectedRecall::NotAtPrompt => Some("Wait for a ready prompt before reinputting commands."),
     }
 }
 
@@ -4053,9 +4051,8 @@ pub struct TermView {
     /// a transient allocation address. `Arc<Mutex<_>>` so the persistence
     /// worker can commit revision/tombstone authority after a labeled Save
     /// Block history write without returning to the GTK thread.
-    history_baselines: std::sync::Arc<
-        std::sync::Mutex<HashMap<std::path::PathBuf, history::HistoryBaseline>>,
-    >,
+    history_baselines:
+        std::sync::Arc<std::sync::Mutex<HashMap<std::path::PathBuf, history::HistoryBaseline>>>,
     /// Last Block-history load attempt for this pane. `Failed` makes ordinary
     /// saves refuse so an unreadable file cannot be overwritten; Retry reads
     /// this to choose ReloadFirst vs SaveAgain (pairs forge `history_load`).
@@ -14578,7 +14575,9 @@ impl TermView {
     where
         F: Fn() + 'static,
     {
-        self.delete_selected_callbacks.borrow_mut().push(Box::new(f));
+        self.delete_selected_callbacks
+            .borrow_mut()
+            .push(Box::new(f));
     }
 
     pub fn scroll_lines(&self, lines: i32) {
@@ -15090,7 +15089,11 @@ impl TermView {
             }
         }
         let max_blocks = self.config.borrow().max_visible_blocks as usize;
-        let overflow = self.finished_blocks.borrow().len().saturating_sub(max_blocks);
+        let overflow = self
+            .finished_blocks
+            .borrow()
+            .len()
+            .saturating_sub(max_blocks);
         if overflow > 0 {
             evict_finished_block_prefix(
                 overflow,
@@ -22504,7 +22507,14 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
         use gtk::gdk::{Key, ModifierType};
         use relm4::gtk;
 
-        for key in [Key::Return, Key::KP_Enter, Key::ISO_Enter, Key::Escape, Key::Delete, Key::KP_Delete] {
+        for key in [
+            Key::Return,
+            Key::KP_Enter,
+            Key::ISO_Enter,
+            Key::Escape,
+            Key::Delete,
+            Key::KP_Delete,
+        ] {
             assert!(super::selection_owns_key(true, key));
             assert!(!super::selection_owns_key(false, key));
             assert!(stranded_focus_key_recovers(key, ModifierType::empty()));

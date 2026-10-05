@@ -553,10 +553,7 @@ mod tests {
             100,
         );
         assert!(entries.iter().any(|entry| {
-            matches!(
-                &entry.accept,
-                Accept::Action(Action::DeleteSelectedBlocks)
-            )
+            matches!(&entry.accept, Accept::Action(Action::DeleteSelectedBlocks))
         }));
     }
 

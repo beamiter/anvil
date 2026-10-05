@@ -147,10 +147,7 @@ pub(crate) enum SearchMsg {
 
 #[derive(Debug)]
 pub(crate) enum SearchOutput {
-    Changed {
-        query: String,
-        case_sensitive: bool,
-    },
+    Changed { query: String, case_sensitive: bool },
     Next,
     Previous,
     Closed,
@@ -376,11 +373,7 @@ fn sync_regex_mode(widgets: &SearchModelWidgets, query: &str) {
     widgets.regex_mode.set_visible(parse_find_query(query).1);
 }
 
-fn emit_changed(
-    sender: &ComponentSender<SearchModel>,
-    query: String,
-    case_sensitive: bool,
-) {
+fn emit_changed(sender: &ComponentSender<SearchModel>, query: String, case_sensitive: bool) {
     let _ = sender.output(SearchOutput::Changed {
         query,
         case_sensitive,
@@ -419,7 +412,8 @@ struct SearchPresentation {
 }
 
 const TRUNCATED_COUNT_HINT: &str = "Counted from a bounded scrollback snapshot or a regex engine different from VTE. Native search may have more matches.";
-const UNKNOWN_ORDINAL_HINT: &str = "This hit is outside the counted range, so its position is unknown.";
+const UNKNOWN_ORDINAL_HINT: &str =
+    "This hit is outside the counted range, so its position is unknown.";
 
 fn presentation(status: &SearchStatus) -> SearchPresentation {
     match status {
@@ -517,7 +511,7 @@ fn apply_status(widgets: &SearchModelWidgets, status: &SearchStatus) {
 mod tests {
     use super::{
         active_pane_changed, invalid_regex_message, oversize_query_status, pane_transition,
-        presentation, parse_find_query, SearchPresentation, SearchStatus, SEARCH_QUERY_BYTE_LIMIT,
+        parse_find_query, presentation, SearchPresentation, SearchStatus, SEARCH_QUERY_BYTE_LIMIT,
     };
 
     #[test]

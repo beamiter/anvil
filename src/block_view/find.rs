@@ -968,11 +968,8 @@ fn metadata_filter_hits_with_budget<'a>(
             scan_budget.consume_bytes(record.output().unwrap_or("").len());
         }
         let budget_stopped = scan_budget.exhausted();
-        if !record_matches_filters_with_bookmark(
-            record,
-            filters,
-            bookmarks.contains(&record.id()),
-        ) {
+        if !record_matches_filters_with_bookmark(record, filters, bookmarks.contains(&record.id()))
+        {
             if budget_stopped {
                 return (
                     hits,
@@ -1000,20 +997,33 @@ fn metadata_filter_hits_with_budget<'a>(
     (hits, None)
 }
 
+/// Immutable query inputs shared by each budget slice of a pattern search.
+struct PatternSearchQuery<'a> {
+    re: &'a regex::Regex,
+    options: CrossBlockSearchOptions,
+    scope: CrossBlockSearchScope,
+    max_hits: usize,
+    filters: &'a BlockFilters,
+    bookmarks: &'a HashSet<u64>,
+}
+
 /// Pattern-search one budget slice starting at `resume` (or the first record).
 /// Returns new hits for this slice plus an optional cursor when the shared
 /// byte/time budget stopped the walk early.
 fn pattern_search_hits_with_budget<'a>(
     records: impl IntoIterator<Item = BackendRecordRef<'a>>,
-    re: &regex::Regex,
-    options: CrossBlockSearchOptions,
-    scope: CrossBlockSearchScope,
-    max_hits: usize,
-    filters: &BlockFilters,
-    bookmarks: &HashSet<u64>,
+    query: PatternSearchQuery<'_>,
     scan_budget: &mut FindScanBudget,
     resume: Option<&CrossBlockSearchCursor>,
 ) -> (Vec<CrossBlockHit>, Option<CrossBlockSearchCursor>) {
+    let PatternSearchQuery {
+        re,
+        options,
+        scope,
+        max_hits,
+        filters,
+        bookmarks,
+    } = query;
     let start_index = resume.map(|cursor| cursor.record_index).unwrap_or(0);
     let mut mid = resume.and_then(|cursor| cursor.mid.clone());
     let mut hits: Vec<CrossBlockHit> = Vec::new();
@@ -1860,12 +1870,14 @@ impl TermView {
         let mut scan_budget = FindScanBudget::for_cross_block();
         let (hits, resume) = pattern_search_hits_with_budget(
             records.iter(),
-            &re,
-            options,
-            scope,
-            max_hits,
-            filters,
-            &bookmarks,
+            PatternSearchQuery {
+                re: &re,
+                options,
+                scope,
+                max_hits,
+                filters,
+                bookmarks: &bookmarks,
+            },
             &mut scan_budget,
             resume,
         );
@@ -2155,17 +2167,17 @@ mod tests {
         pattern_search_hits_with_budget, plan_matching_windows, record_matches_filters,
         regex_consumption, snippet, step_compressed_cursor, unresolved_record_target_result,
         vte_cross_block_pattern, BookmarkedEmptyReason, CrossBlockSearchOptions,
-        CrossBlockSearchScope, FindCursor, FindDirection, FindScanBudget,
-        FindSurface, NativeCursorAction, RecordNavigationResult, RecordSnapshotView,
+        CrossBlockSearchScope, FindCursor, FindDirection, FindScanBudget, FindSurface,
+        NativeCursorAction, PatternSearchQuery, RecordNavigationResult, RecordSnapshotView,
         RegexConsumption, VTE_SEARCH_FLAGS,
-    };
-    use jterm_core::cross_block_search::{
-        utf8_prefix, CROSS_BLOCK_SCAN_BYTE_LIMIT, CROSS_BLOCK_SCAN_TIME_LIMIT,
-        FIND_OVERLAY_SCAN_BYTE_LIMIT, FIND_OVERLAY_SCAN_TIME_LIMIT,
     };
     use crate::block_view::{
         BackendRecordRef, BackendSearchWindow, BlockData, BlockFilters, CompletedCommandRecord,
         ZoneOutputSnapshot,
+    };
+    use jterm_core::cross_block_search::{
+        utf8_prefix, CROSS_BLOCK_SCAN_BYTE_LIMIT, CROSS_BLOCK_SCAN_TIME_LIMIT,
+        FIND_OVERLAY_SCAN_BYTE_LIMIT, FIND_OVERLAY_SCAN_TIME_LIMIT,
     };
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
@@ -2518,7 +2530,7 @@ mod tests {
         assert_eq!(cross_block.remaining_bytes(), CROSS_BLOCK_SCAN_BYTE_LIMIT);
         assert_eq!(cross_block.time_limit, CROSS_BLOCK_SCAN_TIME_LIMIT);
 
-        assert!(CROSS_BLOCK_SCAN_BYTE_LIMIT > FIND_OVERLAY_SCAN_BYTE_LIMIT);
+        const { assert!(CROSS_BLOCK_SCAN_BYTE_LIMIT > FIND_OVERLAY_SCAN_BYTE_LIMIT) };
         assert!(CROSS_BLOCK_SCAN_TIME_LIMIT > FIND_OVERLAY_SCAN_TIME_LIMIT);
     }
 
@@ -3680,24 +3692,12 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            bookmarked_empty_reason(
-                records,
-                &ids,
-                CrossBlockSearchScope::Command,
-                &filters,
-                "",
-            ),
+            bookmarked_empty_reason(records, &ids, CrossBlockSearchScope::Command, &filters, "",),
             None,
             "stale extras must not turn an empty Command-scope query into a miss"
         );
         assert_eq!(
-            bookmarked_empty_reason(
-                records,
-                &ids,
-                CrossBlockSearchScope::Output,
-                &filters,
-                "",
-            ),
+            bookmarked_empty_reason(records, &ids, CrossBlockSearchScope::Output, &filters, "",),
             None,
             "stale extras must not turn an empty Output-scope query into a miss"
         );
@@ -3735,13 +3735,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            bookmarked_empty_reason(
-                records,
-                &ids,
-                CrossBlockSearchScope::All,
-                &filters,
-                "",
-            ),
+            bookmarked_empty_reason(records, &ids, CrossBlockSearchScope::All, &filters, "",),
             None,
             "stale extras must not turn an empty All-scope query into a miss"
         );
@@ -3837,13 +3831,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            bookmarked_empty_reason(
-                records,
-                &ids,
-                CrossBlockSearchScope::All,
-                &filters,
-                " \t ",
-            ),
+            bookmarked_empty_reason(records, &ids, CrossBlockSearchScope::All, &filters, " \t ",),
             Some(BookmarkedEmptyReason::QueryMismatch),
             "whitespace-only All-scope query must stay a mismatch beside stale"
         );
@@ -3912,8 +3900,8 @@ mod tests {
     /// are non-empty but match no retained scoped text — still `QueryMismatch`
     /// under Command/Output with stale extras (NBSP/ZWSP already pinned).
     #[test]
-    fn bookmarked_empty_reason_keeps_wj_figure_bidi_query_mismatch_under_command_and_output_with_stale()
-    {
+    fn bookmarked_empty_reason_keeps_wj_figure_bidi_query_mismatch_under_command_and_output_with_stale(
+    ) {
         let retained = CompletedCommandRecord {
             id: 1,
             cmd: "echo retained".to_string(),
@@ -3999,13 +3987,7 @@ mod tests {
         };
         for query in ["\u{00a0}", "\u{200b}"] {
             assert_eq!(
-                bookmarked_empty_reason(
-                    records,
-                    &ids,
-                    CrossBlockSearchScope::All,
-                    &filters,
-                    query,
-                ),
+                bookmarked_empty_reason(records, &ids, CrossBlockSearchScope::All, &filters, query,),
                 Some(BookmarkedEmptyReason::QueryMismatch),
                 "{query:?} All-scope must stay a mismatch beside stale"
             );
@@ -4044,13 +4026,7 @@ mod tests {
         };
         for query in ["\u{2060}", "\u{2007}", "\u{00ad}", "\u{202a}", "\u{202e}"] {
             assert_eq!(
-                bookmarked_empty_reason(
-                    records,
-                    &ids,
-                    CrossBlockSearchScope::All,
-                    &filters,
-                    query,
-                ),
+                bookmarked_empty_reason(records, &ids, CrossBlockSearchScope::All, &filters, query,),
                 Some(BookmarkedEmptyReason::QueryMismatch),
                 "{query:?} All-scope must stay a mismatch beside stale"
             );
@@ -4180,13 +4156,7 @@ mod tests {
             bookmarked_only: true,
             ..Default::default()
         };
-        for query in [
-            "\u{180b}",
-            "\u{180e}",
-            "\u{fe00}",
-            "\u{17b4}",
-            "\u{034f}",
-        ] {
+        for query in ["\u{180b}", "\u{180e}", "\u{fe00}", "\u{17b4}", "\u{034f}"] {
             for scope in [
                 CrossBlockSearchScope::Command,
                 CrossBlockSearchScope::Output,
@@ -4638,18 +4608,6 @@ mod tests {
             }
         }
     }
-
-
-
-
-
-
-
-
-
-
-
-
 
     /// Bookmark ids that survived from a previous retention window but are
     /// absent from the current records list are missing retained identity, not
@@ -5466,12 +5424,14 @@ mod tests {
         let options = CrossBlockSearchOptions::default();
         let (hits, resume) = pattern_search_hits_with_budget(
             [backend_record],
-            &re,
-            options,
-            CrossBlockSearchScope::All,
-            1,
-            &BlockFilters::default(),
-            &HashSet::new(),
+            PatternSearchQuery {
+                re: &re,
+                options,
+                scope: CrossBlockSearchScope::All,
+                max_hits: 1,
+                filters: &BlockFilters::default(),
+                bookmarks: &HashSet::new(),
+            },
             &mut FindScanBudget::for_cross_block(),
             None,
         );
@@ -5511,12 +5471,14 @@ mod tests {
         };
         let (hits, resume) = pattern_search_hits_with_budget(
             backend_records.iter().copied(),
-            &re,
-            options,
-            CrossBlockSearchScope::All,
-            8,
-            &filters,
-            &bookmarks,
+            PatternSearchQuery {
+                re: &re,
+                options,
+                scope: CrossBlockSearchScope::All,
+                max_hits: 8,
+                filters: &filters,
+                bookmarks: &bookmarks,
+            },
             &mut scan_budget,
             None,
         );
@@ -5581,12 +5543,14 @@ mod tests {
         };
         let (first_hits, first_resume) = pattern_search_hits_with_budget(
             backend_records.iter().copied(),
-            &re,
-            options,
-            CrossBlockSearchScope::Command,
-            8,
-            &BlockFilters::default(),
-            &HashSet::new(),
+            PatternSearchQuery {
+                re: &re,
+                options,
+                scope: CrossBlockSearchScope::Command,
+                max_hits: 8,
+                filters: &BlockFilters::default(),
+                bookmarks: &HashSet::new(),
+            },
             &mut first_budget,
             None,
         );
@@ -5602,12 +5566,14 @@ mod tests {
         };
         let (rest_hits, rest_resume) = pattern_search_hits_with_budget(
             backend_records.iter().copied(),
-            &re,
-            options,
-            CrossBlockSearchScope::Command,
-            8,
-            &BlockFilters::default(),
-            &HashSet::new(),
+            PatternSearchQuery {
+                re: &re,
+                options,
+                scope: CrossBlockSearchScope::Command,
+                max_hits: 8,
+                filters: &BlockFilters::default(),
+                bookmarks: &HashSet::new(),
+            },
             &mut second_budget,
             Some(&resume),
         );
@@ -5699,7 +5665,11 @@ mod tests {
         assert!(!cross_block_search_continue_is_current(0, u64::MAX, false));
         // Finished walk at the wrap generation itself (MAX,MAX,no resume) —
         // pairs core cancel edge catch-up beside MAX→0 schedule bump.
-        assert!(!cross_block_search_continue_is_current(u64::MAX, u64::MAX, false));
+        assert!(!cross_block_search_continue_is_current(
+            u64::MAX,
+            u64::MAX,
+            false
+        ));
         // Near-wrap bump (MAX-1→MAX) cancels with a resume — non-wrapping
         // sibling of the MAX→0 schedule bump (pairs core cancel edge).
         let near_wrap = u64::MAX.wrapping_sub(1);
@@ -5707,21 +5677,31 @@ mod tests {
             near_wrap, near_wrap, true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_wrap, u64::MAX, true
+            near_wrap,
+            u64::MAX,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_wrap, u64::MAX, false
+            near_wrap,
+            u64::MAX,
+            false
         ));
         assert!(cross_block_search_continue_is_current(
-            u64::MAX, u64::MAX, true
+            u64::MAX,
+            u64::MAX,
+            true
         ));
         // Scheduled ahead at the near-wrap boundary (MAX vs MAX-1) cancels —
         // pairs core cancel edge beside the MAX-1→MAX bump.
         assert!(!cross_block_search_continue_is_current(
-            u64::MAX, near_wrap, true
+            u64::MAX,
+            near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            u64::MAX, near_wrap, false
+            u64::MAX,
+            near_wrap,
+            false
         ));
         // Finished walk at the near-wrap generation itself (MAX-1,MAX-1,no
         // resume) cancels like MAX,MAX finished — beside the MAX-1→MAX bump.
@@ -5732,269 +5712,404 @@ mod tests {
         // earlier than the MAX-1→MAX sibling (pairs core cancel edge).
         let near_near_wrap = near_wrap.wrapping_sub(1);
         assert!(cross_block_search_continue_is_current(
-            near_near_wrap, near_near_wrap, true
+            near_near_wrap,
+            near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_wrap, near_wrap, true
+            near_near_wrap,
+            near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_wrap, near_wrap, false
+            near_near_wrap,
+            near_wrap,
+            false
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_wrap, near_near_wrap, true
+            near_wrap,
+            near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_wrap, near_near_wrap, false
+            near_wrap,
+            near_near_wrap,
+            false
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_wrap, near_near_wrap, false
+            near_near_wrap,
+            near_near_wrap,
+            false
         ));
         // Near-near-near-wrap bump (MAX-3→MAX-2) cancels with a resume — one
         // step earlier than the MAX-2→MAX-1 sibling.
         let near_near_near_wrap = near_near_wrap.wrapping_sub(1);
         assert!(cross_block_search_continue_is_current(
-            near_near_near_wrap, near_near_near_wrap, true
+            near_near_near_wrap,
+            near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_wrap, near_near_wrap, true
+            near_near_near_wrap,
+            near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_wrap, near_near_wrap, false
+            near_near_near_wrap,
+            near_near_wrap,
+            false
         ));
         // Scheduled ahead at the near-near-near-wrap boundary (MAX-2 vs MAX-3).
         assert!(!cross_block_search_continue_is_current(
-            near_near_wrap, near_near_near_wrap, true
+            near_near_wrap,
+            near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_wrap, near_near_near_wrap, false
+            near_near_wrap,
+            near_near_near_wrap,
+            false
         ));
         // Finished walk at the near-near-near-wrap generation itself.
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_wrap, near_near_near_wrap, false
+            near_near_near_wrap,
+            near_near_near_wrap,
+            false
         ));
         // Near-near-near-near-wrap bump (MAX-4→MAX-3) cancels with a resume —
         // one step earlier than the MAX-3→MAX-2 sibling.
         let near_near_near_near_wrap = near_near_near_wrap.wrapping_sub(1);
         assert!(cross_block_search_continue_is_current(
-            near_near_near_near_wrap, near_near_near_near_wrap, true
+            near_near_near_near_wrap,
+            near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_wrap, near_near_near_wrap, true
+            near_near_near_near_wrap,
+            near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_wrap, near_near_near_wrap, false
+            near_near_near_near_wrap,
+            near_near_near_wrap,
+            false
         ));
         // Scheduled ahead at the near-near-near-near-wrap boundary (MAX-3 vs MAX-4).
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_wrap, near_near_near_near_wrap, true
+            near_near_near_wrap,
+            near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_wrap, near_near_near_near_wrap, false
+            near_near_near_wrap,
+            near_near_near_near_wrap,
+            false
         ));
         // Finished walk at the near-near-near-near-wrap generation itself.
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_wrap, near_near_near_near_wrap, false
+            near_near_near_near_wrap,
+            near_near_near_near_wrap,
+            false
         ));
         // Near-near-near-near-near-wrap bump (MAX-5→MAX-4) cancels with a
         // resume — one step earlier than the MAX-4→MAX-3 sibling.
         let near_near_near_near_near_wrap = near_near_near_near_wrap.wrapping_sub(1);
         assert!(cross_block_search_continue_is_current(
-            near_near_near_near_near_wrap, near_near_near_near_near_wrap, true
+            near_near_near_near_near_wrap,
+            near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_wrap, near_near_near_near_wrap, true
+            near_near_near_near_near_wrap,
+            near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_wrap, near_near_near_near_wrap, false
+            near_near_near_near_near_wrap,
+            near_near_near_near_wrap,
+            false
         ));
         // Scheduled ahead at the near-near-near-near-near-wrap boundary
         // (MAX-4 vs MAX-5).
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_wrap, near_near_near_near_near_wrap, true
+            near_near_near_near_wrap,
+            near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_wrap, near_near_near_near_near_wrap, false
+            near_near_near_near_wrap,
+            near_near_near_near_near_wrap,
+            false
         ));
         // Finished walk at the near-near-near-near-near-wrap generation itself.
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_wrap, near_near_near_near_near_wrap, false
+            near_near_near_near_near_wrap,
+            near_near_near_near_near_wrap,
+            false
         ));
         // Near-near-near-near-near-near-wrap bump (MAX-6→MAX-5) cancels with a
         // resume — one step earlier than the MAX-5→MAX-4 sibling.
         let near_near_near_near_near_near_wrap = near_near_near_near_near_wrap.wrapping_sub(1);
         assert!(cross_block_search_continue_is_current(
-            near_near_near_near_near_near_wrap, near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_wrap, near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_wrap,
+            near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_wrap, near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_wrap,
+            near_near_near_near_near_wrap,
+            false
         ));
         // Scheduled ahead at the near-near-near-near-near-near-wrap boundary
         // (MAX-5 vs MAX-6).
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_wrap, near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_wrap,
+            near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_wrap, near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_wrap,
+            near_near_near_near_near_near_wrap,
+            false
         ));
         // Finished walk at the near-near-near-near-near-near-wrap generation itself.
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_wrap, near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_wrap,
+            false
         ));
 
         // Near-near-near-near-near-near-near-wrap bump (MAX-7→MAX-6) cancels with a
         // resume — one step earlier than the MAX-6→MAX-5 sibling.
-        let near_near_near_near_near_near_near_wrap = near_near_near_near_near_near_wrap.wrapping_sub(1);
+        let near_near_near_near_near_near_near_wrap =
+            near_near_near_near_near_near_wrap.wrapping_sub(1);
         assert!(cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_wrap,
+            false
         ));
         // Scheduled ahead at the near-near-near-near-near-near-near-wrap boundary
         // (MAX-6 vs MAX-7).
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Finished walk at the near-near-near-near-near-near-near-wrap generation itself.
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_wrap,
+            false
         ));
 
         // Near-near-near-near-near-near-near-near-wrap bump (MAX-8→MAX-7) cancels with a
         // resume — one step earlier than the MAX-7→MAX-6 sibling.
-        let near_near_near_near_near_near_near_near_wrap = near_near_near_near_near_near_near_wrap.wrapping_sub(1);
+        let near_near_near_near_near_near_near_near_wrap =
+            near_near_near_near_near_near_near_wrap.wrapping_sub(1);
         assert!(cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Scheduled ahead at the near-near-near-near-near-near-near-near-wrap boundary
         // (MAX-7 vs MAX-8).
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Finished walk at the near-near-near-near-near-near-near-near-wrap generation itself.
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_wrap,
+            false
         ));
 
         // Near-near-near-near-near-near-near-near-near-wrap bump (MAX-9→MAX-8) cancels with a
         // resume — one step earlier than the MAX-8→MAX-7 sibling.
-        let near_near_near_near_near_near_near_near_near_wrap = near_near_near_near_near_near_near_near_wrap.wrapping_sub(1);
+        let near_near_near_near_near_near_near_near_near_wrap =
+            near_near_near_near_near_near_near_near_wrap.wrapping_sub(1);
         assert!(cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Scheduled ahead at the near-near-near-near-near-near-near-near-near-wrap boundary
         // (MAX-8 vs MAX-9).
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Finished walk at the near-near-near-near-near-near-near-near-near-wrap generation itself.
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_wrap,
+            false
         ));
 
         // Near-near-near-near-near-near-near-near-near-near-wrap bump (MAX-10→MAX-9) cancels with a
         // resume — one step earlier than the MAX-9→MAX-8 sibling.
-        let near_near_near_near_near_near_near_near_near_near_wrap = near_near_near_near_near_near_near_near_near_wrap.wrapping_sub(1);
+        let near_near_near_near_near_near_near_near_near_near_wrap =
+            near_near_near_near_near_near_near_near_near_wrap.wrapping_sub(1);
         assert!(cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Scheduled ahead at the near-near-near-near-near-near-near-near-near-near-wrap boundary
         // (MAX-9 vs MAX-10).
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Finished walk at the near-near-near-near-near-near-near-near-near-near-wrap generation itself.
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Near-near-near-near-near-near-near-near-near-near-near-wrap bump (MAX-11→MAX-10) cancels with a
         // resume — one step earlier than the MAX-10→MAX-9 sibling.
-        let near_near_near_near_near_near_near_near_near_near_near_wrap = near_near_near_near_near_near_near_near_near_near_wrap.wrapping_sub(1);
+        let near_near_near_near_near_near_near_near_near_near_near_wrap =
+            near_near_near_near_near_near_near_near_near_near_wrap.wrapping_sub(1);
         assert!(cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Scheduled ahead at the near-near-near-near-near-near-near-near-near-near-near-wrap boundary
         // (MAX-10 vs MAX-11).
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Finished walk at the near-near-near-near-near-near-near-near-near-near-near-wrap generation itself.
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Near-near-near-near-near-near-near-near-near-near-near-near-wrap bump (MAX-12→MAX-11) cancels with a
         // resume — one step earlier than the MAX-11→MAX-10 sibling.
-        let near_near_near_near_near_near_near_near_near_near_near_near_wrap = near_near_near_near_near_near_near_near_near_near_near_wrap.wrapping_sub(1);
+        let near_near_near_near_near_near_near_near_near_near_near_near_wrap =
+            near_near_near_near_near_near_near_near_near_near_near_wrap.wrapping_sub(1);
         assert!(cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Scheduled ahead at the near-near-near-near-near-near-near-near-near-near-near-near-wrap boundary
         // (MAX-11 vs MAX-12).
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_wrap, true
+            near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            true
         ));
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            false
         ));
         // Finished walk at the near-near-near-near-near-near-near-near-near-near-near-near-wrap generation itself.
         assert!(!cross_block_search_continue_is_current(
-            near_near_near_near_near_near_near_near_near_near_near_near_wrap, near_near_near_near_near_near_near_near_near_near_near_near_wrap, false
+            near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            near_near_near_near_near_near_near_near_near_near_near_near_wrap,
+            false
         ));
-
-
     }
-
 
     #[test]
     fn pattern_search_mid_record_resume_keeps_occurrence_and_skips_filter_gate() {
@@ -6032,12 +6147,14 @@ mod tests {
         };
         let (first_hits, first_resume) = pattern_search_hits_with_budget(
             backend.iter().copied(),
-            &re,
-            options,
-            CrossBlockSearchScope::Command,
-            8,
-            &BlockFilters::default(),
-            &HashSet::new(),
+            PatternSearchQuery {
+                re: &re,
+                options,
+                scope: CrossBlockSearchScope::Command,
+                max_hits: 8,
+                filters: &BlockFilters::default(),
+                bookmarks: &HashSet::new(),
+            },
             &mut first_budget,
             None,
         );
@@ -6064,12 +6181,14 @@ mod tests {
         };
         let (rest_hits, rest_resume) = pattern_search_hits_with_budget(
             backend.iter().copied(),
-            &re,
-            options,
-            CrossBlockSearchScope::Command,
-            8,
-            &filters,
-            &HashSet::new(),
+            PatternSearchQuery {
+                re: &re,
+                options,
+                scope: CrossBlockSearchScope::Command,
+                max_hits: 8,
+                filters: &filters,
+                bookmarks: &HashSet::new(),
+            },
             &mut second_budget,
             Some(&resume),
         );
@@ -6113,12 +6232,14 @@ mod tests {
         };
         let (first_hits, first_resume) = pattern_search_hits_with_budget(
             backend.iter().copied(),
-            &re,
-            options,
-            CrossBlockSearchScope::All,
-            8,
-            &BlockFilters::default(),
-            &HashSet::new(),
+            PatternSearchQuery {
+                re: &re,
+                options,
+                scope: CrossBlockSearchScope::All,
+                max_hits: 8,
+                filters: &BlockFilters::default(),
+                bookmarks: &HashSet::new(),
+            },
             &mut first_budget,
             None,
         );
@@ -6137,12 +6258,14 @@ mod tests {
         };
         let (rest_hits, rest_resume) = pattern_search_hits_with_budget(
             backend.iter().copied(),
-            &re,
-            options,
-            CrossBlockSearchScope::All,
-            8,
-            &BlockFilters::default(),
-            &HashSet::new(),
+            PatternSearchQuery {
+                re: &re,
+                options,
+                scope: CrossBlockSearchScope::All,
+                max_hits: 8,
+                filters: &BlockFilters::default(),
+                bookmarks: &HashSet::new(),
+            },
             &mut second_budget,
             Some(&resume),
         );

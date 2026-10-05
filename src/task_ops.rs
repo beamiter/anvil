@@ -1008,11 +1008,15 @@ impl AppModel {
 mod tests {
     use super::{block_agent_task_anchor_disabled_reason, record_task_terminal_launch_failure};
     use crate::agent_task::{
-        NewTask, TaskManager, TaskStatus, TaskValidationStatus, TaskTerminalRole,
+        NewTask, TaskManager, TaskStatus, TaskTerminalRole, TaskValidationStatus,
     };
     use crate::block_view::BlockAgentEvidence;
 
-    fn sample_evidence(is_background: bool, command: Option<&str>, command_exact: bool) -> BlockAgentEvidence {
+    fn sample_evidence(
+        is_background: bool,
+        command: Option<&str>,
+        command_exact: bool,
+    ) -> BlockAgentEvidence {
         BlockAgentEvidence {
             block_id: 1,
             command: command.map(str::to_string),

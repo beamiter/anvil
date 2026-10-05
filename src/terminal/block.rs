@@ -154,10 +154,7 @@ fn search_in_scope(
     (status, false)
 }
 
-fn validate_block_search_pattern(
-    pattern: &str,
-    case_sensitive: bool,
-) -> Result<(), String> {
+fn validate_block_search_pattern(pattern: &str, case_sensitive: bool) -> Result<(), String> {
     super::vte::compile_count_regex(pattern, case_sensitive)?;
     vte4::Regex::for_search(pattern, super::vte::search_pcre2_flags(case_sensitive))
         .map(|_| ())
@@ -751,21 +748,21 @@ impl Component for BlockTerminal {
                 let _ = sender.output(VteOutput::Notice(message));
             }
             VteInput::SearchSet(query, use_regex, case_sensitive) => {
-                self.search_status =
-                    if let Some(status) = crate::search::oversize_query_status(&query) {
-                        // Do not retain the oversized query: an invalidated Find
-                        // rebuilds from `search_query` and must not re-scan with it.
-                        self.search_query = None;
-                        self.search_live = false;
-                        view.clear_find();
-                        status
-                    } else {
-                        let (status, live) =
-                            search_in_scope(view, &query, use_regex, case_sensitive);
-                        self.search_query = Some((query, use_regex, case_sensitive));
-                        self.search_live = live;
-                        status
-                    };
+                self.search_status = if let Some(status) =
+                    crate::search::oversize_query_status(&query)
+                {
+                    // Do not retain the oversized query: an invalidated Find
+                    // rebuilds from `search_query` and must not re-scan with it.
+                    self.search_query = None;
+                    self.search_live = false;
+                    view.clear_find();
+                    status
+                } else {
+                    let (status, live) = search_in_scope(view, &query, use_regex, case_sensitive);
+                    self.search_query = Some((query, use_regex, case_sensitive));
+                    self.search_live = live;
+                    status
+                };
                 let _ = sender.output(VteOutput::SearchStatus(self.search_status.clone()));
             }
             VteInput::SearchNext | VteInput::SearchPrev => {

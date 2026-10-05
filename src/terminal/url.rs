@@ -307,9 +307,7 @@ mod tests {
 
     #[test]
     fn wrapping_punctuation_does_not_hide_an_openable_url() {
-        let clip = |raw: &str| {
-            clip_plain_url(raw).map(|(_, _, url)| url.to_string())
-        };
+        let clip = |raw: &str| clip_plain_url(raw).map(|(_, _, url)| url.to_string());
         assert_eq!(
             clip("https://example.com").as_deref(),
             Some("https://example.com")

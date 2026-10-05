@@ -145,11 +145,7 @@ pub(crate) fn build_block_history_notice() -> BlockHistoryNoticeChrome {
 /// The newest reason replaces an older one rather than queueing behind it:
 /// every pane in this window shares one file family, and a stale reason would
 /// send the user after a problem that has already been superseded.
-pub(crate) fn reveal_block_history_failure(
-    bar: &gtk::Box,
-    label: &gtk::Label,
-    reason: &str,
-) {
+pub(crate) fn reveal_block_history_failure(bar: &gtk::Box, label: &gtk::Label, reason: &str) {
     let reason = crate::review_input::safe_inline_display(reason, 2 * 1024);
     log::error!("Block history is not being saved: {reason}");
     label.set_text(&format!("Block history was not saved: {reason}"));
@@ -381,12 +377,16 @@ mod tests {
         ];
         let (bar, toast) = partition_persistence_failures(mixed);
         assert_eq!(bar.len(), 2);
-        assert!(bar.iter().all(|f| f.operation == BLOCK_HISTORY_PERSIST_OPERATION));
-        assert_eq!(toast.len(), 2);
-        assert!(toast
+        assert!(bar
             .iter()
-            .all(|f| persistence_failure_surface(&f.operation)
-                == PersistenceFailureSurface::Toast));
+            .all(|f| f.operation == BLOCK_HISTORY_PERSIST_OPERATION));
+        assert_eq!(toast.len(), 2);
+        assert!(
+            toast
+                .iter()
+                .all(|f| persistence_failure_surface(&f.operation)
+                    == PersistenceFailureSurface::Toast)
+        );
         // Newest Block-history reason is preserved in order for the bar.
         assert_eq!(bar[1].error, "volume full");
     }
@@ -447,7 +447,6 @@ mod tests {
         );
     }
 
-
     /// Sticky Retry must `continue` past panes without a Block TermView instead
     /// of aborting — non-Block chrome must not starve later Block panes of
     /// `retry_history_persistence` (pairs forge leaf `continue`).
@@ -484,9 +483,7 @@ mod tests {
             .split("\n    pub(crate) fn persist_config")
             .next()
             .expect("retry closes before persist_config");
-        let hide = retry
-            .find("set_visible(false)")
-            .expect("optimistic hide");
+        let hide = retry.find("set_visible(false)").expect("optimistic hide");
         let walk = retry.find("for tab in").expect("tab walk");
         assert!(hide < walk, "hide must run before the pane walk");
         assert!(

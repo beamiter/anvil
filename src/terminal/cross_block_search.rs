@@ -375,9 +375,7 @@ fn search_status(total: usize, selected: Option<usize>, scan_incomplete: bool) -
         if total == CROSS_BLOCK_SEARCH_LIMIT {
             format!("{position}{total} {noun} (capped) — refine your query.")
         } else if scan_incomplete {
-            format!(
-                "{position}{total} {noun} (scan budget reached — later blocks not examined)"
-            )
+            format!("{position}{total} {noun} (scan budget reached — later blocks not examined)")
         } else {
             format!("{position}{total} {noun}")
         }
@@ -549,17 +547,29 @@ fn jump_unavailable_status() -> &'static str {
     "This result is searchable, but it has no terminal location and no retained output."
 }
 
+/// Palette widgets and bookmark state shared by the initial and continued rows.
+struct CrossBlockHitRowContext<'a> {
+    list_box: &'a gtk::ListBox,
+    view: &'a Rc<TermView>,
+    row_bookmark_buttons: &'a Rc<RefCell<Vec<(u64, gtk::ToggleButton)>>>,
+    status_label: &'a gtk::Label,
+    filter_entry: &'a gtk::SearchEntry,
+    bookmark_changed: &'a BookmarkChangedCallback,
+    bookmarked_filter: &'a gtk::ToggleButton,
+}
+
 fn append_hit_row(
-    list_box: &gtk::ListBox,
-    view: &Rc<TermView>,
+    context: &CrossBlockHitRowContext<'_>,
     hit: &CrossBlockHit,
     jumpable: &std::collections::HashSet<(u64, bool)>,
-    row_bookmark_buttons: &Rc<RefCell<Vec<(u64, gtk::ToggleButton)>>>,
-    status_label: &gtk::Label,
-    filter_entry: &gtk::SearchEntry,
-    bookmark_changed: &BookmarkChangedCallback,
-    bookmarked_filter: &gtk::ToggleButton,
 ) {
+    let list_box = context.list_box;
+    let view = context.view;
+    let row_bookmark_buttons = context.row_bookmark_buttons;
+    let status_label = context.status_label;
+    let filter_entry = context.filter_entry;
+    let bookmark_changed = context.bookmark_changed;
+    let bookmarked_filter = context.bookmarked_filter;
     let surface = if hit.is_output { "out" } else { "cmd" };
     // A hit whose record has no location and no retained
     // output says so before the user activates it.
@@ -584,10 +594,7 @@ fn append_hit_row(
         .valign(gtk::Align::Center)
         .build();
     bookmark_button.add_css_class("flat");
-    sync_bookmark_button(
-        &bookmark_button,
-        view.is_record_bookmarked(hit.block_id),
-    );
+    sync_bookmark_button(&bookmark_button, view.is_record_bookmarked(hit.block_id));
     let record_id = hit.block_id;
     let view_for_bookmark = view.clone();
     let buttons_for_bookmark = row_bookmark_buttons.clone();
@@ -597,25 +604,21 @@ fn append_hit_row(
     let bookmarked_filter = bookmarked_filter.clone();
     bookmark_button.connect_clicked(move |button| {
         let requested = button.is_active();
-        let authoritative =
-            match view_for_bookmark.set_record_bookmarked(record_id, requested) {
-                Some(authoritative) => {
-                    for (id, sibling) in buttons_for_bookmark.borrow().iter() {
-                        if *id == record_id {
-                            sync_bookmark_button(sibling, authoritative);
-                        }
+        let authoritative = match view_for_bookmark.set_record_bookmarked(record_id, requested) {
+            Some(authoritative) => {
+                for (id, sibling) in buttons_for_bookmark.borrow().iter() {
+                    if *id == record_id {
+                        sync_bookmark_button(sibling, authoritative);
                     }
-                    Some(authoritative)
                 }
-                None => {
-                    sync_bookmark_button(button, false);
-                    set_announced_status(
-                        &status_for_bookmark,
-                        "That block is no longer retained.",
-                    );
-                    None
-                }
-            };
+                Some(authoritative)
+            }
+            None => {
+                sync_bookmark_button(button, false);
+                set_announced_status(&status_for_bookmark, "That block is no longer retained.");
+                None
+            }
+        };
         if let Some(authoritative) = authoritative {
             let callback = bookmark_changed.borrow().as_ref().and_then(Weak::upgrade);
             if let Some(callback) = callback {
@@ -926,15 +929,17 @@ pub(super) fn toggle(
                     let jumpable = view.jumpable_search_hits(&results);
                     for hit in &results {
                         append_hit_row(
-                            &list_box,
-                            &view,
+                            &CrossBlockHitRowContext {
+                                list_box: &list_box,
+                                view: &view,
+                                row_bookmark_buttons: &row_bookmark_buttons,
+                                status_label: &status_label,
+                                filter_entry: &filter_entry,
+                                bookmark_changed: &bookmark_changed,
+                                bookmarked_filter: &bookmarked_filter,
+                            },
                             hit,
                             &jumpable,
-                            &row_bookmark_buttons,
-                            &status_label,
-                            &filter_entry,
-                            &bookmark_changed,
-                            &bookmarked_filter,
                         );
                     }
                     let selected = refresh_selection_index(&results, retained_hit.as_ref());
@@ -993,32 +998,30 @@ pub(super) fn toggle(
                                     let jumpable = view.jumpable_search_hits(&more.hits);
                                     for hit in more.hits.iter() {
                                         append_hit_row(
-                                            &list_box,
-                                            &view,
+                                            &CrossBlockHitRowContext {
+                                                list_box: &list_box,
+                                                view: &view,
+                                                row_bookmark_buttons: &row_bookmark_buttons,
+                                                status_label: &status_label,
+                                                filter_entry: &filter_entry,
+                                                bookmark_changed: &bookmark_changed,
+                                                bookmarked_filter: &bookmarked_filter,
+                                            },
                                             hit,
                                             &jumpable,
-                                            &row_bookmark_buttons,
-                                            &status_label,
-                                            &filter_entry,
-                                            &bookmark_changed,
-                                            &bookmarked_filter,
                                         );
                                     }
                                     hits.borrow_mut().extend(more.hits.iter().cloned());
                                     let total = hits.borrow().len();
                                     scan_incomplete.set(more.scan_incomplete);
                                     let bookmarked_empty = if filters.bookmarked_only {
-                                        view.bookmarked_empty_search_status(
-                                            &query, scope, &filters,
-                                        )
+                                        view.bookmarked_empty_search_status(&query, scope, &filters)
                                     } else {
                                         None
                                     };
                                     status_label.set_text(&overlay_scan_status(
                                         total,
-                                        list_box
-                                            .selected_row()
-                                            .map(|row| row.index() as usize),
+                                        list_box.selected_row().map(|row| row.index() as usize),
                                         more.scan_incomplete,
                                         bookmarked_empty,
                                     ));
@@ -2151,16 +2154,31 @@ mod tests {
 
         assert_eq!(search_status(0, None, false), "No matches.");
         assert_eq!(
-            overlay_scan_status(0, None, false, Some("No bookmarked blocks in retained history.")),
+            overlay_scan_status(
+                0,
+                None,
+                false,
+                Some("No bookmarked blocks in retained history.")
+            ),
             "No bookmarked blocks in retained history."
         );
         assert_eq!(
-            overlay_scan_status(0, None, true, Some("No bookmarked blocks in retained history.")),
+            overlay_scan_status(
+                0,
+                None,
+                true,
+                Some("No bookmarked blocks in retained history.")
+            ),
             search_status(0, None, true),
             "an incomplete scan keeps the budget copy even under Bookmarked"
         );
         assert_eq!(
-            overlay_scan_status(1, Some(0), false, Some("No bookmarked blocks in retained history.")),
+            overlay_scan_status(
+                1,
+                Some(0),
+                false,
+                Some("No bookmarked blocks in retained history.")
+            ),
             "1 of 1 match"
         );
         assert_eq!(search_status(1, Some(0), false), "1 of 1 match");

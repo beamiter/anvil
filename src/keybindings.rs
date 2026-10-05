@@ -1320,9 +1320,7 @@ toggle_block_collapsed = "F10"
             .all_bound_actions()
             .iter()
             .any(|(action, _)| *action == Action::DeleteSelectedBlocks));
-        let table = r#"delete_selected_blocks = "F7""#
-            .parse::<toml::Table>()
-            .unwrap();
+        let table = r#"delete_selected_blocks = "F7""#.parse::<toml::Table>().unwrap();
         map.apply_user_overrides(&table).unwrap();
         assert_eq!(
             map.lookup(&parse("F7").unwrap()),

@@ -849,9 +849,9 @@ impl Component for VteTerminal {
                 let _ = sender.output(VteOutput::SearchStatus(SearchStatus::Idle));
             }
             VteInput::CrossBlockSearch => {
-                let _ = sender.output(VteOutput::Notice(
-                    vte_block_mode_only_notice("Cross-block search"),
-                ));
+                let _ = sender.output(VteOutput::Notice(vte_block_mode_only_notice(
+                    "Cross-block search",
+                )));
             }
             VteInput::AskAiAboutSelectedBlock => {
                 let _ = sender.output(VteOutput::Notice(ask_ai_empty_notice().to_string()));
@@ -1040,10 +1040,9 @@ fn search_status_for_vte(
 #[cfg(test)]
 mod tests {
     use super::{
-        compile_count_regex, copy_empty_notice, ask_ai_empty_notice, vte_block_mode_only_notice,
-        launch_failure_message,
-        search_pattern, search_pcre2_flags,
-        search_status_for_vte, InitialCommands, TerminalSearchSnapshot,
+        ask_ai_empty_notice, compile_count_regex, copy_empty_notice, launch_failure_message,
+        search_pattern, search_pcre2_flags, search_status_for_vte, vte_block_mode_only_notice,
+        InitialCommands, TerminalSearchSnapshot,
     };
     use crate::search::SearchStatus;
 
@@ -1053,10 +1052,7 @@ mod tests {
 
     #[test]
     fn copy_with_no_selection_explains_itself() {
-        assert_eq!(
-            copy_empty_notice(false),
-            Some("Nothing selected to copy.")
-        );
+        assert_eq!(copy_empty_notice(false), Some("Nothing selected to copy."));
         assert_eq!(copy_empty_notice(true), None);
     }
 
@@ -1170,10 +1166,7 @@ mod tests {
         assert_eq!(sensitive.find_iter("ab AB Ab").count(), 1);
         let insensitive = compile_count_regex("Ab", false).unwrap();
         assert_eq!(insensitive.find_iter("ab AB Ab").count(), 3);
-        assert_ne!(
-            search_pcre2_flags(false) & pcre2_sys::PCRE2_CASELESS,
-            0
-        );
+        assert_ne!(search_pcre2_flags(false) & pcre2_sys::PCRE2_CASELESS, 0);
         assert_eq!(search_pcre2_flags(true) & pcre2_sys::PCRE2_CASELESS, 0);
     }
 

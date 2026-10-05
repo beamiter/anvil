@@ -66,8 +66,9 @@ pub(crate) enum HistoryRetryAction {
 /// whether the load *Failed*. Saves enqueue under
 /// [`BLOCK_HISTORY_PERSIST_OPERATION`] with the revision intent snapshotted
 /// from this pane's baselines.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum HistoryLoadOutcome {
+    #[default]
     Idle,
     Pending,
     Loaded,
@@ -75,12 +76,6 @@ pub(crate) enum HistoryLoadOutcome {
         kind: io::ErrorKind,
         message: Arc<str>,
     },
-}
-
-impl Default for HistoryLoadOutcome {
-    fn default() -> Self {
-        Self::Idle
-    }
 }
 
 pub(crate) fn history_retry_action(outcome: &HistoryLoadOutcome) -> HistoryRetryAction {
@@ -226,10 +221,7 @@ fn plan_history_saves(
     saves
 }
 
-fn enqueue_pending_clear(
-    pending: &Mutex<VecDeque<HistoryTarget>>,
-    target: Option<HistoryTarget>,
-) {
+fn enqueue_pending_clear(pending: &Mutex<VecDeque<HistoryTarget>>, target: Option<HistoryTarget>) {
     let Some(target) = target else {
         return;
     };
@@ -1478,12 +1470,7 @@ fn enqueue_history_saves(
     if saves.is_empty() {
         return Ok(());
     }
-    let key_path = saves
-        .last()
-        .expect("non-empty saves")
-        .target
-        .path
-        .clone();
+    let key_path = saves.last().expect("non-empty saves").target.path.clone();
     let key = PersistenceKey::for_path("block-history", &key_path);
     let estimated_bytes = estimated_snapshot_retained_bytes(&blocks, blocks.capacity());
     persistence::enqueue_weighted(
@@ -1702,8 +1689,7 @@ impl TermView {
             ) {
                 *self.history_load_outcome.borrow_mut() = HistoryLoadOutcome::Idle;
             }
-        } else if let Some(error) =
-            refuse_save_for_failed_load(&self.history_load_outcome.borrow())
+        } else if let Some(error) = refuse_save_for_failed_load(&self.history_load_outcome.borrow())
         {
             return Err(error);
         }
@@ -3136,9 +3122,14 @@ mod tests {
 
         let mut saw_present_revision = false;
         for _ in 0..100 {
-            if baselines.lock().unwrap().get(&path).is_some_and(|baseline| {
-                matches!(baseline.revision, Some(HistoryRevision::Present { .. }))
-            }) {
+            if baselines
+                .lock()
+                .unwrap()
+                .get(&path)
+                .is_some_and(|baseline| {
+                    matches!(baseline.revision, Some(HistoryRevision::Present { .. }))
+                })
+            {
                 saw_present_revision = true;
                 break;
             }

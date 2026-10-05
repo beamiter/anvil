@@ -33,12 +33,10 @@
               # then run `nix flake check --no-write-lock-file` and copy `got:`.
               # Full revisions beside the hashes make a stale repin conspicuous.
               outputHashes = {
-                # 628811b0261a71c08c6ea2825ba592b6c1d19e80
-                # (matches path-patched local jterm_core / forge direct pin;
-                # published jterm_core@33093da still declares 6ed0b9f until core push)
-                "jagent-0.7.0" = "sha256-JohDGlsirFpTxl/kiv2yZj69KnVGwXjrgRWzP03CszE=";
-                # 33093dab3bbe620a1bd4bee7c33d6a37289f9f5f
-                "jterm_core-0.2.0" = "sha256-P9ucN+gdQyuhr8gLF/bsMvO0FA/a+WCMmfrDY239HOo=";
+                # d1d3bc2251f3fba4468f689a655a932e00a83d86
+                "jagent-0.7.0" = "sha256-Fv9nytvUJWAatoq2Zb14TN6jhh/eKx1spOQ9mz+65ZU=";
+                # faca744b2d5b840f2229bde7ee67887c56d23b2d
+                "jterm_core-0.2.0" = "sha256-tEr/YVdrdjNYMYYeK4C4B5cTWOpaozxk9jYZiW3i3GY=";
               };
             };
             strictDeps = true;

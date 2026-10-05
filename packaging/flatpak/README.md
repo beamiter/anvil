@@ -57,5 +57,6 @@ stored in `config.toml`; provide them through a trusted launcher or an explicit
 Flatpak override.
 
 To regenerate `cargo-sources.json`, use the pinned Flatpak Cargo generator
-against the repository's current `Cargo.lock`, then verify that the JSON has
-exactly two entries per registry package plus the final Cargo source config.
+against the repository's current `Cargo.lock`. Verify each registry package's
+archive and checksum entries, each Git dependency's locked revision and vendored
+manifest, and the final Cargo source config.
