@@ -7,6 +7,15 @@ versioning for tagged releases while it remains experimental.
 
 ### Added
 
+- Finished Block cards separate wrapping folder/branch/time metadata from their
+  status and primary copy/insert controls. A named **More output actions** menu
+  keeps filtering, output-edge navigation and expansion available in narrow panes.
+- Keyboard focus and an open output menu keep Block actions visible after the
+  pointer leaves. Fold controls preserve terminal focus, expose expanded state
+  to assistive technology, and summarize image-only and mixed output accurately.
+  Empty text output disables copy/filter controls instead of offering no-op actions.
+
+
 - **Grouped Block delete is a real document operation.** Selecting cards and
   pressing `Delete`, or using `Delete Block` / `Delete N Blocks` on the card
   menu, now persists immediately, clears find, updates the viewport, and

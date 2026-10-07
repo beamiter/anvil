@@ -172,13 +172,23 @@ impl CommandPromptStatus {
 fn next_block_id(reserved: &RefCell<HashSet<u64>>) -> u64 {
     let mut reserved = reserved.borrow_mut();
     claim_next_unused_block_id(&mut reserved, || {
-        let sequence = BLOCK_ID_COUNTER
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current
-                    .checked_add(1)
-                    .filter(|next| *next <= BLOCK_ID_SEQUENCE_LIMIT)
-            })
-            .unwrap_or_else(|_| panic!("completed-block id sequence exhausted"));
+        // Keep compatibility with Rust versions predating Atomic::try_update.
+        let mut sequence = BLOCK_ID_COUNTER.load(Ordering::Relaxed);
+        loop {
+            let next = sequence
+                .checked_add(1)
+                .filter(|next| *next <= BLOCK_ID_SEQUENCE_LIMIT)
+                .unwrap_or_else(|| panic!("completed-block id sequence exhausted"));
+            match BLOCK_ID_COUNTER.compare_exchange_weak(
+                sequence,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(current) => sequence = current,
+            }
+        }
         process_block_id_namespace() | sequence
     })
 }
@@ -794,7 +804,9 @@ fn focused_widget_keeps_key(
             keyval,
             Key::Return | Key::KP_Enter | Key::ISO_Enter | Key::space
         )
-        && (focused.is::<gtk::Button>() || focused.is::<gtk::CheckButton>())
+        && (focused.is::<gtk::Button>()
+            || focused.is::<gtk::MenuButton>()
+            || focused.is::<gtk::CheckButton>())
     {
         // Preserve GTK keyboard accessibility: unmodified Return and Space
         // activate the focused header control. Ctrl+Return remains modified
@@ -2340,9 +2352,7 @@ fn sync_finished_block_selection(
             blocks::reveal_block_actions(&block.action_box, true);
         } else {
             block.widget().remove_css_class("block-selection-active");
-            if !block.widget().has_css_class("block-hovered") {
-                blocks::reveal_block_actions(&block.action_box, false);
-            }
+            blocks::sync_block_actions(block.widget(), &block.action_box);
         }
     }
 }
@@ -2883,7 +2893,7 @@ fn press_lands_on_header_button(card: &gtk::Widget, header_row: &gtk::Box, x: f6
         if widget == *card {
             return false;
         }
-        on_button |= widget.is::<gtk::Button>();
+        on_button |= widget.is::<gtk::Button>() || widget.is::<gtk::MenuButton>();
         current = widget.parent();
     }
     false
@@ -17491,7 +17501,7 @@ mod tests {
 
     #[test]
     fn malformed_control_string_escape_aborts_then_replays_reset_candidate() {
-        for introducer in [b'P', b'_', b'^', b'X'] {
+        for introducer in *b"P_^X" {
             let mut splitter = ResetAwareParserSplitter::default();
             let mut prefix = vec![0x1b, introducer];
             prefix.extend_from_slice(b"payload\x07\x1b");
@@ -22588,6 +22598,23 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
             true,
         ));
 
+        let menu: gtk::Widget = gtk::MenuButton::new().upcast();
+        card_shell.append(&menu);
+        for key in [Key::Return, Key::space] {
+            assert!(super::focused_widget_keeps_key(
+                &menu,
+                key,
+                ModifierType::empty(),
+                true,
+            ));
+        }
+        assert!(!super::focused_widget_keeps_key(
+            &menu,
+            Key::Return,
+            ModifierType::CONTROL_MASK,
+            true,
+        ));
+
         // The running Ctrl+C / Ctrl+D rescue yields only to a field that
         // edits text; a snapshot VTE or read-only text keeps it.
         assert!(super::focus_edits_text(&entry));
@@ -23567,6 +23594,16 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
             &block.header_row,
             x,
             y
+        ));
+
+        let more = block.action_box.last_child().expect("overflow control");
+        assert!(more.is::<gtk::MenuButton>());
+        let bounds = more.compute_bounds(&card).expect("overflow is laid out");
+        assert!(super::press_lands_on_header_button(
+            &card,
+            &block.header_row,
+            f64::from(bounds.x() + bounds.width() / 2.0),
+            f64::from(bounds.y() + bounds.height() / 2.0),
         ));
 
         // The rest of the header still selects the card.

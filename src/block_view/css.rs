@@ -1084,6 +1084,20 @@ fn block_css(config: &Config) -> String {
         .block-header {{
             border-radius: 6px 6px 0 0;
         }}
+        .block-context {{
+            margin: 0 8px 2px 12px;
+        }}
+        .block-compact .block-context {{
+            margin: 0 6px 2px 8px;
+        }}
+        .block-context > flowboxchild {{
+            padding: 0;
+            min-width: 0;
+        }}
+        .block-action-btn:focus-visible, .block-collapse-btn:focus-visible {{
+            outline: 2px solid {accent};
+            outline-offset: 1px;
+        }}
         .block-header-label {{
             color: {dim_fg};
             font-size: 0.85em;

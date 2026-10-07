@@ -45,6 +45,19 @@ pub(crate) fn reveal_block_actions(action_box: &gtk::Box, revealed: bool) {
     action_box.set_sensitive(revealed);
 }
 
+/// Pointer, keyboard and popover ownership all keep actions available. In
+/// particular, leaving the card with the pointer must not disable a focused
+/// button or close the overflow menu underneath a keyboard user.
+pub(crate) fn sync_block_actions(outer: &gtk::Box, actions: &gtk::Box) {
+    reveal_block_actions(
+        actions,
+        outer.has_css_class("block-hovered")
+            || outer.has_css_class("block-selection-active")
+            || actions.has_css_class("block-actions-focused")
+            || actions.has_css_class("block-actions-open"),
+    );
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CompletedBlockRetentionPlan {
     /// Number of oldest entries to remove from every block-indexed collection.
@@ -1142,14 +1155,24 @@ fn line_count_text(rows: i64) -> String {
     }
 }
 
-fn collapsed_output_summary(rows: i64) -> String {
-    format!("▸ {} hidden — click to show", line_count_text(rows))
+fn collapsed_output_summary(rows: i64, has_text: bool, images: usize) -> String {
+    let mut parts = Vec::new();
+    if has_text {
+        parts.push(line_count_text(rows));
+    }
+    if images > 0 {
+        parts.push(format!(
+            "{images} {}",
+            if images == 1 { "image" } else { "images" }
+        ));
+    }
+    format!("▸ {} hidden — show output", parts.join(" · "))
 }
 
-/// Rows a finished block spends on chrome that is not its output: the command
-/// row plus the card's own padding. Reserved alongside the live input cell so a
+/// Rows a finished block spends on chrome that is not its output: the header,
+/// wrapping context, command row and the card's own padding. Reserved alongside the live input cell so a
 /// capped block still leaves the prompt visible beneath it.
-const FINISHED_BLOCK_NON_OUTPUT_ROWS: i64 = 3;
+const FINISHED_BLOCK_NON_OUTPUT_ROWS: i64 = 4;
 
 /// Rows of output a finished block may show, derived from the history
 /// viewport's own height.
@@ -2519,13 +2542,119 @@ mod tests {
     #[test]
     fn collapsed_summary_uses_singular_and_plural_line_counts() {
         assert_eq!(
-            collapsed_output_summary(1),
-            "▸ 1 line hidden — click to show"
+            collapsed_output_summary(1, true, 0),
+            "▸ 1 line hidden — show output"
         );
         assert_eq!(
-            collapsed_output_summary(42),
-            "▸ 42 lines hidden — click to show"
+            collapsed_output_summary(42, true, 0),
+            "▸ 42 lines hidden — show output"
         );
+    }
+
+    #[test]
+    fn folded_images_are_not_reported_as_terminal_lines() {
+        assert_eq!(
+            collapsed_output_summary(1, false, 1),
+            "▸ 1 image hidden — show output"
+        );
+        assert_eq!(
+            collapsed_output_summary(1, false, 3),
+            "▸ 3 images hidden — show output"
+        );
+        assert_eq!(
+            collapsed_output_summary(42, true, 2),
+            "▸ 42 lines · 2 images hidden — show output"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn repeated_action_feedback_restores_the_original_affordance() {
+        gtk::init().expect("gtk init");
+        let button = icon_button("edit-copy-symbolic", "Copy output");
+        let feedback = ButtonFeedback::new(&button);
+        feedback.flash(&button, "emblem-ok-symbolic", "Output copied");
+        feedback.flash(&button, "dialog-warning-symbolic", "Try again");
+        assert_eq!(button.tooltip_text().as_deref(), Some("Try again"));
+        let context = glib::MainContext::default();
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(1100) {
+            while context.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(button.icon_name().as_deref(), Some("edit-copy-symbolic"));
+        assert_eq!(button.tooltip_text().as_deref(), Some("Copy output"));
+        assert!(feedback.pending.borrow().is_none());
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn block_actions_keep_keyboard_and_popover_ownership() {
+        gtk::init().expect("gtk init");
+        let outer = gtk::Box::new(Orientation::Vertical, 0);
+        let actions = gtk::Box::new(Orientation::Horizontal, 0);
+        for owner in ["block-actions-focused", "block-actions-open"] {
+            actions.add_css_class(owner);
+            sync_block_actions(&outer, &actions);
+            assert!(actions.is_sensitive());
+            assert!(actions.can_target());
+            assert_eq!(actions.opacity(), 1.0);
+            actions.remove_css_class(owner);
+        }
+        for owner in ["block-hovered", "block-selection-active"] {
+            outer.add_css_class(owner);
+            sync_block_actions(&outer, &actions);
+            assert!(actions.is_sensitive());
+            outer.remove_css_class(owner);
+        }
+        sync_block_actions(&outer, &actions);
+        assert!(!actions.is_sensitive());
+        assert!(!actions.can_target());
+        assert_eq!(actions.opacity(), 0.0);
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn block_context_wraps_separately_and_empty_output_actions_are_disabled() {
+        gtk::init().expect("gtk init");
+        let card = FinishedBlock::new(
+            81,
+            "$ ",
+            "true",
+            None,
+            "",
+            Some(0),
+            &Config::safe_defaults(),
+            Some(42),
+            Some(1_700_000_000_000),
+            Some("/a/very/long/project/path"),
+            40,
+        );
+        assert!(!card.copy_output_btn.is_sensitive());
+        assert!(!card.collapsed_state.get());
+        (card.toggle_collapsed)();
+        assert!(!card.collapsed_state.get());
+        let context = card.header_row.next_sibling().expect("context row");
+        assert!(context.is::<gtk::FlowBox>());
+        let context = context
+            .downcast::<gtk::FlowBox>()
+            .expect("wrapping context");
+        assert_eq!(context.selection_mode(), gtk::SelectionMode::None);
+        let mut child = card.header_row.first_child();
+        while let Some(widget) = child {
+            assert!(!widget.has_css_class("block-chip"));
+            child = widget.next_sibling();
+        }
+        let more = card.action_box.last_child().expect("overflow");
+        let more = more.downcast::<gtk::MenuButton>().expect("menu button");
+        let popover = more.popover().expect("output actions");
+        let actions = popover.child().expect("action list");
+        let filter = actions.first_child().expect("filter");
+        assert!(!filter.is_sensitive());
+        let collapse = card.header_row.last_child().expect("fold button");
+        let collapse = collapse.downcast::<gtk::Button>().expect("fold button");
+        assert!(!collapse.gets_focus_on_click());
+        assert!(!collapse.is_sensitive());
     }
 
     #[test]
@@ -3035,9 +3164,9 @@ const fn finished_card_vchrome_px(compact: bool) -> i32 {
 
 pub(crate) fn estimated_finished_block_height(config: &Config, output_rows: i64) -> i32 {
     let cell = estimated_cell_height_px(config);
-    // Header + command row + output rows + margins/borders/filter slack.
+    // Header + wrapping context + command + output + margins/filter slack.
     let rows = output_rows.clamp(1, i32::MAX as i64) as i32;
-    rows.saturating_add(2)
+    rows.saturating_add(3)
         .saturating_mul(cell)
         .saturating_add(finished_card_vchrome_px(config.block_compact))
 }
@@ -3088,20 +3217,50 @@ pub(crate) fn estimated_finished_block_height_for_rows(
     estimated_finished_block_height(config, visible_rows)
 }
 
-fn flash_button_icon(btn: &gtk::Button, icon_name: &'static str, tooltip: &'static str) {
-    let old_icon = btn.icon_name().map(|s| s.to_string());
-    let old_tooltip = btn.tooltip_text().map(|s| s.to_string());
-    set_icon_button(btn, icon_name, tooltip);
-    let btn_for_restore = btn.clone();
-    glib::timeout_add_local_once(std::time::Duration::from_millis(900), move || {
-        if let Some(icon_name) = old_icon.as_deref() {
-            btn_for_restore.set_icon_name(icon_name);
+fn set_output_action_label(button: &gtk::Button, label: &str) {
+    button.set_label(label);
+    button.set_tooltip_text(Some(label));
+    button.update_property(&[gtk::accessible::Property::Label(label)]);
+}
+
+/// Stable per-action baseline and one cancellable feedback timer. Repeated
+/// clicks must never adopt a transient success/refusal as the permanent label.
+struct ButtonFeedback {
+    icon: Option<glib::GString>,
+    tooltip: Option<glib::GString>,
+    pending: RefCell<Option<glib::SourceId>>,
+}
+
+impl ButtonFeedback {
+    fn new(button: &gtk::Button) -> Rc<Self> {
+        Rc::new(Self {
+            icon: button.icon_name(),
+            tooltip: button.tooltip_text(),
+            pending: RefCell::new(None),
+        })
+    }
+
+    fn flash(self: &Rc<Self>, button: &gtk::Button, icon: &str, label: &str) {
+        if let Some(pending) = self.pending.borrow_mut().take() {
+            pending.remove();
         }
-        btn_for_restore.set_tooltip_text(old_tooltip.as_deref());
-        if let Some(accessible_label) = old_tooltip.as_deref() {
-            btn_for_restore.update_property(&[gtk::accessible::Property::Label(accessible_label)]);
-        }
-    });
+        set_icon_button(button, icon, label);
+        let button = button.downgrade();
+        let state = self.clone();
+        let pending = glib::timeout_add_local_once(Duration::from_millis(900), move || {
+            state.pending.borrow_mut().take();
+            if let Some(button) = button.upgrade() {
+                if let Some(icon) = state.icon.as_deref() {
+                    button.set_icon_name(icon);
+                }
+                button.set_tooltip_text(state.tooltip.as_deref());
+                if let Some(label) = state.tooltip.as_deref() {
+                    button.update_property(&[gtk::accessible::Property::Label(label)]);
+                }
+            }
+        });
+        *self.pending.borrow_mut() = Some(pending);
+    }
 }
 
 /// Feed one snapshot into a read-only finished VTE so the render is atomic with
@@ -3690,6 +3849,18 @@ impl FinishedBlock {
         lifecycle_chip.set_visible(false);
         header_row.append(&lifecycle_chip);
 
+        // Secondary context wraps independently from status and primary actions.
+        // Long paths must never displace Copy, recall, or the fold affordance.
+        let metadata = gtk::FlowBox::new();
+        metadata.add_css_class("block-context");
+        metadata.set_selection_mode(gtk::SelectionMode::None);
+        metadata.set_min_children_per_line(1);
+        metadata.set_max_children_per_line(8);
+        metadata.set_column_spacing(6);
+        metadata.set_row_spacing(2);
+        metadata.set_halign(gtk::Align::Fill);
+        metadata.set_hexpand(true);
+
         // Context chips (Warp-style): cwd pill + git-branch pill.
         if let Some(cwd_path) = cwd {
             let shortened = shorten_path(cwd_path);
@@ -3701,7 +3872,7 @@ impl FinishedBlock {
             cwd_chip.set_halign(gtk::Align::Start);
             cwd_chip.set_ellipsize(gtk::pango::EllipsizeMode::Start);
             cwd_chip.set_max_width_chars(40);
-            header_row.append(&cwd_chip);
+            metadata.insert(&cwd_chip, -1);
 
             if let Some(branch) = git_branch_for(cwd_path) {
                 let git_chip = gtk::Label::new(Some(&format!("Branch: {branch}")));
@@ -3709,15 +3880,15 @@ impl FinishedBlock {
                 git_chip.set_halign(gtk::Align::Start);
                 git_chip.set_ellipsize(gtk::pango::EllipsizeMode::End);
                 git_chip.set_max_width_chars(28);
-                header_row.append(&git_chip);
+                metadata.insert(&git_chip, -1);
             }
         }
 
         // A selected card is a lightweight navigation mode. Put its actual
         // keyboard actions on screen instead of requiring the user to remember
         // them. This label deliberately precedes the expanding spacer: it
-        // spends the spacer's slack and therefore cannot shove timestamp,
-        // duration, exit status, or quick actions sideways as selection moves.
+        // spends the spacer's slack before the status and primary actions.
+        // Secondary metadata wraps independently beneath this row.
         let selection_hint = gtk::Label::new(None);
         selection_hint.add_css_class("block-selection-hint");
         selection_hint.set_accessible_role(gtk::AccessibleRole::Status);
@@ -3746,7 +3917,16 @@ impl FinishedBlock {
             let sec = local_secs % 60;
             let ts_label = gtk::Label::new(Some(&format!("{:02}:{:02}:{:02}", h, m, sec)));
             ts_label.add_css_class("block-header-label");
-            header_row.append(&ts_label);
+            if let Some(completed) = i64::try_from(secs)
+                .ok()
+                .and_then(|secs| glib::DateTime::from_unix_local(secs).ok())
+                .and_then(|time| time.format("%Y-%m-%d %H:%M:%S %Z").ok())
+            {
+                let detail = format!("Completed: {completed}");
+                ts_label.set_tooltip_text(Some(&detail));
+                ts_label.update_property(&[gtk::accessible::Property::Label(&detail)]);
+            }
+            metadata.insert(&ts_label, -1);
         }
 
         // Duration badge. Shares Unified's formatter: the card used to round
@@ -3759,7 +3939,7 @@ impl FinishedBlock {
             // The badge rounds; the tooltip does not. Comparing two runs of the
             // same build is the reason anyone reads this number at all.
             dur_label.set_tooltip_text(Some(&format!("{dur_ms} ms")));
-            header_row.append(&dur_label);
+            metadata.insert(&dur_label, -1);
         }
 
         // Exit code badge
@@ -3780,16 +3960,17 @@ impl FinishedBlock {
         // would otherwise swallow the header clicks that select the block.
         action_box.add_css_class("block-action-box");
         reveal_block_actions(&action_box, false);
-        // Small gap between the meta badges (timestamp/duration/exit) on the
-        // right and the action button group, so they read as separate units
-        // rather than one undifferentiated cluster.
+        // Keep status and primary actions visually distinct.
         action_box.set_margin_start(6);
         // Three distinct glyphs. The two copy actions shared `edit-copy` and
         // were therefore separable only by hovering for a tooltip, which is the
         // one thing a quick-action row exists to avoid.
         let copy_cmd_btn = icon_button("edit-copy-symbolic", "Copy command");
         let copy_output_btn = icon_button("text-x-generic-symbolic", "Copy output");
-        let rerun_btn = icon_button("insert-text-symbolic", "Insert command at prompt");
+        let rerun_btn = icon_button(
+            "insert-text-symbolic",
+            "Insert command at prompt for review (does not run)",
+        );
         // Commandless background blocks retain output actions, find/filter,
         // bookmarks and selection, but cannot copy or recall a command.
         copy_cmd_btn.set_visible(!is_background);
@@ -3802,14 +3983,7 @@ impl FinishedBlock {
         // (`finished_block_max_expanded_rows`). Wired below once output_rows and
         // the output VTE exist.
         let expand_btn = icon_button("view-fullscreen-symbolic", "Expand block");
-        for btn in [
-            &copy_cmd_btn,
-            &copy_output_btn,
-            &rerun_btn,
-            &filter_btn,
-            &jump_bottom_btn,
-            &expand_btn,
-        ] {
+        for btn in [&copy_cmd_btn, &copy_output_btn, &rerun_btn] {
             btn.add_css_class("block-action-btn");
             btn.add_css_class("flat");
             // A click runs the action and leaves focus where it was — the live
@@ -3819,7 +3993,76 @@ impl FinishedBlock {
             btn.set_focus_on_click(false);
             action_box.append(btn);
         }
+        // Less frequent output tools live in a keyboard-accessible overflow,
+        // leaving the three copy/reuse actions stable in narrow split panes.
+        let more = gtk::MenuButton::new();
+        more.set_focus_on_click(false);
+        more.set_icon_name("view-more-symbolic");
+        more.set_tooltip_text(Some("More output actions"));
+        more.update_property(&[gtk::accessible::Property::Label("More output actions")]);
+        more.add_css_class("flat");
+        more.add_css_class("block-action-btn");
+        let popover = gtk::Popover::new();
+        let overflow = gtk::Box::new(Orientation::Vertical, 4);
+        overflow.set_margin_top(6);
+        overflow.set_margin_bottom(6);
+        overflow.set_margin_start(6);
+        overflow.set_margin_end(6);
+        for btn in [&filter_btn, &jump_bottom_btn, &expand_btn] {
+            btn.add_css_class("flat");
+            btn.set_focus_on_click(false);
+            btn.set_label(btn.tooltip_text().as_deref().unwrap_or(""));
+            btn.set_halign(gtk::Align::Fill);
+            btn.connect_tooltip_text_notify(|button| {
+                button.set_label(button.tooltip_text().as_deref().unwrap_or(""));
+            });
+            overflow.append(btn);
+            let popover_weak = popover.downgrade();
+            btn.connect_clicked(move |_| {
+                if let Some(popover) = popover_weak.upgrade() {
+                    popover.popdown();
+                }
+            });
+        }
+        popover.set_child(Some(&overflow));
+        more.set_popover(Some(&popover));
+        action_box.append(&more);
         header_row.append(&action_box);
+        {
+            let actions = action_box.downgrade();
+            let card = outer.downgrade();
+            popover.connect_visible_notify(move |popover| {
+                if let (Some(actions), Some(card)) = (actions.upgrade(), card.upgrade()) {
+                    if popover.is_visible() {
+                        actions.add_css_class("block-actions-open");
+                    } else {
+                        actions.remove_css_class("block-actions-open");
+                    }
+                    sync_block_actions(&card, &actions);
+                }
+            });
+        }
+        let focus = gtk::EventControllerFocus::new();
+        {
+            let actions = action_box.downgrade();
+            focus.connect_enter(move |_| {
+                if let Some(actions) = actions.upgrade() {
+                    actions.add_css_class("block-actions-focused");
+                    reveal_block_actions(&actions, true);
+                }
+            });
+        }
+        {
+            let actions = action_box.downgrade();
+            let card = outer.downgrade();
+            focus.connect_leave(move |_| {
+                if let (Some(actions), Some(card)) = (actions.upgrade(), card.upgrade()) {
+                    actions.remove_css_class("block-actions-focused");
+                    sync_block_actions(&card, &actions);
+                }
+            });
+        }
+        outer.add_controller(focus);
 
         let outer_for_enter = outer.clone();
         let action_box_for_enter = action_box.clone();
@@ -3832,9 +4075,7 @@ impl FinishedBlock {
         hover_ctrl.connect_leave(move |_| {
             outer_for_leave.remove_css_class("block-hovered");
             // Only the active edge of a multi-selection owns persistent actions.
-            if !outer_for_leave.has_css_class("block-selection-active") {
-                reveal_block_actions(&action_box_for_leave, false);
-            }
+            sync_block_actions(&outer_for_leave, &action_box_for_leave);
         });
         outer.add_controller(hover_ctrl);
 
@@ -3842,9 +4083,18 @@ impl FinishedBlock {
         let collapse_btn = icon_button("go-down-symbolic", "Hide output");
         collapse_btn.add_css_class("block-collapse-btn");
         collapse_btn.add_css_class("flat");
+        collapse_btn.set_focus_on_click(false);
         header_row.append(&collapse_btn);
 
         content.append(&header_row);
+        if metadata.first_child().is_some() {
+            let mut child = metadata.first_child();
+            while let Some(item) = child {
+                item.set_focusable(false);
+                child = item.next_sibling();
+            }
+            content.append(&metadata);
+        }
 
         // ── VTE-rendered command + output ─────────────────────────────────
         // Command VTE: single-row read-only renderer for the executed command.
@@ -4066,9 +4316,9 @@ impl FinishedBlock {
                     output_vte_for_btn.set_height_request(finished_vte_height_px(visible_rows, ch));
                 }
                 if now_expanded {
-                    set_icon_button(btn, "view-restore-symbolic", "Collapse to default height");
+                    set_output_action_label(btn, "Collapse to default height");
                 } else {
-                    set_icon_button(btn, "view-fullscreen-symbolic", "Expand block");
+                    set_output_action_label(btn, "Expand block");
                 }
             });
         }
@@ -4165,7 +4415,12 @@ impl FinishedBlock {
             Some(ib)
         };
 
-        let collapsed_summary = gtk::Button::with_label(&collapsed_output_summary(output_rows));
+        let collapsed_summary = gtk::Button::with_label(&collapsed_output_summary(
+            output_rows,
+            !output.trim().is_empty(),
+            images.len(),
+        ));
+        collapsed_summary.set_focus_on_click(false);
         collapsed_summary.add_css_class("block-output-summary");
         collapsed_summary.add_css_class("flat");
         collapsed_summary.set_halign(gtk::Align::Start);
@@ -4207,6 +4462,12 @@ impl FinishedBlock {
 
         let has_output = !output.trim().is_empty();
         let has_images = images_box.is_some();
+        copy_output_btn.set_sensitive(has_output);
+        filter_btn.set_sensitive(has_output);
+        if !has_output {
+            copy_output_btn.set_tooltip_text(Some("No text output to copy"));
+            filter_btn.set_tooltip_text(Some("No text output to filter"));
+        }
         if !has_output {
             output_widget.set_visible(false);
         }
@@ -4222,6 +4483,9 @@ impl FinishedBlock {
                 &format!("Toggle output ({})", line_count_text(output_rows)),
             );
         }
+        collapse_btn.update_state(&[gtk::accessible::State::Expanded(
+            (has_output || has_images).then_some(true),
+        )]);
         let collapsed_state: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let set_collapsed: Rc<dyn Fn(bool)> = {
             let collapsed_state = collapsed_state.clone();
@@ -4239,7 +4503,10 @@ impl FinishedBlock {
                 ) else {
                     return;
                 };
-                collapsed_state.set(collapsed);
+                if collapsed_state.replace(collapsed) == collapsed {
+                    return;
+                }
+                collapse_btn.update_state(&[gtk::accessible::State::Expanded(Some(!collapsed))]);
                 // Image-only blocks keep their empty output VTE hidden even
                 // while expanded; only the Pictures fold and unfold.
                 output_widget.set_visible(!collapsed && has_output);
@@ -4303,6 +4570,7 @@ impl FinishedBlock {
         // editor disables filtering but deliberately preserves the query/options;
         // reopening it reapplies the same filter, matching Warp's toggle behavior.
         let filter_enabled = Rc::new(Cell::new(false));
+        let image_count = images.len();
         let toggle_filter: Rc<dyn Fn()> = {
             // The filter editor is built on the FIRST toggle, not at card
             // construction. A search entry, three toggles, a spin button and a
@@ -4505,7 +4773,11 @@ impl FinishedBlock {
                             }
                             expand_btn.set_visible(shown_visual_rows > dynamic_viewport_rows.get());
                             output_scrollbar.set_visible(shown_visual_rows > active_cap);
-                            collapsed_summary.set_label(&collapsed_output_summary(shown_rows));
+                            collapsed_summary.set_label(&collapsed_output_summary(
+                                shown_rows,
+                                true,
+                                image_count,
+                            ));
                             if display_changed {
                                 *displayed_output.borrow_mut() = next_display;
                             }
@@ -4894,7 +5166,7 @@ impl FinishedBlock {
         // Pane sizing is authoritative over a manual expansion: a block expanded
         // for the old geometry must not outlive it.
         if self.expanded.replace(false) {
-            set_icon_button(&self.expand_btn, "view-fullscreen-symbolic", "Expand block");
+            set_output_action_label(&self.expand_btn, "Expand block");
         }
         self.expand_btn.set_visible(output_rows > fitted_rows);
         let stamp = output_render_stamp(effective_cols, output_rows, fitted_rows, generation);
@@ -4969,7 +5241,7 @@ impl FinishedBlock {
             bounded_command_rows
         };
         let rows_for_height = visible_rows
-            .saturating_add(2)
+            .saturating_add(3)
             .saturating_add(command_height_rows.saturating_sub(1));
         Some(
             (rows_for_height.clamp(1, i32::MAX as i64) as i32)
@@ -5050,9 +5322,10 @@ impl FinishedBlock {
     ) {
         let vte_for_cmd = vte.clone();
         let cmd_for_copy = self.cmd_text.clone();
+        let feedback = ButtonFeedback::new(&self.copy_cmd_btn);
         self.copy_cmd_btn.connect_clicked(move |btn| {
             vte_for_cmd.clipboard().set_text(&cmd_for_copy);
-            flash_button_icon(btn, "emblem-ok-symbolic", "Command copied");
+            feedback.flash(btn, "emblem-ok-symbolic", "Command copied");
         });
 
         let vte_for_out = vte.clone();
@@ -5067,6 +5340,7 @@ impl FinishedBlock {
         // transcript there copies a superset, never a wrong block.
         let full_output_for_copy = self.full_output.clone();
         let displayed_output_for_copy = self.displayed_output.clone();
+        let feedback = ButtonFeedback::new(&self.copy_output_btn);
         self.copy_output_btn.connect_clicked(move |btn| {
             let displayed = displayed_output_for_copy.try_borrow().ok();
             let filtered = displayed
@@ -5078,13 +5352,14 @@ impl FinishedBlock {
                 None => (strip_ansi(&full_output_for_copy.borrow()), "Output copied"),
             };
             vte_for_out.clipboard().set_text(&text);
-            flash_button_icon(btn, "emblem-ok-symbolic", label);
+            feedback.flash(btn, "emblem-ok-symbolic", label);
         });
 
         let verified_submission_for_rerun = verified_submission.clone();
         let bracketed_paste_for_rerun = bracketed_paste.clone();
         let active_for_rerun = active.clone();
         let cmd_for_rerun = self.cmd_text.clone();
+        let feedback = ButtonFeedback::new(&self.rerun_btn);
         self.rerun_btn.connect_clicked(move |btn| {
             let recall_is_lossless = super::selected_command_recall_is_lossless(
                 &cmd_for_rerun,
@@ -5094,15 +5369,15 @@ impl FinishedBlock {
                 .try_recall_command(&cmd_for_rerun, bracketed_paste_for_rerun.get())
             {
                 active_for_rerun.borrow().grab_focus();
-                flash_button_icon(btn, "emblem-ok-symbolic", "Command inserted");
+                feedback.flash(btn, "emblem-ok-symbolic", "Command inserted");
             } else if !recall_is_lossless {
-                flash_button_icon(
+                feedback.flash(
                     btn,
                     "dialog-warning-symbolic",
                     "Bracketed paste required for multiline command",
                 );
             } else {
-                flash_button_icon(
+                feedback.flash(
                     btn,
                     "dialog-warning-symbolic",
                     "Wait for an editable prompt",

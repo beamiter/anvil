@@ -435,6 +435,19 @@ directory.
 Shell selection follows this order: `ANVIL_SHELL`, the `shell` config key,
 `jsh` when it is executable on `PATH`, `bash -l`, then `sh`.
 
+## Finished Block controls
+
+Hover or select a finished Block to copy its command/output or insert its command
+at the prompt for review. Insert does not execute it. **More output actions**
+contains Filter output, Jump to bottom, and Expand when the output is long enough.
+The menu and focused controls remain available when the pointer leaves the card.
+
+Folder, branch, timestamp and duration wrap below the status/actions in narrow
+splits. Hover the timestamp for its full local date and timezone. Folded output
+summarizes both text and images; empty text cannot be copied or filtered. Folding
+with the pointer preserves terminal focus, and keyboard users can activate the
+same controls with Tab and Enter/Space.
+
 ## Default shortcuts
 
 Shortcuts are captured at the window level unless noted otherwise. They can be

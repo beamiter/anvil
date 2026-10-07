@@ -1392,9 +1392,9 @@ pub(crate) fn decode_path_identity(encoded: &str) -> Option<PathBuf> {
         return None;
     }
     let mut bytes = Vec::with_capacity(hex.len() / 2);
-    for pair in hex.as_bytes().chunks_exact(2) {
-        let high = hex_nibble(pair[0])?;
-        let low = hex_nibble(pair[1])?;
+    for index in (0..hex.len()).step_by(2) {
+        let high = hex_nibble(hex.as_bytes()[index])?;
+        let low = hex_nibble(hex.as_bytes()[index + 1])?;
         bytes.push((high << 4) | low);
     }
     Some(PathBuf::from(OsString::from_vec(bytes)))
