@@ -325,3 +325,30 @@ anvil commit：git rev-parse --short HEAD
 target/debug/anvil --doctor
 RUST_LOG=anvil=debug target/debug/anvil --mode block --no-restore
 ```
+
+## Responsive card actions and folding regression
+
+1. Open a 40-column split and run a command from a long working-directory path.
+   - Command and output retain their existing VTE rendering and selection
+   - Folder, branch, timestamp and duration wrap on a secondary context row
+   - Status, Copy command, Copy output, Insert and the fold button remain separate
+2. Hover a card, Tab into its actions, then move the pointer outside the card.
+   - Focused actions remain visible and keyboard-operable
+   - Open **More output actions**; moving into its popover does not disable it
+   - Enter/Space activates the focused control, never recalls a selected command
+   - Escape closes the popover; filter, jump and expand actions remain available
+3. Run `true`, then a command with output and (if supported) `kitten icat image.png`.
+   - Empty text output cannot be copied or filtered; empty cards cannot fold
+   - Image-only folds report images, not a fictitious line of output
+   - Mixed text/image folds report both; reopening restores the same content
+   - Clicking fold or its summary does not strand subsequent typing on a button
+4. Filter output, fold/unfold repeatedly, resize narrow/wide, and scroll away/back.
+   - Summary counts track filtered text and retain image counts
+   - Overflow expansion labels switch with their actual state
+   - No double output, lost native selection, or unexpected command execution
+5. Select a block by keyboard and press Escape with a toolbar button focused.
+   - Selection clears normally; action ownership follows actual focus/hover
+   - Returning to the live prompt hides actions after the pointer leaves
+
+Automated regressions are registered in `scripts/test-gtk-display.sh` and run
+individually under Xvfb. Pure summary tests run in the normal Cargo test suite.

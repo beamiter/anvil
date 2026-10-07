@@ -944,7 +944,7 @@ fn resolve_setting_text(
         setting_text_is_safe(value, max_bytes).then(|| value.to_string())
     };
     override_value
-        .and_then(&normalize)
+        .and_then(normalize)
         .or_else(|| configured_value.and_then(normalize))
 }
 

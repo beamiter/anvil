@@ -540,10 +540,10 @@ fn parse_canonical_zone_uri(uri: &str) -> Option<([u8; 16], u64)> {
         return None;
     }
     let mut nonce = [0_u8; 16];
-    for (index, pair) in nonce_hex.chunks_exact(2).enumerate() {
-        let high = lowercase_hex_value(pair[0])?;
-        let low = lowercase_hex_value(pair[1])?;
-        nonce[index] = (high << 4) | low;
+    for (index, decoded) in nonce.iter_mut().enumerate() {
+        let high = lowercase_hex_value(nonce_hex[index * 2])?;
+        let low = lowercase_hex_value(nonce_hex[index * 2 + 1])?;
+        *decoded = (high << 4) | low;
     }
     Some((nonce, id_text.parse().ok()?))
 }

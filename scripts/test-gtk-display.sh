@@ -53,6 +53,9 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    block_view::blocks::tests::repeated_action_feedback_restores_the_original_affordance
+    block_view::blocks::tests::block_actions_keep_keyboard_and_popover_ownership
+    block_view::blocks::tests::block_context_wraps_separately_and_empty_output_actions_are_disabled
     block_view::blocks::tests::unmapped_refit_skips_output_row_scan
     block_view::blocks::tests::a_finished_codex_card_keeps_the_history_inserted_above_its_viewport
     block_view::blocks::tests::earlier_output_notice_follows_the_flag_and_the_fold

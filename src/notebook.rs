@@ -54,12 +54,22 @@ struct CellWorkerPermit;
 
 impl CellWorkerPermit {
     fn acquire() -> Option<Self> {
-        ACTIVE_CELL_WORKERS
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < MAX_CONCURRENT_CELL_WORKERS as i32).then_some(active + 1)
-            })
-            .ok()
-            .map(|_| Self)
+        // CAS preserves the permit bound without requiring Atomic::try_update.
+        let mut active = ACTIVE_CELL_WORKERS.load(Ordering::Acquire);
+        loop {
+            if active >= MAX_CONCURRENT_CELL_WORKERS as i32 {
+                return None;
+            }
+            match ACTIVE_CELL_WORKERS.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self),
+                Err(current) => active = current,
+            }
+        }
     }
 }
 
