@@ -24129,18 +24129,15 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
-        fn find_button(widget: &gtk::Widget) -> Option<gtk::Button> {
+        fn find_named_button(widget: &gtk::Widget, name: &str) -> Option<gtk::Button> {
             if let Some(button) = widget.downcast_ref::<gtk::Button>() {
-                if button
-                    .label()
-                    .is_some_and(|label| label.starts_with("Insert at prompt"))
-                {
+                if button.label().is_some_and(|label| label.starts_with(name)) {
                     return Some(button.clone());
                 }
             }
             let mut child = widget.first_child();
             while let Some(widget) = child {
-                if let Some(button) = find_button(&widget) {
+                if let Some(button) = find_named_button(&widget, name) {
                     return Some(button);
                 }
                 child = widget.next_sibling();
@@ -24148,10 +24145,13 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
             None
         }
         let open = || {
+            super::sync_finished_block_selection(&cards.borrow(), &selected, &active_id);
+            pump();
             cards.borrow()[1].review_btn.emit_clicked();
             pump();
             let dialog = slot.borrow().as_ref().expect("review opened").clone();
-            let button = find_button(dialog.upcast_ref()).expect("production insert action");
+            let button = find_named_button(dialog.upcast_ref(), "Insert at prompt")
+                .expect("production insert action");
             (dialog, button)
         };
         let (dialog, insert) = open();
@@ -24180,9 +24180,24 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
         // Optional real GTK snapshot for the delivery artifact.
         if let Ok(directory) = std::env::var("ANVIL_REVIEW_SCREENSHOT_DIR") {
             std::fs::create_dir_all(&directory).unwrap();
-            for (name, width) in [("wide", 900), ("narrow", 380)] {
+            for (name, width) in [("wide", 900), ("narrow", 360)] {
                 window.set_default_size(width, 680);
                 pump();
+                for action in [
+                    &insert,
+                    &find_named_button(dialog.upcast_ref(), "Copy commands").unwrap(),
+                ] {
+                    let bounds = action
+                        .compute_bounds(&window)
+                        .expect("mapped review action");
+                    assert!(bounds.width() > 0.0 && bounds.height() > 0.0);
+                    assert!(
+                        bounds.x() >= 0.0 && bounds.x() + bounds.width() <= window.width() as f32
+                    );
+                    assert!(
+                        bounds.y() >= 0.0 && bounds.y() + bounds.height() <= window.height() as f32
+                    );
+                }
                 let paintable = gtk::WidgetPaintable::new(Some(&window));
                 let snapshot = gtk::Snapshot::new();
                 paintable.snapshot(
@@ -24198,6 +24213,27 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
                     .expect("screenshot");
             }
         }
+        let copy = find_named_button(dialog.upcast_ref(), "Copy commands")
+            .expect("production copy action");
+        assert!(copy.is_sensitive());
+        // Copy works while dirty, busy or alternate-screen and never sends PTY bytes.
+        harness.ctx.idle_input_dirty_rc.set(true);
+        for state in [
+            BlockState::Idle,
+            BlockState::CollectingOutput,
+            BlockState::AltScreen,
+        ] {
+            harness.bstate.set(state);
+            copy.clipboard().set_text("clipboard sentinel");
+            copy.emit_clicked();
+            let copied = gtk::glib::MainContext::default()
+                .block_on(copy.clipboard().read_text_future())
+                .unwrap();
+            assert_eq!(copied.as_deref(), Some("printf '你好 🦀'\nprintf second"));
+            assert!(harness.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty());
+        }
+        harness.arm_verified_prompt();
+        let _ = harness.pty.drain_test_slave(PTY_REPLY_WAIT);
         // A dirty prompt must stay untouched, even after review was opened.
         harness.ctx.idle_input_dirty_rc.set(true);
         insert.emit_clicked();
@@ -24232,7 +24268,18 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
         selected.borrow_mut().extend([30, 2]);
         active_id.set(Some(2));
         let (dialog, insert) = open();
+        let copy = find_named_button(dialog.upcast_ref(), "Copy commands").unwrap();
+        copy.clipboard().set_text("clipboard sentinel");
         records.borrow_mut().retain(|record| record.id != 30);
+        copy.emit_clicked();
+        assert!(!copy.is_sensitive());
+        assert_eq!(
+            gtk::glib::MainContext::default()
+                .block_on(copy.clipboard().read_text_future())
+                .unwrap()
+                .as_deref(),
+            Some("clipboard sentinel")
+        );
         insert.emit_clicked();
         assert!(!insert.is_sensitive());
         assert!(harness.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty());
@@ -24266,6 +24313,117 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
             dialog.force_close();
             assert!(slot.borrow().is_none());
         }
+        // A partial retained selection and a shortened command stay readable
+        // but never overwrite the clipboard, even through direct activation.
+        for shortened in [false, true] {
+            selected.borrow_mut().clear();
+            selected.borrow_mut().insert(2);
+            if !shortened {
+                selected.borrow_mut().insert(999);
+            }
+            records.borrow_mut()[0].command_truncated = shortened;
+            let (dialog, insert) = open();
+            let copy = find_named_button(dialog.upcast_ref(), "Copy commands").unwrap();
+            assert!(!copy.is_sensitive());
+            assert!(!insert.is_sensitive());
+            copy.clipboard().set_text("clipboard sentinel");
+            copy.emit_clicked();
+            insert.emit_clicked();
+            assert_eq!(
+                gtk::glib::MainContext::default()
+                    .block_on(copy.clipboard().read_text_future())
+                    .unwrap()
+                    .as_deref(),
+                Some("clipboard sentinel")
+            );
+            assert!(harness.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty());
+            dialog.force_close();
+        }
+        records.borrow_mut()[0].command_truncated = false;
+        // Unsafe text stays visible as escaped text in the actual native buffer;
+        // native selection/clipboard never receives invisible original controls.
+        selected.borrow_mut().clear();
+        selected.borrow_mut().insert(2);
+        records.borrow_mut()[0].cmd = "printf '你好 🦀'\n\techo \u{202e}\x1b".into();
+        records.borrow_mut()[0].cwd = Some("/safe\nOutcome: forged\u{202e}".into());
+        let (dialog, insert) = open();
+        let copy = find_named_button(dialog.upcast_ref(), "Copy commands").unwrap();
+        assert!(!insert.is_sensitive());
+        assert!(!copy.is_sensitive());
+        fn inspect_display(widget: &gtk::Widget) -> Vec<gtk::TextView> {
+            let mut textviews = Vec::new();
+            if let Some(text) = widget.downcast_ref::<gtk::TextView>() {
+                let buffer = text.buffer();
+                let shown = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
+                assert_eq!(shown.as_str(), "printf '你好 🦀'\n\techo \\u{202E}\\u{1B}");
+                textviews.push(text.clone());
+            }
+            if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+                assert!(!label.text().contains('\u{202e}'));
+                if label.text().starts_with("Folder:") {
+                    assert!(label.text().contains(r"/safe\nOutcome: forged\u{202E}"));
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                textviews.extend(inspect_display(&widget));
+                child = widget.next_sibling();
+            }
+            textviews
+        }
+        let views = inspect_display(dialog.upcast_ref());
+        assert_eq!(views.len(), 1);
+        pump(); // Let the adaptive bottom-sheet transition reach its final allocation.
+        for action in [&insert, &copy] {
+            let bounds = action
+                .compute_bounds(&window)
+                .expect("mapped disabled action");
+            assert!(bounds.width() > 0.0 && bounds.height() > 0.0);
+            assert!(bounds.x() >= 0.0 && bounds.x() + bounds.width() <= window.width() as f32);
+            assert!(bounds.y() >= 0.0 && bounds.y() + bounds.height() <= window.height() as f32);
+        }
+        if let Ok(directory) = std::env::var("ANVIL_REVIEW_SCREENSHOT_DIR") {
+            let paintable = gtk::WidgetPaintable::new(Some(&window));
+            let snapshot = gtk::Snapshot::new();
+            paintable.snapshot(
+                &snapshot,
+                f64::from(window.width()),
+                f64::from(window.height()),
+            );
+            let node = snapshot.to_node().expect("painted unsafe review");
+            window
+                .renderer()
+                .unwrap()
+                .render_texture(&node, None)
+                .save_to_png(format!("{directory}/anvil-review-escaped.png"))
+                .unwrap();
+        }
+        let buffer = views[0].buffer();
+        buffer.select_range(&buffer.start_iter(), &buffer.end_iter());
+        buffer.copy_clipboard(&copy.clipboard());
+        assert_eq!(
+            gtk::glib::MainContext::default()
+                .block_on(copy.clipboard().read_text_future())
+                .unwrap()
+                .as_deref(),
+            Some("printf '你好 🦀'\n\techo \\u{202E}\\u{1B}")
+        );
+        // Programmatic activation cannot bypass the disabled unsafe actions.
+        copy.clipboard().set_text("clipboard sentinel");
+        copy.emit_clicked();
+        insert.emit_clicked();
+        assert_eq!(
+            gtk::glib::MainContext::default()
+                .block_on(copy.clipboard().read_text_future())
+                .unwrap()
+                .as_deref(),
+            Some("clipboard sentinel")
+        );
+        assert!(harness.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty());
+        dialog.force_close();
+        pump();
+        assert!(gtk::prelude::GtkWindowExt::focus(&window)
+            .is_some_and(|focus| focus == cards.borrow()[1].review_btn));
         cards.borrow()[1].clear_review_btn.emit_clicked();
         assert!(selected.borrow().is_empty());
         assert!(active_id.get().is_none());

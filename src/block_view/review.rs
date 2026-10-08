@@ -8,18 +8,24 @@ use relm4::adw::prelude::*;
 struct ReviewRecord {
     id: u64,
     command: String,
+    // Raw folder remains part of identity even if two escaped displays collide.
+    cwd: Option<String>,
     context: String,
     recallable: bool,
 }
 
 impl ReviewRecord {
     fn from_record(record: &BlockData) -> Self {
-        let outcome = match record.exit_code {
-            Some(0) => "Succeeded (exit 0)".to_string(),
-            Some(code) => format!("Failed (exit {code})"),
-            None => "Exit status unavailable".to_string(),
+        let outcome = match (record.is_background(), record.exit_code) {
+            (true, _) => "Background output; no command result".to_string(),
+            (false, Some(0)) => "Succeeded (exit 0)".to_string(),
+            (false, Some(code @ (130 | 141 | 143))) => format!("Interrupted (exit {code})"),
+            (false, Some(code)) => format!("Failed (exit {code})"),
+            (false, None) => "Exit status unavailable".to_string(),
         };
-        let duration = if record.timing_is_authoritative() {
+        let duration = if record.is_background() {
+            Some("Not applicable (no command)".to_string())
+        } else if record.timing_is_authoritative() {
             record
                 .duration_ms
                 .map(|ms| format!("{} ({ms} ms)", format_block_duration(ms)))
@@ -49,10 +55,37 @@ impl ReviewRecord {
         Self {
             id: record.id,
             command: record.cmd.clone(),
-            context: format!("Folder: {}\nOutcome: {outcome}\nDuration: {duration}\nCommand: {source}\nLifecycle: {lifecycle}\nOutput: {output}", record.cwd.as_deref().unwrap_or("Unavailable")),
+            cwd: record.cwd.clone(),
+            context: format!("Folder: {}\nOutcome: {outcome}\nDuration: {duration}\nCommand: {source}\nLifecycle: {lifecycle}\nOutput: {output}", review_display(record.cwd.as_deref().unwrap_or("Unavailable"), false)),
             recallable: !record.command_truncated,
         }
     }
+}
+
+/// Render full reviewed text without invisible terminal/bidi effects. The review
+/// admission budget bounds input; escapes expand each scalar to at most 10 bytes.
+/// This is presentation only: action payloads and identity retain raw text.
+fn review_display(text: &str, multiline: bool) -> String {
+    let mut display = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if multiline && matches!(ch, '\n' | '\t') {
+            display.push(ch);
+        } else if ch.is_control() || crate::review_input::is_terminal_visual_spoofing_character(ch)
+        {
+            match ch {
+                '\n' => display.push_str(r"\n"),
+                '\r' => display.push_str(r"\r"),
+                '\t' => display.push_str(r"\t"),
+                _ => {
+                    use std::fmt::Write;
+                    write!(display, "\\u{{{:X}}}", ch as u32).expect("write string");
+                }
+            }
+        } else {
+            display.push(ch);
+        }
+    }
+    display
 }
 
 // Keep a multi-selection from constructing thousands of GTK text views or
@@ -81,6 +114,13 @@ fn records_for_review(records: &VecDeque<BlockData>, ids: &HashSet<u64>) -> Vec<
         .collect()
 }
 
+fn complete_reviewed_command(records: &[ReviewRecord], ids: &HashSet<u64>) -> String {
+    if records.len() != ids.len() || records.iter().any(|record| !ids.contains(&record.id)) {
+        return String::new();
+    }
+    reviewed_command(records)
+}
+
 fn reviewed_command(records: &[ReviewRecord]) -> String {
     if records.iter().any(|record| !record.recallable) {
         return String::new();
@@ -94,6 +134,12 @@ fn reviewed_command(records: &[ReviewRecord]) -> String {
 }
 
 fn review_recall_is_lossless(command: &str, bracketed: bool) -> bool {
+    if command.chars().any(|ch| {
+        !matches!(ch, '\n' | '\t')
+            && (ch.is_control() || crate::review_input::is_terminal_visual_spoofing_character(ch))
+    }) {
+        return false;
+    }
     let recall = build_command_recall(command, bracketed);
     !recall.is_empty()
         && !recall.risk.truncated_to_first_line
@@ -213,6 +259,12 @@ pub(super) fn install_with_context(
             let explanation = label("Review full commands and their original folders below. Insertion places commands in the current shell folder, without executing them or changing directory.");
             explanation.set_selectable(false);
             body.append(&explanation);
+            if snapshot.iter().any(|record| review_display(&record.command, true) != record.command
+                || record.cwd.as_deref().is_some_and(|cwd| review_display(cwd, false) != cwd)) {
+                let notice = label("Hidden controls are shown as visible escapes. Selecting text copies the visible spelling. Copy commands and insertion use only complete, safe original commands.");
+                notice.set_selectable(false);
+                body.append(&notice);
+            }
             for (index, record) in snapshot.iter().enumerate() {
                 let section = gtk::Box::new(Orientation::Vertical, 8);
                 section.add_css_class("card");
@@ -225,7 +277,7 @@ pub(super) fn install_with_context(
                 command.set_cursor_visible(false);
                 command.set_monospace(true);
                 command.set_wrap_mode(gtk::WrapMode::WordChar);
-                command.buffer().set_text(&record.command);
+                command.buffer().set_text(&review_display(&record.command, true));
                 command.set_left_margin(8);
                 command.set_right_margin(8);
                 // GtkTextView can initially report a zero minimum height
@@ -262,13 +314,36 @@ pub(super) fn install_with_context(
             status.set_accessible_role(gtk::AccessibleRole::Status);
             let insert = gtk::Button::with_label("Insert at prompt · does not run");
             insert.add_css_class("suggested-action");
-            let command = reviewed_command(&snapshot);
+            let command = complete_reviewed_command(&snapshot, &ids);
             let safe = review_recall_is_lossless(&command, bracketed.get());
+            let copy_safe = review_recall_is_lossless(&command, true);
             if !safe {
-                status.set_text("This selection cannot be inserted without losing or changing command text. Review remains available.");
+                status.set_text(if copy_safe { "The shell cannot insert these commands losslessly. Copy commands remains available." } else { "Some selected command text is missing, shortened, or unsafe. Review remains available; copying and insertion are disabled." });
                 insert.set_sensitive(false);
             }
+            let copy = gtk::Button::with_label("Copy commands");
+            // Clipboard safety is independent of prompt ownership and shell paste support.
+            copy.set_sensitive(copy_safe);
+            let copy_records = Rc::downgrade(&records);
+            let copy_snapshot = snapshot.clone();
+            let copy_command = command.clone();
+            let copy_status = status.clone();
+            copy.connect_clicked(move |button| {
+                if !copy_records.upgrade().is_some_and(|records| review_is_current(&copy_snapshot, &records.borrow())) {
+                    copy_status.set_text("A reviewed block was removed or changed. Close and review the selection again.");
+                    button.set_sensitive(false);
+                    return;
+                }
+                if !review_recall_is_lossless(&copy_command, true) {
+                    copy_status.set_text("This selection cannot be copied as complete, safe commands.");
+                    button.set_sensitive(false);
+                    return;
+                }
+                button.clipboard().set_text(&copy_command);
+                copy_status.set_text("Commands copied. Nothing was inserted or run.");
+            });
             footer.append(&status);
+            footer.append(&copy);
             footer.append(&insert);
             toolbar.add_bottom_bar(&footer);
             dialog.set_child(Some(&toolbar));
@@ -366,6 +441,89 @@ mod tests {
             command_truncated: false,
             output_head_dropped: false,
         }
+    }
+
+    #[test]
+    fn review_refuses_partial_copy_when_selected_records_are_missing() {
+        let records = VecDeque::from([record(7, "echo safe")]);
+        let ids = HashSet::from([7, 8]);
+        let snapshot = records_for_review(&records, &ids);
+        assert_eq!(snapshot.len(), 1, "surviving records remain readable");
+        assert!(complete_reviewed_command(&snapshot, &ids).is_empty());
+        assert!(!review_recall_is_lossless(
+            &complete_reviewed_command(&snapshot, &ids),
+            true
+        ));
+        assert_eq!(
+            complete_reviewed_command(&snapshot, &HashSet::from([7])),
+            "echo safe"
+        );
+    }
+
+    #[test]
+    fn review_folder_cannot_inject_metadata_or_bidi() {
+        let mut data = record(1, "printf '你好 🦀'");
+        data.cwd = Some("/safe\nOutcome: Succeeded\u{202e}\x1b[31m".into());
+        let review = ReviewRecord::from_record(&data);
+        assert!(review
+            .context
+            .contains(r"/safe\nOutcome: Succeeded\u{202E}\u{1B}[31m"));
+        assert!(!review.context.contains('\u{202e}'));
+        assert_eq!(review.command, data.cmd);
+    }
+
+    #[test]
+    fn review_escapes_hidden_characters_without_rewriting_payload() {
+        let raw = "printf '你好 🦀'\n\techo \u{202e}\x1b\r\u{fff9}";
+        let data = record(7, raw);
+        let review = ReviewRecord::from_record(&data);
+        assert_eq!(review.command, raw);
+        assert_eq!(reviewed_command(&[review]), raw);
+        assert_eq!(
+            review_display(raw, true),
+            "printf '你好 🦀'\n\techo \\u{202E}\\u{1B}\\r\\u{FFF9}"
+        );
+        assert!(!review_recall_is_lossless(raw, true));
+        for raw in [
+            "echo \u{fff9}",
+            "echo \u{fffa}",
+            "echo \u{fffb}",
+            "echo \u{200b}",
+        ] {
+            assert!(!review_recall_is_lossless(raw, true));
+        }
+    }
+
+    #[test]
+    fn review_keeps_raw_folder_identity_when_display_spellings_collide() {
+        let mut data = record(7, "echo safe");
+        data.cwd = Some("/folder\u{202e}".into());
+        let snapshot = vec![ReviewRecord::from_record(&data)];
+        data.cwd = Some(r"/folder\u{202E}".into());
+        assert_eq!(
+            snapshot[0].context,
+            ReviewRecord::from_record(&data).context
+        );
+        assert!(!review_is_current(&snapshot, &VecDeque::from([data])));
+    }
+
+    #[test]
+    fn review_outcomes_distinguish_interruptions_and_background_output() {
+        for code in [130, 141, 143] {
+            let mut data = record(1, "sleep 10");
+            data.exit_code = Some(code);
+            assert!(ReviewRecord::from_record(&data)
+                .context
+                .contains(&format!("Interrupted (exit {code})")));
+        }
+        let background = ReviewRecord::from_record(&record(1, ""));
+        assert!(background
+            .context
+            .contains("Background output; no command result"));
+        assert!(background
+            .context
+            .contains("Duration: Not applicable (no command)"));
+        assert!(!background.context.contains("Succeeded"));
     }
 
     #[test]
