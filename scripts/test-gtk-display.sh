@@ -53,6 +53,9 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    block_view::tests::block_review_actions_are_identity_bound_and_never_execute
+    workspace_ops::pane_tree_tests::equalize_without_allocation_leaves_the_tree_untouched
+    workspace_ops::pane_tree_tests::leaf_slot_requires_the_exact_holder_tree_and_clears_focus_before_reparent
     block_view::blocks::tests::repeated_action_feedback_restores_the_original_affordance
     block_view::blocks::tests::block_actions_keep_keyboard_and_popover_ownership
     block_view::blocks::tests::block_context_wraps_separately_and_empty_output_actions_are_disabled

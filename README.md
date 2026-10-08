@@ -439,7 +439,8 @@ Shell selection follows this order: `ANVIL_SHELL`, the `shell` config key,
 
 Hover or select a finished Block to copy its command/output or insert its command
 at the prompt for review. Insert does not execute it. **More output actions**
-contains Filter output, Jump to bottom, and Expand when the output is long enough.
+contains Review block details, Filter output, Jump to bottom, and Expand when
+the output is long enough.
 The menu and focused controls remain available when the pointer leaves the card.
 
 Folder, branch, timestamp and duration wrap below the status/actions in narrow
@@ -447,6 +448,25 @@ splits. Hover the timestamp for its full local date and timezone. Folded output
 summarizes both text and images; empty text cannot be copied or filtered. Folding
 with the pointer preserves terminal focus, and keyboard users can activate the
 same controls with Tab and Enter/Space.
+
+### Review before reuse
+
+Selecting cards shows a review shelf with a count and a clear-selection action.
+Review opens a native responsive dialog, keeping full command text and original
+folders readable and selectable alongside outcome, exact duration, lifecycle and
+capture provenance. Output and images remain on their original VTE cards; review
+does not duplicate, export, or copy them. The history's **Back to live** control
+shows newly completed blocks while you read older history.
+
+For multiple selected blocks, Enter and the contextual insert action open this
+ordered preview first. **Insert at prompt · does not run** inserts the reviewed
+commands into the current shell folder, without changing directories or sending
+Enter. The preview is bound to retained block identities: removal or modification
+invalidates insertion, and a newly completed block cannot join it. Dirty prompts,
+running programs, full-screen apps, shortened commands, unsafe controls, and
+lossy multiline paste are refused. A selection above 128 blocks or 2 MiB of
+command/folder text is refused as a whole; select fewer cards to review it.
+Escape closes review and returns focus to its card control.
 
 ## Default shortcuts
 
@@ -501,13 +521,14 @@ Block mode also has context-sensitive navigation:
   being typed.
 - With one or more blocks selected, `Up` / `Down` moves the active edge,
   `Shift+Up/Down` extends the range, `Home` / `End` moves the selection to the
-  oldest / newest block, `Delete` removes the selection (with Undo), `Enter` recalls every selected command in terminal
-  order without running it, and `Escape` clears the selection. While a command
+  oldest / newest block, `Delete` removes the selection (with Undo), `Enter` recalls
+  a single command or opens an ordered review for multiple cards, and `Escape`
+  clears the selection. While a command
   runs, `Delete` still belongs to that program. These keys keep
   working after a finished command/output surface or card header takes focus;
   ordinary typing still returns safely to the live prompt through its IME.
 - The selection hint reports how many cards are selected and distinguishes
-  `Enter recall` from `Enter recall all`; it no longer makes a static
+  `Enter recall` from `Enter review all`; it no longer makes a static
   prompt-readiness claim. A refused plain Enter is consumed, rings, and briefly
   shows the busy, dirty, unsupported-paste, or unsafe-command reason instead of
   reaching a dirty prompt or running program. Multiline/multi-card recall also

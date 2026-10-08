@@ -40,6 +40,7 @@ mod history;
 mod onboarding;
 #[allow(dead_code)]
 mod palette;
+mod review;
 mod scroll;
 mod selection_hold;
 mod unified_chrome;
@@ -530,10 +531,11 @@ fn set_jump_fab_label(fab: &gtk::Button, unread: u32) {
         } else {
             unread.to_string()
         };
-        content.append(&gtk::Label::new(Some(&n)));
+        content.append(&gtk::Label::new(Some(&format!("{n} new · Live"))));
         let accessible = format!("Jump to latest, {n} unread blocks");
         fab.update_property(&[gtk::accessible::Property::Label(&accessible)]);
     } else {
+        content.append(&gtk::Label::new(Some("Back to live")));
         fab.update_property(&[gtk::accessible::Property::Label("Jump to latest")]);
     }
     fab.set_child(Some(&content));
@@ -2205,12 +2207,10 @@ fn finished_selection_hint(
 ) -> String {
     if selected_count == 1 && can_recall && active_command_is_rerunnable {
         SELECTION_HINT_RUN.to_string()
-    } else if selected_count > 1 && can_recall {
-        format!("Esc cancel  ·  Del  ·  {selected_count} selected  ·  ↵ recall all")
+    } else if selected_count > 1 {
+        format!("Esc cancel  ·  Del  ·  {selected_count} selected  ·  ↵ review all")
     } else if can_recall {
         SELECTION_HINT_RECALL.to_string()
-    } else if selected_count > 1 {
-        format!("Esc cancel  ·  Del  ·  {selected_count} selected")
     } else {
         SELECTION_HINT_CANCEL.to_string()
     }
@@ -2347,6 +2347,12 @@ fn sync_finished_block_selection(
             block.selection_hint_steady.borrow_mut().clear();
         }
         block.selection_hint.set_visible(is_active);
+        block.review_shelf.set_visible(is_active);
+        if is_active {
+            block
+                .review_btn
+                .set_label(&format!("Review {} selected blocks", selected.len()));
+        }
         if is_active {
             block.widget().add_css_class("block-selection-active");
             blocks::reveal_block_actions(&block.action_box, true);
@@ -3596,7 +3602,12 @@ impl VerifiedSubmissionCtx {
         if recall.is_empty() || recall.risk.truncated_to_first_line {
             return false;
         }
-        if let Err(error) = self.pty.try_write_bytes(&recall.bytes) {
+        // This path has proved that the editor is empty. A redundant Ctrl+U
+        // before a bracketed frame is not benign: the PTY boundary treats that
+        // mixed chunk as paste and can move the Ctrl+U inside the frame. Send
+        // just the paste payload, preserving both the preview and shell text.
+        let bytes = recall.bytes.strip_prefix(b"\x15").unwrap_or(&recall.bytes);
+        if let Err(error) = self.pty.try_write_bytes(bytes) {
             log::warn!("could not queue recalled command: {error}");
             return false;
         }
@@ -7497,6 +7508,7 @@ impl RenderBackend for BlockBackend {
         finished_menu_clone: FinishedBlock,
         block_id: u64,
     ) {
+        review::install(self, &finished_menu_clone);
         let block_data_for_export = self.block_data_for_cb.clone();
         let finished_blocks_for_menu = self.finished_blocks_for_cb.clone();
         let vte_for_copy = self.active_vte.clone();
@@ -8017,7 +8029,7 @@ impl RenderBackend for BlockBackend {
 
             if has_selected_commands {
                 let item = make_item(if selected_count > 1 {
-                    "Insert Commands at Prompt"
+                    "Review Commands Before Inserting"
                 } else {
                     "Insert Command at Prompt"
                 });
@@ -8041,10 +8053,11 @@ impl RenderBackend for BlockBackend {
                     selected_command_recall_is_lossless(&command, bracketed_paste_for_action.get())
                 };
                 item.set_sensitive(
-                    selected_recall_is_lossless
-                        && verified_submission_for_action.can_recall_command(),
+                    selected_count > 1
+                        || (selected_recall_is_lossless
+                            && verified_submission_for_action.can_recall_command()),
                 );
-                if !selected_recall_is_lossless {
+                if selected_count == 1 && !selected_recall_is_lossless {
                     const REASON: &str =
                         "Bracketed paste is required to preserve every command line";
                     item.set_tooltip_text(Some(REASON));
@@ -8053,6 +8066,15 @@ impl RenderBackend for BlockBackend {
                 item.connect_clicked(move |_| {
                     popover_c.popdown();
                     let finished = finished_for_rerun.borrow();
+                    if selected_ids_for_rerun.borrow().len() > 1 {
+                        if let Some(card) = finished
+                            .iter()
+                            .find(|card| Some(card.id) == selected_for_rerun.get())
+                        {
+                            card.review_btn.emit_clicked();
+                        }
+                        return;
+                    }
                     let recalled = {
                         let selected = selected_ids_for_rerun.borrow();
                         recall_selected_commands_at_prompt(
@@ -10760,6 +10782,15 @@ impl KeyCtx {
                             &selection_anchor_id_for_key,
                         );
                         return glib::Propagation::Proceed;
+                    }
+                    if selected_block_ids_for_key.borrow().len() > 1 {
+                        if let Some(card) = finished
+                            .iter()
+                            .find(|card| Some(card.id) == selected_block_id_for_key.get())
+                        {
+                            card.review_btn.emit_clicked();
+                        }
+                        return glib::Propagation::Stop;
                     }
                     let recalled = {
                         let selected = selected_block_ids_for_key.borrow();
@@ -14654,13 +14685,22 @@ impl TermView {
     }
 
     /// Recall every selected command, in terminal order, into the editable live
-    /// prompt. Bracketed paste keeps a multi-selection as a multiline buffer; on
-    /// shells without it the existing safe first-line fallback still applies.
+    /// prompt. Multiple blocks open an ordered review first. Insertion refuses
+    /// shells without bracketed paste rather than dropping selected lines.
     pub fn reinput_selected_commands(&self) -> Option<&'static str> {
         if self.fullscreen.get() {
             return Some("Exit the fullscreen program before reinputting commands.");
         }
         let finished = self.finished_blocks.borrow();
+        if self.selected_block_ids.borrow().len() > 1 {
+            if let Some(card) = finished
+                .iter()
+                .find(|card| Some(card.id) == self.selected_block_id.get())
+            {
+                card.review_btn.emit_clicked();
+            }
+            return None;
+        }
         let recalled = {
             let selected = self.selected_block_ids.borrow();
             recall_selected_commands_at_prompt(
@@ -22830,7 +22870,7 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
         super::sync_finished_block_selection(&finished.borrow(), &selected, &active);
         assert_eq!(
             finished.borrow()[1].selection_hint.text(),
-            "Esc cancel  ·  Del  ·  2 selected  ·  ↵ recall all",
+            "Esc cancel  ·  Del  ·  2 selected  ·  ↵ review all",
             "multi-selection must not advertise direct execution"
         );
 
@@ -23429,7 +23469,7 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
         );
         assert_eq!(
             super::finished_selection_hint(2, true, true),
-            "Esc cancel  ·  Del  ·  2 selected  ·  ↵ recall all",
+            "Esc cancel  ·  Del  ·  2 selected  ·  ↵ review all",
             "multi-selection is insert-only besides grouped delete"
         );
         assert_eq!(
@@ -23703,7 +23743,10 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
             .verified_submission
             .try_recall_command("echo history", false));
         let expected = super::build_command_recall("echo history", false);
-        assert_eq!(harness.pty.drain_test_slave(PTY_REPLY_WAIT), expected.bytes);
+        assert_eq!(
+            harness.pty.drain_test_slave(PTY_REPLY_WAIT),
+            expected.bytes[1..]
+        );
         assert_eq!(&*harness.ctx.typed_cmd_rc.borrow(), "echo history");
         assert!(harness.ctx.idle_input_dirty_rc.get());
         assert!(harness.ctx.pty_synced_rc.get());
@@ -24004,6 +24047,231 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
         assert_eq!(block_duration_ms(None, None, ended), None);
         // A clock that went backwards is not a duration.
         assert_eq!(block_duration_ms(None, Some(ended), started), None);
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn block_review_actions_are_identity_bound_and_never_execute() {
+        use super::FinishedBlock;
+        use relm4::adw::prelude::*;
+        use relm4::gtk;
+        gtk::init().expect("gtk init");
+        relm4::adw::init().expect("adwaita init");
+        let harness = ReaderHarness::new();
+        harness.arm_verified_prompt();
+        let _ = harness.pty.drain_test_slave(PTY_REPLY_WAIT);
+        let config = Config::safe_defaults();
+        let mut first = test_block(30, "printf '你好 🦀'", Some(0));
+        first.cwd = Some("/workspace/项目/very-long-folder-name-to-exercise-narrow-layout".into());
+        first.duration_ms = Some(1250);
+        let second = test_block(2, "printf second", Some(1));
+        let records = Rc::new(RefCell::new(VecDeque::from([first, second])));
+        let cards = Rc::new(RefCell::new(
+            records
+                .borrow()
+                .iter()
+                .map(|r| {
+                    FinishedBlock::new(
+                        r.id,
+                        "$ ",
+                        &r.cmd,
+                        None,
+                        &r.output,
+                        r.exit_code,
+                        &config,
+                        r.duration_ms,
+                        None,
+                        r.cwd.as_deref(),
+                        80,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        ));
+        let selected = Rc::new(RefCell::new(HashSet::from([30, 2])));
+        let active_id = Rc::new(Cell::new(Some(2)));
+        let anchor = Rc::new(Cell::new(Some(30)));
+        let bracketed = Rc::new(Cell::new(true));
+        harness.pty.set_shell_bracketed_paste(true);
+        let live = vte4::Terminal::new();
+        let window = relm4::adw::Window::new();
+        window.set_default_size(900, 680);
+        let body = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        for card in cards.borrow().iter() {
+            body.append(card.widget());
+        }
+        body.append(&live);
+        let history_scroll = gtk::ScrolledWindow::builder()
+            .child(&body)
+            .vexpand(true)
+            .hexpand(true)
+            .build();
+        window.set_content(Some(&history_scroll));
+        window.present();
+        let slot = super::review::install_with_context(
+            super::review::ReviewContext {
+                records: records.clone(),
+                finished: cards.clone(),
+                selected: selected.clone(),
+                active_id: active_id.clone(),
+                anchor: anchor.clone(),
+                submission: harness.ctx.verified_submission.clone(),
+                bracketed: bracketed.clone(),
+                live,
+            },
+            &cards.borrow()[1],
+        );
+        super::sync_finished_block_selection(&cards.borrow(), &selected, &active_id);
+        fn pump() {
+            let context = gtk::glib::MainContext::default();
+            let until = Instant::now() + Duration::from_millis(150);
+            while Instant::now() < until {
+                while context.iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        fn find_button(widget: &gtk::Widget) -> Option<gtk::Button> {
+            if let Some(button) = widget.downcast_ref::<gtk::Button>() {
+                if button
+                    .label()
+                    .is_some_and(|label| label.starts_with("Insert at prompt"))
+                {
+                    return Some(button.clone());
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                if let Some(button) = find_button(&widget) {
+                    return Some(button);
+                }
+                child = widget.next_sibling();
+            }
+            None
+        }
+        let open = || {
+            cards.borrow()[1].review_btn.emit_clicked();
+            pump();
+            let dialog = slot.borrow().as_ref().expect("review opened").clone();
+            let button = find_button(dialog.upcast_ref()).expect("production insert action");
+            (dialog, button)
+        };
+        let (dialog, insert) = open();
+        fn assert_commands_have_height(widget: &gtk::Widget) -> usize {
+            let mut count = 0;
+            if let Some(text) = widget.downcast_ref::<gtk::TextView>() {
+                assert!(
+                    text.height() >= 24,
+                    "review command must be readable before any resize"
+                );
+                assert!(text.buffer().char_count() > 0);
+                count += 1;
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                count += assert_commands_have_height(&widget);
+                child = widget.next_sibling();
+            }
+            count
+        }
+        assert_eq!(assert_commands_have_height(dialog.upcast_ref()), 2);
+        assert!(
+            harness.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty(),
+            "opening review must not write PTY bytes"
+        );
+        // Optional real GTK snapshot for the delivery artifact.
+        if let Ok(directory) = std::env::var("ANVIL_REVIEW_SCREENSHOT_DIR") {
+            std::fs::create_dir_all(&directory).unwrap();
+            for (name, width) in [("wide", 900), ("narrow", 380)] {
+                window.set_default_size(width, 680);
+                pump();
+                let paintable = gtk::WidgetPaintable::new(Some(&window));
+                let snapshot = gtk::Snapshot::new();
+                paintable.snapshot(
+                    &snapshot,
+                    f64::from(window.width()),
+                    f64::from(window.height()),
+                );
+                let node = snapshot.to_node().expect("painted review");
+                let renderer = window.renderer().expect("native renderer");
+                let texture = renderer.render_texture(&node, None);
+                texture
+                    .save_to_png(format!("{directory}/anvil-review-{name}.png"))
+                    .expect("screenshot");
+            }
+        }
+        // A dirty prompt must stay untouched, even after review was opened.
+        harness.ctx.idle_input_dirty_rc.set(true);
+        insert.emit_clicked();
+        assert!(harness.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty());
+        assert!(slot.borrow().is_some());
+        harness.ctx.idle_input_dirty_rc.set(false);
+        // Alternate-screen and running-program transitions also fail closed.
+        for state in [BlockState::AltScreen, BlockState::CollectingOutput] {
+            harness.bstate.set(state);
+            insert.emit_clicked();
+            assert!(harness.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty());
+        }
+        harness.arm_verified_prompt();
+        let _ = harness.pty.drain_test_slave(PTY_REPLY_WAIT);
+        // Live completion does not retarget the reviewed selection.
+        records
+            .borrow_mut()
+            .push_back(test_block(90, "do not insert", Some(0)));
+        insert.emit_clicked();
+        assert_eq!(
+            harness.pty.drain_test_slave(PTY_REPLY_WAIT),
+            super::build_command_recall("printf '你好 🦀'\nprintf second", true).bytes[1..]
+        );
+        assert!(slot.borrow().is_none());
+        assert!(selected.borrow().is_empty());
+        assert_eq!(
+            &*harness.ctx.typed_cmd_rc.borrow(),
+            "printf '你好 🦀'\nprintf second"
+        );
+        drop(dialog);
+        // Reopen, then eviction must disable the already-visible action.
+        selected.borrow_mut().extend([30, 2]);
+        active_id.set(Some(2));
+        let (dialog, insert) = open();
+        records.borrow_mut().retain(|record| record.id != 30);
+        insert.emit_clicked();
+        assert!(!insert.is_sensitive());
+        assert!(harness.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty());
+        dialog.force_close();
+        assert!(slot.borrow().is_none());
+        // Escape is handled by the production GTK key controller and never
+        // leaks into the live terminal while dismissing the review.
+        let (dialog, _) = open();
+        let controllers = dialog.observe_controllers();
+        let mut handled = false;
+        for index in 0..controllers.n_items() {
+            if let Some(key) = controllers
+                .item(index)
+                .and_then(|controller| controller.downcast::<gtk::EventControllerKey>().ok())
+            {
+                handled |= key.emit_by_name::<bool>(
+                    "key-pressed",
+                    &[&0xff1bu32, &0u32, &gtk::gdk::ModifierType::empty()],
+                );
+                if slot.borrow().is_none() {
+                    break;
+                }
+            }
+        }
+        assert!(handled);
+        assert!(slot.borrow().is_none());
+        assert!(harness.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty());
+        // Repeated open/close is reusable and does not create retained dialogs.
+        for _ in 0..3 {
+            let (dialog, _) = open();
+            dialog.force_close();
+            assert!(slot.borrow().is_none());
+        }
+        cards.borrow()[1].clear_review_btn.emit_clicked();
+        assert!(selected.borrow().is_empty());
+        assert!(active_id.get().is_none());
+        assert!(!cards.borrow()[1].review_shelf.is_visible());
+        window.close();
+        pump();
     }
 
     fn test_block(id: u64, cmd: &str, exit_code: Option<i32>) -> BlockData {

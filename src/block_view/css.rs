@@ -1102,6 +1102,16 @@ fn block_css(config: &Config) -> String {
             color: {dim_fg};
             font-size: 0.85em;
         }}
+        .block-review-shelf {{
+            margin: 2px 8px 6px;
+            border-radius: 8px;
+            background: alpha({accent}, 0.10);
+            color: {accent};
+        }}
+        .block-review-shelf button {{
+            padding: 6px 10px;
+            min-height: 24px;
+        }}
         .block-selection-hint {{
             color: {accent};
             font-family: {font_stack};

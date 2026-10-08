@@ -3220,12 +3220,9 @@ mod pane_tree_tests {
     }
 
     #[test]
+    #[ignore = "requires an isolated GTK process and display"]
     fn equalize_without_allocation_leaves_the_tree_untouched() {
-        if gtk::init().is_err() {
-            // Pure coverage still runs on headless builders; the live GTK
-            // boundary is exercised whenever a display backend exists.
-            return;
-        }
+        gtk::init().expect("gtk init");
 
         let root = gtk::Paned::new(gtk::Orientation::Horizontal);
         let nested = gtk::Paned::new(gtk::Orientation::Vertical);
@@ -3468,12 +3465,9 @@ mod pane_tree_tests {
     }
 
     #[test]
+    #[ignore = "requires an isolated GTK process and display"]
     fn leaf_slot_requires_the_exact_holder_tree_and_clears_focus_before_reparent() {
-        if gtk::init().is_err() {
-            // Pure planner coverage still runs on headless builders; the live
-            // GTK boundary is exercised whenever a display backend exists.
-            return;
-        }
+        gtk::init().expect("gtk init");
 
         let holder = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         let root_split = gtk::Paned::new(gtk::Orientation::Horizontal);

@@ -704,6 +704,10 @@ pub(crate) struct FinishedBlock {
     pub(crate) copy_cmd_btn: gtk::Button,
     pub(crate) copy_output_btn: gtk::Button,
     pub(crate) rerun_btn: gtk::Button,
+    pub(crate) review_btn: gtk::Button,
+    pub(crate) details_btn: gtk::Button,
+    pub(crate) clear_review_btn: gtk::Button,
+    pub(crate) review_shelf: gtk::Box,
     pub(crate) header_row: gtk::Box,
     pub(crate) action_box: gtk::Box,
     /// Visible keyboard contract for the active edge of a Block selection.
@@ -785,6 +789,10 @@ impl Clone for FinishedBlock {
             copy_cmd_btn: self.copy_cmd_btn.clone(),
             copy_output_btn: self.copy_output_btn.clone(),
             rerun_btn: self.rerun_btn.clone(),
+            review_btn: self.review_btn.clone(),
+            details_btn: self.details_btn.clone(),
+            clear_review_btn: self.clear_review_btn.clone(),
+            review_shelf: self.review_shelf.clone(),
             header_row: self.header_row.clone(),
             action_box: self.action_box.clone(),
             selection_hint: self.selection_hint.clone(),
@@ -2630,6 +2638,7 @@ mod tests {
             Some("/a/very/long/project/path"),
             40,
         );
+        reveal_block_actions(&card.action_box, true);
         assert!(!card.copy_output_btn.is_sensitive());
         assert!(!card.collapsed_state.get());
         (card.toggle_collapsed)();
@@ -2649,7 +2658,9 @@ mod tests {
         let more = more.downcast::<gtk::MenuButton>().expect("menu button");
         let popover = more.popover().expect("output actions");
         let actions = popover.child().expect("action list");
-        let filter = actions.first_child().expect("filter");
+        let details = actions.first_child().expect("details");
+        assert!(details.is_sensitive());
+        let filter = details.next_sibling().expect("filter");
         assert!(!filter.is_sensitive());
         let collapse = card.header_row.last_child().expect("fold button");
         let collapse = collapse.downcast::<gtk::Button>().expect("fold button");
@@ -4008,7 +4019,9 @@ impl FinishedBlock {
         overflow.set_margin_bottom(6);
         overflow.set_margin_start(6);
         overflow.set_margin_end(6);
-        for btn in [&filter_btn, &jump_bottom_btn, &expand_btn] {
+        let details_btn = gtk::Button::with_label("Review block details");
+        details_btn.set_tooltip_text(Some("Review block details"));
+        for btn in [&details_btn, &filter_btn, &jump_bottom_btn, &expand_btn] {
             btn.add_css_class("flat");
             btn.set_focus_on_click(false);
             btn.set_label(btn.tooltip_text().as_deref().unwrap_or(""));
@@ -4087,6 +4100,19 @@ impl FinishedBlock {
         header_row.append(&collapse_btn);
 
         content.append(&header_row);
+        let review_shelf = gtk::Box::new(Orientation::Horizontal, 4);
+        review_shelf.add_css_class("block-review-shelf");
+        let review_btn = gtk::Button::with_label("Review selected blocks");
+        review_btn.set_tooltip_text(Some(
+            "Review full commands in terminal order before inserting; does not run",
+        ));
+        review_btn.add_css_class("flat");
+        review_btn.set_hexpand(true);
+        review_shelf.append(&review_btn);
+        let clear_review_btn = icon_button("window-close-symbolic", "Clear block selection");
+        clear_review_btn.add_css_class("flat");
+        review_shelf.append(&clear_review_btn);
+        review_shelf.set_visible(false);
         if metadata.first_child().is_some() {
             let mut child = metadata.first_child();
             while let Some(item) = child {
@@ -4097,6 +4123,7 @@ impl FinishedBlock {
         }
 
         // ── VTE-rendered command + output ─────────────────────────────────
+        content.append(&review_shelf);
         // Command VTE: single-row read-only renderer for the executed command.
         let cmd_bytes = rendered_command_bytes(cmd, cmd_ansi);
         // Captured command strings use logical newlines. Convert them to CRLF
@@ -4920,6 +4947,10 @@ impl FinishedBlock {
             copy_cmd_btn,
             copy_output_btn,
             rerun_btn,
+            review_btn,
+            details_btn,
+            clear_review_btn,
+            review_shelf,
             header_row,
             action_box,
             selection_hint,
