@@ -1382,7 +1382,7 @@ fn file_config_from_table(table: &toml::Table) -> FileConfig {
     // config file first created to persist some other setting). An explicit,
     // possibly empty, [[remote_hosts]] array is respected as-is.
     let remote_hosts = if table.contains_key("remote_hosts") {
-        parse_remote_hosts(&table)
+        parse_remote_hosts(table)
     } else {
         default_remote_hosts()
     };
