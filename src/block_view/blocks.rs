@@ -2020,6 +2020,21 @@ mod tests {
     }
 
     #[test]
+    fn finished_refit_preserves_current_density_and_saturates() {
+        for rows in [1, 3, 30, 1000] {
+            assert_eq!(
+                finished_card_refit_height(rows, 20, false)
+                    - finished_card_refit_height(rows, 20, true),
+                13
+            );
+        }
+        assert_eq!(
+            finished_card_refit_height(i64::MAX, i32::MAX, true),
+            i32::MAX
+        );
+    }
+
+    #[test]
     #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
     fn output_scrollbar_visibility_cannot_change_the_terminal_width() {
         gtk::init().expect("gtk init");
@@ -3180,6 +3195,15 @@ pub(crate) fn estimated_finished_block_height(config: &Config, output_rows: i64)
     rows.saturating_add(3)
         .saturating_mul(cell)
         .saturating_add(finished_card_vchrome_px(config.block_compact))
+}
+
+/// Refit metadata uses the card's current density, just like its initial
+/// estimate and parked placeholder. A resize must not restore roomy chrome
+/// to the document index while the card is still compact.
+fn finished_card_refit_height(rows: i64, cell_height: i32, compact: bool) -> i32 {
+    (rows.clamp(1, i32::MAX as i64) as i32)
+        .saturating_mul(cell_height)
+        .saturating_add(finished_card_vchrome_px(compact))
 }
 
 /// Values `finalize_block` already derived from the very bytes it is about to
@@ -5274,11 +5298,11 @@ impl FinishedBlock {
         let rows_for_height = visible_rows
             .saturating_add(3)
             .saturating_add(command_height_rows.saturating_sub(1));
-        Some(
-            (rows_for_height.clamp(1, i32::MAX as i64) as i32)
-                .saturating_mul(cell_height)
-                .saturating_add(34),
-        )
+        Some(finished_card_refit_height(
+            rows_for_height,
+            cell_height,
+            self.compact.get(),
+        ))
     }
 
     /// Give a long block first refusal on wheel events while the pointer is over

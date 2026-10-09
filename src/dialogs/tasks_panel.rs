@@ -25,6 +25,24 @@ const DIFF_PAGE: &str = "diff";
 const CREATE_TASK_LABEL: &str = "New agent task from selected block";
 const CLOSE_TASKS_LABEL: &str = "Close Tasks panel";
 
+/// Derive the stack page and both mutually exclusive button states from one
+/// request instead of treating the Diff button as the source of truth.
+fn task_page_presentation(requested: &str) -> (&'static str, bool, bool) {
+    if requested == DIFF_PAGE {
+        (DIFF_PAGE, false, true)
+    } else {
+        (STREAM_PAGE, true, false)
+    }
+}
+
+fn task_page_toggle_request(
+    active: bool,
+    synchronizing: bool,
+    page: &'static str,
+) -> Option<&'static str> {
+    (active && !synchronizing).then_some(page)
+}
+
 /// Full panel state pushed by the application after every domain change.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TasksPanelSync {
@@ -128,6 +146,10 @@ pub(crate) struct TasksPanelModel {
     /// Set while refresh applies a programmatic selection, so the resulting
     /// `row-selected` emission is not mistaken for a user gesture.
     selection_guard: Rc<Cell<bool>>,
+    page: &'static str,
+    /// Programmatic toggle synchronization must not enqueue stale ShowPage
+    /// messages after newer user selections already waiting in the queue.
+    page_guard: Rc<Cell<bool>>,
 }
 
 impl TasksPanelModel {
@@ -489,6 +511,7 @@ impl Component for TasksPanelModel {
     ) -> ComponentParts<Self> {
         let mut action_buttons = Vec::new();
         let selection_guard = Rc::new(Cell::new(false));
+        let page_guard = Rc::new(Cell::new(false));
         let model = Self {
             sync: TasksPanelSync::default(),
             follow_up_drafts: HashMap::new(),
@@ -497,8 +520,13 @@ impl Component for TasksPanelModel {
             rendered_selected: None,
             rendered_approvals: Vec::new(),
             selection_guard: selection_guard.clone(),
+            page: STREAM_PAGE,
+            page_guard: page_guard.clone(),
         };
         let widgets: TasksPanelModelWidgets = view_output!();
+        widgets
+            .diff_page_button
+            .set_group(Some(&widgets.stream_page_button));
 
         for (kind, label) in ACTION_KINDS {
             let button = gtk::Button::with_label(label);
@@ -541,17 +569,23 @@ impl Component for TasksPanelModel {
         });
         widgets.stream_page_button.connect_toggled({
             let sender = sender.clone();
+            let page_guard = page_guard.clone();
             move |button| {
-                if button.is_active() {
-                    sender.input(TasksPanelMsg::ShowPage(STREAM_PAGE));
+                if let Some(page) =
+                    task_page_toggle_request(button.is_active(), page_guard.get(), STREAM_PAGE)
+                {
+                    sender.input(TasksPanelMsg::ShowPage(page));
                 }
             }
         });
         widgets.diff_page_button.connect_toggled({
             let sender = sender.clone();
+            let page_guard = page_guard.clone();
             move |button| {
-                if button.is_active() {
-                    sender.input(TasksPanelMsg::ShowPage(DIFF_PAGE));
+                if let Some(page) =
+                    task_page_toggle_request(button.is_active(), page_guard.get(), DIFF_PAGE)
+                {
+                    sender.input(TasksPanelMsg::ShowPage(page));
                 }
             }
         });
@@ -635,14 +669,14 @@ impl Component for TasksPanelModel {
                 self.emit_action(action, &sender);
             }
             TasksPanelMsg::ShowPage(page) => {
-                let _ = page; // applied in update_view through the toggle buttons
+                self.page = task_page_presentation(page).0;
             }
             TasksPanelMsg::Close => {
                 self.emit_action(TaskPanelAction::Close, &sender);
             }
         }
         if show_diff {
-            widgets.diff_page_button.set_active(true);
+            self.page = DIFF_PAGE;
         }
         self.refresh_view(widgets, &sender);
     }
@@ -744,11 +778,12 @@ impl TasksPanelModel {
             );
         }
 
-        // The page toggle pair mirrors the visible stack child.
-        let on_diff = widgets.diff_page_button.is_active();
-        widgets
-            .page_stack
-            .set_visible_child_name(if on_diff { DIFF_PAGE } else { STREAM_PAGE });
+        let (page, stream_active, diff_active) = task_page_presentation(self.page);
+        self.page_guard.set(true);
+        widgets.stream_page_button.set_active(stream_active);
+        widgets.diff_page_button.set_active(diff_active);
+        self.page_guard.set(false);
+        widgets.page_stack.set_visible_child_name(page);
         self.sync_approvals(widgets, sender);
     }
 }
@@ -763,5 +798,59 @@ fn set_view_text(view: &gtk::TextView, text: &str) {
         != text
     {
         buffer.set_text(text);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{task_page_presentation, task_page_toggle_request, DIFF_PAGE, STREAM_PAGE};
+
+    #[test]
+    fn task_pages_follow_each_request_with_exclusive_button_state() {
+        for requested in [STREAM_PAGE, DIFF_PAGE, STREAM_PAGE, DIFF_PAGE, STREAM_PAGE] {
+            let (page, stream, diff) = task_page_presentation(requested);
+            assert_eq!(page, requested);
+            assert_ne!(stream, diff);
+            assert_eq!(stream, page == STREAM_PAGE);
+            assert_eq!(diff, page == DIFF_PAGE);
+        }
+    }
+
+    #[test]
+    fn repeated_and_unknown_page_requests_have_a_stable_safe_result() {
+        assert_eq!(task_page_presentation(DIFF_PAGE), (DIFF_PAGE, false, true));
+        assert_eq!(task_page_presentation(DIFF_PAGE), (DIFF_PAGE, false, true));
+        assert_eq!(
+            task_page_presentation("unknown"),
+            (STREAM_PAGE, true, false)
+        );
+    }
+
+    #[test]
+    fn queued_page_requests_finish_without_programmatic_feedback() {
+        let mut queue = std::collections::VecDeque::from([DIFF_PAGE, STREAM_PAGE]);
+        let mut final_page = STREAM_PAGE;
+        let mut processed = 0;
+        while let Some(requested) = queue.pop_front() {
+            processed += 1;
+            assert!(
+                processed <= 2,
+                "programmatic changes must not requeue old intent"
+            );
+            let (page, stream, diff) = task_page_presentation(requested);
+            final_page = page;
+            for (active, page) in [(stream, STREAM_PAGE), (diff, DIFF_PAGE)] {
+                if let Some(request) = task_page_toggle_request(active, true, page) {
+                    queue.push_back(request);
+                }
+            }
+        }
+        assert_eq!(final_page, STREAM_PAGE);
+        assert_eq!(processed, 2);
+        assert_eq!(task_page_toggle_request(false, false, DIFF_PAGE), None);
+        assert_eq!(
+            task_page_toggle_request(true, false, DIFF_PAGE),
+            Some(DIFF_PAGE)
+        );
     }
 }

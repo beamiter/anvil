@@ -30,6 +30,7 @@ impl FactoryComponent for RemoteRow {
 
     view! {
         root = adw::ActionRow {
+            set_use_markup: false,
             set_title: &self.name,
             set_subtitle: &self.target,
             set_activatable: true,
@@ -68,7 +69,26 @@ pub(crate) enum RemotePickerMsg {
 
 #[derive(Debug)]
 pub(crate) enum RemotePickerOutput {
-    Connect(usize),
+    Connect(Box<RemoteHost>),
+}
+
+fn captured_picker_host(hosts: &[(usize, RemoteHost)], source_index: usize) -> Option<RemoteHost> {
+    hosts
+        .iter()
+        .find(|(index, _)| *index == source_index)
+        .map(|(_, host)| host.clone())
+}
+
+/// Reordering is harmless; editing, removing, duplicating or invalidating the
+/// displayed profile requires a new selection rather than changing its target.
+pub(crate) fn resolve_picked_profile(
+    hosts: &[RemoteHost],
+    expected: &RemoteHost,
+) -> Result<RemoteHost, &'static str> {
+    crate::config::unique_checked_remote_profile_index(hosts, expected)
+        .and_then(|index| hosts.get(index))
+        .cloned()
+        .ok_or("Remote host changed or is no longer uniquely configured; reopen the picker.")
 }
 
 pub(crate) struct RemotePickerModel {
@@ -200,8 +220,10 @@ impl Component for RemotePickerModel {
                 self.select_first(widgets);
             }
             RemotePickerMsg::Activate(index) => {
-                root.force_close();
-                let _ = sender.output(RemotePickerOutput::Connect(index));
+                if let Some(host) = captured_picker_host(&self.hosts, index) {
+                    root.force_close();
+                    let _ = sender.output(RemotePickerOutput::Connect(Box::new(host)));
+                }
             }
             RemotePickerMsg::Move(delta) => {
                 let len = self.rows.len() as i32;
@@ -222,9 +244,17 @@ impl Component for RemotePickerModel {
                 let Some(row) = widgets.list_box.selected_row() else {
                     return;
                 };
-                let source_index = self.rows.guard()[row.index() as usize].source_index;
-                root.force_close();
-                let _ = sender.output(RemotePickerOutput::Connect(source_index));
+                let source_index = self
+                    .rows
+                    .guard()
+                    .get(row.index() as usize)
+                    .map(|row| row.source_index);
+                if let Some(host) =
+                    source_index.and_then(|index| captured_picker_host(&self.hosts, index))
+                {
+                    root.force_close();
+                    let _ = sender.output(RemotePickerOutput::Connect(Box::new(host)));
+                }
             }
             RemotePickerMsg::Close => root.force_close(),
         }
@@ -254,5 +284,64 @@ impl RemotePickerModel {
         widgets
             .list_box
             .select_row(widgets.list_box.row_at_index(0).as_ref());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_profile_row_disables_implicit_pango_markup() {
+        let source = include_str!("remote_picker.rs");
+        let row = source
+            .split("root = adw::ActionRow {")
+            .nth(1)
+            .unwrap()
+            .split("fn init_model(")
+            .next()
+            .unwrap();
+        assert!(row.contains("set_use_markup: false"));
+    }
+
+    fn host(name: &str) -> RemoteHost {
+        RemoteHost {
+            name: name.into(),
+            host: format!("{name}.example.com"),
+            user: None,
+            docker: false,
+            deploy_artifact: None,
+            remote_shell: "jsh".into(),
+            session: None,
+            ssh_args: Vec::new(),
+            login_shell: true,
+            multiplex: true,
+            deploy: jterm_core::jsh_remote::Deploy::Off,
+        }
+    }
+
+    #[test]
+    fn picker_captures_filtered_source_identity_and_allows_reorder() {
+        let a = host("a");
+        let b = host("b");
+        let captured = captured_picker_host(&[(4, a.clone())], 4).unwrap();
+        assert_eq!(captured, a);
+        assert!(captured_picker_host(&[(4, a.clone())], 0).is_none());
+        assert_eq!(resolve_picked_profile(&[b, a.clone()], &captured), Ok(a));
+    }
+
+    #[test]
+    fn picker_rejects_replacement_removal_edits_and_ambiguity() {
+        let expected = host("a");
+        let mut edited = expected.clone();
+        edited.ssh_args = vec!["-p".into(), "2222".into()];
+        for current in [
+            vec![host("b")],
+            vec![],
+            vec![edited],
+            vec![expected.clone(), expected.clone()],
+        ] {
+            assert!(resolve_picked_profile(&current, &expected).is_err());
+        }
     }
 }

@@ -733,10 +733,8 @@ fn scan_visible_rows_with<'a>(
     let mut result: Vec<VisibleZoneLine> = Vec::new();
     let mut current_id = authority.zone_containing_row(layout.row_epoch, top_absolute_row);
     let mut highest_order = current_id.and_then(|id| authority.order(id));
-    // Whether the row pushed last failed its own column-0 parse, and whether
-    // this scan has already spent its one widening query.
+    // Whether the row pushed last failed its own column-0 parse.
     let mut previous_row_unowned = false;
-    let mut widened = false;
     for (visible_row, uri) in probe_uris.into_iter().enumerate() {
         let absolute_row = top_absolute_row.saturating_add(visible_row as i64);
         let cached = cache
@@ -788,7 +786,7 @@ fn scan_visible_rows_with<'a>(
         // stolen — displacing it would delete its span outright), and the ring
         // proves it carries this zone's canonical marker past column 0.
         let mut widened_head = false;
-        if observed_transition && !widened {
+        if observed_transition {
             let widen_onto = result.last().filter(|previous| {
                 previous_row_unowned
                     && !previous.is_head
@@ -799,7 +797,6 @@ fn scan_visible_rows_with<'a>(
                 widen_onto.map(|previous| (previous.visible_row, previous.absolute_row))
             {
                 if row_carries_zone(prev_visible, id) {
-                    widened = true;
                     widened_head = true;
                     authority.observe_head(id, layout.row_epoch, prev_absolute);
                     cache.heads.insert(prev_absolute, id);
@@ -2645,8 +2642,8 @@ mod tests {
     }
 
     /// The widening query is the only work permitted beyond one probe per row.
-    /// It is asked at most once per scan, only where a transition follows a row
-    /// that failed its own column-0 parse, and a `false` answer changes nothing.
+    /// It is asked at most once per transition, only when the preceding row
+    /// failed its own column-0 parse, and a `false` answer changes nothing.
     #[test]
     fn the_widening_query_is_bounded_and_a_refusal_changes_nothing() {
         let mut authority = make_authority(&[1, 2, 3]);
@@ -2779,6 +2776,64 @@ mod tests {
             "the row whose head moved up is a continuation, not a second head"
         );
         assert!(authority.head_matches(2, 0, 1001));
+    }
+
+    /// Each newly observed mid-column prompt gets its own bounded widening
+    /// check, and the correct heads remain stable on subsequent frames.
+    #[test]
+    fn multiple_mid_column_heads_widen_and_stay_stable_on_rescan() {
+        let mut authority = ZoneChromeAuthority::new(Some([0xab; 16]));
+        for id in 1..=3 {
+            authority.begin_zone(id);
+        }
+        let (one, two, three) = (uri(1), uri(2), uri(3));
+        let inputs = [
+            Some(one.as_str()),
+            None,
+            Some(two.as_str()),
+            None,
+            Some(three.as_str()),
+        ];
+        let layout = ScanLayoutKey {
+            columns: 120,
+            ring_lower: 0,
+            row_epoch: 0,
+        };
+        let mut cache = KnownHeadCache::default();
+        let mut queries = Vec::new();
+        let first = scan_visible_rows_with(
+            layout,
+            1000,
+            inputs,
+            &mut authority,
+            &mut cache,
+            &mut |row, id| {
+                queries.push((row, id));
+                matches!((row, id), (1, 2) | (3, 3))
+            },
+        );
+        let heads = |lines: &[VisibleZoneLine]| {
+            lines
+                .iter()
+                .filter(|line| line.is_head)
+                .map(|line| (line.zone_id, line.absolute_row))
+                .collect::<Vec<_>>()
+        };
+        let expected = vec![(1, 1000), (2, 1001), (3, 1003)];
+        assert_eq!(heads(&first), expected);
+        assert_eq!(queries, vec![(1, 2), (3, 3)]);
+        assert!(authority.head_matches(2, 0, 1001));
+        assert!(authority.head_matches(3, 0, 1003));
+
+        let second = scan_visible_rows_with(
+            layout,
+            1000,
+            inputs,
+            &mut authority,
+            &mut cache,
+            &mut |_, _| panic!("cached validated heads must not be widened again"),
+        );
+        assert_eq!(heads(&second), expected);
     }
 
     /// A validated head survives a guest OSC 8 overwriting its column 0, so

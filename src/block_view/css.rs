@@ -118,19 +118,27 @@ pub(crate) fn rgba_to_hex(c: &RGBA) -> String {
     )
 }
 
-pub(crate) fn shorten_path(path: &str) -> String {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let display = if !home.is_empty() && path.starts_with(&home) {
-        format!("~{}", &path[home.len()..])
-    } else {
-        path.to_string()
+fn shorten_path_with_home(path: &str, home: Option<&Path>) -> String {
+    let path_obj = Path::new(path);
+    let display = match home
+        .filter(|home| !home.as_os_str().is_empty())
+        .and_then(|home| path_obj.strip_prefix(home).ok())
+    {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.to_string_lossy()),
+        None => path.to_string(),
     };
-    let parts: Vec<&str> = display.split('/').filter(|s| !s.is_empty()).collect();
+    let parts: Vec<&str> = display.split('/').filter(|part| !part.is_empty()).collect();
     if parts.len() <= 3 {
         display
     } else {
         format!("…/{}", parts[parts.len() - 2..].join("/"))
     }
+}
+
+pub(crate) fn shorten_path(path: &str) -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    shorten_path_with_home(path, home.as_deref())
 }
 
 /// Branch for the card's context chip, with its HEAD locator memoized.
@@ -1745,5 +1753,50 @@ mod tests {
         assert!(git_branch_uncached(repo.to_str().unwrap()).is_none());
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn shorten_path_requires_a_whole_home_component() {
+        let home = Some(::std::path::Path::new("/home/al"));
+        assert_eq!(shorten_path_with_home("/home/al", home), "~");
+        assert_eq!(
+            shorten_path_with_home("/home/al/project", home),
+            "~/project"
+        );
+        assert_eq!(
+            shorten_path_with_home("/home/alex/project", home),
+            "/home/alex/project"
+        );
+    }
+
+    #[test]
+    fn shorten_path_handles_unicode_root_and_missing_home() {
+        assert_eq!(
+            shorten_path_with_home("/用户/林/project", Some(::std::path::Path::new("/用户/林"))),
+            "~/project"
+        );
+        assert_eq!(
+            shorten_path_with_home(
+                "/用户/林檎/project",
+                Some(::std::path::Path::new("/用户/林"))
+            ),
+            "/用户/林檎/project"
+        );
+        assert_eq!(
+            shorten_path_with_home("/", Some(::std::path::Path::new("/"))),
+            "~"
+        );
+        assert_eq!(
+            shorten_path_with_home("/etc/config", Some(::std::path::Path::new("/"))),
+            "~/etc/config"
+        );
+        assert_eq!(
+            shorten_path_with_home("/home/al/project", None),
+            "/home/al/project"
+        );
+        assert_eq!(
+            shorten_path_with_home("/home/al/project", Some(::std::path::Path::new(""))),
+            "/home/al/project"
+        );
+        assert_eq!(shorten_path_with_home("/a/b/c/d", None), "…/c/d");
     }
 }

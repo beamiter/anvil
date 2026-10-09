@@ -44,6 +44,9 @@ pub(crate) enum AppMsg {
     },
     CopyOutputOnly,
     Action(Action),
+    /// A picker selection carries the displayed immutable profile, never a
+    /// config index that a reload can redirect before this message is handled.
+    ConnectPickedRemote(Box<crate::config::RemoteHost>),
     /// Result of the background "is a newer jsh published?" check. Boxed so one
     /// rare message does not widen every other variant.
     JshUpdateChecked(Box<jterm_core::jsh_install::Status>),

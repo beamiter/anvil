@@ -2248,6 +2248,91 @@ fn insert_items_at_original_indices<T>(live: &mut Vec<T>, items: Vec<(usize, T)>
     }
 }
 
+#[derive(Debug)]
+struct DeletedRestorePlan {
+    /// (stash index, final document index), in document order.
+    restored_positions: Vec<(usize, usize)>,
+    evict_live_prefix: usize,
+    retention: CompletedBlockRetentionPlan,
+}
+
+fn snapshot_deleted_order(ids: impl IntoIterator<Item = u64>, max_blocks: usize) -> Vec<u64> {
+    let limit = max_blocks.max(1);
+    let order: Vec<_> = ids.into_iter().take(limit.saturating_add(1)).collect();
+    if order.len() > limit {
+        // A lowered configuration cap can temporarily leave an older, larger
+        // document. A truncated order would misclassify old survivors as new.
+        // Refuse this undo snapshot rather than invent an ordering for them.
+        Vec::new()
+    } else {
+        order
+    }
+}
+
+/// Reconstruct the deletion's document order using stable identities. Numeric
+/// ids can come from older process namespaces, and saved indices stop being
+/// valid after live retention evicts a prefix. New live records follow the
+/// saved document. Apply the normal count/byte policy before building widgets.
+fn plan_deleted_block_restore(
+    original_order: &[u64],
+    live: &[(u64, usize)],
+    deleted: &[(u64, usize)],
+    max_blocks: usize,
+    max_bytes: usize,
+) -> DeletedRestorePlan {
+    let live_by_id: HashMap<_, _> = live.iter().copied().collect();
+    let deleted_by_id: HashMap<_, _> = deleted
+        .iter()
+        .enumerate()
+        .map(|(index, &(id, bytes))| (id, (index, bytes)))
+        .collect();
+    let original_ids: HashSet<_> = original_order.iter().copied().collect();
+    if original_ids.len() != original_order.len()
+        || live_by_id.len() != live.len()
+        || deleted_by_id.len() != deleted.len()
+        || deleted.iter().any(|(id, _)| live_by_id.contains_key(id))
+        || !deleted.iter().any(|(id, _)| original_ids.contains(id))
+    {
+        // Ambiguous identities cannot prove where a deleted card belongs.
+        // Preserve the live document and restore nothing rather than duplicate
+        // a record or let Undo evict a newer one on an invented ordering.
+        return DeletedRestorePlan {
+            restored_positions: Vec::new(),
+            evict_live_prefix: 0,
+            retention: CompletedBlockRetentionPlan::default(),
+        };
+    }
+    let mut merged = Vec::with_capacity(live.len().saturating_add(deleted.len()));
+    for &id in original_order {
+        if let Some(&bytes) = live_by_id.get(&id) {
+            merged.push((id, bytes, None));
+        } else if let Some(&(index, bytes)) = deleted_by_id.get(&id) {
+            merged.push((id, bytes, Some(index)));
+        }
+    }
+    merged.extend(
+        live.iter()
+            .filter(|(id, _)| !original_ids.contains(id))
+            .map(|&(id, bytes)| (id, bytes, None)),
+    );
+    let candidates: Vec<_> = merged.iter().map(|&(id, bytes, _)| (id, bytes)).collect();
+    let retention = completed_block_retention_plan(&candidates, max_blocks, max_bytes);
+    let evict_live_prefix = merged[..retention.evict_prefix]
+        .iter()
+        .filter(|(_, _, restored)| restored.is_none())
+        .count();
+    let restored_positions = merged[retention.evict_prefix..]
+        .iter()
+        .enumerate()
+        .filter_map(|(position, &(_, _, restored))| restored.map(|index| (index, position)))
+        .collect();
+    DeletedRestorePlan {
+        restored_positions,
+        evict_live_prefix,
+        retention,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SelectionAction {
     Recall,
@@ -2766,6 +2851,16 @@ fn evict_finished_block_prefix(
 /// Bring a selected block into the upper third of the viewport. `compute_point`
 /// returns viewport-relative coordinates, so add the current adjustment before
 /// calculating the new absolute scroll position.
+fn scroll_value_for_viewport_point(
+    current: f64,
+    point_y: f64,
+    lower: f64,
+    upper: f64,
+    page_size: f64,
+) -> f64 {
+    (current + point_y).clamp(lower, (upper - page_size).max(lower))
+}
+
 fn scroll_finished_block_into_view(block: &FinishedBlock, scroll: &ScrolledWindow) {
     let widget = block.widget().clone();
     let scroll = scroll.clone();
@@ -4088,6 +4183,8 @@ pub struct TermView {
     /// index each occupied so undo can reopen the same gaps. Exclusive with
     /// `cleared_stash`: the later of Clear or Delete owns the one-level undo.
     deleted_stash: RefCell<Vec<(usize, BlockData)>>,
+    /// Stable document order at the deletion, before prefix retention changes it.
+    deleted_order: RefCell<Vec<u64>>,
     /// Ids in `cleared_stash` whose cards said their output's beginning was
     /// lost. `BlockData` does not carry that, so the rebuilt cards would
     /// otherwise pass the surviving tail off as the whole transcript.
@@ -5579,10 +5676,16 @@ impl ResetAwareParserSplitter {
                             // OSC 133/52/notification events.
                             let bypass_parser = introducer != b']';
                             let capture_apc = introducer == b'_';
-                            if bypass_parser && !capture_apc {
+                            if capture_apc {
+                                // APC completion dispatches its own part. Retire
+                                // earlier bytes first so a command-start marker
+                                // in this read cannot run after its APC payload.
+                                flush_opaque_passthrough(&mut parts, &mut opaque);
+                                flush_reset_passthrough(&mut parts, &mut passthrough);
+                            } else if bypass_parser {
                                 flush_reset_passthrough(&mut parts, &mut passthrough);
                                 opaque.extend_from_slice(&[0x1b, introducer]);
-                            } else if !capture_apc {
+                            } else {
                                 passthrough.extend_from_slice(&[0x1b, introducer]);
                             }
                             self.state = ResetAwareParserState::ControlString {
@@ -13572,6 +13675,7 @@ impl TermView {
             bookmarks: block_bookmarks,
             cleared_stash: RefCell::new(Vec::new()),
             deleted_stash: RefCell::new(Vec::new()),
+            deleted_order: RefCell::new(Vec::new()),
             cleared_head_dropped: RefCell::new(std::collections::HashSet::new()),
             history_baselines: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             history_load_outcome: RefCell::new(history::HistoryLoadOutcome::Idle),
@@ -14847,6 +14951,7 @@ impl TermView {
             *self.cleared_stash.borrow_mut() = cleared;
             self.cleared_head_dropped.borrow_mut().clear();
             self.deleted_stash.borrow_mut().clear();
+            self.deleted_order.borrow_mut().clear();
         }
 
         let widgets: Vec<gtk::Box> = self
@@ -15086,6 +15191,10 @@ impl TermView {
                 }
             }
         }
+        let deleted_order = snapshot_deleted_order(
+            self.block_data.borrow().iter().map(|block| block.id),
+            self.config.borrow().max_visible_blocks as usize,
+        );
         let mut stash: Vec<(usize, BlockData)> = Vec::with_capacity(targets.len());
         for target in targets.into_iter().rev() {
             if let Some(taken) = self.take_finished_block(target) {
@@ -15098,6 +15207,7 @@ impl TermView {
             return 0;
         }
         *self.deleted_stash.borrow_mut() = stash;
+        *self.deleted_order.borrow_mut() = deleted_order;
         self.cleared_stash.borrow_mut().clear();
         self.cleared_head_dropped.borrow_mut().clear();
         self.visible_indices.borrow_mut().clear();
@@ -15144,17 +15254,58 @@ impl TermView {
             return 0;
         }
         let stash: Vec<(usize, BlockData)> = std::mem::take(&mut *self.deleted_stash.borrow_mut());
+        let original_order = std::mem::take(&mut *self.deleted_order.borrow_mut());
         if stash.is_empty() {
             return 0;
         }
         self.clear_find();
-        let restored_count = stash.len();
+        let plan = {
+            let live: Vec<_> = self
+                .finished_blocks
+                .borrow()
+                .iter()
+                .map(|block| (block.id, block.estimated_retained_bytes()))
+                .collect();
+            let deleted: Vec<_> = stash
+                .iter()
+                .map(|(_, block)| (block.id, block.estimated_restored_retained_bytes()))
+                .collect();
+            plan_deleted_block_restore(
+                &original_order,
+                &live,
+                &deleted,
+                self.config.borrow().max_visible_blocks as usize,
+                MAX_COMPLETED_BLOCK_RETAINED_BYTES,
+            )
+        };
+        log_completed_block_retention("restoring deleted blocks", plan.retention);
+        evict_finished_block_prefix(
+            plan.evict_live_prefix,
+            &self.finished_blocks,
+            &self.block_data,
+            &self.block_list,
+            &self.widget_pool,
+            BlockRemovalRefs {
+                selected_ids: &self.selected_block_ids,
+                selected: &self.selected_block_id,
+                anchor: &self.selection_anchor_id,
+                bookmarks: &self.bookmarks,
+                visible_indices: &self.visible_indices,
+                failure_marker_redraw: self.failure_marker_redraw.as_ref(),
+                unread_count: &self.unread_count,
+                jump_fab: &self.jump_fab,
+            },
+        );
+        let restored_count = plan.restored_positions.len();
+        let mut stash: Vec<_> = stash.into_iter().map(|(_, block)| Some(block)).collect();
         {
             let config = finished_block_config(&self.dynamic_colors, &self.config.borrow());
             let fallback_cols =
                 bounded_finished_vte_columns(self.active.borrow().grid_cols() as i64);
-            for (index, mut block) in stash {
-                let at = index.min(self.finished_blocks.borrow().len());
+            for (stash_index, at) in plan.restored_positions {
+                let mut block = stash[stash_index]
+                    .take()
+                    .expect("each restored block is planned once");
                 let cols = bounded_finished_vte_columns(if block.cols > 0 {
                     block.cols as i64
                 } else {
@@ -15216,31 +15367,6 @@ impl TermView {
                     |data| data.insert(at, block),
                 );
             }
-        }
-        let max_blocks = self.config.borrow().max_visible_blocks as usize;
-        let overflow = self
-            .finished_blocks
-            .borrow()
-            .len()
-            .saturating_sub(max_blocks);
-        if overflow > 0 {
-            evict_finished_block_prefix(
-                overflow,
-                &self.finished_blocks,
-                &self.block_data,
-                &self.block_list,
-                &self.widget_pool,
-                BlockRemovalRefs {
-                    selected_ids: &self.selected_block_ids,
-                    selected: &self.selected_block_id,
-                    anchor: &self.selection_anchor_id,
-                    bookmarks: &self.bookmarks,
-                    visible_indices: &self.visible_indices,
-                    failure_marker_redraw: self.failure_marker_redraw.as_ref(),
-                    unread_count: &self.unread_count,
-                    jump_fab: &self.jump_fab,
-                },
-            );
         }
         self.visible_indices.borrow_mut().clear();
         self.update_viewport();
@@ -15794,8 +15920,15 @@ impl TermView {
                     widget.compute_point(&scroll, &gtk::graphene::Point::new(0.0, 0.0))
                 {
                     let adj = scroll.vadjustment();
-                    let max_value = (adj.upper() - adj.page_size()).max(adj.lower());
-                    adj.set_value((point.y() as f64).clamp(adj.lower(), max_value));
+                    // compute_point targets the scroller's viewport, so its
+                    // displacement is relative to the current scroll value.
+                    adj.set_value(scroll_value_for_viewport_point(
+                        adj.value(),
+                        point.y() as f64,
+                        adj.lower(),
+                        adj.upper(),
+                        adj.page_size(),
+                    ));
                 }
             });
         }
@@ -16002,6 +16135,11 @@ mod tests {
         NOTIFICATION_MIN_INTERVAL, TRUNCATED_COMMAND_PLACEHOLDER, UNAVAILABLE_COMMAND_PLACEHOLDER,
         ZONE_MARKER_CLOSE,
     };
+    use super::{
+        completed_block_retention_plan, plan_deleted_block_restore,
+        scroll_value_for_viewport_point, snapshot_deleted_order,
+    };
+    use super::{ResetAwareParserState, MAX_LOCAL_APC_PAYLOAD_BYTES};
     use crate::agent::{AgentExecutionRef, AgentSession};
     use crate::config::Config;
     use crate::parser::{ColorKind, CommandMeta, KeyboardProtocolQuery, ParserEvent};
@@ -17594,6 +17732,101 @@ mod tests {
         } else {
             splitter.feed(bytes)
         }
+    }
+
+    #[test]
+    fn apc_dispatch_preserves_prior_command_and_surrounding_byte_order() {
+        let input = b"before\x1b]133;C\x07\x1b_Ga=T;payload\x1b\\after";
+        let parts = split_resets(input);
+        assert_eq!(
+            parts,
+            vec![
+                ResetAwareParserPart::Bytes(b"before\x1b]133;C\x07".to_vec()),
+                ResetAwareParserPart::ApcSequence(b"Ga=T;payload".to_vec()),
+                ResetAwareParserPart::Bytes(b"after".to_vec()),
+            ],
+            "the command-start byte run must dispatch before its APC"
+        );
+        assert_eq!(split_bytes(&parts), input);
+    }
+
+    #[test]
+    fn apc_dispatch_byte_order_is_independent_of_every_chunk_boundary() {
+        let inputs: &[&[u8]] = &[
+            b"before\x1b_apc\x1b\\after",
+            b"\x1b]133;C\x07\x1b_Gone\x1b\\between\x1b_Gtwo\x1b\\tail\x1b]133;D;0\x07",
+            b"text\x1bPopaque\x1b\\\x1b_Gapc\x1b\\\x1b[3Jtail",
+            b"\x1bc\x1b_Gapc\x1b\\\x1b]0;title\x07after",
+        ];
+        for input in inputs {
+            for cut in 0..=input.len() {
+                let mut splitter = ResetAwareParserSplitter::default();
+                let mut parts = splitter.feed(&input[..cut]);
+                parts.extend(splitter.feed(&input[cut..]));
+                assert_eq!(split_bytes(&parts), *input, "cut={cut}, input={input:?}");
+            }
+            let mut splitter = ResetAwareParserSplitter::default();
+            let mut parts = Vec::new();
+            for byte in *input {
+                parts.extend(splitter.feed(std::slice::from_ref(byte)));
+            }
+            assert_eq!(split_bytes(&parts), *input, "one byte per feed");
+        }
+    }
+
+    #[test]
+    fn unfinished_and_aborted_apc_never_dispatch_partial_payloads() {
+        let mut splitter = ResetAwareParserSplitter::default();
+        let before = splitter.feed(b"before\x1b_Gunfinished");
+        assert_eq!(
+            before,
+            vec![ResetAwareParserPart::Bytes(b"before".to_vec())]
+        );
+        assert!(splitter.feed(b"more\x1b").is_empty());
+        let recovered = splitter.feed(b"cafter\x1b_Gvalid\x1b\\tail");
+        assert_eq!(
+            recovered,
+            vec![
+                ResetAwareParserPart::Reset {
+                    kind: TerminalResetKind::HardReset,
+                    bytes: b"\x1bc".to_vec(),
+                },
+                ResetAwareParserPart::Bytes(b"after".to_vec()),
+                ResetAwareParserPart::ApcSequence(b"Gvalid".to_vec()),
+                ResetAwareParserPart::Bytes(b"tail".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn overlong_apc_stays_bounded_and_is_discarded_before_next_packet() {
+        let mut splitter = ResetAwareParserSplitter::default();
+        assert!(splitter.feed(b"\x1b_").is_empty());
+        let chunk = vec![b'x'; 4096];
+        for _ in 0..(MAX_LOCAL_APC_PAYLOAD_BYTES / chunk.len()) {
+            assert!(splitter.feed(&chunk).is_empty());
+        }
+        assert!(splitter.feed(b"overflow").is_empty());
+        match &splitter.state {
+            ResetAwareParserState::ControlString {
+                apc_payload,
+                apc_overflow,
+                ..
+            } => {
+                assert!(*apc_overflow);
+                assert!(apc_payload.len() <= MAX_LOCAL_APC_PAYLOAD_BYTES);
+            }
+            state => panic!("expected an overlong APC, got {state:?}"),
+        }
+        let parts = splitter.feed(b"\x1b\\after\x1b_Gvalid\x1b\\tail");
+        assert_eq!(
+            parts,
+            vec![
+                ResetAwareParserPart::Bytes(b"after".to_vec()),
+                ResetAwareParserPart::ApcSequence(b"Gvalid".to_vec()),
+                ResetAwareParserPart::Bytes(b"tail".to_vec()),
+            ]
+        );
     }
 
     #[test]
@@ -23700,6 +23933,196 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
                 super::SelectionActionRefusal::Prompt(CommandPromptStatus::Running),
             ),
             "Esc cancel  ·  Command running  ·  nothing recalled"
+        );
+    }
+
+    fn apply_deleted_restore_plan(
+        original: &[u64],
+        live: &[(u64, usize)],
+        deleted: &[(u64, usize)],
+        max_blocks: usize,
+        max_bytes: usize,
+    ) -> (Vec<u64>, usize) {
+        let plan = plan_deleted_block_restore(original, live, deleted, max_blocks, max_bytes);
+        let mut ids: Vec<_> = live
+            .iter()
+            .skip(plan.evict_live_prefix)
+            .map(|&(id, _)| id)
+            .collect();
+        let constructed = plan.restored_positions.len();
+        for (stash_index, position) in plan.restored_positions {
+            ids.insert(position, deleted[stash_index].0);
+        }
+        (ids, constructed)
+    }
+
+    #[test]
+    fn deleted_undo_never_replaces_a_newer_survivor_after_prefix_eviction() {
+        // Legal cap-three history: [A,B,C], delete B, append D then E.
+        let (ids, constructed) = apply_deleted_restore_plan(
+            &[10, 20, 30],
+            &[(30, 1), (40, 1), (50, 1)],
+            &[(20, 1)],
+            3,
+            100,
+        );
+        assert_eq!(ids, [30, 40, 50]);
+        assert_eq!(constructed, 0, "retired undo cards are not constructed");
+    }
+
+    #[test]
+    fn deleted_undo_obeys_the_byte_budget_before_constructing_cards() {
+        let (ids, constructed) =
+            apply_deleted_restore_plan(&[11, 22, 33], &[(11, 4), (33, 4)], &[(22, 4)], 10, 8);
+        assert_eq!(ids, [22, 33]);
+        assert_eq!(constructed, 1);
+        let (ids, constructed) =
+            apply_deleted_restore_plan(&[11, 22, 33], &[(33, 9)], &[(11, 4), (22, 4)], 10, 8);
+        assert_eq!(
+            ids,
+            [33],
+            "newest oversize exception matches live retention"
+        );
+        assert_eq!(constructed, 0);
+    }
+
+    #[test]
+    fn deleted_undo_uses_document_identity_order_across_random_namespaces() {
+        let (ids, _) = apply_deleted_restore_plan(
+            &[900, 7, 800, 6, 700],
+            &[(900, 1), (800, 1), (700, 1), (2, 1)],
+            &[(7, 1), (6, 1)],
+            10,
+            100,
+        );
+        assert_eq!(ids, [900, 7, 800, 6, 700, 2]);
+        let (ids, _) = apply_deleted_restore_plan(&[900, 7, 800], &[(2, 1)], &[(7, 1)], 10, 100);
+        assert_eq!(
+            ids,
+            [7, 2],
+            "missing original live anchors still precede new records"
+        );
+    }
+
+    #[test]
+    fn deleted_undo_refuses_ambiguous_or_unrecorded_identities() {
+        for (original, live, deleted) in [
+            (vec![1, 1, 2], vec![(2, 1)], vec![(1, 1)]),
+            (vec![1, 2], vec![(2, 1), (2, 1)], vec![(1, 1)]),
+            (vec![1, 2], vec![(2, 1)], vec![(1, 1), (1, 1)]),
+            (vec![1, 2], vec![(1, 1), (2, 1)], vec![(1, 1)]),
+            (vec![1, 2], vec![(2, 1)], vec![(3, 1)]),
+        ] {
+            let expected: Vec<_> = live.iter().map(|&(id, _)| id).collect();
+            let (ids, constructed) = apply_deleted_restore_plan(&original, &live, &deleted, 1, 1);
+            assert_eq!(ids, expected);
+            assert_eq!(constructed, 0);
+        }
+    }
+
+    #[test]
+    fn deleted_undo_restores_empty_and_full_documents_with_shared_zero_limit_policy() {
+        assert_eq!(apply_deleted_restore_plan(&[], &[], &[], 0, 0), (vec![], 0));
+        assert_eq!(
+            apply_deleted_restore_plan(&[9, 3], &[], &[(9, 1), (3, 1)], 0, 0),
+            (vec![3], 1),
+        );
+        assert_eq!(
+            apply_deleted_restore_plan(&[9, 3], &[], &[(9, 1), (3, 1)], 10, 10),
+            (vec![9, 3], 2),
+        );
+    }
+
+    #[test]
+    fn deleted_order_snapshot_is_bounded_without_misclassifying_a_truncated_prefix() {
+        assert_eq!(snapshot_deleted_order([9, 3, 7], 3), [9, 3, 7]);
+        assert!(snapshot_deleted_order([9, 3, 7, 2], 3).is_empty());
+        assert_eq!(snapshot_deleted_order([9], 0), [9]);
+        assert!(snapshot_deleted_order(0..u64::MAX, 3).is_empty());
+    }
+
+    #[test]
+    fn deleted_restore_plan_matches_document_order_for_deletions_evictions_and_new_records() {
+        let original = [900, 7, 800, 6, 700];
+        for selected in 1..(1_u32 << original.len()) {
+            let deleted: Vec<_> = original
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| selected & (1 << index) != 0)
+                .map(|(_, &id)| (id, 2))
+                .collect();
+            let survivors: Vec<_> = original
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| selected & (1 << index) == 0)
+                .map(|(_, &id)| (id, 2))
+                .collect();
+            for evicted in 0..=survivors.len() {
+                for new_count in 0..=2 {
+                    let mut live = survivors[evicted..].to_vec();
+                    live.extend((0..new_count).map(|index| (100 + index, 2)));
+                    let live_ids: HashSet<_> = live.iter().map(|&(id, _)| id).collect();
+                    let deleted_ids: HashSet<_> = deleted.iter().map(|&(id, _)| id).collect();
+                    let mut expected: Vec<_> = original
+                        .iter()
+                        .copied()
+                        .filter(|id| live_ids.contains(id) || deleted_ids.contains(id))
+                        .map(|id| (id, 2))
+                        .collect();
+                    expected.extend((0..new_count).map(|index| (100 + index, 2)));
+                    for cap in 0..=6 {
+                        for budget in [0, 2, 4, 8, 32] {
+                            let retain = completed_block_retention_plan(&expected, cap, budget);
+                            let ids: Vec<_> = expected[retain.evict_prefix..]
+                                .iter()
+                                .map(|&(id, _)| id)
+                                .collect();
+                            let constructed =
+                                ids.iter().filter(|id| deleted_ids.contains(id)).count();
+                            assert_eq!(
+                                apply_deleted_restore_plan(&original, &live, &deleted, cap, budget),
+                                (ids, constructed),
+                                "selected={selected}, evicted={evicted}, new={new_count}, cap={cap}, bytes={budget}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn block_jump_correction_uses_viewport_displacement_from_the_current_scroll() {
+        for (current, point_y, expected) in [
+            (500.0, 0.0, 500.0),
+            (500.0, 80.0, 580.0),
+            (500.0, -80.0, 420.0),
+            (0.0, 80.0, 80.0),
+        ] {
+            assert_eq!(
+                scroll_value_for_viewport_point(current, point_y, 0.0, 2000.0, 200.0),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn block_jump_correction_clamps_to_the_live_adjustment_range() {
+        assert_eq!(
+            scroll_value_for_viewport_point(100.0, -200.0, 20.0, 1000.0, 200.0),
+            20.0
+        );
+        assert_eq!(
+            scroll_value_for_viewport_point(700.0, 200.0, 20.0, 1000.0, 200.0),
+            800.0
+        );
+        assert_eq!(
+            scroll_value_for_viewport_point(100.0, 200.0, 20.0, 10.0, 200.0),
+            20.0
+        );
+        assert_eq!(
+            scroll_value_for_viewport_point(20.0, 0.0, 20.0, 1000.0, 200.0),
+            20.0
         );
     }
 

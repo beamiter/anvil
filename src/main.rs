@@ -1135,8 +1135,8 @@ impl SimpleComponent for AppModel {
         let remote_picker = dialogs::remote_picker::RemotePickerModel::builder()
             .launch(root.clone())
             .forward(sender.input_sender(), |output| match output {
-                dialogs::remote_picker::RemotePickerOutput::Connect(index) => {
-                    AppMsg::Action(Action::ConnectRemote(index as u8))
+                dialogs::remote_picker::RemotePickerOutput::Connect(host) => {
+                    AppMsg::ConnectPickedRemote(host)
                 }
             });
         let command_palette = dialogs::command_palette::PaletteModel::builder()
@@ -1881,6 +1881,7 @@ impl SimpleComponent for AppModel {
                 }
             }
             AppMsg::Action(action) => self.execute_action(action, &sender),
+            AppMsg::ConnectPickedRemote(host) => self.connect_picked_remote(&host, &sender),
             AppMsg::TaskPanelAction(action) => self.execute_task_panel_action(action, &sender),
             AppMsg::AgentTasksTick => self.agent_tasks_tick(&sender),
             AppMsg::ReloadConfig => self.reload_config(&sender),

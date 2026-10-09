@@ -91,6 +91,13 @@ fn unix_fd_add_local<F: FnMut() -> bool + 'static>(fd: RawFd, func: F) {
     }
 }
 
+/// Keep the main-loop source and response producer independently owned. The
+/// standard-library duplicate is CLOEXEC; an error drops the original too.
+fn response_signal_pair(signal: OwnedFd) -> io::Result<(OwnedFd, OwnedFd)> {
+    let producer = signal.try_clone()?;
+    Ok((signal, producer))
+}
+
 /// A PTY pair owned by anvil whose *master* end is wrapped in a `vte4::Pty`
 /// and attached to the active VTE. Read the module docs for the data flow.
 pub struct VtePty {
@@ -251,6 +258,18 @@ impl VtePty {
             });
             return;
         }
+        // The source and producer need independent descriptor lifetimes. After
+        // the producer drops `tx`, the source may observe Disconnected before
+        // the producer sends its final wake; sharing a raw fd could then write
+        // through an already-closed (or reused) descriptor.
+        let (source_signal, producer_signal) =
+            match response_signal_pair(unsafe { OwnedFd::from_raw_fd(efd) }) {
+                Ok(pair) => pair,
+                Err(error) => {
+                    log::warn!("could not duplicate VTE response eventfd: {error}");
+                    return;
+                }
+            };
         let reader_fd = match self
             .local
             .lock()
@@ -258,12 +277,8 @@ impl VtePty {
             .and_then(|guard| guard.as_ref().and_then(|fd| fd.try_clone().ok()))
         {
             Some(fd) => fd,
-            None => {
-                unsafe { libc::close(efd) };
-                return;
-            }
+            None => return,
         };
-        let efd_for_thread = efd;
         let spawn_result = std::thread::Builder::new()
             .name("anvil-vte-response-reader".to_string())
             .spawn(move || {
@@ -282,7 +297,7 @@ impl VtePty {
                             let one: u64 = 1;
                             unsafe {
                                 libc::write(
-                                    efd_for_thread,
+                                    producer_signal.as_raw_fd(),
                                     &one as *const u64 as *const libc::c_void,
                                     8,
                                 );
@@ -296,17 +311,19 @@ impl VtePty {
                 drop(tx);
                 let one: u64 = 1;
                 unsafe {
-                    libc::write(efd_for_thread, &one as *const u64 as *const libc::c_void, 8);
+                    libc::write(
+                        producer_signal.as_raw_fd(),
+                        &one as *const u64 as *const libc::c_void,
+                        8,
+                    );
                 }
             });
         if let Err(error) = spawn_result {
             log::warn!("could not start VTE response reader: {error}");
-            unsafe {
-                libc::close(efd);
-            }
             return;
         }
         unix_fd_add_local(efd, move || {
+            let efd = source_signal.as_raw_fd();
             let mut val: u64 = 0;
             unsafe {
                 libc::read(efd, &mut val as *mut u64 as *mut libc::c_void, 8);
@@ -330,9 +347,6 @@ impl VtePty {
                     }
                     Err(mpsc::TryRecvError::Empty) => return true,
                     Err(mpsc::TryRecvError::Disconnected) => {
-                        unsafe {
-                            libc::close(efd);
-                        }
                         return false;
                     }
                 }
@@ -346,5 +360,58 @@ impl Drop for VtePty {
         if let Ok(mut guard) = self.local.lock() {
             guard.take();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn eventfd() -> OwnedFd {
+        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        assert!(fd >= 0, "{}", io::Error::last_os_error());
+        unsafe { OwnedFd::from_raw_fd(fd) }
+    }
+
+    #[test]
+    fn response_signal_owners_are_distinct_and_cloexec() {
+        let (source, producer) = response_signal_pair(eventfd()).unwrap();
+        assert_ne!(source.as_raw_fd(), producer.as_raw_fd());
+        for fd in [source.as_raw_fd(), producer.as_raw_fd()] {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(flags >= 0);
+            assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        }
+        drop(source);
+        assert!(unsafe { libc::fcntl(producer.as_raw_fd(), libc::F_GETFD) } >= 0);
+    }
+
+    #[test]
+    fn final_response_wake_cannot_reach_a_reused_source_descriptor() {
+        let (source, producer) = response_signal_pair(eventfd()).unwrap();
+        let replacement = eventfd();
+        // Atomically close and reuse a descriptor still owned by this test.
+        // Never target a freed number another parallel test could have taken.
+        assert_eq!(
+            unsafe { libc::dup3(replacement.as_raw_fd(), source.as_raw_fd(), libc::O_CLOEXEC) },
+            source.as_raw_fd()
+        );
+        let one: u64 = 1;
+        assert_eq!(
+            unsafe { libc::write(producer.as_raw_fd(), (&one as *const u64).cast(), 8) },
+            8
+        );
+        let mut received = 0u64;
+        assert_eq!(
+            unsafe { libc::read(producer.as_raw_fd(), (&mut received as *mut u64).cast(), 8) },
+            8
+        );
+        assert_eq!(received, 1);
+        assert_eq!(
+            unsafe { libc::read(source.as_raw_fd(), (&mut received as *mut u64).cast(), 8) },
+            -1,
+            "the reused source descriptor must receive no producer wake"
+        );
+        assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
     }
 }

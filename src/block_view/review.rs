@@ -16,12 +16,15 @@ struct ReviewRecord {
 
 impl ReviewRecord {
     fn from_record(record: &BlockData) -> Self {
-        let outcome = match (record.is_background(), record.exit_code) {
-            (true, _) => "Background output; no command result".to_string(),
-            (false, Some(0)) => "Succeeded (exit 0)".to_string(),
-            (false, Some(code @ (130 | 141 | 143))) => format!("Interrupted (exit {code})"),
-            (false, Some(code)) => format!("Failed (exit {code})"),
-            (false, None) => "Exit status unavailable".to_string(),
+        let outcome = match block_status(Some(&record.cmd), record.exit_code) {
+            BlockStatus::Background => "Background output; no command result".to_string(),
+            BlockStatus::Succeeded => "Succeeded (exit 0)".to_string(),
+            BlockStatus::Interrupted(code) if jterm_core::exit_status::is_job_stop(code) => {
+                format!("Suspended (exit {code})")
+            }
+            BlockStatus::Interrupted(code) => format!("Interrupted (exit {code})"),
+            BlockStatus::Failed(code) => format!("Failed (exit {code})"),
+            BlockStatus::Unreported => "Exit status unavailable".to_string(),
         };
         let duration = if record.is_background() {
             Some("Not applicable (no command)".to_string())
@@ -526,6 +529,17 @@ mod tests {
             .context
             .contains("Duration: Not applicable (no command)"));
         assert!(!background.context.contains("Succeeded"));
+    }
+
+    #[test]
+    fn review_job_control_stops_match_the_suspended_card_status() {
+        for code in 147..=150 {
+            let mut data = record(1, "sleep 10");
+            data.exit_code = Some(code);
+            let review = ReviewRecord::from_record(&data);
+            assert!(review.context.contains(&format!("Suspended (exit {code})")));
+            assert!(!review.context.contains("Failed"));
+        }
     }
 
     #[test]

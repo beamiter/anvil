@@ -375,13 +375,56 @@ fn phase_label(phase: crate::agent_task::CodexAppServerPhase) -> &'static str {
     }
 }
 
-fn push_bounded(out: &mut String, text: &str) {
-    let remaining = MAX_NATIVE_STREAM_DISPLAY_BYTES.saturating_sub(out.len());
-    if remaining == 0 {
-        return;
+/// Every fragment, including headings and truncation notices, shares one
+/// UTF-8 byte budget. Stream text preserves structural newlines/tabs while
+/// neutralizing the same controls and visual spoofing as other review text.
+#[derive(Default)]
+struct StreamDisplay {
+    text: String,
+    truncated: bool,
+}
+
+impl StreamDisplay {
+    fn push_str(&mut self, text: &str) {
+        if self.truncated || text.is_empty() {
+            return;
+        }
+        let remaining = MAX_NATIVE_STREAM_DISPLAY_BYTES.saturating_sub(self.text.len());
+        // Four look-ahead bytes cover any UTF-8 scalar. Even if the shared
+        // helper adds its ellipsis, overflow still leaves more than `remaining`
+        // bytes, including when a scalar cannot fit the final one or two bytes.
+        let shown = jterm_core::review_input::safe_multiline_display(text, remaining + 4);
+        let mut end = shown.len().min(remaining);
+        self.truncated = shown.len() > remaining;
+        while !shown.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.text.push_str(&shown[..end]);
     }
-    let shown = crate::review_text::visible_bounded(text, remaining);
-    out.push_str(&shown);
+
+    fn push(&mut self, character: char) {
+        self.push_str(character.encode_utf8(&mut [0; 4]));
+    }
+
+    fn finish(mut self) -> String {
+        if self.truncated {
+            const NOTICE: &str = "\n(stream display truncated)";
+            let mut end = self
+                .text
+                .len()
+                .min(MAX_NATIVE_STREAM_DISPLAY_BYTES - NOTICE.len());
+            while !self.text.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.text.truncate(end);
+            self.text.push_str(NOTICE);
+        }
+        self.text
+    }
+}
+
+fn push_bounded(out: &mut StreamDisplay, text: &str) {
+    out.push_str(text);
 }
 
 /// Render one native session snapshot as bounded plain text for the panel's
@@ -391,7 +434,7 @@ fn push_bounded(out: &mut String, text: &str) {
 pub(crate) fn render_stream_text(
     snapshot: &crate::agent_task::CodexAppServerViewSnapshot,
 ) -> String {
-    let mut out = String::new();
+    let mut out = StreamDisplay::default();
     out.push_str(&format!("phase: {}", phase_label(snapshot.phase)));
     if let Some(error) = &snapshot.last_error {
         push_bounded(&mut out, &format!("\nerror: {error}"));
@@ -476,7 +519,7 @@ pub(crate) fn render_stream_text(
                 out.push('\n');
                 push_bounded(
                     &mut out,
-                    &crate::review_text::visible_bounded(
+                    &jterm_core::review_input::safe_multiline_display(
                         &command.output,
                         MAX_NATIVE_ITEM_DISPLAY_BYTES,
                     ),
@@ -501,10 +544,7 @@ pub(crate) fn render_stream_text(
             }
         }
     }
-    if out.len() >= MAX_NATIVE_STREAM_DISPLAY_BYTES {
-        out.push_str("\n(stream display truncated)");
-    }
-    out
+    out.finish()
 }
 
 /// One pending approval rendered for the action area: stable identity plus a
@@ -713,5 +753,131 @@ mod tests {
         assert!(plan.rebuild_rows);
         assert!(!plan.apply_selection);
         assert_eq!(plan.select_index, None);
+    }
+    fn stream_snapshot() -> crate::agent_task::CodexAppServerViewSnapshot {
+        crate::agent_task::CodexAppServerViewSnapshot::default()
+    }
+
+    fn stream_history(ordinal: usize) -> crate::agent_task::CodexAppServerTurnHistory {
+        crate::agent_task::CodexAppServerTurnHistory {
+            ordinal,
+            local_turn_id: crate::agent_task::AgentTurnId::new(),
+            follow_up_feedback: Some("please\ncontinue".to_string()),
+            agent_text: String::new(),
+            agent_text_truncated: false,
+            commands: Vec::new(),
+            file_changes: Vec::new(),
+            dropped_updates: 0,
+        }
+    }
+
+    #[test]
+    fn stream_render_empty_snapshot_is_just_phase() {
+        assert_eq!(render_stream_text(&stream_snapshot()), "phase: created");
+    }
+
+    #[test]
+    fn stream_render_preserves_structural_lines_and_tabs() {
+        let mut snapshot = stream_snapshot();
+        snapshot.last_error = Some("first\nsecond".to_string());
+        snapshot.agent_text = "hello\n\tworld".to_string();
+        snapshot.displayed_follow_up_feedback = Some("adjust\nthis".to_string());
+        snapshot.turn_history = vec![stream_history(1)].into();
+        snapshot
+            .commands
+            .push(crate::agent_task::CodexAppServerCommandView {
+                item_id: "command".to_string(),
+                command: "echo hello".to_string(),
+                cwd: "/tmp".to_string(),
+                status: "completed".to_string(),
+                output: "one\ntwo\tthree".to_string(),
+                output_truncated: false,
+            });
+        let rendered = render_stream_text(&snapshot);
+        assert!(rendered.contains("\nerror: first\nsecond"), "{rendered:?}");
+        assert!(rendered.contains("\n> please\ncontinue"));
+        assert!(rendered.contains("\n> adjust\nthis"));
+        assert!(rendered.contains("hello\n\tworld"));
+        assert!(rendered.contains("\n$ echo hello [completed]\none\ntwo\tthree"));
+    }
+
+    #[test]
+    fn stream_render_neutralizes_controls_and_visual_spoofing() {
+        let mut snapshot = stream_snapshot();
+        snapshot.agent_text = "left\u{1b}\u{202e}\u{200b}\u{00a0}\rright".to_string();
+        let rendered = render_stream_text(&snapshot);
+        assert!(rendered.contains("left"));
+        assert!(rendered.contains("right"));
+        for unsafe_char in ['\u{1b}', '\u{202e}', '\u{200b}', '\u{00a0}', '\r'] {
+            assert!(!rendered.contains(unsafe_char));
+        }
+        assert!(rendered.len() <= MAX_NATIVE_STREAM_DISPLAY_BYTES);
+    }
+
+    #[test]
+    fn stream_render_bounds_full_error_plus_history_headings_and_suffixes() {
+        let mut snapshot = stream_snapshot();
+        snapshot.last_error = Some("x".repeat(MAX_NATIVE_STREAM_DISPLAY_BYTES));
+        snapshot.turn_history = (1..=8)
+            .map(|ordinal| {
+                let mut turn = stream_history(ordinal);
+                turn.agent_text = "body".to_string();
+                turn.agent_text_truncated = true;
+                turn.dropped_updates = 10;
+                turn
+            })
+            .collect::<Vec<_>>()
+            .into();
+        snapshot.dropped_turns = 2;
+        snapshot.agent_text = "latest".to_string();
+        snapshot.agent_text_truncated = true;
+        let rendered = render_stream_text(&snapshot);
+        assert!(
+            rendered.len() <= MAX_NATIVE_STREAM_DISPLAY_BYTES,
+            "{} bytes",
+            rendered.len()
+        );
+        assert!(rendered.ends_with("\n(stream display truncated)"));
+    }
+
+    #[test]
+    fn stream_render_bounds_unicode_and_expanding_controls_at_every_edge() {
+        for scalar in ['界', '🙂', '\u{1b}', '\u{202e}'] {
+            for edge in 0..=7 {
+                let mut snapshot = stream_snapshot();
+                snapshot.agent_text = format!(
+                    "{}{}",
+                    "x".repeat(MAX_NATIVE_STREAM_DISPLAY_BYTES - 32 + edge),
+                    scalar.to_string().repeat(40)
+                );
+                let rendered = render_stream_text(&snapshot);
+                assert!(
+                    rendered.len() <= MAX_NATIVE_STREAM_DISPLAY_BYTES,
+                    "{scalar:?}/{edge}: {} bytes",
+                    rendered.len()
+                );
+                assert!(rendered.ends_with("\n(stream display truncated)"));
+                assert!(rendered.is_char_boundary(rendered.len()));
+            }
+        }
+    }
+
+    #[test]
+    fn stream_render_item_budget_preserves_multiline_output() {
+        let mut snapshot = stream_snapshot();
+        snapshot
+            .commands
+            .push(crate::agent_task::CodexAppServerCommandView {
+                item_id: "command".to_string(),
+                command: "echo".to_string(),
+                cwd: "/tmp".to_string(),
+                status: "done".to_string(),
+                output: format!("first\n{}", "界".repeat(MAX_NATIVE_ITEM_DISPLAY_BYTES)),
+                output_truncated: true,
+            });
+        let rendered = render_stream_text(&snapshot);
+        assert!(rendered.contains("\nfirst\n"));
+        assert!(rendered.len() < MAX_NATIVE_ITEM_DISPLAY_BYTES + 256);
+        assert!(rendered.ends_with(" …"));
     }
 }
