@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 const MAX_ENCODED_RECORD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_DECODED_RECORD_BYTES: usize = 16 * 1024 * 1024;
+const HISTORY_ZSTD_WINDOW_LOG_MAX: u32 = 24;
 const MAX_HISTORY_FILE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_HISTORY_DECODED_BYTES: usize = 256 * 1024 * 1024;
 const MAX_HISTORY_FRAMES: usize = 100_000;
@@ -598,7 +599,11 @@ fn decode_record(data: &[u8], compressed: bool, max_decoded_bytes: usize) -> io:
         return Ok(data.to_vec());
     }
 
-    let decoder = zstd::Decoder::new(data).map_err(|error| io::Error::other(error.to_string()))?;
+    let mut decoder =
+        zstd::Decoder::new(data).map_err(|error| io::Error::other(error.to_string()))?;
+    // The output cap does not bound zstd's internal history window. Match the
+    // largest decoded record before a hostile frame can allocate its window.
+    decoder.window_log_max(HISTORY_ZSTD_WINDOW_LOG_MAX)?;
     let mut decoded = Vec::new();
     decoder
         .take(max_decoded_bytes as u64 + 1)
@@ -1031,7 +1036,14 @@ fn read_history_records_with_options(
                     }
                 }
                 let retained_cost = block.estimated_restored_retained_bytes();
-                if keep_limit == 0 {
+                if keep_limit == 0 || retained_byte_limit.is_some_and(|limit| retained_cost > limit)
+                {
+                    // A decode permit covers this transient record, but the
+                    // retained-result permit may not fit even one row. Keep a
+                    // chronological suffix, not an older disconnected prefix.
+                    blocks.clear();
+                    retained_costs.clear();
+                    retained_estimated_bytes = 0;
                     retained_records_dropped = true;
                 } else {
                     while blocks.len() >= keep_limit {
@@ -1098,6 +1110,19 @@ fn read_history_records_with_options(
         seen_ids,
         clear_tombstone,
     })
+}
+
+/// A repaired file was validated but its records were not installed into the
+/// live document. Refresh identity/tombstone observations without granting
+/// authority to delete the unseen records on the immediately following save.
+fn record_revalidated_history(
+    baselines: &Mutex<HashMap<PathBuf, HistoryBaseline>>,
+    reserved: &RefCell<HashSet<u64>>,
+    path: PathBuf,
+    loaded: LoadedRecords,
+) {
+    replace_reserved_history_ids(reserved, loaded.seen_ids.unwrap_or_default());
+    replace_history_baseline(baselines, path, None, loaded.clear_tombstone);
 }
 
 fn validate_history_progress(
@@ -1685,25 +1710,15 @@ impl TermView {
                     return Err(error);
                 }
             };
-        let LoadedRecords {
-            revision,
-            fully_decoded,
-            fully_retained,
-            retained_estimated_bytes,
-            seen_ids,
-            clear_tombstone,
-            ..
-        } = loaded;
-        debug_assert_eq!(_reservation.estimated_bytes(), retained_estimated_bytes);
-        replace_reserved_history_ids(
-            &self.reserved_history_block_ids,
-            seen_ids.unwrap_or_default(),
+        debug_assert_eq!(
+            _reservation.estimated_bytes(),
+            loaded.retained_estimated_bytes
         );
-        replace_history_baseline(
+        record_revalidated_history(
             &self.history_baselines,
+            &self.reserved_history_block_ids,
             target.path,
-            (fully_decoded && fully_retained).then_some(revision),
-            clear_tombstone,
+            loaded,
         );
         *self.history_load_outcome.borrow_mut() = HistoryLoadOutcome::Loaded;
         Ok(())
@@ -1879,12 +1894,13 @@ mod tests {
         encode_history_frames_bounded, enqueue_history_saves, enqueue_pending_clear,
         execute_history_saves, expand_home_prefix_with, history_retry_action, lock_file_name,
         plan_history_saves, push_bounded_back, read_history_records, read_history_records_reserved,
-        read_history_records_with_retained_budget, refuse_save_for_failed_load,
-        replace_history_baseline, replace_reserved_history_ids, save_history_snapshot,
-        save_history_snapshot_with_intent, validate_history_progress, HistoryFileLock,
-        HistoryLoadOutcome, HistoryRetryAction, HistoryRevision, HistoryTarget, SaveIntent,
-        UndecodablePolicy, BLOCK_HISTORY_PERSIST_OPERATION, CLEAR_TOMBSTONE_FRAME_BYTES,
-        MAX_HISTORY_DECODE_DURATION, MAX_HISTORY_FILE_BYTES, MAX_HISTORY_FRAMES,
+        read_history_records_with_retained_budget, record_revalidated_history,
+        refuse_save_for_failed_load, replace_history_baseline, replace_reserved_history_ids,
+        save_history_snapshot, save_history_snapshot_with_intent, validate_history_progress,
+        HistoryFileLock, HistoryLoadOutcome, HistoryRetryAction, HistoryRevision, HistoryTarget,
+        SaveIntent, UndecodablePolicy, BLOCK_HISTORY_PERSIST_OPERATION,
+        CLEAR_TOMBSTONE_FRAME_BYTES, MAX_HISTORY_DECODE_DURATION, MAX_HISTORY_FILE_BYTES,
+        MAX_HISTORY_FRAMES,
     };
     use crate::block_view::BlockData;
     use crate::history_notice::persistence_failure_surface;
@@ -2441,10 +2457,165 @@ mod tests {
             Some(0),
         )
         .unwrap();
+        assert!(tiny.blocks.is_empty());
+        assert_eq!(tiny.retained_estimated_bytes, 0);
+        assert!(!tiny.fully_retained);
+        assert_eq!(tiny.seen_ids, Some(HashSet::from([1, 2, 3])));
+    }
+
+    #[test]
+    fn retained_history_budget_refuses_one_oversize_row_then_accepts_newer_small_rows() {
+        let dir = TestDir::new("retained-single-row-budget");
+        let history = dir.path().join("history.bin");
+        let mut large = sample_block(2, "large");
+        large.output = "x".repeat(1024);
+        let small = sample_block(3, "small");
+        let budget = small.estimated_restored_retained_bytes();
+        assert!(large.estimated_restored_retained_bytes() > budget);
+        for blocks in [
+            vec![large.clone()],
+            vec![sample_block(1, "older"), large.clone()],
+            vec![sample_block(1, "older"), large.clone(), small.clone()],
+        ] {
+            save_history_snapshot(&history, &blocks, false, None).unwrap();
+            let loaded = read_history_records_with_retained_budget(
+                &history,
+                false,
+                100,
+                UndecodablePolicy::Reject,
+                Some(budget),
+            )
+            .unwrap();
+            assert!(loaded.retained_estimated_bytes <= budget);
+            assert!(!loaded.fully_retained);
+            assert_eq!(
+                loaded.seen_ids,
+                Some(blocks.iter().map(|block| block.id).collect())
+            );
+            if blocks.last().unwrap().id == 3 {
+                assert_eq!(
+                    loaded
+                        .blocks
+                        .iter()
+                        .map(|block| block.id)
+                        .collect::<Vec<_>>(),
+                    [3]
+                );
+                assert_eq!(loaded.retained_estimated_bytes, budget);
+            } else {
+                assert!(loaded.blocks.is_empty());
+                assert_eq!(loaded.retained_estimated_bytes, 0);
+            }
+            // Each next fixture is a fresh authoritative file, not a stale merge.
+            fs::remove_file(&history).unwrap();
+        }
+    }
+
+    #[test]
+    fn zstd_decoder_refuses_excessive_internal_window() {
+        // Empty raw block, no content size, advertised 128 MiB window. The
+        // nine input bytes must not reserve an unbounded decoder workspace.
+        let frame = [0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x88, 0x01, 0x00, 0x00];
+        assert!(decode_record(&frame, true, 16).is_err());
+        let normal = zstd::encode_all(&b"hello"[..], 1).unwrap();
+        assert_eq!(decode_record(&normal, true, 16).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn revalidation_preserves_repaired_records_without_bypassing_later_clear() {
+        let dir = TestDir::new("retry-repaired-history");
+        let path = dir.path().join("history.bin");
+        fs::write(&path, [0xff]).unwrap();
+        assert!(read_history_records_reserved(&path, false, 100).is_err());
+        // Simulate repairing the previously unreadable file with valid history.
+        fs::remove_file(&path).unwrap();
+        save_history_snapshot(
+            &path,
+            &[sample_block(40, "recovered")],
+            false,
+            Some(HistoryRevision::Missing),
+        )
+        .unwrap();
+        let (loaded, _reservation) = read_history_records_reserved(&path, false, 100).unwrap();
+        let initial_revision = loaded.revision;
+        assert!(loaded.fully_decoded && loaded.fully_retained);
+        let baselines = Mutex::new(HashMap::new());
+        let reserved = RefCell::new(HashSet::new());
+        record_revalidated_history(&baselines, &reserved, path.clone(), loaded);
+        let target = HistoryTarget {
+            path: path.clone(),
+            compress: false,
+        };
+        let pending = Mutex::new(VecDeque::new());
+        execute_history_saves(
+            &baselines,
+            &pending,
+            &[sample_block(60, "live")],
+            plan_history_saves(&VecDeque::new(), Some(target.clone())),
+        )
+        .unwrap();
+        let saved = read_history_records(&path, false, 100, UndecodablePolicy::Reject).unwrap();
         assert_eq!(
-            tiny.blocks.iter().map(|block| block.id).collect::<Vec<_>>(),
-            [3]
+            saved
+                .blocks
+                .iter()
+                .map(|block| block.id)
+                .collect::<Vec<_>>(),
+            [40, 60]
         );
+        assert!(reserved.borrow().contains(&40));
+        assert_eq!(
+            baseline_observation(&baselines.lock().unwrap(), &path).0,
+            None
+        );
+        // A genuine complete initial load still has exact-revision authority.
+        assert_ne!(initial_revision, saved.revision);
+        let authoritative = save_history_snapshot_with_intent(
+            &path,
+            &[sample_block(60, "live")],
+            false,
+            SaveIntent::Revision {
+                expected_revision: Some(saved.revision),
+                observed_clear_tombstone: saved.clear_tombstone,
+            },
+        )
+        .unwrap();
+        assert!(authoritative.authoritative);
+        assert_eq!(
+            read_history_records(&path, false, 100, UndecodablePolicy::Reject)
+                .unwrap()
+                .blocks
+                .len(),
+            1
+        );
+        // A different pane's explicit Clear must continue to reject the stale
+        // revalidated snapshot instead of resurrecting either record.
+        save_history_snapshot_with_intent(&path, &[], false, SaveIntent::ExplicitReplace).unwrap();
+        let cleared = fs::read(&path).unwrap();
+        assert!(execute_history_saves(
+            &baselines,
+            &pending,
+            &[sample_block(60, "live")],
+            plan_history_saves(&VecDeque::new(), Some(target))
+        )
+        .is_err());
+        assert_eq!(fs::read(&path).unwrap(), cleared);
+    }
+
+    #[test]
+    fn failed_load_retry_records_observation_without_installing_deletion_authority() {
+        let source = include_str!("history.rs");
+        let method = source
+            .split("fn revalidate_failed_history_load(")
+            .nth(1)
+            .unwrap()
+            .split("/// Save block history")
+            .next()
+            .unwrap();
+        assert!(method.contains("record_revalidated_history("));
+        assert!(!method.contains("(fully_decoded && fully_retained).then_some(revision)"));
+        let initial = source.split("pub fn load_history(").nth(1).unwrap();
+        assert!(initial.contains("(fully_decoded && fully_retained).then_some(revision)"));
     }
 
     #[test]
