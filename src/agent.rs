@@ -87,6 +87,14 @@ fn local_agent_command_error(command: &str) -> Option<SessionError> {
         .map(|issue| SessionError::Protocol(ParseError::InvalidCommand(issue.to_string())))
 }
 
+/// Identity of one provider attempt within a task. Stop and Retry keep the
+/// task epoch, so they need an independent, never-reused request generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AgentRequestRef {
+    epoch: AgentSessionEpoch,
+    generation: u64,
+}
+
 /// A UI action's binding to one proposal of one session generation.
 ///
 /// A transcript index alone identifies a *row*, and rows move: New Task,
@@ -141,6 +149,8 @@ pub(crate) struct AgentSession {
     /// pair is the authoritative correlation identity.
     pub(crate) awaiting_command: Option<PendingAgentCommand>,
     next_execution_generation: u64,
+    next_request_generation: u64,
+    active_request: Option<AgentRequestRef>,
     /// Held so dropping the session cancels an in-flight LLM request.
     pub(crate) in_flight: Option<crate::ai::AiHandle>,
     /// Tab + pane the session is bound to. Commands are typed into this
@@ -189,6 +199,8 @@ impl AgentSession {
             restored_history_notice: None,
             awaiting_command: None,
             next_execution_generation: 0,
+            next_request_generation: 0,
+            active_request: None,
             in_flight: None,
             bound_tab,
             bound_pane,
@@ -242,6 +254,7 @@ impl AgentSession {
     }
 
     pub(crate) fn accept_model_reply(&mut self, raw: &str) -> Result<ModelOutcome, SessionError> {
+        self.active_request = None;
         self.in_flight = None;
         if raw.len() > MAX_AGENT_MODEL_REPLY_BYTES {
             // Recorded as a provider failure: no turn is consumed, nothing is
@@ -267,17 +280,48 @@ impl AgentSession {
         self.inner.accept_model_reply(raw)
     }
 
-    /// Apply an asynchronous provider result only to the task that launched
-    /// it. A callback can already be queued when New Task or replacement
-    /// cancels its request, so cancellation alone is not an ownership check.
+    /// Reserve an attempt before launching its worker. A second launch cannot
+    /// overwrite an outstanding request, and exhaustion fails closed.
+    pub(crate) fn begin_model_request(&mut self) -> Option<AgentRequestRef> {
+        if self.state() != AgentState::AwaitingModel
+            || self.is_cancelled()
+            || self.in_flight.is_some()
+            || self.active_request.is_some()
+        {
+            return None;
+        }
+        let Some(generation) = self.next_request_generation.checked_add(1) else {
+            self.cancel();
+            return None;
+        };
+        self.next_request_generation = generation;
+        let request = AgentRequestRef {
+            epoch: self.epoch(),
+            generation,
+        };
+        self.active_request = Some(request);
+        Some(request)
+    }
+
+    pub(crate) fn model_request_is_current(&self, request: AgentRequestRef) -> bool {
+        self.active_request == Some(request)
+            && request.epoch == self.epoch()
+            && self.state() == AgentState::AwaitingModel
+            && !self.is_cancelled()
+    }
+
+    /// Consume only the exact provider attempt that owns the pending state.
+    /// A callback can already be queued when Stop, Retry, or replacement runs.
+    /// Reject it before touching the new attempt's handle or transcript.
     pub(crate) fn apply_llm_reply(
         &mut self,
-        epoch: AgentSessionEpoch,
+        request: AgentRequestRef,
         reply: Result<String, String>,
     ) -> Result<bool, SessionError> {
-        if epoch != self.epoch() || self.is_cancelled() {
+        if !self.model_request_is_current(request) {
             return Ok(false);
         }
+        self.active_request = None;
         match reply {
             Ok(raw) => self.accept_model_reply(&raw).map(|_| true),
             Err(error) => self.model_failed(error).map(|_| true),
@@ -286,6 +330,7 @@ impl AgentSession {
 
     /// Record a provider/transport failure without consuming a model turn.
     pub(crate) fn model_failed(&mut self, message: impl Into<String>) -> Result<(), SessionError> {
+        self.active_request = None;
         self.in_flight = None;
         self.inner.model_failed(message)
     }
@@ -302,9 +347,12 @@ impl AgentSession {
     /// retryable Ready state. This differs from closing the Agent, which seals
     /// the entire session and invalidates its epoch.
     pub(crate) fn stop_model_request(&mut self) -> Result<bool, SessionError> {
-        if self.inner.state() != AgentState::AwaitingModel || self.in_flight.is_none() {
+        if self.inner.state() != AgentState::AwaitingModel
+            || (self.in_flight.is_none() && self.active_request.is_none())
+        {
             return Ok(false);
         }
+        self.active_request = None;
         if let Some(handle) = self.in_flight.take() {
             handle.cancel();
         }
@@ -431,6 +479,7 @@ impl AgentSession {
     }
 
     pub(crate) fn cancel(&mut self) {
+        self.active_request = None;
         if let Some(handle) = self.in_flight.take() {
             handle.cancel();
         }
@@ -457,6 +506,7 @@ impl AgentSession {
         // approved command is still live. Preserve its handle/correlation if
         // the protocol refuses the transition.
         self.inner.start_new_task()?;
+        self.active_request = None;
         self.restored_history_notice = None;
         if let Some(handle) = self.in_flight.take() {
             handle.cancel();
@@ -1607,36 +1657,103 @@ mod tests {
     fn queued_llm_reply_cannot_cross_new_task_or_replacement_epoch() {
         let mut reset = session(10);
         reset.submit_user("old task").unwrap();
-        let old_epoch = reset.epoch();
+        let old_request = reset.begin_model_request().unwrap();
         assert!(reset
             .apply_llm_reply(
-                old_epoch,
+                old_request,
                 Ok(serde_json::json!({"action":"done","message":"old done"}).to_string()),
             )
             .unwrap());
         reset.start_new_task().unwrap();
         reset.submit_user("new task").unwrap();
+        let current_request = reset.begin_model_request().unwrap();
         let reset_transcript = reset.transcript().to_vec();
         assert!(!reset
-            .apply_llm_reply(old_epoch, Ok(run_reply("touch leaked-from-old-task")))
+            .apply_llm_reply(old_request, Ok(run_reply("touch leaked-from-old-task")))
             .unwrap());
         assert_eq!(reset.transcript(), reset_transcript);
         assert_eq!(reset.state(), AgentState::AwaitingModel);
+        assert!(reset.model_request_is_current(current_request));
 
         let mut old = session(10);
         old.submit_user("replaced task").unwrap();
-        let replaced_epoch = old.epoch();
+        let replaced_request = old.begin_model_request().unwrap();
         let mut replacement = session(10);
         replacement.submit_user("replacement task").unwrap();
+        let replacement_request = replacement.begin_model_request().unwrap();
+        assert_eq!(replaced_request.generation, replacement_request.generation);
         let replacement_transcript = replacement.transcript().to_vec();
         assert!(!replacement
             .apply_llm_reply(
-                replaced_epoch,
+                replaced_request,
                 Ok(run_reply("touch leaked-from-replaced-session")),
             )
             .unwrap());
         assert_eq!(replacement.transcript(), replacement_transcript);
         assert_eq!(replacement.state(), AgentState::AwaitingModel);
+        assert!(replacement.model_request_is_current(replacement_request));
+    }
+
+    #[test]
+    fn stopped_attempt_cannot_consume_retry_with_success_or_error() {
+        for reply in [Ok(run_reply("echo stale")), Err("old failure".to_string())] {
+            let mut session = session(10);
+            session.submit_user("task").unwrap();
+            let old = session.begin_model_request().unwrap();
+            assert!(session.begin_model_request().is_none());
+            assert!(session.stop_model_request().unwrap());
+            session.retry_model().unwrap();
+            let current = session.begin_model_request().unwrap();
+            assert_ne!(old, current);
+            assert_eq!(old.epoch, current.epoch);
+            let before = session.transcript().to_vec();
+            assert!(!session.apply_llm_reply(old, reply).unwrap());
+            assert_eq!(session.transcript(), before);
+            assert!(session.model_request_is_current(current));
+            assert_eq!(session.state(), AgentState::AwaitingModel);
+            assert!(session
+                .apply_llm_reply(current, Ok(run_reply("echo current")))
+                .unwrap());
+            let after = session.transcript().to_vec();
+            assert!(!session
+                .apply_llm_reply(current, Err("duplicate".into()))
+                .unwrap());
+            assert_eq!(session.transcript(), after);
+        }
+    }
+
+    #[test]
+    fn model_request_identity_survives_refused_reset_and_retires_on_failure() {
+        let mut session = session(10);
+        assert!(session.begin_model_request().is_none());
+        session.submit_user("task").unwrap();
+        let first = session.begin_model_request().unwrap();
+        assert!(session.start_new_task().is_err());
+        assert!(session.model_request_is_current(first));
+        session.model_failed("provider failed").unwrap();
+        assert!(!session.model_request_is_current(first));
+        session.retry_model().unwrap();
+        let second = session.begin_model_request().unwrap();
+        assert!(!session
+            .apply_llm_reply(first, Ok(run_reply("echo stale")))
+            .unwrap());
+        assert!(session.model_request_is_current(second));
+        session.cancel();
+        assert!(!session.model_request_is_current(second));
+        assert!(!session
+            .apply_llm_reply(second, Err("after close".into()))
+            .unwrap());
+    }
+
+    #[test]
+    fn exhausted_request_generation_fails_closed_without_reusing_a_ticket() {
+        let mut session = session(10);
+        session.submit_user("task").unwrap();
+        session.next_request_generation = u64::MAX;
+        assert!(session.begin_model_request().is_none());
+        assert!(session.is_cancelled());
+        assert!(session.active_request.is_none());
+        assert!(session.in_flight.is_none());
     }
 
     #[test]

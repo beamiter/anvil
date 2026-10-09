@@ -17,11 +17,26 @@ pub(crate) struct AgentBlockCompletion {
     pub(crate) agent_execution: Option<agent::AgentExecutionRef>,
 }
 
-fn should_publish_reply_activity(result: &Result<bool, agent::SessionError>) -> bool {
-    // Ok(false) is the one stale/cancelled callback outcome. Protocol errors
-    // are current replies too, and the state machine records their safe error
-    // turn before returning Err.
-    !matches!(result, Ok(false))
+/// A current synchronous model transition retains its response at the tail:
+/// optional thought then say/proposal, or one protocol/provider error. The
+/// pinned session may compact older rows or replace an earlier provider error,
+/// so the old transcript length is never a valid index into the new one.
+fn completed_reply_activity(transcript: &[agent::Turn]) -> Vec<agent::Turn> {
+    let Some((last, previous)) = transcript.split_last() else {
+        return Vec::new();
+    };
+    match last {
+        agent::Turn::AssistantSay(_) | agent::Turn::AssistantProposed { .. } => {
+            let mut activity = Vec::with_capacity(2);
+            if let Some(thought @ agent::Turn::AssistantThought(_)) = previous.last() {
+                activity.push(thought.clone());
+            }
+            activity.push(last.clone());
+            activity
+        }
+        agent::Turn::ProtocolError(_) => vec![last.clone()],
+        _ => Vec::new(),
+    }
 }
 
 /// Shell Agent with no tab/pane used to only reset the toolbar toggle.
@@ -907,7 +922,7 @@ impl AppModel {
 
     pub(crate) fn agent_handle_reply(
         &self,
-        epoch: agent::AgentSessionEpoch,
+        request: agent::AgentRequestRef,
         reply: Result<String, String>,
         _sender: &ComponentSender<AppModel>,
     ) {
@@ -916,10 +931,9 @@ impl AppModel {
             let Some(session) = guard.as_mut() else {
                 return;
             };
-            let before = session.transcript().len();
-            let result = session.apply_llm_reply(epoch, reply);
-            let activity = if should_publish_reply_activity(&result) {
-                session.transcript()[before..].to_vec()
+            let result = session.apply_llm_reply(request, reply);
+            let activity = if !matches!(result, Ok(false)) {
+                completed_reply_activity(session.transcript())
             } else {
                 Vec::new()
             };
@@ -975,9 +989,9 @@ impl AppModel {
 
         // Build the prompt only for the single legal request state. This
         // guards direct AppMsg injection as well as disabled panel controls.
-        let (request_epoch, bound_tab, bound_pane, system, user, cancellation) = {
-            let guard = self.active_agent.borrow();
-            let Some(session) = guard.as_ref() else {
+        let (request, bound_tab, bound_pane, system, user, cancellation) = {
+            let mut guard = self.active_agent.borrow_mut();
+            let Some(session) = guard.as_mut() else {
                 return;
             };
             if session.state() != agent::AgentState::AwaitingModel
@@ -986,6 +1000,12 @@ impl AppModel {
             {
                 return;
             }
+            let Some(request) = session.begin_model_request() else {
+                drop(guard);
+                self.show_toast("Shell Agent could not reserve a model request.");
+                self.refresh_agent_panel();
+                return;
+            };
             let cwd = self
                 .tabs
                 .iter()
@@ -1003,7 +1023,7 @@ impl AppModel {
             // Cached repo probe with a bounded UI wait; None outside a repo.
             let git = jterm_core::git_meta::read(std::path::Path::new(cwd));
             (
-                session.epoch(),
+                request,
                 session.bound_tab,
                 session.bound_pane,
                 ai::build_agent_system_prompt(),
@@ -1024,7 +1044,7 @@ impl AppModel {
         let handle = ai::ask(client, system, user, move |result| {
             if !callback_cancellation.is_cancelled() {
                 sender_for_reply.input(AppMsg::AgentLlmReply {
-                    epoch: request_epoch,
+                    request,
                     reply: result,
                 });
             }
@@ -1034,7 +1054,7 @@ impl AppModel {
         {
             let mut guard = self.active_agent.borrow_mut();
             if let Some(session) = guard.as_mut() {
-                if session.epoch() == request_epoch
+                if session.model_request_is_current(request)
                     && session.bound_tab == bound_tab
                     && session.bound_pane == bound_pane
                     && session.state() == agent::AgentState::AwaitingModel
@@ -1302,12 +1322,110 @@ mod snapshot_tests {
     fn current_protocol_error_is_published_but_stale_reply_is_not() {
         let mut session = agent::AgentSession::new(1, 2, 4);
         session.submit_user("test protocol handling").unwrap();
-        let current = session.apply_llm_reply(session.epoch(), Ok("not json".to_string()));
+        let request = session.begin_model_request().unwrap();
+        let current = session.apply_llm_reply(request, Ok("not json".to_string()));
         assert!(current.is_err());
-        assert!(should_publish_reply_activity(&current));
+        assert!(matches!(
+            completed_reply_activity(session.transcript()).as_slice(),
+            [agent::Turn::ProtocolError(_)]
+        ));
+        let stale = session.apply_llm_reply(request, Ok("not json".to_string()));
+        assert!(matches!(stale, Ok(false)));
+    }
 
-        let stale = Ok(false);
-        assert!(!should_publish_reply_activity(&stale));
+    fn apply_activity(
+        session: &mut agent::AgentSession,
+        reply: Result<String, String>,
+    ) -> Vec<agent::Turn> {
+        let request = session.begin_model_request().unwrap();
+        let result = session.apply_llm_reply(request, reply);
+        assert!(!matches!(result, Ok(false)));
+        completed_reply_activity(session.transcript())
+    }
+
+    fn say_reply(message: &str) -> String {
+        serde_json::json!({"action":"say", "message":message}).to_string()
+    }
+
+    #[test]
+    fn reply_activity_survives_entry_and_byte_compaction() {
+        let mut entries = agent::AgentSession::new(1, 2, 1000);
+        for _ in 0..64 {
+            entries.submit_user("small").unwrap();
+            entries.accept_model_reply(&say_reply("reply")).unwrap();
+        }
+        entries.submit_user("last request").unwrap();
+        let before = entries.transcript().len();
+        let activity = apply_activity(&mut entries, Ok(say_reply("latest")));
+        assert_eq!(before, 128);
+        assert_eq!(entries.transcript().len(), before);
+        assert!(
+            matches!(activity.as_slice(), [agent::Turn::AssistantSay(text)] if text == "latest")
+        );
+
+        let mut bytes = agent::AgentSession::new(1, 2, 1000);
+        for _ in 0..60 {
+            bytes.submit_user("u".repeat(1024)).unwrap();
+            bytes
+                .accept_model_reply(&say_reply(&"r".repeat(1024)))
+                .unwrap();
+        }
+        bytes.submit_user("last request").unwrap();
+        let before = bytes.transcript().len();
+        let latest = "X".repeat(16 * 1024);
+        let activity = apply_activity(&mut bytes, Ok(say_reply(&latest)));
+        assert!(bytes.transcript().len() < before);
+        assert!(
+            matches!(activity.as_slice(), [agent::Turn::AssistantSay(text)] if text == &latest)
+        );
+    }
+
+    #[test]
+    fn reply_activity_is_exact_for_thoughts_proposals_errors_and_repeated_text() {
+        for action in ["say", "done", "run"] {
+            let mut session = agent::AgentSession::new(1, 2, 10);
+            session.submit_user("task").unwrap();
+            let reply = if action == "run" {
+                serde_json::json!({"action":action,"thought":"reason","command":"echo proposed"})
+            } else {
+                serde_json::json!({"action":action,"thought":"reason","message":"answer"})
+            };
+            let activity = apply_activity(&mut session, Ok(reply.to_string()));
+            assert_eq!(activity.len(), 2);
+            assert!(
+                matches!(&activity[0], agent::Turn::AssistantThought(text) if text == "reason")
+            );
+            assert!(
+                matches!(&activity[1], agent::Turn::AssistantSay(text) if text == "answer")
+                    || matches!(&activity[1], agent::Turn::AssistantProposed { command, .. } if command == "echo proposed")
+            );
+        }
+        let mut session = agent::AgentSession::new(1, 2, 10);
+        for _ in 0..2 {
+            session.submit_user("same").unwrap();
+            let activity = apply_activity(&mut session, Ok(say_reply("same")));
+            assert!(
+                matches!(activity.as_slice(), [agent::Turn::AssistantSay(text)] if text == "same")
+            );
+        }
+        session.submit_user("request").unwrap();
+        let error = apply_activity(&mut session, Err("first failure".into()));
+        assert!(
+            matches!(error.as_slice(), [agent::Turn::ProtocolError(text)] if text == "first failure")
+        );
+        let before = session.transcript().len();
+        session.retry_model().unwrap();
+        let error = apply_activity(&mut session, Err("replacement failure".into()));
+        assert_eq!(session.transcript().len(), before);
+        assert!(
+            matches!(error.as_slice(), [agent::Turn::ProtocolError(text)] if text == "replacement failure")
+        );
+        session.retry_model().unwrap();
+        let protocol = apply_activity(&mut session, Ok("not json".into()));
+        assert!(matches!(
+            protocol.as_slice(),
+            [agent::Turn::ProtocolError(_)]
+        ));
     }
 
     #[test]

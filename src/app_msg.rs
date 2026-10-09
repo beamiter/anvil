@@ -297,7 +297,7 @@ pub(crate) enum AppMsg {
     AgentInsert(crate::agent::AgentProposalRef, String),
     AgentRefreshPrompt(crate::agent::AgentSessionEpoch),
     AgentLlmReply {
-        epoch: crate::agent::AgentSessionEpoch,
+        request: crate::agent::AgentRequestRef,
         reply: Result<String, String>,
     },
     AgentBlockFinished {

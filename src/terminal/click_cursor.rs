@@ -35,7 +35,9 @@ pub(crate) struct ClickCursorCtx {
     /// Current OSC 133 `B` prompt anchor under the pane's render-surface
     /// policy. It bounds how far left a click may walk without bypassing the
     /// same rebase decision used by reviewed submission and prompt status.
-    pub(crate) prompt_anchor: Rc<dyn Fn() -> (i64, i64)>,
+    /// The caller supplies its live terminal borrow so this callback never
+    /// needs to retain the widget or invent an anchor after a weak lookup fails.
+    pub(crate) prompt_anchor: Rc<dyn Fn(&Terminal) -> (i64, i64)>,
     pub(crate) bstate: Rc<Cell<BlockState>>,
     pub(crate) mouse_mode: Rc<Cell<MouseReporting>>,
     pub(crate) fullscreen: Rc<Cell<bool>>,
@@ -341,7 +343,7 @@ fn move_for_click(vte: &Terminal, ctx: &ClickCursorCtx, click: core_click::Cell)
     // prompt belongs to history (selection, links, or block focus), not to the
     // shell line editor. Previously its distance was clamped to `max_left`,
     // which turned any such click into an accidental Home operation.
-    let (start_col, start_row) = (ctx.prompt_anchor)();
+    let (start_col, start_row) = (ctx.prompt_anchor)(vte);
     if !click_may_target_live_input(click, start_row) {
         return Vec::new();
     }
@@ -386,11 +388,14 @@ pub(crate) fn install(vte: &Terminal, ctx: ClickCursorCtx) {
 
     {
         let tracker = tracker.clone();
-        let vte_for_press = vte.clone();
         let press = gtk::GestureClick::new();
         press.set_button(GDK_BUTTON_PRIMARY as u32);
         press.set_propagation_phase(gtk::PropagationPhase::Capture);
         press.connect_pressed(move |controller, n_press, x, y| {
+            let Some(vte_for_press) = controller.widget().and_downcast::<Terminal>() else {
+                tracker.borrow_mut().cancel();
+                return;
+            };
             let modifiers = controller.current_event_state();
             let plain = n_press == 1
                 && !modifiers.intersects(
@@ -407,12 +412,15 @@ pub(crate) fn install(vte: &Terminal, ctx: ClickCursorCtx) {
     }
 
     {
-        let vte_for_motion = vte.clone();
         let motion = gtk::EventControllerMotion::new();
         motion.set_propagation_phase(gtk::PropagationPhase::Capture);
         motion.connect_motion({
             let tracker = tracker.clone();
-            move |_, x, y| {
+            move |controller, x, y| {
+                let Some(vte_for_motion) = controller.widget().and_downcast::<Terminal>() else {
+                    tracker.borrow_mut().cancel();
+                    return;
+                };
                 tracker
                     .borrow_mut()
                     .pointer_at(cell_at(&vte_for_motion, x, y));
@@ -426,13 +434,16 @@ pub(crate) fn install(vte: &Terminal, ctx: ClickCursorCtx) {
     }
 
     {
-        let vte_for_release = vte.clone();
         let legacy = gtk::EventControllerLegacy::new();
         legacy.set_propagation_phase(gtk::PropagationPhase::Capture);
-        legacy.connect_event(move |_, event| {
+        legacy.connect_event(move |controller, event| {
             if event.event_type() != EventType::ButtonRelease {
                 return gtk::glib::Propagation::Proceed;
             }
+            let Some(vte_for_release) = controller.widget().and_downcast::<Terminal>() else {
+                tracker.borrow_mut().cancel();
+                return gtk::glib::Propagation::Proceed;
+            };
             let Some(click) = tracker.borrow_mut().release() else {
                 return gtk::glib::Propagation::Proceed;
             };

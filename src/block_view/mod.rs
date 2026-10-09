@@ -3623,7 +3623,9 @@ fn approved_command_submission_payload(command: &str) -> Result<Vec<u8>, String>
 /// Agent identity rather than binding a later block to the approval.
 #[derive(Clone)]
 struct VerifiedSubmissionCtx {
-    surface: Rc<dyn SubmissionSurface>,
+    // Each synchronous operation leases the TermView-owned surface. Cloned
+    // key/reader contexts and timeout closures must never own that widget.
+    surface: std::rc::Weak<dyn SubmissionSurface>,
     bstate: Rc<Cell<BlockState>>,
     pty: Rc<OwnedPty>,
     typed_cmd: Rc<RefCell<String>>,
@@ -3642,9 +3644,8 @@ struct VerifiedSubmissionCtx {
 }
 
 impl VerifiedSubmissionCtx {
-    fn current_anchor(&self) -> (i64, i64) {
-        self.surface
-            .prompt_anchor(self.prompt_end_pos.get(), self.prompt_anchor_rows.get())
+    fn current_anchor(&self, surface: &dyn SubmissionSurface) -> (i64, i64) {
+        surface.prompt_anchor(self.prompt_end_pos.get(), self.prompt_anchor_rows.get())
     }
 
     /// Describe the live editor using the same proof used by every history
@@ -3663,12 +3664,15 @@ impl VerifiedSubmissionCtx {
         if !self.prompt_anchor_ready.get() {
             return CommandPromptStatus::Initializing;
         }
+        let Some(surface) = self.surface.upgrade() else {
+            return CommandPromptStatus::ShellIntegrationUnavailable;
+        };
         match self.pty.shell_is_foreground() {
             Some(false) => CommandPromptStatus::Running,
             None => CommandPromptStatus::ShellIntegrationUnavailable,
             Some(true) => {
-                if self.surface.cursor_position() == self.current_anchor()
-                    && self.surface.suffix_is_empty() == Some(true)
+                if surface.cursor_position() == self.current_anchor(surface.as_ref())
+                    && surface.suffix_is_empty() == Some(true)
                 {
                     CommandPromptStatus::Ready
                 } else {
@@ -3679,6 +3683,12 @@ impl VerifiedSubmissionCtx {
     }
 
     fn can_recall_command(&self) -> bool {
+        self.surface
+            .upgrade()
+            .is_some_and(|surface| self.can_recall_on_surface(surface.as_ref()))
+    }
+
+    fn can_recall_on_surface(&self, surface: &dyn SubmissionSurface) -> bool {
         classify_command_prompt_status(
             self.bstate.get(),
             false,
@@ -3688,8 +3698,8 @@ impl VerifiedSubmissionCtx {
         )
         .is_ready()
             && self.prompt_anchor_ready.get()
-            && self.surface.cursor_position() == self.current_anchor()
-            && self.surface.suffix_is_empty() == Some(true)
+            && surface.cursor_position() == self.current_anchor(surface)
+            && surface.suffix_is_empty() == Some(true)
             && self.submission.borrow().is_none()
             && self.source_id.borrow().is_none()
             && self.armed_agent_execution.borrow().is_none()
@@ -3706,7 +3716,10 @@ impl VerifiedSubmissionCtx {
     /// from the cursor to BOL, so writing it over an unverified line could keep
     /// a hidden suffix and silently merge two commands.
     fn try_recall_command(&self, command: &str, bracketed_paste: bool) -> bool {
-        if !self.can_recall_command() {
+        let Some(surface) = self.surface.upgrade() else {
+            return false;
+        };
+        if !self.can_recall_on_surface(surface.as_ref()) {
             return false;
         }
         let recall = build_command_recall(command, bracketed_paste);
@@ -3795,9 +3808,13 @@ impl VerifiedSubmissionCtx {
         {
             return Err("the shell prompt is no longer verified empty".to_string());
         }
-        let anchor = self.current_anchor();
-        let cursor = self.surface.cursor_position();
-        let suffix_is_empty = self.surface.suffix_is_empty();
+        let surface = self
+            .surface
+            .upgrade()
+            .ok_or_else(|| "the live submission surface is no longer available".to_string())?;
+        let anchor = self.current_anchor(surface.as_ref());
+        let cursor = surface.cursor_position();
+        let suffix_is_empty = surface.suffix_is_empty();
         if cursor != anchor || suffix_is_empty != Some(true) {
             return Err("the shell prompt visibly contains input".to_string());
         }
@@ -3844,11 +3861,18 @@ impl VerifiedSubmissionCtx {
                 return glib::ControlFlow::Break;
             }
 
+            // Lease only for this poll. Keeping it in the timeout closure
+            // would keep the terminal alive after its TermView owner closes.
+            let Some(surface) = ctx.surface.upgrade() else {
+                ctx.source_id.borrow_mut().take();
+                ctx.fail(VERIFIED_SUBMISSION_LOST);
+                return glib::ControlFlow::Break;
+            };
             let contents = ctx.contents_generation.get();
             if contents == contents_before {
                 return glib::ControlFlow::Continue;
             }
-            let (col, row) = ctx.surface.cursor_position();
+            let (col, row) = surface.cursor_position();
             let observed = (contents, col, row);
             if last_observed.get() == Some(observed) {
                 stable_polls.set(stable_polls.get().saturating_add(1));
@@ -3861,8 +3885,8 @@ impl VerifiedSubmissionCtx {
                 return glib::ControlFlow::Continue;
             }
 
-            let rendered = ctx.surface.visible_editor_text(ctx.current_anchor());
-            let suffix_empty = ctx.surface.suffix_is_empty();
+            let rendered = surface.visible_editor_text(ctx.current_anchor(surface.as_ref()));
+            let suffix_empty = surface.suffix_is_empty();
             if rendered.as_deref() != Some(command.as_str()) || suffix_empty != Some(true) {
                 ctx.source_id.borrow_mut().take();
                 ctx.fail(VERIFIED_SUBMISSION_LOST);
@@ -3897,7 +3921,10 @@ impl VerifiedSubmissionCtx {
     /// shared reviewed boundary inserts without Enter, waits for an exact
     /// generation-stable render, and only then queues CR.
     fn try_submit_historical_rerun(&self, command: &str, bracketed_paste: bool) -> bool {
-        let anchor = self.current_anchor();
+        let Some(surface) = self.surface.upgrade() else {
+            return false;
+        };
+        let anchor = self.current_anchor(surface.as_ref());
         let guards = PromptRerunGuards {
             state: self.bstate.get(),
             pty_synced: self.pty_synced.get(),
@@ -3908,8 +3935,8 @@ impl VerifiedSubmissionCtx {
                 || self.source_id.borrow().is_some(),
             agent_execution_pending: self.armed_agent_execution.borrow().is_some(),
             shell_is_foreground: self.pty.shell_is_foreground(),
-            cursor_at_prompt_anchor: self.surface.cursor_position() == anchor,
-            suffix_is_empty: self.surface.suffix_is_empty(),
+            cursor_at_prompt_anchor: surface.cursor_position() == anchor,
+            suffix_is_empty: surface.suffix_is_empty(),
         };
         if !rerun_is_admissible(guards, command, bracketed_paste) {
             return false;
@@ -4108,6 +4135,10 @@ pub struct TermView {
     /// True only after a token-aware integration announces the exact private
     /// token inside the current prompt boundary.
     agent_execution_supported: Rc<Cell<bool>>,
+    /// Sole persistent strong owner of the query surface. Signal, reader and
+    /// timer contexts hold Weak handles and lease it only during an operation.
+    /// Kept separate from those contexts so they cannot retain the live VTE.
+    _submission_surface_owner: Rc<dyn SubmissionSurface>,
     verified_submission: VerifiedSubmissionCtx,
     /// Identity-verified Agent command currently owning the foreground block.
     active_agent_execution: Rc<Cell<Option<crate::agent::AgentExecutionRef>>>,
@@ -10529,11 +10560,11 @@ struct KeyCtx {
     selected_block_ids_for_key: SelectedBlockIds,
     selected_block_id_for_key: Rc<Cell<Option<u64>>>,
     selection_anchor_id_for_key: Rc<Cell<Option<u64>>>,
-    block_scroll_for_key: ScrolledWindow,
+    block_scroll_for_key: glib::WeakRef<ScrolledWindow>,
     /// With the two below: what `return_to_live_prompt` needs once a stranded
     /// chord hands focus back to the live VTE.
     scroll_debouncer_for_key: ScrollDebouncer,
-    jump_fab_for_key: gtk::Button,
+    jump_fab_for_key: glib::WeakRef<gtk::Button>,
     unread_for_key: Rc<Cell<u32>>,
     bookmarks_for_key: Rc<BookmarkState>,
     bstate_for_key: Rc<Cell<BlockState>>,
@@ -10591,7 +10622,11 @@ impl KeyCtx {
         } = self;
         key_ctrl.connect_key_pressed(move |controller, keyval, keycode, modifiers| {
             use gtk::gdk::Key;
-            let Some(active_vte_for_key) = active_vte_for_key.upgrade() else {
+            let (Some(active_vte_for_key), Some(block_scroll_for_key), Some(jump_fab_for_key)) = (
+                active_vte_for_key.upgrade(),
+                block_scroll_for_key.upgrade(),
+                jump_fab_for_key.upgrade(),
+            ) else {
                 return glib::Propagation::Proceed;
             };
             // The pane-root mount is only a fallback for focus stranded on a
@@ -11441,8 +11476,11 @@ impl TermView {
             let label = sticky_label.clone();
             let jump = sticky_jump_bottom_btn.clone();
             let stop = sticky_stop_btn.clone();
-            let bar = sticky_bar.clone();
+            let bar = sticky_bar.downgrade();
             sticky_minimize_btn.connect_clicked(move |button| {
+                let Some(bar) = bar.upgrade() else {
+                    return;
+                };
                 let now_minimized = !minimized.get();
                 minimized.set(now_minimized);
                 label.set_visible(!now_minimized);
@@ -12137,11 +12175,12 @@ impl TermView {
             Rc::new(RefCell::new(None));
         let verified_submission_source_id: Rc<RefCell<Option<glib::SourceId>>> =
             Rc::new(RefCell::new(None));
+        let submission_surface_owner: Rc<dyn SubmissionSurface> = Rc::new(VteSubmissionSurface {
+            vte: active_vte.clone(),
+            rebase_on_row_delta: rebase_prompt_anchor_on_row_delta,
+        });
         let verified_submission = VerifiedSubmissionCtx {
-            surface: Rc::new(VteSubmissionSurface {
-                vte: active_vte.clone(),
-                rebase_on_row_delta: rebase_prompt_anchor_on_row_delta,
-            }),
+            surface: Rc::downgrade(&submission_surface_owner),
             bstate: bstate.clone(),
             pty: pty.clone(),
             typed_cmd: typed_cmd.clone(),
@@ -12174,11 +12213,10 @@ impl TermView {
             let cwd_cbs = cwd_callbacks.clone();
             let current_cwd_for_signal = current_cwd.clone();
             let current_cwd_external_for_signal = current_cwd_external.clone();
-            let vte_for_cwd = active_vte.clone();
             let pty_for_cwd = pty.clone();
             let cwd_token_for_signal = cwd_token.to_string();
-            active_vte.connect_current_directory_uri_notify(move |_| {
-                if let Some(uri) = vte_for_cwd.current_directory_uri() {
+            active_vte.connect_current_directory_uri_notify(move |vte| {
+                if let Some(uri) = vte.current_directory_uri() {
                     if let Ok((path, host)) = glib::filename_from_uri(uri.as_str()) {
                         let path = path.to_string_lossy().to_string();
                         if path.is_empty() {
@@ -12206,13 +12244,12 @@ impl TermView {
 
         {
             let title_cbs = title_callbacks.clone();
-            let vte_for_title = active_vte.clone();
-            active_vte.connect_window_title_changed(move |_| {
+            active_vte.connect_window_title_changed(move |vte| {
                 // An empty title is forwarded too: it is a program resetting
                 // the title it set (claude sends `OSC 0 ;` on exit), and the
                 // tab label has to fall back to its default instead of keeping
                 // "✳ Claude Code" after the agent is gone.
-                if let Some(title) = vte_for_title.window_title() {
+                if let Some(title) = vte.window_title() {
                     let title_str = title.to_string();
                     for cb in title_cbs.borrow().iter() {
                         cb(&title_str);
@@ -12503,7 +12540,7 @@ impl TermView {
         // reflects the settled post-scroll layout.
         {
             let user_scrolled = user_scrolled_up.clone();
-            let fab = jump_fab.clone();
+            let fab = jump_fab.downgrade();
             let unread = unread_count.clone();
             let scroll = block_scroll.downgrade();
             let holder = active.borrow().widget().downgrade();
@@ -12548,7 +12585,8 @@ impl TermView {
                         if pending_programmatic_only.replace(true) {
                             return;
                         }
-                        let (Some(scroll), Some(holder)) = (scroll.upgrade(), holder.upgrade())
+                        let (Some(scroll), Some(holder), Some(fab)) =
+                            (scroll.upgrade(), holder.upgrade(), fab.upgrade())
                         else {
                             return;
                         };
@@ -12653,14 +12691,16 @@ impl TermView {
 
         // ── Jump-to-bottom FAB click: return to the live prompt ───────────
         {
-            let scroll = block_scroll.clone();
+            let scroll = block_scroll.downgrade();
             let programmatic = programmatic_scroll.clone();
             let user_scrolled = user_scrolled_up.clone();
             let unread = unread_count.clone();
-            let fab = jump_fab.clone();
             let live_vte = active_vte.downgrade();
             let debouncer = scroll_debouncer.clone();
-            jump_fab.connect_clicked(move |_| {
+            jump_fab.connect_clicked(move |fab| {
+                let Some(scroll) = scroll.upgrade() else {
+                    return;
+                };
                 // Returning to the live prompt is not a single set_value: blocks
                 // below the viewport are virtualized, so `upper` only grows as
                 // they scroll into view. One jump lands partway; the target has
@@ -12738,11 +12778,11 @@ impl TermView {
         // header keep the timer below: their elapsed readouts are genuinely
         // time-driven.
         let recompute_sticky_scan: Rc<dyn Fn()> = {
-            let sticky = sticky_bar.clone();
-            let sticky_label = sticky_label.clone();
-            let sticky_jump_bottom = sticky_jump_bottom_btn.clone();
-            let sticky_stop = sticky_stop_btn.clone();
-            let sticky_organism = sticky_organism_slot.clone();
+            let sticky = sticky_bar.downgrade();
+            let sticky_label = sticky_label.downgrade();
+            let sticky_jump_bottom = sticky_jump_bottom_btn.downgrade();
+            let sticky_stop = sticky_stop_btn.downgrade();
+            let sticky_organism = sticky_organism_slot.downgrade();
             let sticky_target = sticky_target_id.clone();
             let sticky_minimized = sticky_minimized.clone();
             let cmd_running = cmd_running.clone();
@@ -12759,6 +12799,22 @@ impl TermView {
                 if fullscreen.get() || cmd_running.get() {
                     return;
                 }
+                let (
+                    Some(sticky),
+                    Some(sticky_label),
+                    Some(sticky_jump_bottom),
+                    Some(sticky_stop),
+                    Some(sticky_organism),
+                ) = (
+                    sticky.upgrade(),
+                    sticky_label.upgrade(),
+                    sticky_jump_bottom.upgrade(),
+                    sticky_stop.upgrade(),
+                    sticky_organism.upgrade(),
+                )
+                else {
+                    return;
+                };
                 if !user_scrolled.get() {
                     sticky_target.set(None);
                     sticky_jump_bottom.set_visible(false);
@@ -13002,7 +13058,7 @@ impl TermView {
             let bstate_for_commit = bstate.clone();
             let typed_cmd_for_commit = typed_cmd.clone();
             let armed_agent_execution_for_commit = armed_agent_execution.clone();
-            let verified_submission_for_commit = verified_submission.clone();
+            let reviewed_submission_for_commit = verified_submission.submission.clone();
             let idle_input_dirty_for_commit = idle_input_dirty.clone();
             let pty_synced_for_commit = pty_synced.clone();
             let finished_blocks_for_commit = finished_blocks_rc.clone();
@@ -13017,12 +13073,12 @@ impl TermView {
             let unified_for_commit = unified;
             let user_scrolled_up_for_commit = user_scrolled_up.clone();
             let debouncer_for_commit = scroll_debouncer.clone();
-            let scroll_for_commit = block_scroll.clone();
-            let fab_for_commit = jump_fab.clone();
+            let scroll_for_commit = block_scroll.downgrade();
+            let fab_for_commit = jump_fab.downgrade();
             let unread_for_commit = unread_count.clone();
             active_vte.connect_commit(move |_, text, _size| {
                 let submission_pending = armed_agent_execution_for_commit.borrow().is_some()
-                    || verified_submission_for_commit.submission.borrow().is_some();
+                    || reviewed_submission_for_commit.borrow().is_some();
                 let route = route_live_commit(
                     text.as_bytes(),
                     &cpr_outstanding_for_commit,
@@ -13089,12 +13145,16 @@ impl TermView {
                     && !unified_for_commit
                     && bstate_for_commit.get() != BlockState::AltScreen
                 {
-                    return_to_live_prompt(
-                        &debouncer_for_commit,
-                        &scroll_for_commit,
-                        &fab_for_commit,
-                        &unread_for_commit,
-                    );
+                    if let (Some(scroll), Some(fab)) =
+                        (scroll_for_commit.upgrade(), fab_for_commit.upgrade())
+                    {
+                        return_to_live_prompt(
+                            &debouncer_for_commit,
+                            &scroll,
+                            &fab,
+                            &unread_for_commit,
+                        );
+                    }
                 }
 
                 // Real terminal input exits historical block selection. Without
@@ -13221,24 +13281,28 @@ impl TermView {
         // chords never get here — the window-level dispatcher captures first
         // and swallows them.
         {
-            let active_vte_for_refocus = active_vte.clone();
-            let root_for_refocus = root.clone();
-            let scroll_for_refocus = block_scroll.clone();
+            let active_vte_for_refocus = active_vte.downgrade();
+            let scroll_for_refocus = block_scroll.downgrade();
             let debouncer_for_refocus = scroll_debouncer.clone();
             let unread_for_refocus = unread_count.clone();
-            let fab_for_refocus = jump_fab.clone();
+            let fab_for_refocus = jump_fab.downgrade();
             let selected_for_refocus = selected_block_id.clone();
             let bstate_for_refocus = bstate.clone();
             let refocus_key = gtk::EventControllerKey::new();
             refocus_key.set_propagation_phase(gtk::PropagationPhase::Capture);
             refocus_key.connect_key_pressed(move |controller, keyval, _keycode, modifiers| {
+                let (Some(active_vte_for_refocus), Some(scroll_for_refocus), Some(fab_for_refocus)) =
+                    (active_vte_for_refocus.upgrade(), scroll_for_refocus.upgrade(), fab_for_refocus.upgrade())
+                else {
+                    return glib::Propagation::Proceed;
+                };
                 if active_vte_for_refocus.has_focus()
                     || selection_owns_key(selected_for_refocus.get().is_some(), keyval)
                     || !stranded_focus_key_recovers(keyval, modifiers)
                 {
                     return glib::Propagation::Proceed;
                 }
-                let Some(focused) = root_for_refocus.root().and_then(|window| window.focus())
+                let Some(focused) = controller.widget().and_then(|root| root.root()).and_then(|window| window.focus())
                 else {
                     return glib::Propagation::Proceed;
                 };
@@ -13274,7 +13338,7 @@ impl TermView {
             let selected_block_ids_for_key = selected_block_ids.clone();
             let selected_block_id_for_key = selected_block_id.clone();
             let selection_anchor_id_for_key = selection_anchor_id.clone();
-            let block_scroll_for_key = block_scroll.clone();
+            let block_scroll_for_key = block_scroll.downgrade();
             let key_ctx = KeyCtx {
                 live_keys_for_key: live_keys.clone(),
                 pty_for_key: pty.clone(),
@@ -13286,7 +13350,7 @@ impl TermView {
                 selection_anchor_id_for_key,
                 block_scroll_for_key,
                 scroll_debouncer_for_key: scroll_debouncer.clone(),
-                jump_fab_for_key: jump_fab.clone(),
+                jump_fab_for_key: jump_fab.downgrade(),
                 unread_for_key: unread_count.clone(),
                 bookmarks_for_key: block_bookmarks.clone(),
                 bstate_for_key: bstate.clone(),
@@ -13348,11 +13412,15 @@ impl TermView {
                 enabled: config.click_moves_cursor,
                 pty: Rc::clone(&pty),
                 prompt_anchor: {
-                    let surface = verified_submission.surface.clone();
                     let prompt_end_pos = prompt_end_pos.clone();
                     let prompt_anchor_rows = prompt_anchor_rows.clone();
-                    Rc::new(move || {
-                        surface.prompt_anchor(prompt_end_pos.get(), prompt_anchor_rows.get())
+                    Rc::new(move |terminal| {
+                        prompt_anchor_for_surface(
+                            rebase_prompt_anchor_on_row_delta,
+                            prompt_end_pos.get(),
+                            prompt_anchor_rows.get(),
+                            terminal.row_count(),
+                        )
                     })
                 },
                 bstate: bstate.clone(),
@@ -13379,10 +13447,13 @@ impl TermView {
             let pointer_cell: Rc<Cell<(i64, i64)>> = Rc::new(Cell::new((1, 1)));
             {
                 let pointer_for_motion = pointer_cell.clone();
-                let vte_for_motion = active_vte.clone();
                 let motion = gtk::EventControllerMotion::new();
                 motion.set_propagation_phase(gtk::PropagationPhase::Capture);
-                motion.connect_motion(move |_, x, y| {
+                motion.connect_motion(move |controller, x, y| {
+                    let Some(vte_for_motion) = controller.widget().and_downcast::<Terminal>()
+                    else {
+                        return;
+                    };
                     let cw = (vte_for_motion.char_width() as f64).max(1.0);
                     let ch = (vte_for_motion.char_height() as f64).max(1.0);
                     let col = (x / cw).floor() as i64 + 1;
@@ -13631,6 +13702,7 @@ impl TermView {
             prompt_anchor_ready,
             armed_agent_execution,
             agent_execution_supported,
+            _submission_surface_owner: submission_surface_owner,
             verified_submission,
             active_agent_execution,
             idle_input_dirty: idle_input_dirty.clone(),
@@ -14130,15 +14202,6 @@ impl TermView {
             );
         }
         self.pty.write_bytes(data);
-    }
-
-    /// Resolve the saved PromptEnd anchor through this pane's surface policy.
-    /// Reviewed submission and click-to-place-cursor use the same method on the
-    /// same surface object.
-    fn current_prompt_anchor(&self) -> (i64, i64) {
-        self.verified_submission
-            .surface
-            .prompt_anchor(self.prompt_end_pos.get(), self.prompt_anchor_rows.get())
     }
 
     /// Content-free, constant-time lifecycle boundary for passive UI. Unknown
@@ -18804,8 +18867,9 @@ mod tests {
                     }));
             }
 
+            let submission_surface: Rc<dyn SubmissionSurface> = surface.clone();
             let verified_submission = VerifiedSubmissionCtx {
-                surface: surface.clone(),
+                surface: Rc::downgrade(&submission_surface),
                 bstate: bstate.clone(),
                 pty: pty.clone(),
                 typed_cmd: typed_cmd.clone(),
@@ -24451,6 +24515,7 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
         let scroll = gtk::ScrolledWindow::new();
         scroll.set_child(Some(&root));
         let keys = Rc::new(LiveKeyRecord::default());
+        let jump_fab = gtk::Button::new();
         let key_ctx = KeyCtx {
             live_keys_for_key: keys,
             pty_for_key: harness.pty.clone(),
@@ -24460,12 +24525,12 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
             selected_block_ids_for_key: selected.clone(),
             selected_block_id_for_key: selected_id.clone(),
             selection_anchor_id_for_key: Rc::new(Cell::new(Some(41))),
-            block_scroll_for_key: scroll.clone(),
+            block_scroll_for_key: scroll.downgrade(),
             scroll_debouncer_for_key: ScrollDebouncer::with_scroll_lock(
                 Rc::new(Cell::new(false)),
                 Rc::new(Cell::new(false)),
             ),
-            jump_fab_for_key: gtk::Button::new(),
+            jump_fab_for_key: jump_fab.downgrade(),
             unread_for_key: Rc::new(Cell::new(0)),
             bookmarks_for_key: Rc::new(BookmarkState::default()),
             bstate_for_key: harness.bstate.clone(),

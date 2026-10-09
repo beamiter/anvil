@@ -2418,8 +2418,8 @@ impl SimpleComponent for AppModel {
             }
             AppMsg::AgentReject(reference) => self.agent_reject(reference, &sender),
             AppMsg::AgentRefreshPrompt(epoch) => self.agent_refresh_prompt(epoch),
-            AppMsg::AgentLlmReply { epoch, reply } => {
-                self.agent_handle_reply(epoch, reply, &sender);
+            AppMsg::AgentLlmReply { request, reply } => {
+                self.agent_handle_reply(request, reply, &sender);
             }
             AppMsg::AgentBlockFinished {
                 tab_id: _,
