@@ -1249,7 +1249,7 @@ Forge's GTK4 frontend is recorded in
 ### ASCII organism
 
 Set `ascii_organism_enabled = true` to attach the optional local organism to
-new Block panes. It reacts only to content-free command lifecycle facts,
+open and new local Block panes. It reacts only to content-free command lifecycle facts,
 focused-pane presence, elapsed time, exit status/duration, and Agent state; it
 does not run commands, use an LLM, or persist command/output text. Its bounded
 memory lives under `${XDG_STATE_HOME:-~/.local/state}/anvil/` and is flushed on
@@ -1259,8 +1259,20 @@ state.
 `ascii_organism_motion = "full" | "calm" | "static"` selects animation and
 spatial behavior. Omitting it follows the desktop animation preference.
 Settings exposes the same four choices as Forge: Automatic, Full, Calm, and
-Static. Changes apply to newly created Block panes; existing pane-local life
-continues without being replaced mid-command.
+Static. Settings and configuration reloads apply immediately to existing local
+Block/Unified panes. Turning it off hides all three representations and stops
+that pane's animation timer; re-enabling reuses the existing body and callbacks.
+
+Pause the pointer near a visible resting body for 600 ms for a quiet two-second
+hello. Split panes share an eight-second cooldown. This passive observer never
+consumes clicks, selection, or keyboard focus; typing, real work, focus transfer,
+fullscreen apps, or changed geometry cancel a pending greeting. Busy/reaction
+poses stay undisturbed. Calm uses a still acknowledgment; Static has no spatial
+body. Greetings do not change physiology or durable memory.
+
+Settings also offers eight explained poses and a preview-only Say hello button,
+even while the live companion is off. Previewing never runs terminal commands or
+changes its memory. Hiding/closing settings stops every preview frame source.
 
 Lifetime growth is now visible as well as named in the badge: juvenile bodies
 use rounder ears, larger eyes, and quicker micro-motion; adult keeps the

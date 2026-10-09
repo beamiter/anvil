@@ -73,6 +73,8 @@ impl AppModel {
         self.shell_argv = new_shell_argv;
         self.reconcile_file_tree_remote_hosts(&old_remote_hosts, sender);
         self.sync_terminal_configs();
+        self.organism_hub.sync_ascii_organism_settings();
+        self.sync_organism_focus();
         if !new_config.ai_enabled {
             self.close_command_suggestion();
             self.close_all_command_corrections();

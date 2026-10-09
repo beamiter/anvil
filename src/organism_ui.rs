@@ -18,6 +18,7 @@ use jterm_core::organism::{
     VisualGrowthStage, VisualTransition, WatchRhythm,
 };
 use jterm_core::organism_attention::{AttentionArbiter, AttentionCue};
+use jterm_core::organism_daily::GentleInteraction;
 use jterm_core::organism_memory::{
     local_circadian_time_at_ms, unix_ms, CircadianProfile, GrowthProgress, GrowthStage,
     LocalCircadianTime, MemoryEvent, MemoryInsight, RepoContext,
@@ -25,6 +26,9 @@ use jterm_core::organism_memory::{
 
 /// An accepted correction only vouches for a command that starts promptly.
 const CORRECTION_ASSIST_WINDOW: Duration = Duration::from_secs(30);
+const POINTER_GREETING_DWELL: Duration = Duration::from_millis(600);
+const POINTER_GREETING_RADIUS: f64 = 32.0;
+
 const HUMAN_INPUT_RETREAT: Duration = Duration::from_millis(900);
 const SURFACE_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 /// Heartbeat while the mind rests or the body is static: life goes on, the
@@ -53,6 +57,17 @@ const TONE_CLASSES: [&str; 5] = [
     "organism-error",
     "organism-warning",
 ];
+
+fn pointer_buttons_down(view: &TermView) -> bool {
+    let buttons = gtk::gdk::ModifierType::BUTTON1_MASK
+        | gtk::gdk::ModifierType::BUTTON2_MASK
+        | gtk::gdk::ModifierType::BUTTON3_MASK;
+    view.widget()
+        .display()
+        .default_seat()
+        .and_then(|seat| seat.pointer())
+        .is_some_and(|pointer| pointer.modifier_state().intersects(buttons))
+}
 
 fn surface_frame_delay(
     motion: OrganismMotion,
@@ -1413,6 +1428,8 @@ struct PresenceEntry {
 struct PresenceState {
     ledger: PresenceLedger,
     entries: Vec<PresenceEntry>,
+    eligible: Vec<std::rc::Weak<TermView>>,
+    last_greeting: Option<Instant>,
 }
 
 /// Window-shared arbiter for the one spatial body. Every pane keeps its own
@@ -1426,6 +1443,38 @@ impl OrganismPresence {
     pub(crate) fn new() -> Rc<Self> {
         Rc::new(Self {
             state: RefCell::new(PresenceState::default()),
+        })
+    }
+
+    /// Remember supported local panes even while disabled, without creating
+    /// widgets, callbacks, or timers until the feature is explicitly enabled.
+    fn remember_view(&self, view: &Rc<TermView>) {
+        let mut state = self.state.borrow_mut();
+        state.eligible.retain(|view| view.strong_count() > 0);
+        if !state.eligible.iter().any(|entry| {
+            entry
+                .upgrade()
+                .is_some_and(|candidate| Rc::ptr_eq(&candidate, view))
+        }) {
+            state.eligible.push(Rc::downgrade(view));
+        }
+    }
+
+    fn eligible_views(&self) -> Vec<Rc<TermView>> {
+        self.state
+            .borrow()
+            .eligible
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .collect()
+    }
+
+    fn runtime_for(&self, view: &Rc<TermView>) -> Option<Rc<OrganismRuntime>> {
+        self.state.borrow().entries.iter().find_map(|entry| {
+            let candidate = entry.view.upgrade()?;
+            Rc::ptr_eq(&candidate, view)
+                .then(|| entry.runtime.upgrade())
+                .flatten()
         })
     }
 
@@ -1640,7 +1689,15 @@ fn repo_work_scope_matches(
 
 struct OrganismRuntime {
     organism: RefCell<NativeOrganism>,
-    motion: OrganismMotion,
+    motion: Cell<OrganismMotion>,
+    enabled: Cell<bool>,
+    awaiting_unobserved_work: Cell<bool>,
+    interaction: RefCell<GentleInteraction>,
+    interaction_epoch: Instant,
+    live_context: Cell<RenderContext>,
+    pointer_position: Cell<Option<(f64, f64)>>,
+    pointer_near: Cell<bool>,
+    pointer_timer: RefCell<Option<gtk::glib::SourceId>>,
     memory_badge: Cell<MemoryBadgeState>,
     shared_life: Rc<Cell<LifeState>>,
     activity: Rc<OrganismActivity>,
@@ -1820,7 +1877,19 @@ impl OrganismRuntime {
 
         let runtime = Rc::new(Self {
             organism: RefCell::new(NativeOrganism::from_persisted_state(shared_life.get())),
-            motion,
+            motion: Cell::new(motion),
+            enabled: Cell::new(true),
+            awaiting_unobserved_work: Cell::new(false),
+            interaction: RefCell::new(GentleInteraction::default()),
+            interaction_epoch: Instant::now(),
+            live_context: Cell::new(RenderContext::new(
+                Behavior::Idle,
+                BodyLanguage::default(),
+                false,
+            )),
+            pointer_position: Cell::new(None),
+            pointer_near: Cell::new(false),
+            pointer_timer: RefCell::new(None),
             memory_badge: Cell::new(if persistent {
                 MemoryBadgeState::Persistent
             } else {
@@ -1899,6 +1968,10 @@ impl OrganismRuntime {
     /// or acquiring a durable vigil cannot leave the window-wide rest counter
     /// stale until the next (possibly one-second) heartbeat.
     fn reconcile_sleeping_claim(&self, view: &TermView, now: Instant) {
+        if !self.enabled.get() {
+            self.set_sleeping(false);
+            return;
+        }
         let mode = surface_mode(
             self.surface_behavior.get(),
             self.command_running.get(),
@@ -1910,7 +1983,7 @@ impl OrganismRuntime {
         let vigil = self.organism.borrow().repo_vigil();
         self.set_sleeping(sleeping_claim(
             owner,
-            self.motion,
+            self.motion.get(),
             alt_screen,
             self.body_position.get().is_some(),
             self.presence_cue.get().is_some(),
@@ -1933,6 +2006,9 @@ impl OrganismRuntime {
         signal: PresenceSignal,
         now: Instant,
     ) {
+        if !runtime.enabled.get() {
+            return;
+        }
         let mode = surface_mode(
             runtime.surface_behavior.get(),
             runtime.command_running.get(),
@@ -1941,7 +2017,7 @@ impl OrganismRuntime {
         let alt_screen = view.live_organism_surface_metrics().alt_screen;
         if !can_show_presence_cue(
             runtime.presence.is_owner(runtime.presence_token),
-            runtime.motion,
+            runtime.motion.get(),
             alt_screen,
             runtime.body_position.get().is_some(),
             mode,
@@ -1996,6 +2072,9 @@ impl OrganismRuntime {
         work: RepoWorkState,
         now: Instant,
     ) {
+        if !runtime.enabled.get() {
+            return;
+        }
         let changed = runtime.organism.borrow_mut().sync_repo_work_state(work);
         if !changed {
             return;
@@ -2064,7 +2143,160 @@ impl OrganismRuntime {
         self.offered_watch_rhythm.set(WatchRhythm::Steady);
     }
 
+    fn cancel_pointer_greeting(&self) {
+        if let Some(source) = self.pointer_timer.borrow_mut().take() {
+            source.remove();
+        }
+        self.pointer_near.set(false);
+        self.pointer_position.set(None);
+        self.interaction.borrow_mut().cancel();
+    }
+
+    fn pointer_can_greet(&self, view: &TermView, x: f64, y: f64) -> bool {
+        if !self.enabled.get()
+            || self.motion.get() == OrganismMotion::Static
+            || !self.presence.is_owner(self.presence_token)
+            || !self.live_body.is_mapped()
+            || self.command_running.get()
+            || !view.organism_activity_settled()
+            || pointer_buttons_down(view)
+            || self
+                .human_input_age(Instant::now())
+                .is_some_and(|age| age < HUMAN_INPUT_RETREAT)
+            || view.live_organism_surface_metrics().alt_screen
+        {
+            return false;
+        }
+        let context = self.live_context.get();
+        if context.transition.is_some()
+            || !matches!(
+                context.behavior,
+                Behavior::Idle | Behavior::Explore | Behavior::Sleep | Behavior::Approach
+            )
+        {
+            return false;
+        }
+        self.live_body
+            .compute_bounds(&view.widget())
+            .is_some_and(|bounds| {
+                x >= f64::from(bounds.x()) - POINTER_GREETING_RADIUS
+                    && x <= f64::from(bounds.x() + bounds.width()) + POINTER_GREETING_RADIUS
+                    && y >= f64::from(bounds.y()) - POINTER_GREETING_RADIUS
+                    && y <= f64::from(bounds.y() + bounds.height()) + POINTER_GREETING_RADIUS
+            })
+    }
+
+    fn observe_pointer(runtime: &Rc<Self>, view: &Rc<TermView>, x: f64, y: f64, dragging: bool) {
+        if dragging || !runtime.pointer_can_greet(view, x, y) {
+            runtime.cancel_pointer_greeting();
+            return;
+        }
+        runtime.pointer_position.set(Some((x, y)));
+        if runtime.pointer_near.replace(true) {
+            return;
+        }
+        if runtime
+            .presence
+            .state
+            .borrow()
+            .last_greeting
+            .is_some_and(|last| last.elapsed() < GentleInteraction::COOLDOWN)
+        {
+            return;
+        }
+        let weak = Rc::downgrade(runtime);
+        let view_weak = Rc::downgrade(view);
+        let source = gtk::glib::timeout_add_local_once(POINTER_GREETING_DWELL, move || {
+            let Some(runtime) = weak.upgrade() else {
+                return;
+            };
+            // Clear the fired id before checking its view: a separately held
+            // runtime must never try removing an already-fired source in Drop.
+            runtime.pointer_timer.borrow_mut().take();
+            let Some(view) = view_weak.upgrade() else {
+                runtime.cancel_pointer_greeting();
+                return;
+            };
+            let Some((x, y)) = runtime.pointer_position.get() else {
+                return;
+            };
+            if !runtime.pointer_can_greet(&view, x, y) {
+                runtime.cancel_pointer_greeting();
+                return;
+            }
+            let now = Instant::now();
+            // The window's single body shares the cooldown across split panes.
+            if runtime
+                .presence
+                .state
+                .borrow()
+                .last_greeting
+                .is_some_and(|last| {
+                    now.saturating_duration_since(last) < GentleInteraction::COOLDOWN
+                })
+            {
+                return;
+            }
+            if runtime.interaction.borrow_mut().request(
+                runtime.interaction_epoch.elapsed(),
+                runtime.live_context.get(),
+            ) {
+                runtime.presence.state.borrow_mut().last_greeting = Some(now);
+                runtime.refresh_surface(&view, now);
+            }
+        });
+        *runtime.pointer_timer.borrow_mut() = Some(source);
+    }
+
+    fn install_pointer_observer(
+        runtime: &Rc<Self>,
+        view: &Rc<TermView>,
+    ) -> gtk::EventControllerMotion {
+        let motion = gtk::EventControllerMotion::new();
+        motion.set_propagation_phase(gtk::PropagationPhase::Bubble);
+        motion.connect_motion({
+            let runtime = runtime.clone();
+            let view = Rc::downgrade(view);
+            move |controller, x, y| {
+                if let Some(view) = view.upgrade() {
+                    let buttons = gtk::gdk::ModifierType::BUTTON1_MASK
+                        | gtk::gdk::ModifierType::BUTTON2_MASK
+                        | gtk::gdk::ModifierType::BUTTON3_MASK;
+                    Self::observe_pointer(
+                        &runtime,
+                        &view,
+                        x,
+                        y,
+                        controller.current_event_state().intersects(buttons),
+                    );
+                }
+            }
+        });
+        motion.connect_leave({
+            let runtime = runtime.clone();
+            move |_| runtime.cancel_pointer_greeting()
+        });
+        view.widget().add_controller(motion.clone());
+        let press = gtk::EventControllerLegacy::new();
+        press.set_propagation_phase(gtk::PropagationPhase::Capture);
+        press.connect_event({
+            let runtime = runtime.clone();
+            move |_, event| {
+                if matches!(
+                    event.event_type(),
+                    gtk::gdk::EventType::ButtonPress | gtk::gdk::EventType::TouchBegin
+                ) {
+                    runtime.cancel_pointer_greeting();
+                }
+                gtk::glib::Propagation::Proceed
+            }
+        });
+        view.widget().add_controller(press);
+        motion
+    }
+
     fn hide_live_body(&self, view: &TermView) {
+        self.cancel_pointer_greeting();
         self.reset_watch_rhythm_at_boundary(Instant::now());
         self.clear_presence_cue();
         self.visual_transition.set(None);
@@ -2088,6 +2320,7 @@ impl OrganismRuntime {
     }
 
     fn advance_generation(&self, preserve_territory_intro: bool) -> u64 {
+        self.cancel_pointer_greeting();
         let territory_intro_pending =
             preserve_territory_intro && self.territory_intro_pending.get();
         self.clear_presence_cue();
@@ -2109,7 +2342,7 @@ impl OrganismRuntime {
             .take()
             .unwrap_or_else(|| self.last_live_behavior.get());
         let transition =
-            visual_transition_for_motion(self.motion, transition_from, reaction.behavior);
+            visual_transition_for_motion(self.motion.get(), transition_from, reaction.behavior);
         self.visual_transition.set(transition);
         self.visual_transition_frame.set(0);
         self.surface_behavior_frame_origin
@@ -2260,12 +2493,31 @@ impl OrganismRuntime {
     }
 
     fn refresh_surface(&self, view: &TermView, now: Instant) {
+        if !self.enabled.get() {
+            self.hide_live_body(view);
+            self.sticky_avatar.set_visible(false);
+            return;
+        }
+        if self.awaiting_unobserved_work.get() {
+            if !view.organism_activity_settled() {
+                self.hide_live_body(view);
+                self.sticky_avatar.set_visible(false);
+                self.status
+                    .set_text("Waiting for the current terminal activity to settle");
+                return;
+            }
+            self.awaiting_unobserved_work.set(false);
+            let idle = self.organism.borrow().idle_reaction();
+            self.render(&idle);
+        }
         // Growth is window-shared. Even static or unfocused bodies refresh
         // their badge on the low-frequency heartbeat after another pane ages
         // the organism into its next stage.
         self.refresh_growth_badge();
         self.refresh_inline_sprite();
-        if self.motion == OrganismMotion::Static {
+        if self.motion.get() == OrganismMotion::Static {
+            self.hide_live_body(view);
+            self.sticky_avatar.set_visible(false);
             // The inline card is the whole visual surface; the live body and
             // sticky avatar were never attached. Consume a first-look rather
             // than carrying it behind an unavailable surface.
@@ -2318,19 +2570,20 @@ impl OrganismRuntime {
         // advances its target slower than once per frame, so transit alone
         // would stutter the walk animation. Calm motion freezes the frame at
         // zero: first frames only, no wandering, no bob, no flourishes.
-        let (geometry_frame, baseline_frame, live_frame) = if self.motion == OrganismMotion::Full {
-            let global = self.surface_frame.get();
-            let (baseline, live) = animation_frames(
-                global,
-                self.surface_behavior_frame_origin.get(),
-                self.presence_cue_frame_origin.get(),
-                mode,
-                self.presence_cue.get(),
-            );
-            (global, baseline, live)
-        } else {
-            (0, 0, 0)
-        };
+        let (geometry_frame, baseline_frame, live_frame) =
+            if self.motion.get() == OrganismMotion::Full {
+                let global = self.surface_frame.get();
+                let (baseline, live) = animation_frames(
+                    global,
+                    self.surface_behavior_frame_origin.get(),
+                    self.presence_cue_frame_origin.get(),
+                    mode,
+                    self.presence_cue.get(),
+                );
+                (global, baseline, live)
+            } else {
+                (0, 0, 0)
+            };
         let language = BodyLanguage::from_state(self.shared_life.get());
         let tempo = wander_tempo(language);
         let wander_walking = match ambient {
@@ -2361,13 +2614,23 @@ impl OrganismRuntime {
         } else {
             live_frame
         };
-        let sprite = sprite_frame_with_context(
-            RenderContext::new(display_behavior, language, walking)
-                .with_growth_stage(growth)
-                .with_watch_rhythm(rhythm)
-                .with_transition(transition),
-            sprite_frame,
-        );
+        let context = RenderContext::new(display_behavior, language, walking)
+            .with_growth_stage(growth)
+            .with_watch_rhythm(rhythm)
+            .with_transition(transition);
+        self.live_context.set(context);
+        if self
+            .pointer_position
+            .get()
+            .is_some_and(|(x, y)| !self.pointer_can_greet(view, x, y))
+        {
+            self.cancel_pointer_greeting();
+        }
+        let context = self
+            .interaction
+            .borrow_mut()
+            .apply(self.interaction_epoch.elapsed(), context);
+        let sprite = sprite_frame_with_context(context, sprite_frame);
         if self.live_body.text().as_str() != sprite.as_ref() {
             self.live_body.set_text(sprite.as_ref());
         }
@@ -2434,7 +2697,23 @@ impl OrganismRuntime {
             cursor_row: metrics.cursor_row,
         };
         let signature = surface_signature(surface);
-        if self.surface_signature.replace(signature) != signature {
+        let previous_signature = self.surface_signature.replace(signature);
+        if previous_signature != signature {
+            if (
+                previous_signature.0,
+                previous_signature.1,
+                previous_signature.2,
+                previous_signature.3,
+                previous_signature.4,
+            ) != (
+                signature.0,
+                signature.1,
+                signature.2,
+                signature.3,
+                signature.4,
+            ) {
+                self.cancel_pointer_greeting();
+            }
             self.body_position.set(None);
             self.body_in_transit.set(false);
         }
@@ -2456,7 +2735,7 @@ impl OrganismRuntime {
                 None => (target.x, target.y, false),
                 // Calm motion never animates a walk; poses snap, and a snap
                 // is not a walk — no transit gait afterwards.
-                Some(_) if self.motion != OrganismMotion::Full => (target.x, target.y, false),
+                Some(_) if self.motion.get() != OrganismMotion::Full => (target.x, target.y, false),
                 Some((px, py)) => {
                     let x = approach(px, target.x, f64::from(metrics.cell_width.max(1)));
                     let mut y = approach(py, target.y, f64::from(metrics.cell_height.max(1)));
@@ -2488,13 +2767,63 @@ impl OrganismRuntime {
         self.sticky_avatar.set_visible(mode != SurfaceMode::Typing);
     }
 
+    fn apply_settings(
+        runtime: &Rc<Self>,
+        view: &Rc<TermView>,
+        enabled: bool,
+        motion: OrganismMotion,
+    ) {
+        let was_enabled = runtime.enabled.replace(enabled);
+        let old_motion = runtime.motion.replace(motion);
+        if was_enabled == enabled && old_motion == motion {
+            return;
+        }
+        runtime.hide_live_body(view);
+        runtime.sticky_avatar.set_visible(false);
+        runtime.card.set_visible(enabled);
+        if let Some(source) = runtime.surface_timer.borrow_mut().take() {
+            source.remove();
+        }
+        runtime.surface_last_frame.set(None);
+        if !enabled {
+            runtime.bump_generation();
+            if runtime.command_running.replace(false) {
+                runtime.activity.command_finished(Instant::now());
+            }
+            runtime.command_started_at.set(None);
+            runtime.agent_watching.set(false);
+            runtime.active_memory_kind.set(None);
+            runtime.active_repo_context.borrow_mut().take();
+            runtime.command_origin_behavior.set(None);
+            runtime.output_rhythm.borrow_mut().reset();
+            return;
+        }
+        if !was_enabled {
+            // Cwd may have changed while presentation was disabled. Never
+            // carry another checkout's guard into the newly visible pane.
+            runtime.clear_repo_work_after_leave(&view.cwd());
+            runtime
+                .awaiting_unobserved_work
+                .set(!view.organism_activity_settled());
+            runtime
+                .organism
+                .borrow_mut()
+                .sync_state(runtime.shared_life.get());
+            let idle = runtime.organism.borrow().idle_reaction();
+            runtime.render(&idle);
+            view.insert_inline_notice(&runtime.card);
+        }
+        runtime.refresh_surface(view, Instant::now());
+        Self::start_surface_tick(runtime, view);
+    }
+
     fn start_surface_tick(runtime: &Rc<Self>, view: &Rc<TermView>) {
         let owner = runtime.presence.is_owner(runtime.presence_token);
         let alt_screen = view.live_organism_surface_metrics().alt_screen;
         Self::schedule_surface_frame(
             runtime,
             view,
-            surface_frame_delay(runtime.motion, owner, alt_screen, false),
+            surface_frame_delay(runtime.motion.get(), owner, alt_screen, false),
         );
     }
 
@@ -2504,7 +2833,7 @@ impl OrganismRuntime {
         let (source, delay) = {
             let mut slot = runtime.surface_timer.borrow_mut();
             let Some(delay) =
-                focus_transfer_rearm_delay(runtime.motion, owner, alt_screen, slot.is_some())
+                focus_transfer_rearm_delay(runtime.motion.get(), owner, alt_screen, slot.is_some())
             else {
                 // A fired callback takes the id before doing any work. It will
                 // see the new owner and choose its next delay at the tail; a
@@ -2527,6 +2856,9 @@ impl OrganismRuntime {
     /// one-second heartbeat while the mind rests, the body is static, or this
     /// pane does not own the one live presence.
     fn schedule_surface_frame(runtime: &Rc<Self>, view: &Rc<TermView>, delay: Duration) {
+        if !runtime.enabled.get() {
+            return;
+        }
         debug_assert!(
             runtime.surface_timer.borrow().is_none(),
             "a surface runtime must never own two pending frame sources"
@@ -2542,6 +2874,9 @@ impl OrganismRuntime {
             // must never leave this fired source's id behind for Drop to
             // remove — glib panics on removing a dead source.
             runtime.surface_timer.borrow_mut().take();
+            if !runtime.enabled.get() {
+                return;
+            }
             let Some(view) = view_weak.upgrade() else {
                 return;
             };
@@ -2612,7 +2947,7 @@ impl OrganismRuntime {
             );
             let rhythm_context_presentable = watch_rhythm_context_presentable(
                 runtime.presence.is_owner(runtime.presence_token),
-                runtime.motion,
+                runtime.motion.get(),
                 mode,
                 alt_screen,
             );
@@ -2687,12 +3022,16 @@ impl OrganismRuntime {
                 }
             }
             let next = surface_frame_delay(
-                runtime.motion,
+                runtime.motion.get(),
                 runtime.presence.is_owner(runtime.presence_token),
                 alt_screen,
                 runtime.activity.resting(now),
             );
-            Self::schedule_surface_frame(&runtime, &view, next);
+            // A synchronous settings callback may already have replaced the
+            // source while this frame was rendering. Never create a second.
+            if runtime.surface_timer.borrow().is_none() {
+                Self::schedule_surface_frame(&runtime, &view, next);
+            }
         });
         *runtime.surface_timer.borrow_mut() = Some(source);
     }
@@ -2714,7 +3053,7 @@ impl OrganismRuntime {
                 return;
             };
             runtime.settle_timer.borrow_mut().take();
-            if runtime.generation.get() != generation {
+            if !runtime.enabled.get() || runtime.generation.get() != generation {
                 return;
             }
             let view = view.upgrade();
@@ -2761,6 +3100,7 @@ impl OrganismRuntime {
 
 impl Drop for OrganismRuntime {
     fn drop(&mut self) {
+        self.cancel_pointer_greeting();
         self.clear_presence_cue();
         self.presence.unregister(self.presence_token);
         self.set_sleeping(false);
@@ -2910,8 +3250,38 @@ impl OrganismHub {
         self.organism_presence.focus_view(focused);
     }
 
+    pub(crate) fn sync_ascii_organism_settings(&self) {
+        let (enabled, motion) = {
+            let config = self.config.borrow();
+            let motion = config.ascii_organism_motion.unwrap_or_else(|| {
+                if gtk::Settings::default()
+                    .is_none_or(|settings| settings.is_gtk_enable_animations())
+                {
+                    OrganismMotion::Full
+                } else {
+                    OrganismMotion::Calm
+                }
+            });
+            (config.ascii_organism_enabled, motion)
+        };
+        for view in self.organism_presence.eligible_views() {
+            if enabled {
+                self.attach_ascii_organism_to_view(&view, false);
+            }
+            if let Some(runtime) = self.organism_presence.runtime_for(&view) {
+                OrganismRuntime::apply_settings(&runtime, &view, enabled, motion);
+            }
+        }
+    }
+
     pub(crate) fn attach_ascii_organism_to_view(&self, view: &Rc<TermView>, remote: bool) {
-        if remote || !self.config.borrow().ascii_organism_enabled {
+        if remote {
+            return;
+        }
+        self.organism_presence.remember_view(view);
+        if !self.config.borrow().ascii_organism_enabled
+            || self.organism_presence.runtime_for(view).is_some()
+        {
             return;
         }
 
@@ -2941,7 +3311,11 @@ impl OrganismHub {
             motion,
             persistent,
         );
+        runtime
+            .awaiting_unobserved_work
+            .set(!view.organism_activity_settled());
         self.organism_presence.bind(presence_token, view, &runtime);
+        OrganismRuntime::install_pointer_observer(&runtime, view);
         // Two surfaces, deliberately: the card is the organism's home in the
         // block conversation, the live body below is its home on the terminal
         // surface itself. A pane that cannot host inline cards keeps only the
@@ -2952,7 +3326,7 @@ impl OrganismHub {
                 "organism card not mounted in this pane; the live-surface body is its only home"
             );
         }
-        if motion != OrganismMotion::Static {
+        {
             if !view.put_live_organism_body(runtime.live_body.upcast_ref(), 0.0, 0.0) {
                 log::warn!("could not attach ASCII organism to the live terminal surface");
             }
@@ -2970,10 +3344,14 @@ impl OrganismHub {
             let runtime = runtime.clone();
             let view_weak = Rc::downgrade(view);
             view.connect_human_input(move |_kind| {
+                if !runtime.enabled.get() {
+                    return;
+                }
                 let now = Instant::now();
                 let entering_retreat = runtime
                     .human_input_age(now)
                     .is_none_or(|age| age >= HUMAN_INPUT_RETREAT);
+                runtime.cancel_pointer_greeting();
                 runtime.last_human_input.set(Some(now));
                 runtime.activity.note_input(now);
                 runtime.reset_watch_rhythm_at_boundary(now);
@@ -3003,6 +3381,9 @@ impl OrganismHub {
             let runtime = runtime.clone();
             let view_weak = Rc::downgrade(view);
             view.connect_alt_screen_transition(move |transition| {
+                if !runtime.enabled.get() {
+                    return;
+                }
                 let now = Instant::now();
                 runtime.reset_watch_rhythm_at_boundary(now);
                 runtime.clear_presence_cue();
@@ -3023,12 +3404,15 @@ impl OrganismHub {
             let runtime = runtime.clone();
             let view_weak = Rc::downgrade(view);
             view.connect_activity(move || {
+                if !runtime.enabled.get() {
+                    return;
+                }
                 let now = Instant::now();
                 let view = view_weak.upgrade();
                 let rhythm_presentable_at_origin = view.as_ref().is_some_and(|view| {
                     watch_rhythm_context_presentable(
                         runtime.presence.is_owner(runtime.presence_token),
-                        runtime.motion,
+                        runtime.motion.get(),
                         surface_mode(
                             runtime.surface_behavior.get(),
                             runtime.command_running.get(),
@@ -3093,6 +3477,10 @@ impl OrganismHub {
             let correction = self.organism_correction.clone();
             let pane = pane_token(view);
             view.connect_command_started(move |event| {
+                if !runtime.enabled.get() {
+                    return;
+                }
+                runtime.awaiting_unobserved_work.set(false);
                 let now = Instant::now();
                 let command_origin = runtime.surface_behavior.get();
                 runtime.bump_generation();
@@ -3275,6 +3663,11 @@ impl OrganismHub {
             let memory = self.organism_memory.clone();
             let shared_life = self.organism_life.clone();
             view.connect_command_finished(move |event| {
+                // Enabling mid-command must not invent a start or replay the
+                // work that happened while the companion was disabled.
+                if !runtime.enabled.get() || !runtime.command_running.get() {
+                    return;
+                }
                 let generation = runtime.bump_generation_for_command_finish();
                 if runtime.command_running.replace(false) {
                     runtime.activity.command_finished(Instant::now());
@@ -3523,6 +3916,9 @@ impl OrganismHub {
             let view_weak = Rc::downgrade(view);
             let shared_life = self.organism_life.clone();
             view.connect_agent_execution_lost(move |_generation, _reason| {
+                if !runtime.enabled.get() {
+                    return;
+                }
                 if !runtime.command_running.get() {
                     // Nothing is running: either nothing ever started, or the
                     // finish was already consumed with correct attribution.
@@ -3590,6 +3986,9 @@ impl OrganismHub {
             let view_weak = Rc::downgrade(view);
             view.connect_block_finished(
                 move |_command, _exit_code, _agent_generation, _duration_ms| {
+                    if !runtime.enabled.get() {
+                        return;
+                    }
                     if let Some(view) = view_weak.upgrade() {
                         view.insert_inline_notice(&runtime.card);
                     }
@@ -3602,6 +4001,377 @@ impl OrganismHub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Send a real X11 pointer motion through gtk's event dispatch, rather
+    /// than calling the observer closure or emitting its signal directly.
+    #[cfg(target_os = "linux")]
+    fn move_native_pointer(window: &gtk::Window, x: i32, y: i32) {
+        use std::ffi::{c_char, c_int, c_uint, c_ulong, c_void};
+        // SAFETY: symbols below use libX11's published ABI; display and surface
+        // remain live until XSync completes. Only this test's pointer is moved.
+        unsafe {
+            let library = libc::dlopen(c"libX11.so.6".as_ptr(), libc::RTLD_NOW);
+            assert!(!library.is_null());
+            let open: unsafe extern "C" fn(*const c_char) -> *mut c_void =
+                std::mem::transmute(libc::dlsym(library, c"XOpenDisplay".as_ptr()));
+            let root: unsafe extern "C" fn(*mut c_void) -> c_ulong =
+                std::mem::transmute(libc::dlsym(library, c"XDefaultRootWindow".as_ptr()));
+            let translate: unsafe extern "C" fn(
+                *mut c_void,
+                c_ulong,
+                c_ulong,
+                c_int,
+                c_int,
+                *mut c_int,
+                *mut c_int,
+                *mut c_ulong,
+            ) -> c_int =
+                std::mem::transmute(libc::dlsym(library, c"XTranslateCoordinates".as_ptr()));
+            let warp: unsafe extern "C" fn(
+                *mut c_void,
+                c_ulong,
+                c_ulong,
+                c_int,
+                c_int,
+                c_uint,
+                c_uint,
+                c_int,
+                c_int,
+            ) -> c_int = std::mem::transmute(libc::dlsym(library, c"XWarpPointer".as_ptr()));
+            let sync: unsafe extern "C" fn(*mut c_void, c_int) -> c_int =
+                std::mem::transmute(libc::dlsym(library, c"XSync".as_ptr()));
+            let close: unsafe extern "C" fn(*mut c_void) -> c_int =
+                std::mem::transmute(libc::dlsym(library, c"XCloseDisplay".as_ptr()));
+            let xid_symbol = libc::dlsym(libc::RTLD_DEFAULT, c"gdk_x11_surface_get_xid".as_ptr());
+            assert!(!xid_symbol.is_null(), "display regression needs X11");
+            let xid: unsafe extern "C" fn(*mut c_void) -> c_ulong = std::mem::transmute(xid_symbol);
+            let display = open(std::ptr::null());
+            assert!(!display.is_null());
+            let surface = window.surface().expect("mapped native window");
+            let mut root_x = 0;
+            let mut root_y = 0;
+            let mut child = 0;
+            assert_ne!(
+                translate(
+                    display,
+                    xid(surface.as_ptr().cast()),
+                    root(display),
+                    x,
+                    y,
+                    &mut root_x,
+                    &mut root_y,
+                    &mut child
+                ),
+                0
+            );
+            warp(display, 0, root(display), 0, 0, 0, 0, root_x, root_y);
+            sync(display, 0);
+            close(display);
+            libc::dlclose(library);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn native_pointer_button(pressed: bool) {
+        use std::ffi::{c_char, c_int, c_uint, c_ulong, c_void};
+        // SAFETY: these are the published X11/XTest ABIs. The test owns the
+        // private display and releases the button before closing the fixture.
+        unsafe {
+            let x11 = libc::dlopen(c"libX11.so.6".as_ptr(), libc::RTLD_NOW);
+            let xtst = libc::dlopen(c"libXtst.so.6".as_ptr(), libc::RTLD_NOW);
+            assert!(!x11.is_null() && !xtst.is_null());
+            let open: unsafe extern "C" fn(*const c_char) -> *mut c_void =
+                std::mem::transmute(libc::dlsym(x11, c"XOpenDisplay".as_ptr()));
+            let button: unsafe extern "C" fn(*mut c_void, c_uint, c_int, c_ulong) -> c_int =
+                std::mem::transmute(libc::dlsym(xtst, c"XTestFakeButtonEvent".as_ptr()));
+            let sync: unsafe extern "C" fn(*mut c_void, c_int) -> c_int =
+                std::mem::transmute(libc::dlsym(x11, c"XSync".as_ptr()));
+            let close: unsafe extern "C" fn(*mut c_void) -> c_int =
+                std::mem::transmute(libc::dlsym(x11, c"XCloseDisplay".as_ptr()));
+            let display = open(std::ptr::null());
+            assert!(!display.is_null());
+            assert_ne!(button(display, 1, c_int::from(pressed), 0), 0);
+            sync(display, 0);
+            close(display);
+            libc::dlclose(xtst);
+            libc::dlclose(x11);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn live_settings_reuse_body_preserve_focus_and_stop_disabled_timers() {
+        gtk::init().expect("gtk display");
+        let view = crate::block_view::organism_settings_test_view();
+        let presence = OrganismPresence::new();
+        presence.remember_view(&view);
+        presence.remember_view(&view);
+        assert_eq!(presence.eligible_views().len(), 1);
+        let token = presence.reserve();
+        let life = Rc::new(Cell::new(LifeState::default()));
+        let activity = OrganismActivity::new(None, GrowthProgress::default());
+        let runtime = OrganismRuntime::new(
+            life.clone(),
+            activity,
+            presence.clone(),
+            token,
+            OrganismMotion::Static,
+            false,
+        );
+        presence.bind(token, &view, &runtime);
+        assert!(Rc::ptr_eq(&presence.runtime_for(&view).unwrap(), &runtime));
+        assert!(!runtime.live_body.can_target());
+        assert!(!runtime.live_body.is_focusable());
+        assert!(!runtime.card.can_target());
+        view.insert_inline_notice(&runtime.card);
+        view.put_live_organism_body(runtime.live_body.upcast_ref(), 0.0, 0.0);
+        view.put_sticky_organism_avatar(runtime.sticky_avatar.upcast_ref());
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let entry = gtk::Entry::new();
+        content.append(&entry);
+        content.append(&view.widget());
+        let screenshot_width = std::env::var("ORGANISM_LIVE_SCREENSHOT_WIDTH")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or(700)
+            .clamp(280, 900);
+        let window = gtk::Window::builder()
+            .default_width(screenshot_width)
+            .default_height(500)
+            .child(&content)
+            .build();
+        window.present();
+        entry.grab_focus();
+        let main = gtk::glib::MainContext::default();
+        let mapped_at = Instant::now();
+        while mapped_at.elapsed() < Duration::from_millis(120) {
+            while main.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(view.widget().is_mapped());
+        presence.focus_view(Some(&view));
+        let before = life.get();
+        for _ in 0..4 {
+            OrganismRuntime::apply_settings(&runtime, &view, false, OrganismMotion::Static);
+            assert!(runtime.surface_timer.borrow().is_none());
+            assert!(!runtime.card.is_visible());
+            assert!(crate::block_view::organism_settings_test_onboarding(&view));
+            assert!(!runtime.sticky_avatar.is_visible());
+            assert!(!runtime.sleeping.get());
+            *runtime.last_repo_root.borrow_mut() = Some("/synthetic/previous-checkout".into());
+            *runtime.last_repo_cwd.borrow_mut() = Some("/synthetic/previous-checkout".into());
+            runtime
+                .organism
+                .borrow_mut()
+                .restore_repo_context(3, false, 0, 3);
+            assert!(runtime.organism.borrow().repo_vigil().is_active());
+            OrganismRuntime::apply_settings(&runtime, &view, true, OrganismMotion::Full);
+            assert!(!runtime.organism.borrow().repo_vigil().is_active());
+            assert!(runtime.last_repo_root.borrow().is_none());
+            assert!(runtime.surface_timer.borrow().is_some());
+            assert!(runtime.card.is_visible());
+            assert!(!crate::block_view::organism_settings_test_onboarding(&view));
+            OrganismRuntime::apply_settings(&runtime, &view, true, OrganismMotion::Static);
+            assert!(runtime.body_position.get().is_none());
+            assert!(!runtime.sticky_avatar.is_visible());
+            assert_eq!(presence.state.borrow().entries.len(), 1);
+        }
+        window.set_default_size(380, 500);
+        while main.iteration(false) {}
+        assert!(!crate::block_view::organism_settings_test_onboarding(&view));
+        crate::block_view::organism_settings_test_first_command(&view);
+        OrganismRuntime::apply_settings(&runtime, &view, false, OrganismMotion::Static);
+        assert!(!crate::block_view::organism_settings_test_onboarding(&view));
+        window.set_default_size(screenshot_width, 500);
+        runtime.last_human_input.set(Some(Instant::now()));
+        OrganismRuntime::apply_settings(&runtime, &view, true, OrganismMotion::Full);
+        assert!(
+            runtime.body_position.get().is_none(),
+            "typing retreat survives motion changes"
+        );
+        assert!(gtk::prelude::GtkWindowExt::focus(&window)
+            .is_some_and(|focus| focus.is_ancestor(&entry) || focus == entry));
+        assert_eq!(
+            state_summary(life.get()),
+            state_summary(before),
+            "settings previews/toggles do not grow the organism"
+        );
+        OrganismRuntime::apply_settings(&runtime, &view, false, OrganismMotion::Full);
+        let main = gtk::glib::MainContext::default();
+        while main.iteration(false) {}
+        assert!(
+            runtime.surface_timer.borrow().is_none(),
+            "queued work cannot revive a disabled timer"
+        );
+        crate::block_view::organism_settings_test_running(&view, true);
+        OrganismRuntime::apply_settings(&runtime, &view, true, OrganismMotion::Full);
+        assert!(runtime.awaiting_unobserved_work.get());
+        assert!(runtime.body_position.get().is_none());
+        assert!(
+            !runtime.command_running.get(),
+            "enabling does not fabricate a command start"
+        );
+        assert_eq!(
+            runtime.status.text().as_str(),
+            "Waiting for the current terminal activity to settle"
+        );
+        crate::block_view::organism_settings_test_running(&view, false);
+        runtime.refresh_surface(&view, Instant::now());
+        assert!(!runtime.awaiting_unobserved_work.get());
+        OrganismRuntime::apply_settings(&runtime, &view, false, OrganismMotion::Full);
+
+        // Exercise the real motion controller on a stationary calm body.
+        #[cfg(target_os = "linux")]
+        {
+            runtime.last_human_input.set(None);
+            OrganismRuntime::apply_settings(&runtime, &view, true, OrganismMotion::Calm);
+            if let Some(source) = runtime.surface_timer.borrow_mut().take() {
+                source.remove();
+            }
+            OrganismRuntime::install_pointer_observer(&runtime, &view);
+            let settle = |duration: Duration| {
+                let start = Instant::now();
+                while start.elapsed() < duration {
+                    while main.iteration(false) {}
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            };
+            runtime.refresh_surface(&view, Instant::now());
+            settle(Duration::from_millis(80));
+            runtime.refresh_surface(&view, Instant::now());
+            settle(Duration::from_millis(80));
+            assert!(
+                runtime.live_body.is_mapped(),
+                "pointer greetings require a genuinely visible body"
+            );
+            let bounds = runtime
+                .live_body
+                .compute_bounds(&window)
+                .expect("body bounds");
+            let x = (bounds.x() + bounds.width() / 2.0) as i32;
+            let y = (bounds.y() + bounds.height() / 2.0) as i32;
+            let life_before = format!("{:?}", life.get());
+            crate::block_view::organism_settings_test_pty_bytes(&view);
+            move_native_pointer(&window, 1, 1);
+            settle(Duration::from_millis(40));
+            move_native_pointer(&window, x, y);
+            settle(Duration::from_millis(100));
+            assert!(
+                runtime.pointer_timer.borrow().is_some(),
+                "native pointer must reach the passive observer"
+            );
+            native_pointer_button(true);
+            settle(Duration::from_millis(40));
+            assert!(
+                runtime.pointer_timer.borrow().is_none(),
+                "press without motion cancels pending dwell without consuming the click"
+            );
+            settle(POINTER_GREETING_DWELL);
+            assert!(
+                presence.state.borrow().last_greeting.is_none(),
+                "held selection never greets"
+            );
+            native_pointer_button(false);
+            settle(Duration::from_millis(40));
+            move_native_pointer(&window, 1, 1);
+            settle(Duration::from_millis(40));
+            move_native_pointer(&window, x, y);
+            settle(Duration::from_millis(100));
+            assert!(runtime.pointer_timer.borrow().is_some());
+            let source = runtime.pointer_timer.borrow().as_ref().unwrap().as_raw();
+            move_native_pointer(&window, x + 1, y);
+            settle(Duration::from_millis(40));
+            assert_eq!(
+                runtime.pointer_timer.borrow().as_ref().unwrap().as_raw(),
+                source,
+                "motion within the hit zone never allocates another timer"
+            );
+            settle(POINTER_GREETING_DWELL);
+            let first = presence
+                .state
+                .borrow()
+                .last_greeting
+                .expect("dwell admitted greeting");
+            if let Some(ms) = std::env::var("ORGANISM_LIVE_SCREENSHOT_PAUSE_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                println!("ORGANISM_LIVE_READY");
+                let until = Instant::now() + Duration::from_millis(ms.min(1_500));
+                while Instant::now() < until {
+                    runtime.refresh_surface(&view, Instant::now());
+                    settle(Duration::from_millis(50));
+                }
+            }
+            assert_eq!(
+                runtime
+                    .interaction
+                    .borrow_mut()
+                    .apply(
+                        runtime.interaction_epoch.elapsed(),
+                        runtime.live_context.get()
+                    )
+                    .behavior,
+                Behavior::Approach
+            );
+            move_native_pointer(&window, 1, 1);
+            settle(Duration::from_millis(40));
+            assert!(runtime.pointer_timer.borrow().is_none());
+            move_native_pointer(&window, x, y);
+            settle(POINTER_GREETING_DWELL + Duration::from_millis(80));
+            assert_eq!(
+                presence.state.borrow().last_greeting,
+                Some(first),
+                "repeated entry respects the shared cooldown"
+            );
+            assert_eq!(
+                format!("{:?}", life.get()),
+                life_before,
+                "greeting never changes real physiology"
+            );
+            assert!(
+                crate::block_view::organism_settings_test_pty_bytes(&view).is_empty(),
+                "pointer greeting sends no terminal input"
+            );
+            presence.focus_view(None);
+            assert!(runtime.pointer_timer.borrow().is_none());
+            assert!(runtime.body_position.get().is_none());
+            OrganismRuntime::observe_pointer(&runtime, &view, f64::from(x), f64::from(y), false);
+            assert!(
+                runtime.pointer_timer.borrow().is_none(),
+                "an unfocused body cannot schedule hover work"
+            );
+            presence.focus_view(Some(&view));
+            runtime.command_running.set(true);
+            runtime.cancel_pointer_greeting();
+            OrganismRuntime::observe_pointer(&runtime, &view, f64::from(x), f64::from(y), false);
+            assert!(
+                runtime.pointer_timer.borrow().is_none(),
+                "busy work does not accept a greeting"
+            );
+            runtime.command_running.set(false);
+            OrganismRuntime::apply_settings(&runtime, &view, false, OrganismMotion::Calm);
+            assert!(runtime.pointer_timer.borrow().is_none());
+        }
+        OrganismRuntime::apply_settings(&runtime, &view, true, OrganismMotion::Static);
+        let still_sprite = runtime.sprite.text();
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(1_000) {
+            while main.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            runtime.sprite.text(),
+            still_sprite,
+            "Static keeps its pose across the dormant heartbeat"
+        );
+        assert!(runtime.body_position.get().is_none());
+        OrganismRuntime::apply_settings(&runtime, &view, false, OrganismMotion::Static);
+        assert!(runtime.surface_timer.borrow().is_none());
+        assert!(runtime.pointer_timer.borrow().is_none());
+        println!("DAILY_RUNTIME_COUNTS disabled_frame_timers=0 disabled_hover_timers=0 static_pose_unchanged=true");
+        window.close();
+    }
 
     #[test]
     fn output_rhythm_uses_only_pulse_count_and_monotonic_quiet_time() {

@@ -4,9 +4,10 @@
 //! notice dock.  It therefore never becomes a `FinishedBlock`, competes for an
 //! inline-notice parent, or contributes to the live terminal's allocation.
 
+use gtk::glib;
 use gtk::prelude::*;
 use relm4::gtk;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 pub(crate) const BLOCK_ONBOARDING_ACCESSIBLE_LABEL: &str =
@@ -69,10 +70,59 @@ fn transition(phase: BlockOnboardingPhase, event: BlockOnboardingEvent) -> Block
     }
 }
 
+/// Only notices mounted into this pane may suppress its empty-state hint.
+/// Widgets and their mount parents are weak so observation never keeps a
+/// notice, document, or pane alive. Signal handlers are retired with the owner.
+struct ObservedInlineNotice {
+    widget: gtk::glib::WeakRef<gtk::Widget>,
+    parent: gtk::glib::WeakRef<gtk::Widget>,
+    visible_notify: Option<glib::SignalHandlerId>,
+    parent_notify: Option<glib::SignalHandlerId>,
+}
+
+impl Drop for ObservedInlineNotice {
+    fn drop(&mut self) {
+        if let Some(widget) = self.widget.upgrade() {
+            if let Some(handler) = self.visible_notify.take() {
+                widget.disconnect(handler);
+            }
+            if let Some(handler) = self.parent_notify.take() {
+                widget.disconnect(handler);
+            }
+        }
+    }
+}
+
+fn should_show_onboarding(
+    phase: BlockOnboardingPhase,
+    surface_suspended: bool,
+    visible_inline_notice: bool,
+) -> bool {
+    phase == BlockOnboardingPhase::Visible && !surface_suspended && !visible_inline_notice
+}
+
 struct BlockOnboardingInner {
     card: gtk::Box,
     phase: Cell<BlockOnboardingPhase>,
     surface_suspended: Cell<bool>,
+    inline_notices: RefCell<Vec<ObservedInlineNotice>>,
+}
+
+impl BlockOnboardingInner {
+    fn sync_visibility(&self) {
+        let visible_notice = self.inline_notices.borrow().iter().any(|notice| {
+            let (Some(widget), Some(parent)) = (notice.widget.upgrade(), notice.parent.upgrade())
+            else {
+                return false;
+            };
+            widget.is_visible() && widget.parent().as_ref() == Some(&parent)
+        });
+        self.card.set_visible(should_show_onboarding(
+            self.phase.get(),
+            self.surface_suspended.get(),
+            visible_notice,
+        ));
+    }
 }
 
 /// Owns the pane-local overlay card and its one-way visibility state.
@@ -106,6 +156,7 @@ impl BlockOnboarding {
                 card,
                 phase: Cell::new(phase),
                 surface_suspended: Cell::new(false),
+                inline_notices: RefCell::new(Vec::new()),
             }),
         }
     }
@@ -142,6 +193,51 @@ impl BlockOnboarding {
         self.sync_visibility();
     }
 
+    /// Observe a successfully mounted inline card. Visible cards take priority
+    /// over empty-state guidance, without consuming its one-shot lifecycle.
+    /// Hiding/removing the last card restores guidance only before real input
+    /// or the first completed block. Re-pinning never duplicates observers.
+    pub(crate) fn observe_inline_notice(&self, widget: &gtk::Widget) {
+        let Some(parent) = widget.parent() else {
+            return;
+        };
+        {
+            let mut notices = self.inner.inline_notices.borrow_mut();
+            notices.retain(|notice| notice.widget.upgrade().is_some());
+            if let Some(notice) = notices
+                .iter_mut()
+                .find(|notice| notice.widget.upgrade().as_ref() == Some(widget))
+            {
+                notice.parent = parent.downgrade();
+            } else {
+                let weak = Rc::downgrade(&self.inner);
+                let visible_notify = widget.connect_visible_notify(move |_| {
+                    if let Some(inner) = weak.upgrade() {
+                        inner.sync_visibility();
+                    }
+                });
+                let weak = Rc::downgrade(&self.inner);
+                let parent_notify = widget.connect_parent_notify(move |_| {
+                    if let Some(inner) = weak.upgrade() {
+                        inner.sync_visibility();
+                    }
+                });
+                notices.push(ObservedInlineNotice {
+                    widget: widget.downgrade(),
+                    parent: parent.downgrade(),
+                    visible_notify: Some(visible_notify),
+                    parent_notify: Some(parent_notify),
+                });
+            }
+        }
+        self.sync_visibility();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_visible(&self) -> bool {
+        self.inner.card.is_visible()
+    }
+
     #[cfg(test)]
     fn widget(&self) -> &gtk::Widget {
         self.inner.card.upcast_ref()
@@ -159,10 +255,7 @@ impl BlockOnboarding {
     }
 
     fn sync_visibility(&self) {
-        self.inner.card.set_visible(
-            self.inner.phase.get() == BlockOnboardingPhase::Visible
-                && !self.inner.surface_suspended.get(),
-        );
+        self.inner.sync_visibility();
     }
 }
 
@@ -262,6 +355,186 @@ mod tests {
                 }
             ),
             Dismissed
+        );
+    }
+
+    #[test]
+    fn visible_notices_only_suspend_eligible_empty_guidance() {
+        for phase in [
+            BlockOnboardingPhase::Disabled,
+            BlockOnboardingPhase::AwaitingHistory,
+            BlockOnboardingPhase::Visible,
+            BlockOnboardingPhase::Dismissed,
+        ] {
+            for suspended in [false, true] {
+                assert!(!should_show_onboarding(phase, suspended, true));
+                assert_eq!(
+                    should_show_onboarding(phase, suspended, false),
+                    phase == BlockOnboardingPhase::Visible && !suspended,
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn inline_notice_priority_handles_multiple_cards_reparenting_and_narrow_panes() {
+        gtk::init().expect("gtk display");
+        let main = gtk::glib::MainContext::default();
+        for width in [700, 380, 280] {
+            let overlay = gtk::Overlay::new();
+            let document = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            overlay.set_child(Some(&document));
+            let onboarding = BlockOnboarding::attach(&overlay, true);
+            let window = gtk::Window::builder()
+                .default_width(width)
+                .default_height(240)
+                .child(&overlay)
+                .build();
+            window.present();
+            onboarding.history_resolved(false);
+            assert!(onboarding.is_visible());
+
+            let notice = gtk::Label::new(Some("Local companion status"));
+            notice.set_wrap(true);
+            document.append(&notice);
+            for _ in 0..8 {
+                onboarding.observe_inline_notice(notice.upcast_ref());
+                assert_eq!(onboarding.inner.inline_notices.borrow().len(), 1);
+                assert!(!onboarding.is_visible());
+                notice.set_visible(false);
+                assert!(
+                    onboarding.is_visible(),
+                    "off restores an untouched empty hint"
+                );
+                notice.set_visible(true);
+                assert!(
+                    !onboarding.is_visible(),
+                    "on reserves the space for the notice"
+                );
+            }
+            onboarding.history_resolved(false);
+            assert!(
+                !onboarding.is_visible(),
+                "a late history result cannot cover a notice"
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !notice.is_mapped() && std::time::Instant::now() < deadline {
+                while main.pending() {
+                    main.iteration(false);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(notice.is_mapped());
+            assert!(
+                !onboarding.widget().is_mapped(),
+                "no overlap even in the narrowest pane"
+            );
+            let bounds = notice.compute_bounds(&overlay).expect("notice bounds");
+            assert!(bounds.x() >= 0.0 && bounds.width() <= overlay.width() as f32);
+
+            let second = gtk::Label::new(Some("Another inline notice"));
+            document.append(&second);
+            onboarding.observe_inline_notice(second.upcast_ref());
+            notice.set_visible(false);
+            assert!(
+                !onboarding.is_visible(),
+                "the second visible notice still owns priority"
+            );
+            second.set_visible(false);
+            assert!(onboarding.is_visible());
+            onboarding.set_surface_suspended(true);
+            second.set_visible(true);
+            second.set_visible(false);
+            assert!(
+                !onboarding.is_visible(),
+                "notice changes cannot end alternate-screen suspension"
+            );
+            onboarding.set_surface_suspended(false);
+            assert!(onboarding.is_visible());
+
+            second.set_visible(true);
+            document.remove(&second);
+            assert!(
+                onboarding.is_visible(),
+                "removing the last visible notice restores the hint"
+            );
+            onboarding.observe_inline_notice(second.upcast_ref());
+            assert_eq!(
+                onboarding.inner.inline_notices.borrow().len(),
+                2,
+                "detached observations are ignored"
+            );
+            let other_document = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            other_document.append(&second);
+            assert!(
+                onboarding.is_visible(),
+                "a card in another pane cannot suppress this hint"
+            );
+            second.set_visible(false);
+            second.set_visible(true);
+            assert!(onboarding.is_visible());
+            other_document.remove(&second);
+            document.append(&second);
+            onboarding.observe_inline_notice(second.upcast_ref());
+            assert!(!onboarding.is_visible());
+            assert_eq!(
+                onboarding.inner.inline_notices.borrow().len(),
+                2,
+                "remounting reuses observers"
+            );
+
+            onboarding.human_input_observed();
+            notice.set_visible(false);
+            second.set_visible(false);
+            assert!(
+                !onboarding.is_visible(),
+                "first input dismisses even while guidance is suppressed"
+            );
+            onboarding.history_resolved(false);
+            assert_eq!(onboarding.phase(), BlockOnboardingPhase::Dismissed);
+            assert!(!onboarding.is_visible());
+
+            let notice_weak = notice.downgrade();
+            document.remove(&notice);
+            drop(notice);
+            assert!(
+                notice_weak.upgrade().is_none(),
+                "observation never retains a notice"
+            );
+            onboarding.observe_inline_notice(second.upcast_ref());
+            assert_eq!(
+                onboarding.inner.inline_notices.borrow().len(),
+                1,
+                "dead observations are pruned"
+            );
+            let inner_weak = Rc::downgrade(&onboarding.inner);
+            drop(onboarding);
+            assert!(
+                inner_weak.upgrade().is_none(),
+                "signal callbacks never retain the pane owner"
+            );
+            second.set_visible(true); // Safe after its observation owner is gone.
+            window.close();
+        }
+
+        // Completion is a second, independent permanent-dismissal boundary.
+        let overlay = gtk::Overlay::new();
+        let document = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        overlay.set_child(Some(&document));
+        let onboarding = BlockOnboarding::attach(&overlay, true);
+        let notice = gtk::Label::new(Some("Companion"));
+        document.append(&notice);
+        onboarding.observe_inline_notice(notice.upcast_ref());
+        onboarding.history_resolved(false);
+        assert!(!onboarding.is_visible());
+        onboarding.finished_block_observed();
+        document.remove(&notice);
+        onboarding.history_resolved(false);
+        assert_eq!(onboarding.phase(), BlockOnboardingPhase::Dismissed);
+        assert!(
+            !onboarding.is_visible(),
+            "a finished command never replays onboarding after notice removal"
         );
     }
 

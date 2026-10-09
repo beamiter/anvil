@@ -53,6 +53,8 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    dialogs::settings::organism_preview::tests::preview_lifecycle_keeps_motion_local_and_stops_hidden_sources
+    organism_ui::tests::live_settings_reuse_body_preserve_focus_and_stop_disabled_timers
     block_view::history::tests::block_history_retry_handles_failed_and_repaired_files_without_panicking
     sidebar::tests::long_breadcrumbs_do_not_expand_the_sidebar_minimum_width
     block_view::history::tests::unified_relative_path_authority_does_not_follow_a_cwd_change
@@ -83,6 +85,7 @@ tests=(
     font::tests::default_font_resolution_preserves_grid_and_configuration
     font::tests::an_appended_font_family_resolves_in_the_native_font_map
     font::tests::a_real_vte_is_given_the_icon_family_behind_the_configured_one
+    block_view::onboarding::tests::inline_notice_priority_handles_multiple_cards_reparenting_and_narrow_panes
     block_view::onboarding::tests::block_onboarding_overlay_is_non_measuring_and_non_targetable
     block_view::find::tests::unified_vte_fresh_query_reaches_scrollback_before_a_prior_match
     block_view::find::tests::a_live_find_counts_what_the_live_vte_steps_through

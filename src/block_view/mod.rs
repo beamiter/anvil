@@ -13907,6 +13907,7 @@ impl TermView {
             }
             DockMount::Refuse => unreachable!("refused before density normalization"),
         }
+        self.block_onboarding.observe_inline_notice(widget);
         self.block_list.queue_allocate();
         self.scroll_debouncer
             .pin_to_bottom_deferred(&self.block_scroll);
@@ -14011,6 +14012,14 @@ impl TermView {
         self.verified_submission
             .surface
             .prompt_anchor(self.prompt_end_pos.get(), self.prompt_anchor_rows.get())
+    }
+
+    /// Content-free, constant-time lifecycle boundary for passive UI. Unknown
+    /// or running activity is conservative; only a settled prompt is idle.
+    pub(crate) fn organism_activity_settled(&self) -> bool {
+        !self.fullscreen.get()
+            && self.bstate.get() == BlockState::AwaitingCommand
+            && self.pty.shell_is_foreground() == Some(true)
     }
 
     /// Review-gated commands may only target a clean, idle shell editor. The
@@ -15865,6 +15874,54 @@ pub(crate) struct BlockAgentEvidence {
     pub(crate) is_background: bool,
     pub(crate) started_at: Option<std::time::SystemTime>,
     pub(crate) finished_at: Option<std::time::SystemTime>,
+}
+
+/// Nonexecuting PTY fixture shared with the organism's display regressions.
+#[cfg(test)]
+pub(crate) fn organism_settings_test_view() -> Rc<TermView> {
+    let view: Rc<TermView> = TermView::new_with_spawner(
+        &crate::config::Config::safe_defaults(),
+        &crate::config::TerminalMode::Block,
+        &["sh".to_string()],
+        None,
+        false,
+        None,
+        "organism-test",
+        &[],
+        &[],
+        |_argv, _cwd, _env, _token| crate::pty::OwnedPty::from_openpty(Some(true)),
+    )
+    .expect("nonexecuting organism test PTY")
+    .into();
+    view.bstate.set(BlockState::AwaitingCommand);
+    view.block_onboarding.history_resolved(false);
+    view
+}
+
+#[cfg(test)]
+pub(crate) fn organism_settings_test_running(view: &TermView, running: bool) {
+    view.bstate.set(if running {
+        BlockState::CollectingOutput
+    } else {
+        BlockState::AwaitingCommand
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn organism_settings_test_onboarding(view: &TermView) -> bool {
+    view.block_onboarding.is_visible()
+}
+
+#[cfg(test)]
+pub(crate) fn organism_settings_test_first_command(view: &TermView) {
+    view.block_onboarding.human_input_observed();
+    view.block_onboarding.finished_block_observed();
+}
+
+#[cfg(test)]
+pub(crate) fn organism_settings_test_pty_bytes(view: &TermView) -> Vec<u8> {
+    view.pty
+        .drain_test_slave(std::time::Duration::from_millis(40))
 }
 
 #[cfg(test)]

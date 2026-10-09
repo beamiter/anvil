@@ -11,6 +11,633 @@ use relm4::prelude::*;
 
 use crate::config::{remote_text_is_safe, RemoteHost};
 
+/// A settings-only gallery: no terminal, reducer, repository memory, or config
+/// writes. All sources use weak references and are removed on hide or close.
+mod organism_preview {
+    use super::adw;
+    use adw::prelude::*;
+    use gtk::glib;
+    use jterm_core::organism::sprite_frame_with_context;
+    use jterm_core::organism_daily::{GentleInteraction, PreviewPose};
+    use relm4::gtk;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+    use std::time::{Duration, Instant};
+
+    use crate::config::OrganismMotion;
+
+    const FRAME_INTERVAL: Duration = Duration::from_millis(100);
+
+    fn motion_for_selection(selected: u32, animations: bool) -> OrganismMotion {
+        match selected {
+            1 => OrganismMotion::Full,
+            2 => OrganismMotion::Calm,
+            3 => OrganismMotion::Static,
+            _ if animations => OrganismMotion::Full,
+            _ => OrganismMotion::Calm,
+        }
+    }
+
+    fn selected_pose(index: u32) -> PreviewPose {
+        PreviewPose::ALL
+            .get(index as usize)
+            .copied()
+            .unwrap_or(PreviewPose::Calm)
+    }
+
+    fn can_greet(pose: PreviewPose) -> bool {
+        matches!(
+            pose,
+            PreviewPose::Calm
+                | PreviewPose::Curious
+                | PreviewPose::Sleeping
+                | PreviewPose::Greeting
+        )
+    }
+
+    fn frame_index(motion: OrganismMotion, elapsed: Duration) -> u64 {
+        if motion == OrganismMotion::Full {
+            (elapsed.as_millis() / FRAME_INTERVAL.as_millis()) as u64
+        } else {
+            0
+        }
+    }
+
+    /// Still modes only wake for a requested greeting's expiry and cooldown.
+    /// Visibility is a hard gate, including during the dialog close animation.
+    fn next_wake(
+        visible: bool,
+        motion: OrganismMotion,
+        now: Duration,
+        greeting: Option<Duration>,
+        last_hello: Option<Duration>,
+    ) -> Option<Duration> {
+        if !visible {
+            return None;
+        }
+        let animation = (motion == OrganismMotion::Full).then_some(FRAME_INTERVAL);
+        let expiry = greeting.and_then(|start| {
+            start
+                .saturating_add(GentleInteraction::HOLD)
+                .checked_sub(now)
+        });
+        let cooldown = last_hello.and_then(|start| {
+            start
+                .saturating_add(GentleInteraction::COOLDOWN)
+                .checked_sub(now)
+        });
+        [animation, expiry, cooldown]
+            .into_iter()
+            .flatten()
+            .filter(|delay| !delay.is_zero())
+            .min()
+            // GLib rounds down to milliseconds; never spin on a sub-ms expiry.
+            .map(|delay| delay.max(Duration::from_millis(1)))
+    }
+
+    struct Preview {
+        group: glib::WeakRef<adw::PreferencesGroup>,
+        pose: glib::WeakRef<adw::ComboRow>,
+        motion: glib::WeakRef<adw::ComboRow>,
+        sample: glib::WeakRef<adw::ActionRow>,
+        sprite: glib::WeakRef<gtk::Label>,
+        hello: glib::WeakRef<gtk::Button>,
+        desktop: Option<gtk::Settings>,
+        desktop_handler: RefCell<Option<glib::SignalHandlerId>>,
+        source: RefCell<Option<glib::SourceId>>,
+        visible: Cell<bool>,
+        epoch: Instant,
+        greeting: Cell<Option<Duration>>,
+        last_hello: Cell<Option<Duration>>,
+        interaction: RefCell<GentleInteraction>,
+    }
+
+    impl Preview {
+        fn stop_source(&self) {
+            if let Some(source) = self.source.borrow_mut().take() {
+                source.remove();
+            }
+        }
+
+        fn cancel_greeting(&self) {
+            self.interaction.borrow_mut().cancel();
+            self.greeting.set(None);
+        }
+
+        fn hide(&self) {
+            self.visible.set(false);
+            self.stop_source();
+            self.cancel_greeting();
+        }
+
+        fn pose(&self) -> PreviewPose {
+            selected_pose(self.pose.upgrade().map_or(0, |row| row.selected()))
+        }
+
+        fn refresh(self: &Rc<Self>) {
+            self.stop_source();
+            let (
+                Some(group),
+                Some(pose_row),
+                Some(motion_row),
+                Some(sample),
+                Some(sprite),
+                Some(hello),
+            ) = (
+                self.group.upgrade(),
+                self.pose.upgrade(),
+                self.motion.upgrade(),
+                self.sample.upgrade(),
+                self.sprite.upgrade(),
+                self.hello.upgrade(),
+            )
+            else {
+                return;
+            };
+            let now = self.epoch.elapsed();
+            let pose = self.pose();
+            let motion = motion_for_selection(
+                motion_row.selected(),
+                self.desktop
+                    .as_ref()
+                    .is_none_or(|settings| settings.is_gtk_enable_animations()),
+            );
+            let context = self.interaction.borrow_mut().apply(now, pose.context());
+            let frame = sprite_frame_with_context(context, frame_index(motion, now));
+            if sprite.text().as_str() != frame.as_ref() {
+                sprite.set_text(frame.as_ref());
+            }
+            if pose_row.subtitle().as_deref() != Some(pose.explanation()) {
+                pose_row.set_subtitle(pose.explanation());
+            }
+            let greeting = self
+                .greeting
+                .get()
+                .filter(|start| now.saturating_sub(*start) < GentleInteraction::HOLD);
+            self.greeting.set(greeting);
+            let cooling_down = self
+                .last_hello
+                .get()
+                .is_some_and(|start| now.saturating_sub(start) < GentleInteraction::COOLDOWN);
+            hello.set_sensitive(can_greet(pose) && !cooling_down);
+            let motion_note = match motion {
+                OrganismMotion::Full => "Full motion: animated example.",
+                OrganismMotion::Calm => "Calm: still poses, with no frame animation.",
+                OrganismMotion::Static => {
+                    "Static: still example; the live companion uses inline cards only."
+                }
+            };
+            let interaction_note = if greeting.is_some() {
+                "Hello! Returning to your chosen pose in a moment."
+            } else if !can_greet(pose) {
+                "Choose a quiet pose to try a greeting."
+            } else if cooling_down {
+                "A little rest before another hello."
+            } else {
+                "Say hello for a brief, local response."
+            };
+            let motion_title = match motion {
+                OrganismMotion::Full => "Full motion",
+                OrganismMotion::Calm => "Calm motion",
+                OrganismMotion::Static => "Static motion",
+            };
+            let short_status = if greeting.is_some() {
+                "Hello!"
+            } else if !can_greet(pose) {
+                "Let it settle"
+            } else if cooling_down {
+                "Resting…"
+            } else {
+                "Local preview"
+            };
+            if sample.title().as_str() != motion_title
+                || sample.subtitle().as_deref() != Some(short_status)
+            {
+                sample.set_title(motion_title);
+                sample.set_subtitle(short_status);
+                sample.set_tooltip_text(Some(&format!("{motion_note}\n{interaction_note}")));
+            }
+            if let Some(delay) = next_wake(
+                self.visible.get() && group.is_mapped(),
+                motion,
+                now,
+                greeting,
+                can_greet(pose).then(|| self.last_hello.get()).flatten(),
+            ) {
+                let weak = Rc::downgrade(self);
+                let source = glib::timeout_add_local_once(delay, move || {
+                    if let Some(preview) = weak.upgrade() {
+                        // The one-shot has fired; never remove a stale source id.
+                        preview.source.borrow_mut().take();
+                        preview.refresh();
+                    }
+                });
+                *self.source.borrow_mut() = Some(source);
+            }
+        }
+    }
+
+    impl Drop for Preview {
+        fn drop(&mut self) {
+            self.stop_source();
+            if let (Some(desktop), Some(handler)) =
+                (&self.desktop, self.desktop_handler.borrow_mut().take())
+            {
+                desktop.disconnect(handler);
+            }
+        }
+    }
+
+    pub(super) fn install(
+        group: &adw::PreferencesGroup,
+        motion: &adw::ComboRow,
+        dialog: &adw::PreferencesDialog,
+    ) {
+        build(group, motion, dialog);
+    }
+
+    fn build(
+        group: &adw::PreferencesGroup,
+        motion: &adw::ComboRow,
+        dialog: &adw::PreferencesDialog,
+    ) -> Rc<Preview> {
+        group.set_title("Organism Preview");
+        group.set_description(Some("Preview eight offline moods, even when your companion is off. This never runs commands or changes its memory."));
+        let labels: Vec<_> = PreviewPose::ALL.iter().map(|pose| pose.label()).collect();
+        let pose = adw::ComboRow::builder()
+            .title("Pose")
+            .model(&gtk::StringList::new(&labels))
+            .selected(0)
+            .build();
+        let sprite = gtk::Label::builder()
+            .width_chars(10)
+            .height_request(76)
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::Center)
+            .can_target(false)
+            .focusable(false)
+            .build();
+        sprite.add_css_class("monospace");
+        sprite.update_property(&[gtk::accessible::Property::Label(
+            "ASCII organism pose preview",
+        )]);
+        let sample = adw::ActionRow::builder().title("Try a greeting").build();
+        sample.add_prefix(&sprite);
+        let hello = gtk::Button::builder()
+            .label("Say hello")
+            .valign(gtk::Align::Center)
+            .build();
+        hello.set_tooltip_text(Some(
+            "A brief preview-only greeting. Does not send terminal input.",
+        ));
+        sample.add_suffix(&hello);
+        group.add(&pose);
+        group.add(&sample);
+        let preview = Rc::new(Preview {
+            group: group.downgrade(),
+            pose: pose.downgrade(),
+            motion: motion.downgrade(),
+            sample: sample.downgrade(),
+            sprite: sprite.downgrade(),
+            hello: hello.downgrade(),
+            desktop: gtk::Settings::default(),
+            desktop_handler: RefCell::new(None),
+            source: RefCell::new(None),
+            visible: Cell::new(false),
+            epoch: Instant::now(),
+            greeting: Cell::new(None),
+            last_hello: Cell::new(None),
+            interaction: RefCell::new(GentleInteraction::default()),
+        });
+        pose.connect_selected_notify({
+            let preview = preview.clone();
+            move |_| {
+                preview.cancel_greeting();
+                preview.refresh();
+            }
+        });
+        hello.connect_clicked({
+            let preview = preview.clone();
+            move |_| {
+                if !preview.visible.get()
+                    || !preview
+                        .group
+                        .upgrade()
+                        .is_some_and(|group| group.is_mapped())
+                {
+                    return;
+                }
+                let now = preview.epoch.elapsed();
+                if preview
+                    .interaction
+                    .borrow_mut()
+                    .request(now, preview.pose().context())
+                {
+                    preview.greeting.set(Some(now));
+                    preview.last_hello.set(Some(now));
+                }
+                preview.refresh();
+            }
+        });
+        group.connect_map({
+            let preview = preview.clone();
+            move |_| {
+                preview.visible.set(true);
+                preview.refresh();
+            }
+        });
+        group.connect_unmap({
+            let preview = preview.clone();
+            move |_| preview.hide()
+        });
+        dialog.connect_closed({
+            let preview = preview.clone();
+            move |_| preview.hide()
+        });
+        motion.connect_selected_notify({
+            let weak = Rc::downgrade(&preview);
+            move |_| {
+                if let Some(preview) = weak.upgrade() {
+                    preview.refresh();
+                }
+            }
+        });
+        if let Some(desktop) = &preview.desktop {
+            let weak = Rc::downgrade(&preview);
+            let handler = desktop.connect_gtk_enable_animations_notify(move |_| {
+                if let Some(preview) = weak.upgrade() {
+                    preview.refresh();
+                }
+            });
+            *preview.desktop_handler.borrow_mut() = Some(handler);
+        }
+        preview.refresh();
+        preview
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        #[ignore = "requires DISPLAY"]
+        fn preview_lifecycle_keeps_motion_local_and_stops_hidden_sources() {
+            gtk::init().expect("GTK display");
+            adw::init().expect("Adwaita initialization");
+            let desktop = gtk::Settings::default().expect("desktop settings");
+            let original_animations = desktop.is_gtk_enable_animations();
+            desktop.set_gtk_enable_animations(false);
+            let entry = gtk::Entry::new();
+            entry.set_text("untouched terminal draft");
+            let view = crate::block_view::organism_settings_test_view();
+            let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            content.append(&entry);
+            content.append(&view.widget());
+            // Use the same dialog-capable Adwaita host as the application.
+            // A plain GtkWindow exercises AdwDialog's separate-window fallback.
+            let window = adw::ApplicationWindow::builder()
+                .default_width(800)
+                .default_height(600)
+                .content(&content)
+                .build();
+            window.present();
+            let dialog = adw::PreferencesDialog::new();
+            dialog.set_title("Settings");
+            let page = adw::PreferencesPage::new();
+            let group = adw::PreferencesGroup::new();
+            // Disabled live controls simulate companion-off or safe mode. The
+            // gallery has no enable/config callback and remains usable.
+            let motion = adw::ComboRow::builder()
+                .model(&gtk::StringList::new(&[
+                    "Automatic",
+                    "Full",
+                    "Calm",
+                    "Static",
+                ]))
+                .selected(1)
+                .sensitive(false)
+                .build();
+            let preview = build(&group, &motion, &dialog);
+            page.add(&group);
+            dialog.add(&page);
+            dialog.present(Some(&window));
+            let main = glib::MainContext::default();
+            let spin_until = |condition: &dyn Fn() -> bool| {
+                let deadline = Instant::now() + Duration::from_secs(4);
+                while !condition() && Instant::now() < deadline {
+                    while main.pending() {
+                        main.iteration(false);
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert!(condition(), "GTK condition did not settle");
+            };
+            spin_until(&|| group.is_mapped());
+            // Discard fixture initialization bytes; the following interactions
+            // must never write into this nonexecuting terminal's PTY.
+            crate::block_view::organism_settings_test_pty_bytes(&view);
+            assert!(group.is_sensitive());
+            assert!(preview.source.borrow().is_some());
+            // Optional native screenshot capture window; ordinary CI never waits.
+            if let Some(pause) = std::env::var("ORGANISM_PREVIEW_SCREENSHOT_PAUSE_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                eprintln!("ORGANISM_PREVIEW_READY");
+                let until = Instant::now() + Duration::from_millis(pause.min(30_000));
+                while Instant::now() < until {
+                    while main.pending() {
+                        main.iteration(false);
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            let pose = preview.pose.upgrade().unwrap();
+            let sprite = preview.sprite.upgrade().unwrap();
+            let hello = preview.hello.upgrade().unwrap();
+            assert!(!sprite.can_target());
+            assert!(!sprite.is_focusable());
+
+            motion.set_selected(3);
+            assert!(preview.source.borrow().is_none());
+            for (index, example) in PreviewPose::ALL.into_iter().enumerate() {
+                pose.set_selected(index as u32);
+                assert_eq!(pose.subtitle().as_deref(), Some(example.explanation()));
+                assert_eq!(
+                    sprite.text().as_str(),
+                    sprite_frame_with_context(example.context(), 0).as_ref()
+                );
+            }
+            pose.set_selected(0);
+            pose.grab_focus();
+            let focus_before = gtk::prelude::GtkWindowExt::focus(&window);
+            assert!(
+                focus_before.is_some(),
+                "the settings control owns keyboard focus"
+            );
+            hello.emit_clicked();
+            let accepted = preview.greeting.get();
+            assert!(accepted.is_some());
+            assert!(!hello.is_sensitive());
+            hello.emit_clicked(); // Even a repeated/programmatic click is bounded.
+            assert_eq!(preview.greeting.get(), accepted);
+            assert_eq!(gtk::prelude::GtkWindowExt::focus(&window), focus_before);
+            assert_eq!(
+                sprite.text().as_str(),
+                sprite_frame_with_context(PreviewPose::Greeting.context(), 0).as_ref()
+            );
+            spin_until(&|| preview.greeting.get().is_none());
+            assert_eq!(
+                sprite.text().as_str(),
+                sprite_frame_with_context(PreviewPose::Calm.context(), 0).as_ref()
+            );
+            assert!(
+                preview.source.borrow().is_some(),
+                "one cooldown wake remains"
+            );
+            pose.set_selected(2);
+            assert!(preview.greeting.get().is_none());
+            assert!(!hello.is_sensitive());
+            assert!(
+                preview.source.borrow().is_none(),
+                "busy still poses do not poll a cooldown"
+            );
+            hello.emit_clicked();
+            assert!(preview.greeting.get().is_none());
+
+            motion.set_selected(0);
+            assert!(
+                preview.source.borrow().is_none(),
+                "automatic follows reduced motion"
+            );
+            desktop.set_gtk_enable_animations(true);
+            assert!(
+                preview.source.borrow().is_some(),
+                "desktop preference updates live"
+            );
+            desktop.set_gtk_enable_animations(false);
+            assert!(preview.source.borrow().is_none());
+            motion.set_selected(1);
+            assert!(preview.source.borrow().is_some());
+            group.set_visible(false);
+            assert!(preview.source.borrow().is_none());
+            group.set_visible(true);
+            spin_until(&|| group.is_mapped());
+            assert!(preview.source.borrow().is_some());
+            dialog.force_close();
+            spin_until(&|| !group.is_mapped());
+            assert!(preview.source.borrow().is_none());
+            // Reopening the same dialog starts exactly one mapped source.
+            dialog.present(Some(&window));
+            spin_until(&|| group.is_mapped());
+            assert!(preview.source.borrow().is_some());
+            dialog.force_close();
+            spin_until(&|| !group.is_mapped());
+            assert!(preview.source.borrow().is_none());
+            assert_eq!(entry.text().as_str(), "untouched terminal draft");
+            assert!(
+                crate::block_view::organism_settings_test_pty_bytes(&view).is_empty(),
+                "pose preview and greeting must not send terminal input"
+            );
+            assert_eq!(
+                motion.selected(),
+                1,
+                "preview never edits the motion control"
+            );
+            desktop.set_gtk_enable_animations(original_animations);
+            assert!(
+                preview.source.borrow().is_none(),
+                "hidden settings callbacks cannot restart a timer"
+            );
+            window.close();
+        }
+
+        #[test]
+        fn automatic_respects_reduced_motion_and_explicit_choices_win() {
+            assert_eq!(motion_for_selection(0, false), OrganismMotion::Calm);
+            assert_eq!(motion_for_selection(0, true), OrganismMotion::Full);
+            assert_eq!(motion_for_selection(1, false), OrganismMotion::Full);
+            assert_eq!(motion_for_selection(2, true), OrganismMotion::Calm);
+            assert_eq!(motion_for_selection(3, true), OrganismMotion::Static);
+        }
+
+        #[test]
+        fn still_modes_never_advance_frames_or_keep_an_idle_timer() {
+            for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+                assert_eq!(frame_index(motion, Duration::from_secs(9)), 0);
+                assert_eq!(next_wake(true, motion, Duration::ZERO, None, None), None);
+            }
+            assert_eq!(
+                frame_index(OrganismMotion::Full, Duration::from_secs(1)),
+                10
+            );
+        }
+
+        #[test]
+        fn greeting_expiry_and_cooldown_are_bounded_even_in_static_mode() {
+            let start = Duration::ZERO;
+            let motion = OrganismMotion::Static;
+            assert_eq!(
+                next_wake(true, motion, start, Some(start), Some(start)),
+                Some(GentleInteraction::HOLD)
+            );
+            assert_eq!(
+                next_wake(
+                    true,
+                    motion,
+                    GentleInteraction::HOLD,
+                    Some(start),
+                    Some(start)
+                ),
+                Some(GentleInteraction::COOLDOWN - GentleInteraction::HOLD)
+            );
+            assert_eq!(
+                next_wake(
+                    true,
+                    motion,
+                    GentleInteraction::COOLDOWN,
+                    Some(start),
+                    Some(start)
+                ),
+                None
+            );
+        }
+
+        #[test]
+        fn hiding_cancels_every_kind_of_preview_wake() {
+            for motion in [
+                OrganismMotion::Full,
+                OrganismMotion::Calm,
+                OrganismMotion::Static,
+            ] {
+                assert_eq!(
+                    next_wake(
+                        false,
+                        motion,
+                        Duration::ZERO,
+                        Some(Duration::ZERO),
+                        Some(Duration::ZERO)
+                    ),
+                    None
+                );
+            }
+        }
+
+        #[test]
+        fn work_previews_do_not_offer_a_greeting_and_invalid_selection_is_safe() {
+            assert_eq!(selected_pose(u32::MAX), PreviewPose::Calm);
+            for (index, pose) in PreviewPose::ALL.into_iter().enumerate() {
+                assert_eq!(selected_pose(index as u32), pose);
+                let mut interaction = GentleInteraction::default();
+                assert_eq!(
+                    can_greet(pose),
+                    interaction.request(Duration::ZERO, pose.context())
+                );
+            }
+        }
+    }
+}
+
 const EDIT_REMOTE_HOST_LABEL: &str = "Edit remote host";
 const REMOVE_REMOTE_HOST_LABEL: &str = "Remove remote host";
 
@@ -387,7 +1014,8 @@ impl Component for SettingsModel {
                     #[name(ascii_organism_row)]
                     adw::SwitchRow {
                         set_title: "ASCII Organism",
-                        set_subtitle: "Show the local, no-LLM organism in new Block panes",
+                        set_subtitle: "Local, no-LLM companion; changes apply to open panes",
+                        set_tooltip_text: Some("Pause near a resting companion for a hello; clicks and selection stay with your terminal."),
                         set_active: model.values.ascii_organism_enabled,
                         set_sensitive: !model.values.safe_mode,
                         connect_active_notify[sender] => move |row| {
@@ -410,6 +1038,9 @@ impl Component for SettingsModel {
                         },
                     },
                 },
+
+                #[name(organism_preview_group)]
+                adw::PreferencesGroup {},
 
                 adw::PreferencesGroup {
                     set_title: &gtk::glib::markup_escape_text("Features & Privacy"),
@@ -644,7 +1275,13 @@ impl Component for SettingsModel {
             remote_dialog: None,
             remote_rows: Vec::new(),
         };
+        let preview_dialog = root.clone();
         let widgets = view_output!();
+        organism_preview::install(
+            &widgets.organism_preview_group,
+            &widgets.ascii_organism_motion_row,
+            &preview_dialog,
+        );
         model.rebuild_remote_rows(&widgets.remote_hosts_group, &sender);
         ComponentParts { model, widgets }
     }

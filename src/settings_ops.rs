@@ -136,11 +136,13 @@ impl AppModel {
             return;
         }
         self.config.borrow_mut().ascii_organism_enabled = enabled;
+        self.organism_hub.sync_ascii_organism_settings();
+        self.sync_organism_focus();
         self.persist_config();
         self.show_toast(if enabled {
-            "ASCII organism will appear in new local Block panes."
+            "ASCII organism enabled in open local Block panes."
         } else {
-            "ASCII organism disabled for new panes."
+            "ASCII organism hidden in all open panes."
         });
     }
 
@@ -155,6 +157,8 @@ impl AppModel {
             3 => Some(config::OrganismMotion::Static),
             _ => None,
         };
+        self.organism_hub.sync_ascii_organism_settings();
+        self.sync_organism_focus();
         self.persist_config();
     }
 
