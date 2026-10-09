@@ -385,9 +385,16 @@ fn read_session(path: &Path) -> io::Result<Vec<PersistedZone>> {
     read_session_for_restore(path).map(|session| session.map_or_else(Vec::new, |s| s.zones))
 }
 
+#[cfg(test)]
 fn read_session_for_restore(path: &Path) -> io::Result<Option<DecodedSession>> {
+    read_session_text(path)?
+        .map(|text| decode_session_for_restore(text.as_bytes()))
+        .transpose()
+}
+
+fn read_session_text(path: &Path) -> io::Result<Option<String>> {
     match jterm_core::snapshot_file::read_bounded(path, MAX_ZONE_HISTORY_FILE_BYTES) {
-        Ok(text) => decode_session_for_restore(text.as_bytes()).map(Some),
+        Ok(text) => Ok(Some(text)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
@@ -406,19 +413,143 @@ pub(super) enum RestoreStatus {
     ReadFailed,
 }
 
+// A zone document is one reconstructable session, not a merged command index.
+// Without persisted record identities, merging a stale pane would duplicate
+// commands or resurrect records deliberately removed from the newer snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionRevision {
+    Missing,
+    Present {
+        device: u64,
+        inode: u64,
+        len: u64,
+        modified: (i64, i64),
+        changed: (i64, i64),
+    },
+}
+
+impl SessionRevision {
+    fn observe(path: &Path) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::Missing),
+            Err(error) => return Err(error),
+        };
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Unified history is not a regular file",
+            ));
+        }
+        Ok(Self::Present {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            len: metadata.len(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        })
+    }
+}
+
+/// Serialize only bounded raw reads and compare/replace operations. Never keep
+/// a lock while decoding, for a pane's lifetime, or wait on the GTK thread. Block history also locks this
+/// directory; its atomic writer itself takes no lock, so calling it below is
+/// not recursive. A busy sibling save is an ordinary retryable failure.
+struct SessionWriteLock(std::fs::File);
+
+impl SessionWriteLock {
+    fn acquire(path: &Path) -> io::Result<Self> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+            .open(parent)?;
+        let metadata = directory.metadata()?;
+        if metadata.mode() & 0o022 != 0 && metadata.mode() & nix::libc::S_ISVTX == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Unified history parent is writable by another user or group",
+            ));
+        }
+        // SAFETY: directory owns a live descriptor and flock retains no pointer.
+        if unsafe {
+            nix::libc::flock(
+                directory.as_raw_fd(),
+                nix::libc::LOCK_EX | nix::libc::LOCK_NB,
+            )
+        } != 0
+        {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::WouldBlock {
+                return Err(io::Error::new(io::ErrorKind::WouldBlock,
+                    "Unified history is busy in another save or restore. Existing files are kept; retry after that operation finishes."));
+            }
+            return Err(error);
+        }
+        Ok(Self(directory))
+    }
+}
+
+impl Drop for SessionWriteLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // Explicit unlock keeps an inherited descriptor from extending this
+        // critical section after a child is forked. File closes on all paths.
+        // SAFETY: the descriptor stays live through this call.
+        unsafe {
+            nix::libc::flock(self.0.as_raw_fd(), nix::libc::LOCK_UN);
+        }
+    }
+}
+
+fn revision_conflict() -> io::Error {
+    io::Error::new(io::ErrorKind::WouldBlock,
+        "Unified history changed since this pane restored or saved it. Existing files are kept and this pane's new history is not being saved. Export this pane's work before reopening it.")
+}
+
+fn read_observed_session(path: &Path) -> io::Result<(Option<DecodedSession>, SessionRevision)> {
+    // The lock also rules out Missing -> Present -> Missing while reading:
+    // matching metadata alone cannot prove an absent document stayed absent.
+    let lock = SessionWriteLock::acquire(path)?;
+    let before = SessionRevision::observe(path)?;
+    let text = read_session_text(path)?;
+    let after = SessionRevision::observe(path)?;
+    drop(lock); // Parsing large bounded documents must not hold the namespace.
+    if before != after {
+        return Err(revision_conflict());
+    }
+    let session = text
+        .map(|text| decode_session_for_restore(text.as_bytes()))
+        .transpose()?;
+    Ok((session, after))
+}
+
 /// Restore authority belongs to one path and one pane. A missing file is a
 /// fresh writable session; a failed read is not an empty session.
 #[derive(Debug, Default)]
 pub(super) struct SessionPersistence {
     path: Option<PathBuf>,
     status: RestoreStatus,
+    revision: std::cell::Cell<Option<SessionRevision>>,
 }
 
 impl SessionPersistence {
     pub(super) fn restore(&mut self, path: &Path) -> io::Result<Vec<PersistedZone>> {
         self.path = Some(path.to_path_buf());
-        match read_session_for_restore(path) {
-            Ok(session) => {
+        self.revision.set(None);
+        match read_observed_session(path) {
+            Ok((session, revision)) => {
+                self.revision.set(Some(revision));
                 self.status = match session.as_ref() {
                     None => RestoreStatus::Missing,
                     Some(session) if session.limited => RestoreStatus::RestoredLimited,
@@ -476,7 +607,13 @@ impl SessionPersistence {
         if let Some(message) = self.save_refusal(path) {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, message));
         }
-        write_session(path, zones)
+        let _lock = SessionWriteLock::acquire(path)?;
+        if self.revision.get() != Some(SessionRevision::observe(path)?) {
+            return Err(revision_conflict());
+        }
+        write_session(path, zones)?;
+        self.revision.set(Some(SessionRevision::observe(path)?));
+        Ok(())
     }
 }
 
@@ -1198,5 +1335,281 @@ mod tests {
         let (record, snapshot) = zone("echo hi", Some("hi")).into_live(41);
         assert_eq!(record.id, 41, "the caller's id wins, not a persisted one");
         assert_eq!(snapshot.expect("snapshot").plain, "hi");
+    }
+    #[test]
+    fn concurrent_panes_cannot_overwrite_newer_saved_records() {
+        let fixture = SessionFixture::new();
+        let mut first = SessionPersistence::default();
+        let mut second = SessionPersistence::default();
+        assert!(first.restore(&fixture.path).unwrap().is_empty());
+        assert!(second.restore(&fixture.path).unwrap().is_empty());
+        first
+            .save(
+                &fixture.path,
+                vec![zone("pane A new command", Some("A output"))],
+            )
+            .unwrap();
+        let saved = std::fs::read(&fixture.path).unwrap();
+        let result = second.save(
+            &fixture.path,
+            vec![zone("pane B new command", Some("B output"))],
+        );
+        let mut reopened = SessionPersistence::default();
+        let restored = reopened.restore(&fixture.path).unwrap();
+        eprintln!(
+            "new-record overlap: save={result:?}, reopened={:?}",
+            restored.iter().map(|z| z.cmd.as_str()).collect::<Vec<_>>()
+        );
+        assert!(
+            result.is_err(),
+            "a stale pane must not replace another pane's new records"
+        );
+        assert_eq!(std::fs::read(&fixture.path).unwrap(), saved);
+        assert_eq!(restored[0].cmd, "pane A new command");
+    }
+
+    #[test]
+    fn concurrent_panes_cannot_resurrect_removed_records() {
+        let mut conflicts = Vec::new();
+        for clear_all in [false, true] {
+            let fixture = SessionFixture::new();
+            fixture.write(
+                &encode_session(vec![
+                    zone("keep", Some("kept")),
+                    zone("deleted", Some("gone")),
+                ])
+                .unwrap(),
+            );
+            let mut first = SessionPersistence::default();
+            let mut stale = SessionPersistence::default();
+            first.restore(&fixture.path).unwrap();
+            let stale_zones = stale.restore(&fixture.path).unwrap();
+            first
+                .save(
+                    &fixture.path,
+                    if clear_all {
+                        vec![]
+                    } else {
+                        vec![zone("keep", Some("kept"))]
+                    },
+                )
+                .unwrap();
+            let saved = std::fs::read(&fixture.path).ok();
+            let result = stale.save(&fixture.path, stale_zones);
+            let mut reopened = SessionPersistence::default();
+            let restored = reopened.restore(&fixture.path).unwrap();
+            eprintln!(
+                "delete overlap (clear={clear_all}): save={result:?}, reopened={:?}",
+                restored.iter().map(|z| z.cmd.as_str()).collect::<Vec<_>>()
+            );
+            if result.is_ok()
+                || std::fs::read(&fixture.path).ok() != saved
+                || restored.iter().any(|z| z.cmd == "deleted")
+            {
+                conflicts.push(clear_all);
+            }
+        }
+        assert!(
+            conflicts.is_empty(),
+            "stale close resurrected history for clear={conflicts:?}"
+        );
+    }
+
+    #[test]
+    fn concurrent_empty_close_cannot_remove_newer_records() {
+        let fixture = SessionFixture::new();
+        let mut active = SessionPersistence::default();
+        let mut empty = SessionPersistence::default();
+        active.restore(&fixture.path).unwrap();
+        empty.restore(&fixture.path).unwrap();
+        active
+            .save(
+                &fixture.path,
+                vec![zone("active work", Some("valuable output"))],
+            )
+            .unwrap();
+        let saved = std::fs::read(&fixture.path).unwrap();
+        let result = empty.save(&fixture.path, Vec::new());
+        let mut reopened = SessionPersistence::default();
+        let restored = reopened.restore(&fixture.path).unwrap();
+        eprintln!(
+            "empty-close overlap: save={result:?}, reopened={:?}",
+            restored.iter().map(|z| z.cmd.as_str()).collect::<Vec<_>>()
+        );
+        assert!(
+            result.is_err(),
+            "an empty stale pane must not remove another pane's saved work"
+        );
+        assert_eq!(std::fs::read(&fixture.path).unwrap(), saved);
+        assert_eq!(restored[0].cmd, "active work");
+    }
+
+    #[test]
+    fn own_successful_saves_refresh_revision_and_keep_clear_authoritative() {
+        let fixture = SessionFixture::new();
+        let mut state = SessionPersistence::default();
+        state.restore(&fixture.path).unwrap();
+        for cmd in ["first", "second", "third"] {
+            state
+                .save(&fixture.path, vec![zone(cmd, Some(cmd))])
+                .unwrap();
+            assert_eq!(read_session(&fixture.path).unwrap()[0].cmd, cmd);
+        }
+        state.save(&fixture.path, Vec::new()).unwrap();
+        assert!(!fixture.path.exists());
+        state.save(&fixture.path, Vec::new()).unwrap();
+        state
+            .save(&fixture.path, vec![zone("after clear", None)])
+            .unwrap();
+        let mut reopened = SessionPersistence::default();
+        assert_eq!(
+            reopened.restore(&fixture.path).unwrap()[0].cmd,
+            "after clear"
+        );
+    }
+
+    #[test]
+    fn externally_replaced_or_removed_history_is_preserved_until_reopen() {
+        for replacement in [Some(vec![zone("external replacement", Some("kept"))]), None] {
+            let fixture = SessionFixture::new();
+            fixture.write(&encode_session(vec![zone("original", None)]).unwrap());
+            let mut state = SessionPersistence::default();
+            state.restore(&fixture.path).unwrap();
+            match replacement {
+                Some(zones) => write_session(&fixture.path, zones).unwrap(),
+                None => std::fs::remove_file(&fixture.path).unwrap(),
+            }
+            let bytes = std::fs::read(&fixture.path).ok();
+            for _ in 0..2 {
+                let result = state.save(&fixture.path, vec![zone("stale", None)]);
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+                assert_eq!(std::fs::read(&fixture.path).ok(), bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn writer_lock_is_nonblocking_and_released_for_retry() {
+        use std::os::fd::AsRawFd;
+        let fixture = SessionFixture::new();
+        let mut state = SessionPersistence::default();
+        state.restore(&fixture.path).unwrap();
+        let directory = std::fs::File::open(&fixture.directory).unwrap();
+        // SAFETY: this fixture owns the live directory descriptor.
+        assert_eq!(
+            unsafe {
+                nix::libc::flock(
+                    directory.as_raw_fd(),
+                    nix::libc::LOCK_EX | nix::libc::LOCK_NB,
+                )
+            },
+            0
+        );
+        let refused = state.save(&fixture.path, vec![zone("retry me", None)]);
+        // Release before assertions so a failing test never strands the lock.
+        // SAFETY: this fixture still owns the directory descriptor.
+        assert_eq!(
+            unsafe { nix::libc::flock(directory.as_raw_fd(), nix::libc::LOCK_UN) },
+            0
+        );
+        assert_eq!(refused.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert!(!fixture.path.exists());
+        state
+            .save(&fixture.path, vec![zone("retry me", None)])
+            .unwrap();
+        assert_eq!(read_session(&fixture.path).unwrap()[0].cmd, "retry me");
+        // A successful write's guard must be gone too.
+        assert_eq!(
+            unsafe {
+                nix::libc::flock(
+                    directory.as_raw_fd(),
+                    nix::libc::LOCK_EX | nix::libc::LOCK_NB,
+                )
+            },
+            0
+        );
+        assert_eq!(
+            unsafe { nix::libc::flock(directory.as_raw_fd(), nix::libc::LOCK_UN) },
+            0
+        );
+    }
+
+    #[test]
+    fn simultaneous_writers_have_one_successful_snapshot() {
+        use std::sync::{Arc, Barrier};
+        for _ in 0..8 {
+            let fixture = SessionFixture::new();
+            let mut first = SessionPersistence::default();
+            let mut second = SessionPersistence::default();
+            first.restore(&fixture.path).unwrap();
+            second.restore(&fixture.path).unwrap();
+            let start = Arc::new(Barrier::new(2));
+            let handles: Vec<_> = [(first, "one"), (second, "two")]
+                .into_iter()
+                .map(|(state, cmd)| {
+                    let path = fixture.path.clone();
+                    let start = Arc::clone(&start);
+                    std::thread::spawn(move || {
+                        start.wait();
+                        let result = state.save(&path, vec![zone(cmd, Some(cmd))]);
+                        (cmd, result)
+                    })
+                })
+                .collect();
+            let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            assert_eq!(
+                results.iter().filter(|(_, r)| r.is_ok()).count(),
+                1,
+                "{results:?}"
+            );
+            let winner = results.iter().find(|(_, r)| r.is_ok()).unwrap().0;
+            assert_eq!(read_session(&fixture.path).unwrap()[0].cmd, winner);
+        }
+    }
+
+    #[test]
+    fn failed_reread_never_keeps_previous_write_authority() {
+        let fixture = SessionFixture::new();
+        let mut state = SessionPersistence::default();
+        state.restore(&fixture.path).unwrap();
+        state
+            .save(&fixture.path, vec![zone("original", None)])
+            .unwrap();
+        fixture.write(b"unreadable JSON");
+        assert!(state.restore(&fixture.path).is_err());
+        fixture.write(&encode_session(vec![zone("repaired", None)]).unwrap());
+        let repaired = std::fs::read(&fixture.path).unwrap();
+        assert!(state.save(&fixture.path, vec![zone("new", None)]).is_err());
+        assert_eq!(std::fs::read(&fixture.path).unwrap(), repaired);
+    }
+    #[test]
+    fn restore_lock_conflict_never_grants_snapshot_authority() {
+        use std::os::fd::AsRawFd;
+        let fixture = SessionFixture::new();
+        fixture.write(&encode_session(vec![zone("saved", None)]).unwrap());
+        let directory = std::fs::File::open(&fixture.directory).unwrap();
+        // SAFETY: this fixture owns the live directory descriptor.
+        assert_eq!(
+            unsafe {
+                nix::libc::flock(
+                    directory.as_raw_fd(),
+                    nix::libc::LOCK_EX | nix::libc::LOCK_NB,
+                )
+            },
+            0
+        );
+        let mut state = SessionPersistence::default();
+        let observed = state.restore(&fixture.path);
+        // SAFETY: the fixture still owns this descriptor.
+        assert_eq!(
+            unsafe { nix::libc::flock(directory.as_raw_fd(), nix::libc::LOCK_UN) },
+            0
+        );
+        assert_eq!(observed.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        let original = std::fs::read(&fixture.path).unwrap();
+        assert!(state.save(&fixture.path, Vec::new()).is_err());
+        assert_eq!(std::fs::read(&fixture.path).unwrap(), original);
+        let zones = state.restore(&fixture.path).unwrap();
+        state.save(&fixture.path, zones).unwrap();
     }
 }

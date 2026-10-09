@@ -8,8 +8,8 @@
     {
         "type": "git",
         "url": "https://github.com/beamiter/jterm_core",
-        "commit": "eb4b5db17acb1591c87cd5489d595952b2f55c42",
-        "dest": "flatpak-cargo/git/jterm_core-eb4b5db"
+        "commit": "7c43e5116d4e85bfcdc3f0fbd9cf1317db3ee3a7",
+        "dest": "flatpak-cargo/git/jterm_core-7c43e51"
     },
     {
         "type": "archive",
@@ -1111,7 +1111,7 @@
     {
         "type": "shell",
         "commands": [
-            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-eb4b5db/.\" \"cargo/vendor/jterm_core\""
+            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-7c43e51/.\" \"cargo/vendor/jterm_core\""
         ]
     },
     {
@@ -2441,7 +2441,7 @@
     },
     {
         "type": "inline",
-        "contents": "[source.vendored-sources]\ndirectory = \"cargo/vendor\"\n\n[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n[source.\"https://github.com/beamiter/jagent\"]\ngit = \"https://github.com/beamiter/jagent\"\nreplace-with = \"vendored-sources\"\nrev = \"d1d3bc2251f3fba4468f689a655a932e00a83d86\"\n\n[source.\"https://github.com/beamiter/jterm_core\"]\ngit = \"https://github.com/beamiter/jterm_core\"\nreplace-with = \"vendored-sources\"\nrev = \"eb4b5db17acb1591c87cd5489d595952b2f55c42\"\n",
+        "contents": "[source.vendored-sources]\ndirectory = \"cargo/vendor\"\n\n[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n[source.\"https://github.com/beamiter/jagent\"]\ngit = \"https://github.com/beamiter/jagent\"\nreplace-with = \"vendored-sources\"\nrev = \"d1d3bc2251f3fba4468f689a655a932e00a83d86\"\n\n[source.\"https://github.com/beamiter/jterm_core\"]\ngit = \"https://github.com/beamiter/jterm_core\"\nreplace-with = \"vendored-sources\"\nrev = \"7c43e5116d4e85bfcdc3f0fbd9cf1317db3ee3a7\"\n",
         "dest": "cargo",
         "dest-filename": "config"
     }

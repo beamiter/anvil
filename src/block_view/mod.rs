@@ -2008,7 +2008,7 @@ fn kitty_key_for(keyval: gtk::gdk::Key, base: Option<char>) -> KittyKey {
         Key::BackSpace => KittyKey::Backspace,
         Key::space | Key::KP_Space => KittyKey::Space,
         _ => match base {
-            Some(ch) if !ch.is_control() => KittyKey::Unicode(ch),
+            Some(ch) if !ch.is_control() => kitty_keyboard::unicode_key(ch, keyval.to_unicode()),
             _ => KittyKey::Functional,
         },
     }
@@ -21927,6 +21927,36 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
         // Popping the last flags forgets the pusher.
         harness.feed(ParserEvent::KittyKeyboard(super::KittyKeyboardOp::Pop(1)));
         assert_eq!(harness.ctx.kitty_pusher_rc.get(), None);
+    }
+
+    #[test]
+    fn kitty_layout_shifted_keys_keep_exact_text_for_commit_rewriting() {
+        use super::gtk::gdk::Key;
+        use super::{kitty_key_for, kitty_keyboard, KittyKey, KittyModifiers};
+        let mods = KittyModifiers {
+            shift: true,
+            alt: true,
+            ..KittyModifiers::default()
+        };
+        for (keyval, base, text) in [
+            (Key::exclam, '1', '!'),
+            (Key::quotedbl, '2', '"'),
+            (Key::colon, ';', ':'),
+            (Key::numerosign, 'ж', '№'),
+        ] {
+            let key = kitty_key_for(keyval, Some(base));
+            assert_eq!(key, KittyKey::UnicodeWithText { base, text });
+            assert_eq!(
+                kitty_keyboard::rewrite_commit(key, mods, format!("\x1b{text}").as_bytes(), 1),
+                kitty_keyboard::encode_key(KittyKey::Unicode(base), mods, 1)
+            );
+            assert_eq!(kitty_keyboard::rewrite_commit(key, mods, b"paste", 1), None);
+        }
+        assert_eq!(kitty_key_for(Key::A, Some('a')), KittyKey::Unicode('a'));
+        assert_eq!(
+            kitty_key_for(Key::Cyrillic_ZHE, Some('ж')),
+            KittyKey::Unicode('ж')
+        );
     }
 
     #[test]

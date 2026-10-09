@@ -384,9 +384,7 @@ impl Component for PaletteModel {
                 self.select_first(widgets);
             }
             PaletteMsg::WorkflowsChanged => {
-                if root.parent().is_some()
-                    && matches!(self.mode, PaletteMode::All | PaletteMode::Workflows)
-                {
+                if root.parent().is_some() && query_uses_workflows(&self.query, self.mode) {
                     self.rebuild_rows();
                     self.select_first(widgets);
                 }
@@ -438,6 +436,14 @@ impl Component for PaletteModel {
                 }
             }
             PaletteMsg::AcceptSelected => {
+                // SearchEntry's delayed Search message may still be pending.
+                // Refresh model and rows synchronously before resolving Enter.
+                let query = widgets.filter_entry.text().to_string();
+                if self.query != query {
+                    self.query = query;
+                    self.rebuild_rows();
+                    self.select_first(widgets);
+                }
                 let Some(row) = widgets.list_box.selected_row() else {
                     return;
                 };
@@ -548,6 +554,13 @@ fn title(mode: PaletteMode) -> &'static str {
     }
 }
 
+fn query_uses_workflows(query: &str, default_mode: PaletteMode) -> bool {
+    matches!(
+        Query::parse(query, default_mode).mode,
+        PaletteMode::All | PaletteMode::Workflows
+    )
+}
+
 fn placeholder(mode: PaletteMode) -> &'static str {
     match mode {
         PaletteMode::All => "Search everything…  (> commands, @ history, : workflows, ? AI)",
@@ -567,6 +580,38 @@ fn escape_markup(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{HistoryLoadRequest, HistoryLoadState, PaletteOpeningGeneration};
+
+    #[test]
+    fn workflow_reload_follows_the_effective_query_mode() {
+        use super::{query_uses_workflows, PaletteMode};
+        assert!(query_uses_workflows(": deploy", PaletteMode::History));
+        assert!(query_uses_workflows("  : build", PaletteMode::Commands));
+        assert!(query_uses_workflows("deploy", PaletteMode::Workflows));
+        assert!(query_uses_workflows("", PaletteMode::All));
+        assert!(!query_uses_workflows("@ history", PaletteMode::All));
+        assert!(!query_uses_workflows("> commands", PaletteMode::Workflows));
+        assert!(!query_uses_workflows("? request", PaletteMode::All));
+    }
+
+    #[test]
+    fn enter_refreshes_model_and_rows_before_resolving_selection() {
+        // This checks the Relm handler wiring without constructing GTK widgets.
+        // It does not claim native event-loop or factory-widget integration.
+        let source = include_str!("command_palette.rs");
+        let enter = source
+            .split_once("PaletteMsg::AcceptSelected => {")
+            .unwrap()
+            .1
+            .split_once("PaletteMsg::Close => {")
+            .unwrap()
+            .0;
+        let input = enter.find("widgets.filter_entry.text()").unwrap();
+        let model = enter.find("self.query = query;").unwrap();
+        let rows = enter.find("self.rebuild_rows();").unwrap();
+        let selection = enter.find("widgets.list_box.selected_row()").unwrap();
+        let activation = enter.find("self.accept(accept,").unwrap();
+        assert!(input < model && model < rows && rows < selection && selection < activation);
+    }
 
     fn history_request(generation: u64) -> HistoryLoadRequest {
         HistoryLoadRequest {
