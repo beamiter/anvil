@@ -408,9 +408,11 @@ pub struct PaneProbe {
 #[derive(Debug)]
 pub enum VteInput {
     WriteInput(Vec<u8>),
+    /// Validated insert-only UI text; claim any held confirming key at write time.
+    InsertReviewText(Vec<u8>),
     /// Text inserted the way a clipboard paste is: bracketed when the
     /// foreground program enabled bracketed paste (Block mode). A dropped
-    /// file's quoted path arrives this way.
+    /// file's quoted path arrives this way; claim held Enter at the write boundary.
     PasteText(String),
     /// Block-mode only: atomically re-check a clean prompt, arm the local
     /// Agent execution identity, and submit the reviewed command.
@@ -694,8 +696,15 @@ impl Component for VteTerminal {
     fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>, _root: &Self::Root) {
         match msg {
             VteInput::WriteInput(data) => self.terminal.feed_child(&data),
+            VteInput::InsertReviewText(data) => {
+                crate::enter_ownership::claim_held();
+                self.terminal.feed_child(&data);
+            }
             // The plain VTE keeps its drop on the write path it always used.
-            VteInput::PasteText(text) => self.terminal.feed_child(text.as_bytes()),
+            VteInput::PasteText(text) => {
+                crate::enter_ownership::claim_held();
+                self.terminal.feed_child(text.as_bytes());
+            }
             VteInput::RunAgentCommand { execution, .. } => {
                 let _ = sender.output(VteOutput::AgentExecutionStartFailed { execution });
             }

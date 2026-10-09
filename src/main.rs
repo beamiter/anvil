@@ -18,6 +18,7 @@ mod config_ops;
 mod config_store;
 mod diagnostics;
 mod dialogs;
+mod enter_ownership;
 mod file_drop;
 mod file_tree;
 mod file_tree_ops;
@@ -1504,9 +1505,16 @@ impl SimpleComponent for AppModel {
         model.apply_tab_placement();
         model.sidebar_box.set_visible(model.sidebar_visible);
 
+        crate::enter_ownership::watch_window(&root);
         // Window-level key controller: intercept shortcuts before VTE.
         let key_controller = gtk::EventControllerKey::new();
         key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let enter_hint = model.toast_overlay.downgrade();
+        crate::enter_ownership::install_controller_with_hint(&key_controller, move || {
+            if let Some(overlay) = enter_hint.upgrade() {
+                overlay.add_toast(adw::Toast::new(crate::enter_ownership::RELEASE_HINT));
+            }
+        });
         {
             let kb = model.kbmap.clone();
             let ksender = sender.clone();
@@ -1854,6 +1862,7 @@ impl SimpleComponent for AppModel {
                 Ok(payload) => {
                     if let Some((tab_index, pane_index)) = self.find_pane(pane_id) {
                         let terminal = &self.tabs[tab_index].panes[pane_index].terminal;
+                        crate::enter_ownership::claim_held();
                         terminal.emit(VteInput::GrabFocus);
                         terminal.emit(VteInput::PasteText(payload));
                     } else {

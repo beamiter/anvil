@@ -372,6 +372,13 @@ shell is confirmed as PTY foreground owner. Such a record is explicitly
 or duration. Replayed and unknown records remain distinguishable in Unified
 exports and chrome.
 
+If Unified history is damaged, unreadable, from an unsupported version, or only
+partly restored because it exceeds restore limits, a persistent pane notice
+explains recovery. Saving, retrying, and closing preserve the existing file;
+new history stays in memory until you repair or move the file and reopen the
+pane to load it. Keep a backup before changing that file. A missing or fully
+restored session remains writable normally.
+
 Use the conventional VTE backend when compatibility with terminal applications
 matters more than command blocks:
 
@@ -467,6 +474,12 @@ running programs, full-screen apps, shortened commands, unsafe controls, and
 lossy multiline paste are refused. A selection above 128 blocks or 2 MiB of
 command/folder text is refused as a whole; select fewer cards to review it.
 Escape closes review and returns focus to its card control.
+A held confirming Enter stays owned until its physical release, so repeats do
+not submit the inserted text after focus returns to the terminal. After startup
+or a focus change, a mouse-only insertion may consume one extra press/release
+cycle for each Enter key whose release has not been observed. A short hint says
+“Release Enter, then press it again.” Ordinary terminal Enter is unchanged when
+no review action has claimed it; a known release keeps later insertions normal.
 
 ## Default shortcuts
 
@@ -539,6 +552,12 @@ Block mode also has context-sensitive navigation:
   selection still exists. `Ctrl+Shift+C` aggregates selected command/output/live
   VTE text in document order; an oversized aggregation fails atomically instead
   of falling back to unrelated card content.
+  Within one terminal, dragging keeps VTE's native cell/word/line selection.
+  A drag across terminal surfaces selects whole surfaces, marked by accent
+  outlines; copying reads their retained rendered text in document order.
+  Cross-selection does not claim PRIMARY or change the clipboard until Copy.
+  If a selected surface disappears or changes, the range is cleared; an
+  incomplete, oversized, or slow capture never copies only a partial range.
 - All history insertion surfaces require lossless encoding. A multiline card is
   therefore left untouched when bracketed paste is unavailable instead of being
   reported as inserted after only its first line was written.
@@ -603,6 +622,11 @@ jsh_update_check = "daily"    # "startup" every launch, "daily" cached, "never" 
 several jterms open at once still cost one request a day.
 
 ## Configuration
+
+When the default `JetBrainsMono Nerd Font Mono` is unavailable, rendering uses
+the system `Monospace` family. Saved settings and custom font families/lists are
+unchanged, and style/size are preserved. Font availability is cached after GTK
+starts; restart Anvil after installing the preferred font.
 
 The configuration file is:
 
@@ -952,7 +976,9 @@ or hides them instantly over the loaded model without rescanning or losing
 loaded expansion state. The name filter composes with that preference.
 
 The header has Back/Forward, Parent, filesystem Home, active-terminal-directory,
-and clickable breadcrumb actions. Location changes, Parent/Home, directory
+and clickable breadcrumb actions. Long breadcrumbs scroll horizontally within
+the sidebar; keyboard focus reveals the current breadcrumb without expanding
+the window minimum width. Location changes, Parent/Home, directory
 activation, history, and typed paths are transactions: Anvil freezes the
 authority, lists the absolute target, and commits the location/root/history
 only after that latest request succeeds. A failure, stale token, or changed

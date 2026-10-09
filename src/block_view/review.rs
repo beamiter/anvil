@@ -349,6 +349,7 @@ pub(super) fn install_with_context(
             dialog.set_child(Some(&toolbar));
             let keys = gtk::EventControllerKey::new();
             keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+            crate::enter_ownership::install_controller(&keys);
             let close_dialog = dialog.downgrade();
             keys.connect_key_pressed(move |_, key, _, _| {
                 if key == gtk::gdk::Key::Escape {
@@ -369,6 +370,7 @@ pub(super) fn install_with_context(
             let inserted = Rc::new(Cell::new(false));
             let inserted_click = inserted.clone();
             insert.connect_clicked(move |button| {
+                crate::enter_ownership::claim_held();
                 let valid = records_weak.upgrade().is_some_and(|records| review_is_current(&snapshot, &records.borrow()));
                 if !valid {
                     status.set_text("A reviewed block was removed or changed. Close and review the selection again.");

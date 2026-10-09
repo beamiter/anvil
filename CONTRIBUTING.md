@@ -39,6 +39,21 @@ and documentation. GitHub Actions additionally exercises GTK tests under Xvfb,
 validates the desktop entry, smoke-tests the headless CLI, builds the portable
 bundle, and builds the Nix package.
 
+CI also exercises a real cross-surface mouse drag through XTest. To include
+that check locally, install `libxtst6` and Python 3 alongside Xvfb, then run:
+
+```bash
+ANVIL_XTEST_DRIVER="$PWD/scripts/qa-cross-selection-pointer.py" make test-display
+```
+
+The pointer helper only targets the synthetic, named QA window in the isolated
+test display. It does not generate keystrokes or execute terminal commands.
+The same display gate runs `qa-enter-ownership.py` against a raw, nonexecuting
+PTY recorder. It covers held main/keypad Enter, focus changes, missed releases,
+modifier changes, refused recalls, ordinary repeats, and fresh deliberate presses.
+Run these helpers only in an isolated test display; no shell is launched by the
+Enter fixture.
+
 The canonical Clippy warning baseline lives in `scripts/clippy.sh`. Update that
 single file only when accepting a new repository-wide lint exception; do not
 add ad-hoc `allow` flags to CI or local scripts.

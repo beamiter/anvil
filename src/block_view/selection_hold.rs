@@ -50,6 +50,7 @@ pub(crate) struct SelectionFeedHold {
     /// The indicator changes only once bytes are really parked, so a click
     /// without output never flashes a false paused state.
     state_cb: RefCell<Option<StateFn>>,
+    release_cb: RefCell<Option<Box<dyn Fn()>>>,
 }
 
 impl SelectionFeedHold {
@@ -60,6 +61,7 @@ impl SelectionFeedHold {
             parked: RefCell::new(Vec::new()),
             flush_cb: RefCell::new(None),
             state_cb: RefCell::new(None),
+            release_cb: RefCell::new(None),
         })
     }
 
@@ -69,6 +71,10 @@ impl SelectionFeedHold {
 
     pub(crate) fn set_state_listener(&self, listener: impl Fn(bool) + 'static) {
         *self.state_cb.borrow_mut() = Some(Box::new(listener));
+    }
+
+    pub(crate) fn set_release_listener(&self, listener: impl Fn() + 'static) {
+        *self.release_cb.borrow_mut() = Some(Box::new(listener));
     }
 
     fn notify_state(&self, parked: bool) {
@@ -170,6 +176,9 @@ impl SelectionFeedHold {
             return;
         }
         let parked = std::mem::take(&mut *self.parked.borrow_mut());
+        if let Some(released) = self.release_cb.borrow().as_ref() {
+            released();
+        }
         if parked.is_empty() {
             return;
         }
@@ -207,6 +216,18 @@ mod tests {
     }
 
     const SGR_ANY: MouseReporting = MouseReporting::new(MouseMode::AnyEvent, MouseEncoding::Sgr);
+
+    #[test]
+    fn releasing_an_empty_hold_notifies_the_external_selection_owner_once() {
+        let hold = SelectionFeedHold::new();
+        let count = Rc::new(std::cell::Cell::new(0));
+        let observed = count.clone();
+        hold.set_release_listener(move || observed.set(observed.get() + 1));
+        hold.begin_drag();
+        hold.flush_now();
+        hold.flush_now();
+        assert_eq!(count.get(), 1);
+    }
 
     #[test]
     fn eligibility_requires_streaming_or_shift_for_mouse_reporting() {

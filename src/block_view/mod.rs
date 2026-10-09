@@ -3607,6 +3607,7 @@ impl VerifiedSubmissionCtx {
         // mixed chunk as paste and can move the Ctrl+U inside the frame. Send
         // just the paste payload, preserving both the preview and shell text.
         let bytes = recall.bytes.strip_prefix(b"\x15").unwrap_or(&recall.bytes);
+        crate::enter_ownership::claim_held();
         if let Err(error) = self.pty.try_write_bytes(bytes) {
             log::warn!("could not queue recalled command: {error}");
             return false;
@@ -4078,6 +4079,7 @@ pub struct TermView {
     /// saves refuse so an unreadable file cannot be overwritten; Retry reads
     /// this to choose ReloadFirst vs SaveAgain (pairs forge `history_load`).
     history_load_outcome: RefCell<history::HistoryLoadOutcome>,
+    zone_persistence: RefCell<zone_history::SessionPersistence>,
     /// Clear Blocks deletion authorities bound to resolved paths and codecs.
     /// Keep each ordered target armed until that exact replacement succeeds.
     /// Shared with the persistence worker the same way as `history_baselines`.
@@ -5133,6 +5135,24 @@ impl UnifiedZoneStore {
             snapshots: HashMap::new(),
             snapshot_bytes: 0,
         }
+    }
+
+    /// Bound candidate count before cloning. A pane can retain substantially
+    /// more live metadata than the restart document needs.
+    fn replay_snapshot(
+        &self,
+        max_zones: usize,
+        max_bytes: usize,
+    ) -> Vec<zone_history::PersistedZone> {
+        let persisted = self
+            .records
+            .iter()
+            .rev()
+            .take(max_zones)
+            .rev()
+            .map(|record| zone_history::PersistedZone::from_live(record, self.snapshot(record.id)))
+            .collect();
+        zone_history::bound_persisted_zones(persisted, max_zones, max_bytes)
     }
 
     fn snapshot(&self, id: u64) -> Option<&ZoneOutputSnapshot> {
@@ -9270,15 +9290,7 @@ impl RenderBackend for UnifiedBackend {
         max_zones: usize,
         max_bytes: usize,
     ) -> Option<Vec<zone_history::PersistedZone>> {
-        let zones = self.zones.borrow();
-        let persisted = zones
-            .records
-            .iter()
-            .map(|record| zone_history::PersistedZone::from_live(record, zones.snapshot(record.id)))
-            .collect();
-        Some(zone_history::bound_persisted_zones(
-            persisted, max_zones, max_bytes,
-        ))
+        Some(self.zones.borrow().replay_snapshot(max_zones, max_bytes))
     }
 
     fn replay_zone_snapshot(&self, zones: Vec<zone_history::PersistedZone>) -> usize {
@@ -10429,6 +10441,7 @@ fn selection_release_is_due(
 
 impl KeyCtx {
     fn connect(self, key_ctrl: &gtk::EventControllerKey, scope: KeyScope) {
+        crate::enter_ownership::install_controller(key_ctrl);
         let KeyCtx {
             live_keys_for_key,
             pty_for_key,
@@ -10714,6 +10727,7 @@ impl KeyCtx {
                     selected_block_ids_for_key.borrow().len(),
                 )
             {
+                crate::enter_ownership::claim_held();
                 let finished = finished_blocks_for_key.borrow();
                 let target = {
                     let selected = selected_block_ids_for_key.borrow();
@@ -10783,6 +10797,7 @@ impl KeyCtx {
                         );
                         return glib::Propagation::Proceed;
                     }
+                    crate::enter_ownership::claim_held();
                     if selected_block_ids_for_key.borrow().len() > 1 {
                         if let Some(card) = finished
                             .iter()
@@ -11100,6 +11115,33 @@ impl TermView {
         initial_commands: &[String],
         env_overrides: &[(String, String)],
     ) -> std::io::Result<Self> {
+        Self::new_with_spawner(
+            config,
+            mode,
+            shell_argv,
+            cwd,
+            cwd_external,
+            session_id,
+            cwd_token,
+            initial_commands,
+            env_overrides,
+            OwnedPty::spawn_with_shell_token,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_spawner(
+        config: &Config,
+        mode: &crate::config::TerminalMode,
+        shell_argv: &[String],
+        cwd: Option<&str>,
+        cwd_external: bool,
+        session_id: Option<&str>,
+        cwd_token: &str,
+        initial_commands: &[String],
+        env_overrides: &[(String, String)],
+        spawn: impl FnOnce(&[&str], Option<&str>, &[(&str, &str)], bool) -> std::io::Result<OwnedPty>,
+    ) -> std::io::Result<Self> {
         // ── Build widget tree ──────────────────────────────────────────────
         let root = gtk::Box::new(Orientation::Vertical, 0);
         root.set_hexpand(true);
@@ -11373,12 +11415,7 @@ impl TermView {
             }
         }
 
-        let pty = Rc::new(OwnedPty::spawn_with_shell_token(
-            &argv,
-            cwd,
-            &env_extra,
-            request_shell_token,
-        )?);
+        let pty = Rc::new(spawn(&argv, cwd, &env_extra, request_shell_token)?);
 
         // Store child PID on the live VTE so kill_all_terminal_children can find it
         unsafe {
@@ -13515,6 +13552,7 @@ impl TermView {
             cleared_head_dropped: RefCell::new(std::collections::HashSet::new()),
             history_baselines: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             history_load_outcome: RefCell::new(history::HistoryLoadOutcome::Idle),
+            zone_persistence: RefCell::new(zone_history::SessionPersistence::default()),
             history_explicit_replace_pending: std::sync::Arc::new(std::sync::Mutex::new(
                 VecDeque::new(),
             )),
@@ -14400,7 +14438,7 @@ impl TermView {
                 return true;
             }
             Err(error) => {
-                log::warn!("refused oversized VTE selection copy: {error}");
+                log::warn!("refused VTE selection copy: {error}");
                 show_clipboard_failure(&self.active_vte, &format!("{error}. Nothing was copied."));
                 self.selection_feed_hold.flush_now();
                 return true;
@@ -16936,6 +16974,52 @@ mod tests {
             zones.snapshot_bytes, MAX_ZONE_SNAPSHOT_BYTES,
             "the budget charges exactly the quantity the per-zone cap bounds"
         );
+    }
+
+    #[test]
+    fn unified_restart_snapshot_keeps_newest_record_and_output_identity() {
+        let mut zones = UnifiedZoneStore::new();
+        for id in 1..=5 {
+            record_unified_zone(
+                &mut zones,
+                CompletedCommandRecord {
+                    id,
+                    cmd: format!("command-{id}"),
+                    exit_code: Some(id as i32),
+                    start_time_ms: None,
+                    end_time_ms: None,
+                    duration_ms: None,
+                    cwd: None,
+                    is_background: false,
+                    completion_provenance: super::CompletionProvenance::ShellReported,
+                    command_source: super::CommandTextSource::ShellReported,
+                    start_mark_seen: true,
+                },
+                5,
+            );
+            zones.insert_snapshot(
+                id,
+                ZoneOutputSnapshot {
+                    plain: format!("output-{id}"),
+                    truncated: false,
+                },
+            );
+        }
+        let snapshot = zones.replay_snapshot(2, 4096);
+        assert_eq!(
+            snapshot
+                .iter()
+                .map(|zone| zone.cmd.as_str())
+                .collect::<Vec<_>>(),
+            ["command-4", "command-5"]
+        );
+        assert_eq!(snapshot[0].output.as_deref(), Some("output-4"));
+        assert_eq!(snapshot[1].output.as_deref(), Some("output-5"));
+        assert_eq!(snapshot[1].exit_code, Some(5));
+        assert!(zones.replay_snapshot(0, 4096).is_empty());
+        assert!(zones.replay_snapshot(2, 0).is_empty());
+        assert_eq!(zones.records.len(), 5, "saving never mutates live history");
+        assert_eq!(zones.snapshots.len(), 5);
     }
 
     #[test]
@@ -23702,6 +23786,483 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
         busy.state = BlockState::CollectingOutput;
         assert!(!super::rerun_is_admissible(busy, "ls", false));
         assert!(super::block_selection_owns_ctrl_enter(Some(7), 1));
+    }
+
+    #[test]
+    #[ignore = "requires isolated GTK display and XTest; nonexecuting PTY recorder"]
+    fn held_enter_history_recall_does_not_submit_the_recalled_command() {
+        if let Ok(mode) = std::env::var("ANVIL_ENTER_MODE") {
+            run_held_enter_history_case(&mode);
+        } else {
+            for mode in [
+                "held",
+                "held-keypad",
+                "blur",
+                "blur-keypad",
+                "held-fresh",
+                "held-keypad-fresh",
+                "blur-fresh",
+                "missed",
+                "missed-keypad",
+                "missed-fresh",
+                "missed-keypad-fresh",
+                "ordinary",
+                "ordinary-keypad",
+                "dirty",
+                "busy",
+                "modifier",
+                "modifier-keypad",
+                "review",
+                "review-keypad",
+                "review-inherited",
+                "review-inherited-keypad-fresh",
+                "review-mouse-only-fresh",
+                "review-mouse-known-fresh",
+                "review-mouse-known-consecutive-fresh",
+                "review-mouse-known-consecutive-keypad-pane-fresh",
+                "held-pane-fresh",
+                "review-inherited-pane-fresh",
+            ] {
+                run_held_enter_history_case(mode);
+            }
+        }
+    }
+
+    fn run_held_enter_history_case(mode: &str) {
+        crate::enter_ownership::reset_for_test();
+        use super::{
+            BookmarkState, FinishedBlock, KeyCtx, KeyScope, LiveKeyRecord, ScrollDebouncer,
+        };
+        use relm4::adw::prelude::*;
+        use relm4::gtk;
+        use vte4::TerminalExt;
+        gtk::init().expect("GTK display");
+        relm4::adw::init().expect("adwaita");
+        let reviewing = mode.contains("review");
+        fn pump() {
+            for _ in 0..64 {
+                if !glib::MainContext::default().iteration(false) {
+                    break;
+                }
+            }
+        }
+        let ordinary = mode.contains("ordinary");
+        let harness = ReaderHarness::new();
+        harness.arm_verified_prompt();
+        let refused = mode.contains("dirty") || mode.contains("busy");
+        if mode.contains("dirty") {
+            harness.ctx.typed_cmd_rc.borrow_mut().push_str("echo KEEP");
+            harness.ctx.idle_input_dirty_rc.set(true);
+        }
+        if mode.contains("busy") {
+            harness.bstate.set(BlockState::CollectingOutput);
+        }
+        let _ = harness.pty.drain_test_slave(PTY_REPLY_WAIT);
+        let active = vte4::Terminal::new();
+        active.set_input_enabled(true);
+        active.feed(b"user@host $ ");
+        let card = FinishedBlock::new(
+            41,
+            "$ ",
+            "echo history",
+            None,
+            "old output\n",
+            Some(0),
+            &Config::safe_defaults(),
+            Some(5),
+            None,
+            None,
+            80,
+        );
+        let finished = Rc::new(RefCell::new(vec![card.clone()]));
+        let selected = Rc::new(RefCell::new(if ordinary {
+            HashSet::new()
+        } else {
+            HashSet::from([41])
+        }));
+        let selected_id = Rc::new(Cell::new(if ordinary { None } else { Some(41) }));
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let passive = gtk::Entry::new();
+        let passive_keys = gtk::EventControllerKey::new();
+        passive_keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        passive_keys.connect_key_pressed(|_, key, _, _| {
+            if matches!(key, gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter) {
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        passive.add_controller(passive_keys);
+        if reviewing {
+            root.append(&passive);
+        }
+        root.append(card.widget());
+        root.append(&active);
+        let partner = vte4::Terminal::new();
+        if mode.contains("pane") {
+            partner.set_input_enabled(true);
+            partner.feed(b"second pane $ ");
+            root.append(&partner);
+            let pty = harness.pty.clone();
+            partner.connect_commit(move |_, text, _| pty.write_bytes(text.as_bytes()));
+        }
+        let scroll = gtk::ScrolledWindow::new();
+        scroll.set_child(Some(&root));
+        let keys = Rc::new(LiveKeyRecord::default());
+        let key_ctx = KeyCtx {
+            live_keys_for_key: keys,
+            pty_for_key: harness.pty.clone(),
+            active_vte_for_key: active.downgrade(),
+            bracketed_paste_for_key: Rc::new(Cell::new(false)),
+            finished_blocks_for_key: finished.clone(),
+            selected_block_ids_for_key: selected.clone(),
+            selected_block_id_for_key: selected_id.clone(),
+            selection_anchor_id_for_key: Rc::new(Cell::new(Some(41))),
+            block_scroll_for_key: scroll.clone(),
+            scroll_debouncer_for_key: ScrollDebouncer::with_scroll_lock(
+                Rc::new(Cell::new(false)),
+                Rc::new(Cell::new(false)),
+            ),
+            jump_fab_for_key: gtk::Button::new(),
+            unread_for_key: Rc::new(Cell::new(0)),
+            bookmarks_for_key: Rc::new(BookmarkState::default()),
+            bstate_for_key: harness.bstate.clone(),
+            root_for_key: root.downgrade(),
+            verified_submission_for_key: harness.ctx.verified_submission.clone(),
+            human_input_for_key: Rc::new(RefCell::new(Vec::new())),
+            selection_release_for_key: Rc::new(Cell::new(None)),
+            delete_selected_for_key: Rc::new(RefCell::new(Vec::new())),
+        };
+        let controller = gtk::EventControllerKey::new();
+        controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+        key_ctx.connect(&controller, KeyScope::LiveSurface);
+        active.add_controller(controller);
+        let pty = harness.pty.clone();
+        active.connect_commit(move |_, text, _| pty.write_bytes(text.as_bytes()));
+        let hint_overlay = relm4::adw::ToastOverlay::new();
+        hint_overlay.set_child(Some(&scroll));
+        let hint_count = Rc::new(Cell::new(0usize));
+        let observed_presses = Rc::new(Cell::new(0usize));
+        let observed_before_insert = Rc::new(Cell::new(0usize));
+        let window = relm4::adw::Window::builder()
+            .title("anvil-cross-selection-qa")
+            .content(&hint_overlay)
+            .default_width(640)
+            .default_height(480)
+            .build();
+        crate::enter_ownership::watch_window(&window);
+        let window_keys = gtk::EventControllerKey::new();
+        window_keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let observed_cb = observed_presses.clone();
+        window_keys.connect_key_pressed(move |_, key, _, _| {
+            if matches!(
+                key,
+                gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter | gtk::gdk::Key::ISO_Enter
+            ) {
+                observed_cb.set(observed_cb.get() + 1);
+            }
+            glib::Propagation::Proceed
+        });
+        let hint_count_cb = hint_count.clone();
+        let hint_overlay_weak = hint_overlay.downgrade();
+        crate::enter_ownership::install_controller_with_hint(&window_keys, move || {
+            hint_count_cb.set(hint_count_cb.get() + 1);
+            if let Some(overlay) = hint_overlay_weak.upgrade() {
+                overlay.add_toast(relm4::adw::Toast::new(crate::enter_ownership::RELEASE_HINT));
+            }
+        });
+        window.add_controller(window_keys);
+        let records = Rc::new(RefCell::new(VecDeque::from([test_block(
+            41,
+            "echo history",
+            Some(0),
+        )])));
+        let review_slot = super::review::install_with_context(
+            super::review::ReviewContext {
+                records: records.clone(),
+                finished,
+                selected: selected.clone(),
+                active_id: selected_id.clone(),
+                anchor: Rc::new(Cell::new(Some(41))),
+                submission: harness.ctx.verified_submission.clone(),
+                bracketed: Rc::new(Cell::new(false)),
+                live: active.clone(),
+            },
+            &card,
+        );
+        window.present();
+        if reviewing {
+            passive.grab_focus();
+        } else {
+            active.grab_focus();
+        }
+        for _ in 0..20 {
+            pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let driver = std::env::var("ANVIL_ENTER_DRIVER").unwrap_or_else(|_| {
+            format!(
+                "{}/scripts/qa-enter-ownership.py",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
+        let ready_dir = std::env::temp_dir().join(format!(
+            "anvil-enter-qa-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&ready_dir).unwrap();
+        let ready_path = ready_dir.join("held");
+        let mut child = std::process::Command::new("python3")
+            .arg(&driver)
+            .arg(mode)
+            .arg(&ready_path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        fn insert_button(widget: &gtk::Widget) -> Option<gtk::Button> {
+            if let Some(button) = widget.downcast_ref::<gtk::Button>() {
+                if button
+                    .label()
+                    .is_some_and(|label| label.starts_with("Insert at prompt"))
+                {
+                    return Some(button.clone());
+                }
+            }
+            let mut next = widget.first_child();
+            while let Some(child) = next {
+                if let Some(button) = insert_button(&child) {
+                    return Some(button);
+                }
+                next = child.next_sibling();
+            }
+            None
+        }
+        let mut switched_pane = false;
+        let mut opened = false;
+        let mut opened_at = None;
+        let clicked = Rc::new(Cell::new(false));
+        let mut pointed = false;
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            pump();
+            if mode.contains("pane") && selected_id.get().is_none() && !switched_pane {
+                partner.grab_focus();
+                switched_pane = true;
+            }
+            if reviewing && ready_path.exists() {
+                if !opened {
+                    card.review_btn.emit_clicked();
+                    opened = true;
+                    opened_at = Some(Instant::now());
+                }
+                if !pointed
+                    && opened_at
+                        .is_some_and(|at: Instant| at.elapsed() >= Duration::from_millis(300))
+                {
+                    if let Some(dialog) = review_slot.borrow().as_ref() {
+                        if let Some(button) = insert_button(dialog.upcast_ref()) {
+                            if let Some(bounds) = button
+                                .compute_bounds(&window)
+                                .filter(|bounds| bounds.width() > 1.0 && bounds.height() > 1.0)
+                            {
+                                assert!(button.is_sensitive(), "production insert is available");
+                                let clicked = clicked.clone();
+                                let observed = observed_presses.clone();
+                                let before_insert = observed_before_insert.clone();
+                                button.connect_clicked(move |_| {
+                                    clicked.set(true);
+                                    before_insert.set(observed.get());
+                                });
+                                use std::io::Write;
+                                writeln!(
+                                    child.stdin.as_mut().unwrap(),
+                                    "{} {}",
+                                    bounds.x() + bounds.width() / 2.0,
+                                    bounds.y() + bounds.height() / 2.0
+                                )
+                                .unwrap();
+                                pointed = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("XTest timeout");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        pump();
+        if ready_path.exists() {
+            std::fs::remove_file(&ready_path).unwrap();
+        }
+        std::fs::remove_dir(&ready_dir).unwrap();
+        if mode.contains("pane") {
+            assert!(
+                switched_pane && partner.has_focus(),
+                "held key reached the second native pane"
+            );
+        }
+        if reviewing {
+            assert!(
+                opened && pointed && clicked.get(),
+                "real pointer must activate the production review insert"
+            );
+        }
+        let bytes = harness.pty.drain_test_slave(PTY_REPLY_WAIT);
+        eprintln!(
+            "nonexecuting PTY bytes: {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        if refused {
+            assert!(
+                bytes.is_empty(),
+                "a refused held selection action must not reach the PTY"
+            );
+            assert_eq!(selected_id.get(), Some(41));
+            window.close();
+            pump();
+            return;
+        }
+        assert!(
+            selected_id.get().is_none(),
+            "the confirmed review action recalled the selection"
+        );
+        if ordinary {
+            assert!(
+                bytes.len() >= 3 && bytes.iter().all(|byte| *byte == b'\r'),
+                "ordinary held Enter must remain repeatable"
+            );
+            window.close();
+            pump();
+            return;
+        }
+        let expected: &[u8] = if mode.contains("fresh") {
+            b"echo history\r"
+        } else {
+            b"echo history"
+        };
+        assert_eq!(
+            bytes, expected,
+            "confirming repeats must not submit; a fresh settled press may submit"
+        );
+        if mode.contains("mouse-only") {
+            assert_eq!(
+                hint_count.get(),
+                1,
+                "the deliberate recovery cycle gets one hint"
+            );
+        } else if mode.contains("inherited") {
+            // A slow frame can expose a repeat before the mouse reaches Insert.
+            // That key is already tracked and needs no uncertainty hint.
+            let expected_hints = usize::from(observed_before_insert.get() == 0);
+            eprintln!(
+                "observed before mouse insert: {}; recovery hints: {}",
+                observed_before_insert.get(),
+                hint_count.get()
+            );
+            assert_eq!(
+                hint_count.get(),
+                expected_hints,
+                "hint only the first unseen press"
+            );
+        } else {
+            assert_eq!(
+                hint_count.get(),
+                0,
+                "known ordinary/confirming key needs no recovery hint"
+            );
+        }
+        if mode.contains("consecutive") {
+            harness.arm_verified_prompt();
+            selected.borrow_mut().insert(41);
+            selected_id.set(Some(41));
+            super::sync_finished_block_selection(
+                std::slice::from_ref(&card),
+                &selected,
+                &selected_id,
+            );
+            card.review_btn.emit_clicked();
+            for _ in 0..40 {
+                pump();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let dialog = review_slot
+                .borrow()
+                .as_ref()
+                .expect("second production review")
+                .clone();
+            let button = insert_button(dialog.upcast_ref()).unwrap();
+            let bounds = button
+                .compute_bounds(&window)
+                .expect("mapped second insert");
+            let second_dir = ready_dir.with_extension("next");
+            std::fs::create_dir(&second_dir).unwrap();
+            let second_ready = second_dir.join("ready");
+            let second_mode = if mode.contains("keypad") {
+                "review-mouse-reuse-keypad-fresh"
+            } else {
+                "review-mouse-reuse-fresh"
+            };
+            let mut child = std::process::Command::new("python3")
+                .arg(&driver)
+                .arg(second_mode)
+                .arg(&second_ready)
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            use std::io::Write;
+            writeln!(
+                child.stdin.as_mut().unwrap(),
+                "{} {}",
+                bounds.x() + bounds.width() / 2.0,
+                bounds.y() + bounds.height() / 2.0
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(8);
+            let mut switched = false;
+            loop {
+                pump();
+                if mode.contains("pane") && selected_id.get().is_none() && !switched {
+                    partner.grab_focus();
+                    switched = true;
+                }
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success());
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("second review XTest timeout");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            pump();
+            let second = harness.pty.drain_test_slave(PTY_REPLY_WAIT);
+            assert_eq!(
+                second, b"echo history\r",
+                "internal dialog/pane focus must not make consecutive insertions double-press"
+            );
+            assert_eq!(hint_count.get(), 0);
+            if mode.contains("pane") {
+                assert!(switched && partner.has_focus());
+            }
+            std::fs::remove_file(second_ready).unwrap();
+            std::fs::remove_dir(second_dir).unwrap();
+        }
+        window.close();
+        pump();
     }
 
     #[test]

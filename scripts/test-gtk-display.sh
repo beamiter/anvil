@@ -53,6 +53,13 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    block_view::history::tests::block_history_retry_handles_failed_and_repaired_files_without_panicking
+    sidebar::tests::long_breadcrumbs_do_not_expand_the_sidebar_minimum_width
+    block_view::history::tests::unified_relative_path_authority_does_not_follow_a_cwd_change
+    block_view::history::tests::unified_failed_restore_preserves_original_bytes_on_save_and_drop
+    block_view::history::tests::failed_zone_history_notice_wraps_and_explains_recovery
+    block_view::history::tests::unified_pane_lifecycle_preserves_failed_and_incomplete_restore_bytes
+    block_view::history::tests::unified_pane_fresh_drop_reopen_and_runtime_retention_remain_writable
     block_view::tests::block_review_actions_are_identity_bound_and_never_execute
     workspace_ops::pane_tree_tests::equalize_without_allocation_leaves_the_tree_untouched
     workspace_ops::pane_tree_tests::leaf_slot_requires_the_exact_holder_tree_and_clears_focus_before_reparent
@@ -68,9 +75,13 @@ tests=(
     block_view::blocks::tests::block_density_switches_on_widgets_that_already_exist
     block_view::blocks::tests::output_scrollbar_visibility_cannot_change_the_terminal_width
     block_view::blocks::tests::visual_row_cache_covers_filter_remap_expand_and_resize_refit
+    enter_ownership::tests::queued_review_write_claims_enter_at_both_backend_boundaries
+    block_view::tests::held_enter_history_recall_does_not_submit_the_recalled_command
     block_view::cross_selection::tests::a_single_native_text_selection_survives_whole_card_selection_precedence
     block_view::css::tests::the_generated_stylesheet_parses_without_error
     terminal::vte::tests::live_screen_search_finds_text_on_the_alternate_screen
+    font::tests::default_font_resolution_preserves_grid_and_configuration
+    font::tests::an_appended_font_family_resolves_in_the_native_font_map
     font::tests::a_real_vte_is_given_the_icon_family_behind_the_configured_one
     block_view::onboarding::tests::block_onboarding_overlay_is_non_measuring_and_non_targetable
     block_view::find::tests::unified_vte_fresh_query_reaches_scrollback_before_a_prior_match
@@ -114,6 +125,42 @@ for test_name in "${tests[@]}"; do
     dbus-run-session "${dbus_run_args[@]}" -- \
         xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
         cargo test --locked "${test_name}" -- --ignored --exact --nocapture
+    if [[ "${test_name}" == block_view::tests::held_enter_history_recall_does_not_submit_the_recalled_command ]]; then
+        for mode in review-mouse-only-fresh review-mouse-only-keypad-fresh review-mouse-only-keypad-pane-fresh; do
+            printf 'GTK display regression: settled release then outside-focus Enter (%s)\n' "${mode}"
+            ANVIL_ENTER_MODE="${mode}" ANVIL_QA_PREWARM_ENTER=1 ANVIL_QA_INHERITED_ENTER=1 \
+                dbus-run-session "${dbus_run_args[@]}" -- \
+                xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
+                cargo test --locked "${test_name}" -- --ignored --exact --nocapture
+        done
+    fi
+    if [[ "${test_name}" == enter_ownership::tests::queued_review_write_claims_enter_at_both_backend_boundaries ]]; then
+        for inherited in 0 1; do
+            for dual in 0 1; do
+                printf 'GTK display regression: file-drop Enter ownership inherited=%s dual=%s\n' "${inherited}" "${dual}"
+                ANVIL_QA_FILE_DROP=1 ANVIL_QA_INHERITED_ENTER="${inherited}" ANVIL_QA_DUAL_ENTER="${dual}" \
+                    dbus-run-session "${dbus_run_args[@]}" -- \
+                    xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
+                    cargo test --locked "${test_name}" -- --ignored --exact --nocapture
+            done
+        done
+        printf 'GTK display regression: file-drop fresh Enter after release\n'
+        ANVIL_QA_FILE_DROP=1 ANVIL_QA_FRESH_ENTER=1 \
+            dbus-run-session "${dbus_run_args[@]}" -- \
+            xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
+            cargo test --locked "${test_name}" -- --ignored --exact --nocapture
+        printf 'GTK display regression: simultaneous main/keypad Enter ownership\n'
+        ANVIL_QA_DUAL_ENTER=1 dbus-run-session "${dbus_run_args[@]}" -- \
+            xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
+            cargo test --locked "${test_name}" -- --ignored --exact --nocapture
+        for dual in 0 1; do
+            printf 'GTK display regression: outside-origin Enter, dual=%s\n' "${dual}"
+            ANVIL_QA_INHERITED_ENTER=1 ANVIL_QA_DUAL_ENTER="${dual}" \
+                dbus-run-session "${dbus_run_args[@]}" -- \
+                xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
+                cargo test --locked "${test_name}" -- --ignored --exact --nocapture
+        done
+    fi
 done
 
 printf 'GTK display regressions passed: %d/%d.\n' "${#tests[@]}" "${#tests[@]}"

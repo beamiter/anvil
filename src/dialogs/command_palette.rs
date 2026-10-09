@@ -322,6 +322,7 @@ impl Component for PaletteModel {
             rows,
         };
         let list_box = model.rows.widget();
+        crate::enter_ownership::install_widget(&root);
         let widgets = view_output!();
         ComponentParts { model, widgets }
     }
@@ -502,6 +503,7 @@ impl PaletteModel {
     }
 
     fn accept(&mut self, accept: Accept, sender: &ComponentSender<Self>, root: &adw::Dialog) {
+        crate::enter_ownership::claim_held();
         self.opening.close();
         self.history_load.close();
         root.force_close();

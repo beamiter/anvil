@@ -618,7 +618,14 @@ impl Component for BlockTerminal {
         };
         match msg {
             VteInput::WriteInput(data) => view.write_input(&data),
-            VteInput::PasteText(text) => view.paste_text(&text),
+            VteInput::InsertReviewText(data) => {
+                crate::enter_ownership::claim_held();
+                view.write_input(&data);
+            }
+            VteInput::PasteText(text) => {
+                crate::enter_ownership::claim_held();
+                view.paste_text(&text);
+            }
             VteInput::RunAgentCommand { execution, command } => {
                 if !view.try_run_agent_command(execution, &command) {
                     let _ = sender.output(VteOutput::AgentExecutionStartFailed { execution });

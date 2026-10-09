@@ -42,6 +42,8 @@ jobs:
             libgtk-4-dev \
             libadwaita-1-dev \
             libvte-2.91-gtk4-dev \
+            libxtst6 \
+            python3 \
             appstream \
             desktop-file-utils \
             file \
@@ -79,7 +81,7 @@ jobs:
         run: xvfb-run --auto-servernum cargo test --all-targets --locked --no-fail-fast 2>&1 | tee test.log
 
       - name: Run display-backed GTK/VTE regressions
-        run: bash scripts/test-gtk-display.sh
+        run: ANVIL_XTEST_DRIVER="$PWD/scripts/qa-cross-selection-pointer.py" bash scripts/test-gtk-display.sh
 
       - name: Run Clippy
         id: clippy

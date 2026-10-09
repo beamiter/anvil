@@ -277,11 +277,20 @@ impl Component for FileHeaderModel {
                 },
             },
 
-            #[name(breadcrumb_box)]
-            gtk::Box {
-                set_orientation: gtk::Orientation::Horizontal,
-                set_spacing: 2,
+            gtk::ScrolledWindow {
+                set_widget_name: "file-tree-breadcrumb-scroll",
+                set_hscrollbar_policy: gtk::PolicyType::Automatic,
+                set_vscrollbar_policy: gtk::PolicyType::Never,
+                set_propagate_natural_width: false,
                 set_hexpand: true,
+                set_focusable: false,
+
+                #[name(breadcrumb_box)]
+                gtk::Box {
+                    set_orientation: gtk::Orientation::Horizontal,
+                    set_spacing: 2,
+                    set_hexpand: true,
+                },
             },
 
             #[name(path_entry)]
@@ -569,6 +578,121 @@ mod tests {
         assert!(terminal_button_tooltip(0).contains("this tree directory"));
         assert!(terminal_button_tooltip(1).contains("may differ from this tree path"));
         assert_eq!(terminal_button_tooltip(128), REMOTE_TERMINAL_TOOLTIP);
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK display"]
+    fn long_breadcrumbs_do_not_expand_the_sidebar_minimum_width() {
+        gtk::init().expect("GTK display");
+        let navigated: Rc<std::cell::RefCell<Vec<std::path::PathBuf>>> = Rc::default();
+        let sink = navigated.clone();
+        let header = FileHeaderModel::builder()
+            .launch((
+                vec!["Local".to_string()],
+                vec!["Local filesystem".to_string()],
+            ))
+            .connect_receiver(move |_, output| {
+                if let FileHeaderOutput::NavigatePath(path) = output {
+                    sink.borrow_mut().push(path);
+                }
+            });
+        let pump = || {
+            let context = gtk::glib::MainContext::default();
+            for _ in 0..200 {
+                if !context.pending() {
+                    break;
+                }
+                context.iteration(false);
+            }
+        };
+        let set_path = |path: std::path::PathBuf| {
+            header.emit(FileHeaderMsg::SetRoot {
+                display: path.display().to_string(),
+                tooltip: path.display().to_string(),
+                path,
+            });
+            pump();
+        };
+        set_path(std::path::PathBuf::from("/tmp/short"));
+        let short_min = header.widget().measure(gtk::Orientation::Horizontal, -1).0;
+        let long = std::path::PathBuf::from("/workspace/private-project-with-a-long-name/nested-working-directory-with-a-long-name/source-history-checkout-with-a-long-name");
+        set_path(long.clone());
+        let long_min = header.widget().measure(gtk::Orientation::Horizontal, -1).0;
+        eprintln!("sidebar minimum widths: short={short_min}, long={long_min}");
+        assert!(
+            long_min <= short_min + 16,
+            "path length must not force the terminal offscreen"
+        );
+        let window = gtk::Window::builder()
+            .default_width(400)
+            .default_height(180)
+            .child(header.widget())
+            .build();
+        window.present();
+        for _ in 0..10 {
+            pump();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let root = header.widget().clone().upcast::<gtk::Widget>();
+        let scroller = descendant_named(&root, "file-tree-breadcrumb-scroll")
+            .unwrap()
+            .downcast::<gtk::ScrolledWindow>()
+            .unwrap();
+        let mut pending = vec![root];
+        let mut target = None;
+        while let Some(widget) = pending.pop() {
+            if let Ok(button) = widget.clone().downcast::<gtk::Button>() {
+                if button.tooltip_text().as_deref() == Some(long.to_str().unwrap()) {
+                    target = Some(button);
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                child = widget.next_sibling();
+                pending.push(widget);
+            }
+        }
+        let button = target.expect("complete last path remains a navigable breadcrumb");
+        assert!(button.grab_focus());
+        // GTK animates keyboard-driven scrolling; wait for the actual bounds,
+        // with a deadline, instead of asserting during its first frame.
+        for _ in 0..100 {
+            pump();
+            let bounds = button.compute_bounds(&scroller).unwrap();
+            if bounds.x() >= -1.0 && bounds.x() + bounds.width() <= scroller.width() as f32 + 1.0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            scroller.hadjustment().value() > 0.0,
+            "keyboard focus must reveal an offscreen path"
+        );
+        let bounds = button.compute_bounds(&scroller).unwrap();
+        eprintln!(
+            "focused breadcrumb: x={}, width={}, viewport={}, scroll={}",
+            bounds.x(),
+            bounds.width(),
+            scroller.width(),
+            scroller.hadjustment().value()
+        );
+        assert!(bounds.x() >= -1.0 && bounds.x() + bounds.width() <= scroller.width() as f32 + 1.0);
+        button.emit_clicked();
+        pump();
+        assert_eq!(&*navigated.borrow(), &[long]);
+        if let Some(path) = std::env::var_os("ANVIL_SIDEBAR_SCREENSHOT") {
+            let paintable = gtk::WidgetPaintable::new(Some(&window));
+            let snapshot = gtk::Snapshot::new();
+            paintable.snapshot(&snapshot, window.width() as f64, window.height() as f64);
+            let node = snapshot.to_node().unwrap();
+            let renderer = gtk::gsk::Renderer::for_surface(&window.surface().unwrap()).unwrap();
+            renderer
+                .render_texture(&node, None)
+                .save_to_png(path)
+                .unwrap();
+            renderer.unrealize();
+        }
+        window.close();
     }
 
     /// A programmatic selector rebuild must not read back as a user switch.

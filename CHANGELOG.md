@@ -852,6 +852,54 @@ versioning for tagged releases while it remains experimental.
 
 ### Fixed
 
+- Dropped file paths keep their review-first behavior when Enter is already held,
+  including a press inherited after focus returns. Paste framing and path quoting
+  are preserved; release Enter before deliberately submitting the inserted path.
+
+- Retrying a failed Block history load no longer panics during revalidation.
+  Still-damaged files stay refused; repaired files can resume persistence.
+
+- Reading Unified history with many small records retains only the newest 64
+  while validating the whole document, avoiding a large discarded-record
+  allocation. Partly restored files remain protected from overwrite.
+
+- Long Files breadcrumb paths scroll within the sidebar instead of forcing the
+  window wider and squeezing the terminal. Keyboard focus reveals offscreen
+  breadcrumbs, and their full path navigation and tooltips remain available.
+
+- Unified panes preserve unread or partly restored history files across save,
+  retry, and close. A persistent recovery notice explains why new history is
+  not being saved; repairing the file grants save authority only after an
+  actual reload. Missing and completely restored sessions remain writable.
+
+- Review insertion also owns an Enter held before the window regained focus,
+  even when GTK supplies no initial press. Main and keypad stay independent.
+  A short recovery hint explains a deliberately consumed press after uncertain
+  focus; observed releases preserve normal consecutive review actions.
+
+- A missing default Nerd Font now resolves to system Monospace instead of a
+  proportional substitute, preserving terminal grid spacing without rewriting
+  custom font choices or saved settings.
+- Generated Pango fallback lists no longer put a leading space in the appended
+  family name, which could silently prevent the configured icon fallback from
+  being used. Font size, weight and style remain unchanged.
+
+- Insert-only history and review actions retain ownership of a held confirming
+  Enter through repeats and focus changes. Delayed review insertion claims held
+  keys again at the write boundary; a fresh, released Enter remains available.
+
+- Cross-block text drags now keep one ordered selection instead of allowing
+  VTE's PRIMARY ownership to erase earlier surfaces. Stable terminal identities,
+  non-measuring outlines, atomic bounded copying and explicit live-feed release
+  keep selection correct across remapping, input and disappearing history.
+  Native single-surface selection remains unchanged; GTK tests include real
+  mouse drags in both directions and clipboard/PRIMARY sentinels.
+
+- Unified restart history now counts working-directory text and the exact JSON
+  representation against its budgets. Quote/control-heavy sessions cannot write
+  a file their own reader rejects; older output is shed before recent command
+  metadata. Snapshot saves select the newest bounded records before cloning.
+
 - **A finished codex session keeps its whole transcript.** codex inserts its
   history above a viewport at the bottom of the pane, with absolute cursor
   moves, a scroll region and reverse index. The finished card fed those raw

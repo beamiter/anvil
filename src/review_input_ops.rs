@@ -50,7 +50,8 @@ impl AppModel {
             return false;
         };
         let term = &self.tabs[tab_index].panes[pane_index].terminal;
-        term.emit(VteInput::WriteInput(text.as_bytes().to_vec()));
+        crate::enter_ownership::claim_held();
+        term.emit(VteInput::InsertReviewText(text.as_bytes().to_vec()));
         term.emit(VteInput::GrabFocus);
         true
     }

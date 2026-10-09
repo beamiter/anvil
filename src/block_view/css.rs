@@ -826,6 +826,10 @@ fn block_css(config: &Config) -> String {
            outward when the top/right/bottom border became a layout-free
            `outline`. Widen each by that pixel so a selected card keeps the same
            2px band, and the active end its 3px one. */
+        .cross-block-text-selected {{
+            outline: 2px solid {accent};
+            outline-offset: -2px;
+        }}
         .block-selected {{
             background-color: rgba({acc_r},{acc_g},{acc_b},0.08);
             outline-color: rgba({acc_r},{acc_g},{acc_b},0.48);
