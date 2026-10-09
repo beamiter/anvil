@@ -1128,8 +1128,8 @@ impl SimpleComponent for AppModel {
                 dialogs::settings::SettingsOutput::RemoteClipboard(enabled) => {
                     AppMsg::SettingsRemoteClipboard(enabled)
                 }
-                dialogs::settings::SettingsOutput::RemoteHosts(hosts) => {
-                    AppMsg::SettingsRemoteHosts(hosts)
+                dialogs::settings::SettingsOutput::RemoteHosts { expected, hosts } => {
+                    AppMsg::SettingsRemoteHosts { expected, hosts }
                 }
             });
         let remote_picker = dialogs::remote_picker::RemotePickerModel::builder()
@@ -2293,7 +2293,9 @@ impl SimpleComponent for AppModel {
             AppMsg::SettingsRemoteClipboard(enabled) => {
                 self.apply_settings_remote_clipboard(enabled)
             }
-            AppMsg::SettingsRemoteHosts(hosts) => self.apply_settings_remote_hosts(hosts, &sender),
+            AppMsg::SettingsRemoteHosts { expected, hosts } => {
+                self.apply_settings_remote_hosts(expected, hosts, &sender)
+            }
             AppMsg::SearchChanged {
                 text,
                 case_sensitive,

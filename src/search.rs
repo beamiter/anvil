@@ -322,6 +322,12 @@ impl Component for SearchModel {
                 }
             }
             SearchMsg::Changed(query) => {
+                // GtkSearchEntry emits search-changed after its own delay.
+                // Closing this bar retains the entry, so a queued change must
+                // not reinstall highlights after SearchOutput::Closed.
+                if !root.is_search_mode() {
+                    return;
+                }
                 sync_regex_mode(widgets, &query);
                 apply_status(
                     widgets,

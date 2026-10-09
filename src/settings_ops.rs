@@ -343,10 +343,11 @@ impl AppModel {
         self.show_toast("Notification preference updated.");
     }
 
-    /// The dialog already validated each entry against the parser's rules; the
-    /// app replaces the whole list so removals persist too.
+    /// Recheck the dialog's replacement and the list it edited before adopting
+    /// it. A config reload may have advanced the disk revision in the meantime.
     pub(crate) fn apply_settings_remote_hosts(
         &mut self,
+        expected: Vec<config::RemoteHost>,
         hosts: Vec<config::RemoteHost>,
         sender: &ComponentSender<AppModel>,
     ) {
@@ -355,6 +356,10 @@ impl AppModel {
             return;
         }
         let old_hosts = self.config.borrow().remote_hosts.clone();
+        if let Err(error) = validate_remote_hosts_update(&old_hosts, &expected, &hosts) {
+            self.show_toast(error);
+            return;
+        }
         self.config.borrow_mut().remote_hosts = hosts;
         self.reconcile_file_tree_remote_hosts(&old_hosts, sender);
         self.persist_config();
@@ -369,5 +374,85 @@ impl AppModel {
         self.sync_terminal_configs();
         self.persist_config();
         self.show_toast("Clipboard policy updated.");
+    }
+}
+
+fn validate_remote_hosts_update(
+    current: &[config::RemoteHost],
+    expected: &[config::RemoteHost],
+    replacement: &[config::RemoteHost],
+) -> Result<(), &'static str> {
+    if replacement.len() > config::MAX_REMOTE_HOSTS {
+        return Err("Remote hosts were not saved: the host limit is exceeded.");
+    }
+    let mut names = std::collections::HashSet::new();
+    for host in replacement {
+        config::validate_remote_host(host)?;
+        if !names.insert(&host.name) {
+            return Err("Remote hosts were not saved: another host uses the same name.");
+        }
+    }
+    if current != expected {
+        return Err(
+            "Remote hosts changed while Settings was open. Close and reopen Settings, then reapply your change; no hosts were saved.",
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn host(name: &str) -> config::RemoteHost {
+        config::RemoteHost {
+            name: name.into(),
+            host: format!("{name}.example"),
+            user: None,
+            docker: false,
+            deploy_artifact: None,
+            remote_shell: "jsh".into(),
+            session: None,
+            ssh_args: Vec::new(),
+            login_shell: true,
+            multiplex: true,
+            deploy: jterm_core::jsh_remote::Deploy::Off,
+        }
+    }
+
+    #[test]
+    fn stale_dialog_cannot_replace_added_removed_or_changed_remote_profiles() {
+        let expected = vec![host("original")];
+        let replacement = vec![host("renamed")];
+        let mut changed = expected.clone();
+        changed[0].ssh_args = vec!["-p".into(), "2222".into()];
+        for current in [vec![host("original"), host("new")], Vec::new(), changed] {
+            assert!(validate_remote_hosts_update(&current, &expected, &replacement).is_err());
+        }
+    }
+
+    #[test]
+    fn current_dialog_can_add_edit_remove_and_follow_its_previous_edit() {
+        let first = vec![host("original")];
+        let second = vec![host("original"), host("new")];
+        let third = vec![host("renamed"), host("new")];
+        for (current, replacement) in [(&first, &second), (&second, &third), (&third, &Vec::new())]
+        {
+            assert!(validate_remote_hosts_update(current, current, replacement).is_ok());
+        }
+    }
+
+    #[test]
+    fn invalid_dialog_replacements_are_rejected_before_installation() {
+        let original = vec![host("original")];
+        let mut invalid = host("invalid");
+        invalid.host = "-unsafe".into();
+        for replacement in [
+            vec![invalid],
+            vec![host("duplicate"), host("duplicate")],
+            vec![host("many"); config::MAX_REMOTE_HOSTS + 1],
+        ] {
+            assert!(validate_remote_hosts_update(&original, &original, &replacement).is_err());
+        }
     }
 }

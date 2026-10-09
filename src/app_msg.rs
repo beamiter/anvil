@@ -142,7 +142,10 @@ pub(crate) enum AppMsg {
     SettingsAgentMaxTurns(u32),
     SettingsNotifications(bool),
     SettingsRemoteClipboard(bool),
-    SettingsRemoteHosts(Vec<crate::config::RemoteHost>),
+    SettingsRemoteHosts {
+        expected: Vec<crate::config::RemoteHost>,
+        hosts: Vec<crate::config::RemoteHost>,
+    },
     SearchChanged {
         text: String,
         case_sensitive: bool,
@@ -189,7 +192,7 @@ pub(crate) enum AppMsg {
     FileTreeSshProbeResolved {
         pane_id: u64,
         token: u64,
-        start: Result<std::path::PathBuf, crate::remote_fs::FsFailureKind>,
+        start: Result<crate::file_tree::SshFileTreeProbeResult, crate::remote_fs::FsFailureKind>,
     },
     /// Retry a failed non-destructive SSH-to-Files probe against the active
     /// pane's freshly observed process authority.

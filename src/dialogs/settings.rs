@@ -850,8 +850,12 @@ pub(crate) enum SettingsOutput {
     AgentMaxTurns(u32),
     Notifications(bool),
     RemoteClipboard(bool),
-    /// The full list after any add or remove; the app replaces and persists it.
-    RemoteHosts(Vec<RemoteHost>),
+    /// The full list before and after an edit, so a reload cannot silently
+    /// authorize an older dialog to replace newer remote profiles.
+    RemoteHosts {
+        expected: Vec<RemoteHost>,
+        hosts: Vec<RemoteHost>,
+    },
 }
 
 pub(crate) struct SettingsModel {
@@ -1575,6 +1579,7 @@ impl Component for SettingsModel {
                 self.clear_remote_errors();
                 match self.validate_remote_draft() {
                     Ok(host) => {
+                        let expected = self.values.remote_hosts.clone();
                         match self.remote_editing {
                             // Replace in place so the host keeps its position in
                             // the picker; a remove-then-push would move it to the
@@ -1590,9 +1595,10 @@ impl Component for SettingsModel {
                         self.remote_editing = None;
                         self.remote_draft = RemoteDraft::default();
                         self.rebuild_remote_rows(&widgets.remote_hosts_group, &sender);
-                        let _ = sender.output(SettingsOutput::RemoteHosts(
-                            self.values.remote_hosts.clone(),
-                        ));
+                        let _ = sender.output(SettingsOutput::RemoteHosts {
+                            expected,
+                            hosts: self.values.remote_hosts.clone(),
+                        });
                     }
                     Err((field, message)) => {
                         self.show_remote_error(field, message);
@@ -1636,12 +1642,14 @@ impl Component for SettingsModel {
                 }
             }
             SettingsMsg::RemoteHostRemoveConfirmed { index, name } => {
+                let expected = self.values.remote_hosts.clone();
                 let removed = remove_remote_host(&mut self.values.remote_hosts, index, &name);
                 if removed {
                     self.rebuild_remote_rows(&widgets.remote_hosts_group, &sender);
-                    let _ = sender.output(SettingsOutput::RemoteHosts(
-                        self.values.remote_hosts.clone(),
-                    ));
+                    let _ = sender.output(SettingsOutput::RemoteHosts {
+                        expected,
+                        hosts: self.values.remote_hosts.clone(),
+                    });
                 }
             }
         }

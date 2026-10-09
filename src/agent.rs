@@ -135,6 +135,7 @@ pub(crate) enum AgentExecutionMatch {
 /// of the in-flight LLM request handle.
 pub(crate) struct AgentSession {
     inner: CoreSession,
+    pub(crate) restored_history_notice: Option<&'static str>,
     /// The approved proposal currently executing in the bound pane. Command
     /// text is only a secondary check; the locally armed epoch + generation
     /// pair is the authoritative correlation identity.
@@ -169,12 +170,23 @@ impl AgentSession {
             Turn::AssistantProposed { command, .. } => local_agent_command_issue(command).is_none(),
             _ => true,
         });
-        safe.then(|| Self::wrap(inner, bound_tab, bound_pane))
+        safe.then(|| {
+            let notice = inner
+                .snapshot()
+                .is_some_and(|snapshot| snapshot.transcript_truncated())
+                .then_some(
+                    "Earlier activity was omitted to keep the saved session within its size limit",
+                );
+            let mut session = Self::wrap(inner, bound_tab, bound_pane);
+            session.restored_history_notice = notice;
+            session
+        })
     }
 
     fn wrap(inner: CoreSession, bound_tab: u64, bound_pane: u64) -> Self {
         Self {
             inner,
+            restored_history_notice: None,
             awaiting_command: None,
             next_execution_generation: 0,
             in_flight: None,
@@ -445,6 +457,7 @@ impl AgentSession {
         // approved command is still live. Preserve its handle/correlation if
         // the protocol refuses the transition.
         self.inner.start_new_task()?;
+        self.restored_history_notice = None;
         if let Some(handle) = self.in_flight.take() {
             handle.cancel();
         }
@@ -481,6 +494,7 @@ pub(crate) struct AgentPanelView {
     /// emits carries it back so a stale click cannot bind to a new proposal.
     pub(crate) epoch: Option<AgentSessionEpoch>,
     pub(crate) transcript: Vec<Turn>,
+    pub(crate) restored_history_notice: Option<&'static str>,
     pub(crate) turns_used: u32,
     pub(crate) max_turns: u32,
     pub(crate) state: AgentState,
@@ -614,6 +628,14 @@ impl Component for AgentPanelModel {
                 set_margin_end: 12,
                 set_margin_top: 2,
                 set_margin_bottom: 10,
+
+                #[name(history_notice)]
+                gtk::Label {
+                    set_visible: false,
+                    set_wrap: true,
+                    set_xalign: 0.0,
+                    add_css_class: "dim-label",
+                },
 
                 #[name(context_card)]
                 gtk::Box {
@@ -806,6 +828,7 @@ impl Component for AgentPanelModel {
             view: AgentPanelView {
                 epoch: None,
                 transcript: Vec::new(),
+                restored_history_notice: None,
                 turns_used: 0,
                 max_turns: 1,
                 state: AgentState::Ready,
@@ -918,6 +941,12 @@ impl Component for AgentPanelModel {
 
 impl AgentPanelModel {
     fn render(&self, widgets: &AgentPanelModelWidgets, sender: ComponentSender<Self>) {
+        widgets
+            .history_notice
+            .set_label(self.view.restored_history_notice.unwrap_or_default());
+        widgets
+            .history_notice
+            .set_visible(self.view.restored_history_notice.is_some());
         while let Some(child) = widgets.proposal_box.first_child() {
             widgets.proposal_box.remove(&child);
         }
@@ -1292,6 +1321,48 @@ fn render_proposed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn legacy_omitted_history_session() -> CoreSession {
+        let mut core = CoreSession::new(10);
+        core.submit_user("retained task").unwrap();
+        let mut snapshot: serde_json::Value =
+            serde_json::from_str(&core.snapshot().unwrap().to_json().unwrap()).unwrap();
+        snapshot["transcript_truncated"] = serde_json::json!(true);
+        CoreSession::restore(
+            jterm_core::agent::AgentSessionSnapshot::from_json(&snapshot.to_string()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn restored_history_notice_survives_failed_reset_and_followup_until_new_task() {
+        let mut session =
+            AgentSession::from_restored(legacy_omitted_history_session(), 1, 2).unwrap();
+        let notice = session
+            .restored_history_notice
+            .expect("old omitted snapshots must disclose history loss");
+        assert!(session.start_new_task().is_err());
+        assert_eq!(session.restored_history_notice, Some(notice));
+        session
+            .accept_model_reply(r#"{"action":"done","message":"finished"}"#)
+            .unwrap();
+        session.continue_after_completion().unwrap();
+        assert_eq!(session.restored_history_notice, Some(notice));
+        session.submit_user("follow up").unwrap();
+        session
+            .accept_model_reply(r#"{"action":"done","message":"finished"}"#)
+            .unwrap();
+        session.start_new_task().unwrap();
+        assert!(session.restored_history_notice.is_none());
+    }
+
+    #[test]
+    fn complete_restored_history_has_no_omission_notice() {
+        let mut core = CoreSession::new(10);
+        core.submit_user("complete task").unwrap();
+        let session = AgentSession::from_restored(core, 1, 2).unwrap();
+        assert!(session.restored_history_notice.is_none());
+    }
 
     #[test]
     fn agent_icon_buttons_have_distinct_accessible_labels() {

@@ -57,6 +57,40 @@ uninstall_dry_run() {
         XDG_DATA_HOME= "${UNINSTALLER}" --dry-run "$@"
 }
 
+# The displayed PATH handoff is executable shell syntax. An apostrophe,
+# dollar, backtick, space, and relative/empty existing PATH components must
+# remain literal data. Assert the whole command before evaluating the fixture.
+path_hint_bin="${TEST_ROOT}/shell hint '\$ \`"
+path_hint_existing="relative/bin:${TEST_PATH}:"
+path_hint_output="$(
+    env HOME="${TEST_HOME}" PATH="${path_hint_existing}" DESTDIR= \
+        CARGO_TARGET_DIR= XDG_CONFIG_HOME= XDG_DATA_HOME= \
+        "${INSTALLER}" --dry-run --binary "${TEST_ROOT}/unused-fixture" \
+        --bin-dir "${path_hint_bin}" --no-desktop --no-config
+)"
+# Match the literal PATH expansion in the displayed command.
+# shellcheck disable=SC2016
+printf -v expected_path_hint '  export PATH=%q:"$PATH"' "${path_hint_bin}"
+assert_contains "shell-safe PATH handoff" "${path_hint_output}" "${expected_path_hint}"
+[[ "${path_hint_output}" != *"echo 'export PATH="* ]] \
+    || fail "PATH handoff retained a breakable nested echo quote"
+path_hint_command=""
+while IFS= read -r path_hint_line; do
+    if [[ "${path_hint_line}" == '  export PATH='* ]]; then
+        [[ -z "${path_hint_command}" ]] || fail "installer emitted multiple PATH commands"
+        path_hint_command="${path_hint_line}"
+    fi
+done <<<"${path_hint_output}"
+[[ "${path_hint_command}" == "${expected_path_hint}" ]] \
+    || fail "installer PATH handoff differed from its escaped form"
+/bin/bash -n <<<"${path_hint_command}" || fail "PATH handoff is invalid Bash syntax"
+path_hint_actual="$(
+    PATH="${path_hint_existing}" /bin/bash --noprofile --norc -c \
+        "${path_hint_command}"$'\n''printf "%s" "$PATH"'
+)"
+[[ "${path_hint_actual}" == "${path_hint_bin}:${path_hint_existing}" ]] \
+    || fail "PATH handoff expanded directory bytes or changed the existing PATH"
+
 default_prefix="${TEST_HOME}/.local"
 mkdir -p "${default_prefix}/bin"
 touch "${default_prefix}/bin/anvil"

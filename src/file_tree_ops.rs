@@ -19,7 +19,18 @@ enum FileTreeRefreshTarget {
 }
 
 impl AppModel {
+    // Files actions consume this observation; cancelling its work must not
+    // look like a focus change that re-arms the same argv on the next poll.
+    fn cancel_file_tree_ssh_follow_for_files_intent(&self) {
+        if let Some(file_tree::SshFileTreeObservation::Target(detection)) =
+            self.file_tree_ssh_observation.as_ref()
+        {
+            detection.cancellation.cancel();
+        }
+    }
+
     fn next_file_tree_ssh_detection_token(&self) -> u64 {
+        self.cancel_file_tree_ssh_follow_for_files_intent();
         let token = self.file_tree_ssh_detection_revision.get().wrapping_add(1);
         self.file_tree_ssh_detection_revision.set(token);
         token
@@ -34,8 +45,9 @@ impl AppModel {
     }
 
     fn clear_file_tree_ssh_observation(&mut self) {
-        if self.file_tree_ssh_observation.take().is_some() {
+        if self.file_tree_ssh_observation.is_some() {
             self.next_file_tree_ssh_detection_token();
+            self.file_tree_ssh_observation = None;
         }
     }
 
@@ -206,8 +218,10 @@ impl AppModel {
         };
         let token = self.next_file_tree_ssh_detection_token();
         let operation_revision = self.file_tree_user_operation_revision.get();
+        let cancellation = file_tree::ScanCancellation::default();
         self.file_tree_ssh_observation = Some(file_tree::SshFileTreeObservation::Target(Box::new(
             file_tree::SshFileTreeDetection {
+                cancellation: cancellation.clone(),
                 token,
                 pane_id,
                 observed,
@@ -248,10 +262,38 @@ impl AppModel {
         // callback preserves the existing root/rows after that proof.
         let callback_sender = sender.clone();
         let worker_location = probe_location.clone();
-        if let Err(error) = file_tree::request_fs_op_at(
+        let worker_cancellation = cancellation.clone();
+        if let Err(error) = file_tree::request_fs_op_cancellable_at(
             &probe_location,
             &[],
-            move || remote_fs::start_dir(&worker_location, &[]),
+            cancellation,
+            move || {
+                if worker_cancellation.is_cancelled() {
+                    return Err(remote_fs::cancelled_error());
+                }
+                let root = remote_fs::start_dir_with_cancellation(
+                    &worker_location,
+                    &[],
+                    &worker_cancellation,
+                )?;
+                if worker_cancellation.is_cancelled() {
+                    return Err(remote_fs::cancelled_error());
+                }
+                let listing = if same_location {
+                    None
+                } else {
+                    Some(remote_fs::list_dir_with_cancellation(
+                        &worker_location,
+                        &[],
+                        &root,
+                        &worker_cancellation,
+                    )?)
+                };
+                if worker_cancellation.is_cancelled() {
+                    return Err(remote_fs::cancelled_error());
+                }
+                Ok(file_tree::SshFileTreeProbeResult { root, listing })
+            },
             move |result| {
                 callback_sender.input(AppMsg::FileTreeSshProbeResolved {
                     pane_id,
@@ -291,7 +333,7 @@ impl AppModel {
         &mut self,
         pane_id: u64,
         token: u64,
-        start: Result<std::path::PathBuf, remote_fs::FsFailureKind>,
+        start: Result<file_tree::SshFileTreeProbeResult, remote_fs::FsFailureKind>,
         sender: &ComponentSender<AppModel>,
     ) {
         let detection = match self.file_tree_ssh_observation.as_mut() {
@@ -333,8 +375,8 @@ impl AppModel {
             return;
         }
 
-        let root = match start {
-            Ok(root) if root.is_absolute() => root,
+        let file_tree::SshFileTreeProbeResult { root, listing } = match start {
+            Ok(result) if result.root.is_absolute() => result,
             Ok(_) => {
                 self.show_file_tree_ssh_failure(
                     pane_id,
@@ -377,17 +419,25 @@ impl AppModel {
             *self.file_tree_location.borrow_mut() = location;
             self.sync_file_header_locations();
         } else {
-            self.stage_file_tree_navigation(
+            let Some(listing) = listing else {
+                self.show_toast("SSH Files did not return its initial directory listing.");
+                return;
+            };
+            // The original detection is still authoritative here. Publish the
+            // already-complete listing without an unguarded second async hop.
+            self.invalidate_pending_file_tree_navigation();
+            self.commit_file_tree_navigation(
                 location,
-                self.config.borrow().remote_hosts.clone(),
                 root,
+                listing,
+                None,
                 file_tree::NavigationHistoryAction::Push,
-                sender,
             );
         }
     }
 
     fn next_file_tree_navigation_token(&self) -> Option<(u64, file_tree::ScanCancellation)> {
+        self.cancel_file_tree_ssh_follow_for_files_intent();
         let token = self.file_tree_navigation_revision.get().checked_add(1)?;
         self.file_tree_navigation_revision.set(token);
         if let Some(previous) = self.file_tree_navigation_cancellation.borrow_mut().take() {
@@ -399,6 +449,7 @@ impl AppModel {
     }
 
     fn invalidate_pending_file_tree_navigation(&self) {
+        self.cancel_file_tree_ssh_follow_for_files_intent();
         self.file_tree_navigation_revision
             .set(self.file_tree_navigation_revision.get().wrapping_add(1));
         if let Some(previous) = self.file_tree_navigation_cancellation.borrow_mut().take() {

@@ -458,7 +458,7 @@ fn fs_scheduler_worker(inner: Arc<FsSchedulerInner>) {
 
 /// Cooperative cancellation shared by the GTK request registry, a queued
 /// scheduler job, and the remote capture watchdog.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct ScanCancellation(Arc<AtomicBool>);
 
 impl ScanCancellation {
@@ -1736,8 +1736,17 @@ pub(crate) fn observed_remote_authority(
     }
 }
 
+/// One automatic follow result: its first listing is obtained before the
+/// original source-pane authority is released by the final GTK callback.
+#[derive(Clone, Debug)]
+pub(crate) struct SshFileTreeProbeResult {
+    pub(crate) root: PathBuf,
+    pub(crate) listing: Option<DirectoryListing>,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct SshFileTreeDetection {
+    pub(crate) cancellation: ScanCancellation,
     pub(crate) token: u64,
     pub(crate) pane_id: u64,
     /// Normalized process observation. Re-resolving a managed profile after a
@@ -1820,7 +1829,8 @@ pub(crate) fn ssh_file_tree_detection_is_current(
     location: &crate::remote_fs::FsLocation,
     hosts: &[crate::config::RemoteHost],
 ) -> bool {
-    detection.pane_id == pane_id
+    !detection.cancellation.is_cancelled()
+        && detection.pane_id == pane_id
         && detection.observed_argv == observed_argv
         && detection.observed == *observed
         && detection.execution_overlay == execution_overlay
@@ -4008,6 +4018,7 @@ mod tests {
         let observed = observed_profile(&["ssh", "deploy@server.example.com", "-p2222"]);
         let location = crate::remote_fs::FsLocation::Local;
         let detection = SshFileTreeDetection {
+            cancellation: ScanCancellation::default(),
             token: 9,
             pane_id: 44,
             observed: observed.clone(),
@@ -4154,6 +4165,32 @@ mod tests {
             &location,
             &[],
         ));
+        detection.cancellation.cancel();
+        assert!(
+            ssh_file_tree_observation_matches_target(
+                Some(&observation),
+                9,
+                44,
+                &detection.observed_argv,
+                &observed,
+                &detection.execution_overlay,
+            ),
+            "Files cancellation consumes the observation instead of automatically retrying it"
+        );
+        assert!(
+            !ssh_file_tree_detection_is_current(
+                &detection,
+                44,
+                &detection.observed_argv,
+                &observed,
+                &detection.execution_overlay,
+                3,
+                7,
+                &location,
+                &[],
+            ),
+            "a completed listing cannot revive a cancelled follow request"
+        );
     }
 
     #[test]

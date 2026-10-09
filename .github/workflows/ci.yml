@@ -44,6 +44,7 @@ jobs:
             libvte-2.91-gtk4-dev \
             libxtst6 \
             python3 \
+            python3-venv \
             appstream \
             desktop-file-utils \
             file \
@@ -68,6 +69,15 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
+
+      - name: Check Files follow ownership
+        run: python3 scripts/test-files-follow.py
+
+      - name: Check search callback lifecycle
+        run: python3 scripts/test-search-lifecycle.py
+
+      - name: Verify generated Flatpak Cargo sources
+        run: scripts/update-flatpak-cargo-sources.sh --check
 
       - name: Check formatting
         run: cargo fmt --all -- --check

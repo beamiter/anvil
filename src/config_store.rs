@@ -1950,6 +1950,48 @@ pub(crate) fn validate_current_config() -> ConfigValidationReport {
     validate_path(&config::config_file_path())
 }
 
+/// One bounded read supplies validation, values and the optimistic save
+/// revision together. Never reopen the path between checking and applying it.
+pub(crate) struct ConfigSnapshot {
+    pub(crate) table: Option<toml::Table>,
+    pub(crate) revision: ConfigRevision,
+    pub(crate) validation: ConfigValidationReport,
+}
+
+pub(crate) fn read_validated_snapshot(path: &Path) -> Result<ConfigSnapshot, String> {
+    let bytes = read_config_bytes(path).map_err(|error| format!("cannot read config: {error}"))?;
+    let revision = revision_from_content(bytes.as_deref());
+    let (table, validation) = match bytes.as_deref() {
+        Some(bytes) => {
+            let text = std::str::from_utf8(bytes).map_err(|_| "config is not valid UTF-8")?;
+            let table = text
+                .parse::<toml::Table>()
+                .map_err(|_| "config is not valid TOML")?;
+            let validation = validate_table(path, &table);
+            if validation.errors() > 0 {
+                return Err(format!(
+                    "{} validation error(s). Run `anvil --check-config`.",
+                    validation.errors()
+                ));
+            }
+            (Some(table), validation)
+        }
+        None => {
+            let mut validation = ConfigValidationReport::new(path, false);
+            validation.warning(
+                "config",
+                "file does not exist; built-in defaults will be used",
+            );
+            (None, validation)
+        }
+    };
+    Ok(ConfigSnapshot {
+        table,
+        revision,
+        validation,
+    })
+}
+
 fn print_validation_human(report: &ConfigValidationReport) -> io::Result<()> {
     let mut stdout = io::stdout().lock();
     writeln!(stdout, "anvil configuration check")?;
@@ -1996,6 +2038,70 @@ pub(crate) fn run_check_path(path: &Path, format: ReportFormat) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reload_snapshot_keeps_values_and_revision_together_after_path_changes() {
+        let dir = temporary_directory("reload-snapshot");
+        let path = dir.join("config.toml");
+        let original = b"tab_width = 320\nstartup_commands = 'echo captured'\n";
+        write_fixture(&path, original);
+        let snapshot = read_validated_snapshot(&path).unwrap();
+        assert_eq!(snapshot.revision, fingerprint(original));
+        assert_eq!(snapshot.validation.errors(), 0);
+
+        // Both an editor's replacement and a disappearing path used to make
+        // reload apply bytes different from the ones it validated.
+        for replacement in [
+            Some(b"tab_width = 90\n".as_slice()),
+            Some(b"invalid = ["),
+            None,
+        ] {
+            match replacement {
+                Some(bytes) => write_fixture(&path, bytes),
+                None => fs::remove_file(&path).unwrap(),
+            }
+            let (loaded, _, _) = config::load_config_from_table(snapshot.table.as_ref());
+            assert_eq!(loaded.tab_width, 320);
+            assert_eq!(loaded.startup_commands.as_deref(), Some("echo captured"));
+            assert_eq!(snapshot.revision, fingerprint(original));
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reload_snapshot_rejects_invalid_input_and_accepts_missing_defaults() {
+        let dir = temporary_directory("reload-invalid");
+        let path = dir.join("config.toml");
+        for invalid in [b"invalid = [".as_slice(), b"tab_width = 'wide'\n", b"\xff"] {
+            write_fixture(&path, invalid);
+            assert!(read_validated_snapshot(&path).is_err());
+            assert_eq!(fs::read(&path).unwrap(), invalid);
+        }
+        fs::remove_file(&path).unwrap();
+        let snapshot = read_validated_snapshot(&path).unwrap();
+        assert_eq!(snapshot.revision, ConfigRevision::Missing);
+        assert!(snapshot.table.is_none());
+        assert_eq!(snapshot.validation.errors(), 0);
+        assert_eq!(snapshot.validation.warnings(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reload_applies_only_the_captured_validated_table() {
+        let source = include_str!("config_ops.rs");
+        let reload = source
+            .split("pub(crate) fn reload_config(")
+            .nth(1)
+            .unwrap()
+            .split("#[allow(deprecated)]")
+            .next()
+            .unwrap();
+        assert!(reload.contains("read_validated_snapshot("));
+        assert!(reload.contains("load_config_from_table(snapshot.table.as_ref())"));
+        assert!(!reload.contains("load_config()"));
+        assert!(!reload.contains("current_revision()"));
+        assert!(!reload.contains("validate_current_config()"));
+    }
 
     #[test]
     fn validator_accepts_unified_terminal_mode() {

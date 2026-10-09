@@ -23,35 +23,18 @@ impl AppModel {
             self.show_toast("Configuration reload is disabled in safe mode.");
             return;
         }
-        if let Some(error) = config::config_file_error() {
-            log::warn!("configuration reload rejected: {error}");
-            self.show_toast(format!(
-                "Config reload rejected; the current settings remain active. {error}"
-            ));
-            return;
-        }
-        let validation = config_store::validate_current_config();
-        if validation.errors() > 0 {
-            log::warn!(
-                "configuration reload rejected: {} validation error(s)",
-                validation.errors()
-            );
-            self.show_toast(format!(
-                "Config reload rejected: {} validation error(s). Run `anvil --check-config`.",
-                validation.errors()
-            ));
-            return;
-        }
-        let revision = match config_store::current_revision() {
-            Ok(revision) => revision,
+        let snapshot = match config_store::read_validated_snapshot(&config::config_file_path()) {
+            Ok(snapshot) => snapshot,
             Err(error) => {
                 log::warn!("configuration reload rejected: {error}");
                 self.show_toast(format!(
-                    "Config reload rejected because its revision could not be read: {error}"
+                    "Config reload rejected; the current settings remain active. {error}"
                 ));
                 return;
             }
         };
+        let revision = snapshot.revision;
+        let validation = snapshot.validation;
         // The file monitor also sees our own saves. Reloading those is a no-op
         // that still costs a full pane refresh and a toast, which is loud once
         // Ctrl+wheel writes the font scale on every zoom burst.
@@ -59,7 +42,7 @@ impl AppModel {
             log::debug!("configuration reload skipped: file matches the last save");
             return;
         }
-        let (new_config, themes, new_kb) = load_config();
+        let (new_config, themes, new_kb) = config::load_config_from_table(snapshot.table.as_ref());
         let new_shell_argv = Rc::new(choose_shell_argv(new_config.shell.as_deref()));
         let backend_changed = std::mem::discriminant(&self.config.borrow().terminal_mode)
             != std::mem::discriminant(&new_config.terminal_mode);

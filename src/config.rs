@@ -3,7 +3,16 @@ use gtk::glib;
 use relm4::gtk;
 use std::cell::RefCell;
 use std::collections::HashSet;
+#[cfg(unix)]
+use std::ffi::CString;
 use std::fs;
+use std::io;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::keybindings::KeybindingMap;
@@ -214,20 +223,214 @@ pub struct RemoteHost {
     pub deploy: jterm_core::jsh_remote::Deploy,
 }
 
-/// Directory for ssh ControlMaster sockets. Prefers `$XDG_RUNTIME_DIR`, falls
-/// back to `~/.cache/anvil`. Created if missing.
-fn control_socket_dir() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
+#[cfg(unix)]
+fn open_owned_directory(path: &Path) -> io::Result<fs::File> {
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(path)?;
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { nix::libc::geteuid() }
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "directory is not an owned, non-writable namespace",
+        ));
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn open_trusted_owned_directory(path: &Path) -> io::Result<(PathBuf, fs::File)> {
+    let original = open_owned_directory(path)?;
+    let canonical = fs::canonicalize(path)?;
+    let directory = open_owned_directory(&canonical)?;
+    let original_metadata = original.metadata()?;
+    let canonical_metadata = directory.metadata()?;
+    if original_metadata.dev() != canonical_metadata.dev()
+        || original_metadata.ino() != canonical_metadata.ino()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "runtime namespace changed while it was being validated",
+        ));
+    }
+    for ancestor in canonical.ancestors() {
+        let metadata = fs::symlink_metadata(ancestor)?;
+        if !metadata.is_dir()
+            || (metadata.uid() != 0 && metadata.uid() != unsafe { nix::libc::geteuid() })
+            || (metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "runtime namespace has an unsafe writable ancestor",
+            ));
+        }
+    }
+    Ok((canonical, directory))
+}
+
+#[cfg(unix)]
+fn ensure_owned_child_directory(
+    parent: &fs::File,
+    parent_path: &Path,
+    name: &str,
+    tighten_existing: bool,
+) -> io::Result<(PathBuf, fs::File)> {
+    let name_c = CString::new(name)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid directory name"))?;
+    // SAFETY: `parent` and `name_c` remain alive for the call. EEXIST is
+    // intentionally accepted and the entry is then opened without following a
+    // symlink, so a concurrent creator cannot redirect the namespace.
+    let created = unsafe { nix::libc::mkdirat(parent.as_raw_fd(), name_c.as_ptr(), 0o700) };
+    if created != 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(error);
+        }
+    }
+    // SAFETY: openat returns a new descriptor on success; it is immediately
+    // owned by `File` and closed on drop.
+    let fd = unsafe {
+        nix::libc::openat(
+            parent.as_raw_fd(),
+            name_c.as_ptr(),
+            nix::libc::O_RDONLY
+                | nix::libc::O_DIRECTORY
+                | nix::libc::O_NOFOLLOW
+                | nix::libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let directory = unsafe { fs::File::from_raw_fd(fd) };
+    let path = parent_path.join(name);
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { nix::libc::geteuid() }
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is not an owned, non-writable directory", path.display()),
+        ));
+    }
+    if tighten_existing || created == 0 {
+        directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+    }
+    Ok((path, directory))
+}
+
+#[cfg(unix)]
+fn private_control_socket_dir() -> io::Result<PathBuf> {
+    let mut failures = Vec::new();
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache/anvil")))?;
-    if let Err(err) = fs::create_dir_all(&base) {
+        .filter(|path| path.is_absolute())
+    {
+        match open_trusted_owned_directory(&runtime).and_then(|(runtime, parent)| {
+            ensure_owned_child_directory(&parent, &runtime, "anvil", true).map(|(path, _)| path)
+        }) {
+            Ok(path) => return Ok(path),
+            Err(error) => failures.push(format!("{}: {error}", runtime.display())),
+        }
+    }
+
+    // A launcher can omit or overwrite XDG_RUNTIME_DIR even though the
+    // systemd-style per-user runtime directory still exists. Validate the
+    // conventional location with the same ownership rules before considering
+    // a cache fallback.
+    let system_runtime = PathBuf::from(format!("/run/user/{}", unsafe { nix::libc::geteuid() }));
+    match open_trusted_owned_directory(&system_runtime).and_then(|(system_runtime, parent)| {
+        ensure_owned_child_directory(&parent, &system_runtime, "anvil", true).map(|(path, _)| path)
+    }) {
+        Ok(path) => return Ok(path),
+        Err(error) => failures.push(format!("{}: {error}", system_runtime.display())),
+    }
+
+    if let Some(home) = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    {
+        let fallback = (|| {
+            let (home, home_directory) = open_trusted_owned_directory(&home)?;
+            let (cache_path, cache_directory) =
+                ensure_owned_child_directory(&home_directory, &home, ".cache", false)?;
+            ensure_owned_child_directory(&cache_directory, &cache_path, "anvil", true)
+                .map(|(path, _)| path)
+        })();
+        match fallback {
+            Ok(path) => return Ok(path),
+            Err(error) => failures.push(format!("{}: {error}", home.display())),
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "no private runtime namespace is available{}",
+            if failures.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", failures.join("; "))
+            }
+        ),
+    ))
+}
+
+#[cfg(not(unix))]
+fn private_control_socket_dir() -> io::Result<PathBuf> {
+    let path = glib::user_cache_dir().join("anvil");
+    fs::create_dir_all(&path)?;
+    Ok(path)
+}
+
+/// Directory for ssh ControlMaster sockets. It is always an owned private
+/// child namespace; unsafe XDG/HOME overrides disable multiplexing instead of
+/// placing an authentication socket in a writable directory.
+fn control_socket_path_is_safe(path: &Path) -> bool {
+    path.to_str().is_some_and(|path| {
+        path.len() <= MAX_CONFIG_PATH_BYTES
+            && !path.contains('%')
+            && !path.chars().any(char::is_control)
+            && !jterm_core::review_input::contains_visual_spoofing(path)
+    })
+}
+
+fn control_socket_dir() -> Option<PathBuf> {
+    let path = match private_control_socket_dir() {
+        Ok(path) => path,
+        Err(error) => {
+            log::warn!(
+                "SSH multiplexing disabled: {}",
+                jterm_core::review_input::safe_inline_display(&error.to_string(), 1024)
+            );
+            return None;
+        }
+    };
+    if !control_socket_path_is_safe(&path) {
         log::warn!(
-            "Failed to create ssh control socket dir {}: {err}",
-            base.display()
+            "SSH multiplexing disabled because its private ControlPath cannot be represented safely"
         );
         return None;
     }
-    Some(base)
+    #[cfg(unix)]
+    {
+        // Linux sockaddr_un paths are short. `%C` expands to a 40-byte hash;
+        // disable multiplexing rather than handing OpenSSH a predictably
+        // unusable or truncated ControlPath.
+        let expanded_len = path.join("cm-").as_os_str().as_bytes().len() + 40;
+        if expanded_len > 100 {
+            log::warn!("SSH multiplexing disabled because its private ControlPath is too long");
+            return None;
+        }
+    }
+    Some(path)
 }
 
 fn wrap_exec_in_login_bash(command: &str) -> String {
@@ -445,6 +648,14 @@ fn build_docker_argv(host: &RemoteHost) -> Vec<String> {
 }
 
 fn build_plain_ssh_argv(host: &RemoteHost) -> Vec<String> {
+    let control_dir = host.multiplex.then(control_socket_dir).flatten();
+    build_plain_ssh_argv_with_control_dir(host, control_dir.as_deref())
+}
+
+fn build_plain_ssh_argv_with_control_dir(
+    host: &RemoteHost,
+    control_dir: Option<&Path>,
+) -> Vec<String> {
     let target = match &host.user {
         Some(u) => format!("{u}@{}", host.host),
         None => host.host.clone(),
@@ -462,7 +673,7 @@ fn build_plain_ssh_argv(host: &RemoteHost) -> Vec<String> {
     }
     let mut argv = vec!["ssh".to_string(), "-t".to_string()];
     if host.multiplex {
-        if let Some(dir) = control_socket_dir() {
+        if let Some(dir) = control_dir {
             // %C is ssh's hash of (local user, host, port, user) — a safe filename.
             let ctl_path = dir.join("cm-%C");
             argv.push("-o".to_string());
@@ -1154,6 +1365,18 @@ fn load_file_config() -> FileConfig {
         };
     };
 
+    file_config_from_table(&table)
+}
+
+fn config_number(table: &toml::Table, key: &str) -> Option<f64> {
+    table.get(key).and_then(|value| {
+        value
+            .as_float()
+            .or_else(|| value.as_integer().map(|value| value as f64))
+    })
+}
+
+fn file_config_from_table(table: &toml::Table) -> FileConfig {
     let colors = table.get("colors").and_then(|v| v.as_table());
     // Fall back to built-in defaults when the section is entirely absent (e.g. a
     // config file first created to persist some other setting). An explicit,
@@ -1165,7 +1388,7 @@ fn load_file_config() -> FileConfig {
     };
 
     FileConfig {
-        opacity: table.get("opacity").and_then(|v| v.as_float()),
+        opacity: config_number(table, "opacity"),
         scrollback: table
             .get("scrollback")
             .and_then(|v| v.as_integer())
@@ -1178,7 +1401,7 @@ fn load_file_config() -> FileConfig {
             .get("icon_font")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
-        font_scale: table.get("font_scale").and_then(|v| v.as_float()),
+        font_scale: config_number(table, "font_scale"),
         theme: table
             .get("theme")
             .and_then(|v| v.as_str())
@@ -1719,7 +1942,24 @@ fn default_remote_hosts() -> Vec<RemoteHost> {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
-    let fc = load_file_config();
+    resolve_file_config(load_file_config())
+}
+
+/// Resolve the exact table accepted by hot reload, without opening the file
+/// again. An editor may replace or remove the path after that snapshot was read.
+pub(crate) fn load_config_from_table(
+    table: Option<&toml::Table>,
+) -> (Config, Vec<Theme>, KeybindingMap) {
+    let fc = table
+        .map(file_config_from_table)
+        .unwrap_or_else(|| FileConfig {
+            remote_hosts: default_remote_hosts(),
+            ..Default::default()
+        });
+    resolve_file_config(fc)
+}
+
+fn resolve_file_config(fc: FileConfig) -> (Config, Vec<Theme>, KeybindingMap) {
     let themes = builtin_themes();
 
     // Resolve active theme
@@ -2102,6 +2342,19 @@ pub(crate) fn choose_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn integer_presentation_numbers_match_the_validator_contract() {
+        for (text, opacity, scale) in [
+            ("opacity = 1\nfont_scale = 2\n", 1.0, 2.0),
+            ("opacity = 0.5\nfont_scale = 1.5\n", 0.5, 1.5),
+        ] {
+            let table = text.parse::<toml::Table>().unwrap();
+            let fc = file_config_from_table(&table);
+            assert_eq!(fc.opacity, Some(opacity));
+            assert_eq!(fc.font_scale, Some(scale));
+        }
+    }
 
     #[test]
     fn terminal_mode_parses_and_round_trips_every_backend() {
@@ -2512,8 +2765,8 @@ mod tests {
     fn multiplex_injects_controlmaster_flags() {
         let mut h = host();
         h.multiplex = true;
-        std::env::set_var("XDG_RUNTIME_DIR", std::env::temp_dir());
-        let argv = build_remote_argv(&h);
+        let argv =
+            build_plain_ssh_argv_with_control_dir(&h, Some(Path::new("/run/user/1000/anvil")));
         assert!(
             argv.iter().any(|a| a == "ControlMaster=auto"),
             "argv: {argv:?}"
@@ -2534,6 +2787,111 @@ mod tests {
         let cm_idx = argv.iter().position(|a| a == "ControlMaster=auto").unwrap();
         assert!(cm_idx < target_idx);
         assert_eq!(argv[target_idx - 1], "--");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_socket_namespace_is_private_and_never_follows_a_link() {
+        use std::os::unix::fs::{symlink, DirBuilderExt, PermissionsExt};
+
+        let root = std::env::temp_dir().join(format!(
+            "anvil-control-dir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let parent = open_owned_directory(&root).unwrap();
+        let (child_path, child) =
+            ensure_owned_child_directory(&parent, &root, "anvil", true).unwrap();
+        assert_eq!(
+            child.metadata().unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        drop(child);
+        fs::remove_dir(&child_path).unwrap();
+        symlink(&root, &child_path).unwrap();
+        assert!(ensure_owned_child_directory(&parent, &root, "anvil", true).is_err());
+        fs::remove_file(&child_path).unwrap();
+        drop(parent);
+        fs::remove_dir(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_socket_namespace_rejects_nonsticky_writable_ancestors() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        let root = std::env::temp_dir().join(format!(
+            "anvil-control-parent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let shared = root.join("shared");
+        fs::DirBuilder::new().mode(0o700).create(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+        let runtime = shared.join("runtime");
+        fs::DirBuilder::new().mode(0o700).create(&runtime).unwrap();
+        assert!(open_trusted_owned_directory(&runtime).is_err());
+        fs::remove_dir(&runtime).unwrap();
+        fs::remove_dir(&shared).unwrap();
+        fs::remove_dir(&root).unwrap();
+    }
+
+    #[test]
+    fn control_socket_path_rejects_openssh_expansion_and_hidden_text() {
+        assert!(control_socket_path_is_safe(Path::new(
+            "/run/user/1000/anvil"
+        )));
+        assert!(!control_socket_path_is_safe(Path::new("/tmp/%h/anvil")));
+        assert!(!control_socket_path_is_safe(Path::new(
+            "/tmp/safe\u{202e}fake"
+        )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_socket_namespace_rejects_shared_and_linked_runtime_without_chmod() {
+        use std::os::unix::fs::{symlink, DirBuilderExt, PermissionsExt};
+        let root = std::env::temp_dir().join(format!(
+            "anvil-shared-runtime-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let shared = root.join("shared");
+        fs::DirBuilder::new().mode(0o700).create(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(open_trusted_owned_directory(&shared).is_err());
+        assert_eq!(
+            fs::metadata(&shared).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
+        let link = root.join("linked");
+        symlink(&shared, &link).unwrap();
+        assert!(open_trusted_owned_directory(&link).is_err());
+        assert_eq!(
+            fs::metadata(&shared).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unsafe_control_namespace_disables_only_generated_multiplexing() {
+        let mut host = host();
+        host.multiplex = true;
+        let argv = build_plain_ssh_argv_with_control_dir(&host, None);
+        assert!(!argv.iter().any(|arg| arg.starts_with("Control")));
+        assert!(argv.iter().any(|arg| arg == "tester@203.0.113.10"));
+        host.multiplex = false;
+        assert_eq!(argv, build_plain_ssh_argv(&host));
     }
 
     #[test]

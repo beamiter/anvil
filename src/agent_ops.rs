@@ -347,6 +347,7 @@ impl AppModel {
             bound_tab,
             bound_pane,
             attached_context,
+            restored_history_notice,
         ) = {
             let session = self.active_agent.borrow();
             let session = session.as_ref()?;
@@ -361,6 +362,7 @@ impl AppModel {
                 session.bound_tab,
                 session.bound_pane,
                 session.last_manual_completed.clone(),
+                session.restored_history_notice,
             )
         };
         let terminal = self.terminal_for(bound_tab, bound_pane);
@@ -380,6 +382,7 @@ impl AppModel {
             .to_string();
         Some(agent::AgentPanelView {
             epoch: Some(epoch),
+            restored_history_notice,
             transcript,
             turns_used,
             max_turns,

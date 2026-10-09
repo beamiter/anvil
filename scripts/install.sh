@@ -697,8 +697,12 @@ if ((DESTDIR_ACTIVE == 0)); then
     if ! bin_dir_on_path; then
         printf '\nNote: %s is not in PATH; the launcher entry uses the absolute path,\n' \
             "${BIN_DIR}"
-        printf 'but shells will not find anvil until you add it, for example:\n'
-        printf "  echo 'export PATH=\"%s:\$PATH\"' >>~/.profile\n" "${BIN_DIR}"
+        printf 'but shells will not find anvil until you add it. In Bash, for this shell:\n'
+        # Quote the directory as one shell word. Nested echo quotes break on
+        # valid apostrophes and can make the suggested command executable data.
+        # PATH expands when the user runs the displayed command.
+        # shellcheck disable=SC2016
+        printf '  export PATH=%q:"$PATH"\n' "${BIN_DIR}"
     fi
     if [[ -n "${SHADOWING_BIN}" \
         && "${SHADOWING_BIN}" != "${BIN_DIR}/anvil" \
