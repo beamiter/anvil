@@ -1066,9 +1066,35 @@ mod tests {
             super::capture_surface_text(&active, 100, std::time::Instant::now()),
             Err(super::SelectionCopyError::TimedOut)
         );
-        // A subsequent genuine native selection becomes the sole copy owner.
+        // Hiding output above queues allocation and VTE geometry work. A
+        // nonblocking pump may finish before the frame clock dispatches it;
+        // that late resize can correctly invalidate a newly created selection.
+        // Settle the fixture before creating one genuine native selection,
+        // then require it to survive another layout interval unchanged.
+        let geometry = || {
+            (
+                active.width(),
+                active.height(),
+                active.row_count(),
+                active.column_count(),
+            )
+        };
+        let before_layout = geometry();
+        settle();
+        let settled_layout = geometry();
+        assert!(active.is_mapped());
         active.select_all();
-        pump();
+        settle();
+        let selected_layout = geometry();
+        eprintln!("native selection geometry before={before_layout:?} settled={settled_layout:?} selected={selected_layout:?} mapped={} selected={}", active.is_mapped(), active.has_selection());
+        assert_eq!(
+            selected_layout, settled_layout,
+            "fixture layout must stay settled after the single selection"
+        );
+        assert!(
+            active.has_selection(),
+            "one native select_all must survive settled layout"
+        );
         let native = cross.copy_text().unwrap().unwrap();
         assert!(native.contains("live-tail"));
         assert!(!native.contains("visible needle"));
