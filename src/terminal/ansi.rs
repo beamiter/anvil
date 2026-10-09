@@ -58,9 +58,10 @@ pub fn ansi256_to_rgb(idx: u8, palette: &[RGBA; 16]) -> (u8, u8, u8) {
         }
         16..=231 => {
             let idx = idx - 16;
-            let r = (idx / 36) * 51;
-            let g = ((idx % 36) / 6) * 51;
-            let b = (idx % 6) * 51;
+            let levels = [0, 95, 135, 175, 215, 255];
+            let r = levels[(idx / 36) as usize];
+            let g = levels[((idx % 36) / 6) as usize];
+            let b = levels[(idx % 6) as usize];
             (r, g, b)
         }
         232..=255 => {
@@ -640,6 +641,34 @@ mod tests {
             (color.green() * 255.0) as u8,
             (color.blue() * 255.0) as u8,
         )
+    }
+
+    #[test]
+    fn ansi256_color_cube_matches_xterm_levels() {
+        let palette = palette();
+        for (red, r) in [0, 95, 135, 175, 215, 255].into_iter().enumerate() {
+            for (green, g) in [0, 95, 135, 175, 215, 255].into_iter().enumerate() {
+                for (blue, b) in [0, 95, 135, 175, 215, 255].into_iter().enumerate() {
+                    let idx = (16 + red * 36 + green * 6 + blue) as u8;
+                    assert_eq!(ansi256_to_rgb(idx, &palette), (r, g, b), "index {idx}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ansi256_palette_and_grayscale_boundaries_are_preserved() {
+        let palette = palette();
+        for idx in 0..16 {
+            assert_eq!(
+                ansi256_to_rgb(idx, &palette),
+                rgba_tuple(&palette[idx as usize])
+            );
+        }
+        for idx in 232..=255 {
+            let gray = 8 + (idx - 232) * 10;
+            assert_eq!(ansi256_to_rgb(idx, &palette), (gray, gray, gray));
+        }
     }
 
     #[test]

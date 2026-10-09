@@ -229,8 +229,8 @@ enum WorkerEvent {
 struct CellHandle {
     child: Arc<Mutex<Option<Child>>>,
     cancelled: Arc<AtomicBool>,
-    /// Kept independently of `Child`: the group can still contain descendants
-    /// after the interpreter itself has exited and been reaped.
+    /// Diagnostic telemetry only. Signals require the owned child under its
+    /// mutex; this cached number must never authorize a signal after reaping.
     pgid: Arc<AtomicI32>,
 }
 
@@ -245,7 +245,6 @@ impl CellHandle {
 
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
-        signal_process_group(self.pgid.load(Ordering::SeqCst));
         if let Ok(mut guard) = self.child.lock() {
             if let Some(child) = guard.as_mut() {
                 terminate_child_group(child);
@@ -297,28 +296,38 @@ fn wait_for_shared_child(child_slot: &Arc<Mutex<Option<Child>>>) -> std::io::Res
             let flags = nix::sys::wait::WaitPidFlag::WEXITED
                 | nix::sys::wait::WaitPidFlag::WNOHANG
                 | nix::sys::wait::WaitPidFlag::WNOWAIT;
-            match nix::sys::wait::waitid(
+            let observed = nix::sys::wait::waitid(
                 nix::sys::wait::Id::Pid(nix::unistd::Pid::from_raw(pid)),
                 flags,
-            )
-            .map_err(std::io::Error::other)?
-            {
-                nix::sys::wait::WaitStatus::Exited(..)
-                | nix::sys::wait::WaitStatus::Signaled(..) => {
-                    // Keep the leader unreaped while killing its group. The
-                    // numeric PID/PGID cannot be reused in this window.
+            );
+            match observed {
+                Ok(
+                    nix::sys::wait::WaitStatus::Exited(..)
+                    | nix::sys::wait::WaitStatus::Signaled(..),
+                ) => {
+                    // Keep the leader unreaped until its group is terminated.
+                    // Cancellation takes this same mutex and cannot use a PID
+                    // between reaping it and clearing the ownership slot.
                     signal_process_group(pid);
-                    let code = child.wait()?.code().unwrap_or(-1);
+                    let status = child.wait();
                     guard.take();
-                    Some(code)
+                    Some(status?.code().unwrap_or(-1))
                 }
-                nix::sys::wait::WaitStatus::StillAlive => None,
-                _ => None,
+                Ok(_) | Err(nix::errno::Errno::EINTR) => None,
+                Err(error) => {
+                    if error == nix::errno::Errno::ECHILD {
+                        // An external reaper already released this identity.
+                        // Forget it without any last signal to its old number.
+                        guard.take();
+                    }
+                    return Err(std::io::Error::from_raw_os_error(error as i32));
+                }
             }
         };
         if let Some(code) = result {
             return Ok(code);
         }
+        // Never retain the ownership lock while sleeping: Stop must stay live.
         std::thread::sleep(CHILD_POLL_INTERVAL);
     }
 }
@@ -329,7 +338,9 @@ fn fail_cell_io_setup(
     sender: &mpsc::SyncSender<WorkerEvent>,
     threads: Vec<std::thread::JoinHandle<()>>,
     error: io::Error,
+    pipes: &CellPipeControl,
 ) {
+    pipes.retire();
     if let Ok(mut guard) = child_slot.lock() {
         if let Some(child) = guard.as_mut() {
             terminate_child_group(child);
@@ -345,6 +356,207 @@ fn fail_cell_io_setup(
     ))));
 }
 
+/// Escaped sessions can retain our pipe ends after the owned group exits.
+/// Retire only our I/O, allowing a short final drain without signalling any
+/// process outside that group. Running cells have no artificial time limit.
+#[derive(Clone, Default)]
+struct CellPipeControl {
+    retired: Arc<Mutex<Option<std::time::Instant>>>,
+    deferred_output: Arc<Mutex<[Vec<u8>; 2]>>,
+}
+
+impl CellPipeControl {
+    fn retire(&self) {
+        self.retired
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get_or_insert_with(std::time::Instant::now);
+    }
+
+    fn check(&self) -> io::Result<()> {
+        if self
+            .retired
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_some_and(|when| when.elapsed() >= Duration::from_millis(100))
+        {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "notebook pipe remained open after cell exit",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn wrap<T: std::os::fd::AsRawFd>(&self, inner: T) -> io::Result<CellPipe<T>> {
+        let fd = inner.as_raw_fd();
+        // SAFETY: `inner` continues to own fd; only its file status changes.
+        let flags = unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFL) };
+        if flags < 0
+            || unsafe { nix::libc::fcntl(fd, nix::libc::F_SETFL, flags | nix::libc::O_NONBLOCK) }
+                < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(CellPipe {
+            inner,
+            control: self.clone(),
+        })
+    }
+
+    fn send_output(
+        &self,
+        sender: &mpsc::SyncSender<WorkerEvent>,
+        mut event: WorkerEvent,
+    ) -> Result<(), WorkerEvent> {
+        loop {
+            if self.check().is_err() {
+                return Err(event);
+            }
+            match sender.try_send(event) {
+                Ok(()) => return Ok(()),
+                Err(mpsc::TrySendError::Disconnected(pending)) => return Err(pending),
+                Err(mpsc::TrySendError::Full(pending)) => event = pending,
+            }
+            // Backpressure is bounded by the same retirement deadline as I/O.
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn send_tail(&self, sender: &mpsc::SyncSender<WorkerEvent>) {
+        // All I/O threads have joined and closed their descriptors first.
+        // Delivering events may wait for the UI, just as the final Done does.
+        let tails = std::mem::take(
+            &mut *self
+                .deferred_output
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        );
+        for (stream, bytes) in [OutputStream::Stdout, OutputStream::Stderr]
+            .into_iter()
+            .zip(tails)
+        {
+            if !bytes.is_empty() && sender.send(WorkerEvent::Output(stream, bytes)).is_err() {
+                break;
+            }
+        }
+    }
+}
+
+struct CellPipe<T> {
+    inner: T,
+    control: CellPipeControl,
+}
+
+impl<T: std::os::fd::AsRawFd> CellPipe<T> {
+    fn wait_ready(&self, events: nix::libc::c_short) -> io::Result<()> {
+        self.control.check()?;
+        let mut poll = nix::libc::pollfd {
+            fd: self.inner.as_raw_fd(),
+            events,
+            revents: 0,
+        };
+        // SAFETY: poll points to one live descriptor still owned by `inner`.
+        let result = unsafe { nix::libc::poll(&mut poll, 1, 10) };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+        self.control.check()
+    }
+}
+
+impl<T: Read + std::os::fd::AsRawFd> Read for CellPipe<T> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            self.control.check()?;
+            match self.inner.read(buffer) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    self.wait_ready(nix::libc::POLLIN)?
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                result => return result,
+            }
+        }
+    }
+}
+
+impl<T: Write + std::os::fd::AsRawFd> Write for CellPipe<T> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            self.control.check()?;
+            match self.inner.write(buffer) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    self.wait_ready(nix::libc::POLLOUT)?
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                result => return result,
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn stream_cell_output<T: Read + std::os::fd::AsRawFd>(
+    mut output: CellPipe<T>,
+    stream: OutputStream,
+    sender: mpsc::SyncSender<WorkerEvent>,
+) {
+    let mut buffer = [0u8; 4096];
+    let tail = loop {
+        match output.read(&mut buffer) {
+            Ok(0) => return,
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => break Vec::new(),
+            Err(_) => return,
+            Ok(count) => {
+                match output.control.send_output(
+                    &sender,
+                    WorkerEvent::Output(stream, buffer[..count].to_vec()),
+                ) {
+                    Ok(()) => {}
+                    Err(WorkerEvent::Output(_, bytes)) if output.control.check().is_err() => {
+                        break bytes
+                    }
+                    Err(_) => return,
+                }
+            }
+        }
+    };
+    // A busy UI must not lose the root's already-buffered tail just because
+    // its channel was full during retirement. Drain the currently available
+    // nonblocking bytes into a bounded final event, then close the descriptor.
+    // One byte beyond the display cap preserves its truncation notification.
+    let mut tail = tail;
+    while tail.len() <= MAX_OUTPUT_BYTES {
+        let limit = buffer.len().min(MAX_OUTPUT_BYTES + 1 - tail.len());
+        match output.inner.read(&mut buffer[..limit]) {
+            Ok(0) | Err(_) => break,
+            Ok(count) => tail.extend_from_slice(&buffer[..count]),
+        }
+    }
+    let index = match stream {
+        OutputStream::Stdout => 0,
+        OutputStream::Stderr => 1,
+    };
+    output
+        .control
+        .deferred_output
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())[index] = tail;
+}
+
 const NON_UTF8_FLATPAK_CWD_ERROR: &str =
     "Notebook working directory contains non-UTF-8 bytes; Flatpak cannot pass it to the host safely.";
 
@@ -357,7 +569,45 @@ fn host_bridge_cwd(cwd: &Path, host_bridge: bool) -> Result<Option<String>, &'st
         .ok_or(NON_UTF8_FLATPAK_CWD_ERROR)
 }
 
+#[derive(Default)]
+struct CellIoSpawner {
+    // Per-worker fault injection exercises setup failure without exhausting
+    // system thread resources or changing another concurrently running cell.
+    #[cfg(test)]
+    fail_at: Option<usize>,
+    #[cfg(test)]
+    attempts: usize,
+}
+
+impl CellIoSpawner {
+    fn spawn<F>(&mut self, name: &str, task: F) -> io::Result<std::thread::JoinHandle<()>>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        #[cfg(test)]
+        {
+            self.attempts += 1;
+            if self.fail_at == Some(self.attempts) {
+                return Err(io::Error::other(
+                    "injected notebook I/O thread spawn failure",
+                ));
+            }
+        }
+        std::thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(task)
+    }
+}
+
 fn spawn_cell_worker(spec: CommandSpec, handle: &CellHandle) -> mpsc::Receiver<WorkerEvent> {
+    spawn_cell_worker_with_io_spawner(spec, handle, CellIoSpawner::default())
+}
+
+fn spawn_cell_worker_with_io_spawner(
+    spec: CommandSpec,
+    handle: &CellHandle,
+    mut io_spawner: CellIoSpawner,
+) -> mpsc::Receiver<WorkerEvent> {
     // Bound queued output as well as the rendered buffers: a command that
     // writes faster than GTK can paint applies backpressure instead of growing
     // an unbounded cross-thread queue.
@@ -419,16 +669,28 @@ fn spawn_cell_worker(spec: CommandSpec, handle: &CellHandle) -> mpsc::Receiver<W
                 pgid.store(id, Ordering::SeqCst);
             }
 
-            let (Some(mut stdin), Some(mut stdout), Some(mut stderr)) =
-                (child.stdin.take(), child.stdout.take(), child.stderr.take())
-            else {
-                terminate_child_group(&mut child);
-                let _ = child.wait();
-                pgid.store(0, Ordering::SeqCst);
-                let _ = sender.send(WorkerEvent::Done(CellOutcome::Failed(
-                    "spawned shell did not expose all requested pipes".to_owned(),
-                )));
-                return;
+            let pipes = CellPipeControl::default();
+            let io = (|| {
+                let (Some(stdin), Some(stdout), Some(stderr)) =
+                    (child.stdin.take(), child.stdout.take(), child.stderr.take())
+                else {
+                    return Err(io::Error::other(
+                        "spawned shell did not expose all requested pipes",
+                    ));
+                };
+                Ok((pipes.wrap(stdin)?, pipes.wrap(stdout)?, pipes.wrap(stderr)?))
+            })();
+            let (mut stdin, stdout, stderr) = match io {
+                Ok(pipes) => pipes,
+                Err(error) => {
+                    terminate_child_group(&mut child);
+                    let _ = child.wait();
+                    pgid.store(0, Ordering::SeqCst);
+                    let _ = sender.send(WorkerEvent::Done(CellOutcome::Failed(format!(
+                        "pipe setup failed: {error}"
+                    ))));
+                    return;
+                }
             };
             match child_slot.lock() {
                 Ok(mut guard) => {
@@ -453,88 +715,49 @@ fn spawn_cell_worker(spec: CommandSpec, handle: &CellHandle) -> mpsc::Receiver<W
             // gives every supported interpreter the exact same source bytes.
             let mut io_threads = Vec::with_capacity(3);
             let source = spec.source;
-            match std::thread::Builder::new()
-                .name("anvil-notebook-stdin".to_owned())
-                .spawn(move || {
-                    let _ = stdin.write_all(source.as_bytes());
-                    if !source.ends_with('\n') {
-                        let _ = stdin.write_all(b"\n");
-                    }
-                }) {
+            match io_spawner.spawn("anvil-notebook-stdin", move || {
+                let _ = stdin.write_all(source.as_bytes());
+                if !source.ends_with('\n') {
+                    let _ = stdin.write_all(b"\n");
+                }
+            }) {
                 Ok(thread) => io_threads.push(thread),
                 Err(error) => {
-                    fail_cell_io_setup(&child_slot, &pgid, &sender, io_threads, error);
+                    fail_cell_io_setup(&child_slot, &pgid, &sender, io_threads, error, &pipes);
                     return;
                 }
             }
 
             let stdout_sender = sender.clone();
-            match std::thread::Builder::new()
-                .name("anvil-notebook-stdout".to_owned())
-                .spawn(move || {
-                    let mut buffer = [0_u8; 4096];
-                    loop {
-                        match stdout.read(&mut buffer) {
-                            Ok(0) => break,
-                            Ok(count) => {
-                                if stdout_sender
-                                    .send(WorkerEvent::Output(
-                                        OutputStream::Stdout,
-                                        buffer[..count].to_vec(),
-                                    ))
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                }) {
+            match io_spawner.spawn("anvil-notebook-stdout", move || {
+                stream_cell_output(stdout, OutputStream::Stdout, stdout_sender);
+            }) {
                 Ok(thread) => io_threads.push(thread),
                 Err(error) => {
-                    fail_cell_io_setup(&child_slot, &pgid, &sender, io_threads, error);
+                    fail_cell_io_setup(&child_slot, &pgid, &sender, io_threads, error, &pipes);
                     return;
                 }
             }
 
             let stderr_sender = sender.clone();
-            match std::thread::Builder::new()
-                .name("anvil-notebook-stderr".to_owned())
-                .spawn(move || {
-                    let mut buffer = [0_u8; 4096];
-                    loop {
-                        match stderr.read(&mut buffer) {
-                            Ok(0) => break,
-                            Ok(count) => {
-                                if stderr_sender
-                                    .send(WorkerEvent::Output(
-                                        OutputStream::Stderr,
-                                        buffer[..count].to_vec(),
-                                    ))
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                }) {
+            match io_spawner.spawn("anvil-notebook-stderr", move || {
+                stream_cell_output(stderr, OutputStream::Stderr, stderr_sender);
+            }) {
                 Ok(thread) => io_threads.push(thread),
                 Err(error) => {
-                    fail_cell_io_setup(&child_slot, &pgid, &sender, io_threads, error);
+                    fail_cell_io_setup(&child_slot, &pgid, &sender, io_threads, error, &pipes);
                     return;
                 }
             }
 
             let exit = wait_for_shared_child(&child_slot);
-            // wait_for_shared_child killed the group before reaping its leader, so
-            // joining cannot hang on a descendant retaining stdout/stderr and no
-            // stale numeric PGID is signalled after reuse.
+            // The wait owner retires the private group before reaping. Pipe
+            // holders in an escaped session are outside that ownership scope.
+            pipes.retire();
             for thread in io_threads {
                 let _ = thread.join();
             }
+            pipes.send_tail(&sender);
 
             let outcome = match exit {
                 Ok(_) if cancelled.load(Ordering::SeqCst) => CellOutcome::Cancelled,
@@ -801,6 +1024,75 @@ impl Component for NotebookModel {
     }
 }
 
+fn current_cell_handle(active: &RefCell<Option<Rc<CellHandle>>>, handle: &Rc<CellHandle>) -> bool {
+    active
+        .borrow()
+        .as_ref()
+        .is_some_and(|current| Rc::ptr_eq(current, handle))
+}
+
+/// Decode each pipe independently: a read boundary is not a UTF-8 boundary.
+/// Only an incomplete trailing code point survives between output events.
+struct CellOutputCapture {
+    remaining: usize,
+    pending: [Vec<u8>; 2],
+    truncated: bool,
+}
+
+impl CellOutputCapture {
+    fn new(limit: usize) -> Self {
+        Self {
+            remaining: limit,
+            pending: Default::default(),
+            truncated: false,
+        }
+    }
+
+    fn append(&mut self, stream: OutputStream, bytes: &[u8]) -> (String, bool) {
+        let count = bytes.len().min(self.remaining);
+        self.remaining -= count;
+        let first_truncation = count < bytes.len() && !self.truncated;
+        self.truncated |= count < bytes.len();
+        let pending = &mut self.pending[match stream {
+            OutputStream::Stdout => 0,
+            OutputStream::Stderr => 1,
+        }];
+        pending.extend_from_slice(&bytes[..count]);
+        let mut text = String::new();
+        loop {
+            match std::str::from_utf8(pending) {
+                Ok(valid) => {
+                    text.push_str(valid);
+                    pending.clear();
+                    break;
+                }
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    text.push_str(
+                        std::str::from_utf8(&pending[..valid]).expect("validated prefix"),
+                    );
+                    if let Some(invalid) = error.error_len() {
+                        text.push('\u{fffd}');
+                        pending.drain(..valid + invalid);
+                    } else {
+                        pending.drain(..valid);
+                        break;
+                    }
+                }
+            }
+        }
+        (text, first_truncation)
+    }
+
+    fn finish(&mut self) -> [String; 2] {
+        self.pending.each_mut().map(|pending| {
+            let text = String::from_utf8_lossy(pending).into_owned();
+            pending.clear();
+            text
+        })
+    }
+}
+
 struct OutputPane {
     root: gtk::Box,
     buffer: gtk::TextBuffer,
@@ -1025,11 +1317,10 @@ impl CellController {
         }
     }
 
-    fn append_output(&self, stream: OutputStream, bytes: &[u8]) {
-        let text = String::from_utf8_lossy(bytes);
+    fn append_output(&self, stream: OutputStream, text: &str) {
         match stream {
-            OutputStream::Stdout => self.stdout.append(&text),
-            OutputStream::Stderr => self.stderr.append(&text),
+            OutputStream::Stdout => self.stdout.append(text),
+            OutputStream::Stderr => self.stderr.append(text),
         }
     }
 
@@ -1076,40 +1367,43 @@ impl CellController {
         let receiver = spawn_cell_worker(command, &handle);
         let weak_cell = Rc::downgrade(self);
         let mut completion = completion;
-        let mut bytes_seen = 0usize;
-        let mut truncated = false;
+        let mut output = CellOutputCapture::new(MAX_OUTPUT_BYTES);
 
         gtk::glib::timeout_add_local(OUTPUT_POLL_INTERVAL, move || {
             let Some(cell) = weak_cell.upgrade() else {
                 handle.cancel();
                 return gtk::glib::ControlFlow::Break;
             };
+            // An obsolete timer must not write into or finish a replacement run.
+            if !current_cell_handle(&cell.active, &handle) {
+                handle.cancel();
+                return gtk::glib::ControlFlow::Break;
+            }
 
             let mut processed = 0usize;
             loop {
                 match receiver.try_recv() {
                     Ok(WorkerEvent::Output(stream, bytes)) => {
-                        if bytes_seen >= MAX_OUTPUT_BYTES {
-                            if !truncated {
-                                truncated = true;
-                                cell.stderr.append("\n[output truncated]\n");
-                            }
-                            processed += 1;
-                            if processed >= MAX_OUTPUT_EVENTS_PER_TICK {
-                                return gtk::glib::ControlFlow::Continue;
-                            }
-                            continue;
+                        let (text, first_truncation) = output.append(stream, &bytes);
+                        if !text.is_empty() {
+                            cell.append_output(stream, &text);
                         }
-                        let remaining = MAX_OUTPUT_BYTES - bytes_seen;
-                        let count = bytes.len().min(remaining);
-                        bytes_seen += count;
-                        cell.append_output(stream, &bytes[..count]);
+                        if first_truncation {
+                            cell.stderr.append("\n[output truncated]\n");
+                        }
                         processed += 1;
                         if processed >= MAX_OUTPUT_EVENTS_PER_TICK {
                             return gtk::glib::ControlFlow::Continue;
                         }
                     }
                     Ok(WorkerEvent::Done(outcome)) => {
+                        let [stdout, stderr] = output.finish();
+                        if !stdout.is_empty() {
+                            cell.stdout.append(&stdout);
+                        }
+                        if !stderr.is_empty() {
+                            cell.stderr.append(&stderr);
+                        }
                         let is_current = cell
                             .active
                             .borrow()
@@ -1128,6 +1422,13 @@ impl CellController {
                         return gtk::glib::ControlFlow::Continue;
                     }
                     Err(mpsc::TryRecvError::Disconnected) => {
+                        let [stdout, stderr] = output.finish();
+                        if !stdout.is_empty() {
+                            cell.stdout.append(&stdout);
+                        }
+                        if !stderr.is_empty() {
+                            cell.stderr.append(&stderr);
+                        }
                         let outcome = CellOutcome::Failed("worker disconnected".to_owned());
                         cell.active.borrow_mut().take();
                         cell.finish(&outcome);
@@ -1295,6 +1596,56 @@ impl NotebookRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cell_output_timer_requires_the_current_handle_identity() {
+        let old = Rc::new(CellHandle::new());
+        let current = Rc::new(CellHandle::new());
+        let active = RefCell::new(Some(current.clone()));
+        assert!(current_cell_handle(&active, &current));
+        assert!(!current_cell_handle(&active, &old));
+        *active.borrow_mut() = None;
+        assert!(!current_cell_handle(&active, &current));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn completed_handle_never_signals_stale_group_telemetry() {
+        let mut sentinel = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let handle = CellHandle::new();
+        handle.pgid.store(sentinel.id() as i32, Ordering::SeqCst);
+        handle.cancel();
+        std::thread::sleep(Duration::from_millis(50));
+        let survived = sentinel.try_wait().unwrap().is_none();
+        // This fixture owns and reaps its sentinel regardless of assertion.
+        let _ = sentinel.kill();
+        let _ = sentinel.wait();
+        assert!(
+            survived,
+            "a completed cell signalled an unowned process group"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn externally_reaped_child_is_forgotten_without_late_signal_authority() {
+        let mut child = Command::new("sh")
+            .args(["-c", "exit 0"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        child.wait().unwrap();
+        let handle = CellHandle::new();
+        *handle.child.lock().unwrap() = Some(child);
+        let error = wait_for_shared_child(&handle.child).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(nix::libc::ECHILD));
+        assert!(handle.child.lock().unwrap().is_none());
+        handle.cancel();
+    }
 
     fn notebook_test_dir(label: &str) -> PathBuf {
         let path =
@@ -1552,5 +1903,551 @@ mod tests {
         assert!(stdout.windows(11).any(|chunk| chunk == b"parent-done"));
         assert!(handle.child.lock().expect("child slot").is_none());
         assert_eq!(handle.pgid.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod pipe_cleanup_tests {
+    use super::*;
+    use std::time::Instant;
+
+    static PIPE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct PipeFixture {
+        root: PathBuf,
+        handle: CellHandle,
+    }
+
+    impl PipeFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "notebook-pipe-fixture-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&root).unwrap();
+            Self {
+                root,
+                handle: CellHandle::new(),
+            }
+        }
+
+        fn release_holder(&self) -> bool {
+            // Only this fixture knows these private release paths. No process
+            // enumeration or signals to an escaped numeric PID are needed.
+            let _ = std::fs::write(self.root.join("release-holder"), b"");
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !self.root.join("holder-closed").exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            self.root.join("holder-closed").exists()
+        }
+    }
+
+    impl Drop for PipeFixture {
+        fn drop(&mut self) {
+            self.handle.cancel();
+            let _ = std::fs::write(self.root.join("release-root"), b"");
+            if self.release_holder() {
+                let _ = std::fs::remove_dir_all(&self.root);
+            }
+        }
+    }
+
+    fn escaped_pipe_case(pipes: &str, cancel: bool) {
+        let _serial = PIPE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let fixture = PipeFixture::new();
+        let redirections = match pipes {
+            "stdin" => "<&3 3<&- >/dev/null 2>/dev/null",
+            "stdout" => "</dev/null 3<&- 2>/dev/null",
+            "stderr" => "</dev/null 3<&- >/dev/null",
+            "all" => "<&3 3<&-",
+            _ => unreachable!(),
+        };
+        // The private holder announces readiness only after setsid. It holds
+        // precisely the selected pipe ends, and exits on our release file.
+        // A fixed safety ceiling also prevents leaks after a test-process crash.
+        let script = format!(
+            "exec 3<&0; setsid sh -c 'printf ready > holder-ready; n=0; \
+             while [ ! -e release-holder ] && [ \"$n\" -lt 1500 ]; do \
+             sleep 0.02; n=$((n+1)); done; \
+             exec 0<&- 1>&- 2>&-; : > holder-closed' {redirections} & exec 3<&-; \
+             while [ ! -e holder-ready ]; do sleep 0.01; done; \
+             printf ready > root-ready; \
+             while [ ! -e release-root ]; do sleep 0.01; done; \
+             printf ordinary-out-tail; printf ordinary-err-tail >&2; exit 7"
+        );
+        let receiver = spawn_cell_worker(
+            CommandSpec {
+                argv: vec!["sh".to_owned(), "-c".to_owned(), script],
+                // The root deliberately does not consume this stdin. A source
+                // larger than pipe capacity exercises the writer as well.
+                source: "x".repeat(256 * 1024),
+                cwd: fixture.root.clone(),
+            },
+            &fixture.handle,
+        );
+        let ready_deadline = Instant::now() + Duration::from_secs(3);
+        while !fixture.root.join("root-ready").exists() {
+            assert!(
+                Instant::now() < ready_deadline,
+                "fixture never acknowledged startup"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(fixture.root.join("holder-ready").exists());
+        let started = Instant::now();
+        if cancel {
+            fixture.handle.cancel();
+        } else {
+            std::fs::write(fixture.root.join("release-root"), b"").unwrap();
+        }
+        let deadline = started + Duration::from_secs(1);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut outcome = None;
+        while Instant::now() < deadline {
+            match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(WorkerEvent::Output(OutputStream::Stdout, bytes)) => stdout.extend(bytes),
+                Ok(WorkerEvent::Output(OutputStream::Stderr, bytes)) => stderr.extend(bytes),
+                Ok(WorkerEvent::Done(done)) => {
+                    outcome = Some(done);
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        let elapsed = started.elapsed();
+        let holder_was_still_live = !fixture.root.join("holder-closed").exists();
+        let reaped = fixture.handle.child.lock().unwrap().is_none();
+        // Clean up even against the old implementation, before asserting the
+        // regression, so a failed test never strands its descriptor holder.
+        assert!(
+            fixture.release_holder(),
+            "fixture holder failed to close its own pipes"
+        );
+        if outcome.is_none() {
+            let cleanup_deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < cleanup_deadline {
+                match receiver.recv_timeout(Duration::from_millis(50)) {
+                    Ok(WorkerEvent::Done(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    _ => {}
+                }
+            }
+        }
+        eprintln!("{pipes}, cancel={cancel}: completion={outcome:?}, elapsed={elapsed:?}, root_reaped={reaped}, escaped_holder_survived={holder_was_still_live}");
+        assert!(
+            holder_was_still_live,
+            "worker must not terminate the escaped session"
+        );
+        assert!(reaped, "the ordinary wait owner must reap the root");
+        assert_eq!(
+            outcome,
+            Some(if cancel {
+                CellOutcome::Cancelled
+            } else {
+                CellOutcome::Exited(7)
+            }),
+            "worker hung on escaped {pipes} descriptors"
+        );
+        if !cancel {
+            assert_eq!(stdout, b"ordinary-out-tail");
+            assert_eq!(stderr, b"ordinary-err-tail");
+        }
+    }
+
+    #[test]
+    fn escaped_stdout_does_not_hold_completion() {
+        escaped_pipe_case("stdout", false);
+    }
+
+    #[test]
+    fn escaped_stderr_does_not_hold_completion() {
+        escaped_pipe_case("stderr", false);
+    }
+
+    #[test]
+    fn escaped_stdin_does_not_hold_completion() {
+        escaped_pipe_case("stdin", false);
+    }
+
+    #[test]
+    fn cancellation_finishes_with_all_escaped_pipe_ends() {
+        escaped_pipe_case("all", true);
+    }
+
+    #[test]
+    fn source_and_output_cross_pipe_capacity_without_losing_the_tail() {
+        let _serial = PIPE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let handle = CellHandle::new();
+        let out = "o".repeat(72 * 1024);
+        let err = "e".repeat(72 * 1024);
+        let source = format!("printf '%s' '{out}'; printf '%s' '{err}' >&2; printf out-tail; printf err-tail >&2; exit 7");
+        let receiver = spawn_cell_worker(
+            CommandSpec {
+                argv: vec!["sh".into()],
+                source,
+                cwd: std::env::temp_dir(),
+            },
+            &handle,
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let outcome = loop {
+            match receiver
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("ordinary source/output must finish")
+            {
+                WorkerEvent::Output(OutputStream::Stdout, bytes) => stdout.extend(bytes),
+                WorkerEvent::Output(OutputStream::Stderr, bytes) => stderr.extend(bytes),
+                WorkerEvent::Done(outcome) => break outcome,
+            }
+        };
+        assert_eq!(outcome, CellOutcome::Exited(7));
+        assert_eq!(stdout, format!("{out}out-tail").as_bytes());
+        assert_eq!(stderr, format!("{err}err-tail").as_bytes());
+        assert!(handle.child.lock().unwrap().is_none());
+    }
+    #[test]
+    fn slow_consumer_keeps_the_roots_buffered_output_tail() {
+        let _serial = PIPE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let handle = CellHandle::new();
+        let words = (0..100).map(|_| "x").collect::<Vec<_>>().join(" ");
+        let receiver = spawn_cell_worker(
+            CommandSpec {
+                argv: vec!["sh".into()],
+                source: format!(
+                    "for value in {words}; do printf x; sleep 0.02; done; printf final-tail"
+                ),
+                cwd: std::env::temp_dir(),
+            },
+            &handle,
+        );
+        let mut stdout = Vec::new();
+        // A real output event acknowledges that the root and reader started.
+        while stdout.is_empty() {
+            match receiver.recv_timeout(Duration::from_secs(3)).unwrap() {
+                WorkerEvent::Output(OutputStream::Stdout, bytes) => stdout.extend(bytes),
+                WorkerEvent::Done(outcome) => panic!("root ended before handshake: {outcome:?}"),
+                _ => {}
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handle.child.lock().unwrap().is_some() {
+            assert!(Instant::now() < deadline, "root did not exit");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Simulate a busy UI with a full output queue throughout retirement.
+        std::thread::sleep(Duration::from_millis(200));
+        let outcome = loop {
+            match receiver.recv_timeout(Duration::from_secs(2)).unwrap() {
+                WorkerEvent::Output(OutputStream::Stdout, bytes) => stdout.extend(bytes),
+                WorkerEvent::Done(outcome) => break outcome,
+                _ => {}
+            }
+        };
+        assert_eq!(outcome, CellOutcome::Exited(0));
+        assert_eq!(stdout, format!("{}final-tail", "x".repeat(100)).as_bytes());
+    }
+
+    #[test]
+    fn deferred_output_is_bounded_even_when_bytes_are_always_ready() {
+        // Deterministic adapter for a continuously readable escaped writer.
+        // No poll is reached: the control is already retired before the read.
+        struct AlwaysReady;
+        impl Read for AlwaysReady {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                bytes.fill(b'x');
+                Ok(bytes.len())
+            }
+        }
+        impl std::os::fd::AsRawFd for AlwaysReady {
+            fn as_raw_fd(&self) -> std::os::fd::RawFd {
+                -1
+            }
+        }
+        let control = CellPipeControl::default();
+        *control.retired.lock().unwrap() = Some(Instant::now() - Duration::from_secs(1));
+        let (sender, receiver) = mpsc::sync_channel(1);
+        stream_cell_output(
+            CellPipe {
+                inner: AlwaysReady,
+                control: control.clone(),
+            },
+            OutputStream::Stdout,
+            sender.clone(),
+        );
+        assert_eq!(
+            control.deferred_output.lock().unwrap()[0].len(),
+            MAX_OUTPUT_BYTES + 1
+        );
+        assert!(control.deferred_output.lock().unwrap()[1].is_empty());
+        control.send_tail(&sender);
+        match receiver.recv().unwrap() {
+            WorkerEvent::Output(OutputStream::Stdout, bytes) => {
+                assert_eq!(bytes.len(), MAX_OUTPUT_BYTES + 1)
+            }
+            _ => panic!("missing bounded final output"),
+        }
+        assert!(control
+            .deferred_output
+            .lock()
+            .unwrap()
+            .iter()
+            .all(Vec::is_empty));
+    }
+
+    #[test]
+    fn output_backpressure_retires_without_waiting_for_a_consumer() {
+        let control = CellPipeControl::default();
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        sender
+            .send(WorkerEvent::Output(OutputStream::Stdout, vec![1]))
+            .unwrap();
+        let reader_control = control.clone();
+        let (ready_sender, ready_receiver) = mpsc::channel();
+        let (done_sender, done_receiver) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            ready_sender.send(()).unwrap();
+            let sent = reader_control
+                .send_output(&sender, WorkerEvent::Output(OutputStream::Stdout, vec![2]));
+            done_sender.send(sent.is_ok()).unwrap();
+        });
+        ready_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(done_receiver
+            .recv_timeout(Duration::from_millis(30))
+            .is_err());
+        let started = Instant::now();
+        control.retire();
+        assert!(!done_receiver.recv_timeout(Duration::from_secs(1)).unwrap());
+        thread.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn retirement_drains_available_tail_then_bounds_an_open_reader() {
+        let (reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let control = CellPipeControl::default();
+        let mut reader = control.wrap(reader).unwrap();
+        writer.write_all(b"tail").unwrap();
+        control.retire();
+        let first_retirement = *control.retired.lock().unwrap();
+        let mut tail = [0u8; 4];
+        reader.read_exact(&mut tail).unwrap();
+        assert_eq!(&tail, b"tail");
+        control.retire();
+        assert_eq!(*control.retired.lock().unwrap(), first_retirement);
+        let started = Instant::now();
+        let error = reader.read(&mut tail).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // The peer is still owned and open; timeout did not depend on its EOF.
+        writer.write_all(b"still-owned").unwrap();
+    }
+
+    #[test]
+    fn pipe_setup_rejects_invalid_descriptors_without_io_workers() {
+        struct InvalidDescriptor;
+        impl std::os::fd::AsRawFd for InvalidDescriptor {
+            fn as_raw_fd(&self) -> std::os::fd::RawFd {
+                -1
+            }
+        }
+        let result = CellPipeControl::default().wrap(InvalidDescriptor);
+        assert!(matches!(result, Err(error) if error.raw_os_error() == Some(nix::libc::EBADF)));
+    }
+
+    #[test]
+    fn partial_io_setup_failure_retires_readers_and_reaps_the_owned_root() {
+        let _serial = PIPE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let child = Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let handle = CellHandle::new();
+        handle.pgid.store(child.id() as i32, Ordering::SeqCst);
+        *handle.child.lock().unwrap() = Some(child);
+        let control = CellPipeControl::default();
+        let (reader, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut reader = control.wrap(reader).unwrap();
+        let (read_sender, read_receiver) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            read_sender
+                .send(reader.read(&mut [0u8; 1]).map_err(|error| error.kind()))
+                .unwrap();
+        });
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let started = Instant::now();
+        fail_cell_io_setup(
+            &handle.child,
+            &handle.pgid,
+            &sender,
+            vec![thread],
+            io::Error::other("fixture spawn failure"),
+            &control,
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(read_receiver.recv().unwrap(), Err(io::ErrorKind::TimedOut));
+        assert!(handle.child.lock().unwrap().is_none());
+        assert_eq!(handle.pgid.load(Ordering::SeqCst), 0);
+        assert!(
+            matches!(receiver.recv().unwrap(), WorkerEvent::Done(CellOutcome::Failed(error)) if error.contains("fixture spawn failure"))
+        );
+        assert!(peer.write_all(b"closed-reader").is_err());
+    }
+    #[test]
+    fn each_io_thread_spawn_failure_closes_workers_and_reaps_the_root() {
+        let _serial = PIPE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for fail_at in 1..=3 {
+            let handle = CellHandle::new();
+            let started = Instant::now();
+            let receiver = spawn_cell_worker_with_io_spawner(
+                CommandSpec {
+                    argv: vec!["sh".into(), "-c".into(), "sleep 30".into()],
+                    source: "x".repeat(256 * 1024),
+                    cwd: std::env::temp_dir(),
+                },
+                &handle,
+                CellIoSpawner {
+                    fail_at: Some(fail_at),
+                    attempts: 0,
+                },
+            );
+            let deadline = started + Duration::from_secs(2);
+            let outcome = loop {
+                if let WorkerEvent::Done(outcome) = receiver
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .expect("injected spawn failure must finish")
+                {
+                    break outcome;
+                }
+            };
+            assert!(
+                matches!(outcome, CellOutcome::Failed(ref error) if error.contains("injected notebook I/O thread spawn failure")),
+                "{outcome:?}"
+            );
+            assert!(handle.child.lock().unwrap().is_none());
+            assert_eq!(handle.pgid.load(Ordering::SeqCst), 0);
+            // Disconnection proves no previously started I/O worker retains a
+            // channel sender after Done and the worker closure has returned.
+            assert!(matches!(
+                receiver.recv_timeout(Duration::from_secs(1)),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            ));
+            eprintln!(
+                "I/O spawn position {fail_at}: controlled failure and cleanup in {:?}",
+                started.elapsed()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod output_capture_tests {
+    use super::{CellOutputCapture, OutputStream};
+
+    #[test]
+    fn output_preserves_utf8_at_every_pipe_boundary() {
+        let source = "aé中文🙂z";
+        for split in 0..=source.len() {
+            let mut capture = CellOutputCapture::new(1024);
+            let mut text = capture
+                .append(OutputStream::Stdout, &source.as_bytes()[..split])
+                .0;
+            text.push_str(
+                &capture
+                    .append(OutputStream::Stdout, &source.as_bytes()[split..])
+                    .0,
+            );
+            text.push_str(&capture.finish()[0]);
+            assert_eq!(text, source, "split at byte {split}");
+        }
+    }
+
+    #[test]
+    fn output_streams_keep_independent_utf8_tails() {
+        let mut capture = CellOutputCapture::new(1024);
+        assert_eq!(capture.append(OutputStream::Stdout, &[0xe4, 0xb8]).0, "");
+        assert_eq!(
+            capture.append(OutputStream::Stderr, b"warning").0,
+            "warning"
+        );
+        assert_eq!(capture.append(OutputStream::Stdout, &[0xad]).0, "中");
+        assert_eq!(capture.finish(), ["", ""]);
+    }
+
+    #[test]
+    fn output_flushes_invalid_and_incomplete_bytes_on_completion() {
+        let mut capture = CellOutputCapture::new(1024);
+        assert_eq!(
+            capture
+                .append(OutputStream::Stdout, &[0xff, b'a', 0xf0, 0x9f])
+                .0,
+            "�a"
+        );
+        assert_eq!(capture.finish(), ["�", ""]);
+        assert_eq!(capture.finish(), ["", ""]);
+    }
+
+    #[test]
+    fn final_crossing_chunk_reports_truncation_once() {
+        let mut capture = CellOutputCapture::new(5);
+        assert_eq!(
+            capture.append(OutputStream::Stdout, b"abc"),
+            ("abc".into(), false)
+        );
+        assert_eq!(
+            capture.append(OutputStream::Stderr, b"def"),
+            ("de".into(), true)
+        );
+        assert_eq!(
+            capture.append(OutputStream::Stdout, b"more"),
+            ("".into(), false)
+        );
+        assert_eq!(capture.finish(), ["", ""]);
+    }
+
+    #[test]
+    fn exact_limit_is_complete_until_another_byte_arrives() {
+        let mut capture = CellOutputCapture::new(3);
+        assert_eq!(
+            capture.append(OutputStream::Stdout, "中".as_bytes()),
+            ("中".into(), false)
+        );
+        assert_eq!(
+            capture.append(OutputStream::Stdout, b""),
+            ("".into(), false)
+        );
+        assert_eq!(
+            capture.append(OutputStream::Stderr, b"!"),
+            ("".into(), true)
+        );
+        let mut zero = CellOutputCapture::new(0);
+        assert_eq!(zero.append(OutputStream::Stdout, b"x"), ("".into(), true));
+    }
+
+    #[test]
+    fn truncating_a_code_point_flushes_only_its_retained_prefix() {
+        let mut capture = CellOutputCapture::new(2);
+        assert_eq!(
+            capture.append(OutputStream::Stdout, "中".as_bytes()),
+            ("".into(), true)
+        );
+        assert_eq!(capture.finish(), ["�", ""]);
     }
 }

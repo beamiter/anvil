@@ -127,7 +127,10 @@ fn metadata_record_markdown(
     }
     // Same reproduction context Block's own card export carries.
     if let Some(cwd) = record.cwd.as_deref().filter(|cwd| !cwd.is_empty()) {
-        markdown.push_str(&format!("**Directory:** {cwd}\n\n"));
+        // OSC-provided paths can contain Markdown links, images, HTML, or
+        // backticks. Keep the original bytes inert inside their own fence.
+        let fence = markdown_fence(cwd);
+        markdown.push_str(&format!("**Directory:**\n{fence}\n{cwd}\n{fence}\n\n"));
     }
     markdown
 }
@@ -323,8 +326,8 @@ impl TermView {
 #[cfg(test)]
 mod tests {
     use super::{
-        export_file_name, metadata_record_export, metadata_record_markdown, records_json,
-        BackendRecords, SessionExportFormat,
+        export_file_name, markdown_fence, metadata_record_export, metadata_record_markdown,
+        records_json, BackendRecords, SessionExportFormat,
     };
     use crate::block_view::{CompletedCommandRecord, UnifiedZoneStore, ZoneOutputSnapshot};
     use std::cell::RefCell;
@@ -433,6 +436,27 @@ mod tests {
         let markdown = metadata_record_markdown(&record, Some(&snapshot));
         assert!(markdown.contains("**Command:**\n````bash\nprintf '```'\n````\n\n"));
         assert!(markdown.contains("**Output:**\n````\n```\n## not a document heading\n````\n\n"));
+    }
+
+    #[test]
+    fn metadata_markdown_keeps_directory_syntax_inside_a_code_fence() {
+        for cwd in [
+            "/work/![image](https://example.invalid/pixel)",
+            "/work/<img src='https://example.invalid/pixel'>",
+            "/work/```\n## fabricated heading",
+            "/work/中文 🦀",
+        ] {
+            let mut record = metadata_record(13);
+            record.cwd = Some(cwd.to_string());
+            let markdown = metadata_record_markdown(&record, None);
+            let fence = markdown_fence(cwd);
+            assert!(
+                markdown.ends_with(&format!("**Directory:**\n{fence}\n{cwd}\n{fence}\n\n")),
+                "{markdown}"
+            );
+            let json = serde_json::to_value(metadata_record_export(&record, None)).unwrap();
+            assert_eq!(json["cwd"], cwd);
+        }
     }
 
     /// Budget eviction removes only snapshot bytes; the surviving record must

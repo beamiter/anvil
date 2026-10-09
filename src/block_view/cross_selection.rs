@@ -520,6 +520,11 @@ impl CrossSelection {
     }
 
     pub(crate) fn clear_all(&self) {
+        // Navigation and whole-card selection replace the active drag too.
+        // Retire its origin before unselecting or replaying held PTY bytes,
+        // so a later motion cannot recreate the selection just cleared.
+        self.start_vte.borrow_mut().take();
+        self.claimed.set(false);
         self.clear_cross_selection();
         for vte in self.all_vtes() {
             vte.unselect_all();
@@ -692,6 +697,35 @@ mod tests {
         assert_eq!(output, "first\ntwo");
         assert!(append_selected_text(&mut output, "x", 9).is_err());
         assert_eq!(output, "first\ntwo");
+    }
+
+    fn assert_explicit_clear_retires_drag(
+        cross: &std::rc::Rc<CrossSelection>,
+        active: &vte4::Terminal,
+    ) {
+        use super::gtk::prelude::*;
+
+        *cross.start_vte.borrow_mut() = Some(active.downgrade());
+        cross.claimed.set(true);
+        let weak = std::rc::Rc::downgrade(cross);
+        let replayed = std::rc::Rc::new(std::cell::Cell::new(0));
+        let replayed_cb = replayed.clone();
+        cross.feed_hold.set_flush(move |bytes| {
+            let cross = weak.upgrade().expect("selection owner is still alive");
+            assert!(cross.start_vte.borrow().is_none());
+            assert!(!cross.claimed.get());
+            assert_eq!(bytes, b"explicit clear tail");
+            replayed_cb.set(replayed_cb.get() + 1);
+        });
+        cross.feed_hold.begin_drag();
+        assert!(cross.feed_hold.try_buffer(b"explicit clear tail"));
+        cross.clear_all();
+        assert_eq!(replayed.get(), 1);
+        assert!(cross.start_vte.borrow().is_none());
+        assert!(!cross.claimed.get());
+        // A duplicate clear is harmless and must not replay anything twice.
+        cross.clear_all();
+        assert_eq!(replayed.get(), 1);
     }
 
     #[test]
@@ -1127,6 +1161,11 @@ mod tests {
         assert!(cross.start_vte.borrow().is_none());
         assert!(!cross.claimed.get());
         assert_eq!(&*flushed.borrow(), b"parked tail");
+
+        // An explicit selection replacement can run while the mouse is
+        // still down (for example Ctrl+Up navigation). It must retire the
+        // old gesture before synchronous feed replay and later drag updates.
+        assert_explicit_clear_retires_drag(&cross, &active);
 
         window.close();
         pump();

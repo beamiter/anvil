@@ -224,8 +224,11 @@ impl AgentDiffPanel {
                         .as_ref()
                         .is_some_and(|diff| diff.stdout.truncated || diff.stderr.truncated);
 
-                let status_text =
-                    bounded_lossy_text(status_summary.stdout.bytes, MAX_STATUS_STDOUT_BYTES);
+                let (status_text, display_truncated) = bounded_lossy_text_with_truncation(
+                    status_summary.stdout.bytes,
+                    MAX_STATUS_STDOUT_BYTES,
+                );
+                self.state.truncated |= display_truncated;
                 let status_body = if status_text.is_empty() {
                     "(working tree clean)"
                 } else {
@@ -235,11 +238,13 @@ impl AgentDiffPanel {
                     format!("$ git status --short --untracked-files=all\n{status_body}");
 
                 if !status_summary.status.success() {
-                    self.state.error = Some(process_failure_message(
+                    let (error, display_truncated) = process_failure_message(
                         "git status --short",
                         status_summary.status,
                         status_summary.stderr.bytes,
-                    ));
+                    );
+                    self.state.error = Some(error);
+                    self.state.truncated |= display_truncated;
                     return;
                 }
 
@@ -247,7 +252,9 @@ impl AgentDiffPanel {
                     self.state.error = Some("tracked Git diff did not run".to_string());
                     return;
                 };
-                let diff_text = bounded_lossy_text(diff.stdout.bytes, MAX_DIFF_STDOUT_BYTES);
+                let (diff_text, display_truncated) =
+                    bounded_lossy_text_with_truncation(diff.stdout.bytes, MAX_DIFF_STDOUT_BYTES);
+                self.state.truncated |= display_truncated;
                 let base = self.requested_base.as_deref().unwrap_or("HEAD");
                 let diff_body = if diff_text.is_empty() {
                     format!("(no tracked changes relative to {base})")
@@ -259,8 +266,14 @@ impl AgentDiffPanel {
                 ));
                 self.state.text.push_str(&diff_body);
 
-                self.state.error = (!diff.status.success())
-                    .then(|| process_failure_message("git diff", diff.status, diff.stderr.bytes));
+                self.state.error = if diff.status.success() {
+                    None
+                } else {
+                    let (error, display_truncated) =
+                        process_failure_message("git diff", diff.status, diff.stderr.bytes);
+                    self.state.truncated |= display_truncated;
+                    Some(error)
+                };
             }
             Err(error) => {
                 self.state.error = Some(error);
@@ -708,16 +721,22 @@ fn kill_process_group_id(_child_id: u32) -> Result<(), String> {
     Ok(())
 }
 
-fn process_failure_message(label: &str, status: ExitStatus, stderr_bytes: Vec<u8>) -> String {
-    let stderr = bounded_lossy_text(stderr_bytes, MAX_DIFF_STDERR_BYTES);
+fn process_failure_message(
+    label: &str,
+    status: ExitStatus,
+    stderr_bytes: Vec<u8>,
+) -> (String, bool) {
+    let (stderr, truncated) =
+        bounded_lossy_text_with_truncation(stderr_bytes, MAX_DIFF_STDERR_BYTES);
     let status = status
         .code()
         .map_or_else(|| "signal".to_string(), |code| format!("exit {code}"));
-    if stderr.trim().is_empty() {
+    let message = if stderr.trim().is_empty() {
         format!("{label} failed ({status})")
     } else {
         format!("{label} failed ({status}): {}", stderr.trim_end())
-    }
+    };
+    (message, truncated)
 }
 
 #[cfg(any(test, not(unix)))]
@@ -810,8 +829,9 @@ fn read_bounded_until(
 /// Lossy decoding can expand one invalid input byte into a three-byte Unicode
 /// replacement character. Apply the same byte ceiling after decoding so the
 /// UI state itself remains under the advertised retention limit.
-fn bounded_lossy_text(bytes: Vec<u8>, limit: usize) -> String {
+fn bounded_lossy_text_with_truncation(bytes: Vec<u8>, limit: usize) -> (String, bool) {
     let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    let truncated = text.len() > limit;
     if text.len() > limit {
         let mut end = limit;
         while end > 0 && !text.is_char_boundary(end) {
@@ -823,7 +843,8 @@ fn bounded_lossy_text(bytes: Vec<u8>, limit: usize) -> String {
     // Preserve multiline/tab layout, but neutralize terminal controls and
     // invisible/bidirectional formatting before the UI displays the diff. `?`
     // is one byte, so this pass cannot exceed the retention ceiling above.
-    text.chars()
+    let text = text
+        .chars()
         .map(|character| match character {
             '\n' | '\t' => character,
             unsafe_character
@@ -834,7 +855,13 @@ fn bounded_lossy_text(bytes: Vec<u8>, limit: usize) -> String {
             }
             visible => visible,
         })
-        .collect()
+        .collect();
+    (text, truncated)
+}
+
+#[cfg(test)]
+fn bounded_lossy_text(bytes: Vec<u8>, limit: usize) -> String {
+    bounded_lossy_text_with_truncation(bytes, limit).0
 }
 
 pub(crate) fn visible_diff_cwd(cwd: &Path) -> String {
@@ -1260,5 +1287,103 @@ mod tests {
         let text = String::from_utf8(diff.stdout.bytes).expect("diff is UTF-8");
         assert!(text.contains("-before"), "{text}");
         assert!(text.contains("+after"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod adapter_audit_regressions {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+    fn captured(bytes: Vec<u8>) -> CapturedBytes {
+        CapturedBytes {
+            bytes,
+            truncated: false,
+        }
+    }
+    fn success(bytes: Vec<u8>) -> ProcessOutput {
+        ProcessOutput {
+            status: ExitStatus::from_raw(0),
+            stdout: captured(bytes),
+            stderr: captured(Vec::new()),
+        }
+    }
+    #[test]
+    fn decoded_diff_clipping_must_be_disclosed() {
+        let mut panel = AgentDiffPanel::default();
+        let mut bytes = vec![0xff; MAX_DIFF_STDOUT_BYTES / 2];
+        bytes.extend_from_slice(b"\nREVIEW TAIL\n");
+        panel.apply_result(Ok(DiffWorkerOutput {
+            status_summary: success(Vec::new()),
+            tracked_diff: Some(success(bytes)),
+        }));
+        assert!(
+            !panel.state.text.contains("REVIEW TAIL"),
+            "fixture must clip actual review content"
+        );
+        assert!(
+            panel.state.truncated,
+            "decoding expanded bytes and removed review content without warning"
+        );
+    }
+    #[test]
+    fn decoded_status_clipping_must_be_disclosed() {
+        let mut panel = AgentDiffPanel::default();
+        let mut bytes = vec![0xff; MAX_STATUS_STDOUT_BYTES / 2];
+        bytes.extend_from_slice(b"\nSTATUS TAIL\n");
+        panel.apply_result(Ok(DiffWorkerOutput {
+            status_summary: success(bytes),
+            tracked_diff: Some(success(Vec::new())),
+        }));
+        assert!(!panel.state.text.contains("STATUS TAIL"));
+        assert!(
+            panel.state.truncated,
+            "decoding clipped the status summary without warning"
+        );
+    }
+    #[test]
+    fn decoded_error_clipping_must_be_disclosed() {
+        let mut panel = AgentDiffPanel::default();
+        let mut status = success(Vec::new());
+        status.status = ExitStatus::from_raw(256);
+        status.stderr = captured(vec![0xff; MAX_DIFF_STDERR_BYTES / 2]);
+        panel.apply_result(Ok(DiffWorkerOutput {
+            status_summary: status,
+            tracked_diff: None,
+        }));
+        assert!(panel.state.error.is_some());
+        assert!(
+            panel.state.truncated,
+            "decoding clipped the diagnostic without warning"
+        );
+    }
+
+    #[test]
+    fn bounded_decode_preserves_exact_utf8_and_reports_only_actual_loss() {
+        for bytes in [b"hello".to_vec(), vec![0xff], "é".as_bytes().to_vec()] {
+            let (text, clipped) = bounded_lossy_text_with_truncation(bytes.clone(), 32);
+            assert_eq!(text, String::from_utf8_lossy(&bytes));
+            assert!(!clipped);
+        }
+        assert_eq!(
+            bounded_lossy_text_with_truncation(b"abcd".to_vec(), 4),
+            ("abcd".into(), false)
+        );
+        assert_eq!(
+            bounded_lossy_text_with_truncation(b"abcde".to_vec(), 4),
+            ("abcd".into(), true)
+        );
+    }
+    #[test]
+    fn decoded_tracked_error_clipping_must_be_disclosed() {
+        let mut panel = AgentDiffPanel::default();
+        let mut diff = success(Vec::new());
+        diff.status = ExitStatus::from_raw(256);
+        diff.stderr = captured(vec![0xff; MAX_DIFF_STDERR_BYTES / 2]);
+        panel.apply_result(Ok(DiffWorkerOutput {
+            status_summary: success(Vec::new()),
+            tracked_diff: Some(diff),
+        }));
+        assert!(panel.state.error.is_some());
+        assert!(panel.state.truncated);
     }
 }
