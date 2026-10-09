@@ -28,6 +28,8 @@ use vte4::{Terminal, TerminalExt};
 use crate::block_view::{BlockState, MouseReporting};
 use crate::pty::OwnedPty;
 
+type PromptAnchorCallback = Rc<dyn Fn(&Terminal) -> (i64, i64)>;
+
 /// Everything the handler needs from the block view's shared state.
 pub(crate) struct ClickCursorCtx {
     pub(crate) enabled: bool,
@@ -37,7 +39,7 @@ pub(crate) struct ClickCursorCtx {
     /// same rebase decision used by reviewed submission and prompt status.
     /// The caller supplies its live terminal borrow so this callback never
     /// needs to retain the widget or invent an anchor after a weak lookup fails.
-    pub(crate) prompt_anchor: Rc<dyn Fn(&Terminal) -> (i64, i64)>,
+    pub(crate) prompt_anchor: PromptAnchorCallback,
     pub(crate) bstate: Rc<Cell<BlockState>>,
     pub(crate) mouse_mode: Rc<Cell<MouseReporting>>,
     pub(crate) fullscreen: Rc<Cell<bool>>,
