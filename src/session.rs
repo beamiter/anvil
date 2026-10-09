@@ -830,6 +830,19 @@ fn read_snapshot_bounded_to(path: &Path, max_bytes: u64) -> io::Result<String> {
                 ),
             ));
         }
+        // Restored paths and argv are integrity-sensitive. Tightening the
+        // parent directory does not revoke an already-open writable file
+        // descriptor held by another user, so reject mutable payloads rather
+        // than accepting or silently repairing their permissions.
+        if metadata.mode() & 0o022 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "session snapshot {} is writable by another user or group",
+                    path.display()
+                ),
+            ));
+        }
     }
     if metadata.len() > max_bytes {
         return Err(io::Error::new(
@@ -3845,6 +3858,31 @@ mod tests {
                     .map(|part| (*part).to_string())
                     .collect::<Vec<_>>()
             );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_reader_rejects_group_or_world_writable_payloads_without_chmodding() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TestDir::new("snapshot-file-modes");
+        let path = dir.path().join("tabs.state");
+        fs::write(&path, b"{}").unwrap();
+        for mode in [0o620, 0o602, 0o666] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            let error =
+                read_snapshot_bounded(&path).expect_err("mutable foreign input must be rejected");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+            assert_eq!(fs::read(&path).unwrap(), b"{}");
+        }
+        for mode in [0o600, 0o640, 0o644] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(read_snapshot_bounded(&path).unwrap(), "{}");
         }
     }
 

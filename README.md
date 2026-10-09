@@ -1068,6 +1068,15 @@ complete configured profile (kept separate from learned/restored runtime
 session state) and requires one valid exact match, so reorder remains safe but
 a same-name replacement, edit, removal, or duplicate cannot redirect the tree.
 
+Remote Files rename/move, copy, and directory-upload publication require Linux,
+Python 3, and libc/filesystem support for `renameat2(RENAME_NOREPLACE)`. The probe
+checks the destination filesystem before copying or accepting an archive and
+fails closed if the primitive is unavailable; it never falls back to plain
+`mv` or installs remote software. Browsing, creating an empty file, and
+single-file hard-link uploads do not need Python. Helper process groups are
+retired before their leader is reaped, and nonblocking pipe deadlines bound
+cancellation even when an escaped descendant retains a descriptor.
+
 Paste also works across locations. Copying or cutting on a host and pasting
 locally downloads (labeled "Paste (download)"); the reverse uploads; pasting
 between two different hosts relays through a staging file under the system

@@ -1359,23 +1359,27 @@ struct PasteSink {
 }
 
 impl PasteSink {
-    fn deliver(&self, text: &str) {
+    fn deliver(&self, text: &str) -> Result<(), String> {
         if self.armed_agent_execution.borrow().is_some()
             || self.reviewed_submission.borrow().is_some()
         {
-            log::warn!("Ignoring paste while a reviewed command submission is pending");
-            return;
+            return Err("A reviewed command submission is pending".to_string());
         }
+        preflight_clipboard_paste(text, self.bracketed_paste.get())?;
         let paste = build_clipboard_paste(text, self.bracketed_paste.get());
         if paste.is_empty() {
-            return;
+            return Ok(());
         }
         if paste.risk.had_embedded_paste_marker {
             log::warn!(
                 "Removed a bracketed-paste marker from pasted text before writing it to the shell"
             );
         }
-        self.pty.write_bytes(&paste.bytes);
+        // Queue admission is the commit point. A busy or closed PTY must not
+        // claim input was accepted or change the shadow of the shell editor.
+        self.pty
+            .try_write_bytes(&paste.bytes)
+            .map_err(|error| error.to_string())?;
         emit_human_input(&self.human_input, HumanInputKind::Clipboard);
         // Mirror what the child actually received into the editor shadow, or
         // the live input cell keeps the height of a command the shell no
@@ -1388,7 +1392,26 @@ impl PasteSink {
             &self.pty_synced,
             &self.idle_input_dirty,
         );
+        Ok(())
     }
+}
+
+/// Reject before normalization creates the body, echo and wire copies. Raw
+/// UTF-8 length plus framing is a conservative bound because normalization
+/// and control removal cannot increase the payload size.
+fn preflight_clipboard_paste(text: &str, bracketed_paste: bool) -> Result<(), String> {
+    let framing = if bracketed_paste && !text.is_empty() {
+        pty_input::PASTE_START.len() + pty_input::PASTE_END.len()
+    } else {
+        0
+    };
+    let limit = crate::pty::FD_WRITER_MAX_MESSAGE_BYTES;
+    if text.len().saturating_add(framing) > limit {
+        return Err(format!(
+            "Paste exceeds the {limit}-byte terminal input limit"
+        ));
+    }
+    Ok(())
 }
 
 /// Encode a finished command for insertion at the live prompt.
@@ -14505,11 +14528,17 @@ impl TermView {
         self.selection_feed_hold.flush_now();
         let clipboard = self.active_vte.clipboard();
         let sink = self.paste_sink();
+        let active_vte = self.active_vte.downgrade();
         clipboard.read_text_async(None::<&gtk::gio::Cancellable>, move |result| {
             let Ok(Some(text)) = result else {
                 return;
             };
-            sink.deliver(text.as_str());
+            if let Err(error) = sink.deliver(text.as_str()) {
+                log::warn!("clipboard paste refused: {error}");
+                if let Some(active_vte) = active_vte.upgrade() {
+                    show_clipboard_failure(&active_vte, &format!("{error}. Nothing was pasted."));
+                }
+            }
         });
     }
 
@@ -14519,7 +14548,10 @@ impl TermView {
     /// agent sees the dropped paths as the paste they are.
     pub(crate) fn paste_text(&self, text: &str) {
         self.selection_feed_hold.flush_now();
-        self.paste_sink().deliver(text);
+        if let Err(error) = self.paste_sink().deliver(text) {
+            log::warn!("text paste refused: {error}");
+            show_clipboard_failure(&self.active_vte, &format!("{error}. Nothing was pasted."));
+        }
     }
 
     fn paste_sink(&self) -> PasteSink {
@@ -24538,6 +24570,106 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
     /// The clipboard injection this repo was vulnerable to: the frame used to be
     /// three separate PTY writes, so the body arrived with a frame already open
     /// and reached the shell verbatim.
+    fn paste_test_sink() -> (super::PasteSink, Rc<Cell<usize>>) {
+        let observed = Rc::new(Cell::new(0));
+        let observed_cb = observed.clone();
+        let callbacks: super::HumanInputCallbacks =
+            Rc::new(RefCell::new(vec![Box::new(move |_| {
+                observed_cb.set(observed_cb.get() + 1);
+            })]));
+        (
+            super::PasteSink {
+                pty: Rc::new(crate::pty::OwnedPty::from_openpty(Some(true)).unwrap()),
+                bracketed_paste: Rc::new(Cell::new(false)),
+                bstate: Rc::new(Cell::new(BlockState::AwaitingCommand)),
+                typed_cmd: Rc::new(RefCell::new("git ".to_string())),
+                armed_agent_execution: Rc::new(RefCell::new(None)),
+                reviewed_submission: Rc::new(RefCell::new(None)),
+                pty_synced: Rc::new(Cell::new(false)),
+                idle_input_dirty: Rc::new(Cell::new(false)),
+                human_input: callbacks,
+            },
+            observed,
+        )
+    }
+
+    #[test]
+    fn refused_clipboard_paste_preserves_editor_and_human_input_state() {
+        let (sink, observed) = paste_test_sink();
+        let oversized = "x".repeat(crate::pty::FD_WRITER_MAX_MESSAGE_BYTES + 1);
+        assert!(sink.deliver(&oversized).is_err());
+        assert_eq!(&*sink.typed_cmd.borrow(), "git ");
+        assert!(!sink.pty_synced.get());
+        assert!(!sink.idle_input_dirty.get());
+        assert_eq!(observed.get(), 0);
+        assert!(sink
+            .pty
+            .drain_test_slave(Duration::from_millis(10))
+            .is_empty());
+    }
+
+    #[test]
+    fn admitted_clipboard_paste_updates_editor_once_after_queue_admission() {
+        let (sink, observed) = paste_test_sink();
+        assert!(sink.deliver("status").is_ok());
+        assert_eq!(&*sink.typed_cmd.borrow(), "git status");
+        assert!(sink.pty_synced.get());
+        assert!(sink.idle_input_dirty.get());
+        assert_eq!(observed.get(), 1);
+        assert_eq!(
+            sink.pty.drain_test_slave(Duration::from_millis(20)),
+            b"status"
+        );
+    }
+
+    #[test]
+    fn late_clipboard_completion_after_close_preserves_editor_state() {
+        let (sink, observed) = paste_test_sink();
+        sink.pty.kill();
+        assert!(sink.deliver("late clipboard").is_err());
+        assert_eq!(&*sink.typed_cmd.borrow(), "git ");
+        assert!(!sink.pty_synced.get());
+        assert!(!sink.idle_input_dirty.get());
+        assert_eq!(observed.get(), 0);
+        assert!(sink
+            .pty
+            .drain_test_slave(Duration::from_millis(10))
+            .is_empty());
+    }
+
+    #[test]
+    fn clipboard_preflight_accounts_for_exact_framing_bytes() {
+        let limit = crate::pty::FD_WRITER_MAX_MESSAGE_BYTES;
+        let exact = "x".repeat(limit);
+        assert!(super::preflight_clipboard_paste(&exact, false).is_ok());
+        assert!(super::preflight_clipboard_paste(&exact, true).is_err());
+        let framing = crate::pty_input::PASTE_START.len() + crate::pty_input::PASTE_END.len();
+        assert!(super::preflight_clipboard_paste(&exact[..limit - framing], true).is_ok());
+        assert!(super::preflight_clipboard_paste(&exact[..limit - framing + 1], true).is_err());
+        assert!(super::preflight_clipboard_paste("", true).is_ok());
+    }
+
+    #[test]
+    fn backpressured_clipboard_paste_preserves_editor_and_observers() {
+        let (sink, observed) = paste_test_sink();
+        // The slave is deliberately not drained. Once its kernel buffer fills,
+        // the writer blocks and the bounded userspace queue fills deterministically.
+        let chunk = vec![b'x'; crate::pty::FD_WRITER_MAX_MESSAGE_BYTES];
+        let mut full = false;
+        for _ in 0..8 {
+            if sink.pty.try_write_bytes(&chunk).is_err() {
+                full = true;
+                break;
+            }
+        }
+        assert!(full, "fixture must reach real PTY queue backpressure");
+        assert!(sink.deliver("status").is_err());
+        assert_eq!(&*sink.typed_cmd.borrow(), "git ");
+        assert!(!sink.pty_synced.get());
+        assert!(!sink.idle_input_dirty.get());
+        assert_eq!(observed.get(), 0);
+    }
+
     #[test]
     fn clipboard_paste_neutralizes_an_embedded_paste_terminator() {
         let paste = build_clipboard_paste("docs\x1b[201~\rrm -rf ~\r", true);

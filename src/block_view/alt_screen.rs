@@ -876,3 +876,48 @@ pub(crate) fn create_finished_terminal(
     add_url_match_regex(&terminal);
     terminal
 }
+
+#[cfg(test)]
+mod reporting_filter_tests {
+    use super::*;
+
+    #[test]
+    fn disabled_reporting_never_reaches_the_host_wheel_encoder() {
+        use jterm_core::parser::{Parser, ParserConfig, ParserEvent};
+        for stream in [
+            b"\x1b[?1000h".as_slice(),
+            b"\x1b[?1000\x00h",
+            b"\x1b[?1000\x07;1006h",
+            b"\x1b[?10\x7f00;1004h",
+            b"\x1b[?1006;1000;1004h",
+            b"\x1b[?2004;1049;1003;1006;1004h",
+        ] {
+            for enabled in [false, true] {
+                let mut parser = Parser::with_config(ParserConfig {
+                    mouse_reporting: enabled,
+                    focus_reporting: enabled,
+                });
+                let mut events = Vec::new();
+                parser.feed(stream, &mut events);
+                let mut state = MouseReporting::OFF;
+                for event in &events {
+                    if let ParserEvent::DecsetMode { mode, set } = event {
+                        state.apply_decset(*mode, *set);
+                    }
+                }
+                assert_eq!(
+                    encode_mouse_wheel(state, 1.0, 7, 9).is_some(),
+                    enabled,
+                    "stream={stream:?}"
+                );
+                if !enabled {
+                    assert!(!events
+                        .iter()
+                        .any(|event| matches!(event, ParserEvent::DecsetMode { mode: 1004, .. })));
+                    assert!(!parser.focus_events());
+                    assert_eq!(parser.mouse_mode(), MouseMode::None);
+                }
+            }
+        }
+    }
+}

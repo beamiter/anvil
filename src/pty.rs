@@ -333,7 +333,7 @@ const PTY_COALESCE_BUDGET: std::time::Duration = std::time::Duration::from_milli
 const PTY_DISPATCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(8);
 const FD_WRITER_MAX_QUEUED_BYTES: usize = 4 * 1024 * 1024;
 const FD_WRITER_MAX_MESSAGES: usize = 256;
-const FD_WRITER_MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const FD_WRITER_MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Write a complete byte slice to a blocking fd, retrying interrupted and
 /// partial writes. This must run only on a background writer thread: a full
@@ -1000,6 +1000,15 @@ impl OwnedPty {
     /// queued startup command formatted with a bare trailing CR — that never see
     /// [`pty_input::encode_paste`].
     pub(crate) fn try_write_bytes(&self, data: &[u8]) -> Result<(), FdWriterSendError> {
+        // A delayed clipboard completion can still hold an Rc<OwnedPty> after
+        // its pane closed. kill() revokes input before closing the master; the
+        // writer's duplicate descriptor must not grant that completion authority.
+        if self.reader_cancelled.load(Ordering::Acquire) {
+            return Err(FdWriterSendError {
+                len: data.len(),
+                reason: "PTY is closed",
+            });
+        }
         let modes = pty_input::PasteModes {
             // The guard does not track DECSET 2004; the reader thread below does.
             bracketed: self.shell_bracketed_paste.load(Ordering::Relaxed),
@@ -1567,6 +1576,18 @@ impl Drop for OwnedPty {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn killed_pane_rejects_late_clipboard_completion() {
+        let target = super::OwnedPty::from_openpty(Some(true)).unwrap();
+        target.kill();
+        target.kill();
+        assert!(target.try_write_bytes(b"late clipboard").is_err());
+        assert!(target
+            .drain_test_slave(std::time::Duration::from_millis(20))
+            .is_empty());
+    }
+
     use super::*;
     use std::time::{Duration, Instant};
 

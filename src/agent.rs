@@ -441,11 +441,15 @@ impl AgentSession {
 
     /// Drop the finished transcript and start fresh in the same pane binding.
     pub(crate) fn start_new_task(&mut self) -> Result<(), SessionError> {
+        // A queued New task action can arrive while a model request or an
+        // approved command is still live. Preserve its handle/correlation if
+        // the protocol refuses the transition.
+        self.inner.start_new_task()?;
         if let Some(handle) = self.in_flight.take() {
             handle.cancel();
         }
         self.awaiting_command = None;
-        self.inner.start_new_task()
+        Ok(())
     }
 
     /// Build the user-side prompt for the next LLM turn. The system prompt
@@ -1708,5 +1712,27 @@ mod tests {
     fn dangerous_commands_are_flagged_through_the_shared_blacklist() {
         assert!(is_dangerous("rm -rf /").is_some());
         assert!(is_dangerous("ls -la").is_none());
+    }
+
+    #[test]
+    fn rejected_new_task_preserves_the_running_approval() {
+        let mut session = session(10);
+        session.submit_user("inspect").unwrap();
+        let ModelOutcome::Proposal { id, .. } = session
+            .accept_model_reply(&run_reply("printf safe"))
+            .unwrap()
+        else {
+            panic!("expected proposal")
+        };
+        let _approved = session.approve(id).unwrap();
+        let pending = session.awaiting_command.clone().unwrap();
+        assert!(session.start_new_task().is_err());
+        assert_eq!(session.awaiting_command.as_ref(), Some(&pending));
+        assert_eq!(
+            session.correlate_execution(pending.execution, "printf safe"),
+            AgentExecutionMatch::Matched(id)
+        );
+        session.observe(id, 0, "safe").unwrap();
+        assert_eq!(session.state(), AgentState::AwaitingModel);
     }
 }

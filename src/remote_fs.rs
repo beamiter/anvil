@@ -1,7 +1,8 @@
 //! Local and remote filesystem access for the sidebar file tree.
 //!
 //! Remote hosts (`config::RemoteHost`) are browsed natively — no sshfs, no new
-//! dependencies. Each operation spawns the system `ssh` or `docker` binary and
+//! Rust dependencies. Atomic remote mutations require Python 3 and Linux renameat2.
+//! Each operation spawns the system `ssh` or `docker` binary and
 //! feeds it a small POSIX sh probe script on stdin (`sh -s -- <op> [args...]`),
 //! mirroring the launcher's jsh-remote.sh-over-ssh philosophy. Everything here
 //! blocks and is meant to run on worker threads behind the file tree's
@@ -11,7 +12,8 @@ use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Command, Stdio};
+type Child = HelperChild;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
@@ -39,6 +41,83 @@ pub(crate) const PROBE_SCRIPT: &str = r#"# remote-fs probe v6 — runs under `sh
 # `stat` prints "<t> <size>" (bytes for regular files, otherwise 0).
 # Exit codes: 0 ok, 2 usage/bad path, 3 cannot enter dir, 4 op failed, 17 target exists.
 set -u
+# GNU mv may emulate no-clobber on filesystems without renameat2 support.
+# Use the Linux syscall directly and probe the actual destination filesystem.
+rename_program='import ctypes
+import errno
+import os
+import sys
+import tempfile
+
+
+def fail(message, code=4):
+    print("remote-fs probe: " + message, file=sys.stderr)
+    raise SystemExit(code)
+
+
+if sys.platform != "linux":
+    fail("atomic no-replace rename requires Linux")
+try:
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = libc.renameat2
+except (AttributeError, OSError):
+    fail("atomic no-replace rename is unavailable in libc")
+renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+renameat2.restype = ctypes.c_int
+
+
+def rename(source, destination):
+    if renameat2(-100, os.fsencode(source), -100, os.fsencode(destination), 1) != 0:
+        number = ctypes.get_errno()
+        raise OSError(number, os.strerror(number))
+
+
+try:
+    if sys.argv[1] == "check":
+        # Probe the actual destination filesystem before moving user data.
+        # No installation or persistent configuration changes are needed.
+        with tempfile.TemporaryDirectory(prefix=".jterm-rename-check-", dir=sys.argv[2]) as stage:
+            source = os.path.join(stage, "source")
+            destination = os.path.join(stage, "destination")
+            os.mkdir(source)
+            rename(source, destination)
+            os.mkdir(source)
+            try:
+                rename(source, destination)
+            except OSError as error:
+                if error.errno not in (errno.EEXIST, errno.ENOTEMPTY):
+                    raise
+            else:
+                fail("filesystem did not enforce atomic no-replace rename")
+    else:
+        rename(sys.argv[2], sys.argv[3])
+except OSError as error:
+    if sys.argv[1] != "check" and error.errno in (errno.EEXIST, errno.ENOTEMPTY):
+        raise SystemExit(17)
+    fail("atomic no-replace rename unavailable or failed (errno %s: %s)" % (error.errno, error.strerror))
+'
+require_noreplace_rename() {
+  command -v python3 >/dev/null 2>&1 || {
+    echo "remote-fs probe: atomic no-replace rename requires Python 3" >&2
+    return 1
+  }
+  python3 -I -c "$rename_program" check "$1"
+}
+publish_noreplace() {
+  python3 -I -c "$rename_program" publish "$1" "$2"
+}
+make_stage() {
+  stage=
+  i=0
+  umask 077
+  while [ "$i" -lt 32 ]; do
+    candidate="$1/.anvil-fs-part-$$-$i"
+    i=$((i + 1))
+    if mkdir "$candidate" 2>/dev/null; then stage=$candidate; break; fi
+  done
+  [ -n "$stage" ] || return 1
+  trap 'rm -rf -- "$stage" 2>/dev/null' EXIT
+}
 op=${1:-}
 case "$op" in
   home)
@@ -73,7 +152,11 @@ case "$op" in
     p=${2:-}
     case "$p" in /*) ;; *) exit 2 ;; esac
     if [ -e "$p" ] || [ -L "$p" ]; then exit 17; fi
-    : > "$p" || exit 4
+    # noclobber uses exclusive creation and also refuses a raced symlink.
+    (set -C; : > "$p") 2>/dev/null || {
+      if [ -e "$p" ] || [ -L "$p" ]; then exit 17; fi
+      exit 4
+    }
     ;;
   rm)
     p=${2:-}
@@ -85,14 +168,20 @@ case "$op" in
     case "$s" in /*) ;; *) exit 2 ;; esac
     case "$n" in /*) ;; *) exit 2 ;; esac
     if [ -e "$n" ] || [ -L "$n" ]; then exit 17; fi
-    mv "$s" "$n" || exit 4
+    d=${n%/*}; d=${d:-/}
+    require_noreplace_rename "$d" || exit 4
+    publish_noreplace "$s" "$n" || exit $?
     ;;
   cp)
     s=${2:-}; n=${3:-}
     case "$s" in /*) ;; *) exit 2 ;; esac
     case "$n" in /*) ;; *) exit 2 ;; esac
     if [ -e "$n" ] || [ -L "$n" ]; then exit 17; fi
-    cp -a "$s" "$n" || exit 4
+    d=${n%/*}; d=${d:-/}
+    require_noreplace_rename "$d" || exit 4
+    make_stage "$d" || exit 4
+    cp -a -- "$s" "$stage/payload" || exit 4
+    publish_noreplace "$stage/payload" "$n" || exit $?
     ;;
   cat)
     p=${2:-}
@@ -201,7 +290,7 @@ case "$op" in
     command -v tar >/dev/null 2>&1 || { echo "remote-fs probe: tar is not installed" >&2; exit 4; }
     d=${p%/*}
     d=${d:-/}
-    tar cf - -C "$d" "${p##*/}" || exit 4
+    tar cf - -C "$d" -- "${p##*/}" || exit 4
     ;;
   untar)
     d=${2:-}; n=${3:-}; id=${4:-}; expected_size=${5:-}; expected_digest=${6:-}
@@ -220,7 +309,7 @@ case "$op" in
     fi
     [ -d "$d" ] || exit 3
     command -v tar >/dev/null 2>&1 || { echo "remote-fs probe: tar is not installed" >&2; exit 4; }
-    command -v mv >/dev/null 2>&1 || { echo "remote-fs probe: mv is not installed" >&2; exit 4; }
+    require_noreplace_rename "$d" || exit 4
     cd "$d" 2>/dev/null || exit 3
     if [ -e "$n" ] || [ -L "$n" ]; then exit 17; fi
     stage=
@@ -267,15 +356,8 @@ case "$op" in
         fi
       fi
       if [ "$count" -eq 1 ] && [ "$valid" -eq 1 ] && [ -d "$source" ] && [ ! -L "$source" ]; then
-        if mv --no-copy -nT -- "$source" "$n" 2>/dev/null; then
-          if [ -e "$source" ] || [ -L "$source" ]; then
-            if [ -e "$n" ] || [ -L "$n" ]; then code=17; fi
-          else
-            code=0
-          fi
-        elif [ -e "$n" ] || [ -L "$n" ]; then
-          code=17
-        fi
+        publish_noreplace "$source" "$n"
+        code=$?
       fi
     fi
     if [ "$code" -ne 0 ] || [ "$verified" -ne 1 ]; then rm -rf -- "$stage"; fi
@@ -1311,8 +1393,29 @@ fn copy_recursive(src: &Path, dst: &Path, depth: usize) -> io::Result<()> {
     } else if metadata.file_type().is_symlink() {
         let target = std::fs::read_link(src)?;
         std::os::unix::fs::symlink(target, dst)
+    } else if metadata.is_file() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut source = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+            .open(src)?;
+        if !source.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "copy source is not a regular file",
+            ));
+        }
+        let mut destination = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dst)?;
+        io::copy(&mut source, &mut destination)?;
+        destination.set_permissions(metadata.permissions())
     } else {
-        std::fs::copy(src, dst).map(drop)
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cannot copy a special filesystem entry",
+        ))
     }
 }
 
@@ -1715,23 +1818,207 @@ fn join_reader(reader: Option<BoundedReader>) -> io::Result<(Vec<u8>, bool)> {
     }
 }
 
+/// Keep the group leader waitable until its process group has been retired.
+/// A cached status prevents later cancellation from signalling a recycled PID.
+struct HelperChild {
+    child: jterm_core::supervised::SupervisedChild,
+    status: Option<std::process::ExitStatus>,
+    pipes: PipeDeadline,
+    stdin: Option<DeadlinePipe<std::process::ChildStdin>>,
+    stdout: Option<DeadlinePipe<std::process::ChildStdout>>,
+    stderr: Option<DeadlinePipe<std::process::ChildStderr>>,
+}
+
+impl HelperChild {
+    fn spawn(command: &mut Command) -> io::Result<Self> {
+        let mut child = jterm_core::supervised::SupervisedChild::spawn(command)?;
+        let pipes = PipeDeadline::new(TRANSFER_TIMEOUT);
+        let stdin = child
+            .take_stdin()
+            .map(|pipe| pipes.wrap(pipe))
+            .transpose()?;
+        let stdout = child
+            .take_stdout()
+            .map(|pipe| pipes.wrap(pipe))
+            .transpose()?;
+        let stderr = child
+            .take_stderr()
+            .map(|pipe| pipes.wrap(pipe))
+            .transpose()?;
+        Ok(Self {
+            child,
+            status: None,
+            pipes,
+            stdin,
+            stdout,
+            stderr,
+        })
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        if self.status.is_none() && self.child.root_has_exited()? {
+            self.finish()?;
+        }
+        Ok(self.status)
+    }
+
+    fn finish(&mut self) -> io::Result<std::process::ExitStatus> {
+        if let Some(status) = self.status {
+            return Ok(status);
+        }
+        self.pipes.retire();
+        let status = self.child.reap_after_group_kill()?;
+        self.status = Some(status);
+        Ok(status)
+    }
+
+    fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+        loop {
+            if let Some(status) = self.try_wait()? {
+                return Ok(status);
+            }
+            std::thread::sleep(WATCHDOG_POLL_INTERVAL);
+        }
+    }
+}
+
+impl Drop for HelperChild {
+    fn drop(&mut self) {
+        self.pipes.retire();
+        // SupervisedChild owns group cleanup and reaping on all error paths.
+    }
+}
+
+/// Pipe ownership is independent of child ownership: an escaped session may
+/// retain an inherited descriptor after the supervised group has been killed.
+/// Nonblocking I/O and a shared deadline bound our own workers in that case.
+#[derive(Clone)]
+struct PipeDeadline {
+    deadline: std::sync::Arc<std::sync::Mutex<std::time::Instant>>,
+    retired: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+}
+
+impl PipeDeadline {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            deadline: std::sync::Arc::new(std::sync::Mutex::new(
+                std::time::Instant::now() + timeout,
+            )),
+            retired: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    fn set_timeout(&self, timeout: Duration) {
+        *self.deadline.lock().unwrap_or_else(|e| e.into_inner()) =
+            std::time::Instant::now() + timeout;
+    }
+
+    fn retire(&self) {
+        // Leave a short drain window for bytes already in the kernel pipes.
+        *self.retired.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+    }
+
+    fn check(&self) -> io::Result<()> {
+        let retired = self.retired.lock().unwrap_or_else(|e| e.into_inner());
+        if std::time::Instant::now() >= *self.deadline.lock().unwrap_or_else(|e| e.into_inner())
+            || retired.is_some_and(|when| when.elapsed() >= Duration::from_millis(100))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "helper pipe did not close before its deadline",
+            ));
+        }
+        Ok(())
+    }
+
+    fn wrap<T: std::os::fd::AsRawFd>(&self, inner: T) -> io::Result<DeadlinePipe<T>> {
+        let fd = inner.as_raw_fd();
+        // SAFETY: fd remains owned by `inner`; only its file status changes.
+        let flags = unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFL) };
+        if flags < 0
+            || unsafe { nix::libc::fcntl(fd, nix::libc::F_SETFL, flags | nix::libc::O_NONBLOCK) }
+                < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(DeadlinePipe {
+            inner,
+            control: self.clone(),
+        })
+    }
+}
+
+struct DeadlinePipe<T> {
+    inner: T,
+    control: PipeDeadline,
+}
+
+impl<T: std::os::fd::AsRawFd> DeadlinePipe<T> {
+    fn wait_ready(&self, events: nix::libc::c_short) -> io::Result<()> {
+        self.control.check()?;
+        let mut poll = nix::libc::pollfd {
+            fd: self.inner.as_raw_fd(),
+            events,
+            revents: 0,
+        };
+        // A short bounded poll also observes retire/cancel without a wake pipe.
+        let result = unsafe { nix::libc::poll(&mut poll, 1, 10) };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+        self.control.check()
+    }
+}
+
+impl<T: Read + std::os::fd::AsRawFd> Read for DeadlinePipe<T> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            self.control.check()?;
+            match self.inner.read(buffer) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    self.wait_ready(nix::libc::POLLIN)?
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                result => return result,
+            }
+        }
+    }
+}
+
+impl<T: Write + std::os::fd::AsRawFd> Write for DeadlinePipe<T> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            self.control.check()?;
+            match self.inner.write(buffer) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    self.wait_ready(nix::libc::POLLOUT)?
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                result => return result,
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// Kill the child and (Unix) its whole process group, which it was made to
 /// lead at spawn: one signal reaps the probe and every descendant that did
 /// not setsid away — a remote `tar`, a relay pipeline — instead of orphaning
 /// them on the pipes. Returns immediately; the caller reaps.
 fn kill_tree(child: &mut Child) {
-    #[cfg(unix)]
-    {
-        if let Ok(pid) = i32::try_from(child.id()) {
-            // SAFETY: one kill on the group the child was made to lead at
-            // spawn; failure (already exited, or never a group leader) is
-            // harmless and the plain kill below still covers the child.
-            unsafe {
-                nix::libc::kill(-pid, nix::libc::SIGKILL);
-            }
-        }
-    }
-    let _ = child.kill();
+    let _ = child.finish();
 }
 
 /// Spawn `argv[0]` with piped stdio, feed it `stdin_bytes`, and capture both
@@ -1763,6 +2050,12 @@ fn run_capture_inner(
     max_out: usize,
     cancellation: Option<&crate::file_tree::ScanCancellation>,
 ) -> io::Result<Capture> {
+    if cancellation.is_some_and(crate::file_tree::ScanCancellation::is_cancelled) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "directory scan was superseded",
+        ));
+    }
     let Some((program, args)) = argv.split_first() else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1782,13 +2075,18 @@ fn run_capture_inner(
         // probe and everything it forked.
         command.process_group(0);
     }
-    let mut child = command.spawn()?;
-    // The script is smaller than any pipe buffer, so this write cannot
-    // deadlock against the child's output. A far side that exits without
-    // reading turns it into a broken pipe, which is not an error here.
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(stdin_bytes);
-    }
+    let mut child = HelperChild::spawn(&mut command)?;
+    child.pipes.set_timeout(timeout);
+    let stdin_writer = child
+        .stdin
+        .take()
+        .map(|mut pipe| {
+            let bytes = stdin_bytes.to_vec();
+            std::thread::Builder::new()
+                .name("anvil-fs-probe-stdin".into())
+                .spawn(move || pipe.write_all(&bytes))
+        })
+        .transpose()?;
     let stdout_reader = child
         .stdout
         .take()
@@ -1831,6 +2129,14 @@ fn run_capture_inner(
             None => std::thread::sleep(WATCHDOG_POLL_INTERVAL),
         }
     };
+    if let Some(writer) = stdin_writer {
+        let result = writer
+            .join()
+            .map_err(|_| io::Error::other("probe stdin writer panicked"))?;
+        if status.success() {
+            result?;
+        }
+    }
     let (stdout, stdout_truncated) = join_reader(stdout_reader)?;
     let (stderr, stderr_truncated) = join_reader(stderr_reader)?;
     if stdout_truncated || stderr_truncated {
@@ -1859,8 +2165,8 @@ fn run_capture_inner(
 /// a lock so the watchdog can kill it mid-stream.
 struct ProbeChild {
     child: Arc<Mutex<Child>>,
-    stdin: Option<ChildStdin>,
-    stdout: Option<ChildStdout>,
+    stdin: Option<DeadlinePipe<std::process::ChildStdin>>,
+    stdout: Option<DeadlinePipe<std::process::ChildStdout>>,
     stderr: Option<BoundedReader>,
 }
 
@@ -1953,7 +2259,7 @@ impl TransferControl {
         if let Ok(mut children) = self.inner.children.lock() {
             children.push(child.clone());
         }
-        if self.is_cancelled() {
+        if self.is_cancelled() || self.is_timed_out() {
             Self::kill_child(child);
         }
     }
@@ -1992,6 +2298,8 @@ impl TransferControl {
     pub(crate) fn check(&self) -> io::Result<()> {
         if self.is_cancelled() {
             Err(cancelled_error())
+        } else if self.is_timed_out() {
+            Err(transfer_timed_out_error())
         } else {
             Ok(())
         }
@@ -2006,9 +2314,26 @@ impl TransferControl {
         let handle = std::thread::Builder::new()
             .name("anvil-fs-transfer-watchdog".to_string())
             .spawn(move || {
-                if rx.recv_timeout(timeout).is_err() {
-                    control.inner.timed_out.store(true, Ordering::SeqCst);
-                    control.kill_all();
+                let started = std::time::Instant::now();
+                loop {
+                    match rx.recv_timeout(WATCHDOG_POLL_INTERVAL) {
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    if started.elapsed() >= timeout {
+                        control.inner.timed_out.store(true, Ordering::SeqCst);
+                        control.kill_all();
+                        break;
+                    }
+                    if let Ok(children) = control.inner.children.lock() {
+                        for child in children.iter() {
+                            if let Ok(mut child) = child.lock() {
+                                if child.try_wait().is_err() {
+                                    kill_tree(&mut child);
+                                }
+                            }
+                        }
+                    }
                 }
             })?;
         Ok(TransferTimeoutGuard {
@@ -2079,11 +2404,15 @@ fn spawn_probe_argv(argv: &[OsString], mode: ScriptDelivery) -> io::Result<Probe
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let mut child = command.spawn()?;
+    let mut child = HelperChild::spawn(&mut command)?;
     let mut stdin = child.stdin.take();
     if mode == ScriptDelivery::Stdin {
         if let Some(mut pipe) = stdin.take() {
-            let _ = pipe.write_all(PROBE_SCRIPT.as_bytes());
+            std::thread::Builder::new()
+                .name("anvil-fs-script-stdin".into())
+                .spawn(move || {
+                    let _ = pipe.write_all(PROBE_SCRIPT.as_bytes());
+                })?;
         }
     }
     let stdout = child.stdout.take();
@@ -3655,6 +3984,9 @@ fn download_file_with(
     let _timeout = control.arm_timeout(TRANSFER_TIMEOUT)?;
     let streamed = stream_to(&mut stdout, &mut file, max, control, progress);
     drop(stdout);
+    if streamed.is_err() {
+        TransferControl::kill_child(&probe_handle);
+    }
     let status = probe_cleanup.wait();
     // Transfer stderr is bounded error detail only; truncation is expected
     // and silently capped here, unlike the probe captures above.
@@ -3797,6 +4129,9 @@ fn upload_file_with_integrity(
     let streamed = stream_to(snapshot, stdin, max, control, progress);
     // stream_to owns and drops stdin here, so the far side sees the payload
     // EOF before it finishes `put`.
+    if streamed.is_err() {
+        TransferControl::kill_child(&probe_handle);
+    }
     let status = probe_cleanup.wait()?;
     let (stderr, _) = join_reader(probe.stderr)?;
     let _ = join_reader(stdout_drain);
@@ -3915,7 +4250,7 @@ fn upload_dir_with_integrity(
             });
         }
     }
-    let tar = Arc::new(Mutex::new(tar_command.spawn()?));
+    let tar = Arc::new(Mutex::new(HelperChild::spawn(&mut tar_command)?));
     let mut tar_cleanup = ChildCleanupGuard::new(&tar);
     let (tar_stdout, tar_stderr) = {
         let mut child = tar
@@ -3996,6 +4331,9 @@ fn upload_dir_with_integrity(
         .stdout
         .map(|pipe| spawn_bounded_reader(pipe, MAX_TRANSFER_STDERR_BYTES));
     let streamed = stream_to(&mut archive, stdin, max, control, progress);
+    if streamed.is_err() {
+        TransferControl::kill_child(&probe_handle);
+    }
     let status = probe_cleanup.wait()?;
     let (stderr, _) = join_reader(probe.stderr)?;
     let _ = join_reader(stdout_drain);
@@ -4063,7 +4401,7 @@ fn download_dir_with(
             });
         }
     }
-    let tar = Arc::new(Mutex::new(tar_command.spawn()?));
+    let tar = Arc::new(Mutex::new(HelperChild::spawn(&mut tar_command)?));
     let mut tar_cleanup = ChildCleanupGuard::new(&tar);
     let (tar_stdin, tar_stderr) = {
         let mut child = tar
@@ -4090,6 +4428,9 @@ fn download_dir_with(
     }
     let tar_status = tar_cleanup.wait();
     let tar_stderr = join_reader(tar_stderr);
+    if streamed.is_err() {
+        TransferControl::kill_child(&probe_handle);
+    }
     let status = probe_cleanup.wait();
     let stderr = join_reader(probe.stderr);
     if control.is_timed_out() {
@@ -5128,13 +5469,20 @@ mod tests {
         use std::os::unix::process::CommandExt;
         let mut command = Command::new("sh");
         command
-            .args(["-c", "sleep 30 & wait"])
+            .args(["-c", "echo $$; sleep 30 & wait"])
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null());
         command.process_group(0);
-        let mut child = command.spawn().unwrap();
-        let pgid = child.id() as i32;
+        let mut child = HelperChild::spawn(&mut command).unwrap();
+        let mut pid = String::new();
+        {
+            use std::io::BufRead;
+            io::BufReader::new(child.stdout.take().unwrap())
+                .read_line(&mut pid)
+                .unwrap();
+        }
+        let pgid = pid.trim().parse::<i32>().unwrap();
         // Give the background sleep time to exec before the kill lands.
         std::thread::sleep(Duration::from_millis(200));
         kill_tree(&mut child);
@@ -6991,13 +7339,14 @@ mod tests {
         let started = std::time::Instant::now();
         let error = download_file_with(
             || {
-                let mut child = Command::new("sh")
+                let mut command = Command::new("sh");
+                command
                     .args(["-c", "printf payload; sleep 1"])
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::null())
-                    .process_group(0)
-                    .spawn()?;
+                    .process_group(0);
+                let mut child = HelperChild::spawn(&mut command)?;
                 let stdout = child.stdout.take();
                 Ok(ProbeChild {
                     child: Arc::new(Mutex::new(child)),
@@ -7691,14 +8040,14 @@ mod tests {
         use std::os::unix::process::CommandExt;
 
         let local = TestDir::new("dir-rejected-producer");
-        let child = Command::new("sleep")
+        let mut command = Command::new("sleep");
+        command
             .arg("30")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .process_group(0)
-            .spawn()
-            .unwrap();
+            .process_group(0);
+        let child = HelperChild::spawn(&mut command).unwrap();
         let child = Arc::new(Mutex::new(child));
         let observed = child.clone();
 
@@ -8083,13 +8432,13 @@ mod tests {
     #[test]
     fn cancel_kills_registered_children_and_flags_interrupted() {
         let control = TransferControl::new();
-        let child = Command::new("sleep")
+        let mut command = Command::new("sleep");
+        command
             .arg("30")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::null());
+        let child = HelperChild::spawn(&mut command).unwrap();
         let child = Arc::new(Mutex::new(child));
         control.register(&child);
         assert!(!control.is_cancelled());
@@ -8829,5 +9178,343 @@ mod tests {
         let error =
             remote_host(&FsLocation::Remote(crate::config::MAX_REMOTE_HOSTS), &hosts).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+}
+
+#[cfg(test)]
+mod transport_regressions {
+    use super::*;
+    struct Temp(PathBuf);
+    impl Temp {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "gtk-fs-audit-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn code(capture: &Capture) -> i32 {
+        capture.code.unwrap_or(-1)
+    }
+    fn capture(args: &[&str], input: &[u8], timeout: Duration) -> io::Result<Capture> {
+        run_capture(
+            &args.iter().map(|s| (*s).into()).collect::<Vec<_>>(),
+            input,
+            timeout,
+            2 * 1024 * 1024,
+        )
+    }
+    fn probe(script: &str, args: &[&str], input: &[u8]) -> Capture {
+        let mut argv = vec!["sh", "-c", script, "probe"];
+        argv.extend(args);
+        capture(&argv, input, Duration::from_secs(5)).unwrap()
+    }
+    fn race_after_check(op: &str, race: &str) -> String {
+        let marker = format!("  {op})\n");
+        let start = PROBE_SCRIPT.find(&marker).unwrap();
+        let tail = &PROBE_SCRIPT[start..];
+        let check = if tail.starts_with("  mkfile)") {
+            if tail.contains("    [ -e \"$p\" ] && exit 17") {
+                "    [ -e \"$p\" ] && exit 17"
+            } else {
+                "    if [ -e \"$p\" ] || [ -L \"$p\" ]; then exit 17; fi"
+            }
+        } else if tail.contains("    [ -e \"$n\" ] && exit 17") {
+            "    [ -e \"$n\" ] && exit 17"
+        } else {
+            "    if [ -e \"$n\" ] || [ -L \"$n\" ]; then exit 17; fi"
+        };
+        let offset = start + tail.find(check).unwrap() + check.len();
+        format!(
+            "{}\n    {}{}",
+            &PROBE_SCRIPT[..offset],
+            race,
+            &PROBE_SCRIPT[offset..]
+        )
+    }
+    #[test]
+    fn local_copy_refuses_existing_regular_file_and_dangling_link() {
+        let root = Temp::new();
+        let src = root.0.join("source");
+        let dst = root.0.join("target");
+        std::fs::write(&src, b"source").unwrap();
+        std::fs::write(&dst, b"keep").unwrap();
+        assert_eq!(
+            copy_recursive(&src, &dst, 0).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(&dst).unwrap(), b"keep");
+        std::fs::remove_file(&dst).unwrap();
+        let missing = root.0.join("missing");
+        std::os::unix::fs::symlink(&missing, &dst).unwrap();
+        assert_eq!(
+            copy_recursive(&src, &dst, 0).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert!(!missing.exists());
+    }
+    #[test]
+    fn remote_mkfile_refuses_a_creator_after_its_precheck() {
+        let root = Temp::new();
+        let target = root.0.join("target");
+        let script = race_after_check("mkfile", "printf keep > \"$p\"");
+        let result = probe(&script, &["mkfile", target.to_str().unwrap()], b"");
+        assert_eq!(code(&result), 17);
+        assert_eq!(std::fs::read(target).unwrap(), b"keep");
+    }
+    #[test]
+    fn remote_move_and_copy_refuse_raced_destinations() {
+        let root = Temp::new();
+        let source = root.0.join("source");
+        let target = root.0.join("target");
+        std::fs::write(&source, b"source").unwrap();
+        for op in ["mv", "cp"] {
+            let script = race_after_check(op, "printf keep > \"$n\"");
+            let result = probe(
+                &script,
+                &[op, source.to_str().unwrap(), target.to_str().unwrap()],
+                b"",
+            );
+            assert_eq!(code(&result), 17, "operation {op}");
+            assert_eq!(std::fs::read(&source).unwrap(), b"source");
+            assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+            std::fs::remove_file(&target).unwrap();
+        }
+    }
+    #[test]
+    fn capture_retires_inherited_pipes_when_the_leader_exits() {
+        let started = std::time::Instant::now();
+        let result = capture(
+            &["sh", "-c", "sleep 2 & printf complete"],
+            b"",
+            Duration::from_secs(4),
+        )
+        .unwrap();
+        assert_eq!(code(&result), 0);
+        assert_eq!(result.stdout, b"complete");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "capture waited for an orphaned group member"
+        );
+    }
+    #[test]
+    fn capture_bounds_escaped_pipe_holders_after_leader_exit() {
+        let started = std::time::Instant::now();
+        let result = capture(
+            &[
+                "sh",
+                "-c",
+                "setsid sh -c 'sleep 2' <&0 & sleep 0.05; exit 0",
+            ],
+            b"",
+            Duration::from_secs(4),
+        );
+        assert!(
+            result.is_err(),
+            "an incomplete inherited pipe must not be accepted"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+    #[test]
+    fn capture_stdin_delivery_obeys_timeout_with_a_nonreading_child() {
+        let started = std::time::Instant::now();
+        let error = capture(
+            &["sh", "-c", "sleep 2"],
+            &vec![b'x'; 1024 * 1024],
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+    #[test]
+    fn streaming_download_and_upload_bound_escaped_pipe_holders() {
+        let root = Temp::new();
+        let src = root.0.join("source");
+        let dst = root.0.join("target");
+        std::fs::write(&src, vec![b'x'; 1024 * 1024]).unwrap();
+        let argv = vec![
+            OsString::from("sh"),
+            OsString::from("-c"),
+            OsString::from("setsid sh -c 'sleep 2' <&0 & sleep 0.05; exit 0"),
+        ];
+        let started = std::time::Instant::now();
+        assert!(download_file_with(
+            || spawn_probe_argv(&argv, ScriptDelivery::Argv),
+            OsStr::new("target"),
+            &root.0,
+            2 * 1024 * 1024,
+            &TransferControl::new(),
+            &|_| {}
+        )
+        .is_err());
+        assert!(!dst.exists());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let started = std::time::Instant::now();
+        assert!(upload_file_with(
+            || spawn_probe_argv(&argv, ScriptDelivery::Argv),
+            &src,
+            2 * 1024 * 1024,
+            &TransferControl::new(),
+            &|_| {}
+        )
+        .is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+    #[test]
+    fn cancelled_streaming_download_does_not_wait_for_an_escaped_holder() {
+        let root = Temp::new();
+        let target = root.0.join("target");
+        let control = TransferControl::new();
+        let token = control.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            token.cancel();
+        });
+        let argv = vec![
+            OsString::from("sh"),
+            OsString::from("-c"),
+            OsString::from("setsid sh -c 'sleep 2' & sleep 2"),
+        ];
+        let started = std::time::Instant::now();
+        let error = download_file_with(
+            || spawn_probe_argv(&argv, ScriptDelivery::Argv),
+            OsStr::new("target"),
+            &root.0,
+            1024,
+            &control,
+            &|_| {},
+        )
+        .unwrap_err();
+        canceller.join().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(!target.exists());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+    fn atomic_program() -> &'static str {
+        PROBE_SCRIPT
+            .split_once("rename_program='")
+            .unwrap()
+            .1
+            .split_once("'\nrequire_noreplace_rename")
+            .unwrap()
+            .0
+    }
+    #[test]
+    fn remote_atomic_rename_fails_closed_without_python() {
+        let root = Temp::new();
+        let src = root.0.join("source");
+        let dst = root.0.join("target");
+        std::fs::write(&src, b"source").unwrap();
+        let path = format!("PATH={}", root.0.display());
+        let result = capture(
+            &[
+                "/usr/bin/env",
+                &path,
+                "/bin/sh",
+                "-c",
+                PROBE_SCRIPT,
+                "probe",
+                "mv",
+                src.to_str().unwrap(),
+                dst.to_str().unwrap(),
+            ],
+            b"",
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(code(&result), 4);
+        assert!(String::from_utf8_lossy(&result.stderr).contains("requires Python 3"));
+        assert_eq!(std::fs::read(src).unwrap(), b"source");
+        assert!(!dst.exists());
+    }
+    #[test]
+    fn remote_atomic_rename_preserves_files_when_syscall_is_unsupported() {
+        let root = Temp::new();
+        let src = root.0.join("source");
+        let dst = root.0.join("target");
+        std::fs::write(&src, b"source").unwrap();
+        std::fs::write(&dst, b"keep").unwrap();
+        let path = format!("PYTHONPATH={}", root.0.display());
+        for errno in [
+            nix::libc::ENOSYS,
+            nix::libc::EINVAL,
+            nix::libc::EOPNOTSUPP,
+            nix::libc::EXDEV,
+        ] {
+            std::fs::write(root.0.join("ctypes.py"),format!("c_int = c_char_p = c_uint = int\nclass Function:\n def __call__(self, *args): return -1\nclass CDLL:\n renameat2 = Function()\n def __init__(self, *args, **kwargs): assert kwargs.get('use_errno') is True\ndef get_errno(): return {errno}\n")).unwrap();
+            let result = capture(
+                &[
+                    "/usr/bin/env",
+                    &path,
+                    "python3",
+                    "-B",
+                    "-c",
+                    atomic_program(),
+                    "publish",
+                    src.to_str().unwrap(),
+                    dst.to_str().unwrap(),
+                ],
+                b"",
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            assert_eq!(code(&result), 4);
+            assert_eq!(std::fs::read(&src).unwrap(), b"source");
+            assert_eq!(std::fs::read(&dst).unwrap(), b"keep");
+        }
+    }
+    #[test]
+    fn remote_atomic_rename_ignores_untrusted_python_import_paths() {
+        let root = Temp::new();
+        let src = root.0.join("source");
+        let dst = root.0.join("target");
+        let marker = root.0.join("executed");
+        std::fs::write(&src, b"source").unwrap();
+        std::fs::write(
+            root.0.join("ctypes.py"),
+            format!("open({:?}, 'w').write('bad')\n", marker.to_str().unwrap()),
+        )
+        .unwrap();
+        let path = format!("PYTHONPATH={}", root.0.display());
+        let result = capture(
+            &[
+                "/usr/bin/env",
+                &path,
+                "sh",
+                "-c",
+                PROBE_SCRIPT,
+                "probe",
+                "mv",
+                src.to_str().unwrap(),
+                dst.to_str().unwrap(),
+            ],
+            b"",
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(code(&result), 0);
+        assert_eq!(std::fs::read(dst).unwrap(), b"source");
+        assert!(!marker.exists());
+    }
+    #[test]
+    fn remote_tar_treats_option_like_basename_as_a_name() {
+        let root = Temp::new();
+        let source = root.0.join("--help");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("kept"), b"data").unwrap();
+        let result = probe(PROBE_SCRIPT, &["tar", source.to_str().unwrap()], b"");
+        assert_eq!(code(&result), 0);
+        assert!(result.stdout.len() > 512);
+        assert_eq!(&result.stdout[257..262], b"ustar");
     }
 }

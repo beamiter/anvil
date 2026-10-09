@@ -105,6 +105,7 @@ jobs:
           scripts/install.sh --help >/dev/null
           scripts/uninstall.sh --help >/dev/null
           bash scripts/test-install-paths.sh
+          bash scripts/test-release-install.sh
           install_plan="$(scripts/install.sh --backend cargo --no-config --no-desktop --dry-run)"
           grep -F "Installed anvil to ${HOME}/.local/bin/anvil" <<<"${install_plan}"
 
