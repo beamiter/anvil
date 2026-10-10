@@ -41,7 +41,7 @@ const INCLUDE_RECENT_WITHHELD_TOOLTIP: &str = concat!(
 );
 // The outer session JSON escapes this JSON string again. Keeping the inner
 // value at 1 MiB leaves ample room below session.rs's 4 MiB hard limit.
-const SESSION_SNAPSHOT_AI_BUDGET: usize = 1024 * 1024;
+const SESSION_SNAPSHOT_AI_BUDGET: usize = ai::SESSION_SNAPSHOT_AI_BUDGET;
 /// A few pixels of tolerance so a viewport that rounds short of `upper` still
 /// counts as "at the bottom".
 const STREAM_FOLLOW_SLACK_PX: f64 = 32.0;

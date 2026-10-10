@@ -29,6 +29,73 @@ pub(crate) use jterm_core::ai::{
     ConversationSnapshot, Role, Turn, MAX_PERSISTED_CHATS,
 };
 
+// Session JSON escapes the chat JSON again; leave room within its 4 MiB cap.
+pub(crate) const SESSION_SNAPSHOT_AI_BUDGET: usize = 1024 * 1024;
+
+/// Apply current persistence policy to an asynchronously cached chat snapshot.
+/// Project only the returned copy: disabling redaction cannot reconstruct text
+/// already removed from a saved snapshot, nor does this mutate the live chats.
+pub(crate) fn project_conversation_for_session(
+    encoded: Option<&str>,
+    redact: bool,
+) -> Result<Option<String>, &'static str> {
+    project_conversation_with_budget(encoded, redact, SESSION_SNAPSHOT_AI_BUDGET)
+}
+
+fn project_conversation_with_budget(
+    encoded: Option<&str>,
+    redact: bool,
+    max_bytes: usize,
+) -> Result<Option<String>, &'static str> {
+    let Some(encoded) = encoded else {
+        return Ok(None);
+    };
+    if !redact {
+        return Ok(Some(encoded.to_owned()));
+    }
+    let snapshot = ConversationSnapshot::from_json(encoded)
+        .map_err(|_| "invalid cached AI conversation")?;
+    let (active_id, chats) = snapshot.into_parts();
+    let chats = chats
+        .into_iter()
+        .map(|chat| {
+            let (id, title, archived, mut turns, mut context, draft, truncated) = chat.into_parts();
+            let redact = jterm_core::redact::redact_secrets;
+            for turn in &mut turns {
+                turn.text = redact(&turn.text);
+            }
+            if let Some(context) = context.as_mut() {
+                context.cmd = redact(&context.cmd);
+                context.output = redact(&context.output);
+                context.cwd = context.cwd.as_deref().map(redact);
+            }
+            jterm_core::ai::ChatSnapshot::from_completed_history(
+                id,
+                &redact(&title),
+                archived,
+                &turns,
+                context.as_ref(),
+                &redact(&draft),
+            )
+            .with_history_truncated(truncated)
+        })
+        .collect();
+    let mut snapshot = ConversationSnapshot::from_chats(active_id, chats)
+        .ok_or("redacted AI conversation could not be represented")?;
+    snapshot
+        .compact_to_measured_limit(max_bytes, |candidate| {
+            candidate.to_json().ok().map(|json| json.len())
+        })
+        .ok_or("redacted AI conversation exceeds the session budget")?;
+    let encoded = snapshot
+        .to_json()
+        .map_err(|_| "redacted AI conversation could not be encoded")?;
+    if encoded.len() > max_bytes {
+        return Err("redacted AI conversation exceeds the session budget");
+    }
+    Ok(Some(encoded))
+}
+
 fn settings(config: &crate::config::Config) -> AiSettings {
     AiSettings {
         enabled: config.ai_enabled,
@@ -358,6 +425,101 @@ pub(crate) fn build_block_chat_prompt(question: &str, context: &BlockContext) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn synthetic_conversation() -> String {
+        // Public documentation's sample AWS identifier, not an actual key.
+        let example = "AKIAIOSFODNN7EXAMPLE";
+        let turns = vec![
+            Turn {
+                role: Role::User,
+                text: example.into(),
+            },
+            Turn {
+                role: Role::Assistant,
+                text: "synthetic reply".into(),
+            },
+        ];
+        let context = BlockContext {
+            cmd: format!("echo {example}"),
+            output: example.into(),
+            cwd: Some(format!("/synthetic/{example}")),
+            exit_code: 7,
+            truncated: true,
+        };
+        let chat = jterm_core::ai::ChatSnapshot::from_completed_history(
+            9,
+            example,
+            true,
+            &turns,
+            Some(&context),
+            example,
+        )
+        .with_history_truncated(true);
+        ConversationSnapshot::from_chats(9, vec![chat])
+            .unwrap()
+            .to_json()
+            .unwrap()
+    }
+
+    #[test]
+    fn session_projection_redacts_queued_old_text_and_preserves_metadata() {
+        let raw = synthetic_conversation();
+        let projected = project_conversation_for_session(Some(&raw), true)
+            .unwrap()
+            .unwrap();
+        assert!(!projected.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(raw.contains("AKIAIOSFODNN7EXAMPLE"));
+        let snapshot = ConversationSnapshot::from_json(&projected).unwrap();
+        assert_eq!(snapshot.active_chat_id(), 9);
+        let chat = &snapshot.chats()[0];
+        assert_eq!(chat.id(), 9);
+        assert!(chat.archived());
+        assert!(chat.history_truncated());
+        assert_eq!(chat.turns().len(), 2);
+        assert_eq!(chat.turns()[0].role, Role::User);
+        assert_eq!(chat.turns()[1].role, Role::Assistant);
+        let context = chat.block_context().unwrap();
+        assert_eq!(context.exit_code, 7);
+        assert!(context.truncated);
+    }
+
+    #[test]
+    fn session_projection_is_repeatable_and_disabled_policy_preserves_cached_text() {
+        let raw = synthetic_conversation();
+        let once = project_conversation_for_session(Some(&raw), true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            project_conversation_for_session(Some(&once), true).unwrap(),
+            Some(once.clone())
+        );
+        assert_eq!(
+            project_conversation_for_session(Some(&raw), false).unwrap(),
+            Some(raw)
+        );
+        assert_eq!(
+            project_conversation_for_session(Some(&once), false).unwrap(),
+            Some(once)
+        );
+        assert_eq!(project_conversation_for_session(None, true), Ok(None));
+    }
+
+    #[test]
+    fn session_projection_fails_closed_and_bounds_expanded_redaction() {
+        assert!(project_conversation_for_session(Some("invalid synthetic JSON"), true).is_err());
+        let raw = synthetic_conversation();
+        let full = project_conversation_for_session(Some(&raw), true)
+            .unwrap()
+            .unwrap();
+        assert!(full.len() > raw.len());
+        let bounded = project_conversation_with_budget(Some(&raw), true, raw.len())
+            .unwrap()
+            .unwrap();
+        assert!(bounded.len() <= raw.len());
+        assert!(ConversationSnapshot::from_json(&bounded).is_ok());
+        assert!(project_conversation_with_budget(Some(&raw), true, 1).is_err());
+    }
+
 
     #[test]
     fn config_mapping_respects_disabled_flag() {

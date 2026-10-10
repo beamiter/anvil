@@ -1208,7 +1208,16 @@ impl AppModel {
                 )
             })
             .collect();
-        session::SavedSession::captured(active, tabs, self.ai_conversation.clone())
+        let redact = self.config.borrow().ai_redact_secrets;
+        let ai_conversation =
+            match ai::project_conversation_for_session(self.ai_conversation.as_deref(), redact) {
+                Ok(projected) => projected,
+                Err(reason) => {
+                    log::warn!("AI conversation omitted from session snapshot: {reason}");
+                    None
+                }
+            };
+        session::SavedSession::captured(active, tabs, ai_conversation)
     }
 
     pub(crate) fn persist_session(&self) {
