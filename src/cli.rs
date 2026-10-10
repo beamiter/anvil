@@ -427,7 +427,10 @@ mod tests {
     #[test]
     fn equals_values_preserve_repeated_option_prefixes_in_paths() {
         let parsed = parse_strs(&["--config=--config=custom.toml"]).unwrap();
-        assert_eq!(parsed.config_path, Some(PathBuf::from("--config=custom.toml")));
+        assert_eq!(
+            parsed.config_path,
+            Some(PathBuf::from("--config=custom.toml"))
+        );
 
         assert_eq!(
             parse_command(&["--check-config=--check-config=custom.toml"]).unwrap(),
