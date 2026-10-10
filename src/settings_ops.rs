@@ -140,7 +140,7 @@ impl AppModel {
         self.sync_organism_focus();
         self.persist_config();
         self.show_toast(if enabled {
-            "ASCII organism enabled in open local Block panes."
+            "ASCII organism enabled in open local Block and Unified panes."
         } else {
             "ASCII organism hidden in all open panes."
         });

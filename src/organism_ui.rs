@@ -58,6 +58,10 @@ const TONE_CLASSES: [&str; 5] = [
     "organism-warning",
 ];
 
+fn follows_desktop_motion(enabled: bool, motion: Option<OrganismMotion>) -> bool {
+    enabled && motion.is_none()
+}
+
 fn pointer_buttons_down(view: &TermView) -> bool {
     let buttons = gtk::gdk::ModifierType::BUTTON1_MASK
         | gtk::gdk::ModifierType::BUTTON2_MASK
@@ -3182,6 +3186,7 @@ fn percent(value: f32) -> u8 {
 /// application state machine.
 pub(crate) struct OrganismHub {
     config: Rc<RefCell<crate::config::Config>>,
+    desktop_motion_observer: RefCell<Option<(gtk::Settings, gtk::glib::SignalHandlerId)>>,
     organism_memory: Rc<RefCell<Option<jterm_core::organism_memory::OrganismMemory>>>,
     organism_life: Rc<Cell<LifeState>>,
     organism_correction: Rc<OrganismCorrectionSignal>,
@@ -3220,15 +3225,36 @@ impl OrganismHub {
             .map(jterm_core::organism_memory::OrganismMemory::growth_progress)
             .unwrap_or_default();
 
-        Rc::new(Self {
+        let hub = Rc::new(Self {
             config,
+            desktop_motion_observer: RefCell::new(None),
             organism_memory: Rc::new(RefCell::new(organism_memory)),
             organism_correction: OrganismCorrectionSignal::new(organism_life.clone()),
             organism_activity: OrganismActivity::new(circadian, growth),
             organism_presence: OrganismPresence::new(),
             organism_agent: OrganismAgentSignal::new(organism_life.clone()),
             organism_life,
-        })
+        });
+        if let Some(desktop) = gtk::Settings::default() {
+            let weak = Rc::downgrade(&hub);
+            let handler = desktop.connect_gtk_enable_animations_notify(move |_| {
+                let Some(hub) = weak.upgrade() else {
+                    return;
+                };
+                let follows_desktop = {
+                    let config = hub.config.borrow();
+                    follows_desktop_motion(
+                        config.ascii_organism_enabled,
+                        config.ascii_organism_motion,
+                    )
+                };
+                if follows_desktop {
+                    hub.sync_ascii_organism_settings();
+                }
+            });
+            *hub.desktop_motion_observer.borrow_mut() = Some((desktop, handler));
+        }
+        hub
     }
 
     pub(crate) fn correction_signal(&self) -> Rc<OrganismCorrectionSignal> {
@@ -3998,9 +4024,31 @@ impl OrganismHub {
     }
 }
 
+impl Drop for OrganismHub {
+    fn drop(&mut self) {
+        if let Some((desktop, handler)) = self.desktop_motion_observer.borrow_mut().take() {
+            desktop.disconnect(handler);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_motion_changes_only_sync_enabled_automatic_companions() {
+        assert!(follows_desktop_motion(true, None));
+        assert!(!follows_desktop_motion(false, None));
+        for motion in [
+            OrganismMotion::Full,
+            OrganismMotion::Calm,
+            OrganismMotion::Static,
+        ] {
+            assert!(!follows_desktop_motion(true, Some(motion)));
+            assert!(!follows_desktop_motion(false, Some(motion)));
+        }
+    }
 
     /// Send a real X11 pointer motion through gtk's event dispatch, rather
     /// than calling the observer closure or emitting its signal directly.

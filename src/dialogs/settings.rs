@@ -1018,8 +1018,8 @@ impl Component for SettingsModel {
                     #[name(ascii_organism_row)]
                     adw::SwitchRow {
                         set_title: "ASCII Organism",
-                        set_subtitle: "Local, no-LLM companion; changes apply to open panes",
-                        set_tooltip_text: Some("Pause near a resting companion for a hello; clicks and selection stay with your terminal."),
+                        set_subtitle: "Local, no-LLM companion for Block/Unified panes",
+                        set_tooltip_text: Some("Changes apply to open panes. Pause near a resting companion for a hello; clicks and selection stay with your terminal."),
                         set_active: model.values.ascii_organism_enabled,
                         set_sensitive: !model.values.safe_mode,
                         connect_active_notify[sender] => move |row| {
