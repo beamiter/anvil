@@ -2222,9 +2222,10 @@ fn resolve_file_config(fc: FileConfig) -> (Config, Vec<Theme>, KeybindingMap) {
         // Unlike the other ANVIL_* overrides, the key-path override is applied
         // at client construction (`jterm_core::ai::resolve_api_key_file`), so
         // the environment-managed path can never be persisted back to TOML.
-        ai_api_key_file: fc
-            .ai_api_key_file
-            .filter(|value| configured_path_is_safe(value, true)),
+        // Keep a selected path intact so core validation can report its error.
+        // Dropping malformed nonempty paths would retarget Settings Store to
+        // the default credential file instead of rejecting the selected path.
+        ai_api_key_file: fc.ai_api_key_file.filter(|value| !value.is_empty()),
         notify_long_blocks: fc.notify_long_blocks.unwrap_or(true),
         notify_long_block_threshold_ms: fc.notify_long_block_threshold_ms.unwrap_or(10_000),
         bottom_bar: fc
@@ -2342,6 +2343,38 @@ pub(crate) fn choose_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_file_selection_preserves_nonempty_paths_for_core_validation() {
+        for raw in [
+            "relative.key".to_string(),
+            " ".to_string(),
+            " /tmp/key ".to_string(),
+            "/tmp/key\n".to_string(),
+            "/tmp/key\u{202e}txt".to_string(),
+            "~//tmp/key".to_string(),
+            format!("/{}", "x".repeat(MAX_CONFIG_PATH_BYTES)),
+            "/run/secrets/provider.key".to_string(),
+            "~/.config/anvil/ai.key".to_string(),
+        ] {
+            let mut table = toml::Table::new();
+            table.insert("ai_api_key_file".into(), toml::Value::String(raw.clone()));
+            let (config, _, _) = load_config_from_table(Some(&table));
+            assert_eq!(config.ai_api_key_file.as_deref(), Some(raw.as_str()));
+        }
+    }
+
+    #[test]
+    fn credential_file_selection_clears_only_exact_empty_or_absent_values() {
+        for value in [None, Some("")] {
+            let mut table = toml::Table::new();
+            if let Some(value) = value {
+                table.insert("ai_api_key_file".into(), toml::Value::String(value.into()));
+            }
+            let (config, _, _) = load_config_from_table(Some(&table));
+            assert_eq!(config.ai_api_key_file, None);
+        }
+    }
 
     #[test]
     fn integer_presentation_numbers_match_the_validator_contract() {
