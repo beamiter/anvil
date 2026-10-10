@@ -791,7 +791,7 @@ fn open_existing_lock_file(path: &Path) -> io::Result<File> {
 /// enforce the complete persisted-file contract locally until the next core
 /// release is available to pin: bounded, regular, singly linked, current-user,
 /// nonblocking, and close-on-exec.
-fn read_snapshot_bounded_to(path: &Path, max_bytes: u64) -> io::Result<String> {
+fn read_snapshot_bytes_bounded_to(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -867,12 +867,20 @@ fn read_snapshot_bounded_to(path: &Path, max_bytes: u64) -> io::Result<String> {
             ),
         ));
     }
+    Ok(bytes)
+}
+
+fn snapshot_text(path: &Path, bytes: Vec<u8>) -> io::Result<String> {
     String::from_utf8(bytes).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("session snapshot {} is not valid UTF-8", path.display()),
         )
     })
+}
+
+fn read_snapshot_bounded_to(path: &Path, max_bytes: u64) -> io::Result<String> {
+    snapshot_text(path, read_snapshot_bytes_bounded_to(path, max_bytes)?)
 }
 
 #[cfg(test)]
@@ -2708,7 +2716,7 @@ fn scan_candidates(
         dir,
         current_token,
         lock_state,
-        &mut read_snapshot_bounded_to,
+        &mut read_snapshot_bytes_bounded_to,
     )
 }
 
@@ -2716,7 +2724,7 @@ fn scan_candidates_with_reader(
     dir: &Path,
     current_token: Option<&str>,
     lock_state: &dyn Fn(&str) -> TokenLockState,
-    read_snapshot: &mut dyn FnMut(&Path, u64) -> io::Result<String>,
+    read_snapshot: &mut dyn FnMut(&Path, u64) -> io::Result<Vec<u8>>,
 ) -> Vec<SessionCandidate> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -2814,6 +2822,18 @@ fn scan_candidates_with_reader(
             break;
         }
         remaining_bytes -= payload_bytes;
+        // Invalid UTF-8 still cost disk I/O and allocation. Charge its bytes
+        // before decoding, just as malformed JSON is charged before parsing.
+        let contents = match snapshot_text(&descriptor.path, contents) {
+            Ok(contents) => contents,
+            Err(err) => {
+                log::error!(
+                    "Invalid session snapshot {}: {err}; file retained",
+                    descriptor.path.display()
+                );
+                continue;
+            }
+        };
 
         let (state, supersedes) =
             match parse_snapshot_payload(&contents, dir, &descriptor.file_name) {
@@ -4743,7 +4763,7 @@ mod tests {
                 let mut payload = encoded.clone();
                 payload.push_str(&" ".repeat(limit as usize - payload.len()));
                 payload_bytes += payload.len() as u64;
-                Ok(payload)
+                Ok(payload.into_bytes())
             },
         );
 
@@ -4754,6 +4774,59 @@ mod tests {
         );
         assert!(read_calls <= MAX_CANDIDATES_PER_SCAN);
         assert_eq!(candidates.len(), read_calls);
+    }
+
+    #[test]
+    fn invalid_utf8_snapshots_still_consume_the_scan_byte_budget() {
+        let dir = TestDir::new("invalid-utf8-scan-budget");
+        for index in 0..MAX_CANDIDATES_PER_SCAN {
+            fs::write(
+                state_file_path_for_token(dir.path(), &token(index as u64 + 100)),
+                b"placeholder",
+            )
+            .unwrap();
+        }
+        let mut payload_bytes = 0u64;
+        let candidates = scan_candidates_with_reader(
+            dir.path(),
+            None,
+            &|_| TokenLockState::Available,
+            &mut |_path, limit| {
+                payload_bytes += limit;
+                Ok(vec![0xff; limit as usize])
+            },
+        );
+        assert!(candidates.is_empty());
+        assert_eq!(payload_bytes, MAX_CANDIDATE_BYTES_PER_SCAN);
+        assert_eq!(
+            fs::read_dir(dir.path()).unwrap().count(),
+            MAX_CANDIDATES_PER_SCAN
+        );
+    }
+
+    #[test]
+    fn a_small_invalid_utf8_snapshot_does_not_hide_valid_candidates() {
+        let dir = TestDir::new("invalid-utf8-scan-recovery");
+        let invalid = state_file_path_for_token(dir.path(), &token(100));
+        let valid = state_file_path_for_token(dir.path(), &token(101));
+        fs::write(&invalid, b"placeholder").unwrap();
+        fs::write(&valid, b"placeholder").unwrap();
+        let encoded = serde_json::to_vec(&saved_session("retained")).unwrap();
+        let candidates = scan_candidates_with_reader(
+            dir.path(),
+            None,
+            &|_| TokenLockState::Available,
+            &mut |path, _limit| {
+                Ok(if path == invalid.as_path() {
+                    vec![0xff]
+                } else {
+                    encoded.clone()
+                })
+            },
+        );
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].path, valid);
+        assert!(invalid.exists());
     }
 
     #[cfg(target_os = "linux")]
