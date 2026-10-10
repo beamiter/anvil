@@ -105,6 +105,7 @@ pub(crate) enum AiPanelMsg {
     },
     Restore(String),
     SetStream(bool),
+    SetRedactSecrets(bool),
     Ask,
     Stop,
     Retry,
@@ -500,7 +501,7 @@ impl Component for AiPanelModel {
                 self.history_path = history_path;
                 self.client = Some(client);
                 self.set_stream(stream);
-                self.redact_secrets = redact_secrets;
+                self.set_redact_secrets(redact_secrets);
                 self.share_command_context = share_command_context;
                 widgets.page_stack.set_visible_child_name(CHAT_PAGE);
                 if let Some((context, intent)) = initial_context {
@@ -528,6 +529,10 @@ impl Component for AiPanelModel {
                 widgets.composer.grab_focus();
             }
             AiPanelMsg::SetStream(enabled) => self.set_stream(enabled),
+            AiPanelMsg::SetRedactSecrets(enabled) => {
+                self.set_redact_secrets(enabled);
+                self.publish_snapshot(widgets, &sender);
+            }
             AiPanelMsg::Restore(encoded) => match ai::ConversationSnapshot::from_json(&encoded) {
                 Ok(snapshot) => {
                     self.cancel_all();
@@ -833,6 +838,15 @@ fn paste_focused_text(widgets: &AiPanelModelWidgets, archived: bool) {
 }
 
 impl AiPanelModel {
+    fn set_redact_secrets(&mut self, enabled: bool) {
+        self.redact_secrets = enabled;
+        // Requests already started own independent client clones. Change only
+        // future requests, without rebuilding a client or resolving credentials.
+        if let Some(client) = self.client.as_mut() {
+            client.redact_secrets = enabled;
+        }
+    }
+
     fn set_stream(&mut self, enabled: bool) {
         // Existing handles already own their chosen transport. Only the next
         // start_request reads this preference; changing it must not reopen the
@@ -1436,6 +1450,58 @@ mod tests {
         assert_eq!(model.delete_confirmed(confirmation), Ok(None));
         assert_eq!(model.store.active_id(), replacement);
         assert!(!model.select_chat(id));
+    }
+
+    #[test]
+    fn redaction_setting_updates_future_client_but_not_an_existing_clone() {
+        let mut model = panel_model(None, false);
+        model.client = Some(
+            ai::AiClient::new(
+                jterm_core::ai::Provider::Ollama,
+                None,
+                "synthetic-model",
+                "http://127.0.0.1:11434",
+                128,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        let started_client = model.client.clone().unwrap();
+        model.set_redact_secrets(true);
+        assert!(model.redact_secrets);
+        assert!(model.client.as_ref().unwrap().redact_secrets);
+        assert!(!started_client.redact_secrets);
+        model.set_redact_secrets(false);
+        assert!(!model.redact_secrets);
+        assert!(!model.client.as_ref().unwrap().redact_secrets);
+    }
+
+    #[test]
+    fn redaction_setting_updates_synthetic_snapshots_without_a_client() {
+        // Public AWS documentation's example identifier, never a real key.
+        let synthetic = "AKIAIOSFODNN7EXAMPLE";
+        let mut model = panel_model(None, false);
+        model.store.set_active_draft(synthetic.into());
+        let id = model.store.active_id();
+        let snapshot = |model: &AiPanelModel| {
+            model
+                .store
+                .clone()
+                .snapshot_for_persistence(model.redact_secrets)
+                .unwrap()
+                .0
+                .to_json()
+                .unwrap()
+        };
+        assert!(snapshot(&model).contains(synthetic));
+        model.set_redact_secrets(true);
+        assert!(model.client.is_none());
+        assert!(!snapshot(&model).contains(synthetic));
+        assert_eq!(model.store.active_id(), id);
+        assert_eq!(model.store.active_draft(), synthetic);
+        model.set_redact_secrets(false);
+        assert!(snapshot(&model).contains(synthetic));
     }
 
     #[test]

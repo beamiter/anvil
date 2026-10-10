@@ -309,6 +309,8 @@ impl AppModel {
             return;
         }
         self.config.borrow_mut().ai_redact_secrets = enabled;
+        self.ai_panel
+            .emit(dialogs::ai_panel::AiPanelMsg::SetRedactSecrets(enabled));
         self.persist_config();
     }
 
