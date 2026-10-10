@@ -2397,10 +2397,19 @@ impl AppModel {
             self.force_quit();
             return;
         }
-        let new_id = active_id
-            .filter(|id| self.index_of(*id).is_some())
-            .unwrap_or_else(|| self.tabs[first_removed.min(self.tabs.len() - 1)].id);
-        self.select_tab(new_id, sender);
+        let remaining_ids: Vec<_> = self.tabs.iter().map(|tab| tab.id).collect();
+        let (new_idx, preserves_active) =
+            tab_selection_after_close(active_id, &remaining_ids, first_removed)
+                .expect("nonempty tabs");
+        if preserves_active {
+            // The old numeric index may now name a different tab. Preserve the
+            // surviving foreground directly instead of synthesizing a handoff.
+            self.active = new_idx;
+            self.rebuild_tab_strip(sender);
+            self.refresh_bottom_bar();
+            return;
+        }
+        self.select_tab(self.tabs[new_idx].id, sender);
     }
 
     pub(crate) fn find_pane(&self, pane_id: u64) -> Option<(usize, usize)> {
@@ -3914,5 +3923,67 @@ mod pane_tree_tests {
         assert!(!preserved.contains("begin_organism_focus_transfer("));
         assert!(!preserved.contains("GrabFocus"));
         assert!(close.contains("self.force_quit()"));
+    }
+    #[test]
+    fn batch_background_removals_preserve_foreground_on_both_sides() {
+        // Original order:10,20,30,40,50; selected30 survives multiple removals.
+        for remaining in [
+            vec![30, 40, 50],
+            vec![10, 20, 30],
+            vec![10, 30, 50],
+            vec![30],
+        ] {
+            let (index, preserved) = tab_selection_after_close(Some(30), &remaining, 0).unwrap();
+            assert!(preserved);
+            assert_eq!(remaining[index], 30);
+        }
+    }
+
+    #[test]
+    fn batch_active_removal_preserves_existing_first_removed_fallback() {
+        // Closing20+30 selects40 at the original first removed index1.
+        assert_eq!(
+            tab_selection_after_close(Some(30), &[10, 40, 50], 1),
+            Some((1, false))
+        );
+        // Closing30+40+50 clamps to the previous surviving tab20.
+        assert_eq!(
+            tab_selection_after_close(Some(40), &[10, 20], 2),
+            Some((1, false))
+        );
+        assert_eq!(tab_selection_after_close(Some(30), &[], 0), None);
+    }
+
+    #[test]
+    fn batch_close_remaps_before_any_surviving_foreground_transition() {
+        let source = include_str!("workspace_ops.rs");
+        let close = source
+            .split("pub(crate) fn close_tabs(")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn find_pane")
+            .next()
+            .unwrap();
+        assert!(close.contains("if ids.is_empty()"));
+        assert!(close.contains("let Some(first_removed)"));
+        assert!(close.contains("self.force_quit()"));
+        assert!(
+            close.find("let active_id =").unwrap() < close.find("self.tabs.remove(index)").unwrap()
+        );
+        assert!(
+            close.contains("tab_selection_after_close(active_id, &remaining_ids, first_removed)")
+        );
+        let preserved = close
+            .split("if preserves_active {")
+            .nth(1)
+            .unwrap()
+            .split("self.select_tab(")
+            .next()
+            .unwrap();
+        assert!(preserved.contains("self.active = new_idx"));
+        assert!(preserved.contains("self.rebuild_tab_strip(sender)"));
+        assert!(preserved.contains("return;"));
+        assert!(!preserved.contains("begin_organism_focus_transfer"));
+        assert!(!preserved.contains("GrabFocus"));
     }
 }
