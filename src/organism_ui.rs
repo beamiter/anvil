@@ -4109,8 +4109,14 @@ mod tests {
         let source = include_str!("organism_ui.rs");
         let production = source.split("#[cfg(test)]\nmod tests {").next().unwrap();
         for (start, end) in [
-            ("view.connect_human_input(", "view.connect_alt_screen_transition("),
-            ("view.connect_alt_screen_transition(", "view.connect_activity("),
+            (
+                "view.connect_human_input(",
+                "view.connect_alt_screen_transition(",
+            ),
+            (
+                "view.connect_alt_screen_transition(",
+                "view.connect_activity(",
+            ),
             ("view.connect_activity(", "view.connect_cwd_changed("),
             ("fn hide_live_body(", "fn bump_generation("),
         ] {
