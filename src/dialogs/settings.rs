@@ -2452,7 +2452,7 @@ impl SettingsModel {
         let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
         content.set_margin_all(12);
         content.append(&list);
-        if let Some((_, existing)) = existing.as_ref() {
+        if let Some(existing) = existing.as_ref() {
             if let Some(note) = advanced_fields_note(existing) {
                 let note = crate::review_input::safe_inline_display(&note, 4 * 1024);
                 let label = gtk::Label::new(Some(&note));
