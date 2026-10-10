@@ -11,6 +11,7 @@ use relm4::prelude::*;
 use std::cell::Cell;
 use std::rc::Rc;
 
+use super::remote_picker::CapturedRemoteProfile;
 use crate::config::{remote_text_is_safe, RemoteHost};
 
 /// GTK notify callbacks run synchronously, before Relm processes queued input.
@@ -1387,11 +1388,18 @@ enum RemoteField {
 /// lets the Relm4 update loop validate and focus fields without putting
 /// application state in GTK signal closures.
 struct RemoteDialogUi {
+    epoch: Rc<()>,
     dialog: adw::Dialog,
     name: adw::EntryRow,
     host: adw::EntryRow,
     user: adw::EntryRow,
     error: gtk::Label,
+}
+
+/// An opening owns its callbacks until its UI is taken. Holding the old token
+/// prevents address reuse from making a delayed event belong to a new dialog.
+fn remote_dialog_event_is_current(current: Option<&Rc<()>>, event: &Rc<()>) -> bool {
+    current.is_some_and(|current| Rc::ptr_eq(current, event))
 }
 
 pub(crate) struct SettingsInit {
@@ -1472,23 +1480,20 @@ pub(crate) enum SettingsMsg {
     AgentMaxTurns(f64),
     Notifications(bool),
     RemoteClipboard(bool),
-    RemoteHostName(String),
-    RemoteHostHost(String),
-    RemoteHostUser(String),
-    RemoteHostDocker(bool),
-    RemoteHostDeploy(u32),
+    RemoteHostName(Rc<()>, String),
+    RemoteHostHost(Rc<()>, String),
+    RemoteHostUser(Rc<()>, String),
+    RemoteHostDocker(Rc<()>, bool),
+    RemoteHostDeploy(Rc<()>, u32),
     RemoteHostOpenAdd,
     /// Commit the independent dialog: append or replace in place.
-    RemoteHostSave,
+    RemoteHostSave(Rc<()>),
     /// Load an existing host into the form instead of starting a new one.
-    RemoteHostEdit(usize),
+    RemoteHostEdit(CapturedRemoteProfile),
     /// Abandon an in-progress edit and leave the saved host as it was.
-    RemoteHostCancel,
-    RemoteHostRemove(usize),
-    RemoteHostRemoveConfirmed {
-        index: usize,
-        name: String,
-    },
+    RemoteHostCancel(Rc<()>),
+    RemoteHostRemove(CapturedRemoteProfile),
+    RemoteHostRemoveConfirmed(CapturedRemoteProfile),
 }
 
 #[derive(Debug)]
@@ -1533,9 +1538,9 @@ pub(crate) struct SettingsModel {
     values: SettingsValues,
     organism_syncing: Rc<Cell<bool>>,
     remote_draft: RemoteDraft,
-    /// Index of the saved host the form is editing; `None` while the form is
-    /// composing a new one.
-    remote_editing: Option<usize>,
+    /// Original immutable profile identity, separate from the editable draft.
+    /// Only `None` represents an explicit Add operation.
+    remote_editing: Option<CapturedRemoteProfile>,
     remote_dialog: Option<RemoteDialogUi>,
     /// Host rows currently added to the "Remote Hosts" group. The view! macro
     /// cannot express a dynamic list, so these are rebuilt imperatively.
@@ -1972,6 +1977,23 @@ impl Component for SettingsModel {
         sender: ComponentSender<Self>,
         root: &Self::Root,
     ) {
+        // Reject stale editor events before touching the currently open UI or
+        // its draft. In particular, closing a replaced dialog queues Cancel.
+        let editor_epoch = match &msg {
+            SettingsMsg::RemoteHostName(epoch, _)
+            | SettingsMsg::RemoteHostHost(epoch, _)
+            | SettingsMsg::RemoteHostUser(epoch, _)
+            | SettingsMsg::RemoteHostDocker(epoch, _)
+            | SettingsMsg::RemoteHostDeploy(epoch, _)
+            | SettingsMsg::RemoteHostSave(epoch)
+            | SettingsMsg::RemoteHostCancel(epoch) => Some(epoch),
+            _ => None,
+        };
+        if editor_epoch.is_some_and(|epoch| {
+            !remote_dialog_event_is_current(self.remote_dialog.as_ref().map(|ui| &ui.epoch), epoch)
+        }) {
+            return;
+        }
         match msg {
             SettingsMsg::Toggle(values, font_names, parent) => {
                 if root.parent().is_some() {
@@ -2250,28 +2272,19 @@ impl Component for SettingsModel {
                 self.values.remote_clipboard = enabled;
                 let _ = sender.output(SettingsOutput::RemoteClipboard(enabled));
             }
-            SettingsMsg::RemoteHostName(name) => self.remote_draft.name = name,
-            SettingsMsg::RemoteHostHost(host) => self.remote_draft.host = host,
-            SettingsMsg::RemoteHostUser(user) => self.remote_draft.user = user,
-            SettingsMsg::RemoteHostDocker(docker) => self.remote_draft.docker = docker,
-            SettingsMsg::RemoteHostDeploy(mode) => self.remote_draft.deploy = mode,
+            SettingsMsg::RemoteHostName(_, name) => self.remote_draft.name = name,
+            SettingsMsg::RemoteHostHost(_, host) => self.remote_draft.host = host,
+            SettingsMsg::RemoteHostUser(_, user) => self.remote_draft.user = user,
+            SettingsMsg::RemoteHostDocker(_, docker) => self.remote_draft.docker = docker,
+            SettingsMsg::RemoteHostDeploy(_, mode) => self.remote_draft.deploy = mode,
             SettingsMsg::RemoteHostOpenAdd => {
                 self.present_remote_host_dialog(None, root, &sender);
             }
-            SettingsMsg::RemoteHostSave => {
+            SettingsMsg::RemoteHostSave(_) => {
                 self.clear_remote_errors();
-                match self.validate_remote_draft() {
-                    Ok(host) => {
-                        let expected = self.values.remote_hosts.clone();
-                        match self.remote_editing {
-                            // Replace in place so the host keeps its position in
-                            // the picker; a remove-then-push would move it to the
-                            // end on every edit.
-                            Some(index) if index < self.values.remote_hosts.len() => {
-                                self.values.remote_hosts[index] = host;
-                            }
-                            _ => self.values.remote_hosts.push(host),
-                        }
+                let expected = self.values.remote_hosts.clone();
+                match self.commit_remote_draft() {
+                    Ok(()) => {
                         if let Some(ui) = self.remote_dialog.take() {
                             ui.dialog.close();
                         }
@@ -2288,19 +2301,19 @@ impl Component for SettingsModel {
                     }
                 }
             }
-            SettingsMsg::RemoteHostEdit(index) => {
-                self.present_remote_host_dialog(Some(index), root, &sender);
+            SettingsMsg::RemoteHostEdit(expected) => {
+                self.present_remote_host_dialog(Some(expected), root, &sender);
             }
-            SettingsMsg::RemoteHostCancel => {
+            SettingsMsg::RemoteHostCancel(_) => {
                 if let Some(ui) = self.remote_dialog.take() {
                     ui.dialog.close();
                 }
                 self.remote_editing = None;
                 self.remote_draft = RemoteDraft::default();
             }
-            SettingsMsg::RemoteHostRemove(index) => {
-                if let Some(host) = self.values.remote_hosts.get(index) {
-                    let name = host.name.clone();
+            SettingsMsg::RemoteHostRemove(expected) => {
+                if let Some(index) = expected.exact_index_in(&self.values.remote_hosts) {
+                    let name = self.values.remote_hosts[index].name.clone();
                     let display = crate::review_input::safe_inline_display(&name, 1_024);
                     let dialog = adw::AlertDialog::new(
                         Some("Remove this host?"),
@@ -2315,18 +2328,15 @@ impl Component for SettingsModel {
                     let sender = sender.clone();
                     dialog.connect_response(None, move |_, response| {
                         if response == "remove" {
-                            sender.input(SettingsMsg::RemoteHostRemoveConfirmed {
-                                index,
-                                name: name.clone(),
-                            });
+                            sender.input(SettingsMsg::RemoteHostRemoveConfirmed(expected.clone()));
                         }
                     });
                     dialog.present(Some(root));
                 }
             }
-            SettingsMsg::RemoteHostRemoveConfirmed { index, name } => {
+            SettingsMsg::RemoteHostRemoveConfirmed(target) => {
                 let expected = self.values.remote_hosts.clone();
-                let removed = remove_remote_host(&mut self.values.remote_hosts, index, &name);
+                let removed = remove_remote_host(&mut self.values.remote_hosts, &target);
                 if removed {
                     self.rebuild_remote_rows(&widgets.remote_hosts_group, &sender);
                     let _ = sender.output(SettingsOutput::RemoteHosts {
@@ -2372,29 +2382,29 @@ impl SettingsModel {
 
     fn present_remote_host_dialog(
         &mut self,
-        editing: Option<usize>,
+        editing: Option<CapturedRemoteProfile>,
         parent: &adw::PreferencesDialog,
         sender: &ComponentSender<Self>,
     ) {
-        if let Some(ui) = self.remote_dialog.take() {
-            ui.dialog.close();
-        }
-        let existing = editing.and_then(|index| {
-            self.values
-                .remote_hosts
-                .get(index)
+        let existing = editing.as_ref().and_then(|expected| {
+            expected
+                .exact_index_in(&self.values.remote_hosts)
+                .and_then(|index| self.values.remote_hosts.get(index))
                 .cloned()
-                .map(|host| (index, host))
         });
         if editing.is_some() && existing.is_none() {
             return;
         }
-        self.remote_editing = existing.as_ref().map(|(index, _)| *index);
+        if let Some(ui) = self.remote_dialog.take() {
+            ui.dialog.close();
+        }
+        self.remote_editing = editing;
         self.remote_draft = existing
             .as_ref()
-            .map(|(_, host)| RemoteDraft::from_host(host))
+            .map(RemoteDraft::from_host)
             .unwrap_or_default();
 
+        let epoch = Rc::new(());
         let dialog = adw::Dialog::builder()
             .title(if existing.is_some() {
                 "Edit Remote Host"
@@ -2469,48 +2479,73 @@ impl SettingsModel {
 
         {
             let sender = sender.clone();
+            let epoch = epoch.clone();
             name.connect_changed(move |row| {
-                sender.input(SettingsMsg::RemoteHostName(row.text().to_string()));
+                sender.input(SettingsMsg::RemoteHostName(
+                    epoch.clone(),
+                    row.text().to_string(),
+                ));
             });
         }
         {
             let sender = sender.clone();
+            let epoch = epoch.clone();
             host.connect_changed(move |row| {
-                sender.input(SettingsMsg::RemoteHostHost(row.text().to_string()));
+                sender.input(SettingsMsg::RemoteHostHost(
+                    epoch.clone(),
+                    row.text().to_string(),
+                ));
             });
         }
         {
             let sender = sender.clone();
+            let epoch = epoch.clone();
             user.connect_changed(move |row| {
-                sender.input(SettingsMsg::RemoteHostUser(row.text().to_string()));
+                sender.input(SettingsMsg::RemoteHostUser(
+                    epoch.clone(),
+                    row.text().to_string(),
+                ));
             });
         }
         {
             let sender = sender.clone();
+            let epoch = epoch.clone();
             docker.connect_active_notify(move |row| {
-                sender.input(SettingsMsg::RemoteHostDocker(row.is_active()));
+                sender.input(SettingsMsg::RemoteHostDocker(
+                    epoch.clone(),
+                    row.is_active(),
+                ));
             });
         }
         {
             let sender = sender.clone();
+            let epoch = epoch.clone();
             deploy.connect_selected_notify(move |row| {
-                sender.input(SettingsMsg::RemoteHostDeploy(row.selected()));
+                sender.input(SettingsMsg::RemoteHostDeploy(epoch.clone(), row.selected()));
             });
         }
         {
             let sender = sender.clone();
-            cancel.connect_clicked(move |_| sender.input(SettingsMsg::RemoteHostCancel));
+            let epoch = epoch.clone();
+            cancel.connect_clicked(move |_| {
+                sender.input(SettingsMsg::RemoteHostCancel(epoch.clone()))
+            });
         }
         {
             let sender = sender.clone();
-            save.connect_clicked(move |_| sender.input(SettingsMsg::RemoteHostSave));
+            let epoch = epoch.clone();
+            save.connect_clicked(move |_| sender.input(SettingsMsg::RemoteHostSave(epoch.clone())));
         }
         {
             let sender = sender.clone();
-            dialog.connect_closed(move |_| sender.input(SettingsMsg::RemoteHostCancel));
+            let epoch = epoch.clone();
+            dialog.connect_closed(move |_| {
+                sender.input(SettingsMsg::RemoteHostCancel(epoch.clone()))
+            });
         }
 
         self.remote_dialog = Some(RemoteDialogUi {
+            epoch,
             dialog: dialog.clone(),
             name,
             host: host.clone(),
@@ -2538,7 +2573,8 @@ impl SettingsModel {
             self.remote_rows.push(row);
             return;
         }
-        for (index, host) in self.values.remote_hosts.iter().enumerate() {
+        for host in &self.values.remote_hosts {
+            let expected = CapturedRemoteProfile::new(host.clone());
             let row = adw::ActionRow::new();
             row.set_use_markup(false);
             let title = if host.name.is_empty() {
@@ -2569,7 +2605,8 @@ impl SettingsModel {
             edit.update_property(&[gtk::accessible::Property::Label(EDIT_REMOTE_HOST_LABEL)]);
             edit.connect_clicked({
                 let sender = sender.clone();
-                move |_| sender.input(SettingsMsg::RemoteHostEdit(index))
+                let expected = expected.clone();
+                move |_| sender.input(SettingsMsg::RemoteHostEdit(expected.clone()))
             });
             row.add_suffix(&edit);
             let remove = gtk::Button::from_icon_name("user-trash-symbolic");
@@ -2580,7 +2617,8 @@ impl SettingsModel {
             remove.update_property(&[gtk::accessible::Property::Label(REMOVE_REMOTE_HOST_LABEL)]);
             remove.connect_clicked({
                 let sender = sender.clone();
-                move |_| sender.input(SettingsMsg::RemoteHostRemove(index))
+                let expected = expected.clone();
+                move |_| sender.input(SettingsMsg::RemoteHostRemove(expected.clone()))
             });
             row.add_suffix(&remove);
             group.add(&row);
@@ -2588,10 +2626,32 @@ impl SettingsModel {
         }
     }
 
+    fn remote_editing_index(&self) -> Result<Option<usize>, (RemoteField, &'static str)> {
+        self.remote_editing
+            .as_ref()
+            .map(|expected| {
+                expected.exact_index_in(&self.values.remote_hosts).ok_or((
+                RemoteField::Form,
+                "The edited host changed or is no longer uniquely configured; reopen the editor.",
+            ))
+            })
+            .transpose()
+    }
+
+    fn commit_remote_draft(&mut self) -> Result<(), (RemoteField, &'static str)> {
+        let host = self.validate_remote_draft()?;
+        match self.remote_editing_index()? {
+            Some(index) => self.values.remote_hosts[index] = host,
+            None => self.values.remote_hosts.push(host),
+        }
+        Ok(())
+    }
+
     /// Mirror `parse_remote_hosts`' acceptance rules so a host added here
     /// always survives the next config load.
     fn validate_remote_draft(&self) -> Result<RemoteHost, (RemoteField, &'static str)> {
-        if self.remote_editing.is_none()
+        let editing_index = self.remote_editing_index()?;
+        if editing_index.is_none()
             && self.values.remote_hosts.len() >= crate::config::MAX_REMOTE_HOSTS
         {
             return Err((RemoteField::Form, "The remote host limit is reached."));
@@ -2629,7 +2689,7 @@ impl SettingsModel {
             .remote_hosts
             .iter()
             .enumerate()
-            .any(|(index, existing)| existing.name == name && Some(index) != self.remote_editing)
+            .any(|(index, existing)| existing.name == name && Some(index) != editing_index)
         {
             return Err((RemoteField::Name, "Another host already uses this name."));
         }
@@ -2655,9 +2715,7 @@ impl SettingsModel {
         // pinned session id or a deploy_artifact the moment someone fixed a
         // typo in the name — the config.toml-only fields are exactly the ones
         // nobody would think to check afterwards.
-        let existing = self
-            .remote_editing
-            .and_then(|index| self.values.remote_hosts.get(index));
+        let existing = editing_index.and_then(|index| self.values.remote_hosts.get(index));
         Ok(RemoteHost {
             name,
             host,
@@ -2707,14 +2765,12 @@ fn advanced_fields_note(host: &RemoteHost) -> Option<String> {
     (!kept.is_empty()).then(|| format!("Kept as configured: {}", kept.join(", ")))
 }
 
-fn remove_remote_host(hosts: &mut Vec<RemoteHost>, index: usize, name: &str) -> bool {
-    if hosts.get(index).is_some_and(|host| host.name == name) {
-        hosts.remove(index);
-        return true;
-    }
-    let before = hosts.len();
-    hosts.retain(|host| host.name != name);
-    before != hosts.len()
+fn remove_remote_host(hosts: &mut Vec<RemoteHost>, expected: &CapturedRemoteProfile) -> bool {
+    let Some(index) = expected.exact_index_in(hosts) else {
+        return false;
+    };
+    hosts.remove(index);
+    true
 }
 
 #[cfg(test)]
@@ -2791,6 +2847,10 @@ mod tests {
             .and_then(|index| hosts.get(index))
             .map(RemoteDraft::from_host)
             .unwrap_or_default();
+        let editing_profile = editing
+            .and_then(|index| hosts.get(index))
+            .cloned()
+            .map(CapturedRemoteProfile::new);
         SettingsModel {
             theme_names: Vec::new(),
             font_names: Vec::new(),
@@ -2826,7 +2886,7 @@ mod tests {
             },
             organism_syncing: Rc::new(Cell::new(false)),
             remote_draft: draft,
-            remote_editing: editing,
+            remote_editing: editing_profile,
             remote_dialog: None,
             remote_rows: Vec::new(),
         }
@@ -2951,30 +3011,37 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_delete_uses_index_when_it_still_matches() {
+    fn confirmed_delete_uses_the_exact_unique_snapshot() {
         let first = host_with_hidden_fields();
         let mut second = host_with_hidden_fields();
         second.name = "staging".to_string();
+        let expected = CapturedRemoteProfile::new(second.clone());
         let mut hosts = vec![first, second];
 
-        assert!(remove_remote_host(&mut hosts, 1, "staging"));
+        assert!(remove_remote_host(&mut hosts, &expected));
         assert_eq!(hosts.len(), 1);
         assert_eq!(hosts[0].name, "dev-60");
     }
 
     #[test]
-    fn confirmed_delete_falls_back_to_name_after_list_changes() {
+    fn confirmed_delete_resolves_the_exact_snapshot_after_reordering() {
         let target = host_with_hidden_fields();
         let mut other = host_with_hidden_fields();
         other.name = "staging".to_string();
         let mut hosts = vec![other, target];
 
-        // The confirmation captured index zero before another update changed
-        // the ordering. The stable profile name must still identify the row.
-        assert!(remove_remote_host(&mut hosts, 0, "dev-60"));
+        // The captured profile moved from index zero. Exact unique identity,
+        // rather than the old index or only its name, still identifies it.
+        assert!(remove_remote_host(
+            &mut hosts,
+            &CapturedRemoteProfile::new(host_with_hidden_fields())
+        ));
         assert_eq!(hosts.len(), 1);
         assert_eq!(hosts[0].name, "staging");
-        assert!(!remove_remote_host(&mut hosts, 9, "missing"));
+        assert!(!remove_remote_host(
+            &mut hosts,
+            &CapturedRemoteProfile::new(host_with_hidden_fields())
+        ));
     }
     #[test]
     fn ascii_reflection_gate_suppresses_synchronous_callbacks_and_restores_state() {
@@ -3097,5 +3164,190 @@ mod tests {
                 .count(),
             4
         );
+    }
+    #[test]
+    fn stale_editor_close_save_and_fields_cannot_touch_a_reopened_draft() {
+        let old = Rc::new(());
+        let current = Rc::new(());
+        let mut draft = "current draft";
+        let mut saves = 0;
+        let mut closes = 0;
+        for event in ["field", "save", "close"] {
+            if remote_dialog_event_is_current(Some(&current), &old) {
+                match event {
+                    "field" => draft = "stale draft",
+                    "save" => saves += 1,
+                    _ => closes += 1,
+                }
+            }
+        }
+        assert_eq!(draft, "current draft");
+        assert_eq!((saves, closes), (0, 0));
+        if remote_dialog_event_is_current(Some(&current), &current) {
+            draft = "current edit";
+            saves += 1;
+        }
+        assert_eq!(draft, "current edit");
+        assert_eq!(saves, 1);
+    }
+
+    #[test]
+    fn taking_current_editor_retires_late_callbacks_without_token_reuse() {
+        let event = Rc::new(());
+        let mut current = Some(event.clone());
+        assert!(remote_dialog_event_is_current(current.as_ref(), &event));
+        let _retired = current.take();
+        assert!(!remote_dialog_event_is_current(current.as_ref(), &event));
+        current = Some(Rc::new(()));
+        assert!(!remote_dialog_event_is_current(current.as_ref(), &event));
+    }
+
+    #[test]
+    fn all_editor_callbacks_carry_the_opening_epoch_and_gate_precedes_mutation() {
+        let source = include_str!("settings.rs");
+        let update = source
+            .split("fn update_with_view(")
+            .nth(1)
+            .unwrap()
+            .split("impl SettingsModel {")
+            .next()
+            .unwrap();
+        let gate = update.split("match msg {").next().unwrap();
+        for variant in ["Name", "Host", "User", "Docker", "Deploy", "Save", "Cancel"] {
+            assert!(gate.contains(&format!("SettingsMsg::RemoteHost{variant}(epoch")));
+        }
+        assert!(gate.contains("remote_dialog_event_is_current("));
+        assert!(gate.contains("return;"));
+        let open = source
+            .split("fn present_remote_host_dialog(")
+            .nth(1)
+            .unwrap()
+            .split("fn rebuild_remote_rows(")
+            .next()
+            .unwrap();
+        assert!(
+            open.find("self.remote_dialog.take()").unwrap()
+                < open.find("ui.dialog.close()").unwrap()
+        );
+        assert!(open.contains("let epoch = Rc::new(())"));
+        assert_eq!(open.matches("let epoch = epoch.clone()").count(), 8);
+        assert!(open.contains("SettingsMsg::RemoteHostSave(epoch.clone())"));
+        assert_eq!(
+            open.matches("SettingsMsg::RemoteHostCancel(epoch.clone())")
+                .count(),
+            2
+        );
+    }
+    #[test]
+    fn editor_original_snapshot_survives_preceding_removal_without_retargeting() {
+        let mut other = host_with_hidden_fields();
+        other.name = "other".into();
+        other.host = "other.example".into();
+        let original = host_with_hidden_fields();
+        let mut model = model(vec![other, original.clone()], Some(1));
+        model.values.remote_hosts.remove(0);
+        model.remote_draft.name = "renamed".into();
+        model.commit_remote_draft().unwrap();
+        assert_eq!(model.values.remote_hosts.len(), 1);
+        assert_eq!(model.values.remote_hosts[0].name, "renamed");
+        assert_eq!(model.values.remote_hosts[0].ssh_args, original.ssh_args);
+        assert_eq!(model.values.remote_hosts[0].session, original.session);
+    }
+
+    #[test]
+    fn stale_editor_target_is_not_replaced_or_recreated_as_an_add() {
+        let original = host_with_hidden_fields();
+        let mut replacement = original.clone();
+        replacement.host = "replacement.example".into();
+        for current in [
+            vec![],
+            vec![replacement],
+            vec![original.clone(), original.clone()],
+        ] {
+            let mut model = model(vec![original.clone()], Some(0));
+            model.values.remote_hosts = current.clone();
+            model.remote_draft.name = "unsaved draft".into();
+            assert!(model.commit_remote_draft().is_err());
+            assert_eq!(model.values.remote_hosts, current);
+            assert_eq!(model.remote_draft.name, "unsaved draft");
+        }
+    }
+
+    #[test]
+    fn removal_snapshot_rejects_same_name_edits_and_duplicate_profiles() {
+        let original = host_with_hidden_fields();
+        let expected = CapturedRemoteProfile::new(original.clone());
+        let mut edited = original.clone();
+        edited.host = "changed.example".into();
+        for mut current in [
+            vec![edited],
+            vec![original.clone(), original.clone()],
+            vec![],
+        ] {
+            let before = current.clone();
+            assert!(!remove_remote_host(&mut current, &expected));
+            assert_eq!(current, before);
+        }
+    }
+
+    #[test]
+    fn editor_and_remove_callbacks_never_fall_back_to_row_indices() {
+        let source = include_str!("settings.rs");
+        let rows = source
+            .split("fn rebuild_remote_rows(")
+            .nth(1)
+            .unwrap()
+            .split("fn remote_editing_index(")
+            .next()
+            .unwrap();
+        assert!(rows.contains("SettingsMsg::RemoteHostEdit(expected.clone())"));
+        assert!(rows.contains("SettingsMsg::RemoteHostRemove(expected.clone())"));
+        assert!(!rows.contains("RemoteHostEdit(index)"));
+        let response = source
+            .split("SettingsMsg::RemoteHostRemove(expected) =>")
+            .nth(1)
+            .unwrap()
+            .split("SettingsMsg::RemoteHostRemoveConfirmed(target)")
+            .next()
+            .unwrap();
+        assert!(response.contains("SettingsMsg::RemoteHostRemoveConfirmed(expected.clone())"));
+        let save = source
+            .split("SettingsMsg::RemoteHostSave(_) =>")
+            .nth(1)
+            .unwrap()
+            .split("SettingsMsg::RemoteHostEdit(expected)")
+            .next()
+            .unwrap();
+        assert!(save.contains("self.commit_remote_draft()"));
+        assert!(save.contains("SettingsOutput::RemoteHosts {"));
+    }
+    #[test]
+    fn editor_can_repair_or_remove_a_uniquely_captured_unavailable_profile() {
+        let mut unavailable = host_with_hidden_fields();
+        unavailable.host = "-unavailable".into();
+        let target = CapturedRemoteProfile::new(unavailable.clone());
+        let mut model = model(vec![unavailable.clone()], Some(0));
+        model.remote_draft.host = "repaired.example".into();
+        model.commit_remote_draft().unwrap();
+        assert_eq!(model.values.remote_hosts[0].host, "repaired.example");
+        let mut hosts = vec![unavailable];
+        assert!(remove_remote_host(&mut hosts, &target));
+        assert!(hosts.is_empty());
+    }
+
+    #[test]
+    fn exact_editor_identity_does_not_confuse_same_name_or_apply_connection_cap() {
+        let original = host_with_hidden_fields();
+        let expected = CapturedRemoteProfile::new(original.clone());
+        let mut other = original.clone();
+        other.host = "different.example".into();
+        let mut hosts = vec![other.clone(); crate::config::MAX_REMOTE_HOSTS];
+        hosts.push(original);
+        assert_eq!(
+            expected.exact_index_in(&hosts),
+            Some(crate::config::MAX_REMOTE_HOSTS)
+        );
+        assert!(remove_remote_host(&mut hosts, &expected));
+        assert_eq!(hosts, vec![other; crate::config::MAX_REMOTE_HOSTS]);
     }
 }

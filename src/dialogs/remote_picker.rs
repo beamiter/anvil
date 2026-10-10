@@ -28,6 +28,18 @@ impl CapturedRemoteProfile {
         &self.0.name
     }
 
+    /// Editor identity must also allow repairing/removing unavailable profiles.
+    /// Connection admission remains the stricter, separate `resolve` path.
+    pub(crate) fn exact_index_in(&self, hosts: &[RemoteHost]) -> Option<usize> {
+        let mut matches = hosts
+            .iter()
+            .enumerate()
+            .filter(|(_, host)| *host == self.0.as_ref())
+            .map(|(index, _)| index);
+        let index = matches.next()?;
+        matches.next().is_none().then_some(index)
+    }
+
     pub(crate) fn resolve(&self, hosts: &[RemoteHost]) -> Result<RemoteHost, &'static str> {
         resolve_picked_profile(hosts, &self.0)
     }
