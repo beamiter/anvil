@@ -53,8 +53,8 @@ fn project_conversation_with_budget(
     if !redact {
         return Ok(Some(encoded.to_owned()));
     }
-    let snapshot = ConversationSnapshot::from_json(encoded)
-        .map_err(|_| "invalid cached AI conversation")?;
+    let snapshot =
+        ConversationSnapshot::from_json(encoded).map_err(|_| "invalid cached AI conversation")?;
     let (active_id, chats) = snapshot.into_parts();
     let chats = chats
         .into_iter()
@@ -519,7 +519,6 @@ mod tests {
         assert!(ConversationSnapshot::from_json(&bounded).is_ok());
         assert!(project_conversation_with_budget(Some(&raw), true, 1).is_err());
     }
-
 
     #[test]
     fn config_mapping_respects_disabled_flag() {
