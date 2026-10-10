@@ -17,12 +17,21 @@ use relm4::gtk;
 use relm4::prelude::*;
 
 use crate::workflows::{ArgsForm, Workflow};
+use std::cell::RefCell;
+use std::rc::Rc;
+
+fn is_current_opening(current: &Option<Rc<()>>, expected: &Rc<()>) -> bool {
+    current
+        .as_ref()
+        .is_some_and(|current| Rc::ptr_eq(current, expected))
+}
 
 /// One row's initial state, taken from the form rather than re-derived from
 /// the argument, so what the entry shows and what the form will render are the
 /// same value.
 #[derive(Debug)]
 struct WorkflowArgInit {
+    opening: Rc<()>,
     name: String,
     description: String,
     value: String,
@@ -30,6 +39,7 @@ struct WorkflowArgInit {
 
 #[derive(Debug)]
 struct WorkflowArgRow {
+    opening: Rc<()>,
     name: String,
     description: String,
     value: String,
@@ -37,8 +47,8 @@ struct WorkflowArgRow {
 
 #[derive(Debug)]
 enum WorkflowArgOutput {
-    Changed(String, String),
-    Submit,
+    Changed(Rc<()>, String, String),
+    Submit(Rc<()>),
 }
 
 #[relm4::factory]
@@ -58,14 +68,15 @@ impl FactoryComponent for WorkflowArgRow {
                 set_text: &self.value,
                 set_hexpand: true,
                 set_valign: gtk::Align::Center,
-                connect_changed[sender, name = self.name.clone()] => move |entry| {
+                connect_changed[sender, name = self.name.clone(), opening = self.opening.clone()] => move |entry| {
                     let _ = sender.output(WorkflowArgOutput::Changed(
+                        opening.clone(),
                         name.clone(),
                         entry.text().to_string(),
                     ));
                 },
-                connect_activate[sender] => move |_| {
-                    let _ = sender.output(WorkflowArgOutput::Submit);
+                connect_activate[sender, opening = self.opening.clone()] => move |_| {
+                    let _ = sender.output(WorkflowArgOutput::Submit(opening.clone()));
                 },
             },
         }
@@ -73,6 +84,7 @@ impl FactoryComponent for WorkflowArgRow {
 
     fn init_model(init: Self::Init, _index: &DynamicIndex, _sender: FactorySender<Self>) -> Self {
         Self {
+            opening: init.opening,
             name: init.name,
             description: init.description,
             value: init.value,
@@ -83,9 +95,9 @@ impl FactoryComponent for WorkflowArgRow {
 #[derive(Debug)]
 pub(crate) enum WorkflowMsg {
     Open(Workflow),
-    Changed(String, String),
-    Submit,
-    Close,
+    Changed(Rc<()>, String, String),
+    Submit(Rc<()>),
+    Close(Rc<()>),
 }
 
 #[derive(Debug)]
@@ -96,6 +108,7 @@ pub(crate) enum WorkflowOutput {
 pub(crate) struct WorkflowModel {
     parent: adw::ApplicationWindow,
     form: Option<ArgsForm>,
+    opening: Rc<RefCell<Option<Rc<()>>>>,
     rows: FactoryVecDeque<WorkflowArgRow>,
 }
 
@@ -155,22 +168,11 @@ impl Component for WorkflowModel {
                         add_css_class: "error",
                     },
 
+                    #[name(actions_box)]
                     gtk::Box {
                         set_orientation: gtk::Orientation::Horizontal,
                         set_spacing: 6,
                         set_halign: gtk::Align::End,
-
-                        gtk::Button {
-                            set_label: "Cancel",
-                            connect_clicked => WorkflowMsg::Close,
-                        },
-
-                        #[name(run_button)]
-                        gtk::Button {
-                            set_label: "Insert command",
-                            add_css_class: "suggested-action",
-                            connect_clicked => WorkflowMsg::Submit,
-                        },
                     },
                 },
             },
@@ -186,16 +188,30 @@ impl Component for WorkflowModel {
             FactoryVecDeque::builder()
                 .launch_default()
                 .forward(sender.input_sender(), |output| match output {
-                    WorkflowArgOutput::Changed(name, value) => WorkflowMsg::Changed(name, value),
-                    WorkflowArgOutput::Submit => WorkflowMsg::Submit,
+                    WorkflowArgOutput::Changed(opening, name, value) => {
+                        WorkflowMsg::Changed(opening, name, value)
+                    }
+                    WorkflowArgOutput::Submit(opening) => WorkflowMsg::Submit(opening),
                 });
         let model = Self {
             parent,
             form: None,
+            opening: Rc::new(RefCell::new(None)),
             rows,
         };
         let args_box = model.rows.widget();
         let widgets = view_output!();
+        // AdwDialog emits closed synchronously when closing begins. Capture
+        // that opening here, not when the queued Relm message is handled.
+        root.connect_closed({
+            let opening = model.opening.clone();
+            move |_| {
+                let current = opening.borrow().clone();
+                if let Some(current) = current {
+                    sender.input(WorkflowMsg::Close(current));
+                }
+            }
+        });
         ComponentParts { model, widgets }
     }
 
@@ -206,8 +222,19 @@ impl Component for WorkflowModel {
         sender: ComponentSender<Self>,
         root: &Self::Root,
     ) {
+        let expected = match &msg {
+            WorkflowMsg::Open(_) => None,
+            WorkflowMsg::Changed(opening, ..)
+            | WorkflowMsg::Submit(opening)
+            | WorkflowMsg::Close(opening) => Some(opening),
+        };
+        if expected.is_some_and(|expected| !is_current_opening(&self.opening.borrow(), expected)) {
+            return;
+        }
         match msg {
             WorkflowMsg::Open(workflow) => {
+                let opening = Rc::new(());
+                *self.opening.borrow_mut() = Some(opening.clone());
                 root.set_title(&format!("Workflow: {}", workflow.name));
                 widgets.description.set_label(&workflow.description);
                 widgets
@@ -224,6 +251,7 @@ impl Component for WorkflowModel {
                 rows.clear();
                 for (index, arg) in form.args().iter().enumerate() {
                     rows.push_back(WorkflowArgInit {
+                        opening: opening.clone(),
                         name: arg.name.clone(),
                         description: arg.description.clone(),
                         // Empty for an argument the file gives no default for —
@@ -234,12 +262,31 @@ impl Component for WorkflowModel {
                 }
                 drop(rows);
                 self.form = Some(form);
+                // Recreate controls with this opening, so an old button gesture
+                // cannot submit or close a replacement form after it is opened.
+                while let Some(child) = widgets.actions_box.first_child() {
+                    widgets.actions_box.remove(&child);
+                }
+                let cancel = gtk::Button::with_label("Cancel");
+                cancel.connect_clicked({
+                    let sender = sender.clone();
+                    let opening = opening.clone();
+                    move |_| sender.input(WorkflowMsg::Close(opening.clone()))
+                });
+                let run_button = gtk::Button::with_label("Insert command");
+                run_button.add_css_class("suggested-action");
+                run_button.connect_clicked({
+                    let opening = opening.clone();
+                    move |_| sender.input(WorkflowMsg::Submit(opening.clone()))
+                });
+                widgets.actions_box.append(&cancel);
+                widgets.actions_box.append(&run_button);
                 root.present(Some(&self.parent));
                 if self.rows.is_empty() {
-                    widgets.run_button.grab_focus();
+                    run_button.grab_focus();
                 }
             }
-            WorkflowMsg::Changed(name, value) => {
+            WorkflowMsg::Changed(_, name, value) => {
                 // Rows are keyed by argument name because `validate` rejects a
                 // workflow with duplicate argument names (and, since the
                 // consolidation, one whose name is not equal to its own trim),
@@ -252,12 +299,14 @@ impl Component for WorkflowModel {
                     form.set(index, value);
                 }
             }
-            WorkflowMsg::Submit => {
+            WorkflowMsg::Submit(_) => {
                 let Some(form) = self.form.as_ref() else {
                     return;
                 };
                 match form.render() {
                     Ok(command) => {
+                        self.opening.borrow_mut().take();
+                        self.form = None;
                         root.force_close();
                         let _ = sender.output(WorkflowOutput::Command(command));
                     }
@@ -272,7 +321,11 @@ impl Component for WorkflowModel {
                     }
                 }
             }
-            WorkflowMsg::Close => root.force_close(),
+            WorkflowMsg::Close(_) => {
+                self.opening.borrow_mut().take();
+                self.form = None;
+                root.force_close();
+            }
         }
     }
 }
@@ -281,4 +334,115 @@ fn escape_markup(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_current_opening;
+    use std::rc::Rc;
+
+    #[test]
+    fn replaced_workflow_rejects_old_row_submit_and_close_tokens() {
+        let old = Rc::new(());
+        let old_row = old.clone();
+        let old_submit = old.clone();
+        let old_close = old.clone();
+        let current = Rc::new(());
+        let active = Some(current.clone());
+        for token in [old_row, old_submit, old_close] {
+            assert!(!is_current_opening(&active, &token));
+        }
+        assert!(is_current_opening(&active, &current));
+        assert!(!Rc::ptr_eq(&old, &current));
+    }
+
+    #[test]
+    fn retiring_a_workflow_rejects_duplicate_submit_and_late_callbacks() {
+        let opening = Rc::new(());
+        let mut active = Some(opening.clone());
+        assert!(is_current_opening(&active, &opening));
+        active.take();
+        assert!(!is_current_opening(&active, &opening));
+        let reopened = Rc::new(());
+        active = Some(reopened.clone());
+        assert!(!is_current_opening(&active, &opening));
+        assert!(is_current_opening(&active, &reopened));
+    }
+
+    #[test]
+    fn workflow_callbacks_keep_their_opening_through_factory_and_native_close_queues() {
+        let source = include_str!("workflow.rs")
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap();
+        assert!(source.contains("WorkflowMsg::Changed(opening, name, value)"));
+        assert!(
+            source.contains("WorkflowArgOutput::Submit(opening) => WorkflowMsg::Submit(opening)")
+        );
+        let update = source.split("    fn update_with_view(").nth(1).unwrap();
+        assert!(update.find("!is_current_opening").unwrap() < update.find("match msg {").unwrap());
+        let open = update
+            .split("WorkflowMsg::Open(workflow) => {")
+            .nth(1)
+            .unwrap();
+        assert!(open.find("Some(opening.clone())").unwrap() < open.find("rows.clear()").unwrap());
+        assert!(open.contains("opening: opening.clone()"));
+        assert!(open.contains("widgets.actions_box.remove(&child)"));
+        assert!(open.contains("gtk::Button::with_label(\"Cancel\")"));
+        assert!(open.contains("move |_| sender.input(WorkflowMsg::Close(opening.clone()))"));
+        assert!(open.contains("move |_| sender.input(WorkflowMsg::Submit(opening.clone()))"));
+        let closed = source.split("root.connect_closed({").nth(1).unwrap();
+        assert!(
+            closed
+                .find("let current = opening.borrow().clone()")
+                .unwrap()
+                < closed
+                    .find("sender.input(WorkflowMsg::Close(current))")
+                    .unwrap()
+        );
+    }
+
+    #[test]
+    fn successful_workflow_submit_retires_before_output_but_errors_keep_the_draft() {
+        let source = include_str!("workflow.rs")
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap();
+        let submit = source.split("WorkflowMsg::Submit(_) => {").nth(1).unwrap();
+        let success = submit
+            .split("Ok(command) => {")
+            .nth(1)
+            .unwrap()
+            .split("Err(error) => {")
+            .next()
+            .unwrap();
+        assert!(
+            success.find("self.opening.borrow_mut().take()").unwrap()
+                < success.find("root.force_close()").unwrap()
+        );
+        assert!(
+            success.find("self.form = None").unwrap()
+                < success
+                    .find("sender.output(WorkflowOutput::Command(command))")
+                    .unwrap()
+        );
+        let error = submit
+            .split("Err(error) => {")
+            .nth(1)
+            .unwrap()
+            .split("WorkflowMsg::Close(_) => {")
+            .next()
+            .unwrap();
+        assert!(error.contains("widgets.error_label.set_visible(true)"));
+        assert!(!error.contains(".take()"));
+        assert!(!error.contains("self.form ="));
+        let close = submit.split("WorkflowMsg::Close(_) => {").nth(1).unwrap();
+        assert!(
+            close.find("self.opening.borrow_mut().take()").unwrap()
+                < close.find("root.force_close()").unwrap()
+        );
+        assert!(
+            close.find("self.form = None").unwrap() < close.find("root.force_close()").unwrap()
+        );
+    }
 }
