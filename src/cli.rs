@@ -189,14 +189,14 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<ParsedAr
                 break;
             }
             _ if option.starts_with("--config=") => {
-                let value = option.trim_start_matches("--config=");
+                let value = option.strip_prefix("--config=").unwrap();
                 if value.is_empty() {
                     return Err("--config requires a path".to_string());
                 }
                 config_path = Some(PathBuf::from(value));
             }
             _ if option.starts_with("--check-config=") => {
-                let value = option.trim_start_matches("--check-config=");
+                let value = option.strip_prefix("--check-config=").unwrap();
                 if value.is_empty() {
                     return Err("--check-config requires a non-empty path".to_string());
                 }
@@ -209,7 +209,7 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<ParsedAr
                 set_utility(
                     &mut utility,
                     Command::PrintShellIntegration(parse_shell(
-                        option.trim_start_matches("--shell-integration="),
+                        option.strip_prefix("--shell-integration=").unwrap(),
                     )?),
                 )?;
             }
@@ -217,7 +217,7 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<ParsedAr
                 set_utility(
                     &mut utility,
                     Command::PrintCompletion(parse_shell(
-                        option.trim_start_matches("--generate-completion="),
+                        option.strip_prefix("--generate-completion=").unwrap(),
                     )?),
                 )?;
             }
@@ -225,15 +225,15 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<ParsedAr
                 set_utility(
                     &mut utility,
                     Command::PrintCompletion(parse_shell(
-                        option.trim_start_matches("--completion="),
+                        option.strip_prefix("--completion=").unwrap(),
                     )?),
                 )?;
             }
             _ if option.starts_with("--mode=") => {
-                launch.mode = Some(parse_mode(option.trim_start_matches("--mode="))?);
+                launch.mode = Some(parse_mode(option.strip_prefix("--mode=").unwrap())?);
             }
             _ if option.starts_with("--working-directory=") => {
-                let value = option.trim_start_matches("--working-directory=");
+                let value = option.strip_prefix("--working-directory=").unwrap();
                 if value.is_empty() {
                     return Err("--working-directory requires a path".to_string());
                 }
@@ -421,6 +421,41 @@ mod tests {
             assert!(script.contains("shell-integration"));
             assert!(script.contains("working-directory"));
             assert!(script.contains("safe-mode"));
+        }
+    }
+
+    #[test]
+    fn equals_values_preserve_repeated_option_prefixes_in_paths() {
+        let parsed = parse_strs(&["--config=--config=custom.toml"]).unwrap();
+        assert_eq!(parsed.config_path, Some(PathBuf::from("--config=custom.toml")));
+
+        assert_eq!(
+            parse_command(&["--check-config=--check-config=custom.toml"]).unwrap(),
+            Command::CheckConfig(
+                Some(PathBuf::from("--check-config=custom.toml")),
+                ReportFormat::Human
+            )
+        );
+        let Command::Run(launch) =
+            parse_command(&["--working-directory=--working-directory=project"]).unwrap()
+        else {
+            panic!("expected run")
+        };
+        assert_eq!(
+            launch.working_directory,
+            Some(PathBuf::from("--working-directory=project"))
+        );
+    }
+
+    #[test]
+    fn equals_values_do_not_accept_repeated_mode_or_shell_prefixes() {
+        for arg in [
+            "--mode=--mode=block",
+            "--shell-integration=--shell-integration=bash",
+            "--generate-completion=--generate-completion=fish",
+            "--completion=--completion=zsh",
+        ] {
+            assert!(parse_strs(&[arg]).is_err(), "unexpectedly accepted {arg}");
         }
     }
 
