@@ -19,11 +19,12 @@ use relm4::prelude::*;
 use crate::workflows::{ArgsForm, Workflow};
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
-fn is_current_opening(current: &Option<Rc<()>>, expected: &Rc<()>) -> bool {
+fn is_current_opening(current: &Option<Arc<()>>, expected: &Arc<()>) -> bool {
     current
         .as_ref()
-        .is_some_and(|current| Rc::ptr_eq(current, expected))
+        .is_some_and(|current| Arc::ptr_eq(current, expected))
 }
 
 /// One row's initial state, taken from the form rather than re-derived from
@@ -31,7 +32,7 @@ fn is_current_opening(current: &Option<Rc<()>>, expected: &Rc<()>) -> bool {
 /// same value.
 #[derive(Debug)]
 struct WorkflowArgInit {
-    opening: Rc<()>,
+    opening: Arc<()>,
     name: String,
     description: String,
     value: String,
@@ -39,7 +40,7 @@ struct WorkflowArgInit {
 
 #[derive(Debug)]
 struct WorkflowArgRow {
-    opening: Rc<()>,
+    opening: Arc<()>,
     name: String,
     description: String,
     value: String,
@@ -47,8 +48,8 @@ struct WorkflowArgRow {
 
 #[derive(Debug)]
 enum WorkflowArgOutput {
-    Changed(Rc<()>, String, String),
-    Submit(Rc<()>),
+    Changed(Arc<()>, String, String),
+    Submit(Arc<()>),
 }
 
 #[relm4::factory]
@@ -95,9 +96,9 @@ impl FactoryComponent for WorkflowArgRow {
 #[derive(Debug)]
 pub(crate) enum WorkflowMsg {
     Open(Workflow),
-    Changed(Rc<()>, String, String),
-    Submit(Rc<()>),
-    Close(Rc<()>),
+    Changed(Arc<()>, String, String),
+    Submit(Arc<()>),
+    Close(Arc<()>),
 }
 
 #[derive(Debug)]
@@ -108,7 +109,7 @@ pub(crate) enum WorkflowOutput {
 pub(crate) struct WorkflowModel {
     parent: adw::ApplicationWindow,
     form: Option<ArgsForm>,
-    opening: Rc<RefCell<Option<Rc<()>>>>,
+    opening: Rc<RefCell<Option<Arc<()>>>>,
     rows: FactoryVecDeque<WorkflowArgRow>,
 }
 
@@ -233,7 +234,7 @@ impl Component for WorkflowModel {
         }
         match msg {
             WorkflowMsg::Open(workflow) => {
-                let opening = Rc::new(());
+                let opening = Arc::new(());
                 *self.opening.borrow_mut() = Some(opening.clone());
                 root.set_title(&format!("Workflow: {}", workflow.name));
                 widgets.description.set_label(&workflow.description);
@@ -339,31 +340,38 @@ fn escape_markup(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::is_current_opening;
-    use std::rc::Rc;
+    use std::sync::Arc;
+
+    #[test]
+    fn workflow_factory_messages_satisfy_the_forwarding_send_contract() {
+        fn assert_send<T: Send>() {}
+        assert_send::<super::WorkflowArgOutput>();
+        assert_send::<super::WorkflowMsg>();
+    }
 
     #[test]
     fn replaced_workflow_rejects_old_row_submit_and_close_tokens() {
-        let old = Rc::new(());
+        let old = Arc::new(());
         let old_row = old.clone();
         let old_submit = old.clone();
         let old_close = old.clone();
-        let current = Rc::new(());
+        let current = Arc::new(());
         let active = Some(current.clone());
         for token in [old_row, old_submit, old_close] {
             assert!(!is_current_opening(&active, &token));
         }
         assert!(is_current_opening(&active, &current));
-        assert!(!Rc::ptr_eq(&old, &current));
+        assert!(!Arc::ptr_eq(&old, &current));
     }
 
     #[test]
     fn retiring_a_workflow_rejects_duplicate_submit_and_late_callbacks() {
-        let opening = Rc::new(());
+        let opening = Arc::new(());
         let mut active = Some(opening.clone());
         assert!(is_current_opening(&active, &opening));
         active.take();
         assert!(!is_current_opening(&active, &opening));
-        let reopened = Rc::new(());
+        let reopened = Arc::new(());
         active = Some(reopened.clone());
         assert!(!is_current_opening(&active, &opening));
         assert!(is_current_opening(&active, &reopened));
