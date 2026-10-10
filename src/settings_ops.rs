@@ -320,6 +320,8 @@ impl AppModel {
             return;
         }
         self.config.borrow_mut().ai_stream = enabled;
+        self.ai_panel
+            .emit(dialogs::ai_panel::AiPanelMsg::SetStream(enabled));
         self.persist_config();
     }
 

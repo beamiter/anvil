@@ -104,6 +104,7 @@ pub(crate) enum AiPanelMsg {
         initial_context: Option<(ai::BlockContext, ai::BlockAiIntent)>,
     },
     Restore(String),
+    SetStream(bool),
     Ask,
     Stop,
     Retry,
@@ -498,7 +499,7 @@ impl Component for AiPanelModel {
             } => {
                 self.history_path = history_path;
                 self.client = Some(client);
-                self.stream = stream;
+                self.set_stream(stream);
                 self.redact_secrets = redact_secrets;
                 self.share_command_context = share_command_context;
                 widgets.page_stack.set_visible_child_name(CHAT_PAGE);
@@ -526,6 +527,7 @@ impl Component for AiPanelModel {
                 self.render_all(widgets, &sender);
                 widgets.composer.grab_focus();
             }
+            AiPanelMsg::SetStream(enabled) => self.set_stream(enabled),
             AiPanelMsg::Restore(encoded) => match ai::ConversationSnapshot::from_json(&encoded) {
                 Ok(snapshot) => {
                     self.cancel_all();
@@ -831,6 +833,13 @@ fn paste_focused_text(widgets: &AiPanelModelWidgets, archived: bool) {
 }
 
 impl AiPanelModel {
+    fn set_stream(&mut self, enabled: bool) {
+        // Existing handles already own their chosen transport. Only the next
+        // start_request reads this preference; changing it must not reopen the
+        // panel, replace the client, or reset a chat.
+        self.stream = enabled;
+    }
+
     fn invalidate_delete_confirmation(&mut self) {
         // Old dialogs retain the old allocation, so its identity cannot be
         // reused. This is an epoch without integer wraparound/ABA.
@@ -1427,6 +1436,25 @@ mod tests {
         assert_eq!(model.delete_confirmed(confirmation), Ok(None));
         assert_eq!(model.store.active_id(), replacement);
         assert!(!model.select_chat(id));
+    }
+
+    #[test]
+    fn stream_setting_changes_future_requests_without_resetting_chat_state() {
+        let mut model = panel_model(None, false);
+        let id = model.store.new_chat().unwrap();
+        model.store.set_active_draft("unsent question".into());
+        model.search = "saved search".into();
+        let (before, _) = model.store.snapshot_for_persistence(false).unwrap();
+        let before = before.to_json().unwrap();
+        for enabled in [false, true, true, false] {
+            model.set_stream(enabled);
+            assert_eq!(model.stream, enabled);
+            assert_eq!(model.store.active_id(), id);
+            assert_eq!(model.store.active_draft(), "unsent question");
+            assert_eq!(model.search, "saved search");
+            let (after, _) = model.store.snapshot_for_persistence(false).unwrap();
+            assert_eq!(after.to_json().unwrap(), before);
+        }
     }
 
     /// The consent flag is the outer gate on every path that could put shell
