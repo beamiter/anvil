@@ -201,7 +201,7 @@ pub(crate) fn dynamic_css(config: &Config) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReloadIntent, dynamic_css};
+    use super::{dynamic_css, ReloadIntent};
     use crate::config::Config;
 
     #[test]
@@ -246,10 +246,8 @@ mod tests {
             .find("*self.config_revision.borrow_mut() = Some(revision)")
             .unwrap();
         assert!(read < rejected && rejection_return < dedup && dedup < apply && apply < revision);
-        assert!(
-            include_str!("action_ops.rs")
-                .contains("Action::ReloadConfig => self.reload_config_explicit(sender)")
-        );
+        assert!(include_str!("action_ops.rs")
+            .contains("Action::ReloadConfig => self.reload_config_explicit(sender)"));
         assert!(
             include_str!("main.rs").contains("AppMsg::ReloadConfig => self.reload_config(&sender)")
         );
