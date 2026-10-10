@@ -66,6 +66,24 @@ pub struct OwnedPty {
     test_foreground_group: std::sync::atomic::AtomicI32,
 }
 
+/// Do not let later commands inherit another pane's master or spare slave.
+/// `openpty` has no CLOEXEC option, so this closes the persistent inheritance
+/// leak but is not atomic against another thread forking before fcntl runs.
+fn openpty_cloexec(size: Option<&nix::pty::Winsize>) -> io::Result<OpenptyResult> {
+    let pair = openpty(size, None).map_err(io::Error::other)?;
+    for fd in [&pair.master, &pair.slave] {
+        // SAFETY: each descriptor is live and owned by `pair`. Preserve any
+        // existing descriptor flags; an error drops both ends before return.
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+        if flags < 0
+            || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(pair)
+}
+
 #[cfg(target_os = "linux")]
 fn move_fd_above_stdio(fd: OwnedFd) -> io::Result<OwnedFd> {
     if fd.as_raw_fd() > libc::STDERR_FILENO {
@@ -788,8 +806,7 @@ impl OwnedPty {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        let OpenptyResult { master, slave } =
-            openpty(Some(&initial_size), None).map_err(io::Error::other)?;
+        let OpenptyResult { master, slave } = openpty_cloexec(Some(&initial_size))?;
 
         match unsafe { unistd::fork() } {
             Ok(ForkResult::Child) => {
@@ -1463,7 +1480,7 @@ fn signal_eventfd(eventfd: RawFd) -> io::Result<()> {
 #[cfg(test)]
 impl OwnedPty {
     pub(crate) fn from_openpty(foreground: Option<bool>) -> io::Result<Self> {
-        let OpenptyResult { master, slave } = openpty(None, None).map_err(io::Error::other)?;
+        let OpenptyResult { master, slave } = openpty_cloexec(None)?;
         prepare_test_slave(&slave);
         // SAFETY: the child uses only async-signal-safe syscalls after fork.
         let child = match unsafe { unistd::fork() }.map_err(io::Error::other)? {
@@ -1590,6 +1607,34 @@ mod tests {
 
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn both_pty_ends_are_close_on_exec() {
+        let pair = openpty_cloexec(None).unwrap();
+        for fd in [&pair.master, &pair.slave] {
+            // SAFETY: the pair keeps both descriptors live during this check.
+            let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+            assert!(flags >= 0);
+            assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn later_exec_does_not_inherit_another_panes_pty() {
+        let pair = openpty_cloexec(None).unwrap();
+        let master = move_fd_above_stdio(pair.master).unwrap();
+        let slave = move_fd_above_stdio(pair.slave).unwrap();
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("test ! -e /proc/self/fd/$1 && test ! -e /proc/self/fd/$2")
+            .arg("anvil-pty-inheritance-test")
+            .arg(master.as_raw_fd().to_string())
+            .arg(slave.as_raw_fd().to_string())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
 
     /// Production used to run this raw scan before dispatching the same bytes
     /// through the stateful terminal parser. Keep the old implementation only
