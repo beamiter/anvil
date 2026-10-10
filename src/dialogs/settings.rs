@@ -643,9 +643,8 @@ mod organism_preview {
             assert_eq!(GentleInteraction::COOLDOWN, Duration::from_secs(8));
             let runtime = include_str!("../organism_ui.rs");
             let production = runtime.split("#[cfg(test)]").next().unwrap();
-            assert!(production.contains(
-                "const POINTER_GREETING_DWELL: Duration = Duration::from_millis(600);"
-            ));
+            assert!(production
+                .contains("const POINTER_GREETING_DWELL: Duration = Duration::from_millis(600);"));
             for detail in [
                 "Full or Calm",
                 "600 ms",
@@ -662,7 +661,9 @@ mod organism_preview {
                 .split("\n#[relm4::component(pub(crate))]")
                 .nth(1)
                 .unwrap();
-            assert!(component.contains("set_tooltip_text: Some(organism_preview::INTERACTION_HINT)"));
+            assert!(
+                component.contains("set_tooltip_text: Some(organism_preview::INTERACTION_HINT)")
+            );
         }
 
         #[test]
