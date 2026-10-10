@@ -728,21 +728,23 @@ impl Component for AiPanelModel {
                 });
                 dialog.present(Some(root));
             }
-            AiPanelMsg::DeleteConfirmed(confirmation) => match self.delete_confirmed(confirmation) {
-                Ok(Some(_)) => {
-                    self.render_all(widgets, &sender);
-                    self.publish_snapshot(widgets, &sender);
-                }
-                Ok(None) => widgets
-                    .status
-                    .set_label("The selected chat changed. Request deletion again."),
-                Err(ChatStoreError::Busy) => {
-                    widgets
+            AiPanelMsg::DeleteConfirmed(confirmation) => {
+                match self.delete_confirmed(confirmation) {
+                    Ok(Some(_)) => {
+                        self.render_all(widgets, &sender);
+                        self.publish_snapshot(widgets, &sender);
+                    }
+                    Ok(None) => widgets
                         .status
-                        .set_label("Stop this response before deleting the chat.");
+                        .set_label("The selected chat changed. Request deletion again."),
+                    Err(ChatStoreError::Busy) => {
+                        widgets
+                            .status
+                            .set_label("Stop this response before deleting the chat.");
+                    }
+                    Err(_) => {}
                 }
-                Err(_) => {}
-            },
+            }
             AiPanelMsg::ClearContext => match self.store.clear_active_context() {
                 Ok(changed) => {
                     if let Some(payload) = self.retry_payloads.get_mut(&self.store.active_id()) {
