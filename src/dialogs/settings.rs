@@ -74,6 +74,10 @@ mod organism_preview {
         }
     }
 
+    fn preview_active(visible: bool, mapped: bool, host_active: Option<bool>) -> bool {
+        visible && mapped && host_active == Some(true)
+    }
+
     /// Still modes only wake for a requested greeting's expiry and cooldown.
     /// Visibility is a hard gate, including during the dialog close animation.
     fn next_wake(
@@ -116,6 +120,7 @@ mod organism_preview {
         desktop: Option<gtk::Settings>,
         desktop_handler: RefCell<Option<glib::SignalHandlerId>>,
         source: RefCell<Option<glib::SourceId>>,
+        host_observer: RefCell<Option<(glib::WeakRef<gtk::Window>, glib::SignalHandlerId)>>,
         visible: Cell<bool>,
         epoch: Instant,
         greeting: Cell<Option<Duration>>,
@@ -135,8 +140,53 @@ mod organism_preview {
             self.greeting.set(None);
         }
 
+        fn host_window(&self) -> Option<gtk::Window> {
+            self.group.upgrade()?.root().and_downcast::<gtk::Window>()
+        }
+
+        fn active(&self) -> bool {
+            preview_active(
+                self.visible.get(),
+                self.group.upgrade().is_some_and(|group| group.is_mapped()),
+                self.host_window().map(|window| window.is_active()),
+            )
+        }
+
+        fn disconnect_host(&self) {
+            let observer = self.host_observer.borrow_mut().take();
+            if let Some((window, handler)) = observer {
+                if let Some(window) = window.upgrade() {
+                    window.disconnect(handler);
+                }
+            }
+        }
+
+        fn observe_host(self: &Rc<Self>) {
+            let host = self.visible.get().then(|| self.host_window()).flatten();
+            let old_host = self
+                .host_observer
+                .borrow()
+                .as_ref()
+                .and_then(|(window, _)| window.upgrade());
+            if host.is_some() && host == old_host {
+                return;
+            }
+            self.disconnect_host();
+            self.cancel_greeting();
+            if let Some(window) = host {
+                let weak = Rc::downgrade(self);
+                let handler = window.connect_is_active_notify(move |_| {
+                    if let Some(preview) = weak.upgrade() {
+                        preview.refresh();
+                    }
+                });
+                *self.host_observer.borrow_mut() = Some((window.downgrade(), handler));
+            }
+        }
+
         fn hide(&self) {
             self.visible.set(false);
+            self.disconnect_host();
             self.stop_source();
             self.cancel_greeting();
         }
@@ -148,7 +198,7 @@ mod organism_preview {
         fn refresh(self: &Rc<Self>) {
             self.stop_source();
             let (
-                Some(group),
+                Some(_group),
                 Some(pose_row),
                 Some(motion_row),
                 Some(sample),
@@ -165,6 +215,10 @@ mod organism_preview {
             else {
                 return;
             };
+            let active = self.active();
+            if !active {
+                self.cancel_greeting();
+            }
             let now = self.epoch.elapsed();
             let pose = self.pose();
             let animations = self
@@ -193,7 +247,7 @@ mod organism_preview {
                 .last_hello
                 .get()
                 .is_some_and(|start| now.saturating_sub(start) < GentleInteraction::COOLDOWN);
-            hello.set_sensitive(can_greet(pose) && !cooling_down);
+            hello.set_sensitive(active && can_greet(pose) && !cooling_down);
             let motion_note = match motion {
                 OrganismMotion::Full => "Full motion: animated example.",
                 OrganismMotion::Calm => "Calm: still poses, with no frame animation.",
@@ -232,7 +286,7 @@ mod organism_preview {
                 sample.set_tooltip_text(Some(&format!("{motion_note}\n{interaction_note}")));
             }
             if let Some(delay) = next_wake(
-                self.visible.get() && group.is_mapped(),
+                active,
                 motion,
                 now,
                 greeting,
@@ -253,6 +307,7 @@ mod organism_preview {
 
     impl Drop for Preview {
         fn drop(&mut self) {
+            self.disconnect_host();
             self.stop_source();
             if let (Some(desktop), Some(handler)) =
                 (&self.desktop, self.desktop_handler.borrow_mut().take())
@@ -317,6 +372,7 @@ mod organism_preview {
             desktop: gtk::Settings::default(),
             desktop_handler: RefCell::new(None),
             source: RefCell::new(None),
+            host_observer: RefCell::new(None),
             visible: Cell::new(false),
             epoch: Instant::now(),
             greeting: Cell::new(None),
@@ -333,12 +389,7 @@ mod organism_preview {
         hello.connect_clicked({
             let preview = preview.clone();
             move |_| {
-                if !preview.visible.get()
-                    || !preview
-                        .group
-                        .upgrade()
-                        .is_some_and(|group| group.is_mapped())
-                {
+                if !preview.active() {
                     return;
                 }
                 let now = preview.epoch.elapsed();
@@ -357,7 +408,17 @@ mod organism_preview {
             let preview = preview.clone();
             move |_| {
                 preview.visible.set(true);
+                preview.observe_host();
                 preview.refresh();
+            }
+        });
+        group.connect_root_notify({
+            let weak = Rc::downgrade(&preview);
+            move |_| {
+                if let Some(preview) = weak.upgrade() {
+                    preview.observe_host();
+                    preview.refresh();
+                }
             }
         });
         group.connect_unmap({
@@ -446,7 +507,7 @@ mod organism_preview {
                 }
                 assert!(condition(), "GTK condition did not settle");
             };
-            spin_until(&|| group.is_mapped());
+            spin_until(&|| preview.active());
             // Discard fixture initialization bytes; the following interactions
             // must never write into this nonexecuting terminal's PTY.
             crate::block_view::organism_settings_test_pty_bytes(&view);
@@ -536,14 +597,14 @@ mod organism_preview {
             group.set_visible(false);
             assert!(preview.source.borrow().is_none());
             group.set_visible(true);
-            spin_until(&|| group.is_mapped());
+            spin_until(&|| preview.active());
             assert!(preview.source.borrow().is_some());
             dialog.force_close();
             spin_until(&|| !group.is_mapped());
             assert!(preview.source.borrow().is_none());
             // Reopening the same dialog starts exactly one mapped source.
             dialog.present(Some(&window));
-            spin_until(&|| group.is_mapped());
+            spin_until(&|| preview.active());
             assert!(preview.source.borrow().is_some());
             dialog.force_close();
             spin_until(&|| !group.is_mapped());
@@ -564,6 +625,76 @@ mod organism_preview {
                 "hidden settings callbacks cannot restart a timer"
             );
             window.close();
+        }
+
+        #[test]
+        fn inactive_preview_has_no_wake_even_with_a_pending_greeting() {
+            for visible in [false, true] {
+                for mapped in [false, true] {
+                    for host in [None, Some(false), Some(true)] {
+                        let active = preview_active(visible, mapped, host);
+                        assert_eq!(active, visible && mapped && host == Some(true));
+                        if !active {
+                            for motion in [
+                                OrganismMotion::Full,
+                                OrganismMotion::Calm,
+                                OrganismMotion::Static,
+                            ] {
+                                assert_eq!(
+                                    next_wake(
+                                        active,
+                                        motion,
+                                        Duration::ZERO,
+                                        Some(Duration::ZERO),
+                                        Some(Duration::ZERO),
+                                    ),
+                                    None
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn canceled_preview_greeting_does_not_replay_or_reset_cooldown() {
+            let mut interaction = GentleInteraction::default();
+            let pose = PreviewPose::Calm.context();
+            assert!(interaction.request(Duration::ZERO, pose));
+            interaction.cancel();
+            assert_eq!(interaction.apply(Duration::from_secs(1), pose), pose);
+            assert!(!interaction.request(Duration::from_secs(1), pose));
+            assert!(interaction.request(GentleInteraction::COOLDOWN, pose));
+        }
+
+        #[test]
+        fn preview_focus_lifecycle_uses_actual_host_and_preserves_cooldown() {
+            let source = include_str!("settings.rs");
+            let production = source.split("#[cfg(test)]").next().unwrap();
+            assert!(production.contains("root().and_downcast::<gtk::Window>()"));
+            assert!(production.contains("window.connect_is_active_notify"));
+            assert!(production.contains("group.connect_root_notify"));
+            assert!(production.contains("host_observer.borrow_mut().take()"));
+            assert!(production.contains("window.disconnect(handler)"));
+            let cancel = production
+                .split("fn cancel_greeting(&self)")
+                .nth(1)
+                .unwrap()
+                .split("fn host_window")
+                .next()
+                .unwrap();
+            assert!(cancel.contains("self.interaction.borrow_mut().cancel()"));
+            assert!(cancel.contains("self.greeting.set(None)"));
+            assert!(!cancel.contains("last_hello"));
+            let refresh = production
+                .split("fn refresh(self: &Rc<Self>)")
+                .nth(1)
+                .unwrap();
+            assert!(refresh.contains("if !active {\n                self.cancel_greeting();"));
+            assert!(refresh.contains("hello.set_sensitive(active &&"));
+            let click = production.split("hello.connect_clicked").nth(1).unwrap();
+            assert!(click.contains("if !preview.active() {"));
         }
 
         #[test]
