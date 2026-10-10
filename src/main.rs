@@ -1153,8 +1153,8 @@ impl SimpleComponent for AppModel {
                 dialogs::command_palette::PaletteOutput::AskAi(query) => {
                     AppMsg::PaletteAskAi(query)
                 }
-                dialogs::command_palette::PaletteOutput::RunWorkflow(path) => {
-                    AppMsg::PaletteRunWorkflow(path)
+                dialogs::command_palette::PaletteOutput::RunWorkflow(path, pane_id) => {
+                    AppMsg::PaletteRunWorkflow(path, pane_id)
                 }
             });
         let debug_dashboard = dialogs::debug_dashboard::DebugDashboardModel::builder()
@@ -1163,8 +1163,8 @@ impl SimpleComponent for AppModel {
         let workflow_dialog = dialogs::workflow::WorkflowModel::builder()
             .launch(root.clone())
             .forward(sender.input_sender(), |output| match output {
-                dialogs::workflow::WorkflowOutput::Command(command) => {
-                    AppMsg::PaletteTypeCommand(command)
+                dialogs::workflow::WorkflowOutput::Command { pane_id, command } => {
+                    AppMsg::WorkflowInsertCommand { pane_id, command }
                 }
             });
         let initial_ai_panel_visible =
@@ -2560,8 +2560,11 @@ impl SimpleComponent for AppModel {
                     self.persist_config();
                 }
             }
-            AppMsg::PaletteRunWorkflow(path) => {
-                self.run_workflow_from_path(path, &sender);
+            AppMsg::PaletteRunWorkflow(path, pane_id) => {
+                self.run_workflow_from_path(path, pane_id, &sender);
+            }
+            AppMsg::WorkflowInsertCommand { pane_id, command } => {
+                self.insert_workflow_command(pane_id, &command);
             }
             AppMsg::FileTreeGotoCwd => self.file_tree_goto_current_cwd(&sender),
             AppMsg::FileTreeGoUp => self.file_tree_go_up(&sender),

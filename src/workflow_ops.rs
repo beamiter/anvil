@@ -18,7 +18,33 @@ use super::*;
 /// and the other three terminals are single-threaded immediate-mode.
 pub(crate) use jterm_core::workflows::RefreshLatch as WorkflowRefreshState;
 
+fn available_workflow_target(
+    pane_id: Option<u64>,
+    exists: impl FnOnce(u64) -> bool,
+) -> Option<u64> {
+    pane_id.filter(|id| exists(*id))
+}
+
 impl AppModel {
+    pub(crate) fn workflow_target_pane(&self) -> Option<u64> {
+        self.tabs
+            .get(self.active)
+            .and_then(|tab| tab.panes.get(tab.active_pane))
+            .map(|pane| pane.id)
+    }
+
+    pub(crate) fn insert_workflow_command(&self, pane_id: u64, command: &str) {
+        if available_workflow_target(Some(pane_id), |id| self.find_pane(id).is_some()).is_none() {
+            self.show_toast(
+                "Workflow was not inserted: its original terminal is no longer available.",
+            );
+            return;
+        }
+        // This only dispatches validated review text to the original component;
+        // it is not an acknowledgment of PTY queue admission or delivery.
+        self.insert_review_text_into_pane(pane_id, command);
+    }
+
     /// Refresh the shared workflow cache without delaying palette presentation.
     /// At most one scan can be in flight; callers immediately keep using the
     /// last completed cache while this worker discovers and parses updates.
@@ -94,8 +120,16 @@ impl AppModel {
     pub(crate) fn run_workflow_from_path(
         &self,
         path: std::path::PathBuf,
+        pane_id: Option<u64>,
         sender: &ComponentSender<AppModel>,
     ) {
+        let Some(pane_id) = available_workflow_target(pane_id, |id| self.find_pane(id).is_some())
+        else {
+            self.show_toast(
+                "Workflow was not opened: its original terminal is no longer available.",
+            );
+            return;
+        };
         let workflow = self
             .workflows
             .borrow()
@@ -117,7 +151,7 @@ impl AppModel {
             // The same render path the dialog uses, so the literal-brace escape
             // and the review-input gate apply to a zero-argument workflow too.
             match workflows::ArgsForm::new(workflow).render() {
-                Ok(rendered) => sender.input(AppMsg::PaletteTypeCommand(rendered)),
+                Ok(command) => sender.input(AppMsg::WorkflowInsertCommand { pane_id, command }),
                 Err(e) => {
                     log::warn!("workflow render failed: {e}");
                     self.show_toast(format!("Workflow could not be rendered: {e}"));
@@ -126,7 +160,7 @@ impl AppModel {
             return;
         }
         self.workflow_dialog
-            .emit(dialogs::workflow::WorkflowMsg::Open(workflow));
+            .emit(dialogs::workflow::WorkflowMsg::Open { workflow, pane_id });
     }
 }
 
@@ -172,6 +206,79 @@ const TOAST_FIELD_BYTES: usize = 256;
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn workflow_target_survives_reordering_but_never_falls_back_after_removal() {
+        let captured = Some(42);
+        assert_eq!(
+            available_workflow_target(captured, |id| [42, 9].contains(&id)),
+            Some(42)
+        );
+        assert_eq!(
+            available_workflow_target(captured, |id| [9, 42].contains(&id)),
+            Some(42)
+        );
+        assert_eq!(
+            available_workflow_target(captured, |id| [9].contains(&id)),
+            None
+        );
+        assert_eq!(
+            available_workflow_target(None, |_| panic!("no target to check")),
+            None
+        );
+    }
+
+    #[test]
+    fn workflow_target_is_carried_from_every_palette_entry_to_targeted_dispatch() {
+        let action = include_str!("action_ops.rs");
+        assert_eq!(action.matches("PaletteMsg::Toggle {").count(), 4);
+        assert_eq!(
+            action
+                .matches("workflow_target: self.workflow_target_pane()")
+                .count(),
+            4
+        );
+        let palette = include_str!("dialogs/command_palette.rs")
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap();
+        assert!(palette.contains("self.workflow_target = workflow_target"));
+        assert!(palette.contains("PaletteOutput::RunWorkflow(path, workflow_target)"));
+        let main = include_str!("main.rs");
+        assert!(main.contains("AppMsg::PaletteRunWorkflow(path, pane_id)"));
+        assert!(main.contains("self.run_workflow_from_path(path, pane_id, &sender)"));
+        assert!(main.contains("self.insert_workflow_command(pane_id, &command)"));
+        let workflow = include_str!("dialogs/workflow.rs")
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap();
+        assert!(workflow.contains("self.target_pane = Some(pane_id)"));
+        assert!(workflow.contains("let Some(pane_id) = self.target_pane"));
+        assert!(workflow.contains("WorkflowOutput::Command { pane_id, command }"));
+        let source = include_str!("workflow_ops.rs")
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap();
+        let dispatch = source
+            .split("pub(crate) fn insert_workflow_command(")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn refresh_workflows_async(")
+            .next()
+            .unwrap();
+        assert!(dispatch.contains("available_workflow_target(Some(pane_id)"));
+        assert!(dispatch.contains("self.insert_review_text_into_pane(pane_id, command)"));
+        assert!(!dispatch.contains("self.active"));
+        let run = source
+            .split("pub(crate) fn run_workflow_from_path(")
+            .nth(1)
+            .unwrap();
+        assert!(run.contains("available_workflow_target(pane_id"));
+        assert!(run.contains("AppMsg::WorkflowInsertCommand { pane_id, command }"));
+        assert!(run.contains("WorkflowMsg::Open { workflow, pane_id }"));
+        assert!(!run.contains("PaletteTypeCommand"));
+        assert!(!run.contains("self.active"));
+    }
 
     fn refusal(path: &str, reason: &str) -> (PathBuf, String) {
         (PathBuf::from(path), reason.to_string())

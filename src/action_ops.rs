@@ -195,6 +195,7 @@ impl AppModel {
                     .unwrap_or_default();
                 self.command_palette
                     .emit(dialogs::command_palette::PaletteMsg::Toggle {
+                        workflow_target: self.workflow_target_pane(),
                         // Match Forge's command center: the default entry point
                         // searches actions, history, workflows and AI together.
                         // Prefixes still narrow the same surface immediately.
@@ -212,6 +213,7 @@ impl AppModel {
                     .unwrap_or_default();
                 self.command_palette
                     .emit(dialogs::command_palette::PaletteMsg::Toggle {
+                        workflow_target: self.workflow_target_pane(),
                         mode: palette::PaletteMode::All,
                         history_path: history.map(std::path::PathBuf::from),
                         live_history,
@@ -226,6 +228,7 @@ impl AppModel {
                     .unwrap_or_default();
                 self.command_palette
                     .emit(dialogs::command_palette::PaletteMsg::Toggle {
+                        workflow_target: self.workflow_target_pane(),
                         mode: palette::PaletteMode::History,
                         history_path: history.map(std::path::PathBuf::from),
                         live_history,
@@ -240,6 +243,7 @@ impl AppModel {
                     .unwrap_or_default();
                 self.command_palette
                     .emit(dialogs::command_palette::PaletteMsg::Toggle {
+                        workflow_target: self.workflow_target_pane(),
                         mode: palette::PaletteMode::Workflows,
                         history_path: history.map(std::path::PathBuf::from),
                         live_history,

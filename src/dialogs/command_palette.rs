@@ -5,7 +5,7 @@ use relm4::adw::prelude::*;
 use relm4::factory::{DynamicIndex, FactoryComponent, FactorySender, FactoryVecDeque};
 use relm4::gtk;
 use relm4::prelude::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -15,7 +15,14 @@ use crate::palette::{self as palette_data, Accept, Entry, PaletteMode, Query};
 use crate::workflows::Workflow;
 
 #[derive(Debug)]
+struct PaletteRowInit {
+    entry: Entry,
+    generation: u64,
+}
+
+#[derive(Debug)]
 struct PaletteRow {
+    generation: u64,
     label: String,
     sublabel: Option<String>,
     right: Option<String>,
@@ -24,12 +31,12 @@ struct PaletteRow {
 
 #[derive(Debug)]
 enum PaletteRowOutput {
-    Activate(Accept),
+    Activate(u64, Accept),
 }
 
 #[relm4::factory]
 impl FactoryComponent for PaletteRow {
-    type Init = Entry;
+    type Init = PaletteRowInit;
     type Input = ();
     type Output = PaletteRowOutput;
     type CommandOutput = ();
@@ -40,8 +47,8 @@ impl FactoryComponent for PaletteRow {
             set_title: &escape_markup(&self.label),
             set_subtitle: &escape_markup(self.sublabel.as_deref().unwrap_or("")),
             set_activatable: true,
-            connect_activated[sender, accept = self.accept.clone()] => move |_| {
-                let _ = sender.output(PaletteRowOutput::Activate(accept.clone()));
+            connect_activated[sender, accept = self.accept.clone(), generation = self.generation] => move |_| {
+                let _ = sender.output(PaletteRowOutput::Activate(generation, accept.clone()));
             },
 
             add_suffix = &gtk::Label {
@@ -54,10 +61,11 @@ impl FactoryComponent for PaletteRow {
 
     fn init_model(entry: Self::Init, _index: &DynamicIndex, _sender: FactorySender<Self>) -> Self {
         Self {
-            label: entry.label,
-            sublabel: entry.sublabel,
-            right: entry.right,
-            accept: entry.accept,
+            generation: entry.generation,
+            label: entry.entry.label,
+            sublabel: entry.entry.sublabel,
+            right: entry.entry.right,
+            accept: entry.entry.accept,
         }
     }
 }
@@ -71,13 +79,14 @@ pub(crate) struct PaletteInit {
 #[derive(Debug)]
 pub(crate) enum PaletteMsg {
     Toggle {
+        workflow_target: Option<u64>,
         mode: PaletteMode,
         history_path: Option<PathBuf>,
         /// Current Block commands, already newest-first. The component merges
         /// these into its persisted snapshot only when the dialog opens.
         live_history: Vec<String>,
     },
-    Search(String),
+    Search(u64, String),
     /// The shared workflow cache was replaced in the app model. Rebuild only
     /// when this dialog is still presented; a closed palette will consume the
     /// same cache the next time it opens.
@@ -89,11 +98,11 @@ pub(crate) enum PaletteMsg {
         generation: u64,
         result: Result<Vec<CommandHistoryRecord>, String>,
     },
-    Activate(Accept),
-    Move(i32),
-    AcceptSelected,
-    Close,
-    Closed,
+    Activate(u64, Accept),
+    Move(u64, i32),
+    AcceptSelected(u64),
+    Close(u64),
+    Closed(u64),
 }
 
 #[derive(Debug)]
@@ -101,13 +110,13 @@ pub(crate) enum PaletteOutput {
     Action(Action),
     TypeCommand(String),
     AskAi(String),
-    RunWorkflow(PathBuf),
+    RunWorkflow(PathBuf, Option<u64>),
 }
 
 #[derive(Debug, Default)]
 struct PaletteOpeningGeneration {
     sequence: u64,
-    active: Option<u64>,
+    active: Rc<Cell<Option<u64>>>,
 }
 
 impl PaletteOpeningGeneration {
@@ -115,20 +124,20 @@ impl PaletteOpeningGeneration {
         // Reusing 1 after overflow is safe in practice: retaining a worker
         // across 2^64 distinct dialog openings is physically impossible.
         self.sequence = self.sequence.checked_add(1).unwrap_or(1);
-        self.active = Some(self.sequence);
+        self.active.set(Some(self.sequence));
         self.sequence
     }
 
     fn close(&mut self) {
-        self.active = None;
+        self.active.set(None);
     }
 
     fn accepts(&self, generation: u64) -> bool {
-        self.active == Some(generation)
+        self.active.get() == Some(generation)
     }
 
     fn active(&self) -> Option<u64> {
-        self.active
+        self.active.get()
     }
 }
 
@@ -209,6 +218,7 @@ pub(crate) struct PaletteModel {
     mode: PaletteMode,
     history_snapshot: Vec<CommandHistoryRecord>,
     opening: PaletteOpeningGeneration,
+    workflow_target: Option<u64>,
     history_load: HistoryLoadState,
     query: String,
     rows: FactoryVecDeque<PaletteRow>,
@@ -226,7 +236,11 @@ impl Component for PaletteModel {
             set_title: "Palette",
             set_content_width: 560,
             set_content_height: 520,
-            connect_closed => PaletteMsg::Closed,
+            connect_closed[sender, generation = model.opening.active.clone()] => move |_| {
+                if let Some(generation) = generation.get() {
+                    sender.input(PaletteMsg::Closed(generation));
+                }
+            },
 
             #[wrap(Some)]
             set_child = &adw::ToolbarView {
@@ -240,8 +254,10 @@ impl Component for PaletteModel {
                     gtk::SearchEntry {
                         set_hexpand: true,
                         set_margin_all: 12,
-                        connect_search_changed[sender] => move |entry| {
-                            sender.input(PaletteMsg::Search(entry.text().to_string()));
+                        connect_search_changed[sender, generation = model.opening.active.clone()] => move |entry| {
+                            if let Some(generation) = generation.get() {
+                                sender.input(PaletteMsg::Search(generation, entry.text().to_string()));
+                            }
                         },
                     },
 
@@ -274,18 +290,21 @@ impl Component for PaletteModel {
 
             add_controller = gtk::EventControllerKey {
                 set_propagation_phase: gtk::PropagationPhase::Capture,
-                connect_key_pressed[sender] => move |_, key, _, state| {
+                connect_key_pressed[sender, generation = model.opening.active.clone()] => move |_, key, _, state| {
+                    let Some(generation) = generation.get() else {
+                        return gtk::glib::Propagation::Proceed;
+                    };
                     use gtk::gdk::{Key, ModifierType};
                     let close_shortcut = matches!(key, Key::P | Key::p)
                         && state.contains(
                             ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK
                         );
                     let message = match key {
-                        Key::Escape => Some(PaletteMsg::Close),
-                        Key::Return | Key::KP_Enter => Some(PaletteMsg::AcceptSelected),
-                        Key::Down => Some(PaletteMsg::Move(1)),
-                        Key::Up => Some(PaletteMsg::Move(-1)),
-                        _ if close_shortcut => Some(PaletteMsg::Close),
+                        Key::Escape => Some(PaletteMsg::Close(generation)),
+                        Key::Return | Key::KP_Enter => Some(PaletteMsg::AcceptSelected(generation)),
+                        Key::Down => Some(PaletteMsg::Move(generation, 1)),
+                        Key::Up => Some(PaletteMsg::Move(generation, -1)),
+                        _ if close_shortcut => Some(PaletteMsg::Close(generation)),
                         _ => None,
                     };
                     if let Some(message) = message {
@@ -308,7 +327,9 @@ impl Component for PaletteModel {
             FactoryVecDeque::builder()
                 .launch_default()
                 .forward(sender.input_sender(), |output| match output {
-                    PaletteRowOutput::Activate(accept) => PaletteMsg::Activate(accept),
+                    PaletteRowOutput::Activate(generation, accept) => {
+                        PaletteMsg::Activate(generation, accept)
+                    }
                 });
         let model = Self {
             parent: init.parent,
@@ -317,6 +338,7 @@ impl Component for PaletteModel {
             mode: PaletteMode::All,
             history_snapshot: Vec::new(),
             opening: PaletteOpeningGeneration::default(),
+            workflow_target: None,
             history_load: HistoryLoadState::default(),
             query: String::new(),
             rows,
@@ -334,19 +356,32 @@ impl Component for PaletteModel {
         sender: ComponentSender<Self>,
         root: &Self::Root,
     ) {
+        let generation = match &msg {
+            PaletteMsg::Search(generation, _)
+            | PaletteMsg::Activate(generation, _)
+            | PaletteMsg::Move(generation, _)
+            | PaletteMsg::AcceptSelected(generation)
+            | PaletteMsg::Close(generation)
+            | PaletteMsg::Closed(generation) => Some(*generation),
+            _ => None,
+        };
+        if generation.is_some_and(|generation| !self.opening.accepts(generation)) {
+            return;
+        }
         match msg {
             PaletteMsg::Toggle {
+                workflow_target,
                 mode,
                 history_path,
                 live_history,
             } => {
                 if root.parent().is_some() {
-                    self.opening.close();
-                    self.history_load.close();
+                    self.close_opening(widgets);
                     root.force_close();
                     return;
                 }
                 let generation = self.opening.open();
+                self.workflow_target = workflow_target;
                 self.mode = mode;
                 // History is pane/path specific. Do not briefly expose a stale
                 // prior opening while its replacement loads; actions and the
@@ -378,7 +413,7 @@ impl Component for PaletteModel {
                     self.spawn_admitted_history_load(request, &sender, widgets);
                 }
             }
-            PaletteMsg::Search(query) => {
+            PaletteMsg::Search(_, query) => {
                 self.query = query;
                 self.rebuild_rows();
                 self.select_first(widgets);
@@ -419,8 +454,8 @@ impl Component for PaletteModel {
                     self.spawn_admitted_history_load(request, &sender, widgets);
                 }
             }
-            PaletteMsg::Activate(accept) => self.accept(accept, &sender, root),
-            PaletteMsg::Move(delta) => {
+            PaletteMsg::Activate(_, accept) => self.accept(accept, &sender, root, widgets),
+            PaletteMsg::Move(_, delta) => {
                 let len = self.rows.len() as i32;
                 if len == 0 {
                     return;
@@ -435,7 +470,7 @@ impl Component for PaletteModel {
                     widgets.list_box.select_row(Some(&row));
                 }
             }
-            PaletteMsg::AcceptSelected => {
+            PaletteMsg::AcceptSelected(_) => {
                 // SearchEntry's delayed Search message may still be pending.
                 // Refresh model and rows synchronously before resolving Enter.
                 let query = widgets.filter_entry.text().to_string();
@@ -448,18 +483,14 @@ impl Component for PaletteModel {
                     return;
                 };
                 let accept = self.rows.guard()[row.index() as usize].accept.clone();
-                self.accept(accept, &sender, root);
+                self.accept(accept, &sender, root, widgets);
             }
-            PaletteMsg::Close => {
-                self.opening.close();
-                self.history_load.close();
+            PaletteMsg::Close(_) => {
+                self.close_opening(widgets);
                 root.force_close();
             }
-            PaletteMsg::Closed => {
-                self.opening.close();
-                self.history_load.close();
-                self.history_snapshot.clear();
-                widgets.history_status.set_visible(false);
+            PaletteMsg::Closed(_) => {
+                self.close_opening(widgets);
             }
         }
     }
@@ -487,6 +518,9 @@ impl PaletteModel {
     }
 
     fn rebuild_rows(&mut self) {
+        let Some(generation) = self.opening.active() else {
+            return;
+        };
         let query = Query::parse(&self.query, self.mode);
         let entries = palette_data::gather(
             &query,
@@ -498,7 +532,7 @@ impl PaletteModel {
         let mut rows = self.rows.guard();
         rows.clear();
         for entry in entries {
-            rows.push_back(entry);
+            rows.push_back(PaletteRowInit { entry, generation });
         }
     }
 
@@ -508,16 +542,30 @@ impl PaletteModel {
             .select_row(widgets.list_box.row_at_index(0).as_ref());
     }
 
-    fn accept(&mut self, accept: Accept, sender: &ComponentSender<Self>, root: &adw::Dialog) {
-        crate::enter_ownership::claim_held();
+    fn close_opening(&mut self, widgets: &PaletteModelWidgets) {
         self.opening.close();
         self.history_load.close();
+        self.history_snapshot.clear();
+        self.workflow_target = None;
+        widgets.history_status.set_visible(false);
+    }
+
+    fn accept(
+        &mut self,
+        accept: Accept,
+        sender: &ComponentSender<Self>,
+        root: &adw::Dialog,
+        widgets: &PaletteModelWidgets,
+    ) {
+        let workflow_target = self.workflow_target;
+        crate::enter_ownership::claim_held();
+        self.close_opening(widgets);
         root.force_close();
         let output = match accept {
             Accept::Action(action) => PaletteOutput::Action(action),
             Accept::TypeCommand(command) => PaletteOutput::TypeCommand(command),
             Accept::AskAi(query) => PaletteOutput::AskAi(query),
-            Accept::RunWorkflow(path) => PaletteOutput::RunWorkflow(path),
+            Accept::RunWorkflow(path) => PaletteOutput::RunWorkflow(path, workflow_target),
         };
         let _ = sender.output(output);
     }
@@ -582,6 +630,94 @@ mod tests {
     use super::{HistoryLoadRequest, HistoryLoadState, PaletteOpeningGeneration};
 
     #[test]
+    fn palette_factory_messages_remain_send_safe() {
+        fn assert_send<T: Send>() {}
+        assert_send::<super::PaletteRowOutput>();
+        assert_send::<super::PaletteMsg>();
+        assert_send::<super::PaletteOutput>();
+    }
+
+    #[test]
+    fn queued_palette_actions_keep_the_signal_time_opening() {
+        let mut opening = PaletteOpeningGeneration::default();
+        let signal_generation = opening.active.clone();
+        let first = opening.open();
+        let queued = signal_generation.get().unwrap();
+        assert_eq!(queued, first);
+        opening.close();
+        assert_eq!(signal_generation.get(), None);
+        let second = opening.open();
+        assert!(!opening.accepts(queued));
+        assert!(opening.accepts(second));
+        assert_eq!(signal_generation.get(), Some(second));
+    }
+
+    #[test]
+    fn palette_rows_and_native_actions_gate_before_selection_or_close() {
+        let source = include_str!("command_palette.rs")
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap();
+        assert!(source.contains("generation = self.generation"));
+        assert!(source.contains("PaletteRowOutput::Activate(generation, accept.clone())"));
+        assert!(source.contains("PaletteMsg::Activate(generation, accept)"));
+        assert!(source.contains("rows.push_back(PaletteRowInit { entry, generation })"));
+        assert_eq!(
+            source
+                .matches("generation = model.opening.active.clone()")
+                .count(),
+            3
+        );
+        for message in [
+            "Search(generation,",
+            "AcceptSelected(generation)",
+            "Move(generation,",
+            "Close(generation)",
+            "Closed(generation)",
+        ] {
+            assert!(source.contains(message), "{message}");
+        }
+        let update = source.split("    fn update_with_view(").nth(1).unwrap();
+        assert!(
+            update.find("!self.opening.accepts(generation)").unwrap()
+                < update.find("match msg {").unwrap()
+        );
+    }
+
+    #[test]
+    fn every_palette_close_path_clears_history_and_target_synchronously() {
+        let source = include_str!("command_palette.rs")
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap();
+        assert_eq!(source.matches("self.close_opening(widgets)").count(), 4);
+        let cleanup = source
+            .split("    fn close_opening(")
+            .nth(1)
+            .unwrap()
+            .split("    fn accept(")
+            .next()
+            .unwrap();
+        for clear in [
+            "self.opening.close()",
+            "self.history_load.close()",
+            "self.history_snapshot.clear()",
+            "self.workflow_target = None",
+            "widgets.history_status.set_visible(false)",
+        ] {
+            assert!(cleanup.contains(clear), "{clear}");
+        }
+        let accept = source.split("    fn accept(").nth(1).unwrap();
+        assert!(
+            accept
+                .find("let workflow_target = self.workflow_target")
+                .unwrap()
+                < accept.find("self.close_opening(widgets)").unwrap()
+        );
+        assert!(accept.contains("PaletteOutput::RunWorkflow(path, workflow_target)"));
+    }
+
+    #[test]
     fn workflow_reload_follows_the_effective_query_mode() {
         use super::{query_uses_workflows, PaletteMode};
         assert!(query_uses_workflows(": deploy", PaletteMode::History));
@@ -599,10 +735,10 @@ mod tests {
         // It does not claim native event-loop or factory-widget integration.
         let source = include_str!("command_palette.rs");
         let enter = source
-            .split_once("PaletteMsg::AcceptSelected => {")
+            .split_once("PaletteMsg::AcceptSelected(_) => {")
             .unwrap()
             .1
-            .split_once("PaletteMsg::Close => {")
+            .split_once("PaletteMsg::Close(_) => {")
             .unwrap()
             .0;
         let input = enter.find("widgets.filter_entry.text()").unwrap();

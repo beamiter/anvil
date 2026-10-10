@@ -95,7 +95,7 @@ impl FactoryComponent for WorkflowArgRow {
 
 #[derive(Debug)]
 pub(crate) enum WorkflowMsg {
-    Open(Workflow),
+    Open { workflow: Workflow, pane_id: u64 },
     Changed(Arc<()>, String, String),
     Submit(Arc<()>),
     Close(Arc<()>),
@@ -103,12 +103,13 @@ pub(crate) enum WorkflowMsg {
 
 #[derive(Debug)]
 pub(crate) enum WorkflowOutput {
-    Command(String),
+    Command { pane_id: u64, command: String },
 }
 
 pub(crate) struct WorkflowModel {
     parent: adw::ApplicationWindow,
     form: Option<ArgsForm>,
+    target_pane: Option<u64>,
     opening: Rc<RefCell<Option<Arc<()>>>>,
     rows: FactoryVecDeque<WorkflowArgRow>,
 }
@@ -197,6 +198,7 @@ impl Component for WorkflowModel {
         let model = Self {
             parent,
             form: None,
+            target_pane: None,
             opening: Rc::new(RefCell::new(None)),
             rows,
         };
@@ -224,7 +226,7 @@ impl Component for WorkflowModel {
         root: &Self::Root,
     ) {
         let expected = match &msg {
-            WorkflowMsg::Open(_) => None,
+            WorkflowMsg::Open { .. } => None,
             WorkflowMsg::Changed(opening, ..)
             | WorkflowMsg::Submit(opening)
             | WorkflowMsg::Close(opening) => Some(opening),
@@ -233,7 +235,8 @@ impl Component for WorkflowModel {
             return;
         }
         match msg {
-            WorkflowMsg::Open(workflow) => {
+            WorkflowMsg::Open { workflow, pane_id } => {
+                self.target_pane = Some(pane_id);
                 let opening = Arc::new(());
                 *self.opening.borrow_mut() = Some(opening.clone());
                 root.set_title(&format!("Workflow: {}", workflow.name));
@@ -304,12 +307,16 @@ impl Component for WorkflowModel {
                 let Some(form) = self.form.as_ref() else {
                     return;
                 };
+                let Some(pane_id) = self.target_pane else {
+                    return;
+                };
                 match form.render() {
                     Ok(command) => {
                         self.opening.borrow_mut().take();
                         self.form = None;
+                        self.target_pane = None;
                         root.force_close();
-                        let _ = sender.output(WorkflowOutput::Command(command));
+                        let _ = sender.output(WorkflowOutput::Command { pane_id, command });
                     }
                     Err(error) => {
                         // Includes "missing values: <names>" for an argument
@@ -325,6 +332,7 @@ impl Component for WorkflowModel {
             WorkflowMsg::Close(_) => {
                 self.opening.borrow_mut().take();
                 self.form = None;
+                self.target_pane = None;
                 root.force_close();
             }
         }
@@ -347,6 +355,7 @@ mod tests {
         fn assert_send<T: Send>() {}
         assert_send::<super::WorkflowArgOutput>();
         assert_send::<super::WorkflowMsg>();
+        assert_send::<super::WorkflowOutput>();
     }
 
     #[test]
@@ -390,7 +399,7 @@ mod tests {
         let update = source.split("    fn update_with_view(").nth(1).unwrap();
         assert!(update.find("!is_current_opening").unwrap() < update.find("match msg {").unwrap());
         let open = update
-            .split("WorkflowMsg::Open(workflow) => {")
+            .split("WorkflowMsg::Open { workflow, pane_id } => {")
             .nth(1)
             .unwrap();
         assert!(open.find("Some(opening.clone())").unwrap() < open.find("rows.clear()").unwrap());
@@ -431,7 +440,7 @@ mod tests {
         assert!(
             success.find("self.form = None").unwrap()
                 < success
-                    .find("sender.output(WorkflowOutput::Command(command))")
+                    .find("sender.output(WorkflowOutput::Command { pane_id, command })")
                     .unwrap()
         );
         let error = submit

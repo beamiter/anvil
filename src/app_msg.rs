@@ -382,6 +382,10 @@ pub(crate) enum AppMsg {
     /// Self-re-arming drain of native runtime events, worktree creation, and
     /// the diff worker.
     AgentTasksTick,
-    PaletteRunWorkflow(std::path::PathBuf),
+    PaletteRunWorkflow(std::path::PathBuf, Option<u64>),
+    WorkflowInsertCommand {
+        pane_id: u64,
+        command: String,
+    },
     Ignore,
 }
