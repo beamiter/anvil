@@ -323,7 +323,7 @@ impl AppModel {
             }
             Action::InstallJsh => self.install_or_update_jsh(sender),
             Action::ToggleSearch => self.toggle_search(),
-            Action::ReloadConfig => self.reload_config(sender),
+            Action::ReloadConfig => self.reload_config_explicit(sender),
             Action::MoveTabLeft => self.move_tab(-1, sender),
             Action::MoveTabRight => self.move_tab(1, sender),
             Action::DuplicateTab => self.duplicate_active_tab(sender),

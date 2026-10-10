@@ -6,6 +6,18 @@
 
 use super::*;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReloadIntent {
+    Monitor,
+    Explicit,
+}
+
+impl ReloadIntent {
+    fn skips_matching_revision(self, revision_matches: bool) -> bool {
+        self == Self::Monitor && revision_matches
+    }
+}
+
 impl AppModel {
     /// Block panes keep a callback-safe configuration snapshot inside
     /// `TermView`; tell each backend to refresh it after the app-level value
@@ -19,6 +31,18 @@ impl AppModel {
     }
 
     pub(crate) fn reload_config(&mut self, sender: &ComponentSender<AppModel>) {
+        self.reload_config_with_intent(sender, ReloadIntent::Monitor);
+    }
+
+    pub(crate) fn reload_config_explicit(&mut self, sender: &ComponentSender<AppModel>) {
+        self.reload_config_with_intent(sender, ReloadIntent::Explicit);
+    }
+
+    fn reload_config_with_intent(
+        &mut self,
+        sender: &ComponentSender<AppModel>,
+        intent: ReloadIntent,
+    ) {
         if self.safe_mode {
             self.show_toast("Configuration reload is disabled in safe mode.");
             return;
@@ -38,7 +62,11 @@ impl AppModel {
         // The file monitor also sees our own saves. Reloading those is a no-op
         // that still costs a full pane refresh and a toast, which is loud once
         // Ctrl+wheel writes the font scale on every zoom burst.
-        if self.config_revision.borrow().as_ref() == Some(&revision) {
+        // An explicit reload also discards live edits whose save failed (or
+        // whose font-scale save is still debounced), even if disk is unchanged.
+        // Validate the disk snapshot first so rejection keeps live state intact.
+        if intent.skips_matching_revision(self.config_revision.borrow().as_ref() == Some(&revision))
+        {
             log::debug!("configuration reload skipped: file matches the last save");
             return;
         }
@@ -173,8 +201,78 @@ pub(crate) fn dynamic_css(config: &Config) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::dynamic_css;
+    use super::{ReloadIntent, dynamic_css};
     use crate::config::Config;
+
+    #[test]
+    fn explicit_reload_restores_unchanged_disk_after_an_unsaved_live_edit() {
+        let disk = "saved A";
+        let live = "unsaved B";
+        let apply = |intent: ReloadIntent, revision_matches| {
+            if intent.skips_matching_revision(revision_matches) {
+                live
+            } else {
+                disk
+            }
+        };
+        assert_eq!(apply(ReloadIntent::Monitor, true), live);
+        assert_eq!(apply(ReloadIntent::Explicit, true), disk);
+        assert_eq!(apply(ReloadIntent::Monitor, false), disk);
+        assert_eq!(apply(ReloadIntent::Explicit, false), disk);
+    }
+
+    #[test]
+    fn explicit_and_monitor_routes_validate_before_revision_or_live_state_changes() {
+        let source = include_str!("config_ops.rs")
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("production source");
+        assert!(source.contains("self.reload_config_with_intent(sender, ReloadIntent::Monitor)"));
+        assert!(source.contains("self.reload_config_with_intent(sender, ReloadIntent::Explicit)"));
+        let reload = source
+            .split("    fn reload_config_with_intent(")
+            .nth(1)
+            .unwrap();
+        let read = reload
+            .find("config_store::read_validated_snapshot")
+            .unwrap();
+        let rejected = reload.find("Err(error) => {").unwrap();
+        let rejection_return = reload[rejected..].find("return;").unwrap() + rejected;
+        let dedup = reload.find("intent.skips_matching_revision").unwrap();
+        let apply = reload
+            .find("*self.config.borrow_mut() = new_config.clone()")
+            .unwrap();
+        let revision = reload
+            .find("*self.config_revision.borrow_mut() = Some(revision)")
+            .unwrap();
+        assert!(read < rejected && rejection_return < dedup && dedup < apply && apply < revision);
+        assert!(
+            include_str!("action_ops.rs")
+                .contains("Action::ReloadConfig => self.reload_config_explicit(sender)")
+        );
+        assert!(
+            include_str!("main.rs").contains("AppMsg::ReloadConfig => self.reload_config(&sender)")
+        );
+    }
+
+    #[test]
+    fn queued_font_persistence_reads_current_config_without_a_stale_scale_payload() {
+        let settings = include_str!("settings_ops.rs");
+        let debounce = settings
+            .split("let token = Rc::clone(&self.font_persist_generation)")
+            .nth(1)
+            .expect("font debounce generation");
+        let callback = debounce.split("});").next().unwrap();
+        assert!(callback.contains("token.get() == generation"));
+        assert!(callback.contains("sender.input(AppMsg::PersistFontScale)"));
+        assert!(!callback.contains("scale"));
+        let main = include_str!("main.rs");
+        assert!(main.contains("AppMsg::PersistFontScale => self.persist_config()"));
+        let workspace = include_str!("workspace_ops.rs");
+        let persist = workspace.split("fn persist_config(&self)").nth(1).unwrap();
+        assert!(persist.contains("let config = self.config.borrow()"));
+        assert!(persist.contains("config_store::save_config(&config, expected.as_ref())"));
+    }
 
     #[test]
     fn the_bell_badge_outranks_the_tab_colour_checked_or_not() {
