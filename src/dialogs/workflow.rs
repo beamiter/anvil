@@ -204,7 +204,7 @@ impl Component for WorkflowModel {
         let widgets = view_output!();
         // AdwDialog emits closed synchronously when closing begins. Capture
         // that opening here, not when the queued Relm message is handled.
-        root.connect_closed({
+        widgets.root.connect_closed({
             let opening = model.opening.clone();
             move |_| {
                 let current = opening.borrow().clone();
