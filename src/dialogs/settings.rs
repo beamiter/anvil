@@ -38,6 +38,17 @@ mod organism_preview {
         }
     }
 
+    fn motion_policy(selected: u32, animations: Option<bool>) -> &'static str {
+        match (selected, animations) {
+            (1, _) => "Full: animated movement and quiet hover greetings.",
+            (2, _) => "Calm: still poses and quiet hover greetings.",
+            (3, _) => "Static: inline cards only; no live hover greetings.",
+            (_, Some(true)) => "Automatic (Full): follows desktop animations.",
+            (_, Some(false)) => "Automatic (Calm): desktop animations are disabled.",
+            (_, None) => "Automatic (Full): desktop preference unavailable.",
+        }
+    }
+
     fn selected_pose(index: u32) -> PreviewPose {
         PreviewPose::ALL
             .get(index as usize)
@@ -156,12 +167,15 @@ mod organism_preview {
             };
             let now = self.epoch.elapsed();
             let pose = self.pose();
-            let motion = motion_for_selection(
-                motion_row.selected(),
-                self.desktop
-                    .as_ref()
-                    .is_none_or(|settings| settings.is_gtk_enable_animations()),
-            );
+            let animations = self
+                .desktop
+                .as_ref()
+                .map(|settings| settings.is_gtk_enable_animations());
+            let motion = motion_for_selection(motion_row.selected(), animations.unwrap_or(true));
+            let policy = motion_policy(motion_row.selected(), animations);
+            if motion_row.subtitle().as_deref() != Some(policy) {
+                motion_row.set_subtitle(policy);
+            }
             let context = self.interaction.borrow_mut().apply(now, pose.context());
             let frame = sprite_frame_with_context(context, frame_index(motion, now));
             if sprite.text().as_str() != frame.as_ref() {
@@ -550,6 +564,70 @@ mod organism_preview {
                 "hidden settings callbacks cannot restart a timer"
             );
             window.close();
+        }
+
+        #[test]
+        fn motion_policy_explains_effective_mode_and_explicit_overrides() {
+            assert_eq!(
+                motion_policy(0, Some(true)),
+                "Automatic (Full): follows desktop animations."
+            );
+            assert_eq!(
+                motion_policy(0, Some(false)),
+                "Automatic (Calm): desktop animations are disabled."
+            );
+            for selected in 1..=3 {
+                assert_eq!(
+                    motion_policy(selected, Some(true)),
+                    motion_policy(selected, Some(false))
+                );
+                assert_eq!(
+                    motion_policy(selected, None),
+                    motion_policy(selected, Some(true))
+                );
+            }
+            assert_eq!(
+                motion_policy(3, Some(true)),
+                "Static: inline cards only; no live hover greetings."
+            );
+            assert_eq!(
+                motion_policy(0, None),
+                "Automatic (Full): desktop preference unavailable."
+            );
+            for animations in [None, Some(false), Some(true)] {
+                assert_eq!(
+                    motion_policy(u32::MAX, animations),
+                    motion_policy(0, animations)
+                );
+            }
+        }
+
+        #[test]
+        fn motion_policy_refresh_uses_existing_selection_and_desktop_notifications() {
+            let source = include_str!("settings.rs");
+            let production = source.split("#[cfg(test)]").next().unwrap();
+            let refresh = production
+                .split("fn refresh(self: &Rc<Self>)")
+                .nth(1)
+                .unwrap()
+                .split("impl Drop for Preview")
+                .next()
+                .unwrap();
+            assert!(refresh.contains("motion_policy(motion_row.selected(), animations)"));
+            assert!(refresh.contains("motion_row.subtitle().as_deref() != Some(policy)"));
+            assert!(refresh.contains("motion_row.set_subtitle(policy)"));
+            let build = production.split("fn build(").nth(1).unwrap();
+            for signal in [
+                "motion.connect_selected_notify",
+                "desktop.connect_gtk_enable_animations_notify",
+            ] {
+                let callback = build.split(signal).nth(1).unwrap();
+                assert!(callback
+                    .split("});")
+                    .next()
+                    .unwrap()
+                    .contains("preview.refresh()"));
+            }
         }
 
         #[test]
