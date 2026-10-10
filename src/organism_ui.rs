@@ -3386,6 +3386,8 @@ impl OrganismHub {
                 runtime.cancel_territory_intro();
                 runtime.set_sleeping(false);
                 if entering_retreat {
+                    // Both live forms yield immediately, even on a slow heartbeat.
+                    runtime.sticky_avatar.set_visible(false);
                     // Keep the accepted-input hot path O(1): hide once, then
                     // keep the single frame callback suppressed for the whole
                     // retreat window. Repeated keys only extend time. Hiding
@@ -3410,6 +3412,8 @@ impl OrganismHub {
                 if !runtime.enabled.get() {
                     return;
                 }
+                // Returning to the primary screen also waits for a safe frame.
+                runtime.sticky_avatar.set_visible(false);
                 let now = Instant::now();
                 runtime.reset_watch_rhythm_at_boundary(now);
                 runtime.clear_presence_cue();
@@ -4035,6 +4039,48 @@ impl Drop for OrganismHub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Source wiring only: the real callbacks must retire the sticky form
+    /// synchronously, while the ordinary frame retains ownership of recovery.
+    #[test]
+    fn input_and_alt_screen_callbacks_hide_sticky_before_the_next_frame() {
+        let source = include_str!("organism_ui.rs");
+        let input = source
+            .split("view.connect_human_input(move |_kind| {")
+            .nth(1)
+            .unwrap()
+            .split("view.connect_alt_screen_transition(move |transition| {")
+            .next()
+            .unwrap();
+        let retreat = input.split("if entering_retreat {").nth(1).unwrap();
+        assert!(retreat.contains("runtime.sticky_avatar.set_visible(false);"));
+        assert!(retreat.contains("view.set_live_organism_visible(false);"));
+        let alternate = source
+            .split("view.connect_alt_screen_transition(move |transition| {")
+            .nth(1)
+            .unwrap()
+            .split("view.connect_activity(move || {")
+            .next()
+            .unwrap();
+        assert!(alternate.contains("runtime.sticky_avatar.set_visible(false);"));
+        assert!(alternate.contains("view.set_live_organism_visible(false);"));
+        let refresh = source
+            .split("fn refresh_surface(&self, view: &TermView, now: Instant) {")
+            .nth(1)
+            .unwrap()
+            .split("fn apply_settings(")
+            .next()
+            .unwrap();
+        assert!(refresh.contains("self.sticky_avatar.set_visible(mode != SurfaceMode::Typing);"));
+        let still = refresh
+            .split("if self.motion.get() == OrganismMotion::Static {")
+            .nth(1)
+            .unwrap()
+            .split("let behavior =")
+            .next()
+            .unwrap();
+        assert!(still.contains("self.sticky_avatar.set_visible(false);"));
+    }
 
     #[test]
     fn desktop_motion_changes_only_sync_enabled_automatic_companions() {
