@@ -985,6 +985,16 @@ fn save_config_to_path(
     }
 
     apply_config_to_table(config, &mut table);
+    // The disk snapshot may be valid while the edited in-memory settings are
+    // not. Reject the merged result before staging or rotating known-good
+    // backups, using the same policy that a subsequent reload will enforce.
+    let validation = validate_table(path, &table);
+    if validation.errors() > 0 {
+        return Err(ConfigWriteError::InvalidConfig {
+            path: path.to_path_buf(),
+            errors: validation.errors(),
+        });
+    }
     let mut rendered = table.to_string();
     if !rendered.ends_with('\n') {
         rendered.push('\n');
@@ -2556,6 +2566,51 @@ mod tests {
         );
         let report = validate_path(&path);
         assert_eq!(report.errors(), 1);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn invalid_edited_settings_preserve_the_config_and_both_backups() {
+        let directory = temporary_directory("invalid-edited-settings");
+        let path = directory.join("config.toml");
+        let original = b"opacity = 0.5\n";
+        let primary = backup_path_for(&path);
+        let secondary = secondary_backup_path_for(&path);
+        write_fixture(&path, original);
+        write_fixture(&primary, "opacity = 0.4\n");
+        write_fixture(&secondary, "opacity = 0.3\n");
+        let expected = revision_at(&path).unwrap();
+
+        for invalid_provider in [false, true] {
+            let mut config = config::load_safe_config().0;
+            if invalid_provider {
+                config.ai_provider = "unsupported-provider".into();
+            } else {
+                config.ai_model.clear();
+            }
+            let error = save_config_to_path(&path, &config, Some(&expected)).unwrap_err();
+            assert!(matches!(error, ConfigWriteError::InvalidConfig { .. }));
+            assert_eq!(fs::read(&path).unwrap(), original);
+            assert_eq!(fs::read_to_string(&primary).unwrap(), "opacity = 0.4\n");
+            assert_eq!(fs::read_to_string(&secondary).unwrap(), "opacity = 0.3\n");
+            assert_eq!(revision_at(&path).unwrap(), expected);
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn invalid_edited_settings_do_not_create_a_new_config() {
+        let directory = temporary_directory("invalid-new-settings");
+        let path = directory.join("config.toml");
+        let mut config = config::load_safe_config().0;
+        config.ai_model.clear();
+
+        let error =
+            save_config_to_path(&path, &config, Some(&ConfigRevision::Missing)).unwrap_err();
+        assert!(matches!(error, ConfigWriteError::InvalidConfig { .. }));
+        assert!(!path.exists());
+        assert!(!backup_path_for(&path).exists());
+        assert!(!secondary_backup_path_for(&path).exists());
         fs::remove_dir_all(directory).unwrap();
     }
 
