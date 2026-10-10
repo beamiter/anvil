@@ -584,7 +584,10 @@ fn write_all_fd_cancellable(fd: RawFd, data: &[u8], cancelled: &AtomicBool) -> i
                 return Err(io::Error::last_os_error());
             }
             if ready.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
-                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "PTY writer poll failed"));
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "PTY writer poll failed",
+                ));
             }
             Ok(())
         },
@@ -1863,7 +1866,10 @@ mod tests {
         assert!(shared.cancelled.load(Ordering::Acquire));
         let deadline = Instant::now() + Duration::from_secs(2);
         while !shared.finished.load(Ordering::Acquire) {
-            assert!(Instant::now() < deadline, "last sender did not retire writer");
+            assert!(
+                Instant::now() < deadline,
+                "last sender did not retire writer"
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(unsafe { libc::fcntl(pair.slave.as_raw_fd(), libc::F_GETFD) } >= 0);
@@ -1879,7 +1885,9 @@ mod tests {
         let flags_after = unsafe { libc::fcntl(observer.as_raw_fd(), libc::F_GETFL) };
         assert_eq!(flags_after, flags_before | libc::O_NONBLOCK);
         let surviving_sender = writer.clone();
-        writer.send(vec![b'x'; FD_WRITER_MAX_MESSAGE_BYTES]).unwrap();
+        writer
+            .send(vec![b'x'; FD_WRITER_MAX_MESSAGE_BYTES])
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             let mut available: libc::c_int = 0;
