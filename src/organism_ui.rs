@@ -18,7 +18,7 @@ use jterm_core::organism::{
     VisualGrowthStage, VisualTransition, WatchRhythm,
 };
 use jterm_core::organism_attention::{AttentionArbiter, AttentionCue};
-use jterm_core::organism_daily::GentleInteraction;
+use jterm_core::organism_daily::{behavior_explanation, GentleInteraction};
 use jterm_core::organism_memory::{
     local_circadian_time_at_ms, unix_ms, CircadianProfile, GrowthProgress, GrowthStage,
     LocalCircadianTime, MemoryEvent, MemoryInsight, RepoContext,
@@ -1743,6 +1743,8 @@ struct OrganismRuntime {
     /// accelerate for ordinary watch animation.
     visual_transition_frame: Cell<u64>,
     last_live_behavior: Cell<Behavior>,
+    // Presentation only: retire this whenever the spatial body is hidden.
+    explained_body_behavior: Cell<Option<Behavior>>,
     transition_source_override: Cell<Option<Behavior>>,
     command_origin_behavior: Cell<Option<Behavior>>,
     /// Where the body currently stands on the live surface; `None` while
@@ -1927,6 +1929,7 @@ impl OrganismRuntime {
             visual_transition: Cell::new(None),
             visual_transition_frame: Cell::new(0),
             last_live_behavior: Cell::new(Behavior::Idle),
+            explained_body_behavior: Cell::new(None),
             transition_source_override: Cell::new(None),
             command_origin_behavior: Cell::new(None),
             body_position: Cell::new(None),
@@ -2309,6 +2312,7 @@ impl OrganismRuntime {
         self.body_position.set(None);
         self.body_in_transit.set(false);
         view.set_live_organism_visible(false);
+        self.explain_body(None);
     }
 
     fn bump_generation(&self) -> u64 {
@@ -2352,6 +2356,7 @@ impl OrganismRuntime {
         self.surface_behavior_frame_origin
             .set(self.surface_frame.get());
         self.surface_behavior.set(reaction.behavior);
+        self.explained_body_behavior.set(None);
         self.refresh_inline_sprite();
         self.refresh_growth_badge();
         let status = match reaction.speech {
@@ -2413,12 +2418,24 @@ impl OrganismRuntime {
         }
     }
 
+    fn explain_body(&self, behavior: Option<Behavior>) {
+        if self.explained_body_behavior.replace(behavior) != behavior {
+            self.refresh_state(self.shared_life.get());
+        }
+    }
+
     fn refresh_state(&self, state: LifeState) {
-        let words = state_words(state);
+        let words = state_caption(
+            self.surface_behavior.get(),
+            self.explained_body_behavior.get(),
+            state,
+        );
         if self.state.text().as_str() != words {
             self.state.set_text(&words);
+            self.state
+                .update_property(&[gtk::accessible::Property::Description(&words)]);
         }
-        let detail = state_summary(state);
+        let detail = format!("{words}\n{}", state_summary(state));
         if self.state.tooltip_text().as_deref() != Some(detail.as_str()) {
             self.state.set_tooltip_text(Some(&detail));
         }
@@ -2758,6 +2775,7 @@ impl OrganismRuntime {
                 self.body_in_transit.set(moved);
                 self.body_position.set(Some((x, y)));
                 view.set_live_organism_visible(true);
+                self.explain_body(Some(context.behavior));
             } else {
                 // A detached/reparenting surface is not a place the body can
                 // visibly sleep. Fail closed until the next measured frame.
@@ -3136,6 +3154,14 @@ fn state_summary(state: LifeState) -> String {
     )
 }
 
+fn state_caption(inline: Behavior, displayed: Option<Behavior>, state: LifeState) -> String {
+    format!(
+        "{} · {}",
+        behavior_explanation(displayed.unwrap_or(inline)),
+        state_words(state)
+    )
+}
+
 fn state_words(state: LifeState) -> String {
     let mut words = Vec::with_capacity(3);
     if state.energy < 0.30 {
@@ -3395,6 +3421,7 @@ impl OrganismHub {
                     // no typing-triggered run competes with the prompt.
                     runtime.body_position.set(None);
                     runtime.body_in_transit.set(false);
+                    runtime.explain_body(None);
                     if let Some(view) = view_weak.upgrade() {
                         // Clear desired visibility even behind the alternate-
                         // screen override, so rmcup cannot briefly restore a
@@ -3424,6 +3451,7 @@ impl OrganismHub {
                 runtime.set_sleeping(false);
                 runtime.body_position.set(None);
                 runtime.body_in_transit.set(false);
+                runtime.explain_body(None);
                 if let Some(view) = view_weak.upgrade() {
                     view.set_live_organism_visible(false);
                 }
@@ -3471,6 +3499,7 @@ impl OrganismHub {
                 // and restores the body below the new cursor edge.
                 runtime.body_position.set(None);
                 runtime.body_in_transit.set(false);
+                runtime.explain_body(None);
                 if let Some(view) = view {
                     view.set_live_organism_visible(false);
                 }
@@ -4039,6 +4068,75 @@ impl Drop for OrganismHub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_caption_explains_the_shown_pose_and_falls_back_after_retreat() {
+        let life = LifeState::default();
+        let inline = Behavior::UnknownOutcome;
+        let greeting = state_caption(inline, Some(Behavior::Approach), life);
+        assert!(greeting.starts_with(behavior_explanation(Behavior::Approach)));
+        assert!(greeting.ends_with(&state_words(life)));
+        // Cancel/typing clears the spatial pose: describe the actual inline
+        // sprite, never the hidden Typing mode's internal WatchCommand pose.
+        let hidden = state_caption(inline, None, life);
+        assert!(hidden.starts_with(behavior_explanation(inline)));
+        assert!(!hidden.contains("running command"));
+        assert!(state_caption(Behavior::InspectError, None, life)
+            .starts_with(behavior_explanation(Behavior::InspectError)));
+    }
+
+    #[test]
+    fn state_caption_uses_core_semantics_without_inventing_a_greeting_or_outcome() {
+        for behavior in [
+            Behavior::Idle,
+            Behavior::Sleep,
+            Behavior::Explore,
+            Behavior::Approach,
+            Behavior::WatchCommand,
+            Behavior::UnknownOutcome,
+            Behavior::InspectError,
+            Behavior::GuardRecovery,
+        ] {
+            let caption = state_caption(behavior, None, LifeState::default());
+            assert!(caption.starts_with(behavior_explanation(behavior)));
+        }
+        // Approach can arise without a greeting; do not relabel every one Hello.
+        assert!(!state_caption(Behavior::Approach, None, LifeState::default()).contains("Hello"));
+    }
+
+    #[test]
+    fn explanation_wiring_tracks_body_retirement_and_transient_dock_cards() {
+        let source = include_str!("organism_ui.rs");
+        let production = source.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        for (start, end) in [
+            ("view.connect_human_input(", "view.connect_alt_screen_transition("),
+            ("view.connect_alt_screen_transition(", "view.connect_activity("),
+            ("view.connect_activity(", "view.connect_cwd_changed("),
+            ("fn hide_live_body(", "fn bump_generation("),
+        ] {
+            let callback = production
+                .split(start)
+                .nth(1)
+                .unwrap()
+                .split(end)
+                .next()
+                .unwrap();
+            assert!(callback.contains("explain_body(None)"));
+        }
+        let render = production
+            .split("fn render(&self, reaction: &Reaction) {")
+            .nth(1)
+            .unwrap()
+            .split("fn refresh_growth_badge(")
+            .next()
+            .unwrap();
+        assert!(render.contains("self.explained_body_behavior.set(None);"));
+        assert!(production.contains("self.explain_body(Some(context.behavior));"));
+        let backend = include_str!("block_view/mod.rs");
+        assert!(backend.contains("return self.dock_inline_notice(widget);"));
+        assert!(backend.contains("fn docks_inline_notices(&self) -> bool {\n        true"));
+        assert!(backend.contains("widget.insert_before(&self.block_list, Some(&active_widget));"));
+    }
 
     /// Source wiring only: the real callbacks must retire the sticky form
     /// synchronously, while the ordinary frame retains ownership of recovery.
