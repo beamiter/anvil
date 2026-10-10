@@ -8,6 +8,42 @@ use relm4::prelude::*;
 
 use crate::config::RemoteHost;
 
+/// An ephemeral selection snapshot. Keep profile fields out of message/debug
+/// traces; shared ownership avoids copying every profile into every tab row.
+#[derive(Clone, PartialEq)]
+pub(crate) struct CapturedRemoteProfile(std::sync::Arc<RemoteHost>);
+
+impl std::fmt::Debug for CapturedRemoteProfile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CapturedRemoteProfile(..)")
+    }
+}
+
+impl CapturedRemoteProfile {
+    pub(crate) fn new(host: RemoteHost) -> Self {
+        Self(std::sync::Arc::new(host))
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.0.name
+    }
+
+    pub(crate) fn resolve(&self, hosts: &[RemoteHost]) -> Result<RemoteHost, &'static str> {
+        resolve_picked_profile(hosts, &self.0)
+    }
+}
+
+pub(crate) fn captured_menu_profiles(hosts: &[RemoteHost]) -> Vec<CapturedRemoteProfile> {
+    // Preserve the existing menu limit; keyboard current-index actions remain
+    // separate and are not converted into delayed snapshot selections.
+    hosts
+        .iter()
+        .take(u8::MAX as usize)
+        .cloned()
+        .map(CapturedRemoteProfile::new)
+        .collect()
+}
+
 #[derive(Debug)]
 struct RemoteRow {
     source_index: usize,
@@ -69,7 +105,7 @@ pub(crate) enum RemotePickerMsg {
 
 #[derive(Debug)]
 pub(crate) enum RemotePickerOutput {
-    Connect(Box<RemoteHost>),
+    Connect(Box<CapturedRemoteProfile>),
 }
 
 fn captured_picker_host(hosts: &[(usize, RemoteHost)], source_index: usize) -> Option<RemoteHost> {
@@ -88,7 +124,9 @@ pub(crate) fn resolve_picked_profile(
     crate::config::unique_checked_remote_profile_index(hosts, expected)
         .and_then(|index| hosts.get(index))
         .cloned()
-        .ok_or("Remote host changed or is no longer uniquely configured; reopen the picker.")
+        .ok_or(
+            "Remote host changed or is no longer uniquely configured; reopen the host selection.",
+        )
 }
 
 pub(crate) struct RemotePickerModel {
@@ -222,7 +260,9 @@ impl Component for RemotePickerModel {
             RemotePickerMsg::Activate(index) => {
                 if let Some(host) = captured_picker_host(&self.hosts, index) {
                     root.force_close();
-                    let _ = sender.output(RemotePickerOutput::Connect(Box::new(host)));
+                    let _ = sender.output(RemotePickerOutput::Connect(Box::new(
+                        CapturedRemoteProfile::new(host),
+                    )));
                 }
             }
             RemotePickerMsg::Move(delta) => {
@@ -253,7 +293,9 @@ impl Component for RemotePickerModel {
                     source_index.and_then(|index| captured_picker_host(&self.hosts, index))
                 {
                     root.force_close();
-                    let _ = sender.output(RemotePickerOutput::Connect(Box::new(host)));
+                    let _ = sender.output(RemotePickerOutput::Connect(Box::new(
+                        CapturedRemoteProfile::new(host),
+                    )));
                 }
             }
             RemotePickerMsg::Close => root.force_close(),
@@ -343,5 +385,67 @@ mod tests {
         ] {
             assert!(resolve_picked_profile(&current, &expected).is_err());
         }
+    }
+    #[test]
+    fn menu_snapshot_reorders_without_retargeting_and_rejects_changed_profiles() {
+        let expected = host("chosen");
+        let captured = captured_menu_profiles(&[expected.clone(), host("other")]).remove(0);
+        assert_eq!(
+            captured.resolve(&[host("other"), expected.clone()]),
+            Ok(expected.clone())
+        );
+        let mut edited = expected.clone();
+        edited.ssh_args = vec!["-p".into(), "2222".into()];
+        for current in [
+            vec![host("replacement")],
+            vec![],
+            vec![edited],
+            vec![expected.clone(), expected.clone()],
+        ] {
+            assert!(captured.resolve(&current).is_err());
+        }
+    }
+
+    #[test]
+    fn captured_profile_debug_never_formats_profile_fields_and_menu_cap_is_unchanged() {
+        let mut synthetic = host("synthetic-private-name");
+        synthetic.ssh_args = vec!["synthetic-sensitive-argument".into()];
+        let captured = CapturedRemoteProfile::new(synthetic);
+        assert_eq!(format!("{captured:?}"), "CapturedRemoteProfile(..)");
+        assert_eq!(
+            format!("{:?}", RemotePickerOutput::Connect(Box::new(captured))),
+            "Connect(CapturedRemoteProfile(..))"
+        );
+        let many = vec![host("bounded"); usize::from(u8::MAX) + 1];
+        assert_eq!(captured_menu_profiles(&many).len(), usize::from(u8::MAX));
+    }
+
+    #[test]
+    fn menu_snapshot_routing_never_falls_back_to_a_current_index() {
+        let tabs = include_str!("../tab_strip.rs");
+        let menu = tabs
+            .split("fn show_context_menu(")
+            .nth(1)
+            .unwrap()
+            .split("fn menu_button")
+            .next()
+            .unwrap();
+        assert!(menu.contains("TabRowOutput::ConnectRemote(Box::new(expected.clone()))"));
+        assert!(!menu.contains("ConnectRemote(index)"));
+        let startup = include_str!("../startup_ui.rs");
+        assert!(startup.contains(
+            "TabRowOutput::ConnectRemote(profile) => AppMsg::ConnectPickedRemote(profile)"
+        ));
+        let action = include_str!("../action_ops.rs");
+        let picked = action
+            .split("pub(crate) fn connect_picked_remote(")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn set_font_scale_all")
+            .next()
+            .unwrap();
+        assert!(picked.contains("expected.resolve(&self.config.borrow().remote_hosts)"));
+        assert!(picked.contains("if self.safe_mode"));
+        assert!(!picked.contains("checked_remote_host("));
     }
 }

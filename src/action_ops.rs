@@ -9,17 +9,14 @@ use super::*;
 impl AppModel {
     pub(crate) fn connect_picked_remote(
         &mut self,
-        expected: &config::RemoteHost,
+        expected: &dialogs::remote_picker::CapturedRemoteProfile,
         sender: &ComponentSender<Self>,
     ) {
         if self.safe_mode {
             self.show_toast("Remote connections are disabled in safe mode.");
             return;
         }
-        let host = dialogs::remote_picker::resolve_picked_profile(
-            &self.config.borrow().remote_hosts,
-            expected,
-        );
+        let host = expected.resolve(&self.config.borrow().remote_hosts);
         match host {
             Ok(host) => self.add_remote_tab(&host, sender),
             Err(message) => self.show_toast(message),

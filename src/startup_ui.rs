@@ -14,9 +14,7 @@ pub(crate) fn tab_row_output_to_msg(output: tab_strip::TabRowOutput) -> AppMsg {
         tab_strip::TabRowOutput::Rename(id, title) => AppMsg::RenameTab(id, title),
         tab_strip::TabRowOutput::NewTab => AppMsg::NewTab,
         tab_strip::TabRowOutput::Action(id, action) => AppMsg::TabRowAction(id, action),
-        tab_strip::TabRowOutput::ConnectRemote(index) => {
-            AppMsg::Action(Action::ConnectRemote(index))
-        }
+        tab_strip::TabRowOutput::ConnectRemote(profile) => AppMsg::ConnectPickedRemote(profile),
         tab_strip::TabRowOutput::Resize(width) => AppMsg::SetTabWidth(width),
         tab_strip::TabRowOutput::Reorder { source_id, target } => {
             AppMsg::ReorderTab(source_id, target)

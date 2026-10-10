@@ -216,13 +216,7 @@ impl AppModel {
 
     fn refresh_tab_strip(&mut self, persist: bool) {
         let config = self.config.borrow();
-        let remote_hosts: Vec<(u8, String)> = config
-            .remote_hosts
-            .iter()
-            .take(u8::MAX as usize)
-            .enumerate()
-            .map(|(index, host)| (index as u8, host.name.clone()))
-            .collect();
+        let remote_hosts = dialogs::remote_picker::captured_menu_profiles(&config.remote_hosts);
         let tab_width = config.tab_width;
         drop(config);
 

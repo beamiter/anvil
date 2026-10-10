@@ -7,6 +7,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
+use crate::dialogs::remote_picker::CapturedRemoteProfile;
 use crate::pane_header::{WorkspaceDragItem, WorkspaceDragPayload};
 use crate::{MAX_TAB_WIDTH, MIN_TAB_WIDTH};
 
@@ -127,7 +128,7 @@ pub(crate) struct TabRowInit {
     pub(crate) pinned: bool,
     pub(crate) private_title: bool,
     pub(crate) connection: Option<ConnectionState>,
-    pub(crate) remote_hosts: Vec<(u8, String)>,
+    pub(crate) remote_hosts: Vec<CapturedRemoteProfile>,
     pub(crate) tab_width: u32,
     pub(crate) sidebar: bool,
     pub(crate) drag_coordinator: Rc<TabDragCoordinator>,
@@ -146,7 +147,7 @@ pub(crate) enum TabRowOutput {
     Rename(u64, String),
     NewTab,
     Action(u64, TabAction),
-    ConnectRemote(u8),
+    ConnectRemote(Box<CapturedRemoteProfile>),
     Resize(u32),
     Reorder {
         source_id: u64,
@@ -193,7 +194,7 @@ pub(crate) struct TabRow {
     pinned: bool,
     private_title: bool,
     connection: Option<ConnectionState>,
-    remote_hosts: Vec<(u8, String)>,
+    remote_hosts: Vec<CapturedRemoteProfile>,
     tab_width: u32,
     sidebar: bool,
     action_state: Rc<RefCell<TabRowActionState>>,
@@ -207,7 +208,7 @@ struct TabRowActionState {
     marked: bool,
     pinned: bool,
     private_title: bool,
-    remote_hosts: Vec<(u8, String)>,
+    remote_hosts: Vec<CapturedRemoteProfile>,
     tab_width: u32,
     sidebar: bool,
 }
@@ -744,7 +745,7 @@ fn show_context_menu(
     marked: bool,
     pinned: bool,
     private_title: bool,
-    remote_hosts: &[(u8, String)],
+    remote_hosts: &[CapturedRemoteProfile],
     sender: FactorySender<TabRow>,
 ) {
     let popover = gtk::Popover::new();
@@ -809,14 +810,16 @@ fn show_context_menu(
 
     if !remote_hosts.is_empty() {
         menu.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-        for (index, name) in remote_hosts {
-            let index = *index;
+        for profile in remote_hosts {
+            let expected = profile.clone();
             add_menu_item(
                 &menu,
-                &format!("Remote: {name}"),
+                &format!("Remote: {}", profile.name()),
                 &popover,
                 sender.clone(),
-                move |sender| sender.output(TabRowOutput::ConnectRemote(index)),
+                move |sender| {
+                    sender.output(TabRowOutput::ConnectRemote(Box::new(expected.clone())))
+                },
             );
         }
     }
@@ -858,6 +861,22 @@ fn add_menu_item<F>(
 mod tests {
     use super::*;
 
+    fn menu_profile(name: &str) -> CapturedRemoteProfile {
+        CapturedRemoteProfile::new(crate::config::RemoteHost {
+            name: name.into(),
+            host: format!("{name}.example.com"),
+            user: None,
+            docker: false,
+            deploy_artifact: None,
+            remote_shell: "jsh".into(),
+            session: None,
+            ssh_args: Vec::new(),
+            login_shell: true,
+            multiplex: true,
+            deploy: jterm_core::jsh_remote::Deploy::Off,
+        })
+    }
+
     fn init() -> TabRowInit {
         TabRowInit {
             id: 7,
@@ -871,7 +890,7 @@ mod tests {
             pinned: false,
             private_title: false,
             connection: Some(ConnectionState::Connecting),
-            remote_hosts: vec![(0, "host-a".to_string())],
+            remote_hosts: vec![menu_profile("host-a")],
             tab_width: 180,
             sidebar: true,
             drag_coordinator: Rc::new(TabDragCoordinator::default()),
@@ -890,7 +909,7 @@ mod tests {
         updated.bell = true;
         updated.marked = true;
         updated.connection = Some(ConnectionState::Connected);
-        updated.remote_hosts.push((1, "host-b".to_string()));
+        updated.remote_hosts.push(menu_profile("host-b"));
         updated.tab_width = 240;
         updated.sidebar = false;
 
