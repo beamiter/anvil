@@ -642,7 +642,7 @@ mod organism_preview {
             assert_eq!(GentleInteraction::HOLD, Duration::from_secs(2));
             assert_eq!(GentleInteraction::COOLDOWN, Duration::from_secs(8));
             let runtime = include_str!("../organism_ui.rs");
-            let production = runtime.split("#[cfg(test)]").next().unwrap();
+            let production = runtime.split("#[cfg(test)]\nmod tests {").next().unwrap();
             assert!(production
                 .contains("const POINTER_GREETING_DWELL: Duration = Duration::from_millis(600);"));
             for detail in [
