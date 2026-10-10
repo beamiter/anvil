@@ -26,6 +26,16 @@ mod organism_preview {
 
     use crate::config::OrganismMotion;
 
+    pub(super) const INTERACTION_HINT: &str = concat!(
+        "Changes apply to open panes.\n",
+        "In Full or Calm, keep the pointer near an idle companion for 600 ms ",
+        "for a brief hello (about 2 seconds). Greetings are at least 8 seconds apart; ",
+        "move away and return to try again.\n",
+        "Typing, running commands and alternate-screen apps take priority. ",
+        "Static uses inline cards only, without live hover greetings. ",
+        "Clicks and selection stay with your terminal."
+    );
+
     const FRAME_INTERVAL: Duration = Duration::from_millis(100);
 
     fn motion_for_selection(selected: u32, animations: bool) -> OrganismMotion {
@@ -625,6 +635,34 @@ mod organism_preview {
                 "hidden settings callbacks cannot restart a timer"
             );
             window.close();
+        }
+
+        #[test]
+        fn interaction_hint_matches_live_timing_and_input_ownership() {
+            assert_eq!(GentleInteraction::HOLD, Duration::from_secs(2));
+            assert_eq!(GentleInteraction::COOLDOWN, Duration::from_secs(8));
+            let runtime = include_str!("../organism_ui.rs");
+            let production = runtime.split("#[cfg(test)]").next().unwrap();
+            assert!(production.contains(
+                "const POINTER_GREETING_DWELL: Duration = Duration::from_millis(600);"
+            ));
+            for detail in [
+                "Full or Calm",
+                "600 ms",
+                "about 2 seconds",
+                "at least 8 seconds",
+                "move away and return",
+                "Static uses inline cards only",
+                "Clicks and selection stay with your terminal.",
+            ] {
+                assert!(INTERACTION_HINT.contains(detail));
+            }
+            let settings = include_str!("settings.rs");
+            let component = settings
+                .split("\n#[relm4::component(pub(crate))]")
+                .nth(1)
+                .unwrap();
+            assert!(component.contains("set_tooltip_text: Some(organism_preview::INTERACTION_HINT)"));
         }
 
         #[test]
@@ -1228,7 +1266,7 @@ impl Component for SettingsModel {
                     adw::SwitchRow {
                         set_title: "ASCII Organism",
                         set_subtitle: "Local, no-LLM companion for Block/Unified panes",
-                        set_tooltip_text: Some("Changes apply to open panes. Pause near a resting companion for a hello; clicks and selection stay with your terminal."),
+                        set_tooltip_text: Some(organism_preview::INTERACTION_HINT),
                         set_active: model.values.ascii_organism_enabled,
                         set_sensitive: !model.values.safe_mode,
                         connect_active_notify[sender] => move |row| {
