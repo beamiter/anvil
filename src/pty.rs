@@ -388,6 +388,10 @@ struct FdWriterShared {
     queue: Mutex<FdWriterQueue>,
     ready: Condvar,
     senders: AtomicUsize,
+    cancelled: AtomicBool,
+    cancellable: bool,
+    #[cfg(test)]
+    finished: AtomicBool,
 }
 
 pub(crate) struct FdWriter {
@@ -424,6 +428,10 @@ impl Clone for FdWriter {
 impl Drop for FdWriter {
     fn drop(&mut self) {
         if self.shared.senders.fetch_sub(1, Ordering::AcqRel) == 1 {
+            if self.shared.cancellable {
+                self.cancel();
+                return;
+            }
             let mut queue = self
                 .shared
                 .queue
@@ -436,6 +444,21 @@ impl Drop for FdWriter {
 }
 
 impl FdWriter {
+    /// Stop admission and discard unsent input. The worker owns its descriptor
+    /// until it observes cancellation; this does not synchronously join it.
+    fn cancel(&self) {
+        self.shared.cancelled.store(true, Ordering::Release);
+        let mut queue = self
+            .shared
+            .queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        queue.closed = true;
+        queue.messages.clear();
+        queue.bytes = 0;
+        self.shared.ready.notify_one();
+    }
+
     pub(crate) fn send(&self, data: Vec<u8>) -> Result<(), FdWriterSendError> {
         let len = data.len();
         if len == 0 {
@@ -452,7 +475,7 @@ impl FdWriter {
             .queue
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if queue.closed {
+        if queue.closed || self.shared.cancelled.load(Ordering::Acquire) {
             return Err(FdWriterSendError {
                 len,
                 reason: "PTY writer is closed",
@@ -478,6 +501,101 @@ impl FdWriter {
 /// descriptor. Overload rejects a whole message instead of retaining
 /// unbounded input or partially enqueueing it.
 pub(crate) fn spawn_fd_writer(fd: OwnedFd, thread_name: &'static str) -> io::Result<FdWriter> {
+    spawn_fd_writer_inner(fd, thread_name, false)
+}
+
+/// Only OwnedPty uses this mode: its reader tolerates the shared O_NONBLOCK
+/// flag. The separate legacy VTE bridge retains its existing blocking mode.
+fn spawn_cancellable_fd_writer(fd: OwnedFd, thread_name: &'static str) -> io::Result<FdWriter> {
+    // SAFETY: fd is live and owned. File-status flags are shared with the
+    // original master and reader duplicates, but not with the slave/stdin.
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0
+        || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    spawn_fd_writer_inner(fd, thread_name, true)
+}
+
+const WRITER_CANCEL_POLL_MS: i32 = 50;
+
+/// `false` means cancellation discarded the remaining tail. Never replay a
+/// prefix already written, and never block in a syscall on this path.
+fn write_cancellable_with(
+    mut data: &[u8],
+    cancelled: &AtomicBool,
+    mut write: impl FnMut(&[u8]) -> io::Result<usize>,
+    mut wait: impl FnMut() -> io::Result<()>,
+) -> io::Result<bool> {
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        if data.is_empty() {
+            return Ok(true);
+        }
+        match write(data) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "PTY write returned zero",
+                ));
+            }
+            Ok(count) => data = &data[count..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if cancelled.load(Ordering::Acquire) {
+                    return Ok(false);
+                }
+                match wait() {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn write_all_fd_cancellable(fd: RawFd, data: &[u8], cancelled: &AtomicBool) -> io::Result<bool> {
+    write_cancellable_with(
+        data,
+        cancelled,
+        |remaining| {
+            // SAFETY: caller owns a nonblocking fd; remaining is readable.
+            let count = unsafe { libc::write(fd, remaining.as_ptr().cast(), remaining.len()) };
+            if count < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(count as usize)
+            }
+        },
+        || {
+            let mut ready = libc::pollfd {
+                fd,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            // Bound sleep, not thread scheduling or a synchronous join.
+            let polled = unsafe { libc::poll(&mut ready, 1, WRITER_CANCEL_POLL_MS) };
+            if polled < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if ready.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "PTY writer poll failed"));
+            }
+            Ok(())
+        },
+    )
+}
+
+fn spawn_fd_writer_inner(
+    fd: OwnedFd,
+    thread_name: &'static str,
+    cancellable: bool,
+) -> io::Result<FdWriter> {
     let shared = Arc::new(FdWriterShared {
         queue: Mutex::new(FdWriterQueue {
             messages: VecDeque::new(),
@@ -486,39 +604,59 @@ pub(crate) fn spawn_fd_writer(fd: OwnedFd, thread_name: &'static str) -> io::Res
         }),
         ready: Condvar::new(),
         senders: AtomicUsize::new(1),
+        cancelled: AtomicBool::new(false),
+        cancellable,
+        #[cfg(test)]
+        finished: AtomicBool::new(false),
     });
     let worker_shared = shared.clone();
     std::thread::Builder::new()
         .name(thread_name.to_string())
-        .spawn(move || loop {
-            let data = {
-                let mut queue = worker_shared
-                    .queue
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                while queue.messages.is_empty() && !queue.closed {
-                    queue = worker_shared
-                        .ready
-                        .wait(queue)
+        .spawn(move || {
+            loop {
+                let data = {
+                    let mut queue = worker_shared
+                        .queue
+                        .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                }
-                let Some(data) = queue.messages.pop_front() else {
-                    break;
+                    while queue.messages.is_empty() && !queue.closed {
+                        queue = worker_shared
+                            .ready
+                            .wait(queue)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                    let Some(data) = queue.messages.pop_front() else {
+                        break;
+                    };
+                    queue.bytes = queue.bytes.saturating_sub(data.len());
+                    data
                 };
-                queue.bytes = queue.bytes.saturating_sub(data.len());
-                data
-            };
-            if let Err(err) = write_all_fd(fd.as_raw_fd(), &data) {
-                log::warn!("{thread_name} stopped: {err}");
-                let mut queue = worker_shared
-                    .queue
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                queue.closed = true;
-                queue.messages.clear();
-                queue.bytes = 0;
-                break;
+                let result = if cancellable {
+                    write_all_fd_cancellable(fd.as_raw_fd(), &data, &worker_shared.cancelled)
+                } else {
+                    write_all_fd(fd.as_raw_fd(), &data).map(|()| true)
+                };
+                match result {
+                    Ok(true) => continue,
+                    Ok(false) => break,
+                    Err(error) => {
+                        if !worker_shared.cancelled.load(Ordering::Acquire) {
+                            log::warn!("{thread_name} stopped: {error}");
+                        }
+                        let mut queue = worker_shared
+                            .queue
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        queue.closed = true;
+                        queue.messages.clear();
+                        queue.bytes = 0;
+                        break;
+                    }
+                }
             }
+            drop(fd);
+            #[cfg(test)]
+            worker_shared.finished.store(true, Ordering::Release);
         })?;
     Ok(FdWriter { shared })
 }
@@ -906,7 +1044,7 @@ impl OwnedPty {
                         return Err(error);
                     }
                 };
-                let input_tx = match spawn_fd_writer(writer_fd, "anvil-pty-writer") {
+                let input_tx = match spawn_cancellable_fd_writer(writer_fd, "anvil-pty-writer") {
                     Ok(tx) => tx,
                     Err(error) => {
                         drop(master);
@@ -1069,6 +1207,7 @@ impl OwnedPty {
     }
 
     pub fn kill(&self) {
+        self.input_tx.cancel();
         request_reader_cancel(
             &self.reader_cancelled,
             self.reader_cancel_eventfd.as_deref(),
@@ -1188,7 +1327,14 @@ impl OwnedPty {
                         }
                     }
                     match file.read(&mut buf) {
-                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                            ) =>
+                        {
+                            continue;
+                        }
                         Ok(0) | Err(_) => {
                             break;
                         }
@@ -1504,7 +1650,7 @@ impl OwnedPty {
                 return Err(error);
             }
         };
-        let input_tx = match spawn_fd_writer(writer_fd, "anvil-test-pty-writer") {
+        let input_tx = match spawn_cancellable_fd_writer(writer_fd, "anvil-test-pty-writer") {
             Ok(tx) => tx,
             Err(error) => {
                 child_lifecycle.force_kill_and_reap();
@@ -1581,6 +1727,7 @@ fn prepare_test_slave(slave: &OwnedFd) {
 
 impl Drop for OwnedPty {
     fn drop(&mut self) {
+        self.input_tx.cancel();
         request_reader_cancel(
             &self.reader_cancelled,
             self.reader_cancel_eventfd.as_deref(),
@@ -1607,6 +1754,163 @@ mod tests {
 
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn cancellable_writer_keeps_partial_offsets_across_interruptions_and_backpressure() {
+        let cancelled = AtomicBool::new(false);
+        let mut steps = VecDeque::from([
+            Err(io::ErrorKind::Interrupted),
+            Ok(2),
+            Err(io::ErrorKind::WouldBlock),
+            Err(io::ErrorKind::Interrupted),
+            Ok(4),
+        ]);
+        let mut supplied = Vec::new();
+        let mut waits = 0;
+        assert!(write_cancellable_with(
+            b"abcdef",
+            &cancelled,
+            |bytes| {
+                supplied.push(bytes.to_vec());
+                steps.pop_front().unwrap().map_err(io::Error::from)
+            },
+            || {
+                waits += 1;
+                Err(io::Error::from(io::ErrorKind::Interrupted))
+            },
+        )
+        .unwrap());
+        assert_eq!(waits, 1);
+        assert_eq!(
+            supplied,
+            [
+                b"abcdef".to_vec(),
+                b"abcdef".to_vec(),
+                b"cdef".to_vec(),
+                b"cdef".to_vec(),
+                b"cdef".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn cancellable_writer_stops_before_write_during_wait_and_after_partial_write() {
+        for stage in 0..3 {
+            let cancelled = AtomicBool::new(stage == 0);
+            let calls = std::cell::Cell::new(0);
+            let completed = write_cancellable_with(
+                b"abc",
+                &cancelled,
+                |_| {
+                    calls.set(calls.get() + 1);
+                    if stage == 1 {
+                        Err(io::Error::from(io::ErrorKind::WouldBlock))
+                    } else {
+                        cancelled.store(true, Ordering::Release);
+                        Ok(1)
+                    }
+                },
+                || {
+                    cancelled.store(true, Ordering::Release);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert!(!completed);
+            assert_eq!(calls.get(), usize::from(stage != 0));
+        }
+    }
+
+    #[test]
+    fn cancellable_writer_preserves_real_errors_and_rejects_zero_writes() {
+        let cancelled = AtomicBool::new(false);
+        for code in [libc::EPIPE, libc::EIO] {
+            let error = write_cancellable_with(
+                b"x",
+                &cancelled,
+                |_| Err(io::Error::from_raw_os_error(code)),
+                || panic!("terminal errors must not poll"),
+            )
+            .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(code));
+        }
+        let error = write_cancellable_with(b"x", &cancelled, |_| Ok(0), || Ok(())).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WriteZero);
+    }
+
+    #[test]
+    fn cancellation_request_blocks_admission_before_queue_close() {
+        let writer = queued_writer(false, 0);
+        // Model the gap after cancel's atomic store but before it acquires
+        // the queue mutex: closed is still false, admission must fail.
+        writer.shared.cancelled.store(true, Ordering::Release);
+        assert!(writer.send(b"late".to_vec()).is_err());
+        let queue = writer.shared.queue.lock().unwrap();
+        assert!(!queue.closed);
+        assert!(queue.messages.is_empty());
+        assert_eq!(queue.bytes, 0);
+    }
+
+    #[test]
+    fn last_sender_drop_cancels_idle_writer_but_earlier_clone_drop_does_not() {
+        let pair = openpty_cloexec(None).unwrap();
+        let writer = spawn_cancellable_fd_writer(pair.master, "anvil-drop-writer-test").unwrap();
+        let last_sender = writer.clone();
+        let shared = writer.shared.clone();
+        drop(writer);
+        assert!(!shared.cancelled.load(Ordering::Acquire));
+        drop(last_sender);
+        assert!(shared.cancelled.load(Ordering::Acquire));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !shared.finished.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "last sender did not retire writer");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(unsafe { libc::fcntl(pair.slave.as_raw_fd(), libc::F_GETFD) } >= 0);
+    }
+
+    #[test]
+    fn cancelled_backpressured_writer_retires_while_slave_remains_open() {
+        let pair = openpty_cloexec(None).unwrap();
+        prepare_test_slave(&pair.slave);
+        let observer = pair.master.try_clone().unwrap();
+        let flags_before = unsafe { libc::fcntl(observer.as_raw_fd(), libc::F_GETFL) };
+        let writer = spawn_cancellable_fd_writer(pair.master, "anvil-cancel-writer-test").unwrap();
+        let flags_after = unsafe { libc::fcntl(observer.as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(flags_after, flags_before | libc::O_NONBLOCK);
+        let surviving_sender = writer.clone();
+        writer.send(vec![b'x'; FD_WRITER_MAX_MESSAGE_BYTES]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let mut available: libc::c_int = 0;
+            assert_eq!(
+                unsafe { libc::ioctl(pair.slave.as_raw_fd(), libc::FIONREAD, &mut available) },
+                0
+            );
+            if available > 0 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "writer made no progress");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!writer.shared.finished.load(Ordering::Acquire));
+        writer.cancel();
+        writer.cancel();
+        assert!(surviving_sender.send(b"late".to_vec()).is_err());
+        {
+            let queue = writer.shared.queue.lock().unwrap();
+            assert!(queue.messages.is_empty());
+            assert_eq!(queue.bytes, 0);
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !writer.shared.finished.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "writer did not retire");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Completion is recorded only after the worker drops its owned fd.
+        // Both our slave and observer remain live throughout this assertion.
+        assert!(unsafe { libc::fcntl(pair.slave.as_raw_fd(), libc::F_GETFD) } >= 0);
+    }
 
     #[test]
     fn both_pty_ends_are_close_on_exec() {
@@ -2073,6 +2377,9 @@ mod tests {
                 }),
                 ready: Condvar::new(),
                 senders: AtomicUsize::new(1),
+                cancelled: AtomicBool::new(false),
+                cancellable: false,
+                finished: AtomicBool::new(false),
             }),
         }
     }
