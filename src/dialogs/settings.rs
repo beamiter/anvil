@@ -8,8 +8,39 @@ use relm4::adw;
 use relm4::adw::prelude::*;
 use relm4::gtk;
 use relm4::prelude::*;
+use std::cell::Cell;
+use std::rc::Rc;
 
 use crate::config::{remote_text_is_safe, RemoteHost};
+
+/// GTK notify callbacks run synchronously, before Relm processes queued input.
+/// Suppress reflection at that boundary, without disconnecting preview listeners.
+fn without_ascii_settings_output<T>(gate: &Cell<bool>, update: impl FnOnce() -> T) -> T {
+    struct Reset<'a>(&'a Cell<bool>, bool);
+    impl Drop for Reset<'_> {
+        fn drop(&mut self) {
+            self.0.set(self.1);
+        }
+    }
+    let _reset = Reset(gate, gate.replace(true));
+    update()
+}
+
+fn reflect_ascii_organism_controls(
+    gate: &Cell<bool>,
+    enabled_row: &adw::SwitchRow,
+    motion_row: &adw::ComboRow,
+    enabled: bool,
+    motion: u32,
+    safe_mode: bool,
+) {
+    without_ascii_settings_output(gate, || {
+        enabled_row.set_active(enabled);
+        motion_row.set_selected(motion);
+        enabled_row.set_sensitive(!safe_mode);
+        motion_row.set_sensitive(!safe_mode && enabled);
+    });
+}
 
 /// A settings-only gallery: no terminal, reducer, repository memory, or config
 /// writes. All sources use weak references and are removed on hide or close.
@@ -663,6 +694,80 @@ mod organism_preview {
                 assert!(condition(), "GTK condition did not settle");
             };
             spin_until(&|| preview.active());
+            let reflected_enabled = adw::SwitchRow::new();
+            let syncing = Rc::new(Cell::new(false));
+            let reflected_outputs = Rc::new(Cell::new(0));
+            reflected_enabled.connect_active_notify({
+                let syncing = syncing.clone();
+                let outputs = reflected_outputs.clone();
+                move |_| {
+                    if !syncing.get() {
+                        outputs.set(outputs.get() + 1);
+                    }
+                }
+            });
+            motion.connect_selected_notify({
+                let syncing = syncing.clone();
+                let outputs = reflected_outputs.clone();
+                move |_| {
+                    if !syncing.get() {
+                        outputs.set(outputs.get() + 1);
+                    }
+                }
+            });
+            super::super::reflect_ascii_organism_controls(
+                &syncing,
+                &reflected_enabled,
+                &motion,
+                false,
+                3,
+                false,
+            );
+            assert!(!reflected_enabled.is_active());
+            assert_eq!(motion.selected(), 3);
+            assert!(!motion.is_sensitive());
+            assert_eq!(
+                motion.subtitle().as_deref(),
+                Some(motion_policy(3, Some(false)))
+            );
+            assert!(preview.source.borrow().is_none());
+            super::super::reflect_ascii_organism_controls(
+                &syncing,
+                &reflected_enabled,
+                &motion,
+                true,
+                0,
+                false,
+            );
+            assert!(reflected_enabled.is_active());
+            assert!(motion.is_sensitive());
+            assert_eq!(
+                motion.subtitle().as_deref(),
+                Some(motion_policy(0, Some(false)))
+            );
+            assert_eq!(
+                reflected_outputs.get(),
+                0,
+                "reflection must not queue settings output"
+            );
+            assert!(!syncing.get());
+            // Restore the fixture's original disabled-live, explicit Full setup.
+            super::super::reflect_ascii_organism_controls(
+                &syncing,
+                &reflected_enabled,
+                &motion,
+                false,
+                1,
+                false,
+            );
+            assert_eq!(reflected_outputs.get(), 0);
+            reflected_enabled.set_active(true);
+            assert_eq!(
+                reflected_outputs.get(),
+                1,
+                "later user changes remain observable"
+            );
+            reflected_enabled.set_active(false);
             // Discard fixture initialization bytes; the following interactions
             // must never write into this nonexecuting terminal's PTY.
             crate::block_view::organism_settings_test_pty_bytes(&view);
@@ -1337,6 +1442,10 @@ fn font_desc_for_choice(font_names: &[String], selected: u32, size: f64) -> Stri
 #[derive(Debug)]
 pub(crate) enum SettingsMsg {
     Toggle(SettingsValues, Vec<String>, adw::ApplicationWindow),
+    SyncAsciiOrganism {
+        enabled: bool,
+        motion: u32,
+    },
     Theme(u32),
     Font(u32),
     FontSize(f64),
@@ -1422,6 +1531,7 @@ pub(crate) struct SettingsModel {
     theme_names: Vec<String>,
     font_names: Vec<String>,
     values: SettingsValues,
+    organism_syncing: Rc<Cell<bool>>,
     remote_draft: RemoteDraft,
     /// Index of the saved host the form is editing; `None` while the form is
     /// composing a new one.
@@ -1582,8 +1692,10 @@ impl Component for SettingsModel {
                         set_tooltip_text: Some(organism_preview::INTERACTION_HINT),
                         set_active: model.values.ascii_organism_enabled,
                         set_sensitive: !model.values.safe_mode,
-                        connect_active_notify[sender] => move |row| {
-                            sender.input(SettingsMsg::AsciiOrganism(row.is_active()));
+                        connect_active_notify[sender, syncing = model.organism_syncing.clone()] => move |row| {
+                            if !syncing.get() {
+                                sender.input(SettingsMsg::AsciiOrganism(row.is_active()));
+                            }
                         },
                     },
 
@@ -1597,8 +1709,10 @@ impl Component for SettingsModel {
                         set_selected: model.values.ascii_organism_motion,
                         set_sensitive: !model.values.safe_mode
                             && model.values.ascii_organism_enabled,
-                        connect_selected_notify[sender] => move |row| {
-                            sender.input(SettingsMsg::AsciiOrganismMotion(row.selected()));
+                        connect_selected_notify[sender, syncing = model.organism_syncing.clone()] => move |row| {
+                            if !syncing.get() {
+                                sender.input(SettingsMsg::AsciiOrganismMotion(row.selected()));
+                            }
                         },
                     },
                 },
@@ -1834,6 +1948,7 @@ impl Component for SettingsModel {
             theme_names: init.theme_names,
             font_names: init.font_names,
             values: init.values,
+            organism_syncing: Rc::new(Cell::new(false)),
             remote_draft: RemoteDraft::default(),
             remote_editing: None,
             remote_dialog: None,
@@ -1898,18 +2013,14 @@ impl Component for SettingsModel {
                 widgets
                     .command_history_row
                     .set_sensitive(!self.values.safe_mode);
-                widgets
-                    .ascii_organism_row
-                    .set_active(self.values.ascii_organism_enabled);
-                widgets
-                    .ascii_organism_motion_row
-                    .set_selected(self.values.ascii_organism_motion);
-                widgets
-                    .ascii_organism_row
-                    .set_sensitive(!self.values.safe_mode);
-                widgets
-                    .ascii_organism_motion_row
-                    .set_sensitive(!self.values.safe_mode && self.values.ascii_organism_enabled);
+                reflect_ascii_organism_controls(
+                    &self.organism_syncing,
+                    &widgets.ascii_organism_row,
+                    &widgets.ascii_organism_motion_row,
+                    self.values.ascii_organism_enabled,
+                    self.values.ascii_organism_motion,
+                    self.values.safe_mode,
+                );
                 widgets.ai_enabled_row.set_active(self.values.ai_enabled);
                 widgets
                     .ai_panel_visible_row
@@ -2016,6 +2127,18 @@ impl Component for SettingsModel {
             SettingsMsg::CommandHistory(enabled) => {
                 self.values.command_history = enabled;
                 let _ = sender.output(SettingsOutput::CommandHistory(enabled));
+            }
+            SettingsMsg::SyncAsciiOrganism { enabled, motion } => {
+                self.values.ascii_organism_enabled = enabled;
+                self.values.ascii_organism_motion = motion;
+                reflect_ascii_organism_controls(
+                    &self.organism_syncing,
+                    &widgets.ascii_organism_row,
+                    &widgets.ascii_organism_motion_row,
+                    enabled,
+                    motion,
+                    self.values.safe_mode,
+                );
             }
             SettingsMsg::AsciiOrganism(enabled) => {
                 self.values.ascii_organism_enabled = enabled;
@@ -2701,6 +2824,7 @@ mod tests {
                 remote_clipboard: false,
                 remote_hosts: hosts,
             },
+            organism_syncing: Rc::new(Cell::new(false)),
             remote_draft: draft,
             remote_editing: editing,
             remote_dialog: None,
@@ -2851,5 +2975,127 @@ mod tests {
         assert_eq!(hosts.len(), 1);
         assert_eq!(hosts[0].name, "staging");
         assert!(!remove_remote_host(&mut hosts, 9, "missing"));
+    }
+    #[test]
+    fn ascii_reflection_gate_suppresses_synchronous_callbacks_and_restores_state() {
+        let gate = Cell::new(false);
+        without_ascii_settings_output(&gate, || {
+            assert!(gate.get());
+            without_ascii_settings_output(&gate, || assert!(gate.get()));
+            assert!(gate.get());
+        });
+        assert!(!gate.get());
+    }
+
+    #[test]
+    fn ascii_reload_reflects_only_accepted_fields_without_outputs_or_reopening() {
+        let source = include_str!("settings.rs");
+        let sync = source
+            .split("SettingsMsg::SyncAsciiOrganism { enabled, motion } => {")
+            .nth(1)
+            .unwrap()
+            .split("SettingsMsg::AsciiOrganism(enabled)")
+            .next()
+            .unwrap();
+        assert!(sync.contains("self.values.ascii_organism_enabled = enabled"));
+        assert!(sync.contains("self.values.ascii_organism_motion = motion"));
+        assert!(sync.contains("reflect_ascii_organism_controls("));
+        for forbidden in [
+            "sender.output",
+            "root.present",
+            "set_selected(0)",
+            "remote_draft",
+            "cancel_greeting",
+        ] {
+            assert!(!sync.contains(forbidden));
+        }
+        for callback in [
+            "connect_active_notify[sender, syncing = model.organism_syncing.clone()]",
+            "connect_selected_notify[sender, syncing = model.organism_syncing.clone()]",
+        ] {
+            let body = source
+                .split(callback)
+                .nth(1)
+                .unwrap()
+                .split("},")
+                .next()
+                .unwrap();
+            assert!(body.contains("if !syncing.get()"));
+        }
+        let reload = include_str!("../config_ops.rs");
+        assert!(
+            reload
+                .find("*self.config.borrow_mut() = new_config.clone()")
+                .unwrap()
+                < reload
+                    .find("self.sync_ascii_organism_settings_dialog()")
+                    .unwrap()
+        );
+    }
+    #[test]
+    fn ascii_confirmations_converge_in_actual_relm_queue_order_without_feedback() {
+        let (inputs, settings_queue) = relm4::channel::<(bool, u32)>();
+        let (outputs, app_queue) = relm4::channel::<(bool, u32)>();
+        let gate = Cell::new(false);
+        let writes = Cell::new(0);
+        // A user output is pending while AppModel accepts an external reload.
+        outputs.emit((true, 3));
+        let mut accepted = (false, 1);
+        inputs.emit(accepted);
+        // AppModel subsequently accepts that user change and confirms it.
+        accepted = app_queue.recv_sync().unwrap();
+        writes.set(writes.get() + 1);
+        inputs.emit(accepted);
+        let mut displayed = (true, 0);
+        for expected in [(false, 1), (true, 3)] {
+            let reflected = settings_queue.recv_sync().unwrap();
+            assert_eq!(reflected, expected);
+            without_ascii_settings_output(&gate, || {
+                displayed = reflected;
+                if !gate.get() {
+                    outputs.emit(reflected);
+                    writes.set(writes.get() + 1);
+                }
+            });
+        }
+        assert_eq!(displayed, accepted);
+        assert_eq!(writes.get(), 1, "reflection never persists a second change");
+        // A safe-mode rejection confirms the unchanged accepted pair.
+        outputs.emit((false, 0));
+        let _rejected = app_queue.recv_sync().unwrap();
+        inputs.emit(accepted);
+        let reflected = settings_queue.recv_sync().unwrap();
+        without_ascii_settings_output(&gate, || displayed = reflected);
+        assert_eq!(displayed, accepted);
+        assert_eq!(writes.get(), 1);
+    }
+
+    #[test]
+    fn every_ascii_app_mutation_confirms_the_current_pair() {
+        let source = include_str!("../settings_ops.rs");
+        let helper = source
+            .split("pub(crate) fn sync_ascii_organism_settings_dialog")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn apply_settings_ascii_organism(")
+            .next()
+            .unwrap();
+        assert!(helper.contains("self.config.borrow()"));
+        assert!(helper.contains("config.ascii_organism_enabled"));
+        assert!(helper.contains("config.ascii_organism_motion"));
+        assert!(helper.contains("SettingsMsg::SyncAsciiOrganism { enabled, motion }"));
+        let mutations = source
+            .split("pub(crate) fn apply_settings_ascii_organism(")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn apply_settings_ai_enabled")
+            .next()
+            .unwrap();
+        assert_eq!(
+            mutations
+                .matches("self.sync_ascii_organism_settings_dialog()")
+                .count(),
+            4
+        );
     }
 }

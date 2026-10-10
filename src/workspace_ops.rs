@@ -443,6 +443,21 @@ fn pane_header_title(osc_title: Option<&str>, cwd: Option<&str>, position: usize
         .unwrap_or_else(|| format!("Pane {}", position + 1))
 }
 
+/// Preserve the selected tab by identity after removal; only a removed or
+/// unavailable selection falls back to the next, then previous, neighbor.
+fn tab_selection_after_close(
+    active_id: Option<u64>,
+    remaining_ids: &[u64],
+    removed_index: usize,
+) -> Option<(usize, bool)> {
+    if let Some(index) =
+        active_id.and_then(|id| remaining_ids.iter().position(|other| *other == id))
+    {
+        return Some((index, true));
+    }
+    (!remaining_ids.is_empty()).then(|| (removed_index.min(remaining_ids.len() - 1), false))
+}
+
 fn active_index_after_remove(active: usize, removed: usize, remaining: usize) -> usize {
     debug_assert!(remaining > 0);
     if active > removed {
@@ -1859,7 +1874,8 @@ impl AppModel {
 
     pub(crate) fn close_tab(&mut self, id: u64, sender: &ComponentSender<AppModel>) {
         let Some(idx) = self.index_of(id) else { return };
-        if idx == self.active {
+        let active_id = self.tabs.get(self.active).map(|tab| tab.id);
+        if active_id == Some(id) {
             self.begin_organism_focus_transfer(None, true);
         }
         let pane_ids = self.tabs[idx]
@@ -1893,11 +1909,18 @@ impl AppModel {
             self.force_quit();
             return;
         }
-        let new_idx = if idx >= self.tabs.len() {
-            self.tabs.len() - 1
-        } else {
-            idx
-        };
+        let remaining_ids: Vec<_> = self.tabs.iter().map(|tab| tab.id).collect();
+        let (new_idx, preserves_active) =
+            tab_selection_after_close(active_id, &remaining_ids, idx).expect("nonempty tabs");
+        if preserves_active {
+            // Removing a background tab may shift the selected tab's index.
+            // Do not run a selection transition: the same stack child, search,
+            // keyboard focus and organism owner are still authoritative.
+            self.active = new_idx;
+            self.rebuild_tab_strip(sender);
+            self.refresh_bottom_bar();
+            return;
+        }
         let new_id = self.tabs[new_idx].id;
         self.select_tab(new_id, sender);
     }
@@ -3064,8 +3087,8 @@ mod pane_tree_tests {
         plan_pane_into_tab, plan_tab_into_pane, prepare_then_commit, reconnect_target_is_valid,
         replay_argv_for_unmanaged_leaf, restored_leaf_mode, snapshot_restorable_command,
         split_layout_reason, swap_target_in_visual_order, switch_tab_empty_notice,
-        tab_drop_preview_is_valid, DropTabIdentity, LeafSlot, PaneIntoTabPlan, SplitLayoutKind,
-        TabIntoPanePlan, PERSISTENCE_FAILURE_NOTICE_COOLDOWN,
+        tab_drop_preview_is_valid, tab_selection_after_close, DropTabIdentity, LeafSlot,
+        PaneIntoTabPlan, SplitLayoutKind, TabIntoPanePlan, PERSISTENCE_FAILURE_NOTICE_COOLDOWN,
     };
     use crate::config::TerminalMode;
     use crate::workspace::ConnStatus;
@@ -3822,5 +3845,74 @@ mod pane_tree_tests {
         assert!(summary.contains("tab 1 — vim"));
         assert!(!summary.contains("tab 9 — vim"));
         assert!(summary.ends_with("…and 2 more"));
+    }
+    #[test]
+    fn background_tab_close_preserves_selected_identity_on_both_sides() {
+        assert_eq!(
+            tab_selection_after_close(Some(20), &[20, 30], 0),
+            Some((0, true))
+        );
+        assert_eq!(
+            tab_selection_after_close(Some(20), &[10, 20], 2),
+            Some((1, true))
+        );
+        assert_eq!(
+            tab_selection_after_close(Some(30), &[10, 30], 1),
+            Some((1, true))
+        );
+    }
+
+    #[test]
+    fn active_tab_close_uses_next_then_previous_and_handles_empty_selection() {
+        assert_eq!(
+            tab_selection_after_close(Some(20), &[10, 30], 1),
+            Some((1, false))
+        );
+        assert_eq!(
+            tab_selection_after_close(Some(30), &[10, 20], 2),
+            Some((1, false))
+        );
+        assert_eq!(
+            tab_selection_after_close(Some(10), &[20, 30], 0),
+            Some((0, false))
+        );
+        assert_eq!(tab_selection_after_close(Some(10), &[], 0), None);
+        assert_eq!(tab_selection_after_close(None, &[20], 0), Some((0, false)));
+        assert_eq!(
+            tab_selection_after_close(Some(99), &[20], 8),
+            Some((0, false))
+        );
+    }
+
+    #[test]
+    fn background_tab_close_does_not_emit_a_selection_transition() {
+        let source = include_str!("workspace_ops.rs");
+        let close = source
+            .split("pub(crate) fn close_tab(")
+            .nth(1)
+            .unwrap()
+            .split("/// Re-label a tab")
+            .next()
+            .unwrap();
+        assert!(close.contains("let Some(idx) = self.index_of(id) else { return };"));
+        assert!(
+            close.find("let active_id =").unwrap() < close.find("self.tabs.remove(idx)").unwrap()
+        );
+        assert!(close.contains("if active_id == Some(id)"));
+        assert!(close.contains("tab_selection_after_close(active_id, &remaining_ids, idx)"));
+        let preserved = close
+            .split("if preserves_active {")
+            .nth(1)
+            .unwrap()
+            .split("let new_id =")
+            .next()
+            .unwrap();
+        assert!(preserved.contains("self.active = new_idx"));
+        assert!(preserved.contains("self.rebuild_tab_strip(sender)"));
+        assert!(preserved.contains("return;"));
+        assert!(!preserved.contains("self.select_tab("));
+        assert!(!preserved.contains("begin_organism_focus_transfer("));
+        assert!(!preserved.contains("GrabFocus"));
+        assert!(close.contains("self.force_quit()"));
     }
 }

@@ -130,12 +130,31 @@ impl AppModel {
         self.show_toast("Command history preference updated.");
     }
 
+    /// Every accepted ASCII setting transition confirms the authoritative pair
+    /// through the same Settings input queue, including external reloads.
+    pub(crate) fn sync_ascii_organism_settings_dialog(&self) {
+        let (enabled, motion) = {
+            let config = self.config.borrow();
+            let motion = match config.ascii_organism_motion {
+                None => 0,
+                Some(config::OrganismMotion::Full) => 1,
+                Some(config::OrganismMotion::Calm) => 2,
+                Some(config::OrganismMotion::Static) => 3,
+            };
+            (config.ascii_organism_enabled, motion)
+        };
+        self.settings
+            .emit(dialogs::settings::SettingsMsg::SyncAsciiOrganism { enabled, motion });
+    }
+
     pub(crate) fn apply_settings_ascii_organism(&mut self, enabled: bool) {
         if self.safe_mode {
+            self.sync_ascii_organism_settings_dialog();
             self.show_toast("ASCII organism is disabled in safe mode.");
             return;
         }
         self.config.borrow_mut().ascii_organism_enabled = enabled;
+        self.sync_ascii_organism_settings_dialog();
         self.organism_hub.sync_ascii_organism_settings();
         self.sync_organism_focus();
         self.persist_config();
@@ -148,6 +167,7 @@ impl AppModel {
 
     pub(crate) fn apply_settings_ascii_organism_motion(&mut self, motion: u32) {
         if self.safe_mode {
+            self.sync_ascii_organism_settings_dialog();
             self.show_toast("ASCII organism is disabled in safe mode.");
             return;
         }
@@ -157,6 +177,7 @@ impl AppModel {
             3 => Some(config::OrganismMotion::Static),
             _ => None,
         };
+        self.sync_ascii_organism_settings_dialog();
         self.organism_hub.sync_ascii_organism_settings();
         self.sync_organism_focus();
         self.persist_config();
