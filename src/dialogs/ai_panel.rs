@@ -84,6 +84,13 @@ struct RequestPayload {
     restore_pending_as_draft: bool,
 }
 
+/// A confirmation belongs to one selection lifetime, even across same-ID restores.
+#[derive(Clone, Debug)]
+pub(crate) struct DeleteConfirmation {
+    chat_id: u64,
+    epoch: Rc<()>,
+}
+
 #[derive(Debug)]
 pub(crate) enum AiPanelMsg {
     Open {
@@ -118,7 +125,7 @@ pub(crate) enum AiPanelMsg {
     Rename(String),
     ToggleArchive,
     Delete,
-    DeleteConfirmed,
+    DeleteConfirmed(DeleteConfirmation),
     ClearContext,
     IncludeRecent(bool),
     CopyFocused,
@@ -148,6 +155,7 @@ pub(crate) struct AiPanelModel {
     include_recent: HashMap<u64, bool>,
     search: String,
     draft_generation: u64,
+    delete_epoch: Rc<()>,
     rendering: bool,
     /// How many bytes of `active_partial()` the transcript buffer already
     /// shows. Streaming splices only the bytes past this offset instead of
@@ -416,6 +424,7 @@ impl Component for AiPanelModel {
             include_recent: HashMap::new(),
             search: String::new(),
             draft_generation: 0,
+            delete_epoch: Rc::new(()),
             rendering: false,
             rendered_partial_bytes: 0,
             scroll_queued: Rc::new(Cell::new(false)),
@@ -495,7 +504,7 @@ impl Component for AiPanelModel {
                 widgets.page_stack.set_visible_child_name(CHAT_PAGE);
                 if let Some((context, intent)) = initial_context {
                     if self.store.active_archived() {
-                        let _ = self.store.new_chat();
+                        let _ = self.new_chat();
                     }
                     if !self.store.is_active_busy() {
                         // The question is a fixed constant per intent; the
@@ -520,7 +529,7 @@ impl Component for AiPanelModel {
             AiPanelMsg::Restore(encoded) => match ai::ConversationSnapshot::from_json(&encoded) {
                 Ok(snapshot) => {
                     self.cancel_all();
-                    self.store = restore_chat_store(snapshot);
+                    self.restore_chats(snapshot);
                     self.retry_payloads.clear();
                     self.conversation_systems.clear();
                     self.render_all(widgets, &sender);
@@ -640,7 +649,7 @@ impl Component for AiPanelModel {
                     self.refresh_library(&widgets.chat_list, &sender);
                 }
             }
-            AiPanelMsg::NewChat => match self.store.new_chat() {
+            AiPanelMsg::NewChat => match self.new_chat() {
                 Ok(_) => {
                     widgets.page_stack.set_visible_child_name(CHAT_PAGE);
                     self.render_all(widgets, &sender);
@@ -654,7 +663,7 @@ impl Component for AiPanelModel {
                 Err(_) => {}
             },
             AiPanelMsg::SelectChat(id) => {
-                if self.store.select_chat(id) {
+                if self.select_chat(id) {
                     self.render_all(widgets, &sender);
                     self.publish_snapshot(widgets, &sender);
                 }
@@ -678,7 +687,7 @@ impl Component for AiPanelModel {
                     self.publish_snapshot(widgets, &sender);
                 }
             }
-            AiPanelMsg::ToggleArchive => match self.store.toggle_archive_active() {
+            AiPanelMsg::ToggleArchive => match self.toggle_archive() {
                 Ok(_) => {
                     self.render_all(widgets, &sender);
                     self.publish_snapshot(widgets, &sender);
@@ -698,6 +707,7 @@ impl Component for AiPanelModel {
                 Err(_) => {}
             },
             AiPanelMsg::Delete => {
+                let confirmation = self.delete_confirmation();
                 let title =
                     crate::review_input::safe_inline_display(self.store.active_title(), 1_024);
                 let dialog = adw::AlertDialog::new(
@@ -713,18 +723,19 @@ impl Component for AiPanelModel {
                 let sender = sender.clone();
                 dialog.connect_response(None, move |_, response| {
                     if response == "delete" {
-                        sender.input(AiPanelMsg::DeleteConfirmed);
+                        sender.input(AiPanelMsg::DeleteConfirmed(confirmation.clone()));
                     }
                 });
                 dialog.present(Some(root));
             }
-            AiPanelMsg::DeleteConfirmed => match self.store.delete_active() {
-                Ok(outcome) => {
-                    self.retry_payloads.remove(&outcome.deleted_chat_id);
-                    self.conversation_systems.remove(&outcome.deleted_chat_id);
+            AiPanelMsg::DeleteConfirmed(confirmation) => match self.delete_confirmed(confirmation) {
+                Ok(Some(_)) => {
                     self.render_all(widgets, &sender);
                     self.publish_snapshot(widgets, &sender);
                 }
+                Ok(None) => widgets
+                    .status
+                    .set_label("The selected chat changed. Request deletion again."),
                 Err(ChatStoreError::Busy) => {
                     widgets
                         .status
@@ -818,6 +829,61 @@ fn paste_focused_text(widgets: &AiPanelModelWidgets, archived: bool) {
 }
 
 impl AiPanelModel {
+    fn invalidate_delete_confirmation(&mut self) {
+        // Old dialogs retain the old allocation, so its identity cannot be
+        // reused. This is an epoch without integer wraparound/ABA.
+        self.delete_epoch = Rc::new(());
+    }
+
+    fn delete_confirmation(&self) -> DeleteConfirmation {
+        DeleteConfirmation {
+            chat_id: self.store.active_id(),
+            epoch: self.delete_epoch.clone(),
+        }
+    }
+
+    fn new_chat(&mut self) -> Result<u64, ChatStoreError> {
+        let id = self.store.new_chat()?;
+        self.invalidate_delete_confirmation();
+        Ok(id)
+    }
+
+    fn select_chat(&mut self, id: u64) -> bool {
+        let changed = self.store.select_chat(id);
+        if changed {
+            self.invalidate_delete_confirmation();
+        }
+        changed
+    }
+
+    fn restore_chats(&mut self, snapshot: ai::ConversationSnapshot) {
+        self.invalidate_delete_confirmation();
+        self.store = restore_chat_store(snapshot);
+    }
+
+    fn toggle_archive(&mut self) -> Result<(), ChatStoreError> {
+        self.store.toggle_archive_active()?;
+        self.invalidate_delete_confirmation();
+        Ok(())
+    }
+
+    fn delete_confirmed(
+        &mut self,
+        confirmation: DeleteConfirmation,
+    ) -> Result<Option<u64>, ChatStoreError> {
+        if confirmation.chat_id != self.store.active_id()
+            || !Rc::ptr_eq(&confirmation.epoch, &self.delete_epoch)
+        {
+            return Ok(None);
+        }
+        // Consume this confirmation even if the busy policy refuses deletion.
+        self.invalidate_delete_confirmation();
+        let outcome = self.store.delete_active()?;
+        self.retry_payloads.remove(&outcome.deleted_chat_id);
+        self.conversation_systems.remove(&outcome.deleted_chat_id);
+        Ok(Some(outcome.deleted_chat_id))
+    }
+
     fn start_request(
         &mut self,
         widgets: &mut AiPanelModelWidgets,
@@ -1298,10 +1364,67 @@ mod tests {
             include_recent: HashMap::new(),
             search: String::new(),
             draft_generation: 0,
+            delete_epoch: Rc::new(()),
             rendering: false,
             rendered_partial_bytes: 0,
             scroll_queued: Rc::new(Cell::new(false)),
         }
+    }
+
+    #[test]
+    fn delete_confirmation_cannot_follow_a_changed_selection() {
+        let mut model = panel_model(None, false);
+        let first = model.store.active_id();
+        let confirmation = model.delete_confirmation();
+        let second = model.new_chat().unwrap();
+        assert_eq!(model.delete_confirmed(confirmation.clone()), Ok(None));
+        assert_eq!(model.store.active_id(), second);
+        assert!(model.select_chat(first));
+        assert_eq!(model.delete_confirmed(confirmation), Ok(None));
+        assert_eq!(model.store.active_id(), first);
+        let confirmation = model.delete_confirmation();
+        assert!(model.select_chat(second));
+        assert_eq!(model.delete_confirmed(confirmation.clone()), Ok(None));
+        assert!(model.select_chat(first));
+        assert_eq!(model.delete_confirmed(confirmation), Ok(None));
+        assert_eq!(model.store.active_id(), first);
+    }
+
+    #[test]
+    fn delete_confirmation_cannot_survive_same_id_restore() {
+        let mut model = panel_model(None, false);
+        let confirmation = model.delete_confirmation();
+        let id = model.store.active_id();
+        let (snapshot, _) = model.store.snapshot_for_persistence(false).unwrap();
+        model.restore_chats(snapshot);
+        assert_eq!(model.store.active_id(), id);
+        assert_eq!(model.delete_confirmed(confirmation), Ok(None));
+        assert_eq!(model.store.active_id(), id);
+    }
+
+    #[test]
+    fn delete_confirmation_cannot_survive_archive_reselection() {
+        let mut model = panel_model(None, false);
+        let id = model.store.active_id();
+        let confirmation = model.delete_confirmation();
+        model.toggle_archive().unwrap();
+        assert!(model.select_chat(id));
+        assert_eq!(model.delete_confirmed(confirmation), Ok(None));
+        assert_eq!(model.store.active_id(), id);
+    }
+
+    #[test]
+    fn delete_confirmation_deletes_only_once_without_retargeting() {
+        let mut model = panel_model(None, false);
+        let id = model.store.active_id();
+        let confirmation = model.delete_confirmation();
+        assert!(!model.select_chat(id));
+        assert_eq!(model.delete_confirmed(confirmation.clone()), Ok(Some(id)));
+        let replacement = model.store.active_id();
+        assert_ne!(replacement, id);
+        assert_eq!(model.delete_confirmed(confirmation), Ok(None));
+        assert_eq!(model.store.active_id(), replacement);
+        assert!(!model.select_chat(id));
     }
 
     /// The consent flag is the outer gate on every path that could put shell
