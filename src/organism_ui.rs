@@ -197,6 +197,23 @@ fn greeting_remaining(origin: Option<GreetingOrigin>, now: Duration) -> Option<D
         .filter(|remaining| !remaining.is_zero())
 }
 
+/// The refresh has already retired expired/cancelled origins. If it retained
+/// an origin while drawing a visible greeting, but rendering then crossed the
+/// end, preserve zero remaining here for one bounded cleanup frame. The next
+/// refresh clears the origin; eligibility and acceptance still use the strict
+/// positive remaining-time check above.
+fn greeting_tail_remaining(
+    origin: Option<GreetingOrigin>,
+    now: Duration,
+    visible_owner: bool,
+) -> Option<Duration> {
+    if !visible_owner {
+        return None;
+    }
+    let (GreetingOrigin::Pointer(start) | GreetingOrigin::Explicit(start)) = origin?;
+    Some(GentleInteraction::HOLD.saturating_sub(now.checked_sub(start)?))
+}
+
 /// The live interaction shares the ordinary frame source. A Full greeting
 /// keeps its normal cadence even after a long idle. Its last short interval
 /// observes the original end; Calm and Static retain their existing policy.
@@ -3403,14 +3420,18 @@ impl OrganismRuntime {
                 && runtime.last_surface_mode.get() == Some(SurfaceMode::Typing)
                 && !runtime.live_body.is_mapped()
                 && !runtime.sticky_avatar.is_mapped();
+            let greeting_visible = runtime.presence.is_owner(runtime.presence_token)
+                && !view.live_organism_surface_metrics().alt_screen
+                && runtime.live_body.is_mapped();
             let next = interaction_frame_delay(
                 next,
                 runtime.motion.get(),
                 typing_hidden,
                 runtime.human_input_age(Instant::now()),
-                greeting_remaining(
+                greeting_tail_remaining(
                     runtime.greeting_origin.get(),
                     runtime.interaction_epoch.elapsed(),
+                    greeting_visible,
                 ),
             );
             // A synchronous settings callback may already have replaced the
@@ -9231,6 +9252,127 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn greeting_tail_crossing_gets_one_cleanup_then_returns_to_dormant() {
+        let start = Duration::from_secs(4);
+        for origin in [
+            GreetingOrigin::Pointer(start),
+            GreetingOrigin::Explicit(start),
+        ] {
+            // First clock read belongs to the refresh which still paints the
+            // greeting. Rendering crosses its end before the fresh tail read.
+            let retained =
+                current_greeting_origin(Some(origin), start + Duration::from_millis(1_999));
+            assert_eq!(retained, Some(origin));
+            let tail_now = start + Duration::from_millis(2_001);
+            assert_eq!(greeting_remaining(retained, tail_now), None);
+            assert_eq!(
+                greeting_tail_remaining(retained, tail_now, true),
+                Some(Duration::ZERO)
+            );
+            for motion in [
+                OrganismMotion::Full,
+                OrganismMotion::Calm,
+                OrganismMotion::Static,
+            ] {
+                for visible_owner in [false, true] {
+                    let delay = interaction_frame_delay(
+                        DORMANT_FRAME_INTERVAL,
+                        motion,
+                        false,
+                        None,
+                        greeting_tail_remaining(retained, tail_now, visible_owner),
+                    );
+                    assert_eq!(
+                        delay,
+                        if motion == OrganismMotion::Full && visible_owner {
+                            Duration::from_millis(1)
+                        } else {
+                            DORMANT_FRAME_INTERVAL
+                        }
+                    );
+                }
+            }
+            let cleared = current_greeting_origin(retained, tail_now + Duration::from_millis(1));
+            assert_eq!(cleared, None);
+            assert_eq!(
+                interaction_frame_delay(
+                    DORMANT_FRAME_INTERVAL,
+                    OrganismMotion::Full,
+                    false,
+                    None,
+                    greeting_tail_remaining(cleared, tail_now, true),
+                ),
+                DORMANT_FRAME_INTERVAL,
+                "no stale origin means no millisecond polling loop"
+            );
+            assert_eq!(
+                greeting_tail_remaining(Some(origin), start + GentleInteraction::HOLD, true),
+                Some(Duration::ZERO)
+            );
+            assert_eq!(
+                greeting_tail_remaining(Some(origin), start - Duration::from_millis(1), true),
+                None
+            );
+            assert_eq!(
+                greeting_tail_remaining(Some(origin), start + Duration::from_millis(1_999), true),
+                Some(Duration::from_millis(1))
+            );
+        }
+        assert_eq!(
+            greeting_tail_remaining(None, Duration::from_secs(99), true),
+            None
+        );
+    }
+
+    #[test]
+    fn greeting_tail_uses_the_retained_visible_origin_only_after_refresh() {
+        let source = include_str!("organism_ui.rs");
+        let production = source.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        let refresh = production
+            .split("fn refresh_surface(")
+            .nth(1)
+            .unwrap()
+            .split("fn apply_settings(")
+            .next()
+            .unwrap();
+        assert!(refresh.contains("self.greeting_origin.set(current_greeting_origin("));
+        let tail = production
+            .split("let greeting_visible =")
+            .nth(1)
+            .unwrap()
+            .split("// A synchronous settings callback")
+            .next()
+            .unwrap();
+        for gate in [
+            "runtime.presence.is_owner",
+            "!view.live_organism_surface_metrics().alt_screen",
+            "runtime.live_body.is_mapped()",
+            "greeting_tail_remaining(",
+            "runtime.greeting_origin.get()",
+            "runtime.interaction_epoch.elapsed()",
+        ] {
+            assert!(tail.contains(gate), "{gate}");
+        }
+        let driver = production
+            .split("fn schedule_surface_frame(")
+            .nth(1)
+            .unwrap();
+        assert!(
+            driver.find("runtime.refresh_surface(&view, now)").unwrap()
+                < driver.find("greeting_tail_remaining(").unwrap()
+        );
+        let rearm = production
+            .split("fn rearm_surface_tick_for_greeting(")
+            .nth(1)
+            .unwrap()
+            .split("fn schedule_surface_frame(")
+            .next()
+            .unwrap();
+        assert!(rearm.contains("greeting_remaining("));
+        assert!(!rearm.contains("greeting_tail_remaining("));
     }
 
     #[test]
