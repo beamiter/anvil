@@ -143,7 +143,7 @@ fn install_card_tooltip_proxy(root: &gtk::Widget, card: &gtk::Widget, labels: &[
             .default_seat()
             .and_then(|seat| seat.pointer())
             .map(|pointer| pointer.modifier_state())
-            .unwrap_or_default();
+            .unwrap_or(gtk::gdk::ModifierType::empty());
         let Some((text, bounds)) =
             card_tooltip_at(root, &card, &labels, (x, y), keyboard_mode, modifiers)
         else {
