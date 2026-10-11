@@ -26,6 +26,7 @@ use jterm_core::organism_memory::{
 
 /// An accepted correction only vouches for a command that starts promptly.
 const CORRECTION_ASSIST_WINDOW: Duration = Duration::from_secs(30);
+const POINTER_GREETING_CANDIDATE_CLASS: &str = "organism-greeting-candidate";
 const POINTER_GREETING_DWELL: Duration = Duration::from_millis(600);
 const POINTER_GREETING_RADIUS: f64 = 32.0;
 
@@ -2182,6 +2183,8 @@ impl OrganismRuntime {
     }
 
     fn cancel_pointer_greeting(&self) {
+        self.live_body
+            .remove_css_class(POINTER_GREETING_CANDIDATE_CLASS);
         if let Some(source) = self.pointer_timer.borrow_mut().take() {
             source.remove();
         }
@@ -2248,6 +2251,9 @@ impl OrganismRuntime {
             let Some(runtime) = weak.upgrade() else {
                 return;
             };
+            runtime
+                .live_body
+                .remove_css_class(POINTER_GREETING_CANDIDATE_CLASS);
             // Clear the fired id before checking its view: a separately held
             // runtime must never try removing an already-fired source in Drop.
             runtime.pointer_timer.borrow_mut().take();
@@ -2284,6 +2290,9 @@ impl OrganismRuntime {
             }
         });
         *runtime.pointer_timer.borrow_mut() = Some(source);
+        runtime
+            .live_body
+            .add_css_class(POINTER_GREETING_CANDIDATE_CLASS);
     }
 
     fn install_pointer_observer(
@@ -4511,12 +4520,38 @@ mod tests {
                 runtime.pointer_timer.borrow().is_some(),
                 "native pointer must reach the passive observer"
             );
+            assert!(runtime
+                .live_body
+                .has_css_class(POINTER_GREETING_CANDIDATE_CLASS));
+            // Compare the same sprite text synchronously; an intervening Full
+            // animation frame must not masquerade as a CSS size change.
+            runtime
+                .live_body
+                .remove_css_class(POINTER_GREETING_CANDIDATE_CLASS);
+            let without_candidate = (
+                runtime.live_body.measure(Orientation::Horizontal, -1),
+                runtime.live_body.measure(Orientation::Vertical, -1),
+            );
+            runtime
+                .live_body
+                .add_css_class(POINTER_GREETING_CANDIDATE_CLASS);
+            assert_eq!(
+                without_candidate,
+                (
+                    runtime.live_body.measure(Orientation::Horizontal, -1),
+                    runtime.live_body.measure(Orientation::Vertical, -1),
+                ),
+                "candidate paint does not change body requisition"
+            );
             native_pointer_button(true);
             settle(Duration::from_millis(40));
             assert!(
                 runtime.pointer_timer.borrow().is_none(),
                 "press without motion cancels pending dwell without consuming the click"
             );
+            assert!(!runtime
+                .live_body
+                .has_css_class(POINTER_GREETING_CANDIDATE_CLASS));
             settle(POINTER_GREETING_DWELL);
             assert!(
                 presence.state.borrow().last_greeting.is_none(),
@@ -4543,6 +4578,9 @@ mod tests {
                 .borrow()
                 .last_greeting
                 .expect("dwell admitted greeting");
+            assert!(!runtime
+                .live_body
+                .has_css_class(POINTER_GREETING_CANDIDATE_CLASS));
             if let Some(ms) = std::env::var("ORGANISM_LIVE_SCREENSHOT_PAUSE_MS")
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
@@ -4575,6 +4613,9 @@ mod tests {
                 Some(first),
                 "repeated entry respects the shared cooldown"
             );
+            assert!(!runtime
+                .live_body
+                .has_css_class(POINTER_GREETING_CANDIDATE_CLASS));
             assert_eq!(
                 format!("{:?}", life.get()),
                 life_before,
@@ -7683,6 +7724,87 @@ mod tests {
             None,
             "a fired callback owns the vacant slot and will reschedule itself"
         );
+    }
+
+    #[test]
+    fn pointer_candidate_paint_tracks_only_the_real_dwell_source() {
+        let source = include_str!("organism_ui.rs");
+        let production = source.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        let observer = production
+            .split("fn observe_pointer(")
+            .nth(1)
+            .unwrap()
+            .split("fn install_pointer_observer(")
+            .next()
+            .unwrap();
+        let arm = observer
+            .find("*runtime.pointer_timer.borrow_mut() = Some(source);")
+            .unwrap();
+        let paint = observer
+            .find(".add_css_class(POINTER_GREETING_CANDIDATE_CLASS)")
+            .unwrap();
+        assert!(arm < paint);
+        assert!(
+            observer
+                .find("last.elapsed() < GentleInteraction::COOLDOWN")
+                .unwrap()
+                < arm
+        );
+        let consume = observer
+            .find("runtime.pointer_timer.borrow_mut().take();")
+            .unwrap();
+        assert!(
+            observer
+                .find(".remove_css_class(POINTER_GREETING_CANDIDATE_CLASS)")
+                .unwrap()
+                < consume
+        );
+        let cancel = production
+            .split("fn cancel_pointer_greeting(&self) {")
+            .nth(1)
+            .unwrap()
+            .split("fn pointer_can_greet(")
+            .next()
+            .unwrap();
+        assert!(
+            cancel
+                .find(".remove_css_class(POINTER_GREETING_CANDIDATE_CLASS)")
+                .unwrap()
+                < cancel
+                    .find("self.pointer_timer.borrow_mut().take()")
+                    .unwrap()
+        );
+        assert_eq!(
+            production
+                .matches(".add_css_class(POINTER_GREETING_CANDIDATE_CLASS)")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn pointer_candidate_style_is_neutral_static_and_geometry_preserving() {
+        let css = include_str!("block_view/css.rs");
+        let rule = css
+            .split(".organism-live-body.organism-greeting-candidate {{")
+            .nth(1)
+            .unwrap()
+            .split("}}")
+            .next()
+            .unwrap();
+        assert!(rule.contains("border-color: rgba({fg_r},{fg_g},{fg_b},0.45);"));
+        assert!(rule.contains("transition: none;"));
+        assert_eq!(rule.matches(';').count(), 2);
+        for forbidden in [
+            "padding",
+            "border-width",
+            "outline",
+            "box-shadow",
+            "background",
+            "{acc_",
+        ] {
+            assert!(!rule.contains(forbidden));
+        }
     }
 
     #[test]

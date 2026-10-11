@@ -581,6 +581,10 @@ fn block_css(config: &Config) -> String {
             color: {warn_hex};
             border-color: rgba({warn_r},{warn_g},{warn_b},0.50);
         }}
+        .organism-live-body.organism-greeting-candidate {{
+            border-color: rgba({fg_r},{fg_g},{fg_b},0.45);
+            transition: none;
+        }}
         .organism-sticky-avatar {{
             color: {agent_hex};
             font-family: {font_stack};
