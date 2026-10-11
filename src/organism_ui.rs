@@ -5571,6 +5571,12 @@ mod tests {
         scroll_content.append(&tail);
         scroll.set_child(Some(&scroll_content));
         proxy_root.append(&scroll);
+        let proxy_focus = gtk::Entry::new();
+        proxy_root.append(&proxy_focus);
+        let control_root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let control_focus = gtk::Entry::new();
+        control_root.append(&control_focus);
+        tooltip_host.append(&control_root);
         tooltip_host.append(&proxy_root);
         tooltip_host.append(&other_root);
         window.set_child(Some(&tooltip_host));
@@ -5580,6 +5586,22 @@ mod tests {
             std::slice::from_ref(&label),
         );
         settle(Duration::from_millis(60));
+        // Same native host, no tooltip hooks: removing a focused subtree can
+        // retain it in GtkWindow's move_focus_widget until focus repair or
+        // disposal. This control separates native ownership from our hooks.
+        assert!(control_focus.grab_focus());
+        assert!(gtk::prelude::GtkWindowExt::focus(&window)
+            .is_some_and(|focus| focus.is_ancestor(&control_root)));
+        let control_weak = control_root.downgrade();
+        tooltip_host.remove(&control_root);
+        drop(control_root);
+        drop(control_focus);
+        let control_retained_after_remove = control_weak.upgrade().is_some();
+        assert!(
+            control_retained_after_remove,
+            "same-host no-hook focused subtree is retained after remove too"
+        );
+        assert!(proxy_focus.grab_focus());
         #[cfg(target_os = "linux")]
         {
             move_native_pointer(&window, 20, 20);
@@ -5630,9 +5652,13 @@ mod tests {
             !proxy_query(previous_point),
             "root callback holds no stale card or label alive"
         );
+        assert!(gtk::prelude::GtkWindowExt::focus(&window)
+            .is_some_and(|focus| focus.is_ancestor(&proxy_root)));
         let root_weak = proxy_root.downgrade();
         tooltip_host.remove(&proxy_root);
         drop(proxy_root);
+        drop(proxy_focus);
+        let proxy_retained_after_remove = root_weak.upgrade().is_some();
         // A never-parented control isolates the hooks from GTK's mapped host
         // lifecycle. The card stays alive after its proxy root is destroyed.
         let isolated_root = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -5651,10 +5677,13 @@ mod tests {
             "card unmap hook does not retain its root"
         );
         assert!(crate::block_view::organism_settings_test_pty_bytes(&view).is_empty());
+        let window_weak = window.downgrade();
         window.close();
-        // Unparenting a mapped widget alone does not finish the native host.
-        // Close it, release fixture-owned children/tooltip, and allow bounded
-        // GTK cleanup. A real strong hook cycle would still fail this check.
+        let proxy_retained_after_close = root_weak.upgrade().is_some();
+        // close() unrealizes the native surface but does not drop this Rust
+        // GtkWindow owner. GTK 4.14.5 clears move_focus_widget in dispose, so
+        // waiting for after-paint on the closed surface is not sufficient.
+        drop(window);
         drop(tooltip);
         drop(scroll);
         drop(scroll_content);
@@ -5663,12 +5692,26 @@ mod tests {
         drop(tooltip_host);
         drop(other_root);
         let cleanup_started = Instant::now();
-        while root_weak.upgrade().is_some()
+        while (root_weak.upgrade().is_some()
+            || control_weak.upgrade().is_some()
+            || window_weak.upgrade().is_some())
             && cleanup_started.elapsed() < Duration::from_millis(500)
         {
             while main.iteration(false) {}
             std::thread::sleep(Duration::from_millis(2));
         }
+        println!(
+            "TOOLTIP_ROOT_RETENTION no_hook_after_remove={control_retained_after_remove} proxy_after_remove={proxy_retained_after_remove} proxy_after_close={proxy_retained_after_close} window_released={} no_hook_released={} proxy_released={}",
+            window_weak.upgrade().is_none(), control_weak.upgrade().is_none(), root_weak.upgrade().is_none(),
+        );
+        assert!(
+            window_weak.upgrade().is_none(),
+            "fixture's native window owner is fully disposed"
+        );
+        assert!(
+            control_weak.upgrade().is_none(),
+            "same-host no-hook control releases"
+        );
         assert!(
             root_weak.upgrade().is_none(),
             "mapped proxy root releases after native host cleanup"
