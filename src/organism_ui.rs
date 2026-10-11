@@ -1838,7 +1838,7 @@ struct OrganismRuntime {
     visual_transition_frame: Cell<u64>,
     last_live_behavior: Cell<Behavior>,
     // Presentation only: retire this whenever the spatial body is hidden.
-    explained_body_behavior: Cell<Option<Behavior>>,
+    explained_body_context: Cell<Option<(Behavior, WatchRhythm)>>,
     transition_source_override: Cell<Option<Behavior>>,
     command_origin_behavior: Cell<Option<Behavior>>,
     /// Where the body currently stands on the live surface; `None` while
@@ -2027,7 +2027,7 @@ impl OrganismRuntime {
             visual_transition: Cell::new(None),
             visual_transition_frame: Cell::new(0),
             last_live_behavior: Cell::new(Behavior::Idle),
-            explained_body_behavior: Cell::new(None),
+            explained_body_context: Cell::new(None),
             transition_source_override: Cell::new(None),
             command_origin_behavior: Cell::new(None),
             body_position: Cell::new(None),
@@ -2549,7 +2549,7 @@ impl OrganismRuntime {
         self.surface_behavior_frame_origin
             .set(self.surface_frame.get());
         self.surface_behavior.set(reaction.behavior);
-        self.explained_body_behavior.set(None);
+        self.explained_body_context.set(None);
         self.refresh_inline_sprite();
         self.refresh_growth_badge();
         let status = match reaction.speech {
@@ -2611,8 +2611,11 @@ impl OrganismRuntime {
         }
     }
 
-    fn explain_body(&self, behavior: Option<Behavior>) {
-        if self.explained_body_behavior.replace(behavior) != behavior {
+    fn explain_body(&self, context: Option<RenderContext>) {
+        // One final presentation snapshot: a rhythm change with an unchanged
+        // watching behavior still updates its visible and accessible wording.
+        let explained = context.map(|context| (context.behavior, context.watch_rhythm));
+        if self.explained_body_context.replace(explained) != explained {
             self.refresh_state(self.shared_life.get());
         }
     }
@@ -2620,7 +2623,7 @@ impl OrganismRuntime {
     fn refresh_state(&self, state: LifeState) {
         let words = state_caption(
             self.surface_behavior.get(),
-            self.explained_body_behavior.get(),
+            self.explained_body_context.get(),
             state,
         );
         if self.state.text().as_str() != words {
@@ -2978,7 +2981,7 @@ impl OrganismRuntime {
                 self.body_in_transit.set(moved);
                 self.body_position.set(Some((x, y)));
                 view.set_live_organism_visible(true);
-                self.explain_body(Some(context.behavior));
+                self.explain_body(Some(context));
             } else {
                 // A detached/reparenting surface is not a place the body can
                 // visibly sleep. Fail closed until the next measured frame.
@@ -3413,12 +3416,27 @@ fn state_summary(state: LifeState) -> String {
     )
 }
 
-fn state_caption(inline: Behavior, displayed: Option<Behavior>, state: LifeState) -> String {
-    format!(
-        "{} · {}",
-        behavior_explanation(displayed.unwrap_or(inline)),
-        state_words(state)
-    )
+fn state_caption(
+    inline: Behavior,
+    displayed: Option<(Behavior, WatchRhythm)>,
+    state: LifeState,
+) -> String {
+    let (behavior, rhythm) = displayed.unwrap_or((inline, WatchRhythm::Steady));
+    let explanation = behavior_explanation(behavior);
+    let rhythm = if matches!(behavior, Behavior::WatchCommand | Behavior::WatchSettled) {
+        match rhythm {
+            WatchRhythm::Steady => None,
+            WatchRhythm::Busy => Some("Recent output activity."),
+            WatchRhythm::Waiting => Some("No new output observed recently."),
+            WatchRhythm::Resumed => Some("Output activity resumed."),
+        }
+    } else {
+        None
+    };
+    match rhythm {
+        Some(rhythm) => format!("{explanation} {rhythm} · {}", state_words(state)),
+        None => format!("{explanation} · {}", state_words(state)),
+    }
 }
 
 fn state_words(state: LifeState) -> String {
@@ -4344,7 +4362,11 @@ mod tests {
     fn state_caption_explains_the_shown_pose_and_falls_back_after_retreat() {
         let life = LifeState::default();
         let inline = Behavior::UnknownOutcome;
-        let greeting = state_caption(inline, Some(Behavior::Approach), life);
+        let greeting = state_caption(
+            inline,
+            Some((Behavior::Approach, WatchRhythm::Steady)),
+            life,
+        );
         assert!(greeting.starts_with(behavior_explanation(Behavior::Approach)));
         assert!(greeting.ends_with(&state_words(life)));
         // Cancel/typing clears the spatial pose: describe the actual inline
@@ -4373,6 +4395,115 @@ mod tests {
         }
         // Approach can arise without a greeting; do not relabel every one Hello.
         assert!(!state_caption(Behavior::Approach, None, LifeState::default()).contains("Hello"));
+    }
+
+    #[test]
+    fn rhythm_caption_describes_only_observed_human_command_output() {
+        let life = LifeState::default();
+        let rhythms = [
+            (WatchRhythm::Steady, None),
+            (WatchRhythm::Busy, Some("Recent output activity.")),
+            (
+                WatchRhythm::Waiting,
+                Some("No new output observed recently."),
+            ),
+            (WatchRhythm::Resumed, Some("Output activity resumed.")),
+        ];
+        for behavior in [
+            Behavior::Idle,
+            Behavior::WatchCommand,
+            Behavior::InspectError,
+            Behavior::SitNearError,
+            Behavior::Celebrate,
+            Behavior::CelebrateBig,
+            Behavior::RestAfterPush,
+            Behavior::UnknownOutcome,
+            Behavior::GlanceAside,
+            Behavior::Sleep,
+            Behavior::Explore,
+            Behavior::Approach,
+            Behavior::WatchAgent,
+            Behavior::WatchSettled,
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardRecovery,
+            Behavior::GuardCautious,
+        ] {
+            for (rhythm, words) in rhythms {
+                let caption = state_caption(Behavior::Idle, Some((behavior, rhythm)), life);
+                let base = behavior_explanation(behavior);
+                let expected = match words
+                    .filter(|_| matches!(behavior, Behavior::WatchCommand | Behavior::WatchSettled))
+                {
+                    Some(words) => format!("{base} {words} · {}", state_words(life)),
+                    None => format!("{base} · {}", state_words(life)),
+                };
+                assert_eq!(caption, expected);
+            }
+        }
+        let watching = state_caption(Behavior::WatchCommand, None, life);
+        assert_eq!(
+            watching,
+            format!(
+                "{} · {}",
+                behavior_explanation(Behavior::WatchCommand),
+                state_words(life)
+            ),
+            "hidden or rejected presentation never adds observed rhythm words"
+        );
+    }
+
+    #[test]
+    fn rhythm_explanation_uses_the_final_context_and_never_the_status_live_region() {
+        let source = include_str!("organism_ui.rs");
+        let production = source.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        let explain = production
+            .split("fn explain_body(")
+            .nth(1)
+            .unwrap()
+            .split("fn human_input_age(")
+            .next()
+            .unwrap();
+        assert!(
+            production.contains("explained_body_context: Cell<Option<(Behavior, WatchRhythm)>>")
+        );
+        assert!(explain.contains("context.map(|context| (context.behavior, context.watch_rhythm))"));
+        assert!(explain.contains("self.explained_body_context.replace(explained) != explained"));
+        assert!(explain.contains("gtk::accessible::Property::Description(&words)"));
+        assert!(explain.contains("self.state.set_tooltip_text(Some(&detail))"));
+        for excluded in [
+            "self.status",
+            "desired_rhythm",
+            "offered_watch_rhythm",
+            "output_rhythm",
+            "transition",
+        ] {
+            assert!(!explain.contains(excluded));
+        }
+        let refresh = production
+            .split("fn refresh_surface(&self, view: &TermView, now: Instant) {")
+            .nth(1)
+            .unwrap()
+            .split("fn apply_settings(")
+            .next()
+            .unwrap();
+        assert!(
+            refresh
+                .find(".apply(self.interaction_epoch.elapsed(), context)")
+                .unwrap()
+                < refresh.find("self.explain_body(Some(context))").unwrap()
+        );
+        for gate in [
+            "if self.motion.get() == OrganismMotion::Static",
+            "if !self.presence.is_owner",
+            "if suppress_live_body_for_focus(mode)",
+            "if metrics.alt_screen",
+        ] {
+            assert!(
+                refresh.find(gate).unwrap()
+                    < refresh.find("self.explain_body(Some(context))").unwrap()
+            );
+        }
     }
 
     #[test]
@@ -4407,8 +4538,8 @@ mod tests {
             .split("fn refresh_growth_badge(")
             .next()
             .unwrap();
-        assert!(render.contains("self.explained_body_behavior.set(None);"));
-        assert!(production.contains("self.explain_body(Some(context.behavior));"));
+        assert!(render.contains("self.explained_body_context.set(None);"));
+        assert!(production.contains("self.explain_body(Some(context));"));
         let backend = include_str!("block_view/mod.rs");
         assert!(backend.contains("return self.dock_inline_notice(widget);"));
         assert!(backend.contains("fn docks_inline_notices(&self) -> bool {\n        true"));
@@ -4884,8 +5015,8 @@ mod tests {
                 "pointer distance does not cancel explicit hello"
             );
             assert_eq!(
-                runtime.explained_body_behavior.get(),
-                Some(Behavior::Approach)
+                runtime.explained_body_context.get(),
+                Some((Behavior::Approach, WatchRhythm::Steady))
             );
             assert!(runtime.say_hello(&view).is_err());
             assert_eq!(presence.state.borrow().last_greeting, explicit_at);
@@ -4938,6 +5069,65 @@ mod tests {
         OrganismRuntime::apply_settings(&runtime, &view, false, OrganismMotion::Static);
         assert!(runtime.surface_timer.borrow().is_none());
         assert!(runtime.pointer_timer.borrow().is_none());
+        // A final watching context changes the existing state label and
+        // tooltip together, without adding announcements to the Status label.
+        let status_before = runtime.status.text();
+        let life_before = format!("{:?}", life.get());
+        let state_updates = Rc::new(Cell::new(0_u32));
+        let updates = state_updates.clone();
+        let handler = runtime
+            .state
+            .connect_label_notify(move |_| updates.set(updates.get() + 1));
+        for (index, (rhythm, words)) in [
+            (WatchRhythm::Busy, "Recent output activity."),
+            (WatchRhythm::Waiting, "No new output observed recently."),
+            (WatchRhythm::Resumed, "Output activity resumed."),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let context =
+                RenderContext::new(Behavior::WatchCommand, BodyLanguage::default(), false)
+                    .with_watch_rhythm(rhythm);
+            runtime.explain_body(Some(context));
+            let caption = runtime.state.text();
+            assert!(caption.contains(words));
+            assert!(caption.starts_with(behavior_explanation(Behavior::WatchCommand)));
+            assert!(runtime
+                .state
+                .tooltip_text()
+                .unwrap()
+                .starts_with(caption.as_str()));
+            assert_eq!(
+                runtime.explained_body_context.get(),
+                Some((Behavior::WatchCommand, rhythm))
+            );
+            assert_eq!(
+                state_updates.get(),
+                index as u32 + 1,
+                "same behavior with a new rhythm updates the label"
+            );
+            runtime.explain_body(Some(context));
+            assert_eq!(
+                state_updates.get(),
+                index as u32 + 1,
+                "identical context does not reannounce text"
+            );
+            assert_eq!(runtime.status.text(), status_before);
+        }
+        runtime.explain_body(None);
+        assert!(!runtime.state.text().contains("output"));
+        assert!(runtime
+            .state
+            .text()
+            .starts_with(behavior_explanation(runtime.surface_behavior.get())));
+        assert_eq!(state_updates.get(), 4);
+        runtime.state.disconnect(handler);
+        assert_eq!(format!("{:?}", life.get()), life_before);
+        assert_eq!(runtime.status.text(), status_before);
+        assert!(runtime.surface_timer.borrow().is_none());
+        assert!(crate::block_view::organism_settings_test_pty_bytes(&view).is_empty());
+
         // Exercise the production single frame source after a long idle.
         // No new native input or display probe is needed: the existing fixture
         // owns this runtime, and the timer's source/deadline are observable.
