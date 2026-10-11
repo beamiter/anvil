@@ -1819,6 +1819,7 @@ impl OrganismRuntime {
         sprite.set_xalign(0.0);
         sprite.set_yalign(0.5);
         sprite.set_selectable(false);
+        sprite.set_accessible_role(gtk::AccessibleRole::Presentation);
         content.append(&sprite);
 
         let detail = GBox::new(Orientation::Vertical, 3);
@@ -4321,6 +4322,19 @@ mod tests {
         assert!(!runtime.live_body.can_target());
         assert!(!runtime.live_body.is_focusable());
         assert!(!runtime.card.can_target());
+        for decoration in [&runtime.sprite, &runtime.live_body, &runtime.sticky_avatar] {
+            assert_eq!(
+                decoration.accessible_role(),
+                gtk::AccessibleRole::Presentation
+            );
+        }
+        assert_eq!(
+            runtime.status.accessible_role(),
+            gtk::AccessibleRole::Status
+        );
+        assert_eq!(runtime.state.accessible_role(), gtk::AccessibleRole::Label);
+        assert!(!runtime.status.text().is_empty());
+        assert!(!runtime.state.text().is_empty());
         view.insert_inline_notice(&runtime.card);
         view.put_live_organism_body(runtime.live_body.upcast_ref(), 0.0, 0.0);
         view.put_sticky_organism_avatar(runtime.sticky_avatar.upcast_ref());
