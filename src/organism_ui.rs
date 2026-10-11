@@ -63,15 +63,23 @@ fn follows_desktop_motion(enabled: bool, motion: Option<OrganismMotion>) -> bool
     enabled && motion.is_none()
 }
 
+/// Query only the pane's current native surface. GdkDevice modifier_state
+/// describes keyboards, not pointer buttons. Outside/unavailable surfaces
+/// remain unknown, rather than being advertised as a global button snapshot.
+fn pointer_buttons_on_surface(root: &gtk::Widget, buttons: gtk::gdk::ModifierType) -> Option<bool> {
+    let pointer = root.display().default_seat()?.pointer()?;
+    let surface = root.native()?.surface()?;
+    let (_, _, modifiers) = surface.device_position(&pointer)?;
+    Some(modifiers.intersects(buttons))
+}
+
 fn pointer_buttons_down(view: &TermView) -> bool {
     let buttons = gtk::gdk::ModifierType::BUTTON1_MASK
         | gtk::gdk::ModifierType::BUTTON2_MASK
         | gtk::gdk::ModifierType::BUTTON3_MASK;
-    view.widget()
-        .display()
-        .default_seat()
-        .and_then(|seat| seat.pointer())
-        .is_some_and(|pointer| pointer.modifier_state().intersects(buttons))
+    // An explicit keyboard hello still works when the pointer is outside the
+    // pane's native surface. Only a known held button blocks this live gate.
+    pointer_buttons_on_surface(&view.widget(), buttons) == Some(true)
 }
 
 /// The card remains pointer-transparent. Resolve only its explanatory labels
@@ -83,15 +91,10 @@ fn card_tooltip_at(
     labels: &[Label],
     point: (i32, i32),
     keyboard_mode: bool,
-    modifiers: gtk::gdk::ModifierType,
+    buttons_down: bool,
 ) -> Option<(gtk::glib::GString, gtk::graphene::Rect)> {
-    let buttons = gtk::gdk::ModifierType::BUTTON1_MASK
-        | gtk::gdk::ModifierType::BUTTON2_MASK
-        | gtk::gdk::ModifierType::BUTTON3_MASK
-        | gtk::gdk::ModifierType::BUTTON4_MASK
-        | gtk::gdk::ModifierType::BUTTON5_MASK;
     if keyboard_mode
-        || modifiers.intersects(buttons)
+        || buttons_down
         || !root.is_mapped()
         || !card.is_mapped()
         || !card.is_ancestor(root)
@@ -138,14 +141,18 @@ fn install_card_tooltip_proxy(root: &gtk::Widget, card: &gtk::Widget, labels: &[
         else {
             return false;
         };
-        let modifiers = root
-            .display()
-            .default_seat()
-            .and_then(|seat| seat.pointer())
-            .map(|pointer| pointer.modifier_state())
-            .unwrap_or(gtk::gdk::ModifierType::empty());
+        let buttons = gtk::gdk::ModifierType::BUTTON1_MASK
+            | gtk::gdk::ModifierType::BUTTON2_MASK
+            | gtk::gdk::ModifierType::BUTTON3_MASK
+            | gtk::gdk::ModifierType::BUTTON4_MASK
+            | gtk::gdk::ModifierType::BUTTON5_MASK;
+        // Native tooltips need a known, released pointer on this surface.
+        // Unlike explicit keyboard hello, unknown state declines the query.
+        if pointer_buttons_on_surface(root, buttons) != Some(false) {
+            return false;
+        }
         let Some((text, bounds)) =
-            card_tooltip_at(root, &card, &labels, (x, y), keyboard_mode, modifiers)
+            card_tooltip_at(root, &card, &labels, (x, y), keyboard_mode, false)
         else {
             return false;
         };
@@ -4885,31 +4892,68 @@ mod tests {
                 &[&point.0, &point.1, &keyboard_mode, &tooltip],
             )
         };
+        #[cfg(target_os = "linux")]
+        let wait_native_button = |wanted: bool| {
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_millis(250) {
+                while main.iteration(false) {}
+                if pointer_buttons_on_surface(&root, gtk::gdk::ModifierType::BUTTON1_MASK)
+                    == Some(wanted)
+                {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            false
+        };
+        #[cfg(target_os = "linux")]
+        {
+            let p = root
+                .compute_point(
+                    &window,
+                    &gtk::graphene::Point::new(state_point.0 as f32, state_point.1 as f32),
+                )
+                .unwrap();
+            move_native_pointer(&window, p.x() as i32, p.y() as i32);
+            while main.iteration(false) {}
+        }
         assert!(root.has_tooltip());
         assert!(query(state_point, false));
-        assert!(!query(state_point, true));
-        let (text, _) = card_tooltip_at(
-            &root,
-            &runtime.card,
-            &labels,
-            state_point,
-            false,
-            gtk::gdk::ModifierType::empty(),
-        )
-        .unwrap();
-        assert_eq!(Some(text), runtime.state.tooltip_text());
-        for button in [
-            gtk::gdk::ModifierType::BUTTON1_MASK,
-            gtk::gdk::ModifierType::BUTTON2_MASK,
-            gtk::gdk::ModifierType::BUTTON3_MASK,
-            gtk::gdk::ModifierType::BUTTON4_MASK,
-            gtk::gdk::ModifierType::BUTTON5_MASK,
-        ] {
+        assert!(gtk::prelude::GtkWindowExt::focus(&window)
+            .is_some_and(|focus| focus.is_ancestor(&entry) || focus == entry));
+        #[cfg(target_os = "linux")]
+        {
+            native_pointer_button(true);
+            let down_observed = wait_native_button(true);
+            let held_rejected = !query(state_point, false);
+            let held_detected = pointer_buttons_down(&view);
+            native_pointer_button(false);
+            let up_observed = wait_native_button(false);
             assert!(
-                card_tooltip_at(&root, &runtime.card, &labels, state_point, false, button,)
-                    .is_none()
+                down_observed && up_observed,
+                "native surface reports both button transitions"
             );
+            assert!(
+                held_rejected,
+                "real native pointer button blocks the tooltip"
+            );
+            assert!(
+                held_detected,
+                "live gate reads the same native surface mask"
+            );
+            assert!(!pointer_buttons_down(&view));
+            assert!(query(state_point, false));
+            // A real click may legitimately focus the underlying terminal;
+            // restore the pre-existing settings fixture's keyboard owner.
+            entry.grab_focus();
         }
+        assert!(!query(state_point, true));
+        let (text, _) =
+            card_tooltip_at(&root, &runtime.card, &labels, state_point, false, false).unwrap();
+        assert_eq!(Some(text), runtime.state.tooltip_text());
+        assert!(
+            card_tooltip_at(&root, &runtime.card, &labels, state_point, false, true,).is_none()
+        );
         let sprite_bounds = runtime.sprite.compute_bounds(&root).unwrap();
         assert!(!query(
             (
@@ -5088,22 +5132,61 @@ mod tests {
                 ),
                 "candidate paint does not change body requisition"
             );
+            let greeting_before_press = presence.state.borrow().last_greeting;
             native_pointer_button(true);
+            let down_observed = wait_native_button(true);
+            // Server mask observation is not the Capture event's dispatch.
+            // Keep the fixture's original event-loop settling boundary.
             settle(Duration::from_millis(40));
+            let held_detected = pointer_buttons_down(&view);
+            let capture_cancelled = runtime.pointer_timer.borrow().is_none();
+            let capture_cleared_paint = !runtime
+                .live_body
+                .has_css_class(POINTER_GREETING_CANDIDATE_CLASS);
+            let explicit_rejected = runtime.say_hello(&view).is_err();
+            let cooldown_after_explicit = presence.state.borrow().last_greeting;
+            let held_bounds = runtime.live_body.compute_bounds(&view.widget());
+            if let Some(bounds) = held_bounds.as_ref() {
+                OrganismRuntime::observe_pointer(
+                    &runtime,
+                    &view,
+                    f64::from(bounds.x() + bounds.width() / 2.0),
+                    f64::from(bounds.y() + bounds.height() / 2.0),
+                    false,
+                );
+            }
+            let held_dwell_rejected = runtime.pointer_timer.borrow().is_none();
+            settle(POINTER_GREETING_DWELL);
+            let cooldown_after_dwell = presence.state.borrow().last_greeting;
+            native_pointer_button(false);
+            let up_observed = wait_native_button(false);
+            // Always release the fixture's native button before assertions,
+            // including a timeout or a regression in the production gate.
+            assert!(down_observed && up_observed);
+            assert!(held_detected);
             assert!(
-                runtime.pointer_timer.borrow().is_none(),
+                capture_cancelled,
                 "press without motion cancels pending dwell without consuming the click"
             );
-            assert!(!runtime
-                .live_body
-                .has_css_class(POINTER_GREETING_CANDIDATE_CLASS));
-            settle(POINTER_GREETING_DWELL);
+            assert!(capture_cleared_paint);
             assert!(
-                presence.state.borrow().last_greeting.is_none(),
+                explicit_rejected,
+                "known held button also refuses explicit hello"
+            );
+            assert!(held_bounds.is_some());
+            assert!(held_dwell_rejected);
+            assert_eq!(cooldown_after_explicit, greeting_before_press);
+            assert_eq!(
+                cooldown_after_dwell, greeting_before_press,
                 "held selection never greets"
             );
-            native_pointer_button(false);
-            settle(Duration::from_millis(40));
+            assert!(!pointer_buttons_down(&view));
+            assert!(runtime.live_greeting_allowed(&view, Instant::now()));
+            assert_eq!(
+                presence.state.borrow().last_greeting,
+                greeting_before_press,
+                "held refusals do not spend the shared cooldown"
+            );
             move_native_pointer(&window, 1, 1);
             settle(Duration::from_millis(40));
             move_native_pointer(&window, x, y);
@@ -5199,6 +5282,17 @@ mod tests {
             assert!(runtime.explicit_greeting_active());
             assert!(!runtime.pointer_near.get());
             assert!(runtime.pointer_position.get().is_none());
+            move_native_pointer(&window, window.width() + 20, window.height() / 2);
+            settle(Duration::from_millis(40));
+            assert_eq!(
+                pointer_buttons_on_surface(&view.widget(), gtk::gdk::ModifierType::BUTTON1_MASK),
+                None,
+                "outside the current native surface is explicitly unknown"
+            );
+            assert!(
+                !pointer_buttons_down(&view),
+                "unknown native-surface state keeps explicit capability"
+            );
             runtime.pointer_departed();
             OrganismRuntime::observe_pointer(&runtime, &view, 1.0, 1.0, false);
             runtime.refresh_surface(&view, Instant::now());
@@ -5480,8 +5574,17 @@ mod tests {
         tooltip_host.append(&proxy_root);
         tooltip_host.append(&other_root);
         window.set_child(Some(&tooltip_host));
-        install_card_tooltip_proxy(proxy_root.upcast_ref(), card.upcast_ref(), &[label.clone()]);
+        install_card_tooltip_proxy(
+            proxy_root.upcast_ref(),
+            card.upcast_ref(),
+            std::slice::from_ref(&label),
+        );
         settle(Duration::from_millis(60));
+        #[cfg(target_os = "linux")]
+        {
+            move_native_pointer(&window, 20, 20);
+            while main.iteration(false) {}
+        }
         let query_point = || {
             let b = label.compute_bounds(&proxy_root).unwrap();
             (
@@ -5530,10 +5633,47 @@ mod tests {
         let root_weak = proxy_root.downgrade();
         tooltip_host.remove(&proxy_root);
         drop(proxy_root);
-        assert!(root_weak.upgrade().is_none());
+        // A never-parented control isolates the hooks from GTK's mapped host
+        // lifecycle. The card stays alive after its proxy root is destroyed.
+        let isolated_root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let isolated_card = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let isolated_label = gtk::Label::new(Some("Weak proxy control"));
+        isolated_card.append(&isolated_label);
+        install_card_tooltip_proxy(
+            isolated_root.upcast_ref(),
+            isolated_card.upcast_ref(),
+            std::slice::from_ref(&isolated_label),
+        );
+        let isolated_weak = isolated_root.downgrade();
+        drop(isolated_root);
+        assert!(
+            isolated_weak.upgrade().is_none(),
+            "card unmap hook does not retain its root"
+        );
         assert!(crate::block_view::organism_settings_test_pty_bytes(&view).is_empty());
-        println!("DAILY_RUNTIME_COUNTS disabled_frame_timers=0 disabled_hover_timers=0 static_pose_unchanged=true");
         window.close();
+        // Unparenting a mapped widget alone does not finish the native host.
+        // Close it, release fixture-owned children/tooltip, and allow bounded
+        // GTK cleanup. A real strong hook cycle would still fail this check.
+        drop(tooltip);
+        drop(scroll);
+        drop(scroll_content);
+        drop(spacer);
+        drop(tail);
+        drop(tooltip_host);
+        drop(other_root);
+        let cleanup_started = Instant::now();
+        while root_weak.upgrade().is_some()
+            && cleanup_started.elapsed() < Duration::from_millis(500)
+        {
+            while main.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            root_weak.upgrade().is_none(),
+            "mapped proxy root releases after native host cleanup"
+        );
+        println!("DAILY_RUNTIME_COUNTS disabled_frame_timers=0 disabled_hover_timers=0 static_pose_unchanged=true");
     }
 
     #[test]
@@ -5598,7 +5738,6 @@ mod tests {
             "gtk::PickFlags::NON_TARGETABLE",
             "card.is_ancestor(root)",
             "label.is_ancestor(card)",
-            "BUTTON5_MASK",
         ] {
             assert!(pick.contains(required), "{required}");
         }
@@ -5606,6 +5745,27 @@ mod tests {
             !pick.contains("is_owner"),
             "inline descriptions are pane-local"
         );
+        assert!(proxy.contains("BUTTON5_MASK"));
+        assert!(proxy.contains("pointer_buttons_on_surface(root, buttons) != Some(false)"));
+        let live = source
+            .split("fn pointer_buttons_down(")
+            .nth(1)
+            .unwrap()
+            .split("fn card_tooltip_at(")
+            .next()
+            .unwrap();
+        assert!(live.contains("== Some(true)"));
+        assert!(!live.contains("BUTTON4_MASK"));
+        let surface = source
+            .split("fn pointer_buttons_on_surface(")
+            .nth(1)
+            .unwrap()
+            .split("fn pointer_buttons_down(")
+            .next()
+            .unwrap();
+        assert!(surface.contains("root.native()?.surface()?"));
+        assert!(surface.contains("surface.device_position(&pointer)?"));
+        assert!(!surface.contains(".modifier_state()"));
     }
 
     #[test]
