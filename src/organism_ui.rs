@@ -86,6 +86,24 @@ fn surface_frame_delay(
     }
 }
 
+/// A measured lack of safe space needs only the existing maintenance pulse
+/// when the sticky fallback is also absent. Unknown allocation stays responsive.
+fn measured_surface_frame_delay(
+    motion: OrganismMotion,
+    owner: bool,
+    alt_screen: bool,
+    resting: bool,
+    no_safe_placement: bool,
+    sticky_mapped: bool,
+) -> Duration {
+    surface_frame_delay(
+        motion,
+        owner,
+        alt_screen,
+        resting || (no_safe_placement && !sticky_mapped),
+    )
+}
+
 /// A focus transfer may replace an already-pending source, but must not start
 /// a second source after the fired callback has taken its id from the slot.
 /// That callback observes the new owner at its tail and schedules the right
@@ -164,6 +182,16 @@ struct SurfaceBox {
     /// On-screen grid row of the cursor: the output growth edge after which a
     /// watching/reaction pose may use only fully clear rows.
     cursor_row: i32,
+}
+
+fn measured_surface_allocation(surface: SurfaceBox, mapped: bool) -> bool {
+    mapped
+        && surface.width > 0
+        && surface.height > 0
+        && surface.cell_width > 0
+        && surface.cell_height > 0
+        && surface.body_width > 0
+        && surface.body_height > 0
 }
 
 type SurfaceSignature = (i32, i32, i32, i32, i32, i32, i32);
@@ -1751,6 +1779,7 @@ struct OrganismRuntime {
     /// hidden, so every reappearance snaps into place and the cat only ever
     /// walks where it can be seen.
     body_position: Cell<Option<(f64, f64)>>,
+    no_safe_body_placement: Cell<bool>,
     /// The body moved last frame — drives gait frames during transit.
     body_in_transit: Cell<bool>,
     /// Surface/body geometry the standing spot was computed against. A resize,
@@ -1934,6 +1963,7 @@ impl OrganismRuntime {
             transition_source_override: Cell::new(None),
             command_origin_behavior: Cell::new(None),
             body_position: Cell::new(None),
+            no_safe_body_placement: Cell::new(false),
             body_in_transit: Cell::new(false),
             surface_signature: Cell::new((0, 0, 0, 0, 0, 0, 0)),
             surface_behavior: Cell::new(Behavior::Idle),
@@ -2515,6 +2545,9 @@ impl OrganismRuntime {
     }
 
     fn refresh_surface(&self, view: &TermView, now: Instant) {
+        // This is evidence from this refresh only, never inferred from a
+        // transient hide, owner change, typing retreat or stale allocation.
+        self.no_safe_body_placement.set(false);
         if !self.enabled.get() {
             self.hide_live_body(view);
             self.sticky_avatar.set_visible(false);
@@ -2784,6 +2817,10 @@ impl OrganismRuntime {
             }
         } else {
             self.hide_live_body(view);
+            self.no_safe_body_placement.set(measured_surface_allocation(
+                surface,
+                view.widget().is_mapped(),
+            ));
         }
         // The Block layer decides whether the sticky running header is active;
         // this child only follows the same accepted-input retreat window.
@@ -3044,11 +3081,13 @@ impl OrganismRuntime {
                     }
                 }
             }
-            let next = surface_frame_delay(
+            let next = measured_surface_frame_delay(
                 runtime.motion.get(),
                 runtime.presence.is_owner(runtime.presence_token),
                 alt_screen,
                 runtime.activity.resting(now),
+                runtime.no_safe_body_placement.get(),
+                runtime.sticky_avatar.is_mapped(),
             );
             // A synchronous settings callback may already have replaced the
             // source while this frame was rendering. Never create a second.
@@ -7644,6 +7683,114 @@ mod tests {
             None,
             "a fired callback owns the vacant slot and will reschedule itself"
         );
+    }
+
+    #[test]
+    fn measured_no_room_slows_only_when_the_sticky_fallback_is_absent() {
+        for motion in [
+            OrganismMotion::Full,
+            OrganismMotion::Calm,
+            OrganismMotion::Static,
+        ] {
+            for owner in [false, true] {
+                for alt in [false, true] {
+                    for resting in [false, true] {
+                        for no_room in [false, true] {
+                            for sticky in [false, true] {
+                                let expected = if no_room && !sticky {
+                                    DORMANT_FRAME_INTERVAL
+                                } else {
+                                    surface_frame_delay(motion, owner, alt, resting)
+                                };
+                                assert_eq!(
+                                    measured_surface_frame_delay(
+                                        motion, owner, alt, resting, no_room, sticky
+                                    ),
+                                    expected
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unmapped_or_unmeasured_surfaces_do_not_prove_a_space_limit() {
+        let measured = SurfaceBox {
+            width: 40,
+            height: 40,
+            right_gutter: 0,
+            cell_width: 8,
+            cell_height: 16,
+            body_width: 80,
+            body_height: 48,
+            cursor_row: 0,
+        };
+        assert!(measured_surface_allocation(measured, true));
+        assert!(!measured_surface_allocation(measured, false));
+        for surface in [
+            SurfaceBox {
+                width: 0,
+                ..measured
+            },
+            SurfaceBox {
+                height: 0,
+                ..measured
+            },
+            SurfaceBox {
+                cell_width: 0,
+                ..measured
+            },
+            SurfaceBox {
+                cell_height: 0,
+                ..measured
+            },
+            SurfaceBox {
+                body_width: 0,
+                ..measured
+            },
+            SurfaceBox {
+                body_height: 0,
+                ..measured
+            },
+        ] {
+            assert!(!measured_surface_allocation(surface, true));
+        }
+    }
+
+    #[test]
+    fn measured_space_evidence_is_fresh_and_only_changes_the_existing_frame_tail() {
+        let source = include_str!("organism_ui.rs");
+        let production = source.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        let refresh = production
+            .split("fn refresh_surface(&self, view: &TermView, now: Instant) {")
+            .nth(1)
+            .unwrap()
+            .split("fn apply_settings(")
+            .next()
+            .unwrap();
+        assert!(
+            refresh
+                .find("self.no_safe_body_placement.set(false);")
+                .unwrap()
+                < refresh.find("if !self.enabled.get()").unwrap()
+        );
+        assert!(refresh.contains("} else {\n            self.hide_live_body(view);\n            self.no_safe_body_placement"));
+        assert!(refresh.contains("measured_surface_allocation(\n                surface,\n                view.widget().is_mapped(),\n            )"));
+        assert_eq!(
+            production
+                .matches(".set(measured_surface_allocation(")
+                .count(),
+            1
+        );
+        let tail = production
+            .split("let next = measured_surface_frame_delay(")
+            .nth(1)
+            .unwrap();
+        assert!(tail.starts_with("\n                runtime.motion.get(),\n                runtime.presence.is_owner(runtime.presence_token),\n                alt_screen,\n                runtime.activity.resting(now),\n                runtime.no_safe_body_placement.get(),\n                runtime.sticky_avatar.is_mapped(),"));
+        assert!(production.contains("Self::schedule_surface_frame(&runtime, &view, next)"));
     }
 
     #[test]
