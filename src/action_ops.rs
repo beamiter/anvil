@@ -6,6 +6,10 @@
 
 use super::*;
 
+fn hello_target_is_current(captured: Option<u64>, current: Option<u64>) -> bool {
+    captured.is_some() && captured == current
+}
+
 impl AppModel {
     pub(crate) fn connect_picked_remote(
         &mut self,
@@ -82,6 +86,42 @@ impl AppModel {
             && gtk::prelude::RootExt::focus(&self.window).is_some_and(|focus| {
                 widget_is_within(focus, self.ai_panel.widget().upcast_ref::<gtk::Widget>())
             })
+    }
+
+    pub(crate) fn greet_ascii_organism(&self, pane_id: Option<u64>) {
+        if self.safe_mode {
+            self.show_toast("ASCII organism is disabled in safe mode.");
+            return;
+        }
+        let Some((tab_index, pane_index)) = pane_id.and_then(|id| self.find_pane(id)) else {
+            self.show_toast("The original companion pane is no longer available.");
+            return;
+        };
+        if !hello_target_is_current(pane_id, self.active_pane_id())
+            || !self.window_active
+            || !self.window.is_active()
+        {
+            self.show_toast("The original companion pane is not active.");
+            return;
+        }
+        let tab = &self.tabs[tab_index];
+        let pane = &tab.panes[pane_index];
+        if pane.cwd_external
+            || tab
+                .remote
+                .as_ref()
+                .is_some_and(|remote| remote.pane_id == pane.id)
+        {
+            self.show_toast("Live hello is available only in a local companion pane.");
+            return;
+        }
+        let Some(view) = pane.terminal.term_view() else {
+            self.show_toast("Live hello needs a local Block or Unified companion.");
+            return;
+        };
+        if let Err(message) = self.organism_hub.say_hello(&view) {
+            self.show_toast(message);
+        }
     }
 
     fn emit_block_action(&self, input: VteInput, feature: &str) {
@@ -248,6 +288,9 @@ impl AppModel {
                         history_path: history.map(std::path::PathBuf::from),
                         live_history,
                     });
+            }
+            Action::AsciiOrganismHello => {
+                self.greet_ascii_organism(self.active_pane_id());
             }
             Action::ToggleSettings => {
                 let config = self.config.borrow();
@@ -527,6 +570,69 @@ pub(crate) fn scroll_empty_notice() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn explicit_hello_never_substitutes_a_new_or_missing_target() {
+        assert!(super::hello_target_is_current(Some(7), Some(7)));
+        for (captured, current) in [
+            (None, None),
+            (None, Some(7)),
+            (Some(7), None),
+            (Some(7), Some(8)),
+        ] {
+            assert!(!super::hello_target_is_current(captured, current));
+        }
+    }
+
+    #[test]
+    fn explicit_hello_keeps_the_palette_target_and_has_no_terminal_write_path() {
+        let palette = include_str!("dialogs/command_palette.rs");
+        let accept = palette
+            .split("fn accept(")
+            .nth(1)
+            .unwrap()
+            .split("fn spawn_history_snapshot_load")
+            .next()
+            .unwrap();
+        assert!(accept.contains("PaletteOutput::AsciiOrganismHello(workflow_target)"));
+        assert!(
+            accept
+                .find("let workflow_target = self.workflow_target")
+                .unwrap()
+                < accept.find("self.close_opening(widgets)").unwrap()
+        );
+        let main = include_str!("main.rs");
+        assert!(main
+            .contains("AppMsg::AsciiOrganismHello(pane_id) => self.greet_ascii_organism(pane_id)"));
+        let source = include_str!("action_ops.rs");
+        let method = source
+            .split("pub(crate) fn greet_ascii_organism(")
+            .nth(1)
+            .unwrap()
+            .split("fn emit_block_action(")
+            .next()
+            .unwrap();
+        for guard in [
+            "self.safe_mode",
+            "self.find_pane(id)",
+            "hello_target_is_current",
+            "pane.cwd_external",
+            "remote.pane_id == pane.id",
+            "pane.terminal.term_view()",
+        ] {
+            assert!(method.contains(guard));
+        }
+        assert!(method.contains("self.organism_hub.say_hello(&view)"));
+        for forbidden in [
+            "write_bytes",
+            "write_input",
+            "VteInput",
+            "grab_focus",
+            "unwrap_or_else",
+        ] {
+            assert!(!method.contains(forbidden));
+        }
+    }
+
     use super::{font_scale_toast_title, quick_switch_empty_notice, scroll_empty_notice};
 
     #[test]

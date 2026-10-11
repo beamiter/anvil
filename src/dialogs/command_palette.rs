@@ -108,6 +108,7 @@ pub(crate) enum PaletteMsg {
 #[derive(Debug)]
 pub(crate) enum PaletteOutput {
     Action(Action),
+    AsciiOrganismHello(Option<u64>),
     TypeCommand(String),
     AskAi(String),
     RunWorkflow(PathBuf, Option<u64>),
@@ -562,6 +563,9 @@ impl PaletteModel {
         self.close_opening(widgets);
         root.force_close();
         let output = match accept {
+            Accept::Action(Action::AsciiOrganismHello) => {
+                PaletteOutput::AsciiOrganismHello(workflow_target)
+            }
             Accept::Action(action) => PaletteOutput::Action(action),
             Accept::TypeCommand(command) => PaletteOutput::TypeCommand(command),
             Accept::AskAi(query) => PaletteOutput::AskAi(query),

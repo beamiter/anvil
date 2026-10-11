@@ -34,6 +34,7 @@ pub(crate) enum Action {
     OpenPalette,
     OpenHistoryPalette,
     ToggleSettings,
+    AsciiOrganismHello,
     ReloadConfig,
     OpenWelcome,
     /// Install jsh, or update the installed one, in a dedicated tab.
@@ -152,6 +153,7 @@ impl Action {
             Action::OpenPalette => "Palette: search everything",
             Action::OpenHistoryPalette => "Palette: search history",
             Action::ToggleSettings => "Toggle settings panel",
+            Action::AsciiOrganismHello => "Say hello to ASCII organism",
             Action::ReloadConfig => "Reload configuration",
             Action::OpenWelcome => "Open welcome & quick start",
             Action::InstallJsh => "Install or update jsh (jterm's shell)",
@@ -257,6 +259,7 @@ impl Action {
             Action::OpenPalette => Some("open_palette"),
             Action::OpenHistoryPalette => Some("open_history_palette"),
             Action::ToggleSettings => Some("toggle_settings"),
+            Action::AsciiOrganismHello => Some("ascii_organism_hello"),
             Action::ReloadConfig => Some("reload_config"),
             Action::OpenWelcome => None,
             // Palette-only: too rare to spend a chord on.
@@ -362,6 +365,7 @@ impl Action {
             Action::OpenPalette,
             Action::OpenHistoryPalette,
             Action::ToggleSettings,
+            Action::AsciiOrganismHello,
             Action::ReloadConfig,
             Action::OpenWelcome,
             Action::InstallJsh,
@@ -805,6 +809,35 @@ impl KeybindingMap {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn live_hello_is_discoverable_and_has_no_default_shortcut() {
+        assert!(super::Action::all_actions().contains(&super::Action::AsciiOrganismHello));
+        assert_eq!(
+            super::Action::AsciiOrganismHello.config_key(),
+            Some("ascii_organism_hello")
+        );
+        assert_eq!(
+            super::Action::AsciiOrganismHello.name(),
+            "Say hello to ASCII organism"
+        );
+        let defaults = super::KeybindingMap::from_defaults();
+        assert!(defaults
+            .binding_display(&super::Action::AsciiOrganismHello)
+            .is_empty());
+        assert!(defaults
+            .all_bound_actions()
+            .iter()
+            .any(|(action, _)| *action == super::Action::AsciiOrganismHello));
+        let overrides = "ascii_organism_hello = 'F10'"
+            .parse::<toml::Table>()
+            .unwrap();
+        let customized = super::KeybindingMap::from_user_overrides(&overrides).unwrap();
+        assert_eq!(
+            customized.lookup(&jterm_core::keybindings::parse("F10").unwrap()),
+            Some(super::Action::AsciiOrganismHello)
+        );
+    }
+
     use super::*;
     use jterm_core::keybindings::{CommonAction, ParseError, DEFAULT_CHORDS};
 

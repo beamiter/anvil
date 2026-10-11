@@ -74,6 +74,31 @@ fn pointer_buttons_down(view: &TermView) -> bool {
         .is_some_and(|pointer| pointer.modifier_state().intersects(buttons))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GreetingOrigin {
+    Pointer(Duration),
+    Explicit(Duration),
+}
+
+fn current_greeting_origin(
+    origin: Option<GreetingOrigin>,
+    now: Duration,
+) -> Option<GreetingOrigin> {
+    origin.filter(|origin| {
+        let (GreetingOrigin::Pointer(start) | GreetingOrigin::Explicit(start)) = origin;
+        now.checked_sub(*start)
+            .is_some_and(|elapsed| elapsed < GentleInteraction::HOLD)
+    })
+}
+
+fn greeting_context_eligible(context: RenderContext) -> bool {
+    context.transition.is_none()
+        && matches!(
+            context.behavior,
+            Behavior::Idle | Behavior::Explore | Behavior::Sleep | Behavior::Approach
+        )
+}
+
 fn surface_frame_delay(
     motion: OrganismMotion,
     owner: bool,
@@ -1726,6 +1751,7 @@ struct OrganismRuntime {
     enabled: Cell<bool>,
     awaiting_unobserved_work: Cell<bool>,
     interaction: RefCell<GentleInteraction>,
+    greeting_origin: Cell<Option<GreetingOrigin>>,
     interaction_epoch: Instant,
     live_context: Cell<RenderContext>,
     pointer_position: Cell<Option<(f64, f64)>>,
@@ -1918,6 +1944,7 @@ impl OrganismRuntime {
             enabled: Cell::new(true),
             awaiting_unobserved_work: Cell::new(false),
             interaction: RefCell::new(GentleInteraction::default()),
+            greeting_origin: Cell::new(None),
             interaction_epoch: Instant::now(),
             live_context: Cell::new(RenderContext::new(
                 Behavior::Idle,
@@ -2190,10 +2217,11 @@ impl OrganismRuntime {
         }
         self.pointer_near.set(false);
         self.pointer_position.set(None);
+        self.greeting_origin.set(None);
         self.interaction.borrow_mut().cancel();
     }
 
-    fn pointer_can_greet(&self, view: &TermView, x: f64, y: f64) -> bool {
+    fn live_greeting_allowed(&self, view: &TermView, now: Instant) -> bool {
         if !self.enabled.get()
             || self.motion.get() == OrganismMotion::Static
             || !self.presence.is_owner(self.presence_token)
@@ -2202,19 +2230,17 @@ impl OrganismRuntime {
             || !view.organism_activity_settled()
             || pointer_buttons_down(view)
             || self
-                .human_input_age(Instant::now())
+                .human_input_age(now)
                 .is_some_and(|age| age < HUMAN_INPUT_RETREAT)
             || view.live_organism_surface_metrics().alt_screen
         {
             return false;
         }
-        let context = self.live_context.get();
-        if context.transition.is_some()
-            || !matches!(
-                context.behavior,
-                Behavior::Idle | Behavior::Explore | Behavior::Sleep | Behavior::Approach
-            )
-        {
+        greeting_context_eligible(self.live_context.get())
+    }
+
+    fn pointer_can_greet(&self, view: &TermView, x: f64, y: f64) -> bool {
+        if !self.live_greeting_allowed(view, Instant::now()) {
             return false;
         }
         self.live_body
@@ -2227,8 +2253,90 @@ impl OrganismRuntime {
             })
     }
 
+    fn retire_pointer_candidate(&self) {
+        self.live_body
+            .remove_css_class(POINTER_GREETING_CANDIDATE_CLASS);
+        if let Some(source) = self.pointer_timer.borrow_mut().take() {
+            source.remove();
+        }
+    }
+
+    fn explicit_greeting_active(&self) -> bool {
+        let origin =
+            current_greeting_origin(self.greeting_origin.get(), self.interaction_epoch.elapsed());
+        self.greeting_origin.set(origin);
+        matches!(origin, Some(GreetingOrigin::Explicit(_)))
+    }
+
+    fn pointer_departed(&self) {
+        if self.explicit_greeting_active() {
+            // Only proximity is exempt for an explicit request. Keep real
+            // pointer state empty; completion never synthesizes a hover.
+            self.live_body
+                .remove_css_class(POINTER_GREETING_CANDIDATE_CLASS);
+            if let Some(source) = self.pointer_timer.borrow_mut().take() {
+                source.remove();
+            }
+            self.pointer_near.set(false);
+            self.pointer_position.set(None);
+        } else {
+            self.cancel_pointer_greeting();
+        }
+    }
+
+    fn say_hello(&self, view: &TermView) -> Result<(), &'static str> {
+        if !self.enabled.get() {
+            return Err("ASCII companion is off.");
+        }
+        if self.motion.get() == OrganismMotion::Static {
+            return Err("Live hello is unavailable in Static motion.");
+        }
+        let now = Instant::now();
+        self.refresh_surface(view, now);
+        if !self.live_greeting_allowed(view, now) || self.body_position.get().is_none() {
+            return Err("No visible idle companion is ready in the original pane.");
+        }
+        if self
+            .presence
+            .state
+            .borrow()
+            .last_greeting
+            .is_some_and(|last| now.saturating_duration_since(last) < GentleInteraction::COOLDOWN)
+        {
+            return Err("Please let the companion rest before another hello.");
+        }
+        let elapsed = self.interaction_epoch.elapsed();
+        let accepted = self
+            .interaction
+            .borrow_mut()
+            .request(elapsed, self.live_context.get());
+        if !accepted {
+            return Err("Please let the companion rest before another hello.");
+        }
+        self.retire_pointer_candidate();
+        self.greeting_origin
+            .set(Some(GreetingOrigin::Explicit(elapsed)));
+        self.presence.state.borrow_mut().last_greeting = Some(now);
+        self.refresh_surface(view, now);
+        Ok(())
+    }
+
     fn observe_pointer(runtime: &Rc<Self>, view: &Rc<TermView>, x: f64, y: f64, dragging: bool) {
-        if dragging || !runtime.pointer_can_greet(view, x, y) {
+        if dragging {
+            runtime.cancel_pointer_greeting();
+            return;
+        }
+        if runtime.explicit_greeting_active() {
+            if !runtime.live_greeting_allowed(view, Instant::now()) {
+                runtime.cancel_pointer_greeting();
+                return;
+            }
+            let near = runtime.pointer_can_greet(view, x, y);
+            runtime.pointer_near.set(near);
+            runtime.pointer_position.set(near.then_some((x, y)));
+            return;
+        }
+        if !runtime.pointer_can_greet(view, x, y) {
             runtime.cancel_pointer_greeting();
             return;
         }
@@ -2285,6 +2393,9 @@ impl OrganismRuntime {
                 runtime.interaction_epoch.elapsed(),
                 runtime.live_context.get(),
             ) {
+                runtime.greeting_origin.set(Some(GreetingOrigin::Pointer(
+                    runtime.interaction_epoch.elapsed(),
+                )));
                 runtime.presence.state.borrow_mut().last_greeting = Some(now);
                 runtime.refresh_surface(&view, now);
             }
@@ -2321,7 +2432,7 @@ impl OrganismRuntime {
         });
         motion.connect_leave({
             let runtime = runtime.clone();
-            move |_| runtime.cancel_pointer_greeting()
+            move |_| runtime.pointer_departed()
         });
         view.widget().add_controller(motion.clone());
         let press = gtk::EventControllerLegacy::new();
@@ -2557,6 +2668,10 @@ impl OrganismRuntime {
         // This is evidence from this refresh only, never inferred from a
         // transient hide, owner change, typing retreat or stale allocation.
         self.no_safe_body_placement.set(false);
+        self.greeting_origin.set(current_greeting_origin(
+            self.greeting_origin.get(),
+            self.interaction_epoch.elapsed(),
+        ));
         if !self.enabled.get() {
             self.hide_live_body(view);
             self.sticky_avatar.set_visible(false);
@@ -2683,12 +2798,15 @@ impl OrganismRuntime {
             .with_watch_rhythm(rhythm)
             .with_transition(transition);
         self.live_context.set(context);
+        if !greeting_context_eligible(context) {
+            self.cancel_pointer_greeting();
+        }
         if self
             .pointer_position
             .get()
             .is_some_and(|(x, y)| !self.pointer_can_greet(view, x, y))
         {
-            self.cancel_pointer_greeting();
+            self.pointer_departed();
         }
         let context = self
             .interaction
@@ -3332,6 +3450,16 @@ impl OrganismHub {
         hub
     }
 
+    pub(crate) fn say_hello(&self, view: &Rc<TermView>) -> Result<(), &'static str> {
+        if !self.config.borrow().ascii_organism_enabled {
+            return Err("ASCII companion is off.");
+        }
+        let Some(runtime) = self.organism_presence.runtime_for(view) else {
+            return Err("No local ASCII companion is available in the original pane.");
+        };
+        runtime.say_hello(view)
+    }
+
     pub(crate) fn correction_signal(&self) -> Rc<OrganismCorrectionSignal> {
         self.organism_correction.clone()
     }
@@ -3490,6 +3618,7 @@ impl OrganismHub {
                 }
                 // Returning to the primary screen also waits for a safe frame.
                 runtime.sticky_avatar.set_visible(false);
+                runtime.cancel_pointer_greeting();
                 let now = Instant::now();
                 runtime.reset_watch_rhythm_at_boundary(now);
                 runtime.clear_presence_cue();
@@ -3514,6 +3643,7 @@ impl OrganismHub {
                 if !runtime.enabled.get() {
                     return;
                 }
+                runtime.cancel_pointer_greeting();
                 let now = Instant::now();
                 let view = view_weak.upgrade();
                 let rhythm_presentable_at_origin = view.as_ref().is_some_and(|view| {
@@ -4642,10 +4772,65 @@ mod tests {
                 "busy work does not accept a greeting"
             );
             runtime.command_running.set(false);
+            move_native_pointer(&window, 1, 1);
+            settle(
+                GentleInteraction::COOLDOWN.saturating_sub(first.elapsed())
+                    + Duration::from_millis(40),
+            );
+            runtime.refresh_surface(&view, Instant::now());
+            settle(Duration::from_millis(80));
+            assert!(runtime.say_hello(&view).is_ok());
+            let explicit_at = presence.state.borrow().last_greeting;
+            assert!(runtime.explicit_greeting_active());
+            assert!(!runtime.pointer_near.get());
+            assert!(runtime.pointer_position.get().is_none());
+            runtime.pointer_departed();
+            OrganismRuntime::observe_pointer(&runtime, &view, 1.0, 1.0, false);
+            runtime.refresh_surface(&view, Instant::now());
+            assert!(
+                runtime.explicit_greeting_active(),
+                "pointer distance does not cancel explicit hello"
+            );
+            assert_eq!(
+                runtime.explained_body_behavior.get(),
+                Some(Behavior::Approach)
+            );
+            assert!(runtime.say_hello(&view).is_err());
+            assert_eq!(presence.state.borrow().last_greeting, explicit_at);
+            let body = runtime.live_body.compute_bounds(&view.widget()).unwrap();
+            let inside = (
+                f64::from(body.x() + body.width() / 2.0),
+                f64::from(body.y() + body.height() / 2.0),
+            );
+            OrganismRuntime::observe_pointer(&runtime, &view, inside.0, inside.1, false);
+            assert!(runtime.pointer_near.get());
+            assert!(runtime.pointer_timer.borrow().is_none());
+            settle(
+                GentleInteraction::COOLDOWN.saturating_sub(explicit_at.unwrap().elapsed())
+                    + Duration::from_millis(40),
+            );
+            runtime.refresh_surface(&view, Instant::now());
+            assert!(runtime.greeting_origin.get().is_none());
+            OrganismRuntime::observe_pointer(&runtime, &view, inside.0, inside.1, false);
+            assert!(
+                runtime.pointer_timer.borrow().is_none(),
+                "staying inside after explicit expiry and cooldown does not synthesize a new entry"
+            );
+            assert!(runtime.say_hello(&view).is_ok());
+            runtime.cancel_pointer_greeting();
+            assert!(runtime.greeting_origin.get().is_none());
+            assert!(
+                runtime.say_hello(&view).is_err(),
+                "cancellation preserves shared cooldown"
+            );
+            assert_eq!(format!("{:?}", life.get()), life_before);
+            assert!(crate::block_view::organism_settings_test_pty_bytes(&view).is_empty());
             OrganismRuntime::apply_settings(&runtime, &view, false, OrganismMotion::Calm);
+            assert!(runtime.say_hello(&view).is_err());
             assert!(runtime.pointer_timer.borrow().is_none());
         }
         OrganismRuntime::apply_settings(&runtime, &view, true, OrganismMotion::Static);
+        assert!(runtime.say_hello(&view).is_err());
         let still_sprite = runtime.sprite.text();
         let start = Instant::now();
         while start.elapsed() < Duration::from_millis(1_000) {
@@ -7724,6 +7909,105 @@ mod tests {
             None,
             "a fired callback owns the vacant slot and will reschedule itself"
         );
+    }
+
+    #[test]
+    fn greeting_origin_is_bounded_and_never_changes_between_pointer_and_explicit() {
+        for origin in [
+            GreetingOrigin::Pointer(Duration::from_secs(4)),
+            GreetingOrigin::Explicit(Duration::from_secs(4)),
+        ] {
+            assert_eq!(
+                current_greeting_origin(Some(origin), Duration::from_secs(4)),
+                Some(origin)
+            );
+            assert_eq!(
+                current_greeting_origin(Some(origin), Duration::from_millis(5_999)),
+                Some(origin)
+            );
+            assert_eq!(
+                current_greeting_origin(Some(origin), Duration::from_secs(6)),
+                None
+            );
+            assert_eq!(
+                current_greeting_origin(Some(origin), Duration::from_secs(60)),
+                None
+            );
+            assert_eq!(
+                current_greeting_origin(Some(origin), Duration::from_secs(3)),
+                None
+            );
+        }
+        assert_eq!(current_greeting_origin(None, Duration::from_secs(4)), None);
+    }
+
+    #[test]
+    fn explicit_hello_only_exempts_pointer_proximity_and_preserves_interruptions() {
+        let source = include_str!("organism_ui.rs");
+        let production = source.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        let eligibility = production
+            .split("fn live_greeting_allowed(")
+            .nth(1)
+            .unwrap()
+            .split("fn pointer_can_greet(")
+            .next()
+            .unwrap();
+        for required in [
+            "self.enabled.get()",
+            "OrganismMotion::Static",
+            "self.presence.is_owner",
+            "self.live_body.is_mapped()",
+            "self.command_running.get()",
+            "view.organism_activity_settled()",
+            "pointer_buttons_down(view)",
+            "HUMAN_INPUT_RETREAT",
+            ".alt_screen",
+            "greeting_context_eligible",
+        ] {
+            assert!(eligibility.contains(required));
+        }
+        let explicit = production
+            .split("fn say_hello(&self, view: &TermView)")
+            .nth(1)
+            .unwrap()
+            .split("fn observe_pointer(")
+            .next()
+            .unwrap();
+        assert!(explicit.contains("self.body_position.get().is_none()"));
+        assert!(explicit.contains("GentleInteraction::COOLDOWN"));
+        assert!(
+            explicit.find("if !accepted").unwrap()
+                < explicit.find("GreetingOrigin::Explicit").unwrap()
+        );
+        for (start, end) in [
+            (
+                "view.connect_human_input(",
+                "view.connect_alt_screen_transition(",
+            ),
+            (
+                "view.connect_alt_screen_transition(",
+                "view.connect_activity(",
+            ),
+            ("view.connect_activity(", "view.connect_cwd_changed("),
+        ] {
+            let callback = production
+                .split(start)
+                .nth(1)
+                .unwrap()
+                .split(end)
+                .next()
+                .unwrap();
+            assert!(callback.contains("runtime.cancel_pointer_greeting()"));
+        }
+        let cancel = production
+            .split("fn cancel_pointer_greeting(&self) {")
+            .nth(1)
+            .unwrap()
+            .split("fn live_greeting_allowed(")
+            .next()
+            .unwrap();
+        assert!(cancel.contains("self.greeting_origin.set(None)"));
+        assert!(cancel.contains("self.interaction.borrow_mut().cancel()"));
     }
 
     #[test]

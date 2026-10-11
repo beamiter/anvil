@@ -383,6 +383,7 @@ pub(crate) enum AppMsg {
     /// the diff worker.
     AgentTasksTick,
     PaletteRunWorkflow(std::path::PathBuf, Option<u64>),
+    AsciiOrganismHello(Option<u64>),
     WorkflowInsertCommand {
         pane_id: u64,
         command: String,
