@@ -27,6 +27,16 @@ fn without_ascii_settings_output<T>(gate: &Cell<bool>, update: impl FnOnce() -> 
     update()
 }
 
+fn ascii_organism_availability(enabled: bool, safe_mode: bool) -> &'static str {
+    if safe_mode {
+        "Unavailable in safe mode; offline preview is still available."
+    } else if !enabled {
+        "Off. Offline preview is still available below."
+    } else {
+        "Local, no-LLM companion for Block/Unified panes"
+    }
+}
+
 fn reflect_ascii_organism_controls(
     gate: &Cell<bool>,
     enabled_row: &adw::SwitchRow,
@@ -36,6 +46,7 @@ fn reflect_ascii_organism_controls(
     safe_mode: bool,
 ) {
     without_ascii_settings_output(gate, || {
+        enabled_row.set_subtitle(ascii_organism_availability(enabled, safe_mode));
         enabled_row.set_active(enabled);
         motion_row.set_selected(motion);
         enabled_row.set_sensitive(!safe_mode);
@@ -725,6 +736,10 @@ mod organism_preview {
                 false,
             );
             assert!(!reflected_enabled.is_active());
+            assert_eq!(
+                reflected_enabled.subtitle().as_deref(),
+                Some(super::super::ascii_organism_availability(false, false))
+            );
             assert_eq!(motion.selected(), 3);
             assert!(!motion.is_sensitive());
             assert_eq!(
@@ -741,6 +756,10 @@ mod organism_preview {
                 false,
             );
             assert!(reflected_enabled.is_active());
+            assert_eq!(
+                reflected_enabled.subtitle().as_deref(),
+                Some(super::super::ascii_organism_availability(true, false))
+            );
             assert!(motion.is_sensitive());
             assert_eq!(
                 motion.subtitle().as_deref(),
@@ -806,7 +825,26 @@ mod organism_preview {
                     sprite_frame_with_context(example.context(), 0).as_ref()
                 );
             }
+            // Safe mode disables the live controls, not this offline gallery.
+            // Exercise the existing real Demo and Hello paths under that state.
+            super::super::reflect_ascii_organism_controls(
+                &syncing,
+                &reflected_enabled,
+                &motion,
+                false,
+                3,
+                true,
+            );
+            assert!(!reflected_enabled.is_sensitive());
+            assert!(!motion.is_sensitive());
+            assert!(group.is_sensitive());
+            assert!(demo_button.is_sensitive());
+            assert_eq!(
+                reflected_enabled.subtitle().as_deref(),
+                Some(super::super::ascii_organism_availability(false, true))
+            );
             pose.set_selected(0);
+            assert!(hello.is_sensitive());
             let previous_hello = preview.last_hello.get();
             demo_button.emit_clicked();
             assert!(preview.sequence.borrow().started.is_some());
@@ -1693,7 +1731,10 @@ impl Component for SettingsModel {
                     #[name(ascii_organism_row)]
                     adw::SwitchRow {
                         set_title: "ASCII Organism",
-                        set_subtitle: "Local, no-LLM companion for Block/Unified panes",
+                        set_subtitle: ascii_organism_availability(
+                            model.values.ascii_organism_enabled,
+                            model.values.safe_mode,
+                        ),
                         set_tooltip_text: Some(organism_preview::INTERACTION_HINT),
                         set_active: model.values.ascii_organism_enabled,
                         set_sensitive: !model.values.safe_mode,
@@ -2775,6 +2816,46 @@ fn remove_remote_host(hosts: &mut Vec<RemoteHost>, expected: &CapturedRemoteProf
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ascii_availability_prioritizes_safe_mode_and_preserves_local_scope() {
+        let safe = super::ascii_organism_availability(false, true);
+        assert_eq!(safe, super::ascii_organism_availability(true, true));
+        assert!(safe.contains("safe mode"));
+        assert!(safe.contains("offline preview"));
+        let off = super::ascii_organism_availability(false, false);
+        assert!(off.starts_with("Off."));
+        assert!(off.contains("Offline preview"));
+        assert_eq!(
+            super::ascii_organism_availability(true, false),
+            "Local, no-LLM companion for Block/Unified panes"
+        );
+    }
+
+    #[test]
+    fn ascii_availability_reflects_accepted_values_without_speculating_on_user_input() {
+        let source = include_str!("settings.rs");
+        let production = source.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        let reflection = production
+            .split("fn reflect_ascii_organism_controls(")
+            .nth(1)
+            .unwrap()
+            .split("mod organism_preview {")
+            .next()
+            .unwrap();
+        assert!(reflection
+            .contains("enabled_row.set_subtitle(ascii_organism_availability(enabled, safe_mode))"));
+        let user_input = production
+            .split("SettingsMsg::AsciiOrganism(enabled) => {")
+            .nth(1)
+            .unwrap()
+            .split("SettingsMsg::AsciiOrganismMotion(motion)")
+            .next()
+            .unwrap();
+        assert!(!user_input.contains("set_subtitle"));
+        assert!(!user_input.contains("ascii_organism_availability"));
+        assert!(production.contains("set_subtitle: ascii_organism_availability("));
+    }
+
     use super::*;
 
     #[test]
