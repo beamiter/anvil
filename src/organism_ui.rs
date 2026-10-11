@@ -84,11 +84,49 @@ fn current_greeting_origin(
     origin: Option<GreetingOrigin>,
     now: Duration,
 ) -> Option<GreetingOrigin> {
-    origin.filter(|origin| {
-        let (GreetingOrigin::Pointer(start) | GreetingOrigin::Explicit(start)) = origin;
-        now.checked_sub(*start)
-            .is_some_and(|elapsed| elapsed < GentleInteraction::HOLD)
+    greeting_remaining(origin, now).and(origin)
+}
+
+fn greeting_remaining(origin: Option<GreetingOrigin>, now: Duration) -> Option<Duration> {
+    let (GreetingOrigin::Pointer(start) | GreetingOrigin::Explicit(start)) = origin?;
+    let elapsed = now.checked_sub(start)?;
+    GentleInteraction::HOLD
+        .checked_sub(elapsed)
+        .filter(|remaining| !remaining.is_zero())
+}
+
+/// The live interaction shares the ordinary frame source. A Full greeting
+/// keeps its normal cadence even after a long idle. Its last short interval
+/// observes the original end; Calm and Static retain their existing policy.
+fn greeting_frame_delay(motion: OrganismMotion, remaining: Option<Duration>) -> Option<Duration> {
+    if motion != OrganismMotion::Full {
+        return None;
+    }
+    remaining.map(|remaining| {
+        remaining
+            .min(SURFACE_FRAME_INTERVAL)
+            .max(Duration::from_millis(1))
     })
+}
+
+/// Only a confirmed Full typing retreat with neither live form mapped may
+/// skip animation wakes. Repeated keys move the absolute boundary, not a new
+/// 900ms timer. If rendering just crossed it, one millisecond remeasures once.
+fn interaction_frame_delay(
+    ordinary: Duration,
+    motion: OrganismMotion,
+    typing_hidden: bool,
+    input_age: Option<Duration>,
+    greeting_left: Option<Duration>,
+) -> Duration {
+    if motion == OrganismMotion::Full && typing_hidden {
+        if let Some(age) = input_age {
+            return HUMAN_INPUT_RETREAT
+                .saturating_sub(age)
+                .max(Duration::from_millis(1));
+        }
+    }
+    greeting_frame_delay(motion, greeting_left).map_or(ordinary, |greeting| ordinary.min(greeting))
 }
 
 fn greeting_context_eligible(context: RenderContext) -> bool {
@@ -1789,6 +1827,7 @@ struct OrganismRuntime {
     generation: Cell<u64>,
     settle_timer: RefCell<Option<gtk::glib::SourceId>>,
     surface_timer: RefCell<Option<gtk::glib::SourceId>>,
+    surface_timer_deadline: Cell<Option<Instant>>,
     surface_last_frame: Cell<Option<Instant>>,
     surface_frame: Cell<u64>,
     surface_behavior_frame_origin: Cell<u64>,
@@ -1981,6 +2020,7 @@ impl OrganismRuntime {
             generation: Cell::new(0),
             settle_timer: RefCell::new(None),
             surface_timer: RefCell::new(None),
+            surface_timer_deadline: Cell::new(None),
             surface_last_frame: Cell::new(None),
             surface_frame: Cell::new(0),
             surface_behavior_frame_origin: Cell::new(0),
@@ -2284,7 +2324,7 @@ impl OrganismRuntime {
         }
     }
 
-    fn say_hello(&self, view: &TermView) -> Result<(), &'static str> {
+    fn say_hello(self: &Rc<Self>, view: &Rc<TermView>) -> Result<(), &'static str> {
         if !self.enabled.get() {
             return Err("ASCII companion is off.");
         }
@@ -2318,6 +2358,7 @@ impl OrganismRuntime {
             .set(Some(GreetingOrigin::Explicit(elapsed)));
         self.presence.state.borrow_mut().last_greeting = Some(now);
         self.refresh_surface(view, now);
+        Self::rearm_surface_tick_for_greeting(self, view);
         Ok(())
     }
 
@@ -2398,6 +2439,7 @@ impl OrganismRuntime {
                 )));
                 runtime.presence.state.borrow_mut().last_greeting = Some(now);
                 runtime.refresh_surface(&view, now);
+                Self::rearm_surface_tick_for_greeting(&runtime, &view);
             }
         });
         *runtime.pointer_timer.borrow_mut() = Some(source);
@@ -2971,6 +3013,7 @@ impl OrganismRuntime {
         if let Some(source) = runtime.surface_timer.borrow_mut().take() {
             source.remove();
         }
+        runtime.surface_timer_deadline.set(None);
         runtime.surface_last_frame.set(None);
         if !enabled {
             runtime.bump_generation();
@@ -3037,6 +3080,35 @@ impl OrganismRuntime {
         Self::schedule_surface_frame(runtime, view, delay);
     }
 
+    /// Acceptance can happen between two dormant frames. Replace only a
+    /// still-pending, later source; a fired callback owns the vacant slot and
+    /// will choose its next delay at the tail. Never create a second source.
+    fn rearm_surface_tick_for_greeting(runtime: &Rc<Self>, view: &Rc<TermView>) {
+        let Some(delay) = greeting_frame_delay(
+            runtime.motion.get(),
+            greeting_remaining(
+                runtime.greeting_origin.get(),
+                runtime.interaction_epoch.elapsed(),
+            ),
+        ) else {
+            return;
+        };
+        let now = Instant::now();
+        if runtime
+            .surface_timer_deadline
+            .get()
+            .is_some_and(|deadline| deadline <= now + delay)
+        {
+            return;
+        }
+        let Some(source) = runtime.surface_timer.borrow_mut().take() else {
+            return;
+        };
+        runtime.surface_timer_deadline.set(None);
+        source.remove();
+        Self::schedule_surface_frame(runtime, view, delay);
+    }
+
     /// Self-rescheduling frame driver. A glib timeout wakes at most ten times
     /// a second — unlike a frame-clock tick callback it never forces the
     /// window's frame clock to run at full rate — and it drops to a
@@ -3052,6 +3124,9 @@ impl OrganismRuntime {
         );
         let runtime_weak = Rc::downgrade(runtime);
         let view_weak = Rc::downgrade(view);
+        runtime
+            .surface_timer_deadline
+            .set(Some(Instant::now() + delay));
         let source = gtk::glib::timeout_add_local_once(delay, move || {
             let Some(runtime) = runtime_weak.upgrade() else {
                 return;
@@ -3061,6 +3136,7 @@ impl OrganismRuntime {
             // must never leave this fired source's id behind for Drop to
             // remove — glib panics on removing a dead source.
             runtime.surface_timer.borrow_mut().take();
+            runtime.surface_timer_deadline.set(None);
             if !runtime.enabled.get() {
                 return;
             }
@@ -3215,6 +3291,22 @@ impl OrganismRuntime {
                 runtime.activity.resting(now),
                 runtime.no_safe_body_placement.get(),
                 runtime.sticky_avatar.is_mapped(),
+            );
+            let typing_hidden = runtime.presence.is_owner(runtime.presence_token)
+                && !view.live_organism_surface_metrics().alt_screen
+                && !runtime.awaiting_unobserved_work.get()
+                && runtime.last_surface_mode.get() == Some(SurfaceMode::Typing)
+                && !runtime.live_body.is_mapped()
+                && !runtime.sticky_avatar.is_mapped();
+            let next = interaction_frame_delay(
+                next,
+                runtime.motion.get(),
+                typing_hidden,
+                runtime.human_input_age(Instant::now()),
+                greeting_remaining(
+                    runtime.greeting_origin.get(),
+                    runtime.interaction_epoch.elapsed(),
+                ),
             );
             // A synchronous settings callback may already have replaced the
             // source while this frame was rendering. Never create a second.
@@ -4846,6 +4938,140 @@ mod tests {
         OrganismRuntime::apply_settings(&runtime, &view, false, OrganismMotion::Static);
         assert!(runtime.surface_timer.borrow().is_none());
         assert!(runtime.pointer_timer.borrow().is_none());
+        // Exercise the production single frame source after a long idle.
+        // No new native input or display probe is needed: the existing fixture
+        // owns this runtime, and the timer's source/deadline are observable.
+        let settle = |duration: Duration| {
+            let start = Instant::now();
+            while start.elapsed() < duration {
+                while main.iteration(false) {}
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        runtime.last_human_input.set(None);
+        *runtime.interaction.borrow_mut() = GentleInteraction::default();
+        presence.state.borrow_mut().last_greeting = None;
+        runtime
+            .activity
+            .active_at
+            .set(Some(Instant::now() - REST_ONSET));
+        OrganismRuntime::apply_settings(&runtime, &view, true, OrganismMotion::Full);
+        settle(Duration::from_millis(80));
+        runtime.refresh_surface(&view, Instant::now());
+        if let Some(source) = runtime.surface_timer.borrow_mut().take() {
+            source.remove();
+        }
+        OrganismRuntime::schedule_surface_frame(&runtime, &view, DORMANT_FRAME_INTERVAL);
+        let dormant_source = runtime.surface_timer.borrow().as_ref().unwrap().as_raw();
+        let frame_before = runtime.surface_frame.get();
+        assert!(runtime.say_hello(&view).is_ok());
+        let accepted_origin = runtime.greeting_origin.get();
+        let accepted_at = presence.state.borrow().last_greeting.unwrap();
+        let active_source = runtime.surface_timer.borrow().as_ref().unwrap().as_raw();
+        assert_ne!(
+            dormant_source, active_source,
+            "acceptance tightens the existing dormant source immediately"
+        );
+        assert!(
+            runtime.surface_timer_deadline.get().unwrap()
+                <= Instant::now() + SURFACE_FRAME_INTERVAL
+        );
+        OrganismRuntime::rearm_surface_tick_for_greeting(&runtime, &view);
+        assert_eq!(
+            runtime.surface_timer.borrow().as_ref().unwrap().as_raw(),
+            active_source,
+            "an earlier pending source is never delayed"
+        );
+        assert!(runtime.say_hello(&view).is_err());
+        assert_eq!(runtime.greeting_origin.get(), accepted_origin);
+        assert_eq!(presence.state.borrow().last_greeting, Some(accepted_at));
+        settle(Duration::from_millis(160));
+        assert!(
+            runtime.surface_frame.get() > frame_before,
+            "Full hello advances before a dormant interval elapses"
+        );
+        assert_eq!(
+            runtime.greeting_origin.get(),
+            accepted_origin,
+            "frame scheduling does not restart the greeting"
+        );
+        settle(
+            GentleInteraction::HOLD.saturating_sub(accepted_at.elapsed())
+                + Duration::from_millis(80),
+        );
+        assert!(runtime.greeting_origin.get().is_none());
+        assert!(
+            runtime.surface_timer_deadline.get().unwrap() > Instant::now() + SURFACE_FRAME_INTERVAL,
+            "expiry restores dormant cadence"
+        );
+        assert_eq!(presence.state.borrow().last_greeting, Some(accepted_at));
+
+        // A canceled greeting cannot resurrect or accelerate a later source.
+        runtime.cancel_pointer_greeting();
+        let canceled_source = runtime.surface_timer.borrow().as_ref().unwrap().as_raw();
+        OrganismRuntime::rearm_surface_tick_for_greeting(&runtime, &view);
+        assert_eq!(
+            runtime.surface_timer.borrow().as_ref().unwrap().as_raw(),
+            canceled_source
+        );
+        let source = runtime.surface_timer.borrow_mut().take().unwrap();
+        source.remove();
+        runtime.surface_timer_deadline.set(None);
+        runtime.greeting_origin.set(Some(GreetingOrigin::Explicit(
+            runtime.interaction_epoch.elapsed(),
+        )));
+        OrganismRuntime::rearm_surface_tick_for_greeting(&runtime, &view);
+        assert!(
+            runtime.surface_timer.borrow().is_none(),
+            "a fired callback's vacant slot is never given a second source"
+        );
+        runtime.cancel_pointer_greeting();
+
+        // The first ordinary frame after a key sleeps to the original retreat
+        // boundary; a later key extends that boundary without allocating work.
+        runtime.activity.note_input(Instant::now());
+        let typed_at = Instant::now();
+        runtime.last_human_input.set(Some(typed_at));
+        runtime.refresh_surface(&view, typed_at);
+        assert!(runtime.body_position.get().is_none());
+        assert!(!runtime.sticky_avatar.is_visible());
+        OrganismRuntime::schedule_surface_frame(&runtime, &view, SURFACE_FRAME_INTERVAL);
+        settle(Duration::from_millis(160));
+        let typing_source = runtime.surface_timer.borrow().as_ref().unwrap().as_raw();
+        let typing_deadline = runtime.surface_timer_deadline.get().unwrap();
+        assert!(typing_deadline >= typed_at + HUMAN_INPUT_RETREAT);
+        assert!(typing_deadline < typed_at + HUMAN_INPUT_RETREAT + Duration::from_millis(80));
+        let repeated_at = Instant::now();
+        runtime.last_human_input.set(Some(repeated_at));
+        runtime.activity.note_input(repeated_at);
+        assert_eq!(
+            runtime.surface_timer.borrow().as_ref().unwrap().as_raw(),
+            typing_source
+        );
+        settle(
+            typing_deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(40),
+        );
+        assert!(
+            runtime.body_position.get().is_none(),
+            "the old deadline cannot end a newer input retreat"
+        );
+        assert!(runtime.surface_timer_deadline.get().unwrap() >= repeated_at + HUMAN_INPUT_RETREAT);
+        settle(
+            (repeated_at + HUMAN_INPUT_RETREAT).saturating_duration_since(Instant::now())
+                + Duration::from_millis(80),
+        );
+        assert!(
+            runtime.body_position.get().is_some(),
+            "the latest absolute retreat deadline restores the live surface"
+        );
+        presence.focus_view(None);
+        assert!(runtime.say_hello(&view).is_err());
+        OrganismRuntime::apply_settings(&runtime, &view, true, OrganismMotion::Static);
+        assert!(runtime.say_hello(&view).is_err());
+        OrganismRuntime::apply_settings(&runtime, &view, false, OrganismMotion::Static);
+        assert!(runtime.surface_timer.borrow().is_none());
+        assert!(runtime.surface_timer_deadline.get().is_none());
+        assert!(crate::block_view::organism_settings_test_pty_bytes(&view).is_empty());
         println!("DAILY_RUNTIME_COUNTS disabled_frame_timers=0 disabled_hover_timers=0 static_pose_unchanged=true");
         window.close();
     }
@@ -7967,7 +8193,7 @@ mod tests {
             assert!(eligibility.contains(required));
         }
         let explicit = production
-            .split("fn say_hello(&self, view: &TermView)")
+            .split("fn say_hello(self: &Rc<Self>, view: &Rc<TermView>)")
             .nth(1)
             .unwrap()
             .split("fn observe_pointer(")
@@ -8197,6 +8423,218 @@ mod tests {
             .unwrap();
         assert!(tail.starts_with("\n                runtime.motion.get(),\n                runtime.presence.is_owner(runtime.presence_token),\n                alt_screen,\n                runtime.activity.resting(now),\n                runtime.no_safe_body_placement.get(),\n                runtime.sticky_avatar.is_mapped(),"));
         assert!(production.contains("Self::schedule_surface_frame(&runtime, &view, next)"));
+    }
+
+    #[test]
+    fn live_interaction_deadlines_preserve_motion_and_exact_boundaries() {
+        let start = Duration::from_secs(5);
+        for origin in [
+            GreetingOrigin::Pointer(start),
+            GreetingOrigin::Explicit(start),
+        ] {
+            assert_eq!(
+                greeting_remaining(Some(origin), start),
+                Some(GentleInteraction::HOLD)
+            );
+            assert_eq!(
+                greeting_remaining(Some(origin), start + Duration::from_millis(1_999)),
+                Some(Duration::from_millis(1))
+            );
+            assert_eq!(
+                greeting_remaining(Some(origin), start + GentleInteraction::HOLD),
+                None
+            );
+            assert_eq!(
+                greeting_remaining(Some(origin), start + Duration::from_secs(9)),
+                None
+            );
+            assert_eq!(
+                greeting_remaining(Some(origin), start - Duration::from_millis(1)),
+                None
+            );
+        }
+        for motion in [
+            OrganismMotion::Full,
+            OrganismMotion::Calm,
+            OrganismMotion::Static,
+        ] {
+            for ordinary in [SURFACE_FRAME_INTERVAL, DORMANT_FRAME_INTERVAL] {
+                for hidden in [false, true] {
+                    for age in [
+                        None,
+                        Some(Duration::ZERO),
+                        Some(Duration::from_millis(400)),
+                        Some(Duration::from_micros(899_999)),
+                        Some(HUMAN_INPUT_RETREAT),
+                        Some(Duration::from_secs(2)),
+                    ] {
+                        for left in [
+                            None,
+                            Some(Duration::from_micros(1)),
+                            Some(Duration::from_millis(99)),
+                            Some(GentleInteraction::HOLD),
+                        ] {
+                            let expected = if motion != OrganismMotion::Full {
+                                ordinary
+                            } else if let Some(age) = age.filter(|_| hidden) {
+                                HUMAN_INPUT_RETREAT
+                                    .saturating_sub(age)
+                                    .max(Duration::from_millis(1))
+                            } else if let Some(left) = left {
+                                ordinary
+                                    .min(left.max(Duration::from_millis(1)))
+                                    .min(SURFACE_FRAME_INTERVAL)
+                            } else {
+                                ordinary
+                            };
+                            assert_eq!(
+                                interaction_frame_delay(ordinary, motion, hidden, age, left),
+                                expected
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn typing_waits_for_the_latest_absolute_retreat_deadline() {
+        let delay = |age| {
+            interaction_frame_delay(
+                SURFACE_FRAME_INTERVAL,
+                OrganismMotion::Full,
+                true,
+                Some(Duration::from_millis(age)),
+                None,
+            )
+        };
+        assert_eq!(delay(100), Duration::from_millis(800));
+        assert_eq!(delay(450), Duration::from_millis(450));
+        assert_eq!(delay(899), Duration::from_millis(1));
+        assert_eq!(delay(900), Duration::from_millis(1));
+        assert_eq!(delay(950), Duration::from_millis(1));
+        // The next refresh has measured a non-Typing mode, so crossing the
+        // deadline is a single catch-up, never a new one-millisecond poll loop.
+        assert_eq!(
+            interaction_frame_delay(
+                SURFACE_FRAME_INTERVAL,
+                OrganismMotion::Full,
+                false,
+                Some(HUMAN_INPUT_RETREAT),
+                None
+            ),
+            SURFACE_FRAME_INTERVAL
+        );
+        assert_eq!(
+            interaction_frame_delay(
+                DORMANT_FRAME_INTERVAL,
+                OrganismMotion::Full,
+                false,
+                Some(HUMAN_INPUT_RETREAT),
+                None
+            ),
+            DORMANT_FRAME_INTERVAL
+        );
+        // A key at t=700 extends retreat to t=1600. The pending t=900 callback
+        // observes age=200 and sleeps only the remaining 700.
+        assert_eq!(
+            Duration::from_millis(900) + delay(200),
+            Duration::from_millis(1_600)
+        );
+        let mut elapsed = Duration::ZERO;
+        let mut wakes = 0;
+        while elapsed < GentleInteraction::HOLD {
+            elapsed += interaction_frame_delay(
+                DORMANT_FRAME_INTERVAL,
+                OrganismMotion::Full,
+                false,
+                None,
+                Some(GentleInteraction::HOLD - elapsed),
+            );
+            wakes += 1;
+        }
+        assert_eq!(elapsed, GentleInteraction::HOLD);
+        assert_eq!(wakes, 20);
+        assert_eq!(
+            interaction_frame_delay(
+                DORMANT_FRAME_INTERVAL,
+                OrganismMotion::Full,
+                false,
+                None,
+                None
+            ),
+            DORMANT_FRAME_INTERVAL
+        );
+    }
+
+    #[test]
+    fn both_accepted_greeting_paths_rearm_only_the_existing_source() {
+        let source = include_str!("organism_ui.rs");
+        let production = source.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        let explicit = production
+            .split("fn say_hello(self: &Rc<Self>, view: &Rc<TermView>)")
+            .nth(1)
+            .unwrap()
+            .split("fn observe_pointer(")
+            .next()
+            .unwrap();
+        assert!(
+            explicit.find("if !accepted").unwrap()
+                < explicit
+                    .find("Self::rearm_surface_tick_for_greeting(self, view)")
+                    .unwrap()
+        );
+        let pointer = production
+            .split("fn observe_pointer(")
+            .nth(1)
+            .unwrap()
+            .split("fn install_pointer_observer(")
+            .next()
+            .unwrap();
+        assert!(pointer.contains("Self::rearm_surface_tick_for_greeting(&runtime, &view)"));
+        let rearm = production
+            .split("fn rearm_surface_tick_for_greeting(")
+            .nth(1)
+            .unwrap()
+            .split("fn schedule_surface_frame(")
+            .next()
+            .unwrap();
+        assert!(rearm.contains("deadline <= now + delay"));
+        assert!(rearm.contains("let Some(source) = runtime.surface_timer.borrow_mut().take() else"));
+        assert!(
+            rearm.find("source.remove()").unwrap()
+                < rearm.find("Self::schedule_surface_frame").unwrap()
+        );
+        assert!(!rearm.contains("GentleInteraction::request"));
+        let typing = production
+            .split("let typing_hidden =")
+            .nth(1)
+            .unwrap()
+            .split("// A synchronous settings callback")
+            .next()
+            .unwrap();
+        for gate in [
+            "runtime.presence.is_owner",
+            "!view.live_organism_surface_metrics().alt_screen",
+            "!runtime.awaiting_unobserved_work.get()",
+            "runtime.last_surface_mode.get() == Some(SurfaceMode::Typing)",
+            "!runtime.live_body.is_mapped()",
+            "!runtime.sticky_avatar.is_mapped()",
+            "runtime.human_input_age(Instant::now())",
+        ] {
+            assert!(typing.contains(gate), "missing typing-retreat gate: {gate}");
+        }
+        let callback = production
+            .split("let source = gtk::glib::timeout_add_local_once(delay, move || {")
+            .nth(1)
+            .unwrap();
+        assert!(
+            callback
+                .find("runtime.surface_timer_deadline.set(None)")
+                .unwrap()
+                < callback.find("if !runtime.enabled.get()").unwrap()
+        );
     }
 
     #[test]
