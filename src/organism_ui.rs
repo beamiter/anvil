@@ -74,6 +74,101 @@ fn pointer_buttons_down(view: &TermView) -> bool {
         .is_some_and(|pointer| pointer.modifier_state().intersects(buttons))
 }
 
+/// The card remains pointer-transparent. Resolve only its explanatory labels
+/// through the actual toplevel pick tree so ancestor clipping and overlays
+/// outside this pane are respected too. This is a read, not event routing.
+fn card_tooltip_at(
+    root: &gtk::Widget,
+    card: &gtk::Widget,
+    labels: &[Label],
+    point: (i32, i32),
+    keyboard_mode: bool,
+    modifiers: gtk::gdk::ModifierType,
+) -> Option<(gtk::glib::GString, gtk::graphene::Rect)> {
+    let buttons = gtk::gdk::ModifierType::BUTTON1_MASK
+        | gtk::gdk::ModifierType::BUTTON2_MASK
+        | gtk::gdk::ModifierType::BUTTON3_MASK
+        | gtk::gdk::ModifierType::BUTTON4_MASK
+        | gtk::gdk::ModifierType::BUTTON5_MASK;
+    if keyboard_mode
+        || modifiers.intersects(buttons)
+        || !root.is_mapped()
+        || !card.is_mapped()
+        || !card.is_ancestor(root)
+    {
+        return None;
+    }
+    let toplevel = root.root()?.dynamic_cast::<gtk::Widget>().ok()?;
+    let position = root.compute_point(
+        &toplevel,
+        &gtk::graphene::Point::new(point.0 as f32, point.1 as f32),
+    )?;
+    let picked = toplevel.pick(
+        f64::from(position.x()),
+        f64::from(position.y()),
+        gtk::PickFlags::NON_TARGETABLE,
+    )?;
+    for label in labels {
+        if label.is_mapped()
+            && label.is_ancestor(card)
+            && (picked == *label.upcast_ref::<gtk::Widget>() || picked.is_ancestor(label))
+        {
+            let text = label.tooltip_text().filter(|text| !text.is_empty())?;
+            return Some((text, label.compute_bounds(root)?));
+        }
+    }
+    None
+}
+
+/// Installed once with the pane's runtime, never from rendering. Both hooks
+/// retain only weak widgets; a retired/reparented card cannot serve old text.
+/// Pane-local cards remain readable even when another pane owns the live body.
+fn install_card_tooltip_proxy(root: &gtk::Widget, card: &gtk::Widget, labels: &[Label]) {
+    let card_weak = card.downgrade();
+    let labels_weak: Vec<_> = labels.iter().map(|label| label.downgrade()).collect();
+    root.set_has_tooltip(true);
+    root.connect_query_tooltip(move |root, x, y, keyboard_mode, tooltip| {
+        let Some(card) = card_weak.upgrade() else {
+            return false;
+        };
+        let Some(labels) = labels_weak
+            .iter()
+            .map(|label| label.upgrade())
+            .collect::<Option<Vec<_>>>()
+        else {
+            return false;
+        };
+        let modifiers = root
+            .display()
+            .default_seat()
+            .and_then(|seat| seat.pointer())
+            .map(|pointer| pointer.modifier_state())
+            .unwrap_or_default();
+        let Some((text, bounds)) =
+            card_tooltip_at(root, &card, &labels, (x, y), keyboard_mode, modifiers)
+        else {
+            return false;
+        };
+        tooltip.set_text(Some(&text));
+        tooltip.set_tip_area(&gtk::gdk::Rectangle::new(
+            bounds.x().floor() as i32,
+            bounds.y().floor() as i32,
+            ((bounds.x() + bounds.width()).ceil() - bounds.x().floor()) as i32,
+            ((bounds.y() + bounds.height()).ceil() - bounds.y().floor()) as i32,
+        ));
+        true
+    });
+    let root_weak = root.downgrade();
+    card.connect_unmap(move |_| {
+        // GTK tracks the proxy root as tooltip owner, so unmapping only the
+        // card needs one native requery. Text changes already trigger their
+        // own GTK requery in set_tooltip_text; no polling or extra source.
+        if let Some(root) = root_weak.upgrade() {
+            root.trigger_tooltip_query();
+        }
+    });
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GreetingOrigin {
     Pointer(Duration),
@@ -3655,6 +3750,11 @@ impl OrganismHub {
             .set(!view.organism_activity_settled());
         self.organism_presence.bind(presence_token, view, &runtime);
         OrganismRuntime::install_pointer_observer(&runtime, view);
+        install_card_tooltip_proxy(
+            &view.widget(),
+            &runtime.card,
+            &[runtime.state.clone(), runtime.status.clone()],
+        );
         // Two surfaces, deliberately: the card is the organism's home in the
         // block conversation, the live body below is its home on the terminal
         // surface itself. A pane that cannot host inline cards keeps only the
@@ -4719,6 +4819,11 @@ mod tests {
             false,
         );
         presence.bind(token, &view, &runtime);
+        install_card_tooltip_proxy(
+            &view.widget(),
+            &runtime.card,
+            &[runtime.state.clone(), runtime.status.clone()],
+        );
         assert!(Rc::ptr_eq(&presence.runtime_for(&view).unwrap(), &runtime));
         assert!(!runtime.live_body.can_target());
         assert!(!runtime.live_body.is_focusable());
@@ -4748,10 +4853,12 @@ mod tests {
             .and_then(|value| value.parse::<i32>().ok())
             .unwrap_or(700)
             .clamp(280, 900);
+        let window_overlay = gtk::Overlay::new();
+        window_overlay.set_child(Some(&content));
         let window = gtk::Window::builder()
             .default_width(screenshot_width)
             .default_height(500)
-            .child(&content)
+            .child(&window_overlay)
             .build();
         window.present();
         entry.grab_focus();
@@ -4762,12 +4869,97 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         assert!(view.widget().is_mapped());
+        // This is a pane-local description even before live-body ownership.
+        // Emit the existing GTK query signal, without synthetic pointer input.
+        let tooltip: gtk::Tooltip = gtk::glib::Object::new();
+        let root = view.widget();
+        let labels = [runtime.state.clone(), runtime.status.clone()];
+        let state_bounds = runtime.state.compute_bounds(&root).unwrap();
+        let state_point = (
+            (state_bounds.x() + state_bounds.width() / 2.0) as i32,
+            (state_bounds.y() + state_bounds.height() / 2.0) as i32,
+        );
+        let query = |point: (i32, i32), keyboard_mode: bool| {
+            root.emit_by_name::<bool>(
+                "query-tooltip",
+                &[&point.0, &point.1, &keyboard_mode, &tooltip],
+            )
+        };
+        assert!(root.has_tooltip());
+        assert!(query(state_point, false));
+        assert!(!query(state_point, true));
+        let (text, _) = card_tooltip_at(
+            &root,
+            &runtime.card,
+            &labels,
+            state_point,
+            false,
+            gtk::gdk::ModifierType::empty(),
+        )
+        .unwrap();
+        assert_eq!(Some(text), runtime.state.tooltip_text());
+        for button in [
+            gtk::gdk::ModifierType::BUTTON1_MASK,
+            gtk::gdk::ModifierType::BUTTON2_MASK,
+            gtk::gdk::ModifierType::BUTTON3_MASK,
+            gtk::gdk::ModifierType::BUTTON4_MASK,
+            gtk::gdk::ModifierType::BUTTON5_MASK,
+        ] {
+            assert!(
+                card_tooltip_at(&root, &runtime.card, &labels, state_point, false, button,)
+                    .is_none()
+            );
+        }
+        let sprite_bounds = runtime.sprite.compute_bounds(&root).unwrap();
+        assert!(!query(
+            (
+                (sprite_bounds.x() + sprite_bounds.width() / 2.0) as i32,
+                (sprite_bounds.y() + sprite_bounds.height() / 2.0) as i32,
+            ),
+            false
+        ));
+        assert!(!runtime.card.can_target());
+        let normal_pick = root.pick(
+            f64::from(state_point.0),
+            f64::from(state_point.1),
+            gtk::PickFlags::DEFAULT,
+        );
+        assert!(
+            !normal_pick
+                .is_some_and(|picked| picked == runtime.card || picked.is_ancestor(&runtime.card)),
+            "tooltip proxy does not alter pointer routing to the terminal"
+        );
+        assert!(gtk::prelude::GtkWindowExt::focus(&window)
+            .is_some_and(|focus| focus.is_ancestor(&entry) || focus == entry));
+        // An overlay outside the pane must hide the card from the tooltip too,
+        // even when that overlay itself passes pointer events through.
+        let cover = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        cover.set_can_target(false);
+        window_overlay.add_overlay(&cover);
+        let cover_at = Instant::now();
+        while cover_at.elapsed() < Duration::from_millis(50) {
+            while main.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(cover.is_mapped());
+        assert!(!query(state_point, false));
+        window_overlay.remove_overlay(&cover);
+        assert!(query(state_point, false));
+        runtime.card.set_visible(false);
+        assert!(!query(state_point, false));
+        runtime.card.set_visible(true);
+        while main.iteration(false) {}
+        assert!(query(state_point, false));
         presence.focus_view(Some(&view));
         let before = life.get();
         for _ in 0..4 {
             OrganismRuntime::apply_settings(&runtime, &view, false, OrganismMotion::Static);
             assert!(runtime.surface_timer.borrow().is_none());
             assert!(!runtime.card.is_visible());
+            assert!(
+                !query(state_point, false),
+                "settings-off immediately retires the proxy"
+            );
             assert!(crate::block_view::organism_settings_test_onboarding(&view));
             assert!(!runtime.sticky_avatar.is_visible());
             assert!(!runtime.sleeping.get());
@@ -5262,8 +5454,158 @@ mod tests {
         assert!(runtime.surface_timer.borrow().is_none());
         assert!(runtime.surface_timer_deadline.get().is_none());
         assert!(crate::block_view::organism_settings_test_pty_bytes(&view).is_empty());
+        // Use the same display fixture/window for clipping and weak-ownership
+        // boundaries. This small subtree has no terminal or extra event source.
+        let tooltip_host = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let proxy_root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let other_root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let scroll = gtk::ScrolledWindow::new();
+        scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        scroll.set_size_request(-1, 80);
+        let scroll_content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let spacer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        spacer.set_size_request(-1, 120);
+        scroll_content.append(&spacer);
+        let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        card.set_can_target(false);
+        let label = gtk::Label::new(Some("Clipped local explanation"));
+        label.set_tooltip_text(Some("Complete local explanation"));
+        card.append(&label);
+        scroll_content.append(&card);
+        let tail = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        tail.set_size_request(-1, 500);
+        scroll_content.append(&tail);
+        scroll.set_child(Some(&scroll_content));
+        proxy_root.append(&scroll);
+        tooltip_host.append(&proxy_root);
+        tooltip_host.append(&other_root);
+        window.set_child(Some(&tooltip_host));
+        install_card_tooltip_proxy(proxy_root.upcast_ref(), card.upcast_ref(), &[label.clone()]);
+        settle(Duration::from_millis(60));
+        let query_point = || {
+            let b = label.compute_bounds(&proxy_root).unwrap();
+            (
+                (b.x() + b.width() / 2.0) as i32,
+                (b.y() + b.height() / 2.0) as i32,
+            )
+        };
+        let proxy_query = |point: (i32, i32)| {
+            proxy_root
+                .emit_by_name::<bool>("query-tooltip", &[&point.0, &point.1, &false, &tooltip])
+        };
+        assert!(card.is_mapped());
+        assert!(label.is_mapped());
+        assert!(
+            !proxy_query(query_point()),
+            "mapped is not enough when the scroller clips a label"
+        );
+        scroll.vadjustment().set_value(120.0);
+        settle(Duration::from_millis(40));
+        assert!(proxy_query(query_point()));
+        let previous_point = query_point();
+        scroll_content.remove(&card);
+        other_root.append(&card);
+        settle(Duration::from_millis(40));
+        assert!(card.is_mapped());
+        assert!(
+            !proxy_query(previous_point),
+            "old pane cannot describe a reparented card"
+        );
+        let old_label_point = label.compute_bounds(&proxy_root).unwrap();
+        assert!(!proxy_query((
+            old_label_point.x() as i32,
+            old_label_point.y() as i32
+        )));
+        let card_weak = card.downgrade();
+        let label_weak = label.downgrade();
+        other_root.remove(&card);
+        drop(card);
+        drop(label);
+        assert!(card_weak.upgrade().is_none());
+        assert!(label_weak.upgrade().is_none());
+        assert!(
+            !proxy_query(previous_point),
+            "root callback holds no stale card or label alive"
+        );
+        let root_weak = proxy_root.downgrade();
+        tooltip_host.remove(&proxy_root);
+        drop(proxy_root);
+        assert!(root_weak.upgrade().is_none());
+        assert!(crate::block_view::organism_settings_test_pty_bytes(&view).is_empty());
         println!("DAILY_RUNTIME_COUNTS disabled_frame_timers=0 disabled_hover_timers=0 static_pose_unchanged=true");
         window.close();
+    }
+
+    #[test]
+    fn card_tooltip_proxy_is_weak_read_only_and_installed_once() {
+        let source = include_str!("organism_ui.rs");
+        let proxy = source
+            .split("fn install_card_tooltip_proxy(")
+            .nth(1)
+            .unwrap()
+            .split("#[derive(Debug, Clone, Copy, PartialEq, Eq)]")
+            .next()
+            .unwrap();
+        assert_eq!(proxy.matches("connect_query_tooltip(").count(), 1);
+        assert_eq!(proxy.matches("connect_unmap(").count(), 1);
+        for required in [
+            "card.downgrade()",
+            "label.downgrade()",
+            "root.downgrade()",
+            "root.trigger_tooltip_query()",
+        ] {
+            assert!(proxy.contains(required), "{required}");
+        }
+        for absent in [
+            "timeout",
+            "add_controller",
+            "set_can_target",
+            "grab_focus",
+            "Rc::clone",
+        ] {
+            assert!(!proxy.contains(absent), "{absent}");
+        }
+        let attach = source
+            .split("pub(crate) fn attach_ascii_organism_to_view(")
+            .nth(1)
+            .unwrap()
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert_eq!(attach.matches("install_card_tooltip_proxy(").count(), 1);
+        let settings = source
+            .split("    fn apply_settings(")
+            .nth(1)
+            .unwrap()
+            .split("    fn ")
+            .next()
+            .unwrap();
+        assert!(
+            settings.contains("runtime.card.set_visible(enabled)"),
+            "disabled descriptions must unmap before another tooltip query"
+        );
+        let pick = source
+            .split("fn card_tooltip_at(")
+            .nth(1)
+            .unwrap()
+            .split("fn install_card_tooltip_proxy(")
+            .next()
+            .unwrap();
+        for required in [
+            "root.root()?",
+            "compute_point(",
+            "toplevel.pick(",
+            "gtk::PickFlags::NON_TARGETABLE",
+            "card.is_ancestor(root)",
+            "label.is_ancestor(card)",
+            "BUTTON5_MASK",
+        ] {
+            assert!(pick.contains(required), "{required}");
+        }
+        assert!(
+            !pick.contains("is_owner"),
+            "inline descriptions are pane-local"
+        );
     }
 
     #[test]
