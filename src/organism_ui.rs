@@ -18,7 +18,13 @@ use jterm_core::organism::{
     VisualGrowthStage, VisualTransition, WatchRhythm,
 };
 use jterm_core::organism_attention::{AttentionArbiter, AttentionCue};
-use jterm_core::organism_daily::{behavior_explanation, GentleInteraction};
+use jterm_core::organism_daily::behavior_explanation;
+#[cfg(test)]
+use jterm_core::organism_daily::GentleInteraction;
+use jterm_core::organism_live::{
+    LiveAttention, LiveAttentionEvent, LiveAttentionInput, LiveAttentionOutcome,
+    LiveAttentionRejection, LiveAttentionSnapshot, LiveAttentionSource, LiveAttentionTicket,
+};
 use jterm_core::organism_memory::{
     local_circadian_time_at_ms, unix_ms, CircadianProfile, GrowthProgress, GrowthStage,
     LocalCircadianTime, MemoryEvent, MemoryInsight, RepoContext,
@@ -27,7 +33,8 @@ use jterm_core::organism_memory::{
 /// An accepted correction only vouches for a command that starts promptly.
 const CORRECTION_ASSIST_WINDOW: Duration = Duration::from_secs(30);
 const POINTER_GREETING_CANDIDATE_CLASS: &str = "organism-greeting-candidate";
-const POINTER_GREETING_DWELL: Duration = Duration::from_millis(600);
+#[cfg(test)]
+const POINTER_GREETING_DWELL: Duration = LiveAttention::<OrganismPaneToken>::DWELL;
 const POINTER_GREETING_RADIUS: f64 = 32.0;
 
 const HUMAN_INPUT_RETREAT: Duration = Duration::from_millis(900);
@@ -176,42 +183,19 @@ fn install_card_tooltip_proxy(root: &gtk::Widget, card: &gtk::Widget, labels: &[
     });
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GreetingOrigin {
-    Pointer(Duration),
-    Explicit(Duration),
-}
-
-fn current_greeting_origin(
-    origin: Option<GreetingOrigin>,
+/// Read only the core snapshot retained by this completed paint. Unlike a
+/// new reconciliation, its original deadline may have just crossed zero and
+/// needs one final native cleanup. There is no host-owned hold timestamp.
+fn painted_greeting_remaining(
+    snapshot: Option<LiveAttentionSnapshot>,
     now: Duration,
-) -> Option<GreetingOrigin> {
-    greeting_remaining(origin, now).and(origin)
-}
-
-fn greeting_remaining(origin: Option<GreetingOrigin>, now: Duration) -> Option<Duration> {
-    let (GreetingOrigin::Pointer(start) | GreetingOrigin::Explicit(start)) = origin?;
-    let elapsed = now.checked_sub(start)?;
-    GentleInteraction::HOLD
-        .checked_sub(elapsed)
-        .filter(|remaining| !remaining.is_zero())
-}
-
-/// The refresh has already retired expired/cancelled origins. If it retained
-/// an origin while drawing a visible greeting, but rendering then crossed the
-/// end, preserve zero remaining here for one bounded cleanup frame. The next
-/// refresh clears the origin; eligibility and acceptance still use the strict
-/// positive remaining-time check above.
-fn greeting_tail_remaining(
-    origin: Option<GreetingOrigin>,
-    now: Duration,
-    visible_owner: bool,
 ) -> Option<Duration> {
-    if !visible_owner {
-        return None;
-    }
-    let (GreetingOrigin::Pointer(start) | GreetingOrigin::Explicit(start)) = origin?;
-    Some(GentleInteraction::HOLD.saturating_sub(now.checked_sub(start)?))
+    let snapshot = snapshot?;
+    snapshot.active.map(|active| {
+        active
+            .deadline
+            .saturating_sub(now.max(snapshot.observed_at))
+    })
 }
 
 /// The live interaction shares the ordinary frame source. A Full greeting
@@ -246,14 +230,6 @@ fn interaction_frame_delay(
         }
     }
     greeting_frame_delay(motion, greeting_left).map_or(ordinary, |greeting| ordinary.min(greeting))
-}
-
-fn greeting_context_eligible(context: RenderContext) -> bool {
-    context.transition.is_none()
-        && matches!(
-            context.behavior,
-            Behavior::Idle | Behavior::Explore | Behavior::Sleep | Behavior::Approach
-        )
 }
 
 fn surface_frame_delay(
@@ -1644,7 +1620,6 @@ struct PresenceState {
     ledger: PresenceLedger,
     entries: Vec<PresenceEntry>,
     eligible: Vec<std::rc::Weak<TermView>>,
-    last_greeting: Option<Instant>,
 }
 
 /// Window-shared arbiter for the one spatial body. Every pane keeps its own
@@ -1652,12 +1627,16 @@ struct PresenceState {
 /// local Block pane may opt its live overlay into visibility.
 pub(crate) struct OrganismPresence {
     state: RefCell<PresenceState>,
+    live_attention: RefCell<LiveAttention<OrganismPaneToken>>,
+    attention_epoch: Instant,
 }
 
 impl OrganismPresence {
     pub(crate) fn new() -> Rc<Self> {
         Rc::new(Self {
             state: RefCell::new(PresenceState::default()),
+            live_attention: RefCell::new(LiveAttention::default()),
+            attention_epoch: Instant::now(),
         })
     }
 
@@ -1747,9 +1726,13 @@ impl OrganismPresence {
                 .collect::<Vec<_>>();
             (changed, new_owner, live_entries)
         };
-        if !changed {
+        let core_changed = self.live_attention.borrow().owner().copied() != new_owner;
+        if !changed && !core_changed {
             return;
         }
+        // Only this window authority changes the core owner. Pane callbacks
+        // can cancel only their own token, never a successor's interaction.
+        self.live_attention.borrow_mut().set_owner(None);
 
         for (_, view, runtime) in &live_entries {
             runtime.hide_live_body(view);
@@ -1759,6 +1742,7 @@ impl OrganismPresence {
             let mut state = self.state.borrow_mut();
             state.ledger.claim(new_owner);
         }
+        self.live_attention.borrow_mut().set_owner(new_owner);
         for (token, view, runtime) in &live_entries {
             if Some(*token) == new_owner {
                 let now = Instant::now();
@@ -1781,6 +1765,10 @@ impl OrganismPresence {
             state.ledger.unregister(token);
             view
         };
+        let retired_owner = self.live_attention.borrow().owner() == Some(&token);
+        if retired_owner {
+            self.live_attention.borrow_mut().set_owner(None);
+        }
         if let Some(view) = view {
             view.set_live_organism_visible(false);
         }
@@ -1907,13 +1895,13 @@ struct OrganismRuntime {
     motion: Cell<OrganismMotion>,
     enabled: Cell<bool>,
     awaiting_unobserved_work: Cell<bool>,
-    interaction: RefCell<GentleInteraction>,
-    greeting_origin: Cell<Option<GreetingOrigin>>,
-    interaction_epoch: Instant,
+    // A render snapshot, not another policy clock or source ledger. The core
+    // owns all candidate/hold/cooldown state once per window.
+    painted_attention: Cell<Option<LiveAttentionSnapshot>>,
     live_context: Cell<RenderContext>,
     pointer_position: Cell<Option<(f64, f64)>>,
     pointer_near: Cell<bool>,
-    pointer_timer: RefCell<Option<gtk::glib::SourceId>>,
+    pointer_timer: RefCell<Option<(gtk::glib::SourceId, LiveAttentionTicket)>>,
     memory_badge: Cell<MemoryBadgeState>,
     shared_life: Rc<Cell<LifeState>>,
     activity: Rc<OrganismActivity>,
@@ -2101,9 +2089,7 @@ impl OrganismRuntime {
             motion: Cell::new(motion),
             enabled: Cell::new(true),
             awaiting_unobserved_work: Cell::new(false),
-            interaction: RefCell::new(GentleInteraction::default()),
-            greeting_origin: Cell::new(None),
-            interaction_epoch: Instant::now(),
+            painted_attention: Cell::new(None),
             live_context: Cell::new(RenderContext::new(
                 Behavior::Idle,
                 BodyLanguage::default(),
@@ -2368,78 +2354,159 @@ impl OrganismRuntime {
         self.offered_watch_rhythm.set(WatchRhythm::Steady);
     }
 
-    fn cancel_pointer_greeting(&self) {
-        self.live_body
-            .remove_css_class(POINTER_GREETING_CANDIDATE_CLASS);
-        if let Some(source) = self.pointer_timer.borrow_mut().take() {
-            source.remove();
-        }
-        self.pointer_near.set(false);
-        self.pointer_position.set(None);
-        self.greeting_origin.set(None);
-        self.interaction.borrow_mut().cancel();
-    }
-
-    fn live_greeting_allowed(&self, view: &TermView, now: Instant) -> bool {
-        if !self.enabled.get()
-            || self.motion.get() == OrganismMotion::Static
-            || !self.presence.is_owner(self.presence_token)
-            || !self.live_body.is_mapped()
-            || self.command_running.get()
-            || !view.organism_activity_settled()
-            || pointer_buttons_down(view)
-            || self
-                .human_input_age(now)
-                .is_some_and(|age| age < HUMAN_INPUT_RETREAT)
-            || view.live_organism_surface_metrics().alt_screen
-        {
-            return false;
-        }
-        greeting_context_eligible(self.live_context.get())
-    }
-
-    fn pointer_can_greet(&self, view: &TermView, x: f64, y: f64) -> bool {
-        if !self.live_greeting_allowed(view, Instant::now()) {
-            return false;
-        }
-        self.live_body
-            .compute_bounds(&view.widget())
-            .is_some_and(|bounds| {
-                x >= f64::from(bounds.x()) - POINTER_GREETING_RADIUS
-                    && x <= f64::from(bounds.x() + bounds.width()) + POINTER_GREETING_RADIUS
-                    && y >= f64::from(bounds.y()) - POINTER_GREETING_RADIUS
-                    && y <= f64::from(bounds.y() + bounds.height()) + POINTER_GREETING_RADIUS
-            })
-    }
-
     fn retire_pointer_candidate(&self) {
         self.live_body
             .remove_css_class(POINTER_GREETING_CANDIDATE_CLASS);
-        if let Some(source) = self.pointer_timer.borrow_mut().take() {
+        if let Some((source, _)) = self.pointer_timer.borrow_mut().take() {
             source.remove();
         }
     }
 
-    fn explicit_greeting_active(&self) -> bool {
-        let origin =
-            current_greeting_origin(self.greeting_origin.get(), self.interaction_epoch.elapsed());
-        self.greeting_origin.set(origin);
-        matches!(origin, Some(GreetingOrigin::Explicit(_)))
+    fn cancel_pointer_greeting(&self) {
+        self.retire_pointer_candidate();
+        self.painted_attention.set(None);
+        self.presence
+            .live_attention
+            .borrow_mut()
+            .cancel(&self.presence_token);
+        // Keep native pointer facts. Cancellation does not create a new visit
+        // when the same pointer remains still over a restored body.
     }
 
-    fn pointer_departed(&self) {
-        if self.explicit_greeting_active() {
-            // Only proximity is exempt for an explicit request. Keep real
-            // pointer state empty; completion never synthesizes a hover.
+    fn live_greeting_allowed(&self, view: &TermView, now: Instant) -> bool {
+        self.enabled.get()
+            && self.motion.get() != OrganismMotion::Static
+            && self.presence.is_owner(self.presence_token)
+            && self.live_body.is_mapped()
+            && !self.command_running.get()
+            && view.organism_activity_settled()
+            && !pointer_buttons_down(view)
+            && self
+                .human_input_age(now)
+                .is_none_or(|age| age >= HUMAN_INPUT_RETREAT)
+            && !view.live_organism_surface_metrics().alt_screen
+    }
+
+    fn pointer_within_body(&self, view: &TermView, x: f64, y: f64) -> bool {
+        self.live_body.is_mapped()
+            && self
+                .live_body
+                .compute_bounds(&view.widget())
+                .is_some_and(|bounds| {
+                    x >= f64::from(bounds.x()) - POINTER_GREETING_RADIUS
+                        && x <= f64::from(bounds.x() + bounds.width()) + POINTER_GREETING_RADIUS
+                        && y >= f64::from(bounds.y()) - POINTER_GREETING_RADIUS
+                        && y <= f64::from(bounds.y() + bounds.height()) + POINTER_GREETING_RADIUS
+                })
+    }
+
+    fn live_attention_input(&self, view: &TermView, now: Instant) -> LiveAttentionInput {
+        LiveAttentionInput {
+            base_context: self.live_context.get(),
+            hard_eligible: self.live_greeting_allowed(view, now),
+            hover_available: self.live_body.is_mapped()
+                && self.live_body.compute_bounds(&view.widget()).is_some(),
+            pointer_inside: self
+                .pointer_position
+                .get()
+                .is_some_and(|(x, y)| self.pointer_within_body(view, x, y)),
+        }
+    }
+
+    fn read_live_attention(&self, view: &TermView, now: Instant) -> Option<LiveAttentionSnapshot> {
+        let input = self.live_attention_input(view, now);
+        let elapsed = now.saturating_duration_since(self.presence.attention_epoch);
+        self.presence
+            .live_attention
+            .borrow()
+            .snapshot(elapsed, &self.presence_token, input)
+            .ok()
+    }
+
+    fn sync_attention_resources(&self, snapshot: Option<LiveAttentionSnapshot>) {
+        let candidate = snapshot.and_then(|snapshot| snapshot.candidate);
+        let retire = self
+            .pointer_timer
+            .borrow()
+            .as_ref()
+            .is_some_and(|(_, ticket)| {
+                candidate.is_none_or(|candidate| candidate.ticket != *ticket)
+            });
+        if retire {
+            self.retire_pointer_candidate();
+        }
+        if snapshot.is_some_and(|snapshot| snapshot.candidate_visible) {
+            self.live_body
+                .add_css_class(POINTER_GREETING_CANDIDATE_CLASS);
+        } else {
             self.live_body
                 .remove_css_class(POINTER_GREETING_CANDIDATE_CLASS);
-            if let Some(source) = self.pointer_timer.borrow_mut().take() {
-                source.remove();
-            }
-            self.pointer_near.set(false);
-            self.pointer_position.set(None);
+        }
+    }
+
+    fn advance_live_attention(
+        &self,
+        view: &TermView,
+        now: Instant,
+        event: LiveAttentionEvent,
+    ) -> Option<LiveAttentionSnapshot> {
+        let input = self.live_attention_input(view, now);
+        self.advance_live_attention_with_input(now, input, event)
+    }
+
+    fn advance_live_attention_with_input(
+        &self,
+        now: Instant,
+        input: LiveAttentionInput,
+        event: LiveAttentionEvent,
+    ) -> Option<LiveAttentionSnapshot> {
+        let snapshot = self
+            .presence
+            .live_attention
+            .borrow_mut()
+            .advance(
+                now.saturating_duration_since(self.presence.attention_epoch),
+                &self.presence_token,
+                input,
+                event,
+            )
+            .ok();
+        // A stale event is not a new empty snapshot. In particular it must
+        // not clear a newer candidate's native source or passive feedback.
+        if snapshot.is_some() {
+            self.sync_attention_resources(snapshot);
+        }
+        snapshot
+    }
+
+    #[cfg(test)]
+    fn explicit_greeting_active(&self, view: &TermView) -> bool {
+        self.read_live_attention(view, Instant::now())
+            .and_then(|snapshot| snapshot.active)
+            .is_some_and(|active| active.source == LiveAttentionSource::Explicit)
+    }
+
+    fn pointer_departed(&self, view: &TermView) {
+        self.pointer_near.set(false);
+        self.pointer_position.set(None);
+        let ticket = {
+            let attention = self.presence.live_attention.borrow();
+            (attention.owner() == Some(&self.presence_token))
+                .then(|| attention.entry_ticket())
+                .flatten()
+        };
+        if let Some(ticket) = ticket {
+            self.advance_live_attention(
+                view,
+                Instant::now(),
+                LiveAttentionEvent::PointerLeft { ticket },
+            );
         } else {
-            self.cancel_pointer_greeting();
+            self.presence
+                .live_attention
+                .borrow_mut()
+                .cancel_hover(&self.presence_token);
+            self.retire_pointer_candidate();
         }
     }
 
@@ -2451,120 +2518,142 @@ impl OrganismRuntime {
             return Err("Live hello is unavailable in Static motion.");
         }
         let now = Instant::now();
-        self.refresh_surface(view, now);
-        if !self.live_greeting_allowed(view, now) || self.body_position.get().is_none() {
+        // Measure and paint read-only first. A due hover must not be admitted
+        // by a speculative Reconcile before this actual Explicit event.
+        self.refresh_surface_with_attention(view, now, false);
+        let Some(snapshot) =
+            self.advance_live_attention(view, Instant::now(), LiveAttentionEvent::Explicit)
+        else {
             return Err("No visible idle companion is ready in the original pane.");
+        };
+        match snapshot.outcome {
+            LiveAttentionOutcome::Accepted(LiveAttentionSource::Explicit) => {}
+            LiveAttentionOutcome::Rejected(LiveAttentionRejection::Cooldown) => {
+                return Err("Please let the companion rest before another hello.");
+            }
+            _ => return Err("No visible idle companion is ready in the original pane."),
         }
-        if self
-            .presence
-            .state
-            .borrow()
-            .last_greeting
-            .is_some_and(|last| now.saturating_duration_since(last) < GentleInteraction::COOLDOWN)
-        {
-            return Err("Please let the companion rest before another hello.");
-        }
-        let elapsed = self.interaction_epoch.elapsed();
-        let accepted = self
-            .interaction
-            .borrow_mut()
-            .request(elapsed, self.live_context.get());
-        if !accepted {
-            return Err("Please let the companion rest before another hello.");
-        }
-        self.retire_pointer_candidate();
-        self.greeting_origin
-            .set(Some(GreetingOrigin::Explicit(elapsed)));
-        self.presence.state.borrow_mut().last_greeting = Some(now);
-        self.refresh_surface(view, now);
+        self.refresh_surface(view, Instant::now());
         Self::rearm_surface_tick_for_greeting(self, view);
         Ok(())
     }
 
     fn observe_pointer(runtime: &Rc<Self>, view: &Rc<TermView>, x: f64, y: f64, dragging: bool) {
-        if dragging {
-            runtime.cancel_pointer_greeting();
-            return;
-        }
-        if runtime.explicit_greeting_active() {
-            if !runtime.live_greeting_allowed(view, Instant::now()) {
-                runtime.cancel_pointer_greeting();
+        let was_near = runtime.pointer_near.get();
+        let near = runtime.pointer_within_body(view, x, y);
+        runtime.pointer_position.set(Some((x, y)));
+        runtime.pointer_near.set(near);
+        let now = Instant::now();
+        let mut input = runtime.live_attention_input(view, now);
+        input.hard_eligible &= !dragging;
+        // Dragging denies admission, but its real exit still releases the
+        // physical visit. Do not swallow the edge before it reaches core.
+        let event = {
+            let attention = runtime.presence.live_attention.borrow();
+            if attention.owner() != Some(&runtime.presence_token) {
                 return;
             }
-            let near = runtime.pointer_can_greet(view, x, y);
-            runtime.pointer_near.set(near);
-            runtime.pointer_position.set(near.then_some((x, y)));
+            if !near {
+                attention
+                    .entry_ticket()
+                    .map(|ticket| LiveAttentionEvent::PointerLeft { ticket })
+            } else if !was_near {
+                attention
+                    .entry_offer()
+                    .map(|ticket| LiveAttentionEvent::PointerEntered { ticket })
+            } else {
+                None
+            }
+        };
+        let Some(event) = event else {
+            // Real motion may update geometry without creating another entry.
+            let snapshot = runtime.advance_live_attention_with_input(
+                now,
+                input,
+                LiveAttentionEvent::Reconcile,
+            );
+            if snapshot.is_some_and(|snapshot| {
+                matches!(snapshot.outcome, LiveAttentionOutcome::Accepted(_))
+            }) {
+                runtime.refresh_surface(view, Instant::now());
+                Self::rearm_surface_tick_for_greeting(runtime, view);
+            }
             return;
-        }
-        if !runtime.pointer_can_greet(view, x, y) {
-            runtime.cancel_pointer_greeting();
+        };
+        let Some(snapshot) = runtime.advance_live_attention_with_input(now, input, event) else {
             return;
-        }
-        runtime.pointer_position.set(Some((x, y)));
-        if runtime.pointer_near.replace(true) {
+        };
+        Self::schedule_pointer_candidate(runtime, view, snapshot);
+    }
+
+    fn schedule_pointer_candidate(
+        runtime: &Rc<Self>,
+        view: &Rc<TermView>,
+        snapshot: LiveAttentionSnapshot,
+    ) {
+        let Some(candidate) = snapshot.candidate else {
             return;
-        }
+        };
         if runtime
-            .presence
-            .state
+            .pointer_timer
             .borrow()
-            .last_greeting
-            .is_some_and(|last| last.elapsed() < GentleInteraction::COOLDOWN)
+            .as_ref()
+            .is_some_and(|(_, ticket)| *ticket == candidate.ticket)
         {
             return;
         }
+        runtime.retire_pointer_candidate();
         let weak = Rc::downgrade(runtime);
         let view_weak = Rc::downgrade(view);
-        let source = gtk::glib::timeout_add_local_once(POINTER_GREETING_DWELL, move || {
-            let Some(runtime) = weak.upgrade() else {
-                return;
-            };
-            runtime
-                .live_body
-                .remove_css_class(POINTER_GREETING_CANDIDATE_CLASS);
-            // Clear the fired id before checking its view: a separately held
-            // runtime must never try removing an already-fired source in Drop.
-            runtime.pointer_timer.borrow_mut().take();
-            let Some(view) = view_weak.upgrade() else {
-                runtime.cancel_pointer_greeting();
-                return;
-            };
-            let Some((x, y)) = runtime.pointer_position.get() else {
-                return;
-            };
-            if !runtime.pointer_can_greet(&view, x, y) {
-                runtime.cancel_pointer_greeting();
-                return;
-            }
-            let now = Instant::now();
-            // The window's single body shares the cooldown across split panes.
-            if runtime
-                .presence
-                .state
-                .borrow()
-                .last_greeting
-                .is_some_and(|last| {
-                    now.saturating_duration_since(last) < GentleInteraction::COOLDOWN
-                })
-            {
-                return;
-            }
-            if runtime.interaction.borrow_mut().request(
-                runtime.interaction_epoch.elapsed(),
-                runtime.live_context.get(),
-            ) {
-                runtime.greeting_origin.set(Some(GreetingOrigin::Pointer(
-                    runtime.interaction_epoch.elapsed(),
-                )));
-                runtime.presence.state.borrow_mut().last_greeting = Some(now);
-                runtime.refresh_surface(&view, now);
-                Self::rearm_surface_tick_for_greeting(&runtime, &view);
+        let delay = candidate
+            .deadline
+            .saturating_sub(runtime.presence.attention_epoch.elapsed())
+            .max(Duration::from_millis(1));
+        let source = gtk::glib::timeout_add_local_once(delay, move || {
+            if let Some(runtime) = weak.upgrade() {
+                Self::finish_pointer_candidate(&runtime, &view_weak, candidate.ticket);
             }
         });
-        *runtime.pointer_timer.borrow_mut() = Some(source);
-        runtime
-            .live_body
-            .add_css_class(POINTER_GREETING_CANDIDATE_CLASS);
+        *runtime.pointer_timer.borrow_mut() = Some((source, candidate.ticket));
+        runtime.sync_attention_resources(Some(snapshot));
+    }
+
+    fn finish_pointer_candidate(
+        runtime: &Rc<Self>,
+        view_weak: &std::rc::Weak<TermView>,
+        ticket: LiveAttentionTicket,
+    ) {
+        // A stale callback may not clear a newer native source's slot.
+        if !runtime
+            .pointer_timer
+            .borrow()
+            .as_ref()
+            .is_some_and(|(_, pending)| *pending == ticket)
+        {
+            return;
+        }
+        runtime.pointer_timer.borrow_mut().take();
+        let Some(view) = view_weak.upgrade() else {
+            runtime.cancel_pointer_greeting();
+            return;
+        };
+        runtime.refresh_surface_with_attention(&view, Instant::now(), false);
+        let result = runtime.advance_live_attention(
+            &view,
+            Instant::now(),
+            LiveAttentionEvent::CandidateDue { ticket },
+        );
+        runtime.refresh_surface_with_attention(&view, Instant::now(), false);
+        // GLib truncates submillisecond delays. If it woke early, translate
+        // the still-pending SAME deadline/ticket into one bounded native wake.
+        if let Some(snapshot) = runtime.read_live_attention(&view, Instant::now()) {
+            Self::schedule_pointer_candidate(runtime, &view, snapshot);
+        }
+        if result
+            .is_some_and(|snapshot| matches!(snapshot.outcome, LiveAttentionOutcome::Accepted(_)))
+        {
+            Self::rearm_surface_tick_for_greeting(runtime, &view);
+        }
     }
 
     fn install_pointer_observer(
@@ -2591,9 +2680,34 @@ impl OrganismRuntime {
                 }
             }
         });
+        motion.connect_enter({
+            let runtime = runtime.clone();
+            let view = Rc::downgrade(view);
+            move |controller, x, y| {
+                if let Some(view) = view.upgrade() {
+                    let buttons = gtk::gdk::ModifierType::BUTTON1_MASK
+                        | gtk::gdk::ModifierType::BUTTON2_MASK
+                        | gtk::gdk::ModifierType::BUTTON3_MASK;
+                    Self::observe_pointer(
+                        &runtime,
+                        &view,
+                        x,
+                        y,
+                        controller.current_event_state().intersects(buttons),
+                    );
+                }
+            }
+        });
         motion.connect_leave({
             let runtime = runtime.clone();
-            move |_| runtime.pointer_departed()
+            let view = Rc::downgrade(view);
+            move |_| {
+                if let Some(view) = view.upgrade() {
+                    runtime.pointer_departed(&view);
+                } else {
+                    runtime.cancel_pointer_greeting();
+                }
+            }
         });
         view.widget().add_controller(motion.clone());
         let press = gtk::EventControllerLegacy::new();
@@ -2829,13 +2943,14 @@ impl OrganismRuntime {
     }
 
     fn refresh_surface(&self, view: &TermView, now: Instant) {
+        self.refresh_surface_with_attention(view, now, true);
+    }
+
+    fn refresh_surface_with_attention(&self, view: &TermView, now: Instant, advance: bool) {
+        self.painted_attention.set(None);
         // This is evidence from this refresh only, never inferred from a
         // transient hide, owner change, typing retreat or stale allocation.
         self.no_safe_body_placement.set(false);
-        self.greeting_origin.set(current_greeting_origin(
-            self.greeting_origin.get(),
-            self.interaction_epoch.elapsed(),
-        ));
         if !self.enabled.get() {
             self.hide_live_body(view);
             self.sticky_avatar.set_visible(false);
@@ -2962,20 +3077,17 @@ impl OrganismRuntime {
             .with_watch_rhythm(rhythm)
             .with_transition(transition);
         self.live_context.set(context);
-        if !greeting_context_eligible(context) {
-            self.cancel_pointer_greeting();
-        }
-        if self
-            .pointer_position
-            .get()
-            .is_some_and(|(x, y)| !self.pointer_can_greet(view, x, y))
-        {
-            self.pointer_departed();
-        }
-        let context = self
-            .interaction
-            .borrow_mut()
-            .apply(self.interaction_epoch.elapsed(), context);
+        // Layout synchronization never emits a physical enter/leave event.
+        let pointer_inside = self.live_attention_input(view, now).pointer_inside;
+        self.pointer_near.set(pointer_inside);
+        let snapshot = if advance {
+            self.advance_live_attention(view, now, LiveAttentionEvent::Reconcile)
+        } else {
+            self.read_live_attention(view, now)
+        };
+        self.sync_attention_resources(snapshot);
+        self.painted_attention.set(snapshot);
+        let context = snapshot.map_or(context, |snapshot| snapshot.presentation);
         let sprite = sprite_frame_with_context(context, sprite_frame);
         if self.live_body.text().as_str() != sprite.as_ref() {
             self.live_body.set_text(sprite.as_ref());
@@ -3129,8 +3241,12 @@ impl OrganismRuntime {
         if was_enabled == enabled && old_motion == motion {
             return;
         }
-        runtime.hide_live_body(view);
-        runtime.sticky_avatar.set_visible(false);
+        // Effective Full/Calm changes only affect native cadence and frames.
+        // Preserve the core's original candidate/hold deadline and cooldown.
+        if !enabled || motion == OrganismMotion::Static {
+            runtime.hide_live_body(view);
+            runtime.sticky_avatar.set_visible(false);
+        }
         runtime.card.set_visible(enabled);
         if let Some(source) = runtime.surface_timer.borrow_mut().take() {
             source.remove();
@@ -3208,10 +3324,14 @@ impl OrganismRuntime {
     fn rearm_surface_tick_for_greeting(runtime: &Rc<Self>, view: &Rc<TermView>) {
         let Some(delay) = greeting_frame_delay(
             runtime.motion.get(),
-            greeting_remaining(
-                runtime.greeting_origin.get(),
-                runtime.interaction_epoch.elapsed(),
-            ),
+            runtime
+                .read_live_attention(view, Instant::now())
+                .and_then(|snapshot| snapshot.active)
+                .map(|active| {
+                    active
+                        .deadline
+                        .saturating_sub(runtime.presence.attention_epoch.elapsed())
+                }),
         ) else {
             return;
         };
@@ -3428,10 +3548,9 @@ impl OrganismRuntime {
                 runtime.motion.get(),
                 typing_hidden,
                 runtime.human_input_age(Instant::now()),
-                greeting_tail_remaining(
-                    runtime.greeting_origin.get(),
-                    runtime.interaction_epoch.elapsed(),
-                    greeting_visible,
+                painted_greeting_remaining(
+                    runtime.painted_attention.get().filter(|_| greeting_visible),
+                    runtime.presence.attention_epoch.elapsed(),
                 ),
             );
             // A synchronous settings callback may already have replaced the
@@ -4617,7 +4736,7 @@ mod tests {
             .unwrap();
         assert!(
             refresh
-                .find(".apply(self.interaction_epoch.elapsed(), context)")
+                .find("snapshot.map_or(context, |snapshot| snapshot.presentation)")
                 .unwrap()
                 < refresh.find("self.explain_body(Some(context))").unwrap()
         );
@@ -4824,6 +4943,26 @@ mod tests {
             libc::dlclose(xtst);
             libc::dlclose(x11);
         }
+    }
+
+    fn window_greeting_probe(
+        presence: &OrganismPresence,
+        token: OrganismPaneToken,
+    ) -> LiveAttentionOutcome {
+        let mut copy = presence.live_attention.borrow().clone();
+        copy.advance(
+            presence.attention_epoch.elapsed(),
+            &token,
+            LiveAttentionInput {
+                base_context: RenderContext::new(Behavior::Idle, BodyLanguage::default(), false),
+                hard_eligible: true,
+                hover_available: false,
+                pointer_inside: false,
+            },
+            LiveAttentionEvent::Explicit,
+        )
+        .expect("current owner")
+        .outcome
     }
 
     #[test]
@@ -5153,7 +5292,7 @@ mod tests {
                 ),
                 "candidate paint does not change body requisition"
             );
-            let greeting_before_press = presence.state.borrow().last_greeting;
+            let greeting_before_press = window_greeting_probe(&presence, token);
             native_pointer_button(true);
             let down_observed = wait_native_button(true);
             // Server mask observation is not the Capture event's dispatch.
@@ -5165,7 +5304,7 @@ mod tests {
                 .live_body
                 .has_css_class(POINTER_GREETING_CANDIDATE_CLASS);
             let explicit_rejected = runtime.say_hello(&view).is_err();
-            let cooldown_after_explicit = presence.state.borrow().last_greeting;
+            let cooldown_after_explicit = window_greeting_probe(&presence, token);
             let held_bounds = runtime.live_body.compute_bounds(&view.widget());
             if let Some(bounds) = held_bounds.as_ref() {
                 OrganismRuntime::observe_pointer(
@@ -5178,7 +5317,7 @@ mod tests {
             }
             let held_dwell_rejected = runtime.pointer_timer.borrow().is_none();
             settle(POINTER_GREETING_DWELL);
-            let cooldown_after_dwell = presence.state.borrow().last_greeting;
+            let cooldown_after_dwell = window_greeting_probe(&presence, token);
             native_pointer_button(false);
             let up_observed = wait_native_button(false);
             // Always release the fixture's native button before assertions,
@@ -5204,7 +5343,7 @@ mod tests {
             assert!(!pointer_buttons_down(&view));
             assert!(runtime.live_greeting_allowed(&view, Instant::now()));
             assert_eq!(
-                presence.state.borrow().last_greeting,
+                window_greeting_probe(&presence, token),
                 greeting_before_press,
                 "held refusals do not spend the shared cooldown"
             );
@@ -5213,20 +5352,22 @@ mod tests {
             move_native_pointer(&window, x, y);
             settle(Duration::from_millis(100));
             assert!(runtime.pointer_timer.borrow().is_some());
-            let source = runtime.pointer_timer.borrow().as_ref().unwrap().as_raw();
+            let source = runtime.pointer_timer.borrow().as_ref().unwrap().0.as_raw();
             move_native_pointer(&window, x + 1, y);
             settle(Duration::from_millis(40));
             assert_eq!(
-                runtime.pointer_timer.borrow().as_ref().unwrap().as_raw(),
+                runtime.pointer_timer.borrow().as_ref().unwrap().0.as_raw(),
                 source,
                 "motion within the hit zone never allocates another timer"
             );
             settle(POINTER_GREETING_DWELL);
-            let first = presence
-                .state
-                .borrow()
-                .last_greeting
+            let first_hold = runtime
+                .read_live_attention(&view, Instant::now())
+                .and_then(|snapshot| snapshot.active)
                 .expect("dwell admitted greeting");
+            assert_eq!(first_hold.source, LiveAttentionSource::Pointer);
+            let first = presence.attention_epoch
+                + first_hold.deadline.saturating_sub(GentleInteraction::HOLD);
             assert!(!runtime
                 .live_body
                 .has_css_class(POINTER_GREETING_CANDIDATE_CLASS));
@@ -5243,12 +5384,9 @@ mod tests {
             }
             assert_eq!(
                 runtime
-                    .interaction
-                    .borrow_mut()
-                    .apply(
-                        runtime.interaction_epoch.elapsed(),
-                        runtime.live_context.get()
-                    )
+                    .read_live_attention(&view, Instant::now())
+                    .unwrap()
+                    .presentation
                     .behavior,
                 Behavior::Approach
             );
@@ -5258,8 +5396,8 @@ mod tests {
             move_native_pointer(&window, x, y);
             settle(POINTER_GREETING_DWELL + Duration::from_millis(80));
             assert_eq!(
-                presence.state.borrow().last_greeting,
-                Some(first),
+                window_greeting_probe(&presence, token),
+                LiveAttentionOutcome::Rejected(LiveAttentionRejection::Cooldown),
                 "repeated entry respects the shared cooldown"
             );
             assert!(!runtime
@@ -5299,10 +5437,21 @@ mod tests {
             runtime.refresh_surface(&view, Instant::now());
             settle(Duration::from_millis(80));
             assert!(runtime.say_hello(&view).is_ok());
-            let explicit_at = presence.state.borrow().last_greeting;
-            assert!(runtime.explicit_greeting_active());
+            let explicit_hold = runtime
+                .read_live_attention(&view, Instant::now())
+                .unwrap()
+                .active
+                .unwrap();
+            let explicit_at = presence.attention_epoch
+                + explicit_hold
+                    .deadline
+                    .saturating_sub(GentleInteraction::HOLD);
+            assert!(runtime.explicit_greeting_active(&view));
             assert!(!runtime.pointer_near.get());
-            assert!(runtime.pointer_position.get().is_none());
+            assert!(runtime
+                .pointer_position
+                .get()
+                .is_none_or(|(x, y)| !runtime.pointer_within_body(&view, x, y)));
             move_native_pointer(&window, window.width() + 20, window.height() / 2);
             settle(Duration::from_millis(40));
             assert_eq!(
@@ -5314,11 +5463,11 @@ mod tests {
                 !pointer_buttons_down(&view),
                 "unknown native-surface state keeps explicit capability"
             );
-            runtime.pointer_departed();
+            runtime.pointer_departed(&view);
             OrganismRuntime::observe_pointer(&runtime, &view, 1.0, 1.0, false);
             runtime.refresh_surface(&view, Instant::now());
             assert!(
-                runtime.explicit_greeting_active(),
+                runtime.explicit_greeting_active(&view),
                 "pointer distance does not cancel explicit hello"
             );
             assert_eq!(
@@ -5326,7 +5475,13 @@ mod tests {
                 Some((Behavior::Approach, WatchRhythm::Steady))
             );
             assert!(runtime.say_hello(&view).is_err());
-            assert_eq!(presence.state.borrow().last_greeting, explicit_at);
+            assert_eq!(
+                runtime
+                    .read_live_attention(&view, Instant::now())
+                    .unwrap()
+                    .active,
+                Some(explicit_hold)
+            );
             let body = runtime.live_body.compute_bounds(&view.widget()).unwrap();
             let inside = (
                 f64::from(body.x() + body.width() / 2.0),
@@ -5336,11 +5491,15 @@ mod tests {
             assert!(runtime.pointer_near.get());
             assert!(runtime.pointer_timer.borrow().is_none());
             settle(
-                GentleInteraction::COOLDOWN.saturating_sub(explicit_at.unwrap().elapsed())
+                GentleInteraction::COOLDOWN.saturating_sub(explicit_at.elapsed())
                     + Duration::from_millis(40),
             );
             runtime.refresh_surface(&view, Instant::now());
-            assert!(runtime.greeting_origin.get().is_none());
+            assert!(runtime
+                .read_live_attention(&view, Instant::now())
+                .unwrap()
+                .active
+                .is_none());
             OrganismRuntime::observe_pointer(&runtime, &view, inside.0, inside.1, false);
             assert!(
                 runtime.pointer_timer.borrow().is_none(),
@@ -5348,7 +5507,11 @@ mod tests {
             );
             assert!(runtime.say_hello(&view).is_ok());
             runtime.cancel_pointer_greeting();
-            assert!(runtime.greeting_origin.get().is_none());
+            assert!(runtime
+                .read_live_attention(&view, Instant::now())
+                .unwrap()
+                .active
+                .is_none());
             assert!(
                 runtime.say_hello(&view).is_err(),
                 "cancellation preserves shared cooldown"
@@ -5446,8 +5609,8 @@ mod tests {
             }
         };
         runtime.last_human_input.set(None);
-        *runtime.interaction.borrow_mut() = GentleInteraction::default();
-        presence.state.borrow_mut().last_greeting = None;
+        *presence.live_attention.borrow_mut() = LiveAttention::default();
+        presence.live_attention.borrow_mut().set_owner(Some(token));
         runtime
             .activity
             .active_at
@@ -5458,12 +5621,190 @@ mod tests {
         if let Some(source) = runtime.surface_timer.borrow_mut().take() {
             source.remove();
         }
+        // The existing mapped native fixture now checks the shared-core
+        // adapter's resource and event boundaries, without another PTY/window.
+        let bounds = runtime.live_body.compute_bounds(&view.widget()).unwrap();
+        let near = (
+            f64::from(bounds.x() + bounds.width() / 2.0),
+            f64::from(bounds.y() + bounds.height() / 2.0),
+        );
+        runtime.pointer_departed(&view);
+        OrganismRuntime::observe_pointer(&runtime, &view, near.0, near.1, false);
+        let candidate = runtime
+            .read_live_attention(&view, Instant::now())
+            .unwrap()
+            .candidate
+            .unwrap();
+        let candidate_source = runtime.pointer_timer.borrow().as_ref().unwrap().0.as_raw();
+        for motion in [OrganismMotion::Calm, OrganismMotion::Full] {
+            OrganismRuntime::apply_settings(&runtime, &view, true, motion);
+            assert_eq!(
+                runtime
+                    .read_live_attention(&view, Instant::now())
+                    .unwrap()
+                    .candidate,
+                Some(candidate)
+            );
+            assert_eq!(
+                runtime.pointer_timer.borrow().as_ref().unwrap().0.as_raw(),
+                candidate_source,
+                "Full/Calm retains the same native dwell source and core deadline"
+            );
+        }
+        // Simulate an early native dispatch with the existing main context;
+        // the production callback must rearm the same ticket, not wait 900ms.
+        let (source, early_ticket) = runtime.pointer_timer.borrow_mut().take().unwrap();
+        source.remove();
+        let weak = Rc::downgrade(&runtime);
+        let view_weak = Rc::downgrade(&view);
+        let early = gtk::glib::timeout_add_local_once(Duration::from_millis(1), move || {
+            if let Some(runtime) = weak.upgrade() {
+                OrganismRuntime::finish_pointer_candidate(&runtime, &view_weak, early_ticket);
+            }
+        });
+        let early_id = early.as_raw();
+        *runtime.pointer_timer.borrow_mut() = Some((early, early_ticket));
+        settle(Duration::from_millis(10));
+        let pending = runtime.pointer_timer.borrow();
+        assert_eq!(pending.as_ref().unwrap().1, candidate.ticket);
+        assert_ne!(pending.as_ref().unwrap().0.as_raw(), early_id);
+        drop(pending);
+        assert_eq!(
+            runtime
+                .read_live_attention(&view, Instant::now())
+                .unwrap()
+                .candidate,
+            Some(candidate)
+        );
+
+        OrganismRuntime::observe_pointer(&runtime, &view, -500.0, -500.0, true);
+        assert!(
+            presence.live_attention.borrow().entry_ticket().is_none(),
+            "dragging exit still releases the real entry"
+        );
+        OrganismRuntime::observe_pointer(&runtime, &view, near.0, near.1, false);
+        let replacement = runtime
+            .read_live_attention(&view, Instant::now())
+            .unwrap()
+            .candidate
+            .unwrap();
+        assert_ne!(replacement.ticket, candidate.ticket);
+        let replacement_source = runtime.pointer_timer.borrow().as_ref().unwrap().0.as_raw();
+        OrganismRuntime::finish_pointer_candidate(
+            &runtime,
+            &Rc::downgrade(&view),
+            candidate.ticket,
+        );
+        assert!(runtime
+            .advance_live_attention(
+                &view,
+                Instant::now(),
+                LiveAttentionEvent::CandidateDue {
+                    ticket: candidate.ticket
+                }
+            )
+            .is_none());
+        assert_eq!(
+            runtime.pointer_timer.borrow().as_ref().unwrap().0.as_raw(),
+            replacement_source,
+            "both stale native dispatch and stale core event leave the new source alone"
+        );
+        assert!(runtime
+            .live_body
+            .has_css_class(POINTER_GREETING_CANDIDATE_CLASS));
+        runtime.cancel_pointer_greeting();
+        runtime.refresh_surface(&view, Instant::now());
+        OrganismRuntime::observe_pointer(&runtime, &view, near.0, near.1, false);
+        assert!(
+            runtime.pointer_timer.borrow().is_none(),
+            "stationary position sync after cancel cannot reenter"
+        );
+        assert!(presence.live_attention.borrow().entry_ticket().is_some());
+        OrganismRuntime::observe_pointer(&runtime, &view, -500.0, -500.0, false);
+        OrganismRuntime::observe_pointer(&runtime, &view, near.0, near.1, false);
+        assert!(runtime.pointer_timer.borrow().is_some());
+        runtime.cancel_pointer_greeting();
+
+        // Put the production core candidate exactly at an overdue boundary,
+        // then call the real explicit adapter before dispatching its source.
+        *presence.live_attention.borrow_mut() = LiveAttention::default();
+        presence.live_attention.borrow_mut().set_owner(Some(token));
+        let input = runtime.live_attention_input(&view, Instant::now());
+        let due_ticket = presence.live_attention.borrow().entry_offer().unwrap();
+        let due = presence
+            .live_attention
+            .borrow_mut()
+            .advance(
+                presence
+                    .attention_epoch
+                    .elapsed()
+                    .saturating_sub(LiveAttention::<OrganismPaneToken>::DWELL),
+                &token,
+                input,
+                LiveAttentionEvent::PointerEntered { ticket: due_ticket },
+            )
+            .unwrap();
+        assert!(due.candidate.is_some());
+        OrganismRuntime::schedule_pointer_candidate(&runtime, &view, due);
+        assert!(
+            runtime.say_hello(&view).is_ok(),
+            "explicit premeasurement must not accept an overdue hover first"
+        );
+        let explicit = runtime
+            .read_live_attention(&view, Instant::now())
+            .unwrap()
+            .active
+            .unwrap();
+        assert_eq!(explicit.source, LiveAttentionSource::Explicit);
+        assert!(runtime.pointer_timer.borrow().is_none());
+        for motion in [OrganismMotion::Calm, OrganismMotion::Full] {
+            OrganismRuntime::apply_settings(&runtime, &view, true, motion);
+            assert_eq!(
+                runtime
+                    .read_live_attention(&view, Instant::now())
+                    .unwrap()
+                    .active,
+                Some(explicit),
+                "Full/Calm never restarts or drops the accepted hold"
+            );
+        }
+        OrganismRuntime::apply_settings(&runtime, &view, true, OrganismMotion::Static);
+        assert!(runtime
+            .read_live_attention(&view, Instant::now())
+            .unwrap()
+            .active
+            .is_none());
+        assert_eq!(
+            window_greeting_probe(&presence, token),
+            LiveAttentionOutcome::Rejected(LiveAttentionRejection::Cooldown)
+        );
+        OrganismRuntime::apply_settings(&runtime, &view, true, OrganismMotion::Full);
+        assert!(
+            runtime.say_hello(&view).is_err(),
+            "Static cancellation preserves the shared cooldown"
+        );
+        runtime.cancel_pointer_greeting();
+        *presence.live_attention.borrow_mut() = LiveAttention::default();
+        presence.live_attention.borrow_mut().set_owner(Some(token));
+        runtime.pointer_departed(&view);
+        runtime.refresh_surface(&view, Instant::now());
+        if let Some(source) = runtime.surface_timer.borrow_mut().take() {
+            source.remove();
+        }
+        println!("LIVE_ATTENTION_ADAPTER full_calm_preserved=true early_ticket_rearmed=true stale_ticket_inert=true drag_exit_reentered=true explicit_wins_due=true static_kept_cooldown=true");
         OrganismRuntime::schedule_surface_frame(&runtime, &view, DORMANT_FRAME_INTERVAL);
         let dormant_source = runtime.surface_timer.borrow().as_ref().unwrap().as_raw();
         let frame_before = runtime.surface_frame.get();
         assert!(runtime.say_hello(&view).is_ok());
-        let accepted_origin = runtime.greeting_origin.get();
-        let accepted_at = presence.state.borrow().last_greeting.unwrap();
+        let accepted_origin = runtime
+            .read_live_attention(&view, Instant::now())
+            .unwrap()
+            .active;
+        let accepted_at = presence.attention_epoch
+            + accepted_origin
+                .unwrap()
+                .deadline
+                .saturating_sub(GentleInteraction::HOLD);
         let active_source = runtime.surface_timer.borrow().as_ref().unwrap().as_raw();
         assert_ne!(
             dormant_source, active_source,
@@ -5480,15 +5821,27 @@ mod tests {
             "an earlier pending source is never delayed"
         );
         assert!(runtime.say_hello(&view).is_err());
-        assert_eq!(runtime.greeting_origin.get(), accepted_origin);
-        assert_eq!(presence.state.borrow().last_greeting, Some(accepted_at));
+        assert_eq!(
+            runtime
+                .read_live_attention(&view, Instant::now())
+                .unwrap()
+                .active,
+            accepted_origin
+        );
+        assert_eq!(
+            window_greeting_probe(&presence, token),
+            LiveAttentionOutcome::Rejected(LiveAttentionRejection::Cooldown)
+        );
         settle(Duration::from_millis(160));
         assert!(
             runtime.surface_frame.get() > frame_before,
             "Full hello advances before a dormant interval elapses"
         );
         assert_eq!(
-            runtime.greeting_origin.get(),
+            runtime
+                .read_live_attention(&view, Instant::now())
+                .unwrap()
+                .active,
             accepted_origin,
             "frame scheduling does not restart the greeting"
         );
@@ -5496,12 +5849,19 @@ mod tests {
             GentleInteraction::HOLD.saturating_sub(accepted_at.elapsed())
                 + Duration::from_millis(80),
         );
-        assert!(runtime.greeting_origin.get().is_none());
+        assert!(runtime
+            .read_live_attention(&view, Instant::now())
+            .unwrap()
+            .active
+            .is_none());
         assert!(
             runtime.surface_timer_deadline.get().unwrap() > Instant::now() + SURFACE_FRAME_INTERVAL,
             "expiry restores dormant cadence"
         );
-        assert_eq!(presence.state.borrow().last_greeting, Some(accepted_at));
+        assert_eq!(
+            window_greeting_probe(&presence, token),
+            LiveAttentionOutcome::Rejected(LiveAttentionRejection::Cooldown)
+        );
 
         // A canceled greeting cannot resurrect or accelerate a later source.
         runtime.cancel_pointer_greeting();
@@ -5514,9 +5874,9 @@ mod tests {
         let source = runtime.surface_timer.borrow_mut().take().unwrap();
         source.remove();
         runtime.surface_timer_deadline.set(None);
-        runtime.greeting_origin.set(Some(GreetingOrigin::Explicit(
-            runtime.interaction_epoch.elapsed(),
-        )));
+        *presence.live_attention.borrow_mut() = LiveAttention::default();
+        presence.live_attention.borrow_mut().set_owner(Some(token));
+        assert!(runtime.say_hello(&view).is_ok());
         OrganismRuntime::rearm_surface_tick_for_greeting(&runtime, &view);
         assert!(
             runtime.surface_timer.borrow().is_none(),
@@ -8893,34 +9253,79 @@ mod tests {
         );
     }
 
+    fn accepted_core_snapshot(
+        source: LiveAttentionSource,
+        start: Duration,
+    ) -> (
+        LiveAttention<u64>,
+        LiveAttentionInput,
+        LiveAttentionSnapshot,
+    ) {
+        let mut core = LiveAttention::default();
+        core.set_owner(Some(1));
+        let input = LiveAttentionInput {
+            base_context: RenderContext::new(Behavior::Idle, BodyLanguage::default(), false),
+            hard_eligible: true,
+            hover_available: true,
+            pointer_inside: true,
+        };
+        let snapshot = match source {
+            LiveAttentionSource::Explicit => core
+                .advance(start, &1, input, LiveAttentionEvent::Explicit)
+                .unwrap(),
+            LiveAttentionSource::Pointer => {
+                let ticket = core.entry_offer().unwrap();
+                core.advance(
+                    start - LiveAttention::<u64>::DWELL,
+                    &1,
+                    input,
+                    LiveAttentionEvent::PointerEntered { ticket },
+                )
+                .unwrap();
+                core.advance(
+                    start,
+                    &1,
+                    input,
+                    LiveAttentionEvent::CandidateDue { ticket },
+                )
+                .unwrap()
+            }
+        };
+        assert_eq!(snapshot.outcome, LiveAttentionOutcome::Accepted(source));
+        (core, input, snapshot)
+    }
+
     #[test]
     fn greeting_origin_is_bounded_and_never_changes_between_pointer_and_explicit() {
-        for origin in [
-            GreetingOrigin::Pointer(Duration::from_secs(4)),
-            GreetingOrigin::Explicit(Duration::from_secs(4)),
-        ] {
+        for source in [LiveAttentionSource::Pointer, LiveAttentionSource::Explicit] {
+            let start = Duration::from_secs(4);
+            let (mut core, input, accepted) = accepted_core_snapshot(source, start);
+            let active = accepted.active.unwrap();
+            assert_eq!(active.deadline, start + GentleInteraction::HOLD);
+            assert_eq!(active.source, source);
+            let repeated = core
+                .advance(
+                    start + Duration::from_secs(1),
+                    &1,
+                    input,
+                    LiveAttentionEvent::Explicit,
+                )
+                .unwrap();
+            assert_eq!(repeated.active, Some(active));
             assert_eq!(
-                current_greeting_origin(Some(origin), Duration::from_secs(4)),
-                Some(origin)
+                repeated.outcome,
+                LiveAttentionOutcome::Rejected(LiveAttentionRejection::Cooldown)
             );
-            assert_eq!(
-                current_greeting_origin(Some(origin), Duration::from_millis(5_999)),
-                Some(origin)
-            );
-            assert_eq!(
-                current_greeting_origin(Some(origin), Duration::from_secs(6)),
-                None
-            );
-            assert_eq!(
-                current_greeting_origin(Some(origin), Duration::from_secs(60)),
-                None
-            );
-            assert_eq!(
-                current_greeting_origin(Some(origin), Duration::from_secs(3)),
-                None
-            );
+            let expired = core
+                .advance(active.deadline, &1, input, LiveAttentionEvent::Reconcile)
+                .unwrap();
+            assert!(expired.active.is_none());
+            assert!(core
+                .advance(start, &1, input, LiveAttentionEvent::Reconcile)
+                .unwrap()
+                .active
+                .is_none());
         }
-        assert_eq!(current_greeting_origin(None, Duration::from_secs(4)), None);
     }
 
     #[test]
@@ -8931,7 +9336,7 @@ mod tests {
             .split("fn live_greeting_allowed(")
             .nth(1)
             .unwrap()
-            .split("fn pointer_can_greet(")
+            .split("fn pointer_within_body(")
             .next()
             .unwrap();
         for required in [
@@ -8944,10 +9349,10 @@ mod tests {
             "pointer_buttons_down(view)",
             "HUMAN_INPUT_RETREAT",
             ".alt_screen",
-            "greeting_context_eligible",
         ] {
-            assert!(eligibility.contains(required));
+            assert!(eligibility.contains(required), "{required}");
         }
+        assert!(!eligibility.contains("pointer_position"));
         let explicit = production
             .split("fn say_hello(self: &Rc<Self>, view: &Rc<TermView>)")
             .nth(1)
@@ -8955,12 +9360,13 @@ mod tests {
             .split("fn observe_pointer(")
             .next()
             .unwrap();
-        assert!(explicit.contains("self.body_position.get().is_none()"));
-        assert!(explicit.contains("GentleInteraction::COOLDOWN"));
         assert!(
-            explicit.find("if !accepted").unwrap()
-                < explicit.find("GreetingOrigin::Explicit").unwrap()
+            explicit
+                .find("refresh_surface_with_attention(view, now, false)")
+                .unwrap()
+                < explicit.find("LiveAttentionEvent::Explicit").unwrap()
         );
+        assert!(!explicit.contains("LiveAttentionEvent::Reconcile"));
         for (start, end) in [
             (
                 "view.connect_human_input(",
@@ -8988,8 +9394,8 @@ mod tests {
             .split("fn live_greeting_allowed(")
             .next()
             .unwrap();
-        assert!(cancel.contains("self.greeting_origin.set(None)"));
-        assert!(cancel.contains("self.interaction.borrow_mut().cancel()"));
+        assert!(cancel.contains(".cancel(&self.presence_token)"));
+        assert!(!cancel.contains("pointer_position.set(None)"));
     }
 
     #[test]
@@ -9003,49 +9409,74 @@ mod tests {
             .split("fn install_pointer_observer(")
             .next()
             .unwrap();
-        let arm = observer
-            .find("*runtime.pointer_timer.borrow_mut() = Some(source);")
-            .unwrap();
-        let paint = observer
-            .find(".add_css_class(POINTER_GREETING_CANDIDATE_CLASS)")
-            .unwrap();
-        assert!(arm < paint);
-        assert!(
-            observer
-                .find("last.elapsed() < GentleInteraction::COOLDOWN")
-                .unwrap()
-                < arm
-        );
-        let consume = observer
-            .find("runtime.pointer_timer.borrow_mut().take();")
-            .unwrap();
-        assert!(
-            observer
-                .find(".remove_css_class(POINTER_GREETING_CANDIDATE_CLASS)")
-                .unwrap()
-                < consume
-        );
-        let cancel = production
-            .split("fn cancel_pointer_greeting(&self) {")
+        let callback = observer
+            .split("fn finish_pointer_candidate(")
             .nth(1)
-            .unwrap()
-            .split("fn pointer_can_greet(")
-            .next()
             .unwrap();
         assert!(
-            cancel
-                .find(".remove_css_class(POINTER_GREETING_CANDIDATE_CLASS)")
-                .unwrap()
-                < cancel
-                    .find("self.pointer_timer.borrow_mut().take()")
+            callback.find("*pending == ticket").unwrap()
+                < callback
+                    .find("runtime.pointer_timer.borrow_mut().take()")
                     .unwrap()
         );
+        assert!(callback.contains("LiveAttentionEvent::CandidateDue"));
+        assert!(callback.contains("refresh_surface_with_attention(&view, Instant::now(), false)"));
+        assert!(observer.contains("Some((source, candidate.ticket))"));
+        let resources = production
+            .split("fn sync_attention_resources(")
+            .nth(1)
+            .unwrap()
+            .split("fn advance_live_attention(")
+            .next()
+            .unwrap();
+        assert!(resources.contains("snapshot.candidate_visible"));
+        assert!(resources.contains("candidate.ticket != *ticket"));
         assert_eq!(
             production
                 .matches(".add_css_class(POINTER_GREETING_CANDIDATE_CLASS)")
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn live_attention_policy_is_window_shared_and_motion_changes_do_not_reset_it() {
+        let source = include_str!("organism_ui.rs");
+        let production = source.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        for removed in [
+            "last_greeting:",
+            "greeting_origin:",
+            "interaction_epoch:",
+            "interaction: RefCell<GentleInteraction>",
+            "enum GreetingOrigin",
+        ] {
+            assert!(!production.contains(removed), "obsolete policy: {removed}");
+        }
+        assert_eq!(
+            production
+                .matches("RefCell<LiveAttention<OrganismPaneToken>>")
+                .count(),
+            1
+        );
+        let settings = production
+            .split("fn apply_settings(")
+            .nth(1)
+            .unwrap()
+            .split("fn start_surface_tick(")
+            .next()
+            .unwrap();
+        assert!(settings.contains("if !enabled || motion == OrganismMotion::Static"));
+        assert!(!settings.contains("LiveAttention::default"));
+        assert!(!settings.contains("LiveAttentionEvent::Explicit"));
+        let refresh = production
+            .split("fn refresh_surface_with_attention(")
+            .nth(1)
+            .unwrap()
+            .split("fn apply_settings(")
+            .next()
+            .unwrap();
+        assert!(!refresh.contains("LiveAttentionEvent::PointerEntered"));
+        assert!(!refresh.contains("LiveAttentionEvent::PointerLeft"));
     }
 
     #[test]
@@ -9183,32 +9614,6 @@ mod tests {
 
     #[test]
     fn live_interaction_deadlines_preserve_motion_and_exact_boundaries() {
-        let start = Duration::from_secs(5);
-        for origin in [
-            GreetingOrigin::Pointer(start),
-            GreetingOrigin::Explicit(start),
-        ] {
-            assert_eq!(
-                greeting_remaining(Some(origin), start),
-                Some(GentleInteraction::HOLD)
-            );
-            assert_eq!(
-                greeting_remaining(Some(origin), start + Duration::from_millis(1_999)),
-                Some(Duration::from_millis(1))
-            );
-            assert_eq!(
-                greeting_remaining(Some(origin), start + GentleInteraction::HOLD),
-                None
-            );
-            assert_eq!(
-                greeting_remaining(Some(origin), start + Duration::from_secs(9)),
-                None
-            );
-            assert_eq!(
-                greeting_remaining(Some(origin), start - Duration::from_millis(1)),
-                None
-            );
-        }
         for motion in [
             OrganismMotion::Full,
             OrganismMotion::Calm,
@@ -9256,20 +9661,21 @@ mod tests {
 
     #[test]
     fn greeting_tail_crossing_gets_one_cleanup_then_returns_to_dormant() {
-        let start = Duration::from_secs(4);
-        for origin in [
-            GreetingOrigin::Pointer(start),
-            GreetingOrigin::Explicit(start),
-        ] {
-            // First clock read belongs to the refresh which still paints the
-            // greeting. Rendering crosses its end before the fresh tail read.
-            let retained =
-                current_greeting_origin(Some(origin), start + Duration::from_millis(1_999));
-            assert_eq!(retained, Some(origin));
+        for source in [LiveAttentionSource::Pointer, LiveAttentionSource::Explicit] {
+            let start = Duration::from_secs(4);
+            let (mut core, input, _) = accepted_core_snapshot(source, start);
+            let retained = core
+                .advance(
+                    start + Duration::from_millis(1_999),
+                    &1,
+                    input,
+                    LiveAttentionEvent::Reconcile,
+                )
+                .unwrap();
             let tail_now = start + Duration::from_millis(2_001);
-            assert_eq!(greeting_remaining(retained, tail_now), None);
+            assert!(core.snapshot(tail_now, &1, input).unwrap().active.is_none());
             assert_eq!(
-                greeting_tail_remaining(retained, tail_now, true),
+                painted_greeting_remaining(Some(retained), tail_now),
                 Some(Duration::ZERO)
             );
             for motion in [
@@ -9277,17 +9683,18 @@ mod tests {
                 OrganismMotion::Calm,
                 OrganismMotion::Static,
             ] {
-                for visible_owner in [false, true] {
-                    let delay = interaction_frame_delay(
-                        DORMANT_FRAME_INTERVAL,
-                        motion,
-                        false,
-                        None,
-                        greeting_tail_remaining(retained, tail_now, visible_owner),
-                    );
+                for visible in [false, true] {
+                    let remaining =
+                        painted_greeting_remaining(visible.then_some(retained), tail_now);
                     assert_eq!(
-                        delay,
-                        if motion == OrganismMotion::Full && visible_owner {
+                        interaction_frame_delay(
+                            DORMANT_FRAME_INTERVAL,
+                            motion,
+                            false,
+                            None,
+                            remaining
+                        ),
+                        if motion == OrganismMotion::Full && visible {
                             Duration::from_millis(1)
                         } else {
                             DORMANT_FRAME_INTERVAL
@@ -9295,34 +9702,28 @@ mod tests {
                     );
                 }
             }
-            let cleared = current_greeting_origin(retained, tail_now + Duration::from_millis(1));
-            assert_eq!(cleared, None);
+            let cleared = core
+                .advance(
+                    tail_now + Duration::from_millis(1),
+                    &1,
+                    input,
+                    LiveAttentionEvent::Reconcile,
+                )
+                .unwrap();
+            assert_eq!(painted_greeting_remaining(Some(cleared), tail_now), None);
             assert_eq!(
                 interaction_frame_delay(
                     DORMANT_FRAME_INTERVAL,
                     OrganismMotion::Full,
                     false,
                     None,
-                    greeting_tail_remaining(cleared, tail_now, true),
+                    painted_greeting_remaining(Some(cleared), tail_now)
                 ),
-                DORMANT_FRAME_INTERVAL,
-                "no stale origin means no millisecond polling loop"
-            );
-            assert_eq!(
-                greeting_tail_remaining(Some(origin), start + GentleInteraction::HOLD, true),
-                Some(Duration::ZERO)
-            );
-            assert_eq!(
-                greeting_tail_remaining(Some(origin), start - Duration::from_millis(1), true),
-                None
-            );
-            assert_eq!(
-                greeting_tail_remaining(Some(origin), start + Duration::from_millis(1_999), true),
-                Some(Duration::from_millis(1))
+                DORMANT_FRAME_INTERVAL
             );
         }
         assert_eq!(
-            greeting_tail_remaining(None, Duration::from_secs(99), true),
+            painted_greeting_remaining(None, Duration::from_secs(99)),
             None
         );
     }
@@ -9332,13 +9733,14 @@ mod tests {
         let source = include_str!("organism_ui.rs");
         let production = source.split("#[cfg(test)]\nmod tests {").next().unwrap();
         let refresh = production
-            .split("fn refresh_surface(")
+            .split("fn refresh_surface_with_attention(")
             .nth(1)
             .unwrap()
             .split("fn apply_settings(")
             .next()
             .unwrap();
-        assert!(refresh.contains("self.greeting_origin.set(current_greeting_origin("));
+        assert!(refresh.contains("self.painted_attention.set(snapshot)"));
+        assert!(refresh.contains("self.live_context.set(context)"));
         let tail = production
             .split("let greeting_visible =")
             .nth(1)
@@ -9346,24 +9748,17 @@ mod tests {
             .split("// A synchronous settings callback")
             .next()
             .unwrap();
-        for gate in [
+        for required in [
             "runtime.presence.is_owner",
             "!view.live_organism_surface_metrics().alt_screen",
             "runtime.live_body.is_mapped()",
-            "greeting_tail_remaining(",
-            "runtime.greeting_origin.get()",
-            "runtime.interaction_epoch.elapsed()",
+            "painted_greeting_remaining(",
+            "runtime.painted_attention.get().filter",
+            "runtime.presence.attention_epoch.elapsed()",
         ] {
-            assert!(tail.contains(gate), "{gate}");
+            assert!(tail.contains(required), "{required}");
         }
-        let driver = production
-            .split("fn schedule_surface_frame(")
-            .nth(1)
-            .unwrap();
-        assert!(
-            driver.find("runtime.refresh_surface(&view, now)").unwrap()
-                < driver.find("greeting_tail_remaining(").unwrap()
-        );
+        assert!(!tail.contains("advance_live_attention"));
         let rearm = production
             .split("fn rearm_surface_tick_for_greeting(")
             .nth(1)
@@ -9371,8 +9766,8 @@ mod tests {
             .split("fn schedule_surface_frame(")
             .next()
             .unwrap();
-        assert!(rearm.contains("greeting_remaining("));
-        assert!(!rearm.contains("greeting_tail_remaining("));
+        assert!(rearm.contains("read_live_attention"));
+        assert!(!rearm.contains("painted_attention"));
     }
 
     #[test]
@@ -9457,7 +9852,7 @@ mod tests {
             .next()
             .unwrap();
         assert!(
-            explicit.find("if !accepted").unwrap()
+            explicit.find("match snapshot.outcome").unwrap()
                 < explicit
                     .find("Self::rearm_surface_tick_for_greeting(self, view)")
                     .unwrap()
@@ -9469,7 +9864,7 @@ mod tests {
             .split("fn install_pointer_observer(")
             .next()
             .unwrap();
-        assert!(pointer.contains("Self::rearm_surface_tick_for_greeting(&runtime, &view)"));
+        assert!(pointer.contains("Self::rearm_surface_tick_for_greeting(runtime, &view)"));
         let rearm = production
             .split("fn rearm_surface_tick_for_greeting(")
             .nth(1)
@@ -9503,6 +9898,9 @@ mod tests {
             assert!(typing.contains(gate), "missing typing-retreat gate: {gate}");
         }
         let callback = production
+            .split("fn schedule_surface_frame(")
+            .nth(1)
+            .unwrap()
             .split("let source = gtk::glib::timeout_add_local_once(delay, move || {")
             .nth(1)
             .unwrap();

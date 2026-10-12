@@ -35,8 +35,8 @@
               outputHashes = {
                 # d1d3bc2251f3fba4468f689a655a932e00a83d86
                 "jagent-0.7.0" = "sha256-Fv9nytvUJWAatoq2Zb14TN6jhh/eKx1spOQ9mz+65ZU=";
-                # eb4b5db17acb1591c87cd5489d595952b2f55c42
-                "jterm_core-0.2.0" = "sha256-moL6YrCQY+vRfkFTsI3W6FovfDd1lTXSaN1qhacWg3g=";
+                # 9db447630d7a612c64eb8e3ff29715fa107ebbc8
+                "jterm_core-0.2.0" = "sha256-5BTFrHbBQQb8BJmRxanzbMFRLiGm/yvG1vJJVlRvMlQ=";
               };
             };
             strictDeps = true;
