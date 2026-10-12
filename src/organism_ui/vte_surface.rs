@@ -753,7 +753,7 @@ fn fixture_state(surface: &VteCompanion, terminal: &vte4::Terminal) -> String {
             .is_some_and(|focus| focus == root || focus.is_ancestor(root))
     });
     format!(
-        "root_mapped={} card_mapped={} glyph_mapped={} window_active={} terminal_has_focus={} terminal_is_focus={} focus_in_root={} geometry={} source={} paint={} idle={} root_size={:?} glyph_size={:?} frame={} revision={}",
+        "root_mapped={} card_mapped={} glyph_mapped={} window_active={} terminal_has_focus={} terminal_is_focus={} focus_in_root={} geometry={} source={} paint={} idle={} root_size={:?} glyph_size={:?} frame={} revision={} focus_type={:?} candidate_opacity={:?} controller_contains_focus={:?}",
         root.as_ref().is_some_and(|root| root.is_mapped()),
         surface.card.is_mapped(),
         surface.glyph.is_mapped(),
@@ -768,7 +768,16 @@ fn fixture_state(surface: &VteCompanion, terminal: &vte4::Terminal) -> String {
         root.as_ref().map(|root| (root.width(), root.height())),
         (surface.glyph.width(), surface.glyph.height()),
         surface.frame.get(),
-        surface.revision.get()
+        surface.revision.get(),
+        focus.as_ref().map(|widget| widget.type_().name()),
+        surface.candidates.each_ref().map(|candidate| candidate.opacity()),
+        root.as_ref().map(|root| {
+            let controllers = root.observe_controllers();
+            (0..controllers.n_items()).filter_map(|index| {
+                controllers.item(index).and_then(|controller| controller.downcast::<gtk::EventControllerFocus>().ok())
+                    .map(|controller| controller.contains_focus())
+            }).collect::<Vec<_>>()
+        })
     )
 }
 
@@ -1485,9 +1494,55 @@ fn exercise_expanded_presentation(
         assert!(surface.source.borrow().is_none());
         assert_eq!(requisition(), expanded_req);
     }
-    assert!(entry.grab_focus());
-    settle(Duration::from_millis(40));
-    assert!(surface.candidates.iter().all(|c| c.opacity() == 0.0));
+    let entry_has_native_focus = || {
+        surface
+            .current_host()
+            .and_then(|window| gtk::prelude::RootExt::focus(&window))
+            .is_some_and(|focus| {
+                focus == *entry.upcast_ref::<gtk::Widget>() || focus.is_ancestor(entry)
+            })
+            && !terminal.has_focus()
+    };
+    println!(
+        "VTE_EXPANDED_BLUR before {}",
+        fixture_state(surface, terminal)
+    );
+    assert!(entry.grab_focus(), "{}", fixture_state(surface, terminal));
+    println!(
+        "VTE_EXPANDED_BLUR immediate entry_focus={} {}",
+        entry_has_native_focus(),
+        fixture_state(surface, terminal)
+    );
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !entry_has_native_focus() && Instant::now() < deadline {
+        settle(Duration::from_millis(10));
+    }
+    assert!(
+        entry_has_native_focus(),
+        "Entry did not acquire native focus: {}",
+        fixture_state(surface, terminal)
+    );
+    let _ = settled_fixture_layout(surface, &view.widget(), terminal, settle);
+    println!(
+        "VTE_EXPANDED_BLUR settled entry_focus={} {}",
+        entry_has_native_focus(),
+        fixture_state(surface, terminal)
+    );
+    assert!(
+        entry_has_native_focus(),
+        "Entry lost focus while layout settled: {}",
+        fixture_state(surface, terminal)
+    );
+    assert!(
+        surface.candidates.iter().all(|c| c.opacity() == 0.0),
+        "{}",
+        fixture_state(surface, terminal)
+    );
+    assert!(
+        surface.source.borrow().is_none(),
+        "Static blur must have no timer: {}",
+        fixture_state(surface, terminal)
+    );
     surface.set_expanded(false); // A late action cannot operate on the unfocused pane.
     assert!(surface.expanded.get());
     assert_eq!(requisition(), expanded_req);
