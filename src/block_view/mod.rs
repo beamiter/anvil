@@ -28,6 +28,7 @@ use jterm_core::kitty_keyboard::{
 use jterm_core::terminal_report::{classify_terminal_report, TerminalReport};
 use jterm_core::wheel::WheelAccumulator;
 
+mod activity_knowledge;
 mod alt_screen;
 mod ansi;
 mod blocks;
@@ -3422,6 +3423,7 @@ type AgentExecutionLostCallbacks =
     Rc<RefCell<Vec<Box<dyn Fn(crate::agent::AgentExecutionRef, &'static str)>>>>;
 type CommandStartedCallbacks = Rc<RefCell<Vec<Box<dyn Fn(CommandStartedEvent)>>>>;
 type CommandFinishedCallbacks = Rc<RefCell<Vec<Box<dyn Fn(CommandFinishedEvent)>>>>;
+type PromptEvidenceInvalidatedCallbacks = Rc<RefCell<Vec<Rc<dyn Fn()>>>>;
 type HumanInputCallbacks = Rc<RefCell<Vec<Box<dyn Fn(HumanInputKind)>>>>;
 type AltScreenCallbacks = Rc<RefCell<Vec<Box<dyn Fn(AltScreenTransition)>>>>;
 
@@ -3641,9 +3643,66 @@ struct VerifiedSubmissionCtx {
     armed_agent_execution: Rc<RefCell<Option<ArmedAgentExecution>>>,
     agent_execution_supported: Rc<Cell<bool>>,
     agent_execution_lost_callbacks: AgentExecutionLostCallbacks,
+    // Only known prompt-proof loss edges, never output/human activity or a
+    // prompt-restoration notification. Fan-out releases this list first.
+    prompt_evidence_invalidated: PromptEvidenceInvalidatedCallbacks,
 }
 
 impl VerifiedSubmissionCtx {
+    fn notify_prompt_evidence_invalidated(&self) {
+        let callbacks = self.prompt_evidence_invalidated.borrow().clone();
+        for callback in callbacks {
+            callback();
+        }
+    }
+
+    fn organism_activity_knowledge(
+        &self,
+        fullscreen: bool,
+        active_agent_execution: bool,
+    ) -> jterm_core::organism_live::LiveActivityKnowledge {
+        let state = self.bstate.get();
+        // End every field borrow before the existing proof reads the native
+        // cursor/suffix. Queue emptiness is not evidence of kernel typeahead.
+        let typed_shadow_empty = self.typed_cmd.borrow().is_empty();
+        let reviewed_submission_pending =
+            self.submission.borrow().is_some() || self.source_id.borrow().is_some();
+        let agent_execution_pending =
+            active_agent_execution || self.armed_agent_execution.borrow().is_some();
+        let prompt_verified_empty = state == BlockState::AwaitingCommand
+            && typed_shadow_empty
+            && !reviewed_submission_pending
+            && !agent_execution_pending
+            && self.command_prompt_status(fullscreen).is_ready();
+        activity_knowledge::activity_knowledge(activity_knowledge::ActivityFacts {
+            state,
+            prompt_verified_empty,
+            typed_shadow_empty,
+            reviewed_submission_pending,
+            agent_execution_pending,
+        })
+    }
+
+    fn write_prompt_input_bytes(&self, data: &[u8]) {
+        let awaiting = self.bstate.get() == BlockState::AwaitingCommand;
+        // Keep the existing typed-shadow/rollback semantics; a bare Enter
+        // invalidates prompt evidence but is not text and not human activity.
+        if awaiting && data.iter().any(|byte| !matches!(byte, b'\r' | b'\n')) {
+            append_typed_command_shadow(
+                &mut self.typed_cmd.borrow_mut(),
+                &String::from_utf8_lossy(data),
+            );
+        }
+        if let Err(error) = self.pty.try_write_bytes(data) {
+            log::warn!("PTY input queue rejected {} byte(s): {error}", error.len());
+            return;
+        }
+        if awaiting && !data.is_empty() {
+            self.idle_input_dirty.set(true);
+            self.notify_prompt_evidence_invalidated();
+        }
+    }
+
     fn current_anchor(&self, surface: &dyn SubmissionSurface) -> (i64, i64) {
         surface.prompt_anchor(self.prompt_end_pos.get(), self.prompt_anchor_rows.get())
     }
@@ -3746,6 +3805,7 @@ impl VerifiedSubmissionCtx {
         *self.typed_cmd.borrow_mut() = recall.echo_text;
         self.idle_input_dirty.set(true);
         self.pty_synced.set(true);
+        self.notify_prompt_evidence_invalidated();
         true
     }
 
@@ -3913,6 +3973,7 @@ impl VerifiedSubmissionCtx {
             glib::ControlFlow::Break
         });
         *self.source_id.borrow_mut() = Some(source);
+        self.notify_prompt_evidence_invalidated();
         Ok(())
     }
 
@@ -6213,6 +6274,9 @@ impl ReaderCtx {
             mouse_reporting: config.mouse_reporting_enabled,
             focus_reporting: config.focus_reporting_enabled,
         });
+        drop(config);
+        self.verified_submission
+            .notify_prompt_evidence_invalidated();
     }
 
     fn parse_and_dispatch(&self, bytes: &[u8]) {
@@ -6817,6 +6881,8 @@ impl ReaderCtx {
         }
         self.bstate_rc.set(BlockState::CollectingPrompt);
         self.engine.borrow_mut().prompt_buf.clear();
+        self.verified_submission
+            .notify_prompt_evidence_invalidated();
         // Live VTE collapses back to the compact input cell
         // now that no command is running. Sync the PTY size
         // so the shell sees the new winsize before it reads
@@ -12196,6 +12262,7 @@ impl TermView {
             armed_agent_execution: armed_agent_execution.clone(),
             agent_execution_supported: agent_execution_supported.clone(),
             agent_execution_lost_callbacks,
+            prompt_evidence_invalidated: Rc::new(RefCell::new(Vec::new())),
         };
         let block_start_time: Rc<Cell<Option<SystemTime>>> = Rc::new(Cell::new(None));
         let visible_indices: Rc<RefCell<std::collections::HashSet<usize>>> =
@@ -14193,15 +14260,16 @@ impl TermView {
     }
 
     fn write_input_bytes(&self, data: &[u8]) {
-        if self.bstate.get() == BlockState::AwaitingCommand
-            && data.iter().any(|byte| !matches!(byte, b'\r' | b'\n'))
-        {
-            append_typed_command_shadow(
-                &mut self.typed_cmd.borrow_mut(),
-                &String::from_utf8_lossy(data),
-            );
-        }
-        self.pty.write_bytes(data);
+        self.verified_submission.write_prompt_input_bytes(data);
+    }
+
+    pub(crate) fn organism_activity_knowledge(
+        &self,
+    ) -> jterm_core::organism_live::LiveActivityKnowledge {
+        self.verified_submission.organism_activity_knowledge(
+            self.fullscreen.get(),
+            self.active_agent_execution.get().is_some(),
+        )
     }
 
     /// Content-free, constant-time lifecycle boundary for passive UI. Unknown
@@ -14757,6 +14825,15 @@ impl TermView {
 
     pub fn connect_activity<F: Fn() + 'static>(&self, f: F) {
         self.activity_callbacks.borrow_mut().push(Box::new(f));
+    }
+
+    /// Observe an established prompt proof becoming invalid. This is neither
+    /// human activity nor shell output; restoration emits no synthetic entry.
+    pub(crate) fn connect_prompt_evidence_invalidated<F: Fn() + 'static>(&self, f: F) {
+        self.verified_submission
+            .prompt_evidence_invalidated
+            .borrow_mut()
+            .push(Rc::new(f));
     }
 
     /// Observe accepted direct-human PTY input without exposing its contents.
@@ -16124,6 +16201,45 @@ pub(crate) fn organism_settings_test_view() -> Rc<TermView> {
     view.bstate.set(BlockState::AwaitingCommand);
     view.block_onboarding.history_resolved(false);
     view
+}
+
+// The nonexecuting display fixture has no shell to emit PromptEnd. Seed its
+// authenticated boundary fields against the actual native editor; ReaderHarness
+// separately exercises real A/B/C/RIS dispatch and the anchor-settle backend.
+#[cfg(test)]
+pub(crate) fn organism_settings_test_clean_prompt(view: &TermView) {
+    let ctx = &view.verified_submission;
+    let surface = ctx.surface.upgrade().expect("live fixture surface");
+    ctx.bstate.set(BlockState::AwaitingCommand);
+    ctx.typed_cmd.borrow_mut().clear();
+    ctx.idle_input_dirty.set(false);
+    ctx.pty_synced.set(false);
+    ctx.prompt_end_pos.set(surface.cursor_position());
+    ctx.prompt_anchor_rows.set(surface.row_count());
+    ctx.prompt_anchor_ready.set(true);
+    assert_eq!(
+        view.organism_activity_knowledge(),
+        jterm_core::organism_live::LiveActivityKnowledge::KnownIdle
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn organism_settings_test_reviewed_invalidation(view: &TermView) {
+    let ctx = &view.verified_submission;
+    let notices = Rc::new(Cell::new(0));
+    let seen = notices.clone();
+    view.connect_prompt_evidence_invalidated(move || seen.set(seen.get() + 1));
+    ctx.begin("echo reviewed", None)
+        .expect("verified fixture submission");
+    assert_eq!(notices.get(), 1);
+    assert!(ctx.submission.borrow().is_some() && ctx.source_id.borrow().is_some());
+    assert_eq!(
+        view.organism_activity_knowledge(),
+        jterm_core::organism_live::LiveActivityKnowledge::Unknown
+    );
+    assert!(ctx.cancel_if_pending("fixture retires its pending verification"));
+    assert!(ctx.submission.borrow().is_none() && ctx.source_id.borrow().is_none());
+    assert_eq!(notices.get(), 1, "cancellation is not prompt restoration");
 }
 
 #[cfg(test)]
@@ -18885,6 +19001,7 @@ mod tests {
                 armed_agent_execution: armed_agent_execution.clone(),
                 agent_execution_supported: agent_execution_supported.clone(),
                 agent_execution_lost_callbacks: agent_lost_callbacks.clone(),
+                prompt_evidence_invalidated: Rc::new(RefCell::new(Vec::new())),
             };
 
             let ctx = ReaderCtx {
@@ -19028,6 +19145,249 @@ mod tests {
             self.backend.take_calls();
             anchor
         }
+    }
+
+    #[test]
+    fn reader_prompt_knowledge_cr_late_command_and_new_prompt_never_replay_hover() {
+        use jterm_core::organism::{Behavior, BodyLanguage, RenderContext};
+        use jterm_core::organism_live::{
+            LiveActivityKnowledge, LiveAttention, LiveAttentionEvent, LiveAttentionInput,
+        };
+        let harness = ReaderHarness::new();
+        let ctx = Rc::new(harness.ctx.verified_submission.clone());
+        assert_eq!(
+            ctx.organism_activity_knowledge(false, false),
+            LiveActivityKnowledge::Unknown
+        );
+        harness.arm_verified_prompt();
+        let input = |activity| LiveAttentionInput {
+            base_context: RenderContext::new(Behavior::Idle, BodyLanguage::default(), false),
+            activity,
+            hard_eligible: true,
+            hover_available: true,
+            pointer_inside: true,
+        };
+        assert_eq!(
+            ctx.organism_activity_knowledge(false, false),
+            LiveActivityKnowledge::KnownIdle
+        );
+        assert!(
+            !ctx.agent_execution_supported.get(),
+            "idle evidence does not require Agent capability"
+        );
+        harness.surface.reads.borrow_mut().clear();
+        assert_eq!(
+            ctx.organism_activity_knowledge(false, true),
+            LiveActivityKnowledge::Unknown
+        );
+        assert!(
+            harness.surface.reads().is_empty(),
+            "known pending work skips native proof reads"
+        );
+        *ctx.typed_cmd.borrow_mut() = " ".to_string();
+        assert_eq!(
+            ctx.organism_activity_knowledge(false, false),
+            LiveActivityKnowledge::Unknown
+        );
+        assert!(
+            harness.surface.reads().is_empty(),
+            "even whitespace in observed typeahead is uncertain"
+        );
+        ctx.typed_cmd.borrow_mut().clear();
+        let core = Rc::new(RefCell::new(LiveAttention::default()));
+        core.borrow_mut().set_owner(Some(1));
+        let ticket = core.borrow().entry_offer().unwrap();
+        core.borrow_mut()
+            .advance(
+                Duration::ZERO,
+                &1,
+                input(LiveActivityKnowledge::KnownIdle),
+                LiveAttentionEvent::PointerEntered { ticket },
+            )
+            .unwrap();
+        let observed = Rc::new(RefCell::new(Vec::new()));
+        let at = Rc::new(Cell::new(Duration::from_millis(599)));
+        {
+            let ctx_weak = Rc::downgrade(&ctx);
+            let core = core.clone();
+            let observed = observed.clone();
+            let at = at.clone();
+            ctx.prompt_evidence_invalidated
+                .borrow_mut()
+                .push(Rc::new(move || {
+                    let ctx = ctx_weak.upgrade().unwrap();
+                    let knowledge = ctx.organism_activity_knowledge(false, false);
+                    // No emitter may call this before its proof actually became invalid.
+                    assert_ne!(knowledge, LiveActivityKnowledge::KnownIdle);
+                    observed.borrow_mut().push(knowledge);
+                    core.borrow_mut()
+                        .advance(
+                            at.get(),
+                            &1,
+                            input(knowledge),
+                            LiveAttentionEvent::Reconcile,
+                        )
+                        .unwrap();
+                }));
+        }
+        ctx.write_prompt_input_bytes(b"\r");
+        assert!(ctx.idle_input_dirty.get());
+        assert!(
+            ctx.typed_cmd.borrow().is_empty(),
+            "Enter is not typed shadow text"
+        );
+        assert!(
+            !ctx.pty_synced.get(),
+            "preserve existing shadow/sync semantics"
+        );
+        assert_eq!(
+            observed.borrow().as_slice(),
+            [LiveActivityKnowledge::Unknown]
+        );
+        assert!(core
+            .borrow()
+            .snapshot(at.get(), &1, input(LiveActivityKnowledge::Unknown))
+            .unwrap()
+            .candidate
+            .is_none());
+        assert_eq!(harness.pty.drain_test_slave(PTY_REPLY_WAIT), b"\r");
+        at.set(Duration::from_millis(600));
+        harness.feed(dispatch_command_start(Some("late command")));
+        assert_eq!(
+            ctx.organism_activity_knowledge(false, false),
+            LiveActivityKnowledge::Busy
+        );
+        harness.feed(dispatch_command_end(Some(0)));
+        assert_eq!(
+            ctx.organism_activity_knowledge(false, false),
+            LiveActivityKnowledge::Unknown
+        );
+        harness.arm_verified_prompt();
+        assert_eq!(
+            ctx.organism_activity_knowledge(false, false),
+            LiveActivityKnowledge::KnownIdle
+        );
+        assert_eq!(
+            observed.borrow().len(),
+            2,
+            "only A invalidates; B/fence recovery emits no event"
+        );
+        let restored = core
+            .borrow_mut()
+            .advance(
+                at.get(),
+                &1,
+                input(LiveActivityKnowledge::KnownIdle),
+                LiveAttentionEvent::Reconcile,
+            )
+            .unwrap();
+        assert!(restored.candidate.is_none() && restored.active.is_none());
+        assert!(core
+            .borrow_mut()
+            .advance(
+                at.get(),
+                &1,
+                input(LiveActivityKnowledge::KnownIdle),
+                LiveAttentionEvent::CandidateDue { ticket }
+            )
+            .is_err());
+        harness.feed(ParserEvent::HardReset);
+        assert_eq!(
+            ctx.organism_activity_knowledge(false, false),
+            LiveActivityKnowledge::Unknown
+        );
+        assert!(
+            !ctx.idle_input_dirty.get(),
+            "RIS clears dirty but cannot establish an idle prompt"
+        );
+        assert_eq!(observed.borrow().len(), 3);
+    }
+
+    #[test]
+    fn prompt_evidence_notifications_follow_successful_admission_only() {
+        use jterm_core::organism_live::LiveActivityKnowledge;
+        let harness = ReaderHarness::new();
+        harness.arm_verified_prompt();
+        let ctx = &harness.ctx.verified_submission;
+        let notices = Rc::new(Cell::new(0));
+        let seen = notices.clone();
+        ctx.prompt_evidence_invalidated
+            .borrow_mut()
+            .push(Rc::new(move || seen.set(seen.get() + 1)));
+        ctx.write_prompt_input_bytes(b"");
+        assert!(ctx.begin("echo one\necho two", None).is_err());
+        assert!(!ctx.try_recall_command("echo one\necho two", false));
+        assert_eq!(notices.get(), 0);
+        assert!(ctx.try_recall_command("echo recalled", false));
+        assert_eq!(notices.get(), 1);
+        assert_eq!(
+            ctx.organism_activity_knowledge(false, false),
+            LiveActivityKnowledge::Unknown
+        );
+        assert_eq!(ctx.typed_cmd.borrow().as_str(), "echo recalled");
+        assert!(ctx.idle_input_dirty.get() && ctx.pty_synced.get());
+        harness.arm_verified_prompt();
+        let before_closed = notices.get();
+        harness.pty.kill();
+        ctx.write_prompt_input_bytes(b"\r");
+        assert!(ctx.begin("echo closed", None).is_err());
+        assert!(!ctx.try_recall_command("echo closed", false));
+        assert_eq!(
+            notices.get(),
+            before_closed,
+            "rejected queues have no success notification"
+        );
+        assert!(!ctx.idle_input_dirty.get() && !ctx.pty_synced.get());
+        assert!(ctx.typed_cmd.borrow().is_empty());
+    }
+
+    #[test]
+    fn prompt_evidence_invalidation_has_only_post_mutation_loss_hooks() {
+        let source = include_str!("mod.rs");
+        let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+        let compact: String = production.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(
+            compact
+                .matches("self.notify_prompt_evidence_invalidated();")
+                .count(),
+            3
+        );
+        assert_eq!(
+            compact
+                .matches("self.verified_submission.notify_prompt_evidence_invalidated();")
+                .count(),
+            2
+        );
+        for sequence in [
+            "ifawaiting&&!data.is_empty(){self.idle_input_dirty.set(true);self.notify_prompt_evidence_invalidated();}",
+            "self.pty_synced.set(true);self.notify_prompt_evidence_invalidated();true",
+            "*self.source_id.borrow_mut()=Some(source);self.notify_prompt_evidence_invalidated();Ok(())",
+            "self.bstate_rc.set(BlockState::CollectingPrompt);self.engine.borrow_mut().prompt_buf.clear();self.verified_submission.notify_prompt_evidence_invalidated();",
+            "drop(config);self.verified_submission.notify_prompt_evidence_invalidated();",
+            "letcallbacks=self.prompt_evidence_invalidated.borrow().clone();forcallbackincallbacks{callback();}",
+        ] { assert!(compact.contains(sequence), "{sequence}"); }
+        let prompt_end = production
+            .split("fn on_prompt_end(&self)")
+            .nth(1)
+            .unwrap()
+            .split("fn on_command_start")
+            .next()
+            .unwrap();
+        assert!(!prompt_end.contains("notify_prompt_evidence_invalidated"));
+        let observer = include_str!("../organism_ui.rs")
+            .split("fn install_prompt_evidence_observer")
+            .nth(1)
+            .unwrap()
+            .split("fn read_live_attention")
+            .next()
+            .unwrap();
+        assert!(
+            observer.contains("Rc::downgrade(runtime)") && observer.contains("Rc::downgrade(view)")
+        );
+        assert!(observer.contains("LiveAttentionEvent::Reconcile"));
+        assert!(
+            !observer.contains("activity.note") && !observer.contains("cancel_pointer_greeting")
+        );
     }
 
     fn dispatch_command_start(command: Option<&str>) -> ParserEvent {

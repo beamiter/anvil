@@ -24,8 +24,9 @@ use jterm_core::organism_daily::behavior_explanation;
 #[cfg(test)]
 use jterm_core::organism_daily::GentleInteraction;
 use jterm_core::organism_live::{
-    LiveAttention, LiveAttentionEvent, LiveAttentionInput, LiveAttentionOutcome,
-    LiveAttentionRejection, LiveAttentionSnapshot, LiveAttentionSource, LiveAttentionTicket,
+    LiveActivityKnowledge, LiveAttention, LiveAttentionEvent, LiveAttentionInput,
+    LiveAttentionOutcome, LiveAttentionRejection, LiveAttentionSnapshot, LiveAttentionSource,
+    LiveAttentionTicket,
 };
 use jterm_core::organism_memory::{
     local_circadian_time_at_ms, unix_ms, CircadianProfile, GrowthProgress, GrowthStage,
@@ -2405,6 +2406,11 @@ impl OrganismRuntime {
     fn live_attention_input(&self, view: &TermView, now: Instant) -> LiveAttentionInput {
         LiveAttentionInput {
             base_context: self.live_context.get(),
+            activity: if self.command_running.get() {
+                LiveActivityKnowledge::Busy
+            } else {
+                view.organism_activity_knowledge()
+            },
             hard_eligible: self.live_greeting_allowed(view, now),
             hover_available: self.live_body.is_mapped()
                 && self.live_body.compute_bounds(&view.widget()).is_some(),
@@ -2413,6 +2419,25 @@ impl OrganismRuntime {
                 .get()
                 .is_some_and(|(x, y)| self.pointer_within_body(view, x, y)),
         }
+    }
+
+    fn install_prompt_evidence_observer(runtime: &Rc<Self>, view: &Rc<TermView>) {
+        let runtime_weak = Rc::downgrade(runtime);
+        let view_weak = Rc::downgrade(view);
+        view.connect_prompt_evidence_invalidated(move || {
+            let (Some(runtime), Some(view)) = (runtime_weak.upgrade(), view_weak.upgrade()) else {
+                return;
+            };
+            let now = Instant::now();
+            // All emitters have finished a real proof-loss mutation. Reconcile
+            // sees those fresh facts before any later prompt can restore them.
+            // It is not inserted into Explicit's read-only premeasurement.
+            let snapshot =
+                runtime.advance_live_attention(&view, now, LiveAttentionEvent::Reconcile);
+            if snapshot.is_some_and(|snapshot| snapshot.active != runtime.painted_attention.get()) {
+                runtime.refresh_surface_with_attention(&view, now, false);
+            }
+        });
     }
 
     fn read_live_attention(&self, view: &TermView, now: Instant) -> Option<LiveAttentionSnapshot> {
@@ -3927,6 +3952,7 @@ impl OrganismHub {
         *runtime.ambient.borrow_mut() = AmbientMind::seeded(pane_token(view) as u64);
         runtime.refresh_surface(view, Instant::now());
         OrganismRuntime::start_surface_tick(&runtime, view);
+        OrganismRuntime::install_prompt_evidence_observer(&runtime, view);
 
         {
             let runtime = runtime.clone();
@@ -4957,6 +4983,7 @@ mod tests {
             &token,
             LiveAttentionInput {
                 base_context: RenderContext::new(Behavior::Idle, BodyLanguage::default(), false),
+                activity: LiveActivityKnowledge::KnownIdle,
                 hard_eligible: true,
                 hover_available: false,
                 pointer_inside: false,
@@ -4988,6 +5015,7 @@ mod tests {
             false,
         );
         presence.bind(token, &view, &runtime);
+        OrganismRuntime::install_prompt_evidence_observer(&runtime, &view);
         install_card_tooltip_proxy(
             &view.widget(),
             &runtime.card,
@@ -5038,6 +5066,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         assert!(view.widget().is_mapped());
+        crate::block_view::organism_settings_test_clean_prompt(&view);
         // This is a pane-local description even before live-body ownership.
         // Emit the existing GTK query signal, without synthetic pointer input.
         let tooltip: gtk::Tooltip = gtk::glib::Object::new();
@@ -5271,6 +5300,52 @@ mod tests {
                 runtime.pointer_timer.borrow().is_some(),
                 "native pointer must reach the passive observer"
             );
+            let before_input = runtime.last_human_input.get();
+            let before_window_cooldown = window_greeting_probe(&presence, token);
+            view.write_input(b"\r");
+            assert_eq!(
+                view.organism_activity_knowledge(),
+                LiveActivityKnowledge::Unknown
+            );
+            assert!(
+                runtime.pointer_timer.borrow().is_none(),
+                "the real admission observer retires the native candidate immediately"
+            );
+            assert_eq!(
+                runtime.last_human_input.get(),
+                before_input,
+                "programmatic submission is not human activity"
+            );
+            assert_eq!(
+                window_greeting_probe(&presence, token),
+                before_window_cooldown
+            );
+            assert_eq!(
+                crate::block_view::organism_settings_test_pty_bytes(&view),
+                b"\r"
+            );
+            crate::block_view::organism_settings_test_clean_prompt(&view);
+            runtime.refresh_surface(&view, Instant::now());
+            assert!(
+                runtime.pointer_timer.borrow().is_none(),
+                "clean prompt recovery is not a pointer entry"
+            );
+            crate::block_view::organism_settings_test_reviewed_invalidation(&view);
+            assert!(runtime.pointer_timer.borrow().is_none());
+            assert_eq!(runtime.last_human_input.get(), before_input);
+            assert_eq!(
+                crate::block_view::organism_settings_test_pty_bytes(&view),
+                b"echo reviewed"
+            );
+            crate::block_view::organism_settings_test_clean_prompt(&view);
+            move_native_pointer(&window, 1, 1);
+            settle(Duration::from_millis(40));
+            move_native_pointer(&window, x, y);
+            settle(Duration::from_millis(100));
+            assert!(
+                runtime.pointer_timer.borrow().is_some(),
+                "only a fresh real entry rearms"
+            );
             assert!(runtime
                 .live_body
                 .has_css_class(POINTER_GREETING_CANDIDATE_CLASS));
@@ -5449,6 +5524,19 @@ mod tests {
                     .deadline
                     .saturating_sub(GentleInteraction::HOLD);
             assert!(runtime.explicit_greeting_active(&view));
+            let human_before_programmatic = runtime.last_human_input.get();
+            view.write_input(b"\r");
+            assert_eq!(
+                view.organism_activity_knowledge(),
+                LiveActivityKnowledge::Unknown
+            );
+            assert_eq!(runtime.read_live_attention(&view, Instant::now()).unwrap().active, Some(explicit_hold), "Unknown keeps the accepted Explicit's original deadline under unchanged native hard eligibility");
+            assert_eq!(runtime.last_human_input.get(), human_before_programmatic);
+            assert_eq!(
+                crate::block_view::organism_settings_test_pty_bytes(&view),
+                b"\r"
+            );
+            crate::block_view::organism_settings_test_clean_prompt(&view);
             assert!(!runtime.pointer_near.get());
             assert!(runtime
                 .pointer_position
@@ -9275,6 +9363,7 @@ mod tests {
         core.set_owner(Some(1));
         let input = LiveAttentionInput {
             base_context: RenderContext::new(Behavior::Idle, BodyLanguage::default(), false),
+            activity: LiveActivityKnowledge::KnownIdle,
             hard_eligible: true,
             hover_available: true,
             pointer_inside: true,
