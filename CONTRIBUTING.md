@@ -39,6 +39,11 @@ and documentation. GitHub Actions additionally exercises GTK tests under Xvfb,
 validates the desktop entry, smoke-tests the headless CLI, builds the portable
 bundle, and builds the Nix package.
 
+`make security` runs Cargo audit with `--deny warnings`, so dependency
+vulnerabilities and advisory warnings, including unmaintained dependencies,
+fail the gate. Resolve the dependency finding and rerun the check before
+submitting a change. ShellCheck runs after the dependency audit succeeds.
+
 CI also exercises a real cross-surface mouse drag through XTest. To include
 that check locally, install `libxtst6` and Python 3 alongside Xvfb, then run:
 

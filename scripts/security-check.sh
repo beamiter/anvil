@@ -13,7 +13,8 @@ if ! command -v cargo-audit >/dev/null 2>&1; then
     echo "Error: cargo-audit is required (install with 'cargo install cargo-audit --locked')." >&2
     exit 1
 fi
-cargo audit
+# Maintenance and other advisory warnings must fail the security gate too.
+cargo audit --deny warnings
 
 # Duplicate crates are not automatically vulnerabilities, but surfacing them
 # here makes dependency drift visible during reviews and scheduled audits.
