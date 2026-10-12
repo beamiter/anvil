@@ -1554,17 +1554,21 @@ mod organism_preview {
 
         #[test]
         fn interaction_hint_matches_live_timing_and_input_ownership() {
-            assert_eq!(GentleInteraction::HOLD, Duration::from_secs(2));
-            assert_eq!(GentleInteraction::COOLDOWN, Duration::from_secs(8));
+            use jterm_core::organism_live::LiveAttention;
+
             let runtime = include_str!("../organism_ui.rs");
             let production = runtime.split("#[cfg(test)]\nmod tests {").next().unwrap();
-            assert!(production
-                .contains("const POINTER_GREETING_DWELL: Duration = Duration::from_millis(600);"));
+            let compact: String = production.split_whitespace().collect();
+            assert!(compact.contains("live_attention:RefCell<LiveAttention<OrganismPaneToken>>"));
+            for detail in [
+                format!("{} ms", LiveAttention::<u64>::DWELL.as_millis()),
+                format!("about {} seconds", GentleInteraction::HOLD.as_secs()),
+                format!("at least {} seconds", GentleInteraction::COOLDOWN.as_secs()),
+            ] {
+                assert!(INTERACTION_HINT.contains(&detail), "{detail}");
+            }
             for detail in [
                 "Full or Calm",
-                "600 ms",
-                "about 2 seconds",
-                "at least 8 seconds",
                 "move away and return",
                 "Static uses inline cards only",
                 "Clicks and selection stay with your terminal.",
@@ -1575,10 +1579,12 @@ mod organism_preview {
             let component = settings
                 .split("\n#[relm4::component(pub(crate))]")
                 .nth(1)
+                .unwrap()
+                .split("\n#[cfg(test)]")
+                .next()
                 .unwrap();
-            assert!(
-                component.contains("set_tooltip_text: Some(organism_preview::INTERACTION_HINT)")
-            );
+            let compact: String = component.split_whitespace().collect();
+            assert!(compact.contains("set_tooltip_text:Some(organism_preview::INTERACTION_HINT)"));
         }
 
         #[test]
