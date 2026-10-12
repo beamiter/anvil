@@ -73,6 +73,15 @@ fn follows_desktop_motion(enabled: bool, motion: Option<OrganismMotion>) -> bool
     enabled && motion.is_none()
 }
 
+/// Compare the retained paint snapshot's active feedback, not its metadata.
+/// An absent current snapshot is a stale-owner event, not a cancellation.
+fn attention_paint_changed(
+    current: Option<LiveAttentionSnapshot>,
+    painted: Option<LiveAttentionSnapshot>,
+) -> bool {
+    current.is_some_and(|snapshot| snapshot.active != painted.and_then(|old| old.active))
+}
+
 /// Query only the pane's current native surface. GdkDevice modifier_state
 /// describes keyboards, not pointer buttons. Outside/unavailable surfaces
 /// remain unknown, rather than being advertised as a global button snapshot.
@@ -2434,7 +2443,7 @@ impl OrganismRuntime {
             // It is not inserted into Explicit's read-only premeasurement.
             let snapshot =
                 runtime.advance_live_attention(&view, now, LiveAttentionEvent::Reconcile);
-            if snapshot.is_some_and(|snapshot| snapshot.active != runtime.painted_attention.get()) {
+            if attention_paint_changed(snapshot, runtime.painted_attention.get()) {
                 runtime.refresh_surface_with_attention(&view, now, false);
             }
         });
@@ -9392,6 +9401,34 @@ mod tests {
         };
         assert_eq!(snapshot.outcome, LiveAttentionOutcome::Accepted(source));
         (core, input, snapshot)
+    }
+
+    #[test]
+    fn attention_paint_compares_active_in_the_retained_snapshot() {
+        let start = Duration::from_secs(4);
+        let (mut core, input, painted) =
+            accepted_core_snapshot(LiveAttentionSource::Explicit, start);
+        let current = core
+            .snapshot(start + Duration::from_millis(1), &1, input)
+            .unwrap();
+        assert_ne!(
+            current, painted,
+            "observation metadata can change without repainting"
+        );
+        assert!(!attention_paint_changed(Some(current), Some(painted)));
+        assert!(attention_paint_changed(Some(current), None));
+        assert!(
+            !attention_paint_changed(None, Some(painted)),
+            "a stale event must not clear new-owner paint"
+        );
+        core.cancel(&1);
+        let cancelled = core
+            .snapshot(start + Duration::from_millis(2), &1, input)
+            .unwrap();
+        assert!(attention_paint_changed(Some(cancelled), Some(painted)));
+        assert!(!attention_paint_changed(Some(cancelled), Some(cancelled)));
+        assert!(!attention_paint_changed(Some(cancelled), None));
+        assert!(!attention_paint_changed(None, None));
     }
 
     #[test]
