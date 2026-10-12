@@ -18,6 +18,7 @@ use super::{BlockState, MouseReporting};
 
 type FlushFn = Box<dyn Fn(Vec<u8>)>;
 type StateFn = Box<dyn Fn(bool)>;
+type WatchStateFn = Rc<dyn Fn(bool)>;
 
 /// A firehose must not let selection parking grow memory without bound or
 /// stall the Block state machine indefinitely.
@@ -51,6 +52,7 @@ pub(crate) struct SelectionFeedHold {
     /// without output never flashes a false paused state.
     state_cb: RefCell<Option<StateFn>>,
     release_cb: RefCell<Option<Box<dyn Fn()>>>,
+    watch_cb: RefCell<Option<WatchStateFn>>,
 }
 
 impl SelectionFeedHold {
@@ -62,6 +64,7 @@ impl SelectionFeedHold {
             flush_cb: RefCell::new(None),
             state_cb: RefCell::new(None),
             release_cb: RefCell::new(None),
+            watch_cb: RefCell::new(None),
         })
     }
 
@@ -75,6 +78,18 @@ impl SelectionFeedHold {
 
     pub(crate) fn set_release_listener(&self, listener: impl Fn() + 'static) {
         *self.release_cb.borrow_mut() = Some(Box::new(listener));
+    }
+
+    /// Independent of the badge and pre-flush selection release listener.
+    pub(crate) fn set_watch_listener(&self, listener: impl Fn(bool) + 'static) {
+        *self.watch_cb.borrow_mut() = Some(Rc::new(listener));
+    }
+
+    fn notify_watch(&self, held: bool) {
+        let callback = self.watch_cb.borrow().clone();
+        if let Some(callback) = callback {
+            callback(held);
+        }
     }
 
     fn notify_state(&self, parked: bool) {
@@ -129,7 +144,9 @@ impl SelectionFeedHold {
 
     pub(crate) fn begin_drag(&self) {
         self.dragging.set(true);
-        self.holding.set(true);
+        if !self.holding.replace(true) {
+            self.notify_watch(true);
+        }
     }
 
     pub(crate) fn end_drag(self: &Rc<Self>, selection_alive: bool) {
@@ -180,12 +197,15 @@ impl SelectionFeedHold {
             released();
         }
         if parked.is_empty() {
+            self.notify_watch(false);
             return;
         }
         self.notify_state(false);
         if let Some(flush) = self.flush_cb.borrow().as_ref() {
             flush(parked);
         }
+        // Replay may finish/change the command. Attach only after its final facts.
+        self.notify_watch(false);
     }
 
     /// Run an irreversible follow-up only after parked bytes have re-entered
@@ -410,5 +430,33 @@ mod tests {
         let action_order = order.clone();
         hold.flush_then(move || action_order.borrow_mut().push("exit-or-control"));
         assert_eq!(order.borrow().as_slice(), ["replay", "exit-or-control"]);
+    }
+    #[test]
+    fn watch_hold_restores_only_after_replay_and_empty_release_is_observed() {
+        let hold = SelectionFeedHold::new();
+        let order = Rc::new(RefCell::new(Vec::new()));
+        let log = order.clone();
+        hold.set_watch_listener(move |held| {
+            log.borrow_mut()
+                .push(if held { "retire" } else { "restore" })
+        });
+        let log = order.clone();
+        hold.set_release_listener(move || log.borrow_mut().push("selection-release"));
+        let log = order.clone();
+        hold.set_flush(move |_| log.borrow_mut().push("replay"));
+        hold.begin_drag();
+        hold.try_buffer(b"data");
+        hold.flush_now();
+        assert_eq!(
+            &*order.borrow(),
+            &["retire", "selection-release", "replay", "restore"]
+        );
+        order.borrow_mut().clear();
+        hold.begin_drag();
+        hold.flush_now();
+        assert_eq!(
+            &*order.borrow(),
+            &["retire", "selection-release", "restore"]
+        );
     }
 }

@@ -46,6 +46,8 @@ mod scroll;
 mod selection_hold;
 mod unified_chrome;
 mod unified_images;
+pub(crate) mod watch_batch;
+pub(crate) mod watch_reader;
 mod zone_history;
 pub(crate) use alt_screen::*;
 pub(crate) use ansi::*;
@@ -62,6 +64,7 @@ pub(crate) use palette::*;
 pub(crate) use scroll::*;
 use selection_hold::SelectionFeedHold;
 pub(crate) use unified_chrome::format_block_duration;
+use watch_reader::WatchReader;
 
 // ── perf profiling (env JTERM_PROF=1) ───────────────────────────────────────
 pub(crate) fn prof_enabled() -> bool {
@@ -4342,6 +4345,7 @@ pub struct TermView {
     /// Defers raw PTY chunks while a user selection covers the streaming live
     /// VTE, then replays them through the original parser/state pipeline.
     selection_feed_hold: Rc<SelectionFeedHold>,
+    watch_reader: Rc<WatchReader>,
     /// Recompute live sizing and finished-card geometry after font or viewport
     /// metrics change. Keeping the closure here makes programmatic font updates
     /// follow the same refit path as GTK allocation signals.
@@ -6061,6 +6065,7 @@ struct ReaderCtx {
     /// Parks incoming PTY chunks while the user drag-selects text on the live
     /// VTE, so streaming repaints can't destroy the selection mid-drag.
     selection_feed_hold: Rc<SelectionFeedHold>,
+    watch_reader: Rc<WatchReader>,
 }
 
 /// Per-event handlers for the PTY reader pipeline: one method per
@@ -6094,6 +6099,7 @@ impl ReaderCtx {
         if !std::mem::take(&mut self.engine.borrow_mut().command_finished_event_pending) {
             return None;
         }
+        self.watch_reader.command_finished(Instant::now());
         Some(CommandFinishedEvent {
             // Keep the display copy intact: a provisional post-D prompt can
             // lose foreground trust and resume CollectingOutput before the
@@ -6179,6 +6185,7 @@ impl ReaderCtx {
     }
 
     fn on_hard_reset(&self) {
+        self.watch_reader.reset(Instant::now());
         self.reset_kitty_keyboard();
         self.forget_unanswered_cpr_later();
         // RIS invalidates the same row mapping as ED3. Record that before any
@@ -6259,6 +6266,7 @@ impl ReaderCtx {
             // after it; only unwind the frontend ownership/chrome state.
             self.backend.exit_fullscreen();
             self.backend.exit_alt_screen_chrome();
+            self.watch_reader.set_alt(false, Instant::now());
             emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Left);
             self.backend.layout_active_surface();
         }
@@ -6292,6 +6300,12 @@ impl ReaderCtx {
         for event in events.iter() {
             self.handle_event(event);
         }
+    }
+
+    fn process_watch_input(&self, data: &[u8], origin: Option<watch_batch::ReaderBatchOrigin>) {
+        self.watch_reader.begin_dispatch(origin, Instant::now());
+        self.process_parser_input(data);
+        self.watch_reader.end_dispatch(Instant::now());
     }
 
     fn process_parser_input(&self, bytes: &[u8]) {
@@ -6409,6 +6423,9 @@ impl ReaderCtx {
                             .saturating_add(bytes.len() as u64),
                     );
                 }
+                if !bytes.is_empty() {
+                    self.watch_reader.note_output();
+                }
                 self.emit_activity();
                 true
             }
@@ -6420,6 +6437,9 @@ impl ReaderCtx {
                 // get the activity marker like any streaming
                 // command. Subscribers coalesce (the tab strip to
                 // one message per 100 ms).
+                if !bytes.is_empty() {
+                    self.watch_reader.note_output();
+                }
                 self.emit_activity();
                 true
             }
@@ -6443,6 +6463,7 @@ impl ReaderCtx {
             if !prompt_boundary_infers_command_end(state, shell_is_foreground) {
                 return;
             }
+            self.watch_reader.command_finished(Instant::now());
             if let Some(execution) = self.active_agent_execution_rc.take() {
                 emit_agent_execution_lost(
                     &self.verified_submission.agent_execution_lost_callbacks,
@@ -6465,6 +6486,7 @@ impl ReaderCtx {
                 }
                 self.backend.exit_fullscreen();
                 self.backend.exit_alt_screen_chrome();
+                self.watch_reader.set_alt(false, Instant::now());
                 emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Left);
                 self.backend.layout_active_surface();
             }
@@ -7132,6 +7154,7 @@ impl ReaderCtx {
                 cwd: started_cwd,
             },
         );
+        self.watch_reader.command_started(Instant::now());
         // Do not clear the input shadow here. VTE `feed()` is
         // asynchronous, so the text-range capture above can
         // occasionally be empty even for a real command. It
@@ -7202,11 +7225,13 @@ impl ReaderCtx {
                 return;
             }
             AgentCommandEndDecision::Accept => {
+                self.watch_reader.command_finished(Instant::now());
                 if active_agent_execution.is_some() {
                     self.engine.borrow_mut().agent_completion_trusted = true;
                 }
             }
             AgentCommandEndDecision::AcceptWithoutAgentCorrelation => {
+                self.watch_reader.command_finished(Instant::now());
                 let execution =
                     active_agent_execution.expect("decision requires an active Agent execution");
                 self.active_agent_execution_rc.set(None);
@@ -7258,6 +7283,7 @@ impl ReaderCtx {
             }
             self.backend.exit_fullscreen();
             self.backend.exit_alt_screen_chrome();
+            self.watch_reader.set_alt(false, Instant::now());
             emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Left);
             self.backend.layout_active_surface();
         }
@@ -7321,6 +7347,7 @@ impl ReaderCtx {
         self.sync_kitty_flags();
         self.engine.borrow_mut().active_alt_screen_mode = Some(mode);
         self.backend.enter_alt_screen_chrome();
+        self.watch_reader.set_alt(true, Instant::now());
         emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Entered);
         // Hand the viewport to the alt-screen app: hide finished
         // blocks so the live VTE fills the scroll area.
@@ -7343,6 +7370,7 @@ impl ReaderCtx {
         // just the command name + exit code.
         self.engine.borrow_mut().active_alt_screen_mode = None;
         self.backend.exit_alt_screen_chrome();
+        self.watch_reader.set_alt(false, Instant::now());
         emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Left);
         let leave = format!("\x1b[?{mode}l");
         self.backend.feed_live(leave.as_bytes());
@@ -9800,39 +9828,40 @@ impl ReaderCtx {
 
         let ctx = Rc::new(self);
 
-        // Keep the complete security-observer → parser → Block state machine
-        // behind one replayable closure. A selection hold intercepts raw chunks
-        // before this boundary and flushes them back through this exact path.
-        let process_chunk: Rc<RefCell<dyn FnMut(Vec<u8>)>> = Rc::new(RefCell::new({
-            let ctx = ctx.clone();
-            move |data: Vec<u8>| {
-                ctx.process_parser_input(&data);
-            }
-        }));
-
-        ctx.selection_feed_hold.set_flush({
-            let process_chunk = Rc::downgrade(&process_chunk);
-            move |bytes| {
-                if let Some(process_chunk) = process_chunk.upgrade() {
-                    (process_chunk.borrow_mut())(bytes);
-                }
+        // Separate replay provenance before the parser. A fresh read has one
+        // sequence spanning every splitter/parser stretch; buffered replay has none.
+        let weak = Rc::downgrade(&ctx);
+        ctx.selection_feed_hold.set_flush(move |bytes| {
+            if let Some(ctx) = weak.upgrade() {
+                ctx.process_watch_input(
+                    &bytes,
+                    Some(watch_batch::ReaderBatchOrigin::BufferedReplay),
+                );
             }
         });
-
-        let hold_for_reader = ctx.selection_feed_hold.clone();
-        let hold_for_exit = ctx.selection_feed_hold.clone();
-        let exited_cbs = ctx.exited_cbs.clone();
+        let weak = Rc::downgrade(&ctx.watch_reader);
+        ctx.selection_feed_hold.set_watch_listener(move |held| {
+            if let Some(watch) = weak.upgrade() {
+                watch.set_held(held, Instant::now());
+            }
+        });
+        let exit_ctx = ctx.clone();
         pty.start_reader(
             move |data: Vec<u8>| {
-                if hold_for_reader.try_buffer(&data) {
+                if data.is_empty() {
                     return;
                 }
-                (process_chunk.borrow_mut())(data);
+                let origin = ctx.watch_reader.fresh_origin(Instant::now());
+                if ctx.selection_feed_hold.try_buffer(&data) {
+                    return;
+                }
+                ctx.process_watch_input(&data, origin);
             },
             move |exit_code| {
-                hold_for_exit.flush_then(|| {
+                exit_ctx.selection_feed_hold.flush_then(|| {
+                    exit_ctx.watch_reader.source_ended(Instant::now());
                     log::debug!("Shell exited with code {}", exit_code);
-                    for cb in exited_cbs.borrow().iter() {
+                    for cb in exit_ctx.exited_cbs.borrow().iter() {
                         cb(exit_code);
                     }
                 });
@@ -11576,6 +11605,7 @@ impl TermView {
         // Park the raw feed during that drag and explain the frozen surface only
         // after the first chunk is actually deferred.
         let selection_feed_hold = SelectionFeedHold::new();
+        let watch_reader = Rc::new(WatchReader::default());
         {
             let hold_badge = gtk::Label::new(Some("Output paused — selection"));
             hold_badge.add_css_class("feed-hold-badge");
@@ -12562,6 +12592,7 @@ impl TermView {
                 verified_submission: verified_submission.clone(),
                 block_finished_cbs: block_finished_callbacks.clone(),
                 selection_feed_hold: selection_feed_hold.clone(),
+                watch_reader: watch_reader.clone(),
             }
             .install(&pty, &active_vte)?;
 
@@ -13835,6 +13866,7 @@ impl TermView {
             cross_selection,
             ftcs_seen: ftcs_seen.clone(),
             selection_feed_hold,
+            watch_reader,
             layout_active_surface,
             render_backend: render_backend_slot
                 .borrow_mut()
@@ -14821,6 +14853,17 @@ impl TermView {
 
     pub fn connect_title_changed<F: Fn(&str) + 'static>(&self, f: F) {
         self.title_callbacks.borrow_mut().push(Box::new(f));
+    }
+
+    pub(crate) fn connect_watch_observation(
+        &self,
+        listener: impl Fn(&watch_reader::ReaderWatchEvent) + 'static,
+    ) {
+        self.watch_reader.connect(listener);
+    }
+
+    pub(crate) fn watch_observation_snapshot(&self) -> watch_reader::ReaderSnapshot {
+        self.watch_reader.snapshot()
     }
 
     pub fn connect_activity<F: Fn() + 'static>(&self, f: F) {
@@ -19075,6 +19118,7 @@ mod tests {
                 verified_submission,
                 block_finished_cbs,
                 selection_feed_hold: SelectionFeedHold::new(),
+                watch_reader: Rc::new(super::WatchReader::default()),
             };
             Self {
                 ctx,
@@ -19107,7 +19151,8 @@ mod tests {
         }
 
         fn feed_raw(&self, bytes: &[u8]) {
-            self.ctx.process_parser_input(bytes);
+            let origin = self.ctx.watch_reader.fresh_origin(Instant::now());
+            self.ctx.process_watch_input(bytes, origin);
         }
 
         fn live_output(&self) -> String {
@@ -19145,6 +19190,100 @@ mod tests {
             self.backend.take_calls();
             anchor
         }
+    }
+
+    // These use the existing ReaderHarness and its existing test PTY. They
+    // are CI regressions; the isolated pure harness does not run them.
+    #[test]
+    fn reader_watch_real_read_normalizes_parser_stretches_once() {
+        use super::watch_batch::{BatchDisposition, BatchFact};
+        use super::watch_reader::ReaderWatchFact;
+        let harness = ReaderHarness::new();
+        harness.arm_verified_prompt();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let log = events.clone();
+        harness
+            .ctx
+            .watch_reader
+            .connect(move |event| log.borrow_mut().push(event.clone()));
+        harness.feed_raw(b"\x1b]133;C\x07left\x1b]0;title\x07right");
+        assert_eq!(harness.commands_started.borrow().len(), 1);
+        let events = events.borrow();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.fact, ReaderWatchFact::TrustedStart))
+                .count(),
+            1
+        );
+        let outputs: Vec<_> = events
+            .iter()
+            .filter(|event| matches!(event.fact, ReaderWatchFact::Output(_)))
+            .collect();
+        assert_eq!(outputs.len(), 1);
+        assert!(matches!(
+            outputs[0].fact,
+            ReaderWatchFact::Output(BatchFact {
+                sequence: 0,
+                disposition: BatchDisposition::Accepted,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn reader_watch_replayed_lifecycle_never_recreates_start_or_completed_command() {
+        use super::watch_batch::ReaderBatchOrigin;
+        use super::watch_reader::ReaderWatchFact;
+        let harness = ReaderHarness::new();
+        harness.arm_verified_prompt();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let log = events.clone();
+        harness
+            .ctx
+            .watch_reader
+            .connect(move |event| log.borrow_mut().push(event.clone()));
+        harness.ctx.watch_reader.set_held(true, Instant::now());
+        harness.ctx.process_watch_input(
+            b"\x1b]133;C\x07output\x1b]133;D;0\x07",
+            Some(ReaderBatchOrigin::BufferedReplay),
+        );
+        harness.ctx.watch_reader.set_held(false, Instant::now());
+        assert_eq!(
+            harness.commands_started.borrow().len(),
+            1,
+            "original product lifecycle remains intact"
+        );
+        assert_eq!(harness.commands_finished.borrow().len(), 1);
+        assert_eq!(harness.ctx.watch_reader.snapshot().identity, None);
+        assert!(events
+            .borrow()
+            .iter()
+            .all(|event| event.fact == ReaderWatchFact::Reconcile));
+    }
+
+    #[test]
+    fn reader_watch_old_command_output_quarantines_new_command_in_same_read() {
+        use super::watch_batch::{BatchDisposition, BatchFact};
+        use super::watch_reader::ReaderWatchFact;
+        let harness = ReaderHarness::new();
+        harness.arm_verified_prompt();
+        harness.feed_raw(b"\x1b]133;C\x07");
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let log = events.clone();
+        harness
+            .ctx
+            .watch_reader
+            .connect(move |event| log.borrow_mut().push(event.clone()));
+        harness.feed_raw(b"old\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07");
+        assert_eq!(harness.commands_started.borrow().len(), 2);
+        assert!(matches!(
+            events.borrow().last().unwrap().fact,
+            ReaderWatchFact::Output(BatchFact {
+                disposition: BatchDisposition::Quarantined,
+                ..
+            })
+        ));
     }
 
     #[test]

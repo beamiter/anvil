@@ -1,6 +1,8 @@
 //! Native bodies for the experimental ASCII organism.
 
 pub(crate) mod vte_surface;
+mod watch_adapter;
+use watch_adapter::WatchAdapter;
 
 use gtk::prelude::*;
 use gtk::{Box as GBox, Label, Orientation};
@@ -468,92 +470,6 @@ fn stable_repo_hash(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct OutputRhythmTracker {
-    command_started: Option<Instant>,
-    third_recent_output: Option<Instant>,
-    second_recent_output: Option<Instant>,
-    last_output: Option<Instant>,
-    resumed_until: Option<Instant>,
-    rhythm: WatchRhythm,
-}
-
-impl OutputRhythmTracker {
-    const BUSY_WINDOW: Duration = Duration::from_millis(1_200);
-    const WAITING_AFTER: Duration = Duration::from_secs(3);
-    const RESUMED_HOLD: Duration = Duration::from_millis(900);
-
-    fn reset(&mut self) {
-        *self = Self::default();
-    }
-
-    fn start(&mut self, now: Instant) {
-        self.reset();
-        self.command_started = Some(now);
-    }
-
-    fn note_output(&mut self, now: Instant) {
-        let quiet_since = self.last_output.or(self.command_started);
-        let was_waiting = quiet_since
-            .is_some_and(|last| now.saturating_duration_since(last) >= Self::WAITING_AFTER);
-        self.third_recent_output = self.second_recent_output;
-        self.second_recent_output = self.last_output;
-        self.last_output = Some(now);
-        if was_waiting {
-            self.rhythm = WatchRhythm::Resumed;
-            self.resumed_until = Some(now + Self::RESUMED_HOLD);
-        } else if self.resumed_until.is_some_and(|until| now < until) {
-            self.rhythm = WatchRhythm::Resumed;
-        } else if self
-            .third_recent_output
-            .is_some_and(|oldest| now.saturating_duration_since(oldest) <= Self::BUSY_WINDOW)
-        {
-            self.rhythm = WatchRhythm::Busy;
-            self.resumed_until = None;
-        } else {
-            self.rhythm = WatchRhythm::Steady;
-        }
-    }
-
-    fn sample(&mut self, now: Instant, command_running: bool) -> WatchRhythm {
-        if !command_running {
-            self.reset();
-            return WatchRhythm::Steady;
-        }
-        if self.resumed_until.is_some_and(|until| now < until) {
-            return WatchRhythm::Resumed;
-        }
-        self.resumed_until = None;
-        if self
-            .last_output
-            .or(self.command_started)
-            .is_some_and(|last| now.saturating_duration_since(last) >= Self::WAITING_AFTER)
-        {
-            self.rhythm = WatchRhythm::Waiting;
-        } else if self
-            .third_recent_output
-            .is_some_and(|oldest| now.saturating_duration_since(oldest) <= Self::BUSY_WINDOW)
-        {
-            self.rhythm = WatchRhythm::Busy;
-        } else {
-            self.rhythm = WatchRhythm::Steady;
-        }
-        self.rhythm
-    }
-}
-
-fn reset_output_rhythm_at_boundary(
-    tracker: &mut OutputRhythmTracker,
-    command_running: bool,
-    now: Instant,
-) {
-    if command_running {
-        tracker.start(now);
-    } else {
-        tracker.reset();
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1947,6 +1863,7 @@ struct OrganismRuntime {
     settle_timer: RefCell<Option<gtk::glib::SourceId>>,
     surface_timer: RefCell<Option<gtk::glib::SourceId>>,
     surface_timer_deadline: Cell<Option<Instant>>,
+    surface_timer_revision: Cell<Option<u64>>,
     surface_last_frame: Cell<Option<Instant>>,
     surface_frame: Cell<u64>,
     surface_behavior_frame_origin: Cell<u64>,
@@ -1984,7 +1901,7 @@ struct OrganismRuntime {
     agent_watching: Cell<bool>,
     last_human_input: Cell<Option<Instant>>,
     output_activity: Cell<bool>,
-    output_rhythm: RefCell<OutputRhythmTracker>,
+    output_rhythm: RefCell<WatchAdapter<OrganismPaneToken>>,
     visible_watch_rhythm: Cell<WatchRhythm>,
     /// The last rhythm boundary offered to attention. A rejected boundary is
     /// remembered until the sensed rhythm changes, so it is dropped rather
@@ -2138,6 +2055,7 @@ impl OrganismRuntime {
             settle_timer: RefCell::new(None),
             surface_timer: RefCell::new(None),
             surface_timer_deadline: Cell::new(None),
+            surface_timer_revision: Cell::new(Some(0)),
             surface_last_frame: Cell::new(None),
             surface_frame: Cell::new(0),
             surface_behavior_frame_origin: Cell::new(0),
@@ -2159,7 +2077,7 @@ impl OrganismRuntime {
             agent_watching: Cell::new(false),
             last_human_input: Cell::new(None),
             output_activity: Cell::new(false),
-            output_rhythm: RefCell::new(OutputRhythmTracker::default()),
+            output_rhythm: RefCell::new(WatchAdapter::new(presence_token)),
             visible_watch_rhythm: Cell::new(WatchRhythm::Steady),
             offered_watch_rhythm: Cell::new(WatchRhythm::Steady),
             card: outer.upcast(),
@@ -2355,12 +2273,24 @@ impl OrganismRuntime {
         self.territory_intro_until.set(active_until);
     }
 
+    fn watch_context_eligible(&self, view: &TermView, now: Instant) -> bool {
+        self.enabled.get()
+            && watch_rhythm_context_presentable(
+                self.presence.is_owner(self.presence_token),
+                self.motion.get(),
+                surface_mode(
+                    self.surface_behavior.get(),
+                    self.command_running.get(),
+                    self.human_input_age(now),
+                ),
+                view.live_organism_surface_metrics().alt_screen,
+            )
+    }
+
     fn reset_watch_rhythm_at_boundary(&self, now: Instant) {
-        reset_output_rhythm_at_boundary(
-            &mut self.output_rhythm.borrow_mut(),
-            self.command_running.get(),
-            now,
-        );
+        self.output_rhythm
+            .borrow_mut()
+            .retire(now.saturating_duration_since(self.presence.attention_epoch));
         self.output_activity.set(false);
         self.visible_watch_rhythm.set(WatchRhythm::Steady);
         self.offered_watch_rhythm.set(WatchRhythm::Steady);
@@ -3299,7 +3229,7 @@ impl OrganismRuntime {
             runtime.active_memory_kind.set(None);
             runtime.active_repo_context.borrow_mut().take();
             runtime.command_origin_behavior.set(None);
-            runtime.output_rhythm.borrow_mut().reset();
+            runtime.reset_watch_rhythm_at_boundary(Instant::now());
             return;
         }
         if !was_enabled {
@@ -3387,6 +3317,18 @@ impl OrganismRuntime {
         Self::schedule_surface_frame(runtime, view, delay);
     }
 
+    /// Shared frame callback ownership, checked before touching a native source.
+    fn consume_surface_frame_callback(&self, revision: u64) -> bool {
+        if self.surface_timer_revision.get() != Some(revision)
+            || self.surface_timer.borrow().is_none()
+        {
+            return false;
+        }
+        self.surface_timer.borrow_mut().take();
+        self.surface_timer_deadline.set(None);
+        true
+    }
+
     /// Self-rescheduling frame driver. A glib timeout wakes at most ten times
     /// a second — unlike a frame-clock tick callback it never forces the
     /// window's frame clock to run at full rate — and it drops to a
@@ -3400,6 +3342,16 @@ impl OrganismRuntime {
             runtime.surface_timer.borrow().is_none(),
             "a surface runtime must never own two pending frame sources"
         );
+        let Some(revision) = runtime
+            .surface_timer_revision
+            .get()
+            .and_then(|old| old.checked_add(1))
+        else {
+            runtime.surface_timer_revision.set(None);
+            runtime.surface_timer_deadline.set(None);
+            return;
+        };
+        runtime.surface_timer_revision.set(Some(revision));
         let runtime_weak = Rc::downgrade(runtime);
         let view_weak = Rc::downgrade(view);
         runtime
@@ -3409,12 +3361,10 @@ impl OrganismRuntime {
             let Some(runtime) = runtime_weak.upgrade() else {
                 return;
             };
-            // Cleared before ANY other guard: a runtime kept alive past its
-            // view (agent-lost idle closures, parser-owned callback vectors)
-            // must never leave this fired source's id behind for Drop to
-            // remove — glib panics on removing a dead source.
-            runtime.surface_timer.borrow_mut().take();
-            runtime.surface_timer_deadline.set(None);
+            // Retire only this fired source, before ordinary lifetime gates.
+            if !runtime.consume_surface_frame_callback(revision) {
+                return;
+            }
             if !runtime.enabled.get() {
                 return;
             }
@@ -3477,10 +3427,14 @@ impl OrganismRuntime {
                 runtime.ambient.borrow_mut().interrupt();
                 runtime.ambient_display.set(AmbientBehavior::Idle);
             }
+            let watch_eligible = runtime.watch_context_eligible(&view, now);
+            let watch_reader = view.watch_observation_snapshot();
+            let watch_now = runtime.presence.attention_epoch.elapsed();
             let desired_rhythm = runtime
                 .output_rhythm
                 .borrow_mut()
-                .sample(now, runtime.command_running.get());
+                .advance(watch_now, watch_reader, watch_eligible)
+                .rhythm;
             let rhythm_plan = watch_rhythm_plan(
                 desired_rhythm,
                 runtime.visible_watch_rhythm.get(),
@@ -3588,6 +3542,12 @@ impl OrganismRuntime {
                     runtime.painted_attention.get().filter(|_| greeting_visible),
                     runtime.presence.attention_epoch.elapsed(),
                 ),
+            );
+            let watch_now = runtime.presence.attention_epoch.elapsed();
+            let next = watch_adapter::frame_delay(
+                next,
+                runtime.output_rhythm.borrow().snapshot(watch_now),
+                watch_now,
             );
             // A synchronous settings callback may already have replaced the
             // source while this frame was rendering. Never create a second.
@@ -4033,6 +3993,32 @@ impl OrganismHub {
         {
             let runtime = runtime.clone();
             let view_weak = Rc::downgrade(view);
+            view.connect_watch_observation(move |event| {
+                let Some(view) = view_weak.upgrade() else {
+                    return;
+                };
+                let eligible = runtime.watch_context_eligible(&view, event.at);
+                let current = view.watch_observation_snapshot();
+                if current != event.snapshot {
+                    return;
+                }
+                let output_pulse = runtime.output_rhythm.borrow_mut().event(
+                    event
+                        .at
+                        .saturating_duration_since(runtime.presence.attention_epoch),
+                    event,
+                    current,
+                    eligible,
+                );
+                if output_pulse {
+                    runtime.output_activity.set(true);
+                }
+            });
+        }
+
+        {
+            let runtime = runtime.clone();
+            let view_weak = Rc::downgrade(view);
             view.connect_activity(move || {
                 if !runtime.enabled.get() {
                     return;
@@ -4040,24 +4026,6 @@ impl OrganismHub {
                 runtime.cancel_pointer_greeting();
                 let now = Instant::now();
                 let view = view_weak.upgrade();
-                let rhythm_presentable_at_origin = view.as_ref().is_some_and(|view| {
-                    watch_rhythm_context_presentable(
-                        runtime.presence.is_owner(runtime.presence_token),
-                        runtime.motion.get(),
-                        surface_mode(
-                            runtime.surface_behavior.get(),
-                            runtime.command_running.get(),
-                            runtime.human_input_age(now),
-                        ),
-                        view.live_organism_surface_metrics().alt_screen,
-                    )
-                });
-                if rhythm_presentable_at_origin {
-                    runtime.output_activity.set(true);
-                    runtime.output_rhythm.borrow_mut().note_output(now);
-                } else {
-                    runtime.reset_watch_rhythm_at_boundary(now);
-                }
                 runtime.activity.note_output(now);
                 runtime.clear_presence_cue();
                 // Preserve arrival eligibility while its introducing command
@@ -4120,7 +4088,7 @@ impl OrganismHub {
                 runtime
                     .command_origin_behavior
                     .set(command_origin.is_repo_vigil().then_some(command_origin));
-                runtime.output_rhythm.borrow_mut().start(now);
+                runtime.reset_watch_rhythm_at_boundary(now);
                 runtime.visible_watch_rhythm.set(WatchRhythm::Steady);
                 runtime.offered_watch_rhythm.set(WatchRhythm::Steady);
                 runtime.output_activity.set(false);
@@ -4305,7 +4273,7 @@ impl OrganismHub {
                     runtime.activity.command_finished(Instant::now());
                 }
                 runtime.command_started_at.set(None);
-                runtime.output_rhythm.borrow_mut().reset();
+                runtime.reset_watch_rhythm_at_boundary(Instant::now());
                 runtime.visible_watch_rhythm.set(WatchRhythm::Steady);
                 runtime.offered_watch_rhythm.set(WatchRhythm::Steady);
                 runtime.output_activity.set(false);
@@ -4582,7 +4550,7 @@ impl OrganismHub {
                     }
                     runtime.command_started_at.set(None);
                     runtime.agent_watching.set(false);
-                    runtime.output_rhythm.borrow_mut().reset();
+                    runtime.reset_watch_rhythm_at_boundary(Instant::now());
                     runtime.visible_watch_rhythm.set(WatchRhythm::Steady);
                     runtime.offered_watch_rhythm.set(WatchRhythm::Steady);
                     runtime.output_activity.set(false);
@@ -5893,6 +5861,7 @@ mod tests {
         println!("LIVE_ATTENTION_ADAPTER full_calm_preserved=true early_ticket_rearmed=true stale_ticket_inert=true drag_exit_reentered=true explicit_wins_due=true static_kept_cooldown=true");
         OrganismRuntime::schedule_surface_frame(&runtime, &view, DORMANT_FRAME_INTERVAL);
         let dormant_source = runtime.surface_timer.borrow().as_ref().unwrap().as_raw();
+        let dormant_revision = runtime.surface_timer_revision.get().unwrap();
         let frame_before = runtime.surface_frame.get();
         assert!(runtime.say_hello(&view).is_ok());
         let accepted_origin = runtime
@@ -5913,6 +5882,15 @@ mod tests {
             runtime.surface_timer_deadline.get().unwrap()
                 <= Instant::now() + SURFACE_FRAME_INTERVAL
         );
+        let active_deadline = runtime.surface_timer_deadline.get();
+        assert!(!runtime.consume_surface_frame_callback(dormant_revision));
+        assert_eq!(
+            runtime.surface_timer.borrow().as_ref().unwrap().as_raw(),
+            active_source,
+            "a queued old native callback cannot consume the replacement source"
+        );
+        assert_eq!(runtime.surface_timer_deadline.get(), active_deadline);
+        assert_eq!(runtime.surface_frame.get(), frame_before);
         OrganismRuntime::rearm_surface_tick_for_greeting(&runtime, &view);
         assert_eq!(
             runtime.surface_timer.borrow().as_ref().unwrap().as_raw(),
@@ -6297,108 +6275,6 @@ mod tests {
         assert!(surface.contains("root.native()?.surface()?"));
         assert!(surface.contains("surface.device_position(&pointer)?"));
         assert!(!surface.contains(".modifier_state()"));
-    }
-
-    #[test]
-    fn output_rhythm_uses_only_pulse_count_and_monotonic_quiet_time() {
-        let start = Instant::now();
-        let mut rhythm = OutputRhythmTracker::default();
-        rhythm.start(start);
-        rhythm.note_output(start);
-        rhythm.note_output(start + Duration::from_millis(300));
-        rhythm.note_output(start + Duration::from_millis(600));
-        assert_eq!(
-            rhythm.sample(start + Duration::from_millis(600), true),
-            WatchRhythm::Busy
-        );
-        assert_eq!(
-            rhythm.sample(start + Duration::from_secs(2), true),
-            WatchRhythm::Steady
-        );
-        assert_eq!(
-            rhythm.sample(start + Duration::from_millis(3_600), true),
-            WatchRhythm::Waiting
-        );
-
-        rhythm.note_output(start + Duration::from_millis(3_700));
-        assert_eq!(
-            rhythm.sample(start + Duration::from_millis(4_000), true),
-            WatchRhythm::Resumed
-        );
-        assert_eq!(
-            rhythm.sample(start + Duration::from_millis(4_700), true),
-            WatchRhythm::Steady
-        );
-        assert_eq!(
-            rhythm.sample(start + Duration::from_secs(5), false),
-            WatchRhythm::Steady
-        );
-        assert_eq!(rhythm.last_output, None);
-        assert_eq!(rhythm.command_started, None);
-    }
-
-    #[test]
-    fn output_rhythm_handles_silent_commands_and_a_true_sliding_window() {
-        let start = Instant::now();
-        let mut silent = OutputRhythmTracker::default();
-        silent.start(start);
-        assert_eq!(
-            silent.sample(start + Duration::from_millis(2_999), true),
-            WatchRhythm::Steady
-        );
-        assert_eq!(
-            silent.sample(start + Duration::from_secs(3), true),
-            WatchRhythm::Waiting
-        );
-        silent.note_output(start + Duration::from_millis(3_100));
-        assert_eq!(
-            silent.sample(start + Duration::from_millis(3_100), true),
-            WatchRhythm::Resumed
-        );
-
-        let mut sliding = OutputRhythmTracker::default();
-        sliding.start(start);
-        sliding.note_output(start);
-        sliding.note_output(start + Duration::from_millis(1_100));
-        sliding.note_output(start + Duration::from_millis(1_210));
-        assert_eq!(
-            sliding.sample(start + Duration::from_millis(1_210), true),
-            WatchRhythm::Steady
-        );
-        sliding.note_output(start + Duration::from_millis(1_220));
-        assert_eq!(
-            sliding.sample(start + Duration::from_millis(1_220), true),
-            WatchRhythm::Busy,
-            "the most recent three pulses, not a tumbling first-pulse window, define busy"
-        );
-    }
-
-    #[test]
-    fn presentation_boundary_consumes_rhythm_and_restarts_visible_quiet_time() {
-        let start = Instant::now();
-        let boundary = start + Duration::from_secs(4);
-        let mut rhythm = OutputRhythmTracker::default();
-        rhythm.start(start);
-        rhythm.note_output(start);
-        rhythm.note_output(start + Duration::from_millis(100));
-        rhythm.note_output(start + Duration::from_millis(200));
-        assert_eq!(
-            rhythm.sample(start + Duration::from_millis(200), true),
-            WatchRhythm::Busy
-        );
-
-        reset_output_rhythm_at_boundary(&mut rhythm, true, boundary);
-        assert_eq!(rhythm.sample(boundary, true), WatchRhythm::Steady);
-        assert_eq!(
-            rhythm.sample(boundary + Duration::from_millis(2_999), true),
-            WatchRhythm::Steady,
-            "hidden busy/waiting edges must not replay after presentation resumes"
-        );
-        assert_eq!(
-            rhythm.sample(boundary + Duration::from_secs(3), true),
-            WatchRhythm::Waiting,
-            "a new visible quiet interval may create a fresh edge"
-        );
     }
 
     #[test]
@@ -10042,7 +9918,7 @@ mod tests {
             .unwrap();
         assert!(
             callback
-                .find("runtime.surface_timer_deadline.set(None)")
+                .find("if !runtime.consume_surface_frame_callback(revision)")
                 .unwrap()
                 < callback.find("if !runtime.enabled.get()").unwrap()
         );
