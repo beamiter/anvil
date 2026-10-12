@@ -153,7 +153,10 @@ impl VteCompanion {
             let weak = Rc::downgrade(&surface);
             move |_| {
                 if let Some(surface) = weak.upgrade() {
-                    surface.refresh();
+                    // GTK emits the crossing before Window::focus points to
+                    // the new widget. Reuse the one cancellable weak idle to
+                    // observe the committed focus after this event stack.
+                    surface.queue_geometry_refresh();
                 }
             }
         });
@@ -488,6 +491,36 @@ impl Drop for VteCompanion {
 }
 
 #[cfg(test)]
+fn fixture_state(surface: &VteCompanion, terminal: &vte4::Terminal) -> String {
+    let root = surface.root.upgrade();
+    let host = surface.current_host();
+    let focus = host.as_ref().and_then(gtk::prelude::GtkWindowExt::focus);
+    let focus_in_root = root.as_ref().is_some_and(|root| {
+        focus
+            .as_ref()
+            .is_some_and(|focus| focus == root || focus.is_ancestor(root))
+    });
+    format!(
+        "root_mapped={} card_mapped={} glyph_mapped={} window_active={} terminal_has_focus={} terminal_is_focus={} focus_in_root={} geometry={} source={} paint={} idle={} root_size={:?} glyph_size={:?} frame={} revision={}",
+        root.as_ref().is_some_and(|root| root.is_mapped()),
+        surface.card.is_mapped(),
+        surface.glyph.is_mapped(),
+        host.as_ref().is_some_and(|host| host.is_active()),
+        terminal.has_focus(),
+        terminal.is_focus(),
+        focus_in_root,
+        surface.glyph_has_visible_area(),
+        surface.source.borrow().is_some(),
+        surface.paint_observer.borrow().is_some(),
+        surface.geometry_idle.borrow().is_some(),
+        root.as_ref().map(|root| (root.width(), root.height())),
+        (surface.glyph.width(), surface.glyph.height()),
+        surface.frame.get(),
+        surface.revision.get()
+    )
+}
+
+#[cfg(test)]
 pub(super) fn exercise_existing_fixture(
     window: &gtk::Window,
     overlay: &gtk::Overlay,
@@ -524,7 +557,11 @@ pub(super) fn exercise_existing_fixture(
     assert!(surface.focused_and_mapped());
     assert_eq!(surface.current_host().as_ref(), Some(window));
     assert!(surface.glyph_has_visible_area());
-    assert!(surface.source.borrow().is_some());
+    assert!(
+        surface.source.borrow().is_some(),
+        "{}",
+        fixture_state(&surface, terminal)
+    );
     assert!(surface.paint_observer.borrow().is_some());
     let clock = root.frame_clock().unwrap();
     let source_ticket = surface.source.borrow().as_ref().unwrap().1.clone();
@@ -597,7 +634,11 @@ pub(super) fn exercise_existing_fixture(
         "the existing terminal writer receives the input exactly once"
     );
     assert_eq!(surface.glyph.opacity(), 0.0);
-    assert!(surface.source.borrow().is_some());
+    assert!(
+        surface.source.borrow().is_some(),
+        "{}",
+        fixture_state(&surface, terminal)
+    );
     settle(Duration::from_millis(100));
     assert_eq!(
         allocation(),
@@ -631,8 +672,28 @@ pub(super) fn exercise_existing_fixture(
     assert!(surface.paint_observer.borrow().is_none());
     assert_eq!(allocation(), settled_allocation);
     assert!(terminal.grab_focus());
+    let context = gtk::glib::MainContext::default();
+    let old_focus_idle = context
+        .find_source_by_id(&surface.geometry_idle.borrow().as_ref().unwrap().0)
+        .unwrap();
+    // Leave before the enter idle can run: the old focus transition cannot
+    // revive a pane after the final focus has already moved elsewhere.
+    assert!(entry.grab_focus());
+    assert!(surface.geometry_idle.borrow().is_none());
+    assert!(old_focus_idle.is_destroyed());
     settle(Duration::from_millis(40));
-    assert!(surface.source.borrow().is_some());
+    assert!(surface.source.borrow().is_none());
+    assert!(surface.paint_observer.borrow().is_none());
+    assert_eq!(surface.glyph.opacity(), 0.0);
+    assert!(terminal.grab_focus());
+    assert!(surface.geometry_idle.borrow().is_some());
+    assert!(surface.source.borrow().is_none());
+    settle(Duration::from_millis(40));
+    assert!(
+        surface.source.borrow().is_some(),
+        "focus restore: {}",
+        fixture_state(&surface, terminal)
+    );
     // A partially collapsed Paned keeps its child mapped at a translated
     // minimum allocation. The bottom margin is visible but the glyph is not.
     split.set_position(1);
@@ -648,7 +709,11 @@ pub(super) fn exercise_existing_fixture(
     split.set_position(300);
     settle(Duration::from_millis(100));
     assert!(surface.glyph_has_visible_area());
-    assert!(surface.source.borrow().is_some());
+    assert!(
+        surface.source.borrow().is_some(),
+        "{}",
+        fixture_state(&surface, terminal)
+    );
     assert_eq!(surface.glyph.opacity(), 1.0);
     split.set_position(0);
     settle(Duration::from_millis(60));
@@ -659,7 +724,11 @@ pub(super) fn exercise_existing_fixture(
     split.set_position(300);
     assert!(terminal.grab_focus());
     settle(Duration::from_millis(60));
-    assert!(surface.source.borrow().is_some());
+    assert!(
+        surface.source.borrow().is_some(),
+        "{}",
+        fixture_state(&surface, terminal)
+    );
     let old_clock = root.frame_clock().unwrap();
     split.set_start_child(None::<&gtk::Widget>);
     settle(Duration::from_millis(40));
@@ -675,7 +744,11 @@ pub(super) fn exercise_existing_fixture(
     split.set_position(300);
     assert!(terminal.grab_focus());
     settle(Duration::from_millis(80));
-    assert!(surface.source.borrow().is_some());
+    assert!(
+        surface.source.borrow().is_some(),
+        "{}",
+        fixture_state(&surface, terminal)
+    );
     assert!(surface.host.borrow().is_some());
     config.borrow_mut().ascii_organism_enabled = false;
     surface.refresh();
@@ -690,7 +763,11 @@ pub(super) fn exercise_existing_fixture(
     assert!(surface.source.borrow().is_none());
     surface.set_local(true);
     settle(Duration::from_millis(60));
-    assert!(surface.source.borrow().is_some());
+    assert!(
+        surface.source.borrow().is_some(),
+        "{}",
+        fixture_state(&surface, terminal)
+    );
     surface.close();
     assert!(!surface.card.is_visible());
     assert!(surface.source.borrow().is_none());
@@ -836,6 +913,23 @@ mod tests {
         ] {
             assert!(!production.contains(forbidden), "{forbidden}");
         }
+        let enter = production
+            .split("focus.connect_enter({")
+            .nth(1)
+            .unwrap()
+            .split("focus.connect_leave({")
+            .next()
+            .unwrap();
+        assert!(enter.contains("surface.queue_geometry_refresh();"));
+        assert!(!enter.contains("surface.refresh();"));
+        let leave = production
+            .split("focus.connect_leave({")
+            .nth(1)
+            .unwrap()
+            .split("root.add_controller(focus)")
+            .next()
+            .unwrap();
+        assert!(leave.contains("surface.refresh();"));
         assert!(production.contains("terminal.connect_commit("));
         assert!(production.contains("Rc::ptr_eq(current, &callback_ticket)"));
         assert!(production.contains("self.glyph"));
