@@ -1266,7 +1266,7 @@ fn settled_fixture_layout(
     slot: &gtk::Widget,
     terminal: &vte4::Terminal,
     settle: &impl Fn(Duration),
-) -> [i32; 8] {
+) -> [i32; 14] {
     let root = surface.root.upgrade().expect("live fixture root");
     assert_eq!(
         slot.parent().as_ref(),
@@ -1282,6 +1282,15 @@ fn settled_fixture_layout(
         let slot = slot.clone();
         let terminal = terminal.clone();
         move || {
+            let paned = root.parent().and_downcast::<gtk::Paned>();
+            let axis = paned
+                .as_ref()
+                .map(|p| match p.orientation() {
+                    gtk::Orientation::Horizontal => 0,
+                    gtk::Orientation::Vertical => 1,
+                    _ => -1,
+                })
+                .unwrap_or(-1);
             [
                 root.width(),
                 root.height(),
@@ -1291,6 +1300,12 @@ fn settled_fixture_layout(
                 slot.height(),
                 terminal.width(),
                 terminal.height(),
+                axis,
+                paned.as_ref().map_or(-1, |p| p.width()),
+                paned.as_ref().map_or(-1, |p| p.height()),
+                paned.as_ref().map_or(-1, |p| p.position()),
+                paned.as_ref().map_or(-1, |p| p.min_position()),
+                paned.as_ref().map_or(-1, |p| p.max_position()),
             ]
         }
     });
@@ -1345,7 +1360,7 @@ fn settled_fixture_layout(
 }
 
 #[cfg(test)]
-fn assert_fixture_budget(compact: [i32; 8], expanded: [i32; 8]) {
+fn assert_fixture_budget(compact: [i32; 14], expanded: [i32; 14]) {
     // All dimensions are actual allocations. Card margins are unchanged.
     // Account for parent resizing instead of assuming Paned stayed fixed.
     assert_eq!(
@@ -1648,10 +1663,17 @@ fn exercise_expanded_presentation(
     // Reuse this same Paned to exercise real horizontal narrowing as well as
     // the vertical clipping above. The complete seven-column body must yield
     // to a complete five-column glyph, then disappear, without losing height.
+    let vertical_layout = settled_fixture_layout(surface, &view.widget(), terminal, settle);
     let vertical_position = split.position();
     split.set_orientation(gtk::Orientation::Horizontal);
-    split.set_position(split.width() / 2);
-    settle(Duration::from_millis(100));
+    // GtkPaned retains last_allocation across axis changes. Let the new axis
+    // allocate before requesting a position, otherwise its resize policy can
+    // scale that request using the old axis length.
+    let horizontal_axis = settled_fixture_layout(surface, &view.widget(), terminal, settle);
+    let horizontal_requested = split.width() / 2;
+    split.set_position(horizontal_requested);
+    let horizontal_layout = settled_fixture_layout(surface, &view.widget(), terminal, settle);
+    println!("VTE_PANED_AXIS horizontal requested={horizontal_requested} before={vertical_layout:?} axis={horizontal_axis:?} settled={horizontal_layout:?}");
     let wide_position = split.position();
     assert!(wide_position > 1);
     assert_eq!(surface.current_presentation(), Presentation::Expanded);
@@ -1701,10 +1723,18 @@ fn exercise_expanded_presentation(
     assert_eq!(surface.current_presentation(), Presentation::Expanded);
     assert_eq!(requisition(), expanded_req);
     split.set_orientation(gtk::Orientation::Vertical);
+    let vertical_axis = settled_fixture_layout(surface, &view.widget(), terminal, settle);
     split.set_position(vertical_position);
-    settle(Duration::from_millis(100));
+    let vertical_restored = settled_fixture_layout(surface, &view.widget(), terminal, settle);
+    println!("VTE_PANED_AXIS vertical requested={vertical_position} axis={vertical_axis:?} settled={vertical_restored:?} original={vertical_layout:?}");
+    assert_eq!(
+        split.position(),
+        vertical_position,
+        "restored Paned position: {vertical_restored:?}"
+    );
     assert_eq!(surface.current_presentation(), Presentation::Expanded);
-    assert_eq!((terminal.width(), terminal.height()), expanded_terminal);
+    assert_eq!((terminal.width(), terminal.height()), expanded_terminal,
+        "restored vertical allocation: original={vertical_layout:?} axis={vertical_axis:?} restored={vertical_restored:?}");
     surface.set_expanded(false);
     settle(Duration::from_millis(100));
     assert!(!surface.expanded.get());
