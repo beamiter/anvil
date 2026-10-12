@@ -82,6 +82,22 @@ pub(crate) fn wrap_with_scrollbar(terminal: &Terminal) -> gtk::Box {
     hbox
 }
 
+/// Mount the production VTE/scrollbar grid in its caller-owned pane root.
+/// Widget assembly only: no PTY, child process, signal routing or ownership policy.
+pub(crate) fn mount_terminal_grid(root: &gtk::Box, terminal: &Terminal) -> gtk::Box {
+    root.set_hexpand(true);
+    root.set_vexpand(true);
+    root.add_css_class("terminal-box");
+    let scrollbar = gtk::Scrollbar::new(Orientation::Vertical, terminal.vadjustment().as_ref());
+    let grid = gtk::Box::new(Orientation::Horizontal, 0);
+    grid.set_hexpand(true);
+    grid.set_vexpand(true);
+    grid.append(terminal);
+    grid.append(&scrollbar);
+    root.append(&grid);
+    grid
+}
+
 pub(crate) fn terminal_working_directory(terminal: &Terminal) -> Option<String> {
     if let Some(uri) = terminal.current_directory_uri() {
         let file = gio::File::for_uri(uri.as_str());
@@ -597,17 +613,7 @@ impl Component for VteTerminal {
     ) -> ComponentParts<Self> {
         let terminal = create_terminal(&init.config.borrow());
 
-        // Build the scrollbar wrapper directly into the provided root box.
-        root.set_hexpand(true);
-        root.set_vexpand(true);
-        root.add_css_class("terminal-box");
-        let scrollbar = gtk::Scrollbar::new(Orientation::Vertical, terminal.vadjustment().as_ref());
-        let grid = gtk::Box::new(Orientation::Horizontal, 0);
-        grid.set_hexpand(true);
-        grid.set_vexpand(true);
-        grid.append(&terminal);
-        grid.append(&scrollbar);
-        root.append(&grid);
+        mount_terminal_grid(&root, &terminal);
         let companion = crate::organism_ui::vte_surface::VteCompanion::new(
             &root,
             &terminal,

@@ -1099,11 +1099,102 @@ pub(super) fn exercise_existing_fixture(
     assert!(live_source.is_destroyed());
     assert!(idle_source.is_destroyed());
     clock.emit_by_name::<()>("after-paint", &[]);
+    exercise_production_grid_fixture(window, overlay, terminal, settle);
     assert!(
         crate::block_view::organism_settings_test_pty_bytes(view).is_empty(),
         "display and lifecycle actions never write terminal bytes"
     );
     println!("VTE_COMPANION_NATIVE full_animates=true calm_static_hold=true allocation_stable=true commit_passes_once=true clipped_timer_retires=true paint_edge_restores=true hidden_closed_drop_retired=true");
+}
+
+#[cfg(test)]
+fn exercise_production_grid_fixture(
+    window: &gtk::Window,
+    overlay: &gtk::Overlay,
+    original_terminal: &vte4::Terminal,
+    settle: &impl Fn(Duration),
+) {
+    let original_child = overlay.child().expect("existing fixture content");
+    gtk::prelude::RootExt::set_focus(window, None::<&gtk::Widget>);
+    overlay.set_child(None::<&gtk::Widget>);
+    let mut settings = Config::safe_defaults();
+    settings.ascii_organism_enabled = true;
+    settings.ascii_organism_motion = Some(OrganismMotion::Static);
+    let config = Rc::new(RefCell::new(settings));
+    // Only a terminal widget: no Relm component init, spawn, PTY or process.
+    let terminal = crate::terminal::vte::create_terminal(&config.borrow());
+    assert!(terminal.pty().is_none());
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let grid = crate::terminal::vte::mount_terminal_grid(&root, &terminal);
+    let surface = VteCompanion::new(&root, &terminal, config.clone(), true);
+    overlay.set_child(Some(&root));
+    assert!(terminal.grab_focus());
+    settle(Duration::from_millis(100));
+    assert!(surface.focused_and_mapped());
+    let requisition = || {
+        let h = surface.card.measure(gtk::Orientation::Horizontal, -1);
+        (h, surface.card.measure(gtk::Orientation::Vertical, h.1))
+    };
+    let compact_req = requisition();
+    let compact = settled_fixture_layout(&surface, grid.upcast_ref(), &terminal, settle);
+    surface.set_expanded(true);
+    assert!(surface.expanded.get());
+    let expanded = settled_fixture_layout(&surface, grid.upcast_ref(), &terminal, settle);
+    let expanded_req = requisition();
+    assert_eq!(surface.current_presentation(), Presentation::Expanded);
+    assert_fixture_budget(compact, expanded);
+    assert_eq!(
+        compact[7] - expanded[7],
+        compact[5] - expanded[5],
+        "production VTE/grid budget: compact={compact:?}, expanded={expanded:?}"
+    );
+    assert!(expanded_req.1 .0 > compact_req.1 .0);
+    config.borrow_mut().ascii_organism_motion = Some(OrganismMotion::Full);
+    for frame in 0..120 {
+        surface.frame.set(frame);
+        surface.refresh();
+        assert_eq!(requisition(), expanded_req);
+    }
+    assert_eq!(
+        settled_fixture_layout(&surface, grid.upcast_ref(), &terminal, settle),
+        expanded
+    );
+    config.borrow_mut().ascii_organism_motion = Some(OrganismMotion::Static);
+    surface.refresh();
+    terminal.emit_by_name::<()>("commit", &[&"x", &1u32]);
+    assert!(surface
+        .candidates
+        .iter()
+        .all(|label| label.opacity() == 0.0));
+    assert_eq!(
+        settled_fixture_layout(&surface, grid.upcast_ref(), &terminal, settle),
+        expanded,
+        "input retreat must not reallocate the production VTE/grid"
+    );
+    surface.set_expanded(false);
+    assert!(!surface.expanded.get());
+    assert_eq!(
+        settled_fixture_layout(&surface, grid.upcast_ref(), &terminal, settle),
+        compact
+    );
+    assert_eq!(requisition(), compact_req);
+    assert!(terminal.pty().is_none());
+    surface.close();
+    assert!(surface.source.borrow().is_none());
+    assert!(surface.geometry_idle.borrow().is_none());
+    let weak = Rc::downgrade(&surface);
+    drop(surface);
+    assert!(weak.upgrade().is_none());
+    gtk::prelude::RootExt::set_focus(window, None::<&gtk::Widget>);
+    overlay.set_child(None::<&gtk::Widget>);
+    overlay.set_child(Some(&original_child));
+    assert!(original_terminal.grab_focus());
+    settle(Duration::from_millis(100));
+    assert!(gtk::prelude::RootExt::focus(window).is_some_and(|focus| {
+        focus == *original_terminal.upcast_ref::<gtk::Widget>()
+            || focus.is_ancestor(original_terminal)
+    }));
+    assert!(terminal.pty().is_none());
 }
 
 #[cfg(test)]
@@ -1122,6 +1213,106 @@ fn assert_accessible_hidden(label: &gtk::Label, hidden: bool) {
     assert!(
         mismatch.is_none(),
         "unexpected accessible Hidden: {mismatch:?}"
+    );
+}
+
+#[cfg(test)]
+fn settled_fixture_layout(
+    surface: &Rc<VteCompanion>,
+    slot: &gtk::Widget,
+    terminal: &vte4::Terminal,
+    settle: &impl Fn(Duration),
+) -> [i32; 8] {
+    let root = surface.root.upgrade().expect("live fixture root");
+    assert_eq!(
+        slot.parent().as_ref(),
+        Some(root.upcast_ref::<gtk::Widget>())
+    );
+    assert_eq!(
+        surface.card.parent().as_ref(),
+        Some(root.upcast_ref::<gtk::Widget>())
+    );
+    let sample = Rc::new({
+        let root = root.clone();
+        let card = surface.card.clone();
+        let slot = slot.clone();
+        let terminal = terminal.clone();
+        move || {
+            [
+                root.width(),
+                root.height(),
+                card.width(),
+                card.height(),
+                slot.width(),
+                slot.height(),
+                terminal.width(),
+                terminal.height(),
+            ]
+        }
+    });
+    struct PaintObserver {
+        clock: gtk::gdk::FrameClock,
+        handler: Option<gtk::glib::SignalHandlerId>,
+    }
+    impl Drop for PaintObserver {
+        fn drop(&mut self) {
+            if let Some(handler) = self.handler.take() {
+                self.clock.disconnect(handler);
+            }
+        }
+    }
+    let clock = root.frame_clock().expect("mapped fixture clock");
+    let previous = Rc::new(Cell::new(None));
+    let stable = Rc::new(Cell::new(0u32));
+    let handler = clock.connect_after_paint({
+        let sample = sample.clone();
+        let previous = previous.clone();
+        let stable = stable.clone();
+        move |_| {
+            let current = sample();
+            if previous.replace(Some(current)) == Some(current) {
+                stable.set(stable.get().saturating_add(1));
+            } else {
+                stable.set(0);
+            }
+        }
+    });
+    let observer = PaintObserver {
+        clock,
+        handler: Some(handler),
+    };
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while stable.get() < 2 && Instant::now() < deadline {
+        root.queue_draw();
+        settle(Duration::from_millis(10));
+    }
+    drop(observer);
+    let result = sample();
+    assert_eq!(
+        Some(result),
+        previous.get(),
+        "layout changed after its last actual paint"
+    );
+    assert!(
+        stable.get() >= 2,
+        "root/card/direct-slot/terminal layout did not settle: {result:?}"
+    );
+    result
+}
+
+#[cfg(test)]
+fn assert_fixture_budget(compact: [i32; 8], expanded: [i32; 8]) {
+    // All dimensions are actual allocations. Card margins are unchanged.
+    // Account for parent resizing instead of assuming Paned stayed fixed.
+    assert_eq!(
+        compact[4] - expanded[4],
+        0,
+        "direct-slot widths: compact={compact:?}, expanded={expanded:?}"
+    );
+    assert_eq!(
+        compact[5] - expanded[5],
+        expanded[3] - compact[3] + compact[1] - expanded[1],
+        "root/card/direct-slot/terminal budget: compact={compact:?}, expanded={expanded:?}"
     );
 }
 
@@ -1169,8 +1360,8 @@ fn exercise_expanded_presentation(
     assert!(surface.expanded_slot.parent().is_none());
     assert!(!surface.mounting.get());
     let compact_req = requisition();
-    let compact_terminal = (terminal.width(), terminal.height());
-    let compact_height = surface.card.height();
+    let compact_layout = settled_fixture_layout(surface, &view.widget(), terminal, settle);
+    let compact_terminal = (compact_layout[6], compact_layout[7]);
     config.borrow_mut().ascii_organism_motion = Some(OrganismMotion::Static);
     surface.refresh();
     surface.set_expanded(true);
@@ -1179,8 +1370,9 @@ fn exercise_expanded_presentation(
     assert_eq!(surface.current_presentation(), Presentation::Expanded);
     assert_eq!(surface.glyph.parent(), None);
     let expanded_req = requisition();
-    let expanded_terminal = (terminal.width(), terminal.height());
-    let expanded_height = surface.card.height();
+    let expanded_layout = settled_fixture_layout(surface, &view.widget(), terminal, settle);
+    let expanded_terminal = (expanded_layout[6], expanded_layout[7]);
+    let expanded_height = expanded_layout[3];
     let slot_h = surface
         .expanded_slot
         .measure(gtk::Orientation::Horizontal, -1);
@@ -1199,10 +1391,10 @@ fn exercise_expanded_presentation(
     }
     assert!(expanded_req.1 .0 > compact_req.1 .0);
     assert_eq!(expanded_terminal.0, compact_terminal.0);
-    assert_eq!(
-        compact_terminal.1 - expanded_terminal.1,
-        expanded_height - compact_height
-    );
+    // This preserved fixture carries a Block TermView: its internal VTE is
+    // quantized to cell rows. The exact companion budget belongs to the
+    // direct TermView slot; internal VTE stability is checked below.
+    assert_fixture_budget(compact_layout, expanded_layout);
     surface.set_expanded(true);
     assert_eq!(requisition(), expanded_req);
     for candidate in &surface.candidates {
