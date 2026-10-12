@@ -1,4 +1,6 @@
-//! Native Block-pane body for the experimental ASCII organism.
+//! Native bodies for the experimental ASCII organism.
+
+pub(crate) mod vte_surface;
 
 use gtk::prelude::*;
 use gtk::{Box as GBox, Label, Orientation};
@@ -5929,6 +5931,14 @@ mod tests {
         assert!(runtime.surface_timer.borrow().is_none());
         assert!(runtime.surface_timer_deadline.get().is_none());
         assert!(crate::block_view::organism_settings_test_pty_bytes(&view).is_empty());
+        vte_surface::exercise_existing_fixture(
+            &window,
+            &window_overlay,
+            &content,
+            &entry,
+            &view,
+            &settle,
+        );
         // Use the same display fixture/window for clipping and weak-ownership
         // boundaries. This small subtree has no terminal or extra event source.
         let tooltip_host = gtk::Box::new(gtk::Orientation::Vertical, 0);

@@ -1258,7 +1258,7 @@ Forge's GTK4 frontend is recorded in
 ### ASCII organism
 
 Set `ascii_organism_enabled = true` to attach the optional local organism to
-open and new local Block panes. It reacts only to content-free command lifecycle facts,
+open and new local Block/Unified panes. It reacts only to content-free command lifecycle facts,
 focused-pane presence, elapsed time, exit status/duration, and Agent state; it
 does not run commands, use an LLM, or persist command/output text. Its bounded
 memory lives under `${XDG_STATE_HOME:-~/.local/state}/anvil/` and is flushed on
@@ -1269,9 +1269,21 @@ state.
 spatial behavior. Omitting it follows the desktop animation preference.
 Settings exposes the same four choices as Forge: Automatic, Full, Calm, and
 Static. Settings and configuration reloads apply immediately to existing local
-Block/Unified panes. Turning it off hides all three representations and stops
-that pane's animation timer; re-enabling reuses the existing body and callbacks.
+Block/Unified and traditional VTE panes. Turning it off hides the companion and
+stops that pane's animation timer; re-enabling reuses its existing widgets.
 
+Traditional VTE has partial, display-only support: a neutral five-character
+companion sits outside the terminal grid, alongside a short capability label.
+Full uses the shared renderer's animation; Calm and Static hold a still frame.
+Sent input and focus loss hide the glyph while preserving its layout slot.
+Fully clipped, hidden, inactive, closed, and disabled panes stop their animation
+source. A passive observer of existing native paints checks clipping changes;
+it does not request additional frames, and recovery may wait for the next paint.
+Command activity and alternate-screen state cannot be verified through the
+supported VTE API, so hover greetings and Hello are unavailable in this mode.
+Settings and the card's accessible description explain this limitation.
+
+The following interactions and lifecycle expressions apply to Block/Unified.
 Pause the pointer near a visible resting body for 600 ms for a quiet two-second
 hello. Split panes share an eight-second cooldown. This passive observer never
 consumes clicks, selection, or keyboard focus; typing, real work, focus transfer,

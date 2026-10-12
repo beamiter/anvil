@@ -1,6 +1,7 @@
 //! VTE terminal backend as a relm4 Component.
 //!
-//! Wraps a `vte4::Terminal` + `gtk::Scrollbar` in a horizontal box. The shell
+//! Wraps a `vte4::Terminal` + `gtk::Scrollbar` row and an optional native
+//! display-only companion outside its grid. The shell
 //! is spawned on init. VTE signals (cwd/exit/bell/title/activity) are forwarded
 //! as component Output messages instead of forge's callback-Vec observer model.
 
@@ -223,6 +224,7 @@ pub(crate) fn spawn_shell(
     env_extra: &[(String, String)],
     probe: PaneProbe,
     sender: ComponentSender<VteTerminal>,
+    on_launch_failed: impl Fn() + 'static,
 ) {
     let (argv_vec, _) = crate::config::shell_argv_with_session(argv_owned, session_id);
     let home = std::env::var("HOME").ok();
@@ -261,6 +263,7 @@ pub(crate) fn spawn_shell(
     ) {
         Ok(envv) => envv,
         Err(error) => {
+            on_launch_failed();
             let message = launch_failure_message(&error);
             log::error!("{message}");
             terminal.feed(format!("\r\nanvil: {message}\r\n").as_bytes());
@@ -313,6 +316,7 @@ pub(crate) fn spawn_shell(
                     let _ = sender.output(VteOutput::Launched);
                 }
                 Err(error) => {
+                    on_launch_failed();
                     let message = launch_failure_message(&error);
                     log::error!("{message}");
                     let terminal_message = format!("\r\nanvil: {message}\r\n");
@@ -562,6 +566,7 @@ pub struct VteTerminal {
     terminal: Terminal,
     config: Rc<RefCell<Config>>,
     search_status: SearchStatus,
+    companion: Rc<crate::organism_ui::vte_surface::VteCompanion>,
 }
 
 impl VteTerminal {
@@ -579,7 +584,7 @@ impl Component for VteTerminal {
     type Widgets = ();
 
     fn init_root() -> Self::Root {
-        gtk::Box::new(Orientation::Horizontal, 0)
+        gtk::Box::new(Orientation::Vertical, 0)
     }
 
     fn init(
@@ -594,8 +599,18 @@ impl Component for VteTerminal {
         root.set_vexpand(true);
         root.add_css_class("terminal-box");
         let scrollbar = gtk::Scrollbar::new(Orientation::Vertical, terminal.vadjustment().as_ref());
-        root.append(&terminal);
-        root.append(&scrollbar);
+        let grid = gtk::Box::new(Orientation::Horizontal, 0);
+        grid.set_hexpand(true);
+        grid.set_vexpand(true);
+        grid.append(&terminal);
+        grid.append(&scrollbar);
+        root.append(&grid);
+        let companion = crate::organism_ui::vte_surface::VteCompanion::new(
+            &root,
+            &terminal,
+            init.config.clone(),
+            !init.working_directory_external,
+        );
 
         setup_terminal_click_handler(&terminal);
 
@@ -605,6 +620,7 @@ impl Component for VteTerminal {
             let term_for_cwd = terminal.clone();
             let probe_for_cwd = init.probe.clone();
             let cwd_token = init.cwd_token.clone();
+            let companion = Rc::downgrade(&companion);
             terminal.connect_current_directory_uri_notify(move |_| {
                 if let Some(uri) = term_for_cwd.current_directory_uri() {
                     if let Ok((path, host)) = gtk::glib::filename_from_uri(uri.as_str()) {
@@ -619,6 +635,9 @@ impl Component for VteTerminal {
                             probe_for_cwd.shell_pid.get(),
                         );
                         let external = crate::terminal::resolve_cwd_external(authority, foreground);
+                        if let Some(companion) = companion.upgrade() {
+                            companion.set_local(!external);
+                        }
                         let _ = sender.output(VteOutput::CwdChanged { path, external });
                     }
                 }
@@ -626,7 +645,11 @@ impl Component for VteTerminal {
         }
         {
             let sender = sender.clone();
+            let companion = Rc::downgrade(&companion);
             terminal.connect_child_exited(move |_term, status| {
+                if let Some(companion) = companion.upgrade() {
+                    companion.close();
+                }
                 let _ = sender.output(VteOutput::Exited(status));
             });
         }
@@ -665,6 +688,14 @@ impl Component for VteTerminal {
             &init.env_extra,
             init.probe.clone(),
             sender.clone(),
+            {
+                let companion = Rc::downgrade(&companion);
+                move || {
+                    if let Some(companion) = companion.upgrade() {
+                        companion.close();
+                    }
+                }
+            },
         );
 
         // Grab focus once the widget is realized.
@@ -689,6 +720,7 @@ impl Component for VteTerminal {
             terminal,
             config: init.config,
             search_status: SearchStatus::Idle,
+            companion,
         };
         ComponentParts { model, widgets: () }
     }
@@ -756,8 +788,9 @@ impl Component for VteTerminal {
                 self.terminal
                     .set_color_cursor_foreground(Some(&config.cursor_foreground));
             }
-            VteInput::SyncConfig => {}
+            VteInput::SyncConfig => self.companion.refresh(),
             VteInput::Kill => {
+                self.companion.close();
                 if let Some(pid) = unsafe { self.terminal.data::<i32>("child-pid") } {
                     let pid_val = unsafe { *pid.as_ref() };
                     unsafe {

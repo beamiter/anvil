@@ -21,7 +21,7 @@ impl ReloadIntent {
 impl AppModel {
     /// Block panes keep a callback-safe configuration snapshot inside
     /// `TermView`; tell each backend to refresh it after the app-level value
-    /// changes. Plain VTE panes already share the app's `Rc` and no-op.
+    /// changes. Plain VTE panes also refresh their native companion surface.
     pub(crate) fn sync_terminal_configs(&self) {
         for tab in &self.tabs {
             for pane in &tab.panes {

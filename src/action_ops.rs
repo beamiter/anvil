@@ -116,7 +116,7 @@ impl AppModel {
             return;
         }
         let Some(view) = pane.terminal.term_view() else {
-            self.show_toast("Live hello needs a local Block or Unified companion.");
+            self.show_toast(crate::organism_ui::vte_surface::HELLO_UNAVAILABLE);
             return;
         };
         if let Err(message) = self.organism_hub.say_hello(&view) {

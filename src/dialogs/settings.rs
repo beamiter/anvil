@@ -33,7 +33,7 @@ fn ascii_organism_availability(enabled: bool, safe_mode: bool) -> &'static str {
     } else if !enabled {
         "Off. Offline preview is still available below."
     } else {
-        "Local, no-LLM companion for Block/Unified panes"
+        "Local, no-LLM companion; traditional VTE has limited display support."
     }
 }
 
@@ -71,12 +71,16 @@ mod organism_preview {
 
     pub(super) const INTERACTION_HINT: &str = concat!(
         "Changes apply to open panes.\n",
-        "In Full or Calm, keep the pointer near an idle companion for 600 ms ",
+        "In Block/Unified with Full or Calm, keep the pointer near an idle companion for 600 ms ",
         "for a brief hello (about 2 seconds). Greetings are at least 8 seconds apart; ",
         "move away and return to try again.\n",
         "Typing, running commands and alternate-screen apps take priority. ",
         "Static uses inline cards only, without live hover greetings. ",
-        "Clicks and selection stay with your terminal."
+        "Clicks and selection stay with your terminal.\n",
+        "Traditional VTE shows a neutral companion outside the terminal grid. ",
+        "Command activity and alternate-screen state are unavailable, so hover ",
+        "greetings and Hello are unavailable. Sent input briefly hides the companion ",
+        "without moving the terminal."
     );
 
     const FRAME_INTERVAL: Duration = Duration::from_millis(100);
@@ -3300,7 +3304,7 @@ mod tests {
         assert!(off.contains("Offline preview"));
         assert_eq!(
             super::ascii_organism_availability(true, false),
-            "Local, no-LLM companion for Block/Unified panes"
+            "Local, no-LLM companion; traditional VTE has limited display support."
         );
     }
 

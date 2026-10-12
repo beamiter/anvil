@@ -156,10 +156,11 @@ impl AppModel {
         self.config.borrow_mut().ascii_organism_enabled = enabled;
         self.sync_ascii_organism_settings_dialog();
         self.organism_hub.sync_ascii_organism_settings();
+        self.sync_terminal_configs();
         self.sync_organism_focus();
         self.persist_config();
         self.show_toast(if enabled {
-            "ASCII organism enabled in open local Block and Unified panes."
+            "ASCII organism enabled. Traditional VTE has limited display support."
         } else {
             "ASCII organism hidden in all open panes."
         });
@@ -179,6 +180,7 @@ impl AppModel {
         };
         self.sync_ascii_organism_settings_dialog();
         self.organism_hub.sync_ascii_organism_settings();
+        self.sync_terminal_configs();
         self.sync_organism_focus();
         self.persist_config();
     }
