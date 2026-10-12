@@ -678,14 +678,44 @@ mod tests {
             text: "Ctrl".to_string(),
         };
         let entries = gather(&query, &kbmap, &[], &[], 500);
+        let matcher = SkimMatcherV2::default().smart_case();
         for entry in &entries {
             assert!(
-                entry.label.to_lowercase().contains("ctrl"),
+                matcher.fuzzy_match(&entry.label, &query.text).is_some(),
                 "{:?} matched only through its keybinding hint {:?}",
                 entry.label,
                 entry.right
             );
+            let mut original = entry.clone();
+            original.score = 0;
+            let mut changed_hint = original.clone();
+            changed_hint.right = Some("Unrelated shortcut hint".into());
+            let mut before = Vec::new();
+            let mut after = Vec::new();
+            push_if_match(&matcher, &query.text, original, &mut before);
+            push_if_match(&matcher, &query.text, changed_hint, &mut after);
+            assert_eq!(before.len(), 1);
+            assert_eq!(after.len(), 1);
+            assert_eq!(before[0].label, after[0].label);
+            assert_eq!(before[0].score, after[0].score);
         }
+        // A hint-only match must be rejected independently of the action list.
+        let mut matches = Vec::new();
+        push_if_match(
+            &matcher,
+            &query.text,
+            Entry {
+                tier: 0,
+                score: 0,
+                label: "Open".into(),
+                sublabel: None,
+                right: Some("Ctrl+O".into()),
+                search_extra: None,
+                accept: Accept::TypeCommand(String::new()),
+            },
+            &mut matches,
+        );
+        assert!(matches.is_empty());
     }
 
     #[test]

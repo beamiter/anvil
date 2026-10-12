@@ -665,7 +665,14 @@ pub(crate) fn exercise_companion_presentation_palette(
                 }
             }
         });
+    let wait_for = |stage: &str, deadline: std::time::Instant, ready: &dyn Fn() -> bool| {
+        while !ready() && std::time::Instant::now() < deadline {
+            settle(Duration::from_millis(10));
+        }
+        assert!(ready(), "palette native stage did not settle: {stage}");
+    };
     let open = || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
         assert!(terminal.grab_focus());
         palette.emit(PaletteMsg::Toggle {
             workflow_target: Some(42),
@@ -673,8 +680,52 @@ pub(crate) fn exercise_companion_presentation_palette(
             history_path: None,
             live_history: Vec::new(),
         });
-        settle(Duration::from_millis(100));
-        assert!(palette.widget().parent().is_some());
+        // AdwDialog opens and grabs focus on a later frame, after mapping.
+        // Wait for the actual filter descendant before sending a real key.
+        let filter_ready = || {
+            palette.widget().is_mapped()
+                && palette.widget().parent().is_some()
+                && gtk::prelude::RootExt::focus(parent).is_some_and(|focus| {
+                    let widgets = palette.widgets();
+                    focus == *widgets.filter_entry.upcast_ref::<gtk::Widget>()
+                        || focus.is_ancestor(&widgets.filter_entry)
+                })
+        };
+        wait_for("filter ready", deadline, &filter_ready);
+        // Toggle explicitly focuses the filter before AdwDialog's second map
+        // tick opens the sheet. Two actual after-paint frames occur after those
+        // update-phase ticks, unlike mapped/focus alone or a fixed sleep.
+        struct PaintObserver {
+            clock: gtk::gdk::FrameClock,
+            handler: Option<gtk::glib::SignalHandlerId>,
+        }
+        impl Drop for PaintObserver {
+            fn drop(&mut self) {
+                if let Some(handler) = self.handler.take() {
+                    self.clock.disconnect(handler);
+                }
+            }
+        }
+        let clock = palette.widget().frame_clock().expect("mapped dialog clock");
+        let paints = Rc::new(Cell::new(0u32));
+        let handler = clock.connect_after_paint({
+            let paints = paints.clone();
+            move |_| paints.set(paints.get().saturating_add(1))
+        });
+        let observer = PaintObserver {
+            clock,
+            handler: Some(handler),
+        };
+        while paints.get() < 2 && std::time::Instant::now() < deadline {
+            palette.widget().queue_draw();
+            settle(Duration::from_millis(10));
+        }
+        drop(observer);
+        assert!(
+            paints.get() >= 2,
+            "dialog did not complete two native paints"
+        );
+        assert!(filter_ready(), "dialog lost filter focus before the key");
     };
     let key = |keyval: u32| {
         let controllers = palette.widget().observe_controllers();
@@ -690,8 +741,16 @@ pub(crate) fn exercise_companion_presentation_palette(
             "key-pressed",
             &[&keyval, &0u32, &gtk::gdk::ModifierType::empty()]
         ));
-        settle(Duration::from_millis(100));
-        assert!(palette.widget().parent().is_none());
+        wait_for(
+            "closed and terminal focus restored",
+            std::time::Instant::now() + Duration::from_secs(3),
+            &|| {
+                !palette.widget().is_mapped()
+                    && palette.widget().parent().is_none()
+                    && gtk::prelude::RootExt::focus(parent)
+                        .is_some_and(|focus| focus == *terminal || focus.is_ancestor(terminal))
+            },
+        );
     };
     open();
     palette

@@ -160,7 +160,8 @@ impl VteCompanion {
             candidate.set_can_target(false);
             candidate.set_focusable(false);
             candidate.set_opacity(0.0);
-            candidate.update_state(&[gtk::accessible::State::Hidden(true)]);
+            // GTK owns Hidden during map/unmap. Presentation leaf labels are
+            // omitted by the accessibility backend without overriding it.
             candidate
         });
         expanded_slot.set_child(Some(&candidates[0]));
@@ -317,9 +318,7 @@ impl VteCompanion {
             }
             if self.expanded_slot.parent().is_none() {
                 self.card.prepend(&self.expanded_slot);
-                if self.revision.get() != revision {
-                    return;
-                }
+                // The caller checks the revision before doing any more work.
             }
         } else {
             if self.expanded_slot.parent().as_ref() == Some(self.card.upcast_ref::<gtk::Widget>()) {
@@ -1214,14 +1213,54 @@ fn exercise_expanded_presentation(
             candidate.accessible_role(),
             gtk::AccessibleRole::Presentation
         );
-        assert_accessible_hidden(candidate, true);
-        candidate.update_state(&[gtk::accessible::State::Hidden(false)]);
-        assert_accessible_hidden(candidate, false);
-        assert_eq!(requisition(), expanded_req);
-        candidate.update_state(&[gtk::accessible::State::Hidden(true)]);
-        assert_accessible_hidden(candidate, true);
+        assert!(gtk::test_accessible_has_role(
+            candidate,
+            gtk::AccessibleRole::Presentation
+        ));
+        assert!(candidate.first_accessible_child().is_none());
         assert_eq!(requisition(), expanded_req);
     }
+    assert!(surface.capability.is_mapped());
+    assert!(!matches!(
+        surface.capability.accessible_role(),
+        gtk::AccessibleRole::Presentation | gtk::AccessibleRole::None
+    ));
+    assert!(gtk::test_accessible_has_property(
+        &surface.capability,
+        gtk::AccessibleProperty::Description
+    ));
+    assert_accessible_hidden(&surface.capability, false);
+    surface.set_expanded(false);
+    settle(Duration::from_millis(100));
+    assert_eq!(requisition(), compact_req);
+    for candidate in &surface.candidates {
+        assert!(candidate.is_visible());
+        assert_eq!(
+            candidate.accessible_role(),
+            gtk::AccessibleRole::Presentation
+        );
+        assert!(gtk::test_accessible_has_role(
+            candidate,
+            gtk::AccessibleRole::Presentation
+        ));
+        assert!(candidate.first_accessible_child().is_none());
+    }
+    surface.set_expanded(true);
+    settle(Duration::from_millis(100));
+    assert_eq!(requisition(), expanded_req);
+    for candidate in &surface.candidates {
+        assert!(candidate.is_visible());
+        assert_eq!(
+            candidate.accessible_role(),
+            gtk::AccessibleRole::Presentation
+        );
+        assert!(gtk::test_accessible_has_role(
+            candidate,
+            gtk::AccessibleRole::Presentation
+        ));
+        assert!(candidate.first_accessible_child().is_none());
+    }
+    assert!(surface.capability.is_mapped());
     assert_accessible_hidden(&surface.capability, false);
     config.borrow_mut().ascii_organism_motion = Some(OrganismMotion::Full);
     for frame in 0..120 {
@@ -1470,9 +1509,8 @@ mod tests {
         assert!(production.contains("expanded_slot.set_child(Some(&candidates[0]))"));
         assert!(production.contains("expanded_slot.set_measure_overlay(candidate, true)"));
         assert!(production.contains("expanded_slot.set_clip_overlay(candidate, true)"));
-        assert!(
-            production.contains("candidate.update_state(&[gtk::accessible::State::Hidden(true)])")
-        );
+        assert!(production.contains(".accessible_role(gtk::AccessibleRole::Presentation)"));
+        assert!(!production.contains("accessible::State::Hidden"));
         assert!(!production.contains("set_height_request"));
         let refresh = production.split("pub(crate) fn refresh").nth(1).unwrap();
         assert!(
