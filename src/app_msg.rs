@@ -384,6 +384,7 @@ pub(crate) enum AppMsg {
     AgentTasksTick,
     PaletteRunWorkflow(std::path::PathBuf, Option<u64>),
     AsciiOrganismHello(Option<u64>),
+    SetVteCompanionExpanded(Option<u64>, bool),
     WorkflowInsertCommand {
         pane_id: u64,
         command: String,

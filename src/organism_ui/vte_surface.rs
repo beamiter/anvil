@@ -7,14 +7,16 @@
 use super::{HUMAN_INPUT_RETREAT, SURFACE_FRAME_INTERVAL};
 use crate::config::{Config, OrganismMotion};
 use gtk::prelude::*;
-use jterm_core::organism::{sticky_glyph_with_context, Behavior, BodyLanguage, RenderContext};
+use jterm_core::organism::{
+    sprite_frame_with_context, sticky_glyph_with_context, Behavior, BodyLanguage, RenderContext,
+};
 use relm4::gtk;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use vte4::TerminalExt;
 
-pub(crate) const CAPABILITY_DETAIL: &str = "Traditional VTE shows a neutral companion outside the terminal grid. Command activity and alternate-screen state are unavailable, so hover greetings and Hello are unavailable. Sent input briefly hides the companion without moving the terminal.";
+pub(crate) const CAPABILITY_DETAIL: &str = "Traditional VTE shows a neutral companion outside the terminal grid. Command activity and alternate-screen state are unavailable, so hover greetings and Hello are unavailable. Sent input briefly hides the companion without moving the terminal. Use the command palette to expand or collapse this neutral companion.";
 pub(crate) const HELLO_UNAVAILABLE: &str = "Hello is unavailable in traditional VTE: command activity and alternate-screen state cannot be verified.";
 
 fn display_frame(motion: OrganismMotion, frame: u64) -> u64 {
@@ -46,10 +48,58 @@ fn visible_edges(x: f32, y: f32, width: f32, height: f32) -> Option<[f32; 4]> {
         .then_some([x, y, right, bottom])
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Presentation {
+    Compact,
+    Expanded,
+    Fallback,
+    Hidden,
+}
+
+fn presentation(expanded: bool, full_fits: bool, fallback_fits: bool) -> Presentation {
+    if !expanded {
+        Presentation::Compact
+    } else if full_fits {
+        Presentation::Expanded
+    } else if fallback_fits {
+        Presentation::Fallback
+    } else {
+        Presentation::Hidden
+    }
+}
+
+fn neutral_candidates() -> [String; 4] {
+    let context = RenderContext::new(Behavior::Idle, BodyLanguage::default(), false);
+    [
+        sprite_frame_with_context(context, 0).into_owned(),
+        sprite_frame_with_context(context, 35).into_owned(),
+        sticky_glyph_with_context(context, 0).into_owned(),
+        sticky_glyph_with_context(context, 55).into_owned(),
+    ]
+}
+
+fn contains_edges(outer: [f32; 4], inner: [f32; 4]) -> bool {
+    outer.iter().chain(inner.iter()).all(|v| v.is_finite())
+        && outer[2] > outer[0]
+        && outer[3] > outer[1]
+        && inner[2] > inner[0]
+        && inner[3] > inner[1]
+        && inner[0] >= outer[0]
+        && inner[1] >= outer[1]
+        && inner[2] <= outer[2]
+        && inner[3] <= outer[3]
+}
+
 pub(crate) struct VteCompanion {
     root: gtk::glib::WeakRef<gtk::Box>,
     card: gtk::Box,
     glyph: gtk::Label,
+    capability: gtk::Label,
+    expanded_slot: gtk::Overlay,
+    candidates: [gtk::Label; 4],
+    expanded: Cell<bool>,
+    mounting: Cell<bool>,
+    presentation: Cell<Presentation>,
     config: Rc<RefCell<Config>>,
     local: Cell<bool>,
     closed: Cell<bool>,
@@ -93,6 +143,32 @@ impl VteCompanion {
         glyph.set_max_width_chars(5);
         glyph.set_can_target(false);
         glyph.set_focusable(false);
+        // Every neutral candidate is both measured and painted by the same
+        // native label. Measured overlays reserve the maximum requisition;
+        // only opacity changes between frames, retreat and width fallback.
+        // GTK font/CSS/scale invalidation remeasures the real labels directly.
+        let expanded_slot = gtk::Overlay::new();
+        expanded_slot.set_can_target(false);
+        expanded_slot.set_focusable(false);
+        expanded_slot.set_overflow(gtk::Overflow::Hidden);
+        let candidates = neutral_candidates().map(|text| {
+            let candidate = gtk::Label::builder()
+                .accessible_role(gtk::AccessibleRole::Presentation)
+                .label(text)
+                .build();
+            candidate.add_css_class("monospace");
+            candidate.set_can_target(false);
+            candidate.set_focusable(false);
+            candidate.set_opacity(0.0);
+            candidate.update_state(&[gtk::accessible::State::Hidden(true)]);
+            candidate
+        });
+        expanded_slot.set_child(Some(&candidates[0]));
+        for candidate in &candidates[1..] {
+            expanded_slot.add_overlay(candidate);
+            expanded_slot.set_measure_overlay(candidate, true);
+            expanded_slot.set_clip_overlay(candidate, true);
+        }
         let label = gtk::Label::new(Some("VTE · display only"));
         label.add_css_class("dim-label");
         label.set_xalign(0.0);
@@ -110,6 +186,12 @@ impl VteCompanion {
             root: root.downgrade(),
             card,
             glyph,
+            capability: label,
+            expanded_slot,
+            candidates,
+            expanded: Cell::new(false),
+            mounting: Cell::new(false),
+            presentation: Cell::new(Presentation::Compact),
             config,
             local: Cell::new(local),
             closed: Cell::new(false),
@@ -193,6 +275,140 @@ impl VteCompanion {
         surface
     }
 
+    pub(crate) fn set_expanded(self: &Rc<Self>, expanded: bool) {
+        if self.closed.get()
+            || !self.local.get()
+            || !self.config.borrow().ascii_organism_enabled
+            || !self.focused_and_mapped()
+            || self.expanded.get() == expanded
+        {
+            return;
+        }
+        self.expanded.set(expanded);
+        let detail = format!(
+            "{} Current presentation: {}.",
+            CAPABILITY_DETAIL,
+            if expanded { "expanded" } else { "compact" }
+        );
+        self.capability
+            .update_property(&[gtk::accessible::Property::Description(&detail)]);
+        self.refresh();
+    }
+
+    fn sync_presentation_layout(&self, revision: u64) {
+        struct Mounting<'a>(&'a Cell<bool>);
+        impl Drop for Mounting<'_> {
+            fn drop(&mut self) {
+                self.0.set(false);
+            }
+        }
+        self.mounting.set(true);
+        let _mounting = Mounting(&self.mounting);
+        // Native unparent/map/property signals may synchronously request the
+        // opposite state. The reentrant refresh retires the revision and queues
+        // the existing idle, rather than mutating this hierarchy recursively.
+        // Reconcile actual parents, never assume a preceding remove completed.
+        if self.expanded.get() {
+            if self.glyph.parent().as_ref() == Some(self.card.upcast_ref::<gtk::Widget>()) {
+                self.card.remove(&self.glyph);
+                if self.revision.get() != revision {
+                    return;
+                }
+            }
+            if self.expanded_slot.parent().is_none() {
+                self.card.prepend(&self.expanded_slot);
+                if self.revision.get() != revision {
+                    return;
+                }
+            }
+        } else {
+            if self.expanded_slot.parent().as_ref() == Some(self.card.upcast_ref::<gtk::Widget>()) {
+                self.card.remove(&self.expanded_slot);
+                if self.revision.get() != revision {
+                    return;
+                }
+            }
+            if self.glyph.parent().is_none() {
+                self.card.prepend(&self.glyph);
+            }
+        }
+    }
+
+    fn geometry_widget(&self) -> &gtk::Widget {
+        if self.expanded.get() {
+            self.expanded_slot.upcast_ref()
+        } else {
+            self.glyph.upcast_ref()
+        }
+    }
+
+    // Use the actual candidate Pango ink AND logical bounds, transformed into
+    // the host coordinate space, and require complete ancestor containment.
+    fn candidate_fits(&self, candidate: &gtk::Label) -> bool {
+        let Some(window) = self.current_host() else {
+            return false;
+        };
+        if !candidate.is_mapped() {
+            return false;
+        }
+        let (ink, logical) = candidate.layout().pixel_extents();
+        let (ox, oy) = candidate.layout_offsets();
+        let left = i64::from(ink.x().min(logical.x())) + i64::from(ox);
+        let top = i64::from(ink.y().min(logical.y())) + i64::from(oy);
+        let right = (i64::from(ink.x()) + i64::from(ink.width()))
+            .max(i64::from(logical.x()) + i64::from(logical.width()))
+            + i64::from(ox);
+        let bottom = (i64::from(ink.y()) + i64::from(ink.height()))
+            .max(i64::from(logical.y()) + i64::from(logical.height()))
+            + i64::from(oy);
+        let mut edges = [
+            f32::INFINITY,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+        ];
+        for (x, y) in [(left, top), (right, top), (left, bottom), (right, bottom)] {
+            let Some(point) =
+                candidate.compute_point(&window, &gtk::graphene::Point::new(x as f32, y as f32))
+            else {
+                return false;
+            };
+            if !point.x().is_finite() || !point.y().is_finite() {
+                return false;
+            }
+            edges[0] = edges[0].min(point.x());
+            edges[1] = edges[1].min(point.y());
+            edges[2] = edges[2].max(point.x());
+            edges[3] = edges[3].max(point.y());
+        }
+        let mut ancestor = Some(candidate.clone().upcast::<gtk::Widget>());
+        while let Some(widget) = ancestor {
+            let Some(bounds) = widget.compute_bounds(&window) else {
+                return false;
+            };
+            let Some(outer) =
+                visible_edges(bounds.x(), bounds.y(), bounds.width(), bounds.height())
+            else {
+                return false;
+            };
+            if !contains_edges(outer, edges) {
+                return false;
+            }
+            ancestor = widget.parent();
+        }
+        true
+    }
+
+    fn current_presentation(&self) -> Presentation {
+        if !self.expanded.get() {
+            return Presentation::Compact;
+        }
+        let full_fits = self.candidates[..2].iter().all(|c| self.candidate_fits(c));
+        let fallback_fits =
+            !full_fits && self.candidates[2..].iter().all(|c| self.candidate_fits(c));
+        presentation(true, full_fits, fallback_fits)
+    }
+
     pub(crate) fn set_local(self: &Rc<Self>, local: bool) {
         if self.local.replace(local) != local {
             self.refresh();
@@ -253,7 +469,7 @@ impl VteCompanion {
         let Some(window) = self.current_host() else {
             return false;
         };
-        let Some(bounds) = self.glyph.compute_bounds(&window) else {
+        let Some(bounds) = self.geometry_widget().compute_bounds(&window) else {
             return false;
         };
         let Some([mut left, mut top, mut right, mut bottom]) =
@@ -261,7 +477,7 @@ impl VteCompanion {
         else {
             return false;
         };
-        let mut ancestor = self.glyph.parent();
+        let mut ancestor = self.geometry_widget().parent();
         // Stay within each owning pane/container's allocation, including the
         // Paned viewport when GTK gives a shrunken child its minimum size and
         // translates it outside that viewport. Opacity is intentionally not
@@ -295,7 +511,7 @@ impl VteCompanion {
     }
 
     fn queue_geometry_refresh(self: &Rc<Self>) {
-        if self.geometry_idle.borrow().is_some() {
+        if self.closed.get() || self.geometry_idle.borrow().is_some() {
             return;
         }
         let ticket = Rc::new(());
@@ -362,7 +578,9 @@ impl VteCompanion {
                     return;
                 }
                 let eligible = surface.glyph_has_visible_area();
-                if surface.geometry_eligible.replace(eligible) != eligible {
+                let choice = surface.current_presentation();
+                let changed = surface.presentation.replace(choice) != choice;
+                if surface.geometry_eligible.replace(eligible) != eligible || changed {
                     surface.queue_geometry_refresh();
                 }
             });
@@ -381,7 +599,23 @@ impl VteCompanion {
         self.retire_source();
         let revision = self.revision.get().wrapping_add(1);
         self.revision.set(revision);
+        // Closing wins even during a synchronous hierarchy mutation. It must
+        // retire all wakes before returning, without a topology cleanup idle.
+        if self.closed.get() {
+            self.sync_paint_observer(false);
+            self.card.set_visible(false);
+            return;
+        }
+        if self.mounting.get() {
+            self.queue_geometry_refresh();
+            return;
+        }
         self.bind_host();
+        self.sync_presentation_layout(revision);
+        if self.revision.get() != revision {
+            self.queue_geometry_refresh();
+            return;
+        }
         let (enabled, requested_motion) = {
             let config = self.config.borrow();
             (config.ascii_organism_enabled, config.ascii_organism_motion)
@@ -406,25 +640,43 @@ impl VteCompanion {
         self.sync_paint_observer(focused);
         let geometry = self.glyph_has_visible_area();
         self.geometry_eligible.set(geometry);
-        let active = focused && geometry;
+        let choice = self.current_presentation();
+        self.presentation.set(choice);
+        let active = focused && geometry && choice != Presentation::Hidden;
         let retreat = retreat_remaining(self.last_input.get(), Instant::now());
-        // Keep the grid and this five-character slot allocated across input,
-        // focus and animation changes. Only an explicit Off/locality/close
-        // boundary removes the card from layout.
-        self.glyph.set_opacity(if active && retreat.is_none() {
-            1.0
-        } else {
-            0.0
-        });
-        if self.revision.get() != revision {
-            return;
-        }
+        // Preserve the expanded measurement envelope throughout all paint-only
+        // changes. Invisible candidates remain visible widgets and keep their
+        // native min/natural requisitions.
         let context = RenderContext::new(Behavior::Idle, BodyLanguage::default(), false);
-        let glyph = sticky_glyph_with_context(context, display_frame(motion, self.frame.get()));
-        if self.glyph.text().as_str() != glyph.as_ref() {
-            self.glyph.set_text(glyph.as_ref());
+        let frame = display_frame(motion, self.frame.get());
+        let painted = active && retreat.is_none();
+        if self.expanded.get() {
+            let text = if choice == Presentation::Expanded {
+                sprite_frame_with_context(context, frame)
+            } else {
+                sticky_glyph_with_context(context, frame)
+            };
+            for candidate in &self.candidates {
+                candidate.set_opacity(if painted && candidate.text().as_str() == text.as_ref() {
+                    1.0
+                } else {
+                    0.0
+                });
+                if self.revision.get() != revision {
+                    return;
+                }
+            }
+        } else {
+            self.glyph.set_opacity(if painted { 1.0 } else { 0.0 });
             if self.revision.get() != revision {
                 return;
+            }
+            let text = sticky_glyph_with_context(context, frame);
+            if self.glyph.text().as_str() != text.as_ref() {
+                self.glyph.set_text(text.as_ref());
+                if self.revision.get() != revision {
+                    return;
+                }
             }
         }
         // GTK property notifications can synchronously re-enter settings or
@@ -432,6 +684,7 @@ impl VteCompanion {
         if self.revision.get() != revision
             || !self.focused_and_mapped()
             || !self.glyph_has_visible_area()
+            || self.current_presentation() == Presentation::Hidden
         {
             return;
         }
@@ -596,6 +849,8 @@ pub(super) fn exercise_existing_fixture(
             surface.card.height(),
         )
     };
+    // Extended presentation uses the same native fixture and terminal.
+    exercise_expanded_presentation(&surface, terminal, view, entry, &split, &config, settle);
     let settled_allocation = allocation();
     surface.frame.set(54);
     surface.refresh();
@@ -752,6 +1007,8 @@ pub(super) fn exercise_existing_fixture(
     assert!(surface.host.borrow().is_some());
     config.borrow_mut().ascii_organism_enabled = false;
     surface.refresh();
+    surface.set_expanded(true);
+    assert!(!surface.expanded.get());
     assert!(!surface.card.is_visible());
     assert!(surface.source.borrow().is_none());
     assert!(surface.paint_observer.borrow().is_none());
@@ -759,6 +1016,8 @@ pub(super) fn exercise_existing_fixture(
     surface.refresh();
     settle(Duration::from_millis(60));
     surface.set_local(false);
+    surface.set_expanded(true);
+    assert!(!surface.expanded.get());
     assert!(!surface.card.is_visible());
     assert!(surface.source.borrow().is_none());
     surface.set_local(true);
@@ -768,7 +1027,27 @@ pub(super) fn exercise_existing_fixture(
         "{}",
         fixture_state(&surface, terminal)
     );
-    surface.close();
+    let closed_during_mount = Rc::new(Cell::new(false));
+    let close_handler = surface.glyph.connect_parent_notify({
+        let weak = Rc::downgrade(&surface);
+        let closed = closed_during_mount.clone();
+        move |glyph| {
+            if glyph.parent().is_none() && !closed.replace(true) {
+                if let Some(surface) = weak.upgrade() {
+                    surface.close();
+                    assert!(surface.source.borrow().is_none());
+                    assert!(surface.geometry_idle.borrow().is_none());
+                    assert!(surface.paint_observer.borrow().is_none());
+                }
+            }
+        }
+    });
+    surface.set_expanded(true);
+    surface.glyph.disconnect(close_handler);
+    assert!(closed_during_mount.get());
+    assert!(surface.closed.get());
+    assert!(!surface.mounting.get());
+    assert!(surface.expanded_slot.parent().is_none());
     assert!(!surface.card.is_visible());
     assert!(surface.source.borrow().is_none());
     assert!(surface.geometry_idle.borrow().is_none());
@@ -778,6 +1057,8 @@ pub(super) fn exercise_existing_fixture(
         !surface.card.is_visible(),
         "settings cannot revive an exited or failed child"
     );
+    assert!(surface.expanded_slot.parent().is_none());
+    assert!(surface.geometry_idle.borrow().is_none());
     let weak = Rc::downgrade(&surface);
     let card_weak = surface.card.downgrade();
     let glyph_weak = surface.glyph.downgrade();
@@ -827,8 +1108,440 @@ pub(super) fn exercise_existing_fixture(
 }
 
 #[cfg(test)]
+fn assert_accessible_hidden(label: &gtk::Label, hidden: bool) {
+    use gtk::glib::translate::{from_glib_full, ToGlibPtr};
+    // The existing fixture alone starts with GTK_A11Y=test. GTK's varargs
+    // collector consumes Hidden as gboolean (C int); mismatch text is owned.
+    let expected: gtk::glib::ffi::gboolean = i32::from(hidden);
+    let mismatch: Option<gtk::glib::GString> = unsafe {
+        from_glib_full(gtk::ffi::gtk_test_accessible_check_state(
+            label.upcast_ref::<gtk::Accessible>().to_glib_none().0,
+            gtk::ffi::GTK_ACCESSIBLE_STATE_HIDDEN,
+            expected,
+        ))
+    };
+    assert!(
+        mismatch.is_none(),
+        "unexpected accessible Hidden: {mismatch:?}"
+    );
+}
+
+#[cfg(test)]
+fn exercise_expanded_presentation(
+    surface: &Rc<VteCompanion>,
+    terminal: &vte4::Terminal,
+    view: &crate::block_view::TermView,
+    entry: &gtk::Entry,
+    split: &gtk::Paned,
+    config: &Rc<RefCell<Config>>,
+    settle: &impl Fn(Duration),
+) {
+    let requisition = || {
+        let horizontal = surface.card.measure(gtk::Orientation::Horizontal, -1);
+        (
+            horizontal,
+            surface
+                .card
+                .measure(gtk::Orientation::Vertical, horizontal.1),
+        )
+    };
+    assert_accessible_hidden(&surface.capability, false);
+    let reversed = Rc::new(Cell::new(false));
+    let handler = surface.glyph.connect_parent_notify({
+        let weak = Rc::downgrade(surface);
+        let reversed = reversed.clone();
+        move |glyph| {
+            if glyph.parent().is_none() && !reversed.replace(true) {
+                if let Some(surface) = weak.upgrade() {
+                    surface.set_expanded(false);
+                }
+            }
+        }
+    });
+    surface.set_expanded(true);
+    settle(Duration::from_millis(100));
+    surface.glyph.disconnect(handler);
+    assert!(reversed.get());
+    assert!(!surface.expanded.get());
+    assert_eq!(
+        surface.glyph.parent().as_ref(),
+        Some(surface.card.upcast_ref::<gtk::Widget>())
+    );
+    assert!(surface.expanded_slot.parent().is_none());
+    assert!(!surface.mounting.get());
+    let compact_req = requisition();
+    let compact_terminal = (terminal.width(), terminal.height());
+    let compact_height = surface.card.height();
+    config.borrow_mut().ascii_organism_motion = Some(OrganismMotion::Static);
+    surface.refresh();
+    surface.set_expanded(true);
+    settle(Duration::from_millis(100));
+    assert!(surface.expanded.get());
+    assert_eq!(surface.current_presentation(), Presentation::Expanded);
+    assert_eq!(surface.glyph.parent(), None);
+    let expanded_req = requisition();
+    let expanded_terminal = (terminal.width(), terminal.height());
+    let expanded_height = surface.card.height();
+    let slot_h = surface
+        .expanded_slot
+        .measure(gtk::Orientation::Horizontal, -1);
+    let slot_v = surface
+        .expanded_slot
+        .measure(gtk::Orientation::Vertical, slot_h.1);
+    for candidate in &surface.candidates {
+        let h = candidate.measure(gtk::Orientation::Horizontal, -1);
+        let v = candidate.measure(gtk::Orientation::Vertical, slot_h.1);
+        assert!(slot_h.0 >= h.0 && slot_h.1 >= h.1);
+        assert!(slot_v.0 >= v.0 && slot_v.1 >= v.1);
+    }
+    for candidate in &surface.candidates[1..] {
+        assert!(surface.expanded_slot.is_measure_overlay(candidate));
+        assert!(surface.expanded_slot.is_clip_overlay(candidate));
+    }
+    assert!(expanded_req.1 .0 > compact_req.1 .0);
+    assert_eq!(expanded_terminal.0, compact_terminal.0);
+    assert_eq!(
+        compact_terminal.1 - expanded_terminal.1,
+        expanded_height - compact_height
+    );
+    surface.set_expanded(true);
+    assert_eq!(requisition(), expanded_req);
+    for candidate in &surface.candidates {
+        assert!(candidate.is_visible());
+        assert!(!candidate.can_target());
+        assert!(!candidate.is_focusable());
+        assert_eq!(
+            candidate.accessible_role(),
+            gtk::AccessibleRole::Presentation
+        );
+        assert_accessible_hidden(candidate, true);
+        candidate.update_state(&[gtk::accessible::State::Hidden(false)]);
+        assert_accessible_hidden(candidate, false);
+        assert_eq!(requisition(), expanded_req);
+        candidate.update_state(&[gtk::accessible::State::Hidden(true)]);
+        assert_accessible_hidden(candidate, true);
+        assert_eq!(requisition(), expanded_req);
+    }
+    assert_accessible_hidden(&surface.capability, false);
+    config.borrow_mut().ascii_organism_motion = Some(OrganismMotion::Full);
+    for frame in 0..120 {
+        surface.frame.set(frame);
+        surface.refresh();
+        assert_eq!(
+            surface
+                .candidates
+                .iter()
+                .filter(|c| c.opacity() == 1.0)
+                .count(),
+            1
+        );
+        assert_eq!(requisition(), expanded_req);
+        assert_eq!((terminal.width(), terminal.height()), expanded_terminal);
+    }
+    terminal.emit_by_name::<()>("commit", &[&"e", &1u32]);
+    assert_eq!(
+        crate::block_view::organism_settings_test_pty_bytes(view),
+        b"e"
+    );
+    assert!(surface.candidates.iter().all(|c| c.opacity() == 0.0));
+    assert_eq!(requisition(), expanded_req);
+    assert_eq!((terminal.width(), terminal.height()), expanded_terminal);
+    surface.last_input.set(None);
+    for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+        config.borrow_mut().ascii_organism_motion = Some(motion);
+        surface.refresh();
+        assert_eq!(surface.candidates[0].opacity(), 1.0);
+        assert!(surface.source.borrow().is_none());
+        assert_eq!(requisition(), expanded_req);
+    }
+    assert!(entry.grab_focus());
+    settle(Duration::from_millis(40));
+    assert!(surface.candidates.iter().all(|c| c.opacity() == 0.0));
+    surface.set_expanded(false); // A late action cannot operate on the unfocused pane.
+    assert!(surface.expanded.get());
+    assert_eq!(requisition(), expanded_req);
+    assert!(terminal.grab_focus());
+    settle(Duration::from_millis(40));
+    assert_eq!(surface.current_presentation(), Presentation::Expanded);
+    let font = gtk::pango::FontDescription::from_string("monospace 24");
+    let attrs = gtk::pango::AttrList::new();
+    attrs.insert(gtk::pango::AttrFontDesc::new(&font));
+    for candidate in &surface.candidates {
+        candidate.set_attributes(Some(&attrs));
+    }
+    settle(Duration::from_millis(100));
+    assert!(
+        requisition().1 .0 > expanded_req.1 .0,
+        "native font invalidation must remeasure the real paint labels"
+    );
+    for candidate in &surface.candidates {
+        candidate.set_attributes(None);
+    }
+    settle(Duration::from_millis(100));
+    assert_eq!(requisition(), expanded_req);
+    // Use real ancestor-only Paned clipping, not a guessed terminal font size.
+    // The centered one-line candidate must become drawable before all three
+    // lines fit, while every step retains exactly the same requisition.
+    let mut found_fallback = false;
+    for position in 1..=expanded_height + 4 {
+        split.set_position(position);
+        settle(Duration::from_millis(20));
+        assert_eq!(requisition(), expanded_req);
+        if surface.current_presentation() == Presentation::Fallback {
+            assert!(surface.candidates[..2].iter().all(|c| c.opacity() == 0.0));
+            assert_eq!(
+                surface.candidates[2..]
+                    .iter()
+                    .filter(|c| c.opacity() == 1.0)
+                    .count(),
+                1
+            );
+            // A settled fit must not oscillate or schedule more work merely
+            // because the window already paints again. No frame is requested.
+            let clock = surface.current_host().unwrap().frame_clock().unwrap();
+            for _ in 0..3 {
+                clock.emit_by_name::<()>("after-paint", &[]);
+                assert_eq!(surface.current_presentation(), Presentation::Fallback);
+                assert!(surface.geometry_idle.borrow().is_none());
+                assert!(surface.source.borrow().is_none());
+                assert_eq!(requisition(), expanded_req);
+            }
+            found_fallback = true;
+            break;
+        }
+    }
+    assert!(found_fallback, "{}", fixture_state(surface, terminal));
+    split.set_position(1);
+    settle(Duration::from_millis(100));
+    assert_eq!(surface.current_presentation(), Presentation::Hidden);
+    assert!(surface.source.borrow().is_none());
+    assert_eq!(
+        requisition(),
+        expanded_req,
+        "ancestor clipping must not change the envelope"
+    );
+    split.set_position(300);
+    settle(Duration::from_millis(100));
+    assert_eq!(surface.current_presentation(), Presentation::Expanded);
+    assert_eq!((terminal.width(), terminal.height()), expanded_terminal);
+    // Reuse this same Paned to exercise real horizontal narrowing as well as
+    // the vertical clipping above. The complete seven-column body must yield
+    // to a complete five-column glyph, then disappear, without losing height.
+    let vertical_position = split.position();
+    split.set_orientation(gtk::Orientation::Horizontal);
+    split.set_position(split.width() / 2);
+    settle(Duration::from_millis(100));
+    let wide_position = split.position();
+    assert!(wide_position > 1);
+    assert_eq!(surface.current_presentation(), Presentation::Expanded);
+    assert_eq!(requisition(), expanded_req);
+    split.set_position(1);
+    settle(Duration::from_millis(100));
+    assert_eq!(surface.current_presentation(), Presentation::Hidden);
+    assert!(surface.candidates.iter().all(|c| c.opacity() == 0.0));
+    assert!(surface.source.borrow().is_none());
+    assert_eq!(requisition(), expanded_req);
+    let mut found_narrow_fallback = false;
+    for position in 2..wide_position {
+        split.set_position(position);
+        settle(Duration::from_millis(20));
+        assert_eq!(requisition(), expanded_req);
+        if surface.current_presentation() == Presentation::Fallback {
+            assert!(surface.candidates[..2].iter().all(|c| c.opacity() == 0.0));
+            assert_eq!(
+                surface.candidates[2..]
+                    .iter()
+                    .filter(|c| c.opacity() == 1.0)
+                    .count(),
+                1
+            );
+            assert!(surface.candidates[2..]
+                .iter()
+                .all(|c| surface.candidate_fits(c)));
+            let clock = surface.current_host().unwrap().frame_clock().unwrap();
+            for _ in 0..3 {
+                clock.emit_by_name::<()>("after-paint", &[]);
+                assert_eq!(surface.current_presentation(), Presentation::Fallback);
+                assert!(surface.geometry_idle.borrow().is_none());
+                assert!(surface.source.borrow().is_none());
+                assert_eq!(requisition(), expanded_req);
+            }
+            found_narrow_fallback = true;
+            break;
+        }
+    }
+    assert!(
+        found_narrow_fallback,
+        "{}",
+        fixture_state(surface, terminal)
+    );
+    split.set_position(wide_position);
+    settle(Duration::from_millis(100));
+    assert_eq!(surface.current_presentation(), Presentation::Expanded);
+    assert_eq!(requisition(), expanded_req);
+    split.set_orientation(gtk::Orientation::Vertical);
+    split.set_position(vertical_position);
+    settle(Duration::from_millis(100));
+    assert_eq!(surface.current_presentation(), Presentation::Expanded);
+    assert_eq!((terminal.width(), terminal.height()), expanded_terminal);
+    surface.set_expanded(false);
+    settle(Duration::from_millis(100));
+    assert!(!surface.expanded.get());
+    assert_eq!(surface.glyph.width_chars(), 5);
+    assert_eq!(surface.glyph.max_width_chars(), 5);
+    assert_eq!(requisition(), compact_req);
+    assert_eq!((terminal.width(), terminal.height()), compact_terminal);
+    surface.set_expanded(false);
+    assert_eq!(requisition(), compact_req);
+    let current = Rc::new(Cell::new(Some(42)));
+    crate::dialogs::command_palette::exercise_companion_presentation_palette(
+        &surface.current_host().expect("existing host"),
+        terminal.upcast_ref(),
+        current.clone(),
+        Rc::new({
+            let weak = Rc::downgrade(surface);
+            move |target, desired| {
+                if crate::action_ops::hello_target_is_current(target, current.get()) {
+                    if let Some(surface) = weak.upgrade() {
+                        surface.set_expanded(desired);
+                    }
+                }
+            }
+        }),
+        Rc::new({
+            let weak = Rc::downgrade(surface);
+            move || weak.upgrade().is_some_and(|s| s.expanded.get())
+        }),
+        settle,
+    );
+    assert!(
+        crate::block_view::organism_settings_test_pty_bytes(view).is_empty(),
+        "palette Enter/Escape never reaches the terminal writer"
+    );
+    assert_eq!(requisition(), compact_req);
+    assert_eq!((terminal.width(), terminal.height()), compact_terminal);
+    config.borrow_mut().ascii_organism_motion = Some(OrganismMotion::Full);
+    surface.refresh();
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn neutral_presentation_candidates_cover_the_joint_120_frame_period() {
+        let context = RenderContext::new(Behavior::Idle, BodyLanguage::default(), false);
+        let candidates = neutral_candidates();
+        let expected: std::collections::BTreeSet<_> = candidates.iter().cloned().collect();
+        let mut actual = std::collections::BTreeSet::new();
+        for frame in 0..120 {
+            let sprite = sprite_frame_with_context(context, frame);
+            assert_eq!(sprite.lines().count(), 3);
+            assert!(sprite.is_ascii() && sprite.lines().all(|line| line.len() <= 7));
+            actual.insert(sprite.into_owned());
+            let compact = sticky_glyph_with_context(context, frame);
+            assert_eq!(compact.len(), 5);
+            actual.insert(compact.into_owned());
+        }
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 4);
+    }
+
+    #[test]
+    fn expanded_fit_is_complete_and_never_changes_the_requested_preference() {
+        assert_eq!(presentation(false, false, false), Presentation::Compact);
+        assert_eq!(presentation(true, true, true), Presentation::Expanded);
+        assert_eq!(presentation(true, false, true), Presentation::Fallback);
+        assert_eq!(presentation(true, false, false), Presentation::Hidden);
+        let full = [0.0, 0.0, 7.0, 3.0];
+        assert!(contains_edges(full, full));
+        assert!(!contains_edges([0.0, 0.0, 6.999, 3.0], full));
+        assert!(!contains_edges([0.0, 0.0, 7.0, 2.999], full));
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -1.0] {
+            assert!(!contains_edges([0.0, 0.0, bad, 3.0], full));
+        }
+    }
+
+    #[test]
+    fn native_envelope_measures_the_same_four_widgets_that_it_paints() {
+        let source = include_str!("vte_surface.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        assert!(!production.contains("gtk::Grid"));
+        assert!(production.contains("expanded_slot.set_child(Some(&candidates[0]))"));
+        assert!(production.contains("expanded_slot.set_measure_overlay(candidate, true)"));
+        assert!(production.contains("expanded_slot.set_clip_overlay(candidate, true)"));
+        assert!(
+            production.contains("candidate.update_state(&[gtk::accessible::State::Hidden(true)])")
+        );
+        assert!(!production.contains("set_height_request"));
+        let refresh = production.split("pub(crate) fn refresh").nth(1).unwrap();
+        assert!(
+            refresh.find("if self.closed.get()").unwrap()
+                < refresh.find("if self.mounting.get()").unwrap()
+        );
+        assert!(
+            production.contains("if self.closed.get() || self.geometry_idle.borrow().is_some()")
+        );
+        let script = include_str!("../../scripts/test-gtk-display.sh");
+        assert!(script.contains("export GTK_A11Y=none"));
+        assert!(!script.contains("export GTK_A11Y=test"));
+        assert!(script.contains("if [[ \"${test_name}\" == organism_ui::tests::live_settings_reuse_body_preserve_focus_and_stop_disabled_timers ]]; then\n        fixture_a11y=\"test\""));
+        assert!(script.contains("GTK_A11Y=\"${fixture_a11y}\" dbus-run-session"));
+        let paint = production.split("let painted =").nth(1).unwrap();
+        assert!(!paint.contains("candidate.set_text"));
+        assert!(!paint.contains("candidate.set_visible"));
+    }
+
+    #[test]
+    fn palette_presentation_preserves_original_target_and_has_no_binding() {
+        let palette = include_str!("../dialogs/command_palette.rs");
+        let accept = palette
+            .split("    fn accept(")
+            .nth(1)
+            .unwrap()
+            .split("fn spawn_history_snapshot_load")
+            .next()
+            .unwrap();
+        assert!(
+            accept
+                .find("let workflow_target = self.workflow_target")
+                .unwrap()
+                < accept.find("root.force_close()").unwrap()
+        );
+        assert!(accept.contains("PaletteOutput::SetVteCompanionExpanded(workflow_target, true)"));
+        assert!(accept.contains("PaletteOutput::SetVteCompanionExpanded(workflow_target, false)"));
+        let keys = include_str!("../keybindings.rs");
+        assert!(keys.contains("Action::ExpandVteCompanion | Action::CollapseVteCompanion => None"));
+        let actions = include_str!("../action_ops.rs");
+        let target = actions
+            .split("pub(crate) fn set_vte_companion_expanded")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn greet_ascii_organism")
+            .next()
+            .unwrap();
+        for gate in [
+            "self.safe_mode",
+            "ascii_organism_enabled",
+            "hello_target_is_current",
+            "self.window.is_active()",
+            "self.find_pane(id)",
+            "pane.cwd_external",
+            "tab.remote",
+            "TerminalMode::Vte",
+        ] {
+            assert!(
+                target
+                    .split_whitespace()
+                    .collect::<String>()
+                    .contains(&gate.split_whitespace().collect::<String>()),
+                "{gate}"
+            );
+        }
+        assert!(!target.contains("grab_focus"));
+        assert!(!target.contains("write_input"));
+        assert!(!target.contains("say_hello"));
+    }
 
     #[test]
     fn neutral_display_uses_shared_frames_without_changing_slot_width() {

@@ -1141,7 +1141,7 @@ impl SimpleComponent for AppModel {
             });
         let command_palette = dialogs::command_palette::PaletteModel::builder()
             .launch(dialogs::command_palette::PaletteInit {
-                parent: root.clone(),
+                parent: root.clone().upcast(),
                 keybindings: kbmap.clone(),
                 workflows: workflows.clone(),
             })
@@ -1150,6 +1150,10 @@ impl SimpleComponent for AppModel {
                 dialogs::command_palette::PaletteOutput::AsciiOrganismHello(pane_id) => {
                     AppMsg::AsciiOrganismHello(pane_id)
                 }
+                dialogs::command_palette::PaletteOutput::SetVteCompanionExpanded(
+                    pane_id,
+                    expanded,
+                ) => AppMsg::SetVteCompanionExpanded(pane_id, expanded),
                 dialogs::command_palette::PaletteOutput::TypeCommand(command) => {
                     AppMsg::PaletteTypeCommand(command)
                 }
@@ -2567,6 +2571,9 @@ impl SimpleComponent for AppModel {
                 self.run_workflow_from_path(path, pane_id, &sender);
             }
             AppMsg::AsciiOrganismHello(pane_id) => self.greet_ascii_organism(pane_id),
+            AppMsg::SetVteCompanionExpanded(pane_id, expanded) => {
+                self.set_vte_companion_expanded(pane_id, expanded);
+            }
             AppMsg::WorkflowInsertCommand { pane_id, command } => {
                 self.insert_workflow_command(pane_id, &command);
             }

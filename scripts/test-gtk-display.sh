@@ -125,7 +125,14 @@ done
 
 for test_name in "${tests[@]}"; do
     printf 'GTK display regression: %s\n' "${test_name}"
-    dbus-run-session "${dbus_run_args[@]}" -- \
+    # GTK caches its accessibility backend on first use. Only the existing
+    # companion fixture needs TestATContext for exact decorative Hidden values;
+    # all other invocations retain the original disabled accessibility backend.
+    fixture_a11y=none
+    if [[ "${test_name}" == organism_ui::tests::live_settings_reuse_body_preserve_focus_and_stop_disabled_timers ]]; then
+        fixture_a11y="test"
+    fi
+    GTK_A11Y="${fixture_a11y}" dbus-run-session "${dbus_run_args[@]}" -- \
         xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
         cargo test --locked "${test_name}" -- --ignored --exact --nocapture
     if [[ "${test_name}" == block_view::tests::held_enter_history_recall_does_not_submit_the_recalled_command ]]; then

@@ -35,6 +35,8 @@ pub(crate) enum Action {
     OpenHistoryPalette,
     ToggleSettings,
     AsciiOrganismHello,
+    ExpandVteCompanion,
+    CollapseVteCompanion,
     ReloadConfig,
     OpenWelcome,
     /// Install jsh, or update the installed one, in a dedicated tab.
@@ -154,6 +156,8 @@ impl Action {
             Action::OpenHistoryPalette => "Palette: search history",
             Action::ToggleSettings => "Toggle settings panel",
             Action::AsciiOrganismHello => "Say hello to ASCII organism",
+            Action::ExpandVteCompanion => "Expand VTE neutral companion",
+            Action::CollapseVteCompanion => "Collapse VTE neutral companion",
             Action::ReloadConfig => "Reload configuration",
             Action::OpenWelcome => "Open welcome & quick start",
             Action::InstallJsh => "Install or update jsh (jterm's shell)",
@@ -260,6 +264,7 @@ impl Action {
             Action::OpenHistoryPalette => Some("open_history_palette"),
             Action::ToggleSettings => Some("toggle_settings"),
             Action::AsciiOrganismHello => Some("ascii_organism_hello"),
+            Action::ExpandVteCompanion | Action::CollapseVteCompanion => None,
             Action::ReloadConfig => Some("reload_config"),
             Action::OpenWelcome => None,
             // Palette-only: too rare to spend a chord on.
@@ -366,6 +371,8 @@ impl Action {
             Action::OpenHistoryPalette,
             Action::ToggleSettings,
             Action::AsciiOrganismHello,
+            Action::ExpandVteCompanion,
+            Action::CollapseVteCompanion,
             Action::ReloadConfig,
             Action::OpenWelcome,
             Action::InstallJsh,
@@ -1458,5 +1465,16 @@ toggle_block_collapsed = "F10"
             map.lookup(&parse("Ctrl+Alt+X").unwrap()),
             Some(Action::SwapPanes)
         );
+    }
+
+    #[test]
+    fn vte_companion_presentation_actions_are_palette_only() {
+        let bindings = KeybindingMap::from_defaults();
+        let actions = Action::all_actions();
+        for action in [Action::ExpandVteCompanion, Action::CollapseVteCompanion] {
+            assert_eq!(action.config_key(), None);
+            assert!(bindings.binding_display(&action).is_empty());
+            assert!(actions.contains(&action));
+        }
     }
 }

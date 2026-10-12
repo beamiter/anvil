@@ -71,7 +71,7 @@ impl FactoryComponent for PaletteRow {
 }
 
 pub(crate) struct PaletteInit {
-    pub(crate) parent: adw::ApplicationWindow,
+    pub(crate) parent: gtk::Window,
     pub(crate) keybindings: Rc<RefCell<KeybindingMap>>,
     pub(crate) workflows: Rc<RefCell<Vec<Workflow>>>,
 }
@@ -109,6 +109,7 @@ pub(crate) enum PaletteMsg {
 pub(crate) enum PaletteOutput {
     Action(Action),
     AsciiOrganismHello(Option<u64>),
+    SetVteCompanionExpanded(Option<u64>, bool),
     TypeCommand(String),
     AskAi(String),
     RunWorkflow(PathBuf, Option<u64>),
@@ -213,7 +214,7 @@ impl HistoryLoadState {
 }
 
 pub(crate) struct PaletteModel {
-    parent: adw::ApplicationWindow,
+    parent: gtk::Window,
     keybindings: Rc<RefCell<KeybindingMap>>,
     workflows: Rc<RefCell<Vec<Workflow>>>,
     mode: PaletteMode,
@@ -290,6 +291,7 @@ impl Component for PaletteModel {
             },
 
             add_controller = gtk::EventControllerKey {
+                set_name: Some("anvil-palette-keyboard"),
                 set_propagation_phase: gtk::PropagationPhase::Capture,
                 connect_key_pressed[sender, generation = model.opening.active.clone()] => move |_, key, _, state| {
                     let Some(generation) = generation.get() else {
@@ -566,6 +568,12 @@ impl PaletteModel {
             Accept::Action(Action::AsciiOrganismHello) => {
                 PaletteOutput::AsciiOrganismHello(workflow_target)
             }
+            Accept::Action(Action::ExpandVteCompanion) => {
+                PaletteOutput::SetVteCompanionExpanded(workflow_target, true)
+            }
+            Accept::Action(Action::CollapseVteCompanion) => {
+                PaletteOutput::SetVteCompanionExpanded(workflow_target, false)
+            }
             Accept::Action(action) => PaletteOutput::Action(action),
             Accept::TypeCommand(command) => PaletteOutput::TypeCommand(command),
             Accept::AskAi(query) => PaletteOutput::AskAi(query),
@@ -627,6 +635,103 @@ fn escape_markup(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_companion_presentation_palette(
+    parent: &gtk::Window,
+    terminal: &gtk::Widget,
+    current_target: Rc<Cell<Option<u64>>>,
+    apply: Rc<dyn Fn(Option<u64>, bool)>,
+    expanded: Rc<dyn Fn() -> bool>,
+    settle: &impl Fn(std::time::Duration),
+) {
+    use std::time::Duration;
+    let outputs = Rc::new(RefCell::new(Vec::new()));
+    let palette = PaletteModel::builder()
+        .launch(PaletteInit {
+            parent: parent.clone(),
+            keybindings: Rc::new(RefCell::new(KeybindingMap::from_defaults())),
+            workflows: Rc::new(RefCell::new(Vec::new())),
+        })
+        .connect_receiver({
+            let outputs = outputs.clone();
+            move |_, output| {
+                if let PaletteOutput::SetVteCompanionExpanded(target, desired) = output {
+                    outputs.borrow_mut().push((target, desired));
+                    apply(target, desired);
+                } else {
+                    panic!("unexpected palette output");
+                }
+            }
+        });
+    let open = || {
+        assert!(terminal.grab_focus());
+        palette.emit(PaletteMsg::Toggle {
+            workflow_target: Some(42),
+            mode: PaletteMode::All,
+            history_path: None,
+            live_history: Vec::new(),
+        });
+        settle(Duration::from_millis(100));
+        assert!(palette.widget().parent().is_some());
+    };
+    let key = |keyval: u32| {
+        let controllers = palette.widget().observe_controllers();
+        let controller = (0..controllers.n_items())
+            .find_map(|index| {
+                controllers
+                    .item(index)
+                    .and_then(|c| c.downcast::<gtk::EventControllerKey>().ok())
+                    .filter(|c| c.name().as_deref() == Some("anvil-palette-keyboard"))
+            })
+            .expect("production palette key controller");
+        assert!(controller.emit_by_name::<bool>(
+            "key-pressed",
+            &[&keyval, &0u32, &gtk::gdk::ModifierType::empty()]
+        ));
+        settle(Duration::from_millis(100));
+        assert!(palette.widget().parent().is_none());
+    };
+    open();
+    palette
+        .widgets()
+        .filter_entry
+        .set_text("Expand VTE neutral companion");
+    key(0xff0d); // Actual production Return handler, including delayed search.
+    assert_eq!(&*outputs.borrow(), &[(Some(42), true)]);
+    assert!(
+        expanded(),
+        "force_close must return native focus before the accepted action"
+    );
+    assert!(gtk::prelude::RootExt::focus(parent)
+        .is_some_and(|focus| focus == *terminal || focus.is_ancestor(terminal)));
+    open();
+    palette
+        .widgets()
+        .filter_entry
+        .set_text("Collapse VTE neutral companion");
+    key(0xff1b); // Escape cancels without changing presentation.
+    assert!(expanded());
+    assert_eq!(outputs.borrow().len(), 1);
+    open();
+    palette
+        .widgets()
+        .filter_entry
+        .set_text("Collapse VTE neutral companion");
+    current_target.set(Some(99));
+    key(0xff0d);
+    assert_eq!(outputs.borrow().last(), Some(&(Some(42), false)));
+    assert!(expanded(), "old opening target cannot change the new pane");
+    current_target.set(Some(42));
+    open();
+    palette
+        .widgets()
+        .filter_entry
+        .set_text("Collapse VTE neutral companion");
+    key(0xff0d);
+    assert!(!expanded());
+    drop(palette);
 }
 
 #[cfg(test)]

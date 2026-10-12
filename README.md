@@ -1274,11 +1274,20 @@ stops that pane's animation timer; re-enabling reuses its existing widgets.
 
 Traditional VTE has partial, display-only support: a neutral five-character
 companion sits outside the terminal grid, alongside a short capability label.
+Use the command palette's **Expand VTE neutral companion** or **Collapse VTE
+neutral companion** action to choose a full three-line neutral pose or the
+original compact glyph. The choice belongs only to that open pane; new panes
+start compact and no shortcut or saved preference is added. A stale palette
+action never changes a different pane.
 Full uses the shared renderer's animation; Calm and Static hold a still frame.
-Sent input and focus loss hide the glyph while preserving its layout slot.
+Expanded presentation reserves the native font's three-line envelope. In a
+narrow or clipped pane it shows the complete compact glyph when that fits,
+otherwise hides the decoration without collapsing its reserved space.
+Sent input and focus loss hide the decoration while preserving its layout slot.
 Fully clipped, hidden, inactive, closed, and disabled panes stop their animation
 source. A passive observer of existing native paints checks clipping changes;
 it does not request additional frames, and recovery may wait for the next paint.
+A resize or font change may briefly clip a frame before the display settles.
 Command activity and alternate-screen state cannot be verified through the
 supported VTE API, so hover greetings and Hello are unavailable in this mode.
 Settings and the card's accessible description explain this limitation.

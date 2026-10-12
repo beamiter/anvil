@@ -4975,6 +4975,7 @@ mod tests {
     #[ignore = "requires DISPLAY"]
     fn live_settings_reuse_body_preserve_focus_and_stop_disabled_timers() {
         gtk::init().expect("gtk display");
+        relm4::adw::init().expect("same native fixture adwaita window");
         let view = crate::block_view::organism_settings_test_view();
         let presence = OrganismPresence::new();
         presence.remember_view(&view);
@@ -5029,11 +5030,14 @@ mod tests {
             .clamp(280, 900);
         let window_overlay = gtk::Overlay::new();
         window_overlay.set_child(Some(&content));
-        let window = gtk::Window::builder()
+        // Keep one existing window/PTY. AdwDialog embeds only in an AdwWindow;
+        // a plain GtkWindow would silently create a separate dialog window.
+        let window = relm4::adw::Window::builder()
             .default_width(screenshot_width)
             .default_height(500)
-            .child(&window_overlay)
-            .build();
+            .content(&window_overlay)
+            .build()
+            .upcast::<gtk::Window>();
         window.present();
         entry.grab_focus();
         let main = gtk::glib::MainContext::default();
@@ -6045,7 +6049,12 @@ mod tests {
         tooltip_host.append(&control_root);
         tooltip_host.append(&proxy_root);
         tooltip_host.append(&other_root);
-        window.set_child(Some(&tooltip_host));
+        relm4::adw::prelude::AdwWindowExt::set_content(
+            window
+                .downcast_ref::<relm4::adw::Window>()
+                .expect("same adwaita fixture host"),
+            Some(&tooltip_host),
+        );
         install_card_tooltip_proxy(
             proxy_root.upcast_ref(),
             card.upcast_ref(),

@@ -570,6 +570,9 @@ pub struct VteTerminal {
 }
 
 impl VteTerminal {
+    pub(crate) fn companion(&self) -> Rc<crate::organism_ui::vte_surface::VteCompanion> {
+        Rc::clone(&self.companion)
+    }
     pub fn terminal(&self) -> &Terminal {
         &self.terminal
     }

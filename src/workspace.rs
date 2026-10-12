@@ -34,6 +34,15 @@ impl TermCtl {
         }
     }
 
+    pub(crate) fn vte_companion(
+        &self,
+    ) -> Option<std::rc::Rc<crate::organism_ui::vte_surface::VteCompanion>> {
+        match self {
+            Self::Vte(controller) => Some(controller.model().companion()),
+            Self::Block(_) => None,
+        }
+    }
+
     pub(crate) fn widget(&self) -> gtk::Widget {
         match self {
             Self::Vte(controller) => controller.widget().clone().upcast(),

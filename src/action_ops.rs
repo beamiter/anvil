@@ -6,7 +6,7 @@
 
 use super::*;
 
-fn hello_target_is_current(captured: Option<u64>, current: Option<u64>) -> bool {
+pub(crate) fn hello_target_is_current(captured: Option<u64>, current: Option<u64>) -> bool {
     captured.is_some() && captured == current
 }
 
@@ -86,6 +86,36 @@ impl AppModel {
             && gtk::prelude::RootExt::focus(&self.window).is_some_and(|focus| {
                 widget_is_within(focus, self.ai_panel.widget().upcast_ref::<gtk::Widget>())
             })
+    }
+
+    pub(crate) fn set_vte_companion_expanded(&self, pane_id: Option<u64>, expanded: bool) {
+        if self.safe_mode
+            || !self.config.borrow().ascii_organism_enabled
+            || !hello_target_is_current(pane_id, self.active_pane_id())
+            || !self.window_active
+            || !self.window.is_active()
+        {
+            return;
+        }
+        let Some((tab_index, pane_index)) = pane_id.and_then(|id| self.find_pane(id)) else {
+            return;
+        };
+        let tab = &self.tabs[tab_index];
+        let pane = &tab.panes[pane_index];
+        if pane.cwd_external
+            || tab
+                .remote
+                .as_ref()
+                .is_some_and(|remote| remote.pane_id == pane.id)
+            || pane.mode != crate::config::TerminalMode::Vte
+        {
+            return;
+        }
+        // Clone out of the component model before native setters can reenter.
+        // No second queued command may outlive this current-pane validation.
+        if let Some(companion) = pane.terminal.vte_companion() {
+            companion.set_expanded(expanded);
+        }
     }
 
     pub(crate) fn greet_ascii_organism(&self, pane_id: Option<u64>) {
@@ -292,6 +322,9 @@ impl AppModel {
             Action::AsciiOrganismHello => {
                 self.greet_ascii_organism(self.active_pane_id());
             }
+            // These actions require the palette's captured opening target.
+            // A generic action dispatch must never retarget the current pane.
+            Action::ExpandVteCompanion | Action::CollapseVteCompanion => {}
             Action::ToggleSettings => {
                 let config = self.config.borrow();
                 let font_desc = gtk::pango::FontDescription::from_string(&config.font_desc);
