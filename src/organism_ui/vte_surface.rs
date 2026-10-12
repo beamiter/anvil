@@ -108,7 +108,12 @@ pub(crate) struct VteCompanion {
     last_input: Cell<Option<Instant>>,
     revision: Cell<u64>,
     source: RefCell<Option<(gtk::glib::SourceId, Rc<()>)>>,
-    host: RefCell<Option<(gtk::glib::WeakRef<gtk::Window>, gtk::glib::SignalHandlerId)>>,
+    host: RefCell<
+        Option<(
+            gtk::glib::WeakRef<gtk::Window>,
+            [gtk::glib::SignalHandlerId; 2],
+        )>,
+    >,
     desktop: RefCell<Option<(gtk::Settings, gtk::glib::SignalHandlerId)>>,
     geometry_eligible: Cell<bool>,
     paint_observer: RefCell<
@@ -436,17 +441,32 @@ impl VteCompanion {
         let old = self.host.borrow_mut().take();
         if let Some((window, handler)) = old {
             if let Some(window) = window.upgrade() {
-                window.disconnect(handler);
+                for handler in handler {
+                    window.disconnect(handler);
+                }
             }
         }
         if let Some(window) = next {
             let weak = Rc::downgrade(self);
-            let handler = window.connect_is_active_notify(move |_| {
+            let active = window.connect_is_active_notify(move |window| {
                 if let Some(surface) = weak.upgrade() {
-                    surface.refresh();
+                    if surface.current_host().as_ref() == Some(window) {
+                        surface.refresh();
+                    }
                 }
             });
-            *self.host.borrow_mut() = Some((window.downgrade(), handler));
+            let weak = Rc::downgrade(self);
+            // Crossing controller state can disagree with actual root focus.
+            // Window notifies after committing its actual focus widget.
+            // Observe that final fact without another timer or cached focus.
+            let focus = window.connect_focus_widget_notify(move |window| {
+                if let Some(surface) = weak.upgrade() {
+                    if surface.current_host().as_ref() == Some(window) {
+                        surface.refresh();
+                    }
+                }
+            });
+            *self.host.borrow_mut() = Some((window.downgrade(), [active, focus]));
         }
     }
 
@@ -733,7 +753,9 @@ impl Drop for VteCompanion {
         }
         if let Some((window, handler)) = self.host.get_mut().take() {
             if let Some(window) = window.upgrade() {
-                window.disconnect(handler);
+                for handler in handler {
+                    window.disconnect(handler);
+                }
             }
         }
         if let Some((desktop, handler)) = self.desktop.get_mut().take() {
@@ -935,22 +957,30 @@ pub(super) fn exercise_existing_fixture(
     assert!(surface.paint_observer.borrow().is_none());
     assert_eq!(allocation(), settled_allocation);
     assert!(terminal.grab_focus());
+    assert!(terminal.has_focus());
+    assert!(surface.focused_and_mapped());
+    assert!(surface.geometry_idle.borrow().is_none());
     let context = gtk::glib::MainContext::default();
-    let old_focus_idle = context
-        .find_source_by_id(&surface.geometry_idle.borrow().as_ref().unwrap().0)
+    let old_focus_source = context
+        .find_source_by_id(&surface.source.borrow().as_ref().unwrap().0)
         .unwrap();
-    // Leave before the enter idle can run: the old focus transition cannot
-    // revive a pane after the final focus has already moved elsewhere.
+    // The final Window focus notification commits the Full source immediately
+    // and retires the earlier crossing idle. A subsequent blur must destroy
+    // that source before returning, with no queued focus revival.
     assert!(entry.grab_focus());
     assert!(surface.geometry_idle.borrow().is_none());
-    assert!(old_focus_idle.is_destroyed());
+    assert!(surface.source.borrow().is_none());
+    assert!(old_focus_source.is_destroyed());
+    assert!(surface.paint_observer.borrow().is_none());
     settle(Duration::from_millis(40));
     assert!(surface.source.borrow().is_none());
     assert!(surface.paint_observer.borrow().is_none());
     assert_eq!(surface.glyph.opacity(), 0.0);
     assert!(terminal.grab_focus());
-    assert!(surface.geometry_idle.borrow().is_some());
-    assert!(surface.source.borrow().is_none());
+    assert!(terminal.has_focus());
+    assert!(surface.focused_and_mapped());
+    assert!(surface.geometry_idle.borrow().is_none());
+    assert!(surface.source.borrow().is_some());
     settle(Duration::from_millis(40));
     assert!(
         surface.source.borrow().is_some(),
@@ -997,6 +1027,11 @@ pub(super) fn exercise_existing_fixture(
     settle(Duration::from_millis(40));
     assert!(surface.host.borrow().is_none());
     assert!(surface.paint_observer.borrow().is_none());
+    assert!(surface.source.borrow().is_none());
+    let detached_revision = surface.revision.get();
+    window.notify("focus-widget");
+    window.notify("is-active");
+    assert_eq!(surface.revision.get(), detached_revision);
     assert!(surface.source.borrow().is_none());
     old_clock.emit_by_name::<()>("after-paint", &[]);
     assert!(
@@ -1928,6 +1963,27 @@ mod tests {
             .next()
             .unwrap();
         assert!(leave.contains("surface.refresh();"));
+        let host = production
+            .split("fn bind_host(")
+            .nth(1)
+            .unwrap()
+            .split("fn focused_and_mapped(")
+            .next()
+            .unwrap();
+        assert!(host.contains("connect_focus_widget_notify"));
+        assert_eq!(
+            host.matches("surface.current_host().as_ref() == Some(window)")
+                .count(),
+            2
+        );
+        assert!(host.contains("[active, focus]"));
+        assert!(host.contains("for handler in handler"));
+        let drop = production
+            .split("impl Drop for VteCompanion")
+            .nth(1)
+            .unwrap();
+        assert!(drop.contains("self.host.get_mut().take()"));
+        assert!(drop.contains("for handler in handler"));
         assert!(production.contains("terminal.connect_commit("));
         assert!(production.contains("Rc::ptr_eq(current, &callback_ticket)"));
         assert!(production.contains("self.glyph"));
