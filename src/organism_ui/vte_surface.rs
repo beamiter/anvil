@@ -58,7 +58,11 @@ enum Presentation {
 
 fn presentation(expanded: bool, full_fits: bool, fallback_fits: bool) -> Presentation {
     if !expanded {
-        Presentation::Compact
+        if fallback_fits {
+            Presentation::Compact
+        } else {
+            Presentation::Hidden
+        }
     } else if full_fits {
         Presentation::Expanded
     } else if fallback_fits {
@@ -405,7 +409,7 @@ impl VteCompanion {
 
     fn current_presentation(&self) -> Presentation {
         if !self.expanded.get() {
-            return Presentation::Compact;
+            return presentation(false, false, self.candidate_fits(&self.glyph));
         }
         let full_fits = self.candidates[..2].iter().all(|c| self.candidate_fits(c));
         let fallback_fits =
@@ -659,6 +663,19 @@ impl VteCompanion {
         self.sync_paint_observer(focused);
         let geometry = self.glyph_has_visible_area();
         self.geometry_eligible.set(geometry);
+        // Qualify the exact compact frame that will be painted, including
+        // native ink overhang. Text changes precede containment, never follow it.
+        let context = RenderContext::new(Behavior::Idle, BodyLanguage::default(), false);
+        let frame = display_frame(motion, self.frame.get());
+        if !self.expanded.get() {
+            let text = sticky_glyph_with_context(context, frame);
+            if self.glyph.text().as_str() != text.as_ref() {
+                self.glyph.set_text(text.as_ref());
+                if self.revision.get() != revision {
+                    return;
+                }
+            }
+        }
         let choice = self.current_presentation();
         self.presentation.set(choice);
         let active = focused && geometry && choice != Presentation::Hidden;
@@ -666,8 +683,6 @@ impl VteCompanion {
         // Preserve the expanded measurement envelope throughout all paint-only
         // changes. Invisible candidates remain visible widgets and keep their
         // native min/natural requisitions.
-        let context = RenderContext::new(Behavior::Idle, BodyLanguage::default(), false);
-        let frame = display_frame(motion, self.frame.get());
         let painted = active && retreat.is_none();
         if self.expanded.get() {
             let text = if choice == Presentation::Expanded {
@@ -689,13 +704,6 @@ impl VteCompanion {
             self.glyph.set_opacity(if painted { 1.0 } else { 0.0 });
             if self.revision.get() != revision {
                 return;
-            }
-            let text = sticky_glyph_with_context(context, frame);
-            if self.glyph.text().as_str() != text.as_ref() {
-                self.glyph.set_text(text.as_ref());
-                if self.revision.get() != revision {
-                    return;
-                }
             }
         }
         // GTK property notifications can synchronously re-enter settings or
@@ -1722,6 +1730,57 @@ fn exercise_expanded_presentation(
     settle(Duration::from_millis(100));
     assert_eq!(surface.current_presentation(), Presentation::Expanded);
     assert_eq!(requisition(), expanded_req);
+    // Reuse this mapped Paned for compact partial clipping. A positive
+    // intersection alone must not paint half a glyph or keep Full ticking.
+    surface.set_expanded(false);
+    settled_fixture_layout(surface, &view.widget(), terminal, settle);
+    let mut saw_partial_compact = false;
+    for position in 1..wide_position {
+        split.set_position(position);
+        settled_fixture_layout(surface, &view.widget(), terminal, settle);
+        assert_eq!(requisition(), compact_req);
+        if surface.glyph_has_visible_area() && !surface.candidate_fits(&surface.glyph) {
+            saw_partial_compact = true;
+            for motion in [
+                OrganismMotion::Full,
+                OrganismMotion::Calm,
+                OrganismMotion::Static,
+            ] {
+                config.borrow_mut().ascii_organism_motion = Some(motion);
+                surface.refresh();
+                settle(Duration::from_millis(20));
+                assert_eq!(surface.current_presentation(), Presentation::Hidden);
+                assert_eq!(surface.glyph.opacity(), 0.0);
+                assert!(surface.source.borrow().is_none());
+                assert!(surface.card.is_mapped());
+                assert!(!surface.expanded.get());
+                assert_eq!(requisition(), compact_req);
+            }
+            let clock = surface.current_host().unwrap().frame_clock().unwrap();
+            for _ in 0..3 {
+                clock.emit_by_name::<()>("after-paint", &[]);
+                assert!(surface.geometry_idle.borrow().is_none());
+                assert_eq!(surface.glyph.opacity(), 0.0);
+                assert_eq!(requisition(), compact_req);
+            }
+            break;
+        }
+    }
+    assert!(saw_partial_compact, "{}", fixture_state(surface, terminal));
+    config.borrow_mut().ascii_organism_motion = Some(OrganismMotion::Full);
+    surface.refresh();
+    assert!(surface.source.borrow().is_none());
+    split.set_position(wide_position);
+    settled_fixture_layout(surface, &view.widget(), terminal, settle);
+    assert_eq!(surface.current_presentation(), Presentation::Compact);
+    assert_eq!(surface.glyph.opacity(), 1.0);
+    assert!(surface.source.borrow().is_some());
+    assert_eq!(requisition(), compact_req);
+    config.borrow_mut().ascii_organism_motion = Some(OrganismMotion::Static);
+    surface.refresh();
+    surface.set_expanded(true);
+    settled_fixture_layout(surface, &view.widget(), terminal, settle);
+    assert_eq!(requisition(), expanded_req);
     split.set_orientation(gtk::Orientation::Vertical);
     let vertical_axis = settled_fixture_layout(surface, &view.widget(), terminal, settle);
     split.set_position(vertical_position);
@@ -1799,8 +1858,29 @@ mod tests {
     }
 
     #[test]
+    fn compact_requires_complete_fit_without_changing_requested_presentation() {
+        let body = [0.0, 0.0, 50.0, 20.0];
+        for clip in [
+            [0.0, 0.0, 49.5, 20.0],
+            [0.5, 0.0, 50.0, 20.0],
+            [0.0, 0.0, 50.0, 19.5],
+            [0.0, 0.5, 50.0, 20.0],
+        ] {
+            assert_eq!(
+                presentation(false, false, contains_edges(clip, body)),
+                Presentation::Hidden
+            );
+        }
+        assert_eq!(
+            presentation(false, false, contains_edges(body, body)),
+            Presentation::Compact
+        );
+        assert_eq!(presentation(false, false, false), Presentation::Hidden);
+    }
+
+    #[test]
     fn expanded_fit_is_complete_and_never_changes_the_requested_preference() {
-        assert_eq!(presentation(false, false, false), Presentation::Compact);
+        assert_eq!(presentation(false, false, true), Presentation::Compact);
         assert_eq!(presentation(true, true, true), Presentation::Expanded);
         assert_eq!(presentation(true, false, true), Presentation::Fallback);
         assert_eq!(presentation(true, false, false), Presentation::Hidden);
@@ -1811,6 +1891,28 @@ mod tests {
         for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -1.0] {
             assert!(!contains_edges([0.0, 0.0, bad, 3.0], full));
         }
+    }
+
+    #[test]
+    fn compact_native_path_checks_exact_pose_before_paint_and_keeps_recovery() {
+        let source = include_str!("vte_surface.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        assert!(production
+            .contains("return presentation(false, false, self.candidate_fits(&self.glyph))"));
+        let refresh = production.split("pub(crate) fn refresh").nth(1).unwrap();
+        assert!(
+            refresh.find("self.glyph.set_text").unwrap()
+                < refresh
+                    .find("let choice = self.current_presentation()")
+                    .unwrap()
+        );
+        assert!(
+            refresh.find("self.sync_paint_observer(focused)").unwrap()
+                < refresh.find("let geometry =").unwrap()
+        );
+        assert!(refresh.contains("|| self.current_presentation() == Presentation::Hidden"));
+        assert!(!refresh.contains("self.card.set_visible(painted)"));
+        assert!(source.contains("assert!(saw_partial_compact,"));
     }
 
     #[test]
