@@ -1320,6 +1320,7 @@ pub(crate) struct OrganismActivity {
     commands_running: Cell<u32>,
     active_at: Cell<Option<Instant>>,
     ticked_at: Cell<Option<Instant>>,
+    enabled_bodies: Cell<u32>,
     sleeping_bodies: Cell<u32>,
     circadian_profile: Cell<Option<CircadianProfile>>,
     circadian_profile_day: Cell<Option<i64>>,
@@ -1348,6 +1349,7 @@ impl OrganismActivity {
             commands_running: Cell::new(0),
             active_at: Cell::new(Some(Instant::now())),
             ticked_at: Cell::new(None),
+            enabled_bodies: Cell::new(0),
             sleeping_bodies: Cell::new(0),
             circadian_profile: Cell::new(circadian_profile),
             // Force one fresh cross-window read at the first command, then at
@@ -1356,6 +1358,25 @@ impl OrganismActivity {
             morning_greeted_session: Cell::new(None),
             growth: Cell::new(growth),
         })
+    }
+
+    /// Count enabled runtimes, including offscreen panes whose heartbeat
+    /// continues. Focus and map/unmap changes do not pause physiology.
+    fn body_enabled(&self) {
+        self.enabled_bodies
+            .set(self.enabled_bodies.get().saturating_add(1));
+    }
+
+    fn body_disabled(&self) {
+        debug_assert!(self.enabled_bodies.get() > 0);
+        let remaining = self.enabled_bodies.get().saturating_sub(1);
+        self.enabled_bodies.set(remaining);
+        if remaining == 0 {
+            // No source is advancing the shared mind. A later enable or new
+            // pane starts a fresh interval instead of simulating disabled time.
+            self.ticked_at.set(None);
+            self.input_activity.borrow_mut().clear();
+        }
     }
 
     fn set_growth(&self, growth: GrowthProgress) {
@@ -2029,6 +2050,7 @@ impl OrganismRuntime {
         sticky_avatar.set_focusable(false);
         sticky_avatar.set_accessible_role(gtk::AccessibleRole::Presentation);
 
+        activity.body_enabled();
         let runtime = Rc::new(Self {
             organism: RefCell::new(NativeOrganism::from_persisted_state(shared_life.get())),
             motion: Cell::new(motion),
@@ -3223,6 +3245,13 @@ impl OrganismRuntime {
         if was_enabled == enabled && old_motion == motion {
             return;
         }
+        if was_enabled != enabled {
+            if enabled {
+                runtime.activity.body_enabled();
+            } else {
+                runtime.activity.body_disabled();
+            }
+        }
         // Effective Full/Calm changes only affect native cadence and frames.
         // Preserve the core's original candidate/hold deadline and cooldown.
         if !enabled || motion == OrganismMotion::Static {
@@ -3640,6 +3669,9 @@ impl OrganismRuntime {
 
 impl Drop for OrganismRuntime {
     fn drop(&mut self) {
+        if self.enabled.get() {
+            self.activity.body_disabled();
+        }
         self.cancel_pointer_greeting();
         self.clear_presence_cue();
         self.presence.unregister(self.presence_token);
@@ -8811,6 +8843,60 @@ mod tests {
         assert_eq!(signal.dismiss_streak.get(), 2);
         signal.note_accepted(1);
         assert_eq!(signal.dismiss_streak.get(), 0);
+    }
+
+    #[test]
+    fn last_enabled_body_pauses_clock_and_retires_input_until_resume() {
+        let activity = OrganismActivity::new(None, GrowthProgress::default());
+        let start = activity.session_started;
+        activity.body_enabled();
+        activity.tick_slice(start);
+        activity.note_input(start);
+        activity.body_disabled();
+        assert!(activity.ticked_at.get().is_none());
+        activity.body_enabled();
+        // Even a quick reenable cannot revive the pre-disable input window.
+        assert_eq!(
+            activity.tick_slice(start + Duration::from_millis(100)),
+            (0.0, 0.0)
+        );
+        assert_eq!(
+            activity.tick_slice(start + Duration::from_millis(200)),
+            (0.0, 0.1)
+        );
+        activity.body_disabled();
+        activity.body_enabled();
+        assert_eq!(
+            activity.tick_slice(start + Duration::from_secs(3600)),
+            (0.0, 0.0)
+        );
+        assert_eq!(
+            activity.tick_slice(start + Duration::from_millis(3_600_100)),
+            (0.0, 0.1)
+        );
+    }
+
+    #[test]
+    fn disabling_one_of_several_enabled_bodies_preserves_clock_and_input() {
+        let activity = OrganismActivity::new(None, GrowthProgress::default());
+        let start = activity.session_started;
+        activity.body_enabled();
+        activity.body_enabled();
+        activity.tick_slice(start);
+        activity.note_input(start);
+        activity.body_disabled();
+        assert_eq!(activity.enabled_bodies.get(), 1);
+        assert_eq!(
+            activity.tick_slice(start + Duration::from_millis(200)),
+            (0.2, 0.0)
+        );
+        activity.body_enabled();
+        assert_eq!(
+            activity.tick_slice(start + Duration::from_millis(300)),
+            (0.1, 0.0)
+        );
+        activity.body_disabled();
+        assert_eq!(activity.enabled_bodies.get(), 1);
     }
 
     #[test]
