@@ -239,6 +239,39 @@ pub struct Frame {
     rgb_masks: [c_ulong; 3],
 }
 impl Frame {
+    /// Diagnostic only: no assertion, threshold, filtering, or pixel mutation.
+    pub fn log_differences(&self, full: &Self, stage: &str) {
+        let mut differences = 0usize;
+        let mut bounds: Option<(i32, i32, i32, i32)> = None;
+        for (i, (a, b)) in self.pixels.iter().zip(&full.pixels).enumerate() {
+            if a == b {
+                continue;
+            }
+            let x = self.rect.x + (i % self.rect.width as usize) as i32;
+            let y = self.rect.y + (i / self.rect.width as usize) as i32;
+            bounds = Some(match bounds {
+                Some((l, t, r, b)) => (l.min(x), t.min(y), r.max(x), b.max(y)),
+                None => (x, y, x, y),
+            });
+            if differences < 128 {
+                let rgb = |pixel: c_ulong| {
+                    self.rgb_masks.map(|mask| {
+                        let shift = mask.trailing_zeros();
+                        (u128::from((pixel & mask) >> shift) * 255 / u128::from(mask >> shift))
+                            as u8
+                    })
+                };
+                eprintln!(
+                    "paint-difference {stage}: ({x},{y}) old={a:#x}/{:?} new={b:#x}/{:?}",
+                    rgb(*a),
+                    rgb(*b)
+                );
+            }
+            differences += 1;
+        }
+        eprintln!("paint-difference {stage}: total={differences} bbox={bounds:?} masks={:?} shape={:?}/{:?} pixel_counts={}/{}", self.rgb_masks, self.rect, full.rect, self.pixels.len(), full.pixels.len());
+    }
+
     pub fn assert_same_pixels(&self, full: &Self, stage: &str) {
         assert_eq!(self.rect, full.rect, "{stage}: ROI changed");
         assert_eq!(self.scale, full.scale, "{stage}: scale changed");

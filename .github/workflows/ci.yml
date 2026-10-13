@@ -91,7 +91,17 @@ jobs:
         run: xvfb-run --auto-servernum cargo test --all-targets --locked --no-fail-fast 2>&1 | tee test.log
 
       - name: Run display-backed GTK/VTE regressions
-        run: ANVIL_XTEST_DRIVER="$PWD/scripts/qa-cross-selection-pointer.py" bash scripts/test-gtk-display.sh
+        run: GTK_PAINT_DIAGNOSTICS_DIR="$PWD/gtk-paint-diagnostics" ANVIL_XTEST_DRIVER="$PWD/scripts/qa-cross-selection-pointer.py" bash scripts/test-gtk-display.sh
+
+      - name: Upload synthetic GTK paint diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: gtk-paint-diagnostics
+          path: gtk-paint-diagnostics/
+          if-no-files-found: ignore
+          retention-days: 7
+
 
       - name: Run Clippy
         id: clippy

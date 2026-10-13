@@ -4988,6 +4988,7 @@ mod tests {
         );
         assert!(runtime.surface_timer.borrow().is_none());
         move_native_pointer(window, 0, 0);
+        let fixture_started = Instant::now();
         let main = gtk::glib::MainContext::default();
         let paint = PaintSerial::new(window).unwrap();
         let probe = SurfaceProbe::new(window).unwrap();
@@ -5004,6 +5005,17 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(2));
             }
             assert!(ready(), "inline paint fixture did not settle");
+        };
+        let log_state = |stage: &str| {
+            let origin = runtime
+                .card
+                .compute_point(window, &gtk::graphene::Point::new(0.0, 0.0));
+            eprintln!("paint-state {stage}: elapsed_us={} frame={} clock_time={:?} snapshots={} window_active={} focus={:?} animations={:?} content_size={}x{} local_border={:?} window_border={:?} content_origin={origin:?} recorded={:?} status_bounds={:?} sprite_bounds={:?} css={:?} state={:?}",
+                fixture_started.elapsed().as_micros(), paint.current(), window.frame_clock().map(|clock| clock.frame_time()),
+                inline_card::snapshot_count(&runtime.card), window.is_active(), gtk::prelude::RootExt::focus(window).map(|widget| widget.type_().name().to_string()),
+                gtk::Settings::default().map(|settings| settings.is_gtk_enable_animations()), runtime.card.width(), runtime.card.height(),
+                runtime.card.compute_bounds(&runtime.card), runtime.card.compute_bounds(window), inline_card::recorded_geometry(&runtime.card),
+                runtime.status.compute_bounds(window), runtime.sprite.compute_bounds(window), runtime.card.css_classes(), runtime.card.state_flags());
         };
         let status = runtime.status.text();
         let state = runtime.state.text();
@@ -5029,6 +5041,7 @@ mod tests {
         runtime.card.add_css_class("organism-paint-fixture");
 
         for stage in 0..6 {
+            log_state(&format!("stage-{stage}-before-change"));
             let old = runtime.card.compute_bounds(window).unwrap();
             let old_width = window.width();
             let before = paint.current();
@@ -5096,7 +5109,9 @@ mod tests {
             };
             let name = format!("inline-card-{stage}");
             probe.log_metadata(&runtime.status, roi, &name);
+            log_state(&format!("stage-{stage}-before-incremental"));
             let incremental = probe.capture(roi).unwrap();
+            log_state(&format!("stage-{stage}-after-incremental"));
             let before = paint.current();
             probe.expose_full().unwrap();
             wait(&|| paint.current() > before);
@@ -5105,15 +5120,56 @@ mod tests {
                 current,
                 "expose must not change geometry"
             );
+            log_state(&format!("stage-{stage}-before-complete"));
             let complete = probe.capture(roi).unwrap();
+            log_state(&format!("stage-{stage}-after-complete"));
             if incremental.pixels != complete.pixels {
-                let directory = std::env::temp_dir();
+                incremental.log_differences(&complete, &name);
+                let directory = std::env::var_os("GTK_PAINT_DIAGNOSTICS_DIR")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| std::env::temp_dir().join("gtk-paint-diagnostics"));
+                std::fs::create_dir_all(&directory).unwrap();
                 incremental
                     .write_ppm(&directory.join(format!("{name}-incremental.ppm")))
                     .unwrap();
                 complete
                     .write_ppm(&directory.join(format!("{name}-complete.ppm")))
                     .unwrap();
+                // Observe drift without replacing the original failing pair.
+                match probe.capture(roi) {
+                    Ok(delayed) => {
+                        complete.log_differences(&delayed, &format!("{name}-same-state-readback"));
+                        delayed
+                            .write_ppm(&directory.join(format!("{name}-delayed.ppm")))
+                            .unwrap();
+                    }
+                    Err(error) => eprintln!("diagnostic same-state readback failed: {error}"),
+                }
+                let serial = paint.current();
+                if let Err(error) = probe.expose_full() {
+                    eprintln!("diagnostic second expose failed: {error}");
+                } else {
+                    let started = Instant::now();
+                    while paint.current() <= serial && started.elapsed() < Duration::from_secs(2) {
+                        while main.iteration(false) {}
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    if paint.current() <= serial {
+                        eprintln!("diagnostic second expose timed out without a new paint");
+                    }
+                    log_state(&format!("stage-{stage}-diagnostic-second-expose"));
+                    match probe.capture(roi) {
+                        Ok(second) => {
+                            complete.log_differences(&second, &format!("{name}-second-complete"));
+                            second
+                                .write_ppm(&directory.join(format!("{name}-second-complete.ppm")))
+                                .unwrap();
+                        }
+                        Err(error) => {
+                            eprintln!("diagnostic second expose readback failed: {error}")
+                        }
+                    }
+                }
             }
             incremental.assert_same_pixels(&complete, &name);
             inline_card::assert_native_paint_contract(&runtime.card);

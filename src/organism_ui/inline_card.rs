@@ -9,27 +9,39 @@ use gtk::{glib, prelude::*, subclass::prelude::*};
 use relm4::gtk;
 
 // BEGIN PURE PAINT BOUNDS
-/// Union the allocated card and child snapshot, round outward, and reserve a
-/// one-logical-pixel paint guard. Shadows/negative offsets remain included.
-/// Cairo clips to this exact envelope; no painted glyph can escape its damage.
-fn paint_bounds(width: i32, height: i32, child: [f32; 4]) -> Option<[f32; 4]> {
-    let [x, y, w, h] = child;
-    if width <= 0 || height <= 0 || w < 0.0 || h < 0.0 {
+/// Union the real local CSS border box and child ink, then round outward.
+/// The guard covers the current inset outline; arbitrary outer CSS shadows
+/// are not claimed to be part of compute_bounds or this paint contract.
+fn paint_bounds(card: [f32; 4], child: [f32; 4]) -> Option<[f32; 4]> {
+    if card[2] <= 0.0 || card[3] <= 0.0 || child[2] < 0.0 || child[3] < 0.0 {
         return None;
     }
-    if !child.iter().all(|value| value.is_finite()) {
+    if !card
+        .iter()
+        .chain(child.iter())
+        .all(|value| value.is_finite())
+    {
         return None;
     }
-    let left = x.min(0.0).floor() - 1.0;
-    let top = y.min(0.0).floor() - 1.0;
-    let right = (x + w).max(width as f32).ceil() + 1.0;
-    let bottom = (y + h).max(height as f32).ceil() + 1.0;
+    let card_right = card[0] + card[2];
+    let card_bottom = card[1] + card[3];
+    let child_right = child[0] + child[2];
+    let child_bottom = child[1] + child[3];
+    if ![card_right, card_bottom, child_right, child_bottom]
+        .iter()
+        .all(|value| value.is_finite())
+    {
+        return None;
+    }
+    let left = card[0].min(child[0]).floor() - 1.0;
+    let top = card[1].min(child[1]).floor() - 1.0;
+    let right = card_right.max(child_right).ceil() + 1.0;
+    let bottom = card_bottom.max(child_bottom).ceil() + 1.0;
     let result = [left, top, right - left, bottom - top];
-    if result.iter().all(|value| value.is_finite()) {
-        Some(result)
-    } else {
-        None
-    }
+    result
+        .iter()
+        .all(|value| value.is_finite())
+        .then_some(result)
 }
 // END PURE PAINT BOUNDS
 
@@ -40,6 +52,10 @@ mod imp {
     pub struct InlineCard {
         #[cfg(test)]
         pub snapshots: std::cell::Cell<u64>,
+        #[cfg(test)]
+        pub last_envelope: std::cell::Cell<Option<[f32; 4]>>,
+        #[cfg(test)]
+        pub last_children: std::cell::Cell<Option<[f32; 4]>>,
     }
 
     #[glib::object_subclass]
@@ -62,9 +78,16 @@ mod imp {
                 return;
             };
             let child = node.bounds();
+            if widget.width() <= 0 || widget.height() <= 0 {
+                return;
+            }
+            // width/height are content-box dimensions. Native bounds include
+            // asymmetric CSS border/padding and can begin at negative offsets.
+            let Some(card) = widget.compute_bounds(&*widget) else {
+                return;
+            };
             let Some([x, y, width, height]) = paint_bounds(
-                widget.width(),
-                widget.height(),
+                [card.x(), card.y(), card.width(), card.height()],
                 [child.x(), child.y(), child.width(), child.height()],
             ) else {
                 return;
@@ -75,7 +98,12 @@ mod imp {
             let cr = snapshot.append_cairo(&gtk::graphene::Rect::new(x, y, width, height));
             node.draw(&cr);
             #[cfg(test)]
-            self.snapshots.set(self.snapshots.get() + 1);
+            {
+                self.snapshots.set(self.snapshots.get() + 1);
+                self.last_envelope.set(Some([x, y, width, height]));
+                self.last_children
+                    .set(Some([child.x(), child.y(), child.width(), child.height()]));
+            }
         }
     }
 
@@ -116,6 +144,10 @@ pub(super) fn assert_native_paint_contract(card: &gtk::Widget) {
     assert!(bounds.x() <= 0.0 && bounds.y() <= 0.0);
     assert!(bounds.x() + bounds.width() >= card.width() as f32);
     assert!(bounds.y() + bounds.height() >= card.height() as f32);
+    let border = card.compute_bounds(card).expect("mapped local border box");
+    assert!(bounds.x() <= border.x() && bounds.y() <= border.y());
+    assert!(bounds.x() + bounds.width() >= border.x() + border.width());
+    assert!(bounds.y() + bounds.height() >= border.y() + border.height());
     let native = original.bounds();
     assert!(bounds.x() <= native.x() && bounds.y() <= native.y());
     assert!(bounds.x() + bounds.width() >= native.x() + native.width());
@@ -165,6 +197,16 @@ pub(super) fn snapshot_count(card: &gtk::Widget) -> u64 {
         .get()
 }
 
+/// Observes the last real snapshot without recording or invalidating a node.
+#[cfg(test)]
+pub(super) fn recorded_geometry(card: &gtk::Widget) -> (Option<[f32; 4]>, Option<[f32; 4]>) {
+    let imp = card
+        .downcast_ref::<InlineCard>()
+        .expect("owned paint boundary")
+        .imp();
+    (imp.last_envelope.get(), imp.last_children.get())
+}
+
 // BEGIN PURE TESTS
 #[cfg(test)]
 mod tests {
@@ -172,8 +214,8 @@ mod tests {
 
     #[test]
     fn paint_envelope_covers_whole_card_not_only_changed_glyphs() {
-        let first = paint_bounds(640, 70, [130.0, 28.0, 250.0, 16.0]);
-        let next = paint_bounds(640, 70, [130.0, 28.0, 40.0, 16.0]);
+        let first = paint_bounds([0.0, 0.0, 640.0, 70.0], [130.0, 28.0, 250.0, 16.0]);
+        let next = paint_bounds([0.0, 0.0, 640.0, 70.0], [130.0, 28.0, 40.0, 16.0]);
         assert_eq!(first, Some([-1.0, -1.0, 642.0, 72.0]));
         assert_eq!(first, next);
         let [x, y, w, h] = first.unwrap();
@@ -184,12 +226,12 @@ mod tests {
     #[test]
     fn paint_envelope_retains_fractional_overflow_and_negative_offsets() {
         assert_eq!(
-            paint_bounds(100, 30, [-2.25, -3.25, 105.0, 40.0]),
+            paint_bounds([0.0, 0.0, 100.0, 30.0], [-2.25, -3.25, 105.0, 40.0]),
             Some([-4.0, -5.0, 108.0, 43.0])
         );
         for fraction in [0.0, 0.125, 0.5, 0.875] {
             let child = [-fraction, -fraction, 101.0, 31.0];
-            let [x, y, w, h] = paint_bounds(100, 30, child).unwrap();
+            let [x, y, w, h] = paint_bounds([0.0, 0.0, 100.0, 30.0], child).unwrap();
             assert!(x <= child[0] && y <= child[1]);
             assert!(x + w >= child[0] + child[2]);
             assert!(y + h >= child[1] + child[3]);
@@ -197,9 +239,34 @@ mod tests {
     }
 
     #[test]
+    fn paint_envelope_covers_asymmetric_native_border_box() {
+        let border = [-3.0, -1.0, 104.0, 32.0];
+        let child = [12.0, 8.0, 50.0, 14.0];
+        assert_eq!(paint_bounds(border, child), Some([-4.0, -2.0, 106.0, 34.0]));
+        // A content-only envelope began at -1 and missed this left stripe.
+        let [x, y, w, h] = paint_bounds(border, child).unwrap();
+        assert!(x < border[0] && y < border[1]);
+        assert!(x + w > border[0] + border[2]);
+        assert!(y + h > border[1] + border[3]);
+        for invalid in [
+            [f32::NAN, 0.0, 104.0, 32.0],
+            [f32::MAX, 0.0, f32::MAX, 32.0],
+            [0.0, 0.0, -1.0, 32.0],
+        ] {
+            assert_eq!(paint_bounds(invalid, child), None);
+        }
+    }
+
+    #[test]
     fn paint_envelope_rejects_unallocated_and_invalid_nodes() {
         for (width, height) in [(0, 30), (100, 0), (-1, 30)] {
-            assert_eq!(paint_bounds(width, height, [0.0, 0.0, 100.0, 30.0]), None);
+            assert_eq!(
+                paint_bounds(
+                    [0.0, 0.0, width as f32, height as f32],
+                    [0.0, 0.0, 100.0, 30.0]
+                ),
+                None
+            );
         }
         for child in [
             [f32::NAN, 0.0, 100.0, 30.0],
@@ -207,7 +274,7 @@ mod tests {
             [0.0, 0.0, -1.0, 30.0],
             [f32::MAX, 0.0, f32::MAX, 30.0],
         ] {
-            assert_eq!(paint_bounds(100, 30, child), None);
+            assert_eq!(paint_bounds([0.0, 0.0, 100.0, 30.0], child), None);
         }
     }
 }
