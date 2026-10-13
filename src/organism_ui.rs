@@ -1498,31 +1498,52 @@ impl OrganismActivity {
             .unwrap_or(0.0)
     }
 
-    /// Claim this window's bounded interval exactly once, partitioned by the
-    /// union of actual input windows. A late callback consumes only its final
-    /// second; a second body at the same instant consumes nothing.
-    fn tick_slice(&self, now: Instant) -> (f32, f32) {
+    /// Claim one monotonic window interval. All native bodies share this
+    /// anchor, while the core owns input and rest-boundary accounting.
+    fn claim_interval(&self, now: Instant) -> Option<(Duration, Duration)> {
         let Some(previous) = self.ticked_at.get() else {
             self.ticked_at.set(Some(now));
             self.input_activity
                 .borrow_mut()
                 .trim_before(now.saturating_duration_since(self.session_started));
-            return (0.0, 0.0);
+            return None;
         };
         if now <= previous {
-            return (0.0, 0.0);
+            return None;
         }
         self.ticked_at.set(Some(now));
         let elapsed = now.duration_since(previous).min(MAX_TICK);
         let end = now.saturating_duration_since(self.session_started);
-        let active = self
-            .input_activity
+        Some((end.saturating_sub(elapsed), end))
+    }
+
+    fn advance_life(&self, state: &mut LifeState, now: Instant, phase: CircadianPhase) -> f32 {
+        let Some((start, end)) = self.claim_interval(now) else {
+            return 0.0;
+        };
+        let rest_from = if self.sleeping_rest() {
+            Some(start)
+        } else if self.no_commands_running() {
+            self.active_at
+                .get()
+                .and_then(|at| at.checked_add(REST_ONSET))
+                .map(|at| at.saturating_duration_since(self.session_started))
+        } else {
+            None
+        };
+        self.input_activity
             .borrow_mut()
-            .active_during(end.saturating_sub(elapsed), end);
-        (
-            active.as_secs_f32(),
-            elapsed.saturating_sub(active).as_secs_f32(),
-        )
+            .tick_life(state, start, end, rest_from, phase)
+    }
+
+    /// Inspect the claimed activity partition in clock/lifecycle regressions.
+    #[cfg(test)]
+    fn tick_slice(&self, now: Instant) -> (f32, f32) {
+        let Some((start, end)) = self.claim_interval(now) else {
+            return (0.0, 0.0);
+        };
+        let active = self.input_activity.borrow_mut().active_during(start, end);
+        (active.as_secs_f32(), (end - start - active).as_secs_f32())
     }
 }
 
@@ -3442,17 +3463,13 @@ impl OrganismRuntime {
             // clock and evolve the one shared mind. Persistence is untouched —
             // the evolved state only reaches disk with the next lifecycle
             // event, exactly as before.
-            let (active, inactive) = runtime.activity.tick_slice(now);
-            if active + inactive > 0.0 {
-                let mut life = runtime.shared_life.get();
-                let resting = runtime.activity.resting(now) || runtime.activity.sleeping_rest();
-                let phase = runtime.activity.circadian_phase(local.bucket);
-                if active > 0.0 {
-                    life.tick(active, true, resting, phase);
-                }
-                if inactive > 0.0 {
-                    life.tick(inactive, false, resting, phase);
-                }
+            let mut life = runtime.shared_life.get();
+            let elapsed = runtime.activity.advance_life(
+                &mut life,
+                now,
+                runtime.activity.circadian_phase(local.bucket),
+            );
+            if elapsed > 0.0 {
                 runtime.shared_life.set(life);
                 runtime.refresh_state(life);
             }
@@ -8843,6 +8860,117 @@ mod tests {
         assert_eq!(signal.dismiss_streak.get(), 2);
         signal.note_accepted(1);
         assert_eq!(signal.dismiss_streak.get(), 0);
+    }
+
+    fn assert_physiology_close(actual: LifeState, expected: LifeState) {
+        for (actual, expected) in [
+            (actual.energy, expected.energy),
+            (actual.mood, expected.mood),
+            (actual.curiosity, expected.curiosity),
+            (actual.boredom, expected.boredom),
+            (actual.stress, expected.stress),
+            (actual.social_need, expected.social_need),
+            (actual.attachment, expected.attachment),
+            (actual.confidence, expected.confidence),
+        ] {
+            assert!(
+                (actual - expected).abs() < 0.000001,
+                "{actual} != {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn physiology_rest_counts_only_time_after_the_quiet_threshold() {
+        for (begin_ms, end_ms, awake, rest) in [
+            (59_000, 60_000, 1.0, 0.0),
+            (59_500, 60_500, 0.5, 0.5),
+            (60_000, 61_000, 0.0, 1.0),
+        ] {
+            let activity = OrganismActivity::new(None, GrowthProgress::default());
+            let start = activity.session_started;
+            activity.active_at.set(Some(start));
+            let mut actual = LifeState::default();
+            let mut expected = actual;
+            let phase = CircadianPhase::Unlearned;
+            assert_eq!(
+                activity.advance_life(&mut actual, start + Duration::from_millis(begin_ms), phase),
+                0.0
+            );
+            assert_eq!(
+                activity.advance_life(&mut actual, start + Duration::from_millis(end_ms), phase),
+                1.0
+            );
+            if awake > 0.0 {
+                expected.tick(awake, false, false, phase);
+            }
+            if rest > 0.0 {
+                expected.tick(rest, false, true, phase);
+            }
+            assert_physiology_close(actual, expected);
+        }
+    }
+
+    #[test]
+    fn physiology_running_gates_quiet_and_visible_sleep_but_keeps_exhaustion_rest() {
+        let activity = OrganismActivity::new(None, GrowthProgress::default());
+        let start = activity.session_started;
+        activity.command_started(start);
+        activity.body_started_sleeping();
+        let phase = CircadianPhase::Unlearned;
+        let mut actual = LifeState::default();
+        let mut expected = actual;
+        activity.advance_life(&mut actual, start + Duration::from_secs(60), phase);
+        activity.advance_life(&mut actual, start + Duration::from_secs(61), phase);
+        expected.tick(1.0, false, false, phase);
+        assert_physiology_close(actual, expected);
+
+        activity.command_finished(start + Duration::from_secs(61));
+        activity.advance_life(&mut actual, start + Duration::from_millis(61_500), phase);
+        expected.tick(0.5, false, true, phase);
+        assert_physiology_close(actual, expected);
+
+        activity.command_started(start + Duration::from_millis(61_500));
+        actual.energy = 0.05;
+        expected = actual;
+        activity.advance_life(&mut actual, start + Duration::from_millis(62_000), phase);
+        expected.tick(0.5, false, false, phase);
+        assert_physiology_close(actual, expected);
+        assert!(
+            actual.energy > 0.05,
+            "core exhaustion rest remains available during a command"
+        );
+    }
+
+    #[test]
+    fn physiology_preserves_shared_state_and_chronological_input_without_double_ticks() {
+        let activity = OrganismActivity::new(None, GrowthProgress::default());
+        let start = activity.session_started;
+        let phase = CircadianPhase::Unlearned;
+        let mut actual = LifeState::default();
+        activity.advance_life(&mut actual, start, phase);
+        activity.note_input(start + Duration::from_millis(900));
+        // A lifecycle event may mutate the shared state after the last frame.
+        actual.confidence = 0.9;
+        let mut expected = actual;
+        expected.tick(0.9, false, false, phase);
+        expected.tick(0.1, true, false, phase);
+        activity.advance_life(&mut actual, start + Duration::from_secs(1), phase);
+        assert_physiology_close(actual, expected);
+        assert_eq!(
+            activity.advance_life(&mut actual, start + Duration::from_secs(1), phase),
+            0.0
+        );
+        assert_eq!(activity.advance_life(&mut actual, start, phase), 0.0);
+        assert_physiology_close(actual, expected);
+        activity.body_enabled();
+        activity.body_disabled();
+        activity.body_enabled();
+        assert_eq!(
+            activity.advance_life(&mut actual, start + Duration::from_secs(10), phase),
+            0.0
+        );
+        assert_physiology_close(actual, expected);
     }
 
     #[test]
