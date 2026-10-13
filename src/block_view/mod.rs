@@ -26831,10 +26831,10 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
 
     #[test]
     fn csi_erase_line_from_start() {
-        // CSI 1K: erase from start to cursor (fills with spaces)
+        // CSI 1K: erase from start through cursor, inclusive (fills with spaces)
         assert_eq!(
             strip_ansi_with_clear_detect("abcdef\r\u{1b}[3C\u{1b}[1K"),
-            ("   def".to_string(), false)
+            ("    ef".to_string(), false)
         );
     }
 

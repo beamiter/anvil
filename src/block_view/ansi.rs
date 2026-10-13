@@ -417,7 +417,7 @@ fn strip_ansi_with_clear_detect_replay(input: &str) -> (String, bool) {
                             },
                             b'C' => {
                                 let count = parse_param_first(&param_buf, 1);
-                                cursor = (cursor + count).min(cells.len());
+                                cursor = cursor.saturating_add(count).min(cells.len());
                             }
                             b'D' => {
                                 let count = parse_param_first(&param_buf, 1);
@@ -563,6 +563,20 @@ mod tests {
         ansi_has_visible_text, contains_case_insensitive as cci, strip_ansi_with_clear_detect,
         strip_ansi_with_clear_detect_replay,
     };
+
+    #[test]
+    fn saturated_horizontal_motion_stays_within_materialized_text() {
+        let input = format!("abc\x1b[{}Cx", usize::MAX);
+        assert_eq!(
+            strip_ansi_with_clear_detect(&input),
+            ("abcx".to_string(), false)
+        );
+        let input = format!("abc\r\x1b[{}Cx", usize::MAX);
+        assert_eq!(
+            strip_ansi_with_clear_detect(&input),
+            ("abcx".to_string(), false)
+        );
+    }
 
     #[test]
     fn erase_entire_line_preserves_cursor_for_following_text() {
