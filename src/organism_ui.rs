@@ -294,37 +294,6 @@ fn focus_transfer_rearm_delay(
     timer_pending.then(|| surface_frame_delay(motion, owner, alt_screen, false))
 }
 
-fn reaction_hold(reaction: &Reaction) -> Duration {
-    let millis = match reaction.behavior {
-        // Ordinary/quiet passes acknowledge the event without occupying the
-        // output centre for the old fixed eight seconds.
-        Behavior::Idle => 1_500,
-        Behavior::Celebrate if reaction.tone == Tone::Quiet => 1_800,
-        Behavior::Celebrate => 2_500,
-        // Errors need time to be noticed; a repeated streak deliberately sits
-        // longer, but the next input still interrupts it immediately.
-        Behavior::InspectError => 5_000,
-        Behavior::SitNearError => 10_000,
-        Behavior::CelebrateBig => 7_000,
-        Behavior::RestAfterPush => 5_000,
-        Behavior::UnknownOutcome => 4_500,
-        // GlanceAside is live-only and uses its own timer. Keep this arm for
-        // exhaustive safety if a future caller ever wraps it in a Reaction.
-        Behavior::GlanceAside => 1_400,
-        Behavior::WatchCommand
-        | Behavior::Sleep
-        | Behavior::Explore
-        | Behavior::Approach
-        | Behavior::WatchAgent
-        | Behavior::WatchSettled
-        | Behavior::GuardFailure
-        | Behavior::GuardStuck
-        | Behavior::GuardRecovery
-        | Behavior::GuardCautious => 2_500,
-    };
-    Duration::from_millis(millis)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SurfaceMode {
     Idle,
@@ -4559,7 +4528,7 @@ impl OrganismHub {
                     &runtime,
                     view_weak.clone(),
                     generation,
-                    reaction_hold(&reaction),
+                    reaction.hold_duration(),
                 );
                 // Dispatch last, after this pane has committed its own
                 // reducer/memory/render work. Only the typed failure fact
@@ -4639,7 +4608,7 @@ impl OrganismHub {
                         &runtime,
                         view_weak,
                         generation,
-                        reaction_hold(&reaction),
+                        reaction.hold_duration(),
                     );
                 });
             });
@@ -9716,6 +9685,48 @@ mod tests {
     }
 
     #[test]
+    fn sustained_completion_reuses_protected_quiet_pose_without_motion_escalation() {
+        let mut organism = NativeOrganism::default();
+        organism.command_started(CommandKind::Other);
+        let reaction = organism.command_finished(CommandKind::Other, Some(0), Some(60_000));
+        assert_eq!(reaction.behavior, Behavior::Celebrate);
+        assert_eq!(reaction.tone, Tone::Quiet);
+        assert_eq!(reaction.speech, None);
+        assert_eq!(reaction.hold_duration(), Duration::from_millis(1800));
+        assert_eq!(
+            surface_mode(reaction.behavior, false, None),
+            SurfaceMode::Reacting
+        );
+        assert_eq!(
+            surface_mode(reaction.behavior, true, None),
+            SurfaceMode::Watching
+        );
+        assert_eq!(
+            surface_mode(reaction.behavior, false, Some(Duration::ZERO)),
+            SurfaceMode::Typing
+        );
+        assert_eq!(presence_signal_for_exit(Some(0)), None);
+        for motion in [OrganismMotion::Calm, OrganismMotion::Static] {
+            assert_eq!(
+                visual_transition_for_motion(motion, Behavior::WatchSettled, reaction.behavior),
+                None
+            );
+            assert_eq!(
+                surface_frame_delay(motion, true, false, false),
+                DORMANT_FRAME_INTERVAL
+            );
+        }
+        let context = RenderContext::new(reaction.behavior, BodyLanguage::default(), false);
+        assert!(!GentleInteraction::default().request(Duration::ZERO, context));
+        let next = organism.command_started(CommandKind::Other);
+        assert_eq!(next.behavior, Behavior::WatchCommand);
+        assert_eq!(
+            surface_mode(next.behavior, true, None),
+            SurfaceMode::Watching
+        );
+    }
+
+    #[test]
     fn reaction_holds_follow_semantic_weight_instead_of_one_fixed_timeout() {
         let reaction = |behavior, tone| Reaction {
             behavior,
@@ -9729,11 +9740,11 @@ mod tests {
         let repeated_error = reaction(Behavior::SitNearError, Tone::Error);
         let big_recovery = reaction(Behavior::CelebrateBig, Tone::Success);
 
-        assert!(reaction_hold(&quiet_pass) < reaction_hold(&ordinary_pass));
-        assert!(reaction_hold(&ordinary_pass) < reaction_hold(&first_error));
-        assert!(reaction_hold(&first_error) < reaction_hold(&big_recovery));
-        assert!(reaction_hold(&big_recovery) < reaction_hold(&repeated_error));
-        assert_eq!(reaction_hold(&repeated_error), Duration::from_secs(10));
+        assert!(quiet_pass.hold_duration() < ordinary_pass.hold_duration());
+        assert!(ordinary_pass.hold_duration() < first_error.hold_duration());
+        assert!(first_error.hold_duration() < big_recovery.hold_duration());
+        assert!(big_recovery.hold_duration() < repeated_error.hold_duration());
+        assert_eq!(repeated_error.hold_duration(), Duration::from_secs(10));
     }
 
     #[test]
