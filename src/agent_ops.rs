@@ -864,6 +864,7 @@ impl AppModel {
                 "Safety check",
                 "Agent stopped because command completion correlation failed.",
             );
+            self.refresh_agent_panel();
             return;
         };
 
