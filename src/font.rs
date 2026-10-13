@@ -600,7 +600,9 @@ mod tests {
                 (bg.blue() * 255.0) as u8,
             ];
             let matching = pixels
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .filter(|pixel| {
                     let argb = u32::from_ne_bytes([pixel[0], pixel[1], pixel[2], pixel[3]]);
                     [
