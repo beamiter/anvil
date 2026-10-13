@@ -302,7 +302,7 @@ fn replay_visibility(bytes: &[u8]) -> VisibilityGrid {
                             b"" | b"0" => grid.truncate_row(row, col),
                             b"1" => {
                                 if let Some(cells) = grid.rows.get_mut(row) {
-                                    let upto = col.min(cells.len());
+                                    let upto = col.saturating_add(1).min(cells.len());
                                     for cell in cells.iter_mut().take(upto) {
                                         *cell = ' ';
                                     }
@@ -405,13 +405,13 @@ fn strip_ansi_with_clear_detect_replay(input: &str) -> (String, bool) {
                             b'K' => match param_buf.as_slice() {
                                 b"" | b"0" => cells.truncate(cursor),
                                 b"1" => {
-                                    for c in cells.iter_mut().take(cursor) {
+                                    for c in cells.iter_mut().take(cursor.saturating_add(1)) {
                                         *c = ' ';
                                     }
                                 }
                                 b"2" => {
+                                    // EL clears cells without moving the cursor.
                                     cells.clear();
-                                    cursor = 0;
                                 }
                                 _ => {}
                             },
@@ -455,6 +455,10 @@ fn strip_ansi_with_clear_detect_replay(input: &str) -> (String, bool) {
             if cursor < cells.len() {
                 cells[cursor] = ch;
             } else {
+                // An erase can leave the cursor beyond retained text. Restore
+                // only that existing column gap, never CSI-requested space:
+                // horizontal movement is bounded by materialized line length.
+                cells.resize(cursor, ' ');
                 cells.push(ch);
             }
             cursor += 1;
@@ -561,6 +565,22 @@ mod tests {
     };
 
     #[test]
+    fn erase_entire_line_preserves_cursor_for_following_text() {
+        for (input, expected) in [
+            ("abc\x1b[2Kx\x1b[1Gz", "z  x"),
+            ("abc\x1b[2K\x08x", "  x"),
+            ("abc\x1b[2K", ""),
+            ("abc\x1b[2K\nx", "\nx"),
+            ("abc\r\x1b[2Kx", "x"),
+        ] {
+            assert_eq!(
+                strip_ansi_with_clear_detect(input),
+                (expected.to_string(), false)
+            );
+        }
+    }
+
+    #[test]
     fn plain_fast_path_matches_replay_semantics() {
         let cases = [
             "",
@@ -603,6 +623,29 @@ mod tests {
                 fast_started.elapsed()
             );
         }
+    }
+
+    #[test]
+    fn erase_line_start_includes_the_cursor_column() {
+        for (input, expected) in [
+            ("abc\r\x1b[1K", " bc"),
+            ("abc\x1b[2G\x1b[1K", "  c"),
+            ("abc\x1b[3G\x1b[1K", "   "),
+            ("abc\x1b[2G\x1b[1Kz", " zc"),
+            ("abc\x1b[1Kx", "   x"),
+        ] {
+            assert_eq!(
+                strip_ansi_with_clear_detect(input),
+                (expected.to_string(), false)
+            );
+        }
+    }
+
+    #[test]
+    fn erased_cursor_cell_cannot_keep_output_visible() {
+        assert!(!ansi_has_visible_text(b"x\r\x1b[1K"));
+        assert!(!ansi_has_visible_text(b"abc\x1b[3G\x1b[1K"));
+        assert!(ansi_has_visible_text(b"abc\x1b[2G\x1b[1K"));
     }
 
     #[test]
